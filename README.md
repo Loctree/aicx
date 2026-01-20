@@ -3,7 +3,7 @@
 > Memory extraction tools for AI agent sessions
 > Created by M&K (c)2026 VetCoders
 
-## agent-memory
+## ai-contexters
 
 Extract timeline and decisions from AI agent session files:
 - **Claude Code**: `~/.claude/projects/*/*.jsonl`
@@ -19,16 +19,16 @@ cargo install --path .
 
 ```bash
 # List all projects/sessions
-agent-memory list
+ai-contexters list
 
 # Extract Claude Code sessions (last 48h)
-agent-memory claude -p CodeScribe -H 48 -o ./reports
+ai-contexters claude -p CodeScribe -H 48 -o ./reports
 
 # Extract Codex history (last 48h)
-agent-memory codex -p codescribe -H 48 -o ./reports
+ai-contexters codex -p codescribe -H 48 -o ./reports
 
 # Extract all agents
-agent-memory all -p codescribe -H 168 -o ./reports  # Last 7 days
+ai-contexters all -p codescribe -H 168 -o ./reports  # Last 7 days
 ```
 
 ### Output Formats

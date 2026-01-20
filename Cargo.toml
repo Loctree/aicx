@@ -1,5 +1,5 @@
 [package]
-name = "agent-memory"
+name = "ai-contexters"
 version = "0.1.0"
 edition = "2024"
 description = "Extract timeline and memory from AI agent sessions (Claude Code, Codex, Gemini)"
@@ -19,7 +19,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1"
 
 [[bin]]
-name = "agent-memory"
+name = "ai-contexters"
 path = "src/main.rs"
 
 [profile.release]
