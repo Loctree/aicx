@@ -334,12 +334,31 @@ fn extract_message_text(message: &Option<serde_json::Value>) -> String {
                 .join("\n")
         }
         Some(serde_json::Value::Object(obj)) => {
-            // Sometimes message is object with "content" field
-            obj.get("content")
-                .or_else(|| obj.get("text"))
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .unwrap_or_default()
+            // Message is object with "content" field (can be string or array)
+            if let Some(content) = obj.get("content") {
+                match content {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Array(arr) => {
+                        // Content is array of blocks (assistant messages)
+                        arr.iter()
+                            .filter_map(|item| {
+                                if let Some(block) = item.as_object() {
+                                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                        return block.get("text").and_then(|t| t.as_str()).map(String::from);
+                                    }
+                                }
+                                None
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                    _ => String::new(),
+                }
+            } else if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                text.to_string()
+            } else {
+                String::new()
+            }
         }
         _ => String::new(),
     }
