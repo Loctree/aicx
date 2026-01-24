@@ -44,6 +44,10 @@ Single-binary Rust CLI (`ai-contexters`) that extracts timeline data from AI age
 ## CLI Usage
 
 ```bash
+ai-contexters init                           # Interactive init (creates .ai-context and runs an agent)
+ai-contexters init --agent codex --no-confirm # Non-interactive agent selection
+ai-contexters init --no-run                  # Build context/prompt only
+
 ai-contexters list                           # List available sessions
 ai-contexters claude -p <project> -H 48      # Extract Claude sessions (last 48h)
 ai-contexters codex -p <project> -H 48       # Extract Codex history
@@ -51,6 +55,27 @@ ai-contexters all -p <project> -H 168        # Extract all (7 days)
 ```
 
 Flags: `-p` project filter, `-H` hours back, `-o` output dir, `-f` format (md/json/both)
+
+## Init artifacts
+
+`ai-contexters init` creates `.ai-context/` in repo root.
+
+```
+.ai-context/
+  share/
+    summary.md      # curated, append-only summary (trimmed to 500 lines)
+    timeline.md     # full append-only timeline
+  local/
+    context/
+    prompts/
+    logs/
+    runs/
+    state/
+    memex/
+    config/
+```
+
+Only `share/summary.md` and `share/timeline.md` are intended to be committed.
 
 ---
 

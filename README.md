@@ -8,6 +8,7 @@
 Extract timeline and decisions from AI agent session files:
 - **Claude Code**: `~/.claude/projects/*/*.jsonl`
 - **Codex**: `~/.codex/history.jsonl`
+- **Gemini CLI**: `~/.gemini/tmp/<hash>/chats/session-*.json`
 
 ### Installation
 
@@ -15,7 +16,40 @@ Extract timeline and decisions from AI agent session files:
 cargo install --path .
 ```
 
-### Usage
+### Quickstart (init)
+
+```bash
+# Interactive init (creates .ai-context and runs an agent)
+ai-contexters init
+
+# Non-interactive agent selection (skip confirmation)
+ai-contexters init --agent codex --no-confirm
+
+# Build context/prompt only (no agent run)
+ai-contexters init --no-run
+```
+
+`init` creates a single per-repo folder: `.ai-context/`
+
+```
+.ai-context/
+  share/
+    summary.md      # curated, append-only summary (trimmed to 500 lines)
+    timeline.md     # full append-only timeline
+  local/
+    context/        # loct + extracted memories
+    prompts/        # built prompts
+    logs/
+    runs/
+    state/
+    memex/
+    config/
+```
+
+Only `share/summary.md` and `share/timeline.md` are meant to be committed.  
+Everything else stays local.
+
+### Usage (classic extractors)
 
 ```bash
 # List all projects/sessions
@@ -54,6 +88,11 @@ ai-contexters all -p codescribe -H 168 -o ./reports  # Last 7 days
 - `-H <hours>`: Look back period (default: 48)
 - `-o <dir>`: Output directory (default: current)
 - `-f <format>`: Output format: `md`, `json`, or `both` (default: both)
+
+### Notes
+
+- `init` requires `loct` available in PATH.
+- `--model` is optional; if omitted, the agent uses its default model.
 
 ---
 

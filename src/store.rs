@@ -107,8 +107,7 @@ pub fn load_index() -> StoreIndex {
 pub fn save_index(index: &StoreIndex) -> Result<()> {
     let path = store_base_dir()?.join("index.json");
     let json = serde_json::to_string_pretty(index).context("Failed to serialize index")?;
-    fs::write(&path, json)
-        .with_context(|| format!("Failed to write index: {}", path.display()))?;
+    fs::write(&path, json).with_context(|| format!("Failed to write index: {}", path.display()))?;
     Ok(())
 }
 
@@ -123,15 +122,9 @@ pub fn update_index(
     let now = Utc::now();
     index.last_updated = now;
 
-    let project_idx = index
-        .projects
-        .entry(project.to_string())
-        .or_default();
+    let project_idx = index.projects.entry(project.to_string()).or_default();
 
-    let agent_idx = project_idx
-        .agents
-        .entry(agent.to_string())
-        .or_default();
+    let agent_idx = project_idx.agents.entry(agent.to_string()).or_default();
 
     if !agent_idx.dates.contains(&date.to_string()) {
         agent_idx.dates.push(date.to_string());
@@ -171,10 +164,7 @@ pub fn write_context(
 
     // Header if new file
     if !path.exists() {
-        content.push_str(&format!(
-            "# {} | {} | {}\n\n",
-            project, agent, date
-        ));
+        content.push_str(&format!("# {} | {} | {}\n\n", project, agent, date));
     }
 
     for entry in entries {

@@ -157,7 +157,8 @@ fn chunk_day_entries(
         let global_end = entries[end - 1].0 + 1;
 
         chunks.push(Chunk {
-            id: format!("{}_{}_{}_{{:03}}", project, agent, date).replace("{:03}", &format!("{:03}", seq)),
+            id: format!("{}_{}_{}_{{:03}}", project, agent, date)
+                .replace("{:03}", &format!("{:03}", seq)),
             project: project.to_string(),
             agent: agent.to_string(),
             date: date.to_string(),
@@ -186,8 +187,16 @@ fn chunk_day_entries(
 }
 
 /// Format entries into chunk text with metadata header.
-pub fn format_chunk_text(entries: &[&TimelineEntry], project: &str, agent: &str, date: &str) -> String {
-    let mut text = format!("[project: {} | agent: {} | date: {}]\n\n", project, agent, date);
+pub fn format_chunk_text(
+    entries: &[&TimelineEntry],
+    project: &str,
+    agent: &str,
+    date: &str,
+) -> String {
+    let mut text = format!(
+        "[project: {} | agent: {} | date: {}]\n\n",
+        project, agent, date
+    );
 
     for entry in entries {
         let time = entry.timestamp.format("%H:%M:%S");
@@ -233,7 +242,12 @@ pub fn chunk_summary(chunks: &[Chunk]) -> String {
 
     let total_tokens: usize = chunks.iter().map(|c| c.token_estimate).sum();
     let avg_tokens = total_tokens / chunks.len();
-    let dates: Vec<&str> = chunks.iter().map(|c| c.date.as_str()).collect::<std::collections::HashSet<_>>().into_iter().collect();
+    let dates: Vec<&str> = chunks
+        .iter()
+        .map(|c| c.date.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
 
     format!(
         "{} chunks, {} total tokens (avg {}), {} days",
@@ -310,7 +324,11 @@ mod tests {
         };
 
         let chunks = chunk_entries(&entries, "proj", "claude", &config);
-        assert!(chunks.len() > 1, "Expected multiple chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() > 1,
+            "Expected multiple chunks, got {}",
+            chunks.len()
+        );
 
         // Verify sequential IDs
         for (i, chunk) in chunks.iter().enumerate() {

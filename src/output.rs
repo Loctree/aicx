@@ -106,15 +106,16 @@ const DECISION_KEYWORDS: &[&str] = &[
 ];
 
 /// Case-sensitive keywords (checked without lowercasing).
-const DECISION_KEYWORDS_CASE_SENSITIVE: &[&str] = &[
-    "WAŻNE",
-    "KEY",
-];
+const DECISION_KEYWORDS_CASE_SENSITIVE: &[&str] = &["WAŻNE", "KEY"];
 
 fn is_decision_message(message: &str) -> bool {
     let lower = message.to_lowercase();
-    DECISION_KEYWORDS.iter().any(|kw| lower.contains(&kw.to_lowercase()))
-        || DECISION_KEYWORDS_CASE_SENSITIVE.iter().any(|kw| message.contains(kw))
+    DECISION_KEYWORDS
+        .iter()
+        .any(|kw| lower.contains(&kw.to_lowercase()))
+        || DECISION_KEYWORDS_CASE_SENSITIVE
+            .iter()
+            .any(|kw| message.contains(kw))
 }
 
 // ============================================================================
@@ -136,21 +137,28 @@ pub fn write_report(
     match &config.mode {
         OutputMode::NewFile => {
             let date_str = metadata.generated_at.format("%Y%m%d_%H%M%S");
-            let prefix = metadata
-                .project_filter
-                .as_deref()
-                .unwrap_or("all");
+            let prefix = metadata.project_filter.as_deref().unwrap_or("all");
 
             if config.format == OutputFormat::Json || config.format == OutputFormat::Both {
-                let json_path = config.dir.join(format!("{}_memory_{}.json", prefix, date_str));
+                let json_path = config
+                    .dir
+                    .join(format!("{}_memory_{}.json", prefix, date_str));
                 write_json_report(&json_path, entries, metadata)?;
                 written_paths.push(json_path);
             }
 
             if config.format == OutputFormat::Markdown || config.format == OutputFormat::Both {
-                let md_path = config.dir.join(format!("{}_memory_{}.md", prefix, date_str));
+                let md_path = config
+                    .dir
+                    .join(format!("{}_memory_{}.md", prefix, date_str));
                 let loctree = maybe_loctree_snapshot(config)?;
-                write_markdown_full(&md_path, entries, metadata, config.max_message_chars, loctree.as_deref())?;
+                write_markdown_full(
+                    &md_path,
+                    entries,
+                    metadata,
+                    config.max_message_chars,
+                    loctree.as_deref(),
+                )?;
                 written_paths.push(md_path);
             }
         }
@@ -174,7 +182,13 @@ pub fn write_report(
                     resolved.with_extension("md")
                 };
                 let loctree = maybe_loctree_snapshot(config)?;
-                append_markdown_timeline(&md_path, entries, metadata, config.max_message_chars, loctree.as_deref())?;
+                append_markdown_timeline(
+                    &md_path,
+                    entries,
+                    metadata,
+                    config.max_message_chars,
+                    loctree.as_deref(),
+                )?;
                 written_paths.push(md_path);
             }
         }
@@ -283,8 +297,8 @@ fn write_json_report(
         entries,
     };
 
-    let file = File::create(path)
-        .with_context(|| format!("Failed to create: {}", path.display()))?;
+    let file =
+        File::create(path).with_context(|| format!("Failed to create: {}", path.display()))?;
     serde_json::to_writer_pretty(file, &report)?;
     eprintln!("  -> {}", path.display());
     Ok(())
@@ -315,7 +329,11 @@ fn append_json_timeline(
         writeln!(file, "{}", serde_json::to_string(entry)?)?;
     }
 
-    eprintln!("  -> {} (appended {} entries)", path.display(), entries.len());
+    eprintln!(
+        "  -> {} (appended {} entries)",
+        path.display(),
+        entries.len()
+    );
     Ok(())
 }
 
@@ -340,13 +358,17 @@ fn write_markdown_full(
     max_chars: usize,
     loctree_snapshot: Option<&str>,
 ) -> Result<()> {
-    let mut file = File::create(path)
-        .with_context(|| format!("Failed to create: {}", path.display()))?;
+    let mut file =
+        File::create(path).with_context(|| format!("Failed to create: {}", path.display()))?;
 
     write_markdown_header(&mut file, metadata)?;
 
     // Write initial sync marker so append mode can track from when this file was created
-    writeln!(file, "<!-- sync: {} -->", metadata.generated_at.to_rfc3339())?;
+    writeln!(
+        file,
+        "<!-- sync: {} -->",
+        metadata.generated_at.to_rfc3339()
+    )?;
     writeln!(file)?;
 
     if let Some(snapshot) = loctree_snapshot {
@@ -396,7 +418,11 @@ fn append_markdown_timeline(
 
     // Write sync separator
     writeln!(file)?;
-    writeln!(file, "<!-- sync: {} -->", metadata.generated_at.to_rfc3339())?;
+    writeln!(
+        file,
+        "<!-- sync: {} -->",
+        metadata.generated_at.to_rfc3339()
+    )?;
     writeln!(file)?;
 
     if let Some(snapshot) = loctree_snapshot {
@@ -408,7 +434,11 @@ fn append_markdown_timeline(
     write_markdown_entries(&mut file, &owned_entries, max_chars)?;
     write_markdown_footer(&mut file)?;
 
-    eprintln!("  -> {} (appended {} entries)", path.display(), owned_entries.len());
+    eprintln!(
+        "  -> {} (appended {} entries)",
+        path.display(),
+        owned_entries.len()
+    );
     Ok(())
 }
 
@@ -448,8 +478,16 @@ fn write_markdown_header(w: &mut impl Write, metadata: &ReportMetadata) -> Resul
     writeln!(w, "# Agent Memory Timeline\n")?;
     writeln!(w, "| Field | Value |")?;
     writeln!(w, "|-------|-------|")?;
-    writeln!(w, "| Generated | {} |", metadata.generated_at.format("%Y-%m-%d %H:%M:%S UTC"))?;
-    writeln!(w, "| Filter | {} |", metadata.project_filter.as_deref().unwrap_or("(all)"))?;
+    writeln!(
+        w,
+        "| Generated | {} |",
+        metadata.generated_at.format("%Y-%m-%d %H:%M:%S UTC")
+    )?;
+    writeln!(
+        w,
+        "| Filter | {} |",
+        metadata.project_filter.as_deref().unwrap_or("(all)")
+    )?;
     writeln!(w, "| Period | last {} hours |", metadata.hours_back)?;
     writeln!(w, "| Entries | {} |", metadata.total_entries)?;
     writeln!(w, "| Sessions | {} |", metadata.sessions.len())?;
@@ -471,7 +509,11 @@ fn write_loctree_section(w: &mut impl Write, snapshot: &str) -> Result<()> {
     Ok(())
 }
 
-fn write_markdown_entries(w: &mut impl Write, entries: &[TimelineEntry], max_chars: usize) -> Result<()> {
+fn write_markdown_entries(
+    w: &mut impl Write,
+    entries: &[TimelineEntry],
+    max_chars: usize,
+) -> Result<()> {
     // Group by date
     let mut by_date: HashMap<String, Vec<&TimelineEntry>> = HashMap::new();
     for entry in entries {
@@ -496,7 +538,11 @@ fn write_markdown_entries(w: &mut impl Write, entries: &[TimelineEntry], max_cha
 
 fn write_single_entry(w: &mut impl Write, entry: &TimelineEntry, max_chars: usize) -> Result<()> {
     let time = entry.timestamp.format("%H:%M:%S");
-    let role_icon = if entry.role == "user" { "\u{1f464}" } else { "\u{1f916}" };
+    let role_icon = if entry.role == "user" {
+        "\u{1f464}"
+    } else {
+        "\u{1f916}"
+    };
     let agent_badge = match entry.agent.as_str() {
         "claude" => "[Claude]",
         "codex" => "[Codex]",
@@ -512,7 +558,11 @@ fn write_single_entry(w: &mut impl Write, entry: &TimelineEntry, max_chars: usiz
         ""
     };
 
-    writeln!(w, "### {}{} {} {} `{}`\n", decision_pin, time, role_icon, agent_badge, session_short)?;
+    writeln!(
+        w,
+        "### {}{} {} {} `{}`\n",
+        decision_pin, time, role_icon, agent_badge, session_short
+    )?;
 
     if let Some(ref branch) = entry.branch {
         writeln!(w, "Branch: `{}`\n", branch)?;
@@ -540,7 +590,10 @@ fn apply_truncation(message: &str, max_chars: usize) -> String {
         message.to_string()
     } else {
         let truncated: String = message.chars().take(max_chars).collect();
-        format!("{}...\n\n*[truncated at {} chars, total {}]*", truncated, max_chars, char_count)
+        format!(
+            "{}...\n\n*[truncated at {} chars, total {}]*",
+            truncated, max_chars, char_count
+        )
     }
 }
 
@@ -609,12 +662,8 @@ mod tests {
 
     fn unique_test_dir(name: &str) -> PathBuf {
         let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "ai_ctx_test_{}_{}_{}",
-            std::process::id(),
-            n,
-            name
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ai_ctx_test_{}_{}_{}", std::process::id(), n, name));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -679,7 +728,11 @@ mod tests {
     fn test_rotation_under_limit() {
         let dir = unique_test_dir("rot_under");
         for i in 0..3 {
-            fs::write(dir.join(format!("test_memory_2026010{}_120000.md", i)), "content").unwrap();
+            fs::write(
+                dir.join(format!("test_memory_2026010{}_120000.md", i)),
+                "content",
+            )
+            .unwrap();
         }
         let deleted = rotate_outputs(&dir, "test", 5).unwrap();
         assert_eq!(deleted, 0);
@@ -690,7 +743,11 @@ mod tests {
     fn test_rotation_over_limit() {
         let dir = unique_test_dir("rot_over");
         for i in 0..5 {
-            fs::write(dir.join(format!("test_memory_2026010{}_120000.md", i)), "content").unwrap();
+            fs::write(
+                dir.join(format!("test_memory_2026010{}_120000.md", i)),
+                "content",
+            )
+            .unwrap();
         }
         let deleted = rotate_outputs(&dir, "test", 2).unwrap();
         assert_eq!(deleted, 3);
@@ -712,8 +769,16 @@ mod tests {
     fn test_rotation_mixed_extensions() {
         let dir = unique_test_dir("rot_mixed");
         for i in 0..4 {
-            fs::write(dir.join(format!("proj_memory_2026010{}_120000.md", i)), "md").unwrap();
-            fs::write(dir.join(format!("proj_memory_2026010{}_120000.json", i)), "json").unwrap();
+            fs::write(
+                dir.join(format!("proj_memory_2026010{}_120000.md", i)),
+                "md",
+            )
+            .unwrap();
+            fs::write(
+                dir.join(format!("proj_memory_2026010{}_120000.json", i)),
+                "json",
+            )
+            .unwrap();
         }
         // 8 files total, keep 4
         let deleted = rotate_outputs(&dir, "proj", 4).unwrap();
@@ -729,7 +794,11 @@ mod tests {
         fs::write(dir.join("README.md"), "keep").unwrap();
         // Matching files
         for i in 0..3 {
-            fs::write(dir.join(format!("test_memory_2026010{}_120000.md", i)), "rotate").unwrap();
+            fs::write(
+                dir.join(format!("test_memory_2026010{}_120000.md", i)),
+                "rotate",
+            )
+            .unwrap();
         }
         let deleted = rotate_outputs(&dir, "test", 1).unwrap();
         assert_eq!(deleted, 2);
@@ -744,7 +813,11 @@ mod tests {
     fn test_rotation_zero_means_unlimited() {
         let dir = unique_test_dir("rot_zero");
         for i in 0..10 {
-            fs::write(dir.join(format!("x_memory_2026010{}_120000.md", i)), "content").unwrap();
+            fs::write(
+                dir.join(format!("x_memory_2026010{}_120000.md", i)),
+                "content",
+            )
+            .unwrap();
         }
         let deleted = rotate_outputs(&dir, "x", 0).unwrap();
         assert_eq!(deleted, 0);
@@ -774,7 +847,10 @@ mod tests {
         }
 
         // Check markdown content
-        let md_path = paths.iter().find(|p| p.extension().unwrap() == "md").unwrap();
+        let md_path = paths
+            .iter()
+            .find(|p| p.extension().unwrap() == "md")
+            .unwrap();
         let content = fs::read_to_string(md_path).unwrap();
         assert!(content.contains("# Agent Memory Timeline"));
         assert!(content.contains("## 2026-01-22"));

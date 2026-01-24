@@ -7,7 +7,7 @@
 //!
 //! Created by M&K (c)2026 VetCoders
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -99,8 +99,7 @@ pub fn load_sync_state() -> MemexSyncState {
 /// Persist sync state to disk.
 pub fn save_sync_state(state: &MemexSyncState) -> Result<()> {
     let path = sync_state_path()?;
-    let json = serde_json::to_string_pretty(state)
-        .context("Failed to serialize sync state")?;
+    let json = serde_json::to_string_pretty(state).context("Failed to serialize sync state")?;
     fs::write(&path, json)?;
     Ok(())
 }
@@ -149,16 +148,18 @@ pub fn sync_chunks_batch(chunks_dir: &Path, config: &MemexConfig) -> Result<Sync
     let mut cmd = Command::new("rmcp-memex");
     cmd.arg("index")
         .arg(chunks_dir)
-        .arg("-n").arg(&config.namespace)
-        .arg("-s").arg("flat")
-        .arg("--dedup").arg("true");
+        .arg("-n")
+        .arg(&config.namespace)
+        .arg("-s")
+        .arg("flat")
+        .arg("--dedup")
+        .arg("true");
 
     if let Some(ref db_path) = config.db_path {
         cmd.arg("--db-path").arg(db_path);
     }
 
-    let output = cmd.output()
-        .context("Failed to run rmcp-memex index")?;
+    let output = cmd.output().context("Failed to run rmcp-memex index")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -217,21 +218,30 @@ pub fn sync_chunk_single(
 
     let mut cmd = Command::new("rmcp-memex");
     cmd.arg("upsert")
-        .arg("-n").arg(&config.namespace)
-        .arg("-i").arg(chunk_id)
-        .arg("-t").arg(text)
-        .arg("-m").arg(&meta_str);
+        .arg("-n")
+        .arg(&config.namespace)
+        .arg("-i")
+        .arg(chunk_id)
+        .arg("-t")
+        .arg(text)
+        .arg("-m")
+        .arg(&meta_str);
 
     if let Some(ref db_path) = config.db_path {
         cmd.arg("--db-path").arg(db_path);
     }
 
-    let output = cmd.output()
+    let output = cmd
+        .output()
         .with_context(|| format!("Failed to upsert chunk: {}", chunk_id))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("rmcp-memex upsert failed for {}: {}", chunk_id, stderr.trim());
+        bail!(
+            "rmcp-memex upsert failed for {}: {}",
+            chunk_id,
+            stderr.trim()
+        );
     }
 
     Ok(())
@@ -262,7 +272,8 @@ pub fn sync_new_chunks(chunks_dir: &Path, config: &MemexConfig) -> Result<SyncRe
     let new_files: Vec<&PathBuf> = all_files
         .iter()
         .filter(|p| {
-            let id = p.file_stem()
+            let id = p
+                .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
             !state.synced_chunks.contains(&id)
@@ -284,7 +295,8 @@ pub fn sync_new_chunks(chunks_dir: &Path, config: &MemexConfig) -> Result<SyncRe
         // Per-file upsert mode
         let mut result = SyncResult::default();
         for file in &new_files {
-            let id = file.file_stem()
+            let id = file
+                .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
             let text = match fs::read_to_string(file) {
@@ -310,7 +322,8 @@ pub fn sync_new_chunks(chunks_dir: &Path, config: &MemexConfig) -> Result<SyncRe
 
     // Update sync state with newly synced chunks
     for file in &new_files {
-        let id = file.file_stem()
+        let id = file
+            .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
         state.synced_chunks.insert(id);
@@ -336,8 +349,10 @@ pub fn search_memex(query: &str, namespace: &str) -> Result<String> {
 
     let output = Command::new("rmcp-memex")
         .arg("search")
-        .arg("-n").arg(namespace)
-        .arg("-q").arg(query)
+        .arg("-n")
+        .arg(namespace)
+        .arg("-q")
+        .arg(query)
         .output()
         .context("Failed to run rmcp-memex search")?;
 
@@ -411,7 +426,10 @@ mod tests {
     #[test]
     fn test_parse_indexed_count() {
         assert_eq!(parse_indexed_count("Indexed 42 documents"), Some(42));
-        assert_eq!(parse_indexed_count("Processing... 10 chunks indexed"), Some(10));
+        assert_eq!(
+            parse_indexed_count("Processing... 10 chunks indexed"),
+            Some(10)
+        );
         assert_eq!(parse_indexed_count("no numbers here"), None);
         assert_eq!(parse_indexed_count(""), None);
     }

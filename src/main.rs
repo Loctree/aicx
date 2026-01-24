@@ -15,6 +15,7 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
 use ai_contexters::chunker::{self, ChunkerConfig};
+use ai_contexters::init::{self, InitOptions};
 use ai_contexters::memex::{self, MemexConfig};
 use ai_contexters::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
 use ai_contexters::sources::{self, ExtractionConfig};
@@ -206,6 +207,37 @@ enum Commands {
 
     /// List available projects/sessions
     List,
+
+    /// Initialize repo context and run an agent
+    Init {
+        /// Project name override
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Agent override: claude or codex
+        #[arg(short, long)]
+        agent: Option<String>,
+
+        /// Model override (optional; if omitted uses agent default)
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Hours to look back for context (default: 4800)
+        #[arg(short = 'H', long, default_value = "4800")]
+        hours: u64,
+
+        /// Maximum lines per context section in the prompt
+        #[arg(long, default_value = "1200")]
+        max_lines: usize,
+
+        /// Build context/prompt only, do not run an agent
+        #[arg(long)]
+        no_run: bool,
+
+        /// Skip "Run? (y)es / (n)o" confirmation
+        #[arg(long)]
+        no_confirm: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -220,42 +252,100 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Claude {
-            project, hours, output, format, append_to,
-            rotate, incremental, include_assistant, loctree, project_root, memex,
+            project,
+            hours,
+            output,
+            format,
+            append_to,
+            rotate,
+            incremental,
+            include_assistant,
+            loctree,
+            project_root,
+            memex,
         } => {
             run_extraction(
                 &["claude"],
-                project, hours, &output, &format, append_to,
-                rotate, incremental, include_assistant, loctree, project_root, memex,
+                project,
+                hours,
+                &output,
+                &format,
+                append_to,
+                rotate,
+                incremental,
+                include_assistant,
+                loctree,
+                project_root,
+                memex,
             )?;
         }
         Commands::Codex {
-            project, hours, output, format, append_to,
-            rotate, incremental, loctree, project_root, memex,
+            project,
+            hours,
+            output,
+            format,
+            append_to,
+            rotate,
+            incremental,
+            loctree,
+            project_root,
+            memex,
         } => {
             run_extraction(
                 &["codex"],
-                project, hours, &output, &format, append_to,
-                rotate, incremental, false, loctree, project_root, memex,
+                project,
+                hours,
+                &output,
+                &format,
+                append_to,
+                rotate,
+                incremental,
+                false,
+                loctree,
+                project_root,
+                memex,
             )?;
         }
         Commands::All {
-            project, hours, output, append_to,
-            rotate, incremental, include_assistant, loctree, project_root, memex,
+            project,
+            hours,
+            output,
+            append_to,
+            rotate,
+            incremental,
+            include_assistant,
+            loctree,
+            project_root,
+            memex,
         } => {
             run_extraction(
                 &["claude", "codex", "gemini"],
-                project, hours, &output, "both", append_to,
-                rotate, incremental, include_assistant, loctree, project_root, memex,
+                project,
+                hours,
+                &output,
+                "both",
+                append_to,
+                rotate,
+                incremental,
+                include_assistant,
+                loctree,
+                project_root,
+                memex,
             )?;
         }
         Commands::Store {
-            project, agent, hours, include_assistant, memex,
+            project,
+            agent,
+            hours,
+            include_assistant,
+            memex,
         } => {
             run_store(project, agent, hours, include_assistant, memex)?;
         }
         Commands::MemexSync {
-            namespace, per_chunk, db_path,
+            namespace,
+            per_chunk,
+            db_path,
         } => {
             run_memex_sync(&namespace, per_chunk, db_path)?;
         }
@@ -276,6 +366,26 @@ fn main() -> Result<()> {
                     );
                 }
             }
+        }
+        Commands::Init {
+            project,
+            agent,
+            model,
+            hours,
+            max_lines,
+            no_run,
+            no_confirm,
+        } => {
+            let opts = InitOptions {
+                project,
+                agent,
+                model,
+                horizon_hours: hours,
+                max_lines,
+                no_run,
+                no_confirm,
+            };
+            init::run_init(opts)?;
         }
     }
 
@@ -339,7 +449,12 @@ fn run_extraction(
     // Dedup via state
     let pre_dedup = entries.len();
     entries.retain(|e| {
-        let hash = StateManager::content_hash(&e.agent, &e.session_id, e.timestamp.timestamp(), &e.message);
+        let hash = StateManager::content_hash(
+            &e.agent,
+            &e.session_id,
+            e.timestamp.timestamp(),
+            &e.message,
+        );
         state.is_new(hash)
     });
 
@@ -424,7 +539,12 @@ fn run_extraction(
     // Update state
     if !entries.is_empty() {
         for e in &entries {
-            let hash = StateManager::content_hash(&e.agent, &e.session_id, e.timestamp.timestamp(), &e.message);
+            let hash = StateManager::content_hash(
+                &e.agent,
+                &e.session_id,
+                e.timestamp.timestamp(),
+                &e.message,
+            );
             state.mark_seen(hash);
         }
 
@@ -439,7 +559,10 @@ fn run_extraction(
             }
         }
 
-        state.record_run(entries.len(), agents.iter().map(|s| s.to_string()).collect());
+        state.record_run(
+            entries.len(),
+            agents.iter().map(|s| s.to_string()).collect(),
+        );
         state.prune_old_hashes(50_000);
         state.save()?;
     }
@@ -457,12 +580,18 @@ fn run_extraction(
         let agent_name = agents.join("+");
 
         let chunker_config = ChunkerConfig::default();
-        let chunks = chunker::chunk_entries(&output_entries, proj_name, &agent_name, &chunker_config);
+        let chunks =
+            chunker::chunk_entries(&output_entries, proj_name, &agent_name, &chunker_config);
 
         if !chunks.is_empty() {
             let chunks_dir = store::chunks_dir()?;
             chunker::write_chunks_to_dir(&chunks, &chunks_dir)?;
-            eprintln!("  Chunked: {} chunks ({}) → {}", chunks.len(), chunker::chunk_summary(&chunks), chunks_dir.display());
+            eprintln!(
+                "  Chunked: {} chunks ({}) → {}",
+                chunks.len(),
+                chunker::chunk_summary(&chunks),
+                chunks_dir.display()
+            );
 
             let memex_config = MemexConfig::default();
             match memex::sync_new_chunks(&chunks_dir, &memex_config) {
@@ -565,13 +694,18 @@ fn run_store(
     }
 
     store::save_index(&index)?;
-    eprintln!("✓ Stored {} entries in {} groups", stored_count, groups.len());
+    eprintln!(
+        "✓ Stored {} entries in {} groups",
+        stored_count,
+        groups.len()
+    );
 
     // Chunk and sync to memex if requested
     if sync_memex && !output_entries.is_empty() {
         let agent_label = agents.join("+");
         let chunker_config = ChunkerConfig::default();
-        let chunks = chunker::chunk_entries(&output_entries, proj_name, &agent_label, &chunker_config);
+        let chunks =
+            chunker::chunk_entries(&output_entries, proj_name, &agent_label, &chunker_config);
 
         if !chunks.is_empty() {
             let chunks_dir = store::chunks_dir()?;
@@ -581,7 +715,10 @@ fn run_store(
             let memex_config = MemexConfig::default();
             match memex::sync_new_chunks(&chunks_dir, &memex_config) {
                 Ok(result) => {
-                    eprintln!("  Memex: {} pushed, {} skipped", result.chunks_pushed, result.chunks_skipped);
+                    eprintln!(
+                        "  Memex: {} pushed, {} skipped",
+                        result.chunks_pushed, result.chunks_skipped
+                    );
                 }
                 Err(e) => eprintln!("  Memex sync failed: {}", e),
             }
@@ -614,7 +751,14 @@ fn run_memex_sync(namespace: &str, per_chunk: bool, db_path: Option<PathBuf>) ->
 
     eprintln!("Syncing chunks from: {}", chunks_dir.display());
     eprintln!("  Namespace: {}", config.namespace);
-    eprintln!("  Mode: {}", if config.batch_mode { "batch" } else { "per-chunk" });
+    eprintln!(
+        "  Mode: {}",
+        if config.batch_mode {
+            "batch"
+        } else {
+            "per-chunk"
+        }
+    );
 
     let result = memex::sync_new_chunks(&chunks_dir, &config)?;
 

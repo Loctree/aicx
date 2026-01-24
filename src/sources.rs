@@ -457,14 +457,11 @@ fn parse_gemini_session(
         }
 
         // Parse timestamp (always RFC3339 in Gemini CLI)
-        let timestamp = msg
-            .timestamp
-            .as_ref()
-            .and_then(|ts| {
-                DateTime::parse_from_rfc3339(ts)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc))
-            });
+        let timestamp = msg.timestamp.as_ref().and_then(|ts| {
+            DateTime::parse_from_rfc3339(ts)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
+        });
 
         let timestamp = match timestamp {
             Some(ts) => ts,
@@ -1027,12 +1024,21 @@ mod tests {
         }"#;
 
         let session: GeminiSession = serde_json::from_str(json).unwrap();
-        assert_eq!(session.session_id.as_deref(), Some("a45ff16f-2a8c-4a45-b690-2c2aaf631b71"));
-        assert_eq!(session.project_hash.as_deref(), Some("fef6ad02174d592d21e7f8a6143564388027ec0c38bbb44dec26e99f9cd9140f"));
+        assert_eq!(
+            session.session_id.as_deref(),
+            Some("a45ff16f-2a8c-4a45-b690-2c2aaf631b71")
+        );
+        assert_eq!(
+            session.project_hash.as_deref(),
+            Some("fef6ad02174d592d21e7f8a6143564388027ec0c38bbb44dec26e99f9cd9140f")
+        );
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0].msg_type.as_deref(), Some("user"));
         assert_eq!(session.messages[0].content.as_deref(), Some("siemka!"));
         assert_eq!(session.messages[1].msg_type.as_deref(), Some("gemini"));
-        assert_eq!(session.messages[1].content.as_deref(), Some("Cześć Maciej."));
+        assert_eq!(
+            session.messages[1].content.as_deref(),
+            Some("Cześć Maciej.")
+        );
     }
 }
