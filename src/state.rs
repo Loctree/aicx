@@ -97,16 +97,40 @@ impl StateManager {
     // Dedup API
     // ========================================================================
 
-    /// Compute a stable content hash from entry fields.
+    /// Compute a stable content hash from entry fields (exact dedup).
     ///
     /// Uses `DefaultHasher` (SipHash) for fast, collision-resistant hashing.
     /// The hash is deterministic within a single binary build (which is
     /// sufficient for dedup across runs of the same version).
-    pub fn content_hash(agent: &str, session_id: &str, timestamp: i64, message: &str) -> u64 {
+    ///
+    /// **Note:** `session_id` is intentionally excluded from the hash.
+    /// Claude Code stores the same user message in multiple session JSONL
+    /// files within the same project directory. Including session_id would
+    /// cause these semantic duplicates to have different hashes, defeating
+    /// dedup. The (agent, timestamp, message) triple is sufficient for
+    /// unique identification.
+    pub fn content_hash(agent: &str, _session_id: &str, timestamp: i64, message: &str) -> u64 {
         let mut hasher = DefaultHasher::new();
         agent.hash(&mut hasher);
-        session_id.hash(&mut hasher);
         timestamp.hash(&mut hasher);
+        message.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Compute an overlap hash for cross-agent dedup.
+    ///
+    /// When the same prompt is broadcast to multiple agents simultaneously
+    /// (e.g., 8 parallel Claude sessions), each gets an identical message
+    /// within a narrow time window. The exact hash treats these as distinct
+    /// because `agent` differs.
+    ///
+    /// The overlap hash ignores `agent` and buckets timestamps into 60-second
+    /// windows, so identical messages arriving within the same minute from
+    /// different agents collapse into one.
+    pub fn overlap_hash(_agent: &str, _session_id: &str, timestamp: i64, message: &str) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        let bucket = timestamp / 60; // 60-second window
+        bucket.hash(&mut hasher);
         message.hash(&mut hasher);
         hasher.finish()
     }
@@ -230,16 +254,54 @@ mod tests {
     fn test_content_hash_varies_with_input() {
         let h1 = StateManager::content_hash("claude", "sess-123", 1700000000, "hello");
         let h2 = StateManager::content_hash("claude", "sess-123", 1700000000, "world");
-        assert_ne!(h1, h2);
+        assert_ne!(h1, h2, "different message → different hash");
 
         let h3 = StateManager::content_hash("codex", "sess-123", 1700000000, "hello");
-        assert_ne!(h1, h3);
+        assert_ne!(h1, h3, "different agent → different hash");
 
+        // session_id is intentionally excluded: same message from different
+        // sessions within the same project is a semantic duplicate
         let h4 = StateManager::content_hash("claude", "sess-456", 1700000000, "hello");
-        assert_ne!(h1, h4);
+        assert_eq!(h1, h4, "different session_id → SAME hash (cross-session dedup)");
 
         let h5 = StateManager::content_hash("claude", "sess-123", 1700000001, "hello");
-        assert_ne!(h1, h5);
+        assert_ne!(h1, h5, "different timestamp → different hash");
+    }
+
+    #[test]
+    fn test_overlap_hash_ignores_agent() {
+        let prompt = "Deploy the new auth module to staging and run integration tests";
+        let ts = 1700000000i64;
+
+        let h_claude = StateManager::overlap_hash("claude", "s1", ts, prompt);
+        let h_codex = StateManager::overlap_hash("codex", "s2", ts, prompt);
+        assert_eq!(h_claude, h_codex, "same message + same bucket → SAME overlap hash");
+    }
+
+    #[test]
+    fn test_overlap_hash_buckets_60s() {
+        let prompt = "Identical broadcast prompt";
+
+        // Pick a timestamp that's cleanly at a bucket boundary
+        let base = 1700000040i64; // bucket = 28333334
+        let same_bucket = base + 19; // 1700000059 → bucket 28333334 (still same)
+
+        let h1 = StateManager::overlap_hash("claude", "s1", base, prompt);
+        let h2 = StateManager::overlap_hash("codex", "s2", same_bucket, prompt);
+        assert_eq!(h1, h2, "within same 60s bucket → SAME hash");
+
+        // Next bucket starts at base rounded up to next 60
+        let next_bucket = base - (base % 60) + 60; // 1700000040 - 40 + 60 = 1700000060
+        let h3 = StateManager::overlap_hash("claude", "s1", next_bucket, prompt);
+        assert_ne!(h1, h3, "different 60s bucket → different hash");
+    }
+
+    #[test]
+    fn test_overlap_hash_different_message() {
+        let ts = 1700000000i64;
+        let h1 = StateManager::overlap_hash("claude", "s1", ts, "prompt A");
+        let h2 = StateManager::overlap_hash("claude", "s1", ts, "prompt B");
+        assert_ne!(h1, h2, "different message → different overlap hash");
     }
 
     #[test]

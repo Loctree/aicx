@@ -502,18 +502,46 @@ fn run_extraction(
         entries.extend(agent_entries);
     }
 
-    // Dedup via state (skip if --force)
+    // Two-level dedup (skip if --force):
+    //
+    // 1. Exact dedup: (agent, timestamp, message) — catches same entry
+    //    from multiple session JSONL files within the same agent.
+    // 2. Overlap dedup: (message, timestamp_bucket_60s) — catches the same
+    //    prompt broadcast to multiple agents simultaneously (e.g., 8 parallel
+    //    Claude sessions receiving identical 3-paragraph context).
+    //
+    // We mark_seen during filtering so duplicates within a single run
+    // are caught — not just across runs.
     let pre_dedup = entries.len();
+    let overlap_project = format!("_overlap:{project_name}");
     if !force {
-        entries.retain(|e| {
-            let hash = StateManager::content_hash(
+        let mut deduped = Vec::with_capacity(entries.len());
+        for e in entries {
+            let exact = StateManager::content_hash(
                 &e.agent,
                 &e.session_id,
                 e.timestamp.timestamp(),
                 &e.message,
             );
-            state.is_new(&project_name, hash)
-        });
+            if !state.is_new(&project_name, exact) {
+                continue; // exact duplicate
+            }
+
+            let overlap = StateManager::overlap_hash(
+                &e.agent,
+                &e.session_id,
+                e.timestamp.timestamp(),
+                &e.message,
+            );
+            if !state.is_new(&overlap_project, overlap) {
+                continue; // cross-agent overlap duplicate
+            }
+
+            state.mark_seen(&project_name, exact);
+            state.mark_seen(&overlap_project, overlap);
+            deduped.push(e);
+        }
+        entries = deduped;
     }
 
     if pre_dedup != entries.len() {
@@ -615,16 +643,26 @@ fn run_extraction(
         }
     }
 
-    // Update state
+    // Update state (hashes already marked during dedup filtering above)
     if !entries.is_empty() {
-        for e in &entries {
-            let hash = StateManager::content_hash(
-                &e.agent,
-                &e.session_id,
-                e.timestamp.timestamp(),
-                &e.message,
-            );
-            state.mark_seen(&project_name, hash);
+        if force {
+            // When --force skips dedup, we still mark entries as seen for future runs
+            for e in &entries {
+                let exact = StateManager::content_hash(
+                    &e.agent,
+                    &e.session_id,
+                    e.timestamp.timestamp(),
+                    &e.message,
+                );
+                let overlap = StateManager::overlap_hash(
+                    &e.agent,
+                    &e.session_id,
+                    e.timestamp.timestamp(),
+                    &e.message,
+                );
+                state.mark_seen(&project_name, exact);
+                state.mark_seen(&overlap_project, overlap);
+            }
         }
 
         if incremental {
