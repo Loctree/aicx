@@ -7,7 +7,7 @@
 //!
 //! Features: incremental extraction, deduplication, rotation, append mode.
 //!
-//! Created by M&K (c)2026 VetCoders
+//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::Result;
 use chrono::Utc;
@@ -626,10 +626,14 @@ fn run_extraction(
         }
 
         let mut index = store::load_index();
+        let now = Utc::now();
+        let time_str = now.format("%H%M%S").to_string();
         for ((agent_name, date), group_entries) in &groups {
-            let path = store::write_context(&project_name, agent_name, date, group_entries)?;
+            let paths = store::write_context(&project_name, agent_name, date, &time_str, group_entries)?;
             store::update_index(&mut index, &project_name, agent_name, date, group_entries.len());
-            eprintln!("  store → {}", path.display());
+            for path in &paths {
+                eprintln!("  store → {}", path.display());
+            }
         }
         store::save_index(&index)?;
     }
@@ -803,11 +807,15 @@ fn run_store(
             .push(entry.clone());
     }
 
+    let now = Utc::now();
+    let time_str = now.format("%H%M%S").to_string();
     for ((agent_name, date), group_entries) in &groups {
-        let path = store::write_context(proj_name, agent_name, date, group_entries)?;
+        let paths = store::write_context(proj_name, agent_name, date, &time_str, group_entries)?;
         store::update_index(&mut index, proj_name, agent_name, date, group_entries.len());
         stored_count += group_entries.len();
-        eprintln!("  → {} ({} entries)", path.display(), group_entries.len());
+        for path in &paths {
+            eprintln!("  → {} ({} entries)", path.display(), group_entries.len());
+        }
     }
 
     store::save_index(&index)?;
@@ -847,38 +855,33 @@ fn run_store(
 
 /// List context files from the global store, filtered by recency.
 fn run_refs(hours: u64, project: Option<String>) -> Result<()> {
-    let ctx_dir = store::contexts_dir()?;
-    if !ctx_dir.exists() {
-        eprintln!("No contexts directory found at: {}", ctx_dir.display());
-        return Ok(());
-    }
+    let base = store::store_base_dir()?;
 
     let cutoff = std::time::SystemTime::now()
         - std::time::Duration::from_secs(hours * 3600);
 
     let mut files: Vec<PathBuf> = Vec::new();
 
-    // Walk contexts/<project>/<agent>/<date>.md
     let project_dirs: Vec<_> = if let Some(ref p) = project {
-        let d = ctx_dir.join(p);
+        let d = base.join(p);
         if d.is_dir() { vec![d] } else { vec![] }
     } else {
-        std::fs::read_dir(&ctx_dir)?
+        std::fs::read_dir(&base)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.is_dir())
+            .filter(|p| p.is_dir() && p.file_name().is_some_and(|n| n != "memex"))
             .collect()
     };
 
     for proj_dir in project_dirs {
-        for agent_entry in std::fs::read_dir(&proj_dir)?.filter_map(|e| e.ok()) {
-            let agent_path = agent_entry.path();
-            if !agent_path.is_dir() {
+        for date_entry in std::fs::read_dir(&proj_dir)?.filter_map(|e| e.ok()) {
+            let date_path = date_entry.path();
+            if !date_path.is_dir() {
                 continue;
             }
-            for file_entry in std::fs::read_dir(&agent_path)?.filter_map(|e| e.ok()) {
+            for file_entry in std::fs::read_dir(&date_path)?.filter_map(|e| e.ok()) {
                 let fpath = file_entry.path();
-                if fpath.extension().is_some_and(|ext| ext == "md")
+                if fpath.extension().is_some_and(|ext| ext == "md" || ext == "json")
                     && let Ok(meta) = fpath.metadata()
                     && let Ok(mtime) = meta.modified()
                     && mtime >= cutoff
