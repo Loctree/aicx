@@ -6,6 +6,7 @@ pub mod chunker;
 pub mod init;
 pub mod memex;
 pub mod output;
+pub mod redact;
 pub mod sanitize;
 pub mod sources;
 pub mod state;

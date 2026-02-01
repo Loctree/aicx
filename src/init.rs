@@ -29,8 +29,11 @@ pub struct InitOptions {
     pub model: Option<String>,
     pub horizon_hours: u64,
     pub max_lines: usize,
+    pub include_assistant: bool,
+    pub redact_secrets: bool,
     pub no_run: bool,
     pub no_confirm: bool,
+    pub no_gitignore: bool,
 }
 
 struct InitPaths {
@@ -76,16 +79,16 @@ impl Logger {
 
 pub fn run_init(options: InitOptions) -> Result<()> {
     let root = repo_root()?;
-    let project = options
-        .project
-        .unwrap_or_else(sources::detect_project_name);
+    let project = options.project.unwrap_or_else(sources::detect_project_name);
 
     let run_id = Local::now().format("%Y%m%d_%H%M%S").to_string();
     let ts_local = Local::now().format("%Y-%m-%d %H:%M").to_string();
 
     let paths = init_paths(&root)?;
     ensure_dirs(&paths)?;
-    update_gitignore(&root)?;
+    if !options.no_gitignore {
+        update_gitignore(&root)?;
+    }
 
     let log_path = paths.logs.join(format!("{}.log", run_id));
     let mut log = Logger::new(&log_path)?;
@@ -113,7 +116,13 @@ pub fn run_init(options: InitOptions) -> Result<()> {
     log.line("");
 
     log.line("== Step 3/4: ai-contexters context ==");
-    extract_context(&paths.context, &project, options.horizon_hours)?;
+    extract_context(
+        &paths.context,
+        &project,
+        options.horizon_hours,
+        options.include_assistant,
+        options.redact_secrets,
+    )?;
     log.line("");
 
     let prompt_path = paths.prompts.join(format!("{}_prompt.md", run_id));
@@ -378,12 +387,18 @@ fn write_loct_for_ai(root: &Path, out_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn extract_context(out_dir: &Path, project: &str, hours: u64) -> Result<Vec<TimelineEntry>> {
+fn extract_context(
+    out_dir: &Path,
+    project: &str,
+    hours: u64,
+    include_assistant: bool,
+    redact_secrets: bool,
+) -> Result<Vec<TimelineEntry>> {
     let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
     let config = ExtractionConfig {
         project_filter: vec![project.to_string()],
         cutoff,
-        include_assistant: false,
+        include_assistant,
         watermark: None,
     };
 
@@ -395,7 +410,11 @@ fn extract_context(out_dir: &Path, project: &str, hours: u64) -> Result<Vec<Time
             agent: e.agent.clone(),
             session_id: e.session_id.clone(),
             role: e.role.clone(),
-            message: e.message.clone(),
+            message: if redact_secrets {
+                crate::redact::redact_secrets(&e.message)
+            } else {
+                e.message.clone()
+            },
             branch: e.branch.clone(),
             cwd: e.cwd.clone(),
         })

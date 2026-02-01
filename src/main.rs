@@ -11,7 +11,7 @@
 
 use anyhow::Result;
 use chrono::Utc;
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
 use ai_contexters::chunker::{self, ChunkerConfig};
@@ -28,6 +28,17 @@ use ai_contexters::store;
 #[command(author = "M&K (c)2026 VetCoders")]
 #[command(version)]
 struct Cli {
+    /// Redact secrets (tokens/keys) from outputs before writing/syncing.
+    ///
+    /// Use `--no-redact-secrets` to disable (not recommended).
+    #[arg(
+        long = "no-redact-secrets",
+        action = ArgAction::SetFalse,
+        default_value_t = true,
+        global = true
+    )]
+    redact_secrets: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -268,6 +279,10 @@ enum Commands {
         #[arg(long, default_value = "1200")]
         max_lines: usize,
 
+        /// Include assistant messages in context (can be large)
+        #[arg(long)]
+        include_assistant: bool,
+
         /// Build context/prompt only, do not run an agent
         #[arg(long)]
         no_run: bool,
@@ -275,6 +290,10 @@ enum Commands {
         /// Skip "Run? (y)es / (n)o" confirmation
         #[arg(long)]
         no_confirm: bool,
+
+        /// Do not auto-modify `.gitignore`
+        #[arg(long)]
+        no_gitignore: bool,
     },
 }
 
@@ -287,6 +306,7 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let redact_secrets = cli.redact_secrets;
 
     match cli.command {
         Commands::Claude {
@@ -317,6 +337,7 @@ fn main() -> Result<()> {
                 project_root,
                 memex,
                 force,
+                redact_secrets,
             )?;
         }
         Commands::Codex {
@@ -346,6 +367,7 @@ fn main() -> Result<()> {
                 project_root,
                 memex,
                 force,
+                redact_secrets,
             )?;
         }
         Commands::All {
@@ -375,6 +397,7 @@ fn main() -> Result<()> {
                 project_root,
                 memex,
                 force,
+                redact_secrets,
             )?;
         }
         Commands::Store {
@@ -384,7 +407,14 @@ fn main() -> Result<()> {
             include_assistant,
             memex,
         } => {
-            run_store(project, agent, hours, include_assistant, memex)?;
+            run_store(
+                project,
+                agent,
+                hours,
+                include_assistant,
+                memex,
+                redact_secrets,
+            )?;
         }
         Commands::MemexSync {
             namespace,
@@ -417,8 +447,10 @@ fn main() -> Result<()> {
             model,
             hours,
             max_lines,
+            include_assistant,
             no_run,
             no_confirm,
+            no_gitignore,
         } => {
             let opts = InitOptions {
                 project,
@@ -426,8 +458,11 @@ fn main() -> Result<()> {
                 model,
                 horizon_hours: hours,
                 max_lines,
+                include_assistant,
+                redact_secrets,
                 no_run,
                 no_confirm,
+                no_gitignore,
             };
             init::run_init(opts)?;
         }
@@ -461,6 +496,7 @@ fn run_extraction(
     project_root: Option<PathBuf>,
     sync_memex: bool,
     force: bool,
+    redact_secrets: bool,
 ) -> Result<()> {
     // Load state for incremental/dedup
     let mut state = StateManager::load();
@@ -477,7 +513,11 @@ fn run_extraction(
         let source_key = format!(
             "{}:{}",
             agents.join("+"),
-            if project.is_empty() { "all".to_string() } else { project.join("+") }
+            if project.is_empty() {
+                "all".to_string()
+            } else {
+                project.join("+")
+            }
         );
         state.get_watermark(&source_key)
     } else {
@@ -568,7 +608,11 @@ fn run_extraction(
             agent: e.agent.clone(),
             session_id: e.session_id.clone(),
             role: e.role.clone(),
-            message: e.message.clone(),
+            message: if redact_secrets {
+                ai_contexters::redact::redact_secrets(&e.message)
+            } else {
+                e.message.clone()
+            },
             branch: e.branch.clone(),
             cwd: e.cwd.clone(),
         })
@@ -581,7 +625,11 @@ fn run_extraction(
 
     let metadata = ReportMetadata {
         generated_at: Utc::now(),
-        project_filter: if project.is_empty() { None } else { Some(project.join(", ")) },
+        project_filter: if project.is_empty() {
+            None
+        } else {
+            Some(project.join(", "))
+        },
         hours_back: hours,
         total_entries: output_entries.len(),
         sessions: sessions.clone(),
@@ -633,8 +681,15 @@ fn run_extraction(
         let now = Utc::now();
         let time_str = now.format("%H%M%S").to_string();
         for ((agent_name, date), group_entries) in &groups {
-            let paths = store::write_context(&project_name, agent_name, date, &time_str, group_entries)?;
-            store::update_index(&mut index, &project_name, agent_name, date, group_entries.len());
+            let paths =
+                store::write_context(&project_name, agent_name, date, &time_str, group_entries)?;
+            store::update_index(
+                &mut index,
+                &project_name,
+                agent_name,
+                date,
+                group_entries.len(),
+            );
             for path in &paths {
                 eprintln!("  store → {}", path.display());
             }
@@ -677,7 +732,11 @@ fn run_extraction(
             let source_key = format!(
                 "{}:{}",
                 agents.join("+"),
-                if project.is_empty() { "all".to_string() } else { project.join("+") }
+                if project.is_empty() {
+                    "all".to_string()
+                } else {
+                    project.join("+")
+                }
             );
             if let Some(latest) = entries.last() {
                 state.update_watermark(&source_key, latest.timestamp);
@@ -701,7 +760,11 @@ fn run_extraction(
 
     // Memex sync: chunk entries and push to vector store
     if sync_memex && !output_entries.is_empty() {
-        let proj_name = if project.is_empty() { "unknown" } else { &project[0] };
+        let proj_name = if project.is_empty() {
+            "unknown"
+        } else {
+            &project[0]
+        };
         let agent_name = agents.join("+");
 
         let chunker_config = ChunkerConfig::default();
@@ -744,6 +807,7 @@ fn run_store(
     hours: u64,
     include_assistant: bool,
     sync_memex: bool,
+    redact_secrets: bool,
 ) -> Result<()> {
     let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
 
@@ -788,14 +852,22 @@ fn run_store(
             agent: e.agent.clone(),
             session_id: e.session_id.clone(),
             role: e.role.clone(),
-            message: e.message.clone(),
+            message: if redact_secrets {
+                ai_contexters::redact::redact_secrets(&e.message)
+            } else {
+                e.message.clone()
+            },
             branch: e.branch.clone(),
             cwd: e.cwd.clone(),
         })
         .collect();
 
     // Group by agent+date and write to central store
-    let proj_name = if project.is_empty() { "unknown" } else { &project[0] };
+    let proj_name = if project.is_empty() {
+        "unknown"
+    } else {
+        &project[0]
+    };
     let mut index = store::load_index();
     let mut stored_count = 0usize;
 
@@ -861,8 +933,7 @@ fn run_store(
 fn run_refs(hours: u64, project: Option<String>) -> Result<()> {
     let base = store::store_base_dir()?;
 
-    let cutoff = std::time::SystemTime::now()
-        - std::time::Duration::from_secs(hours * 3600);
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
 
     let mut files: Vec<PathBuf> = Vec::new();
 
@@ -885,7 +956,9 @@ fn run_refs(hours: u64, project: Option<String>) -> Result<()> {
             }
             for file_entry in std::fs::read_dir(&date_path)?.filter_map(|e| e.ok()) {
                 let fpath = file_entry.path();
-                if fpath.extension().is_some_and(|ext| ext == "md" || ext == "json")
+                if fpath
+                    .extension()
+                    .is_some_and(|ext| ext == "md" || ext == "json")
                     && let Ok(meta) = fpath.metadata()
                     && let Ok(mtime) = meta.modified()
                     && mtime >= cutoff

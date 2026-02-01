@@ -8,7 +8,7 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
 
 /// Known safe agent binary names.
@@ -21,10 +21,7 @@ const ALLOWED_AGENTS: &[&str] = &["claude", "codex"];
 /// Check if a path string contains traversal sequences.
 fn contains_traversal(path: &str) -> bool {
     let path_lower = path.to_lowercase();
-    path_lower.contains("..")
-        || path.contains('\0')
-        || path.contains('\n')
-        || path.contains('\r')
+    path_lower.contains("..") || path.contains('\0') || path.contains('\n') || path.contains('\r')
 }
 
 /// Get the user's home directory.

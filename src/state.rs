@@ -262,7 +262,10 @@ mod tests {
         // session_id is intentionally excluded: same message from different
         // sessions within the same project is a semantic duplicate
         let h4 = StateManager::content_hash("claude", "sess-456", 1700000000, "hello");
-        assert_eq!(h1, h4, "different session_id → SAME hash (cross-session dedup)");
+        assert_eq!(
+            h1, h4,
+            "different session_id → SAME hash (cross-session dedup)"
+        );
 
         let h5 = StateManager::content_hash("claude", "sess-123", 1700000001, "hello");
         assert_ne!(h1, h5, "different timestamp → different hash");
@@ -275,7 +278,10 @@ mod tests {
 
         let h_claude = StateManager::overlap_hash("claude", "s1", ts, prompt);
         let h_codex = StateManager::overlap_hash("codex", "s2", ts, prompt);
-        assert_eq!(h_claude, h_codex, "same message + same bucket → SAME overlap hash");
+        assert_eq!(
+            h_claude, h_codex,
+            "same message + same bucket → SAME overlap hash"
+        );
     }
 
     #[test]

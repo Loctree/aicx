@@ -296,7 +296,11 @@ pub fn extract_codex(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
 
     // Second pass: determine which sessions match the filter
     let matching_sessions: HashSet<String> = if !config.project_filter.is_empty() {
-        let filters_lower: Vec<String> = config.project_filter.iter().map(|f| f.to_lowercase()).collect();
+        let filters_lower: Vec<String> = config
+            .project_filter
+            .iter()
+            .map(|f| f.to_lowercase())
+            .collect();
         sessions
             .iter()
             .filter(|(_id, msgs)| {
@@ -435,7 +439,11 @@ fn parse_gemini_session(
 
     // Check project filter against message content
     let session_matches_filter = if !config.project_filter.is_empty() {
-        let filters_lower: Vec<String> = config.project_filter.iter().map(|f| f.to_lowercase()).collect();
+        let filters_lower: Vec<String> = config
+            .project_filter
+            .iter()
+            .map(|f| f.to_lowercase())
+            .collect();
         filters_lower.iter().any(|fl| {
             session.messages.iter().any(|m| {
                 m.content
