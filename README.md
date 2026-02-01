@@ -1,7 +1,7 @@
 # AI Contexters
 
 > Memory extraction tools for AI agent sessions
-> Created by M&K (c)2026 VetCoders
+> Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 ## ai-contexters
 
@@ -96,4 +96,4 @@ ai-contexters all -p codescribe -H 168 -o ./reports  # Last 7 days
 
 ---
 
-*Created by M&K (c)2026 VetCoders*
+*Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders*

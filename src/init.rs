@@ -381,7 +381,7 @@ fn write_loct_for_ai(root: &Path, out_path: &Path) -> Result<()> {
 fn extract_context(out_dir: &Path, project: &str, hours: u64) -> Result<Vec<TimelineEntry>> {
     let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
     let config = ExtractionConfig {
-        project_filter: Some(project.to_string()),
+        project_filter: vec![project.to_string()],
         cutoff,
         include_assistant: false,
         watermark: None,

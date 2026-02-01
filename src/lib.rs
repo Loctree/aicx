@@ -1,6 +1,6 @@
 //! ai-contexters library crate.
 //!
-//! Created by M&K (c)2026 VetCoders
+//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 pub mod chunker;
 pub mod init;

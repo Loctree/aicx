@@ -5,7 +5,7 @@
 //! - Single chunk upsert (`rmcp-memex upsert`)
 //! - Semantic search (`rmcp-memex search`)
 //!
-//! Created by M&K (c)2026 VetCoders
+//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};

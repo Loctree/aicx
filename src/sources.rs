@@ -41,7 +41,7 @@ pub struct TimelineEntry {
 /// Configuration for extraction.
 #[derive(Debug, Clone)]
 pub struct ExtractionConfig {
-    pub project_filter: Option<String>,
+    pub project_filter: Vec<String>,
     pub cutoff: DateTime<Utc>,
     pub include_assistant: bool,
     pub watermark: Option<DateTime<Utc>>,
@@ -142,11 +142,15 @@ pub fn extract_claude(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
         let dir_name = dir_entry.file_name().to_string_lossy().to_string();
 
         // Filter by project if specified
-        if let Some(ref filter) = config.project_filter {
+        if !config.project_filter.is_empty() {
             let decoded = decode_claude_project_path(&dir_name);
-            if !decoded.to_lowercase().contains(&filter.to_lowercase())
-                && !dir_name.to_lowercase().contains(&filter.to_lowercase())
-            {
+            let decoded_lower = decoded.to_lowercase();
+            let dir_lower = dir_name.to_lowercase();
+            let matches = config.project_filter.iter().any(|f| {
+                let fl = f.to_lowercase();
+                decoded_lower.contains(&fl) || dir_lower.contains(&fl)
+            });
+            if !matches {
                 continue;
             }
         }
@@ -291,16 +295,18 @@ pub fn extract_codex(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     }
 
     // Second pass: determine which sessions match the filter
-    let matching_sessions: HashSet<String> = if let Some(ref filter) = config.project_filter {
-        let filter_lower = filter.to_lowercase();
+    let matching_sessions: HashSet<String> = if !config.project_filter.is_empty() {
+        let filters_lower: Vec<String> = config.project_filter.iter().map(|f| f.to_lowercase()).collect();
         sessions
             .iter()
             .filter(|(_id, msgs)| {
-                msgs.iter().any(|m| {
-                    m.text.to_lowercase().contains(&filter_lower)
-                        || m.cwd
-                            .as_ref()
-                            .is_some_and(|c| c.to_lowercase().contains(&filter_lower))
+                filters_lower.iter().any(|fl| {
+                    msgs.iter().any(|m| {
+                        m.text.to_lowercase().contains(fl)
+                            || m.cwd
+                                .as_ref()
+                                .is_some_and(|c| c.to_lowercase().contains(fl))
+                    })
                 })
             })
             .map(|(id, _)| id.clone())
@@ -428,12 +434,14 @@ fn parse_gemini_session(
     let project_hash = session.project_hash.clone();
 
     // Check project filter against message content
-    let session_matches_filter = if let Some(ref filter) = config.project_filter {
-        let filter_lower = filter.to_lowercase();
-        session.messages.iter().any(|m| {
-            m.content
-                .as_ref()
-                .is_some_and(|c| c.to_lowercase().contains(&filter_lower))
+    let session_matches_filter = if !config.project_filter.is_empty() {
+        let filters_lower: Vec<String> = config.project_filter.iter().map(|f| f.to_lowercase()).collect();
+        filters_lower.iter().any(|fl| {
+            session.messages.iter().any(|m| {
+                m.content
+                    .as_ref()
+                    .is_some_and(|c| c.to_lowercase().contains(fl))
+            })
         })
     } else {
         true
@@ -650,20 +658,19 @@ pub fn detect_project_name() -> String {
     if let Ok(output) = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if let Some(name) = std::path::Path::new(&s).file_name() {
-                return name.to_string_lossy().to_string();
-            }
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if let Some(name) = std::path::Path::new(&s).file_name() {
+            return name.to_string_lossy().to_string();
         }
     }
 
     // Fallback: cwd dirname
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(name) = cwd.file_name() {
-            return name.to_string_lossy().to_string();
-        }
+    if let Ok(cwd) = std::env::current_dir()
+        && let Some(name) = cwd.file_name()
+    {
+        return name.to_string_lossy().to_string();
     }
 
     "unknown".to_string()

@@ -36,9 +36,9 @@ struct Cli {
 enum Commands {
     /// Extract timeline from Claude Code sessions
     Claude {
-        /// Project directory filter (e.g., "CodeScribe" or full path)
-        #[arg(short, long)]
-        project: Option<String>,
+        /// Project directory filter(s): -p foo bar baz
+        #[arg(short, long, num_args = 1..)]
+        project: Vec<String>,
 
         /// Hours to look back (default: 48)
         #[arg(short = 'H', long, default_value = "48")]
@@ -87,9 +87,9 @@ enum Commands {
 
     /// Extract timeline from Codex history
     Codex {
-        /// Project/repo filter
-        #[arg(short, long)]
-        project: Option<String>,
+        /// Project/repo filter(s): -p foo bar baz
+        #[arg(short, long, num_args = 1..)]
+        project: Vec<String>,
 
         /// Hours to look back (default: 48)
         #[arg(short = 'H', long, default_value = "48")]
@@ -134,9 +134,9 @@ enum Commands {
 
     /// Extract from all agents (Claude + Codex + Gemini)
     All {
-        /// Project filter
-        #[arg(short, long)]
-        project: Option<String>,
+        /// Project filter(s): -p foo bar baz
+        #[arg(short, long, num_args = 1..)]
+        project: Vec<String>,
 
         /// Hours to look back
         #[arg(short = 'H', long, default_value = "48")]
@@ -181,9 +181,9 @@ enum Commands {
 
     /// Store contexts in central store (~/.ai-contexters/) and optionally sync to memex
     Store {
-        /// Project name (required for store organization)
-        #[arg(short, long)]
-        project: Option<String>,
+        /// Project name(s): -p foo bar baz
+        #[arg(short, long, num_args = 1..)]
+        project: Vec<String>,
 
         /// Agent filter: claude, codex, gemini (default: all)
         #[arg(short, long)]
@@ -449,7 +449,7 @@ fn main() -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn run_extraction(
     agents: &[&str],
-    project: Option<String>,
+    project: Vec<String>,
     hours: u64,
     output_dir: &Path,
     format: &str,
@@ -464,7 +464,11 @@ fn run_extraction(
 ) -> Result<()> {
     // Load state for incremental/dedup
     let mut state = StateManager::load();
-    let project_name = project.as_deref().unwrap_or("_global").to_string();
+    let project_name = if project.is_empty() {
+        "_global".to_string()
+    } else {
+        project.join("+")
+    };
 
     let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
 
@@ -473,7 +477,7 @@ fn run_extraction(
         let source_key = format!(
             "{}:{}",
             agents.join("+"),
-            project.as_deref().unwrap_or("all")
+            if project.is_empty() { "all".to_string() } else { project.join("+") }
         );
         state.get_watermark(&source_key)
     } else {
@@ -577,7 +581,7 @@ fn run_extraction(
 
     let metadata = ReportMetadata {
         generated_at: Utc::now(),
-        project_filter: project.clone(),
+        project_filter: if project.is_empty() { None } else { Some(project.join(", ")) },
         hours_back: hours,
         total_entries: output_entries.len(),
         sessions: sessions.clone(),
@@ -673,7 +677,7 @@ fn run_extraction(
             let source_key = format!(
                 "{}:{}",
                 agents.join("+"),
-                project.as_deref().unwrap_or("all")
+                if project.is_empty() { "all".to_string() } else { project.join("+") }
             );
             if let Some(latest) = entries.last() {
                 state.update_watermark(&source_key, latest.timestamp);
@@ -697,7 +701,7 @@ fn run_extraction(
 
     // Memex sync: chunk entries and push to vector store
     if sync_memex && !output_entries.is_empty() {
-        let proj_name = project.as_deref().unwrap_or("unknown");
+        let proj_name = if project.is_empty() { "unknown" } else { &project[0] };
         let agent_name = agents.join("+");
 
         let chunker_config = ChunkerConfig::default();
@@ -735,7 +739,7 @@ fn run_extraction(
 
 /// Store extracted contexts in central store and optionally sync to memex.
 fn run_store(
-    project: Option<String>,
+    project: Vec<String>,
     agent: Option<String>,
     hours: u64,
     include_assistant: bool,
@@ -791,7 +795,7 @@ fn run_store(
         .collect();
 
     // Group by agent+date and write to central store
-    let proj_name = project.as_deref().unwrap_or("unknown");
+    let proj_name = if project.is_empty() { "unknown" } else { &project[0] };
     let mut index = store::load_index();
     let mut stored_count = 0usize;
 

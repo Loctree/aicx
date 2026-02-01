@@ -79,4 +79,4 @@ Only `share/summary.md` and `share/timeline.md` are intended to be committed.
 
 ---
 
-*Created by M&K (c)2026 VetCoders*
+*Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders*

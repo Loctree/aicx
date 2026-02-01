@@ -7,7 +7,7 @@
 //! - Loctree snapshot embedding
 //! - Decision markers and proper code block handling
 //!
-//! Created by M&K (c)2026 VetCoders
+//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
