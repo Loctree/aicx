@@ -633,6 +633,12 @@ fn run_extraction(
     };
 
     // ── Store-first: group entries by repo (from cwd) × agent × date ──
+    //
+    // Writes agent-friendly chunks (~1500 tokens) to central store.
+    // Paths go to stdout so agents can read them directly.
+    let chunker_config = ai_contexters::chunker::ChunkerConfig::default();
+    let mut all_written_paths: Vec<std::path::PathBuf> = Vec::new();
+
     if !output_entries.is_empty() {
         let mut repo_groups: std::collections::BTreeMap<
             (String, String, String),
@@ -657,26 +663,29 @@ fn run_extraction(
             std::collections::BTreeMap::new();
 
         for ((repo, agent_name, date), group_entries) in &repo_groups {
-            let paths =
-                store::write_context(repo, agent_name, date, &time_str, group_entries)?;
+            let paths = store::write_context_chunked(
+                repo,
+                agent_name,
+                date,
+                &time_str,
+                group_entries,
+                &chunker_config,
+            )?;
             store::update_index(&mut index, repo, agent_name, date, group_entries.len());
             *repo_summary
                 .entry(repo.clone())
                 .or_default()
                 .entry(agent_name.clone())
                 .or_insert(0) += group_entries.len();
-            for path in &paths {
-                eprintln!("  store → {}", path.display());
-            }
+            all_written_paths.extend(paths);
         }
         store::save_index(&index)?;
 
-        // Print per-repo summary to stderr
-        let store_base = store::store_base_dir().unwrap_or_default();
+        // Summary to stderr (diagnostics)
         eprintln!(
-            "✓ {} entries → {}",
+            "✓ {} entries → {} chunks",
             output_entries.len(),
-            store_base.display()
+            all_written_paths.len(),
         );
         for (repo, agents_map) in &repo_summary {
             let total: usize = agents_map.values().sum();
@@ -685,6 +694,11 @@ fn run_extraction(
                 .map(|(a, c)| format!("{}: {}", a, c))
                 .collect();
             eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
+        }
+
+        // stdout: agent-readable paths (one per line)
+        for path in &all_written_paths {
+            println!("{}", path.display());
         }
     }
 
@@ -881,9 +895,11 @@ fn run_store(
         })
         .collect();
 
-    // Group by repo (from cwd) × agent × date and write to central store
+    // Group by repo (from cwd) × agent × date and write chunked to central store
+    let chunker_config = ai_contexters::chunker::ChunkerConfig::default();
     let mut index = store::load_index();
     let mut stored_count = 0usize;
+    let mut all_written_paths: Vec<std::path::PathBuf> = Vec::new();
 
     let mut repo_groups: std::collections::BTreeMap<
         (String, String, String),
@@ -906,7 +922,14 @@ fn run_store(
         std::collections::BTreeMap::new();
 
     for ((repo, agent_name, date), group_entries) in &repo_groups {
-        let paths = store::write_context(repo, agent_name, date, &time_str, group_entries)?;
+        let paths = store::write_context_chunked(
+            repo,
+            agent_name,
+            date,
+            &time_str,
+            group_entries,
+            &chunker_config,
+        )?;
         store::update_index(&mut index, repo, agent_name, date, group_entries.len());
         stored_count += group_entries.len();
         *repo_summary
@@ -914,15 +937,16 @@ fn run_store(
             .or_default()
             .entry(agent_name.clone())
             .or_insert(0) += group_entries.len();
-        for path in &paths {
-            eprintln!("  store → {}", path.display());
-        }
+        all_written_paths.extend(paths);
     }
 
     store::save_index(&index)?;
 
-    let store_base = store::store_base_dir().unwrap_or_default();
-    eprintln!("✓ {} entries → {}", stored_count, store_base.display());
+    eprintln!(
+        "✓ {} entries → {} chunks",
+        stored_count,
+        all_written_paths.len(),
+    );
     for (repo, agents_map) in &repo_summary {
         let total: usize = agents_map.values().sum();
         let detail: Vec<String> = agents_map
@@ -930,6 +954,11 @@ fn run_store(
             .map(|(a, c)| format!("{}: {}", a, c))
             .collect();
         eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
+    }
+
+    // stdout: agent-readable paths
+    for path in &all_written_paths {
+        println!("{}", path.display());
     }
 
     // Chunk and sync to memex if requested

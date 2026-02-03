@@ -7,9 +7,8 @@
 
 use anyhow::{Context, Result};
 use chrono::{Local, Utc};
-use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -132,9 +131,7 @@ pub fn run_init(options: InitOptions) -> Result<()> {
     ));
     let prompt_bytes = build_prompt(
         &prompt_path,
-        &loct_path,
         &paths.context,
-        options.max_lines,
         &ts_local,
     )?;
     if prompt_bytes > PROMPT_SIZE_WARN_BYTES {
@@ -153,9 +150,20 @@ pub fn run_init(options: InitOptions) -> Result<()> {
         return Ok(());
     }
 
-    let agent = resolve_agent(options.agent)?;
+    let agent = if options.no_confirm && options.agent.is_none() {
+        "codex".to_string()
+    } else {
+        resolve_agent(options.agent)?
+    };
     onboarding(&mut log, &agent)?;
     check_agent(&agent)?;
+    if !confirm_claude_risk(&mut log, &agent)? {
+        log.line("Run canceled.");
+        log.line(&format!("[prompt] {}", prompt_path.display()));
+        log.line(&format!("[loct]   {}", loct_path.display()));
+        log.line(&format!("[log]    {}", log_path.display()));
+        return Ok(());
+    }
 
     if !options.no_confirm {
         let run = confirm_run(&mut log)?;
@@ -171,14 +179,7 @@ pub fn run_init(options: InitOptions) -> Result<()> {
     let model = options.model.as_deref();
 
     let report_path = paths.runs.join(format!("{}_report.md", run_id));
-    let report = run_agent(
-        &root,
-        &agent,
-        model,
-        &prompt_path,
-        &report_path,
-        &paths.config,
-    )?;
+    let report = run_agent(&root, &agent, model, &prompt_path, &report_path)?;
 
     let (clean_report, summary_block) = split_summary_block(&report);
     append_timeline(
@@ -309,7 +310,8 @@ fn update_gitignore(root: &Path) -> Result<()> {
 }
 
 fn ensure_loct(log: &mut Logger) -> Result<()> {
-    let ok = Command::new("loct").arg("--version").output().is_ok();
+    let loct_bin = resolve_loct_bin()?;
+    let ok = Command::new(&loct_bin).arg("--version").output().is_ok();
     if !ok {
         log.warn("loct not found in PATH");
         anyhow::bail!("loct is required for init");
@@ -332,12 +334,16 @@ fn write_meta(root: &Path, paths: &InitPaths, project: &str, run_id: &str) -> Re
         .map(|s| !s.success())
         .unwrap_or(false);
 
-    let loct_version = Command::new("loct")
-        .arg("--version")
-        .output()
+    let loct_version = resolve_loct_bin()
         .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
+        .and_then(|bin| {
+            Command::new(bin)
+                .arg("--version")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+        })
         .unwrap_or_default();
 
     let ai_contexters_version = env!("CARGO_PKG_VERSION").to_string();
@@ -361,7 +367,8 @@ fn write_meta(root: &Path, paths: &InitPaths, project: &str, run_id: &str) -> Re
 }
 
 fn run_loct_auto(root: &Path) -> Result<()> {
-    let status = Command::new("loct")
+    let loct_bin = resolve_loct_bin()?;
+    let status = Command::new(&loct_bin)
         .arg("auto")
         .current_dir(root)
         .status()
@@ -373,7 +380,8 @@ fn run_loct_auto(root: &Path) -> Result<()> {
 }
 
 fn write_loct_for_ai(root: &Path, out_path: &Path) -> Result<()> {
-    let output = Command::new("loct")
+    let loct_bin = resolve_loct_bin()?;
+    let output = Command::new(&loct_bin)
         .arg("--for-ai")
         .current_dir(root)
         .output()
@@ -385,6 +393,26 @@ fn write_loct_for_ai(root: &Path, out_path: &Path) -> Result<()> {
 
     fs::write(out_path, output.stdout)?;
     Ok(())
+}
+
+fn resolve_loct_bin() -> Result<PathBuf> {
+    if let Ok(val) = std::env::var("LOCT_BIN") {
+        let path = PathBuf::from(val);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    let path_var = std::env::var_os("PATH")
+        .ok_or_else(|| anyhow::anyhow!("PATH is not set"))?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join("loct");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(anyhow::anyhow!("loct not found in PATH"))
 }
 
 fn extract_context(
@@ -448,45 +476,118 @@ fn extract_context(
 
 fn build_prompt(
     prompt_path: &Path,
-    loct_path: &Path,
     context_dir: &Path,
-    max_lines: usize,
     ts_local: &str,
 ) -> Result<usize> {
     let validated_prompt = sanitize::validate_write_path(prompt_path)?;
     // SECURITY: path sanitized via validate_write_path (traversal + allowlist)
     let mut file = File::create(&validated_prompt)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
 
+    let share_dir = context_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("share"));
+    let artifacts_root = share_dir
+        .clone()
+        .map(|d| d.join("artifacts"))
+        .unwrap_or_else(|| PathBuf::from(".ai-context/share/artifacts"));
+    let summary_path = artifacts_root.join("SUMMARY.md");
+    let timeline_path = artifacts_root.join("TIMELINE.md");
+    let triage_path = artifacts_root.join("TRIAGE.md");
+    let prompts_dir = artifacts_root.join("prompts");
+
     writeln!(
         file,
-        "You are an agent completing an initialization pipeline for a repository."
+        "You are an agent initializing a repository."
     )?;
     writeln!(file)?;
     writeln!(file, "Rules:")?;
-    writeln!(file, "- No internet access.")?;
-    writeln!(file, "- Use only the context in this prompt.")?;
-    writeln!(file, "- Do not guess facts that are not present.")?;
+    writeln!(
+        file,
+        "- You MUST use tools; do not answer without running tools."
+    )?;
+    writeln!(
+        file,
+        "- Explore ai-contexters artifacts (paths listed below) newest-first until you can form a coherent picture of work on this repo."
+    )?;
+    writeln!(
+        file,
+        "- While exploring, append entries to TIMELINE.md (newest on top)."
+    )?;
+    writeln!(
+        file,
+        "- Use the loctree MCP tool for repo structure; do not rely on injected `loct --for-ai` output."
+    )?;
+    writeln!(
+        file,
+        "- After identifying red flags and hot spots, you may read repo code to confirm."
+    )?;
+    writeln!(file, "- Do not hallucinate technical facts.")?;
+    writeln!(file, "- Language: English. Tone: direct and concise.")?;
     writeln!(file)?;
-    writeln!(file, "Tasks:")?;
-    writeln!(
-        file,
-        "1) Summary: what the repo is and how it is organized."
-    )?;
-    writeln!(
-        file,
-        "2) Build/Test Quickstart: exact commands or what's missing."
-    )?;
-    writeln!(
-        file,
-        "3) Next Tasks: 5-10 checkbox items (small, actionable)."
-    )?;
-    writeln!(file, "4) Risks/Tech debt: max 10 with minimal fixes.")?;
+    writeln!(file, "Exploration schedule (required):")?;
+    writeln!(file, "1) ai-contexters artifacts (newest-first) + update TIMELINE.md.")?;
+    writeln!(file, "2) Identify red flags / hot spots.")?;
+    writeln!(file, "3) Selective verification in repo code (confirm only).")?;
+    writeln!(file, "4) TRIAGE.md (unfinished implementations, P0-P2).")?;
+    writeln!(file, "5) Generate task prompts (\"Emil Kurier\" format).")?;
     writeln!(file)?;
-    writeln!(file, "Required report format:")?;
-    writeln!(file, "- Summary")?;
-    writeln!(file, "- Build/Test Quickstart")?;
-    writeln!(file, "- Next Tasks")?;
-    writeln!(file, "- Risks")?;
+    writeln!(file, "Artifacts to produce (write to):")?;
+    writeln!(
+        file,
+        "- SUMMARY.md: {} (max 120 lines, concise but complete; add a section \"Recent PRs (default branch)\").",
+        summary_path.display()
+    )?;
+    writeln!(
+        file,
+        "- TIMELINE.md: {} (newest on top; append during exploration; no length limit).",
+        timeline_path.display()
+    )?;
+    writeln!(
+        file,
+        "- TRIAGE.md: {} (unfinished implementations with triage P0/P1/P2 + rationale and sources).",
+        triage_path.display()
+    )?;
+    writeln!(
+        file,
+        "- PROMPTS/: {} (one file per task group named `%TIMESTAMP_PROMPT_<TITLE>_P0.md` / `_P1.md` / `_P2.md`).",
+        prompts_dir.display()
+    )?;
+    writeln!(file)?;
+    writeln!(file, "Quality gate:")?;
+    writeln!(
+        file,
+        "- If evidence is insufficient, do NOT generate prompts for that task group."
+    )?;
+    writeln!(
+        file,
+        "- In that case, write a short \"Missing Info\" note into TRIAGE.md with what is needed."
+    )?;
+    writeln!(file, "- Before finalizing, run:")?;
+    writeln!(file, "  - `cargo clippy -- -D warnings`")?;
+    writeln!(file, "  - `semgrep scan --config auto`")?;
+    writeln!(file, "  - project tests (if missing, state what should be run).")?;
+    writeln!(file)?;
+    writeln!(file, "Task prompt requirements (\"Emil Kurier\" format):")?;
+    writeln!(file, "- Each file is a ready-to-paste prompt for another agent (no pre/post commentary).")?;
+    writeln!(file, "- Preserve intent 1:1; do not ask for more details.")?;
+    writeln!(file, "- Always includes:")?;
+    writeln!(file, "  1) Task description from the current transcript")?;
+    writeln!(file, "  2) Initial context")?;
+    writeln!(file, "  3) Actionable todo list with [ ] / [x] blocks:")?;
+    writeln!(file, "     - investigate code")?;
+    writeln!(file, "     - implement")?;
+    writeln!(file, "     - verify integrity (format, lint)")?;
+    writeln!(file, "     - tests (if missing, you MUST write them)")?;
+    writeln!(file, "  4) Expected deliverables")?;
+    writeln!(file, "  5) Report expectation")?;
+    writeln!(file, "  6) Appendix: tooling (loctree: `loct auto`, `loct --for-ai`, `loct find <...>`, clippy, etc.) + anti-technical-debt rules (e.g. \"remove all legacy leftovers after refactor\").")?;
+    writeln!(file, "  7) Call to action and a cheesy joke + kaomoji (no emoji). Both must be in English, unique, and the kaomoji must be creative (not a common/recycled one).")?;
+    writeln!(file, "- Tone: tolerant, motivating, empathetic. Kaomoji ALWAYS. No emoji anywhere.")?;
+    writeln!(file)?;
+    writeln!(file, "TRIAGE.md requirements:")?;
+    writeln!(file, "- Each item MUST include a source pointer: artifact path + section/line if available (e.g. `path#L12` or `path:SectionName`).")?;
+    writeln!(file, "- Group items by domain (e.g. Auth Context, Loctree Refactor, Vista UI), then assign P0/P1/P2 within each group.")?;
     writeln!(file)?;
     writeln!(
         file,
@@ -501,65 +602,73 @@ fn build_prompt(
     writeln!(file, "{}", SUMMARY_END)?;
     writeln!(file, "Keep bullets short and factual.")?;
     writeln!(file)?;
-    writeln!(file, "CONTEXT (truncated):")?;
+    writeln!(file, "ARTIFACTS (paths only, newest first):")?;
     writeln!(file)?;
 
-    if loct_path.exists() {
-        writeln!(file, "## loct --for-ai (first {} lines)", max_lines)?;
-        append_first_lines(&mut file, loct_path, max_lines)?;
-        writeln!(file)?;
+    let mut artifacts: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+
+    if context_dir.exists() {
+        for entry in fs::read_dir(context_dir)?.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_file()
+                && !path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("loct_for_ai"))
+                && let Ok(meta) = path.metadata()
+                && let Ok(mtime) = meta.modified()
+            {
+                artifacts.push((path, mtime));
+            }
+        }
     }
 
-    let mut context_files: Vec<PathBuf> = fs::read_dir(context_dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "md"))
-        .filter(|p| {
-            let name = p.file_name().unwrap_or(OsStr::new("")).to_string_lossy();
-            name.contains("memory_") || name.contains("timeline")
-        })
-        .collect();
-
-    context_files.sort_by(|a, b| {
-        let an = a
-            .file_name()
-            .map(|s| s.to_string_lossy())
-            .unwrap_or_default();
-        let bn = b
-            .file_name()
-            .map(|s| s.to_string_lossy())
-            .unwrap_or_default();
-        an.cmp(&bn)
-    });
-
-    for ctx in context_files {
-        let name = ctx
-            .file_name()
-            .map(|s| s.to_string_lossy())
-            .unwrap_or_default();
-        writeln!(file, "## {} (first {} lines)", name, max_lines)?;
-        append_first_lines(&mut file, &ctx, max_lines)?;
-        writeln!(file)?;
+    // Also include shared artifacts if present.
+    let share_dir = context_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("share"));
+    if let Some(dir) = share_dir
+        && dir.exists()
+    {
+        for entry in fs::read_dir(dir)?.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_file()
+                && let Ok(meta) = path.metadata()
+                && let Ok(mtime) = meta.modified()
+            {
+                artifacts.push((path, mtime));
+            }
+        }
     }
+
+    artifacts.sort_by(|a, b| b.1.cmp(&a.1));
+
+    if artifacts.is_empty() {
+        writeln!(file, "(no artifacts found)")?;
+    } else {
+        for (path, mtime) in &artifacts {
+            let ts = chrono::DateTime::<Local>::from(*mtime)
+                .format("%Y-%m-%d %H:%M:%S");
+            writeln!(file, "- {} (mtime: {})", path.display(), ts)?;
+        }
+    }
+    writeln!(file)?;
+
+    writeln!(file, "Notes:")?;
+    writeln!(
+        file,
+        "- Do not rely on injected context blocks; open artifacts directly using tools."
+    )?;
+    writeln!(
+        file,
+        "- Use loctree MCP tool (repo-view/tree/focus/slice/find/impact) to build structure context."
+    )?;
+    writeln!(file)?;
 
     file.flush()?;
     let bytes = fs::metadata(prompt_path)?.len() as usize;
     Ok(bytes)
-}
-
-fn append_first_lines(w: &mut impl Write, path: &Path, max_lines: usize) -> Result<()> {
-    let validated = sanitize::validate_read_path(path)?;
-    // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
-    let file = File::open(&validated)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let reader = BufReader::new(file);
-    for (idx, line) in reader.lines().enumerate() {
-        if idx >= max_lines {
-            break;
-        }
-        let line = line?;
-        writeln!(w, "{}", line)?;
-    }
-    Ok(())
 }
 
 fn resolve_agent(agent: Option<String>) -> Result<String> {
@@ -580,7 +689,7 @@ fn resolve_agent(agent: Option<String>) -> Result<String> {
         std::io::stdin().read_line(&mut input)?;
         let input = input.trim();
         if input.is_empty() {
-            return Ok("claude".to_string());
+            return Ok("codex".to_string());
         }
         match normalize_agent(input) {
             Ok(agent) => return Ok(agent),
@@ -607,6 +716,19 @@ fn onboarding(log: &mut Logger, agent: &str) -> Result<()> {
     Ok(())
 }
 
+fn confirm_claude_risk(log: &mut Logger, agent: &str) -> Result<bool> {
+    if agent != "claude" {
+        return Ok(true);
+    }
+    log.line("Memory bloat possible - do you accept the risk? (y)es / (n)o");
+    print!("> ");
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let input = input.trim().to_lowercase();
+    Ok(input == "y" || input == "yes")
+}
+
 fn check_agent(agent: &str) -> Result<()> {
     let safe = sanitize::safe_agent_name(agent)?;
     // SECURITY: agent name validated via safe_agent_name allowlist (claude, codex only)
@@ -631,31 +753,15 @@ fn confirm_run(log: &mut Logger) -> Result<bool> {
     }
 }
 
-fn ensure_mcp_config(config_dir: &Path) -> Result<PathBuf> {
-    fs::create_dir_all(config_dir)?;
-    let path = config_dir.join("mcp.json");
-    if !path.exists() {
-        fs::write(
-            &path,
-            r#"{
-  "mcpServers": {}
-}
-"#,
-        )?;
-    }
-    Ok(path)
-}
-
 fn run_agent(
     root: &Path,
     agent: &str,
     model: Option<&str>,
     prompt_path: &Path,
     report_path: &Path,
-    config_dir: &Path,
 ) -> Result<String> {
     match agent {
-        "claude" => run_claude(model, prompt_path, report_path, config_dir),
+        "claude" => run_claude(model, prompt_path, report_path),
         "codex" => run_codex(model, prompt_path, report_path, root),
         _ => anyhow::bail!("unknown agent: {}", agent),
     }
@@ -665,68 +771,108 @@ fn run_claude(
     model: Option<&str>,
     prompt_path: &Path,
     report_path: &Path,
-    config_dir: &Path,
 ) -> Result<String> {
     let validated_prompt = sanitize::validate_read_path(prompt_path)?;
-    let prompt = fs::read_to_string(validated_prompt)?;
-    let mcp_config = ensure_mcp_config(config_dir)?;
+    let bootstrap = bootstrap_prompt(&validated_prompt);
+    if should_dispatch_terminal() {
+        let validated_report = sanitize::validate_write_path(report_path)?;
 
-    let mut cmd = Command::new("claude");
-    cmd.arg("-p")
-        .arg("--no-session-persistence")
-        .arg("--mcp-config")
-        .arg(mcp_config)
-        .arg("--strict-mcp-config")
-        .arg("--tools")
-        .arg("")
-        .arg("--output-format")
-        .arg("text");
+        let mut cmd = String::from(
+            "claude --dangerously-skip-permissions -p --output-format stream-json --include-partial-messages",
+        );
+        if let Some(model) = model {
+            cmd.push_str(" --model ");
+            cmd.push_str(&shell_escape_str(model));
+        }
+        cmd.push(' ');
+        cmd.push_str(&shell_escape_str(&bootstrap));
+        cmd.push_str(" | jq -r ");
+        cmd.push_str(&shell_escape_str(
+            "if .delta?.text then .delta.text \
+             elif .content_block?.text then .content_block.text \
+             elif .message?.content then (.message.content[]? | select(.type==\"text\") | .text) \
+             else empty end",
+        ));
+        cmd.push_str(" | awk '1' > ");
+        cmd.push_str(&shell_escape(&validated_report));
 
-    if let Some(model) = model {
-        cmd.arg("--model").arg(model);
+        dispatch_terminal(&cmd)?;
+        wait_for_report(&validated_report, std::time::Duration::from_secs(60 * 60))?;
+    } else {
+        let mut cmd = Command::new("claude");
+        cmd.arg("--dangerously-skip-permissions")
+            .arg("-p")
+            .arg("--output-format")
+            .arg("text");
+
+        if let Some(model) = model {
+            cmd.arg("--model").arg(model);
+        }
+
+        let output = cmd
+            .arg(bootstrap)
+            .output()
+            .context("Failed to run claude")?;
+
+        if !output.status.success() {
+            anyhow::bail!("claude command failed");
+        }
+
+        let report = String::from_utf8_lossy(&output.stdout).to_string();
+        fs::write(report_path, &report)?;
     }
 
-    let output = cmd.arg(prompt).output().context("Failed to run claude")?;
+    let mut report = String::new();
+    let validated_report = sanitize::validate_read_path(report_path)?;
+    File::open(&validated_report)
+        .with_context(|| format!("claude did not write report: {}", report_path.display()))?
+        .read_to_string(&mut report)?;
 
-    if !output.status.success() {
-        anyhow::bail!("claude command failed");
+    if report.trim().is_empty() {
+        anyhow::bail!("claude report empty");
     }
 
-    let report = String::from_utf8_lossy(&output.stdout).to_string();
-    fs::write(report_path, &report)?;
     Ok(report)
 }
 
 fn run_codex(
-    model: Option<&str>,
+    _model: Option<&str>,
     prompt_path: &Path,
     report_path: &Path,
     root: &Path,
 ) -> Result<String> {
     let validated_prompt = sanitize::validate_read_path(prompt_path)?;
-    // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
-    let prompt_file = File::open(&validated_prompt)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let bootstrap_path = write_bootstrap_prompt(&validated_prompt)?;
 
-    let mut cmd = Command::new("codex");
-    cmd.arg("exec")
-        .arg("--sandbox")
-        .arg("read-only")
-        .arg("-C")
-        .arg(root)
-        .arg("--output-last-message")
-        .arg(report_path);
+    if should_dispatch_terminal() {
+        let validated_report = sanitize::validate_write_path(report_path)?;
+        let cmd = format!(
+            "codex --dangerously-bypass-approvals-and-sandbox exec -C {} --output-last-message {} < {}",
+            shell_escape(root),
+            shell_escape(&validated_report),
+            shell_escape(&bootstrap_path)
+        );
+        dispatch_terminal(&cmd)?;
+        wait_for_report(&validated_report, std::time::Duration::from_secs(60 * 60))?;
+    } else {
+        // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
+        let prompt_file = File::open(&bootstrap_path)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        let mut cmd = Command::new("codex");
+        cmd.arg("--dangerously-bypass-approvals-and-sandbox")
+            .arg("exec")
+            .arg("-C")
+            .arg(root)
+            .arg("--output-last-message")
+            .arg(report_path);
 
-    if let Some(model) = model {
-        cmd.arg("-m").arg(model);
-    }
+        let status = cmd
+            .stdin(Stdio::from(prompt_file))
+            .status()
+            .context("Failed to run codex")?;
 
-    let status = cmd
-        .stdin(Stdio::from(prompt_file))
-        .status()
-        .context("Failed to run codex")?;
-
-    if !status.success() {
-        anyhow::bail!("codex command failed");
+        if !status.success() {
+            anyhow::bail!("codex command failed");
+        }
     }
 
     let mut report = String::new();
@@ -741,6 +887,112 @@ fn run_codex(
     }
 
     Ok(report)
+}
+
+fn should_dispatch_terminal() -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    match std::env::var("AI_CTX_DISPATCH_TERMINAL") {
+        Ok(val) => {
+            let v = val.trim().to_lowercase();
+            !(v.is_empty() || v == "0" || v == "false" || v == "no")
+        }
+        Err(_) => true,
+    }
+}
+
+fn dispatch_terminal(command: &str) -> Result<()> {
+    let escaped = escape_osascript(command);
+    let status = Command::new("osascript")
+        .args([
+            "-e",
+            "tell application \"Terminal\" to activate",
+            "-e",
+            &format!(
+                "tell application \"Terminal\" to do script \"{}\"",
+                escaped
+            ),
+        ])
+        .status()
+        .context("Failed to dispatch command via osascript")?;
+    if !status.success() {
+        anyhow::bail!("osascript failed to dispatch Terminal command");
+    }
+    Ok(())
+}
+
+fn shell_escape(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn shell_escape_str(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn bootstrap_prompt(prompt_path: &Path) -> String {
+    format!(
+        "First, read the full prompt from this file: {}. Use tools to open it. Do not proceed until you have read it. Then follow its instructions exactly.",
+        prompt_path.display()
+    )
+}
+
+fn write_bootstrap_prompt(prompt_path: &Path) -> Result<PathBuf> {
+    let bootstrap_path = prompt_path.with_extension("bootstrap.txt");
+    let validated = sanitize::validate_write_path(&bootstrap_path)?;
+    fs::write(&validated, bootstrap_prompt(prompt_path))?;
+    Ok(validated)
+}
+
+fn escape_osascript(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    for ch in command.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn wait_for_report(path: &Path, timeout: std::time::Duration) -> Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(meta) = fs::metadata(path) {
+            if meta.len() > 0 {
+                return Ok(());
+            }
+        }
+        if start.elapsed() > timeout {
+            anyhow::bail!(
+                "Timed out waiting for report to be written: {}",
+                path.display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
 }
 
 fn split_summary_block(report: &str) -> (String, Option<String>) {
@@ -835,4 +1087,162 @@ fn append_timeline(
     writeln!(file)?;
     writeln!(file)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use filetime::{set_file_mtime, FileTime};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempRoot {
+        path: PathBuf,
+    }
+
+    impl TempRoot {
+        fn new() -> Self {
+            let mut dir = std::env::temp_dir();
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            dir.push(format!("ai-ctx-init-test-{}-{}", std::process::id(), nanos));
+            fs::create_dir_all(&dir).unwrap();
+            Self { path: dir }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn setup_dirs() -> (TempRoot, PathBuf, PathBuf, PathBuf) {
+        let root = TempRoot::new();
+        let context_dir = root
+            .path()
+            .join(".ai-context")
+            .join("local")
+            .join("context");
+        let share_dir = root.path().join(".ai-context").join("share");
+        let prompts_dir = root
+            .path()
+            .join(".ai-context")
+            .join("local")
+            .join("prompts");
+        fs::create_dir_all(&context_dir).unwrap();
+        fs::create_dir_all(&share_dir).unwrap();
+        fs::create_dir_all(&prompts_dir).unwrap();
+        let prompt_path = prompts_dir.join("prompt.md");
+        (root, context_dir, share_dir, prompt_path)
+    }
+
+    fn build_and_read_prompt(prompt_path: &Path, context_dir: &Path) -> String {
+        build_prompt(prompt_path, context_dir, "2026-02-03 12:00").unwrap();
+        fs::read_to_string(prompt_path).unwrap()
+    }
+
+    #[test]
+    fn test_build_prompt_includes_core_rules() {
+        let (_root, context_dir, _share_dir, prompt_path) = setup_dirs();
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir);
+
+        assert!(prompt.contains("Exploration schedule (required):"));
+        assert!(prompt.contains("Quality gate:"));
+        assert!(prompt.contains("cargo clippy -- -D warnings"));
+        assert!(prompt.contains("semgrep scan --config auto"));
+        assert!(prompt.contains("TIMELINE.md:"));
+        assert!(prompt.contains("TRIAGE.md:"));
+        assert!(prompt.contains("PROMPTS/:"));
+        assert!(!prompt.contains("CONTEXT (truncated):"));
+    }
+
+    #[test]
+    fn test_build_prompt_lists_artifacts_newest_first() {
+        let (_root, context_dir, share_dir, prompt_path) = setup_dirs();
+
+        let old = context_dir.join("a_old.md");
+        let new = context_dir.join("b_new.md");
+        let mid = share_dir.join("c_mid.md");
+
+        fs::write(&old, "old").unwrap();
+        fs::write(&new, "new").unwrap();
+        fs::write(&mid, "mid").unwrap();
+
+        set_file_mtime(&old, FileTime::from_unix_time(1_600_000_000, 0)).unwrap();
+        set_file_mtime(&mid, FileTime::from_unix_time(1_600_000_100, 0)).unwrap();
+        set_file_mtime(&new, FileTime::from_unix_time(1_600_000_200, 0)).unwrap();
+
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir);
+
+        let mut in_section = false;
+        let mut listed = Vec::new();
+        for line in prompt.lines() {
+            if line.starts_with("ARTIFACTS (paths only, newest first):") {
+                in_section = true;
+                continue;
+            }
+            if in_section && line.starts_with("Notes:") {
+                break;
+            }
+            if in_section {
+                if let Some(rest) = line.strip_prefix("- ") {
+                    if let Some((path, _)) = rest.split_once(" (mtime:") {
+                        listed.push(path.to_string());
+                    }
+                }
+            }
+        }
+
+        assert!(listed.len() >= 3);
+        assert!(listed[0].ends_with("b_new.md"));
+        assert!(listed[1].ends_with("c_mid.md"));
+        assert!(listed[2].ends_with("a_old.md"));
+    }
+
+    #[test]
+    fn test_build_prompt_excludes_loct_for_ai() {
+        let (_root, context_dir, _share_dir, prompt_path) = setup_dirs();
+        let loct = context_dir.join("x_loct_for_ai.md");
+        fs::write(&loct, "should not appear").unwrap();
+        set_file_mtime(&loct, FileTime::from_unix_time(1_700_000_000, 0)).unwrap();
+
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir);
+        assert!(!prompt.contains("x_loct_for_ai.md"));
+    }
+
+    #[test]
+    fn test_build_prompt_includes_share_artifacts() {
+        let (_root, context_dir, share_dir, prompt_path) = setup_dirs();
+        let shared = share_dir.join("shared.md");
+        fs::write(&shared, "shared").unwrap();
+        set_file_mtime(&shared, FileTime::from_unix_time(1_700_000_000, 0)).unwrap();
+
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir);
+        assert!(prompt.contains("shared.md"));
+    }
+
+    #[test]
+    fn test_build_prompt_no_content_injection() {
+        let (_root, context_dir, _share_dir, prompt_path) = setup_dirs();
+        let artifact = context_dir.join("artifact.md");
+        fs::write(&artifact, "SENSITIVE_TEST_TOKEN").unwrap();
+
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir);
+        assert!(!prompt.contains("SENSITIVE_TEST_TOKEN"));
+    }
+
+    #[test]
+    fn test_build_prompt_empty_artifacts() {
+        let (_root, context_dir, _share_dir, prompt_path) = setup_dirs();
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir);
+        assert!(prompt.contains("(no artifacts found)"));
+    }
 }

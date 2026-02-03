@@ -4,3 +4,10 @@ Cargo.lock
 
 # agents
 agents/state/
+
+# AI Context
+.ai-context/*
+!.ai-context/share/
+!.ai-context/share/summary.md
+!.ai-context/share/timeline.md
+*.log

@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+use crate::chunker::{self, ChunkerConfig};
 use crate::output::TimelineEntry;
 use crate::sanitize;
 
@@ -203,6 +204,51 @@ pub fn write_context(
     let write_path = sanitize::validate_write_path(&json_path)?;
     fs::write(&write_path, &json_content)?;
     written.push(json_path);
+
+    Ok(written)
+}
+
+/// Write timeline entries as agent-friendly chunks to the central store.
+///
+/// Instead of one monolithic file per (project, agent, date), splits entries
+/// into overlapping ~1500-token windows preserving conversation flow.
+///
+/// Layout: `~/.ai-contexters/<project>/<date>/<time>_<agent>-<seq:03>.md`
+///
+/// Returns paths of all written chunk files.
+pub fn write_context_chunked(
+    project: &str,
+    agent: &str,
+    date: &str,
+    time: &str,
+    entries: &[TimelineEntry],
+    chunker_config: &ChunkerConfig,
+) -> Result<Vec<PathBuf>> {
+    if entries.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let chunks = chunker::chunk_entries(entries, project, agent, chunker_config);
+    let dir = store_base_dir()?.join(project).join(date);
+    fs::create_dir_all(&dir)?;
+
+    let mut written = Vec::new();
+
+    for chunk in &chunks {
+        // Extract seq from chunk.id (last _NNN part)
+        let seq = chunk
+            .id
+            .rsplit('_')
+            .next()
+            .unwrap_or("001");
+
+        let filename = format!("{}_{}-{}.md", time, agent, seq);
+        let path = dir.join(&filename);
+
+        let write_path = sanitize::validate_write_path(&path)?;
+        fs::write(&write_path, &chunk.text)?;
+        written.push(path);
+    }
 
     Ok(written)
 }

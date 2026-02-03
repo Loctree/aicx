@@ -200,9 +200,9 @@ pub fn format_chunk_text(
 
     for entry in entries {
         let time = entry.timestamp.format("%H:%M:%S");
-        // Truncate very long messages to avoid monster chunks
+        // Truncate very long messages to avoid monster chunks (UTF-8 safe).
         let msg = if entry.message.len() > 4000 {
-            format!("{}...[truncated]", &entry.message[..4000])
+            truncate_message_bytes(&entry.message, 4000)
         } else {
             entry.message.clone()
         };
@@ -210,6 +210,17 @@ pub fn format_chunk_text(
     }
 
     text
+}
+
+fn truncate_message_bytes(message: &str, max_bytes: usize) -> String {
+    let mut cutoff = max_bytes.min(message.len());
+    while cutoff > 0 && !message.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+    let mut out = String::with_capacity(cutoff + 15);
+    out.push_str(&message[..cutoff]);
+    out.push_str("...[truncated]");
+    out
 }
 
 // ============================================================================
@@ -349,7 +360,7 @@ mod tests {
 
         let chunks = chunk_entries(&entries, "proj", "claude", &config);
         // Single long message can't be split within chunker (it's per-message)
-        // but format_chunk_text truncates at 4000 chars
+        // but format_chunk_text truncates at 4000 bytes
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].text.contains("[truncated]"));
     }
@@ -398,6 +409,19 @@ mod tests {
         assert!(text.starts_with("[project: TestProj | agent: claude | date: 2026-01-22]"));
         assert!(text.contains("[14:30:00] user: hello"));
         assert!(text.contains("[14:31:00] assistant: hi there"));
+    }
+
+    #[test]
+    fn test_format_chunk_text_truncates_utf8_safely() {
+        let mut msg = "a".repeat(3999);
+        msg.push('é'); // 2-byte char forces non-boundary at 4000
+        let entries = [make_entry(14, 30, "user", &msg)];
+        let refs: Vec<&TimelineEntry> = entries.iter().collect();
+
+        let text = format_chunk_text(&refs, "TestProj", "claude", "2026-01-22");
+
+        assert!(text.contains("[truncated]"));
+        assert!(!text.contains('é'));
     }
 
     #[test]
