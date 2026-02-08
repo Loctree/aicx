@@ -47,11 +47,15 @@ Single-binary Rust CLI (`ai-contexters`) that extracts timeline data from AI age
 ai-contexters init                           # Interactive init (creates .ai-context and runs an agent)
 ai-contexters init --agent codex --no-confirm # Non-interactive agent selection
 ai-contexters init --no-run                  # Build context/prompt only
+ai-contexters init --no-confirm --action "Fix the login flow regressions"
 
 ai-contexters list                           # List available sessions
 ai-contexters claude -p <project> -H 48      # Extract Claude sessions (last 48h)
 ai-contexters codex -p <project> -H 48       # Extract Codex history
 ai-contexters all -p <project> -H 168        # Extract all (7 days)
+
+# Integration: emit one JSON payload to stdout
+ai-contexters codex -p <project> -H 48 --emit json | jq .
 ```
 
 Flags: `-p` project filter, `-H` hours back, `-o` output dir, `-f` format (md/json/both)
@@ -63,8 +67,11 @@ Flags: `-p` project filter, `-H` hours back, `-o` output dir, `-f` format (md/js
 ```
 .ai-context/
   share/
-    summary.md      # curated, append-only summary (trimmed to 500 lines)
-    timeline.md     # full append-only timeline
+    artifacts/
+      SUMMARY.md    # curated, append-only summary (trimmed to 500 lines)
+      TIMELINE.md   # full append-only timeline
+      TRIAGE.md     # unfinished implementations + P0/P1/P2
+      prompts/      # task prompts ("Emil Kurier" format)
   local/
     context/
     prompts/
@@ -75,8 +82,13 @@ Flags: `-p` project filter, `-H` hours back, `-o` output dir, `-f` format (md/js
     config/
 ```
 
-Only `share/summary.md` and `share/timeline.md` are intended to be committed.
+Only `share/artifacts/SUMMARY.md` and `share/artifacts/TIMELINE.md` are intended to be committed by default.
+`TRIAGE.md` and `prompts/` are optional to share.
 
 ---
+
+Notes:
+- `init` requires `loct` available in PATH (or set `LOCT_BIN` to a full path).
+- Claude streaming output uses `jq` (and `awk` for passthrough).
 
 *Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders*

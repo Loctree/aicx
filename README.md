@@ -27,6 +27,9 @@ ai-contexters init --agent codex --no-confirm
 
 # Build context/prompt only (no agent run)
 ai-contexters init --no-run
+
+# Provide a focused action for the agent
+ai-contexters init --no-confirm --action "Fix the login flow regressions"
 ```
 
 `init` creates a single per-repo folder: `.ai-context/`
@@ -34,8 +37,11 @@ ai-contexters init --no-run
 ```
 .ai-context/
   share/
-    summary.md      # curated, append-only summary (trimmed to 500 lines)
-    timeline.md     # full append-only timeline
+    artifacts/
+      SUMMARY.md    # curated, append-only summary (trimmed to 500 lines)
+      TIMELINE.md   # full append-only timeline
+      TRIAGE.md     # unfinished implementations + P0/P1/P2
+      prompts/      # task prompts ("Emil Kurier" format)
   local/
     context/        # loct + extracted memories
     prompts/        # built prompts
@@ -46,8 +52,8 @@ ai-contexters init --no-run
     config/
 ```
 
-Only `share/summary.md` and `share/timeline.md` are meant to be committed.  
-Everything else stays local.
+Only `share/artifacts/SUMMARY.md` and `share/artifacts/TIMELINE.md` are meant to be committed by default.  
+`TRIAGE.md` and `prompts/` are optional to share.
 
 ### Usage (classic extractors)
 
@@ -63,6 +69,22 @@ ai-contexters codex -p codescribe -H 48 -o ./reports
 
 # Extract all agents
 ai-contexters all -p codescribe -H 168 -o ./reports  # Last 7 days
+```
+
+### Integration-friendly stdout
+
+By default, extractors print **store chunk paths** to stdout (one per line).
+
+If you want a single JSON payload on stdout (for piping into other tools), use:
+
+```bash
+ai-contexters codex -p codescribe -H 48 --emit json | jq .
+```
+
+To write to the store but print nothing to stdout:
+
+```bash
+ai-contexters all -p codescribe -H 48 --emit none
 ```
 
 ### Output Formats
@@ -91,7 +113,8 @@ ai-contexters all -p codescribe -H 168 -o ./reports  # Last 7 days
 
 ### Notes
 
-- `init` requires `loct` available in PATH.
+- `init` requires `loct` available in PATH (or set `LOCT_BIN` to a full path).
+- Claude streaming output uses `jq` (and `awk` for passthrough).
 - `--model` is optional; if omitted, the agent uses its default model.
 
 ---

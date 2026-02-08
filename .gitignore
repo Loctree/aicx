@@ -1,6 +1,7 @@
 /target
 Cargo.lock
 /.loctree
+.DS_Store
 
 # agents
 agents/state/
@@ -8,6 +9,11 @@ agents/state/
 # AI Context
 .ai-context/*
 !.ai-context/share/
-!.ai-context/share/summary.md
-!.ai-context/share/timeline.md
+!.ai-context/share/artifacts/
+!.ai-context/share/artifacts/SUMMARY.md
+!.ai-context/share/artifacts/TIMELINE.md
+!.ai-context/share/artifacts/TRIAGE.md
+!.ai-context/share/artifacts/prompts/
+!.ai-context/share/artifacts/prompts/*.md
 *.log
+/.ai-context

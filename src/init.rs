@@ -18,6 +18,10 @@ use crate::sources::{self, ExtractionConfig};
 
 const SUMMARY_START: &str = "===AI_CONTEXT_SUMMARY_START===";
 const SUMMARY_END: &str = "===AI_CONTEXT_SUMMARY_END===";
+const CLAUDE_JQ_FILTER: &str = "if .delta?.text then .delta.text \
+    elif .content_block?.text then .content_block.text \
+    elif .message?.content then (.message.content[]? | select(.type==\"text\") | .text) \
+    else empty end";
 const SUMMARY_MAX_LINES: usize = 500;
 const PROMPT_SIZE_WARN_BYTES: usize = 180_000;
 
@@ -30,6 +34,7 @@ pub struct InitOptions {
     pub max_lines: usize,
     pub include_assistant: bool,
     pub redact_secrets: bool,
+    pub action: Option<String>,
     pub no_run: bool,
     pub no_confirm: bool,
     pub no_gitignore: bool,
@@ -95,6 +100,9 @@ pub fn run_init(options: InitOptions) -> Result<()> {
     log.line("== ai-contexters init ==");
     log.line(&format!("root:    {}", root.display()));
     log.line(&format!("project: {}", project));
+    if let Some(action) = options.action.as_deref() {
+        log.line(&format!("action:  {}", action));
+    }
     log.line(&format!("run_id:  {}", run_id));
     log.line(&format!("log:     {}", log_path.display()));
     log.line("");
@@ -133,6 +141,7 @@ pub fn run_init(options: InitOptions) -> Result<()> {
         &prompt_path,
         &paths.context,
         &ts_local,
+        options.action.as_deref(),
     )?;
     if prompt_bytes > PROMPT_SIZE_WARN_BYTES {
         log.warn(&format!(
@@ -191,10 +200,12 @@ pub fn run_init(options: InitOptions) -> Result<()> {
         &clean_report,
     )?;
 
+    let mut summary_written = false;
     match summary_block {
         Some(block) => {
             append_summary(&paths.summary, &block)?;
             trim_summary(&paths.summary, SUMMARY_MAX_LINES)?;
+            summary_written = true;
         }
         None => {
             log.warn("summary block missing; summary.md not updated");
@@ -209,6 +220,20 @@ pub fn run_init(options: InitOptions) -> Result<()> {
     log.line(&format!("[summary] {}", paths.summary.display()));
     log.line(&format!("[timeline] {}", paths.timeline.display()));
     log.line(&format!("[log]    {}", log_path.display()));
+    log.line("");
+    log.line("== SUMMARY ==");
+    log.line(&format!("Agent: {}", agent));
+    log.line(&format!("Report: {}", report_path.display()));
+    log.line(&format!("Timeline: {} (updated)", paths.timeline.display()));
+    if summary_written {
+        log.line(&format!("Summary: {} (updated)", paths.summary.display()));
+    } else {
+        log.line(&format!("Summary: {} (not updated)", paths.summary.display()));
+    }
+    log.line("Next steps:");
+    log.line(&format!("1) Review the report: {}", report_path.display()));
+    log.line(&format!("2) Scan the timeline: {}", paths.timeline.display()));
+    log.line(&format!("3) Check the summary: {}", paths.summary.display()));
 
     Ok(())
 }
@@ -290,8 +315,12 @@ fn update_gitignore(root: &Path) -> Result<()> {
             "# AI Context",
             ".ai-context/*",
             "!.ai-context/share/",
-            "!.ai-context/share/summary.md",
-            "!.ai-context/share/timeline.md",
+            "!.ai-context/share/artifacts/",
+            "!.ai-context/share/artifacts/SUMMARY.md",
+            "!.ai-context/share/artifacts/TIMELINE.md",
+            "!.ai-context/share/artifacts/TRIAGE.md",
+            "!.ai-context/share/artifacts/prompts/",
+            "!.ai-context/share/artifacts/prompts/*.md",
         ]
         .join("\n");
 
@@ -478,6 +507,7 @@ fn build_prompt(
     prompt_path: &Path,
     context_dir: &Path,
     ts_local: &str,
+    action: Option<&str>,
 ) -> Result<usize> {
     let validated_prompt = sanitize::validate_write_path(prompt_path)?;
     // SECURITY: path sanitized via validate_write_path (traversal + allowlist)
@@ -496,11 +526,13 @@ fn build_prompt(
     let triage_path = artifacts_root.join("TRIAGE.md");
     let prompts_dir = artifacts_root.join("prompts");
 
-    writeln!(
-        file,
-        "You are an agent initializing a repository."
-    )?;
+    writeln!(file, "You are an agent initializing a repository.")?;
     writeln!(file)?;
+    if let Some(action) = action {
+        writeln!(file, "Action focus (must address):")?;
+        writeln!(file, "- {}", action)?;
+        writeln!(file)?;
+    }
     writeln!(file, "Rules:")?;
     writeln!(
         file,
@@ -787,12 +819,7 @@ fn run_claude(
         cmd.push(' ');
         cmd.push_str(&shell_escape_str(&bootstrap));
         cmd.push_str(" | jq -r ");
-        cmd.push_str(&shell_escape_str(
-            "if .delta?.text then .delta.text \
-             elif .content_block?.text then .content_block.text \
-             elif .message?.content then (.message.content[]? | select(.type==\"text\") | .text) \
-             else empty end",
-        ));
+        cmd.push_str(&shell_escape_str(CLAUDE_JQ_FILTER));
         cmd.push_str(" | awk '1' > ");
         cmd.push_str(&shell_escape(&validated_report));
 
@@ -980,10 +1007,10 @@ fn escape_osascript(command: &str) -> String {
 fn wait_for_report(path: &Path, timeout: std::time::Duration) -> Result<()> {
     let start = std::time::Instant::now();
     loop {
-        if let Ok(meta) = fs::metadata(path) {
-            if meta.len() > 0 {
-                return Ok(());
-            }
+        if let Ok(meta) = fs::metadata(path)
+            && meta.len() > 0
+        {
+            return Ok(());
         }
         if start.elapsed() > timeout {
             anyhow::bail!(
@@ -1144,15 +1171,19 @@ mod tests {
         (root, context_dir, share_dir, prompt_path)
     }
 
-    fn build_and_read_prompt(prompt_path: &Path, context_dir: &Path) -> String {
-        build_prompt(prompt_path, context_dir, "2026-02-03 12:00").unwrap();
+    fn build_and_read_prompt(
+        prompt_path: &Path,
+        context_dir: &Path,
+        action: Option<&str>,
+    ) -> String {
+        build_prompt(prompt_path, context_dir, "2026-02-03 12:00", action).unwrap();
         fs::read_to_string(prompt_path).unwrap()
     }
 
     #[test]
     fn test_build_prompt_includes_core_rules() {
         let (_root, context_dir, _share_dir, prompt_path) = setup_dirs();
-        let prompt = build_and_read_prompt(&prompt_path, &context_dir);
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None);
 
         assert!(prompt.contains("Exploration schedule (required):"));
         assert!(prompt.contains("Quality gate:"));
@@ -1162,6 +1193,19 @@ mod tests {
         assert!(prompt.contains("TRIAGE.md:"));
         assert!(prompt.contains("PROMPTS/:"));
         assert!(!prompt.contains("CONTEXT (truncated):"));
+    }
+
+    #[test]
+    fn test_build_prompt_includes_action() {
+        let (_root, context_dir, _share_dir, prompt_path) = setup_dirs();
+        let prompt = build_and_read_prompt(
+            &prompt_path,
+            &context_dir,
+            Some("Zaimplementuj tę flagę ziom teraz"),
+        );
+
+        assert!(prompt.contains("Action focus (must address):"));
+        assert!(prompt.contains("Zaimplementuj tę flagę ziom teraz"));
     }
 
     #[test]
@@ -1180,7 +1224,7 @@ mod tests {
         set_file_mtime(&mid, FileTime::from_unix_time(1_600_000_100, 0)).unwrap();
         set_file_mtime(&new, FileTime::from_unix_time(1_600_000_200, 0)).unwrap();
 
-        let prompt = build_and_read_prompt(&prompt_path, &context_dir);
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None);
 
         let mut in_section = false;
         let mut listed = Vec::new();
@@ -1214,7 +1258,7 @@ mod tests {
         fs::write(&loct, "should not appear").unwrap();
         set_file_mtime(&loct, FileTime::from_unix_time(1_700_000_000, 0)).unwrap();
 
-        let prompt = build_and_read_prompt(&prompt_path, &context_dir);
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None);
         assert!(!prompt.contains("x_loct_for_ai.md"));
     }
 
@@ -1225,7 +1269,7 @@ mod tests {
         fs::write(&shared, "shared").unwrap();
         set_file_mtime(&shared, FileTime::from_unix_time(1_700_000_000, 0)).unwrap();
 
-        let prompt = build_and_read_prompt(&prompt_path, &context_dir);
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None);
         assert!(prompt.contains("shared.md"));
     }
 
@@ -1235,14 +1279,14 @@ mod tests {
         let artifact = context_dir.join("artifact.md");
         fs::write(&artifact, "SENSITIVE_TEST_TOKEN").unwrap();
 
-        let prompt = build_and_read_prompt(&prompt_path, &context_dir);
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None);
         assert!(!prompt.contains("SENSITIVE_TEST_TOKEN"));
     }
 
     #[test]
     fn test_build_prompt_empty_artifacts() {
         let (_root, context_dir, _share_dir, prompt_path) = setup_dirs();
-        let prompt = build_and_read_prompt(&prompt_path, &context_dir);
+        let prompt = build_and_read_prompt(&prompt_path, &context_dir, None);
         assert!(prompt.contains("(no artifacts found)"));
     }
 }

@@ -11,7 +11,8 @@
 
 use anyhow::Result;
 use chrono::Utc;
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 use ai_contexters::chunker::{self, ChunkerConfig};
@@ -41,6 +42,16 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum StdoutEmit {
+    /// Print store chunk paths (one per line).
+    Paths,
+    /// Print JSON report (includes `store_paths` for convenience).
+    Json,
+    /// Print nothing to stdout.
+    None,
 }
 
 #[derive(Subcommand)]
@@ -94,6 +105,10 @@ enum Commands {
         /// Force full extraction, ignore dedup hashes
         #[arg(long)]
         force: bool,
+
+        /// What to print to stdout: paths, json, none (default: paths)
+        #[arg(long, value_enum, default_value_t = StdoutEmit::Paths)]
+        emit: StdoutEmit,
     },
 
     /// Extract timeline from Codex history
@@ -141,6 +156,10 @@ enum Commands {
         /// Force full extraction, ignore dedup hashes
         #[arg(long)]
         force: bool,
+
+        /// What to print to stdout: paths, json, none (default: paths)
+        #[arg(long, value_enum, default_value_t = StdoutEmit::Paths)]
+        emit: StdoutEmit,
     },
 
     /// Extract from all agents (Claude + Codex + Gemini)
@@ -188,6 +207,10 @@ enum Commands {
         /// Force full extraction, ignore dedup hashes
         #[arg(long)]
         force: bool,
+
+        /// What to print to stdout: paths, json, none (default: paths)
+        #[arg(long, value_enum, default_value_t = StdoutEmit::Paths)]
+        emit: StdoutEmit,
     },
 
     /// Store contexts in central store (~/.ai-contexters/) and optionally sync to memex
@@ -283,6 +306,10 @@ enum Commands {
         #[arg(long)]
         include_assistant: bool,
 
+        /// Action focus appended to the prompt
+        #[arg(long)]
+        action: Option<String>,
+
         /// Build context/prompt only, do not run an agent
         #[arg(long)]
         no_run: bool,
@@ -322,6 +349,7 @@ fn main() -> Result<()> {
             project_root,
             memex,
             force,
+            emit,
         } => {
             run_extraction(
                 &["claude"],
@@ -338,6 +366,7 @@ fn main() -> Result<()> {
                 memex,
                 force,
                 redact_secrets,
+                emit,
             )?;
         }
         Commands::Codex {
@@ -352,6 +381,7 @@ fn main() -> Result<()> {
             project_root,
             memex,
             force,
+            emit,
         } => {
             run_extraction(
                 &["codex"],
@@ -368,6 +398,7 @@ fn main() -> Result<()> {
                 memex,
                 force,
                 redact_secrets,
+                emit,
             )?;
         }
         Commands::All {
@@ -382,6 +413,7 @@ fn main() -> Result<()> {
             project_root,
             memex,
             force,
+            emit,
         } => {
             run_extraction(
                 &["claude", "codex", "gemini"],
@@ -398,6 +430,7 @@ fn main() -> Result<()> {
                 memex,
                 force,
                 redact_secrets,
+                emit,
             )?;
         }
         Commands::Store {
@@ -448,6 +481,7 @@ fn main() -> Result<()> {
             hours,
             max_lines,
             include_assistant,
+            action,
             no_run,
             no_confirm,
             no_gitignore,
@@ -460,6 +494,7 @@ fn main() -> Result<()> {
                 max_lines,
                 include_assistant,
                 redact_secrets,
+                action,
                 no_run,
                 no_confirm,
                 no_gitignore,
@@ -497,6 +532,7 @@ fn run_extraction(
     sync_memex: bool,
     force: bool,
     redact_secrets: bool,
+    emit: StdoutEmit,
 ) -> Result<()> {
     // Load state for incremental/dedup
     let mut state = StateManager::load();
@@ -696,10 +732,46 @@ fn run_extraction(
             eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
         }
 
-        // stdout: agent-readable paths (one per line)
-        for path in &all_written_paths {
-            println!("{}", path.display());
+    }
+
+    // stdout emission (integration-friendly).
+    match emit {
+        StdoutEmit::Paths => {
+            // agent-readable paths (one per line)
+            for path in &all_written_paths {
+                println!("{}", path.display());
+            }
         }
+        StdoutEmit::Json => {
+            #[derive(Serialize)]
+            struct JsonStdoutReport<'a> {
+                generated_at: chrono::DateTime<Utc>,
+                project_filter: &'a Option<String>,
+                hours_back: u64,
+                total_entries: usize,
+                sessions: &'a [String],
+                entries: &'a [output::TimelineEntry],
+                store_paths: Vec<String>,
+            }
+
+            let store_paths: Vec<String> = all_written_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+
+            let report = JsonStdoutReport {
+                generated_at: metadata.generated_at,
+                project_filter: &metadata.project_filter,
+                hours_back: metadata.hours_back,
+                total_entries: metadata.total_entries,
+                sessions: &metadata.sessions,
+                entries: &output_entries,
+                store_paths,
+            };
+
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        StdoutEmit::None => {}
     }
 
     // ── Optional local output (only when -o explicitly passed) ──
@@ -793,16 +865,11 @@ fn run_extraction(
 
     // Memex sync: chunk entries and push to vector store
     if sync_memex && !output_entries.is_empty() {
-        let proj_name = if project.is_empty() {
-            "unknown"
-        } else {
-            &project[0]
-        };
         let agent_name = agents.join("+");
 
         let chunker_config = ChunkerConfig::default();
         let chunks =
-            chunker::chunk_entries(&output_entries, proj_name, &agent_name, &chunker_config);
+            chunker::chunk_entries(&output_entries, &project_name, &agent_name, &chunker_config);
 
         if !chunks.is_empty() {
             let chunks_dir = store::chunks_dir()?;
@@ -965,13 +1032,13 @@ fn run_store(
     if sync_memex && !output_entries.is_empty() {
         let agent_label = agents.join("+");
         let store_proj = if project.is_empty() {
-            "unknown"
+            "_global".to_string()
         } else {
-            &project[0]
+            project.join("+")
         };
         let chunker_config = ChunkerConfig::default();
         let chunks =
-            chunker::chunk_entries(&output_entries, store_proj, &agent_label, &chunker_config);
+            chunker::chunk_entries(&output_entries, &store_proj, &agent_label, &chunker_config);
 
         if !chunks.is_empty() {
             let chunks_dir = store::chunks_dir()?;
