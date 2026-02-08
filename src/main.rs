@@ -597,19 +597,12 @@ fn run_extraction(
     if !force {
         let mut deduped = Vec::with_capacity(entries.len());
         for e in entries {
-            let exact = StateManager::content_hash(
-                &e.agent,
-                e.timestamp.timestamp(),
-                &e.message,
-            );
+            let exact = StateManager::content_hash(&e.agent, e.timestamp.timestamp(), &e.message);
             if !state.is_new(&project_name, exact) {
                 continue; // exact duplicate
             }
 
-            let overlap = StateManager::overlap_hash(
-                e.timestamp.timestamp(),
-                &e.message,
-            );
+            let overlap = StateManager::overlap_hash(e.timestamp.timestamp(), &e.message);
             if !state.is_new(&overlap_project, overlap) {
                 continue; // cross-agent overlap duplicate
             }
@@ -695,8 +688,10 @@ fn run_extraction(
         let time_str = now.format("%H%M%S").to_string();
 
         // Per-repo summary counters
-        let mut repo_summary: std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>> =
-            std::collections::BTreeMap::new();
+        let mut repo_summary: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, usize>,
+        > = std::collections::BTreeMap::new();
 
         for ((repo, agent_name, date), group_entries) in &repo_groups {
             let paths = store::write_context_chunked(
@@ -731,7 +726,6 @@ fn run_extraction(
                 .collect();
             eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
         }
-
     }
 
     // stdout emission (integration-friendly).
@@ -818,15 +812,9 @@ fn run_extraction(
         if force {
             // When --force skips dedup, we still mark entries as seen for future runs
             for e in &entries {
-                let exact = StateManager::content_hash(
-                    &e.agent,
-                    e.timestamp.timestamp(),
-                    &e.message,
-                );
-                let overlap = StateManager::overlap_hash(
-                    e.timestamp.timestamp(),
-                    &e.message,
-                );
+                let exact =
+                    StateManager::content_hash(&e.agent, e.timestamp.timestamp(), &e.message);
+                let overlap = StateManager::overlap_hash(e.timestamp.timestamp(), &e.message);
                 state.mark_seen(&project_name, exact);
                 state.mark_seen(&overlap_project, overlap);
             }
@@ -985,8 +973,10 @@ fn run_store(
     let now = Utc::now();
     let time_str = now.format("%H%M%S").to_string();
 
-    let mut repo_summary: std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>> =
-        std::collections::BTreeMap::new();
+    let mut repo_summary: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, usize>,
+    > = std::collections::BTreeMap::new();
 
     for ((repo, agent_name, date), group_entries) in &repo_groups {
         let paths = store::write_context_chunked(

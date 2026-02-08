@@ -228,12 +228,21 @@ pub fn run_init(options: InitOptions) -> Result<()> {
     if summary_written {
         log.line(&format!("Summary: {} (updated)", paths.summary.display()));
     } else {
-        log.line(&format!("Summary: {} (not updated)", paths.summary.display()));
+        log.line(&format!(
+            "Summary: {} (not updated)",
+            paths.summary.display()
+        ));
     }
     log.line("Next steps:");
     log.line(&format!("1) Review the report: {}", report_path.display()));
-    log.line(&format!("2) Scan the timeline: {}", paths.timeline.display()));
-    log.line(&format!("3) Check the summary: {}", paths.summary.display()));
+    log.line(&format!(
+        "2) Scan the timeline: {}",
+        paths.timeline.display()
+    ));
+    log.line(&format!(
+        "3) Check the summary: {}",
+        paths.summary.display()
+    ));
 
     Ok(())
 }
@@ -432,8 +441,7 @@ fn resolve_loct_bin() -> Result<PathBuf> {
         }
     }
 
-    let path_var = std::env::var_os("PATH")
-        .ok_or_else(|| anyhow::anyhow!("PATH is not set"))?;
+    let path_var = std::env::var_os("PATH").ok_or_else(|| anyhow::anyhow!("PATH is not set"))?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join("loct");
         if candidate.is_file() {
@@ -558,9 +566,15 @@ fn build_prompt(
     writeln!(file, "- Language: English. Tone: direct and concise.")?;
     writeln!(file)?;
     writeln!(file, "Exploration schedule (required):")?;
-    writeln!(file, "1) ai-contexters artifacts (newest-first) + update TIMELINE.md.")?;
+    writeln!(
+        file,
+        "1) ai-contexters artifacts (newest-first) + update TIMELINE.md."
+    )?;
     writeln!(file, "2) Identify red flags / hot spots.")?;
-    writeln!(file, "3) Selective verification in repo code (confirm only).")?;
+    writeln!(
+        file,
+        "3) Selective verification in repo code (confirm only)."
+    )?;
     writeln!(file, "4) TRIAGE.md (unfinished implementations, P0-P2).")?;
     writeln!(file, "5) Generate task prompts (\"Emil Kurier\" format).")?;
     writeln!(file)?;
@@ -598,10 +612,16 @@ fn build_prompt(
     writeln!(file, "- Before finalizing, run:")?;
     writeln!(file, "  - `cargo clippy -- -D warnings`")?;
     writeln!(file, "  - `semgrep scan --config auto`")?;
-    writeln!(file, "  - project tests (if missing, state what should be run).")?;
+    writeln!(
+        file,
+        "  - project tests (if missing, state what should be run)."
+    )?;
     writeln!(file)?;
     writeln!(file, "Task prompt requirements (\"Emil Kurier\" format):")?;
-    writeln!(file, "- Each file is a ready-to-paste prompt for another agent (no pre/post commentary).")?;
+    writeln!(
+        file,
+        "- Each file is a ready-to-paste prompt for another agent (no pre/post commentary)."
+    )?;
     writeln!(file, "- Preserve intent 1:1; do not ask for more details.")?;
     writeln!(file, "- Always includes:")?;
     writeln!(file, "  1) Task description from the current transcript")?;
@@ -613,13 +633,28 @@ fn build_prompt(
     writeln!(file, "     - tests (if missing, you MUST write them)")?;
     writeln!(file, "  4) Expected deliverables")?;
     writeln!(file, "  5) Report expectation")?;
-    writeln!(file, "  6) Appendix: tooling (loctree: `loct auto`, `loct --for-ai`, `loct find <...>`, clippy, etc.) + anti-technical-debt rules (e.g. \"remove all legacy leftovers after refactor\").")?;
-    writeln!(file, "  7) Call to action and a cheesy joke + kaomoji (no emoji). Both must be in English, unique, and the kaomoji must be creative (not a common/recycled one).")?;
-    writeln!(file, "- Tone: tolerant, motivating, empathetic. Kaomoji ALWAYS. No emoji anywhere.")?;
+    writeln!(
+        file,
+        "  6) Appendix: tooling (loctree: `loct auto`, `loct --for-ai`, `loct find <...>`, clippy, etc.) + anti-technical-debt rules (e.g. \"remove all legacy leftovers after refactor\")."
+    )?;
+    writeln!(
+        file,
+        "  7) Call to action and a cheesy joke + kaomoji (no emoji). Both must be in English, unique, and the kaomoji must be creative (not a common/recycled one)."
+    )?;
+    writeln!(
+        file,
+        "- Tone: tolerant, motivating, empathetic. Kaomoji ALWAYS. No emoji anywhere."
+    )?;
     writeln!(file)?;
     writeln!(file, "TRIAGE.md requirements:")?;
-    writeln!(file, "- Each item MUST include a source pointer: artifact path + section/line if available (e.g. `path#L12` or `path:SectionName`).")?;
-    writeln!(file, "- Group items by domain (e.g. Auth Context, Loctree Refactor, Vista UI), then assign P0/P1/P2 within each group.")?;
+    writeln!(
+        file,
+        "- Each item MUST include a source pointer: artifact path + section/line if available (e.g. `path#L12` or `path:SectionName`)."
+    )?;
+    writeln!(
+        file,
+        "- Group items by domain (e.g. Auth Context, Loctree Refactor, Vista UI), then assign P0/P1/P2 within each group."
+    )?;
     writeln!(file)?;
     writeln!(
         file,
@@ -680,8 +715,7 @@ fn build_prompt(
         writeln!(file, "(no artifacts found)")?;
     } else {
         for (path, mtime) in &artifacts {
-            let ts = chrono::DateTime::<Local>::from(*mtime)
-                .format("%Y-%m-%d %H:%M:%S");
+            let ts = chrono::DateTime::<Local>::from(*mtime).format("%Y-%m-%d %H:%M:%S");
             writeln!(file, "- {} (mtime: {})", path.display(), ts)?;
         }
     }
@@ -799,11 +833,7 @@ fn run_agent(
     }
 }
 
-fn run_claude(
-    model: Option<&str>,
-    prompt_path: &Path,
-    report_path: &Path,
-) -> Result<String> {
+fn run_claude(model: Option<&str>, prompt_path: &Path, report_path: &Path) -> Result<String> {
     let validated_prompt = sanitize::validate_read_path(prompt_path)?;
     let bootstrap = bootstrap_prompt(&validated_prompt);
     if should_dispatch_terminal() {
@@ -936,10 +966,7 @@ fn dispatch_terminal(command: &str) -> Result<()> {
             "-e",
             "tell application \"Terminal\" to activate",
             "-e",
-            &format!(
-                "tell application \"Terminal\" to do script \"{}\"",
-                escaped
-            ),
+            &format!("tell application \"Terminal\" to do script \"{}\"", escaped),
         ])
         .status()
         .context("Failed to dispatch command via osascript")?;
@@ -1119,7 +1146,7 @@ fn append_timeline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use filetime::{set_file_mtime, FileTime};
+    use filetime::{FileTime, set_file_mtime};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};

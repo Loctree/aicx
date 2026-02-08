@@ -283,21 +283,21 @@ mod tests {
         let base = 1700000040i64; // bucket = 28333334
         let same_bucket = base + 19; // 1700000059 → bucket 28333334 (still same)
 
-        let h1 = StateManager::overlap_hash( base, prompt);
-        let h2 = StateManager::overlap_hash( same_bucket, prompt);
+        let h1 = StateManager::overlap_hash(base, prompt);
+        let h2 = StateManager::overlap_hash(same_bucket, prompt);
         assert_eq!(h1, h2, "within same 60s bucket → SAME hash");
 
         // Next bucket starts at base rounded up to next 60
         let next_bucket = base - (base % 60) + 60; // 1700000040 - 40 + 60 = 1700000060
-        let h3 = StateManager::overlap_hash( next_bucket, prompt);
+        let h3 = StateManager::overlap_hash(next_bucket, prompt);
         assert_ne!(h1, h3, "different 60s bucket → different hash");
     }
 
     #[test]
     fn test_overlap_hash_different_message() {
         let ts = 1700000000i64;
-        let h1 = StateManager::overlap_hash( ts, "prompt A");
-        let h2 = StateManager::overlap_hash( ts, "prompt B");
+        let h1 = StateManager::overlap_hash(ts, "prompt A");
+        let h2 = StateManager::overlap_hash(ts, "prompt B");
         assert_ne!(h1, h2, "different message → different overlap hash");
     }
 

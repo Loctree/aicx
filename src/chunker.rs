@@ -33,6 +33,8 @@ pub struct Chunk {
     pub text: String,
     /// Estimated token count (~chars/4)
     pub token_estimate: usize,
+    /// Decision/plan highlights extracted from the chunk
+    pub highlights: Vec<String>,
 }
 
 /// Configuration for the chunker.
@@ -145,6 +147,7 @@ fn chunk_day_entries(
 
         // Build chunk from entries[start..end]
         let window: Vec<&TimelineEntry> = entries[start..end].iter().map(|(_, e)| *e).collect();
+        let highlights = extract_highlights(&window);
         let text = format_chunk_text(&window, project, agent, date);
         let token_estimate = estimate_tokens(&text);
 
@@ -166,6 +169,7 @@ fn chunk_day_entries(
             msg_range: (global_start, global_end),
             text,
             token_estimate,
+            highlights,
         });
 
         seq += 1;
@@ -210,6 +214,44 @@ pub fn format_chunk_text(
     }
 
     text
+}
+
+const HIGHLIGHT_KEYWORDS: &[&str] = &[
+    "decision:",
+    "plan:",
+    "architecture",
+    "breaking",
+    "todo:",
+    "fixme:",
+];
+
+const HIGHLIGHT_KEYWORDS_CASE_SENSITIVE: &[&str] = &["WAŻNE", "KEY"];
+
+fn extract_highlights(entries: &[&TimelineEntry]) -> Vec<String> {
+    let mut highlights = Vec::new();
+    for entry in entries {
+        if highlights.len() >= 3 {
+            break;
+        }
+        if !is_highlight_message(&entry.message) {
+            continue;
+        }
+
+        if let Some(line) = entry.message.lines().map(str::trim).find(|l| !l.is_empty())
+            && highlights.last().map(String::as_str) != Some(line)
+        {
+            highlights.push(line.to_string());
+        }
+    }
+    highlights
+}
+
+fn is_highlight_message(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    HIGHLIGHT_KEYWORDS.iter().any(|kw| lower.contains(kw))
+        || HIGHLIGHT_KEYWORDS_CASE_SENSITIVE
+            .iter()
+            .any(|kw| message.contains(kw))
 }
 
 fn truncate_message_bytes(message: &str, max_bytes: usize) -> String {
@@ -439,6 +481,7 @@ mod tests {
                 msg_range: (0, 5),
                 text: "chunk one content".to_string(),
                 token_estimate: 4,
+                highlights: vec![],
             },
             Chunk {
                 id: "proj_claude_2026-01-22_002".to_string(),
@@ -449,6 +492,7 @@ mod tests {
                 msg_range: (3, 8),
                 text: "chunk two content".to_string(),
                 token_estimate: 4,
+                highlights: vec![],
             },
         ];
 
@@ -515,6 +559,7 @@ mod tests {
                 msg_range: (0, 5),
                 text: "x".repeat(100),
                 token_estimate: 25,
+                highlights: vec![],
             },
             Chunk {
                 id: "b".to_string(),
@@ -525,6 +570,7 @@ mod tests {
                 msg_range: (5, 10),
                 text: "y".repeat(200),
                 token_estimate: 50,
+                highlights: vec![],
             },
         ];
 
@@ -532,5 +578,26 @@ mod tests {
         assert!(summary.contains("2 chunks"));
         assert!(summary.contains("75 total tokens"));
         assert!(summary.contains("2 days"));
+    }
+
+    #[test]
+    fn test_extract_highlights_filters_keywords() {
+        let entries = vec![
+            make_entry(10, 0, "user", "Decision: lock chunking heuristics"),
+            make_entry(10, 1, "assistant", "Just chatting"),
+            make_entry(10, 2, "user", "TODO: add summarization notes"),
+            make_entry(10, 3, "user", "KEY architectural choice"),
+        ];
+        let refs: Vec<&TimelineEntry> = entries.iter().collect();
+
+        let highlights = extract_highlights(&refs);
+        assert_eq!(
+            highlights,
+            vec![
+                "Decision: lock chunking heuristics",
+                "TODO: add summarization notes",
+                "KEY architectural choice"
+            ]
+        );
     }
 }

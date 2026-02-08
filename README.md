@@ -1,122 +1,97 @@
 # AI Contexters
 
-> Memory extraction tools for AI agent sessions
-> Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+Memory extraction + context distillation for AI agent sessions.
 
-## ai-contexters
+`ai-contexters` turns local agent logs into:
+- a clean, deduped timeline,
+- chunked “agent-readable” context stored in `~/.ai-contexters/`,
+- optional `.ai-context/` artifacts for repo-level “bring new agent up to speed” workflows,
+- optional sync into memex (vector memory).
 
-Extract timeline and decisions from AI agent session files:
-- **Claude Code**: `~/.claude/projects/*/*.jsonl`
-- **Codex**: `~/.codex/history.jsonl`
-- **Gemini CLI**: `~/.gemini/tmp/<hash>/chats/session-*.json`
+Supported sources:
+- Claude Code: `~/.claude/projects/*/*.jsonl`
+- Codex: `~/.codex/history.jsonl`
+- Gemini CLI: `~/.gemini/tmp/<hash>/chats/session-*.json`
 
-### Installation
+## Install
 
 ```bash
 cargo install --path .
 ```
 
-### Quickstart (init)
+## Quickstart
+
+Extract everything from the last 4 hours, store-first, and print the stored chunk paths:
 
 ```bash
-# Interactive init (creates .ai-context and runs an agent)
-ai-contexters init
-
-# Non-interactive agent selection (skip confirmation)
-ai-contexters init --agent codex --no-confirm
-
-# Build context/prompt only (no agent run)
-ai-contexters init --no-run
-
-# Provide a focused action for the agent
-ai-contexters init --no-confirm --action "Fix the login flow regressions"
+ai-contexters all -H 4
 ```
 
-`init` creates a single per-repo folder: `.ai-context/`
-
-```
-.ai-context/
-  share/
-    artifacts/
-      SUMMARY.md    # curated, append-only summary (trimmed to 500 lines)
-      TIMELINE.md   # full append-only timeline
-      TRIAGE.md     # unfinished implementations + P0/P1/P2
-      prompts/      # task prompts ("Emil Kurier" format)
-  local/
-    context/        # loct + extracted memories
-    prompts/        # built prompts
-    logs/
-    runs/
-    state/
-    memex/
-    config/
-```
-
-Only `share/artifacts/SUMMARY.md` and `share/artifacts/TIMELINE.md` are meant to be committed by default.  
-`TRIAGE.md` and `prompts/` are optional to share.
-
-### Usage (classic extractors)
+Pipe one JSON payload (handy for automation):
 
 ```bash
-# List all projects/sessions
-ai-contexters list
-
-# Extract Claude Code sessions (last 48h)
-ai-contexters claude -p CodeScribe -H 48 -o ./reports
-
-# Extract Codex history (last 48h)
-ai-contexters codex -p codescribe -H 48 -o ./reports
-
-# Extract all agents
-ai-contexters all -p codescribe -H 168 -o ./reports  # Last 7 days
+ai-contexters all -H 4 --emit json | jq .
 ```
 
-### Integration-friendly stdout
-
-By default, extractors print **store chunk paths** to stdout (one per line).
-
-If you want a single JSON payload on stdout (for piping into other tools), use:
+Bootstrap a repo context (`.ai-context/`) and run an agent:
 
 ```bash
-ai-contexters codex -p codescribe -H 48 --emit json | jq .
+ai-contexters init --agent codex --no-confirm --action "Map the repo and propose next steps"
 ```
 
-To write to the store but print nothing to stdout:
+## What Gets Written Where
+
+Central store (always, for extractors):
+- `~/.ai-contexters/<project>/<date>/<time>_<agent>-<seq>.md`
+- `~/.ai-contexters/index.json`
+- `~/.ai-contexters/memex/chunks/` (when memex is used)
+
+Repo-local init artifacts:
+- `.ai-context/share/artifacts/SUMMARY.md`
+- `.ai-context/share/artifacts/TIMELINE.md`
+- `.ai-context/share/artifacts/TRIAGE.md`
+- `.ai-context/share/artifacts/prompts/`
+
+## Common Workflows
+
+Daily “what changed?” (clean stdout, just store paths):
 
 ```bash
-ai-contexters all -p codescribe -H 48 --emit none
+ai-contexters claude -p CodeScribe -H 24 --emit paths
 ```
 
-### Output Formats
+Incremental mode (watermark per source, avoids re-processing):
 
-- **Markdown** (`*_memory_*.md`): Human-readable timeline with emoji badges
-- **JSON** (`*_memory_*.json`): Queryable format for automation
-
-### Example Output
-
-```markdown
-## 2026-01-17
-
-### 03:18:01 👤 [Codex] `019bc9f5`
-
-> # Plan: Unix Socket IPC Architecture
-> - ✅ Jeden tray (CLI)
-> - ✅ GUI jako thin client
+```bash
+ai-contexters all -H 168 --incremental
 ```
 
-### Filtering
+Include assistant messages (bigger, but useful for full-context forensic runs):
 
-- `-p <project>`: Filter by project name (case-insensitive substring match)
-- `-H <hours>`: Look back period (default: 48)
-- `-o <dir>`: Output directory (default: current)
-- `-f <format>`: Output format: `md`, `json`, or `both` (default: both)
+```bash
+ai-contexters claude -p CodeScribe -H 48 --include-assistant
+```
 
-### Notes
+Memex sync (vector memory):
 
-- `init` requires `loct` available in PATH (or set `LOCT_BIN` to a full path).
-- Claude streaming output uses `jq` (and `awk` for passthrough).
-- `--model` is optional; if omitted, the agent uses its default model.
+```bash
+ai-contexters all -H 48 --memex
+ai-contexters memex-sync --namespace ai-contexts
+```
+
+## Docs
+
+- `docs/ARCHITECTURE.md` (module map + data flows)
+- `docs/COMMANDS.md` (exact CLI reference + examples)
+- `docs/STORE_LAYOUT.md` (store + `.ai-context/` layouts)
+- `docs/REDACTION.md` (secret redaction, regex engine notes)
+- `docs/DISTILLATION.md` (chunking/distillation model + tuning ideas)
+
+## Notes
+
+- Secrets are redacted by default. Disable only if you know what you’re doing: `--no-redact-secrets`.
+- `init` expects `loct` in `PATH` (or `LOCT_BIN=/full/path/to/loct`).
 
 ---
 
-*Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders*
+Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders

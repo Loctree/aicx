@@ -1,7 +1,8 @@
 //! Central context store for ai-contexters.
 //!
 //! Manages the `~/.ai-contexters/` directory structure:
-//! - `<project>/<date>/<time>_<agent>-context.{md,json}` — extracted timelines
+//! - `<project>/<date>/<time>_<agent>-<seq>.md` — chunked, agent-readable timelines (default)
+//! - `<project>/<date>/<time>_<agent>-context.{md,json}` — monolithic timelines (kept for library use/tests)
 //! - `memex/chunks/` — pre-chunked text for RAG indexing
 //! - `index.json` — manifest of stored contexts
 //!
@@ -236,11 +237,7 @@ pub fn write_context_chunked(
 
     for chunk in &chunks {
         // Extract seq from chunk.id (last _NNN part)
-        let seq = chunk
-            .id
-            .rsplit('_')
-            .next()
-            .unwrap_or("001");
+        let seq = chunk.id.rsplit('_').next().unwrap_or("001");
 
         let filename = format!("{}_{}-{}.md", time, agent, seq);
         let path = dir.join(&filename);

@@ -2,14 +2,15 @@
 //!
 //! Goal: avoid accidentally persisting sensitive tokens into:
 //! - `.ai-context/*` artifacts
-//! - `~/.ai-contexters/contexts/*`
+//! - `~/.ai-contexters/<project>/<date>/*`
 //! - memex chunks
 //!
 //! This is best-effort and intentionally conservative.
 //!
 //! Created by M&K (c)2026 VetCoders
 
-use regex::{Captures, Regex};
+use regex::{Captures, Regex, RegexSet};
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 static RE_BLOCK_PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
@@ -33,6 +34,23 @@ static RE_GOOGLE_API_KEY: LazyLock<Regex> =
 static RE_AUTH_BEARER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bAuthorization:\s*Bearer\s+\S+").expect("regex"));
 
+static SECRET_LOOKUP_SET: LazyLock<RegexSet> = LazyLock::new(|| {
+    // Fast negative path: if nothing matches here (and no env/private-key match),
+    // we can return the input unchanged without running the full replacement pipeline.
+    RegexSet::new([
+        r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+        r"\bsk-[A-Za-z0-9]{20,}\b",
+        r"\bgithub_pat_[A-Za-z0-9_]{20,}\b",
+        r"\bghp_[A-Za-z0-9]{36}\b",
+        r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",
+        r"\bAKIA[0-9A-Z]{16}\b",
+        r"\bAIza[0-9A-Za-z_-]{35}\b",
+        r"(?i)\bAuthorization:\s*Bearer\s+\S+",
+        r"(?i)\b(X-API-KEY|X-Auth-Token|Api-Key|Token)\s*:\s*([^\s]+)",
+    ])
+    .expect("regexset")
+});
+
 static RE_ENV_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
     // Only redact env-var style assignments (UPPERCASE names), to avoid false positives
     // like `onPatientCreated={() => ...}` or `selectedPatientId=...` in code snippets.
@@ -50,61 +68,71 @@ static RE_HEADER_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 pub fn redact_secrets(text: &str) -> String {
+    if !SECRET_LOOKUP_SET.is_match(text) && !RE_ENV_ASSIGNMENT.is_match(text) {
+        return text.to_string();
+    }
+
+    // Apply the pipeline in-place, but only allocate when a replacement actually happens.
+    // `replace_all` returns `Cow::Borrowed` when there are no matches.
     let mut out = text.to_string();
 
-    out = RE_BLOCK_PRIVATE_KEY
-        .replace_all(&out, "[REDACTED_PRIVATE_KEY_BLOCK]")
-        .to_string();
+    if let Cow::Owned(s) = RE_BLOCK_PRIVATE_KEY.replace_all(&out, "[REDACTED_PRIVATE_KEY_BLOCK]") {
+        out = s;
+    }
 
-    out = RE_AUTH_BEARER
-        .replace_all(&out, "Authorization: Bearer [REDACTED]")
-        .to_string();
+    if let Cow::Owned(s) = RE_AUTH_BEARER.replace_all(&out, "Authorization: Bearer [REDACTED]") {
+        out = s;
+    }
 
-    out = RE_ENV_ASSIGNMENT
-        .replace_all(&out, |caps: &Captures| {
-            let prefix = caps.name("prefix").map(|m| m.as_str()).unwrap_or("");
-            let key = caps.name("key").map(|m| m.as_str()).unwrap_or("");
-            let full = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+    let env_replaced = RE_ENV_ASSIGNMENT.replace_all(&out, |caps: &Captures| {
+        let prefix = caps.name("prefix").map(|m| m.as_str()).unwrap_or("");
+        let key = caps.name("key").map(|m| m.as_str()).unwrap_or("");
+        let full = caps.get(0).map(|m| m.as_str()).unwrap_or("");
 
-            let is_sensitive = key.ends_with("API_KEY")
-                || key.ends_with("OAUTH_TOKEN")
-                || key.ends_with("TOKEN")
-                || key.ends_with("SECRET")
-                || key.ends_with("PASSWORD")
-                || key.starts_with("PAT_")
-                || key.contains("_PAT_")
-                || key.ends_with("_PAT");
+        let is_sensitive = key.ends_with("API_KEY")
+            || key.ends_with("OAUTH_TOKEN")
+            || key.ends_with("TOKEN")
+            || key.ends_with("SECRET")
+            || key.ends_with("PASSWORD")
+            || key.starts_with("PAT_")
+            || key.contains("_PAT_")
+            || key.ends_with("_PAT");
 
-            if is_sensitive {
-                format!("{prefix}{key}=[REDACTED]")
-            } else {
-                full.to_string()
-            }
-        })
-        .to_string();
+        if is_sensitive {
+            format!("{prefix}{key}=[REDACTED]")
+        } else {
+            full.to_string()
+        }
+    });
 
-    out = RE_HEADER_TOKEN
-        .replace_all(&out, |caps: &Captures| format!("{}: [REDACTED]", &caps[1]))
-        .to_string();
+    if let Cow::Owned(s) = env_replaced {
+        out = s;
+    }
 
-    out = RE_OPENAI_KEY
-        .replace_all(&out, "[REDACTED_OPENAI_KEY]")
-        .to_string();
-    out = RE_GITHUB_PAT
-        .replace_all(&out, "[REDACTED_GITHUB_PAT]")
-        .to_string();
-    out = RE_GITHUB_CLASSIC
-        .replace_all(&out, "[REDACTED_GITHUB_TOKEN]")
-        .to_string();
-    out = RE_SLACK_TOKEN
-        .replace_all(&out, "[REDACTED_SLACK_TOKEN]")
-        .to_string();
-    out = RE_AWS_ACCESS_KEY
-        .replace_all(&out, "[REDACTED_AWS_ACCESS_KEY]")
-        .to_string();
-    out = RE_GOOGLE_API_KEY
-        .replace_all(&out, "[REDACTED_GOOGLE_API_KEY]")
-        .to_string();
+    if let Cow::Owned(s) =
+        RE_HEADER_TOKEN.replace_all(&out, |caps: &Captures| format!("{}: [REDACTED]", &caps[1]))
+    {
+        out = s;
+    }
+
+    if let Cow::Owned(s) = RE_OPENAI_KEY.replace_all(&out, "[REDACTED_OPENAI_KEY]") {
+        out = s;
+    }
+    if let Cow::Owned(s) = RE_GITHUB_PAT.replace_all(&out, "[REDACTED_GITHUB_PAT]") {
+        out = s;
+    }
+    if let Cow::Owned(s) = RE_GITHUB_CLASSIC.replace_all(&out, "[REDACTED_GITHUB_TOKEN]") {
+        out = s;
+    }
+    if let Cow::Owned(s) = RE_SLACK_TOKEN.replace_all(&out, "[REDACTED_SLACK_TOKEN]") {
+        out = s;
+    }
+    if let Cow::Owned(s) = RE_AWS_ACCESS_KEY.replace_all(&out, "[REDACTED_AWS_ACCESS_KEY]") {
+        out = s;
+    }
+    if let Cow::Owned(s) = RE_GOOGLE_API_KEY.replace_all(&out, "[REDACTED_GOOGLE_API_KEY]") {
+        out = s;
+    }
 
     out
 }
@@ -147,5 +175,12 @@ mod tests {
         let s = "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----";
         let r = redact_secrets(s);
         assert_eq!(r, "[REDACTED_PRIVATE_KEY_BLOCK]");
+    }
+
+    #[test]
+    fn no_match_returns_identity() {
+        let s = "nothing to redact here";
+        let r = redact_secrets(s);
+        assert_eq!(r, s);
     }
 }

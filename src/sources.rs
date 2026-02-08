@@ -559,10 +559,7 @@ pub fn extract_codex_sessions(config: &ExtractionConfig) -> Result<Vec<TimelineE
 }
 
 /// Parse a single Codex session JSONL file.
-fn parse_codex_session_file(
-    path: &Path,
-    config: &ExtractionConfig,
-) -> Result<Vec<TimelineEntry>> {
+fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     let validated = sanitize::validate_read_path(path)?;
     // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
     let file = File::open(&validated)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
@@ -586,14 +583,26 @@ fn parse_codex_session_file(
     for ev in &events {
         if ev.event_type == "session_meta" {
             if session_cwd.is_none() {
-                session_cwd = ev.payload.get("cwd").and_then(|v| v.as_str()).map(String::from);
+                session_cwd = ev
+                    .payload
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
             }
             if session_id.is_none() {
-                session_id = ev.payload.get("id").and_then(|v| v.as_str()).map(String::from);
+                session_id = ev
+                    .payload
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
             }
         }
         if ev.event_type == "turn_context" && session_cwd.is_none() {
-            session_cwd = ev.payload.get("cwd").and_then(|v| v.as_str()).map(String::from);
+            session_cwd = ev
+                .payload
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(String::from);
         }
     }
 
