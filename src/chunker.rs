@@ -281,13 +281,20 @@ fn is_highlight_message(message: &str) -> bool {
 struct ChunkSignals {
     todo_open: Vec<String>,
     todo_done: Vec<String>,
+    ultrathink: Vec<String>,
+    insights: Vec<String>,
+    plan_mode: Vec<String>,
     intents: Vec<String>,
     results: Vec<String>,
 }
 
 const MAX_TODO_ITEMS: usize = 8;
+const MAX_ULTRATHINK_BLOCKS: usize = 4;
+const MAX_INSIGHT_BLOCKS: usize = 6;
+const MAX_PLAN_MODE_EVENTS: usize = 8;
 const MAX_INTENT_LINES: usize = 6;
 const MAX_RESULT_LINES: usize = 6;
+const MAX_TAG_BLOCK_LINES: usize = 4;
 
 const INTENT_KEYWORDS: &[&str] = &[
     // Polish
@@ -335,12 +342,18 @@ const RESULT_KEYWORDS: &[&str] = &[
 
 fn extract_signals(entries: &[&TimelineEntry]) -> ChunkSignals {
     let (todo_open, todo_done) = extract_checklist_items(entries);
+    let ultrathink = extract_tag_blocks(entries, is_ultrathink_tag, MAX_ULTRATHINK_BLOCKS);
+    let insights = extract_tag_blocks(entries, is_insight_tag, MAX_INSIGHT_BLOCKS);
+    let plan_mode = extract_tag_blocks(entries, is_plan_mode_tag, MAX_PLAN_MODE_EVENTS);
     let intents = extract_intent_lines(entries);
     let results = extract_result_lines(entries);
 
     ChunkSignals {
         todo_open,
         todo_done,
+        ultrathink,
+        insights,
+        plan_mode,
         intents,
         results,
     }
@@ -498,9 +511,84 @@ fn truncate_signal_line(line: &str) -> String {
     truncate_message_bytes(line, MAX_BYTES)
 }
 
+fn is_ultrathink_tag(line: &str) -> bool {
+    line.to_lowercase().contains("ultrathink")
+}
+
+fn is_insight_tag(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    // Prefer common "tag" forms like "Insight:" / "★ Insight" / "Insight ─".
+    lower.starts_with("insight")
+        || lower.contains("★ insight")
+        || lower.contains("insight ─")
+        || lower.contains("insight -")
+}
+
+fn is_plan_mode_tag(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    // Capture Plan Mode session transitions + explicit accept/approval actions.
+    lower.contains("plan mode")
+        || lower.contains("accept plan")
+        || lower.contains("user accepted the plan")
+        || lower.contains("approve and bypass permissions")
+        || lower.contains("bypass permissions")
+}
+
+fn extract_tag_blocks(
+    entries: &[&TimelineEntry],
+    is_tag: fn(&str) -> bool,
+    max_blocks: usize,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    for entry in entries {
+        let lines: Vec<&str> = entry.message.lines().collect();
+        for (i, raw) in lines.iter().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || !is_tag(line) {
+                continue;
+            }
+
+            let mut block = Vec::new();
+            block.push(line);
+
+            for raw_next in lines.iter().skip(i + 1) {
+                let next = raw_next.trim();
+                if next.is_empty() {
+                    break;
+                }
+                if is_tag(next) {
+                    break;
+                }
+                block.push(next);
+                if block.len() >= MAX_TAG_BLOCK_LINES {
+                    break;
+                }
+            }
+
+            let joined = block.join(" ");
+            let key = normalize_key(&joined);
+            if !seen.insert(key) {
+                continue;
+            }
+
+            out.push(truncate_signal_line(&joined));
+            if out.len() >= max_blocks {
+                return out;
+            }
+        }
+    }
+
+    out
+}
+
 fn format_signals_block(signals: &ChunkSignals, highlights: &[String]) -> Option<String> {
     let has_any = !signals.todo_open.is_empty()
         || !signals.todo_done.is_empty()
+        || !signals.ultrathink.is_empty()
+        || !signals.insights.is_empty()
+        || !signals.plan_mode.is_empty()
         || !signals.intents.is_empty()
         || !signals.results.is_empty()
         || !highlights.is_empty();
@@ -543,6 +631,27 @@ fn format_signals_block(signals: &ChunkSignals, highlights: &[String]) -> Option
                 "... (+{} more done)\n",
                 signals.todo_done.len() - MAX_TODO_ITEMS
             ));
+        }
+    }
+
+    if !signals.ultrathink.is_empty() {
+        out.push_str("Ultrathink:\n");
+        for line in &signals.ultrathink {
+            out.push_str(&format!("- {}\n", line));
+        }
+    }
+
+    if !signals.insights.is_empty() {
+        out.push_str("Insight:\n");
+        for line in &signals.insights {
+            out.push_str(&format!("- {}\n", line));
+        }
+    }
+
+    if !signals.plan_mode.is_empty() {
+        out.push_str("Plan mode:\n");
+        for line in &signals.plan_mode {
+            out.push_str(&format!("- {}\n", line));
         }
     }
 
@@ -924,7 +1033,7 @@ mod tests {
             14,
             30,
             "user",
-            "No i tutaj mam taki pomysł, żeby to zrobić\n- [ ] pierwsza rzecz\n- [x] druga rzecz",
+            "No i tutaj mam taki pomysł, żeby to zrobić\nPlan mode: enabled\nUser accepted the plan\nUltrathink:\n- [ ] pierwsza rzecz\n- [x] druga rzecz\n\n★ Insight ─ to działa",
         )];
         let refs: Vec<&TimelineEntry> = entries.iter().collect();
 
@@ -934,6 +1043,13 @@ mod tests {
         assert!(text.contains("RED LIGHT: checklist detected (open: 1, done: 1)"));
         assert!(text.contains("- [ ] pierwsza rzecz"));
         assert!(text.contains("- [x] druga rzecz"));
+        assert!(text.contains("Ultrathink:"));
+        assert!(text.contains("- Ultrathink:"));
+        assert!(text.contains("Insight:"));
+        assert!(text.contains("- ★ Insight ─ to działa"));
+        assert!(text.contains("Plan mode:"));
+        assert!(text.contains("- Plan mode: enabled"));
+        assert!(text.contains("- User accepted the plan"));
         assert!(text.contains("Intent:"));
         assert!(text.contains("No i tutaj mam taki pomysł, żeby to zrobić"));
         assert!(text.contains("[/signals]"));

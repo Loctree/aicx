@@ -55,6 +55,13 @@ Signals (persisted in the chunk text as `[signals]...[/signals]`):
 - TODO checklist extraction (`- [ ]`, `- [x]`) with a prominent "RED LIGHT" marker when open items exist
 - intent-line extraction (example: "mam taki pomysl, zeby ...")
 - result-line extraction (example: "SMOKE TEST PASSED", "0 failed")
+- tag vicinity extraction for Claude-style markers:
+  - `Ultrathink` (typically indicates important decisions)
+  - `Insight` (important implementation discoveries)
+- plan-mode session signals:
+  - `Plan mode` (session start / context)
+  - `User accepted the plan` / `Accept plan`
+  - `Approve and bypass permissions`
 - optional inclusion of keyword-based highlights as "Notes"
 
 Highlights (programmatic only):
