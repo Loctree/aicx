@@ -358,6 +358,157 @@ pub fn extract_claude_file(path: &Path, config: &ExtractionConfig) -> Result<Vec
     Ok(entries)
 }
 
+/// Extract timeline entries from a single Codex JSONL file by path.
+///
+/// Supports both:
+/// - Codex history format (`~/.codex/history.jsonl`) — `CodexEntry` per line.
+/// - Codex session format (`~/.codex/sessions/**/**/*.jsonl`) — `CodexSessionEvent` per line.
+pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
+    let validated = sanitize::validate_read_path(path)?;
+    // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
+    let file = File::open(&validated)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let reader = BufReader::new(file);
+
+    // Detect file format from the first non-empty line.
+    let mut first_line: Option<String> = None;
+    for line in reader.lines() {
+        let line = line?;
+        if !line.trim().is_empty() {
+            first_line = Some(line);
+            break;
+        }
+    }
+
+    let Some(first_line) = first_line else {
+        return Ok(vec![]);
+    };
+
+    // History file: parse as CodexEntry (per line).
+    if serde_json::from_str::<CodexEntry>(&first_line).is_ok() {
+        let file = File::open(&validated)?; // reopen from start
+        let reader = BufReader::new(file);
+
+        // First pass: group by session_id (same behavior as extract_codex()).
+        let mut sessions: HashMap<String, Vec<CodexEntry>> = HashMap::new();
+
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let entry: CodexEntry = match serde_json::from_str(&line) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            sessions
+                .entry(entry.session_id.clone())
+                .or_default()
+                .push(entry);
+        }
+
+        // Second pass: determine matching sessions (if filter provided).
+        let matching_sessions: HashSet<String> = if !config.project_filter.is_empty() {
+            let filters_lower: Vec<String> = config
+                .project_filter
+                .iter()
+                .map(|f| f.to_lowercase())
+                .collect();
+            sessions
+                .iter()
+                .filter(|(_id, msgs)| {
+                    filters_lower.iter().any(|fl| {
+                        msgs.iter().any(|m| {
+                            m.text.to_lowercase().contains(fl)
+                                || m.cwd
+                                    .as_ref()
+                                    .is_some_and(|c| c.to_lowercase().contains(fl))
+                        })
+                    })
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        } else {
+            sessions.keys().cloned().collect()
+        };
+
+        // Third pass: build timeline entries from matching sessions.
+        let mut entries: Vec<TimelineEntry> = Vec::new();
+
+        for (session_id, msgs) in &sessions {
+            if !matching_sessions.contains(session_id) {
+                continue;
+            }
+
+            for msg in msgs {
+                let timestamp = match Utc.timestamp_opt(msg.ts, 0).single() {
+                    Some(ts) => ts,
+                    None => continue,
+                };
+
+                // Respect cutoff
+                if timestamp < config.cutoff {
+                    continue;
+                }
+
+                // Respect watermark
+                if config.watermark.is_some_and(|wm| timestamp <= wm) {
+                    continue;
+                }
+
+                let role = msg.role.as_deref().unwrap_or("user").to_string();
+
+                // Skip assistant messages if not requested
+                if !config.include_assistant && role == "assistant" {
+                    continue;
+                }
+
+                if msg.text.is_empty() {
+                    continue;
+                }
+
+                entries.push(TimelineEntry {
+                    timestamp,
+                    agent: "codex".to_string(),
+                    session_id: session_id.clone(),
+                    role,
+                    message: msg.text.clone(),
+                    branch: None,
+                    cwd: msg.cwd.clone(),
+                });
+            }
+        }
+
+        entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        return Ok(entries);
+    }
+
+    // Session file: parse as CodexSessionEvent (delegate to existing parser).
+    if serde_json::from_str::<CodexSessionEvent>(&first_line).is_ok() {
+        let mut entries = parse_codex_session_file(&validated, config)?;
+        entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        return Ok(entries);
+    }
+
+    Err(anyhow::anyhow!(
+        "Unsupported codex file format: {}",
+        validated.display()
+    ))
+}
+
+/// Extract timeline entries from a single Gemini CLI session JSON file by path.
+///
+/// Gemini sessions are JSON (not JSONL) and live under:
+/// `~/.gemini/tmp/<hash>/chats/session-*.json`
+pub fn extract_gemini_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
+    let validated = sanitize::validate_read_path(path)?;
+    // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
+    let mut entries = parse_gemini_session(&validated, config)?;
+    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    Ok(entries)
+}
+
 // ============================================================================
 // Claude history.jsonl extractor
 // ============================================================================
@@ -1381,6 +1532,89 @@ mod tests {
         assert_eq!(entries[0].message, "Hello");
         assert_eq!(entries[1].role, "assistant");
         assert_eq!(entries[1].message, "Hi");
+
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_extract_codex_file_history_format() {
+        let tmp = std::env::temp_dir().join("ai-ctx-codex-direct-history.jsonl");
+        let _ = fs::remove_file(&tmp);
+
+        let content = r#"{"session_id":"s1","text":"hello","ts":1000,"role":"user","cwd":"/tmp/a"}
+{"session_id":"s1","text":"hi back","ts":1001,"role":"assistant","cwd":"/tmp/a"}
+{"session_id":"s2","text":"unrelated","ts":2000,"role":"user","cwd":"/tmp/b"}"#;
+        fs::write(&tmp, content).unwrap();
+
+        let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff,
+            include_assistant: true,
+            watermark: None,
+        };
+
+        let entries = extract_codex_file(&tmp, &config).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].agent, "codex");
+        assert_eq!(entries[0].role, "user");
+        assert_eq!(entries[1].role, "assistant");
+
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_extract_codex_file_session_format_detects() {
+        let tmp = std::env::temp_dir().join("ai-ctx-codex-direct-session.jsonl");
+        let _ = fs::remove_file(&tmp);
+
+        // Minimal session file (no event_msg) should parse and yield 0 entries.
+        let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"sess","cwd":"/tmp/x"}}"#;
+        fs::write(&tmp, content).unwrap();
+
+        let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff,
+            include_assistant: true,
+            watermark: None,
+        };
+
+        let entries = extract_codex_file(&tmp, &config).unwrap();
+        assert!(entries.is_empty());
+
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_extract_gemini_file_session_json() {
+        let tmp = std::env::temp_dir().join("ai-ctx-gemini-direct.json");
+        let _ = fs::remove_file(&tmp);
+
+        let content = r#"{
+  "sessionId": "sess-1",
+  "projectHash": "hash-1",
+  "messages": [
+    {"type":"user","content":"hi","timestamp":"2026-02-01T00:00:00Z","thoughts":[]},
+    {"type":"gemini","content":"hello","timestamp":"2026-02-01T00:00:01Z","thoughts":[]},
+    {"type":"info","content":"skip me","timestamp":"2026-02-01T00:00:02Z","thoughts":[]}
+  ]
+}"#;
+        fs::write(&tmp, content).unwrap();
+
+        let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff,
+            include_assistant: true,
+            watermark: None,
+        };
+
+        let entries = extract_gemini_file(&tmp, &config).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].agent, "gemini");
+        assert_eq!(entries[0].role, "user");
+        assert_eq!(entries[1].role, "assistant");
 
         let _ = fs::remove_file(&tmp);
     }

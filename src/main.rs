@@ -637,16 +637,8 @@ fn run_extract_file(
 
     let mut entries = match format {
         ExtractInputFormat::Claude => sources::extract_claude_file(&input, &config)?,
-        ExtractInputFormat::Codex => {
-            anyhow::bail!(
-                "extract --format codex not implemented yet (use `ai-contexters codex ...` for now)"
-            )
-        }
-        ExtractInputFormat::Gemini => {
-            anyhow::bail!(
-                "extract --format gemini not implemented yet (use `ai-contexters all ...` for now)"
-            )
-        }
+        ExtractInputFormat::Codex => sources::extract_codex_file(&input, &config)?,
+        ExtractInputFormat::Gemini => sources::extract_gemini_file(&input, &config)?,
     };
 
     // Sort by timestamp (extractors should already do this).
