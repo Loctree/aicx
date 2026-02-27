@@ -4,9 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>VetCoders Skills Suite — From Noise to Signal</title>
-<meta name="description" content="Nine skills that take AI agents from blind coding to shipped products. The complete pipeline from context bootstrap to marketplace launch.">
+<meta name="description" content="Ten skills that take AI agents from blind coding to shipped products. The complete pipeline from context bootstrap to marketplace launch.">
 <meta property="og:title" content="VetCoders Skills Suite">
-<meta property="og:description" content="Nine skills. One pipeline. From noise to signal.">
+<meta property="og:description" content="Ten skills. One pipeline. From noise to signal.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Lora:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
@@ -20,7 +20,8 @@
   --font-body:'Lora',Georgia,serif;
 }
 html{scroll-behavior:smooth}
-body{font-family:var(--font-body);background:var(--dark);color:var(--light);line-height:1.7;overflow-x:hidden}
+body{font-family:var(--font-body);background:var(--dark);color:var(--light);line-height:1.7;overflow-x:hidden;-webkit-user-select:none;user-select:none}
+code,.code-block,.formula{-webkit-user-select:text;user-select:text;cursor:text}
 h1,h2,h3,h4,h5,h6{font-family:var(--font-head);font-weight:600;line-height:1.25}
 
 /* NAV */
@@ -77,7 +78,9 @@ section{padding:5rem 2rem}
 
 /* CARDS */
 .cards-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:1.5rem}
-.card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:12px;padding:1.5rem;transition:all .25s;position:relative;overflow:hidden}
+.card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:12px;padding:1.5rem;transition:transform .3s ease,border-color .25s,box-shadow .3s;position:relative;overflow:hidden;transform-style:preserve-3d;will-change:transform}
+.card:hover{box-shadow:0 8px 32px rgba(217,119,87,.08)}
+.scroll-progress{position:fixed;top:0;left:0;height:2px;width:0;background:var(--orange);z-index:200;pointer-events:none;transition:width .08s linear}
 .card:hover{border-color:var(--orange);transform:translateY(-3px);box-shadow:0 8px 30px rgba(217,119,87,.08)}
 .card .card-phase{font-family:var(--font-head);font-size:.65rem;text-transform:uppercase;letter-spacing:.1em;font-weight:600;margin-bottom:.8rem;display:inline-block;padding:.2rem .6rem;border-radius:4px}
 .card .card-phase.build{background:rgba(106,155,204,.15);color:var(--blue)}
@@ -160,7 +163,7 @@ footer .tagline-footer{font-size:.75rem;color:rgba(176,174,165,.5);font-style:it
     <h1>From <span class="accent">Noise</span> to Signal</h1>
     <p class="tagline">"Code is noise until proven signal. Each loop removes entropy. Stop when the circle is full."</p>
     <div class="stats-row">
-      <div class="stat"><div class="num">9</div><div class="label">Skills</div></div>
+      <div class="stat"><div class="num">10</div><div class="label">Skills</div></div>
       <div class="stat"><div class="num">3</div><div class="label">Phases</div></div>
       <div class="stat"><div class="num">30+</div><div class="label">Languages</div></div>
       <div class="stat"><div class="num">98%</div><div class="label">Task Completeness</div></div>
@@ -204,6 +207,8 @@ footer .tagline-footer{font-size:.75rem;color:rgba(176,174,165,.5);font-style:it
     <div class="pipeline-flow">
       <div class="pipe-step phase2">dou</div>
       <span class="pipe-arrow">&rarr;</span>
+      <div class="pipe-step phase2">decorate</div>
+      <span class="pipe-arrow">&rarr;</span>
       <div class="pipe-step phase2">hydrate</div>
     </div>
 
@@ -219,7 +224,7 @@ footer .tagline-footer{font-size:.75rem;color:rgba(176,174,165,.5);font-style:it
 <section id="skills">
   <div class="container fade-up">
     <div class="section-label">The Suite</div>
-    <h2 class="section-title">Nine Skills, One Mission</h2>
+    <h2 class="section-title">Ten Skills, One Mission</h2>
     <p class="section-sub">From context bootstrap to marketplace launch &mdash; born from the Definition of Undone manifesto.</p>
 
     <div class="cards-grid">
@@ -286,6 +291,14 @@ footer .tagline-footer{font-size:.75rem;color:rgba(176,174,165,.5);font-style:it
         <p class="card-desc">Definition of Undone audit across the entire product surface. Crawls URLs, checks governance, measures the gap between code and market.</p>
         <div class="card-tags"><span class="tag">product surface</span><span class="tag">SEO</span><span class="tag">Plague Score</span></div>
         <div class="card-trigger">"DoU audit" &middot; "Co brakuje do launchu?"</div>
+      </div>
+
+      <div class="card" style="border-color:var(--blue)">
+        <div class="card-phase ship">Phase 3 &middot; Ship</div>
+        <h3>vetcoders-decorate</h3>
+        <p class="card-desc">Visual polish within YOUR design language. Detects existing palette, fonts, and theme &mdash; proposes smaczki (hover effects, scroll behaviors, micro-interactions) using your tokens. Never overrides your style.</p>
+        <div class="card-tags"><span class="tag">smaczki</span><span class="tag">detect &amp; enhance</span><span class="tag">micro-interactions</span><span class="tag">curb appeal</span></div>
+        <div class="card-trigger">"Decorate" &middot; "Udekoruj" &middot; "Make it look good" &middot; "Smaczki"</div>
       </div>
 
       <div class="card">
@@ -375,12 +388,12 @@ Step N: Converged &mdash; DoU &lt; threshold = DoD
       <h4 style="font-size:1rem;margin-bottom:.5rem;color:var(--light)">As Claude Code Skills</h4>
       <div class="code-block">
         <button class="copy-btn" onclick="copyCode(this)">Copy</button>
-        <code><span class="comment"># Clone the suite</span><br>git clone https://github.com/VetCoders/vetcoders-skills-suite ~/.claude/skills/vetcoders<br><br><span class="comment"># Or install individual skills</span><br>cp -r vetcoders-ship ~/.claude/skills/<br>cp -r vetcoders-init ~/.claude/skills/<br>cp -r vetcoders-workflow ~/.claude/skills/<br>cp -r vetcoders-implement ~/.claude/skills/<br>cp -r vetcoders-spawn ~/.claude/skills/<br>cp -r vetcoders-followup ~/.claude/skills/<br>cp -r vetcoders-marbles ~/.claude/skills/<br>cp -r vetcoders-dou ~/.claude/skills/<br>cp -r vetcoders-hydrate ~/.claude/skills/</code>
+        <code><span class="comment"># Clone the suite</span><br>git clone https://github.com/VetCoders/vetcoders-skills-suite ~/.claude/skills/vetcoders<br><br><span class="comment"># Or install individual skills</span><br>cp -r vetcoders-ship ~/.claude/skills/<br>cp -r vetcoders-init ~/.claude/skills/<br>cp -r vetcoders-workflow ~/.claude/skills/<br>cp -r vetcoders-implement ~/.claude/skills/<br>cp -r vetcoders-spawn ~/.claude/skills/<br>cp -r vetcoders-followup ~/.claude/skills/<br>cp -r vetcoders-marbles ~/.claude/skills/<br>cp -r vetcoders-dou ~/.claude/skills/<br>cp -r vetcoders-decorate ~/.claude/skills/<br>cp -r vetcoders-hydrate ~/.claude/skills/</code>
       </div>
 
       <h4 style="font-size:1rem;margin:2rem 0 .5rem;color:var(--light)">Requirements</h4>
       <div class="code-block">
-        <code><span class="comment"># Required &mdash; structural code intelligence (98% task completeness)</span><br>cargo install loctree<br><br><span class="comment"># Required &mdash; session history extraction</span><br>cargo install ai-contexters<br><br><span class="comment"># Optional &mdash; web research, library docs, security scan</span><br><span class="comment"># Configure brave-search, Context7, semgrep MCP servers</span></code>
+        <code><span class="comment"># Required &mdash; structural code intelligence</span><br>cargo install loctree<br><br><span class="comment"># Required &mdash; session history extraction</span><br>cargo install ai-contexters<br><br><span class="comment"># Optional &mdash; web research, library docs, security scan</span><br><span class="comment"># Configure brave-search, Context7, semgrep MCP servers</span></code>
       </div>
 
       <h4 style="font-size:1rem;margin:2rem 0 .5rem;color:var(--light)">Quick Start</h4>
@@ -664,33 +677,38 @@ function shuffleArr(a){
 
   function draw(){
     ctx.clearRect(0,0,W,H);
+    // Parallax: mouse offset normalized -1..1, grooves shift less, marbles more
+    var pmx=mx>=0?(mx-W/2)/(W/2):0, pmy=my>=0?(my-H/2)/(H/2):0;
+    var PS=MR*1.8; // parallax strength
     ctx.beginPath();ctx.arc(W/2,H/2,Math.min(W,H)*0.37,0,Math.PI*2);
     ctx.strokeStyle='rgba(176,174,165,0.03)';ctx.lineWidth=2;ctx.stroke();
-    // Empty grooves — dimmed, spotlight on hover
+    // Layer 1: grooves (board surface) — subtle parallax
     for(var i=0;i<slots.length;i++){
       if(!slots[i].marble){
+        var gx=slots[i].x-pmx*PS*0.25, gy=slots[i].y-pmy*PS*0.25;
         var p=prox(slots[i].x,slots[i].y);
         ctx.globalAlpha=DIM+p*(BRIGHT-DIM);
-        drawGroove(ctx,slots[i].x,slots[i].y,MR);
+        drawGroove(ctx,gx,gy,MR);
       }
     }
     ctx.globalAlpha=1;
-    // Marbles — dimmed, spotlight on hover
+    // Layer 2: marbles (above board) — stronger parallax
     for(var i=0;i<slots.length;i++){
       var s=slots[i];if(!s.marble) continue;
       var m=s.marble;
       m.drop=Math.max(0,m.drop-0.03);
       var yOff=-MR*2.5*m.drop*m.drop;
+      var bx=s.x-pmx*PS*0.7, by=s.y-pmy*PS*0.7;
       var p=prox(s.x,s.y);
       var ta=DIM+p*(BRIGHT-DIM);
       m.alpha+=(ta-m.alpha)*0.08;
       if(m.drop<0.3){
         ctx.globalAlpha=0.1*(1-m.drop/0.3)*m.alpha;
-        ctx.beginPath();ctx.ellipse(s.x,s.y+MR*0.15,MR*0.6,MR*0.2,0,0,Math.PI*2);
+        ctx.beginPath();ctx.ellipse(bx,by+MR*0.15,MR*0.6,MR*0.2,0,0,Math.PI*2);
         ctx.fillStyle='rgba(0,0,0,1)';ctx.fill();
       }
       ctx.globalAlpha=m.alpha;
-      ctx.drawImage(m.sprite,s.x-m.sprite.width/2,s.y+yOff-m.sprite.height/2);
+      ctx.drawImage(m.sprite,bx-m.sprite.width/2,by+yOff-m.sprite.height/2);
     }
     ctx.globalAlpha=1;
     frame++;
@@ -892,6 +910,33 @@ function copyCode(btn){
     setTimeout(function(){ btn.textContent = 'Copy'; }, 1500);
   });
 }
+
+// ============ SCROLL PROGRESS BAR ============
+(function(){
+  var bar=document.createElement('div');
+  bar.className='scroll-progress';
+  document.body.appendChild(bar);
+  window.addEventListener('scroll',function(){
+    var h=document.documentElement.scrollHeight-window.innerHeight;
+    bar.style.width=h>0?(window.scrollY/h*100)+'%':'0';
+  },{passive:true});
+})();
+
+// ============ 3D CARD TILT ON HOVER ============
+(function(){
+  var cards=document.querySelectorAll('.card');
+  cards.forEach(function(card){
+    card.addEventListener('mousemove',function(e){
+      var r=card.getBoundingClientRect();
+      var x=(e.clientX-r.left)/r.width-0.5;
+      var y=(e.clientY-r.top)/r.height-0.5;
+      card.style.transform='perspective(700px) rotateY('+x*6+'deg) rotateX('+(-y*6)+'deg) scale(1.01)';
+    });
+    card.addEventListener('mouseleave',function(){
+      card.style.transform='perspective(700px) rotateY(0) rotateX(0) scale(1)';
+    });
+  });
+})();
 </script>
 </body>
 </html>

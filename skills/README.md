@@ -1,6 +1,6 @@
 # VetCoders Skills Suite
 
-**Nine skills that take AI agents from blind coding to shipped products.**
+**Ten skills that take AI agents from blind coding to shipped products.**
 
 The complete pipeline from context bootstrap to marketplace launch — born from the [Definition of Undone](https://vetcoders.io/definition-of-undone) manifesto and 14 months of building production software with AI agents.
 
@@ -13,7 +13,7 @@ vetcoders-ship "task description"
   │                                        ↓
   Phase 2 — Converge:                  marbles ↻ (loop until P0=P1=P2=0)
   │                                        ↓
-  Phase 3 — Ship:                      dou → hydrate
+  Phase 3 — Ship:                      dou → decorate → hydrate
   │
   done.
 ```
@@ -55,6 +55,7 @@ implement/spawn are internal execution tools used by workflow and marbles.
 | Skill | Purpose | Key Output |
 |-------|---------|------------|
 | **vetcoders-dou** | Definition of Undone audit across entire product surface | Undone Matrix + Plague Score |
+| **vetcoders-decorate** | Visual polish and curb appeal — branded pages, interactive showcases, animations | Showcase HTML + brand tokens |
 | **vetcoders-hydrate** | Package for market: repo governance, SEO, distribution, listings | "Done Done" artifacts |
 
 ## Requirements
@@ -85,6 +86,7 @@ cp -r vetcoders-spawn ~/.claude/skills/
 cp -r vetcoders-followup ~/.claude/skills/
 cp -r vetcoders-marbles ~/.claude/skills/
 cp -r vetcoders-dou ~/.claude/skills/
+cp -r vetcoders-decorate ~/.claude/skills/
 cp -r vetcoders-hydrate ~/.claude/skills/
 ```
 
