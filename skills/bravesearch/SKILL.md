@@ -57,4 +57,4 @@ News results (if available) are appended at the end.
 - Always include source URLs in your response when using search results
 - This skill uses the Brave Search API (free tier, 2000 queries/month)
 - No dependencies beyond Python 3 stdlib (urllib, json)
-- API key is embedded in the script — do not share the script publicly
+- Requires `BRAVE_API_KEY` environment variable to be set

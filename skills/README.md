@@ -155,7 +155,7 @@ The skills are language-agnostic with specific optimizations for:
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+See [CONTRIBUTING.md](../CONTRIBUTING.md) for guidelines.
 
 The suite uses its own methodology — before submitting changes:
 1. Run `vetcoders-init` to bootstrap context
@@ -165,7 +165,7 @@ The suite uses its own methodology — before submitting changes:
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](../LICENSE).
 
 ## Developed by
 

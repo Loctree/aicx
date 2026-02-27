@@ -1551,17 +1551,33 @@ fn run_dashboard(args: DashboardRunArgs) -> Result<()> {
             .with_context(|| format!("Failed to create output directory: {}", parent.display()))?;
     }
 
-    // Atomic write: temp file + rename (consistent with dashboard_server)
-    let tmp_path = output_path.with_extension("tmp");
+    // Atomic write: temp file + sync + rename (consistent with dashboard_server)
+    let base_name = output_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("dashboard");
+    let tmp_path = output_path.with_file_name(format!(
+        ".{}.{}.tmp",
+        base_name,
+        std::process::id()
+    ));
     fs::write(&tmp_path, &artifact.html)
         .with_context(|| format!("Failed to write temporary dashboard: {}", tmp_path.display()))?;
-    fs::rename(&tmp_path, &output_path).with_context(|| {
+    // Ensure data is durable before atomic swap
+    let f = fs::File::open(&tmp_path)
+        .with_context(|| format!("Failed to reopen temp file: {}", tmp_path.display()))?;
+    f.sync_all()
+        .with_context(|| format!("Failed to sync temp file: {}", tmp_path.display()))?;
+    drop(f);
+    if let Err(rename_err) = fs::rename(&tmp_path, &output_path) {
         let _ = fs::remove_file(&tmp_path);
-        format!(
-            "Failed to atomically replace dashboard: {}",
-            output_path.display()
-        )
-    })?;
+        return Err(rename_err).with_context(|| {
+            format!(
+                "Failed to atomically replace dashboard: {}",
+                output_path.display()
+            )
+        });
+    }
 
     eprintln!("✓ Dashboard generated");
     eprintln!("  Output: {}", output_path.display());

@@ -114,6 +114,7 @@ pub fn build_dashboard(config: &DashboardConfig) -> Result<DashboardArtifact> {
         for record in &mut scan.payload.records {
             record.absolute_path.clear();
         }
+        scan.payload.store_root.clear();
     }
 
     let html = render_dashboard_html(&scan.payload, &config.title)?;
