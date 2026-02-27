@@ -32,6 +32,10 @@ pub struct DashboardConfig {
     pub title: String,
     /// Max characters in per-record preview.
     pub preview_chars: usize,
+    /// When true, include absolute filesystem paths in rendered HTML.
+    /// Should be false for static file export (privacy) and true for
+    /// local-only server mode.
+    pub include_absolute_paths: bool,
 }
 
 /// Dashboard generation output.
@@ -104,7 +108,14 @@ struct ScanResult {
 
 /// Build a complete HTML dashboard from store data.
 pub fn build_dashboard(config: &DashboardConfig) -> Result<DashboardArtifact> {
-    let scan = scan_store(&config.store_root, config.preview_chars)?;
+    let mut scan = scan_store(&config.store_root, config.preview_chars)?;
+
+    if !config.include_absolute_paths {
+        for record in &mut scan.payload.records {
+            record.absolute_path.clear();
+        }
+    }
+
     let html = render_dashboard_html(&scan.payload, &config.title)?;
 
     Ok(DashboardArtifact {
@@ -479,6 +490,8 @@ fn read_json_preview_and_search(
     (entry_count, preview, search_excerpt, detail)
 }
 
+const MAX_JSON_RECURSE_DEPTH: usize = 64;
+
 fn collect_json_strings(
     value: &Value,
     out: &mut Vec<String>,
@@ -486,7 +499,21 @@ fn collect_json_strings(
     max_items: usize,
     max_total_chars: usize,
 ) {
-    if out.len() >= max_items || *total_chars >= max_total_chars {
+    collect_json_strings_inner(value, out, total_chars, max_items, max_total_chars, 0);
+}
+
+fn collect_json_strings_inner(
+    value: &Value,
+    out: &mut Vec<String>,
+    total_chars: &mut usize,
+    max_items: usize,
+    max_total_chars: usize,
+    depth: usize,
+) {
+    if depth >= MAX_JSON_RECURSE_DEPTH
+        || out.len() >= max_items
+        || *total_chars >= max_total_chars
+    {
         return;
     }
 
@@ -506,7 +533,14 @@ fn collect_json_strings(
         }
         Value::Array(items) => {
             for item in items {
-                collect_json_strings(item, out, total_chars, max_items, max_total_chars);
+                collect_json_strings_inner(
+                    item,
+                    out,
+                    total_chars,
+                    max_items,
+                    max_total_chars,
+                    depth + 1,
+                );
                 if out.len() >= max_items || *total_chars >= max_total_chars {
                     break;
                 }
@@ -514,7 +548,14 @@ fn collect_json_strings(
         }
         Value::Object(map) => {
             for (_, v) in map {
-                collect_json_strings(v, out, total_chars, max_items, max_total_chars);
+                collect_json_strings_inner(
+                    v,
+                    out,
+                    total_chars,
+                    max_items,
+                    max_total_chars,
+                    depth + 1,
+                );
                 if out.len() >= max_items || *total_chars >= max_total_chars {
                     break;
                 }
@@ -1325,16 +1366,7 @@ const DASHBOARD_SCRIPT: &str = r#"
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn mk_tmp_dir(name: &str) -> PathBuf {
-        let dir = std::env::current_dir()
-            .expect("cwd")
-            .join("target")
-            .join("test-tmp")
-            .join(format!("{}_{}", name, Utc::now().timestamp_micros()));
-        fs::create_dir_all(&dir).expect("create dir");
-        dir
-    }
+    use crate::test_util::mk_tmp_dir;
 
     #[test]
     fn parses_session_filename_variants() {
@@ -1412,6 +1444,7 @@ mod tests {
             store_root: root.clone(),
             title: "AI Context Dashboard".to_string(),
             preview_chars: 100,
+            include_absolute_paths: false,
         };
 
         let artifact = build_dashboard(&cfg).expect("dashboard");

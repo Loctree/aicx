@@ -8,17 +8,20 @@ Created by M&K (c)2026 VetCoders
 """
 
 import json
+import os
 import sys
 import urllib.request
 import urllib.parse
 import urllib.error
 from typing import Optional
 
-API_KEY = "BSAeuzvSGH4bfOYNshg6bnI0gA6rFe1"
+API_KEY = os.environ.get("BRAVE_API_KEY", "")
 API_URL = "https://api.search.brave.com/res/v1/web/search"
 
 
 def search(query: str, count: int = 8, lang: Optional[str] = None) -> dict:
+    if not API_KEY:
+        return {"error": "BRAVE_API_KEY environment variable is not set"}
     params = {"q": query, "count": str(count)}
     if lang:
         params["search_lang"] = lang

@@ -289,6 +289,7 @@ fn rebuild_dashboard(config: &DashboardServerConfig) -> Result<BuildOutput> {
         store_root: config.store_root.clone(),
         title: config.title.clone(),
         preview_chars: config.preview_chars,
+        include_absolute_paths: true,
     })?;
     write_dashboard_artifact(&config.artifact_path, &artifact.html)?;
 
@@ -373,16 +374,7 @@ fn write_dashboard_artifact(path: &Path, html: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn mk_tmp_dir(name: &str) -> PathBuf {
-        let dir = std::env::current_dir()
-            .expect("cwd")
-            .join("target")
-            .join("test-tmp")
-            .join(format!("{}_{}", name, Utc::now().timestamp_micros()));
-        fs::create_dir_all(&dir).expect("create dir");
-        dir
-    }
+    use crate::test_util::mk_tmp_dir;
 
     fn seed_store(root: &Path) {
         let p = root.join("demo").join("2026-02-24");

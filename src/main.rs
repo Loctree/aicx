@@ -1540,18 +1540,28 @@ fn run_dashboard(args: DashboardRunArgs) -> Result<()> {
         store_root: root.clone(),
         title: args.title,
         preview_chars: args.preview_chars,
+        include_absolute_paths: false,
     };
 
     let artifact = dashboard::build_dashboard(&config)?;
 
-    let mut output_path = ai_contexters::sanitize::validate_write_path(&args.output)?;
+    let output_path = ai_contexters::sanitize::validate_write_path(&args.output)?;
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create output directory: {}", parent.display()))?;
     }
-    output_path = ai_contexters::sanitize::validate_write_path(&output_path)?;
-    fs::write(&output_path, artifact.html)
-        .with_context(|| format!("Failed to write dashboard: {}", output_path.display()))?;
+
+    // Atomic write: temp file + rename (consistent with dashboard_server)
+    let tmp_path = output_path.with_extension("tmp");
+    fs::write(&tmp_path, &artifact.html)
+        .with_context(|| format!("Failed to write temporary dashboard: {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, &output_path).with_context(|| {
+        let _ = fs::remove_file(&tmp_path);
+        format!(
+            "Failed to atomically replace dashboard: {}",
+            output_path.display()
+        )
+    })?;
 
     eprintln!("✓ Dashboard generated");
     eprintln!("  Output: {}", output_path.display());
