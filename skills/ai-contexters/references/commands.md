@@ -1,4 +1,4 @@
-# ai-contexters — Complete Command Reference
+# aicx — Complete Command Reference
 
 ## Global Flags
 
@@ -10,7 +10,7 @@ Redacted patterns: PEM blocks, `Authorization: Bearer`, env vars with `*_API_KEY
 
 ---
 
-## ai-contexters claude
+## aicx claude
 
 Extract timelines from Claude Code sessions (`~/.claude/projects/*/*.jsonl`).
 
@@ -32,12 +32,12 @@ Extract timelines from Claude Code sessions (`~/.claude/projects/*/*.jsonl`).
 
 **Example:**
 ```bash
-ai-contexters claude -p CodeScribe -H 72 --incremental --loctree --emit json
+aicx claude -p CodeScribe -H 72 --incremental --loctree --emit json
 ```
 
 ---
 
-## ai-contexters codex
+## aicx codex
 
 Extract from Codex history (`~/.codex/history.jsonl`).
 
@@ -45,12 +45,12 @@ Same flags as `claude`. Treats Codex per-session, per-message entries.
 
 **Example:**
 ```bash
-ai-contexters codex -p loctree-plugin -H 24 --incremental
+aicx codex -p loctree-plugin -H 24 --incremental
 ```
 
 ---
 
-## ai-contexters all
+## aicx all
 
 Extract from all agents (Claude + Codex + Gemini) simultaneously.
 
@@ -58,12 +58,12 @@ Same flags as `claude` except `--format` is hardcoded to `both` for local output
 
 **Example:**
 ```bash
-ai-contexters all -H 168 --incremental --memex
+aicx all -H 168 --incremental --memex
 ```
 
 ---
 
-## ai-contexters extract
+## aicx extract
 
 Direct one-shot file extraction. No agent discovery, no store, no dedup.
 
@@ -82,15 +82,15 @@ Direct one-shot file extraction. No agent discovery, no store, no dedup.
 
 **Examples:**
 ```bash
-ai-contexters extract --format claude ~/.claude/projects/proj/uuid.jsonl -o /tmp/report.md
-ai-contexters extract --format codex ~/.codex/history.jsonl -o /tmp/codex.md --user-only
-ai-contexters extract --format gemini ~/.gemini/tmp/hash/chats/session-1.json -o /tmp/gemini.md
-ai-contexters extract --format claude /path/to/huge.jsonl -o /tmp/short.md --max-message-chars 8000
+aicx extract --format claude ~/.claude/projects/proj/uuid.jsonl -o /tmp/report.md
+aicx extract --format codex ~/.codex/history.jsonl -o /tmp/codex.md --user-only
+aicx extract --format gemini ~/.gemini/tmp/hash/chats/session-1.json -o /tmp/gemini.md
+aicx extract --format claude /path/to/huge.jsonl -o /tmp/short.md --max-message-chars 8000
 ```
 
 ---
 
-## ai-contexters store
+## aicx store
 
 Store extracted contexts centrally and optionally sync to memex.
 
@@ -106,12 +106,12 @@ Store extracted contexts centrally and optionally sync to memex.
 
 **Example:**
 ```bash
-ai-contexters store -p CodeScribe --agent claude -H 720 --memex
+aicx store -p CodeScribe --agent claude -H 720 --memex
 ```
 
 ---
 
-## ai-contexters memex-sync
+## aicx memex-sync
 
 Sync stored chunks from `~/.ai-contexters/memex/chunks/` to rmcp-memex vector memory.
 
@@ -125,13 +125,13 @@ Sync stored chunks from `~/.ai-contexters/memex/chunks/` to rmcp-memex vector me
 
 **Example:**
 ```bash
-ai-contexters memex-sync --namespace ai-contexts
-ai-contexters memex-sync --per-chunk --namespace codescribe-sessions
+aicx memex-sync --namespace ai-contexts
+aicx memex-sync --per-chunk --namespace codescribe-sessions
 ```
 
 ---
 
-## ai-contexters list
+## aicx list
 
 Discover available AI agent session sources on this machine. No flags.
 
@@ -144,7 +144,7 @@ Discover available AI agent session sources on this machine. No flags.
 
 ---
 
-## ai-contexters refs
+## aicx refs
 
 List stored context files from central store, filtered by recency.
 
@@ -157,12 +157,12 @@ List stored context files from central store, filtered by recency.
 
 **Example:**
 ```bash
-ai-contexters refs -H 72 -p CodeScribe
+aicx refs -H 72 -p CodeScribe
 ```
 
 ---
 
-## ai-contexters state
+## aicx state
 
 Manage dedup hashes, watermarks, and run history (`~/.ai-contexters/state.json`).
 
@@ -174,14 +174,14 @@ Manage dedup hashes, watermarks, and run history (`~/.ai-contexters/state.json`)
 
 **Examples:**
 ```bash
-ai-contexters state --info
-ai-contexters state --reset -p CodeScribe
-ai-contexters state --reset    # reset all
+aicx state --info
+aicx state --reset -p CodeScribe
+aicx state --reset    # reset all
 ```
 
 ---
 
-## ai-contexters init
+## aicx init
 
 Bootstrap `.ai-context/` workspace and optionally launch agent.
 
@@ -212,10 +212,10 @@ Bootstrap `.ai-context/` workspace and optionally launch agent.
 
 **Examples:**
 ```bash
-ai-contexters init --agent codex --no-confirm --action "Audit memory and propose next steps"
-ai-contexters init --no-run --action "Review auth module"
-ai-contexters init --agent claude --agent-prompt-file ./custom-rules.md --no-confirm
-ai-contexters init -p CodeScribe --agent codex -H 720 --action "Full refactor plan"
+aicx init --agent codex --no-confirm --action "Audit memory and propose next steps"
+aicx init --no-run --action "Review auth module"
+aicx init --agent claude --agent-prompt-file ./custom-rules.md --no-confirm
+aicx init -p CodeScribe --agent codex -H 720 --action "Full refactor plan"
 ```
 
 ---

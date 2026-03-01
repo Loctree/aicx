@@ -1,6 +1,6 @@
 [package]
 name = "ai-contexters"
-version = "0.2.5"
+version = "0.3.0"
 edition = "2024"
 description = "Extract timeline and memory from AI agent sessions (Claude Code, Codex, Gemini)"
 authors = ["Maciej Gad <void@div0.space>", "Monika Szymanska <hello@vetcoders.io>"]
@@ -24,7 +24,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "net"] }
 filetime = "0.2"
 
 [[bin]]
-name = "ai-contexters"
+name = "aicx"
 path = "src/main.rs"
 
 [profile.release]

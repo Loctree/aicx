@@ -1,6 +1,6 @@
 # Distillation (Chunking)
 
-`ai-contexters` distills raw timelines into chunked “agent-readable” context files.
+`aicx` distills raw timelines into chunked “agent-readable” context files.
 
 This is the piece that makes the tool useful for:
 - vector indexing (memex),

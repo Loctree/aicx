@@ -2,7 +2,7 @@
 
 Memory extraction + context distillation for AI agent sessions.
 
-`ai-contexters` turns local agent logs into:
+`aicx` turns local agent logs into:
 - a clean, deduped timeline,
 - chunked “agent-readable” context stored in `~/.ai-contexters/`,
 - optional `.ai-context/` artifacts for repo-level “bring new agent up to speed” workflows,
@@ -24,19 +24,19 @@ cargo install --path .
 Extract everything from the last 4 hours, store-first, and print the stored chunk paths:
 
 ```bash
-ai-contexters all -H 4
+aicx all -H 4
 ```
 
 Pipe one JSON payload (handy for automation):
 
 ```bash
-ai-contexters all -H 4 --emit json | jq .
+aicx all -H 4 --emit json | jq .
 ```
 
 Bootstrap a repo context (`.ai-context/`) and run an agent:
 
 ```bash
-ai-contexters init --agent codex --no-confirm --action "Map the repo and propose next steps"
+aicx init --agent codex --no-confirm --action "Map the repo and propose next steps"
 ```
 
 ## What Gets Written Where
@@ -57,26 +57,26 @@ Repo-local init artifacts:
 Daily “what changed?” (clean stdout, just store paths):
 
 ```bash
-ai-contexters claude -p CodeScribe -H 24 --emit paths
+aicx claude -p CodeScribe -H 24 --emit paths
 ```
 
 Incremental mode (watermark per source, avoids re-processing):
 
 ```bash
-ai-contexters all -H 168 --incremental
+aicx all -H 168 --incremental
 ```
 
 User-only mode (smaller output; excludes assistant + reasoning):
 
 ```bash
-ai-contexters claude -p CodeScribe -H 48 --user-only
+aicx claude -p CodeScribe -H 48 --user-only
 ```
 
 Memex sync (vector memory):
 
 ```bash
-ai-contexters all -H 48 --memex
-ai-contexters memex-sync --namespace ai-contexts
+aicx all -H 48 --memex
+aicx memex-sync --namespace ai-contexts
 ```
 
 ## Docs

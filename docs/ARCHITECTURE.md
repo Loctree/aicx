@@ -1,6 +1,6 @@
 # Architecture
 
-`ai-contexters` is a single Rust CLI that:
+`aicx` is a single Rust CLI that:
 - reads local agent session logs,
 - normalizes them into a single timeline schema,
 - deduplicates and chunks the timeline into “agent-readable” context files,
@@ -9,7 +9,7 @@
 
 ```mermaid
 flowchart TD
-  CLI[ai-contexters CLI] --> SRC[sources.rs: extract_*]
+  CLI[aicx CLI] --> SRC[sources.rs: extract_*]
   SRC --> DEDUP[state.rs: dedup + watermark]
   DEDUP --> RED[redact.rs: redact_secrets]
   RED --> STORE[store.rs: write_context_chunked]
@@ -78,7 +78,7 @@ Note on memex sync:
 
 1. Detect repo root (git root).
 2. Build local context:
-   - extracted memories (via ai-contexters store)
+   - extracted memories (via aicx store)
    - loctree snapshot (requires `loct` in `PATH` or `LOCT_BIN`)
 3. Write `.ai-context/share/artifacts/*`:
    - `SUMMARY.md` (curated append-only)

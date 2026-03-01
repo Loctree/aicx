@@ -1,6 +1,6 @@
 # Commands
 
-This is the exact CLI surface for `ai-contexters` (generated from `src/main.rs` via clap).
+This is the exact CLI surface for `aicx` (generated from `src/main.rs` via clap).
 
 For the shortest “it works” path, see `README.md`.
 
@@ -10,20 +10,20 @@ For the shortest “it works” path, see `README.md`.
 - Default behavior is redaction enabled.
 - Passing this flag disables redaction (not recommended unless you fully trust inputs and outputs).
 
-## `ai-contexters list`
+## `aicx list`
 
 List available local sources and their sizes.
 
 ```bash
-ai-contexters list
+aicx list
 ```
 
-## `ai-contexters claude`
+## `aicx claude`
 
 Extract timeline from Claude Code sessions.
 
 ```bash
-ai-contexters claude [OPTIONS]
+aicx claude [OPTIONS]
 ```
 
 Common options:
@@ -45,13 +45,13 @@ Examples:
 
 ```bash
 # Last 24h, store-first chunks, print chunk paths to stdout
-ai-contexters claude -p CodeScribe -H 24
+aicx claude -p CodeScribe -H 24
 
 # Also write a local JSON report
-ai-contexters claude -p CodeScribe -H 24 -o ./reports -f json
+aicx claude -p CodeScribe -H 24 -o ./reports -f json
 
 # Automation-friendly JSON payload on stdout
-ai-contexters claude -p CodeScribe -H 24 --emit json | jq .
+aicx claude -p CodeScribe -H 24 --emit json | jq .
 ```
 
 `--emit json` payload shape (stable fields):
@@ -68,12 +68,12 @@ ai-contexters claude -p CodeScribe -H 24 --emit json | jq .
 }
 ```
 
-## `ai-contexters codex`
+## `aicx codex`
 
 Extract timeline from Codex history.
 
 ```bash
-ai-contexters codex [OPTIONS]
+aicx codex [OPTIONS]
 ```
 
 Same as `claude`, including assistant messages by default. Use `--user-only` if you want a user-only view.
@@ -81,15 +81,15 @@ Same as `claude`, including assistant messages by default. Use `--user-only` if 
 Example:
 
 ```bash
-ai-contexters codex -p codescribe -H 48 --loctree --emit json | jq .
+aicx codex -p codescribe -H 48 --loctree --emit json | jq .
 ```
 
-## `ai-contexters all`
+## `aicx all`
 
 Extract from all supported agents (Claude + Codex + Gemini).
 
 ```bash
-ai-contexters all [OPTIONS]
+aicx all [OPTIONS]
 ```
 
 Options are similar to `claude`, with one important detail:
@@ -99,18 +99,18 @@ Examples:
 
 ```bash
 # Everything, last 7 days, incremental
-ai-contexters all -H 168 --incremental
+aicx all -H 168 --incremental
 
 # User-only mode (exclude assistant + reasoning)
-ai-contexters all -H 48 --user-only
+aicx all -H 48 --user-only
 ```
 
-## `ai-contexters store`
+## `aicx store`
 
 Write chunked contexts into the global store (`~/.ai-contexters/`) and optionally sync to memex.
 
 ```bash
-ai-contexters store [OPTIONS]
+aicx store [OPTIONS]
 ```
 
 Options:
@@ -123,15 +123,15 @@ Options:
 Example:
 
 ```bash
-ai-contexters store -p CodeScribe --agent claude -H 720
+aicx store -p CodeScribe --agent claude -H 720
 ```
 
-## `ai-contexters memex-sync`
+## `aicx memex-sync`
 
 Sync stored chunks to `rmcp-memex` vector memory.
 
 ```bash
-ai-contexters memex-sync [OPTIONS]
+aicx memex-sync [OPTIONS]
 ```
 
 Options:
@@ -142,15 +142,15 @@ Options:
 Example:
 
 ```bash
-ai-contexters memex-sync --namespace ai-contexts
+aicx memex-sync --namespace ai-contexts
 ```
 
-## `ai-contexters refs`
+## `aicx refs`
 
 List reference context files from the global store.
 
 ```bash
-ai-contexters refs [OPTIONS]
+aicx refs [OPTIONS]
 ```
 
 Options:
@@ -160,15 +160,15 @@ Options:
 Example:
 
 ```bash
-ai-contexters refs -H 72 -p CodeScribe
+aicx refs -H 72 -p CodeScribe
 ```
 
-## `ai-contexters state`
+## `aicx state`
 
 Manage dedup state.
 
 ```bash
-ai-contexters state [OPTIONS]
+aicx state [OPTIONS]
 ```
 
 Options:
@@ -179,15 +179,15 @@ Options:
 Example:
 
 ```bash
-ai-contexters state --info
+aicx state --info
 ```
 
-## `ai-contexters init`
+## `aicx init`
 
 Initialize repo context and run an agent.
 
 ```bash
-ai-contexters init [OPTIONS]
+aicx init [OPTIONS]
 ```
 
 Options:
@@ -207,7 +207,7 @@ Options:
 Example:
 
 ```bash
-ai-contexters init --agent codex --no-confirm --action "Audit memory and propose a plan"
+aicx init --agent codex --no-confirm --action "Audit memory and propose a plan"
 ```
 
 ## Exit Codes

@@ -29,7 +29,7 @@ use ai_contexters::store;
 
 /// AI Contexters - timeline and decisions from AI sessions
 #[derive(Parser)]
-#[command(name = "ai-contexters")]
+#[command(name = "aicx")]
 #[command(author = "M&K (c)2026 VetCoders")]
 #[command(version)]
 struct Cli {
@@ -243,7 +243,7 @@ enum Commands {
     /// Extract timeline from a single agent session file (direct path).
     ///
     /// Example:
-    ///   ai-contexters extract --format claude /path/to/session.jsonl -o /tmp/report.md
+    ///   aicx extract --format claude /path/to/session.jsonl -o /tmp/report.md
     Extract {
         /// Input format (agent): claude | codex | gemini
         #[arg(long, value_enum, alias = "input-format")]
@@ -340,14 +340,14 @@ enum Commands {
         info: bool,
     },
 
-    /// Generate a searchable HTML dashboard from the ai-contexters store.
+    /// Generate a searchable HTML dashboard from the aicx store.
     Dashboard {
         /// Store root directory (default: ~/.ai-contexters)
         #[arg(long)]
         store_root: Option<PathBuf>,
 
         /// Output HTML path
-        #[arg(short, long, default_value = "ai-contexters-dashboard.html")]
+        #[arg(short, long, default_value = "aicx-dashboard.html")]
         output: PathBuf,
 
         /// Document title
@@ -374,7 +374,7 @@ enum Commands {
         port: u16,
 
         /// Artifact path written on startup and each regeneration
-        #[arg(long, default_value = "ai-contexters-dashboard.html")]
+        #[arg(long, default_value = "aicx-dashboard.html")]
         artifact: PathBuf,
 
         /// Document title
@@ -1437,7 +1437,7 @@ fn run_memex_sync(namespace: &str, per_chunk: bool, db_path: Option<PathBuf>) ->
     let chunks_dir = store::chunks_dir()?;
     if !chunks_dir.exists() {
         eprintln!("No chunks directory found at: {}", chunks_dir.display());
-        eprintln!("Run `ai-contexters store --memex` first to generate chunks.");
+        eprintln!("Run `aicx store --memex` first to generate chunks.");
         return Ok(());
     }
 

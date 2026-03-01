@@ -1,6 +1,6 @@
 # Store Layout
 
-`ai-contexters` writes two kinds of artifacts:
+`aicx` writes two kinds of artifacts:
 - Central store under `~/.ai-contexters/` (cross-repo, global, machine-local).
 - Repo-local init workspace under `.ai-context/` (meant for collaboration within a repo).
 
@@ -43,11 +43,11 @@ These are meant for indexing via `rmcp-memex`:
 - batch mode: `rmcp-memex index <dir> ...`
 - per-chunk mode: `rmcp-memex upsert <chunk_id> ...`
 
-The `ai-contexters memex-sync` command wraps this behavior and maintains a minimal sync state (see `src/memex.rs`).
+The `aicx memex-sync` command wraps this behavior and maintains a minimal sync state (see `src/memex.rs`).
 
 ## Repo Init Workspace: `.ai-context/`
 
-Created by `ai-contexters init` (see `src/init.rs`).
+Created by `aicx init` (see `src/init.rs`).
 
 ```
 .ai-context/

@@ -24,7 +24,7 @@ cargo fmt
 
 ## Architecture
 
-Single-binary Rust CLI (`ai-contexters`) that extracts timeline data from AI agent session files.
+Single-binary Rust CLI (`aicx`) that extracts timeline data from AI agent session files.
 
 **Supported agents:**
 - Claude Code: `~/.claude/projects/*/*.jsonl`
@@ -44,25 +44,25 @@ Single-binary Rust CLI (`ai-contexters`) that extracts timeline data from AI age
 ## CLI Usage
 
 ```bash
-ai-contexters init                           # Interactive init (creates .ai-context and runs an agent)
-ai-contexters init --agent codex --no-confirm # Non-interactive agent selection
-ai-contexters init --no-run                  # Build context/prompt only
-ai-contexters init --no-confirm --action "Fix the login flow regressions"
+aicx init                           # Interactive init (creates .ai-context and runs an agent)
+aicx init --agent codex --no-confirm # Non-interactive agent selection
+aicx init --no-run                  # Build context/prompt only
+aicx init --no-confirm --action "Fix the login flow regressions"
 
-ai-contexters list                           # List available sessions
-ai-contexters claude -p <project> -H 48      # Extract Claude sessions (last 48h)
-ai-contexters codex -p <project> -H 48       # Extract Codex history
-ai-contexters all -p <project> -H 168        # Extract all (7 days)
+aicx list                           # List available sessions
+aicx claude -p <project> -H 48      # Extract Claude sessions (last 48h)
+aicx codex -p <project> -H 48       # Extract Codex history
+aicx all -p <project> -H 168        # Extract all (7 days)
 
 # Integration: emit one JSON payload to stdout
-ai-contexters codex -p <project> -H 48 --emit json | jq .
+aicx codex -p <project> -H 48 --emit json | jq .
 ```
 
 Flags: `-p` project filter, `-H` hours back, `-o` output dir, `-f` format (md/json/both)
 
 ## Init artifacts
 
-`ai-contexters init` creates `.ai-context/` in repo root.
+`aicx init` creates `.ai-context/` in repo root.
 
 ```
 .ai-context/

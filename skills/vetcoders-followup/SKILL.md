@@ -44,8 +44,8 @@ Do not skip sequence unless user explicitly opts out.
 
 1. Extract context memory:
 ```bash
-ai-contexters all -p <project> --incremental
-ai-contexters refs -H 168 -p <project>
+aicx all -p <project> --incremental
+aicx refs -H 168 -p <project>
 ```
 2. Map structure:
 - `repo-view(project)`

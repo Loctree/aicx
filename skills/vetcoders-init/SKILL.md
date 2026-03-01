@@ -6,7 +6,7 @@ description: >-
   "give context to agent", "prepare agent", "bootstrap agent", "daj kontekst",
   "zainicjuj", "przygotuj agenta", "init session", "start fresh with context",
   or when starting work on a repo and the agent needs situational awareness.
-  Combines ai-contexters (session history extraction) with loctree MCP
+  Combines aicx (session history extraction) with loctree MCP
   (codebase structure mapping) to equip the agent with memory and visibility
   before implementation work.
 ---
@@ -34,7 +34,7 @@ Running init is a forcing function: it prevents blind coding.
 Pull historical context from previous AI sessions for this project:
 
 ```bash
-ai-contexters all -p <project_name> --incremental
+aicx all -p <project_name> --incremental
 ```
 
 This extracts deduplicated, chunked timelines from Claude Code, Codex, and
@@ -44,10 +44,10 @@ already-processed entries.
 **If no project name is obvious**, detect from repo:
 ```bash
 PROJECT=$(basename "$(git rev-parse --show-toplevel)")
-ai-contexters all -p "$PROJECT" -H 168 --incremental
+aicx all -p "$PROJECT" -H 168 --incremental
 ```
 
-**If ai-contexters is not installed**, skip this step and note the gap.
+**If aicx is not installed**, skip this step and note the gap.
 Memory is valuable but not blocking.
 
 ### Step 2: Read Recent Context
@@ -55,7 +55,7 @@ Memory is valuable but not blocking.
 Check what memory was extracted:
 
 ```bash
-ai-contexters refs -H 168 -p <project_name>
+aicx refs -H 168 -p <project_name>
 ```
 
 Read the most recent 1-2 context files to understand:
@@ -113,29 +113,29 @@ Historical context from previous sessions is available at:
 ~/.ai-contexters/<project_name>/
 
 List available context files with:
-ai-contexters refs -p <project_name> -H 168
+aicx refs -p <project_name> -H 168
 ```
 
 ## Quick Reference
 
 | Step | Tool | What It Gives |
 |------|------|--------------|
-| Memory | `ai-contexters all -p X --incremental` | Past decisions, TODOs, signals |
-| Refs | `ai-contexters refs -H 168 -p X` | Paths to stored context chunks |
+| Memory | `aicx all -p X --incremental` | Past decisions, TODOs, signals |
+| Refs | `aicx refs -H 168 -p X` | Paths to stored context chunks |
 | Eyes | `repo-view(project)` | Current structure + health |
 | Focus | `focus(directory)` | Module-level detail |
 | Signals | `follow(scope)` | Dead code, cycles, twins |
 
 ## Fallback
 
-If **ai-contexters** unavailable: skip memory steps, proceed with loctree only.
+If **aicx** unavailable: skip memory steps, proceed with loctree only.
 If **loctree MCP** unavailable: fall back to `loct --for-ai` CLI, then `rg --files`.
 If **both** unavailable: read CLAUDE.md + README.md + recent git log. Announce gaps.
 
 ## Anti-Patterns
 
 - Starting implementation without running init (blind coding)
-- Running loctree but skipping ai-contexters (no memory of past work)
+- Running loctree but skipping aicx (no memory of past work)
 - Reading every context file (context bloat) — read only the 1-2 most recent
 - Skipping repo-view and jumping to grep (no structural map)
 

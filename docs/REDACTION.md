@@ -1,6 +1,6 @@
 # Redaction (Regex Engine)
 
-`ai-contexters` redacts secrets by default before writing anything to disk.
+`aicx` redacts secrets by default before writing anything to disk.
 The goal is pragmatic safety: avoid accidentally persisting tokens/keys in:
 - `.ai-context/` artifacts,
 - `~/.ai-contexters/` store,

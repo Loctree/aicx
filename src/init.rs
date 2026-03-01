@@ -99,7 +99,7 @@ pub fn run_init(mut options: InitOptions) -> Result<()> {
     let log_path = paths.logs.join(format!("{}.log", run_id));
     let mut log = Logger::new(&log_path)?;
 
-    log.line("== ai-contexters init ==");
+    log.line("== aicx init ==");
     log.line(&format!("root:    {}", root.display()));
     log.line(&format!("project: {}", project));
     if let Some(action) = options.action.as_deref() {
@@ -130,7 +130,7 @@ pub fn run_init(mut options: InitOptions) -> Result<()> {
     write_loct_for_ai(&root, &loct_path)?;
     log.line("");
 
-    log.line("== Step 3/4: ai-contexters context ==");
+    log.line("== Step 3/4: aicx context ==");
     extract_context(
         &paths.context,
         &project,

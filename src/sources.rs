@@ -275,7 +275,7 @@ fn parse_claude_jsonl(
 /// Extract timeline entries from a single Claude JSONL-like file by path.
 ///
 /// This is intentionally a "direct file" extractor used by:
-/// `ai-contexters extract --format claude <path> -o <out.md>`
+/// `aicx extract --format claude <path> -o <out.md>`
 ///
 /// Unlike `extract_claude()`, this does not require the file to live under
 /// `~/.claude/projects/**` nor to have a `.jsonl` extension (Claude task outputs

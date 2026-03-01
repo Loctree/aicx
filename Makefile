@@ -1,7 +1,7 @@
 .PHONY: help fmt test clippy check
 
 help:
-	@echo "ai-contexters - development commands"
+	@echo "aicx - development commands"
 	@echo ""
 	@echo "Usage: make [target]"
 	@echo ""

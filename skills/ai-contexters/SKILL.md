@@ -6,10 +6,10 @@ description: >-
   "recover session", "get timeline", "bootstrap agent context",
   "init ai-context", "sync to memex", "list sessions", "find stored contexts",
   "check dedup state", "extract from claude", "extract from codex",
-  "extract from gemini", "run ai-contexters", "get context from previous session",
+  "extract from gemini", "run aicx", "get context from previous session",
   "what was I working on", "resume previous session",
   or needs to recover plans, decisions, and work history from AI agent sessions
-  (Claude Code, Codex, Gemini CLI). Covers the full ai-contexters CLI:
+  (Claude Code, Codex, Gemini CLI). Covers the full aicx CLI:
   extraction, storage, vector sync, state management, and repo bootstrapping.
 ---
 
@@ -19,7 +19,7 @@ A Rust CLI that extracts, deduplicates, stores, and syncs timelines from
 Claude Code, Codex, and Gemini CLI sessions. Turns raw JSONL/JSON logs into
 clean, agent-readable markdown chunks with signal extraction.
 
-**Binary location**: `ai-contexters` (in PATH via cargo install)
+**Binary location**: `aicx` (in PATH via cargo install)
 **Central store**: `~/.ai-contexters/`
 **Repo workspace**: `.ai-context/` (created by `init`)
 
@@ -30,19 +30,19 @@ clean, agent-readable markdown chunks with signal extraction.
 Extract from all agents, incremental, store centrally:
 
 ```bash
-ai-contexters all -H 24 --incremental
+aicx all -H 24 --incremental
 ```
 
 Extract from specific project, last 7 days:
 
 ```bash
-ai-contexters claude -p CodeScribe -H 168 --incremental
+aicx claude -p CodeScribe -H 168 --incremental
 ```
 
 Extract and sync to vector memory:
 
 ```bash
-ai-contexters all -H 48 --incremental --memex
+aicx all -H 48 --incremental --memex
 ```
 
 ### 2. Session Recovery (before resuming work)
@@ -50,19 +50,19 @@ ai-contexters all -H 48 --incremental --memex
 Find the session file and extract a readable report:
 
 ```bash
-ai-contexters extract --format claude ~/.claude/projects/<proj>/<uuid>.jsonl -o /tmp/report.md
+aicx extract --format claude ~/.claude/projects/<proj>/<uuid>.jsonl -o /tmp/report.md
 ```
 
 For Codex sessions:
 
 ```bash
-ai-contexters extract --format codex ~/.codex/history.jsonl -o /tmp/codex.md
+aicx extract --format codex ~/.codex/history.jsonl -o /tmp/codex.md
 ```
 
 For Gemini sessions:
 
 ```bash
-ai-contexters extract --format gemini ~/.gemini/tmp/<hash>/chats/session-*.json -o /tmp/gemini.md
+aicx extract --format gemini ~/.gemini/tmp/<hash>/chats/session-*.json -o /tmp/gemini.md
 ```
 
 ### 3. Repo Bootstrap (init)
@@ -70,13 +70,13 @@ ai-contexters extract --format gemini ~/.gemini/tmp/<hash>/chats/session-*.json 
 Bootstrap `.ai-context/` workspace with full context and optionally launch agent:
 
 ```bash
-ai-contexters init --agent codex --no-confirm --action "Audit memory and propose next steps"
+aicx init --agent codex --no-confirm --action "Audit memory and propose next steps"
 ```
 
 Build context only (no agent launch):
 
 ```bash
-ai-contexters init --no-run --action "Review and refactor auth module"
+aicx init --no-run --action "Review and refactor auth module"
 ```
 
 ### 4. Reference Lookup
@@ -84,13 +84,13 @@ ai-contexters init --no-run --action "Review and refactor auth module"
 Find stored context files from last 3 days:
 
 ```bash
-ai-contexters refs -H 72
+aicx refs -H 72
 ```
 
 Filter by project:
 
 ```bash
-ai-contexters refs -H 168 -p CodeScribe
+aicx refs -H 168 -p CodeScribe
 ```
 
 ### 5. State Management
@@ -98,13 +98,13 @@ ai-contexters refs -H 168 -p CodeScribe
 Check dedup statistics:
 
 ```bash
-ai-contexters state --info
+aicx state --info
 ```
 
 Reset dedup for fresh re-extraction:
 
 ```bash
-ai-contexters state --reset -p CodeScribe
+aicx state --reset -p CodeScribe
 ```
 
 ## Command Reference (Quick)
@@ -176,8 +176,8 @@ Disable with `--no-redact-secrets` (not recommended).
 
 **Custom prompting:**
 ```bash
-ai-contexters init --agent codex --agent-prompt "Focus only on Rust modules" --action "Refactor VAD"
-ai-contexters init --agent claude --agent-prompt-file ./my-prompt.md --no-confirm
+aicx init --agent codex --agent-prompt "Focus only on Rust modules" --action "Refactor VAD"
+aicx init --agent claude --agent-prompt-file ./my-prompt.md --no-confirm
 ```
 
 **Requires**: `loct` in PATH (or `LOCT_BIN` env var).
@@ -194,24 +194,24 @@ ai-contexters init --agent claude --agent-prompt-file ./my-prompt.md --no-confir
 
 ```bash
 # Feed stored paths to another agent
-ai-contexters claude -p CodeScribe -H 24 --emit paths | xargs cat > /tmp/full-context.md
+aicx claude -p CodeScribe -H 24 --emit paths | xargs cat > /tmp/full-context.md
 
 # JSON for automation
-ai-contexters all -H 48 --emit json | jq '.store_paths[]'
+aicx all -H 48 --emit json | jq '.store_paths[]'
 ```
 
 ### Cron job (daily extraction)
 
 ```bash
 # In crontab: extract all, incremental, sync to memex
-0 9 * * * ai-contexters all -H 24 --incremental --memex 2>> ~/.ai-contexters/cron.log
+0 9 * * * aicx all -H 24 --incremental --memex 2>> ~/.ai-contexters/cron.log
 ```
 
 ### Trim large sessions
 
 ```bash
-ai-contexters extract --format claude /path/to/huge.jsonl -o /tmp/report.md --max-message-chars 8000
-ai-contexters extract --format claude /path/to/huge.jsonl -o /tmp/report.md --user-only
+aicx extract --format claude /path/to/huge.jsonl -o /tmp/report.md --max-message-chars 8000
+aicx extract --format claude /path/to/huge.jsonl -o /tmp/report.md --user-only
 ```
 
 ## Additional Resources
