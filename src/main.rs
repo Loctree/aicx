@@ -45,8 +45,16 @@ struct Cli {
     )]
     redact_secrets: bool,
 
+    /// Project filter (used if no subcommand is provided)
+    #[arg(short, long, global = true)]
+    project: Option<String>,
+
+    /// Hours to look back (used if no subcommand is provided)
+    #[arg(short = 'H', long, default_value = "48", global = true)]
+    hours: u64,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -474,7 +482,7 @@ fn main() -> Result<()> {
     let redact_secrets = cli.redact_secrets;
 
     match cli.command {
-        Commands::Claude {
+        Some(Commands::Claude {
             project,
             hours,
             output,
@@ -489,7 +497,7 @@ fn main() -> Result<()> {
             memex,
             force,
             emit,
-        } => {
+        }) => {
             let include_assistant = include_assistant_flag || !user_only;
             run_extraction(ExtractionParams {
                 agents: &["claude"],
@@ -509,7 +517,7 @@ fn main() -> Result<()> {
                 emit,
             })?;
         }
-        Commands::Codex {
+        Some(Commands::Codex {
             project,
             hours,
             output,
@@ -524,7 +532,7 @@ fn main() -> Result<()> {
             memex,
             force,
             emit,
-        } => {
+        }) => {
             let include_assistant = include_assistant_flag || !user_only;
             run_extraction(ExtractionParams {
                 agents: &["codex"],
@@ -544,7 +552,7 @@ fn main() -> Result<()> {
                 emit,
             })?;
         }
-        Commands::All {
+        Some(Commands::All {
             project,
             hours,
             output,
@@ -558,7 +566,7 @@ fn main() -> Result<()> {
             memex,
             force,
             emit,
-        } => {
+        }) => {
             let include_assistant = include_assistant_flag || !user_only;
             run_extraction(ExtractionParams {
                 agents: &["claude", "codex", "gemini"],
@@ -578,14 +586,14 @@ fn main() -> Result<()> {
                 emit,
             })?;
         }
-        Commands::Extract {
+        Some(Commands::Extract {
             format,
             input,
             output,
             user_only,
             include_assistant: include_assistant_flag,
             max_message_chars,
-        } => {
+        }) => {
             let include_assistant = include_assistant_flag || !user_only;
             run_extract_file(
                 format,
@@ -596,14 +604,14 @@ fn main() -> Result<()> {
                 redact_secrets,
             )?;
         }
-        Commands::Store {
+        Some(Commands::Store {
             project,
             agent,
             hours,
             user_only,
             include_assistant: include_assistant_flag,
             memex,
-        } => {
+        }) => {
             let include_assistant = include_assistant_flag || !user_only;
             run_store(
                 project,
@@ -614,14 +622,14 @@ fn main() -> Result<()> {
                 redact_secrets,
             )?;
         }
-        Commands::MemexSync {
+        Some(Commands::MemexSync {
             namespace,
             per_chunk,
             db_path,
-        } => {
+        }) => {
             run_memex_sync(&namespace, per_chunk, db_path)?;
         }
-        Commands::List => {
+        Some(Commands::List) => {
             let sources = sources::list_available_sources()?;
             if sources.is_empty() {
                 println!("No AI agent session sources found.");
@@ -639,7 +647,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Init {
+        Some(Commands::Init {
             project,
             agent,
             model,
@@ -653,7 +661,7 @@ fn main() -> Result<()> {
             no_run,
             no_confirm,
             no_gitignore,
-        } => {
+        }) => {
             let include_assistant = include_assistant_flag || !user_only;
             let opts = InitOptions {
                 project,
@@ -672,33 +680,33 @@ fn main() -> Result<()> {
             };
             init::run_init(opts)?;
         }
-        Commands::Refs {
+        Some(Commands::Refs {
             hours,
             project,
             summary,
             strict,
-        } => {
+        }) => {
             run_refs(hours, project, summary, strict)?;
         }
-        Commands::Rank {
+        Some(Commands::Rank {
             hours,
             project,
-        } => {
-            run_rank(hours, &project)?;
+        }) => {
+            run_rank(hours, &project, redact_secrets)?;
         }
-        Commands::State {
+        Some(Commands::State {
             reset,
             project,
             info,
-        } => {
+        }) => {
             run_state(reset, project, info)?;
         }
-        Commands::Dashboard {
+        Some(Commands::Dashboard {
             store_root,
             output,
             title,
             preview_chars,
-        } => {
+        }) => {
             run_dashboard(DashboardRunArgs {
                 store_root,
                 output,
@@ -706,14 +714,14 @@ fn main() -> Result<()> {
                 preview_chars,
             })?;
         }
-        Commands::DashboardServe {
+        Some(Commands::DashboardServe {
             store_root,
             host,
             port,
             artifact,
             title,
             preview_chars,
-        } => {
+        }) => {
             run_dashboard_server(DashboardServerRunArgs {
                 store_root,
                 host,
@@ -723,7 +731,12 @@ fn main() -> Result<()> {
                 preview_chars,
             })?;
         }
-    }
+        None => {
+            let project = cli.project.unwrap_or_else(|| sources::detect_project_name());
+            let hours = cli.hours;
+            run_rank(hours, &project, redact_secrets)?;
+        }
+        }
 
     Ok(())
 }
@@ -1371,7 +1384,26 @@ fn run_store(
     Ok(())
 }
 
-fn run_rank(hours: u64, project: &str) -> Result<()> {
+fn run_rank(hours: u64, project: &str, redact_secrets: bool) -> Result<()> {
+    // Unconditionally sync store incrementally before ranking
+    let _ = run_extraction(ExtractionParams {
+        agents: &["claude", "codex", "gemini"],
+        project: vec![project.to_string()],
+        hours,
+        output_dir: None,
+        format: "none",
+        append_to: None,
+        rotate: 0,
+        incremental: true,
+        include_assistant: true,
+        include_loctree: false,
+        project_root: None,
+        sync_memex: false,
+        force: false,
+        redact_secrets,
+        emit: StdoutEmit::None,
+    });
+
     let base = store::store_base_dir()?;
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
 
@@ -1407,13 +1439,15 @@ fn run_rank(hours: u64, project: &str) -> Result<()> {
     println!("Ranked Artifacts for {} (last {}h):", project, hours);
     println!("------------------------------------------------------------");
 
-    // Group by prefix (e.g. 160800_codex)
+    // Group by prefix (e.g. 2026-03-12/160800_codex)
     let mut bundles: std::collections::BTreeMap<String, Vec<PathBuf>> = std::collections::BTreeMap::new();
     
     for f in files {
-        let name = f.file_name().unwrap_or_default().to_string_lossy().to_string();
-        // e.g., 160800_codex-021.md -> prefix = 160800_codex
-        let prefix = name.split('-').next().unwrap_or(&name).to_string();
+        let parent_name = f.parent().and_then(|p| p.file_name()).unwrap_or_default().to_string_lossy();
+        let name = f.file_name().unwrap_or_default().to_string_lossy();
+        // e.g., 160800_codex-021.md -> file_prefix = 160800_codex
+        let file_prefix = name.split('-').next().unwrap_or(&name);
+        let prefix = format!("{}/{}", parent_name, file_prefix);
         bundles.entry(prefix).or_default().push(f);
     }
 
