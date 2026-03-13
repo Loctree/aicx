@@ -1472,7 +1472,7 @@ fn run_rank(hours: u64, project: &str) -> Result<()> {
 }
 
 fn is_noise_artifact(path: &std::path::Path) -> bool {
-    if !path.is_file() || !path.extension().is_some_and(|ext| ext == "md") {
+    if !path.is_file() || path.extension().is_none_or(|ext| ext != "md") {
         return false;
     }
     let Ok(content) = std::fs::read_to_string(path) else {
