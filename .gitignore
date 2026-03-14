@@ -19,6 +19,7 @@ agents/state/
 /.ai-context
 *.zip
 /.ai-agents
+/skills
 *.orig
 *.patch
 aicx-dashboard.html
