@@ -4,9 +4,9 @@ set -euo pipefail
 # aicx setup — install binaries + configure MCP for all AI tools
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/VetCoders/ai-contexters/main/scripts/setup.sh | bash
-#   bash scripts/setup.sh
-#   bash scripts/setup.sh --skip-install  # MCP config only
+#   curl -fsSL https://raw.githubusercontent.com/VetCoders/ai-contexters/main/install.sh | bash
+#   bash install.sh
+#   bash install.sh --skip-install  # MCP config only
 #
 # Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
@@ -15,7 +15,7 @@ for arg in "$@"; do
   case "$arg" in
     --skip-install) SKIP_INSTALL=1 ;;
     --help|-h)
-      echo "Usage: setup.sh [--skip-install]"
+      echo "Usage: install.sh [--skip-install]"
       echo "  Install aicx + aicx-mcp and configure MCP for Claude Code, Codex, and Gemini."
       exit 0
       ;;
