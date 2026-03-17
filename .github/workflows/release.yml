@@ -1,0 +1,257 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (vX.Y.Z)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  PACKAGE_NAME: ai-contexters
+
+jobs:
+  verify:
+    name: Verify release input
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      version: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          release_tag="${REF_NAME}"
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            release_tag="${INPUT_TAG}"
+          fi
+          if [[ -z "${release_tag}" ]]; then
+            echo "release tag is required" >&2
+            exit 1
+          fi
+          if [[ ! "${release_tag}" =~ ^v[0-9]+[.][0-9]+[.][0-9]+ ]]; then
+            echo "release tag must look like vX.Y.Z" >&2
+            exit 1
+          fi
+          echo "release_tag=${release_tag}" >> "${GITHUB_OUTPUT}"
+          echo "version=${release_tag#v}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check git tag exists
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+        run: git rev-parse --verify "refs/tags/${RELEASE_TAG}" >/dev/null
+
+      - name: Check Cargo.toml version matches tag
+        env:
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          import tomllib
+
+          with open("Cargo.toml", "rb") as fh:
+              cargo_version = tomllib.load(fh)["package"]["version"]
+
+          release_version = os.environ["RELEASE_VERSION"]
+          if cargo_version != release_version:
+              print(
+                  f"Cargo.toml version {cargo_version} does not match release tag v{release_version}",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+          PY
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: semgrep
+        run: |
+          python -m pip install --upgrade pip semgrep
+          semgrep --config auto --error --quiet
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-verify-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            release-verify-
+
+      - name: cargo clippy
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
+
+      - name: cargo test --bin aicx
+        run: cargo test --locked --bin aicx
+
+      - name: cargo test --bin aicx-mcp
+        run: cargo test --locked --bin aicx-mcp
+
+      - name: cargo fmt
+        run: cargo fmt -- --check
+
+      - name: cargo publish --dry-run
+        run: cargo publish --locked --dry-run
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive_ext: tar.gz
+            binary_ext: ""
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+            binary_ext: ""
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+            binary_ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+            binary_ext: .exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            release-${{ runner.os }}-${{ matrix.target }}-
+
+      - name: Install musl tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+
+      - name: Build release binaries
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin aicx --bin aicx-mcp
+
+      - name: Package release archive
+        id: package
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+          BINARY_EXT: ${{ matrix.binary_ext }}
+          PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import shutil
+          import tarfile
+          import zipfile
+
+          version = os.environ["VERSION"]
+          target = os.environ["TARGET"]
+          archive_ext = os.environ["ARCHIVE_EXT"]
+          binary_ext = os.environ["BINARY_EXT"]
+          package_name = os.environ["PACKAGE_NAME"]
+
+          release_dir = Path("target") / target / "release"
+          dist_dir = Path("dist")
+          dist_dir.mkdir(exist_ok=True)
+
+          bundle_name = f"{package_name}-v{version}-{target}"
+          bundle_dir = dist_dir / bundle_name
+          bundle_dir.mkdir()
+
+          docs_dir = bundle_dir / "docs"
+          docs_dir.mkdir()
+
+          for binary in ("aicx", "aicx-mcp"):
+              shutil.copy2(release_dir / f"{binary}{binary_ext}", bundle_dir / f"{binary}{binary_ext}")
+
+          for source in ("LICENSE", "README.md"):
+              shutil.copy2(source, bundle_dir / Path(source).name)
+
+          for source in ("docs/COMMANDS.md", "docs/RELEASES.md"):
+              shutil.copy2(source, docs_dir / Path(source).name)
+
+          archive_path = dist_dir / f"{bundle_name}.{archive_ext}"
+          if archive_ext == "tar.gz":
+              with tarfile.open(archive_path, "w:gz") as archive:
+                  archive.add(bundle_dir, arcname=bundle_name)
+          else:
+              with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                  for path in bundle_dir.rglob("*"):
+                      archive.write(path, path.relative_to(dist_dir))
+
+          digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+          checksum_path = Path(f"{archive_path}.sha256")
+          checksum_path.write_text(f"{digest}  {archive_path.name}\n", encoding="utf-8")
+
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+          with output_path.open("a", encoding="utf-8") as fh:
+              fh.write(f"archive={archive_path.as_posix()}\n")
+              fh.write(f"checksum={checksum_path.as_posix()}\n")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+
+  github-release:
+    name: Publish GitHub Release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.verify.outputs.release_tag }}
+          generate_release_notes: true
+          files: dist/*

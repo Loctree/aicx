@@ -16,7 +16,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Guard that prevents concurrent `aicx store` child-process spawns.
+/// Guard that prevents concurrent background refresh child-process spawns.
 static RESCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 
 use crate::rank;
@@ -88,6 +88,24 @@ fn default_store_hours() -> u64 {
     24
 }
 
+fn incremental_rescan_args(hours: u64, project: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "all".to_string(),
+        "-H".to_string(),
+        hours.to_string(),
+        "--incremental".to_string(),
+        "--emit".to_string(),
+        "none".to_string(),
+    ];
+
+    if let Some(project) = project {
+        args.push("-p".to_string());
+        args.push(project.to_string());
+    }
+
+    args
+}
+
 // ============================================================================
 // MCP Server
 // ============================================================================
@@ -127,8 +145,9 @@ impl AicxMcpServer {
 
         // Non-blocking auto-rescan with rate-limit guard.
         if !RESCAN_RUNNING.swap(true, Ordering::SeqCst) {
+            let args = incremental_rescan_args(24, project.as_deref());
             match std::process::Command::new("aicx")
-                .args(["store", "-H", "24", "--incremental"])
+                .args(&args)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -140,7 +159,7 @@ impl AicxMcpServer {
                     });
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to spawn aicx store rescan: {e}");
+                    tracing::warn!("Failed to spawn aicx background refresh: {e}");
                     RESCAN_RUNNING.store(false, Ordering::SeqCst);
                 }
             }
@@ -326,7 +345,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_store",
-        description = "Trigger incremental extraction from all AI agents (Claude, Codex, Gemini) and store chunks centrally. Fast — skips already-processed entries."
+        description = "Trigger a recent incremental rescan across AI agent sessions (Claude, Codex, Gemini) and store any new chunks centrally. Uses watermarks + dedup to skip already-processed history."
     )]
     async fn store_sync(
         &self,
@@ -334,35 +353,38 @@ impl AicxMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let hours = params.hours;
         let project = params.project;
-
-        let mut args = vec![
-            "store".to_string(),
-            "-H".to_string(),
-            hours.to_string(),
-            "--incremental".to_string(),
-        ];
-        if let Some(ref p) = project {
-            args.push("-p".to_string());
-            args.push(p.clone());
-        }
+        let args = incremental_rescan_args(hours, project.as_deref());
 
         let output = std::process::Command::new("aicx")
             .args(&args)
             .output()
             .map_err(|e| McpError::internal_error(format!("Failed to run aicx: {e}"), None))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let status = output
+                .status
+                .code()
+                .map_or_else(|| "signal".to_string(), |code| code.to_string());
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "Incremental rescan failed (status: {status}).\n{}\n{}",
+                stdout.trim(),
+                stderr.trim(),
+            ))]));
+        }
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "{}{}",
-            stdout.trim(),
-            if stderr.trim().is_empty() {
-                String::new()
-            } else {
-                format!("\n{}", stderr.trim())
-            },
-        ))]))
+        let scope = project
+            .as_deref()
+            .map_or_else(|| "all projects".to_string(), |p| format!("project '{p}'"));
+        let mut summary =
+            format!("Incremental rescan completed for {scope} over the last {hours}h.");
+        if !stderr.trim().is_empty() {
+            summary.push('\n');
+            summary.push_str(stderr.trim());
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(summary)]))
     }
 }
 
@@ -441,4 +463,41 @@ pub async fn run_sse(port: u16) -> anyhow::Result<()> {
     axum::serve(listener, app)
         .await
         .map_err(|e| anyhow::anyhow!("MCP HTTP server error: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::incremental_rescan_args;
+
+    #[test]
+    fn incremental_rescan_args_use_all_incremental_and_quiet_stdout() {
+        assert_eq!(
+            incremental_rescan_args(24, None),
+            vec![
+                "all".to_string(),
+                "-H".to_string(),
+                "24".to_string(),
+                "--incremental".to_string(),
+                "--emit".to_string(),
+                "none".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn incremental_rescan_args_include_project_filter() {
+        assert_eq!(
+            incremental_rescan_args(72, Some("ai-contexters")),
+            vec![
+                "all".to_string(),
+                "-H".to_string(),
+                "72".to_string(),
+                "--incremental".to_string(),
+                "--emit".to_string(),
+                "none".to_string(),
+                "-p".to_string(),
+                "ai-contexters".to_string(),
+            ]
+        );
+    }
 }

@@ -167,6 +167,30 @@ pub fn validate_dir_path(path: &Path) -> Result<PathBuf> {
     Ok(validated)
 }
 
+/// Open a file for reading only after validating the path.
+pub fn open_file_validated(path: &Path) -> Result<std::fs::File> {
+    let validated = validate_read_path(path)?;
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    std::fs::File::open(&validated)
+        .map_err(|e| anyhow!("Failed to open '{}': {}", validated.display(), e))
+}
+
+/// Read a UTF-8 text file only after validating the path.
+pub fn read_to_string_validated(path: &Path) -> Result<String> {
+    let validated = validate_read_path(path)?;
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    std::fs::read_to_string(&validated)
+        .map_err(|e| anyhow!("Failed to read '{}': {}", validated.display(), e))
+}
+
+/// Read a directory only after validating it as an allowed directory path.
+pub fn read_dir_validated(path: &Path) -> Result<std::fs::ReadDir> {
+    let validated = validate_dir_path(path)?;
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    std::fs::read_dir(&validated)
+        .map_err(|e| anyhow!("Failed to read dir '{}': {}", validated.display(), e))
+}
+
 // ============================================================================
 // Public API: input validation
 // ============================================================================
@@ -279,6 +303,53 @@ mod tests {
     fn test_validate_dir_path() {
         let tmp = std::env::temp_dir();
         assert!(validate_dir_path(&tmp).is_ok());
+    }
+
+    #[test]
+    fn test_open_file_validated() {
+        let tmp = std::env::temp_dir().join("ai-ctx-san-open-file");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let test_file = tmp.join("test.txt");
+        fs::write(&test_file, "hello").unwrap();
+
+        let mut opened = open_file_validated(&test_file).unwrap();
+        let mut content = String::new();
+        use std::io::Read as _;
+        opened.read_to_string(&mut content).unwrap();
+        assert_eq!(content, "hello");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_read_to_string_validated() {
+        let tmp = std::env::temp_dir().join("ai-ctx-san-read-string");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let test_file = tmp.join("test.txt");
+        fs::write(&test_file, "hello").unwrap();
+
+        let content = read_to_string_validated(&test_file).unwrap();
+        assert_eq!(content, "hello");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_read_dir_validated() {
+        let tmp = std::env::temp_dir().join("ai-ctx-san-read-dir");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("a.txt"), "a").unwrap();
+
+        let entries = read_dir_validated(&tmp)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .count();
+        assert_eq!(entries, 1);
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

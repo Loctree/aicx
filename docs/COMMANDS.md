@@ -1,8 +1,14 @@
 # Commands
 
-This is the exact CLI surface for `aicx` (generated from `src/main.rs` via clap).
+This is the current CLI surface for `aicx`.
 
 For the shortest “it works” path, see `README.md`.
+
+## Defaults Worth Knowing
+
+- `claude`, `codex`, `all`, and `store` write to the central store and print nothing to stdout unless you pass `--emit`.
+- `refs` prints a compact summary by default; use `--emit paths` for raw file paths.
+- `all --incremental` is the watermark-driven refresh path. `store` is store-first and non-incremental.
 
 ## Global Options
 
@@ -39,13 +45,16 @@ Common options:
 - `--project-root <DIR>` project root for loctree snapshot (defaults to cwd)
 - `--memex` also chunk + sync to memex after extraction
 - `--force` ignore dedup hashes for this run
-- `--emit <paths|json|none>` stdout mode (default: `paths`)
+- `--emit <paths|json|none>` stdout mode (default: `none`)
 
 Examples:
 
 ```bash
-# Last 24h, store-first chunks, print chunk paths to stdout
+# Last 24h, store-first chunks, keep stdout quiet
 aicx claude -p CodeScribe -H 24
+
+# Print chunk paths explicitly
+aicx claude -p CodeScribe -H 24 --emit paths
 
 # Also write a local JSON report
 aicx claude -p CodeScribe -H 24 -o ./reports -f json
@@ -76,12 +85,12 @@ Extract timeline from Codex history.
 aicx codex [OPTIONS]
 ```
 
-Same as `claude`, including assistant messages by default. Use `--user-only` if you want a user-only view.
+Same as `claude`, including `--emit <paths|json|none>` with default `none`, and assistant messages by default. Use `--user-only` if you want a user-only view.
 
 Example:
 
 ```bash
-aicx codex -p codescribe -H 48 --loctree --emit json | jq .
+aicx codex -p CodeScribe -H 48 --loctree --emit json | jq .
 ```
 
 ## `aicx all`
@@ -92,17 +101,41 @@ Extract from all supported agents (Claude + Codex + Gemini).
 aicx all [OPTIONS]
 ```
 
-Options are similar to `claude`, with one important detail:
+Options are similar to `claude`, with two important details:
 - `all` does not expose `--format` because local report writing is hardcoded to `both`.
+- `all` defaults to `--emit none`, so stdout stays quiet unless you opt in.
 
 Examples:
 
 ```bash
 # Everything, last 7 days, incremental
-aicx all -H 168 --incremental
+aicx all -H 168 --incremental --emit none
+
+# Same run, but print raw store chunk paths too
+aicx all -H 168 --incremental --emit paths
 
 # User-only mode (exclude assistant + reasoning)
 aicx all -H 48 --user-only
+```
+
+## `aicx extract`
+
+Extract timeline from a single agent session file (direct path).
+
+```bash
+aicx extract --format <claude|codex|gemini> --output <FILE> <INPUT>
+```
+
+Options:
+- `--format <FORMAT>` input format / agent
+- `-o, --output <OUTPUT>` output file path
+- `--user-only` exclude assistant + reasoning messages
+- `--max-message-chars <N>` truncate huge messages in markdown (`0` = no truncation)
+
+Example:
+
+```bash
+aicx extract --format claude /path/to/session.jsonl -o /tmp/report.md
 ```
 
 ## `aicx store`
@@ -119,11 +152,16 @@ Options:
 - `-H, --hours <HOURS>` lookback window (default: `48`)
 - `--user-only` exclude assistant + reasoning messages (default: assistant included)
 - `--memex` also chunk + sync to memex
+- `--emit <paths|json|none>` stdout mode (default: `none`)
+
+Notes:
+- `store` is store-first, not watermark-driven.
+- For incremental refreshes, use `aicx all --incremental --emit none`.
 
 Example:
 
 ```bash
-aicx store -p CodeScribe --agent claude -H 720
+aicx store -p CodeScribe --agent claude -H 720 --emit paths
 ```
 
 ## `aicx memex-sync`
@@ -156,11 +194,96 @@ aicx refs [OPTIONS]
 Options:
 - `-H, --hours <HOURS>` filter by file mtime (default: `48`)
 - `-p, --project <PROJECT>` filter by project
+- `--emit <summary|paths>` stdout mode (default: `summary`)
+- `--strict` exclude low-signal noise artifacts
 
 Example:
 
 ```bash
 aicx refs -H 72 -p CodeScribe
+```
+
+## `aicx rank`
+
+Rank and filter artifacts by content quality.
+
+```bash
+aicx rank [OPTIONS] --project <PROJECT>
+```
+
+Options:
+- `-p, --project <PROJECT>` project filter (required)
+- `-H, --hours <HOURS>` lookback window (default: `48`)
+- `--strict` only show chunks scoring >= 5
+- `--top <N>` show only top N bundles
+
+Example:
+
+```bash
+aicx rank -p CodeScribe --strict --top 10
+```
+
+## `aicx intents`
+
+Extract structured intents and decisions from stored context.
+
+```bash
+aicx intents [OPTIONS] --project <PROJECT>
+```
+
+Options:
+- `-p, --project <PROJECT>` project filter (required)
+- `-H, --hours <HOURS>` lookback window (default: `720`)
+- `--emit <markdown|json>` output format (default: `markdown`)
+- `--strict` only show high-confidence intents
+- `--kind <decision|intent|outcome|task>` filter by kind
+
+Example:
+
+```bash
+aicx intents -p CodeScribe --strict --kind decision
+```
+
+## `aicx dashboard`
+
+Generate a searchable HTML dashboard from the store.
+
+```bash
+aicx dashboard [OPTIONS]
+```
+
+Options:
+- `--store-root <DIR>` override store root
+- `-o, --output <OUTPUT>` output HTML path (default: `aicx-dashboard.html`)
+- `--title <TITLE>` document title
+- `--preview-chars <N>` max preview characters per record (`0` = no truncation)
+
+Example:
+
+```bash
+aicx dashboard -p CodeScribe -H 168 -o ./aicx-dashboard.html
+```
+
+## `aicx dashboard-serve`
+
+Run the dashboard HTTP server with on-demand regeneration endpoints.
+
+```bash
+aicx dashboard-serve [OPTIONS]
+```
+
+Options:
+- `--store-root <DIR>` override store root
+- `--host <HOST>` bind host (default: `127.0.0.1`)
+- `--port <PORT>` bind TCP port (default: `8033`)
+- `--artifact <ARTIFACT>` artifact path written on startup and regeneration
+- `--title <TITLE>` document title
+- `--preview-chars <N>` max preview characters per record
+
+Example:
+
+```bash
+aicx dashboard-serve --port 8033
 ```
 
 ## `aicx state`
@@ -180,6 +303,24 @@ Example:
 
 ```bash
 aicx state --info
+```
+
+## `aicx serve`
+
+Run `aicx` as an MCP server (stdio or streamable HTTP/SSE transport).
+
+```bash
+aicx serve [OPTIONS]
+```
+
+Options:
+- `--transport <stdio|sse>` transport (default: `stdio`)
+- `--port <PORT>` SSE/HTTP port (default: `8044`)
+
+Example:
+
+```bash
+aicx serve --transport sse --port 8044
 ```
 
 ## `aicx init`

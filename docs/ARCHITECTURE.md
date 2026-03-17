@@ -53,6 +53,7 @@ High-level sequence (see `src/main.rs::run_extraction`):
    - group by `(repo-from-cwd, agent, date)`
    - chunk per group (~1500 tokens, overlap), write `.md` chunks into `~/.ai-contexters/`
 7. Stdout emission:
+   - `--emit none` prints nothing (default for extractors and `store`)
    - `--emit paths` prints stored chunk paths, one per line
    - `--emit json` prints a single JSON payload including `store_paths`
    - `--emit none` prints nothing

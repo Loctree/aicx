@@ -391,8 +391,7 @@ pub fn extract_claude_file(path: &Path, config: &ExtractionConfig) -> Result<Vec
 /// - Codex session format (`~/.codex/sessions/**/**/*.jsonl`) — `CodexSessionEvent` per line.
 pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     let validated = sanitize::validate_read_path(path)?;
-    // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
-    let file = File::open(&validated)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let file = sanitize::open_file_validated(path)?;
     let reader = BufReader::new(file);
 
     // Detect file format from the first non-empty line.
@@ -411,7 +410,7 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
 
     // History file: parse as CodexEntry (per line).
     if serde_json::from_str::<CodexEntry>(&first_line).is_ok() {
-        let file = File::open(&validated)?; // reopen from start
+        let file = sanitize::open_file_validated(path)?;
         let reader = BufReader::new(file);
 
         // First pass: group by session_id (same behavior as extract_codex()).

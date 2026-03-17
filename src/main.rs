@@ -1544,6 +1544,7 @@ fn run_rank(
         emit: StdoutEmit::None,
     });
 
+    let project = ai_contexters::sanitize::safe_project_name(project)?;
     let base = store::store_base_dir()?;
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
 
@@ -1551,12 +1552,18 @@ fn run_rank(
     let proj_dir = base.join(project);
 
     if proj_dir.is_dir() {
-        for date_entry in std::fs::read_dir(&proj_dir)?.filter_map(|e| e.ok()) {
+        let proj_dir = ai_contexters::sanitize::validate_dir_path(&proj_dir)?;
+        for date_entry in
+            ai_contexters::sanitize::read_dir_validated(&proj_dir)?.filter_map(|e| e.ok())
+        {
             let date_path = date_entry.path();
             if !date_path.is_dir() {
                 continue;
             }
-            for file_entry in std::fs::read_dir(&date_path)?.filter_map(|e| e.ok()) {
+            let date_path = ai_contexters::sanitize::validate_dir_path(&date_path)?;
+            for file_entry in
+                ai_contexters::sanitize::read_dir_validated(&date_path)?.filter_map(|e| e.ok())
+            {
                 let fpath = file_entry.path();
                 if fpath
                     .extension()
@@ -1768,30 +1775,41 @@ fn is_noise_artifact(path: &std::path::Path) -> bool {
 
 /// List context files from the global store, filtered by recency.
 fn run_refs(hours: u64, project: Option<String>, emit: RefsEmit, strict: bool) -> Result<()> {
-    let base = store::store_base_dir()?;
+    let base = ai_contexters::sanitize::validate_dir_path(&store::store_base_dir()?)?;
 
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
 
     let mut files: Vec<PathBuf> = Vec::new();
 
     let project_dirs: Vec<_> = if let Some(ref p) = project {
-        let d = base.join(p);
-        if d.is_dir() { vec![d] } else { vec![] }
+        let safe_project = ai_contexters::sanitize::safe_project_name(p)?;
+        let d = base.join(safe_project);
+        if d.is_dir() {
+            vec![ai_contexters::sanitize::validate_dir_path(&d)?]
+        } else {
+            vec![]
+        }
     } else {
-        std::fs::read_dir(&base)?
+        ai_contexters::sanitize::read_dir_validated(&base)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| p.is_dir() && p.file_name().is_some_and(|n| n != "memex"))
+            .filter_map(|path| ai_contexters::sanitize::validate_dir_path(&path).ok())
             .collect()
     };
 
     for proj_dir in project_dirs {
-        for date_entry in std::fs::read_dir(&proj_dir)?.filter_map(|e| e.ok()) {
+        for date_entry in
+            ai_contexters::sanitize::read_dir_validated(&proj_dir)?.filter_map(|e| e.ok())
+        {
             let date_path = date_entry.path();
             if !date_path.is_dir() {
                 continue;
             }
-            for file_entry in std::fs::read_dir(&date_path)?.filter_map(|e| e.ok()) {
+            let date_path = ai_contexters::sanitize::validate_dir_path(&date_path)?;
+            for file_entry in
+                ai_contexters::sanitize::read_dir_validated(&date_path)?.filter_map(|e| e.ok())
+            {
                 let fpath = file_entry.path();
                 if fpath
                     .extension()

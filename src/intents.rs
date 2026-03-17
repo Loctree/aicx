@@ -9,13 +9,13 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::chunker::{
     INTENT_KEYWORDS, is_decision_tag, is_outcome_tag, is_result_line, normalize_key,
     parse_checklist_task, truncate_signal_line,
 };
+use crate::sanitize;
 use crate::store;
 
 const STRICT_CONFIDENCE: u8 = 3;
@@ -180,7 +180,7 @@ fn extract_intents_from_root_at(
     let mut task_events = Vec::new();
 
     for file in files {
-        let content = fs::read_to_string(&file.path)
+        let content = sanitize::read_to_string_validated(&file.path)
             .with_context(|| format!("Failed to read chunk file: {}", file.path.display()))?;
 
         let (signal_lines, transcript_entries) = parse_chunk_document(&content);
@@ -222,14 +222,18 @@ fn collect_chunk_files(
     project: &str,
     cutoff: DateTime<Utc>,
 ) -> Result<Vec<StoredChunkFile>> {
+    let project = sanitize::safe_project_name(project)?;
+    let store_root = sanitize::validate_dir_path(store_root)?;
     let project_root = store_root.join(project);
     if !project_root.is_dir() {
         return Ok(Vec::new());
     }
+    let project_root = sanitize::validate_dir_path(&project_root)?;
 
     let mut files = Vec::new();
 
-    for date_entry in fs::read_dir(&project_root)
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    for date_entry in sanitize::read_dir_validated(&project_root)
         .with_context(|| format!("Failed to read project dir: {}", project_root.display()))?
     {
         let date_entry = match date_entry {
@@ -250,7 +254,8 @@ fn collect_chunk_files(
             continue;
         };
 
-        for file_entry in fs::read_dir(&date_path)
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        for file_entry in sanitize::read_dir_validated(&date_path)
             .with_context(|| format!("Failed to read date dir: {}", date_path.display()))?
         {
             let file_entry = match file_entry {
@@ -1001,6 +1006,7 @@ fn push_unique(target: &mut Vec<String>, value: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn write_chunk(root: &Path, project: &str, date: &str, name: &str, body: &str) {
         let dir = root.join(project).join(date);

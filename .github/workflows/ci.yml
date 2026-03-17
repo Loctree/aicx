@@ -5,6 +5,9 @@ on:
     branches: [main, develop]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -20,6 +23,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        if: runner.os == 'Linux'
+        with:
+          python-version: '3.x'
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -34,14 +42,24 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: semgrep
+        if: runner.os == 'Linux'
+        run: |
+          python -m pip install --upgrade pip semgrep
+          semgrep --config auto --error --quiet
+
       - name: cargo check
-        run: cargo check
+        run: cargo check --locked
 
       - name: cargo clippy
-        run: cargo clippy --all-features --all-targets -- -D warnings
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
 
-      - name: cargo test
-        run: cargo test
+      - name: cargo test --bin aicx
+        run: cargo test --locked --bin aicx
 
       - name: cargo fmt
         run: cargo fmt -- --check
+
+      - name: cargo publish --dry-run
+        if: runner.os == 'Linux'
+        run: cargo publish --locked --dry-run

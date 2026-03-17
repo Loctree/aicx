@@ -1,14 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# aicx setup — install binaries + configure MCP for all AI tools
+# aicx setup — install binaries + configure MCP for supported AI tools
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/VetCoders/ai-contexters/main/install.sh | bash
 #   bash install.sh
 #   bash install.sh --skip-install  # MCP config only
+# Run from a local checkout when crates.io / release artifacts are not your install path yet.
 #
 # Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+MANIFEST_PATH="$SCRIPT_DIR/Cargo.toml"
+HAS_LOCAL_MANIFEST=0
+if [ -f "$MANIFEST_PATH" ]; then
+  HAS_LOCAL_MANIFEST=1
+fi
+AICX_INSTALL_MODE="${AICX_INSTALL_MODE:-auto}"
+AICX_GIT_URL="${AICX_GIT_URL:-https://github.com/VetCoders/ai-contexters}"
 
 SKIP_INSTALL=0
 for arg in "$@"; do
@@ -17,12 +26,81 @@ for arg in "$@"; do
     --help|-h)
       echo "Usage: install.sh [--skip-install]"
       echo "  Install aicx + aicx-mcp and configure MCP for Claude Code, Codex, and Gemini."
+      echo "  Run from the repo root or any local checkout that contains Cargo.toml."
+      echo ""
+      echo "Install source is controlled by AICX_INSTALL_MODE:"
+      echo "  auto  - prefer local checkout, otherwise install from git"
+      echo "  local - cargo install --path <checkout> --locked"
+      echo "  git   - cargo install --git \$AICX_GIT_URL --locked ai-contexters"
       exit 0
       ;;
   esac
 done
 
+resolve_aicx() {
+  if command -v aicx >/dev/null 2>&1; then
+    AICX_RUN=("aicx")
+    return 0
+  fi
+
+  if [ "$HAS_LOCAL_MANIFEST" -eq 1 ] && command -v cargo >/dev/null 2>&1; then
+    AICX_RUN=("cargo" "run" "--quiet" "--manifest-path" "$MANIFEST_PATH" "--bin" "aicx" "--")
+    return 0
+  fi
+
+  return 1
+}
+
+resolve_aicx_mcp() {
+  if command -v aicx-mcp >/dev/null 2>&1; then
+    AICX_MCP_COMMAND=$(command -v aicx-mcp)
+    AICX_MCP_ARGS_JSON='[]'
+    return 0
+  fi
+
+  if [ "$HAS_LOCAL_MANIFEST" -eq 1 ] && command -v cargo >/dev/null 2>&1; then
+    AICX_MCP_COMMAND="cargo"
+    AICX_MCP_ARGS_JSON=$(AICX_MANIFEST_PATH="$MANIFEST_PATH" python3 - <<'PY'
+import json
+import os
+
+print(json.dumps([
+    "run",
+    "--quiet",
+    "--manifest-path",
+    os.environ["AICX_MANIFEST_PATH"],
+    "--bin",
+    "aicx-mcp",
+    "--",
+]))
+PY
+)
+    return 0
+  fi
+
+  return 1
+}
+
 echo "=== aicx setup ==="
+
+resolve_install_mode() {
+  case "$AICX_INSTALL_MODE" in
+    auto)
+      if [ "$HAS_LOCAL_MANIFEST" -eq 1 ]; then
+        echo "local"
+      else
+        echo "git"
+      fi
+      ;;
+    local|git)
+      echo "$AICX_INSTALL_MODE"
+      ;;
+    *)
+      echo "Error: unsupported AICX_INSTALL_MODE='$AICX_INSTALL_MODE' (expected auto, local, or git)." >&2
+      exit 1
+      ;;
+  esac
+}
 
 # --- Step 1: Install binaries ---
 if [ "$SKIP_INSTALL" -eq 0 ]; then
@@ -31,27 +109,50 @@ if [ "$SKIP_INSTALL" -eq 0 ]; then
     exit 1
   fi
 
-  echo "[1/4] Installing aicx + aicx-mcp..."
-  cargo install ai-contexters 2>&1 | tail -3
-  echo "  aicx:     $(command -v aicx)"
-  echo "  aicx-mcp: $(command -v aicx-mcp)"
+  INSTALL_MODE=$(resolve_install_mode)
+  if [ "$INSTALL_MODE" = "local" ]; then
+    echo "[1/4] Installing aicx + aicx-mcp from this checkout..."
+    cargo install --path "$SCRIPT_DIR" --locked --force --bin aicx --bin aicx-mcp 2>&1 | tail -5
+  else
+    echo "[1/4] Installing aicx + aicx-mcp from git..."
+    if ! cargo install --git "$AICX_GIT_URL" --locked ai-contexters 2>&1 | tail -20; then
+      echo "Error: git install failed."
+      echo "  If the repo is private or not accessible, clone it locally and run ./install.sh from that checkout."
+      exit 1
+    fi
+  fi
 else
   echo "[1/4] Skipping install (--skip-install)"
 fi
 
 # --- Step 2: Verify ---
 echo "[2/4] Verifying..."
-if ! command -v aicx >/dev/null 2>&1; then
-  echo "Error: aicx not found in PATH after install."
-  echo "  Ensure ~/.cargo/bin is in your PATH."
+if ! resolve_aicx; then
+  echo "Error: aicx is not available."
+  if [ "$HAS_LOCAL_MANIFEST" -eq 1 ]; then
+    echo "  From this checkout, run './install.sh' or 'cargo install --path . --locked --bin aicx --bin aicx-mcp'."
+  else
+    echo "  Ensure ~/.cargo/bin is in your PATH."
+  fi
   exit 1
 fi
-echo "  aicx $(aicx --version 2>/dev/null | awk '{print $2}')"
+echo "  aicx $("${AICX_RUN[@]}" --version 2>/dev/null | awk '{print $2}')"
 
-AICX_MCP_BIN=$(command -v aicx-mcp 2>/dev/null || echo "")
-if [ -z "$AICX_MCP_BIN" ]; then
-  echo "  Warning: aicx-mcp not found. MCP server won't be available."
-  AICX_MCP_BIN="aicx-mcp"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "Error: python3 not found. install.sh uses python3 to update MCP settings."
+  exit 1
+fi
+
+AICX_MCP_COMMAND=""
+AICX_MCP_ARGS_JSON='[]'
+if resolve_aicx_mcp; then
+  if [ "$AICX_MCP_COMMAND" = "cargo" ]; then
+    echo "  aicx-mcp via cargo run (local checkout fallback)"
+  else
+    echo "  aicx-mcp $AICX_MCP_COMMAND"
+  fi
+else
+  echo "  Warning: aicx-mcp not found. MCP config will be skipped."
 fi
 
 # --- Step 3: Configure MCP ---
@@ -73,42 +174,46 @@ configure_mcp() {
     echo '{}' > "$settings_path"
   fi
 
-  # Check if aicx MCP is already configured
-  if python3 -c "
-import json, sys
-with open('$settings_path') as f:
-    d = json.load(f)
-servers = d.get('mcpServers', {})
-if 'aicx' in servers:
-    sys.exit(0)
-sys.exit(1)
-" 2>/dev/null; then
-    echo "  [$tool_name] already configured"
+  if [ -z "$AICX_MCP_COMMAND" ]; then
+    echo "  [$tool_name] skipped (aicx-mcp unavailable)"
     return
   fi
 
-  # Add aicx MCP server config
-  python3 -c "
+  update_status=$(
+    SETTINGS_PATH="$settings_path" \
+    AICX_MCP_COMMAND="$AICX_MCP_COMMAND" \
+    AICX_MCP_ARGS_JSON="$AICX_MCP_ARGS_JSON" \
+    python3 - <<'PY'
 import json
-path = '$settings_path'
-with open(path) as f:
-    d = json.load(f)
-if 'mcpServers' not in d:
-    d['mcpServers'] = {}
-d['mcpServers']['aicx'] = {
-    'command': '$AICX_MCP_BIN',
-    'args': []
-}
-with open(path, 'w') as f:
-    json.dump(d, f, indent=2)
-    f.write('\n')
-" 2>/dev/null
+import os
 
-  if [ $? -eq 0 ]; then
-    echo "  [$tool_name] configured: $settings_path"
-  else
+path = os.environ["SETTINGS_PATH"]
+desired = {
+    "command": os.environ["AICX_MCP_COMMAND"],
+    "args": json.loads(os.environ["AICX_MCP_ARGS_JSON"]),
+}
+
+with open(path) as f:
+    data = json.load(f)
+
+servers = data.setdefault("mcpServers", {})
+current = servers.get("aicx")
+
+if current == desired:
+    print("already configured")
+else:
+    servers["aicx"] = desired
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    print("configured")
+PY
+  ) || {
     echo "  [$tool_name] failed to configure (python3 error)"
-  fi
+    return
+  }
+
+  echo "  [$tool_name] ${update_status}: $settings_path"
 }
 
 # Claude Code
@@ -122,7 +227,8 @@ configure_mcp "gemini" "$HOME/.gemini/settings.json"
 
 # --- Step 4: Initial store ---
 echo "[4/4] Initial context extraction..."
-aicx store -H 168 --incremental 2>&1 | tail -5
+"${AICX_RUN[@]}" all -H 168 --incremental --emit none
+echo "  initial rescan complete"
 echo ""
 
 # --- Done ---
@@ -135,10 +241,11 @@ echo ""
 echo "MCP tools available in Claude Code / Codex / Gemini:"
 echo "  aicx_search  — fuzzy search across session history"
 echo "  aicx_rank    — quality-score stored chunks"
-echo "  aicx_refs    — list stored context files"
-echo "  aicx_store   — trigger incremental extraction"
+echo "  aicx_refs    — compact summary or raw path list of stored context files"
+echo "  aicx_store   — trigger recent incremental rescan"
 echo ""
 echo "Quick start:"
+echo "  aicx all -H 24 --incremental --emit none"
+echo "  aicx refs -H 24                    # compact summary of recent files"
+echo "  aicx refs -H 24 --emit paths       # raw stored file paths"
 echo "  aicx rank -p <project> --strict    # see quality chunks"
-echo "  aicx dashboard-serve --port 8033   # web dashboard + search API"
-echo "  aicx serve --transport sse         # MCP over HTTP for multi-agent"

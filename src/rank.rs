@@ -8,8 +8,10 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use serde::Serialize;
+use std::io;
 use std::path::Path;
 
+use crate::sanitize;
 use crate::sanitize::normalize_query;
 
 // ============================================================================
@@ -241,6 +243,7 @@ pub fn fuzzy_search_store(
     limit: usize,
     project_filter: Option<&str>,
 ) -> std::io::Result<(Vec<FuzzyResult>, usize)> {
+    let store_root = sanitize::validate_dir_path(store_root).map_err(io::Error::other)?;
     let normalized_query = normalize_query(query);
     let query_terms: Vec<&str> = normalized_query.split_whitespace().collect();
     let project_filter_lower = project_filter.map(|filter| filter.to_lowercase());
@@ -248,7 +251,10 @@ pub fn fuzzy_search_store(
     let mut results = Vec::new();
     let mut total_scanned = 0usize;
 
-    for project_entry in std::fs::read_dir(store_root)?.filter_map(|entry| entry.ok()) {
+    for project_entry in sanitize::read_dir_validated(&store_root)
+        .map_err(io::Error::other)?
+        .filter_map(|entry| entry.ok())
+    {
         let project_path = project_entry.path();
         if !project_path.is_dir() {
             continue;
@@ -263,6 +269,9 @@ pub fn fuzzy_search_store(
         if project == "memex" {
             continue;
         }
+        if sanitize::safe_project_name(&project).is_err() {
+            continue;
+        }
 
         if let Some(ref filter) = project_filter_lower
             && !project.to_lowercase().contains(filter)
@@ -270,7 +279,10 @@ pub fn fuzzy_search_store(
             continue;
         }
 
-        let Ok(date_entries) = std::fs::read_dir(&project_path) else {
+        let Ok(project_path) = sanitize::validate_dir_path(&project_path) else {
+            continue;
+        };
+        let Ok(date_entries) = sanitize::read_dir_validated(&project_path) else {
             continue;
         };
         for date_entry in date_entries.filter_map(|entry| entry.ok()) {
@@ -285,7 +297,10 @@ pub fn fuzzy_search_store(
                 .to_string_lossy()
                 .to_string();
 
-            let Ok(file_entries) = std::fs::read_dir(&date_path) else {
+            let Ok(date_path) = sanitize::validate_dir_path(&date_path) else {
+                continue;
+            };
+            let Ok(file_entries) = sanitize::read_dir_validated(&date_path) else {
                 continue;
             };
             for file_entry in file_entries.filter_map(|entry| entry.ok()) {
@@ -295,7 +310,7 @@ pub fn fuzzy_search_store(
                 }
                 total_scanned += 1;
 
-                let Ok(content) = std::fs::read_to_string(&file_path) else {
+                let Ok(content) = sanitize::read_to_string_validated(&file_path) else {
                     continue;
                 };
 

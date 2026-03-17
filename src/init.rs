@@ -927,8 +927,7 @@ fn run_claude(model: Option<&str>, prompt_path: &Path, report_path: &Path) -> Re
     }
 
     let mut report = String::new();
-    let validated_report = sanitize::validate_read_path(report_path)?;
-    File::open(&validated_report)
+    sanitize::open_file_validated(report_path)
         .with_context(|| format!("claude did not write report: {}", report_path.display()))?
         .read_to_string(&mut report)?;
 
@@ -980,9 +979,7 @@ fn run_codex(
     }
 
     let mut report = String::new();
-    let validated_report = sanitize::validate_read_path(report_path)?;
-    // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
-    File::open(&validated_report) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    sanitize::open_file_validated(report_path)
         .with_context(|| format!("codex did not write report: {}", report_path.display()))?
         .read_to_string(&mut report)?;
 

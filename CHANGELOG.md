@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-03-17
+
+### Added
+
+- Release/distribution docs now spell out the current source-first install path and the tag-driven GitHub Release lane.
+
+### Changed
+
+- Installer now prefers local checkout installs, supports a git fallback, and finishes setup with a quiet incremental refresh plus compact summary output.
+- MCP background refresh and `aicx_store` now use the real incremental rescan path (`aicx all --incremental --emit none`) instead of relying on a misleading stdout contract.
+- `docs/COMMANDS.md` has been expanded to cover the active CLI surface and current stdout defaults.
+
 ## [0.4.0] - 2026-03-16
 
 ### Added
