@@ -6,6 +6,7 @@
 agents/state/
 
 # AI Context
+/.vibecrafted
 .ai-context/*
 !.ai-context/share/
 !.ai-context/share/artifacts/
@@ -28,3 +29,4 @@ CLAUDE.md
 *.out
 /.vibecrafted
 /.claude/
+/release-bundles

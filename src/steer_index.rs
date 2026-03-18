@@ -1,3 +1,12 @@
+//! BM25 + LanceDB steer index for fast session retrieval.
+//!
+//! The steer index is a dual-layer search structure over the canonical store:
+//! a BM25 text index for keyword ranking and a LanceDB vector store for
+//! metadata-filtered recall.  Public functions delegate to the store base
+//! directory discovered at runtime, keeping callers free of path logic.
+//!
+//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rmcp_memex::{
@@ -8,6 +17,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::types::FrameKind;
 
 const STEER_NAMESPACE: &str = "steer";
 const STEER_BM25_DIR: &str = "steer_bm25";
@@ -178,13 +189,12 @@ fn build_steer_metadata(file: &Path) -> serde_json::Value {
         "path".to_string(),
         serde_json::Value::String(file.display().to_string()),
     );
-    if let Some(s) = sidecar {
-        if let Ok(val) = serde_json::to_value(s) {
-            if let Some(obj) = val.as_object() {
-                for (k, v) in obj {
-                    meta.insert(k.clone(), v.clone());
-                }
-            }
+    if let Some(s) = sidecar
+        && let Ok(val) = serde_json::to_value(s)
+        && let Some(obj) = val.as_object()
+    {
+        for (k, v) in obj {
+            meta.insert(k.clone(), v.clone());
         }
     }
 
@@ -208,6 +218,11 @@ fn build_steer_search_text(meta: &serde_json::Map<String, serde_json::Value>) ->
         &mut terms,
         "kind",
         meta.get("kind").and_then(|v| v.as_str()),
+    );
+    add_searchable_value(
+        &mut terms,
+        "frame_kind",
+        meta.get("frame_kind").and_then(|v| v.as_str()),
     );
     add_searchable_value(
         &mut terms,
@@ -394,7 +409,7 @@ async fn bootstrap_steer_index_if_missing_at(base: &Path) -> Result<bool> {
         expected_docs
     );
     let bm25_writer = BM25Index::new(&steer_bm25_config(base, false))?;
-    let _ = bm25_writer.purge_namespace(STEER_NAMESPACE).await;
+    let _ = bm25_writer.delete_namespace_term(STEER_NAMESPACE).await;
     sync_steer_bm25_at(base, &docs).await?;
 
     Ok(true)
@@ -440,11 +455,13 @@ async fn ensure_steer_index_compatible_at(base: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_candidate_query(
     run_id: Option<&str>,
     prompt_id: Option<&str>,
     agent: Option<&str>,
     kind: Option<&str>,
+    frame_kind: Option<FrameKind>,
     project: Option<&str>,
     date_lo: Option<&str>,
     date_hi: Option<&str>,
@@ -454,6 +471,7 @@ fn build_candidate_query(
     add_query_value(&mut terms, project);
     add_query_value(&mut terms, agent);
     add_query_value(&mut terms, kind);
+    add_query_value(&mut terms, frame_kind.map(FrameKind::as_str));
     add_query_value(&mut terms, run_id);
     add_query_value(&mut terms, prompt_id);
 
@@ -475,6 +493,7 @@ fn metadata_matches(
     prompt_id: Option<&str>,
     agent: Option<&str>,
     kind: Option<&str>,
+    frame_kind: Option<FrameKind>,
     project: Option<&str>,
     date_lo: Option<&str>,
     date_hi: Option<&str>,
@@ -509,6 +528,11 @@ fn metadata_matches(
         } else {
             return false;
         }
+    }
+    if let Some(expected) = frame_kind
+        && meta.get("frame_kind").and_then(|v| v.as_str()) != Some(expected.as_str())
+    {
+        return false;
     }
     if let Some(lo) = date_lo {
         if let Some(d) = meta.get("date").and_then(|v| v.as_str()) {
@@ -588,6 +612,7 @@ fn search_store_scan_at(
     prompt_id: Option<&str>,
     agent: Option<&str>,
     kind: Option<&str>,
+    frame_kind: Option<FrameKind>,
     project: Option<&str>,
     date_lo: Option<&str>,
     date_hi: Option<&str>,
@@ -599,7 +624,7 @@ fn search_store_scan_at(
     for file in files.into_iter().rev() {
         let meta = build_store_scan_metadata(&file);
         if !metadata_matches(
-            &meta, run_id, prompt_id, agent, kind, project, date_lo, date_hi,
+            &meta, run_id, prompt_id, agent, kind, frame_kind, project, date_lo, date_hi,
         ) {
             continue;
         }
@@ -620,14 +645,15 @@ async fn search_bm25_candidates_at(
     prompt_id: Option<&str>,
     agent: Option<&str>,
     kind: Option<&str>,
+    frame_kind: Option<FrameKind>,
     project: Option<&str>,
     date_lo: Option<&str>,
     date_hi: Option<&str>,
     limit: usize,
 ) -> Result<Vec<serde_json::Value>> {
-    let Some(query) =
-        build_candidate_query(run_id, prompt_id, agent, kind, project, date_lo, date_hi)
-    else {
+    let Some(query) = build_candidate_query(
+        run_id, prompt_id, agent, kind, frame_kind, project, date_lo, date_hi,
+    ) else {
         return Ok(vec![]);
     };
 
@@ -671,6 +697,7 @@ async fn search_bm25_candidates_at(
             prompt_id,
             agent,
             kind,
+            frame_kind,
             project,
             date_lo,
             date_hi,
@@ -712,9 +739,9 @@ async fn rebuild_steer_index_if_needed_at(base: &Path) -> Result<()> {
 
         let db_path = steer_db_path(base);
         let storage = StorageManager::new_lance_only(&db_path.to_string_lossy()).await?;
-        let _ = storage.purge_namespace(STEER_NAMESPACE).await;
+        let _ = storage.delete_namespace_documents(STEER_NAMESPACE).await;
         let bm25 = BM25Index::new(&steer_bm25_config(base, false))?;
-        let _ = bm25.purge_namespace(STEER_NAMESPACE).await;
+        let _ = bm25.delete_namespace_term(STEER_NAMESPACE).await;
 
         let paths: Vec<PathBuf> = all_files.into_iter().map(|f| f.path).collect();
         let path_refs: Vec<&PathBuf> = paths.iter().collect();
@@ -753,6 +780,7 @@ pub async fn search_steer_index(
     prompt_id: Option<&str>,
     agent: Option<&str>,
     kind: Option<&str>,
+    frame_kind: Option<FrameKind>,
     project: Option<&str>,
     date_lo: Option<&str>,
     date_hi: Option<&str>,
@@ -762,7 +790,7 @@ pub async fn search_steer_index(
     ensure_steer_index_compatible_at(&base).await?;
 
     let candidate_results = search_bm25_candidates_at(
-        &base, run_id, prompt_id, agent, kind, project, date_lo, date_hi, limit,
+        &base, run_id, prompt_id, agent, kind, frame_kind, project, date_lo, date_hi, limit,
     )
     .await?;
 
@@ -771,7 +799,7 @@ pub async fn search_steer_index(
     }
 
     search_store_scan_at(
-        &base, run_id, prompt_id, agent, kind, project, date_lo, date_hi, limit,
+        &base, run_id, prompt_id, agent, kind, frame_kind, project, date_lo, date_hi, limit,
     )
 }
 
@@ -816,6 +844,7 @@ mod tests {
                 kind: Kind::Reports,
                 run_id: Some("impl-055522".to_string()),
                 prompt_id: Some("20260405_045135".to_string()),
+                frame_kind: Some(FrameKind::AgentReply),
                 agent_model: Some("gpt-5".to_string()),
                 started_at: None,
                 completed_at: None,
@@ -860,6 +889,7 @@ mod tests {
             kind: Kind::Reports,
             run_id: Some(run_id.to_string()),
             prompt_id: Some(prompt_id.to_string()),
+            frame_kind: Some(FrameKind::AgentReply),
             agent_model: Some("gpt-5.4".to_string()),
             started_at: Some("2026-03-31T16:00:00Z".to_string()),
             completed_at: Some("2026-03-31T16:05:00Z".to_string()),
@@ -1016,6 +1046,7 @@ mod tests {
             None,
             Some("claude"),
             Some("reports"),
+            None,
             Some("VetCoders/vibecrafted"),
             None,
             None,

@@ -157,7 +157,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added (Governance)
 
-- LICENSE (MIT), CONTRIBUTING.md, CHANGELOG.md, SECURITY.md.
+- LICENSE (BSL 1.1), CONTRIBUTING.md, CHANGELOG.md, SECURITY.md.
 - GitHub Actions CI workflow (ubuntu + macos-14).
 - Issue templates (bug report, feature request).
 - Cargo.toml: keywords, categories, homepage, excludes.

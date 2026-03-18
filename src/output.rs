@@ -855,6 +855,7 @@ mod tests {
                 message: "Fix the build pipeline".to_string(),
                 branch: Some("feat/pipeline".to_string()),
                 cwd: Some("/home/project".to_string()),
+                frame_kind: None,
             },
             TimelineEntry {
                 timestamp: Utc.with_ymd_and_hms(2026, 1, 22, 10, 31, 0).unwrap(),
@@ -864,6 +865,7 @@ mod tests {
                 message: "decision: We should use incremental builds".to_string(),
                 branch: Some("feat/pipeline".to_string()),
                 cwd: None,
+                frame_kind: None,
             },
             TimelineEntry {
                 timestamp: Utc.with_ymd_and_hms(2026, 1, 23, 9, 0, 0).unwrap(),
@@ -873,6 +875,7 @@ mod tests {
                 message: "Show me the code structure".to_string(),
                 branch: None,
                 cwd: None,
+                frame_kind: None,
             },
         ]
     }
@@ -1076,6 +1079,7 @@ mod tests {
             message: long_message.clone(),
             branch: None,
             cwd: None,
+            frame_kind: None,
         }];
         let metadata = ReportMetadata {
             generated_at: Utc.with_ymd_and_hms(2026, 1, 23, 13, 0, 0).unwrap(),
@@ -1113,6 +1117,7 @@ mod tests {
             message: "a".repeat(200),
             branch: None,
             cwd: None,
+            frame_kind: None,
         }];
         let metadata = ReportMetadata {
             generated_at: Utc.with_ymd_and_hms(2026, 1, 23, 13, 0, 0).unwrap(),
@@ -1217,6 +1222,7 @@ mod tests {
             message: "First entry".to_string(),
             branch: None,
             cwd: None,
+            frame_kind: None,
         }];
         let metadata1 = ReportMetadata {
             generated_at: Utc.with_ymd_and_hms(2026, 1, 22, 12, 0, 0).unwrap(),
@@ -1237,6 +1243,7 @@ mod tests {
                 message: "First entry".to_string(), // duplicate
                 branch: None,
                 cwd: None,
+                frame_kind: None,
             },
             TimelineEntry {
                 timestamp: Utc.with_ymd_and_hms(2026, 1, 23, 16, 0, 0).unwrap(),
@@ -1246,6 +1253,7 @@ mod tests {
                 message: "New entry after sync".to_string(),
                 branch: None,
                 cwd: None,
+                frame_kind: None,
             },
         ];
         let metadata2 = ReportMetadata {
@@ -1289,6 +1297,7 @@ mod tests {
             message: msg.to_string(),
             branch: None,
             cwd: None,
+            frame_kind: None,
         }];
         let metadata = ReportMetadata {
             generated_at: Utc.with_ymd_and_hms(2026, 1, 23, 13, 0, 0).unwrap(),
@@ -1403,6 +1412,7 @@ mod tests {
             message: "Line one\nLine two\nLine three".to_string(),
             branch: None,
             cwd: None,
+            frame_kind: None,
         }];
         let metadata = ReportMetadata {
             generated_at: Utc.with_ymd_and_hms(2026, 1, 23, 13, 0, 0).unwrap(),

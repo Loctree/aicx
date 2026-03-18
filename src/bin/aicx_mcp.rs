@@ -5,11 +5,12 @@
 //!
 //! Usage:
 //!   aicx-mcp                          # stdio transport
-//!   aicx-mcp --transport sse          # HTTP on port 8044
-//!   aicx-mcp --transport sse --port 9000
+//!   aicx-mcp --transport http         # streamable HTTP on port 8044
+//!   aicx-mcp --transport http --port 9000
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
+use ai_contexters::mcp::{self, McpTransport};
 use std::io::Write as _;
 use std::panic;
 use std::process::ExitCode;
@@ -22,11 +23,11 @@ use clap::Parser;
 #[command(author = "M&K (c)2026 VetCoders")]
 #[command(version)]
 struct Args {
-    /// Transport: stdio (default) or sse
-    #[arg(long, default_value = "stdio", value_parser = ["stdio", "sse"])]
-    transport: String,
+    /// Transport: stdio (default) or http. Legacy alias: sse.
+    #[arg(long, value_enum, default_value_t = McpTransport::Stdio)]
+    transport: McpTransport,
 
-    /// Port for SSE/HTTP transport
+    /// Port for streamable HTTP transport
     #[arg(long, default_value = "8044")]
     port: u16,
 }
@@ -86,12 +87,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match rt.block_on(async {
-        match args.transport.as_str() {
-            "sse" => ai_contexters::mcp::run_sse(args.port).await,
-            _ => ai_contexters::mcp::run_stdio().await,
-        }
-    }) {
+    match rt.block_on(async { mcp::run_transport(args.transport, args.port).await }) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let err_str = format!("{e:?}");

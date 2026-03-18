@@ -1,14 +1,15 @@
 [package]
-name = "ai-contexters"
-version = "0.5.7"
+name = "aicx"
+
+version = "0.6.0"
 edition = "2024"
-rust-version = "1.85"
-description = "Operator CLI + MCP server: canonical corpus first, semantic materialization via memex second (Claude Code, Codex, Gemini)"
+rust-version = "1.88"
+description = "Operator CLI + MCP server: canonical corpus first, optional semantic index second (Claude Code, Codex, Gemini)"
 authors = ["Maciej Gad <void@div0.space>", "Monika Szymanska <hello@vetcoders.io>"]
-license = "MIT"
-repository = "https://github.com/VetCoders/ai-contexters"
-homepage = "https://github.com/VetCoders/ai-contexters"
-documentation = "https://docs.rs/ai-contexters"
+license = "BUSL-1.1"
+repository = "https://github.com/Loctree/aicx"
+homepage = "https://github.com/Loctree/aicx"
+documentation = "https://docs.rs/aicx"
 readme = "README.md"
 keywords = ["ai", "context", "timeline", "claude", "codex"]
 categories = ["command-line-utilities", "development-tools"]
@@ -35,7 +36,8 @@ rmcp = { version = "1.2", features = ["server", "schemars", "transport-io", "tra
 libc = "0.2.183"
 # Remote integration boundary: consume the published crate instead of any local workspace checkout
 # or path patching. ai-contexters uses the library surface from crates.io here.
-rmcp-memex = { version = "0.4.1", default-features = false }
+rmcp-memex = { version = "0.5.0", default-features = false }
+schemars = "1.2.1"
 
 [dev-dependencies]
 filetime = "0.2"

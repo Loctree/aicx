@@ -77,8 +77,8 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --locked --all-features --all-targets -- -D warnings
 
-      - name: cargo test --bin aicx
-        run: cargo test --locked --bin aicx
+      - name: cargo test
+        run: cargo test --locked --all-targets
 
       - name: cargo fmt
         run: cargo fmt -- --check

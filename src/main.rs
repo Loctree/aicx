@@ -1,26 +1,27 @@
-//! AI Contexters — the operator front door for agent session history.
+//! AI Contexters — the operator front door for agent session logs.
 //!
 //! `aicx` orchestrates a two-layer pipeline: canonical corpus first,
-//! semantic materialization second. Materialization is always explicit.
+//! optional semantic index second. Materialization is always explicit.
 //!
 //! Two-layer architecture:
 //!   1. **Canonical corpus** (`~/.aicx/`) — deduplicated, chunked, steerable markdown.
 //!      Built by extractors (`claude`, `codex`, `all`) and `store`. This is ground truth.
-//!   2. **Semantic materialization** (memex) — vector + BM25 index for embedding-aware
+//!   2. **Optional semantic index** (memex) — vector + BM25 index for semantic
 //!      retrieval by agents and MCP tools. Built by `memex-sync` or `--memex` on extractors.
-//!      Memex is the retrieval kernel; `aicx` is the orchestrator.
+//!      `aicx` owns the canonical corpus; memex is layered on top.
 //!
 //! Supported sources:
 //! - Claude Code: ~/.claude/projects/*/*.jsonl
 //! - Codex: ~/.codex/history.jsonl
 //! - Gemini: ~/.gemini/tmp/<hash>/chats/session-*.json
 //! - Gemini Antigravity: ~/.gemini/antigravity/{conversations/<uuid>.pb,brain/<uuid>/}
+//! - Junie: ~/.junie/sessions/session-*/events.jsonl
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Context, Result};
-use chrono::Utc;
-use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
+use chrono::{NaiveDate, Utc};
+use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -30,23 +31,25 @@ use std::path::{Path, PathBuf};
 use ai_contexters::dashboard::{self, DashboardConfig};
 use ai_contexters::dashboard_server::{self, DashboardServerConfig};
 use ai_contexters::intents;
+use ai_contexters::mcp::{self, McpTransport};
 use ai_contexters::memex::{self, MemexConfig, SyncProgress, SyncProgressPhase};
 use ai_contexters::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
 use ai_contexters::rank;
+use ai_contexters::reports_extractor::{self, ReportsExtractorConfig};
 use ai_contexters::sources::{self, ExtractionConfig};
 use ai_contexters::state::StateManager;
 use ai_contexters::store;
 
-/// aicx — operator front door for agent session history.
+/// aicx — operator front door for agent session logs.
 ///
 /// Two-layer pipeline, both operator-driven:
 ///   Layer 1 (canonical corpus): extract, deduplicate, and chunk agent logs
 ///     into steerable markdown at ~/.aicx/. This is ground truth.
-///   Layer 2 (semantic materialization): embed the corpus into a vector + BM25
-///     index (memex) for retrieval by agents and MCP tools. Nothing syncs
-///     automatically — you decide when to materialize.
+///   Layer 2 (optional semantic index): embed the corpus into a vector + BM25
+///     index (memex) for semantic retrieval by agents and MCP tools. Nothing
+///     syncs automatically — you decide when to materialize.
 ///
-/// aicx is the orchestrator; memex is the retrieval kernel.
+/// aicx owns the canonical corpus; memex is an optional semantic index layered on top.
 ///
 /// Quick start:
 ///   aicx all -H 4 --incremental        # build canonical corpus (layer 1)
@@ -57,28 +60,23 @@ use ai_contexters::store;
 #[command(name = "aicx")]
 #[command(author = "M&K (c)2026 VetCoders")]
 #[command(version)]
+#[command(verbatim_doc_comment)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Clone, Copy, Debug, Args)]
+struct RedactionArgs {
     /// Redact secrets (tokens/keys) from outputs before writing/syncing.
     ///
     /// Use `--no-redact-secrets` to disable (not recommended).
     #[arg(
         long = "no-redact-secrets",
         action = ArgAction::SetFalse,
-        default_value_t = true,
-        global = true
+        default_value_t = true
     )]
     redact_secrets: bool,
-
-    /// Project filter (used if no subcommand is provided)
-    #[arg(short, long, global = true)]
-    project: Option<String>,
-
-    /// Hours to look back (used if no subcommand is provided)
-    #[arg(short = 'H', long, default_value = "48", global = true)]
-    hours: u64,
-
-    #[command(subcommand)]
-    command: Option<Commands>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -105,6 +103,32 @@ enum ExtractInputFormat {
     Codex,
     Gemini,
     GeminiAntigravity,
+    Junie,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum SortOrder {
+    Newest,
+    Oldest,
+    Score,
+}
+
+#[derive(Debug, Args, Clone)]
+struct RetrievalFilters {
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
+    #[arg(long, value_enum)]
+    sort: Option<SortOrder>,
+    #[arg(long)]
+    score: Option<u8>,
+    #[arg(long)]
+    agent: Option<String>,
+    #[arg(long)]
+    since: Option<String>,
+    #[arg(long)]
+    until: Option<String>,
+    #[arg(long, value_enum)]
+    frame_kind: Option<ai_contexters::types::FrameKind>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -114,10 +138,13 @@ enum Commands {
     ///
     /// Reads ~/.claude/projects/ logs, deduplicates, chunks, and writes
     /// steerable markdown to ~/.aicx/. Add --memex to also materialize new
-    /// chunks into the memex retrieval kernel (layer 2).
+    /// chunks into the optional memex semantic index (layer 2).
     #[command(display_order = 2)]
     Claude {
-        /// Project directory filter(s): -p foo bar baz
+        #[command(flatten)]
+        redaction: RedactionArgs,
+
+        /// Source cwd/project filter(s): narrows session discovery before repo segmentation
         #[arg(short, long, num_args = 1..)]
         project: Vec<String>,
 
@@ -161,7 +188,7 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
 
-        /// After extraction, materialize new chunks into the memex retrieval kernel (layer 2).
+        /// After extraction, materialize new chunks into the optional memex semantic index (layer 2).
         /// Shortcut for running `aicx memex-sync` as a separate step.
         #[arg(long)]
         memex: bool,
@@ -183,10 +210,13 @@ enum Commands {
     ///
     /// Reads ~/.codex/history.jsonl, deduplicates, chunks, and writes
     /// steerable markdown to ~/.aicx/. Add --memex to also materialize new
-    /// chunks into the memex retrieval kernel (layer 2).
+    /// chunks into the optional memex semantic index (layer 2).
     #[command(display_order = 3)]
     Codex {
-        /// Project/repo filter(s): -p foo bar baz
+        #[command(flatten)]
+        redaction: RedactionArgs,
+
+        /// Source cwd/project filter(s): narrows session discovery before repo segmentation
         #[arg(short, long, num_args = 1..)]
         project: Vec<String>,
 
@@ -230,7 +260,7 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
 
-        /// After extraction, materialize new chunks into the memex retrieval kernel (layer 2).
+        /// After extraction, materialize new chunks into the optional memex semantic index (layer 2).
         /// Shortcut for running `aicx memex-sync` as a separate step.
         #[arg(long)]
         memex: bool,
@@ -248,15 +278,18 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract + store from all agents (Claude + Codex + Gemini) into the canonical corpus (layer 1).
+    /// Extract + store from all agents (Claude + Codex + Gemini + Junie) into the canonical corpus (layer 1).
     ///
     /// The daily-driver command: runs each extractor, deduplicates, chunks, and
     /// writes steerable markdown to ~/.aicx/. With --incremental, uses per-source
     /// watermarks to skip already-processed entries. Add --memex to also
-    /// materialize new chunks into the memex retrieval kernel (layer 2).
+    /// materialize new chunks into the optional memex semantic index (layer 2).
     #[command(display_order = 1)]
     All {
-        /// Project filter(s): -p foo bar baz
+        #[command(flatten)]
+        redaction: RedactionArgs,
+
+        /// Source cwd/project filter(s): narrows session discovery before repo segmentation
         #[arg(short, long, num_args = 1..)]
         project: Vec<String>,
 
@@ -296,7 +329,7 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
 
-        /// After extraction, materialize new chunks into the memex retrieval kernel (layer 2).
+        /// After extraction, materialize new chunks into the optional memex semantic index (layer 2).
         /// Shortcut for running `aicx memex-sync` as a separate step.
         #[arg(long)]
         memex: bool,
@@ -322,7 +355,10 @@ enum Commands {
     ///   aicx extract --format claude /path/to/session.jsonl -o /tmp/report.md
     #[command(display_order = 5)]
     Extract {
-        /// Input format (agent): claude | codex | gemini | gemini-antigravity
+        #[command(flatten)]
+        redaction: RedactionArgs,
+
+        /// Input format (agent): claude | codex | gemini | gemini-antigravity | junie
         #[arg(long, value_enum, alias = "input-format")]
         format: ExtractInputFormat,
 
@@ -362,11 +398,14 @@ enum Commands {
     /// Best for backfills and targeted re-extraction; use `all --incremental`
     /// for daily watermark-tracked refreshes.
     ///
-    /// Add --memex to also materialize new chunks into the memex retrieval
-    /// kernel (layer 2) — a shortcut for running `memex-sync` separately.
+    /// Add --memex to also materialize new chunks into the optional memex
+    /// semantic index (layer 2) — a shortcut for running `memex-sync` separately.
     #[command(display_order = 4)]
     Store {
-        /// Project name(s): -p foo bar baz
+        #[command(flatten)]
+        redaction: RedactionArgs,
+
+        /// Source cwd/project filter(s): narrows session discovery before repo segmentation
         #[arg(short, long, num_args = 1..)]
         project: Vec<String>,
 
@@ -386,7 +425,7 @@ enum Commands {
         #[arg(long, hide = true, conflicts_with = "user_only")]
         include_assistant: bool,
 
-        /// After extraction, materialize new chunks into the memex retrieval kernel (layer 2).
+        /// After extraction, materialize new chunks into the optional memex semantic index (layer 2).
         /// Shortcut for running `aicx memex-sync` as a separate step.
         #[arg(long)]
         memex: bool,
@@ -397,7 +436,7 @@ enum Commands {
     },
 
     // ── Layer 2: Semantic materialization ──────────────────────────────
-    /// Materialize the canonical corpus into the memex retrieval kernel (layer 2).
+    /// Materialize the canonical corpus into the optional memex semantic index (layer 2).
     ///
     /// Reads chunks from ~/.aicx/, embeds them, and upserts into the rmcp-memex
     /// vector + BM25 index. Materialization is always operator-driven — nothing
@@ -408,7 +447,7 @@ enum Commands {
     /// Incremental:    aicx memex-sync                (only new chunks since last sync)
     /// Full rebuild:   aicx memex-sync --reindex      (wipe index, re-embed everything)
     /// Per-chunk mode: aicx memex-sync --per-chunk    (granular library writes instead of batch store)
-    #[command(display_order = 20)]
+    #[command(display_order = 20, verbatim_doc_comment)]
     MemexSync {
         /// Namespace in the semantic index
         #[arg(short, long, default_value = "ai-contexts")]
@@ -447,7 +486,7 @@ enum Commands {
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
-        /// Project filter
+        /// Repo or store-bucket filter (case-insensitive substring)
         #[arg(short, long)]
         project: Option<String>,
 
@@ -498,22 +537,69 @@ enum Commands {
         preview_chars: usize,
     },
 
-    /// Run dashboard HTTP server with server-shell UI and on-demand data regeneration (layer 1).
+    /// Extract Vibecrafted workflow and marbles reports into a standalone HTML explorer.
+    ReportsExtractor {
+        /// Vibecrafted artifact root (default: ~/.vibecrafted/artifacts)
+        #[arg(long)]
+        artifacts_root: Option<PathBuf>,
+
+        /// Artifact organization bucket
+        #[arg(long, default_value = "VetCoders")]
+        org: String,
+
+        /// Repository bucket (defaults to the current directory name)
+        #[arg(long)]
+        repo: Option<String>,
+
+        /// Workflow filter (matches workflow label, skill code, run/prompt IDs, lane, and title)
+        #[arg(long)]
+        workflow: Option<String>,
+
+        /// Inclusive start date (YYYY-MM-DD or YYYY_MMDD)
+        #[arg(long)]
+        date_from: Option<String>,
+
+        /// Inclusive end date (YYYY-MM-DD or YYYY_MMDD)
+        #[arg(long)]
+        date_to: Option<String>,
+
+        /// Output HTML path
+        #[arg(short, long, default_value = "aicx-reports.html")]
+        output: PathBuf,
+
+        /// Optional JSON bundle output path for later import/merge
+        #[arg(long)]
+        bundle_output: Option<PathBuf>,
+
+        /// Document title
+        #[arg(long, default_value = "AI Contexters Report Explorer")]
+        title: String,
+
+        /// Max preview characters per record (0 = no truncation)
+        #[arg(long, default_value = "280")]
+        preview_chars: usize,
+    },
+
+    /// Run a local dashboard server with live search and regeneration endpoints (layer 1).
     DashboardServe {
         /// Store root directory (default: ~/.aicx)
         #[arg(long)]
         store_root: Option<PathBuf>,
 
-        /// Bind host IP address (example: 127.0.0.1)
+        /// Bind host IP address (loopback only; example: 127.0.0.1)
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
 
         /// Bind TCP port
-        #[arg(long, default_value = "8033")]
+        #[arg(long, default_value = "9478")]
         port: u16,
 
+        /// Suppress automatic browser open on startup
+        #[arg(long)]
+        no_open: bool,
+
         /// Legacy compatibility path retained for status surfaces; not written in server mode
-        #[arg(long, default_value = "aicx-dashboard.html")]
+        #[arg(long, default_value = "aicx-dashboard.html", hide = true)]
         artifact: PathBuf,
 
         /// Document title
@@ -535,6 +621,17 @@ enum Commands {
         #[arg(short = 'H', long, default_value = "720")]
         hours: u64,
 
+        #[command(flatten)]
+        filters: RetrievalFilters,
+
+        /// Return only intent entries without a matching outcome within the same session
+        #[arg(long)]
+        unresolved: bool,
+
+        /// Collapse multiple intents from the same session into one entry
+        #[arg(long)]
+        collapse_session: bool,
+
         /// Output format: markdown or json
         #[arg(long, default_value = "markdown", value_parser = ["markdown", "json"])]
         emit: String,
@@ -548,24 +645,47 @@ enum Commands {
         kind: Option<String>,
     },
 
+    /// Stream newly-arriving intents/chunks in a follow-like mode.
+    Tail {
+        /// Project filter (required)
+        #[arg(short, long)]
+        project: String,
+
+        /// Hours to look back (default: 48)
+        #[arg(short = 'H', long, default_value = "48")]
+        hours: u64,
+
+        /// Subscribe to filesystem events and stream new entries
+        #[arg(long)]
+        follow: bool,
+
+        /// Filter by kind: decision, intent, outcome, task
+        #[arg(short, long)]
+        kind: Option<String>,
+
+        #[command(flatten)]
+        filters: RetrievalFilters,
+    },
+
     /// Run aicx as an MCP server (stdio or streamable HTTP).
     ///
     /// Exposes search, steer, and rank tools over MCP for agent retrieval.
-    /// Layer 1 tools (aicx_steer, aicx_search) work immediately — they query
-    /// the canonical corpus on disk.
-    /// Layer 2 (aicx_search with embedding mode) requires a materialized memex
-    /// index — run `aicx memex-sync` first to embed the corpus.
+    /// `aicx_steer` and `aicx_rank` query the canonical corpus on disk.
+    /// `aicx_search` widens with memex semantic retrieval when a materialized
+    /// index exists, and otherwise falls back to canonical-store fuzzy search.
+    #[command(verbatim_doc_comment)]
     Serve {
-        /// Transport: stdio (default) or sse
-        #[arg(long, default_value = "stdio", value_parser = ["stdio", "sse"])]
-        transport: String,
+        /// Transport: stdio (default) or http. Legacy alias: sse.
+        #[arg(long, value_enum, default_value_t = McpTransport::Stdio)]
+        transport: McpTransport,
 
-        /// Port for SSE transport (default: 8044)
+        /// Port for streamable HTTP transport (default: 8044)
         #[arg(long, default_value = "8044")]
         port: u16,
     },
 
     #[command(
+        hide = true,
         about = "Retired compatibility shim; prints migration guidance",
         long_about = "aicx init has been retired.\n\nContext initialisation is now handled by /vc-init inside Claude Code.\nSee: https://vibecrafted.io/\n\nLegacy flags are still accepted for compatibility, but they have no effect."
     )]
@@ -626,15 +746,15 @@ enum Commands {
     /// Fuzzy search across the canonical corpus (layer 1, filesystem-only).
     ///
     /// Searches chunk content and frontmatter directly in ~/.aicx/ — works
-    /// immediately, no memex index needed. For embedding-aware semantic
-    /// retrieval, materialize the index with `memex-sync` first, then use
-    /// MCP tools via `aicx serve`.
+    /// immediately, no memex index needed. For semantic retrieval through MCP
+    /// tools, materialize the index with `memex-sync` first, then use
+    /// `aicx serve`.
     #[command(display_order = 12)]
     Search {
         /// Search query string
         query: String,
 
-        /// Project filter (org/repo substring, case-insensitive)
+        /// Repo or store-bucket filter (case-insensitive substring)
         #[arg(short, long)]
         project: Option<String>,
 
@@ -647,13 +767,8 @@ enum Commands {
         #[arg(short, long)]
         date: Option<String>,
 
-        /// Maximum results to return
-        #[arg(short, long, default_value = "10")]
-        limit: usize,
-
-        /// Minimum score threshold (0-100)
-        #[arg(short, long, value_parser = clap::value_parser!(u8).range(0..=100))]
-        score: Option<u8>,
+        #[command(flatten)]
+        filters: RetrievalFilters,
 
         /// Emit compact JSON instead of plain text
         #[arg(short = 'j', long)]
@@ -668,6 +783,7 @@ enum Commands {
     /// Example:
     ///   aicx steer --run-id mrbl-001
     ///   aicx steer --project ai-contexters --kind reports --date 2026-03-28
+    #[command(verbatim_doc_comment)]
     Steer {
         /// Filter by run_id (exact match)
         #[arg(long)]
@@ -677,15 +793,11 @@ enum Commands {
         #[arg(long)]
         prompt_id: Option<String>,
 
-        /// Filter by agent: claude, codex, gemini
-        #[arg(short, long)]
-        agent: Option<String>,
-
         /// Filter by kind: conversations, plans, reports, other
         #[arg(short, long)]
         kind: Option<String>,
 
-        /// Filter by project (case-insensitive substring)
+        /// Filter by repo or store bucket (case-insensitive substring)
         #[arg(short, long)]
         project: Option<String>,
 
@@ -694,9 +806,8 @@ enum Commands {
         #[arg(short, long)]
         date: Option<String>,
 
-        /// Maximum results
-        #[arg(short, long, default_value = "20")]
-        limit: usize,
+        #[command(flatten)]
+        filters: RetrievalFilters,
     },
 
     /// Migrate legacy ~/.ai-contexters/ data into the canonical AICX store.
@@ -724,10 +835,10 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let redact_secrets = cli.redact_secrets;
 
     match cli.command {
         Some(Commands::Claude {
+            redaction,
             project,
             hours,
             output,
@@ -759,12 +870,13 @@ fn main() -> Result<()> {
                 project_root,
                 sync_memex: memex,
                 force,
-                redact_secrets,
+                redact_secrets: redaction.redact_secrets,
                 emit,
                 conversation,
             })?;
         }
         Some(Commands::Codex {
+            redaction,
             project,
             hours,
             output,
@@ -796,12 +908,13 @@ fn main() -> Result<()> {
                 project_root,
                 sync_memex: memex,
                 force,
-                redact_secrets,
+                redact_secrets: redaction.redact_secrets,
                 emit,
                 conversation,
             })?;
         }
         Some(Commands::All {
+            redaction,
             project,
             hours,
             output,
@@ -819,7 +932,7 @@ fn main() -> Result<()> {
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
             run_extraction(ExtractionParams {
-                agents: &["claude", "codex", "gemini"],
+                agents: &["claude", "codex", "gemini", "junie"],
                 project,
                 hours,
                 output_dir: output.as_deref(),
@@ -832,12 +945,13 @@ fn main() -> Result<()> {
                 project_root,
                 sync_memex: memex,
                 force,
-                redact_secrets,
+                redact_secrets: redaction.redact_secrets,
                 emit,
                 conversation,
             })?;
         }
         Some(Commands::Extract {
+            redaction,
             format,
             project,
             input,
@@ -855,11 +969,12 @@ fn main() -> Result<()> {
                 output,
                 include_assistant,
                 max_message_chars,
-                redact_secrets,
+                redaction.redact_secrets,
                 conversation,
             )?;
         }
         Some(Commands::Store {
+            redaction,
             project,
             agent,
             hours,
@@ -876,7 +991,7 @@ fn main() -> Result<()> {
                 include_assistant,
                 memex,
                 emit,
-                redact_secrets,
+                redaction.redact_secrets,
             )?;
         }
         Some(Commands::MemexSync {
@@ -940,10 +1055,36 @@ fn main() -> Result<()> {
                 preview_chars,
             })?;
         }
+        Some(Commands::ReportsExtractor {
+            artifacts_root,
+            org,
+            repo,
+            workflow,
+            date_from,
+            date_to,
+            output,
+            bundle_output,
+            title,
+            preview_chars,
+        }) => {
+            run_reports_extractor(ReportsExtractorRunArgs {
+                artifacts_root,
+                org,
+                repo,
+                workflow,
+                date_from,
+                date_to,
+                output,
+                bundle_output,
+                title,
+                preview_chars,
+            })?;
+        }
         Some(Commands::DashboardServe {
             store_root,
             host,
             port,
+            no_open,
             artifact,
             title,
             preview_chars,
@@ -952,6 +1093,7 @@ fn main() -> Result<()> {
                 store_root,
                 host,
                 port,
+                no_open,
                 artifact,
                 title,
                 preview_chars,
@@ -960,28 +1102,43 @@ fn main() -> Result<()> {
         Some(Commands::Intents {
             project,
             hours,
+            filters,
+            unresolved,
+            collapse_session,
             emit,
             strict,
             kind,
         }) => {
-            run_intents(&project, hours, &emit, strict, kind.as_deref())?;
+            run_intents(
+                &project,
+                hours,
+                &emit,
+                strict,
+                kind.as_deref(),
+                filters,
+                unresolved,
+                collapse_session,
+            )?;
+        }
+        Some(Commands::Tail {
+            project,
+            hours,
+            follow,
+            kind,
+            filters,
+        }) => {
+            run_tail(&project, hours, follow, kind.as_deref(), filters)?;
         }
         Some(Commands::Serve { transport, port }) => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async {
-                match transport.as_str() {
-                    "sse" => ai_contexters::mcp::run_sse(port).await,
-                    _ => ai_contexters::mcp::run_stdio().await,
-                }
-            })?;
+            rt.block_on(async { mcp::run_transport(transport, port).await })?;
         }
         Some(Commands::Search {
             query,
             project,
             hours,
             date,
-            limit,
-            score,
+            filters,
             json,
         }) => {
             run_search(
@@ -989,28 +1146,25 @@ fn main() -> Result<()> {
                 project.as_deref(),
                 hours,
                 date.as_deref(),
-                limit,
-                score,
                 json,
+                filters,
             )?;
         }
         Some(Commands::Steer {
             run_id,
             prompt_id,
-            agent,
             kind,
             project,
             date,
-            limit,
+            filters,
         }) => {
             run_steer(
                 run_id.as_deref(),
                 prompt_id.as_deref(),
-                agent.as_deref(),
                 kind.as_deref(),
                 project.as_deref(),
                 date.as_deref(),
-                limit,
+                filters,
             )?;
         }
         Some(Commands::Migrate {
@@ -1028,12 +1182,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_intents(
     project: &str,
     hours: u64,
     emit: &str,
     strict: bool,
     kind: Option<&str>,
+    filters: RetrievalFilters,
+    unresolved: bool,
+    collapse_session: bool,
 ) -> Result<()> {
     let kind_filter = kind.map(|k| match k {
         "decision" => intents::IntentKind::Decision,
@@ -1048,9 +1206,84 @@ fn run_intents(
         hours,
         strict,
         kind_filter,
+        frame_kind: filters.frame_kind,
     };
 
-    let records = intents::extract_intents(&config)?;
+    let mut records = intents::extract_intents(&config)?;
+
+    if unresolved {
+        use std::collections::HashSet;
+        let mut resolved_sessions = HashSet::new();
+        for rec in &records {
+            if rec.kind == intents::IntentKind::Outcome {
+                resolved_sessions.insert(rec.session_id.clone());
+            }
+        }
+        records.retain(|r| {
+            r.kind != intents::IntentKind::Intent || !resolved_sessions.contains(&r.session_id)
+        });
+    }
+
+    if collapse_session {
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        let mut order = Vec::new();
+        for rec in records {
+            let key = rec.session_id.clone();
+            match map.entry(key.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    order.push(key);
+                    let mut clone = rec.clone();
+                    clone.count = Some(1);
+                    entry.insert(clone);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let existing = entry.get_mut();
+                    *existing.count.as_mut().unwrap() += 1;
+                    if !existing.evidence.contains(&rec.summary) {
+                        existing.evidence.push(rec.summary);
+                    }
+                    if !existing.source_chunk.contains(&rec.source_chunk) {
+                        existing.source_chunk =
+                            format!("{}, {}", existing.source_chunk, rec.source_chunk);
+                    }
+                }
+            }
+        }
+        records = order.into_iter().filter_map(|k| map.remove(&k)).collect();
+    }
+
+    if let Some(agent_filter) = &filters.agent {
+        records.retain(|r| r.agent == *agent_filter);
+    }
+
+    let (lo, hi) = if let Some(ref d) = filters.since {
+        let bounds = parse_date_filter(d)?;
+        (bounds.0, bounds.1)
+    } else {
+        (None, filters.until.clone())
+    };
+
+    if lo.is_some() || hi.is_some() {
+        records.retain(|r| {
+            lo.as_ref().is_none_or(|lo| r.date.as_str() >= lo.as_str())
+                && hi.as_ref().is_none_or(|hi| r.date.as_str() <= hi.as_str())
+        });
+    }
+
+    if let Some(sort_order) = filters.sort {
+        records.sort_by(|a, b| {
+            let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
+            let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
+            match sort_order {
+                SortOrder::Newest => t_b.cmp(t_a),
+                SortOrder::Oldest => t_a.cmp(t_b),
+                SortOrder::Score => std::cmp::Ordering::Equal, // Not supported
+            }
+        });
+    }
+
+    records.truncate(filters.limit);
 
     if records.is_empty() {
         eprintln!(
@@ -1072,6 +1305,108 @@ fn run_intents(
     }
 
     Ok(())
+}
+
+fn run_tail(
+    project: &str,
+    hours: u64,
+    follow: bool,
+    kind: Option<&str>,
+    mut filters: RetrievalFilters,
+) -> Result<()> {
+    if !follow {
+        // One-shot mode
+        if filters.limit == 10 {
+            filters.limit = 20; // default 20 for tail
+        }
+        filters.sort = Some(SortOrder::Newest);
+        return run_intents(
+            project, hours, "markdown", false, kind, filters, false, false,
+        );
+    }
+
+    let kind_filter = kind.map(|k| match k {
+        "decision" => intents::IntentKind::Decision,
+        "intent" => intents::IntentKind::Intent,
+        "outcome" => intents::IntentKind::Outcome,
+        "task" => intents::IntentKind::Task,
+        _ => unreachable!("clap validates this"),
+    });
+
+    let mut config = intents::IntentsConfig {
+        project: project.to_string(),
+        hours,
+        strict: false,
+        kind_filter,
+        frame_kind: filters.frame_kind,
+    };
+
+    let mut last_seen = std::collections::HashSet::new();
+    eprintln!("Watching for new intents in project '{}'...", project);
+
+    loop {
+        if let Ok(mut records) = intents::extract_intents(&config) {
+            // Apply filtering identical to run_intents
+            if let Some(agent_filter) = &filters.agent {
+                records.retain(|r| r.agent == *agent_filter);
+            }
+            let (lo, hi) = if let Some(ref d) = filters.since {
+                (
+                    parse_date_filter(d).ok().and_then(|b| b.0),
+                    parse_date_filter(d).ok().and_then(|b| b.1),
+                )
+            } else {
+                (None, filters.until.clone())
+            };
+            if lo.is_some() || hi.is_some() {
+                records.retain(|r| {
+                    lo.as_ref().is_none_or(|lo| r.date.as_str() >= lo.as_str())
+                        && hi.as_ref().is_none_or(|hi| r.date.as_str() <= hi.as_str())
+                });
+            }
+
+            records.sort_by(|a, b| {
+                let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
+                let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
+                t_a.cmp(t_b) // Oldest to newest for streaming
+            });
+
+            let mut new_records = Vec::new();
+            for rec in records {
+                let key = format!(
+                    "{}|{}|{}|{}",
+                    rec.source_chunk,
+                    rec.timestamp.as_deref().unwrap_or(""),
+                    rec.summary,
+                    rec.agent
+                );
+                if last_seen.insert(key) {
+                    new_records.push(rec);
+                }
+            }
+
+            if !new_records.is_empty() {
+                for rec in new_records {
+                    let mut out = String::new();
+                    out.push_str(&format!("### {} | {}\n", rec.kind.heading(), rec.agent));
+                    out.push_str(&format!("{}: {}\n", rec.kind.heading(), rec.summary));
+                    out.push_str(&format!(
+                        "WHY: {}\n",
+                        rec.context.as_deref().unwrap_or("not captured")
+                    ));
+                    out.push_str("EVIDENCE:\n");
+                    out.push_str(&format!("- source_chunk: {}\n", rec.source_chunk));
+                    for evidence in &rec.evidence {
+                        out.push_str(&format!("- {}\n", evidence));
+                    }
+                    println!("{}\n", out);
+                }
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        config.hours = 1; // shrink window after first pass
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1102,6 +1437,7 @@ fn run_extract_file(
         ExtractInputFormat::GeminiAntigravity => {
             sources::extract_gemini_antigravity_file(&input, &config)?
         }
+        ExtractInputFormat::Junie => sources::extract_junie_file(&input, &config)?,
     };
 
     // Sort by timestamp (extractors should already do this).
@@ -1188,6 +1524,81 @@ fn run_extract_file(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StoreScopeSurface {
+    requested_source_filters: Option<Vec<String>>,
+    resolved_repositories: Vec<String>,
+    includes_non_repository_contexts: bool,
+    resolved_store_buckets: BTreeMap<String, BTreeMap<String, usize>>,
+}
+
+impl StoreScopeSurface {
+    fn empty(requested_filters: &[String]) -> Self {
+        Self {
+            requested_source_filters: normalized_requested_source_filters(requested_filters),
+            resolved_repositories: Vec::new(),
+            includes_non_repository_contexts: false,
+            resolved_store_buckets: BTreeMap::new(),
+        }
+    }
+
+    fn from_store_summary(
+        requested_filters: &[String],
+        store_summary: &store::StoreWriteSummary,
+    ) -> Self {
+        Self {
+            requested_source_filters: normalized_requested_source_filters(requested_filters),
+            resolved_repositories: store_summary
+                .project_summary
+                .keys()
+                .filter(|bucket| bucket.as_str() != store::NON_REPOSITORY_CONTEXTS)
+                .cloned()
+                .collect(),
+            includes_non_repository_contexts: store_summary
+                .project_summary
+                .contains_key(store::NON_REPOSITORY_CONTEXTS),
+            resolved_store_buckets: store_summary.project_summary.clone(),
+        }
+    }
+
+    fn repository_buckets(&self) -> BTreeMap<String, BTreeMap<String, usize>> {
+        self.resolved_store_buckets
+            .iter()
+            .filter(|(bucket, _)| bucket.as_str() != store::NON_REPOSITORY_CONTEXTS)
+            .map(|(bucket, counts)| (bucket.clone(), counts.clone()))
+            .collect()
+    }
+}
+
+fn normalized_requested_source_filters(requested_filters: &[String]) -> Option<Vec<String>> {
+    if requested_filters.is_empty() {
+        None
+    } else {
+        Some(requested_filters.to_vec())
+    }
+}
+
+fn render_requested_source_filters(requested_filters: &[String]) -> String {
+    if requested_filters.is_empty() {
+        "(all sources)".to_string()
+    } else {
+        requested_filters.join(", ")
+    }
+}
+
+fn render_resolved_store_buckets(scope: &StoreScopeSurface) -> String {
+    if scope.resolved_store_buckets.is_empty() {
+        "(none written)".to_string()
+    } else {
+        scope
+            .resolved_store_buckets
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 struct ExtractionParams<'a> {
@@ -1291,7 +1702,7 @@ fn sync_memex_if_requested(sync_memex: bool, all_written_paths: &[PathBuf]) -> R
         // the dedicated `memex-sync` command so sync state and observability do
         // not drift between code paths.
         let result = sync_memex_paths(&memex_config, all_written_paths)
-            .context("Failed to materialize canonical chunks into memex retrieval kernel")?;
+            .context("Failed to materialize canonical chunks into memex semantic index")?;
         eprintln!(
             "  Memex: {} materialized, {} skipped, {} ignored",
             result.chunks_materialized, result.chunks_skipped, result.chunks_ignored
@@ -1355,6 +1766,10 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         include_assistant,
         watermark,
     };
+    eprintln!(
+        "  Requested source filters: {}",
+        render_requested_source_filters(&project)
+    );
 
     // Extract from requested sources
     let mut entries = Vec::new();
@@ -1364,6 +1779,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             "claude" => sources::extract_claude(&config)?,
             "codex" => sources::extract_codex(&config)?,
             "gemini" => sources::extract_gemini(&config)?,
+            "junie" => sources::extract_junie(&config)?,
             _ => Vec::new(),
         };
 
@@ -1450,16 +1866,20 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
 
     let chunker_config = ai_contexters::chunker::ChunkerConfig::default();
     let mut all_written_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut scope_surface = StoreScopeSurface::empty(&project);
 
     if !output_entries.is_empty() {
         let store_summary = store::store_semantic_segments(&output_entries, &chunker_config)?;
+        scope_surface = StoreScopeSurface::from_store_summary(&project, &store_summary);
         let newly_written_paths = store_summary.written_paths.clone();
         all_written_paths.extend(newly_written_paths.iter().cloned());
 
         // Update fast local metadata index
         if let Ok(rt) = tokio::runtime::Runtime::new() {
             let path_refs: Vec<&PathBuf> = newly_written_paths.iter().collect();
-            let _ = rt.block_on(ai_contexters::steer_index::sync_steer_index(&path_refs));
+            if let Err(e) = rt.block_on(ai_contexters::steer_index::sync_steer_index(&path_refs)) {
+                eprintln!("⚠ steer index sync failed (search may be stale): {e}");
+            }
         }
 
         // Summary to stderr (diagnostics)
@@ -1476,6 +1896,10 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                 .collect();
             eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
         }
+        eprintln!(
+            "  Resolved store buckets: {}",
+            render_resolved_store_buckets(&scope_surface)
+        );
 
         sync_memex_if_requested(sync_memex, &newly_written_paths)?;
     }
@@ -1502,6 +1926,8 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                     hours_back: u64,
                     total_messages: usize,
                     sessions: &'a [String],
+                    #[serde(flatten)]
+                    scope: &'a StoreScopeSurface,
                     messages: Vec<sources::ConversationMessage>,
                     store_paths: Vec<String>,
                 }
@@ -1513,6 +1939,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                     hours_back: metadata.hours_back,
                     total_messages: conv_msgs.len(),
                     sessions: &metadata.sessions,
+                    scope: &scope_surface,
                     messages: conv_msgs,
                     store_paths,
                 };
@@ -1525,6 +1952,8 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                     hours_back: u64,
                     total_entries: usize,
                     sessions: &'a [String],
+                    #[serde(flatten)]
+                    scope: &'a StoreScopeSurface,
                     entries: &'a [output::TimelineEntry],
                     store_paths: Vec<String>,
                 }
@@ -1535,6 +1964,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                     hours_back: metadata.hours_back,
                     total_entries: metadata.total_entries,
                     sessions: &metadata.sessions,
+                    scope: &scope_surface,
                     entries: &output_entries,
                     store_paths,
                 };
@@ -1655,7 +2085,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Store extracted contexts in the canonical corpus and optionally materialize into the memex retrieval kernel.
+/// Store extracted contexts in the canonical corpus and optionally materialize into the memex semantic index.
 fn run_store(
     project: Vec<String>,
     agent: Option<String>,
@@ -1671,7 +2101,8 @@ fn run_store(
         Some("claude") => vec!["claude"],
         Some("codex") => vec!["codex"],
         Some("gemini") => vec!["gemini"],
-        _ => vec!["claude", "codex", "gemini"],
+        Some("junie") => vec!["junie"],
+        _ => vec!["claude", "codex", "gemini", "junie"],
     };
 
     let config = ExtractionConfig {
@@ -1680,6 +2111,10 @@ fn run_store(
         include_assistant,
         watermark: None,
     };
+    eprintln!(
+        "  Requested source filters: {}",
+        render_requested_source_filters(&project)
+    );
 
     let mut all_entries = Vec::new();
     for &ag in &agents {
@@ -1687,6 +2122,7 @@ fn run_store(
             "claude" => sources::extract_claude(&config)?,
             "codex" => sources::extract_codex(&config)?,
             "gemini" => sources::extract_gemini(&config)?,
+            "junie" => sources::extract_junie(&config)?,
             _ => Vec::new(),
         };
         eprintln!("  [{}] {} entries", ag, agent_entries.len());
@@ -1739,11 +2175,14 @@ fn run_store(
     let store_summary = store_result?;
     let stored_count = store_summary.total_entries;
     let all_written_paths = store_summary.written_paths.clone();
+    let scope_surface = StoreScopeSurface::from_store_summary(&project, &store_summary);
 
     // Update fast local metadata index
     if let Ok(rt) = tokio::runtime::Runtime::new() {
         let path_refs: Vec<&PathBuf> = all_written_paths.iter().collect();
-        let _ = rt.block_on(ai_contexters::steer_index::sync_steer_index(&path_refs));
+        if let Err(e) = rt.block_on(ai_contexters::steer_index::sync_steer_index(&path_refs)) {
+            eprintln!("⚠ steer index sync failed (search may be stale): {e}");
+        }
     }
 
     eprintln!(
@@ -1759,6 +2198,10 @@ fn run_store(
             .collect();
         eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
     }
+    eprintln!(
+        "  Resolved store buckets: {}",
+        render_resolved_store_buckets(&scope_surface)
+    );
 
     sync_memex_if_requested(sync_memex, &all_written_paths)?;
 
@@ -1778,8 +2221,12 @@ fn run_store(
                 serde_json::to_string_pretty(&serde_json::json!({
                     "total_entries": stored_count,
                     "total_chunks": all_written_paths.len(),
+                    "requested_source_filters": scope_surface.requested_source_filters,
+                    "resolved_repositories": scope_surface.resolved_repositories,
+                    "includes_non_repository_contexts": scope_surface.includes_non_repository_contexts,
+                    "resolved_store_buckets": scope_surface.resolved_store_buckets,
+                    "repos": scope_surface.repository_buckets(),
                     "store_paths": store_paths,
-                    "repos": store_summary.project_summary,
                 }))?
             );
         }
@@ -1861,34 +2308,32 @@ fn extract_date_from_query(query: &str) -> (String, Option<String>) {
 
     // Pattern 1: "<month> <year>" e.g. "january 2026"
     for i in 0..words.len().saturating_sub(1) {
-        if let Some(m) = month_number(&lower[i]) {
-            if let Ok(y) = lower[i + 1].parse::<u32>() {
-                if (2020..=2099).contains(&y) {
-                    let days = days_in_month(y, m);
-                    let lo = format!("{y:04}-{m:02}-01");
-                    let hi = format!("{y:04}-{m:02}-{days:02}");
-                    date_filter = Some(format!("{lo}..{hi}"));
-                    used[i] = true;
-                    used[i + 1] = true;
-                }
-            }
+        if let Some(m) = month_number(&lower[i])
+            && let Ok(y) = lower[i + 1].parse::<u32>()
+            && (2020..=2099).contains(&y)
+        {
+            let days = days_in_month(y, m);
+            let lo = format!("{y:04}-{m:02}-01");
+            let hi = format!("{y:04}-{m:02}-{days:02}");
+            date_filter = Some(format!("{lo}..{hi}"));
+            used[i] = true;
+            used[i + 1] = true;
         }
     }
 
     // Pattern 2: "<year> <month>" e.g. "2026 january"
     if date_filter.is_none() {
         for i in 0..words.len().saturating_sub(1) {
-            if let Ok(y) = lower[i].parse::<u32>() {
-                if (2020..=2099).contains(&y) {
-                    if let Some(m) = month_number(&lower[i + 1]) {
-                        let days = days_in_month(y, m);
-                        let lo = format!("{y:04}-{m:02}-01");
-                        let hi = format!("{y:04}-{m:02}-{days:02}");
-                        date_filter = Some(format!("{lo}..{hi}"));
-                        used[i] = true;
-                        used[i + 1] = true;
-                    }
-                }
+            if let Ok(y) = lower[i].parse::<u32>()
+                && (2020..=2099).contains(&y)
+                && let Some(m) = month_number(&lower[i + 1])
+            {
+                let days = days_in_month(y, m);
+                let lo = format!("{y:04}-{m:02}-01");
+                let hi = format!("{y:04}-{m:02}-{days:02}");
+                date_filter = Some(format!("{lo}..{hi}"));
+                used[i] = true;
+                used[i + 1] = true;
             }
         }
     }
@@ -1937,7 +2382,7 @@ fn days_in_month(year: u32, month: u32) -> u32 {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
         2 => {
-            if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+            if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) {
                 29
             } else {
                 28
@@ -1974,9 +2419,8 @@ fn run_search(
     project: Option<&str>,
     hours: u64,
     date: Option<&str>,
-    limit: usize,
-    score: Option<u8>,
     json: bool,
+    filters: RetrievalFilters,
 ) -> Result<()> {
     // Extract inline date hints from query if no explicit --date given
     let (effective_query, inline_date) = if date.is_none() {
@@ -1996,10 +2440,15 @@ fn run_search(
 
     let root = store::store_base_dir()?;
     // Fetch more results pre-filter so score/date/hours filtering has material to work with.
-    let fetch_limit = if effective_date.is_some() || score.is_some() || hours > 0 {
-        limit.saturating_mul(5).max(50)
+    let fetch_limit = if effective_date.is_some()
+        || filters.score.is_some()
+        || hours > 0
+        || filters.since.is_some()
+        || filters.until.is_some()
+    {
+        filters.limit.saturating_mul(5).max(50)
     } else {
-        limit
+        filters.limit
     };
 
     // Try fast search with rmcp_memex first (instant), fallback to brute-force if it fails or returns nothing
@@ -2008,24 +2457,46 @@ fn run_search(
             &search_query,
             fetch_limit,
             project,
+            filters.frame_kind,
         )) {
             Ok((res, scan)) if !res.is_empty() => (res, scan),
             Err(err) if memex::is_compatibility_error(&err) => return Err(err),
-            _ => rank::fuzzy_search_store(&root, &search_query, fetch_limit, project)?,
+            _ => rank::fuzzy_search_store(
+                &root,
+                &search_query,
+                fetch_limit,
+                project,
+                filters.frame_kind,
+            )?,
         }
     } else {
-        rank::fuzzy_search_store(&root, &search_query, fetch_limit, project)?
+        rank::fuzzy_search_store(
+            &root,
+            &search_query,
+            fetch_limit,
+            project,
+            filters.frame_kind,
+        )?
     };
 
     let mut results = results;
 
-    if let Some(min_score) = score {
+    if let Some(min_score) = filters.score {
         results.retain(|r| r.score >= min_score);
+    }
+    if let Some(agent_filter) = &filters.agent {
+        results.retain(|r| r.agent == *agent_filter);
     }
 
     // Apply date filter (day granularity) — takes priority over hours.
-    let results: Vec<_> = if let Some(ref d) = effective_date {
-        let (lo, hi) = parse_date_filter(d)?;
+    let (lo, hi) = if let Some(ref d) = effective_date {
+        let bounds = parse_date_filter(d)?;
+        (bounds.0, bounds.1)
+    } else {
+        (filters.since.clone(), filters.until.clone())
+    };
+
+    let mut results: Vec<_> = if lo.is_some() || hi.is_some() {
         results
             .into_iter()
             .filter(|r| {
@@ -2043,8 +2514,24 @@ fn run_search(
     } else {
         results
     };
+
+    if let Some(sort_order) = filters.sort {
+        results.sort_by(|a, b| {
+            let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
+            let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
+            match sort_order {
+                SortOrder::Newest => t_b.cmp(t_a),
+                SortOrder::Oldest => t_a.cmp(t_b),
+                SortOrder::Score => b.score.cmp(&a.score).then(t_b.cmp(t_a)),
+            }
+        });
+    } else {
+        // default sort
+        results.sort_by(|a, b| b.score.cmp(&a.score));
+    }
+
     // Truncate to requested limit after date filtering
-    let results: Vec<_> = results.into_iter().take(limit).collect();
+    let results: Vec<_> = results.into_iter().take(filters.limit).collect();
 
     if json {
         println!("{}", rank::render_search_json(&results, scanned)?);
@@ -2076,31 +2563,52 @@ fn run_search(
 fn run_steer(
     run_id: Option<&str>,
     prompt_id: Option<&str>,
-    agent: Option<&str>,
     kind: Option<&str>,
     project: Option<&str>,
     date: Option<&str>,
-    limit: usize,
+    filters: RetrievalFilters,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
-    let (date_lo, date_hi) = if let Some(d) = date {
+    let effective_date = date;
+    let (date_lo, date_hi) = if let Some(d) = effective_date {
         let bounds = parse_date_filter(d)?;
         (bounds.0, bounds.1)
     } else {
-        (None, None)
+        (filters.since.clone(), filters.until.clone())
     };
 
-    let metadatas = rt.block_on(ai_contexters::steer_index::search_steer_index(
+    let mut metadatas = rt.block_on(ai_contexters::steer_index::search_steer_index(
         run_id,
         prompt_id,
-        agent,
+        filters.agent.as_deref(),
         kind,
+        filters.frame_kind,
         project,
         date_lo.as_deref(),
         date_hi.as_deref(),
-        limit,
+        filters.limit,
     ))?;
+
+    if let Some(sort_order) = filters.sort {
+        metadatas.sort_by(|a, b| {
+            let t_a = a
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .or_else(|| a.get("date").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            let t_b = b
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .or_else(|| b.get("date").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            match sort_order {
+                SortOrder::Newest => t_b.cmp(t_a),
+                SortOrder::Oldest => t_a.cmp(t_b),
+                SortOrder::Score => std::cmp::Ordering::Equal, // steer_index has no score natively, ignore
+            }
+        });
+    }
 
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
@@ -2410,17 +2918,18 @@ fn run_memex_sync(
     Ok(())
 }
 
-/// Run the dashboard server shell against the canonical store.
+/// Run the local dashboard server against the canonical store.
 struct DashboardServerRunArgs {
     store_root: Option<PathBuf>,
     host: String,
     port: u16,
+    no_open: bool,
     artifact: PathBuf,
     title: String,
     preview_chars: usize,
 }
 
-/// Run dashboard server mode with server-shell HTML and API-backed regeneration.
+/// Run dashboard server mode with lightweight HTML shell and API-backed regeneration.
 fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
     let root = if let Some(path) = args.store_root {
         path
@@ -2449,6 +2958,18 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
         host,
         port: args.port,
     };
+
+    if !args.no_open {
+        let url = format!("http://{}:{}", host, args.port);
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg(&url).spawn();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+        }
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -2515,6 +3036,141 @@ fn run_dashboard(args: DashboardRunArgs) -> Result<()> {
 
     println!("{}", output_path.display());
     Ok(())
+}
+
+/// Build a standalone HTML explorer for Vibecrafted report artifacts.
+struct ReportsExtractorRunArgs {
+    artifacts_root: Option<PathBuf>,
+    org: String,
+    repo: Option<String>,
+    workflow: Option<String>,
+    date_from: Option<String>,
+    date_to: Option<String>,
+    output: PathBuf,
+    bundle_output: Option<PathBuf>,
+    title: String,
+    preview_chars: usize,
+}
+
+fn run_reports_extractor(args: ReportsExtractorRunArgs) -> Result<()> {
+    let artifacts_root = if let Some(path) = args.artifacts_root {
+        path
+    } else {
+        default_vibecrafted_artifacts_root()?
+    };
+    let repo = if let Some(repo) = args.repo {
+        repo
+    } else {
+        infer_repo_name_from_cwd()?
+    };
+    let date_from = parse_cli_date(args.date_from.as_deref(), "--date-from")?;
+    let date_to = parse_cli_date(args.date_to.as_deref(), "--date-to")?;
+    let bundle_output = args
+        .bundle_output
+        .clone()
+        .unwrap_or_else(|| default_reports_bundle_path(&args.output));
+    let config = ReportsExtractorConfig {
+        artifacts_root: artifacts_root.clone(),
+        org: args.org,
+        repo: repo.clone(),
+        date_from,
+        date_to,
+        workflow: args.workflow,
+        title: args.title,
+        preview_chars: args.preview_chars,
+    };
+
+    let artifact = reports_extractor::build_reports_explorer(&config)?;
+    write_text_output(&args.output, &artifact.html, "report explorer HTML")?;
+    write_text_output(
+        &bundle_output,
+        &artifact.bundle_json,
+        "report explorer JSON bundle",
+    )?;
+
+    eprintln!("✓ Vibecrafted reports extracted");
+    eprintln!("  Repo: {}/{}", config.org, repo);
+    eprintln!("  Artifacts: {}", artifacts_root.display());
+    eprintln!("  HTML: {}", args.output.display());
+    eprintln!("  Bundle: {}", bundle_output.display());
+    eprintln!(
+        "  Stats: {} records, {} completed, {} incomplete, {} workflows",
+        artifact.stats.total_records,
+        artifact.stats.completed_records,
+        artifact.stats.incomplete_records,
+        artifact.stats.total_workflows
+    );
+    println!("{}", args.output.display());
+    Ok(())
+}
+
+fn default_vibecrafted_artifacts_root() -> Result<PathBuf> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    Ok(home.join(".vibecrafted").join("artifacts"))
+}
+
+fn default_reports_bundle_path(output: &Path) -> PathBuf {
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let stem = output
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("aicx-reports");
+    parent.join(format!("{stem}.bundle.json"))
+}
+
+fn infer_repo_name_from_cwd() -> Result<String> {
+    let cwd = std::env::current_dir().context("Cannot determine current directory")?;
+    let mut probe = cwd.as_path();
+    loop {
+        if probe.join(".git").exists() {
+            let repo = probe
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Could not infer --repo from git root"))?;
+            return Ok(repo.to_string());
+        }
+        let Some(parent) = probe.parent() else {
+            break;
+        };
+        probe = parent;
+    }
+
+    let repo = cwd
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Could not infer --repo from the current directory"))?;
+    Ok(repo.to_string())
+}
+
+fn parse_cli_date(value: Option<&str>, flag_name: &str) -> Result<Option<NaiveDate>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let formats = ["%Y-%m-%d", "%Y_%m%d"];
+    for format in formats {
+        if let Ok(date) = NaiveDate::parse_from_str(value, format) {
+            return Ok(Some(date));
+        }
+    }
+    Err(anyhow::anyhow!(
+        "Invalid {} value '{}'. Use YYYY-MM-DD or YYYY_MMDD.",
+        flag_name,
+        value
+    ))
+}
+
+fn write_text_output(path: &Path, content: &str, label: &str) -> Result<()> {
+    let mut validated = ai_contexters::sanitize::validate_write_path(path)?;
+    if let Some(parent) = validated.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create output directory: {}", parent.display()))?;
+    }
+    validated = ai_contexters::sanitize::validate_write_path(&validated)?;
+    fs::write(&validated, content)
+        .with_context(|| format!("Failed to write {}: {}", label, validated.display()))
 }
 
 #[cfg(test)]
@@ -2678,11 +3334,66 @@ mod tests {
             .expect("search command with score/json should parse");
 
         match cli.command {
-            Some(Commands::Search { score, json, .. }) => {
-                assert_eq!(score, Some(60));
+            Some(Commands::Search { filters, json, .. }) => {
+                assert_eq!(filters.score, Some(60));
                 assert!(json);
             }
             _ => panic!("expected search command"),
+        }
+    }
+
+    #[test]
+    fn search_accepts_frame_kind_filter() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "search",
+            "dashboard",
+            "--frame-kind",
+            "internal_thought",
+        ])
+        .expect("search command with frame-kind should parse");
+
+        match cli.command {
+            Some(Commands::Search { filters, .. }) => {
+                assert_eq!(
+                    filters.frame_kind,
+                    Some(ai_contexters::types::FrameKind::InternalThought)
+                );
+            }
+            _ => panic!("expected search command"),
+        }
+    }
+
+    #[test]
+    fn steer_accepts_frame_kind_filter() {
+        let cli = Cli::try_parse_from(["aicx", "steer", "--frame-kind", "user_msg"])
+            .expect("steer command with frame-kind should parse");
+
+        match cli.command {
+            Some(Commands::Steer { filters, .. }) => {
+                assert_eq!(filters.frame_kind, Some(ai_contexters::types::FrameKind::UserMsg));
+            }
+            _ => panic!("expected steer command"),
+        }
+    }
+
+    #[test]
+    fn intents_accepts_frame_kind_filter() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "intents",
+            "--project",
+            "ai-contexters",
+            "--frame-kind",
+            "tool_call",
+        ])
+        .expect("intents command with frame-kind should parse");
+
+        match cli.command {
+            Some(Commands::Intents { filters, .. }) => {
+                assert_eq!(filters.frame_kind, Some(ai_contexters::types::FrameKind::ToolCall));
+            }
+            _ => panic!("expected intents command"),
         }
     }
 
@@ -2696,13 +3407,32 @@ mod tests {
     }
 
     #[test]
-    fn top_level_help_marks_init_as_retired() {
+    fn top_level_help_hides_retired_init_from_primary_surface() {
         let mut cmd = Cli::command();
         let rendered = cmd.render_help().to_string();
 
-        assert!(rendered.contains("init"));
-        assert!(rendered.contains("Retired compatibility shim"));
+        assert!(!rendered.contains("\n  init "));
+        assert!(!rendered.contains("Retired compatibility shim"));
         assert!(!rendered.contains("Initialize repo context and run an agent"));
+    }
+
+    #[test]
+    fn top_level_help_does_not_advertise_dead_root_flags() {
+        let mut cmd = Cli::command();
+        let rendered = cmd.render_long_help().to_string();
+
+        assert!(!rendered.contains("used if no subcommand is provided"));
+        assert!(!rendered.contains("Project filter (used if no subcommand is provided)"));
+        assert!(!rendered.contains("Hours to look back (used if no subcommand is provided)"));
+    }
+
+    #[test]
+    fn top_level_help_uses_semantic_index_language() {
+        let mut cmd = Cli::command();
+        let rendered = cmd.render_long_help().to_string();
+
+        assert!(rendered.contains("Layer 2 (optional semantic index)"));
+        assert!(!rendered.contains("retrieval kernel"));
     }
 
     #[test]
@@ -2722,6 +3452,131 @@ mod tests {
     }
 
     #[test]
+    fn serve_accepts_http_and_legacy_sse_transport_names() {
+        let http = Cli::try_parse_from(["aicx", "serve", "--transport", "http"])
+            .expect("http transport should parse");
+        let legacy = Cli::try_parse_from(["aicx", "serve", "--transport", "sse"])
+            .expect("legacy sse alias should parse");
+
+        match http.command {
+            Some(Commands::Serve { transport, .. }) => {
+                assert_eq!(transport, McpTransport::Http);
+            }
+            _ => panic!("expected serve command for http transport"),
+        }
+
+        match legacy.command {
+            Some(Commands::Serve { transport, .. }) => {
+                assert_eq!(transport, McpTransport::Http);
+            }
+            _ => panic!("expected serve command for legacy sse transport"),
+        }
+    }
+
+    #[test]
+    fn serve_help_prefers_http_name_and_explains_search_fallback() {
+        let mut cmd = Cli::command();
+        let serve = cmd
+            .find_subcommand_mut("serve")
+            .expect("serve subcommand should exist");
+        let rendered = serve.render_long_help().to_string();
+
+        assert!(rendered.contains("Transport: stdio (default) or http."));
+        assert!(!rendered.contains("Transport: stdio (default) or sse"));
+        assert!(rendered.contains("falls back to canonical-store fuzzy search"));
+        assert!(!rendered.contains("embedding mode"));
+    }
+
+    #[test]
+    fn search_help_explains_semantic_path_without_embedding_jargon() {
+        let mut cmd = Cli::command();
+        let search = cmd
+            .find_subcommand_mut("search")
+            .expect("search subcommand should exist");
+        let rendered = search.render_long_help().to_string();
+
+        assert!(rendered.contains("semantic retrieval through MCP tools"));
+        assert!(!rendered.contains("embedding-aware"));
+    }
+
+    #[test]
+    fn steer_help_keeps_examples_split() {
+        let mut cmd = Cli::command();
+        let steer = cmd
+            .find_subcommand_mut("steer")
+            .expect("steer subcommand should exist");
+        let rendered = steer.render_long_help().to_string();
+
+        assert!(rendered.contains("aicx steer --run-id mrbl-001"));
+        assert!(
+            rendered
+                .contains("aicx steer --project ai-contexters --kind reports --date 2026-03-28")
+        );
+        assert!(!rendered.contains("mrbl-001 aicx steer"));
+        assert!(!rendered.contains("--no-redact-secrets"));
+        assert!(!rendered.contains("--hours <HOURS>"));
+    }
+
+    #[test]
+    fn dashboard_serve_help_hides_legacy_artifact_flag() {
+        let mut cmd = Cli::command();
+        let dashboard_serve = cmd
+            .find_subcommand_mut("dashboard-serve")
+            .expect("dashboard-serve subcommand should exist");
+        let rendered = dashboard_serve.render_long_help().to_string();
+
+        assert!(!rendered.contains("--artifact"));
+        assert!(rendered.contains("Run a local dashboard server"));
+    }
+
+    #[test]
+    fn reports_extractor_help_describes_embedded_html_and_bundle() {
+        let mut cmd = Cli::command();
+        let reports = cmd
+            .find_subcommand_mut("reports-extractor")
+            .expect("reports-extractor subcommand should exist");
+        let rendered = reports.render_long_help().to_string();
+
+        assert!(rendered.contains("standalone HTML explorer"));
+        assert!(rendered.contains("~/.vibecrafted/artifacts"));
+        assert!(rendered.contains("--bundle-output"));
+        assert!(rendered.contains("--date-from"));
+        assert!(rendered.contains("--date-to"));
+        assert!(!rendered.contains("canonical store"));
+    }
+
+    #[test]
+    fn root_only_shortcuts_without_subcommand_are_rejected() {
+        let err = Cli::try_parse_from(["aicx", "-H", "24"])
+            .expect_err("root-only shortcut mode should not parse");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("unexpected argument '-H'"));
+    }
+
+    #[test]
+    fn non_corpus_commands_reject_redaction_flags() {
+        let err = Cli::try_parse_from(["aicx", "search", "dashboard", "--no-redact-secrets"])
+            .expect_err("search should not accept corpus-building-only redaction flags");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("--no-redact-secrets"));
+    }
+
+    #[test]
+    fn corpus_builders_accept_redaction_flags() {
+        let cli = Cli::try_parse_from(["aicx", "claude", "--no-redact-secrets"])
+            .expect("claude should accept corpus-building redaction flags");
+
+        match cli.command {
+            Some(Commands::Claude { redaction, .. }) => {
+                assert!(!redaction.redact_secrets);
+            }
+            _ => panic!("expected claude command"),
+        }
+    }
+
+    #[test]
     fn extract_accepts_gemini_antigravity_format() {
         let cli = Cli::try_parse_from([
             "aicx",
@@ -2737,6 +3592,27 @@ mod tests {
         match cli.command {
             Some(Commands::Extract { format, .. }) => {
                 assert!(matches!(format, ExtractInputFormat::GeminiAntigravity));
+            }
+            _ => panic!("expected extract command"),
+        }
+    }
+
+    #[test]
+    fn extract_accepts_junie_format() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "extract",
+            "--format",
+            "junie",
+            "/tmp/session/events.jsonl",
+            "-o",
+            "/tmp/report.md",
+        ])
+        .expect("extract command with junie should parse");
+
+        match cli.command {
+            Some(Commands::Extract { format, .. }) => {
+                assert!(matches!(format, ExtractInputFormat::Junie));
             }
             _ => panic!("expected extract command"),
         }

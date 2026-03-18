@@ -1,7 +1,7 @@
-//! Memex integration — the retrieval kernel behind `aicx memex-sync` and `--memex`.
+//! Memex integration — the optional semantic index behind `aicx memex-sync` and `--memex`.
 //!
 //! This module is the boundary between the aicx orchestrator and the published
-//! `rmcp-memex` 0.4.1 library. Live ai-contexters flows stay inside that
+//! `rmcp-memex` 0.5.0 library. Live ai-contexters flows stay inside that
 //! library boundary:
 //!
 //! - Config discovery, embedding resolution, and content hashing
@@ -1062,6 +1062,11 @@ fn chunk_metadata_for_memex(chunk_path: &Path, chunk_id: &str, text: &str) -> se
         insert_optional_string(&mut metadata, "skill_code", sidecar.skill_code);
         insert_optional_string(
             &mut metadata,
+            "frame_kind",
+            sidecar.frame_kind.map(|kind| kind.to_string()),
+        );
+        insert_optional_string(
+            &mut metadata,
             "framework_version",
             sidecar.framework_version,
         );
@@ -1290,6 +1295,7 @@ pub async fn fast_memex_search(
     query: &str,
     limit: usize,
     project_filter: Option<&str>,
+    frame_kind_filter: Option<crate::types::FrameKind>,
 ) -> Result<(Vec<FuzzyResult>, usize)> {
     let truth = validate_semantic_index_compatibility(DEFAULT_MEMEX_NAMESPACE, None).await?;
     let config = BM25Config::default()
@@ -1320,11 +1326,21 @@ pub async fn fast_memex_search(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let doc_frame_kind = doc
+                .metadata
+                .get("frame_kind")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
 
-            if let Some(ref pf) = project_lower {
-                if !doc_project.to_lowercase().contains(pf) {
-                    continue;
-                }
+            if let Some(ref pf) = project_lower
+                && !doc_project.to_lowercase().contains(pf)
+            {
+                continue;
+            }
+            if let Some(expected) = frame_kind_filter
+                && doc_frame_kind.as_deref() != Some(expected.as_str())
+            {
+                continue;
             }
 
             let kind = doc
@@ -1378,6 +1394,18 @@ pub async fn fast_memex_search(
             // BM25 score usually > 0. The higher the better.
             let final_score = ((chunk_score.score as f32 * 5.0 + score * 10.0) as u8).min(100);
 
+            let timestamp = doc
+                .metadata
+                .get("started_at")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or_else(|| {
+                    doc.metadata
+                        .get("timestamp")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                });
+
             results.push(FuzzyResult {
                 file: format!("{}.md", id),
                 path: doc
@@ -1388,8 +1416,10 @@ pub async fn fast_memex_search(
                     .to_string(),
                 project: doc_project,
                 kind,
+                frame_kind: doc_frame_kind,
                 agent,
                 date,
+                timestamp,
                 score: final_score,
                 label: if final_score >= 80 {
                     "HIGH".to_string()
@@ -1873,6 +1903,7 @@ model = "qwen3-embedding:4b"
                 kind: crate::store::Kind::Conversations,
                 run_id: Some("mrbl-001".to_string()),
                 prompt_id: Some("api-redesign_20260327".to_string()),
+                frame_kind: Some(crate::types::FrameKind::AgentReply),
                 agent_model: Some("gpt-5.4".to_string()),
                 started_at: Some("2026-03-27T10:00:00Z".to_string()),
                 completed_at: Some("2026-03-27T10:01:00Z".to_string()),

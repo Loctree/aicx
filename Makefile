@@ -3,7 +3,7 @@
 
 .PHONY: all build install install-bin install-config install-cargo git-hooks
 .PHONY: precheck test check fmt fmt-check clippy semgrep ci clean help manifest-check
-.PHONY: version-show version-check release-plan release-check release-tag release-push package-check
+.PHONY: version-show version-check version-bump changelog-close release-plan release-prepare release-check release-tag release-push release-publish package-check
 
 all: build
 
@@ -100,18 +100,57 @@ version-check:
 assert "## [Unreleased]" in changelog or (_ for _ in ()).throw(SystemExit("CHANGELOG.md is missing '\''## [Unreleased]'\''")); \
 print(f"Current version {version} already has a dedicated changelog section." if f"## [{version}]" in changelog or f"## [v{version}]" in changelog else f"Cargo.toml version {version} present; CHANGELOG has Unreleased section.")'
 
+version-bump:
+ifeq ($(origin VERSION),command line)
+	@python3 tools/version_bump.py "$(VERSION)"
+	@echo ""
+	@echo "Note: Cargo.lock is intentionally not touched by version-bump."
+	@echo "To sync the lockfile for this package only (no network):"
+	@echo "  cargo update --package ai-contexters --offline"
+	@echo "Or rely on 'make release-prepare' to sync it for you."
+else
+	@echo "VERSION is required. Usage: make version-bump VERSION={patch|minor|major|x.y.z}" >&2 && exit 1
+endif
+
+changelog-close:
+	@python3 tools/changelog_close.py
+
 release-plan:
 	@echo "AICX release flow"
 	@echo ""
 	@echo "1. Ensure branch is merged and green."
-	@echo "2. Run: make release-check"
-	@echo "3. Create annotated tag: make release-tag"
-	@echo "4. Push tag: make release-push"
-	@echo "5. GitHub Actions release workflow builds and publishes archives."
+	@echo "2. Prepare the release bundle:"
+	@echo "     make release-prepare VERSION={patch|minor|major|x.y.z}"
+	@echo "   (runs version-bump + changelog-close + precheck)"
+	@echo "3. Review diff, commit Cargo.toml + Cargo.lock + CHANGELOG.md."
+	@echo "4. Run: make release-check"
+	@echo "5. Create annotated tag: make release-tag"
+	@echo "6. Push tag: make release-push"
+	@echo "7. Publish to crates.io: make release-publish (dry run)"
+	@echo "                         make release-publish CONFIRM=1 (actual push)"
+	@echo "8. GitHub Actions release workflow builds and publishes archives."
 	@echo ""
 	@echo "Reference docs:"
 	@echo "  - docs/RELEASES.md"
 	@echo "  - docs/COMMANDS.md"
+
+release-prepare:
+ifeq ($(origin VERSION),command line)
+	@$(MAKE) version-bump VERSION=$(VERSION)
+	@$(MAKE) changelog-close
+	@cargo update --package ai-contexters --offline
+	@$(MAKE) precheck
+else
+	@echo "VERSION is required. Usage: make release-prepare VERSION={patch|minor|major|x.y.z}" >&2 && exit 1
+endif
+	@echo ""
+	@echo "=== Release prepared ==="
+	@echo "Next: review diff, commit, then:"
+	@echo "  make release-check"
+	@echo "  make release-tag"
+	@echo "  make release-push"
+	@echo "  make release-publish        # dry-run"
+	@echo "  make release-publish CONFIRM=1  # actual push to crates.io"
 
 release-check: version-check
 	@echo "[extra] Verifying release package..."
@@ -129,6 +168,14 @@ release-tag:
 
 release-push:
 	git push origin "$(TAG)"
+
+release-publish:
+	@if [ "$(CONFIRM)" != "1" ]; then \
+		echo "Dry run. To actually publish to crates.io, run: make release-publish CONFIRM=1"; \
+		cargo publish --locked --dry-run; \
+	else \
+		cargo publish --locked; \
+	fi
 
 package-check:
 	cargo package --locked
@@ -154,13 +201,17 @@ help:
 	@echo "  make clean           - Clean build artifacts"
 	@echo ""
 	@echo "Release / Version:"
-	@echo "  make version-show    - Show package version and tag state"
-	@echo "  make version-check   - Validate Cargo.toml + CHANGELOG release readiness basics"
-	@echo "  make release-plan    - Print the post-merge release flow"
-	@echo "  make release-check   - Strict release readiness gate"
-	@echo "  make release-tag     - Create annotated tag from Cargo.toml version"
-	@echo "  make release-push    - Push the current release tag to origin"
-	@echo "  make package-check   - Run cargo package --locked"
+	@echo "  make version-show          - Show package version and tag state"
+	@echo "  make version-check         - Validate Cargo.toml + CHANGELOG release readiness basics"
+	@echo "  make version-bump VERSION=X - Bump Cargo.toml version. X={patch|minor|major|x.y.z}"
+	@echo "  make changelog-close       - Close CHANGELOG '## [Unreleased]' to current version + date"
+	@echo "  make release-plan          - Print the full post-merge release flow"
+	@echo "  make release-prepare VERSION=X - version-bump + changelog-close + precheck. X={patch|minor|major|x.y.z}"
+	@echo "  make release-check         - Strict release readiness gate"
+	@echo "  make release-tag           - Create annotated tag from Cargo.toml version"
+	@echo "  make release-push          - Push the current release tag to origin"
+	@echo "  make release-publish       - cargo publish to crates.io (dry-run; CONFIRM=1 to actually push)"
+	@echo "  make package-check         - Run cargo package --locked"
 	@echo ""
 	@echo "Quick start:"
 	@echo "  make install         - Contributor/local operator setup"

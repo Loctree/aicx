@@ -1,12 +1,13 @@
 //! MCP (Model Context Protocol) server for aicx.
 //!
-//! Exposes aicx functionality as MCP tools so any AI agent can query
-//! search chunks, rank artifacts, and retrieve steer metadata.
+//! Exposes aicx functionality as MCP tools so agents can search canonical
+//! chunks, rank artifacts, and retrieve steer metadata.
 //!
-//! Supports stdio and SSE transports.
+//! Supports stdio and streamable HTTP transports.
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
+use clap::ValueEnum;
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::{
     ErrorData as McpError, handler::server::tool::ToolRouter, handler::server::wrapper::Parameters,
@@ -20,10 +21,18 @@ static RESCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 
 use crate::rank;
 use crate::store;
+use crate::types::FrameKind;
 
 // ============================================================================
 // Tool parameter & result types
 // ============================================================================
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum McpTransport {
+    Stdio,
+    #[value(alias = "sse")]
+    Http,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchParams {
@@ -38,8 +47,18 @@ pub struct SearchParams {
     pub score: Option<u8>,
     /// Hours to look back (0 = all time)
     pub hours: Option<u64>,
+    /// Optional agent filter
+    pub agent: Option<String>,
     /// Optional date filter (single day or range)
     pub date: Option<String>,
+    /// Optional lower date bound or single-day shorthand
+    pub since: Option<String>,
+    /// Optional upper date bound
+    pub until: Option<String>,
+    /// Optional sort order: newest, oldest, score
+    pub sort: Option<String>,
+    /// Optional frame/channel filter: user_msg, agent_reply, internal_thought, tool_call
+    pub frame_kind: Option<FrameKind>,
 }
 
 fn default_limit() -> usize {
@@ -58,6 +77,14 @@ pub struct RankParams {
     /// Only show chunks scoring >= 5
     #[serde(default)]
     pub strict: bool,
+    /// Optional agent filter
+    pub agent: Option<String>,
+    /// Optional lower date bound or single-day shorthand
+    pub since: Option<String>,
+    /// Optional upper date bound
+    pub until: Option<String>,
+    /// Optional sort order: newest, oldest, score
+    pub sort: Option<String>,
     /// Show only top N bundles
     pub top: Option<usize>,
 }
@@ -76,6 +103,8 @@ pub struct SteerParams {
     pub agent: Option<String>,
     /// Filter by kind: conversations, plans, reports, other
     pub kind: Option<String>,
+    /// Filter by frame/channel: user_msg, agent_reply, internal_thought, tool_call
+    pub frame_kind: Option<FrameKind>,
     /// Filter by project (case-insensitive substring)
     pub project: Option<String>,
     /// Filter by date (YYYY-MM-DD, or range like 2026-03-20..2026-03-28)
@@ -83,6 +112,14 @@ pub struct SteerParams {
     /// Max results (default: 20)
     #[serde(default = "default_steer_limit")]
     pub limit: usize,
+    /// Minimum score threshold (0-100)
+    pub score: Option<u8>,
+    /// Sort order (newest, oldest, score)
+    pub sort: Option<String>,
+    /// Date boundary
+    pub since: Option<String>,
+    /// Date boundary
+    pub until: Option<String>,
 }
 
 fn default_steer_limit() -> usize {
@@ -103,6 +140,7 @@ struct RankItem {
     file: String,
     project: String,
     date: String,
+    timestamp: Option<String>,
     kind: String,
     agent: String,
     score: u8,
@@ -162,7 +200,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_search",
-        description = "Fuzzy search across stored AI session chunks. Returns quality-scored results with matched lines. Supports Polish diacritics normalization and optional project filtering."
+        description = "Search stored AI session chunks. Uses memex semantic retrieval when available and otherwise falls back to canonical-store fuzzy search. Returns quality-scored results with matched lines."
     )]
     async fn search(
         &self,
@@ -174,6 +212,7 @@ impl AicxMcpServer {
         let score = validate_score_filter(params.score)?;
         let hours = params.hours.unwrap_or(0);
         let date = params.date;
+        let frame_kind = params.frame_kind;
         let fetch_limit = if score.is_some() || date.is_some() || hours > 0 {
             limit.saturating_mul(5).max(50)
         } else {
@@ -203,32 +242,53 @@ impl AicxMcpServer {
         }
 
         // Try fast search with rmcp_memex first (instant), fallback to brute-force if it fails
-        let (results, scanned) =
-            match crate::memex::fast_memex_search(&query, fetch_limit, project.as_deref()).await {
-                Ok((res, scan)) if !res.is_empty() => (res, scan),
-                Err(err) if crate::memex::is_compatibility_error(&err) => {
-                    return Err(McpError::internal_error(
-                        format!("Search index incompatible: {err}"),
-                        None,
-                    ));
-                }
-                _ => {
-                    // Fallback to reading all markdown files sequentially (slow)
-                    let store_root = store::store_base_dir()
-                        .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
-                    rank::fuzzy_search_store(&store_root, &query, fetch_limit, project.as_deref())
-                        .map_err(|e| McpError::internal_error(format!("Read store: {e}"), None))?
-                }
-            };
+        let (results, scanned) = match crate::memex::fast_memex_search(
+            &query,
+            fetch_limit,
+            project.as_deref(),
+            frame_kind,
+        )
+        .await
+        {
+            Ok((res, scan)) if !res.is_empty() => (res, scan),
+            Err(err) if crate::memex::is_compatibility_error(&err) => {
+                return Err(McpError::internal_error(
+                    format!("Search index incompatible: {err}"),
+                    None,
+                ));
+            }
+            _ => {
+                // Fallback to reading all markdown files sequentially (slow)
+                let store_root = store::store_base_dir()
+                    .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+                rank::fuzzy_search_store(
+                    &store_root,
+                    &query,
+                    fetch_limit,
+                    project.as_deref(),
+                    frame_kind,
+                )
+                .map_err(|e| McpError::internal_error(format!("Read store: {e}"), None))?
+            }
+        };
 
         let mut results = results;
 
         if let Some(min_score) = score {
             results.retain(|result| result.score >= min_score);
         }
+        if let Some(ref agent_filter) = params.agent {
+            results.retain(|r| r.agent == *agent_filter);
+        }
 
-        let results: Vec<_> = if let Some(ref date_filter) = date {
-            let (lo, hi) = parse_date_filter_mcp(date_filter);
+        let date_effective = date.or(params.since.clone());
+        let (lo, hi) = if let Some(ref date_filter) = date_effective {
+            parse_date_filter_mcp(date_filter)
+        } else {
+            (None, params.until.clone())
+        };
+
+        let mut results: Vec<_> = if lo.is_some() || hi.is_some() {
             results
                 .into_iter()
                 .filter(|result| {
@@ -249,6 +309,22 @@ impl AicxMcpServer {
         } else {
             results
         };
+
+        if let Some(sort_order) = params.sort.as_deref() {
+            results.sort_by(|a, b| {
+                let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
+                let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
+                match sort_order {
+                    "newest" => t_b.cmp(t_a),
+                    "oldest" => t_a.cmp(t_b),
+                    "score" => b.score.cmp(&a.score).then(t_b.cmp(t_a)),
+                    _ => t_b.cmp(t_a),
+                }
+            });
+        } else {
+            results.sort_by(|a, b| b.score.cmp(&a.score));
+        }
+
         let results: Vec<_> = results.into_iter().take(limit).collect();
 
         let json = rank::render_search_json(&results, scanned)
@@ -270,8 +346,15 @@ impl AicxMcpServer {
         let strict = params.strict;
         let top = params.top;
 
-        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
+        let cutoff = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(hours.saturating_mul(3600).min(365 * 24 * 3600));
         let mut scored = Vec::new();
+
+        let (lo, hi) = if let Some(ref d) = params.since {
+            parse_date_filter_mcp(d)
+        } else {
+            (None, params.until.clone())
+        };
 
         let files = store::context_files_since(cutoff, Some(&project))
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
@@ -280,10 +363,53 @@ impl AicxMcpServer {
             if file.path.extension().is_none_or(|ext| ext != "md") {
                 continue;
             }
+            if let Some(ref agent_filter) = params.agent
+                && file.agent != *agent_filter
+            {
+                continue;
+            }
+            if lo
+                .as_ref()
+                .is_some_and(|lo| file.date_iso.as_str() < lo.as_str())
+                || hi
+                    .as_ref()
+                    .is_some_and(|hi| file.date_iso.as_str() > hi.as_str())
+            {
+                continue;
+            }
+
             let cs = rank::score_chunk_file(&file.path);
             if strict && cs.score < 5 {
                 continue;
             }
+
+            let sidecar_path = file.path.with_extension("meta.json");
+            let timestamp = if sidecar_path.exists() {
+                crate::sanitize::read_to_string_validated(&sidecar_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| {
+                        v.get("started_at")
+                            .and_then(|s| s.as_str())
+                            .map(String::from)
+                            .or_else(|| {
+                                v.get("timestamp")
+                                    .and_then(|s| s.as_str())
+                                    .map(String::from)
+                            })
+                    })
+            } else {
+                None
+            };
+            let final_timestamp = timestamp.or_else(|| {
+                file.path
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map(chrono::DateTime::<chrono::Utc>::from)
+                    .map(|d| d.to_rfc3339())
+            });
+
             scored.push(RankItem {
                 file: file
                     .path
@@ -293,6 +419,7 @@ impl AicxMcpServer {
                     .to_string(),
                 project: file.project,
                 date: file.date_iso,
+                timestamp: final_timestamp,
                 kind: file.kind.dir_name().to_string(),
                 agent: file.agent,
                 score: cs.score,
@@ -304,7 +431,20 @@ impl AicxMcpServer {
             });
         }
 
-        scored.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
+        if let Some(sort_order) = params.sort.as_deref() {
+            scored.sort_by(|a, b| {
+                let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
+                let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
+                match sort_order {
+                    "newest" => t_b.cmp(t_a),
+                    "oldest" => t_a.cmp(t_b),
+                    "score" => b.score.cmp(&a.score).then(t_b.cmp(t_a)),
+                    _ => t_b.cmp(t_a),
+                }
+            });
+        } else {
+            scored.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
+        }
 
         if let Some(n) = top {
             scored.truncate(n);
@@ -332,17 +472,19 @@ impl AicxMcpServer {
     ) -> Result<CallToolResult, McpError> {
         let limit = params.limit.min(100);
 
-        let (date_lo, date_hi) = if let Some(ref d) = params.date {
+        let date_effective = params.date.or(params.since.clone());
+        let (date_lo, date_hi) = if let Some(ref d) = date_effective {
             parse_date_filter_mcp(d)
         } else {
-            (None, None)
+            (None, params.until.clone())
         };
 
-        let metadatas = crate::steer_index::search_steer_index(
+        let mut metadatas = crate::steer_index::search_steer_index(
             params.run_id.as_deref(),
             params.prompt_id.as_deref(),
             params.agent.as_deref(),
             params.kind.as_deref(),
+            params.frame_kind,
             params.project.as_deref(),
             date_lo.as_deref(),
             date_hi.as_deref(),
@@ -350,6 +492,38 @@ impl AicxMcpServer {
         )
         .await
         .map_err(|e| McpError::internal_error(format!("Index error: {e}"), None))?;
+
+        if let Some(min_score) = params.score {
+            metadatas.retain(|m| {
+                let score = m.get("score").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                score >= min_score
+            });
+        }
+
+        if let Some(sort_order) = params.sort.as_deref() {
+            metadatas.sort_by(|a, b| {
+                let t_a = a
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| a.get("date").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                let t_b = b
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| b.get("date").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                match sort_order {
+                    "newest" => t_b.cmp(t_a),
+                    "oldest" => t_a.cmp(t_b),
+                    "score" => {
+                        let s_a = a.get("score").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let s_b = b.get("score").and_then(|v| v.as_u64()).unwrap_or(0);
+                        s_b.cmp(&s_a).then(t_b.cmp(t_a))
+                    }
+                    _ => t_b.cmp(t_a),
+                }
+            });
+        }
 
         let json = serde_json::to_string(&SteerResponse {
             results: metadatas.len(),
@@ -399,7 +573,7 @@ pub async fn run_stdio() -> anyhow::Result<()> {
 }
 
 /// Run MCP server over streamable HTTP transport on given port.
-pub async fn run_sse(port: u16) -> anyhow::Result<()> {
+pub async fn run_http(port: u16) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
@@ -436,6 +610,19 @@ pub async fn run_sse(port: u16) -> anyhow::Result<()> {
     axum::serve(listener, app)
         .await
         .map_err(|e| anyhow::anyhow!("MCP HTTP server error: {e}"))
+}
+
+/// Legacy compatibility wrapper for callers that still use the old `run_sse` name.
+pub async fn run_sse(port: u16) -> anyhow::Result<()> {
+    run_http(port).await
+}
+
+/// Run the selected MCP transport.
+pub async fn run_transport(transport: McpTransport, port: u16) -> anyhow::Result<()> {
+    match transport {
+        McpTransport::Stdio => run_stdio().await,
+        McpTransport::Http => run_http(port).await,
+    }
 }
 
 /// Parse a date filter string into (optional_low, optional_high) bounds.
@@ -476,9 +663,10 @@ fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, McpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SCORE_FILTER, RankItem, RankResponse, SearchParams, SteerResponse,
+        MAX_SCORE_FILTER, McpTransport, RankItem, RankResponse, SearchParams, SteerResponse,
         incremental_rescan_args, parse_date_filter_mcp, validate_score_filter,
     };
+    use clap::ValueEnum as _;
 
     #[test]
     fn incremental_rescan_args_use_all_incremental_and_quiet_stdout() {
@@ -548,6 +736,7 @@ mod tests {
                 file: "chunk.md".to_string(),
                 project: "VetCoders/ai-contexters".to_string(),
                 date: "2026-03-31".to_string(),
+                timestamp: Some("2026-03-31T10:00:00Z".to_string()),
                 kind: "reports".to_string(),
                 agent: "codex".to_string(),
                 score: 8,
@@ -607,5 +796,23 @@ mod tests {
         let err = validate_score_filter(Some(MAX_SCORE_FILTER + 1))
             .expect_err("score above 100 should be rejected");
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn mcp_transport_prefers_http_but_accepts_legacy_sse_alias() {
+        let possible = McpTransport::value_variants()
+            .iter()
+            .map(|variant| {
+                variant
+                    .to_possible_value()
+                    .expect("possible value")
+                    .get_name()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(possible, vec!["stdio".to_string(), "http".to_string()]);
+        assert_eq!(McpTransport::from_str("http", true), Ok(McpTransport::Http));
+        assert_eq!(McpTransport::from_str("sse", true), Ok(McpTransport::Http));
     }
 }

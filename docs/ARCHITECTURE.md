@@ -1,18 +1,19 @@
 # Architecture
 
-`aicx` is the operator front door for agent session history. It orchestrates a
-two-layer pipeline — canonical corpus first, semantic materialization second:
+`aicx` is the operator front door for agent session logs. It orchestrates a
+two-layer pipeline — canonical corpus first, optional semantic index second:
 
 1. **Canonical corpus** (layer 1, `~/.aicx/`): read local agent session logs,
    normalize into a single timeline schema, deduplicate, chunk into steerable
    markdown with frontmatter metadata. This is ground truth.
-2. **Semantic materialization** (layer 2, memex): embed the canonical corpus into
-   a vector + BM25 index for retrieval by agents and MCP tools. Always
+2. **Optional semantic index** (layer 2, memex): embed the canonical corpus into
+   a vector + BM25 index for semantic retrieval by agents and MCP tools. Always
    operator-driven — nothing syncs automatically.
 
-`aicx` is the orchestrator; memex is the retrieval kernel.
+`aicx` owns the canonical corpus; memex is an optional semantic index layered on top.
 
-The pipeline exposes chunks through CLI, MCP, and dashboard search surfaces.
+The pipeline exposes chunks through CLI, MCP, dashboard search surfaces, and an
+adjacent Vibecrafted artifact explorer for workflow/marbles reports.
 
 ```mermaid
 flowchart TD
@@ -38,6 +39,7 @@ Library modules (see `src/lib.rs`):
 - `src/redact.rs`: secret redaction (regex engine)
 - `src/sanitize.rs`: path validation for reads/writes (defense against traversal)
 - `src/steer_index.rs`: fast metadata index for steering-aware retrieval
+- `src/reports_extractor.rs`: scans `~/.vibecrafted/artifacts` and renders a standalone HTML/JSON dossier for workflow and marbles artifact review
 
 Binary orchestration:
 - `src/main.rs`: clap CLI, wires flows together, handles stdout emission (`--emit`).
@@ -56,22 +58,24 @@ High-level sequence (see `src/main.rs::run_extraction`):
 4. Deduplicate:
    - exact hash: `(agent, timestamp, message)`
    - overlap hash: `(timestamp_bucket_60s, message)` across agents
-5. Redact secrets (default) via `src/redact.rs` unless `--no-redact-secrets`.
+5. On corpus-building commands, redact secrets by default via `src/redact.rs`
+   unless `--no-redact-secrets`.
 6. Store-first chunking:
-   - group by `(repo-from-cwd, agent, date)`
+   - use the source-side `--project` filter only to narrow session discovery
+   - then group the surviving entries by resolved repo identity `(repo-from-cwd, agent, date)`
    - chunk per group (~1500 tokens, overlap), write canonical `.md` chunks into `~/.aicx/store/` or `~/.aicx/non-repository-contexts/`
 7. Stdout emission:
    - `--emit none` prints nothing (default for extractors and `store`)
    - `--emit paths` prints stored chunk paths, one per line
-   - `--emit json` prints a single JSON payload including `store_paths`
+   - `--emit json` prints a single JSON payload including `store_paths`, `requested_source_filters`, and `resolved_store_buckets`
    - `--emit none` prints nothing
 8. Optional local output (`-o`): write a report to the given directory.
-9. Optional memex materialization (`--memex`): materialize canonical chunks into the memex retrieval kernel (see note below).
+9. Optional memex materialization (`--memex`): materialize canonical chunks into the optional memex semantic index (see note below).
 
 Note on memex materialization:
 - `--memex` reads from the same canonical chunk + sidecar store that the CLI, MCP, and dashboard use.
 - Batch import and per-chunk upsert share the same metadata contract from `.meta.json` sidecars.
-- Memex is the retrieval kernel layered on top of the canonical store — not primary storage. Nothing materializes automatically.
+- Memex is an optional semantic index layered on top of the canonical store — not primary storage. Nothing materializes automatically.
 
 Framework note:
 - Repo-local `.ai-context/` artifacts are now owned by higher-level workflow tooling such as `/vc-init`, not by the retired `aicx init` flow.
@@ -101,16 +105,16 @@ Frontmatter is not just telemetry — it is part of the steering and selective r
 
 `store` is the “build the canonical corpus from older history” command (see `src/main.rs::run_store`):
 
-1. Extract selected agents + projects for a lookback window.
+1. Extract selected agents + source filters for a lookback window.
 2. Redact secrets (default).
-3. Chunk and write into the canonical `~/.aicx/` store.
+3. Chunk and write into the canonical `~/.aicx/` store, which may resolve into multiple repo buckets plus `non-repository-contexts`.
 4. Optional memex sync (`--memex`).
 
 ## MCP Surface (`src/mcp.rs`)
 
 The MCP server exposes three tools via stdio and streamable HTTP transports:
 
-- `aicx_search` — fuzzy text search across stored chunks with quality scoring; returns compact JSON using the same rich fields as CLI `aicx search --json`
+- `aicx_search` — search stored chunks with quality scoring; widens with memex semantic retrieval when available and otherwise falls back to canonical-store fuzzy search
 - `aicx_rank` — rank chunks by signal density for a project as compact JSON
 - `aicx_steer` — retrieve chunks by steering metadata (run_id, prompt_id, agent, kind, project, date) using sidecar data; the primary metadata-aware retrieval path for orchestration
 
@@ -122,4 +126,4 @@ Two mechanisms protect your machine and your data:
 - Path validation (read/write) in `src/sanitize.rs`.
 - Best-effort secret redaction in `src/redact.rs` (enabled by default).
 
-Redaction is conservative by design: it’s OK to over-redact sometimes; it’s not OK to leak tokens into committed artifacts.
+Redaction is conservative by design: it’s OK to over-redact sometimes; it’s not OK to leak tokens into committed artifacts. The flag lives only on corpus-building commands that create or rewrite artifacts, not on read-only search and steering surfaces.

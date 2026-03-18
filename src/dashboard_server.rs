@@ -1,6 +1,6 @@
 //! AI Contexters dashboard HTTP server runtime.
 //!
-//! Serves the dashboard server-shell UI and supports on-demand data regeneration.
+//! Serves the local dashboard UI and supports live search/regeneration APIs.
 
 use anyhow::{Context, Result, anyhow};
 use axum::{
@@ -134,6 +134,8 @@ struct FuzzySearchParams {
     project: Option<String>,
     /// Optional minimum score threshold (0-100)
     score: Option<u8>,
+    /// Optional frame/channel filter
+    frame_kind: Option<crate::types::FrameKind>,
 }
 
 fn default_search_limit() -> usize {
@@ -174,6 +176,7 @@ struct FuzzySearchResult {
     path: String,
     project: String,
     kind: String,
+    frame_kind: Option<String>,
     agent: String,
     date: String,
     score: u8,
@@ -209,6 +212,8 @@ struct SteerSearchParams {
     agent: Option<String>,
     /// Filter by kind
     kind: Option<String>,
+    /// Filter by frame/channel
+    frame_kind: Option<crate::types::FrameKind>,
     /// Filter by project (case-insensitive substring)
     project: Option<String>,
     /// Filter by date (YYYY-MM-DD or range)
@@ -223,6 +228,7 @@ struct SteerSearchResult {
     project: String,
     agent: String,
     kind: String,
+    frame_kind: Option<String>,
     date: String,
     session_id: String,
     run_id: Option<String>,
@@ -278,11 +284,15 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         .route("/api/status", get(get_status))
         .route("/api/browse", get(get_browse))
         .route("/api/detail", get(get_detail))
+        .route("/api/chunk", get(get_chunk))
+        .route("/api/context", get(get_context))
         .route("/api/regenerate", post(regenerate_dashboard))
         .route("/api/search/fuzzy", get(fuzzy_search))
         .route("/api/search/semantic", get(semantic_search))
         .route("/api/search/cross", get(cross_search))
         .route("/api/search/steer", get(steer_search))
+        .route("/manifest.webmanifest", get(get_manifest))
+        .route("/service-worker.js", get(get_service_worker))
         .with_state(state);
 
     let addr = SocketAddr::new(config.host, config.port);
@@ -290,23 +300,22 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         .await
         .with_context(|| format!("Failed to bind dashboard server on http://{addr}"))?;
 
-    eprintln!("✓ Dashboard server started (server-mode shell)");
+    eprintln!("✓ Dashboard server started (PWA shell)");
     eprintln!("  URL: http://{addr}");
-    eprintln!("  Browse:    GET  http://{addr}/api/browse");
+    eprintln!("  Browse:    GET  http://{addr}/api/browse?sort=newest&since=24h&project=<p>");
     eprintln!("  Detail:    GET  http://{addr}/api/detail?id=<n>");
+    eprintln!("  Chunk:     GET  http://{addr}/api/chunk?id=<n>");
+    eprintln!("  Context:   GET  http://{addr}/api/context");
     eprintln!("  Status:    GET  http://{addr}/api/status");
     eprintln!("  Regenerate: POST http://{addr}/api/regenerate");
     eprintln!("  Fuzzy:     GET  http://{addr}/api/search/fuzzy?q=<query>&score=<min>");
     eprintln!("  Semantic:  GET  http://{addr}/api/search/semantic?q=<query>&ns=<namespace>");
     eprintln!("  Cross:     GET  http://{addr}/api/search/cross?q=<query>");
     eprintln!("  Steer:     GET  http://{addr}/api/search/steer?run_id=<id>&project=<p>");
+    eprintln!("  PWA:       GET  http://{addr}/manifest.webmanifest");
     eprintln!(
         "  Required header: {}: {}",
         REGENERATE_HEADER_NAME, REGENERATE_HEADER_VALUE
-    );
-    eprintln!(
-        "  Artifact arg (unused in server mode): {}",
-        config.artifact_path.display()
     );
     eprintln!("  Store: {}", config.store_root.display());
 
@@ -510,25 +519,126 @@ struct BrowseResponse {
     records: Vec<BrowseRecord>,
 }
 
-/// Browse all records (lightweight, no search_blob/detail_text).
-async fn get_browse(State(state): State<Arc<DashboardServerState>>) -> Json<BrowseResponse> {
+#[derive(Debug, Deserialize)]
+struct BrowseParams {
+    project: Option<String>,
+    agent: Option<String>,
+    kind: Option<String>,
+    #[serde(default = "default_browse_sort")]
+    sort: String,
+    since: Option<String>,
+}
+
+fn default_browse_sort() -> String {
+    "newest".to_string()
+}
+
+fn parse_relative_time(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let now = Utc::now().timestamp();
+    let (num, unit) = if let Some(h) = s.strip_suffix('h') {
+        (h.parse::<i64>().ok()?, 3600)
+    } else if let Some(d) = s.strip_suffix('d') {
+        (d.parse::<i64>().ok()?, 86400)
+    } else {
+        return None;
+    };
+    Some(now - num * unit)
+}
+
+#[derive(Debug, Deserialize)]
+struct ChunkParams {
+    id: Option<usize>,
+    path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChunkResponse {
+    ok: bool,
+    id: Option<usize>,
+    path: String,
+    content: String,
+    project: String,
+    agent: String,
+    kind: String,
+    date: String,
+    bytes: u64,
+}
+
+/// Browse all records with optional server-side filtering.
+async fn get_browse(
+    State(state): State<Arc<DashboardServerState>>,
+    params: Result<Query<BrowseParams>, QueryRejection>,
+) -> Response {
+    let params = match params {
+        Ok(Query(p)) => p,
+        Err(rejection) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: format!("Invalid query parameters: {rejection}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
     let snapshot = state.snapshot.read().await;
-    let records: Vec<BrowseRecord> = snapshot
+    let since_ts = params.since.as_deref().and_then(parse_relative_time);
+
+    let mut records: Vec<BrowseRecord> = snapshot
         .payload
         .records
         .iter()
+        .filter(|r| {
+            if let Some(ref p) = params.project
+                && !r.project.eq_ignore_ascii_case(p)
+            {
+                return false;
+            }
+            if let Some(ref a) = params.agent
+                && !r.agent.eq_ignore_ascii_case(a)
+            {
+                return false;
+            }
+            if let Some(ref k) = params.kind
+                && r.kind != *k
+            {
+                return false;
+            }
+            if let Some(ts) = since_ts
+                && r.sort_ts < ts
+            {
+                return false;
+            }
+            true
+        })
         .map(BrowseRecord::from)
         .collect();
-    Json(BrowseResponse {
-        ok: true,
-        generated_at: snapshot.payload.generated_at.clone(),
-        stats: snapshot.stats.clone(),
-        assumptions: snapshot.assumptions.clone(),
-        projects: snapshot.payload.projects.clone(),
-        agents: snapshot.payload.agents.clone(),
-        kinds: snapshot.payload.kinds.clone(),
-        records,
-    })
+
+    match params.sort.as_str() {
+        "oldest" => records.sort_by_key(|r| r.sort_ts),
+        _ => records.sort_by(|a, b| b.sort_ts.cmp(&a.sort_ts)),
+    }
+
+    (
+        StatusCode::OK,
+        Json(BrowseResponse {
+            ok: true,
+            generated_at: snapshot.payload.generated_at.clone(),
+            stats: snapshot.stats.clone(),
+            assumptions: snapshot.assumptions.clone(),
+            projects: snapshot.payload.projects.clone(),
+            agents: snapshot.payload.agents.clone(),
+            kinds: snapshot.payload.kinds.clone(),
+            records,
+        }),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -588,6 +698,201 @@ async fn get_detail(
 }
 
 // ============================================================================
+// Chunk endpoint — bounded file reader for inline markdown rendering
+// ============================================================================
+
+async fn get_chunk(
+    State(state): State<Arc<DashboardServerState>>,
+    params: Result<Query<ChunkParams>, QueryRejection>,
+) -> Response {
+    let Query(params) = match params {
+        Ok(q) => q,
+        Err(rejection) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: format!("Invalid query parameters: {rejection}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let snapshot = state.snapshot.read().await;
+    let store_root = &state.config.store_root;
+
+    let record = if let Some(id) = params.id {
+        snapshot.payload.records.iter().find(|r| r.id == id)
+    } else if let Some(ref rel_path) = params.path {
+        snapshot
+            .payload
+            .records
+            .iter()
+            .find(|r| r.relative_path == *rel_path)
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                ok: false,
+                error: "Either 'id' or 'path' parameter is required".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let Some(record) = record else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                ok: false,
+                error: "Chunk not found".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let file_path = store_root.join(&record.relative_path);
+    let file_path = match resolve_bounded_path(store_root, &file_path) {
+        Ok(p) => p,
+        Err(err) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: format!("Path resolution rejected: {err}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let content = match std::fs::read_to_string(&file_path) {
+        Ok(c) => c,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: format!("Failed to read chunk: {err}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(ChunkResponse {
+            ok: true,
+            id: Some(record.id),
+            path: record.relative_path.clone(),
+            content,
+            project: record.project.clone(),
+            agent: record.agent.clone(),
+            kind: record.kind.clone(),
+            date: record.date.clone(),
+            bytes: record.bytes,
+        }),
+    )
+        .into_response()
+}
+
+fn resolve_bounded_path(root: &Path, target: &Path) -> Result<PathBuf> {
+    let target_str = target.to_string_lossy();
+    if target_str.contains("..") {
+        return Err(anyhow!("Path contains traversal sequence"));
+    }
+
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("Cannot canonicalize store root: {}", root.display()))?;
+
+    if !target.exists() {
+        return Err(anyhow!("Path does not exist: {}", target.display()));
+    }
+
+    let canonical_target = target
+        .canonicalize()
+        .with_context(|| format!("Cannot canonicalize target: {}", target.display()))?;
+
+    if !canonical_target.starts_with(&canonical_root) {
+        return Err(anyhow!(
+            "Path escapes store root: {} is not under {}",
+            canonical_target.display(),
+            canonical_root.display()
+        ));
+    }
+
+    Ok(canonical_target)
+}
+
+// ============================================================================
+// Context / PWA endpoints
+// ============================================================================
+
+async fn get_context(State(state): State<Arc<DashboardServerState>>) -> Json<serde_json::Value> {
+    let snapshot = state.snapshot.read().await;
+    Json(serde_json::json!({
+        "ok": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "store_root": state.config.store_root.display().to_string(),
+        "host": state.config.host.to_string(),
+        "port": state.config.port,
+        "generated_at": snapshot.generated_at.to_rfc3339(),
+        "build_count": snapshot.build_count,
+        "stats": snapshot.stats,
+    }))
+}
+
+async fn get_manifest() -> Response {
+    let manifest = serde_json::json!({
+        "name": "aicx Dashboard",
+        "short_name": "aicx",
+        "description": "AI Context Browser \u{2014} operator retrieval dashboard",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "theme_color": "#0a0f19",
+        "background_color": "#0a0f19",
+        "icons": []
+    });
+    let body = serde_json::to_string_pretty(&manifest).unwrap_or_default();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/manifest+json"),
+    );
+    (headers, body).into_response()
+}
+
+async fn get_service_worker() -> Response {
+    let sw_js = "const CACHE_NAME='aicx-shell-v1';\
+const SHELL_URLS=['/','/manifest.webmanifest'];\
+self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE_NAME)\
+.then(c=>c.addAll(SHELL_URLS)));self.skipWaiting();});\
+self.addEventListener('activate',e=>{e.waitUntil(caches.keys()\
+.then(ks=>Promise.all(ks.filter(k=>k!==CACHE_NAME).map(k=>caches.delete(k)))));\
+self.clients.claim();});\
+self.addEventListener('fetch',e=>{const u=new URL(e.request.url);\
+if(u.pathname.startsWith('/api/')||u.pathname==='/service-worker.js')return;\
+e.respondWith(caches.match(e.request).then(r=>{if(r)return r;\
+return fetch(e.request).catch(()=>{if(e.request.mode==='navigate')\
+return new Response('<html><body style=\"background:#0a0f19;color:#e5e7eb;\
+font-family:system-ui;display:flex;align-items:center;justify-content:center;\
+height:100vh;margin:0\"><div style=\"text-align:center\"><h1>aicx store not \
+reachable</h1><p>Start the server with <code>aicx dashboard-serve</code></p>\
+</div></body></html>',{headers:{'Content-Type':'text/html'}});});}));});";
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/javascript; charset=utf-8"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    (headers, sw_js).into_response()
+}
+
+// ============================================================================
 // Search handlers
 // ============================================================================
 
@@ -628,6 +933,7 @@ async fn fuzzy_search(
     let limit = params.limit.min(100);
     let store_root = state.config.store_root.clone();
     let project_filter = params.project;
+    let frame_kind = params.frame_kind;
     let score = match validate_score_filter(params.score) {
         Ok(score) => score,
         Err(error) => {
@@ -647,6 +953,7 @@ async fn fuzzy_search(
             limit,
             project_filter.as_deref(),
             score,
+            frame_kind,
         )
     })
     .await;
@@ -687,6 +994,7 @@ fn run_fuzzy_search(
     limit: usize,
     project_filter: Option<&str>,
     score: Option<u8>,
+    frame_kind: Option<crate::types::FrameKind>,
 ) -> Result<(Vec<FuzzySearchResult>, usize)> {
     // Non-blocking auto-rescan with rate-limit guard.
     if !DASHBOARD_RESCAN_RUNNING.swap(true, Ordering::SeqCst) {
@@ -720,13 +1028,20 @@ fn run_fuzzy_search(
             query,
             fetch_limit,
             project_filter,
+            frame_kind,
         )) {
             Ok((res, scan)) if !res.is_empty() => (res, scan),
             Err(err) if crate::memex::is_compatibility_error(&err) => return Err(err),
-            _ => rank::fuzzy_search_store(store_root, query, fetch_limit, project_filter)?,
+            _ => rank::fuzzy_search_store(
+                store_root,
+                query,
+                fetch_limit,
+                project_filter,
+                frame_kind,
+            )?,
         }
     } else {
-        rank::fuzzy_search_store(store_root, query, fetch_limit, project_filter)?
+        rank::fuzzy_search_store(store_root, query, fetch_limit, project_filter, frame_kind)?
     };
 
     let mut results = results;
@@ -744,6 +1059,7 @@ fn run_fuzzy_search(
                 path: result.path,
                 project: result.project,
                 kind: result.kind,
+                frame_kind: result.frame_kind,
                 agent: result.agent,
                 date: result.date,
                 score: result.score,
@@ -1023,6 +1339,7 @@ fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSear
         params.prompt_id.as_deref(),
         params.agent.as_deref(),
         params.kind.as_deref(),
+        params.frame_kind,
         params.project.as_deref(),
         date_lo.as_deref(),
         date_hi.as_deref(),
@@ -1094,6 +1411,10 @@ fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSear
             project,
             agent,
             kind,
+            frame_kind: meta
+                .get("frame_kind")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             date,
             session_id,
             run_id,

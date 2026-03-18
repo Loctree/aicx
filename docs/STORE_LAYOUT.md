@@ -50,7 +50,7 @@ It is updated on every store write.
 ### Memex Integration
 
 The `aicx memex-sync` command (and `--memex` flag) materializes canonical chunks
-into the `rmcp-memex` retrieval kernel. Materialization is always operator-driven
+into the optional `rmcp-memex` semantic index. Materialization is always operator-driven
 — nothing syncs automatically:
 - Sync state is maintained in `~/.aicx/memex/sync_state.json`.
 - `~/.aicx/.aicxignore` is honored before queueing chunks for embed/index work.

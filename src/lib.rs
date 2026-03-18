@@ -12,6 +12,7 @@ pub mod memex;
 pub mod output;
 pub mod rank;
 pub mod redact;
+pub mod reports_extractor;
 pub mod sanitize;
 pub mod segmentation;
 pub mod sources;

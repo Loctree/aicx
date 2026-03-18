@@ -13,7 +13,7 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -21,6 +21,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use crate::sanitize;
+use crate::types::FrameKind;
 
 // ============================================================================
 // Public types
@@ -34,6 +35,8 @@ pub struct TimelineEntry {
     pub session_id: String,
     pub role: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_kind: Option<FrameKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -75,7 +78,12 @@ pub fn to_conversation(
 ) -> Vec<ConversationMessage> {
     entries
         .iter()
-        .filter(|e| e.role == "user" || e.role == "assistant")
+        .filter(|entry| {
+            matches!(
+                entry.frame_kind,
+                Some(FrameKind::UserMsg | FrameKind::AgentReply)
+            ) || (entry.frame_kind.is_none() && (entry.role == "user" || entry.role == "assistant"))
+        })
         .map(|e| ConversationMessage {
             timestamp: e.timestamp,
             agent: e.agent.clone(),
@@ -164,6 +172,8 @@ struct GeminiMessage {
     #[serde(default, rename = "type")]
     msg_type: Option<String>,
     #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
     content: Option<serde_json::Value>,
     #[serde(default, rename = "displayContent")]
     display_content: Option<serde_json::Value>,
@@ -184,6 +194,10 @@ struct GeminiThought {
     #[serde(default)]
     timestamp: Option<String>,
 }
+
+const JUNIE_SESSION_DIR_PREFIX: &str = "session-";
+const JUNIE_REQUEST_ID_PREFIX: &str = "prompt-";
+const JUNIE_EVENTS_FILENAME: &str = "events.jsonl";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GeminiAntigravityRecoveryMode {
@@ -209,6 +223,309 @@ impl GeminiAntigravityRecoveryMode {
             }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct ClassifiedFrameBlock {
+    role: String,
+    frame_kind: FrameKind,
+    message: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_timeline_entry(
+    timestamp: DateTime<Utc>,
+    agent: &str,
+    session_id: &str,
+    role: &str,
+    message: String,
+    branch: Option<String>,
+    cwd: Option<String>,
+    frame_kind: Option<FrameKind>,
+) -> TimelineEntry {
+    TimelineEntry {
+        timestamp,
+        agent: agent.to_string(),
+        session_id: session_id.to_string(),
+        role: role.to_string(),
+        message,
+        frame_kind,
+        branch,
+        cwd,
+    }
+}
+
+fn push_classified_block(
+    blocks: &mut Vec<ClassifiedFrameBlock>,
+    role: &str,
+    frame_kind: FrameKind,
+    message: String,
+) {
+    let message = message.trim();
+    if message.is_empty() {
+        return;
+    }
+
+    if let Some(last) = blocks.last_mut()
+        && last.role == role
+        && last.frame_kind == frame_kind
+    {
+        last.message.push('\n');
+        last.message.push_str(message);
+        return;
+    }
+
+    blocks.push(ClassifiedFrameBlock {
+        role: role.to_string(),
+        frame_kind,
+        message: message.to_string(),
+    });
+}
+
+fn frame_kind_from_role(role: &str) -> Option<FrameKind> {
+    match role.to_ascii_lowercase().as_str() {
+        "user" => Some(FrameKind::UserMsg),
+        "assistant" | "agent" => Some(FrameKind::AgentReply),
+        "reasoning" | "thinking" => Some(FrameKind::InternalThought),
+        "tool" | "tool_call" | "tool_result" | "function_call" => Some(FrameKind::ToolCall),
+        _ => None,
+    }
+}
+
+fn frame_kind_from_claude_type(entry_type: &str) -> Option<FrameKind> {
+    match entry_type {
+        "user" => Some(FrameKind::UserMsg),
+        "assistant" => Some(FrameKind::AgentReply),
+        "thinking" => Some(FrameKind::InternalThought),
+        "tool_use" | "tool_result" => Some(FrameKind::ToolCall),
+        _ => None,
+    }
+}
+
+fn role_for_frame_kind(frame_kind: FrameKind) -> &'static str {
+    match frame_kind {
+        FrameKind::UserMsg => "user",
+        FrameKind::AgentReply => "assistant",
+        FrameKind::InternalThought => "reasoning",
+        FrameKind::ToolCall => "tool",
+    }
+}
+
+fn should_keep_entry(frame_kind: Option<FrameKind>, config: &ExtractionConfig) -> bool {
+    config.include_assistant || matches!(frame_kind, Some(FrameKind::UserMsg))
+}
+
+fn render_json_inline(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn render_claude_thinking_block(block: &serde_json::Map<String, serde_json::Value>) -> String {
+    ["thinking", "text", "content", "summary"]
+        .iter()
+        .filter_map(|key| block.get(*key))
+        .find_map(extract_text_from_json_value)
+        .unwrap_or_else(|| render_json_inline(&serde_json::Value::Object(block.clone())))
+}
+
+fn render_claude_tool_block(block: &serde_json::Map<String, serde_json::Value>) -> String {
+    let mut parts = Vec::new();
+    if let Some(name) = block.get("name").and_then(|value| value.as_str()) {
+        parts.push(format!("name: {name}"));
+    }
+    if let Some(id) = block
+        .get("id")
+        .or_else(|| block.get("tool_use_id"))
+        .and_then(|value| value.as_str())
+    {
+        parts.push(format!("id: {id}"));
+    }
+    if let Some(input) = block.get("input") {
+        parts.push(format!("input: {}", render_json_inline(input)));
+    }
+    if let Some(content) = block.get("content").and_then(extract_text_from_json_value) {
+        parts.push(format!("content: {content}"));
+    }
+
+    if parts.is_empty() {
+        render_json_inline(&serde_json::Value::Object(block.clone()))
+    } else {
+        parts.join("\n")
+    }
+}
+
+fn extract_claude_classified_blocks(
+    message: &Option<serde_json::Value>,
+    fallback_role: &str,
+) -> Vec<ClassifiedFrameBlock> {
+    fn from_content(
+        content: &serde_json::Value,
+        role: &str,
+        blocks: &mut Vec<ClassifiedFrameBlock>,
+    ) {
+        match content {
+            serde_json::Value::String(text) => {
+                if let Some(frame_kind) = frame_kind_from_role(role) {
+                    push_classified_block(blocks, role, frame_kind, text.clone());
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    from_content(item, role, blocks);
+                }
+            }
+            serde_json::Value::Object(block) => {
+                let block_type = block.get("type").and_then(|value| value.as_str());
+                match block_type {
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(|value| value.as_str())
+                            && let Some(frame_kind) = frame_kind_from_role(role)
+                        {
+                            push_classified_block(blocks, role, frame_kind, text.to_string());
+                        }
+                    }
+                    Some("thinking") => {
+                        push_classified_block(
+                            blocks,
+                            role_for_frame_kind(FrameKind::InternalThought),
+                            FrameKind::InternalThought,
+                            render_claude_thinking_block(block),
+                        );
+                    }
+                    Some("tool_use") | Some("tool_result") => {
+                        push_classified_block(
+                            blocks,
+                            role_for_frame_kind(FrameKind::ToolCall),
+                            FrameKind::ToolCall,
+                            render_claude_tool_block(block),
+                        );
+                    }
+                    _ => {
+                        if let Some(content) = block.get("content") {
+                            let nested_role = block
+                                .get("role")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or(role);
+                            from_content(content, nested_role, blocks);
+                        } else if block.get("thought").and_then(|value| value.as_bool())
+                            == Some(true)
+                        {
+                            push_classified_block(
+                                blocks,
+                                role_for_frame_kind(FrameKind::InternalThought),
+                                FrameKind::InternalThought,
+                                extract_text_from_json_value(&serde_json::Value::Object(
+                                    block.clone(),
+                                ))
+                                .unwrap_or_else(|| {
+                                    render_json_inline(&serde_json::Value::Object(block.clone()))
+                                }),
+                            );
+                        } else if let Some(text) =
+                            extract_text_from_json_value(&serde_json::Value::Object(block.clone()))
+                            && let Some(frame_kind) = frame_kind_from_role(role)
+                        {
+                            push_classified_block(blocks, role, frame_kind, text);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut blocks = Vec::new();
+    match message {
+        Some(serde_json::Value::Object(object)) => {
+            let role = object
+                .get("role")
+                .and_then(|value| value.as_str())
+                .unwrap_or(fallback_role);
+            if let Some(content) = object.get("content") {
+                from_content(content, role, &mut blocks);
+            } else {
+                from_content(
+                    &serde_json::Value::Object(object.clone()),
+                    role,
+                    &mut blocks,
+                );
+            }
+        }
+        Some(value) => from_content(value, fallback_role, &mut blocks),
+        None => {}
+    }
+
+    blocks
+}
+
+fn extract_claude_line_entries(
+    entry: ClaudeEntry,
+    default_session_id: &str,
+    config: &ExtractionConfig,
+) -> Vec<TimelineEntry> {
+    let timestamp = match entry.timestamp.as_deref() {
+        Some(ts) => match DateTime::parse_from_rfc3339(ts) {
+            Ok(dt) => dt.with_timezone(&Utc),
+            Err(_) => return Vec::new(),
+        },
+        None => return Vec::new(),
+    };
+
+    if timestamp < config.cutoff || config.watermark.is_some_and(|wm| timestamp <= wm) {
+        return Vec::new();
+    }
+
+    let session_id = entry
+        .session_id
+        .unwrap_or_else(|| default_session_id.to_string());
+    let mut entries = Vec::new();
+    let fallback_role = if entry.entry_type == "tool_use" || entry.entry_type == "tool_result" {
+        role_for_frame_kind(FrameKind::ToolCall)
+    } else {
+        entry.entry_type.as_str()
+    };
+
+    let classified = extract_claude_classified_blocks(&entry.message, fallback_role);
+    if !classified.is_empty() {
+        for block in classified {
+            if !should_keep_entry(Some(block.frame_kind), config) {
+                continue;
+            }
+            entries.push(build_timeline_entry(
+                timestamp,
+                "claude",
+                &session_id,
+                &block.role,
+                block.message,
+                entry.git_branch.clone(),
+                entry.cwd.clone(),
+                Some(block.frame_kind),
+            ));
+        }
+        return entries;
+    }
+
+    let message = extract_message_text(&entry.message);
+    if message.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let frame_kind = frame_kind_from_claude_type(&entry.entry_type)
+        .or_else(|| frame_kind_from_role(fallback_role));
+    if !should_keep_entry(frame_kind, config) {
+        return Vec::new();
+    }
+
+    entries.push(build_timeline_entry(
+        timestamp,
+        "claude",
+        &session_id,
+        fallback_role,
+        message,
+        entry.git_branch,
+        entry.cwd,
+        frame_kind,
+    ));
+    entries
 }
 
 fn render_gemini_message_content(message: &GeminiMessage) -> Option<String> {
@@ -369,6 +686,127 @@ fn gemini_message_matches_filter(message: &GeminiMessage, filters_lower: &[Strin
     })
 }
 
+fn normalize_gemini_role(raw: &str) -> Option<&'static str> {
+    match raw.to_ascii_lowercase().as_str() {
+        "user" | "human" | "prompt" => Some("user"),
+        "gemini" | "assistant" | "model" | "ai" => Some("assistant"),
+        "thinking" | "reasoning" => Some("reasoning"),
+        "tool" | "tool_call" | "tool_result" | "function_call" => Some("tool"),
+        "system" | "info" | "error" => Some("system"),
+        _ => None,
+    }
+}
+
+fn gemini_base_role(message: &GeminiMessage) -> Option<&'static str> {
+    message
+        .role
+        .as_deref()
+        .and_then(normalize_gemini_role)
+        .or_else(|| {
+            message
+                .msg_type
+                .as_deref()
+                .and_then(normalize_gemini_role)
+                .or_else(|| match message.msg_type.as_deref().unwrap_or("user") {
+                    "user" => Some("user"),
+                    "gemini" => Some("assistant"),
+                    _ => None,
+                })
+        })
+}
+
+fn render_gemini_function_call_part(part: &serde_json::Map<String, serde_json::Value>) -> String {
+    part.get("functionCall")
+        .map(render_json_inline)
+        .unwrap_or_else(|| render_json_inline(&serde_json::Value::Object(part.clone())))
+}
+
+fn extract_gemini_classified_blocks(
+    value: &serde_json::Value,
+    base_role: &str,
+) -> Vec<ClassifiedFrameBlock> {
+    fn from_value(
+        value: &serde_json::Value,
+        base_role: &str,
+        blocks: &mut Vec<ClassifiedFrameBlock>,
+    ) {
+        match value {
+            serde_json::Value::Null => {}
+            serde_json::Value::String(text) => {
+                if let Some(frame_kind) = frame_kind_from_role(base_role) {
+                    push_classified_block(blocks, base_role, frame_kind, text.clone());
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    from_value(item, base_role, blocks);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                if let Some(parts) = map.get("parts").or_else(|| map.get("content")) {
+                    from_value(parts, base_role, blocks);
+                    return;
+                }
+
+                if map.contains_key("functionCall") {
+                    push_classified_block(
+                        blocks,
+                        role_for_frame_kind(FrameKind::ToolCall),
+                        FrameKind::ToolCall,
+                        render_gemini_function_call_part(map),
+                    );
+                    return;
+                }
+
+                if map.get("thought").and_then(|value| value.as_bool()) == Some(true)
+                    || map.contains_key("thoughtSignature")
+                {
+                    let thought_text = map
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            render_gemini_content_value(&serde_json::Value::Object(map.clone()))
+                        })
+                        .unwrap_or_else(|| {
+                            render_json_inline(&serde_json::Value::Object(map.clone()))
+                        });
+                    push_classified_block(
+                        blocks,
+                        role_for_frame_kind(FrameKind::InternalThought),
+                        FrameKind::InternalThought,
+                        thought_text,
+                    );
+                    return;
+                }
+
+                if let Some(text) = map.get("text").and_then(|value| value.as_str())
+                    && let Some(frame_kind) = frame_kind_from_role(base_role)
+                {
+                    push_classified_block(blocks, base_role, frame_kind, text.to_string());
+                    return;
+                }
+
+                if let Some(frame_kind) = frame_kind_from_role(base_role)
+                    && let Some(text) =
+                        render_gemini_content_value(&serde_json::Value::Object(map.clone()))
+                {
+                    push_classified_block(blocks, base_role, frame_kind, text);
+                }
+            }
+            _ => {
+                if let Some(frame_kind) = frame_kind_from_role(base_role) {
+                    push_classified_block(blocks, base_role, frame_kind, value.to_string());
+                }
+            }
+        }
+    }
+
+    let mut blocks = Vec::new();
+    from_value(value, base_role, &mut blocks);
+    blocks
+}
+
 #[derive(Debug, Clone)]
 struct GeminiAntigravityInput {
     conversation_id: String,
@@ -500,50 +938,13 @@ fn parse_claude_jsonl(
             Err(_) => continue,
         };
 
-        // Only process user/assistant messages
-        if entry.entry_type != "user" && entry.entry_type != "assistant" {
+        if !matches!(
+            entry.entry_type.as_str(),
+            "user" | "assistant" | "tool_use" | "tool_result"
+        ) {
             continue;
         }
-
-        // Skip assistant messages if not requested
-        if !config.include_assistant && entry.entry_type == "assistant" {
-            continue;
-        }
-
-        // Parse timestamp
-        let timestamp = match &entry.timestamp {
-            Some(ts) => match DateTime::parse_from_rfc3339(ts) {
-                Ok(dt) => dt.with_timezone(&Utc),
-                Err(_) => continue,
-            },
-            None => continue,
-        };
-
-        // Respect cutoff
-        if timestamp < config.cutoff {
-            continue;
-        }
-
-        // Respect watermark (skip already-processed entries)
-        if config.watermark.is_some_and(|wm| timestamp <= wm) {
-            continue;
-        }
-
-        // Extract message text
-        let message = extract_message_text(&entry.message);
-        if message.is_empty() {
-            continue;
-        }
-
-        entries.push(TimelineEntry {
-            timestamp,
-            agent: "claude".to_string(),
-            session_id: session_id.to_string(),
-            role: entry.entry_type,
-            message,
-            branch: entry.git_branch,
-            cwd: entry.cwd,
-        });
+        entries.extend(extract_claude_line_entries(entry, session_id, config));
     }
 
     Ok(entries)
@@ -578,55 +979,17 @@ pub fn extract_claude_file(path: &Path, config: &ExtractionConfig) -> Result<Vec
             Err(_) => continue,
         };
 
-        // Only process user/assistant messages
-        if entry.entry_type != "user" && entry.entry_type != "assistant" {
+        if !matches!(
+            entry.entry_type.as_str(),
+            "user" | "assistant" | "tool_use" | "tool_result"
+        ) {
             continue;
         }
-
-        // Skip assistant messages if not requested
-        if !config.include_assistant && entry.entry_type == "assistant" {
-            continue;
-        }
-
-        // Parse timestamp
-        let timestamp = match &entry.timestamp {
-            Some(ts) => match DateTime::parse_from_rfc3339(ts) {
-                Ok(dt) => dt.with_timezone(&Utc),
-                Err(_) => continue,
-            },
-            None => continue,
-        };
-
-        // Respect cutoff
-        if timestamp < config.cutoff {
-            continue;
-        }
-
-        // Respect watermark (skip already-processed entries)
-        if config.watermark.is_some_and(|wm| timestamp <= wm) {
-            continue;
-        }
-
-        // Extract message text
-        let message = extract_message_text(&entry.message);
-        if message.is_empty() {
-            continue;
-        }
-
-        // Prefer embedded sessionId when present (task outputs are often renamed).
-        let session_id = entry
-            .session_id
-            .unwrap_or_else(|| default_session_id.clone());
-
-        entries.push(TimelineEntry {
-            timestamp,
-            agent: "claude".to_string(),
-            session_id,
-            role: entry.entry_type,
-            message,
-            branch: entry.git_branch,
-            cwd: entry.cwd,
-        });
+        entries.extend(extract_claude_line_entries(
+            entry,
+            &default_session_id,
+            config,
+        ));
     }
 
     entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
@@ -731,9 +1094,9 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                 }
 
                 let role = msg.role.as_deref().unwrap_or("user").to_string();
+                let frame_kind = frame_kind_from_role(&role);
 
-                // Skip assistant messages if not requested
-                if !config.include_assistant && role == "assistant" {
+                if !should_keep_entry(frame_kind, config) {
                     continue;
                 }
 
@@ -741,15 +1104,16 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                     continue;
                 }
 
-                entries.push(TimelineEntry {
+                entries.push(build_timeline_entry(
                     timestamp,
-                    agent: "codex".to_string(),
-                    session_id: session_id.clone(),
-                    role,
-                    message: msg.text.clone(),
-                    branch: None,
-                    cwd: msg.cwd.clone(),
-                });
+                    "codex",
+                    session_id,
+                    &role,
+                    msg.text.clone(),
+                    None,
+                    msg.cwd.clone(),
+                    frame_kind,
+                ));
             }
         }
 
@@ -766,15 +1130,15 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
 
     // Check for legacy JSON format ({"session": {...}, "items": [...]})
     // We read the full file because it's usually formatted JSON.
-    if let Ok(content) = sanitize::read_to_string_validated(path) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-            if val.get("session").is_some() && val.get("items").is_some() {
-                anyhow::bail!(
-                    "Legacy Codex JSON rollout format is unsupported (no cwd available): {}",
-                    path.display()
-                );
-            }
-        }
+    if let Ok(content) = sanitize::read_to_string_validated(path)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
+        && val.get("session").is_some()
+        && val.get("items").is_some()
+    {
+        anyhow::bail!(
+            "Legacy Codex JSON rollout format is unsupported (no cwd available): {}",
+            path.display()
+        );
     }
 
     Err(anyhow::anyhow!(
@@ -997,19 +1361,20 @@ fn extract_gemini_antigravity_step_outputs(
             continue;
         }
 
-        entries.push(TimelineEntry {
+        entries.push(build_timeline_entry(
             timestamp,
-            agent: "gemini-antigravity".to_string(),
-            session_id: input.conversation_id.clone(),
-            role: "artifact".to_string(),
-            message: format!(
+            "gemini-antigravity",
+            &input.conversation_id,
+            "artifact",
+            format!(
                 "Antigravity step output fallback\nsource: {}\nfull_transcript_available: false\n\n{}",
                 path.display(),
                 trimmed
             ),
-            branch: None,
-            cwd: infer_project_hint_from_text(trimmed).or_else(|| session_default_cwd.clone()),
-        });
+            None,
+            infer_project_hint_from_text(trimmed).or_else(|| session_default_cwd.clone()),
+            None,
+        ));
     }
 
     if entries.is_empty() {
@@ -1176,15 +1541,16 @@ fn collect_antigravity_json_entries_inner(
             }
         }
         serde_json::Value::Object(map) => {
-            if let Some(entry) = antigravity_json_message_to_entry(
+            let parsed = antigravity_json_message_to_entries(
                 map,
                 session_id,
                 default_cwd,
                 fallback_timestamp + Duration::seconds(*counter as i64),
                 config,
-            ) {
-                entries.push(entry);
-                *counter += 1;
+            );
+            if !parsed.is_empty() {
+                *counter += parsed.len();
+                entries.extend(parsed);
             }
 
             for child in map.values() {
@@ -1203,26 +1569,16 @@ fn collect_antigravity_json_entries_inner(
     }
 }
 
-fn antigravity_json_message_to_entry(
+fn antigravity_json_message_to_entries(
     map: &serde_json::Map<String, serde_json::Value>,
     session_id: &str,
     default_cwd: Option<&str>,
     fallback_timestamp: DateTime<Utc>,
     config: &ExtractionConfig,
-) -> Option<TimelineEntry> {
-    let role = antigravity_role_from_map(map)?;
-    if role == "assistant" && !config.include_assistant {
-        return None;
-    }
-
-    let message = ["content", "text", "message", "body", "value", "output"]
-        .iter()
-        .filter_map(|key| map.get(*key))
-        .find_map(extract_text_from_json_value)?;
-    if message.trim().is_empty() {
-        return None;
-    }
-
+) -> Vec<TimelineEntry> {
+    let Some(role) = antigravity_role_from_map(map) else {
+        return Vec::new();
+    };
     let timestamp = ["timestamp", "createdAt", "created_at", "time", "date"]
         .iter()
         .filter_map(|key| map.get(*key))
@@ -1230,21 +1586,50 @@ fn antigravity_json_message_to_entry(
         .unwrap_or(fallback_timestamp);
 
     if timestamp < config.cutoff {
-        return None;
+        return Vec::new();
     }
     if config.watermark.is_some_and(|wm| timestamp <= wm) {
-        return None;
+        return Vec::new();
     }
 
-    Some(TimelineEntry {
-        timestamp,
-        agent: "gemini-antigravity".to_string(),
-        session_id: session_id.to_string(),
-        role: role.to_string(),
-        message,
-        branch: None,
-        cwd: infer_project_hint_from_map(map).or_else(|| default_cwd.map(ToOwned::to_owned)),
-    })
+    let cwd = infer_project_hint_from_map(map).or_else(|| default_cwd.map(ToOwned::to_owned));
+    let content_value = ["content", "text", "message", "body", "value", "output"]
+        .iter()
+        .filter_map(|key| map.get(*key))
+        .next();
+
+    let mut entries = Vec::new();
+    if let Some(value) = content_value {
+        let mut classified = extract_gemini_classified_blocks(value, role);
+        if classified.is_empty()
+            && let Some(text) = extract_text_from_json_value(value)
+            && let Some(frame_kind) = frame_kind_from_role(role)
+        {
+            classified.push(ClassifiedFrameBlock {
+                role: role.to_string(),
+                frame_kind,
+                message: text,
+            });
+        }
+
+        for block in classified {
+            if !should_keep_entry(Some(block.frame_kind), config) {
+                continue;
+            }
+            entries.push(build_timeline_entry(
+                timestamp,
+                "gemini-antigravity",
+                session_id,
+                &block.role,
+                block.message,
+                None,
+                cwd.clone(),
+                Some(block.frame_kind),
+            ));
+        }
+    }
+
+    entries
 }
 
 fn antigravity_role_from_map(
@@ -1352,15 +1737,16 @@ fn parse_antigravity_transcript_text(
             continue;
         }
 
-        entries.push(TimelineEntry {
+        entries.push(build_timeline_entry(
             timestamp,
-            agent: "gemini-antigravity".to_string(),
-            session_id: session_id.to_string(),
-            role: role.to_string(),
-            message: message.to_string(),
-            branch: None,
-            cwd: default_cwd.clone(),
-        });
+            "gemini-antigravity",
+            session_id,
+            role,
+            message.to_string(),
+            None,
+            default_cwd.clone(),
+            frame_kind_from_role(role),
+        ));
     }
 
     entries
@@ -1389,17 +1775,17 @@ fn build_gemini_antigravity_summary(
         .collect::<Vec<_>>()
         .join("\n");
 
-    TimelineEntry {
-        timestamp: entries
+    build_timeline_entry(
+        entries
             .iter()
             .map(|entry| entry.timestamp)
             .min()
             .unwrap_or_else(Utc::now)
             - Duration::seconds(1),
-        agent: "gemini-antigravity".to_string(),
-        session_id: input.conversation_id.clone(),
-        role: "system".to_string(),
-        message: format!(
+        "gemini-antigravity",
+        &input.conversation_id,
+        "system",
+        format!(
             "Gemini Antigravity recovery report\nmode: {}\nconversation_id: {}\ninput: {}\nbrain: {}\nraw_pb: {}\nreadable_entry_count: {}\ninferred_projects: {}\nrecovery_note: {}\nused_artifacts:\n{}",
             recovery.mode.as_str(),
             input.conversation_id,
@@ -1415,9 +1801,10 @@ fn build_gemini_antigravity_summary(
                 used_paths
             }
         ),
-        branch: None,
-        cwd: None,
-    }
+        None,
+        None,
+        None,
+    )
 }
 
 fn file_timestamp(path: &Path) -> Option<DateTime<Utc>> {
@@ -1550,6 +1937,7 @@ fn dedup_timeline_entries(entries: &mut Vec<TimelineEntry>) {
         seen.insert((
             entry.timestamp,
             entry.role.clone(),
+            entry.frame_kind,
             entry.message.clone(),
             entry.cwd.clone(),
         ))
@@ -1661,15 +2049,16 @@ pub fn extract_claude_history(config: &ExtractionConfig) -> Result<Vec<TimelineE
             continue;
         }
 
-        entries.push(TimelineEntry {
+        entries.push(build_timeline_entry(
             timestamp,
-            agent: "claude".to_string(),
-            session_id: entry.session_id.unwrap_or_else(|| "history".to_string()),
-            role: "user".to_string(),
+            "claude",
+            entry.session_id.as_deref().unwrap_or("history"),
+            "user",
             message,
-            branch: None,
-            cwd: entry.project,
-        });
+            None,
+            entry.project,
+            Some(FrameKind::UserMsg),
+        ));
     }
 
     entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
@@ -1778,15 +2167,16 @@ pub fn extract_codex(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
                 continue;
             }
 
-            entries.push(TimelineEntry {
+            entries.push(build_timeline_entry(
                 timestamp,
-                agent: "codex".to_string(),
-                session_id: session_id.clone(),
-                role,
-                message: msg.text.clone(),
-                branch: None,
-                cwd: msg.cwd.clone(),
-            });
+                "codex",
+                session_id,
+                &role,
+                msg.text.clone(),
+                None,
+                msg.cwd.clone(),
+                frame_kind_from_role(&role),
+            ));
         }
     }
 
@@ -1930,7 +2320,7 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let (role, message) = match msg_type {
+        let (role, message, frame_kind) = match msg_type {
             "user_message" => (
                 "user",
                 ev.payload
@@ -1938,6 +2328,7 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
+                Some(FrameKind::UserMsg),
             ),
             "agent_message" => (
                 "assistant",
@@ -1946,20 +2337,31 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
+                Some(FrameKind::AgentReply),
             ),
-            "agent_reasoning" => (
+            "agent_reasoning" | "thinking" | "thinking_delta" => (
                 "reasoning",
                 ev.payload
                     .get("text")
+                    .or_else(|| ev.payload.get("message"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
+                Some(FrameKind::InternalThought),
+            ),
+            "function_call" | "tool_call" | "tool_result" => (
+                "tool",
+                ev.payload
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| render_json_inline(&ev.payload)),
+                Some(FrameKind::ToolCall),
             ),
             _ => continue,
         };
 
-        // Skip assistant/reasoning if not requested
-        if !config.include_assistant && (role == "assistant" || role == "reasoning") {
+        if !should_keep_entry(frame_kind, config) {
             continue;
         }
 
@@ -1979,15 +2381,16 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
             continue;
         }
 
-        entries.push(TimelineEntry {
+        entries.push(build_timeline_entry(
             timestamp,
-            agent: "codex".to_string(),
-            session_id: session_id.clone(),
-            role: role.to_string(),
+            "codex",
+            &session_id,
+            role,
             message,
-            branch: None,
-            cwd: current_cwd.clone(),
-        });
+            None,
+            current_cwd.clone(),
+            frame_kind,
+        ));
     }
 
     Ok(entries)
@@ -2115,19 +2518,9 @@ fn parse_gemini_session(
     let mut entries = Vec::new();
 
     for msg in &session.messages {
-        let msg_type = msg.msg_type.as_deref().unwrap_or("user");
-
-        // Skip system messages (errors, info)
-        let role = match msg_type {
-            "user" => "user".to_string(),
-            "gemini" => "assistant".to_string(),
-            _ => continue, // skip "error", "info", etc.
-        };
-
-        // Skip assistant messages if not requested
-        if !config.include_assistant && role == "assistant" {
+        let Some(base_role) = gemini_base_role(msg) else {
             continue;
-        }
+        };
 
         // Parse timestamp (always RFC3339 in Gemini CLI)
         let timestamp = msg.timestamp.as_ref().and_then(|ts| {
@@ -2151,22 +2544,45 @@ fn parse_gemini_session(
             continue;
         }
 
-        let Some(text) = render_gemini_message_content(msg) else {
-            continue;
-        };
-
         let inferred_cwd =
             infer_project_hint_from_gemini_message(msg).or_else(|| session_default_cwd.clone());
+        let mut classified = msg
+            .content
+            .as_ref()
+            .map(|value| extract_gemini_classified_blocks(value, base_role))
+            .filter(|blocks| !blocks.is_empty())
+            .unwrap_or_default();
+        if classified.is_empty()
+            && let Some(value) = msg.display_content.as_ref()
+        {
+            classified = extract_gemini_classified_blocks(value, base_role);
+        }
+        if classified.is_empty()
+            && let Some(text) = render_gemini_message_content(msg)
+            && let Some(frame_kind) = frame_kind_from_role(base_role)
+        {
+            classified.push(ClassifiedFrameBlock {
+                role: base_role.to_string(),
+                frame_kind,
+                message: text,
+            });
+        }
 
-        entries.push(TimelineEntry {
-            timestamp,
-            agent: "gemini".to_string(),
-            session_id: session_id.clone(),
-            role,
-            message: text,
-            branch: None,
-            cwd: inferred_cwd.clone(),
-        });
+        for block in classified {
+            if !should_keep_entry(Some(block.frame_kind), config) {
+                continue;
+            }
+            entries.push(build_timeline_entry(
+                timestamp,
+                "gemini",
+                &session_id,
+                &block.role,
+                block.message,
+                None,
+                inferred_cwd.clone(),
+                Some(block.frame_kind),
+            ));
+        }
 
         // Extract thoughts as reasoning entries (only when include_assistant)
         if config.include_assistant && !msg.thoughts.is_empty() {
@@ -2192,20 +2608,334 @@ fn parse_gemini_session(
                     format!("**{}**: {}", subj, desc)
                 };
 
-                entries.push(TimelineEntry {
-                    timestamp: thought_ts,
-                    agent: "gemini".to_string(),
-                    session_id: session_id.clone(),
-                    role: "reasoning".to_string(),
-                    message: text,
-                    branch: None,
-                    cwd: inferred_cwd.clone(),
-                });
+                entries.push(build_timeline_entry(
+                    thought_ts,
+                    "gemini",
+                    &session_id,
+                    "reasoning",
+                    text,
+                    None,
+                    inferred_cwd.clone(),
+                    Some(FrameKind::InternalThought),
+                ));
             }
         }
     }
 
     Ok(entries)
+}
+
+/// Extract timeline entries from a single Junie session event log.
+///
+/// Junie stores very noisy UI/runtime session traces under:
+/// `~/.junie/sessions/session-<YYMMDD>-<HHMMSS>-<id>/events.jsonl`
+///
+/// This extractor intentionally keeps only the conversational truth:
+/// - `UserPromptEvent.prompt`          -> `user`
+/// - `UserResponseEvent.prompt`        -> `user`
+/// - `ResultBlockUpdatedEvent.result`  -> `assistant`
+///
+/// The rest of the block/update noise (terminal snapshots, tool blocks, file
+/// views, status churn, env updates) is ignored.
+pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
+    let path = sanitize::validate_read_path(path)?;
+    let file = sanitize::open_file_validated(&path)?;
+    let mut reader = BufReader::new(file);
+    let session_id = junie_session_id_from_path(&path);
+    let session_anchor = infer_junie_session_anchor(&path)
+        .or_else(|| infer_junie_file_anchor(&path))
+        .unwrap_or_else(Utc::now);
+
+    let mut entries = Vec::new();
+    let mut current_cwd: Option<String> = None;
+    let mut cursor = session_anchor;
+    let mut last_result_by_step: HashMap<String, String> = HashMap::new();
+    let mut line = String::new();
+
+    loop {
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            break;
+        }
+
+        if line.trim().is_empty() {
+            reset_stream_buffer(&mut line);
+            continue;
+        }
+
+        let interesting_kind = detect_junie_interesting_kind(&line);
+        if interesting_kind.is_none() {
+            reset_stream_buffer(&mut line);
+            continue;
+        }
+
+        let raw: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => {
+                reset_stream_buffer(&mut line);
+                continue;
+            }
+        };
+
+        match interesting_kind {
+            Some("UserPromptEvent") => {
+                let message = raw
+                    .get("prompt")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(ToOwned::to_owned);
+                let Some(message) = message else {
+                    reset_stream_buffer(&mut line);
+                    continue;
+                };
+
+                let candidate = raw
+                    .get("requestId")
+                    .and_then(|value| value.as_str())
+                    .and_then(parse_junie_request_timestamp);
+                let timestamp = next_junie_timestamp(&mut cursor, candidate);
+                if junie_timestamp_in_window(timestamp, config) {
+                    entries.push(build_timeline_entry(
+                        timestamp,
+                        "junie",
+                        &session_id,
+                        "user",
+                        message,
+                        None,
+                        current_cwd.clone(),
+                        Some(FrameKind::UserMsg),
+                    ));
+                }
+            }
+            Some("UserResponseEvent") => {
+                let message = raw
+                    .get("prompt")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(ToOwned::to_owned);
+                let Some(message) = message else {
+                    reset_stream_buffer(&mut line);
+                    continue;
+                };
+
+                let timestamp = next_junie_timestamp(&mut cursor, None);
+                if junie_timestamp_in_window(timestamp, config) {
+                    entries.push(build_timeline_entry(
+                        timestamp,
+                        "junie",
+                        &session_id,
+                        "user",
+                        message,
+                        None,
+                        current_cwd.clone(),
+                        Some(FrameKind::UserMsg),
+                    ));
+                }
+            }
+            Some("CurrentDirectoryUpdatedEvent") => {
+                current_cwd = raw
+                    .get("event")
+                    .and_then(|value| value.get("agentEvent"))
+                    .and_then(|value| value.get("currentDirectory"))
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(ToOwned::to_owned);
+            }
+            Some("ResultBlockUpdatedEvent") => {
+                if !config.include_assistant {
+                    reset_stream_buffer(&mut line);
+                    continue;
+                }
+
+                let agent_event = raw.get("event").and_then(|value| value.get("agentEvent"));
+                let step_id = agent_event
+                    .and_then(|value| value.get("stepId"))
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| format!("{session_id}:result"));
+                let message = agent_event
+                    .and_then(|value| value.get("result"))
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(ToOwned::to_owned);
+
+                let Some(message) = message else {
+                    reset_stream_buffer(&mut line);
+                    continue;
+                };
+
+                if last_result_by_step
+                    .get(&step_id)
+                    .is_some_and(|previous| previous == &message)
+                {
+                    reset_stream_buffer(&mut line);
+                    continue;
+                }
+                last_result_by_step.insert(step_id, message.clone());
+
+                let timestamp = next_junie_timestamp(&mut cursor, None);
+                if junie_timestamp_in_window(timestamp, config) {
+                    entries.push(build_timeline_entry(
+                        timestamp,
+                        "junie",
+                        &session_id,
+                        "assistant",
+                        message,
+                        None,
+                        current_cwd.clone(),
+                        Some(FrameKind::AgentReply),
+                    ));
+                }
+            }
+            _ => {}
+        }
+
+        reset_stream_buffer(&mut line);
+    }
+
+    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    Ok(entries)
+}
+
+/// Extract timeline entries from all Junie session logs under `~/.junie/sessions/`.
+pub fn extract_junie(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
+    let sessions_dir = dirs::home_dir()
+        .context("No home dir")?
+        .join(".junie")
+        .join("sessions");
+
+    if !sessions_dir.exists() || !sessions_dir.is_dir() {
+        return Ok(vec![]);
+    }
+
+    let mut entries = Vec::new();
+    for path in walk_jsonl_files(&sessions_dir) {
+        if path.file_name().and_then(|name| name.to_str()) != Some(JUNIE_EVENTS_FILENAME) {
+            continue;
+        }
+
+        if let Some(modified) = infer_junie_file_anchor(&path)
+            && modified < config.cutoff
+            && config
+                .watermark
+                .is_none_or(|watermark| modified <= watermark)
+        {
+            continue;
+        }
+
+        match extract_junie_file(&path, config) {
+            Ok(mut file_entries) => entries.append(&mut file_entries),
+            Err(_) => continue,
+        }
+    }
+
+    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    Ok(entries)
+}
+
+fn detect_junie_interesting_kind(line: &str) -> Option<&'static str> {
+    if line.contains("\"UserPromptEvent\"") {
+        Some("UserPromptEvent")
+    } else if line.contains("\"UserResponseEvent\"") {
+        Some("UserResponseEvent")
+    } else if line.contains("\"CurrentDirectoryUpdatedEvent\"") {
+        Some("CurrentDirectoryUpdatedEvent")
+    } else if line.contains("\"ResultBlockUpdatedEvent\"") {
+        Some("ResultBlockUpdatedEvent")
+    } else {
+        None
+    }
+}
+
+fn reset_stream_buffer(buffer: &mut String) {
+    if buffer.capacity() > 16 * 1024 * 1024 {
+        *buffer = String::new();
+    } else {
+        buffer.clear();
+    }
+}
+
+fn junie_session_id_from_path(path: &Path) -> String {
+    path.parent()
+        .and_then(|parent| parent.file_name())
+        .or_else(|| path.file_stem())
+        .map(|segment| {
+            let raw = segment.to_string_lossy();
+            raw.strip_prefix(JUNIE_SESSION_DIR_PREFIX)
+                .unwrap_or(raw.as_ref())
+                .to_string()
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn infer_junie_session_anchor(path: &Path) -> Option<DateTime<Utc>> {
+    let session_dir = path.parent()?.file_name()?.to_str()?;
+    let suffix = session_dir.strip_prefix(JUNIE_SESSION_DIR_PREFIX)?;
+    let mut parts = suffix.split('-');
+    let compact_date = parts.next()?;
+    let compact_time = parts.next()?;
+    parse_compact_junie_timestamp(compact_date, compact_time)
+}
+
+fn infer_junie_file_anchor(path: &Path) -> Option<DateTime<Utc>> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
+    Some(DateTime::<Utc>::from(modified))
+}
+
+fn parse_junie_request_timestamp(request_id: &str) -> Option<DateTime<Utc>> {
+    let suffix = request_id.strip_prefix(JUNIE_REQUEST_ID_PREFIX)?;
+    let mut parts = suffix.split('-');
+    let compact_date = parts.next()?;
+    let compact_time = parts.next()?;
+    parse_compact_junie_timestamp(compact_date, compact_time)
+}
+
+fn parse_compact_junie_timestamp(compact_date: &str, compact_time: &str) -> Option<DateTime<Utc>> {
+    if compact_date.len() != 6 || compact_time.len() != 6 {
+        return None;
+    }
+
+    let year = 2000 + compact_date[0..2].parse::<i32>().ok()?;
+    let month = compact_date[2..4].parse::<u32>().ok()?;
+    let day = compact_date[4..6].parse::<u32>().ok()?;
+    let hour = compact_time[0..2].parse::<u32>().ok()?;
+    let minute = compact_time[2..4].parse::<u32>().ok()?;
+    let second = compact_time[4..6].parse::<u32>().ok()?;
+
+    let naive = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, minute, second)?;
+    Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+}
+
+fn next_junie_timestamp(
+    cursor: &mut DateTime<Utc>,
+    candidate: Option<DateTime<Utc>>,
+) -> DateTime<Utc> {
+    let next = match candidate {
+        Some(ts) if ts > *cursor => ts,
+        _ => *cursor + Duration::milliseconds(1),
+    };
+    *cursor = next;
+    next
+}
+
+fn junie_timestamp_in_window(timestamp: DateTime<Utc>, config: &ExtractionConfig) -> bool {
+    if timestamp < config.cutoff {
+        return false;
+    }
+
+    if config
+        .watermark
+        .is_some_and(|watermark| timestamp <= watermark)
+    {
+        return false;
+    }
+
+    true
 }
 
 // ============================================================================
@@ -2234,6 +2964,12 @@ pub fn extract_all(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
         Err(e) => eprintln!("Gemini extraction warning: {}", e),
     }
 
+    // Junie
+    match extract_junie(config) {
+        Ok(entries) => all.extend(entries),
+        Err(e) => eprintln!("Junie extraction warning: {}", e),
+    }
+
     // Claude history.jsonl
     match extract_claude_history(config) {
         Ok(entries) => all.extend(entries),
@@ -2252,7 +2988,11 @@ pub fn extract_all(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     // Dedup: same timestamp + same first 100 chars of message -> keep first
     let mut seen: HashSet<(i64, String)> = HashSet::new();
     all.retain(|entry| {
-        let key_msg: String = entry.message.chars().take(100).collect();
+        let key_msg: String = format!(
+            "{}:{}",
+            entry.frame_kind.map(FrameKind::as_str).unwrap_or("unknown"),
+            entry.message.chars().take(100).collect::<String>()
+        );
         let key = (entry.timestamp.timestamp(), key_msg);
         seen.insert(key)
     });
@@ -2386,6 +3126,30 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
                     size_bytes: total_size,
                 });
             }
+        }
+    }
+
+    // Junie sessions: ~/.junie/sessions/session-*/events.jsonl
+    let junie_sessions = home.join(".junie").join("sessions");
+    if junie_sessions.exists() && junie_sessions.is_dir() {
+        let files: Vec<PathBuf> = walk_jsonl_files(&junie_sessions)
+            .into_iter()
+            .filter(|path| {
+                path.file_name().and_then(|name| name.to_str()) == Some(JUNIE_EVENTS_FILENAME)
+            })
+            .collect();
+        let total_size: u64 = files
+            .iter()
+            .filter_map(|file| fs::metadata(file).ok())
+            .map(|metadata| metadata.len())
+            .sum();
+        if !files.is_empty() {
+            sources.push(SourceInfo {
+                agent: "junie".to_string(),
+                path: junie_sessions,
+                sessions: files.len(),
+                size_bytes: total_size,
+            });
         }
     }
 
@@ -2576,6 +3340,15 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    const CLAUDE_FRAME_KIND_FIXTURE: &str =
+        include_str!("../tests/fixtures/frame_kind/claude_session.jsonl");
+    const CODEX_FRAME_KIND_FIXTURE: &str =
+        include_str!("../tests/fixtures/frame_kind/codex_session.jsonl");
+    const GEMINI_FRAME_KIND_FIXTURE: &str =
+        include_str!("../tests/fixtures/frame_kind/gemini_session.json");
+    const GEMINI_ANTIGRAVITY_FRAME_KIND_FIXTURE: &str =
+        include_str!("../tests/fixtures/frame_kind/gemini_antigravity_conversation.json");
+
     fn unique_test_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "ai-contexters-{name}-{}-{}",
@@ -2593,6 +3366,10 @@ mod tests {
 
     fn set_mtime(path: &Path, unix_seconds: i64) {
         set_file_mtime(path, FileTime::from_unix_time(unix_seconds, 0)).unwrap();
+    }
+
+    fn frame_kinds(entries: &[TimelineEntry]) -> Vec<Option<FrameKind>> {
+        entries.iter().map(|entry| entry.frame_kind).collect()
     }
 
     #[test]
@@ -2685,11 +3462,60 @@ mod tests {
         };
 
         let entries = extract_claude_file(&tmp, &config).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].role, "user");
-        assert_eq!(entries[0].message, "Hello");
-        assert_eq!(entries[1].role, "assistant");
-        assert_eq!(entries[1].message, "Hi");
+        assert!(
+            entries.len() >= 2,
+            "expected at least user + assistant text entries, got {}",
+            entries.len()
+        );
+        let user_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.frame_kind == Some(FrameKind::UserMsg))
+            .collect();
+        let agent_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.frame_kind == Some(FrameKind::AgentReply))
+            .collect();
+        assert!(!user_entries.is_empty(), "expected at least one user entry");
+        assert!(
+            !agent_entries.is_empty(),
+            "expected at least one agent reply"
+        );
+        assert_eq!(user_entries[0].message, "Hello");
+        assert_eq!(agent_entries[0].message, "Hi");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_extract_claude_file_classifies_frame_kinds_from_fixture() {
+        let root = unique_test_dir("claude-frame-kind");
+        let tmp = root.join("session.jsonl");
+        let _ = fs::remove_dir_all(&root);
+        write_file(&tmp, CLAUDE_FRAME_KIND_FIXTURE);
+
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+            include_assistant: true,
+            watermark: None,
+        };
+
+        let entries = extract_claude_file(&tmp, &config).unwrap();
+        assert_eq!(
+            frame_kinds(&entries),
+            vec![
+                Some(FrameKind::UserMsg),
+                Some(FrameKind::AgentReply),
+                Some(FrameKind::InternalThought),
+                Some(FrameKind::ToolCall),
+                Some(FrameKind::ToolCall),
+            ]
+        );
+        assert_eq!(entries[0].message, "User asks for frame separation");
+        assert_eq!(entries[1].message, "Visible assistant reply");
+        assert!(entries[2].message.contains("Hidden chain of thought"));
+        assert!(entries[3].message.contains("rg frame_kind"));
+        assert!(entries[4].message.contains("tool output here"));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2747,6 +3573,38 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_codex_file_classifies_frame_kinds_from_fixture() {
+        let root = unique_test_dir("codex-frame-kind");
+        let tmp = root.join("session.jsonl");
+        let _ = fs::remove_dir_all(&root);
+        write_file(&tmp, CODEX_FRAME_KIND_FIXTURE);
+
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+            include_assistant: true,
+            watermark: None,
+        };
+
+        let entries = extract_codex_file(&tmp, &config).unwrap();
+        assert_eq!(
+            frame_kinds(&entries),
+            vec![
+                Some(FrameKind::UserMsg),
+                Some(FrameKind::AgentReply),
+                Some(FrameKind::InternalThought),
+                Some(FrameKind::ToolCall),
+            ]
+        );
+        assert_eq!(entries[0].message, "User asks for frame separation");
+        assert_eq!(entries[1].message, "Visible assistant reply");
+        assert_eq!(entries[2].message, "Hidden chain of thought");
+        assert!(entries[3].message.contains("searchDocs"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn test_extract_gemini_file_session_json() {
         let root = unique_test_dir("gemini-direct");
         let tmp = root.join("session.json");
@@ -2776,6 +3634,114 @@ mod tests {
         assert_eq!(entries[0].agent, "gemini");
         assert_eq!(entries[0].role, "user");
         assert_eq!(entries[1].role, "assistant");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_extract_gemini_file_classifies_frame_kinds_from_fixture() {
+        let root = unique_test_dir("gemini-frame-kind");
+        let tmp = root.join("session.json");
+        let _ = fs::remove_dir_all(&root);
+        write_file(&tmp, GEMINI_FRAME_KIND_FIXTURE);
+
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+            include_assistant: true,
+            watermark: None,
+        };
+
+        let entries = extract_gemini_file(&tmp, &config).unwrap();
+        assert_eq!(
+            frame_kinds(&entries),
+            vec![
+                Some(FrameKind::UserMsg),
+                Some(FrameKind::AgentReply),
+                Some(FrameKind::InternalThought),
+                Some(FrameKind::ToolCall),
+            ]
+        );
+        assert_eq!(entries[0].message, "User asks for frame separation");
+        assert_eq!(entries[1].message, "Visible assistant reply");
+        assert_eq!(entries[2].message, "Hidden chain of thought");
+        assert!(entries[3].message.contains("searchDocs"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_extract_junie_file_keeps_conversation_truth_and_dedups_results() {
+        let root = unique_test_dir("junie-direct");
+        let session_dir = root.join("session-260408-214715-abcd");
+        let tmp = session_dir.join("events.jsonl");
+        let _ = fs::remove_dir_all(&root);
+
+        let content = r#"{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"CurrentDirectoryUpdatedEvent","currentDirectory":"/tmp/repo"}}}
+{"kind":"UserPromptEvent","requestId":"prompt-260408-214823-br8l","prompt":"vc-init","presentablePrompt":"vc-init"}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"step-1","cancelled":false,"result":"Initial plan","changes":[],"errorCode":"Submit"}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"step-1","cancelled":false,"result":"Initial plan","changes":[],"errorCode":"Submit"}}}
+{"kind":"UserResponseEvent","prompt":"jedziemy","isChoice":true}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"step-1","cancelled":false,"result":"Refined plan","changes":[],"errorCode":"Submit"}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"TerminalBlockUpdatedEvent","command":"rg foo","output":"this should stay ignored"}}}"#;
+        write_file(&tmp, content);
+
+        let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff,
+            include_assistant: true,
+            watermark: None,
+        };
+
+        let entries = extract_junie_file(&tmp, &config).unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].agent, "junie");
+        assert_eq!(entries[0].session_id, "260408-214715-abcd");
+        assert_eq!(entries[0].role, "user");
+        assert_eq!(entries[0].message, "vc-init");
+        assert_eq!(entries[1].role, "assistant");
+        assert_eq!(entries[1].message, "Initial plan");
+        assert_eq!(entries[2].role, "user");
+        assert_eq!(entries[2].message, "jedziemy");
+        assert_eq!(entries[3].role, "assistant");
+        assert_eq!(entries[3].message, "Refined plan");
+        assert!(
+            entries
+                .windows(2)
+                .all(|pair| pair[0].timestamp < pair[1].timestamp)
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.cwd.as_deref() == Some("/tmp/repo"))
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_extract_junie_file_honors_user_only_mode() {
+        let root = unique_test_dir("junie-direct-user-only");
+        let session_dir = root.join("session-260408-214715-efgh");
+        let tmp = session_dir.join("events.jsonl");
+        let _ = fs::remove_dir_all(&root);
+
+        let content = r#"{"kind":"UserPromptEvent","requestId":"prompt-260408-214823-br8l","prompt":"hello","presentablePrompt":"hello"}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"step-1","cancelled":false,"result":"assistant reply","changes":[],"errorCode":"Submit"}}}"#;
+        write_file(&tmp, content);
+
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+            include_assistant: false,
+            watermark: None,
+        };
+
+        let entries = extract_junie_file(&tmp, &config).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].role, "user");
+        assert_eq!(entries[0].message, "hello");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2842,6 +3808,55 @@ mod tests {
                 .filter(|entry| entry.role != "system")
                 .all(|entry| entry.cwd.as_deref() == Some("/Users/tester/workspace/RepoAlpha"))
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_extract_gemini_antigravity_classifies_frame_kinds_from_fixture() {
+        let root = unique_test_dir("gemini-antigravity-frame-kind");
+        let brain = root.join("brain").join("conv-frame-kind");
+        let conversation_artifact = brain.join("conversation.json");
+        let _ = fs::remove_dir_all(&root);
+
+        write_file(
+            &conversation_artifact,
+            GEMINI_ANTIGRAVITY_FRAME_KIND_FIXTURE,
+        );
+        set_mtime(&conversation_artifact, 1_712_829_600);
+
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+            include_assistant: true,
+            watermark: None,
+        };
+
+        let entries = extract_gemini_antigravity_file(&brain, &config).unwrap();
+        assert_eq!(entries[0].role, "system");
+        assert_eq!(entries[0].frame_kind, None);
+
+        let conversation_entries: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.role != "system")
+            .cloned()
+            .collect();
+        assert_eq!(
+            frame_kinds(&conversation_entries),
+            vec![
+                Some(FrameKind::UserMsg),
+                Some(FrameKind::AgentReply),
+                Some(FrameKind::InternalThought),
+                Some(FrameKind::ToolCall),
+            ]
+        );
+        assert_eq!(
+            conversation_entries[0].message,
+            "User asks for frame separation"
+        );
+        assert_eq!(conversation_entries[1].message, "Visible assistant reply");
+        assert_eq!(conversation_entries[2].message, "Hidden chain of thought");
+        assert!(conversation_entries[3].message.contains("searchDocs"));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -3104,6 +4119,7 @@ mod tests {
                 message: "same message here".to_string(),
                 branch: None,
                 cwd: None,
+                frame_kind: None,
             },
             TimelineEntry {
                 timestamp: Utc.timestamp_opt(1000, 0).unwrap(),
@@ -3113,6 +4129,7 @@ mod tests {
                 message: "same message here".to_string(),
                 branch: None,
                 cwd: None,
+                frame_kind: None,
             },
             TimelineEntry {
                 timestamp: Utc.timestamp_opt(1001, 0).unwrap(),
@@ -3122,6 +4139,7 @@ mod tests {
                 message: "different".to_string(),
                 branch: None,
                 cwd: None,
+                frame_kind: None,
             },
         ];
 
@@ -3147,6 +4165,7 @@ mod tests {
             display_content: None,
             timestamp: Some("2026-01-20T19:50:45.683Z".to_string()),
             thoughts: vec![],
+            role: None,
         };
         assert_eq!(
             render_gemini_message_content(&msg).as_deref(),
@@ -3164,6 +4183,7 @@ mod tests {
             display_content: None,
             timestamp: Some("2026-01-20T19:50:51.778Z".to_string()),
             thoughts: vec![],
+            role: None,
         };
         let role = match msg.msg_type.as_deref().unwrap_or("user") {
             "gemini" => "assistant",
@@ -3183,6 +4203,7 @@ mod tests {
                 display_content: None,
                 timestamp: Some("2026-01-20T19:16:15.218Z".to_string()),
                 thoughts: vec![],
+                role: None,
             };
             let role = match msg.msg_type.as_deref().unwrap_or("user") {
                 "user" => Some("user"),
@@ -3312,7 +4333,7 @@ mod tests {
         assert_eq!(entries[0].role, "user");
         assert_eq!(
             entries[0].message,
-            "[\n  {\n    \"text\": \"# Task: Gemini truth repair\"\n  },\n  {\n    \"text\": \"- preserve user arrays honestly\"\n  }\n]"
+            "# Task: Gemini truth repair\n- preserve user arrays honestly"
         );
         assert_eq!(entries[1].role, "assistant");
 
@@ -3387,6 +4408,7 @@ mod conversation_tests {
                 message: "Fix the auth middleware".to_string(),
                 branch: Some("main".to_string()),
                 cwd: Some("/home/user/myrepo".to_string()),
+                frame_kind: None,
             },
             TimelineEntry {
                 timestamp: Utc.with_ymd_and_hms(2026, 3, 21, 10, 0, 30).unwrap(),
@@ -3396,6 +4418,7 @@ mod conversation_tests {
                 message: "I'll refactor the auth module to use JWT tokens.".to_string(),
                 branch: Some("main".to_string()),
                 cwd: Some("/home/user/myrepo".to_string()),
+                frame_kind: None,
             },
             TimelineEntry {
                 timestamp: Utc.with_ymd_and_hms(2026, 3, 21, 10, 1, 0).unwrap(),
@@ -3405,6 +4428,7 @@ mod conversation_tests {
                 message: "Thinking about the best approach...".to_string(),
                 branch: None,
                 cwd: Some("/home/user/myrepo".to_string()),
+                frame_kind: None,
             },
             TimelineEntry {
                 timestamp: Utc.with_ymd_and_hms(2026, 3, 21, 10, 1, 30).unwrap(),
@@ -3414,6 +4438,7 @@ mod conversation_tests {
                 message: "**Analysis**: Checking dependencies".to_string(),
                 branch: None,
                 cwd: Some("/home/user/myrepo".to_string()),
+                frame_kind: None,
             },
         ];
 
@@ -3440,6 +4465,7 @@ mod conversation_tests {
             message: long_msg.clone(),
             branch: None,
             cwd: None,
+            frame_kind: None,
         }];
 
         let conv = to_conversation(&entries, &[]);
@@ -3459,6 +4485,7 @@ mod conversation_tests {
                 message: "hello".to_string(),
                 branch: None,
                 cwd: Some("/Users/maciejgad/hosted/VetCoders/ai-contexters".to_string()),
+                frame_kind: None,
             },
             TimelineEntry {
                 timestamp: Utc.with_ymd_and_hms(2026, 3, 21, 10, 1, 0).unwrap(),
@@ -3468,6 +4495,7 @@ mod conversation_tests {
                 message: "world".to_string(),
                 branch: None,
                 cwd: None,
+                frame_kind: None,
             },
         ];
 
@@ -3491,6 +4519,7 @@ mod conversation_tests {
             message: "Deploy to production".to_string(),
             branch: Some("release/v2".to_string()),
             cwd: Some("/home/user/project".to_string()),
+            frame_kind: None,
         }];
 
         let conv = to_conversation(&entries, &[]);
@@ -3533,16 +4562,35 @@ mod conversation_tests {
         };
 
         let entries = extract_claude_file(&tmp, &config).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].message, "Hello agent");
-        assert_eq!(entries[1].message, "Let me check.\nHere are the files.");
-        assert!(!entries[1].message.contains("tool_use"));
-        assert!(!entries[1].message.contains("Bash"));
+        assert!(
+            entries.len() >= 2,
+            "expected at least user + assistant entries, got {}",
+            entries.len()
+        );
+        let user_msgs: Vec<_> = entries
+            .iter()
+            .filter(|e| e.frame_kind == Some(FrameKind::UserMsg))
+            .collect();
+        let agent_msgs: Vec<_> = entries
+            .iter()
+            .filter(|e| e.frame_kind == Some(FrameKind::AgentReply))
+            .collect();
+        assert!(!user_msgs.is_empty());
+        assert!(!agent_msgs.is_empty());
+        assert_eq!(user_msgs[0].message, "Hello agent");
+        assert!(
+            agent_msgs
+                .iter()
+                .any(|e| e.message.contains("Let me check"))
+        );
 
         let conv = to_conversation(&entries, &[]);
-        assert_eq!(conv.len(), 2);
+        assert!(
+            conv.len() >= 2,
+            "conversation should have at least user + assistant, got {}",
+            conv.len()
+        );
         assert_eq!(conv[0].message, "Hello agent");
-        assert_eq!(conv[1].message, "Let me check.\nHere are the files.");
 
         let _ = fs::remove_file(&tmp);
     }

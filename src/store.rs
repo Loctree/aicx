@@ -1333,6 +1333,7 @@ enum SourceFormat {
     Codex,
     Gemini,
     GeminiAntigravity,
+    Junie,
 }
 
 #[derive(Debug, Clone)]
@@ -2025,6 +2026,20 @@ fn source_format_hint(path: &Path, agent_hint: Option<&str>) -> Option<SourceFor
             }
             return None;
         }
+        Some("junie") => {
+            if extension.as_deref() == Some("jsonl")
+                && file_name == "events.jsonl"
+                && (path_str.contains("/.junie/sessions/")
+                    || path
+                        .parent()
+                        .and_then(|parent| parent.file_name())
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("session-")))
+            {
+                return Some(SourceFormat::Junie);
+            }
+            return None;
+        }
         Some(_) => return None,
         None => {}
     }
@@ -2040,6 +2055,18 @@ fn source_format_hint(path: &Path, agent_hint: Option<&str>) -> Option<SourceFor
         && (file_name.starts_with("session-") || path_str.contains("/.gemini/tmp/"))
     {
         return Some(SourceFormat::Gemini);
+    }
+
+    if extension.as_deref() == Some("jsonl")
+        && file_name == "events.jsonl"
+        && (path_str.contains("/.junie/sessions/")
+            || path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("session-")))
+    {
+        return Some(SourceFormat::Junie);
     }
 
     if extension.as_deref() == Some("jsonl")
@@ -2158,6 +2185,7 @@ fn extract_entries_from_source(source: &ResolvedSource) -> Result<Vec<TimelineEn
         SourceFormat::GeminiAntigravity => {
             sources::extract_gemini_antigravity_file(&source.path, &config)
         }
+        SourceFormat::Junie => sources::extract_junie_file(&source.path, &config),
     }
 }
 
@@ -2469,6 +2497,7 @@ mod tests {
                 message: "hello world".to_string(),
                 branch: None,
                 cwd: None,
+                frame_kind: None,
             },
             TimelineEntry {
                 timestamp: Utc.with_ymd_and_hms(2026, 1, 22, 14, 30, 12).unwrap(),
@@ -2478,6 +2507,7 @@ mod tests {
                 message: "hi there\nsecond line".to_string(),
                 branch: None,
                 cwd: None,
+                frame_kind: None,
             },
         ];
 
@@ -2580,6 +2610,7 @@ mod tests {
             message: message.to_string(),
             branch: None,
             cwd: None,
+            frame_kind: None,
         }
     }
 
@@ -2827,9 +2858,10 @@ mod tests {
             agent: "codex".to_string(),
             session_id: "sess-telemetry".to_string(),
             role: "assistant".to_string(),
-            message: "---\nrun_id: mrbl-001\nprompt_id: api-redesign_20260327\nmodel: gpt-5.4\nstarted_at: 2026-03-27T10:00:00Z\ncompleted_at: 2026-03-27T10:01:00Z\ntoken_usage: 1234\nfindings_count: 4\nphase: implement\nmode: session-first\nskill_code: vc-workflow\nframework_version: 2026-03\n---\n## Findings\nTelemetry wiring landed.\n".to_string(),
+            message: "---\nrun_id: mrbl-001\nprompt_id: api-redesign_20260327\nmodel: gpt-5.4\nstarted_at: 2026-03-27T10:00:00Z\ncompleted_at: 2026-03-27T10:01:00Z\ntoken_usage: 1234\nfindings_count: 4\nframe_kind: agent_reply\nphase: implement\nmode: session-first\nskill_code: vc-workflow\nframework_version: 2026-03\n---\n## Findings\nTelemetry wiring landed.\n".to_string(),
             branch: None,
             cwd: None,
+            frame_kind: None,
         }];
 
         let written = write_context_session_first_at(
@@ -2869,6 +2901,10 @@ mod tests {
         );
         assert_eq!(sidecar.token_usage, Some(1234));
         assert_eq!(sidecar.findings_count, Some(4));
+        assert_eq!(
+            sidecar.frame_kind,
+            Some(crate::types::FrameKind::AgentReply)
+        );
         assert_eq!(sidecar.workflow_phase.as_deref(), Some("implement"));
         assert_eq!(sidecar.mode.as_deref(), Some("session-first"));
         assert_eq!(sidecar.skill_code.as_deref(), Some("vc-workflow"));
@@ -2907,6 +2943,7 @@ mod tests {
             message: message.to_string(),
             branch: None,
             cwd: cwd.map(ToOwned::to_owned),
+            frame_kind: None,
         }
     }
 
