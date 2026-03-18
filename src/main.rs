@@ -3371,10 +3371,7 @@ mod tests {
 
         match cli.command {
             Some(Commands::Steer { filters, .. }) => {
-                assert_eq!(
-                    filters.frame_kind,
-                    Some(ai_contexters::types::FrameKind::UserMsg)
-                );
+                assert_eq!(filters.frame_kind, Some(ai_contexters::types::FrameKind::UserMsg));
             }
             _ => panic!("expected steer command"),
         }
@@ -3394,10 +3391,7 @@ mod tests {
 
         match cli.command {
             Some(Commands::Intents { filters, .. }) => {
-                assert_eq!(
-                    filters.frame_kind,
-                    Some(ai_contexters::types::FrameKind::ToolCall)
-                );
+                assert_eq!(filters.frame_kind, Some(ai_contexters::types::FrameKind::ToolCall));
             }
             _ => panic!("expected intents command"),
         }
