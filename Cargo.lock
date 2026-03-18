@@ -21,6 +21,7 @@ dependencies = [
  "clap",
  "dirs",
  "filetime",
+ "libc",
  "regex",
  "rmcp",
  "serde",
