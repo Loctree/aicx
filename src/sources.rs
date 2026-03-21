@@ -148,6 +148,7 @@ struct CodexEntry {
 struct GeminiSession {
     #[serde(default)]
     session_id: Option<String>,
+    #[allow(dead_code)]
     #[serde(default)]
     project_hash: Option<String>,
     #[serde(default)]
@@ -1906,8 +1907,11 @@ fn parse_gemini_session(
         .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()))
         .unwrap_or_default();
 
-    // Use projectHash as a pseudo-cwd for filtering
-    let project_hash = session.project_hash.clone();
+    let session_default_cwd = session
+        .messages
+        .iter()
+        .filter_map(|message| message.content.as_deref())
+        .find_map(infer_project_hint_from_text);
 
     // Check project filter against message content
     let session_matches_filter = if !config.project_filter.is_empty() {
@@ -1975,6 +1979,9 @@ fn parse_gemini_session(
             continue;
         }
 
+        let inferred_cwd =
+            infer_project_hint_from_text(&text).or_else(|| session_default_cwd.clone());
+
         entries.push(TimelineEntry {
             timestamp,
             agent: "gemini".to_string(),
@@ -1982,7 +1989,7 @@ fn parse_gemini_session(
             role,
             message: text,
             branch: None,
-            cwd: project_hash.clone(),
+            cwd: inferred_cwd.clone(),
         });
 
         // Extract thoughts as reasoning entries (only when include_assistant)
@@ -2016,7 +2023,7 @@ fn parse_gemini_session(
                     role: "reasoning".to_string(),
                     message: text,
                     branch: None,
-                    cwd: project_hash.clone(),
+                    cwd: inferred_cwd.clone(),
                 });
             }
         }
