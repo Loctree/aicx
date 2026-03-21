@@ -1,6 +1,6 @@
 [package]
 name = "ai-contexters"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Extract timeline and memory from AI agent sessions (Claude Code, Codex, Gemini)"
