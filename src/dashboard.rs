@@ -8,8 +8,7 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
-use regex::Regex;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -17,6 +16,9 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+
+#[cfg(test)]
+use regex::Regex;
 
 const MAX_JSON_PARSE_BYTES: u64 = 8 * 1024 * 1024;
 const SEARCH_READ_BYTES: u64 = 256 * 1024;
@@ -116,11 +118,6 @@ pub fn build_dashboard(config: &DashboardConfig) -> Result<DashboardArtifact> {
 
 fn scan_store(store_root: &Path, preview_chars: usize) -> Result<ScanResult> {
     let store_root = crate::sanitize::validate_dir_path(store_root)?;
-    let date_re = Regex::new(r"^\d{4}-\d{2}-\d{2}$").expect("valid date regex");
-    let session_re = Regex::new(
-        r"^(?P<time>\d{6})_(?P<agent>[A-Za-z0-9][A-Za-z0-9_-]*?)(?:-(?P<suffix>context|\d{3}|[A-Za-z0-9_-]+))?\.(?P<ext>md|json|txt|markdown)$",
-    )
-    .expect("valid session regex");
 
     let mut stats = DashboardStats {
         search_backend: "raw-notes-fuzzy".to_string(),
@@ -128,10 +125,10 @@ fn scan_store(store_root: &Path, preview_chars: usize) -> Result<ScanResult> {
     };
 
     let mut assumptions = vec![
-        "Data source is raw files from ~/.ai-contexters (filesystem-first, no memex).".to_string(),
+        "Data source is canonical files from ~/.aicx with repo and non-repository roots.".to_string(),
         "Layout is intentionally simplified to Search -> List -> Content for daily browsing.".to_string(),
-        "Date folders are interpreted only when directory name matches YYYY-MM-DD.".to_string(),
-        "Session files are classified by filename pattern <HHMMSS>_<agent>-<suffix>.{md,json,txt,markdown}.".to_string(),
+        "Repo-scoped files are scanned from ~/.aicx/store/<org>/<repo>/<YYYY_MMDD>/<kind>/<agent>/...".to_string(),
+        "Non-repository fallbacks are scanned from ~/.aicx/non-repository-contexts/<YYYY_MMDD>/<kind>/<agent>/...".to_string(),
         "Fuzzy search index uses normalized matching over file metadata and bounded raw-note content excerpts.".to_string(),
     ];
 
@@ -155,164 +152,88 @@ fn scan_store(store_root: &Path, preview_chars: usize) -> Result<ScanResult> {
             .push("state.json not found; dedup history is not surfaced in dashboard.".to_string());
     }
 
-    let entries = fs::read_dir(&store_root)
-        .with_context(|| format!("Failed to read store root: {}", store_root.display()))?;
-
-    for project_entry in entries {
-        let project_entry = match project_entry {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let project_path = project_entry.path();
-        let project_ft = match project_entry.file_type() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if project_ft.is_symlink() || !project_ft.is_dir() {
+    for stored_file in crate::store::scan_context_files_at(&store_root)? {
+        let file_path = stored_file.path.clone();
+        let extension = file_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !supported_note_extension(&extension) {
             continue;
         }
 
-        let project_name = project_entry.file_name().to_string_lossy().to_string();
-        if project_name.starts_with('.') || project_name == "memex" || project_name == "contexts" {
-            continue;
-        }
-
-        let mut has_date_dir = false;
-
-        let date_dirs = match fs::read_dir(&project_path) {
-            Ok(v) => v,
+        let metadata = match fs::metadata(&file_path) {
+            Ok(metadata) => metadata,
             Err(_) => continue,
         };
 
-        for date_entry in date_dirs {
-            let date_entry = match date_entry {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+        let file_name = file_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown-file")
+            .to_string();
+        let (entry_count, preview, search_excerpt, detail_text) =
+            read_preview_and_search_excerpt(&file_path, &extension, metadata.len(), preview_chars);
 
-            let date_path = date_entry.path();
-            let date_ft = match date_entry.file_type() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if date_ft.is_symlink() || !date_ft.is_dir() {
-                continue;
-            }
+        let modified = metadata.modified().ok();
+        let modified_utc = format_modified_utc(modified);
+        let time = modified
+            .map(DateTime::<Utc>::from)
+            .map(|datetime| datetime.format("%H:%M:%S").to_string())
+            .unwrap_or_else(|| "00:00:00".to_string());
+        let sort_ts = modified
+            .map(|mtime| DateTime::<Utc>::from(mtime).timestamp())
+            .unwrap_or_default();
+        let relative_path = file_path
+            .strip_prefix(&store_root)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| file_path.display().to_string());
 
-            let date_name = date_entry.file_name().to_string_lossy().to_string();
-            if !date_re.is_match(&date_name) {
-                stats.ignored_non_date_dirs += 1;
-                continue;
-            }
+        let search_blob = trim_chars(
+            &collapse_ws(&format!(
+                "{} {} {} {} {} {}",
+                stored_file.project,
+                stored_file.agent,
+                stored_file.date_iso,
+                relative_path,
+                stored_file.kind.dir_name(),
+                search_excerpt
+            ))
+            .to_lowercase(),
+            MAX_SEARCH_TEXT_CHARS,
+        );
 
-            has_date_dir = true;
-            projects.insert(project_name.clone());
+        stats.fuzzy_index_chars += search_blob.len();
+        projects.insert(stored_file.project.clone());
+        agents.insert(stored_file.agent.clone());
+        kinds.insert(stored_file.kind.dir_name().to_string());
 
-            let files = match fs::read_dir(&date_path) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+        let record = DashboardRecord {
+            id: records.len() + 1,
+            project: stored_file.project,
+            agent: stored_file.agent,
+            date: stored_file.date_iso,
+            time,
+            kind: stored_file.kind.dir_name().to_string(),
+            extension,
+            file_name,
+            relative_path,
+            absolute_path: file_path.display().to_string(),
+            bytes: metadata.len(),
+            size_human: human_size(metadata.len()),
+            modified_utc,
+            sort_ts,
+            entry_count,
+            preview,
+            search_blob,
+            detail_text,
+        };
 
-            for file_entry in files {
-                let file_entry = match file_entry {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let file_path = file_entry.path();
-                let file_ft = match file_entry.file_type() {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                if file_ft.is_symlink() || !file_ft.is_file() {
-                    continue;
-                }
-
-                let file_name = file_entry.file_name().to_string_lossy().to_string();
-                let extension = file_path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-
-                if !supported_note_extension(&extension) {
-                    continue;
-                }
-
-                let md = match file_entry.metadata() {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                let parsed = parse_session_filename(&file_name, &session_re);
-                if parsed.is_none() {
-                    stats.malformed_session_files += 1;
-                }
-
-                let (time, agent, kind) = parsed.unwrap_or_else(|| {
-                    (
-                        "000000".to_string(),
-                        "unknown".to_string(),
-                        classify_extension_kind_ref(&extension).to_string(),
-                    )
-                });
-
-                let (entry_count, preview, search_excerpt, detail_text) =
-                    read_preview_and_search_excerpt(
-                        &file_path,
-                        &extension,
-                        md.len(),
-                        preview_chars,
-                    );
-
-                let modified_utc = format_modified_utc(md.modified().ok());
-                let sort_ts = parse_sort_ts(&date_name, &time, md.modified().ok());
-                let relative_path = format!("{}/{}/{}", project_name, date_name, file_name);
-
-                let search_blob = trim_chars(
-                    &collapse_ws(&format!(
-                        "{} {} {} {} {} {}",
-                        project_name, agent, date_name, relative_path, kind, search_excerpt
-                    ))
-                    .to_lowercase(),
-                    MAX_SEARCH_TEXT_CHARS,
-                );
-
-                stats.fuzzy_index_chars += search_blob.len();
-
-                let record = DashboardRecord {
-                    id: records.len() + 1,
-                    project: project_name.clone(),
-                    agent: agent.clone(),
-                    date: date_name.clone(),
-                    time,
-                    kind: kind.clone(),
-                    extension,
-                    file_name,
-                    relative_path,
-                    absolute_path: file_path.display().to_string(),
-                    bytes: md.len(),
-                    size_human: human_size(md.len()),
-                    modified_utc,
-                    sort_ts,
-                    entry_count,
-                    preview,
-                    search_blob,
-                    detail_text,
-                };
-
-                stats.total_files += 1;
-                stats.total_bytes += md.len();
-                stats.total_entries_estimate += record.entry_count.unwrap_or(0);
-                agents.insert(record.agent.clone());
-                kinds.insert(kind);
-
-                records.push(record);
-            }
-        }
-
-        if !has_date_dir {
-            stats.ignored_non_store_projects += 1;
-        }
+        stats.total_files += 1;
+        stats.total_bytes += metadata.len();
+        stats.total_entries_estimate += record.entry_count.unwrap_or(0);
+        records.push(record);
     }
 
     records.sort_by(|a, b| {
@@ -367,6 +288,7 @@ fn supported_note_extension(ext: &str) -> bool {
     matches!(ext, "md" | "markdown" | "txt" | "json")
 }
 
+#[cfg(test)]
 fn classify_extension_kind_ref(ext: &str) -> &'static str {
     match ext {
         "json" => "raw-json",
@@ -636,18 +558,7 @@ fn format_modified_utc(modified: Option<SystemTime>) -> String {
     dt.to_rfc3339()
 }
 
-fn normalize_date(raw: &str) -> String {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
-        return dt.with_timezone(&Utc).format("%Y-%m-%d").to_string();
-    }
-
-    if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
-        return date.format("%Y-%m-%d").to_string();
-    }
-
-    raw.chars().take(10).collect()
-}
-
+#[cfg(test)]
 fn parse_session_filename(file_name: &str, re: &Regex) -> Option<(String, String, String)> {
     let caps = re.captures(file_name)?;
 
@@ -678,22 +589,6 @@ fn parse_session_filename(file_name: &str, re: &Regex) -> Option<(String, String
     .to_string();
 
     Some((time, agent, kind))
-}
-
-fn parse_sort_ts(date: &str, time: &str, fallback: Option<SystemTime>) -> i64 {
-    if time.len() == 6 {
-        let stamp = format!("{} {}", normalize_date(date), time);
-        if let Ok(naive) = NaiveDateTime::parse_from_str(&stamp, "%Y-%m-%d %H%M%S") {
-            return DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc).timestamp();
-        }
-    }
-
-    fallback
-        .map(|t| {
-            let dt: DateTime<Utc> = t.into();
-            dt.timestamp()
-        })
-        .unwrap_or(0)
 }
 
 fn trim_chars(s: &str, max_chars: usize) -> String {
@@ -1356,18 +1251,24 @@ mod tests {
     #[test]
     fn scans_store_and_builds_payload() {
         let root = mk_tmp_dir("ai_ctx_dashboard_scan");
-        let proj = root.join("demo-project").join("2026-02-24");
+        let proj = root
+            .join("store")
+            .join("local")
+            .join("demo-project")
+            .join("2026_0224")
+            .join("conversations")
+            .join("codex");
         fs::create_dir_all(&proj).expect("proj");
 
         fs::write(
-            proj.join("101112_codex-context.json"),
+            proj.join("2026_0224_codex_dashjson001_001.json"),
             r#"[
                 {"timestamp":"2026-02-24T10:11:12Z","agent":"codex","role":"user","message":"hello world"}
             ]"#,
         )
         .expect("json");
         fs::write(
-            proj.join("101112_codex-001.md"),
+            proj.join("2026_0224_codex_dashmd001_001.md"),
             "# demo\n\n### 2026-02-24 10:11:12 UTC | user\n> hello world\n",
         )
         .expect("md");
@@ -1391,7 +1292,7 @@ mod tests {
             scan.payload
                 .records
                 .iter()
-                .any(|r| r.kind == "context-json")
+                .any(|r| r.kind == "conversations")
         );
 
         let _ = fs::remove_dir_all(root);
@@ -1400,10 +1301,16 @@ mod tests {
     #[test]
     fn builds_dashboard_html_with_simple_layout() {
         let root = mk_tmp_dir("ai_ctx_dashboard_html");
-        let proj = root.join("demo").join("2026-02-24");
+        let proj = root
+            .join("store")
+            .join("local")
+            .join("demo")
+            .join("2026_0224")
+            .join("conversations")
+            .join("claude");
         fs::create_dir_all(&proj).expect("proj");
         fs::write(
-            proj.join("120000_claude-context.md"),
+            proj.join("2026_0224_claude_dashhtml001_001.md"),
             "# demo | claude | 2026-02-24\n\n### 2026-02-24 12:00:00 UTC | user\n> hi\n",
         )
         .expect("md");
@@ -1447,11 +1354,17 @@ mod tests {
     #[test]
     fn scan_skips_symlinked_files() {
         let root = mk_tmp_dir("ai_ctx_dashboard_symlink_root");
-        let proj = root.join("demo").join("2026-02-24");
+        let proj = root
+            .join("store")
+            .join("local")
+            .join("demo")
+            .join("2026_0224")
+            .join("conversations")
+            .join("codex");
         fs::create_dir_all(&proj).expect("proj");
 
         let outside = mk_tmp_dir("ai_ctx_dashboard_symlink_outside");
-        let outside_file = outside.join("120000_codex-context.md");
+        let outside_file = outside.join("2026_0224_codex_outside001_001.md");
         fs::write(
             &outside_file,
             "outside file that should not be scanned via symlink",
@@ -1459,12 +1372,12 @@ mod tests {
         .expect("outside");
 
         fs::write(
-            proj.join("120001_codex-context.md"),
+            proj.join("2026_0224_codex_inside001_001.md"),
             "inside file that should be scanned",
         )
         .expect("inside");
 
-        let symlink_path = proj.join("120000_codex-context.md");
+        let symlink_path = proj.join("2026_0224_codex_symlink001_001.md");
         std::os::unix::fs::symlink(&outside_file, &symlink_path).expect("symlink");
 
         let scan = scan_store(&root, 120).expect("scan");
@@ -1473,7 +1386,7 @@ mod tests {
             scan.payload
                 .records
                 .iter()
-                .all(|r| r.file_name != "120000_codex-context.md")
+                .all(|r| r.file_name != "2026_0224_codex_symlink001_001.md")
         );
 
         let _ = fs::remove_dir_all(root);

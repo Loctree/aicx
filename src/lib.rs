@@ -13,6 +13,7 @@ pub mod output;
 pub mod rank;
 pub mod redact;
 pub mod sanitize;
+pub mod segmentation;
 pub mod sources;
 pub mod state;
 pub mod store;

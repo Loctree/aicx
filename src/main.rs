@@ -1193,56 +1193,12 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         sessions,
     };
 
-    // ── Store-first: group entries by repo (from cwd) × agent × date ──
-    //
-    // Writes agent-friendly chunks (~1500 tokens) to central store.
-    // Raw path emission is opt-in via `--emit paths` / `--emit json`.
     let chunker_config = ai_contexters::chunker::ChunkerConfig::default();
     let mut all_written_paths: Vec<std::path::PathBuf> = Vec::new();
 
     if !output_entries.is_empty() {
-        let mut repo_groups: std::collections::BTreeMap<
-            (String, String, String),
-            Vec<output::TimelineEntry>,
-        > = std::collections::BTreeMap::new();
-
-        for entry in &output_entries {
-            let repo = sources::repo_name_from_cwd(entry.cwd.as_deref(), &project);
-            let date = entry.timestamp.format("%Y-%m-%d").to_string();
-            repo_groups
-                .entry((repo, entry.agent.clone(), date))
-                .or_default()
-                .push(entry.clone());
-        }
-
-        let mut index = store::load_index();
-        let now = Utc::now();
-        let time_str = now.format("%H%M%S").to_string();
-
-        // Per-repo summary counters
-        let mut repo_summary: std::collections::BTreeMap<
-            String,
-            std::collections::BTreeMap<String, usize>,
-        > = std::collections::BTreeMap::new();
-
-        for ((repo, agent_name, date), group_entries) in &repo_groups {
-            let paths = store::write_context_chunked(
-                repo,
-                agent_name,
-                date,
-                &time_str,
-                group_entries,
-                &chunker_config,
-            )?;
-            store::update_index(&mut index, repo, agent_name, date, group_entries.len());
-            *repo_summary
-                .entry(repo.clone())
-                .or_default()
-                .entry(agent_name.clone())
-                .or_insert(0) += group_entries.len();
-            all_written_paths.extend(paths);
-        }
-        store::save_index(&index)?;
+        let store_summary = store::store_semantic_segments(&output_entries, &chunker_config)?;
+        all_written_paths.extend(store_summary.written_paths.clone());
 
         // Summary to stderr (diagnostics)
         eprintln!(
@@ -1250,7 +1206,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             output_entries.len(),
             all_written_paths.len(),
         );
-        for (repo, agents_map) in &repo_summary {
+        for (repo, agents_map) in &store_summary.project_summary {
             let total: usize = agents_map.values().sum();
             let detail: Vec<String> = agents_map
                 .iter()
@@ -1528,61 +1484,17 @@ fn run_store(
             e.message = ai_contexters::redact::redact_secrets(&e.message);
         }
     }
-    // Group by repo (from cwd) × agent × date and write chunked to central store
     let chunker_config = ai_contexters::chunker::ChunkerConfig::default();
-    let mut index = store::load_index();
-    let mut stored_count = 0usize;
-    let mut all_written_paths: Vec<std::path::PathBuf> = Vec::new();
-
-    let mut repo_groups: std::collections::BTreeMap<
-        (String, String, String),
-        Vec<output::TimelineEntry>,
-    > = std::collections::BTreeMap::new();
-
-    for entry in &all_entries {
-        let repo = sources::repo_name_from_cwd(entry.cwd.as_deref(), &project);
-        let date = entry.timestamp.format("%Y-%m-%d").to_string();
-        repo_groups
-            .entry((repo, entry.agent.clone(), date))
-            .or_default()
-            .push(entry.clone());
-    }
-
-    let now = Utc::now();
-    let time_str = now.format("%H%M%S").to_string();
-
-    let mut repo_summary: std::collections::BTreeMap<
-        String,
-        std::collections::BTreeMap<String, usize>,
-    > = std::collections::BTreeMap::new();
-
-    for ((repo, agent_name, date), group_entries) in &repo_groups {
-        let paths = store::write_context_chunked(
-            repo,
-            agent_name,
-            date,
-            &time_str,
-            group_entries,
-            &chunker_config,
-        )?;
-        store::update_index(&mut index, repo, agent_name, date, group_entries.len());
-        stored_count += group_entries.len();
-        *repo_summary
-            .entry(repo.clone())
-            .or_default()
-            .entry(agent_name.clone())
-            .or_insert(0) += group_entries.len();
-        all_written_paths.extend(paths);
-    }
-
-    store::save_index(&index)?;
+    let store_summary = store::store_semantic_segments(&all_entries, &chunker_config)?;
+    let stored_count = store_summary.total_entries;
+    let all_written_paths = store_summary.written_paths.clone();
 
     eprintln!(
         "✓ {} entries → {} chunks",
         stored_count,
         all_written_paths.len(),
     );
-    for (repo, agents_map) in &repo_summary {
+    for (repo, agents_map) in &store_summary.project_summary {
         let total: usize = agents_map.values().sum();
         let detail: Vec<String> = agents_map
             .iter()
@@ -1608,7 +1520,7 @@ fn run_store(
                     "total_entries": stored_count,
                     "total_chunks": all_written_paths.len(),
                     "store_paths": store_paths,
-                    "repos": repo_summary,
+                    "repos": store_summary.project_summary,
                 }))?
             );
         }
@@ -1675,41 +1587,16 @@ fn run_rank(
         emit: StdoutEmit::None,
     });
 
-    let project = ai_contexters::sanitize::safe_project_name(project)?;
-    let base = store::store_base_dir()?;
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
 
-    let mut files: Vec<PathBuf> = Vec::new();
-    let proj_dir = base.join(project);
-
-    if proj_dir.is_dir() {
-        let proj_dir = ai_contexters::sanitize::validate_dir_path(&proj_dir)?;
-        for date_entry in
-            ai_contexters::sanitize::read_dir_validated(&proj_dir)?.filter_map(|e| e.ok())
-        {
-            let date_path = date_entry.path();
-            if !date_path.is_dir() {
-                continue;
-            }
-            let date_path = ai_contexters::sanitize::validate_dir_path(&date_path)?;
-            for file_entry in
-                ai_contexters::sanitize::read_dir_validated(&date_path)?.filter_map(|e| e.ok())
-            {
-                let fpath = file_entry.path();
-                if fpath
-                    .extension()
-                    .is_some_and(|ext| ext == "md" || ext == "json")
-                    && let Ok(meta) = fpath.metadata()
-                    && let Ok(mtime) = meta.modified()
-                    && mtime >= cutoff
-                {
-                    files.push(fpath);
-                }
-            }
-        }
-    }
-
-    files.sort();
+    let files: Vec<_> = store::context_files_since(cutoff, Some(project))?
+        .into_iter()
+        .filter(|file| {
+            file.path
+                .extension()
+                .is_some_and(|ext| ext == "md" || ext == "json")
+        })
+        .collect();
 
     if files.is_empty() {
         println!(
@@ -1719,19 +1606,18 @@ fn run_rank(
         return Ok(());
     }
 
-    // Group by prefix (e.g. 2026-03-12/160800_codex)
-    let mut bundles: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    let mut bundles: BTreeMap<String, Vec<store::StoredContextFile>> = BTreeMap::new();
 
-    for f in files {
-        let parent_name = f
-            .parent()
-            .and_then(|p| p.file_name())
-            .unwrap_or_default()
-            .to_string_lossy();
-        let name = f.file_name().unwrap_or_default().to_string_lossy();
-        let file_prefix = name.split('-').next().unwrap_or(&name);
-        let prefix = format!("{}/{}", parent_name, file_prefix);
-        bundles.entry(prefix).or_default().push(f);
+    for file in files {
+        let prefix = format!(
+            "{}/{}/{}/{}/{}",
+            file.project,
+            file.date_compact,
+            file.kind.dir_name(),
+            file.agent,
+            file.session_id
+        );
+        bundles.entry(prefix).or_default().push(file);
     }
 
     // Score each chunk and compute bundle averages
@@ -1749,7 +1635,7 @@ fn run_rank(
     for (key, bundle_files) in &bundles {
         let scored_files: Vec<(PathBuf, rank::ChunkScore)> = bundle_files
             .iter()
-            .map(|f| (f.clone(), rank::score_chunk_file(f)))
+            .map(|file| (file.path.clone(), rank::score_chunk_file(&file.path)))
             .collect();
 
         let total_score: u32 = scored_files.iter().map(|(_, s)| s.score as u32).sum();
@@ -1906,59 +1792,11 @@ fn is_noise_artifact(path: &std::path::Path) -> bool {
 
 /// List context files from the global store, filtered by recency.
 fn run_refs(hours: u64, project: Option<String>, emit: RefsEmit, strict: bool) -> Result<()> {
-    let base = ai_contexters::sanitize::validate_dir_path(&store::store_base_dir()?)?;
-
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
-
-    let mut files: Vec<PathBuf> = Vec::new();
-
-    let project_dirs: Vec<_> = if let Some(ref p) = project {
-        let safe_project = ai_contexters::sanitize::safe_project_name(p)?;
-        let d = base.join(safe_project);
-        if d.is_dir() {
-            vec![ai_contexters::sanitize::validate_dir_path(&d)?]
-        } else {
-            vec![]
-        }
-    } else {
-        ai_contexters::sanitize::read_dir_validated(&base)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.is_dir() && p.file_name().is_some_and(|n| n != "memex"))
-            .filter_map(|path| ai_contexters::sanitize::validate_dir_path(&path).ok())
-            .collect()
-    };
-
-    for proj_dir in project_dirs {
-        for date_entry in
-            ai_contexters::sanitize::read_dir_validated(&proj_dir)?.filter_map(|e| e.ok())
-        {
-            let date_path = date_entry.path();
-            if !date_path.is_dir() {
-                continue;
-            }
-            let date_path = ai_contexters::sanitize::validate_dir_path(&date_path)?;
-            for file_entry in
-                ai_contexters::sanitize::read_dir_validated(&date_path)?.filter_map(|e| e.ok())
-            {
-                let fpath = file_entry.path();
-                if fpath
-                    .extension()
-                    .is_some_and(|ext| ext == "md" || ext == "json")
-                    && let Ok(meta) = fpath.metadata()
-                    && let Ok(mtime) = meta.modified()
-                    && mtime >= cutoff
-                {
-                    if strict && is_noise_artifact(&fpath) {
-                        continue;
-                    }
-                    files.push(fpath);
-                }
-            }
-        }
+    let mut files = store::context_files_since(cutoff, project.as_deref())?;
+    if strict {
+        files.retain(|file| !is_noise_artifact(&file.path));
     }
-
-    files.sort();
 
     if files.is_empty() {
         eprintln!("No context files found within last {} hours.", hours);
@@ -1969,7 +1807,7 @@ fn run_refs(hours: u64, project: Option<String>, emit: RefsEmit, strict: bool) -
                 let stdout = io::stdout();
                 let mut out = io::BufWriter::new(stdout.lock());
                 for f in &files {
-                    if let Err(err) = writeln!(out, "{}", f.display()) {
+                    if let Err(err) = writeln!(out, "{}", f.path.display()) {
                         if err.kind() == io::ErrorKind::BrokenPipe {
                             return Ok(());
                         }
@@ -2007,49 +1845,20 @@ struct RefsProjectSummary {
     agents: BTreeMap<String, RefsAgentSummary>,
 }
 
-fn extract_agent_from_filename(path: &Path) -> String {
-    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-        return "unknown".to_string();
-    };
-    let Some((_, tail)) = stem.split_once('_') else {
-        return "unknown".to_string();
-    };
-    let agent = tail
-        .split_once('-')
-        .map(|(a, _)| a)
-        .filter(|a| !a.is_empty())
-        .unwrap_or(tail);
-    if agent.is_empty() {
-        "unknown".to_string()
-    } else {
-        agent.to_ascii_lowercase()
-    }
-}
-
-fn print_refs_summary(files: &[PathBuf]) -> Result<()> {
+fn print_refs_summary(files: &[store::StoredContextFile]) -> Result<()> {
     let mut by_project: BTreeMap<String, RefsProjectSummary> = BTreeMap::new();
 
     for path in files {
         let file_name = path
+            .path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown-file")
             .to_string();
-        let date = path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown-date")
-            .to_string();
-        let project = path
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or("_unknown")
-            .to_string();
-        let latest_rel = format!("{}/{}", date, file_name);
-        let agent = extract_agent_from_filename(path);
+        let date = path.date_iso.clone();
+        let project = path.project.clone();
+        let latest_rel = format!("{}/{}/{}", date, path.kind.dir_name(), file_name);
+        let agent = path.agent.to_ascii_lowercase();
 
         let project_summary = by_project.entry(project).or_default();
         project_summary.total_files += 1;

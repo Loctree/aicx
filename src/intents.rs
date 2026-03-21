@@ -222,75 +222,45 @@ fn collect_chunk_files(
     project: &str,
     cutoff: DateTime<Utc>,
 ) -> Result<Vec<StoredChunkFile>> {
-    let project = sanitize::safe_project_name(project)?;
-    let store_root = sanitize::validate_dir_path(store_root)?;
-    let project_root = store_root.join(project);
-    if !project_root.is_dir() {
-        return Ok(Vec::new());
-    }
-    let project_root = sanitize::validate_dir_path(&project_root)?;
-
     let mut files = Vec::new();
 
-    for date_entry in sanitize::read_dir_validated(&project_root)
-        .with_context(|| format!("Failed to read project dir: {}", project_root.display()))?
-    {
-        let date_entry = match date_entry {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
-        let date_path = date_entry.path();
-        let file_type = match date_entry.file_type() {
-            Ok(kind) => kind,
-            Err(_) => continue,
-        };
-        if file_type.is_symlink() || !file_type.is_dir() {
+    for file in store::scan_context_files_at(store_root)? {
+        if file.path.extension().and_then(|ext| ext.to_str()) != Some("md") {
             continue;
         }
-
-        let date_name = date_entry.file_name().to_string_lossy().to_string();
-        let Some(date) = parse_date_dir(&date_name) else {
-            continue;
-        };
-
-        for file_entry in sanitize::read_dir_validated(&date_path)
-            .with_context(|| format!("Failed to read date dir: {}", date_path.display()))?
+        if !file
+            .project
+            .to_ascii_lowercase()
+            .contains(&project.to_ascii_lowercase())
         {
-            let file_entry = match file_entry {
-                Ok(entry) => entry,
-                Err(_) => continue,
-            };
-            let path = file_entry.path();
-            let file_type = match file_entry.file_type() {
-                Ok(kind) => kind,
-                Err(_) => continue,
-            };
-            if file_type.is_symlink() || !file_type.is_file() {
-                continue;
-            }
-            if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
-                continue;
-            }
-
-            let file_name = file_entry.file_name().to_string_lossy().to_string();
-            let Some((time, agent, sequence)) = parse_chunk_filename(&file_name) else {
-                continue;
-            };
-            let Some(timestamp) = combine_date_time(date, &time) else {
-                continue;
-            };
-            if timestamp < cutoff {
-                continue;
-            }
-
-            files.push(StoredChunkFile {
-                agent,
-                date: date_name.clone(),
-                path,
-                sequence,
-                timestamp,
-            });
+            continue;
         }
+
+        let timestamp = file
+            .path
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .map(DateTime::<Utc>::from)
+            .or_else(|| {
+                NaiveDate::parse_from_str(&file.date_iso, "%Y-%m-%d")
+                    .ok()
+                    .and_then(|date| combine_date_time(date, "000000"))
+            });
+        let Some(timestamp) = timestamp else {
+            continue;
+        };
+        if timestamp < cutoff {
+            continue;
+        }
+
+        files.push(StoredChunkFile {
+            agent: file.agent,
+            date: file.date_iso,
+            path: file.path,
+            sequence: file.chunk,
+            timestamp,
+        });
     }
 
     files.sort_by(|left, right| {
@@ -301,32 +271,6 @@ fn collect_chunk_files(
     });
 
     Ok(files)
-}
-
-fn parse_date_dir(name: &str) -> Option<NaiveDate> {
-    NaiveDate::parse_from_str(name, "%Y-%m-%d").ok()
-}
-
-fn parse_chunk_filename(name: &str) -> Option<(String, String, u32)> {
-    if !name.ends_with(".md") || name.ends_with("-context.md") {
-        return None;
-    }
-
-    let stem = name.strip_suffix(".md")?;
-    let (time, rest) = stem.split_once('_')?;
-    if time.len() != 6 || !time.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-
-    let dash = rest.rfind('-')?;
-    let agent = rest[..dash].trim();
-    let seq = rest[dash + 1..].trim();
-    if agent.is_empty() {
-        return None;
-    }
-    let sequence = seq.parse().ok()?;
-
-    Some((time.to_string(), agent.to_string(), sequence))
 }
 
 fn combine_date_time(date: NaiveDate, time: &str) -> Option<DateTime<Utc>> {
@@ -1007,9 +951,29 @@ mod tests {
     use std::fs;
 
     fn write_chunk(root: &Path, project: &str, date: &str, name: &str, body: &str) {
-        let dir = root.join(project).join(date);
+        let date_compact = crate::store::compact_date(date);
+        let agent = if name.contains("_claude") || name.contains("claude") {
+            "claude"
+        } else if name.contains("_gemini") || name.contains("gemini") {
+            "gemini"
+        } else {
+            "codex"
+        };
+        let sequence = name
+            .trim_end_matches(".md")
+            .rsplit_once('-')
+            .and_then(|(_, tail)| tail.parse::<u32>().ok())
+            .unwrap_or(1);
+        let basename = crate::store::session_basename(date, agent, "intentstest01", sequence);
+        let dir = root
+            .join("store")
+            .join("local")
+            .join(project)
+            .join(date_compact)
+            .join("conversations")
+            .join(agent);
         fs::create_dir_all(&dir).expect("create chunk dir");
-        fs::write(dir.join(name), body).expect("write chunk");
+        fs::write(dir.join(basename), body).expect("write chunk");
     }
 
     #[test]

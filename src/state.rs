@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn test_state_path_is_under_store() {
         if let Ok(path) = StateManager::state_path() {
-            assert!(path.to_string_lossy().contains(".ai-contexters"));
+            assert!(path.to_string_lossy().contains(".aicx"));
             assert!(path.to_string_lossy().ends_with("state.json"));
         }
     }

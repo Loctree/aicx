@@ -13,7 +13,6 @@ use rmcp::{
     model::*, tool, tool_router,
 };
 use serde::Deserialize;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Guard that prevents concurrent background refresh child-process spawns.
@@ -192,58 +191,39 @@ impl AicxMcpServer {
         let strict = params.strict;
         let top = params.top;
 
-        let store_root = store::store_base_dir()
-            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
         let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
+        let mut scored: Vec<serde_json::Value> = Vec::new();
 
-        let proj_dir = store_root.join(&project);
-        if !proj_dir.is_dir() {
+        let files = store::context_files_since(cutoff, Some(&project))
+            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+
+        if files.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "No data for project '{project}'"
             ))]));
         }
 
-        let mut scored: Vec<serde_json::Value> = Vec::new();
-
-        let Ok(dates) = std::fs::read_dir(&proj_dir) else {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "Cannot read project dir",
-            )]));
-        };
-
-        for date_entry in dates.filter_map(|e| e.ok()) {
-            let date_path = date_entry.path();
-            if !date_path.is_dir() {
+        for file in files {
+            if file.path.extension().is_none_or(|ext| ext != "md") {
                 continue;
             }
-            let Ok(files) = std::fs::read_dir(&date_path) else {
+            let cs = rank::score_chunk_file(&file.path);
+            if strict && cs.score < 5 {
                 continue;
-            };
-            for file_entry in files.filter_map(|e| e.ok()) {
-                let fpath = file_entry.path();
-                if fpath.extension().is_none_or(|ext| ext != "md") {
-                    continue;
-                }
-                if let Ok(meta) = fpath.metadata()
-                    && let Ok(mtime) = meta.modified()
-                    && mtime >= cutoff
-                {
-                    let cs = rank::score_chunk_file(&fpath);
-                    if strict && cs.score < 5 {
-                        continue;
-                    }
-                    scored.push(serde_json::json!({
-                        "file": fpath.file_name().unwrap_or_default().to_string_lossy(),
-                        "date": date_path.file_name().unwrap_or_default().to_string_lossy(),
-                        "score": cs.score,
-                        "label": cs.label,
-                        "signal": cs.signal_lines,
-                        "noise": cs.noise_lines,
-                        "total": cs.total_lines,
-                        "density": format!("{:.0}%", cs.density * 100.0),
-                    }));
-                }
             }
+            scored.push(serde_json::json!({
+                "file": file.path.file_name().unwrap_or_default().to_string_lossy(),
+                "project": file.project,
+                "date": file.date_iso,
+                "kind": file.kind.dir_name(),
+                "agent": file.agent,
+                "score": cs.score,
+                "label": cs.label,
+                "signal": cs.signal_lines,
+                "noise": cs.noise_lines,
+                "total": cs.total_lines,
+                "density": format!("{:.0}%", cs.density * 100.0),
+            }));
         }
 
         scored.sort_by(|a, b| b["score"].as_u64().cmp(&a["score"].as_u64()));
@@ -276,61 +256,17 @@ impl AicxMcpServer {
         let project = params.project;
         let strict = params.strict;
 
-        let store_root = store::store_base_dir()
-            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
         let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
 
-        let mut paths: Vec<PathBuf> = Vec::new();
-
-        let project_dirs: Vec<PathBuf> = if let Some(ref p) = project {
-            let d = store_root.join(p);
-            if d.is_dir() { vec![d] } else { vec![] }
-        } else {
-            std::fs::read_dir(&store_root)
-                .map_err(|e| McpError::internal_error(format!("{e}"), None))?
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.is_dir() && p.file_name().is_some_and(|n| n != "memex"))
-                .collect()
-        };
-
-        for proj_dir in project_dirs {
-            let Ok(dates) = std::fs::read_dir(&proj_dir) else {
-                continue;
-            };
-            for date_entry in dates.filter_map(|e| e.ok()) {
-                let date_path = date_entry.path();
-                if !date_path.is_dir() {
-                    continue;
-                }
-                let Ok(files) = std::fs::read_dir(&date_path) else {
-                    continue;
-                };
-                for file_entry in files.filter_map(|e| e.ok()) {
-                    let fpath = file_entry.path();
-                    if fpath
-                        .extension()
-                        .is_some_and(|ext| ext == "md" || ext == "json")
-                        && let Ok(meta) = fpath.metadata()
-                        && let Ok(mtime) = meta.modified()
-                        && mtime >= cutoff
-                    {
-                        if strict {
-                            let cs = rank::score_chunk_file(&fpath);
-                            if cs.score < 5 {
-                                continue;
-                            }
-                        }
-                        paths.push(fpath);
-                    }
-                }
-            }
+        let mut paths = store::context_files_since(cutoff, project.as_deref())
+            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+        if strict {
+            paths.retain(|file| rank::score_chunk_file(&file.path).score >= 5);
         }
 
-        paths.sort();
         let text = paths
             .iter()
-            .map(|p| p.display().to_string())
+            .map(|file| file.path.display().to_string())
             .collect::<Vec<_>>()
             .join("\n");
 

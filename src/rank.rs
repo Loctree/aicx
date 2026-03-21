@@ -13,6 +13,7 @@ use std::path::Path;
 
 use crate::sanitize;
 use crate::sanitize::normalize_query;
+use crate::store;
 
 // ============================================================================
 // Noise patterns — lines that inflate chunk size without adding value
@@ -243,7 +244,6 @@ pub fn fuzzy_search_store(
     limit: usize,
     project_filter: Option<&str>,
 ) -> std::io::Result<(Vec<FuzzyResult>, usize)> {
-    let store_root = sanitize::validate_dir_path(store_root).map_err(io::Error::other)?;
     let normalized_query = normalize_query(query);
     let query_terms: Vec<&str> = normalized_query.split_whitespace().collect();
     let project_filter_lower = project_filter.map(|filter| filter.to_lowercase());
@@ -251,105 +251,59 @@ pub fn fuzzy_search_store(
     let mut results = Vec::new();
     let mut total_scanned = 0usize;
 
-    for project_entry in sanitize::read_dir_validated(&store_root)
-        .map_err(io::Error::other)?
-        .filter_map(|entry| entry.ok())
-    {
-        let project_path = project_entry.path();
-        if !project_path.is_dir() {
-            continue;
-        }
-
-        let project = project_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-
-        if project == "memex" {
-            continue;
-        }
-        if sanitize::safe_project_name(&project).is_err() {
+    let stored_files = store::scan_context_files_at(store_root).map_err(io::Error::other)?;
+    for stored_file in stored_files {
+        if stored_file.path.extension().is_none_or(|ext| ext != "md") {
             continue;
         }
 
         if let Some(ref filter) = project_filter_lower
-            && !project.to_lowercase().contains(filter)
+            && !stored_file.project.to_lowercase().contains(filter)
         {
             continue;
         }
 
-        let Ok(project_path) = sanitize::validate_dir_path(&project_path) else {
-            continue;
-        };
-        let Ok(date_entries) = sanitize::read_dir_validated(&project_path) else {
-            continue;
-        };
-        for date_entry in date_entries.filter_map(|entry| entry.ok()) {
-            let date_path = date_entry.path();
-            if !date_path.is_dir() {
-                continue;
-            }
+        total_scanned += 1;
 
-            let date = date_path
+        let Ok(content) = sanitize::read_to_string_validated(&stored_file.path) else {
+            continue;
+        };
+
+        let content_normalized = normalize_query(&content);
+        if !query_terms
+            .iter()
+            .all(|term| content_normalized.contains(term))
+        {
+            continue;
+        }
+
+        let matched_lines = content
+            .lines()
+            .filter(|line| {
+                let normalized_line = normalize_query(line);
+                query_terms
+                    .iter()
+                    .any(|term| normalized_line.contains(term))
+            })
+            .take(5)
+            .map(|line| line.trim().to_string())
+            .collect();
+
+        let chunk_score = score_chunk_content(&content);
+        results.push(FuzzyResult {
+            file: stored_file
+                .path
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
-                .to_string();
-
-            let Ok(date_path) = sanitize::validate_dir_path(&date_path) else {
-                continue;
-            };
-            let Ok(file_entries) = sanitize::read_dir_validated(&date_path) else {
-                continue;
-            };
-            for file_entry in file_entries.filter_map(|entry| entry.ok()) {
-                let file_path = file_entry.path();
-                if file_path.extension().is_none_or(|ext| ext != "md") {
-                    continue;
-                }
-                total_scanned += 1;
-
-                let Ok(content) = sanitize::read_to_string_validated(&file_path) else {
-                    continue;
-                };
-
-                let content_normalized = normalize_query(&content);
-                if !query_terms
-                    .iter()
-                    .all(|term| content_normalized.contains(term))
-                {
-                    continue;
-                }
-
-                let matched_lines = content
-                    .lines()
-                    .filter(|line| {
-                        let normalized_line = normalize_query(line);
-                        query_terms
-                            .iter()
-                            .any(|term| normalized_line.contains(term))
-                    })
-                    .take(5)
-                    .map(|line| line.trim().to_string())
-                    .collect();
-
-                let chunk_score = score_chunk_content(&content);
-                results.push(FuzzyResult {
-                    file: file_path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string(),
-                    project: project.clone(),
-                    date: date.clone(),
-                    score: chunk_score.score,
-                    label: chunk_score.label.to_string(),
-                    density: chunk_score.density,
-                    matched_lines,
-                });
-            }
-        }
+                .to_string(),
+            project: stored_file.project,
+            date: stored_file.date_iso,
+            score: chunk_score.score,
+            label: chunk_score.label.to_string(),
+            density: chunk_score.density,
+            matched_lines,
+        });
     }
 
     results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
