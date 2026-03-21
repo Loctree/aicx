@@ -183,6 +183,14 @@ aicx extract --format gemini-antigravity \
   -o /tmp/antigravity-report.md
 ```
 
+Single-session Gemini Antigravity extract (conversation artifacts first, explicit step-output fallback):
+
+```bash
+aicx extract --format gemini-antigravity \
+  ~/.gemini/antigravity/conversations/<uuid>.pb \
+  -o /tmp/antigravity-report.md
+```
+
 ## Docs
 
 - `docs/ARCHITECTURE.md` (module map + data flows)

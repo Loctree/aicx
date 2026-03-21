@@ -2408,6 +2408,138 @@ impl SourceLocator {
 }
 
 // ============================================================================
+// Migration
+// ============================================================================
+
+/// Migrate older file-centric contexts (`file: *`) to the currently inferred repository name.
+pub fn run_migration(dry_run: bool) -> Result<()> {
+    let base = store_base_dir()?;
+    if !base.exists() {
+        println!("Store directory does not exist. Nothing to migrate.");
+        return Ok(());
+    }
+
+    let mut index = load_index();
+    let mut modified = false;
+
+    // Identify projects starting with "file: "
+    let file_projects: Vec<String> = index
+        .projects
+        .keys()
+        .filter(|k| k.starts_with("file: "))
+        .cloned()
+        .collect();
+
+    if file_projects.is_empty() {
+        println!("No file-centric projects found. Migration complete.");
+        return Ok(());
+    }
+
+    // Determine target project.
+    let target_project = crate::sources::detect_project_name();
+    if target_project == "unknown_project" || target_project.is_empty() {
+        println!("WARNING: Could not infer a canonical repository name for migration.");
+        println!(
+            "Please run this command from inside a known repository, or explicitly specify the project."
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Migrating file-centric contexts to canonical project: '{}'",
+        target_project
+    );
+
+    for old_proj in file_projects {
+        println!("  - Found legacy project: '{}'", old_proj);
+        let old_dir = base.join(&old_proj);
+        let target_dir = base.join(&target_project);
+
+        if !old_dir.exists() {
+            println!("    (Directory missing, cleaning up index entry)");
+            if !dry_run {
+                index.projects.remove(&old_proj);
+                modified = true;
+            }
+            continue;
+        }
+
+        if dry_run {
+            println!(
+                "    [DRY RUN] Would move contents of {} to {}",
+                old_dir.display(),
+                target_dir.display()
+            );
+            continue;
+        }
+
+        // Actual migration
+        for date_entry_res in fs::read_dir(&old_dir)? {
+            let date_entry = match date_entry_res {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if !date_entry.path().is_dir() {
+                continue;
+            }
+
+            let date_name = date_entry.file_name();
+            let target_date_dir = target_dir.join(&date_name);
+
+            fs::create_dir_all(&target_date_dir)?;
+
+            for file_entry_res in fs::read_dir(date_entry.path())? {
+                let file_entry = match file_entry_res {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let file_name = file_entry.file_name();
+                let target_file = target_date_dir.join(&file_name);
+
+                if !target_file.exists() {
+                    fs::rename(file_entry.path(), &target_file)?;
+                } else {
+                    println!("    Collision detected for {:?}, skipping.", target_file);
+                }
+            }
+            let _ = fs::remove_dir(date_entry.path());
+        }
+
+        let _ = fs::remove_dir(&old_dir);
+
+        // Update index: merge stats into target_project
+        if let Some(old_stats) = index.projects.remove(&old_proj) {
+            let target_stats = index.projects.entry(target_project.clone()).or_default();
+
+            for (agent, agent_stats) in old_stats.agents {
+                let t_agent = target_stats.agents.entry(agent).or_default();
+
+                t_agent.total_entries += agent_stats.total_entries;
+                for d in agent_stats.dates {
+                    if !t_agent.dates.contains(&d) {
+                        t_agent.dates.push(d);
+                    }
+                }
+                t_agent.dates.sort();
+                if t_agent.last_updated < agent_stats.last_updated {
+                    t_agent.last_updated = agent_stats.last_updated;
+                }
+            }
+        }
+        modified = true;
+        println!("    Migrated '{}' successfully.", old_proj);
+    }
+
+    if modified && !dry_run {
+        index.last_updated = chrono::Utc::now();
+        save_index(&index)?;
+        println!("Index updated.");
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

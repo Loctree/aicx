@@ -1,59 +1,38 @@
-//! AI Contexters — the operator front door for agent session history.
+//! AI Contexters
 //!
-//! `aicx` orchestrates a two-layer pipeline: canonical corpus first,
-//! semantic materialization second. Materialization is always explicit.
-//!
-//! Two-layer architecture:
-//!   1. **Canonical corpus** (`~/.aicx/`) — deduplicated, chunked, steerable markdown.
-//!      Built by extractors (`claude`, `codex`, `all`) and `store`. This is ground truth.
-//!   2. **Semantic materialization** (memex) — vector + BM25 index for embedding-aware
-//!      retrieval by agents and MCP tools. Built by `memex-sync` or `--memex` on extractors.
-//!      Memex is the retrieval kernel; `aicx` is the orchestrator.
-//!
-//! Supported sources:
+//! Extracts timeline and decisions from AI agent session files:
 //! - Claude Code: ~/.claude/projects/*/*.jsonl
 //! - Codex: ~/.codex/history.jsonl
 //! - Gemini: ~/.gemini/tmp/<hash>/chats/session-*.json
 //! - Gemini Antigravity: ~/.gemini/antigravity/{conversations/<uuid>.pb,brain/<uuid>/}
 //!
+//! Features: incremental extraction, deduplication, rotation, append mode.
+//!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+use ai_contexters::chunker::{self, ChunkerConfig};
 use ai_contexters::dashboard::{self, DashboardConfig};
 use ai_contexters::dashboard_server::{self, DashboardServerConfig};
+use ai_contexters::init::{self, InitOptions};
 use ai_contexters::intents;
-use ai_contexters::memex::{self, MemexConfig, SyncProgress, SyncProgressPhase};
+use ai_contexters::memex::{self, MemexConfig};
 use ai_contexters::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
 use ai_contexters::rank;
 use ai_contexters::sources::{self, ExtractionConfig};
 use ai_contexters::state::StateManager;
 use ai_contexters::store;
 
-/// aicx — operator front door for agent session history.
-///
-/// Two-layer pipeline, both operator-driven:
-///   Layer 1 (canonical corpus): extract, deduplicate, and chunk agent logs
-///     into steerable markdown at ~/.aicx/. This is ground truth.
-///   Layer 2 (semantic materialization): embed the corpus into a vector + BM25
-///     index (memex) for retrieval by agents and MCP tools. Nothing syncs
-///     automatically — you decide when to materialize.
-///
-/// aicx is the orchestrator; memex is the retrieval kernel.
-///
-/// Quick start:
-///   aicx all -H 4 --incremental        # build canonical corpus (layer 1)
-///   aicx memex-sync                     # materialize into memex (layer 2)
-///   aicx all -H 4 --incremental --memex # both layers in one shot
-///   aicx memex-sync --reindex           # full rebuild after model change
-#[derive(Debug, Parser)]
+/// AI Contexters - timeline and decisions from AI sessions
+#[derive(Parser)]
 #[command(name = "aicx")]
 #[command(author = "M&K (c)2026 VetCoders")]
 #[command(version)]
@@ -107,15 +86,9 @@ enum ExtractInputFormat {
     GeminiAntigravity,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum Commands {
-    // ── Layer 1: Canonical corpus ─────────────────────────────────────
-    /// Extract + store Claude Code sessions into the canonical corpus (layer 1).
-    ///
-    /// Reads ~/.claude/projects/ logs, deduplicates, chunks, and writes
-    /// steerable markdown to ~/.aicx/. Add --memex to also materialize new
-    /// chunks into the memex retrieval kernel (layer 2).
-    #[command(display_order = 2)]
+    /// Extract timeline from Claude Code sessions
     Claude {
         /// Project directory filter(s): -p foo bar baz
         #[arg(short, long, num_args = 1..)]
@@ -161,8 +134,7 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
 
-        /// After extraction, materialize new chunks into the memex retrieval kernel (layer 2).
-        /// Shortcut for running `aicx memex-sync` as a separate step.
+        /// Also chunk and sync to memex after extraction
         #[arg(long)]
         memex: bool,
 
@@ -179,12 +151,7 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract + store Codex sessions into the canonical corpus (layer 1).
-    ///
-    /// Reads ~/.codex/history.jsonl, deduplicates, chunks, and writes
-    /// steerable markdown to ~/.aicx/. Add --memex to also materialize new
-    /// chunks into the memex retrieval kernel (layer 2).
-    #[command(display_order = 3)]
+    /// Extract timeline from Codex history
     Codex {
         /// Project/repo filter(s): -p foo bar baz
         #[arg(short, long, num_args = 1..)]
@@ -230,8 +197,7 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
 
-        /// After extraction, materialize new chunks into the memex retrieval kernel (layer 2).
-        /// Shortcut for running `aicx memex-sync` as a separate step.
+        /// Also chunk and sync to memex after extraction
         #[arg(long)]
         memex: bool,
 
@@ -248,13 +214,7 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract + store from all agents (Claude + Codex + Gemini) into the canonical corpus (layer 1).
-    ///
-    /// The daily-driver command: runs each extractor, deduplicates, chunks, and
-    /// writes steerable markdown to ~/.aicx/. With --incremental, uses per-source
-    /// watermarks to skip already-processed entries. Add --memex to also
-    /// materialize new chunks into the memex retrieval kernel (layer 2).
-    #[command(display_order = 1)]
+    /// Extract from all agents (Claude + Codex + Gemini)
     All {
         /// Project filter(s): -p foo bar baz
         #[arg(short, long, num_args = 1..)]
@@ -296,8 +256,7 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
 
-        /// After extraction, materialize new chunks into the memex retrieval kernel (layer 2).
-        /// Shortcut for running `aicx memex-sync` as a separate step.
+        /// Also chunk and sync to memex after extraction
         #[arg(long)]
         memex: bool,
 
@@ -314,13 +273,10 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract a single session file and write it to a specific output path (layer 1, direct).
-    ///
-    /// Bypasses the canonical store — useful for one-off inspection or piping.
+    /// Extract timeline from a single agent session file (direct path).
     ///
     /// Example:
     ///   aicx extract --format claude /path/to/session.jsonl -o /tmp/report.md
-    #[command(display_order = 5)]
     Extract {
         /// Input format (agent): claude | codex | gemini | gemini-antigravity
         #[arg(long, value_enum, alias = "input-format")]
@@ -354,17 +310,7 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Build the canonical corpus in ~/.aicx/ from agent logs (layer 1).
-    ///
-    /// Store-first corpus builder: extracts, deduplicates, chunks, and writes
-    /// steerable markdown. Unlike `all --incremental`, this command does not use
-    /// watermarks — it re-processes the full lookback window every time.
-    /// Best for backfills and targeted re-extraction; use `all --incremental`
-    /// for daily watermark-tracked refreshes.
-    ///
-    /// Add --memex to also materialize new chunks into the memex retrieval
-    /// kernel (layer 2) — a shortcut for running `memex-sync` separately.
-    #[command(display_order = 4)]
+    /// Store contexts in central store (~/.ai-contexters/) and optionally sync to memex
     Store {
         /// Project name(s): -p foo bar baz
         #[arg(short, long, num_args = 1..)]
@@ -386,8 +332,7 @@ enum Commands {
         #[arg(long, hide = true, conflicts_with = "user_only")]
         include_assistant: bool,
 
-        /// After extraction, materialize new chunks into the memex retrieval kernel (layer 2).
-        /// Shortcut for running `aicx memex-sync` as a separate step.
+        /// Also chunk and sync to memex
         #[arg(long)]
         memex: bool,
 
@@ -396,54 +341,27 @@ enum Commands {
         emit: StdoutEmit,
     },
 
-    // ── Layer 2: Semantic materialization ──────────────────────────────
-    /// Materialize the canonical corpus into the memex retrieval kernel (layer 2).
-    ///
-    /// Reads chunks from ~/.aicx/, embeds them, and upserts into the rmcp-memex
-    /// vector + BM25 index. Materialization is always operator-driven — nothing
-    /// syncs automatically. You either run this command explicitly, or use
-    /// `--memex` on any extractor as a one-shot shortcut.
-    ///
-    /// First build:    aicx memex-sync                (embed + index all unsynced chunks)
-    /// Incremental:    aicx memex-sync                (only new chunks since last sync)
-    /// Full rebuild:   aicx memex-sync --reindex      (wipe index, re-embed everything)
-    /// Per-chunk mode: aicx memex-sync --per-chunk    (granular library writes instead of batch store)
-    #[command(display_order = 20)]
+    /// Sync stored chunks to rmcp-memex vector memory
     MemexSync {
-        /// Namespace in the semantic index
+        /// Namespace in vector store
         #[arg(short, long, default_value = "ai-contexts")]
         namespace: String,
 
-        /// Use per-chunk library writes instead of batch store (slower, more granular)
+        /// Use per-chunk upsert instead of batch index
         #[arg(long)]
         per_chunk: bool,
 
         /// Override LanceDB path
         #[arg(long)]
         db_path: Option<PathBuf>,
-
-        /// Wipe the memex index and re-embed the entire canonical corpus.
-        /// Use after an embedding model or dimension change, or when the
-        /// index has drifted from the canonical store.
-        #[arg(long)]
-        reindex: bool,
     },
 
-    // ── Layer 1: Query & inspect ──────────────────────────────────────
-    /// List raw agent session sources on disk (pre-extraction inputs).
-    ///
-    /// Shows Claude Code, Codex, and Gemini log paths with session counts
-    /// and sizes. This is what extractors will read from — use `refs` to
-    /// see what is already in the canonical store after extraction.
-    #[command(display_order = 10)]
+    /// List available projects/sessions
     List,
 
-    /// List chunks in the canonical store (layer 1 inventory).
-    ///
-    /// Shows what extractors have already written to ~/.aicx/.
-    #[command(display_order = 11)]
+    /// List context files from global store (references)
     Refs {
-        /// Hours to look back (filter by canonical chunk date)
+        /// Hours to look back (filter by file mtime)
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
@@ -464,7 +382,26 @@ enum Commands {
         strict: bool,
     },
 
-    /// Manage extraction dedup state (watermarks and hashes).
+    /// Rank and filter artifacts by content quality (QUALITY > quantity)
+    Rank {
+        /// Hours to look back
+        #[arg(short = 'H', long, default_value = "48")]
+        hours: u64,
+
+        /// Project filter
+        #[arg(short, long)]
+        project: String,
+
+        /// Only show chunks scoring >= 5 (hide noise)
+        #[arg(long)]
+        strict: bool,
+
+        /// Show only top N bundles by score
+        #[arg(long)]
+        top: Option<usize>,
+    },
+
+    /// Manage dedup state
     State {
         /// Reset all dedup hashes
         #[arg(long)]
@@ -479,9 +416,9 @@ enum Commands {
         info: bool,
     },
 
-    /// Generate a searchable HTML dashboard from the canonical store (layer 1).
+    /// Generate a searchable HTML dashboard from the aicx store.
     Dashboard {
-        /// Store root directory (default: ~/.aicx)
+        /// Store root directory (default: ~/.ai-contexters)
         #[arg(long)]
         store_root: Option<PathBuf>,
 
@@ -498,9 +435,9 @@ enum Commands {
         preview_chars: usize,
     },
 
-    /// Run dashboard HTTP server with server-shell UI and on-demand data regeneration (layer 1).
+    /// Run dashboard HTTP server with on-demand regeneration endpoints.
     DashboardServe {
-        /// Store root directory (default: ~/.aicx)
+        /// Store root directory (default: ~/.ai-contexters)
         #[arg(long)]
         store_root: Option<PathBuf>,
 
@@ -512,7 +449,7 @@ enum Commands {
         #[arg(long, default_value = "8033")]
         port: u16,
 
-        /// Legacy compatibility path retained for status surfaces; not written in server mode
+        /// Artifact path written on startup and each regeneration
         #[arg(long, default_value = "aicx-dashboard.html")]
         artifact: PathBuf,
 
@@ -525,7 +462,7 @@ enum Commands {
         preview_chars: usize,
     },
 
-    /// Extract structured intents and decisions from canonical store (layer 1).
+    /// Extract structured intents and decisions from stored context
     Intents {
         /// Project filter (required)
         #[arg(short, long)]
@@ -548,13 +485,7 @@ enum Commands {
         kind: Option<String>,
     },
 
-    /// Run aicx as an MCP server (stdio or streamable HTTP).
-    ///
-    /// Exposes search, steer, and rank tools over MCP for agent retrieval.
-    /// Layer 1 tools (aicx_steer, aicx_search) work immediately — they query
-    /// the canonical corpus on disk.
-    /// Layer 2 (aicx_search with embedding mode) requires a materialized memex
-    /// index — run `aicx memex-sync` first to embed the corpus.
+    /// Run aicx as an MCP server (stdio or streamable HTTP)
     Serve {
         /// Transport: stdio (default) or sse
         #[arg(long, default_value = "stdio", value_parser = ["stdio", "sse"])]
@@ -565,33 +496,30 @@ enum Commands {
         port: u16,
     },
 
-    #[command(
-        about = "Retired compatibility shim; prints migration guidance",
-        long_about = "aicx init has been retired.\n\nContext initialisation is now handled by /vc-init inside Claude Code.\nSee: https://vibecrafted.io/\n\nLegacy flags are still accepted for compatibility, but they have no effect."
-    )]
+    /// Initialize repo context and run an agent
     Init {
         /// Project name override
-        #[arg(short, long, hide = true)]
+        #[arg(short, long)]
         project: Option<String>,
 
         /// Agent override: claude or codex
-        #[arg(short, long, hide = true)]
+        #[arg(short, long)]
         agent: Option<String>,
 
         /// Model override (optional; if omitted uses agent default)
-        #[arg(long, hide = true)]
+        #[arg(long)]
         model: Option<String>,
 
         /// Hours to look back for context (default: 4800)
-        #[arg(short = 'H', long, default_value = "4800", hide = true)]
+        #[arg(short = 'H', long, default_value = "4800")]
         hours: u64,
 
         /// Maximum lines per context section in the prompt
-        #[arg(long, default_value = "1200", hide = true)]
+        #[arg(long, default_value = "1200")]
         max_lines: usize,
 
         /// Only include user messages in context (exclude assistant + reasoning)
-        #[arg(long, hide = true)]
+        #[arg(long)]
         user_only: bool,
 
         /// Include assistant messages (legacy flag; now default)
@@ -599,119 +527,35 @@ enum Commands {
         include_assistant: bool,
 
         /// Action focus appended to the prompt
-        #[arg(long, hide = true)]
+        #[arg(long)]
         action: Option<String>,
 
         /// Additional agent prompt appended after core rules (verbatim)
-        #[arg(long, hide = true)]
+        #[arg(long)]
         agent_prompt: Option<String>,
 
         /// Read additional agent prompt from a file (verbatim)
-        #[arg(long, hide = true)]
+        #[arg(long)]
         agent_prompt_file: Option<PathBuf>,
 
         /// Build context/prompt only, do not run an agent
-        #[arg(long, hide = true)]
+        #[arg(long)]
         no_run: bool,
 
         /// Skip "Run? (y)es / (n)o" confirmation
-        #[arg(long, hide = true)]
+        #[arg(long)]
         no_confirm: bool,
 
         /// Do not auto-modify `.gitignore`
-        #[arg(long, hide = true)]
+        #[arg(long)]
         no_gitignore: bool,
     },
 
-    /// Fuzzy search across the canonical corpus (layer 1, filesystem-only).
-    ///
-    /// Searches chunk content and frontmatter directly in ~/.aicx/ — works
-    /// immediately, no memex index needed. For embedding-aware semantic
-    /// retrieval, materialize the index with `memex-sync` first, then use
-    /// MCP tools via `aicx serve`.
-    #[command(display_order = 12)]
-    Search {
-        /// Search query string
-        query: String,
-
-        /// Project filter (org/repo substring, case-insensitive)
-        #[arg(short, long)]
-        project: Option<String>,
-
-        /// Hours to look back (0 = all time)
-        #[arg(short = 'H', long, default_value = "0")]
-        hours: u64,
-
-        /// Filter by date: single day (2026-03-28), range (2026-03-20..2026-03-28),
-        /// or open-ended (2026-03-20.. or ..2026-03-28)
-        #[arg(short, long)]
-        date: Option<String>,
-
-        /// Maximum results to return
-        #[arg(short, long, default_value = "10")]
-        limit: usize,
-
-        /// Minimum score threshold (0-100)
-        #[arg(short, long, value_parser = clap::value_parser!(u8).range(0..=100))]
-        score: Option<u8>,
-
-        /// Emit compact JSON instead of plain text
-        #[arg(short = 'j', long)]
-        json: bool,
-    },
-
-    /// Retrieve chunks by steering metadata (layer 1, frontmatter fields).
-    ///
-    /// Filters the canonical store by run_id, prompt_id, agent, kind, project,
-    /// and/or date range using frontmatter metadata — no grep needed.
-    ///
-    /// Example:
-    ///   aicx steer --run-id mrbl-001
-    ///   aicx steer --project ai-contexters --kind reports --date 2026-03-28
-    Steer {
-        /// Filter by run_id (exact match)
-        #[arg(long)]
-        run_id: Option<String>,
-
-        /// Filter by prompt_id (exact match)
-        #[arg(long)]
-        prompt_id: Option<String>,
-
-        /// Filter by agent: claude, codex, gemini
-        #[arg(short, long)]
-        agent: Option<String>,
-
-        /// Filter by kind: conversations, plans, reports, other
-        #[arg(short, long)]
-        kind: Option<String>,
-
-        /// Filter by project (case-insensitive substring)
-        #[arg(short, long)]
-        project: Option<String>,
-
-        /// Filter by date: single day (2026-03-28), range (2026-03-20..2026-03-28),
-        /// or open-ended (2026-03-20.. or ..2026-03-28)
-        #[arg(short, long)]
-        date: Option<String>,
-
-        /// Maximum results
-        #[arg(short, long, default_value = "20")]
-        limit: usize,
-    },
-
-    /// Migrate legacy ~/.ai-contexters/ data into the canonical AICX store.
+    /// Migrate older file-centric contexts to canonical repo-centric directories
     Migrate {
         /// Dry run: show what would be moved without modifying files
         #[arg(long)]
         dry_run: bool,
-
-        /// Override legacy input store root (default: ~/.ai-contexters)
-        #[arg(long)]
-        legacy_root: Option<PathBuf>,
-
-        /// Override AICX store root (default: ~/.aicx)
-        #[arg(long)]
-        store_root: Option<PathBuf>,
     },
 }
 
@@ -883,9 +727,8 @@ fn main() -> Result<()> {
             namespace,
             per_chunk,
             db_path,
-            reindex,
         }) => {
-            run_memex_sync(&namespace, per_chunk, db_path, reindex)?;
+            run_memex_sync(&namespace, per_chunk, db_path)?;
         }
         Some(Commands::List) => {
             let sources = sources::list_available_sources()?;
@@ -905,10 +748,38 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Some(Commands::Init { .. }) => {
-            eprintln!("aicx init has been retired.");
-            eprintln!("Context initialisation is now handled by /vc-init inside Claude Code.");
-            eprintln!("See: https://vibecrafted.io/");
+        Some(Commands::Init {
+            project,
+            agent,
+            model,
+            hours,
+            max_lines,
+            action,
+            agent_prompt,
+            agent_prompt_file,
+            user_only,
+            include_assistant: include_assistant_flag,
+            no_run,
+            no_confirm,
+            no_gitignore,
+        }) => {
+            let include_assistant = include_assistant_flag || !user_only;
+            let opts = InitOptions {
+                project,
+                agent,
+                model,
+                horizon_hours: hours,
+                max_lines,
+                include_assistant,
+                redact_secrets,
+                action,
+                agent_prompt,
+                agent_prompt_file,
+                no_run,
+                no_confirm,
+                no_gitignore,
+            };
+            init::run_init(opts)?;
         }
         Some(Commands::Refs {
             hours,
@@ -919,6 +790,14 @@ fn main() -> Result<()> {
         }) => {
             let emit = if summary { RefsEmit::Summary } else { emit };
             run_refs(hours, project, emit, strict)?;
+        }
+        Some(Commands::Rank {
+            hours,
+            project,
+            strict,
+            top,
+        }) => {
+            run_rank(hours, &project, redact_secrets, strict, top)?;
         }
         Some(Commands::State {
             reset,
@@ -975,53 +854,13 @@ fn main() -> Result<()> {
                 }
             })?;
         }
-        Some(Commands::Search {
-            query,
-            project,
-            hours,
-            date,
-            limit,
-            score,
-            json,
-        }) => {
-            run_search(
-                &query,
-                project.as_deref(),
-                hours,
-                date.as_deref(),
-                limit,
-                score,
-                json,
-            )?;
-        }
-        Some(Commands::Steer {
-            run_id,
-            prompt_id,
-            agent,
-            kind,
-            project,
-            date,
-            limit,
-        }) => {
-            run_steer(
-                run_id.as_deref(),
-                prompt_id.as_deref(),
-                agent.as_deref(),
-                kind.as_deref(),
-                project.as_deref(),
-                date.as_deref(),
-                limit,
-            )?;
-        }
-        Some(Commands::Migrate {
-            dry_run,
-            legacy_root,
-            store_root,
-        }) => {
-            ai_contexters::store::run_migration_with_paths(dry_run, legacy_root, store_root)?;
+        Some(Commands::Migrate { dry_run }) => {
+            ai_contexters::store::run_migration(dry_run)?;
         }
         None => {
-            Cli::command().print_help()?;
+            let project = cli.project.unwrap_or_else(sources::detect_project_name);
+            let hours = cli.hours;
+            run_rank(hours, &project, redact_secrets, false, None)?;
         }
     }
 
@@ -1209,100 +1048,6 @@ struct ExtractionParams<'a> {
     emit: StdoutEmit,
 }
 
-struct MemexProgressPrinter {
-    enabled: bool,
-    width: usize,
-}
-
-impl MemexProgressPrinter {
-    fn new() -> Self {
-        Self {
-            enabled: io::stderr().is_terminal(),
-            width: 0,
-        }
-    }
-
-    fn update(&mut self, progress: &SyncProgress) {
-        if !self.enabled {
-            return;
-        }
-
-        let message = render_memex_progress(progress);
-        let width = self.width.max(message.len());
-        self.width = width;
-        eprint!("\r{message:<width$}");
-        let _ = io::stderr().flush();
-    }
-
-    fn finish(&mut self) {
-        if self.enabled && self.width > 0 {
-            eprint!("\r{:<width$}\r", "", width = self.width);
-            let _ = io::stderr().flush();
-            self.width = 0;
-        }
-    }
-}
-
-fn render_memex_progress(progress: &SyncProgress) -> String {
-    match progress.phase {
-        SyncProgressPhase::Discovering => {
-            format!(
-                "  Memex scan... {}/{}",
-                progress.done.max(1),
-                progress.total.max(1)
-            )
-        }
-        SyncProgressPhase::Embedding => {
-            format!(
-                "  Memex embed... {}/{}",
-                progress.done.max(1),
-                progress.total.max(1)
-            )
-        }
-        SyncProgressPhase::Writing => {
-            format!(
-                "  Memex index... {}/{}",
-                progress.done.max(1),
-                progress.total.max(1)
-            )
-        }
-        SyncProgressPhase::Completed => format!("  {}", progress.detail),
-    }
-}
-
-fn sync_memex_paths(config: &MemexConfig, chunk_paths: &[PathBuf]) -> Result<memex::SyncResult> {
-    let mut printer = MemexProgressPrinter::new();
-    let enabled = printer.enabled;
-    let result = if enabled {
-        memex::sync_new_chunk_paths_with_progress(chunk_paths, config, |progress| {
-            printer.update(&progress);
-        })
-    } else {
-        memex::sync_new_chunk_paths(chunk_paths, config)
-    };
-    printer.finish();
-    result
-}
-
-fn sync_memex_if_requested(sync_memex: bool, all_written_paths: &[PathBuf]) -> Result<()> {
-    if sync_memex && !all_written_paths.is_empty() {
-        let memex_config = MemexConfig::default();
-        // Keep extractor/store `--memex` on the same stateful transport seam as
-        // the dedicated `memex-sync` command so sync state and observability do
-        // not drift between code paths.
-        let result = sync_memex_paths(&memex_config, all_written_paths)
-            .context("Failed to materialize canonical chunks into memex retrieval kernel")?;
-        eprintln!(
-            "  Memex: {} materialized, {} skipped, {} ignored",
-            result.chunks_materialized, result.chunks_skipped, result.chunks_ignored
-        );
-        for err in &result.errors {
-            eprintln!("  Memex error: {}", err);
-        }
-    }
-    Ok(())
-}
-
 fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     let ExtractionParams {
         agents,
@@ -1448,19 +1193,56 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         sessions,
     };
 
+    // ── Store-first: group entries by repo (from cwd) × agent × date ──
+    //
+    // Writes agent-friendly chunks (~1500 tokens) to central store.
+    // Raw path emission is opt-in via `--emit paths` / `--emit json`.
     let chunker_config = ai_contexters::chunker::ChunkerConfig::default();
     let mut all_written_paths: Vec<std::path::PathBuf> = Vec::new();
 
     if !output_entries.is_empty() {
-        let store_summary = store::store_semantic_segments(&output_entries, &chunker_config)?;
-        let newly_written_paths = store_summary.written_paths.clone();
-        all_written_paths.extend(newly_written_paths.iter().cloned());
+        let mut repo_groups: std::collections::BTreeMap<
+            (String, String, String),
+            Vec<output::TimelineEntry>,
+        > = std::collections::BTreeMap::new();
 
-        // Update fast local metadata index
-        if let Ok(rt) = tokio::runtime::Runtime::new() {
-            let path_refs: Vec<&PathBuf> = newly_written_paths.iter().collect();
-            let _ = rt.block_on(ai_contexters::steer_index::sync_steer_index(&path_refs));
+        for entry in &output_entries {
+            let repo = sources::repo_name_from_cwd(entry.cwd.as_deref(), &project);
+            let date = entry.timestamp.format("%Y-%m-%d").to_string();
+            repo_groups
+                .entry((repo, entry.agent.clone(), date))
+                .or_default()
+                .push(entry.clone());
         }
+
+        let mut index = store::load_index();
+        let now = Utc::now();
+        let time_str = now.format("%H%M%S").to_string();
+
+        // Per-repo summary counters
+        let mut repo_summary: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, usize>,
+        > = std::collections::BTreeMap::new();
+
+        for ((repo, agent_name, date), group_entries) in &repo_groups {
+            let paths = store::write_context_chunked(
+                repo,
+                agent_name,
+                date,
+                &time_str,
+                group_entries,
+                &chunker_config,
+            )?;
+            store::update_index(&mut index, repo, agent_name, date, group_entries.len());
+            *repo_summary
+                .entry(repo.clone())
+                .or_default()
+                .entry(agent_name.clone())
+                .or_insert(0) += group_entries.len();
+            all_written_paths.extend(paths);
+        }
+        store::save_index(&index)?;
 
         // Summary to stderr (diagnostics)
         eprintln!(
@@ -1468,7 +1250,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             output_entries.len(),
             all_written_paths.len(),
         );
-        for (repo, agents_map) in &store_summary.project_summary {
+        for (repo, agents_map) in &repo_summary {
             let total: usize = agents_map.values().sum();
             let detail: Vec<String> = agents_map
                 .iter()
@@ -1476,8 +1258,6 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                 .collect();
             eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
         }
-
-        sync_memex_if_requested(sync_memex, &newly_written_paths)?;
     }
 
     // stdout emission (integration-friendly).
@@ -1652,10 +1432,44 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         );
     }
 
+    // Memex sync: chunk entries and push to vector store
+    if sync_memex && !output_entries.is_empty() {
+        let agent_name = agents.join("+");
+
+        let chunker_config = ChunkerConfig::default();
+        let chunks =
+            chunker::chunk_entries(&output_entries, &project_name, &agent_name, &chunker_config);
+
+        if !chunks.is_empty() {
+            let chunks_dir = store::chunks_dir()?;
+            chunker::write_chunks_to_dir(&chunks, &chunks_dir)?;
+            eprintln!(
+                "  Chunked: {} chunks ({}) → {}",
+                chunks.len(),
+                chunker::chunk_summary(&chunks),
+                chunks_dir.display()
+            );
+
+            let memex_config = MemexConfig::default();
+            match memex::sync_new_chunks(&chunks_dir, &memex_config) {
+                Ok(result) => {
+                    eprintln!(
+                        "  Memex: {} pushed, {} skipped",
+                        result.chunks_pushed, result.chunks_skipped,
+                    );
+                    for err in &result.errors {
+                        eprintln!("  Memex error: {}", err);
+                    }
+                }
+                Err(e) => eprintln!("  Memex sync failed: {}", e),
+            }
+        }
+    }
+
     Ok(())
 }
 
-/// Store extracted contexts in the canonical corpus and optionally materialize into the memex retrieval kernel.
+/// Store extracted contexts in central store and optionally sync to memex.
 fn run_store(
     project: Vec<String>,
     agent: Option<String>,
@@ -1714,44 +1528,61 @@ fn run_store(
             e.message = ai_contexters::redact::redact_secrets(&e.message);
         }
     }
+    // Group by repo (from cwd) × agent × date and write chunked to central store
     let chunker_config = ai_contexters::chunker::ChunkerConfig::default();
-    let stderr_is_tty = io::stderr().is_terminal();
-    let mut progress_width = 0usize;
-    let store_result = if stderr_is_tty {
-        store::store_semantic_segments_with_progress(
-            &all_entries,
-            &chunker_config,
-            |done, total| {
-                let message = format!("  Chunking... {done}/{total} segments");
-                let width = progress_width.max(message.len());
-                progress_width = width;
-                eprint!("\r{message:<width$}");
-                let _ = io::stderr().flush();
-            },
-        )
-    } else {
-        store::store_semantic_segments(&all_entries, &chunker_config)
-    };
-    if stderr_is_tty && progress_width > 0 {
-        eprint!("\r{:<width$}\r", "", width = progress_width);
-        let _ = io::stderr().flush();
-    }
-    let store_summary = store_result?;
-    let stored_count = store_summary.total_entries;
-    let all_written_paths = store_summary.written_paths.clone();
+    let mut index = store::load_index();
+    let mut stored_count = 0usize;
+    let mut all_written_paths: Vec<std::path::PathBuf> = Vec::new();
 
-    // Update fast local metadata index
-    if let Ok(rt) = tokio::runtime::Runtime::new() {
-        let path_refs: Vec<&PathBuf> = all_written_paths.iter().collect();
-        let _ = rt.block_on(ai_contexters::steer_index::sync_steer_index(&path_refs));
+    let mut repo_groups: std::collections::BTreeMap<
+        (String, String, String),
+        Vec<output::TimelineEntry>,
+    > = std::collections::BTreeMap::new();
+
+    for entry in &all_entries {
+        let repo = sources::repo_name_from_cwd(entry.cwd.as_deref(), &project);
+        let date = entry.timestamp.format("%Y-%m-%d").to_string();
+        repo_groups
+            .entry((repo, entry.agent.clone(), date))
+            .or_default()
+            .push(entry.clone());
     }
+
+    let now = Utc::now();
+    let time_str = now.format("%H%M%S").to_string();
+
+    let mut repo_summary: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, usize>,
+    > = std::collections::BTreeMap::new();
+
+    for ((repo, agent_name, date), group_entries) in &repo_groups {
+        let paths = store::write_context_chunked(
+            repo,
+            agent_name,
+            date,
+            &time_str,
+            group_entries,
+            &chunker_config,
+        )?;
+        store::update_index(&mut index, repo, agent_name, date, group_entries.len());
+        stored_count += group_entries.len();
+        *repo_summary
+            .entry(repo.clone())
+            .or_default()
+            .entry(agent_name.clone())
+            .or_insert(0) += group_entries.len();
+        all_written_paths.extend(paths);
+    }
+
+    store::save_index(&index)?;
 
     eprintln!(
         "✓ {} entries → {} chunks",
         stored_count,
         all_written_paths.len(),
     );
-    for (repo, agents_map) in &store_summary.project_summary {
+    for (repo, agents_map) in &repo_summary {
         let total: usize = agents_map.values().sum();
         let detail: Vec<String> = agents_map
             .iter()
@@ -1759,8 +1590,6 @@ fn run_store(
             .collect();
         eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
     }
-
-    sync_memex_if_requested(sync_memex, &all_written_paths)?;
 
     match emit {
         StdoutEmit::Paths => {
@@ -1779,12 +1608,255 @@ fn run_store(
                     "total_entries": stored_count,
                     "total_chunks": all_written_paths.len(),
                     "store_paths": store_paths,
-                    "repos": store_summary.project_summary,
+                    "repos": repo_summary,
                 }))?
             );
         }
         StdoutEmit::None => {}
     }
+
+    // Chunk and sync to memex if requested
+    if sync_memex && !all_entries.is_empty() {
+        let agent_label = agents.join("+");
+        let store_proj = if project.is_empty() {
+            "_global".to_string()
+        } else {
+            project.join("+")
+        };
+        let chunker_config = ChunkerConfig::default();
+        let chunks =
+            chunker::chunk_entries(&all_entries, &store_proj, &agent_label, &chunker_config);
+
+        if !chunks.is_empty() {
+            let chunks_dir = store::chunks_dir()?;
+            chunker::write_chunks_to_dir(&chunks, &chunks_dir)?;
+            eprintln!("  Chunked: {}", chunker::chunk_summary(&chunks));
+
+            let memex_config = MemexConfig::default();
+            match memex::sync_new_chunks(&chunks_dir, &memex_config) {
+                Ok(result) => {
+                    eprintln!(
+                        "  Memex: {} pushed, {} skipped",
+                        result.chunks_pushed, result.chunks_skipped
+                    );
+                }
+                Err(e) => eprintln!("  Memex sync failed: {}", e),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn run_rank(
+    hours: u64,
+    project: &str,
+    redact_secrets: bool,
+    strict: bool,
+    top: Option<usize>,
+) -> Result<()> {
+    // Unconditionally sync store incrementally before ranking
+    let _ = run_extraction(ExtractionParams {
+        agents: &["claude", "codex", "gemini"],
+        project: vec![project.to_string()],
+        hours,
+        output_dir: None,
+        format: "none",
+        append_to: None,
+        rotate: 0,
+        incremental: true,
+        include_assistant: true,
+        include_loctree: false,
+        project_root: None,
+        sync_memex: false,
+        force: false,
+        conversation: false,
+        redact_secrets,
+        emit: StdoutEmit::None,
+    });
+
+    let project = ai_contexters::sanitize::safe_project_name(project)?;
+    let base = store::store_base_dir()?;
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    let proj_dir = base.join(project);
+
+    if proj_dir.is_dir() {
+        let proj_dir = ai_contexters::sanitize::validate_dir_path(&proj_dir)?;
+        for date_entry in
+            ai_contexters::sanitize::read_dir_validated(&proj_dir)?.filter_map(|e| e.ok())
+        {
+            let date_path = date_entry.path();
+            if !date_path.is_dir() {
+                continue;
+            }
+            let date_path = ai_contexters::sanitize::validate_dir_path(&date_path)?;
+            for file_entry in
+                ai_contexters::sanitize::read_dir_validated(&date_path)?.filter_map(|e| e.ok())
+            {
+                let fpath = file_entry.path();
+                if fpath
+                    .extension()
+                    .is_some_and(|ext| ext == "md" || ext == "json")
+                    && let Ok(meta) = fpath.metadata()
+                    && let Ok(mtime) = meta.modified()
+                    && mtime >= cutoff
+                {
+                    files.push(fpath);
+                }
+            }
+        }
+    }
+
+    files.sort();
+
+    if files.is_empty() {
+        println!(
+            "No context files found within last {} hours for project {}.",
+            hours, project
+        );
+        return Ok(());
+    }
+
+    // Group by prefix (e.g. 2026-03-12/160800_codex)
+    let mut bundles: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+
+    for f in files {
+        let parent_name = f
+            .parent()
+            .and_then(|p| p.file_name())
+            .unwrap_or_default()
+            .to_string_lossy();
+        let name = f.file_name().unwrap_or_default().to_string_lossy();
+        let file_prefix = name.split('-').next().unwrap_or(&name);
+        let prefix = format!("{}/{}", parent_name, file_prefix);
+        bundles.entry(prefix).or_default().push(f);
+    }
+
+    // Score each chunk and compute bundle averages
+    struct ScoredBundle {
+        key: String,
+        files: Vec<(PathBuf, rank::ChunkScore)>,
+        avg_score: f32,
+        max_score: u8,
+        total_signal: usize,
+        total_lines: usize,
+    }
+
+    let mut scored_bundles: Vec<ScoredBundle> = Vec::new();
+
+    for (key, bundle_files) in &bundles {
+        let scored_files: Vec<(PathBuf, rank::ChunkScore)> = bundle_files
+            .iter()
+            .map(|f| (f.clone(), rank::score_chunk_file(f)))
+            .collect();
+
+        let total_score: u32 = scored_files.iter().map(|(_, s)| s.score as u32).sum();
+        let avg_score = total_score as f32 / scored_files.len().max(1) as f32;
+        let max_score = scored_files.iter().map(|(_, s)| s.score).max().unwrap_or(0);
+        let total_signal: usize = scored_files.iter().map(|(_, s)| s.signal_lines).sum();
+        let total_lines: usize = scored_files.iter().map(|(_, s)| s.total_lines).sum();
+
+        scored_bundles.push(ScoredBundle {
+            key: key.clone(),
+            files: scored_files,
+            avg_score,
+            max_score,
+            total_signal,
+            total_lines,
+        });
+    }
+
+    // Sort by average score descending, then by key descending (recency)
+    scored_bundles.sort_by(|a, b| {
+        b.avg_score
+            .partial_cmp(&a.avg_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.key.cmp(&a.key))
+    });
+
+    // Apply --strict filter
+    if strict {
+        scored_bundles.retain(|b| b.avg_score >= 5.0);
+    }
+
+    // Apply --top limit
+    if let Some(n) = top {
+        scored_bundles.truncate(n);
+    }
+
+    if scored_bundles.is_empty() {
+        println!(
+            "No artifacts above quality threshold for {} (last {}h).",
+            project, hours
+        );
+        return Ok(());
+    }
+
+    println!("Ranked Artifacts for {} (last {}h):", project, hours);
+    println!("------------------------------------------------------------");
+
+    for bundle in &scored_bundles {
+        let label = match bundle.avg_score.round() as u8 {
+            0..=2 => "NOISE",
+            3..=4 => "LOW",
+            5..=7 => "MEDIUM",
+            _ => "HIGH",
+        };
+        let density = if bundle.total_lines > 0 {
+            bundle.total_signal as f32 / bundle.total_lines as f32
+        } else {
+            0.0
+        };
+
+        println!(
+            "- Bundle: {} ({} files) — Avg: {:.1}/10  Peak: {}/10  Density: {:.0}%  [{}]",
+            bundle.key,
+            bundle.files.len(),
+            bundle.avg_score,
+            bundle.max_score,
+            density * 100.0,
+            label,
+        );
+
+        for (path, score) in &bundle.files {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            println!(
+                "    {} {} {}/10 (sig:{} noise:{} total:{})",
+                match score.label {
+                    "HIGH" => "+",
+                    "MEDIUM" => "~",
+                    "LOW" => "-",
+                    _ => "x",
+                },
+                name,
+                score.score,
+                score.signal_lines,
+                score.noise_lines,
+                score.total_lines,
+            );
+        }
+    }
+
+    // Summary stats
+    let total_bundles = scored_bundles.len();
+    let high_count = scored_bundles.iter().filter(|b| b.avg_score >= 8.0).count();
+    let medium_count = scored_bundles
+        .iter()
+        .filter(|b| b.avg_score >= 5.0 && b.avg_score < 8.0)
+        .count();
+    let low_count = scored_bundles
+        .iter()
+        .filter(|b| b.avg_score >= 3.0 && b.avg_score < 5.0)
+        .count();
+    let noise_count = scored_bundles.iter().filter(|b| b.avg_score < 3.0).count();
+
+    println!("------------------------------------------------------------");
+    println!(
+        "Summary: {} bundles — HIGH: {} | MEDIUM: {} | LOW: {} | NOISE: {}",
+        total_bundles, high_count, medium_count, low_count, noise_count,
+    );
 
     Ok(())
 }
@@ -1832,335 +1904,61 @@ fn is_noise_artifact(path: &std::path::Path) -> bool {
     is_noise
 }
 
-/// Month names → number, supports English + Polish.
-fn month_number(s: &str) -> Option<u32> {
-    match s {
-        "january" | "jan" | "styczen" | "stycznia" | "styczeń" => Some(1),
-        "february" | "feb" | "luty" | "lutego" => Some(2),
-        "march" | "mar" | "marzec" | "marca" => Some(3),
-        "april" | "apr" | "kwiecien" | "kwietnia" | "kwiecień" => Some(4),
-        "may" | "maj" | "maja" => Some(5),
-        "june" | "jun" | "czerwiec" | "czerwca" => Some(6),
-        "july" | "jul" | "lipiec" | "lipca" => Some(7),
-        "august" | "aug" | "sierpien" | "sierpnia" | "sierpień" => Some(8),
-        "september" | "sep" | "wrzesien" | "września" | "wrzesień" => Some(9),
-        "october" | "oct" | "pazdziernik" | "października" | "październik" => Some(10),
-        "november" | "nov" | "listopad" | "listopada" => Some(11),
-        "december" | "dec" | "grudzien" | "grudnia" | "grudzień" => Some(12),
-        _ => None,
-    }
-}
-
-/// Extract inline date hints from query, returning (cleaned_query, Option<date_filter>).
-/// Recognises: "january 2026", "march 2026", "2026-03", "2026-01-15".
-fn extract_date_from_query(query: &str) -> (String, Option<String>) {
-    let words: Vec<&str> = query.split_whitespace().collect();
-    let lower: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
-    let mut used = vec![false; words.len()];
-    let mut date_filter: Option<String> = None;
-
-    // Pattern 1: "<month> <year>" e.g. "january 2026"
-    for i in 0..words.len().saturating_sub(1) {
-        if let Some(m) = month_number(&lower[i]) {
-            if let Ok(y) = lower[i + 1].parse::<u32>() {
-                if (2020..=2099).contains(&y) {
-                    let days = days_in_month(y, m);
-                    let lo = format!("{y:04}-{m:02}-01");
-                    let hi = format!("{y:04}-{m:02}-{days:02}");
-                    date_filter = Some(format!("{lo}..{hi}"));
-                    used[i] = true;
-                    used[i + 1] = true;
-                }
-            }
-        }
-    }
-
-    // Pattern 2: "<year> <month>" e.g. "2026 january"
-    if date_filter.is_none() {
-        for i in 0..words.len().saturating_sub(1) {
-            if let Ok(y) = lower[i].parse::<u32>() {
-                if (2020..=2099).contains(&y) {
-                    if let Some(m) = month_number(&lower[i + 1]) {
-                        let days = days_in_month(y, m);
-                        let lo = format!("{y:04}-{m:02}-01");
-                        let hi = format!("{y:04}-{m:02}-{days:02}");
-                        date_filter = Some(format!("{lo}..{hi}"));
-                        used[i] = true;
-                        used[i + 1] = true;
-                    }
-                }
-            }
-        }
-    }
-
-    // Pattern 3: YYYY-MM (no day) e.g. "2026-01"
-    if date_filter.is_none() {
-        let re_ym = regex::Regex::new(r"^(\d{4})-(\d{2})$").unwrap();
-        for (i, w) in lower.iter().enumerate() {
-            if let Some(caps) = re_ym.captures(w) {
-                let y: u32 = caps[1].parse().unwrap();
-                let m: u32 = caps[2].parse().unwrap();
-                if (1..=12).contains(&m) {
-                    let days = days_in_month(y, m);
-                    let lo = format!("{y:04}-{m:02}-01");
-                    let hi = format!("{y:04}-{m:02}-{days:02}");
-                    date_filter = Some(format!("{lo}..{hi}"));
-                    used[i] = true;
-                }
-            }
-        }
-    }
-
-    // Pattern 4: full ISO date YYYY-MM-DD → single day
-    if date_filter.is_none() {
-        let re_ymd = regex::Regex::new(r"^(\d{4}-\d{2}-\d{2})$").unwrap();
-        for (i, w) in lower.iter().enumerate() {
-            if re_ymd.is_match(w) {
-                date_filter = Some(w.clone());
-                used[i] = true;
-            }
-        }
-    }
-
-    let cleaned: Vec<&str> = words
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !used[*i])
-        .map(|(_, w)| *w)
-        .collect();
-
-    (cleaned.join(" "), date_filter)
-}
-
-fn days_in_month(year: u32, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
-                29
-            } else {
-                28
-            }
-        }
-        _ => 30,
-    }
-}
-
-/// Parse a date filter string into (Option<start>, Option<end>) inclusive bounds.
-/// Formats: "2026-03-28", "2026-03-20..2026-03-28", "2026-03-20..", "..2026-03-28"
-fn parse_date_filter(s: &str) -> Result<(Option<String>, Option<String>)> {
-    if let Some((left, right)) = s.split_once("..") {
-        let lo = if left.is_empty() {
-            None
-        } else {
-            Some(left.to_string())
-        };
-        let hi = if right.is_empty() {
-            None
-        } else {
-            Some(right.to_string())
-        };
-        Ok((lo, hi))
-    } else {
-        // single day
-        Ok((Some(s.to_string()), Some(s.to_string())))
-    }
-}
-
-/// Ad-hoc terminal fuzzy search across the aicx store.
-fn run_search(
-    query: &str,
-    project: Option<&str>,
-    hours: u64,
-    date: Option<&str>,
-    limit: usize,
-    score: Option<u8>,
-    json: bool,
-) -> Result<()> {
-    // Extract inline date hints from query if no explicit --date given
-    let (effective_query, inline_date) = if date.is_none() {
-        extract_date_from_query(query)
-    } else {
-        (query.to_string(), None)
-    };
-    let effective_date = date.map(String::from).or(inline_date);
-    let search_query = if effective_date.is_some() && effective_query.is_empty() {
-        // date-only query: match everything, rely on date filter
-        "*".to_string()
-    } else if !effective_query.is_empty() {
-        effective_query
-    } else {
-        query.to_string()
-    };
-
-    let root = store::store_base_dir()?;
-    // Fetch more results pre-filter so score/date/hours filtering has material to work with.
-    let fetch_limit = if effective_date.is_some() || score.is_some() || hours > 0 {
-        limit.saturating_mul(5).max(50)
-    } else {
-        limit
-    };
-
-    // Try fast search with rmcp_memex first (instant), fallback to brute-force if it fails or returns nothing
-    let (results, scanned) = if let Ok(rt) = tokio::runtime::Runtime::new() {
-        match rt.block_on(memex::fast_memex_search(
-            &search_query,
-            fetch_limit,
-            project,
-        )) {
-            Ok((res, scan)) if !res.is_empty() => (res, scan),
-            Err(err) if memex::is_compatibility_error(&err) => return Err(err),
-            _ => rank::fuzzy_search_store(&root, &search_query, fetch_limit, project)?,
-        }
-    } else {
-        rank::fuzzy_search_store(&root, &search_query, fetch_limit, project)?
-    };
-
-    let mut results = results;
-
-    if let Some(min_score) = score {
-        results.retain(|r| r.score >= min_score);
-    }
-
-    // Apply date filter (day granularity) — takes priority over hours.
-    let results: Vec<_> = if let Some(ref d) = effective_date {
-        let (lo, hi) = parse_date_filter(d)?;
-        results
-            .into_iter()
-            .filter(|r| {
-                lo.as_ref().is_none_or(|lo| r.date.as_str() >= lo.as_str())
-                    && hi.as_ref().is_none_or(|hi| r.date.as_str() <= hi.as_str())
-            })
-            .collect()
-    } else if hours > 0 {
-        let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
-        let cutoff_date = cutoff.format("%Y-%m-%d").to_string();
-        results
-            .into_iter()
-            .filter(|r| r.date >= cutoff_date)
-            .collect()
-    } else {
-        results
-    };
-    // Truncate to requested limit after date filtering
-    let results: Vec<_> = results.into_iter().take(limit).collect();
-
-    if json {
-        println!("{}", rank::render_search_json(&results, scanned)?);
-        return Ok(());
-    }
-
-    if results.is_empty() {
-        eprintln!("No matches for {:?} (scanned {} chunks).", query, scanned);
-        return Ok(());
-    }
-
-    print!(
-        "{}",
-        rank::render_search_text(&results, io::stdout().is_terminal())
-    );
-    let _ = io::stdout().flush();
-
-    if io::stderr().is_terminal() {
-        eprintln!(
-            "\n{} result(s) from {} scanned chunks.",
-            results.len(),
-            scanned
-        );
-    }
-    Ok(())
-}
-
-/// Retrieve chunks by steering metadata (frontmatter sidecar fields).
-fn run_steer(
-    run_id: Option<&str>,
-    prompt_id: Option<&str>,
-    agent: Option<&str>,
-    kind: Option<&str>,
-    project: Option<&str>,
-    date: Option<&str>,
-    limit: usize,
-) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-
-    let (date_lo, date_hi) = if let Some(d) = date {
-        let bounds = parse_date_filter(d)?;
-        (bounds.0, bounds.1)
-    } else {
-        (None, None)
-    };
-
-    let metadatas = rt.block_on(ai_contexters::steer_index::search_steer_index(
-        run_id,
-        prompt_id,
-        agent,
-        kind,
-        project,
-        date_lo.as_deref(),
-        date_hi.as_deref(),
-        limit,
-    ))?;
-
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
-    let color = stdout.is_terminal();
-    let matched = metadatas.len();
-
-    for meta in metadatas {
-        let path = meta.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-        let p = meta.get("project").and_then(|v| v.as_str()).unwrap_or("?");
-        let a = meta.get("agent").and_then(|v| v.as_str()).unwrap_or("?");
-        let d = meta.get("date").and_then(|v| v.as_str()).unwrap_or("?");
-        let k = meta.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
-        let run_str = meta.get("run_id").and_then(|v| v.as_str()).unwrap_or("-");
-        let prompt_str = meta
-            .get("prompt_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("-");
-        let model_str = meta
-            .get("agent_model")
-            .and_then(|v| v.as_str())
-            .unwrap_or("-");
-
-        if color {
-            let _ = writeln!(
-                out,
-                "\x1b[1;36m{}\x1b[0m | \x1b[35m{}\x1b[0m | \x1b[90m{}\x1b[0m | {}",
-                p, a, d, k
-            );
-            let _ = writeln!(
-                out,
-                "  run_id: \x1b[33m{run_str}\x1b[0m  prompt_id: \x1b[33m{prompt_str}\x1b[0m  model: \x1b[90m{model_str}\x1b[0m"
-            );
-            let _ = writeln!(out, "  \x1b[90;4m{}\x1b[0m", path);
-            let _ = writeln!(out);
-        } else {
-            let _ = writeln!(out, "{} | {} | {} | {}", p, a, d, k);
-            let _ = writeln!(
-                out,
-                "  run_id: {run_str}  prompt_id: {prompt_str}  model: {model_str}"
-            );
-            let _ = writeln!(out, "  {}", path);
-            let _ = writeln!(out);
-        }
-    }
-
-    let _ = out.flush();
-    if io::stderr().is_terminal() {
-        eprintln!("{matched} match(es) from steer index.");
-    }
-
-    Ok(())
-}
-
-/// List chunks in the canonical store, filtered by recency.
+/// List context files from the global store, filtered by recency.
 fn run_refs(hours: u64, project: Option<String>, emit: RefsEmit, strict: bool) -> Result<()> {
+    let base = ai_contexters::sanitize::validate_dir_path(&store::store_base_dir()?)?;
+
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
-    let mut files = store::context_files_since(cutoff, project.as_deref())?;
-    if strict {
-        files.retain(|file| !is_noise_artifact(&file.path));
+
+    let mut files: Vec<PathBuf> = Vec::new();
+
+    let project_dirs: Vec<_> = if let Some(ref p) = project {
+        let safe_project = ai_contexters::sanitize::safe_project_name(p)?;
+        let d = base.join(safe_project);
+        if d.is_dir() {
+            vec![ai_contexters::sanitize::validate_dir_path(&d)?]
+        } else {
+            vec![]
+        }
+    } else {
+        ai_contexters::sanitize::read_dir_validated(&base)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir() && p.file_name().is_some_and(|n| n != "memex"))
+            .filter_map(|path| ai_contexters::sanitize::validate_dir_path(&path).ok())
+            .collect()
+    };
+
+    for proj_dir in project_dirs {
+        for date_entry in
+            ai_contexters::sanitize::read_dir_validated(&proj_dir)?.filter_map(|e| e.ok())
+        {
+            let date_path = date_entry.path();
+            if !date_path.is_dir() {
+                continue;
+            }
+            let date_path = ai_contexters::sanitize::validate_dir_path(&date_path)?;
+            for file_entry in
+                ai_contexters::sanitize::read_dir_validated(&date_path)?.filter_map(|e| e.ok())
+            {
+                let fpath = file_entry.path();
+                if fpath
+                    .extension()
+                    .is_some_and(|ext| ext == "md" || ext == "json")
+                    && let Ok(meta) = fpath.metadata()
+                    && let Ok(mtime) = meta.modified()
+                    && mtime >= cutoff
+                {
+                    if strict && is_noise_artifact(&fpath) {
+                        continue;
+                    }
+                    files.push(fpath);
+                }
+            }
+        }
     }
+
+    files.sort();
 
     if files.is_empty() {
         eprintln!("No context files found within last {} hours.", hours);
@@ -2171,7 +1969,7 @@ fn run_refs(hours: u64, project: Option<String>, emit: RefsEmit, strict: bool) -
                 let stdout = io::stdout();
                 let mut out = io::BufWriter::new(stdout.lock());
                 for f in &files {
-                    if let Err(err) = writeln!(out, "{}", f.path.display()) {
+                    if let Err(err) = writeln!(out, "{}", f.display()) {
                         if err.kind() == io::ErrorKind::BrokenPipe {
                             return Ok(());
                         }
@@ -2209,20 +2007,49 @@ struct RefsProjectSummary {
     agents: BTreeMap<String, RefsAgentSummary>,
 }
 
-fn print_refs_summary(files: &[store::StoredContextFile]) -> Result<()> {
+fn extract_agent_from_filename(path: &Path) -> String {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return "unknown".to_string();
+    };
+    let Some((_, tail)) = stem.split_once('_') else {
+        return "unknown".to_string();
+    };
+    let agent = tail
+        .split_once('-')
+        .map(|(a, _)| a)
+        .filter(|a| !a.is_empty())
+        .unwrap_or(tail);
+    if agent.is_empty() {
+        "unknown".to_string()
+    } else {
+        agent.to_ascii_lowercase()
+    }
+}
+
+fn print_refs_summary(files: &[PathBuf]) -> Result<()> {
     let mut by_project: BTreeMap<String, RefsProjectSummary> = BTreeMap::new();
 
     for path in files {
         let file_name = path
-            .path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown-file")
             .to_string();
-        let date = path.date_iso.clone();
-        let project = path.project.clone();
-        let latest_rel = format!("{}/{}/{}", date, path.kind.dir_name(), file_name);
-        let agent = path.agent.to_ascii_lowercase();
+        let date = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown-date")
+            .to_string();
+        let project = path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("_unknown")
+            .to_string();
+        let latest_rel = format!("{}/{}", date, file_name);
+        let agent = extract_agent_from_filename(path);
 
         let project_summary = by_project.entry(project).or_default();
         project_summary.total_files += 1;
@@ -2330,77 +2157,43 @@ fn run_state(reset: bool, project: Option<String>, info: bool) -> Result<()> {
     Ok(())
 }
 
-/// Sync stored chunks to rmcp-memex semantic index.
-fn run_memex_sync(
-    namespace: &str,
-    per_chunk: bool,
-    db_path: Option<PathBuf>,
-    reindex: bool,
-) -> Result<()> {
-    let truth = memex::resolve_runtime_truth(db_path.as_deref())?;
-    let store_root = store::store_base_dir()?;
+/// Sync stored chunks to rmcp-memex vector memory.
+fn run_memex_sync(namespace: &str, per_chunk: bool, db_path: Option<PathBuf>) -> Result<()> {
+    if !memex::check_memex_available() {
+        eprintln!("Error: rmcp-memex not found in PATH.");
+        eprintln!("Install with: cargo install rmcp-memex");
+        std::process::exit(1);
+    }
 
-    let canonical_root = store::canonical_store_dir()?;
-    let chunk_paths: Vec<PathBuf> = store::scan_context_files_raw()?
-        .into_iter()
-        .map(|file| file.path)
-        .collect();
-    if chunk_paths.is_empty() {
-        eprintln!(
-            "No canonical stored chunks found under: {}",
-            canonical_root.display()
-        );
-        eprintln!("Run `aicx store`, `aicx all`, or another extractor first.");
+    let chunks_dir = store::chunks_dir()?;
+    if !chunks_dir.exists() {
+        eprintln!("No chunks directory found at: {}", chunks_dir.display());
+        eprintln!("Run `aicx store --memex` first to generate chunks.");
         return Ok(());
     }
 
     let config = MemexConfig {
         namespace: namespace.to_string(),
-        db_path: db_path.clone(),
+        db_path,
         batch_mode: !per_chunk,
-        preprocess: true,
     };
 
-    eprintln!(
-        "Syncing canonical chunks from: {}",
-        canonical_root.display()
-    );
-    eprintln!("  Chunk files: {}", chunk_paths.len());
+    eprintln!("Syncing chunks from: {}", chunks_dir.display());
     eprintln!("  Namespace: {}", config.namespace);
-    eprintln!("  Embedding model: {}", truth.embedding_model);
-    eprintln!("  Embedding dims: {}", truth.embedding_dimension);
-    eprintln!("  LanceDB path: {}", truth.db_path.display());
-    eprintln!("  BM25 path: {}", truth.bm25_path.display());
-    if let Some(path) = truth.config_path.as_ref() {
-        eprintln!("  Config: {}", path.display());
-    }
-    let ignore_path = store_root.join(store::AICX_IGNORE_FILENAME);
-    if ignore_path.is_file() {
-        eprintln!("  Ignore file: {}", ignore_path.display());
-    }
     eprintln!(
         "  Mode: {}",
         if config.batch_mode {
-            "batch store (library-backed, metadata-rich)"
+            "batch"
         } else {
-            "per-chunk store (library-backed)"
+            "per-chunk"
         }
     );
 
-    if reindex {
-        eprintln!("  Reindex: wiping current rmcp-memex store before rebuild");
-        eprintln!(
-            "  Warning: Lance vector schema is shared across the whole store, so other namespaces in {} will need a rebuild too.",
-            truth.db_path.display()
-        );
-        memex::reset_semantic_index(namespace, db_path.as_deref())?;
-    }
-
-    let result = sync_memex_paths(&config, &chunk_paths)?;
+    let result = memex::sync_new_chunks(&chunks_dir, &config)?;
 
     eprintln!(
-        "✓ Memex sync: {} materialized, {} skipped, {} ignored",
-        result.chunks_materialized, result.chunks_skipped, result.chunks_ignored,
+        "✓ Memex sync: {} pushed, {} skipped",
+        result.chunks_pushed, result.chunks_skipped,
     );
 
     for err in &result.errors {
@@ -2410,7 +2203,7 @@ fn run_memex_sync(
     Ok(())
 }
 
-/// Run the dashboard server shell against the canonical store.
+/// Build and write an AI context dashboard HTML file.
 struct DashboardServerRunArgs {
     store_root: Option<PathBuf>,
     host: String,
@@ -2420,7 +2213,7 @@ struct DashboardServerRunArgs {
     preview_chars: usize,
 }
 
-/// Run dashboard server mode with server-shell HTML and API-backed regeneration.
+/// Run dashboard server mode with artifact regeneration endpoints.
 fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
     let root = if let Some(path) = args.store_root {
         path
@@ -2439,7 +2232,7 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
             host
         ));
     }
-    let artifact_path = args.artifact;
+    let artifact_path = ai_contexters::sanitize::validate_write_path(&args.artifact)?;
 
     let config = DashboardServerConfig {
         store_root: root,
@@ -2543,50 +2336,6 @@ mod tests {
     }
 
     #[test]
-    fn render_memex_progress_formats_live_stages() {
-        assert_eq!(
-            render_memex_progress(&SyncProgress {
-                phase: SyncProgressPhase::Discovering,
-                done: 12,
-                total: 48,
-                detail: String::new(),
-            }),
-            "  Memex scan... 12/48"
-        );
-        assert_eq!(
-            render_memex_progress(&SyncProgress {
-                phase: SyncProgressPhase::Embedding,
-                done: 64,
-                total: 256,
-                detail: String::new(),
-            }),
-            "  Memex embed... 64/256"
-        );
-        assert_eq!(
-            render_memex_progress(&SyncProgress {
-                phase: SyncProgressPhase::Writing,
-                done: 128,
-                total: 256,
-                detail: String::new(),
-            }),
-            "  Memex index... 128/256"
-        );
-    }
-
-    #[test]
-    fn render_memex_progress_passes_completed_detail_through() {
-        assert_eq!(
-            render_memex_progress(&SyncProgress {
-                phase: SyncProgressPhase::Completed,
-                done: 0,
-                total: 0,
-                detail: "Completed: 10 materialized, 2 skipped, 3 ignored".to_string(),
-            }),
-            "  Completed: 10 materialized, 2 skipped, 3 ignored"
-        );
-    }
-
-    #[test]
     fn claude_defaults_to_silent_stdout() {
         let cli = Cli::try_parse_from(["aicx", "claude"]).expect("claude command should parse");
 
@@ -2673,55 +2422,6 @@ mod tests {
     }
 
     #[test]
-    fn search_accepts_score_and_json_flags() {
-        let cli = Cli::try_parse_from(["aicx", "search", "dashboard", "--score", "60", "--json"])
-            .expect("search command with score/json should parse");
-
-        match cli.command {
-            Some(Commands::Search { score, json, .. }) => {
-                assert_eq!(score, Some(60));
-                assert!(json);
-            }
-            _ => panic!("expected search command"),
-        }
-    }
-
-    #[test]
-    fn rank_subcommand_is_rejected() {
-        let err = Cli::try_parse_from(["aicx", "rank", "-p", "foo"])
-            .expect_err("rank subcommand should be rejected");
-        let rendered = err.to_string();
-        assert!(rendered.contains("unrecognized subcommand"));
-        assert!(rendered.contains("rank"));
-    }
-
-    #[test]
-    fn top_level_help_marks_init_as_retired() {
-        let mut cmd = Cli::command();
-        let rendered = cmd.render_help().to_string();
-
-        assert!(rendered.contains("init"));
-        assert!(rendered.contains("Retired compatibility shim"));
-        assert!(!rendered.contains("Initialize repo context and run an agent"));
-    }
-
-    #[test]
-    fn init_help_explains_retirement_and_hides_legacy_flags() {
-        let mut cmd = Cli::command();
-        let init = cmd
-            .find_subcommand_mut("init")
-            .expect("init subcommand should exist for compatibility");
-        let rendered = init.render_long_help().to_string();
-
-        assert!(rendered.contains("aicx init has been retired."));
-        assert!(rendered.contains("/vc-init inside Claude Code."));
-        assert!(!rendered.contains("--agent"));
-        assert!(!rendered.contains("--action"));
-        assert!(!rendered.contains("--no-run"));
-        assert!(!rendered.contains("Initialize repo context and run an agent"));
-    }
-
-    #[test]
     fn extract_accepts_gemini_antigravity_format() {
         let cli = Cli::try_parse_from([
             "aicx",
@@ -2739,33 +2439,6 @@ mod tests {
                 assert!(matches!(format, ExtractInputFormat::GeminiAntigravity));
             }
             _ => panic!("expected extract command"),
-        }
-    }
-
-    #[test]
-    fn migrate_accepts_custom_roots() {
-        let cli = Cli::try_parse_from([
-            "aicx",
-            "migrate",
-            "--dry-run",
-            "--legacy-root",
-            "/tmp/legacy",
-            "--store-root",
-            "/tmp/aicx",
-        ])
-        .expect("migrate command with explicit roots should parse");
-
-        match cli.command {
-            Some(Commands::Migrate {
-                dry_run,
-                legacy_root,
-                store_root,
-            }) => {
-                assert!(dry_run);
-                assert_eq!(legacy_root, Some(PathBuf::from("/tmp/legacy")));
-                assert_eq!(store_root, Some(PathBuf::from("/tmp/aicx")));
-            }
-            _ => panic!("expected migrate command"),
         }
     }
 

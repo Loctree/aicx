@@ -148,7 +148,6 @@ struct CodexEntry {
 struct GeminiSession {
     #[serde(default)]
     session_id: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     project_hash: Option<String>,
     #[serde(default)]
@@ -164,9 +163,7 @@ struct GeminiMessage {
     #[serde(default, rename = "type")]
     msg_type: Option<String>,
     #[serde(default)]
-    content: Option<serde_json::Value>,
-    #[serde(default, rename = "displayContent")]
-    display_content: Option<serde_json::Value>,
+    content: Option<String>,
     #[serde(default)]
     timestamp: Option<String>,
     /// Agent reasoning/thinking steps.
@@ -209,164 +206,6 @@ impl GeminiAntigravityRecoveryMode {
             }
         }
     }
-}
-
-fn render_gemini_message_content(message: &GeminiMessage) -> Option<String> {
-    message
-        .content
-        .as_ref()
-        .and_then(render_gemini_content_value)
-        .or_else(|| {
-            message
-                .display_content
-                .as_ref()
-                .and_then(render_gemini_content_value)
-        })
-}
-
-fn truncate_gemini_large_data(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(map) => {
-            if let Some(inline_data) = map.get("inlineData") {
-                let placeholder = render_gemini_inline_data_placeholder(inline_data);
-                map.remove("inlineData");
-                map.insert(
-                    "inlineDataPlaceholder".to_string(),
-                    serde_json::Value::String(placeholder),
-                );
-            }
-            if let Some(file_data) = map.get("fileData") {
-                let placeholder = render_gemini_file_data_placeholder(file_data);
-                map.remove("fileData");
-                map.insert(
-                    "fileDataPlaceholder".to_string(),
-                    serde_json::Value::String(placeholder),
-                );
-            }
-            for v in map.values_mut() {
-                truncate_gemini_large_data(v);
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            for v in arr.iter_mut() {
-                truncate_gemini_large_data(v);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn render_gemini_content_value(value: &serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::Null => None,
-        serde_json::Value::String(text) => {
-            if text.trim().is_empty() {
-                None
-            } else {
-                Some(text.clone())
-            }
-        }
-        serde_json::Value::Array(arr) => {
-            let mut cleaned = serde_json::Value::Array(arr.clone());
-            truncate_gemini_large_data(&mut cleaned);
-            if let Ok(json) = serde_json::to_string_pretty(&cleaned) {
-                let trimmed = json.trim();
-                if trimmed.is_empty() || trimmed == "[]" {
-                    None
-                } else {
-                    Some(json)
-                }
-            } else {
-                None
-            }
-        }
-        serde_json::Value::Object(map) => {
-            let mut cleaned = serde_json::Value::Object(map.clone());
-            truncate_gemini_large_data(&mut cleaned);
-            if let Ok(json) = serde_json::to_string_pretty(&cleaned) {
-                let trimmed = json.trim();
-                if trimmed.is_empty() || trimmed == "{}" {
-                    None
-                } else {
-                    Some(json)
-                }
-            } else {
-                None
-            }
-        }
-        _ => Some(value.to_string()),
-    }
-}
-
-fn render_gemini_inline_data_placeholder(value: &serde_json::Value) -> String {
-    let mime_type = value
-        .as_object()
-        .and_then(|map| map.get("mimeType"))
-        .and_then(|value| value.as_str())
-        .unwrap_or("unknown");
-    let data_chars = value
-        .as_object()
-        .and_then(|map| map.get("data"))
-        .and_then(|value| value.as_str())
-        .map(|data| data.len());
-
-    match data_chars {
-        Some(count) => {
-            format!("[inlineData omitted: mimeType={mime_type}, data_chars={count}]")
-        }
-        None => format!("[inlineData omitted: mimeType={mime_type}]"),
-    }
-}
-
-fn render_gemini_file_data_placeholder(value: &serde_json::Value) -> String {
-    let mime_type = value
-        .as_object()
-        .and_then(|map| map.get("mimeType"))
-        .and_then(|value| value.as_str())
-        .unwrap_or("unknown");
-    let uri = value
-        .as_object()
-        .and_then(|map| map.get("fileUri").or_else(|| map.get("uri")))
-        .and_then(|value| value.as_str());
-
-    match uri {
-        Some(uri) if !uri.is_empty() => {
-            format!("[fileData omitted: mimeType={mime_type}, uri={uri}]")
-        }
-        _ => format!("[fileData omitted: mimeType={mime_type}]"),
-    }
-}
-
-fn infer_project_hint_from_gemini_message(message: &GeminiMessage) -> Option<String> {
-    message
-        .content
-        .as_ref()
-        .and_then(infer_project_hint_from_json_value)
-        .or_else(|| {
-            message
-                .display_content
-                .as_ref()
-                .and_then(infer_project_hint_from_json_value)
-        })
-        .or_else(|| {
-            render_gemini_message_content(message)
-                .as_deref()
-                .and_then(infer_project_hint_from_text)
-        })
-}
-
-fn gemini_message_matches_filter(message: &GeminiMessage, filters_lower: &[String]) -> bool {
-    let content = render_gemini_message_content(message);
-    let project_hint = infer_project_hint_from_gemini_message(message);
-
-    filters_lower.iter().any(|filter| {
-        content
-            .as_ref()
-            .is_some_and(|text| text.to_lowercase().contains(filter))
-            || project_hint
-                .as_ref()
-                .is_some_and(|cwd| cwd.to_lowercase().contains(filter))
-    })
 }
 
 #[derive(Debug, Clone)]
@@ -762,19 +601,6 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
         let mut entries = parse_codex_session_file(path, config)?;
         entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
         return Ok(entries);
-    }
-
-    // Check for legacy JSON format ({"session": {...}, "items": [...]})
-    // We read the full file because it's usually formatted JSON.
-    if let Ok(content) = sanitize::read_to_string_validated(path) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-            if val.get("session").is_some() && val.get("items").is_some() {
-                anyhow::bail!(
-                    "Legacy Codex JSON rollout format is unsupported (no cwd available): {}",
-                    path.display()
-                );
-            }
-        }
     }
 
     Err(anyhow::anyhow!(
@@ -1400,13 +1226,12 @@ fn build_gemini_antigravity_summary(
         session_id: input.conversation_id.clone(),
         role: "system".to_string(),
         message: format!(
-            "Gemini Antigravity recovery report\nmode: {}\nconversation_id: {}\ninput: {}\nbrain: {}\nraw_pb: {}\nreadable_entry_count: {}\ninferred_projects: {}\nrecovery_note: {}\nused_artifacts:\n{}",
+            "Gemini Antigravity recovery report\nmode: {}\nconversation_id: {}\ninput: {}\nbrain: {}\nraw_pb: {}\ninferred_projects: {}\nrecovery_note: {}\nused_artifacts:\n{}",
             recovery.mode.as_str(),
             input.conversation_id,
             input.input_path.display(),
             input.brain_dir.display(),
             raw_pb,
-            entries.len(),
             inferred_label,
             recovery.mode.note(),
             if used_paths.is_empty() {
@@ -1858,12 +1683,19 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
         }
     }
 
-    // Extract global session metadata (like session_id) and the initial cwd
+    // Extract session metadata
+    let mut session_cwd: Option<String> = None;
     let mut session_id: Option<String> = None;
-    let mut initial_cwd: Option<String> = None;
 
     for ev in &events {
         if ev.event_type == "session_meta" {
+            if session_cwd.is_none() {
+                session_cwd = ev
+                    .payload
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+            }
             if session_id.is_none() {
                 session_id = ev
                     .payload
@@ -1871,13 +1703,13 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
                     .and_then(|v| v.as_str())
                     .map(String::from);
             }
-            if initial_cwd.is_none() {
-                initial_cwd = ev
-                    .payload
-                    .get("cwd")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-            }
+        }
+        if ev.event_type == "turn_context" && session_cwd.is_none() {
+            session_cwd = ev
+                .payload
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(String::from);
         }
     }
 
@@ -1888,40 +1720,26 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
             .unwrap_or_default()
     });
 
+    // Project filter: check if session cwd matches
+    if !config.project_filter.is_empty() {
+        let matches = session_cwd.as_ref().is_some_and(|cwd| {
+            let cwd_lower = cwd.to_lowercase();
+            config
+                .project_filter
+                .iter()
+                .any(|f| cwd_lower.contains(&f.to_lowercase()))
+        });
+        if !matches {
+            return Ok(vec![]);
+        }
+    }
+
     // Collect event_msg entries (user_message + agent_message)
     let mut entries = Vec::new();
-    let mut current_cwd = initial_cwd;
 
     for ev in &events {
-        // Update current context per-turn
-        if ev.event_type == "turn_context" {
-            if let Some(cwd) = ev
-                .payload
-                .get("cwd")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-            {
-                current_cwd = Some(cwd);
-            }
-            continue;
-        }
-
         if ev.event_type != "event_msg" {
             continue;
-        }
-
-        // Project filter: check if the current turn's cwd matches
-        if !config.project_filter.is_empty() {
-            let matches = current_cwd.as_ref().is_some_and(|cwd| {
-                let cwd_lower = cwd.to_lowercase();
-                config
-                    .project_filter
-                    .iter()
-                    .any(|f| cwd_lower.contains(&f.to_lowercase()))
-            });
-            if !matches {
-                continue;
-            }
         }
 
         let msg_type = ev
@@ -1986,7 +1804,7 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
             role: role.to_string(),
             message,
             branch: None,
-            cwd: current_cwd.clone(),
+            cwd: session_cwd.clone(),
         });
     }
 
@@ -2088,10 +1906,8 @@ fn parse_gemini_session(
         .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()))
         .unwrap_or_default();
 
-    let session_default_cwd = session
-        .messages
-        .iter()
-        .find_map(infer_project_hint_from_gemini_message);
+    // Use projectHash as a pseudo-cwd for filtering
+    let project_hash = session.project_hash.clone();
 
     // Check project filter against message content
     let session_matches_filter = if !config.project_filter.is_empty() {
@@ -2100,10 +1916,13 @@ fn parse_gemini_session(
             .iter()
             .map(|f| f.to_lowercase())
             .collect();
-        session
-            .messages
-            .iter()
-            .any(|message| gemini_message_matches_filter(message, &filters_lower))
+        filters_lower.iter().any(|fl| {
+            session.messages.iter().any(|m| {
+                m.content
+                    .as_ref()
+                    .is_some_and(|c| c.to_lowercase().contains(fl))
+            })
+        })
     } else {
         true
     };
@@ -2151,12 +1970,10 @@ fn parse_gemini_session(
             continue;
         }
 
-        let Some(text) = render_gemini_message_content(msg) else {
+        let text = msg.content.as_deref().unwrap_or("").to_string();
+        if text.is_empty() {
             continue;
-        };
-
-        let inferred_cwd =
-            infer_project_hint_from_gemini_message(msg).or_else(|| session_default_cwd.clone());
+        }
 
         entries.push(TimelineEntry {
             timestamp,
@@ -2165,7 +1982,7 @@ fn parse_gemini_session(
             role,
             message: text,
             branch: None,
-            cwd: inferred_cwd.clone(),
+            cwd: project_hash.clone(),
         });
 
         // Extract thoughts as reasoning entries (only when include_assistant)
@@ -2199,7 +2016,7 @@ fn parse_gemini_session(
                     role: "reasoning".to_string(),
                     message: text,
                     branch: None,
-                    cwd: inferred_cwd.clone(),
+                    cwd: project_hash.clone(),
                 });
             }
         }
@@ -2666,15 +2483,14 @@ mod tests {
 
     #[test]
     fn test_extract_claude_file_parses_text_only_blocks() {
-        let root = unique_test_dir("claude-direct");
-        let tmp = root.join("session.jsonl");
-        let _ = fs::remove_dir_all(&root);
+        let tmp = std::env::temp_dir().join("ai-ctx-claude-direct.jsonl");
+        let _ = fs::remove_file(&tmp);
 
         let content = r#"{"type":"user","message":{"role":"user","content":"Hello"},"timestamp":"2026-02-09T22:03:06.765Z","sessionId":"sess123","gitBranch":"main","cwd":"/tmp"}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hi"}]},"timestamp":"2026-02-09T22:03:07.765Z","sessionId":"sess123"}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"echo hi"}}]},"timestamp":"2026-02-09T22:03:08.765Z","sessionId":"sess123"}
 {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]},"timestamp":"2026-02-09T22:03:09.765Z","sessionId":"sess123"}"#;
-        write_file(&tmp, content);
+        fs::write(&tmp, content).unwrap();
 
         let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
         let config = ExtractionConfig {
@@ -2691,19 +2507,18 @@ mod tests {
         assert_eq!(entries[1].role, "assistant");
         assert_eq!(entries[1].message, "Hi");
 
-        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_extract_codex_file_history_format() {
-        let root = unique_test_dir("codex-direct-history");
-        let tmp = root.join("history.jsonl");
-        let _ = fs::remove_dir_all(&root);
+        let tmp = std::env::temp_dir().join("ai-ctx-codex-direct-history.jsonl");
+        let _ = fs::remove_file(&tmp);
 
         let content = r#"{"session_id":"s1","text":"hello","ts":1000,"role":"user","cwd":"/tmp/a"}
 {"session_id":"s1","text":"hi back","ts":1001,"role":"assistant","cwd":"/tmp/a"}
 {"session_id":"s2","text":"unrelated","ts":2000,"role":"user","cwd":"/tmp/b"}"#;
-        write_file(&tmp, content);
+        fs::write(&tmp, content).unwrap();
 
         let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
         let config = ExtractionConfig {
@@ -2719,18 +2534,17 @@ mod tests {
         assert_eq!(entries[0].role, "user");
         assert_eq!(entries[1].role, "assistant");
 
-        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_extract_codex_file_session_format_detects() {
-        let root = unique_test_dir("codex-direct-session");
-        let tmp = root.join("session.jsonl");
-        let _ = fs::remove_dir_all(&root);
+        let tmp = std::env::temp_dir().join("ai-ctx-codex-direct-session.jsonl");
+        let _ = fs::remove_file(&tmp);
 
         // Minimal session file (no event_msg) should parse and yield 0 entries.
         let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"sess","cwd":"/tmp/x"}}"#;
-        write_file(&tmp, content);
+        fs::write(&tmp, content).unwrap();
 
         let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
         let config = ExtractionConfig {
@@ -2743,14 +2557,13 @@ mod tests {
         let entries = extract_codex_file(&tmp, &config).unwrap();
         assert!(entries.is_empty());
 
-        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&tmp);
     }
 
     #[test]
     fn test_extract_gemini_file_session_json() {
-        let root = unique_test_dir("gemini-direct");
-        let tmp = root.join("session.json");
-        let _ = fs::remove_dir_all(&root);
+        let tmp = std::env::temp_dir().join("ai-ctx-gemini-direct.json");
+        let _ = fs::remove_file(&tmp);
 
         let content = r#"{
   "sessionId": "sess-1",
@@ -2761,7 +2574,7 @@ mod tests {
     {"type":"info","content":"skip me","timestamp":"2026-02-01T00:00:02Z","thoughts":[]}
   ]
 }"#;
-        write_file(&tmp, content);
+        fs::write(&tmp, content).unwrap();
 
         let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
         let config = ExtractionConfig {
@@ -2777,7 +2590,7 @@ mod tests {
         assert_eq!(entries[0].role, "user");
         assert_eq!(entries[1].role, "assistant");
 
-        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&tmp);
     }
 
     #[test]
@@ -3143,15 +2956,11 @@ mod tests {
     fn test_gemini_message_with_content() {
         let msg = GeminiMessage {
             msg_type: Some("user".to_string()),
-            content: Some(serde_json::Value::String("hello from gemini".to_string())),
-            display_content: None,
+            content: Some("hello from gemini".to_string()),
             timestamp: Some("2026-01-20T19:50:45.683Z".to_string()),
             thoughts: vec![],
         };
-        assert_eq!(
-            render_gemini_message_content(&msg).as_deref(),
-            Some("hello from gemini")
-        );
+        assert_eq!(msg.content.as_deref().unwrap_or(""), "hello from gemini");
         assert_eq!(msg.msg_type.as_deref().unwrap(), "user");
     }
 
@@ -3160,8 +2969,7 @@ mod tests {
         // "gemini" type maps to "assistant" role
         let msg = GeminiMessage {
             msg_type: Some("gemini".to_string()),
-            content: Some(serde_json::Value::String("response text".to_string())),
-            display_content: None,
+            content: Some("response text".to_string()),
             timestamp: Some("2026-01-20T19:50:51.778Z".to_string()),
             thoughts: vec![],
         };
@@ -3179,8 +2987,7 @@ mod tests {
         for msg_type in &["error", "info"] {
             let msg = GeminiMessage {
                 msg_type: Some(msg_type.to_string()),
-                content: Some(serde_json::Value::String("some system message".to_string())),
-                display_content: None,
+                content: Some("some system message".to_string()),
                 timestamp: Some("2026-01-20T19:16:15.218Z".to_string()),
                 thoughts: vec![],
             };
@@ -3232,142 +3039,12 @@ mod tests {
         );
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0].msg_type.as_deref(), Some("user"));
-        assert_eq!(
-            session.messages[0].content.as_ref(),
-            Some(&serde_json::Value::String("siemka!".to_string()))
-        );
+        assert_eq!(session.messages[0].content.as_deref(), Some("siemka!"));
         assert_eq!(session.messages[1].msg_type.as_deref(), Some("gemini"));
         assert_eq!(
-            session.messages[1].content.as_ref(),
-            Some(&serde_json::Value::String("Cześć Maciej.".to_string()))
+            session.messages[1].content.as_deref(),
+            Some("Cześć Maciej.")
         );
-    }
-
-    #[test]
-    fn test_render_gemini_content_value_preserves_structured_blocks() {
-        let value = serde_json::json!([
-            {"text": "co to jest reachy mini? @../../../.gemini/tmp/codescribe/images/clipboard-1773858428029.png"},
-            {"text": "\n--- Content from referenced files ---"},
-            {"inlineData": {"mimeType": "image/png", "data": "abc123"}},
-            {"text": "\n--- End of content ---"}
-        ]);
-
-        let rendered = render_gemini_content_value(&value).unwrap();
-        assert!(rendered.contains("co to jest reachy mini?"));
-        assert!(rendered.contains("--- Content from referenced files ---"));
-        assert!(rendered.contains("[inlineData omitted: mimeType=image/png, data_chars=6]"));
-        assert!(rendered.contains("--- End of content ---"));
-    }
-
-    #[test]
-    fn test_render_gemini_content_value_supports_object_shapes() {
-        let value = serde_json::json!({
-            "content": [
-                {"text": "first line"},
-                {"fileData": {"mimeType": "text/plain", "fileUri": "file:///tmp/note.txt"}}
-            ]
-        });
-
-        let rendered = render_gemini_content_value(&value).unwrap();
-        assert!(rendered.contains("first line"));
-        assert!(rendered.contains("file:///tmp/note.txt"));
-        assert!(rendered.contains("mimeType=text/plain"));
-    }
-
-    #[test]
-    fn test_extract_gemini_file_preserves_user_array_content() {
-        let root = unique_test_dir("gemini-array-user");
-        let tmp = root.join("session.json");
-        let _ = fs::remove_dir_all(&root);
-
-        let content = r##"{
-  "sessionId": "sess-array",
-  "messages": [
-    {
-      "type":"user",
-      "content":[
-        {"text":"# Task: Gemini truth repair"},
-        {"text":"- preserve user arrays honestly"}
-      ],
-      "timestamp":"2026-02-01T00:00:00Z"
-    },
-    {
-      "type":"gemini",
-      "content":"working on it",
-      "timestamp":"2026-02-01T00:00:01Z"
-    }
-  ]
-}"##;
-        write_file(&tmp, content);
-
-        let config = ExtractionConfig {
-            project_filter: vec![],
-            cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
-            include_assistant: true,
-            watermark: None,
-        };
-
-        let entries = extract_gemini_file(&tmp, &config).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].role, "user");
-        assert_eq!(
-            entries[0].message,
-            "[\n  {\n    \"text\": \"# Task: Gemini truth repair\"\n  },\n  {\n    \"text\": \"- preserve user arrays honestly\"\n  }\n]"
-        );
-        assert_eq!(entries[1].role, "assistant");
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn test_extract_gemini_file_keeps_inline_data_as_explicit_placeholder() {
-        let root = unique_test_dir("gemini-inline-data");
-        let tmp = root.join("session.json");
-        let _ = fs::remove_dir_all(&root);
-
-        let content = r#"{
-  "sessionId": "sess-inline",
-  "messages": [
-    {
-      "type":"user",
-      "timestamp":"2026-02-01T00:00:00Z",
-      "content":[
-        {"text":"co to jest reachy mini? @../../../.gemini/tmp/codescribe/images/clipboard-1773858428029.png"},
-        {"text":"\n--- Content from referenced files ---"},
-        {"inlineData":{"mimeType":"image/png","data":"abc123"}},
-        {"text":"\n--- End of content ---"}
-      ],
-      "displayContent":[
-        {"text":"co to jest reachy mini? @../../../.gemini/tmp/codescribe/images/clipboard-1773858428029.png"}
-      ]
-    },
-    {
-      "type":"gemini",
-      "timestamp":"2026-02-01T00:00:01Z",
-      "content":"To jest humanoidalny robot."
-    }
-  ]
-}"#;
-        write_file(&tmp, content);
-
-        let config = ExtractionConfig {
-            project_filter: vec![],
-            cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
-            include_assistant: true,
-            watermark: None,
-        };
-
-        let entries = extract_gemini_file(&tmp, &config).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert!(entries[0].message.contains("co to jest reachy mini?"));
-        assert!(
-            entries[0]
-                .message
-                .contains("[inlineData omitted: mimeType=image/png, data_chars=6]")
-        );
-        assert!(entries[1].message.contains("humanoidalny robot"));
-
-        let _ = fs::remove_dir_all(&root);
     }
 }
 
@@ -3508,11 +3185,7 @@ mod conversation_tests {
     #[test]
     fn test_extract_claude_excludes_tool_blocks_then_conversation_clean() {
         use std::fs;
-        let tmp = std::env::temp_dir().join(format!(
-            "ai-ctx-conv-tool-blocks-{}-{}.jsonl",
-            std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
+        let tmp = std::env::temp_dir().join("ai-ctx-conv-tool-blocks.jsonl");
         let _ = fs::remove_file(&tmp);
 
         let content = concat!(
