@@ -642,7 +642,13 @@ fn write_semantic_segment_at(
     date: &str,
     chunker_config: &ChunkerConfig,
 ) -> Result<Vec<PathBuf>> {
-    let project = segment.repo.as_ref().map(RepoIdentity::slug);
+    // Only assertable identities (Primary/Secondary) earn canonical store placement.
+    // Fallback/Opaque/None route to non-repository-contexts.
+    let project = if segment.has_assertable_identity() {
+        segment.repo.as_ref().map(RepoIdentity::slug)
+    } else {
+        None
+    };
     let root = if project.is_some() {
         base.join(CANONICAL_STORE_DIRNAME)
     } else {
@@ -2823,6 +2829,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
 
         fs::create_dir_all(&repo_root).unwrap();
+        fs::create_dir_all(repo_root.join(".git")).unwrap();
         fs::create_dir_all(legacy_root.join("demo").join("2026-03-21")).unwrap();
         write_codex_history(
             &source,

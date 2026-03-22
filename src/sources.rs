@@ -164,7 +164,9 @@ struct GeminiMessage {
     #[serde(default, rename = "type")]
     msg_type: Option<String>,
     #[serde(default)]
-    content: Option<String>,
+    content: Option<serde_json::Value>,
+    #[serde(default, rename = "displayContent")]
+    display_content: Option<serde_json::Value>,
     #[serde(default)]
     timestamp: Option<String>,
     /// Agent reasoning/thinking steps.
@@ -207,6 +209,154 @@ impl GeminiAntigravityRecoveryMode {
             }
         }
     }
+}
+
+fn render_gemini_message_content(message: &GeminiMessage) -> Option<String> {
+    message
+        .content
+        .as_ref()
+        .and_then(render_gemini_content_value)
+        .or_else(|| {
+            message
+                .display_content
+                .as_ref()
+                .and_then(render_gemini_content_value)
+        })
+}
+
+fn render_gemini_content_value(value: &serde_json::Value) -> Option<String> {
+    let mut parts = Vec::new();
+    collect_gemini_content_parts(value, &mut parts);
+    let rendered = parts.join("\n");
+    (!rendered.trim().is_empty()).then_some(rendered)
+}
+
+fn collect_gemini_content_parts(value: &serde_json::Value, parts: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Null => {}
+        serde_json::Value::String(text) => {
+            if !text.is_empty() {
+                parts.push(text.clone());
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_gemini_content_parts(item, parts);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(inline_data) = map.get("inlineData") {
+                parts.push(render_gemini_inline_data_placeholder(inline_data));
+                return;
+            }
+
+            if let Some(file_data) = map.get("fileData") {
+                parts.push(render_gemini_file_data_placeholder(file_data));
+                return;
+            }
+
+            if let Some(text) = map.get("text").and_then(|value| value.as_str()) {
+                if !text.is_empty() {
+                    parts.push(text.to_string());
+                    return;
+                }
+            }
+
+            for key in [
+                "content",
+                "parts",
+                "displayContent",
+                "message",
+                "body",
+                "value",
+            ] {
+                if let Some(nested) = map.get(key) {
+                    let original_len = parts.len();
+                    collect_gemini_content_parts(nested, parts);
+                    if parts.len() > original_len {
+                        return;
+                    }
+                }
+            }
+
+            let keys = map.keys().cloned().collect::<Vec<_>>().join(", ");
+            if !keys.is_empty() {
+                parts.push(format!("[gemini structured content omitted: keys={keys}]"));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn render_gemini_inline_data_placeholder(value: &serde_json::Value) -> String {
+    let mime_type = value
+        .as_object()
+        .and_then(|map| map.get("mimeType"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let data_chars = value
+        .as_object()
+        .and_then(|map| map.get("data"))
+        .and_then(|value| value.as_str())
+        .map(|data| data.len());
+
+    match data_chars {
+        Some(count) => {
+            format!("[inlineData omitted: mimeType={mime_type}, data_chars={count}]")
+        }
+        None => format!("[inlineData omitted: mimeType={mime_type}]"),
+    }
+}
+
+fn render_gemini_file_data_placeholder(value: &serde_json::Value) -> String {
+    let mime_type = value
+        .as_object()
+        .and_then(|map| map.get("mimeType"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let uri = value
+        .as_object()
+        .and_then(|map| map.get("fileUri").or_else(|| map.get("uri")))
+        .and_then(|value| value.as_str());
+
+    match uri {
+        Some(uri) if !uri.is_empty() => {
+            format!("[fileData omitted: mimeType={mime_type}, uri={uri}]")
+        }
+        _ => format!("[fileData omitted: mimeType={mime_type}]"),
+    }
+}
+
+fn infer_project_hint_from_gemini_message(message: &GeminiMessage) -> Option<String> {
+    message
+        .content
+        .as_ref()
+        .and_then(infer_project_hint_from_json_value)
+        .or_else(|| {
+            message
+                .display_content
+                .as_ref()
+                .and_then(infer_project_hint_from_json_value)
+        })
+        .or_else(|| {
+            render_gemini_message_content(message)
+                .as_deref()
+                .and_then(infer_project_hint_from_text)
+        })
+}
+
+fn gemini_message_matches_filter(message: &GeminiMessage, filters_lower: &[String]) -> bool {
+    let content = render_gemini_message_content(message);
+    let project_hint = infer_project_hint_from_gemini_message(message);
+
+    filters_lower.iter().any(|filter| {
+        content
+            .as_ref()
+            .is_some_and(|text| text.to_lowercase().contains(filter))
+            || project_hint
+                .as_ref()
+                .is_some_and(|cwd| cwd.to_lowercase().contains(filter))
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -602,6 +752,19 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
         let mut entries = parse_codex_session_file(path, config)?;
         entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
         return Ok(entries);
+    }
+
+    // Check for legacy JSON format ({"session": {...}, "items": [...]})
+    // We read the full file because it's usually formatted JSON.
+    if let Ok(content) = fs::read_to_string(path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            if val.get("session").is_some() && val.get("items").is_some() {
+                anyhow::bail!(
+                    "Legacy Codex JSON rollout format is unsupported (no cwd available): {}",
+                    path.display()
+                );
+            }
+        }
     }
 
     Err(anyhow::anyhow!(
@@ -1227,12 +1390,13 @@ fn build_gemini_antigravity_summary(
         session_id: input.conversation_id.clone(),
         role: "system".to_string(),
         message: format!(
-            "Gemini Antigravity recovery report\nmode: {}\nconversation_id: {}\ninput: {}\nbrain: {}\nraw_pb: {}\ninferred_projects: {}\nrecovery_note: {}\nused_artifacts:\n{}",
+            "Gemini Antigravity recovery report\nmode: {}\nconversation_id: {}\ninput: {}\nbrain: {}\nraw_pb: {}\nreadable_entry_count: {}\ninferred_projects: {}\nrecovery_note: {}\nused_artifacts:\n{}",
             recovery.mode.as_str(),
             input.conversation_id,
             input.input_path.display(),
             input.brain_dir.display(),
             raw_pb,
+            entries.len(),
             inferred_label,
             recovery.mode.note(),
             if used_paths.is_empty() {
@@ -1684,19 +1848,12 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
         }
     }
 
-    // Extract session metadata
-    let mut session_cwd: Option<String> = None;
+    // Extract global session metadata (like session_id) and the initial cwd
     let mut session_id: Option<String> = None;
+    let mut initial_cwd: Option<String> = None;
 
     for ev in &events {
         if ev.event_type == "session_meta" {
-            if session_cwd.is_none() {
-                session_cwd = ev
-                    .payload
-                    .get("cwd")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-            }
             if session_id.is_none() {
                 session_id = ev
                     .payload
@@ -1704,13 +1861,13 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
                     .and_then(|v| v.as_str())
                     .map(String::from);
             }
-        }
-        if ev.event_type == "turn_context" && session_cwd.is_none() {
-            session_cwd = ev
-                .payload
-                .get("cwd")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            if initial_cwd.is_none() {
+                initial_cwd = ev
+                    .payload
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+            }
         }
     }
 
@@ -1721,26 +1878,40 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
             .unwrap_or_default()
     });
 
-    // Project filter: check if session cwd matches
-    if !config.project_filter.is_empty() {
-        let matches = session_cwd.as_ref().is_some_and(|cwd| {
-            let cwd_lower = cwd.to_lowercase();
-            config
-                .project_filter
-                .iter()
-                .any(|f| cwd_lower.contains(&f.to_lowercase()))
-        });
-        if !matches {
-            return Ok(vec![]);
-        }
-    }
-
     // Collect event_msg entries (user_message + agent_message)
     let mut entries = Vec::new();
+    let mut current_cwd = initial_cwd;
 
     for ev in &events {
+        // Update current context per-turn
+        if ev.event_type == "turn_context" {
+            if let Some(cwd) = ev
+                .payload
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+            {
+                current_cwd = Some(cwd);
+            }
+            continue;
+        }
+
         if ev.event_type != "event_msg" {
             continue;
+        }
+
+        // Project filter: check if the current turn's cwd matches
+        if !config.project_filter.is_empty() {
+            let matches = current_cwd.as_ref().is_some_and(|cwd| {
+                let cwd_lower = cwd.to_lowercase();
+                config
+                    .project_filter
+                    .iter()
+                    .any(|f| cwd_lower.contains(&f.to_lowercase()))
+            });
+            if !matches {
+                continue;
+            }
         }
 
         let msg_type = ev
@@ -1805,7 +1976,7 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
             role: role.to_string(),
             message,
             branch: None,
-            cwd: session_cwd.clone(),
+            cwd: current_cwd.clone(),
         });
     }
 
@@ -1910,8 +2081,7 @@ fn parse_gemini_session(
     let session_default_cwd = session
         .messages
         .iter()
-        .filter_map(|message| message.content.as_deref())
-        .find_map(infer_project_hint_from_text);
+        .find_map(infer_project_hint_from_gemini_message);
 
     // Check project filter against message content
     let session_matches_filter = if !config.project_filter.is_empty() {
@@ -1920,13 +2090,10 @@ fn parse_gemini_session(
             .iter()
             .map(|f| f.to_lowercase())
             .collect();
-        filters_lower.iter().any(|fl| {
-            session.messages.iter().any(|m| {
-                m.content
-                    .as_ref()
-                    .is_some_and(|c| c.to_lowercase().contains(fl))
-            })
-        })
+        session
+            .messages
+            .iter()
+            .any(|message| gemini_message_matches_filter(message, &filters_lower))
     } else {
         true
     };
@@ -1974,13 +2141,12 @@ fn parse_gemini_session(
             continue;
         }
 
-        let text = msg.content.as_deref().unwrap_or("").to_string();
-        if text.is_empty() {
+        let Some(text) = render_gemini_message_content(msg) else {
             continue;
-        }
+        };
 
         let inferred_cwd =
-            infer_project_hint_from_text(&text).or_else(|| session_default_cwd.clone());
+            infer_project_hint_from_gemini_message(msg).or_else(|| session_default_cwd.clone());
 
         entries.push(TimelineEntry {
             timestamp,
@@ -2963,11 +3129,15 @@ mod tests {
     fn test_gemini_message_with_content() {
         let msg = GeminiMessage {
             msg_type: Some("user".to_string()),
-            content: Some("hello from gemini".to_string()),
+            content: Some(serde_json::Value::String("hello from gemini".to_string())),
+            display_content: None,
             timestamp: Some("2026-01-20T19:50:45.683Z".to_string()),
             thoughts: vec![],
         };
-        assert_eq!(msg.content.as_deref().unwrap_or(""), "hello from gemini");
+        assert_eq!(
+            render_gemini_message_content(&msg).as_deref(),
+            Some("hello from gemini")
+        );
         assert_eq!(msg.msg_type.as_deref().unwrap(), "user");
     }
 
@@ -2976,7 +3146,8 @@ mod tests {
         // "gemini" type maps to "assistant" role
         let msg = GeminiMessage {
             msg_type: Some("gemini".to_string()),
-            content: Some("response text".to_string()),
+            content: Some(serde_json::Value::String("response text".to_string())),
+            display_content: None,
             timestamp: Some("2026-01-20T19:50:51.778Z".to_string()),
             thoughts: vec![],
         };
@@ -2994,7 +3165,8 @@ mod tests {
         for msg_type in &["error", "info"] {
             let msg = GeminiMessage {
                 msg_type: Some(msg_type.to_string()),
-                content: Some("some system message".to_string()),
+                content: Some(serde_json::Value::String("some system message".to_string())),
+                display_content: None,
                 timestamp: Some("2026-01-20T19:16:15.218Z".to_string()),
                 thoughts: vec![],
             };
@@ -3046,12 +3218,140 @@ mod tests {
         );
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0].msg_type.as_deref(), Some("user"));
-        assert_eq!(session.messages[0].content.as_deref(), Some("siemka!"));
+        assert_eq!(
+            session.messages[0].content.as_ref(),
+            Some(&serde_json::Value::String("siemka!".to_string()))
+        );
         assert_eq!(session.messages[1].msg_type.as_deref(), Some("gemini"));
         assert_eq!(
-            session.messages[1].content.as_deref(),
-            Some("Cześć Maciej.")
+            session.messages[1].content.as_ref(),
+            Some(&serde_json::Value::String("Cześć Maciej.".to_string()))
         );
+    }
+
+    #[test]
+    fn test_render_gemini_content_value_preserves_structured_blocks() {
+        let value = serde_json::json!([
+            {"text": "co to jest reachy mini? @../../../.gemini/tmp/codescribe/images/clipboard-1773858428029.png"},
+            {"text": "\n--- Content from referenced files ---"},
+            {"inlineData": {"mimeType": "image/png", "data": "abc123"}},
+            {"text": "\n--- End of content ---"}
+        ]);
+
+        let rendered = render_gemini_content_value(&value).unwrap();
+        assert!(rendered.contains("co to jest reachy mini?"));
+        assert!(rendered.contains("--- Content from referenced files ---"));
+        assert!(rendered.contains("[inlineData omitted: mimeType=image/png, data_chars=6]"));
+        assert!(rendered.contains("--- End of content ---"));
+    }
+
+    #[test]
+    fn test_render_gemini_content_value_supports_object_shapes() {
+        let value = serde_json::json!({
+            "content": [
+                {"text": "first line"},
+                {"fileData": {"mimeType": "text/plain", "fileUri": "file:///tmp/note.txt"}}
+            ]
+        });
+
+        let rendered = render_gemini_content_value(&value).unwrap();
+        assert!(rendered.contains("first line"));
+        assert!(rendered.contains("file:///tmp/note.txt"));
+        assert!(rendered.contains("mimeType=text/plain"));
+    }
+
+    #[test]
+    fn test_extract_gemini_file_preserves_user_array_content() {
+        let tmp = std::env::temp_dir().join("ai-ctx-gemini-array-user.json");
+        let _ = fs::remove_file(&tmp);
+
+        let content = r##"{
+  "sessionId": "sess-array",
+  "messages": [
+    {
+      "type":"user",
+      "content":[
+        {"text":"# Task: Gemini truth repair"},
+        {"text":"- preserve user arrays honestly"}
+      ],
+      "timestamp":"2026-02-01T00:00:00Z"
+    },
+    {
+      "type":"gemini",
+      "content":"working on it",
+      "timestamp":"2026-02-01T00:00:01Z"
+    }
+  ]
+}"##;
+        fs::write(&tmp, content).unwrap();
+
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+            include_assistant: true,
+            watermark: None,
+        };
+
+        let entries = extract_gemini_file(&tmp, &config).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].role, "user");
+        assert_eq!(
+            entries[0].message,
+            "# Task: Gemini truth repair\n- preserve user arrays honestly"
+        );
+        assert_eq!(entries[1].role, "assistant");
+
+        let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_extract_gemini_file_keeps_inline_data_as_explicit_placeholder() {
+        let tmp = std::env::temp_dir().join("ai-ctx-gemini-inline-data.json");
+        let _ = fs::remove_file(&tmp);
+
+        let content = r#"{
+  "sessionId": "sess-inline",
+  "messages": [
+    {
+      "type":"user",
+      "timestamp":"2026-02-01T00:00:00Z",
+      "content":[
+        {"text":"co to jest reachy mini? @../../../.gemini/tmp/codescribe/images/clipboard-1773858428029.png"},
+        {"text":"\n--- Content from referenced files ---"},
+        {"inlineData":{"mimeType":"image/png","data":"abc123"}},
+        {"text":"\n--- End of content ---"}
+      ],
+      "displayContent":[
+        {"text":"co to jest reachy mini? @../../../.gemini/tmp/codescribe/images/clipboard-1773858428029.png"}
+      ]
+    },
+    {
+      "type":"gemini",
+      "timestamp":"2026-02-01T00:00:01Z",
+      "content":"To jest humanoidalny robot."
+    }
+  ]
+}"#;
+        fs::write(&tmp, content).unwrap();
+
+        let config = ExtractionConfig {
+            project_filter: vec![],
+            cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+            include_assistant: true,
+            watermark: None,
+        };
+
+        let entries = extract_gemini_file(&tmp, &config).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].message.contains("co to jest reachy mini?"));
+        assert!(
+            entries[0]
+                .message
+                .contains("[inlineData omitted: mimeType=image/png, data_chars=6]")
+        );
+        assert!(entries[1].message.contains("humanoidalny robot"));
+
+        let _ = fs::remove_file(&tmp);
     }
 }
 
