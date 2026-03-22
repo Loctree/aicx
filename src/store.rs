@@ -2671,6 +2671,146 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // ================================================================
+    // Repo-centric retrieval tests
+    // ================================================================
+
+    fn retrieval_test_root(name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "aicx-retrieval-{name}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
+    }
+
+    fn write_chunk_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn scan_retrieves_repo_centric_files_with_correct_metadata() {
+        let root = retrieval_test_root("repo-scan");
+        let _ = fs::remove_dir_all(&root);
+
+        // Create canonical repo-centric layout:
+        // store/VetCoders/ai-contexters/2026_0321/conversations/claude/<file>.md
+        let chunk_dir = root
+            .join("store")
+            .join("VetCoders")
+            .join("ai-contexters")
+            .join("2026_0321")
+            .join("conversations")
+            .join("claude");
+        write_chunk_file(
+            &chunk_dir.join("2026_0321_claude_sess-abc123_001.md"),
+            "Decision: use repo-centric store layout",
+        );
+
+        let scanned = scan_context_files_at(&root).expect("scan should succeed");
+        assert_eq!(scanned.len(), 1);
+
+        let file = &scanned[0];
+        assert_eq!(file.project, "VetCoders/ai-contexters");
+        assert_eq!(file.agent, "claude");
+        assert_eq!(file.kind, Kind::Conversations);
+        assert_eq!(file.date_compact, "2026_0321");
+        assert_eq!(file.date_iso, "2026-03-21");
+        assert_eq!(file.session_id, "sess-abc123");
+        assert_eq!(file.chunk, 1);
+        assert!(file.repo.is_some());
+        assert_eq!(
+            file.repo.as_ref().unwrap().slug(),
+            "VetCoders/ai-contexters"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_retrieves_non_repository_files_with_explicit_project_label() {
+        let root = retrieval_test_root("non-repo-scan");
+        let _ = fs::remove_dir_all(&root);
+
+        // Create non-repository layout:
+        // non-repository-contexts/2026_0321/plans/codex/<file>.md
+        let chunk_dir = root
+            .join("non-repository-contexts")
+            .join("2026_0321")
+            .join("plans")
+            .join("codex");
+        write_chunk_file(
+            &chunk_dir.join("2026_0321_codex_sess-xyz789_001.md"),
+            "Migration plan before repo identity is known",
+        );
+
+        let scanned = scan_context_files_at(&root).expect("scan should succeed");
+        assert_eq!(scanned.len(), 1);
+
+        let file = &scanned[0];
+        assert_eq!(file.project, NON_REPOSITORY_CONTEXTS);
+        assert_eq!(file.agent, "codex");
+        assert_eq!(file.kind, Kind::Plans);
+        assert!(file.repo.is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_retrieves_both_repo_and_non_repo_files_together() {
+        let root = retrieval_test_root("combined-scan");
+        let _ = fs::remove_dir_all(&root);
+
+        // Repo-centric file
+        let repo_dir = root
+            .join("store")
+            .join("VetCoders")
+            .join("loctree")
+            .join("2026_0320")
+            .join("reports")
+            .join("gemini");
+        write_chunk_file(
+            &repo_dir.join("2026_0320_gemini_sess-rpt001_001.md"),
+            "## Report\nCoverage report for loctree scanner",
+        );
+
+        // Non-repo file
+        let non_repo_dir = root
+            .join("non-repository-contexts")
+            .join("2026_0321")
+            .join("other")
+            .join("claude");
+        write_chunk_file(
+            &non_repo_dir.join("2026_0321_claude_sess-misc01_001.md"),
+            "Unscoped brainstorm notes",
+        );
+
+        let scanned = scan_context_files_at(&root).expect("scan should succeed");
+        assert_eq!(scanned.len(), 2);
+
+        let repo_file = scanned.iter().find(|f| f.project == "VetCoders/loctree");
+        let non_repo_file = scanned
+            .iter()
+            .find(|f| f.project == NON_REPOSITORY_CONTEXTS);
+
+        assert!(repo_file.is_some(), "repo-centric file must be found");
+        assert!(non_repo_file.is_some(), "non-repository file must be found");
+
+        let repo_file = repo_file.unwrap();
+        assert_eq!(repo_file.kind, Kind::Reports);
+        assert_eq!(repo_file.agent, "gemini");
+        assert!(repo_file.repo.is_some());
+
+        let non_repo_file = non_repo_file.unwrap();
+        assert_eq!(non_repo_file.kind, Kind::Other);
+        assert_eq!(non_repo_file.agent, "claude");
+        assert!(non_repo_file.repo.is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn migration_rebuilds_existing_sources_into_canonical_store() {
         let root = migration_test_root("rebuild-canonical");

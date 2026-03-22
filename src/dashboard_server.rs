@@ -159,7 +159,10 @@ struct CrossSearchParams {
 #[derive(Debug, Serialize)]
 struct FuzzySearchResult {
     file: String,
+    path: String,
     project: String,
+    kind: String,
+    agent: String,
     date: String,
     score: u8,
     label: String,
@@ -489,7 +492,10 @@ fn run_fuzzy_search(
         .into_iter()
         .map(|result| FuzzySearchResult {
             file: result.file,
+            path: result.path,
             project: result.project,
+            kind: result.kind,
+            agent: result.agent,
             date: result.date,
             score: result.score,
             label: result.label,

@@ -229,7 +229,10 @@ pub struct ChunkScore {
 #[derive(Debug, Clone, Serialize)]
 pub struct FuzzyResult {
     pub file: String,
+    pub path: String,
     pub project: String,
+    pub kind: String,
+    pub agent: String,
     pub date: String,
     pub score: u8,
     pub label: String,
@@ -297,7 +300,10 @@ pub fn fuzzy_search_store(
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string(),
+            path: stored_file.path.display().to_string(),
             project: stored_file.project,
+            kind: stored_file.kind.dir_name().to_string(),
+            agent: stored_file.agent,
             date: stored_file.date_iso,
             score: chunk_score.score,
             label: chunk_score.label.to_string(),
@@ -731,5 +737,142 @@ Some boilerplate text.
             "High-value signals should score >=8, got {}",
             score.score
         );
+    }
+
+    // ================================================================
+    // Repo-centric fuzzy search retrieval tests
+    // ================================================================
+
+    use chrono::Utc;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn search_test_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "aicx-rank-{name}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
+    }
+
+    fn write_chunk(path: &PathBuf, content: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn fuzzy_search_returns_repo_centric_metadata() {
+        let root = search_test_root("fuzzy-repo");
+        let _ = fs::remove_dir_all(&root);
+
+        // Create a repo-centric chunk with searchable signal content
+        let chunk_path = root
+            .join("store")
+            .join("VetCoders")
+            .join("ai-contexters")
+            .join("2026_0321")
+            .join("conversations")
+            .join("claude")
+            .join("2026_0321_claude_sess-search1_001.md");
+        write_chunk(
+            &chunk_path,
+            "Decision: adopt repo-centric store layout for session recovery",
+        );
+
+        let (results, scanned) =
+            fuzzy_search_store(&root, "repo-centric store", 10, None).expect("search should work");
+
+        assert!(scanned > 0, "should scan at least one file");
+        assert_eq!(results.len(), 1, "should find the matching chunk");
+
+        let result = &results[0];
+        assert_eq!(result.project, "VetCoders/ai-contexters");
+        assert_eq!(result.kind, "conversations");
+        assert_eq!(result.agent, "claude");
+        assert_eq!(result.date, "2026-03-21");
+        assert!(!result.path.is_empty(), "path should be populated");
+        assert!(
+            result.path.contains("store/VetCoders/ai-contexters"),
+            "path should contain repo-centric structure"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fuzzy_search_returns_non_repository_metadata() {
+        let root = search_test_root("fuzzy-nonrepo");
+        let _ = fs::remove_dir_all(&root);
+
+        // Create a non-repository chunk
+        let chunk_path = root
+            .join("non-repository-contexts")
+            .join("2026_0321")
+            .join("plans")
+            .join("codex")
+            .join("2026_0321_codex_sess-plan01_001.md");
+        write_chunk(
+            &chunk_path,
+            "Migration plan: adopt repo-centric layout for all agents",
+        );
+
+        let (results, scanned) =
+            fuzzy_search_store(&root, "migration plan", 10, None).expect("search should work");
+
+        assert!(scanned > 0);
+        assert_eq!(results.len(), 1);
+
+        let result = &results[0];
+        assert_eq!(result.project, "non-repository-contexts");
+        assert_eq!(result.kind, "plans");
+        assert_eq!(result.agent, "codex");
+        assert!(
+            result.path.contains("non-repository-contexts"),
+            "path should reference non-repository root"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fuzzy_search_filters_by_repo_project() {
+        let root = search_test_root("fuzzy-filter");
+        let _ = fs::remove_dir_all(&root);
+
+        // Two repos with the same keyword
+        let chunk1 = root
+            .join("store")
+            .join("VetCoders")
+            .join("ai-contexters")
+            .join("2026_0321")
+            .join("conversations")
+            .join("claude")
+            .join("2026_0321_claude_sess-a1_001.md");
+        write_chunk(&chunk1, "Decision: adopt the new architecture");
+
+        let chunk2 = root
+            .join("store")
+            .join("VetCoders")
+            .join("loctree")
+            .join("2026_0321")
+            .join("conversations")
+            .join("claude")
+            .join("2026_0321_claude_sess-b1_001.md");
+        write_chunk(&chunk2, "Decision: adopt scanner improvements");
+
+        // Unfiltered: both match
+        let (all, _) =
+            fuzzy_search_store(&root, "decision adopt", 10, None).expect("unfiltered search");
+        assert_eq!(all.len(), 2);
+
+        // Filter by ai-contexters: only one match
+        let (filtered, _) = fuzzy_search_store(&root, "decision adopt", 10, Some("ai-contexters"))
+            .expect("filtered search");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].project, "VetCoders/ai-contexters");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
