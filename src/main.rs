@@ -551,11 +551,19 @@ enum Commands {
         no_gitignore: bool,
     },
 
-    /// Migrate older file-centric contexts to canonical repo-centric directories
+    /// Truthfully rebuild legacy contexts into canonical AICX store or salvage them under legacy-store
     Migrate {
         /// Dry run: show what would be moved without modifying files
         #[arg(long)]
         dry_run: bool,
+
+        /// Override legacy input store root (default: ~/.ai-contexters)
+        #[arg(long)]
+        legacy_root: Option<PathBuf>,
+
+        /// Override AICX store root (default: ~/.aicx)
+        #[arg(long)]
+        store_root: Option<PathBuf>,
     },
 }
 
@@ -854,8 +862,12 @@ fn main() -> Result<()> {
                 }
             })?;
         }
-        Some(Commands::Migrate { dry_run }) => {
-            ai_contexters::store::run_migration(dry_run)?;
+        Some(Commands::Migrate {
+            dry_run,
+            legacy_root,
+            store_root,
+        }) => {
+            ai_contexters::store::run_migration_with_paths(dry_run, legacy_root, store_root)?;
         }
         None => {
             let project = cli.project.unwrap_or_else(sources::detect_project_name);
@@ -2248,6 +2260,33 @@ mod tests {
                 assert!(matches!(format, ExtractInputFormat::GeminiAntigravity));
             }
             _ => panic!("expected extract command"),
+        }
+    }
+
+    #[test]
+    fn migrate_accepts_custom_roots() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "migrate",
+            "--dry-run",
+            "--legacy-root",
+            "/tmp/legacy",
+            "--store-root",
+            "/tmp/aicx",
+        ])
+        .expect("migrate command with explicit roots should parse");
+
+        match cli.command {
+            Some(Commands::Migrate {
+                dry_run,
+                legacy_root,
+                store_root,
+            }) => {
+                assert!(dry_run);
+                assert_eq!(legacy_root, Some(PathBuf::from("/tmp/legacy")));
+                assert_eq!(store_root, Some(PathBuf::from("/tmp/aicx")));
+            }
+            _ => panic!("expected migrate command"),
         }
     }
 

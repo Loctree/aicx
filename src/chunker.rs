@@ -27,6 +27,8 @@ pub struct Chunk {
     pub date: String,
     /// Session ID from first message in chunk
     pub session_id: String,
+    /// Classified kind for this chunk's content
+    pub kind: crate::store::Kind,
     /// Index range in original day's entries (start, end exclusive)
     pub msg_range: (usize, usize),
     /// Formatted chunk text with header
@@ -160,6 +162,9 @@ fn chunk_day_entries(
         let global_start = entries[start].0;
         let global_end = entries[end - 1].0 + 1;
 
+        let kind =
+            crate::store::classify_kind(&window.iter().map(|e| (*e).clone()).collect::<Vec<_>>());
+
         chunks.push(Chunk {
             id: format!("{}_{}_{}_{{:03}}", project, agent, date)
                 .replace("{:03}", &format!("{:03}", seq)),
@@ -167,6 +172,7 @@ fn chunk_day_entries(
             agent: agent.to_string(),
             date: date.to_string(),
             session_id,
+            kind,
             msg_range: (global_start, global_end),
             text,
             token_estimate,
@@ -959,6 +965,7 @@ mod tests {
                 agent: "claude".to_string(),
                 date: "2026-01-22".to_string(),
                 session_id: "s1".to_string(),
+                kind: crate::store::Kind::Conversations,
                 msg_range: (0, 5),
                 text: "chunk one content".to_string(),
                 token_estimate: 4,
@@ -970,6 +977,7 @@ mod tests {
                 agent: "claude".to_string(),
                 date: "2026-01-22".to_string(),
                 session_id: "s1".to_string(),
+                kind: crate::store::Kind::Conversations,
                 msg_range: (3, 8),
                 text: "chunk two content".to_string(),
                 token_estimate: 4,
@@ -1037,6 +1045,7 @@ mod tests {
                 agent: "c".to_string(),
                 date: "2026-01-20".to_string(),
                 session_id: "s".to_string(),
+                kind: crate::store::Kind::Conversations,
                 msg_range: (0, 5),
                 text: "x".repeat(100),
                 token_estimate: 25,
@@ -1048,6 +1057,7 @@ mod tests {
                 agent: "c".to_string(),
                 date: "2026-01-21".to_string(),
                 session_id: "s".to_string(),
+                kind: crate::store::Kind::Conversations,
                 msg_range: (5, 10),
                 text: "y".repeat(200),
                 token_estimate: 50,
