@@ -224,67 +224,71 @@ fn render_gemini_message_content(message: &GeminiMessage) -> Option<String> {
         })
 }
 
-fn render_gemini_content_value(value: &serde_json::Value) -> Option<String> {
-    let mut parts = Vec::new();
-    collect_gemini_content_parts(value, &mut parts);
-    let rendered = parts.join("\n");
-    (!rendered.trim().is_empty()).then_some(rendered)
-}
-
-fn collect_gemini_content_parts(value: &serde_json::Value, parts: &mut Vec<String>) {
+fn truncate_gemini_large_data(value: &mut serde_json::Value) {
     match value {
-        serde_json::Value::Null => {}
-        serde_json::Value::String(text) => {
-            if !text.is_empty() {
-                parts.push(text.clone());
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                collect_gemini_content_parts(item, parts);
-            }
-        }
         serde_json::Value::Object(map) => {
             if let Some(inline_data) = map.get("inlineData") {
-                parts.push(render_gemini_inline_data_placeholder(inline_data));
-                return;
+                let placeholder = render_gemini_inline_data_placeholder(inline_data);
+                map.remove("inlineData");
+                map.insert("inlineDataPlaceholder".to_string(), serde_json::Value::String(placeholder));
             }
-
             if let Some(file_data) = map.get("fileData") {
-                parts.push(render_gemini_file_data_placeholder(file_data));
-                return;
+                let placeholder = render_gemini_file_data_placeholder(file_data);
+                map.remove("fileData");
+                map.insert("fileDataPlaceholder".to_string(), serde_json::Value::String(placeholder));
             }
-
-            if let Some(text) = map.get("text").and_then(|value| value.as_str()) {
-                if !text.is_empty() {
-                    parts.push(text.to_string());
-                    return;
-                }
+            for v in map.values_mut() {
+                truncate_gemini_large_data(v);
             }
-
-            for key in [
-                "content",
-                "parts",
-                "displayContent",
-                "message",
-                "body",
-                "value",
-            ] {
-                if let Some(nested) = map.get(key) {
-                    let original_len = parts.len();
-                    collect_gemini_content_parts(nested, parts);
-                    if parts.len() > original_len {
-                        return;
-                    }
-                }
-            }
-
-            let keys = map.keys().cloned().collect::<Vec<_>>().join(", ");
-            if !keys.is_empty() {
-                parts.push(format!("[gemini structured content omitted: keys={keys}]"));
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                truncate_gemini_large_data(v);
             }
         }
         _ => {}
+    }
+}
+
+fn render_gemini_content_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) => {
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(text.clone())
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            let mut cleaned = serde_json::Value::Array(arr.clone());
+            truncate_gemini_large_data(&mut cleaned);
+            if let Ok(json) = serde_json::to_string_pretty(&cleaned) {
+                let trimmed = json.trim();
+                if trimmed.is_empty() || trimmed == "[]" {
+                    None
+                } else {
+                    Some(json)
+                }
+            } else {
+                None
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let mut cleaned = serde_json::Value::Object(map.clone());
+            truncate_gemini_large_data(&mut cleaned);
+            if let Ok(json) = serde_json::to_string_pretty(&cleaned) {
+                let trimmed = json.trim();
+                if trimmed.is_empty() || trimmed == "{}" {
+                    None
+                } else {
+                    Some(json)
+                }
+            } else {
+                None
+            }
+        }
+        _ => Some(value.to_string()),
     }
 }
 
@@ -3297,7 +3301,7 @@ mod tests {
         assert_eq!(entries[0].role, "user");
         assert_eq!(
             entries[0].message,
-            "# Task: Gemini truth repair\n- preserve user arrays honestly"
+            "[\n  {\n    \"text\": \"# Task: Gemini truth repair\"\n  },\n  {\n    \"text\": \"- preserve user arrays honestly\"\n  }\n]"
         );
         assert_eq!(entries[1].role, "assistant");
 
