@@ -6,7 +6,7 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use crate::sources::TimelineEntry;
-use crate::store::Kind;
+use crate::types::{Kind, RepoIdentity, SemanticSegment, SourceTier};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -16,37 +16,6 @@ use std::process::Command;
 // ============================================================================
 // Source trust model
 // ============================================================================
-
-/// Explicit trust tier for a repo identity signal.
-///
-/// Not all evidence for "which repo is this?" is equal. A git remote URL
-/// is canonical truth; a directory layout is a strong hint; a hex hash is
-/// opaque noise. This enum makes the distinction machine-readable so the
-/// store can decide whether to assert identity or route to fallback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum SourceTier {
-    /// Git remote URL or explicit GitHub/GitLab link in message text.
-    /// The strongest signal — the repo literally named itself.
-    Primary,
-    /// Local git repo discovered on disk (via `.git/` traversal + known layout),
-    /// or a projectHash resolved through a trustworthy local mapping file.
-    Secondary,
-    /// Known directory layout (e.g. `~/hosted/<org>/<repo>`) without a `.git/`
-    /// directory or remote confirmation. Plausible but not proven.
-    Fallback,
-    /// Hex hash, opaque identifier, or source that is explicitly not a
-    /// conversation (e.g. `.pb` protobuf, step-output). Must never assert
-    /// repo identity on its own.
-    Opaque,
-}
-
-impl SourceTier {
-    /// Whether this tier is strong enough to assert repo identity for
-    /// canonical store placement (under `store/<org>/<repo>/`).
-    pub fn is_assertable(self) -> bool {
-        matches!(self, Self::Primary | Self::Secondary)
-    }
-}
 
 /// A repo identity paired with the trust tier of the signal that produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,45 +69,6 @@ impl ProjectHashRegistry {
             identity,
             tier: SourceTier::Secondary,
         })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RepoIdentity {
-    pub organization: String,
-    pub repository: String,
-}
-
-impl RepoIdentity {
-    pub fn slug(&self) -> String {
-        format!("{}/{}", self.organization, self.repository)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SemanticSegment {
-    pub repo: Option<RepoIdentity>,
-    /// The trust tier of the strongest signal that produced `repo`.
-    /// `None` when `repo` is `None`.
-    pub source_tier: Option<SourceTier>,
-    pub kind: Kind,
-    pub agent: String,
-    pub session_id: String,
-    pub entries: Vec<TimelineEntry>,
-}
-
-impl SemanticSegment {
-    pub fn project_label(&self) -> String {
-        self.repo
-            .as_ref()
-            .map(RepoIdentity::slug)
-            .unwrap_or_else(|| "non-repository-contexts".to_string())
-    }
-
-    /// Whether the repo identity is strong enough for canonical store placement.
-    /// Returns `false` for `None` repo or Fallback/Opaque tiers.
-    pub fn has_assertable_identity(&self) -> bool {
-        self.source_tier.is_some_and(SourceTier::is_assertable)
     }
 }
 

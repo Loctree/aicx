@@ -782,7 +782,6 @@ fn main() -> Result<()> {
             eprintln!("aicx init has been retired.");
             eprintln!("Context initialisation is now handled by /vc-init inside Claude Code.");
             eprintln!("See: https://vibecrafted.io/");
-            std::process::exit(0);
         }
         Some(Commands::Refs {
             hours,
