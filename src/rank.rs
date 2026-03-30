@@ -238,6 +238,8 @@ pub struct FuzzyResult {
     pub label: String,
     pub density: f32,
     pub matched_lines: Vec<String>,
+    pub session_id: Option<String>,
+    pub cwd: Option<String>,
 }
 
 /// Fuzzy-search stored chunk files with normalized AND-matching and quality scoring.
@@ -311,7 +313,25 @@ pub fn fuzzy_search_store(
         let chunk_score = score_chunk_content(&content);
 
         let match_ratio = matched_terms as f32 / query_terms.len() as f32;
-        let final_score = (chunk_score.score as f32 * 0.5 + 5.0 * match_ratio) as u8;
+        let final_score =
+            ((chunk_score.score as f32 * 5.0 + 50.0 * match_ratio) as u8).min(100);
+
+        // Read sidecar for session_id and cwd (best-effort)
+        let sidecar_path = stored_file.path.with_extension("meta.json");
+        let (session_id, cwd) = if sidecar_path.exists() {
+            sanitize::read_to_string_validated(&sidecar_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .map(|v| {
+                    (
+                        v.get("session_id").and_then(|s| s.as_str()).map(String::from),
+                        v.get("cwd").and_then(|s| s.as_str()).map(String::from),
+                    )
+                })
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
 
         results.push(FuzzyResult {
             file: stored_file
@@ -326,9 +346,17 @@ pub fn fuzzy_search_store(
             agent: stored_file.agent,
             date: stored_file.date_iso,
             score: final_score,
-            label: chunk_score.label.to_string(),
+            label: if final_score >= 80 {
+                "HIGH".to_string()
+            } else if final_score >= 60 {
+                "MEDIUM".to_string()
+            } else {
+                "LOW".to_string()
+            },
             density: chunk_score.density,
             matched_lines,
+            session_id,
+            cwd,
         });
     }
 

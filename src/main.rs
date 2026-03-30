@@ -2008,14 +2008,62 @@ fn run_search(
 
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
+    let color = io::stdout().is_terminal();
+    // Filter matched_lines: drop chunk header self-references like "[project: X | agent: Y | date: Z]"
+    let meta_prefix = "[project:";
+
     for r in &results {
-        let _ = writeln!(
-            out,
-            "[{}/10 {}] {} | {} | {} | {}",
-            r.score, r.label, r.project, r.agent, r.date, r.file
-        );
-        for line in &r.matched_lines {
-            let _ = writeln!(out, "  > {}", line);
+        let session_str = r.session_id.as_deref().unwrap_or("-");
+        let cwd_str = r.cwd.as_deref().unwrap_or("-");
+        if color {
+            let score_color = match r.label.as_str() {
+                "HIGH" => "\x1b[1;32m",
+                "MEDIUM" => "\x1b[1;33m",
+                _ => "\x1b[1;31m",
+            };
+            let _ = writeln!(
+                out,
+                "{score_color}[{}/100 {}]\x1b[0m \x1b[1;36m{}\x1b[0m | \x1b[35m{}\x1b[0m | \x1b[90m{}\x1b[0m",
+                r.score, r.label, r.project, r.agent, r.date
+            );
+            let _ = writeln!(out, "session(s): \x1b[90m{session_str}\x1b[0m");
+            let _ = writeln!(out, "cwd: \x1b[90m{cwd_str}\x1b[0m");
+            let _ = writeln!(out, "search result:");
+            for line in &r.matched_lines {
+                if line.trim().starts_with(meta_prefix) {
+                    continue;
+                }
+                let mut truncated: String = line.chars().take(200).collect();
+                if line.chars().count() > 200 {
+                    truncated.push_str(" ...");
+                }
+                let _ = writeln!(out, "  \x1b[90m>\x1b[0m \x1b[90m{}\x1b[0m", truncated);
+            }
+            let _ = writeln!(out, "source file(s):");
+            let _ = writeln!(out, "\x1b[90;4m{}\x1b[0m", r.path);
+            let _ = writeln!(out);
+        } else {
+            let _ = writeln!(
+                out,
+                "[{}/100 {}] {} | {} | {}",
+                r.score, r.label, r.project, r.agent, r.date
+            );
+            let _ = writeln!(out, "session(s): {session_str}");
+            let _ = writeln!(out, "cwd: {cwd_str}");
+            let _ = writeln!(out, "search result:");
+            for line in &r.matched_lines {
+                if line.trim().starts_with(meta_prefix) {
+                    continue;
+                }
+                let mut truncated: String = line.chars().take(200).collect();
+                if line.chars().count() > 200 {
+                    truncated.push_str(" ...");
+                }
+                let _ = writeln!(out, "  > {}", truncated);
+            }
+            let _ = writeln!(out, "source file(s):");
+            let _ = writeln!(out, "{}", r.path);
+            let _ = writeln!(out);
         }
     }
     let _ = out.flush();

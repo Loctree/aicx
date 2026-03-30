@@ -1225,11 +1225,6 @@ const DASHBOARD_SCRIPT: &str = r#"
       clearTimeout(debounceTimer);
       refresh();
     }
-    if (e.key === ' ' && !liveCheckbox.checked) {
-      // first space in non-live mode triggers immediate refresh
-      clearTimeout(debounceTimer);
-      setTimeout(refresh, 0);         // after the space char is inserted
-    }
   });
 
   // dropdowns always refresh immediately
