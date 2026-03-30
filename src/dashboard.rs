@@ -499,20 +499,26 @@ fn render_dashboard_html(payload: &DashboardPayload, title: &str) -> Result<Stri
     </header>
 
     <section class="controls">
-      <input id="ctx-search" type="search" placeholder="Fuzzy search… (Enter or pause to trigger)" autocomplete="off" />
-      <label class="live-toggle" title="Live search (search while typing)">
-        <input id="ctx-live" type="checkbox" /> <span>Live</span>
-      </label>
-      <select id="ctx-project"><option value="">All projects</option></select>
-      <select id="ctx-agent"><option value="">All agents/sources</option></select>
-      <select id="ctx-kind"><option value="">All kinds</option></select>
+      <div class="search-row">
+        <input id="ctx-search" type="search" placeholder="Fuzzy search… (Enter or pause to trigger)" autocomplete="off" />
+        <label class="live-toggle" title="Live search (search while typing)">
+          <input id="ctx-live" type="checkbox" /> <span>Live</span>
+        </label>
+      </div>
+      <div class="filter-row">
+        <select id="ctx-project"><option value="">All projects</option></select>
+        <select id="ctx-agent"><option value="">All agents/sources</option></select>
+        <select id="ctx-kind"><option value="">All kinds</option></select>
+      </div>
     </section>
 
-    <section class="layout">
+    <section class="layout" id="ctx-layout">
       <aside class="list-pane">
         <div id="ctx-summary" class="summary"></div>
         <div id="ctx-list" class="result-list"></div>
       </aside>
+
+      <div class="resize-handle" id="ctx-resize-handle" title="Drag to resize panels"></div>
 
       <article class="detail-pane">
         <div class="detail-head">
@@ -728,21 +734,44 @@ body {
 }
 
 .controls {
-  display: grid;
-  grid-template-columns: minmax(280px, 2fr) auto repeat(3, minmax(140px, 1fr));
-  gap: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   margin-bottom: 12px;
+}
+
+.search-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.search-row input[type="search"] {
+  flex: 1;
+  min-width: 0;
+}
+
+.filter-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
 }
 
 .live-toggle {
   display: flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   cursor: pointer;
-  font-size: 0.8rem;
+  font-size: 0.82rem;
   color: var(--muted);
   white-space: nowrap;
   user-select: none;
+  min-width: 60px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  flex-shrink: 0;
 }
 
 .live-toggle input:checked + span {
@@ -750,7 +779,7 @@ body {
   font-weight: 600;
 }
 
-.controls input,
+.controls input[type="search"],
 .controls select {
   width: 100%;
   border: 1px solid var(--line);
@@ -759,13 +788,54 @@ body {
   color: var(--text);
   padding: 11px 12px;
   font-size: 0.98rem;
+  transition: border-color 0.15s;
+}
+
+.controls input[type="search"]:focus,
+.controls select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.15);
 }
 
 .layout {
   display: grid;
-  grid-template-columns: minmax(330px, 0.95fr) minmax(480px, 1.45fr);
-  gap: 12px;
+  grid-template-columns: minmax(250px, 0.95fr) 6px minmax(300px, 1.45fr);
+  gap: 0;
   min-height: calc(100vh - 210px);
+}
+
+.resize-handle {
+  width: 6px;
+  cursor: col-resize;
+  position: relative;
+  z-index: 10;
+  background: transparent;
+  transition: background 0.15s;
+}
+
+.resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 2px;
+  height: 48px;
+  border-radius: 2px;
+  background: var(--line);
+  transition: background 0.15s, height 0.15s;
+}
+
+.resize-handle:hover,
+.resize-handle.dragging {
+  background: rgba(56, 189, 248, 0.06);
+}
+
+.resize-handle:hover::after,
+.resize-handle.dragging::after {
+  background: var(--accent);
+  height: 72px;
 }
 
 .list-pane,
@@ -774,6 +844,16 @@ body {
   border-radius: 12px;
   background: linear-gradient(180deg, var(--panel), var(--panel-2));
   overflow: hidden;
+  min-width: 0;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.list-pane {
+  margin-right: 3px;
+}
+
+.detail-pane {
+  margin-left: 3px;
 }
 
 .summary {
@@ -796,6 +876,7 @@ body {
   color: inherit;
   padding: 11px 13px;
   cursor: pointer;
+  transition: background 0.12s;
 }
 
 .result-item:hover {
@@ -905,13 +986,22 @@ body {
 }
 
 @media (max-width: 1020px) {
-  .controls {
+  .filter-row {
     grid-template-columns: 1fr;
   }
 
   .layout {
-    grid-template-columns: 1fr;
+    grid-template-columns: 1fr !important;
     min-height: 0;
+  }
+
+  .resize-handle {
+    display: none;
+  }
+
+  .list-pane,
+  .detail-pane {
+    margin: 0;
   }
 
   .result-list {
@@ -1101,7 +1191,7 @@ const DASHBOARD_SCRIPT: &str = r#"
     }
 
     ui.detailTitle.textContent = record.file_name || '(unnamed file)';
-    ui.detailMeta.textContent = `${record.project || 'unknown'} | ${record.agent || 'unknown'} | ${record.kind || 'unknown'} | score ${Number(score || 0).toFixed(2)}`;
+    ui.detailMeta.textContent = `${record.project || 'unknown'} | ${record.agent || 'unknown'} | ${record.kind || 'unknown'} | score ${Math.round(Number(score || 0) * 100)}/100`;
     ui.detailPath.textContent = record.absolute_path || record.relative_path || '';
     ui.detailPreview.textContent = record.preview || '';
     ui.detailContent.textContent = record.detail_text || record.preview || '(no content)';
@@ -1144,7 +1234,7 @@ const DASHBOARD_SCRIPT: &str = r#"
       top.appendChild(mkBadge(record.agent || 'agent'));
       top.appendChild(mkBadge(record.kind || 'kind'));
       top.appendChild(mkBadge(record.date || 'date'));
-      top.appendChild(mkBadge(`score ${Number(score).toFixed(2)}`));
+      top.appendChild(mkBadge(`${Math.round(Number(score) * 100)}/100`));
 
       const name = document.createElement('div');
       name.className = 'result-name';
@@ -1247,6 +1337,53 @@ const DASHBOARD_SCRIPT: &str = r#"
       // no-op
     }
   });
+
+  /* --- resizable panels ------------------------------------------------ */
+  const resizeHandle = document.getElementById('ctx-resize-handle');
+  const layoutEl = document.getElementById('ctx-layout');
+
+  if (resizeHandle && layoutEl) {
+    const STORAGE_KEY = 'aicx-split-ratio';
+    const MIN_LIST = 250;
+    const MIN_DETAIL = 300;
+
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) {
+      const ratio = parseFloat(saved);
+      if (ratio > 0 && ratio < 1) {
+        layoutEl.style.gridTemplateColumns = `${ratio}fr 6px ${1 - ratio}fr`;
+      }
+    }
+
+    let dragging = false;
+
+    resizeHandle.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      dragging = true;
+      resizeHandle.classList.add('dragging');
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+    });
+
+    document.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      const rect = layoutEl.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const total = rect.width - 6;
+      const listW = Math.max(MIN_LIST, Math.min(x, total - MIN_DETAIL));
+      const ratio = listW / total;
+      layoutEl.style.gridTemplateColumns = `${ratio}fr 6px ${1 - ratio}fr`;
+      localStorage.setItem(STORAGE_KEY, ratio.toFixed(4));
+    });
+
+    document.addEventListener('mouseup', () => {
+      if (!dragging) return;
+      dragging = false;
+      resizeHandle.classList.remove('dragging');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    });
+  }
 
   window.AIContextersDashboard = {
     version: '4.0.0',

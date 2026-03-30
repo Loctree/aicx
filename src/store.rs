@@ -599,23 +599,39 @@ pub fn store_semantic_segments(
     entries: &[TimelineEntry],
     chunker_config: &ChunkerConfig,
 ) -> Result<StoreWriteSummary> {
-    store_semantic_segments_at(&store_base_dir()?, entries, chunker_config)
+    store_semantic_segments_with_progress(entries, chunker_config, |_, _| {})
 }
 
-fn store_semantic_segments_at(
+pub fn store_semantic_segments_with_progress<F>(
+    entries: &[TimelineEntry],
+    chunker_config: &ChunkerConfig,
+    progress: F,
+) -> Result<StoreWriteSummary>
+where
+    F: FnMut(usize, usize),
+{
+    store_semantic_segments_at(&store_base_dir()?, entries, chunker_config, progress)
+}
+
+fn store_semantic_segments_at<F>(
     base: &Path,
     entries: &[TimelineEntry],
     chunker_config: &ChunkerConfig,
-) -> Result<StoreWriteSummary> {
+    mut progress: F,
+) -> Result<StoreWriteSummary>
+where
+    F: FnMut(usize, usize),
+{
     let mut summary = StoreWriteSummary::default();
     if entries.is_empty() {
         return Ok(summary);
     }
 
     let segments = semantic_segments(entries);
+    let total_segments = segments.len();
     let mut index = load_index_at(base);
 
-    for segment in segments {
+    for (segment_idx, segment) in segments.into_iter().enumerate() {
         let date = segment
             .entries
             .first()
@@ -639,6 +655,7 @@ fn store_semantic_segments_at(
             .or_insert(0) += segment.entries.len();
         summary.total_entries += segment.entries.len();
         summary.written_paths.extend(paths);
+        progress(segment_idx + 1, total_segments);
     }
 
     save_index_at(base, &index)?;
@@ -1962,7 +1979,7 @@ fn rebuild_source_into_store_impl(
         anyhow::bail!("source produced no timeline entries");
     }
 
-    let summary = store_semantic_segments_at(store_root, &entries, chunker_config)?;
+    let summary = store_semantic_segments_at(store_root, &entries, chunker_config, |_, _| {})?;
     Ok(summary.written_paths)
 }
 
@@ -2767,8 +2784,9 @@ mod tests {
             ),
         ];
 
-        let summary = store_semantic_segments_at(&root, &entries, &ChunkerConfig::default())
-            .expect("store semantic segments");
+        let summary =
+            store_semantic_segments_at(&root, &entries, &ChunkerConfig::default(), |_, _| {})
+                .expect("store semantic segments");
 
         assert_eq!(summary.total_entries, 4);
         assert!(
@@ -2800,6 +2818,58 @@ mod tests {
                 .iter()
                 .any(|file| file.project == "VetCoders/loctree")
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_store_semantic_segments_reports_progress_per_segment() {
+        let root = retrieval_test_root("segmentation-progress");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let entries = vec![
+            semantic_entry(
+                (2026, 3, 21, 9, 0, 0),
+                "sess-a",
+                "user",
+                "No repo yet, just planning the migration.",
+                None,
+            ),
+            semantic_entry(
+                (2026, 3, 21, 9, 1, 0),
+                "sess-a",
+                "assistant",
+                "Goal:\n- make segmentation real\nAcceptance:\n- stop fake buckets",
+                None,
+            ),
+            semantic_entry(
+                (2026, 3, 21, 9, 2, 0),
+                "sess-a",
+                "user",
+                "Switch to https://github.com/VetCoders/ai-contexters now.",
+                None,
+            ),
+            semantic_entry(
+                (2026, 3, 21, 9, 3, 0),
+                "sess-a",
+                "user",
+                "Then inspect https://github.com/VetCoders/loctree as well.",
+                None,
+            ),
+        ];
+
+        let mut progress_updates = Vec::new();
+        let summary = store_semantic_segments_at(
+            &root,
+            &entries,
+            &ChunkerConfig::default(),
+            |done, total| progress_updates.push((done, total)),
+        )
+        .expect("store semantic segments");
+
+        assert_eq!(summary.total_entries, 4);
+        assert_eq!(progress_updates, vec![(1, 3), (2, 3), (3, 3)]);
 
         let _ = fs::remove_dir_all(&root);
     }

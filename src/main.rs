@@ -1501,7 +1501,28 @@ fn run_store(
         }
     }
     let chunker_config = ai_contexters::chunker::ChunkerConfig::default();
-    let store_summary = store::store_semantic_segments(&all_entries, &chunker_config)?;
+    let stderr_is_tty = io::stderr().is_terminal();
+    let mut progress_width = 0usize;
+    let store_result = if stderr_is_tty {
+        store::store_semantic_segments_with_progress(
+            &all_entries,
+            &chunker_config,
+            |done, total| {
+                let message = format!("  Chunking... {done}/{total} segments");
+                let width = progress_width.max(message.len());
+                progress_width = width;
+                eprint!("\r{message:<width$}");
+                let _ = io::stderr().flush();
+            },
+        )
+    } else {
+        store::store_semantic_segments(&all_entries, &chunker_config)
+    };
+    if stderr_is_tty && progress_width > 0 {
+        eprint!("\r{:<width$}\r", "", width = progress_width);
+        let _ = io::stderr().flush();
+    }
+    let store_summary = store_result?;
     let stored_count = store_summary.total_entries;
     let all_written_paths = store_summary.written_paths.clone();
 
@@ -1976,10 +1997,7 @@ fn run_search(
     let (results, scanned) = rank::fuzzy_search_store(&root, &search_query, fetch_limit, project)?;
 
     if results.is_empty() {
-        eprintln!(
-            "No matches for {:?} (scanned {} chunks).",
-            query, scanned
-        );
+        eprintln!("No matches for {:?} (scanned {} chunks).", query, scanned);
         return Ok(());
     }
 

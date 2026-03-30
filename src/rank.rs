@@ -313,8 +313,7 @@ pub fn fuzzy_search_store(
         let chunk_score = score_chunk_content(&content);
 
         let match_ratio = matched_terms as f32 / query_terms.len() as f32;
-        let final_score =
-            ((chunk_score.score as f32 * 5.0 + 50.0 * match_ratio) as u8).min(100);
+        let final_score = ((chunk_score.score as f32 * 5.0 + 50.0 * match_ratio) as u8).min(100);
 
         // Read sidecar for session_id and cwd (best-effort)
         let sidecar_path = stored_file.path.with_extension("meta.json");
@@ -324,7 +323,9 @@ pub fn fuzzy_search_store(
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
                 .map(|v| {
                     (
-                        v.get("session_id").and_then(|s| s.as_str()).map(String::from),
+                        v.get("session_id")
+                            .and_then(|s| s.as_str())
+                            .map(String::from),
                         v.get("cwd").and_then(|s| s.as_str()).map(String::from),
                     )
                 })
@@ -412,8 +413,9 @@ pub fn fuzzy_search_store(
             }
         }
         for r in &mut deduped {
-            r.matched_lines
-                .retain(|line| line_freq.get(&normalize_query(line)).copied().unwrap_or(0) < threshold);
+            r.matched_lines.retain(|line| {
+                line_freq.get(&normalize_query(line)).copied().unwrap_or(0) < threshold
+            });
         }
     }
 
@@ -660,10 +662,7 @@ fn is_signal_line(lower: &str) -> bool {
 }
 
 /// Lines that are generic preamble/boilerplate — should not contribute to search matching.
-const SEARCH_BOILERPLATE: &[&str] = &[
-    "created by m&k",
-    "vibecrafted with ai agents",
-];
+const SEARCH_BOILERPLATE: &[&str] = &["created by m&k", "vibecrafted with ai agents"];
 
 /// Sentinel brackets for aicx read blocks. Content between these markers
 /// is injected context from aicx tools — not original session signal.
