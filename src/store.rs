@@ -14,7 +14,6 @@ use chrono::{DateTime, TimeZone, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -22,56 +21,14 @@ use std::time::SystemTime;
 use crate::chunker::{self, ChunkerConfig};
 use crate::output::TimelineEntry;
 use crate::sanitize;
-use crate::segmentation::{RepoIdentity, SemanticSegment, semantic_segments};
+use crate::segmentation::semantic_segments;
 use crate::sources::{self, ExtractionConfig};
+pub use crate::types::Kind;
+use crate::types::{RepoIdentity, SemanticSegment};
 
 // ============================================================================
 // Kind classification
 // ============================================================================
-
-/// Canonical kind for a session segment in the store.
-///
-/// Kind determines the subdirectory under `<project>/<date>/` and is part
-/// of the canonical store path.  Classification is conservative: when in
-/// doubt, segments fall through to `Other`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Kind {
-    Conversations,
-    Plans,
-    Reports,
-    #[default]
-    Other,
-}
-
-impl Kind {
-    /// Directory name used in the canonical store layout.
-    pub fn dir_name(self) -> &'static str {
-        match self {
-            Self::Conversations => "conversations",
-            Self::Plans => "plans",
-            Self::Reports => "reports",
-            Self::Other => "other",
-        }
-    }
-
-    /// Parse from a string (case-insensitive, accepts both singular and plural).
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "conversations" | "conversation" => Some(Self::Conversations),
-            "plans" | "plan" => Some(Self::Plans),
-            "reports" | "report" => Some(Self::Reports),
-            "other" => Some(Self::Other),
-            _ => None,
-        }
-    }
-}
-
-impl fmt::Display for Kind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.dir_name())
-    }
-}
 
 // ── Kind heuristics ────────────────────────────────────────────────────────
 
