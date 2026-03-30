@@ -1,4 +1,4 @@
-//! Integration with rmcp-memex for vector memory indexing.
+//! Integration with rmcp-memex for semantic indexing.
 //!
 //! Shells out to the `rmcp-memex` CLI binary for:
 //! - Batch indexing of chunk files (`rmcp-memex index`)
