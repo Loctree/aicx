@@ -47,6 +47,14 @@ pub struct Chunk {
     pub token_usage: Option<u64>,
     /// Optional findings count reported by the source frontmatter
     pub findings_count: Option<u32>,
+    /// Optional workflow phase reported by the source frontmatter
+    pub workflow_phase: Option<String>,
+    /// Optional routing mode reported by the source frontmatter
+    pub mode: Option<String>,
+    /// Optional framework skill code reported by the source frontmatter
+    pub skill_code: Option<String>,
+    /// Optional steering schema/framework version reported by the source frontmatter
+    pub framework_version: Option<String>,
     /// Index range in original day's entries (start, end exclusive)
     pub msg_range: (usize, usize),
     /// Formatted chunk text with header
@@ -82,6 +90,14 @@ pub struct ChunkMetadataSidecar {
     pub token_usage: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub findings_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub framework_version: Option<String>,
 }
 
 impl From<&Chunk> for ChunkMetadataSidecar {
@@ -101,6 +117,10 @@ impl From<&Chunk> for ChunkMetadataSidecar {
             completed_at: chunk.completed_at.clone(),
             token_usage: chunk.token_usage,
             findings_count: chunk.findings_count,
+            workflow_phase: chunk.workflow_phase.clone(),
+            mode: chunk.mode.clone(),
+            skill_code: chunk.skill_code.clone(),
+            framework_version: chunk.framework_version.clone(),
         }
     }
 }
@@ -156,26 +176,30 @@ fn prepare_entries_for_chunking<'a>(
     }
 
     let (frontmatter, body) = crate::frontmatter::parse(&first.message);
-    let Some(frontmatter) = frontmatter else {
+    if body == first.message {
         return (None, Cow::Borrowed(entries));
-    };
+    }
 
     let mut stripped_entries = entries.to_vec();
     if let Some(stripped_first) = stripped_entries.first_mut() {
         stripped_first.message = body.to_string();
     }
 
-    (Some(frontmatter), Cow::Owned(stripped_entries))
+    (frontmatter, Cow::Owned(stripped_entries))
 }
 
 fn apply_frontmatter(chunk: &mut Chunk, frontmatter: &crate::frontmatter::ReportFrontmatter) {
-    chunk.run_id = frontmatter.run_id.clone();
-    chunk.prompt_id = frontmatter.prompt_id.clone();
-    chunk.agent_model = frontmatter.model.clone();
-    chunk.started_at = frontmatter.started_at.clone();
-    chunk.completed_at = frontmatter.completed_at.clone();
-    chunk.token_usage = frontmatter.token_usage;
-    chunk.findings_count = frontmatter.findings_count;
+    chunk.run_id = frontmatter.telemetry.run_id.clone();
+    chunk.prompt_id = frontmatter.telemetry.prompt_id.clone();
+    chunk.agent_model = frontmatter.telemetry.model.clone();
+    chunk.started_at = frontmatter.telemetry.started_at.clone();
+    chunk.completed_at = frontmatter.telemetry.completed_at.clone();
+    chunk.token_usage = frontmatter.telemetry.token_usage;
+    chunk.findings_count = frontmatter.telemetry.findings_count;
+    chunk.workflow_phase = frontmatter.steering.workflow_phase.clone();
+    chunk.mode = frontmatter.steering.mode.clone();
+    chunk.skill_code = frontmatter.steering.skill_code.clone();
+    chunk.framework_version = frontmatter.steering.framework_version.clone();
 }
 
 // ============================================================================
@@ -293,6 +317,10 @@ fn chunk_day_entries(
             completed_at: None,
             token_usage: None,
             findings_count: None,
+            workflow_phase: None,
+            mode: None,
+            skill_code: None,
+            framework_version: None,
             msg_range: (global_start, global_end),
             text,
             token_estimate,
@@ -1082,7 +1110,7 @@ mod tests {
             14,
             30,
             "assistant",
-            "---\nrun_id: mrbl-001\nprompt_id: api-redesign_20260327\nmodel: gpt-5.4\nstarted_at: 2026-03-27T10:00:00Z\ncompleted_at: 2026-03-27T10:01:00Z\ntoken_usage: 1234\nfindings_count: 4\n---\n## Report\nContent here",
+            "---\nrun_id: mrbl-001\nprompt_id: api-redesign_20260327\nmodel: gpt-5.4\nstarted_at: 2026-03-27T10:00:00Z\ncompleted_at: 2026-03-27T10:01:00Z\ntoken_usage: 1234\nfindings_count: 4\nphase: implement\nmode: session-first\nskill_code: vc-workflow\nframework_version: 2026-03\n---\n## Report\nContent here",
         )];
 
         let chunks = chunk_entries(&entries, "proj", "claude", &ChunkerConfig::default());
@@ -1096,8 +1124,33 @@ mod tests {
         assert_eq!(chunk.completed_at.as_deref(), Some("2026-03-27T10:01:00Z"));
         assert_eq!(chunk.token_usage, Some(1234));
         assert_eq!(chunk.findings_count, Some(4));
+        assert_eq!(chunk.workflow_phase.as_deref(), Some("implement"));
+        assert_eq!(chunk.mode.as_deref(), Some("session-first"));
+        assert_eq!(chunk.skill_code.as_deref(), Some("vc-workflow"));
+        assert_eq!(chunk.framework_version.as_deref(), Some("2026-03"));
         assert!(chunk.text.contains("## Report"));
         assert!(!chunk.text.contains("run_id: mrbl-001"));
+        assert!(!chunk.text.contains("phase: implement"));
+    }
+
+    #[test]
+    fn test_chunk_entries_strip_malformed_frontmatter_without_metadata() {
+        let entries = vec![make_entry(
+            14,
+            30,
+            "assistant",
+            "---\nrun_id: [nope\nmode: session-first\n---\n## Report\nBody survives",
+        )];
+
+        let chunks = chunk_entries(&entries, "proj", "claude", &ChunkerConfig::default());
+        assert_eq!(chunks.len(), 1);
+
+        let chunk = &chunks[0];
+        assert_eq!(chunk.run_id, None);
+        assert_eq!(chunk.mode, None);
+        assert!(chunk.text.contains("## Report"));
+        assert!(chunk.text.contains("Body survives"));
+        assert!(!chunk.text.contains("mode: session-first"));
     }
 
     #[test]
@@ -1121,6 +1174,10 @@ mod tests {
                 completed_at: None,
                 token_usage: None,
                 findings_count: None,
+                workflow_phase: Some("implement".to_string()),
+                mode: Some("session-first".to_string()),
+                skill_code: Some("vc-workflow".to_string()),
+                framework_version: Some("2026-03".to_string()),
                 msg_range: (0, 5),
                 text: "chunk one content".to_string(),
                 token_estimate: 4,
@@ -1141,6 +1198,10 @@ mod tests {
                 completed_at: None,
                 token_usage: None,
                 findings_count: None,
+                workflow_phase: None,
+                mode: None,
+                skill_code: None,
+                framework_version: None,
                 msg_range: (3, 8),
                 text: "chunk two content".to_string(),
                 token_estimate: 4,
@@ -1166,6 +1227,10 @@ mod tests {
             Some("/Users/tester/workspaces/proj")
         );
         assert_eq!(metadata.kind, crate::store::Kind::Conversations);
+        assert_eq!(metadata.workflow_phase.as_deref(), Some("implement"));
+        assert_eq!(metadata.mode.as_deref(), Some("session-first"));
+        assert_eq!(metadata.skill_code.as_deref(), Some("vc-workflow"));
+        assert_eq!(metadata.framework_version.as_deref(), Some("2026-03"));
 
         let legacy: ChunkMetadataSidecar = serde_json::from_value(serde_json::json!({
             "id": "legacy",
@@ -1177,6 +1242,10 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(legacy.cwd, None);
+        assert_eq!(legacy.workflow_phase, None);
+        assert_eq!(legacy.mode, None);
+        assert_eq!(legacy.skill_code, None);
+        assert_eq!(legacy.framework_version, None);
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -1239,6 +1308,10 @@ mod tests {
                 completed_at: None,
                 token_usage: None,
                 findings_count: None,
+                workflow_phase: None,
+                mode: None,
+                skill_code: None,
+                framework_version: None,
                 msg_range: (0, 5),
                 text: "x".repeat(100),
                 token_estimate: 25,
@@ -1259,6 +1332,10 @@ mod tests {
                 completed_at: None,
                 token_usage: None,
                 findings_count: None,
+                workflow_phase: None,
+                mode: None,
+                skill_code: None,
+                framework_version: None,
                 msg_range: (5, 10),
                 text: "y".repeat(200),
                 token_estimate: 50,

@@ -87,6 +87,29 @@ fn default_store_hours() -> u64 {
     24
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SteerParams {
+    /// Filter by run_id (exact match against sidecar metadata)
+    pub run_id: Option<String>,
+    /// Filter by prompt_id (exact match against sidecar metadata)
+    pub prompt_id: Option<String>,
+    /// Filter by agent name: claude, codex, gemini (case-insensitive)
+    pub agent: Option<String>,
+    /// Filter by kind: conversations, plans, reports, other
+    pub kind: Option<String>,
+    /// Filter by project (case-insensitive substring)
+    pub project: Option<String>,
+    /// Filter by date (YYYY-MM-DD, or range like 2026-03-20..2026-03-28)
+    pub date: Option<String>,
+    /// Max results (default: 20)
+    #[serde(default = "default_steer_limit")]
+    pub limit: usize,
+}
+
+fn default_steer_limit() -> usize {
+    20
+}
+
 fn incremental_rescan_args(hours: u64, project: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "all".to_string(),
@@ -280,6 +303,131 @@ impl AicxMcpServer {
     }
 
     #[tool(
+        name = "aicx_steer",
+        description = "Retrieve stored chunks by steering metadata (frontmatter fields). Filters by run_id, prompt_id, agent, kind, project, and/or date range using sidecar metadata — no filesystem grep needed. Returns chunk paths with their sidecar metadata for selective re-entry."
+    )]
+    async fn steer(
+        &self,
+        Parameters(params): Parameters<SteerParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = params.limit.min(100);
+        let files = store::scan_context_files()
+            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+
+        let (date_lo, date_hi) = if let Some(ref d) = params.date {
+            parse_date_filter_mcp(d)
+        } else {
+            (None, None)
+        };
+
+        let project_lower = params.project.as_deref().map(str::to_ascii_lowercase);
+        let agent_lower = params.agent.as_deref().map(str::to_ascii_lowercase);
+        let kind_lower = params.kind.as_deref().map(str::to_ascii_lowercase);
+
+        let mut matched: Vec<serde_json::Value> = Vec::new();
+
+        for file in &files {
+            if matched.len() >= limit {
+                break;
+            }
+
+            // Project filter (from StoredContextFile, no sidecar needed)
+            if let Some(ref needle) = project_lower {
+                if !file.project.to_ascii_lowercase().contains(needle) {
+                    continue;
+                }
+            }
+
+            // Agent filter
+            if let Some(ref needle) = agent_lower {
+                if file.agent.to_ascii_lowercase() != *needle {
+                    continue;
+                }
+            }
+
+            // Kind filter
+            if let Some(ref needle) = kind_lower {
+                if file.kind.dir_name() != *needle {
+                    continue;
+                }
+            }
+
+            // Date filter using canonical chunk date (not filesystem mtime)
+            if let Some(ref lo) = date_lo {
+                if file.date_iso.as_str() < lo.as_str() {
+                    continue;
+                }
+            }
+            if let Some(ref hi) = date_hi {
+                if file.date_iso.as_str() > hi.as_str() {
+                    continue;
+                }
+            }
+
+            // run_id / prompt_id require sidecar lookup
+            if params.run_id.is_some() || params.prompt_id.is_some() {
+                let sidecar = store::load_sidecar(&file.path);
+                if let Some(ref sidecar) = sidecar {
+                    if let Some(ref wanted) = params.run_id {
+                        if sidecar.run_id.as_deref() != Some(wanted.as_str()) {
+                            continue;
+                        }
+                    }
+                    if let Some(ref wanted) = params.prompt_id {
+                        if sidecar.prompt_id.as_deref() != Some(wanted.as_str()) {
+                            continue;
+                        }
+                    }
+                    matched.push(serde_json::json!({
+                        "path": file.path.display().to_string(),
+                        "project": file.project,
+                        "agent": file.agent,
+                        "kind": file.kind.dir_name(),
+                        "date": file.date_iso,
+                        "session_id": file.session_id,
+                        "run_id": sidecar.run_id,
+                        "prompt_id": sidecar.prompt_id,
+                        "agent_model": sidecar.agent_model,
+                        "started_at": sidecar.started_at,
+                        "completed_at": sidecar.completed_at,
+                        "token_usage": sidecar.token_usage,
+                        "findings_count": sidecar.findings_count,
+                    }));
+                } else {
+                    continue; // No sidecar means no match for run_id/prompt_id
+                }
+            } else {
+                // No sidecar-specific filters; still include sidecar data if available
+                let sidecar = store::load_sidecar(&file.path);
+                matched.push(serde_json::json!({
+                    "path": file.path.display().to_string(),
+                    "project": file.project,
+                    "agent": file.agent,
+                    "kind": file.kind.dir_name(),
+                    "date": file.date_iso,
+                    "session_id": file.session_id,
+                    "run_id": sidecar.as_ref().and_then(|s| s.run_id.as_deref()),
+                    "prompt_id": sidecar.as_ref().and_then(|s| s.prompt_id.as_deref()),
+                    "agent_model": sidecar.as_ref().and_then(|s| s.agent_model.as_deref()),
+                    "started_at": sidecar.as_ref().and_then(|s| s.started_at.as_deref()),
+                    "completed_at": sidecar.as_ref().and_then(|s| s.completed_at.as_deref()),
+                    "token_usage": sidecar.as_ref().and_then(|s| s.token_usage),
+                    "findings_count": sidecar.as_ref().and_then(|s| s.findings_count),
+                }));
+            }
+        }
+
+        let json = serde_json::to_string_pretty(&serde_json::json!({
+            "scanned": files.len(),
+            "matched": matched.len(),
+            "items": matched,
+        }))
+        .unwrap_or_default();
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
         name = "aicx_store",
         description = "Trigger a recent incremental rescan across AI agent sessions (Claude, Codex, Gemini) and store any new chunks centrally. Uses watermarks + dedup to skip already-processed history."
     )]
@@ -401,9 +549,34 @@ pub async fn run_sse(port: u16) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("MCP HTTP server error: {e}"))
 }
 
+/// Parse a date filter string into (optional_low, optional_high) bounds.
+///
+/// Accepted formats:
+/// - `2026-03-28` → exact day
+/// - `2026-03-20..2026-03-28` → inclusive range
+/// - `2026-03-20..` → open-ended (from date onward)
+/// - `..2026-03-28` → open-ended (up to date)
+fn parse_date_filter_mcp(date: &str) -> (Option<String>, Option<String>) {
+    if let Some((lo, hi)) = date.split_once("..") {
+        let lo = if lo.is_empty() {
+            None
+        } else {
+            Some(lo.to_string())
+        };
+        let hi = if hi.is_empty() {
+            None
+        } else {
+            Some(hi.to_string())
+        };
+        (lo, hi)
+    } else {
+        (Some(date.to_string()), Some(date.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::incremental_rescan_args;
+    use super::{incremental_rescan_args, parse_date_filter_mcp};
 
     #[test]
     fn incremental_rescan_args_use_all_incremental_and_quiet_stdout() {
@@ -418,6 +591,31 @@ mod tests {
                 "none".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn parse_date_filter_mcp_exact_day() {
+        let (lo, hi) = parse_date_filter_mcp("2026-03-28");
+        assert_eq!(lo.as_deref(), Some("2026-03-28"));
+        assert_eq!(hi.as_deref(), Some("2026-03-28"));
+    }
+
+    #[test]
+    fn parse_date_filter_mcp_range() {
+        let (lo, hi) = parse_date_filter_mcp("2026-03-20..2026-03-28");
+        assert_eq!(lo.as_deref(), Some("2026-03-20"));
+        assert_eq!(hi.as_deref(), Some("2026-03-28"));
+    }
+
+    #[test]
+    fn parse_date_filter_mcp_open_ended() {
+        let (lo, hi) = parse_date_filter_mcp("2026-03-20..");
+        assert_eq!(lo.as_deref(), Some("2026-03-20"));
+        assert!(hi.is_none());
+
+        let (lo, hi) = parse_date_filter_mcp("..2026-03-28");
+        assert!(lo.is_none());
+        assert_eq!(hi.as_deref(), Some("2026-03-28"));
     }
 
     #[test]

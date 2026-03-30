@@ -167,9 +167,42 @@ Example:
 aicx store -p CodeScribe --agent claude -H 720 --emit paths
 ```
 
+## `aicx steer`
+
+Retrieve chunks by steering metadata (frontmatter sidecar fields). Filters by `run_id`, `prompt_id`, agent, kind, project, and/or date range using sidecar metadata — no filesystem grep needed.
+
+```bash
+aicx steer [OPTIONS]
+```
+
+Options:
+- `--run-id <RUN_ID>` filter by run_id (exact match)
+- `--prompt-id <PROMPT_ID>` filter by prompt_id (exact match)
+- `-a, --agent <AGENT>` filter by agent: claude, codex, gemini
+- `-k, --kind <KIND>` filter by kind: conversations, plans, reports, other
+- `-p, --project <PROJECT>` filter by project (case-insensitive substring)
+- `-d, --date <DATE>` filter by date: single day, range, or open-ended
+- `-l, --limit <N>` max results (default: `20`)
+
+Examples:
+
+```bash
+# All chunks from a specific run
+aicx steer --run-id mrbl-001
+
+# Reports for a project on a specific date
+aicx steer --project ai-contexters --kind reports --date 2026-03-28
+
+# All claude chunks in a date range
+aicx steer --agent claude --date 2026-03-20..2026-03-28
+
+# Chunks from a specific prompt
+aicx steer --prompt-id api-redesign_20260327
+```
+
 ## `aicx memex-sync`
 
-Sync stored chunks to `rmcp-memex` vector memory.
+Sync stored chunks to `rmcp-memex` semantic index.
 
 ```bash
 aicx memex-sync [OPTIONS]

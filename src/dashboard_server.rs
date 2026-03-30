@@ -27,6 +27,7 @@ use tokio::sync::RwLock;
 
 use crate::dashboard::{self, DashboardConfig, DashboardStats};
 use crate::rank;
+use crate::store;
 
 /// Guard that prevents concurrent `aicx store` child-process spawns from dashboard search.
 static DASHBOARD_RESCAN_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -187,6 +188,49 @@ struct MemexSearchResponse {
     results: serde_json::Value,
 }
 
+#[derive(Debug, Deserialize)]
+struct SteerSearchParams {
+    /// Filter by run_id (exact)
+    run_id: Option<String>,
+    /// Filter by prompt_id (exact)
+    prompt_id: Option<String>,
+    /// Filter by agent name
+    agent: Option<String>,
+    /// Filter by kind
+    kind: Option<String>,
+    /// Filter by project (case-insensitive substring)
+    project: Option<String>,
+    /// Filter by date (YYYY-MM-DD or range)
+    date: Option<String>,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SteerSearchResult {
+    path: String,
+    project: String,
+    agent: String,
+    kind: String,
+    date: String,
+    session_id: String,
+    run_id: Option<String>,
+    prompt_id: Option<String>,
+    agent_model: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    token_usage: Option<u64>,
+    findings_count: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct SteerSearchResponse {
+    ok: bool,
+    scanned: usize,
+    matched: usize,
+    items: Vec<SteerSearchResult>,
+}
+
 struct RebuildFlagGuard<'a> {
     flag: &'a AtomicBool,
 }
@@ -223,6 +267,7 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         .route("/api/search/fuzzy", get(fuzzy_search))
         .route("/api/search/semantic", get(semantic_search))
         .route("/api/search/cross", get(cross_search))
+        .route("/api/search/steer", get(steer_search))
         .with_state(state);
 
     let addr = SocketAddr::new(config.host, config.port);
@@ -237,6 +282,7 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
     eprintln!("  Fuzzy:     GET  http://{addr}/api/search/fuzzy?q=<query>");
     eprintln!("  Semantic:  GET  http://{addr}/api/search/semantic?q=<query>&ns=<namespace>");
     eprintln!("  Cross:     GET  http://{addr}/api/search/cross?q=<query>");
+    eprintln!("  Steer:     GET  http://{addr}/api/search/steer?run_id=<id>&project=<p>");
     eprintln!(
         "  Required header: {}: {}",
         REGENERATE_HEADER_NAME, REGENERATE_HEADER_VALUE
@@ -689,6 +735,172 @@ fn run_memex_cross_search(query: &str, limit: usize, mode: &str) -> Result<Memex
         query: query.to_string(),
         source: format!("rmcp-memex cross-search --mode {}", mode),
         results,
+    })
+}
+
+/// Steering-metadata search across stored chunks.
+///
+/// Filters by sidecar metadata (run_id, prompt_id, agent, kind, project, date)
+/// using canonical chunk dates instead of filesystem mtime.
+async fn steer_search(params: Result<Query<SteerSearchParams>, QueryRejection>) -> Response {
+    let Query(params) = match params {
+        Ok(q) => q,
+        Err(rejection) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: format!("Invalid query parameters: {rejection}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let limit = params.limit.min(100);
+
+    let result = tokio::task::spawn_blocking(move || run_steer_search(params, limit)).await;
+
+    match result {
+        Ok(Ok(response)) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(Err(err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                ok: false,
+                error: format!("{err:#}"),
+            }),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                ok: false,
+                error: format!("Steer search task failed: {err}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn parse_date_bounds(date: &str) -> (Option<String>, Option<String>) {
+    if let Some((lo, hi)) = date.split_once("..") {
+        let lo = if lo.is_empty() {
+            None
+        } else {
+            Some(lo.to_string())
+        };
+        let hi = if hi.is_empty() {
+            None
+        } else {
+            Some(hi.to_string())
+        };
+        (lo, hi)
+    } else {
+        (Some(date.to_string()), Some(date.to_string()))
+    }
+}
+
+fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSearchResponse> {
+    let files = store::scan_context_files()?;
+    let total = files.len();
+
+    let (date_lo, date_hi) = if let Some(ref d) = params.date {
+        parse_date_bounds(d)
+    } else {
+        (None, None)
+    };
+
+    let project_lower = params.project.as_deref().map(str::to_ascii_lowercase);
+    let agent_lower = params.agent.as_deref().map(str::to_ascii_lowercase);
+    let kind_lower = params.kind.as_deref().map(str::to_ascii_lowercase);
+
+    let mut items = Vec::new();
+
+    for file in &files {
+        if items.len() >= limit {
+            break;
+        }
+
+        if let Some(ref needle) = project_lower {
+            if !file.project.to_ascii_lowercase().contains(needle) {
+                continue;
+            }
+        }
+        if let Some(ref needle) = agent_lower {
+            if file.agent.to_ascii_lowercase() != *needle {
+                continue;
+            }
+        }
+        if let Some(ref needle) = kind_lower {
+            if file.kind.dir_name() != *needle {
+                continue;
+            }
+        }
+        if let Some(ref lo) = date_lo {
+            if file.date_iso.as_str() < lo.as_str() {
+                continue;
+            }
+        }
+        if let Some(ref hi) = date_hi {
+            if file.date_iso.as_str() > hi.as_str() {
+                continue;
+            }
+        }
+
+        if params.run_id.is_some() || params.prompt_id.is_some() {
+            let sidecar = store::load_sidecar(&file.path);
+            if let Some(ref sc) = sidecar {
+                if let Some(ref wanted) = params.run_id {
+                    if sc.run_id.as_deref() != Some(wanted.as_str()) {
+                        continue;
+                    }
+                }
+                if let Some(ref wanted) = params.prompt_id {
+                    if sc.prompt_id.as_deref() != Some(wanted.as_str()) {
+                        continue;
+                    }
+                }
+                items.push(SteerSearchResult {
+                    path: file.path.display().to_string(),
+                    project: file.project.clone(),
+                    agent: file.agent.clone(),
+                    kind: file.kind.dir_name().to_string(),
+                    date: file.date_iso.clone(),
+                    session_id: file.session_id.clone(),
+                    run_id: sc.run_id.clone(),
+                    prompt_id: sc.prompt_id.clone(),
+                    agent_model: sc.agent_model.clone(),
+                    started_at: sc.started_at.clone(),
+                    completed_at: sc.completed_at.clone(),
+                    token_usage: sc.token_usage,
+                    findings_count: sc.findings_count,
+                });
+            }
+        } else {
+            let sidecar = store::load_sidecar(&file.path);
+            items.push(SteerSearchResult {
+                path: file.path.display().to_string(),
+                project: file.project.clone(),
+                agent: file.agent.clone(),
+                kind: file.kind.dir_name().to_string(),
+                date: file.date_iso.clone(),
+                session_id: file.session_id.clone(),
+                run_id: sidecar.as_ref().and_then(|s| s.run_id.clone()),
+                prompt_id: sidecar.as_ref().and_then(|s| s.prompt_id.clone()),
+                agent_model: sidecar.as_ref().and_then(|s| s.agent_model.clone()),
+                started_at: sidecar.as_ref().and_then(|s| s.started_at.clone()),
+                completed_at: sidecar.as_ref().and_then(|s| s.completed_at.clone()),
+                token_usage: sidecar.as_ref().and_then(|s| s.token_usage),
+                findings_count: sidecar.as_ref().and_then(|s| s.findings_count),
+            });
+        }
+    }
+
+    Ok(SteerSearchResponse {
+        ok: true,
+        scanned: total,
+        matched: items.len(),
+        items,
     })
 }
 

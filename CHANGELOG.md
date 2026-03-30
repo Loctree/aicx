@@ -6,6 +6,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-03-30
+
+### Added
+- **Live search** with CLI `aicx search` subcommand and real-time result deduplication.
+- **Resizable dashboard** with drag-to-resize panels.
+- **Store progress reporting** on stderr (TTY-gated `Chunking... N/M segments`).
+- Session metadata (agent, model, cwd) included in search output.
+- `cwd` field on `Chunk` for working-directory awareness.
+
+### Changed
+- Extracted shared types (`types.rs`) to break the `segmentation ↔ store` cycle; `segmentation` no longer depends on `store`.
+- Removed `init` submodule and deprecated `Init` command (returns naturally instead of `process::exit`).
+- Search results now strip aicx boilerplate for cleaner output.
+
+### Removed
+- `src/init.rs` deleted (`git rm`); init flow fully retired.
+
+## [0.5.2] - 2026-03-28
+
+### Added
+- **YAML frontmatter parsing** for chunk metadata extraction.
+- **Sidecar files** (`.meta.yaml`) written alongside memex chunks for external tooling.
+
+## [0.5.1] - 2026-03-24
+
+### Added
+- **Repo-signal segmentation** in the store pipeline — chunks now carry repository identity signals.
+- **Memex chunk sidecars** and `--preprocess` flag for pre-processing before memex push.
+- **Makefile** with comprehensive build, test, lint, and release targets.
+- Gemini truncation support and improved fuzzy search scoring.
+- Test: repo-centric store runtime contract (`runtime_cli_store_contract.rs`).
+- Test: legacy Codex format rejection (`legacy_codex_format_test.rs`).
+
+### Changed
+- Store contracts and migration scaffolding landed for repo-centric retrieval.
+- Read/query surfaces hardened for repo-centric store paths.
+- Checkpoint extraction seam hardened.
+
+### Fixed
+- Gemini JSON message structures preserved instead of being flattened (`sources.rs`).
+
 ## [0.5.0] - 2026-03-21
 
 ### Added

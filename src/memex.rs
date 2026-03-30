@@ -571,6 +571,10 @@ mod tests {
                 completed_at: None,
                 token_usage: None,
                 findings_count: None,
+                workflow_phase: None,
+                mode: None,
+                skill_code: None,
+                framework_version: None,
             })
             .unwrap(),
         )

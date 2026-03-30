@@ -2626,7 +2626,7 @@ mod tests {
             agent: "codex".to_string(),
             session_id: "sess-telemetry".to_string(),
             role: "assistant".to_string(),
-            message: "---\nrun_id: mrbl-001\nprompt_id: api-redesign_20260327\nmodel: gpt-5.4\nstarted_at: 2026-03-27T10:00:00Z\ncompleted_at: 2026-03-27T10:01:00Z\ntoken_usage: 1234\nfindings_count: 4\n---\n## Findings\nTelemetry wiring landed.\n".to_string(),
+            message: "---\nrun_id: mrbl-001\nprompt_id: api-redesign_20260327\nmodel: gpt-5.4\nstarted_at: 2026-03-27T10:00:00Z\ncompleted_at: 2026-03-27T10:01:00Z\ntoken_usage: 1234\nfindings_count: 4\nphase: implement\nmode: session-first\nskill_code: vc-workflow\nframework_version: 2026-03\n---\n## Findings\nTelemetry wiring landed.\n".to_string(),
             branch: None,
             cwd: None,
         }];
@@ -2652,6 +2652,7 @@ mod tests {
         let content = fs::read_to_string(chunk_path).expect("read stored chunk");
         assert!(content.contains("## Findings"));
         assert!(!content.contains("run_id: mrbl-001"));
+        assert!(!content.contains("mode: session-first"));
 
         let sidecar_path = chunk_path.with_extension("meta.json");
         assert!(sidecar_path.exists());
@@ -2667,6 +2668,10 @@ mod tests {
         );
         assert_eq!(sidecar.token_usage, Some(1234));
         assert_eq!(sidecar.findings_count, Some(4));
+        assert_eq!(sidecar.workflow_phase.as_deref(), Some("implement"));
+        assert_eq!(sidecar.mode.as_deref(), Some("session-first"));
+        assert_eq!(sidecar.skill_code.as_deref(), Some("vc-workflow"));
+        assert_eq!(sidecar.framework_version.as_deref(), Some("2026-03"));
 
         let scanned = scan_context_files_at(&root).expect("scan canonical store");
         assert_eq!(scanned.len(), 1, "sidecar files must not scan as chunks");

@@ -1,12 +1,13 @@
 # AI Contexters
 
-Memory extraction + context distillation for AI agent sessions.
+Timeline extraction + context distillation for AI agent sessions.
 
-`aicx` turns local agent logs into:
+`aicx` is the ledger and control surface for agent session history. It turns local agent logs into:
 - a clean, deduped timeline,
-- chunked “agent-readable” context stored in `~/.ai-contexters/`,
+- chunked “agent-readable” context stored in `~/.aicx/`,
+- steering metadata (frontmatter) for selective re-entry by orchestration,
 - optional `.ai-context/` artifacts for repo-level “bring new agent up to speed” workflows,
-- optional sync into memex (vector memory).
+- optional sync into memex (semantic index for vector-based retrieval).
 
 Supported sources:
 - Claude Code: `~/.claude/projects/*/*.jsonl`
@@ -112,7 +113,15 @@ User-only mode (smaller output; excludes assistant + reasoning):
 aicx claude -p CodeScribe -H 48 --user-only
 ```
 
-Memex sync (vector memory):
+Steering retrieval (filter chunks by frontmatter metadata):
+
+```bash
+aicx steer --run-id mrbl-001
+aicx steer --project ai-contexters --kind reports --date 2026-03-28
+aicx steer --agent claude --date 2026-03-20..2026-03-28
+```
+
+Memex sync (semantic index):
 
 ```bash
 aicx all -H 48 --memex

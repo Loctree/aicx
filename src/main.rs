@@ -340,7 +340,7 @@ enum Commands {
         emit: StdoutEmit,
     },
 
-    /// Sync stored chunks to rmcp-memex vector memory
+    /// Sync stored chunks to rmcp-memex semantic index
     MemexSync {
         /// Namespace in vector store
         #[arg(short, long, default_value = "ai-contexts")]
@@ -570,6 +570,45 @@ enum Commands {
 
         /// Maximum results to return
         #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+
+    /// Retrieve chunks by steering metadata (frontmatter fields).
+    ///
+    /// Filters by run_id, prompt_id, agent, kind, project, and/or date range
+    /// using sidecar metadata — no filesystem grep needed.
+    ///
+    /// Example:
+    ///   aicx steer --run-id mrbl-001
+    ///   aicx steer --project ai-contexters --kind reports --date 2026-03-28
+    Steer {
+        /// Filter by run_id (exact match)
+        #[arg(long)]
+        run_id: Option<String>,
+
+        /// Filter by prompt_id (exact match)
+        #[arg(long)]
+        prompt_id: Option<String>,
+
+        /// Filter by agent: claude, codex, gemini
+        #[arg(short, long)]
+        agent: Option<String>,
+
+        /// Filter by kind: conversations, plans, reports, other
+        #[arg(short, long)]
+        kind: Option<String>,
+
+        /// Filter by project (case-insensitive substring)
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Filter by date: single day (2026-03-28), range (2026-03-20..2026-03-28),
+        /// or open-ended (2026-03-20.. or ..2026-03-28)
+        #[arg(short, long)]
+        date: Option<String>,
+
+        /// Maximum results
+        #[arg(short, long, default_value = "20")]
         limit: usize,
     },
 
@@ -864,6 +903,25 @@ fn main() -> Result<()> {
             limit,
         }) => {
             run_search(&query, project.as_deref(), hours, date.as_deref(), limit)?;
+        }
+        Some(Commands::Steer {
+            run_id,
+            prompt_id,
+            agent,
+            kind,
+            project,
+            date,
+            limit,
+        }) => {
+            run_steer(
+                run_id.as_deref(),
+                prompt_id.as_deref(),
+                agent.as_deref(),
+                kind.as_deref(),
+                project.as_deref(),
+                date.as_deref(),
+                limit,
+            )?;
         }
         Some(Commands::Migrate {
             dry_run,
@@ -2095,6 +2153,144 @@ fn run_search(
     Ok(())
 }
 
+/// Retrieve chunks by steering metadata (frontmatter sidecar fields).
+fn run_steer(
+    run_id: Option<&str>,
+    prompt_id: Option<&str>,
+    agent: Option<&str>,
+    kind: Option<&str>,
+    project: Option<&str>,
+    date: Option<&str>,
+    limit: usize,
+) -> Result<()> {
+    let files = store::scan_context_files()?;
+
+    let (date_lo, date_hi) = if let Some(d) = date {
+        parse_date_filter(d)?
+    } else {
+        (None, None)
+    };
+
+    let project_lower = project.map(str::to_ascii_lowercase);
+    let agent_lower = agent.map(str::to_ascii_lowercase);
+    let kind_lower = kind.map(str::to_ascii_lowercase);
+
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    let color = stdout.is_terminal();
+    let mut matched = 0usize;
+    let mut scanned = 0usize;
+
+    for file in &files {
+        if matched >= limit {
+            break;
+        }
+        scanned += 1;
+
+        if let Some(ref needle) = project_lower {
+            if !file.project.to_ascii_lowercase().contains(needle) {
+                continue;
+            }
+        }
+        if let Some(ref needle) = agent_lower {
+            if file.agent.to_ascii_lowercase() != *needle {
+                continue;
+            }
+        }
+        if let Some(ref needle) = kind_lower {
+            if file.kind.dir_name() != *needle {
+                continue;
+            }
+        }
+        if let Some(ref lo) = date_lo {
+            if file.date_iso.as_str() < lo.as_str() {
+                continue;
+            }
+        }
+        if let Some(ref hi) = date_hi {
+            if file.date_iso.as_str() > hi.as_str() {
+                continue;
+            }
+        }
+
+        // Sidecar-specific filters
+        let sidecar = if run_id.is_some() || prompt_id.is_some() {
+            let sc = store::load_sidecar(&file.path);
+            if let Some(ref sc) = sc {
+                if let Some(wanted) = run_id {
+                    if sc.run_id.as_deref() != Some(wanted) {
+                        continue;
+                    }
+                }
+                if let Some(wanted) = prompt_id {
+                    if sc.prompt_id.as_deref() != Some(wanted) {
+                        continue;
+                    }
+                }
+            } else {
+                continue;
+            }
+            sc
+        } else {
+            store::load_sidecar(&file.path)
+        };
+
+        matched += 1;
+
+        let run_str = sidecar
+            .as_ref()
+            .and_then(|s| s.run_id.as_deref())
+            .unwrap_or("-");
+        let prompt_str = sidecar
+            .as_ref()
+            .and_then(|s| s.prompt_id.as_deref())
+            .unwrap_or("-");
+        let model_str = sidecar
+            .as_ref()
+            .and_then(|s| s.agent_model.as_deref())
+            .unwrap_or("-");
+
+        if color {
+            let _ = writeln!(
+                out,
+                "\x1b[1;36m{}\x1b[0m | \x1b[35m{}\x1b[0m | \x1b[90m{}\x1b[0m | {}",
+                file.project,
+                file.agent,
+                file.date_iso,
+                file.kind.dir_name(),
+            );
+            let _ = writeln!(
+                out,
+                "  run_id: \x1b[33m{run_str}\x1b[0m  prompt_id: \x1b[33m{prompt_str}\x1b[0m  model: \x1b[90m{model_str}\x1b[0m"
+            );
+            let _ = writeln!(out, "  \x1b[90;4m{}\x1b[0m", file.path.display());
+            let _ = writeln!(out);
+        } else {
+            let _ = writeln!(
+                out,
+                "{} | {} | {} | {}",
+                file.project,
+                file.agent,
+                file.date_iso,
+                file.kind.dir_name(),
+            );
+            let _ = writeln!(
+                out,
+                "  run_id: {run_str}  prompt_id: {prompt_str}  model: {model_str}"
+            );
+            let _ = writeln!(out, "  {}", file.path.display());
+            let _ = writeln!(out);
+        }
+    }
+
+    let _ = out.flush();
+    if io::stderr().is_terminal() {
+        eprintln!("{matched} match(es) from {scanned} chunks scanned.");
+    }
+
+    Ok(())
+}
+
 /// List context files from the global store, filtered by recency.
 fn run_refs(hours: u64, project: Option<String>, emit: RefsEmit, strict: bool) -> Result<()> {
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
@@ -2271,12 +2467,10 @@ fn run_state(reset: bool, project: Option<String>, info: bool) -> Result<()> {
     Ok(())
 }
 
-/// Sync stored chunks to rmcp-memex vector memory.
+/// Sync stored chunks to rmcp-memex semantic index.
 fn run_memex_sync(namespace: &str, per_chunk: bool, db_path: Option<PathBuf>) -> Result<()> {
     if !memex::check_memex_available() {
-        eprintln!("Error: rmcp-memex not found in PATH.");
-        eprintln!("Install with: cargo install rmcp-memex");
-        std::process::exit(1);
+        anyhow::bail!("rmcp-memex not found in PATH. Install with: cargo install rmcp-memex");
     }
 
     let chunks_dir = store::chunks_dir()?;
