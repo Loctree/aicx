@@ -110,16 +110,33 @@ if [ "$SKIP_INSTALL" -eq 0 ]; then
     exit 1
   fi
 
+  # Show live compilation progress: count Compiling lines → [1/4] Compiling... (N crates)
+  cargo_install_with_progress() {
+    local total=0
+    "$@" 2>&1 | while IFS= read -r line; do
+      case "$line" in
+        *Compiling*)
+          total=$((total + 1))
+          printf '\r  Compiling... (%d crates)' "$total" >&2
+          ;;
+        *Finished*|*Installing*|*Installed*|*Replacing*)
+          printf '\r  %s\n' "$line" >&2
+          ;;
+      esac
+    done
+    printf '\n' >&2
+  }
+
   INSTALL_MODE=$(resolve_install_mode)
   if [ "$INSTALL_MODE" = "local" ]; then
     echo "[1/4] Installing aicx + aicx-mcp from this checkout..."
-    cargo install --path "$SCRIPT_DIR" --locked --force --bin aicx --bin aicx-mcp 2>&1 | tail -5
+    cargo_install_with_progress cargo install --path "$SCRIPT_DIR" --locked --force --bin aicx --bin aicx-mcp
   elif [ "$INSTALL_MODE" = "crates" ]; then
     echo "[1/4] Installing aicx + aicx-mcp from crates.io..."
-    cargo install ai-contexters --locked 2>&1 | tail -20
+    cargo_install_with_progress cargo install ai-contexters --locked
   else
     echo "[1/4] Installing aicx + aicx-mcp from git..."
-    if ! cargo install --git "$AICX_GIT_URL" --locked ai-contexters 2>&1 | tail -20; then
+    if ! cargo_install_with_progress cargo install --git "$AICX_GIT_URL" --locked ai-contexters; then
       echo "Error: git install failed."
       echo "  If you only need the published release, use AICX_INSTALL_MODE=crates or run 'cargo install ai-contexters --locked'."
       exit 1
@@ -229,27 +246,31 @@ configure_mcp "codex" "$HOME/.codex/settings.json"
 # Gemini
 configure_mcp "gemini" "$HOME/.gemini/settings.json"
 
-# --- Step 4: Initial store ---
-echo "[4/4] Initial context extraction..."
-"${AICX_RUN[@]}" all -H 168 --incremental --emit none
-echo "  initial rescan complete"
+# --- Step 4: Full store bootstrap ---
+echo "[4/4] Full context extraction (this may take a moment)..."
+"${AICX_RUN[@]}" all -H 10000 --incremental --emit none
+echo "  store bootstrap complete"
 echo ""
 
 # --- Done ---
 echo "=== Setup complete ==="
 echo ""
+if [ -d "$HOME/.ai-contexters" ]; then
+  echo "Legacy store detected at ~/.ai-contexters/"
+  echo "Run 'aicx migrate' to move your history to the new canonical ~/.aicx/ store."
+  echo ""
+fi
 echo "Installed:"
-echo "  aicx      — CLI for extraction, ranking, search, dashboard"
-echo "  aicx-mcp  — MCP server (4 tools: search, rank, refs, store)"
+echo "  aicx      — CLI for extraction, search, steer, dashboard"
+echo "  aicx-mcp  — MCP server (3 tools: search, rank, steer)"
 echo ""
 echo "MCP tools available in Claude Code / Codex / Gemini:"
 echo "  aicx_search  — fuzzy search across session history"
 echo "  aicx_rank    — quality-score stored chunks"
-echo "  aicx_refs    — compact summary or raw path list of stored context files"
-echo "  aicx_store   — trigger recent incremental rescan"
+echo "  aicx_steer   — retrieve chunks by run/prompt/project/agent/date metadata"
 echo ""
 echo "Quick start:"
 echo "  aicx store -H 24                   # rescan last 24h from all agents"
 echo "  aicx search 'query terms'          # fuzzy search across session history"
 echo "  aicx refs -H 24                    # compact summary of recent files"
-echo "  aicx rank -p <project> --strict    # see quality chunks"
+echo "  aicx steer --project ai-contexters # metadata-aware retrieval"
