@@ -430,6 +430,7 @@ pub fn normalize_query(text: &str) -> String {
 
 /// Patterns in messages that indicate aicx's own operational traffic.
 /// These create feedback loops: search → log → extract → search matches own query.
+/// Retired MCP tool names stay here so historical traces remain filterable.
 const SELF_ECHO_PATTERNS: &[&str] = &[
     // MCP tool calls
     "aicx_search",

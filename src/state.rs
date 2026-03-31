@@ -1,7 +1,7 @@
 //! State management for ai-contexters.
 //!
 //! Tracks processing watermarks, content hashes for deduplication,
-//! and run history. Persists to `~/.ai-contexters/state.json`.
+//! and run history. Persists to `~/.aicx/state.json`.
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
@@ -44,7 +44,7 @@ pub struct StateManager {
 }
 
 impl StateManager {
-    /// Returns the path to the state file: `~/.ai-contexters/state.json`
+    /// Returns the path to the state file: `~/.aicx/state.json`
     fn state_path() -> Result<PathBuf> {
         let base = crate::store::store_base_dir()?;
         Ok(base.join("state.json"))
