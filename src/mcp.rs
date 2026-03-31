@@ -1,7 +1,7 @@
 //! MCP (Model Context Protocol) server for aicx.
 //!
 //! Exposes aicx functionality as MCP tools so any AI agent can query
-//! session history, search chunks, rank artifacts, and extract intents.
+//! search chunks, rank artifacts, and retrieve steer metadata.
 //!
 //! Supports stdio and SSE transports.
 //!
@@ -12,7 +12,7 @@ use rmcp::{
     ErrorData as McpError, handler::server::tool::ToolRouter, handler::server::wrapper::Parameters,
     model::*, tool, tool_router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Guard that prevents concurrent background refresh child-process spawns.
@@ -34,11 +34,19 @@ pub struct SearchParams {
     pub limit: usize,
     /// Optional project filter (case-insensitive substring)
     pub project: Option<String>,
+    /// Minimum score threshold (0-100)
+    pub score: Option<u8>,
+    /// Hours to look back (0 = all time)
+    pub hours: Option<u64>,
+    /// Optional date filter (single day or range)
+    pub date: Option<String>,
 }
 
 fn default_limit() -> usize {
     10
 }
+
+const MAX_SCORE_FILTER: u8 = 100;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RankParams {
@@ -56,35 +64,6 @@ pub struct RankParams {
 
 fn default_rank_hours() -> u64 {
     72
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct RefsParams {
-    /// Hours to look back (default: 168)
-    #[serde(default = "default_refs_hours")]
-    pub hours: u64,
-    /// Optional project filter
-    pub project: Option<String>,
-    /// Exclude noise artifacts
-    #[serde(default)]
-    pub strict: bool,
-}
-
-fn default_refs_hours() -> u64 {
-    168
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct StoreParams {
-    /// Hours to look back (default: 24)
-    #[serde(default = "default_store_hours")]
-    pub hours: u64,
-    /// Optional project filter
-    pub project: Option<String>,
-}
-
-fn default_store_hours() -> u64 {
-    24
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -108,6 +87,36 @@ pub struct SteerParams {
 
 fn default_steer_limit() -> usize {
     20
+}
+
+#[derive(Debug, Serialize)]
+struct RankResponse {
+    project: String,
+    hours: u64,
+    strict: bool,
+    results: usize,
+    items: Vec<RankItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct RankItem {
+    file: String,
+    project: String,
+    date: String,
+    kind: String,
+    agent: String,
+    score: u8,
+    label: String,
+    signal: usize,
+    noise: usize,
+    total: usize,
+    density: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SteerResponse {
+    results: usize,
+    items: Vec<serde_json::Value>,
 }
 
 fn incremental_rescan_args(hours: u64, project: Option<&str>) -> Vec<String> {
@@ -162,6 +171,14 @@ impl AicxMcpServer {
         let query = params.query;
         let limit = params.limit.min(50);
         let project = params.project;
+        let score = validate_score_filter(params.score)?;
+        let hours = params.hours.unwrap_or(0);
+        let date = params.date;
+        let fetch_limit = if score.is_some() || date.is_some() || hours > 0 {
+            limit.saturating_mul(5).max(50)
+        } else {
+            limit
+        };
 
         // Non-blocking auto-rescan with rate-limit guard.
         if !RESCAN_RUNNING.swap(true, Ordering::SeqCst) {
@@ -187,23 +204,49 @@ impl AicxMcpServer {
 
         // Try fast search with rmcp_memex first (instant), fallback to brute-force if it fails
         let (results, scanned) =
-            match crate::memex::fast_memex_search(&query, limit, project.as_deref()).await {
+            match crate::memex::fast_memex_search(&query, fetch_limit, project.as_deref()).await {
                 Ok((res, scan)) if !res.is_empty() => (res, scan),
                 _ => {
                     // Fallback to reading all markdown files sequentially (slow)
                     let store_root = store::store_base_dir()
                         .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
-                    rank::fuzzy_search_store(&store_root, &query, limit, project.as_deref())
+                    rank::fuzzy_search_store(&store_root, &query, fetch_limit, project.as_deref())
                         .map_err(|e| McpError::internal_error(format!("Read store: {e}"), None))?
                 }
             };
 
-        let json = serde_json::to_string_pretty(&serde_json::json!({
-            "scanned": scanned,
-            "results": results.len(),
-            "items": results,
-        }))
-        .unwrap_or_default();
+        let mut results = results;
+
+        if let Some(min_score) = score {
+            results.retain(|result| result.score >= min_score);
+        }
+
+        let results: Vec<_> = if let Some(ref date_filter) = date {
+            let (lo, hi) = parse_date_filter_mcp(date_filter);
+            results
+                .into_iter()
+                .filter(|result| {
+                    lo.as_ref()
+                        .is_none_or(|lo| result.date.as_str() >= lo.as_str())
+                        && hi
+                            .as_ref()
+                            .is_none_or(|hi| result.date.as_str() <= hi.as_str())
+                })
+                .collect()
+        } else if hours > 0 {
+            let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
+            let cutoff_date = cutoff.format("%Y-%m-%d").to_string();
+            results
+                .into_iter()
+                .filter(|result| result.date >= cutoff_date)
+                .collect()
+        } else {
+            results
+        };
+        let results: Vec<_> = results.into_iter().take(limit).collect();
+
+        let json = rank::render_search_json(&results, scanned)
+            .map_err(|e| McpError::internal_error(format!("Serialize search JSON: {e}"), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
@@ -222,16 +265,10 @@ impl AicxMcpServer {
         let top = params.top;
 
         let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
-        let mut scored: Vec<serde_json::Value> = Vec::new();
+        let mut scored = Vec::new();
 
         let files = store::context_files_since(cutoff, Some(&project))
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
-
-        if files.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No data for project '{project}'"
-            ))]));
-        }
 
         for file in files {
             if file.path.extension().is_none_or(|ext| ext != "md") {
@@ -241,72 +278,42 @@ impl AicxMcpServer {
             if strict && cs.score < 5 {
                 continue;
             }
-            scored.push(serde_json::json!({
-                "file": file.path.file_name().unwrap_or_default().to_string_lossy(),
-                "project": file.project,
-                "date": file.date_iso,
-                "kind": file.kind.dir_name(),
-                "agent": file.agent,
-                "score": cs.score,
-                "label": cs.label,
-                "signal": cs.signal_lines,
-                "noise": cs.noise_lines,
-                "total": cs.total_lines,
-                "density": format!("{:.0}%", cs.density * 100.0),
-            }));
+            scored.push(RankItem {
+                file: file
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                project: file.project,
+                date: file.date_iso,
+                kind: file.kind.dir_name().to_string(),
+                agent: file.agent,
+                score: cs.score,
+                label: cs.label.to_string(),
+                signal: cs.signal_lines,
+                noise: cs.noise_lines,
+                total: cs.total_lines,
+                density: format!("{:.0}%", cs.density * 100.0),
+            });
         }
 
-        scored.sort_by(|a, b| b["score"].as_u64().cmp(&a["score"].as_u64()));
+        scored.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
 
         if let Some(n) = top {
             scored.truncate(n);
         }
 
-        let output = serde_json::to_string_pretty(&serde_json::json!({
-            "project": project,
-            "hours": hours,
-            "strict": strict,
-            "chunks": scored.len(),
-            "items": scored,
-        }))
-        .unwrap_or_default();
+        let json = serde_json::to_string(&RankResponse {
+            project,
+            hours,
+            strict,
+            results: scored.len(),
+            items: scored,
+        })
+        .map_err(|e| McpError::internal_error(format!("Serialize rank JSON: {e}"), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
-    #[tool(
-        name = "aicx_refs",
-        description = "List stored context files from the aicx central store, filtered by recency and optionally by project. Returns file paths."
-    )]
-    async fn refs(
-        &self,
-        Parameters(params): Parameters<RefsParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let hours = params.hours;
-        let project = params.project;
-        let strict = params.strict;
-
-        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
-
-        let mut paths = store::context_files_since(cutoff, project.as_deref())
-            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
-        if strict {
-            paths.retain(|file| rank::score_chunk_file(&file.path).score >= 5);
-        }
-
-        let text = paths
-            .iter()
-            .map(|file| file.path.display().to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        Ok(CallToolResult::success(vec![Content::text(
-            if text.is_empty() {
-                format!("No context files found within last {hours} hours.")
-            } else {
-                format!("{} files:\n{text}", paths.len())
-            },
-        )]))
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
     #[tool(
@@ -338,58 +345,13 @@ impl AicxMcpServer {
         .await
         .map_err(|e| McpError::internal_error(format!("Index error: {e}"), None))?;
 
-        let json = serde_json::to_string_pretty(&serde_json::json!({
-            "scanned": 0,
-            "matched": metadatas.len(),
-            "items": metadatas,
-        }))
-        .unwrap_or_default();
+        let json = serde_json::to_string(&SteerResponse {
+            results: metadatas.len(),
+            items: metadatas,
+        })
+        .map_err(|e| McpError::internal_error(format!("Serialize steer JSON: {e}"), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
-    }
-
-    #[tool(
-        name = "aicx_store",
-        description = "Trigger a recent incremental rescan across AI agent sessions (Claude, Codex, Gemini) and store any new chunks centrally. Uses watermarks + dedup to skip already-processed history."
-    )]
-    async fn store_sync(
-        &self,
-        Parameters(params): Parameters<StoreParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let hours = params.hours;
-        let project = params.project;
-        let args = incremental_rescan_args(hours, project.as_deref());
-
-        let output = std::process::Command::new("aicx")
-            .args(&args)
-            .output()
-            .map_err(|e| McpError::internal_error(format!("Failed to run aicx: {e}"), None))?;
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let status = output
-                .status
-                .code()
-                .map_or_else(|| "signal".to_string(), |code| code.to_string());
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "Incremental rescan failed (status: {status}).\n{}\n{}",
-                stdout.trim(),
-                stderr.trim(),
-            ))]));
-        }
-
-        let scope = project
-            .as_deref()
-            .map_or_else(|| "all projects".to_string(), |p| format!("project '{p}'"));
-        let mut summary =
-            format!("Incremental rescan completed for {scope} over the last {hours}h.");
-        if !stderr.trim().is_empty() {
-            summary.push('\n');
-            summary.push_str(stderr.trim());
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(summary)]))
     }
 }
 
@@ -495,9 +457,22 @@ fn parse_date_filter_mcp(date: &str) -> (Option<String>, Option<String>) {
     }
 }
 
+fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, McpError> {
+    match score {
+        Some(score) if score > MAX_SCORE_FILTER => Err(McpError::invalid_params(
+            format!("score must be between 0 and {MAX_SCORE_FILTER}"),
+            None,
+        )),
+        _ => Ok(score),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{incremental_rescan_args, parse_date_filter_mcp};
+    use super::{
+        MAX_SCORE_FILTER, RankItem, RankResponse, SearchParams, SteerResponse,
+        incremental_rescan_args, parse_date_filter_mcp, validate_score_filter,
+    };
 
     #[test]
     fn incremental_rescan_args_use_all_incremental_and_quiet_stdout() {
@@ -554,5 +529,77 @@ mod tests {
                 "ai-contexters".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn rank_response_serializes_as_compact_json() {
+        let json = serde_json::to_string(&RankResponse {
+            project: "VetCoders/ai-contexters".to_string(),
+            hours: 72,
+            strict: true,
+            results: 1,
+            items: vec![RankItem {
+                file: "chunk.md".to_string(),
+                project: "VetCoders/ai-contexters".to_string(),
+                date: "2026-03-31".to_string(),
+                kind: "reports".to_string(),
+                agent: "codex".to_string(),
+                score: 8,
+                label: "HIGH".to_string(),
+                signal: 14,
+                noise: 2,
+                total: 20,
+                density: "70%".to_string(),
+            }],
+        })
+        .expect("rank response should serialize");
+
+        assert!(!json.contains('\n'));
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&json).expect("rank JSON should parse");
+        assert_eq!(payload["results"], 1);
+        assert_eq!(payload["items"][0]["score"], 8);
+        assert_eq!(payload["items"][0]["label"], "HIGH");
+    }
+
+    #[test]
+    fn steer_response_serializes_as_compact_json() {
+        let json = serde_json::to_string(&SteerResponse {
+            results: 1,
+            items: vec![serde_json::json!({
+                "path": "/tmp/chunk.md",
+                "project": "VetCoders/ai-contexters",
+                "agent": "codex",
+                "kind": "reports",
+            })],
+        })
+        .expect("steer response should serialize");
+
+        assert!(!json.contains('\n'));
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&json).expect("steer JSON should parse");
+        assert_eq!(payload["results"], 1);
+        assert_eq!(payload["items"][0]["path"], "/tmp/chunk.md");
+        assert_eq!(payload["items"][0]["agent"], "codex");
+    }
+
+    #[test]
+    fn search_params_roundtrip_include_new_optional_filters() {
+        let params: SearchParams =
+            serde_json::from_str(r#"{"query":"dashboard"}"#).expect("search params should parse");
+        assert_eq!(params.limit, 10);
+        assert!(params.project.is_none());
+        assert!(params.score.is_none());
+        assert!(params.hours.is_none());
+        assert!(params.date.is_none());
+    }
+
+    #[test]
+    fn score_filter_rejects_values_above_max() {
+        let err = validate_score_filter(Some(MAX_SCORE_FILTER + 1))
+            .expect_err("score above 100 should be rejected");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
     }
 }
