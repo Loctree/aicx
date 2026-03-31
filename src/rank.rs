@@ -1,4 +1,4 @@
-//! Per-chunk content quality scoring for `aicx rank`.
+//! Per-chunk content quality scoring and fuzzy-search presentation helpers.
 //!
 //! Scores each chunk file on a 0–10 scale based on signal density,
 //! penalizing noise patterns (echoed skill prompts, tool JSON, system
@@ -8,6 +8,7 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use serde::Serialize;
+use std::fmt::Write as _;
 use std::io;
 use std::path::Path;
 
@@ -240,6 +241,118 @@ pub struct FuzzyResult {
     pub matched_lines: Vec<String>,
     pub session_id: Option<String>,
     pub cwd: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompactSearchResponse {
+    results: usize,
+    scanned: usize,
+    items: Vec<CompactSearchItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompactSearchItem {
+    score: u8,
+    label: String,
+    project: String,
+    agent: String,
+    date: String,
+    session: String,
+    cwd: String,
+    matches: Vec<String>,
+    path: String,
+}
+
+const SEARCH_MATCH_MAX_CHARS: usize = 200;
+const SEARCH_META_PREFIX: &str = "[project:";
+
+pub fn render_search_json(results: &[FuzzyResult], scanned: usize) -> serde_json::Result<String> {
+    let items = results
+        .iter()
+        .map(|result| CompactSearchItem {
+            score: result.score,
+            label: result.label.clone(),
+            project: result.project.clone(),
+            agent: result.agent.clone(),
+            date: result.date.clone(),
+            session: result.session_id.clone().unwrap_or_else(|| "-".to_string()),
+            cwd: result.cwd.clone().unwrap_or_else(|| "-".to_string()),
+            matches: display_search_matches(result),
+            path: result.path.clone(),
+        })
+        .collect();
+
+    serde_json::to_string(&CompactSearchResponse {
+        results: results.len(),
+        scanned,
+        items,
+    })
+}
+
+pub fn render_search_text(results: &[FuzzyResult], color: bool) -> String {
+    let mut out = String::new();
+
+    for result in results {
+        let session_str = result.session_id.as_deref().unwrap_or("-");
+        let cwd_str = result.cwd.as_deref().unwrap_or("-");
+        let matches = display_search_matches(result);
+
+        if color {
+            let score_color = match result.label.as_str() {
+                "HIGH" => "\x1b[1;32m",
+                "MEDIUM" => "\x1b[1;33m",
+                _ => "\x1b[1;31m",
+            };
+            let _ = writeln!(
+                out,
+                "{score_color}[{}/100 {}]\x1b[0m \x1b[1;36m{}\x1b[0m | \x1b[35m{}\x1b[0m | \x1b[90m{}\x1b[0m",
+                result.score, result.label, result.project, result.agent, result.date
+            );
+            let _ = writeln!(out, "session(s): \x1b[90m{session_str}\x1b[0m");
+            let _ = writeln!(out, "cwd: \x1b[90m{cwd_str}\x1b[0m");
+            let _ = writeln!(out, "search result:");
+            for line in &matches {
+                let _ = writeln!(out, "  \x1b[90m>\x1b[0m \x1b[90m{}\x1b[0m", line);
+            }
+            let _ = writeln!(out, "source file(s):");
+            let _ = writeln!(out, "\x1b[90;4m{}\x1b[0m", result.path);
+            let _ = writeln!(out);
+        } else {
+            let _ = writeln!(
+                out,
+                "[{}/100 {}] {} | {} | {}",
+                result.score, result.label, result.project, result.agent, result.date
+            );
+            let _ = writeln!(out, "session(s): {session_str}");
+            let _ = writeln!(out, "cwd: {cwd_str}");
+            let _ = writeln!(out, "search result:");
+            for line in &matches {
+                let _ = writeln!(out, "  > {}", line);
+            }
+            let _ = writeln!(out, "source file(s):");
+            let _ = writeln!(out, "{}", result.path);
+            let _ = writeln!(out);
+        }
+    }
+
+    out
+}
+
+fn display_search_matches(result: &FuzzyResult) -> Vec<String> {
+    result
+        .matched_lines
+        .iter()
+        .filter(|line| !line.trim().starts_with(SEARCH_META_PREFIX))
+        .map(|line| truncate_search_match(line, SEARCH_MATCH_MAX_CHARS))
+        .collect()
+}
+
+fn truncate_search_match(line: &str, max_chars: usize) -> String {
+    let mut truncated: String = line.chars().take(max_chars).collect();
+    if line.chars().count() > max_chars {
+        truncated.push_str(" ...");
+    }
+    truncated
 }
 
 /// Fuzzy-search stored chunk files with normalized AND-matching and quality scoring.
@@ -1037,5 +1150,59 @@ Some boilerplate text.
         assert_eq!(filtered[0].project, "VetCoders/ai-contexters");
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn render_search_json_matches_cli_surface_fields() {
+        let long_line = "x".repeat(205);
+        let json = render_search_json(
+            &[FuzzyResult {
+                file: "chunk.md".to_string(),
+                path: "/tmp/chunk.md".to_string(),
+                project: "VetCoders/ai-contexters".to_string(),
+                kind: "reports".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-03-31".to_string(),
+                score: 88,
+                label: "HIGH".to_string(),
+                density: 0.8,
+                matched_lines: vec![
+                    "[project: test | agent: codex | date: 2026-03-31]".to_string(),
+                    long_line.clone(),
+                    "decision: align MCP search JSON with CLI".to_string(),
+                ],
+                session_id: Some("sess-123".to_string()),
+                cwd: Some("/repo".to_string()),
+            }],
+            127,
+        )
+        .expect("search JSON should serialize");
+
+        assert!(!json.contains('\n'));
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&json).expect("search JSON should parse");
+
+        assert_eq!(payload["results"], 1);
+        assert_eq!(payload["scanned"], 127);
+        assert_eq!(payload["items"][0]["score"], 88);
+        assert_eq!(payload["items"][0]["label"], "HIGH");
+        assert_eq!(payload["items"][0]["project"], "VetCoders/ai-contexters");
+        assert_eq!(payload["items"][0]["agent"], "codex");
+        assert_eq!(payload["items"][0]["date"], "2026-03-31");
+        assert_eq!(payload["items"][0]["session"], "sess-123");
+        assert_eq!(payload["items"][0]["cwd"], "/repo");
+        assert_eq!(payload["items"][0]["path"], "/tmp/chunk.md");
+        assert_eq!(payload["items"][0]["matches"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            payload["items"][0]["matches"][1],
+            "decision: align MCP search JSON with CLI"
+        );
+        assert!(
+            payload["items"][0]["matches"][0]
+                .as_str()
+                .unwrap()
+                .ends_with(" ...")
+        );
     }
 }

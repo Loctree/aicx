@@ -4,7 +4,7 @@
 //! - `store/<organization>/<repository>/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
 //! - `non-repository-contexts/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
 //! - `store/<project>/<date>/<time>_<agent>-context.{md,json}` — legacy monolithic helpers kept for library use/tests
-//! - `memex/chunks/` — pre-chunked text for RAG indexing
+//! - `memex/sync_state.json` — sync bookkeeping for the semantic index add-on
 //! - `index.json` — manifest of stored contexts
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
@@ -287,7 +287,7 @@ pub struct AgentIndex {
 // Index operations
 // ============================================================================
 
-/// Load the store index from `~/.ai-contexters/index.json`.
+/// Load the store index from `~/.aicx/index.json`.
 ///
 /// Returns a default empty index if the file doesn't exist or can't be parsed.
 pub fn load_index() -> StoreIndex {
@@ -687,18 +687,24 @@ pub fn context_files_since(
     cutoff: SystemTime,
     project_filter: Option<&str>,
 ) -> Result<Vec<StoredContextFile>> {
+    context_files_since_at(&store_base_dir()?, cutoff, project_filter)
+}
+
+fn context_files_since_at(
+    base: &Path,
+    cutoff: SystemTime,
+    project_filter: Option<&str>,
+) -> Result<Vec<StoredContextFile>> {
     let filter = project_filter.map(|value| value.to_ascii_lowercase());
-    let mut files = scan_context_files()?;
+    let cutoff_date = DateTime::<Utc>::from(cutoff).format("%Y-%m-%d").to_string();
+    let mut files = scan_context_files_at(base)?;
     files.retain(|file| {
         let matches_project = filter
             .as_ref()
             .is_none_or(|needle| file.project.to_ascii_lowercase().contains(needle));
-        let matches_cutoff = file
-            .path
-            .metadata()
-            .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .is_some_and(|modified| modified >= cutoff);
+        // Discovery recency is anchored to the canonical chunk date encoded in the
+        // store layout, not filesystem mtime which can drift during migration/copy.
+        let matches_cutoff = file.date_iso >= cutoff_date;
         matches_project && matches_cutoff
     });
     Ok(files)
@@ -725,18 +731,14 @@ fn chunks_by_run_id_at(
     cutoff: SystemTime,
 ) -> Result<Vec<StoredContextFile>> {
     let filter = project.map(|value| value.to_ascii_lowercase());
+    let cutoff_date = DateTime::<Utc>::from(cutoff).format("%Y-%m-%d").to_string();
     let mut matched = Vec::new();
 
     for file in scan_context_files_at(base)? {
         let matches_project = filter
             .as_ref()
             .is_none_or(|needle| file.project.to_ascii_lowercase().contains(needle));
-        let matches_cutoff = file
-            .path
-            .metadata()
-            .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .is_some_and(|modified| modified >= cutoff);
+        let matches_cutoff = file.date_iso >= cutoff_date;
 
         if !matches_project || !matches_cutoff {
             continue;
@@ -2215,6 +2217,7 @@ impl SourceLocator {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use filetime::{FileTime, set_file_mtime};
     use std::env;
 
     #[test]
@@ -2855,6 +2858,10 @@ mod tests {
         fs::write(path, content).unwrap();
     }
 
+    fn set_mtime(path: &Path, unix_seconds: i64) {
+        set_file_mtime(path, FileTime::from_unix_time(unix_seconds, 0)).unwrap();
+    }
+
     #[test]
     fn scan_retrieves_repo_centric_files_with_correct_metadata() {
         let root = retrieval_test_root("repo-scan");
@@ -2972,6 +2979,53 @@ mod tests {
         assert_eq!(non_repo_file.kind, Kind::Other);
         assert_eq!(non_repo_file.agent, "claude");
         assert!(non_repo_file.repo.is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn context_files_since_uses_canonical_chunk_date_not_mtime() {
+        let root = retrieval_test_root("context-files-since-date");
+        let _ = fs::remove_dir_all(&root);
+
+        let recent = root
+            .join("store")
+            .join("VetCoders")
+            .join("ai-contexters")
+            .join("2026_0331")
+            .join("reports")
+            .join("claude")
+            .join("2026_0331_claude_sess-new_001.md");
+        let old = root
+            .join("store")
+            .join("VetCoders")
+            .join("ai-contexters")
+            .join("2026_0328")
+            .join("reports")
+            .join("claude")
+            .join("2026_0328_claude_sess-old_001.md");
+
+        write_chunk_file(&recent, "Fresh canonical chunk");
+        write_chunk_file(&old, "Stale canonical chunk");
+
+        // Reverse the mtimes to prove recency follows the canonical store date.
+        set_mtime(&recent, 1);
+        set_mtime(&old, 2_000_000_000);
+
+        let cutoff: SystemTime = Utc.with_ymd_and_hms(2026, 3, 30, 0, 0, 0).unwrap().into();
+        let files = context_files_since_at(&root, cutoff, Some("ai-contexters"))
+            .expect("context file filtering should succeed");
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].date_iso, "2026-03-31");
+        assert_eq!(
+            files[0]
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap(),
+            "2026_0331_claude_sess-new_001.md"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

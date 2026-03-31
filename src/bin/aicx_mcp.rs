@@ -1,6 +1,6 @@
 //! Standalone MCP server binary for aicx.
 //!
-//! Exposes aicx search, rank, refs, and store as MCP tools.
+//! Exposes aicx search, rank, and steer as MCP tools.
 //! Supports stdio (default) and streamable HTTP transports.
 //!
 //! Usage:
