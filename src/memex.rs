@@ -411,6 +411,13 @@ pub fn sync_new_chunks(chunks_dir: &Path, config: &MemexConfig) -> Result<SyncRe
         result
     };
 
+    // Build/update fast local metadata index using LanceDB directly
+    if let Ok(rt) = tokio::runtime::Runtime::new() {
+        if let Err(e) = rt.block_on(crate::steer_index::sync_steer_index(&new_files)) {
+            tracing::warn!("Failed to sync steer index: {}", e);
+        }
+    }
+
     // Update sync state with newly synced chunks
     for file in &new_files {
         let id = file
@@ -424,6 +431,140 @@ pub fn sync_new_chunks(chunks_dir: &Path, config: &MemexConfig) -> Result<SyncRe
     save_sync_state(&state)?;
 
     Ok(result)
+}
+
+use crate::rank::{FuzzyResult, score_chunk_content};
+
+// ============================================================================
+// High-level fast search via rmcp-memex library
+// ============================================================================
+
+/// Fast semantic/keyword search using `rmcp_memex`'s embedded LanceDB and Tantivy index.
+pub async fn fast_memex_search(
+    query: &str,
+    limit: usize,
+    project_filter: Option<&str>,
+) -> Result<(Vec<FuzzyResult>, usize)> {
+    use rmcp_memex::search::{BM25Config, BM25Index};
+    use rmcp_memex::storage::StorageManager;
+
+    let config = BM25Config::default();
+    let index = BM25Index::new(&config).context("Failed to load BM25 index")?;
+
+    // Search BM25 (fetch more in case of project filter)
+    let raw_results = index.search(query, Some("ai-contexts"), limit * 5)?;
+    let total_scanned = raw_results.len(); // Approximate
+
+    let storage = StorageManager::new_lance_only("~/.rmcp-servers/rmcp-memex/lancedb")
+        .await
+        .context("Failed to open LanceDB")?;
+
+    let mut results = Vec::new();
+    let project_lower = project_filter.map(|s| s.to_lowercase());
+
+    for (id, _, score) in raw_results {
+        if results.len() >= limit {
+            break;
+        }
+
+        if let Ok(Some(doc)) = storage.get_document("ai-contexts", &id).await {
+            // Apply project filter if any
+            let doc_project = doc
+                .metadata
+                .get("project")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            if let Some(ref pf) = project_lower {
+                if !doc_project.to_lowercase().contains(pf) {
+                    continue;
+                }
+            }
+
+            let kind = doc
+                .metadata
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let agent = doc
+                .metadata
+                .get("agent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let date = doc
+                .metadata
+                .get("date")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let session_id = doc
+                .metadata
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let cwd = doc
+                .metadata
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            // Score content to get density and matched lines
+            let chunk_score = score_chunk_content(&doc.document);
+
+            // Extract matching lines
+            let query_terms: Vec<&str> = query.split_whitespace().collect();
+            let matched_lines: Vec<String> = doc
+                .document
+                .lines()
+                .filter(|line| {
+                    let lower = line.to_lowercase();
+                    query_terms
+                        .iter()
+                        .any(|&term| lower.contains(&term.to_lowercase()))
+                })
+                .take(5)
+                .map(|s| s.trim().to_string())
+                .collect();
+
+            // Calculate final score using BM25 score and signal density
+            // BM25 score usually > 0. The higher the better.
+            let final_score = ((chunk_score.score as f32 * 5.0 + score * 10.0) as u8).min(100);
+
+            results.push(FuzzyResult {
+                file: format!("{}.md", id),
+                path: doc
+                    .metadata
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&format!("{}.md", id))
+                    .to_string(),
+                project: doc_project,
+                kind,
+                agent,
+                date,
+                score: final_score,
+                label: if final_score >= 80 {
+                    "HIGH".to_string()
+                } else if final_score >= 60 {
+                    "MEDIUM".to_string()
+                } else {
+                    "LOW".to_string()
+                },
+                density: chunk_score.density,
+                matched_lines,
+                session_id,
+                cwd,
+            });
+        }
+    }
+
+    // Sort by score
+    results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
+
+    Ok((results, total_scanned))
 }
 
 // ============================================================================

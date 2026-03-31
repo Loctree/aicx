@@ -1,6 +1,6 @@
 [package]
 name = "ai-contexters"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2024"
 rust-version = "1.85"
 description = "Extract timeline and memory from AI agent sessions (Claude Code, Codex, Gemini)"
@@ -30,6 +30,7 @@ axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "signal"] }
 rmcp = { version = "1.2", features = ["server", "schemars", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 libc = "0.2.183"
+rmcp-memex = { version = "0.4.0", path = "../rmcp-memex", default-features = false }
 
 [dev-dependencies]
 filetime = "0.2"

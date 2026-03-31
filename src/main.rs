@@ -2163,129 +2163,73 @@ fn run_steer(
     date: Option<&str>,
     limit: usize,
 ) -> Result<()> {
-    let files = store::scan_context_files()?;
+    let rt = tokio::runtime::Runtime::new()?;
 
     let (date_lo, date_hi) = if let Some(d) = date {
-        parse_date_filter(d)?
+        let bounds = parse_date_filter(d)?;
+        (bounds.0, bounds.1)
     } else {
         (None, None)
     };
 
-    let project_lower = project.map(str::to_ascii_lowercase);
-    let agent_lower = agent.map(str::to_ascii_lowercase);
-    let kind_lower = kind.map(str::to_ascii_lowercase);
+    let metadatas = rt.block_on(ai_contexters::steer_index::search_steer_index(
+        run_id,
+        prompt_id,
+        agent,
+        kind,
+        project,
+        date_lo.as_deref(),
+        date_hi.as_deref(),
+        limit,
+    ))?;
 
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
     let color = stdout.is_terminal();
-    let mut matched = 0usize;
-    let mut scanned = 0usize;
+    let matched = metadatas.len();
 
-    for file in &files {
-        if matched >= limit {
-            break;
-        }
-        scanned += 1;
-
-        if let Some(ref needle) = project_lower {
-            if !file.project.to_ascii_lowercase().contains(needle) {
-                continue;
-            }
-        }
-        if let Some(ref needle) = agent_lower {
-            if file.agent.to_ascii_lowercase() != *needle {
-                continue;
-            }
-        }
-        if let Some(ref needle) = kind_lower {
-            if file.kind.dir_name() != *needle {
-                continue;
-            }
-        }
-        if let Some(ref lo) = date_lo {
-            if file.date_iso.as_str() < lo.as_str() {
-                continue;
-            }
-        }
-        if let Some(ref hi) = date_hi {
-            if file.date_iso.as_str() > hi.as_str() {
-                continue;
-            }
-        }
-
-        // Sidecar-specific filters
-        let sidecar = if run_id.is_some() || prompt_id.is_some() {
-            let sc = store::load_sidecar(&file.path);
-            if let Some(ref sc) = sc {
-                if let Some(wanted) = run_id {
-                    if sc.run_id.as_deref() != Some(wanted) {
-                        continue;
-                    }
-                }
-                if let Some(wanted) = prompt_id {
-                    if sc.prompt_id.as_deref() != Some(wanted) {
-                        continue;
-                    }
-                }
-            } else {
-                continue;
-            }
-            sc
-        } else {
-            store::load_sidecar(&file.path)
-        };
-
-        matched += 1;
-
-        let run_str = sidecar
-            .as_ref()
-            .and_then(|s| s.run_id.as_deref())
+    for meta in metadatas {
+        let path = meta.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        let p = meta.get("project").and_then(|v| v.as_str()).unwrap_or("?");
+        let a = meta.get("agent").and_then(|v| v.as_str()).unwrap_or("?");
+        let d = meta.get("date").and_then(|v| v.as_str()).unwrap_or("?");
+        let k = meta.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+        let run_str = meta.get("run_id").and_then(|v| v.as_str()).unwrap_or("-");
+        let prompt_str = meta
+            .get("prompt_id")
+            .and_then(|v| v.as_str())
             .unwrap_or("-");
-        let prompt_str = sidecar
-            .as_ref()
-            .and_then(|s| s.prompt_id.as_deref())
-            .unwrap_or("-");
-        let model_str = sidecar
-            .as_ref()
-            .and_then(|s| s.agent_model.as_deref())
+        let model_str = meta
+            .get("agent_model")
+            .and_then(|v| v.as_str())
             .unwrap_or("-");
 
         if color {
             let _ = writeln!(
                 out,
                 "\x1b[1;36m{}\x1b[0m | \x1b[35m{}\x1b[0m | \x1b[90m{}\x1b[0m | {}",
-                file.project,
-                file.agent,
-                file.date_iso,
-                file.kind.dir_name(),
+                p, a, d, k
             );
             let _ = writeln!(
                 out,
                 "  run_id: \x1b[33m{run_str}\x1b[0m  prompt_id: \x1b[33m{prompt_str}\x1b[0m  model: \x1b[90m{model_str}\x1b[0m"
             );
-            let _ = writeln!(out, "  \x1b[90;4m{}\x1b[0m", file.path.display());
+            let _ = writeln!(out, "  \x1b[90;4m{}\x1b[0m", path);
             let _ = writeln!(out);
         } else {
-            let _ = writeln!(
-                out,
-                "{} | {} | {} | {}",
-                file.project,
-                file.agent,
-                file.date_iso,
-                file.kind.dir_name(),
-            );
+            let _ = writeln!(out, "{} | {} | {} | {}", p, a, d, k);
             let _ = writeln!(
                 out,
                 "  run_id: {run_str}  prompt_id: {prompt_str}  model: {model_str}"
             );
-            let _ = writeln!(out, "  {}", file.path.display());
+            let _ = writeln!(out, "  {}", path);
             let _ = writeln!(out);
         }
     }
 
     let _ = out.flush();
     if io::stderr().is_terminal() {
-        eprintln!("{matched} match(es) from {scanned} chunks scanned.");
+        eprintln!("{matched} match(es) from steer index.");
     }
 
     Ok(())

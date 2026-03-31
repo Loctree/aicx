@@ -16,5 +16,6 @@ pub mod sanitize;
 pub mod segmentation;
 pub mod sources;
 pub mod state;
+pub mod steer_index;
 pub mod store;
 pub mod types;

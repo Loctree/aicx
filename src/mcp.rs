@@ -162,8 +162,6 @@ impl AicxMcpServer {
         let query = params.query;
         let limit = params.limit.min(50);
         let project = params.project;
-        let store_root = store::store_base_dir()
-            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
 
         // Non-blocking auto-rescan with rate-limit guard.
         if !RESCAN_RUNNING.swap(true, Ordering::SeqCst) {
@@ -187,9 +185,18 @@ impl AicxMcpServer {
             }
         }
 
+        // Try fast search with rmcp_memex first (instant), fallback to brute-force if it fails
         let (results, scanned) =
-            rank::fuzzy_search_store(&store_root, &query, limit, project.as_deref())
-                .map_err(|e| McpError::internal_error(format!("Read store: {e}"), None))?;
+            match crate::memex::fast_memex_search(&query, limit, project.as_deref()).await {
+                Ok((res, scan)) if !res.is_empty() => (res, scan),
+                _ => {
+                    // Fallback to reading all markdown files sequentially (slow)
+                    let store_root = store::store_base_dir()
+                        .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+                    rank::fuzzy_search_store(&store_root, &query, limit, project.as_deref())
+                        .map_err(|e| McpError::internal_error(format!("Read store: {e}"), None))?
+                }
+            };
 
         let json = serde_json::to_string_pretty(&serde_json::json!({
             "scanned": scanned,
@@ -311,8 +318,6 @@ impl AicxMcpServer {
         Parameters(params): Parameters<SteerParams>,
     ) -> Result<CallToolResult, McpError> {
         let limit = params.limit.min(100);
-        let files = store::scan_context_files()
-            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
 
         let (date_lo, date_hi) = if let Some(ref d) = params.date {
             parse_date_filter_mcp(d)
@@ -320,107 +325,23 @@ impl AicxMcpServer {
             (None, None)
         };
 
-        let project_lower = params.project.as_deref().map(str::to_ascii_lowercase);
-        let agent_lower = params.agent.as_deref().map(str::to_ascii_lowercase);
-        let kind_lower = params.kind.as_deref().map(str::to_ascii_lowercase);
-
-        let mut matched: Vec<serde_json::Value> = Vec::new();
-
-        for file in &files {
-            if matched.len() >= limit {
-                break;
-            }
-
-            // Project filter (from StoredContextFile, no sidecar needed)
-            if let Some(ref needle) = project_lower {
-                if !file.project.to_ascii_lowercase().contains(needle) {
-                    continue;
-                }
-            }
-
-            // Agent filter
-            if let Some(ref needle) = agent_lower {
-                if file.agent.to_ascii_lowercase() != *needle {
-                    continue;
-                }
-            }
-
-            // Kind filter
-            if let Some(ref needle) = kind_lower {
-                if file.kind.dir_name() != *needle {
-                    continue;
-                }
-            }
-
-            // Date filter using canonical chunk date (not filesystem mtime)
-            if let Some(ref lo) = date_lo {
-                if file.date_iso.as_str() < lo.as_str() {
-                    continue;
-                }
-            }
-            if let Some(ref hi) = date_hi {
-                if file.date_iso.as_str() > hi.as_str() {
-                    continue;
-                }
-            }
-
-            // run_id / prompt_id require sidecar lookup
-            if params.run_id.is_some() || params.prompt_id.is_some() {
-                let sidecar = store::load_sidecar(&file.path);
-                if let Some(ref sidecar) = sidecar {
-                    if let Some(ref wanted) = params.run_id {
-                        if sidecar.run_id.as_deref() != Some(wanted.as_str()) {
-                            continue;
-                        }
-                    }
-                    if let Some(ref wanted) = params.prompt_id {
-                        if sidecar.prompt_id.as_deref() != Some(wanted.as_str()) {
-                            continue;
-                        }
-                    }
-                    matched.push(serde_json::json!({
-                        "path": file.path.display().to_string(),
-                        "project": file.project,
-                        "agent": file.agent,
-                        "kind": file.kind.dir_name(),
-                        "date": file.date_iso,
-                        "session_id": file.session_id,
-                        "run_id": sidecar.run_id,
-                        "prompt_id": sidecar.prompt_id,
-                        "agent_model": sidecar.agent_model,
-                        "started_at": sidecar.started_at,
-                        "completed_at": sidecar.completed_at,
-                        "token_usage": sidecar.token_usage,
-                        "findings_count": sidecar.findings_count,
-                    }));
-                } else {
-                    continue; // No sidecar means no match for run_id/prompt_id
-                }
-            } else {
-                // No sidecar-specific filters; still include sidecar data if available
-                let sidecar = store::load_sidecar(&file.path);
-                matched.push(serde_json::json!({
-                    "path": file.path.display().to_string(),
-                    "project": file.project,
-                    "agent": file.agent,
-                    "kind": file.kind.dir_name(),
-                    "date": file.date_iso,
-                    "session_id": file.session_id,
-                    "run_id": sidecar.as_ref().and_then(|s| s.run_id.as_deref()),
-                    "prompt_id": sidecar.as_ref().and_then(|s| s.prompt_id.as_deref()),
-                    "agent_model": sidecar.as_ref().and_then(|s| s.agent_model.as_deref()),
-                    "started_at": sidecar.as_ref().and_then(|s| s.started_at.as_deref()),
-                    "completed_at": sidecar.as_ref().and_then(|s| s.completed_at.as_deref()),
-                    "token_usage": sidecar.as_ref().and_then(|s| s.token_usage),
-                    "findings_count": sidecar.as_ref().and_then(|s| s.findings_count),
-                }));
-            }
-        }
+        let metadatas = crate::steer_index::search_steer_index(
+            params.run_id.as_deref(),
+            params.prompt_id.as_deref(),
+            params.agent.as_deref(),
+            params.kind.as_deref(),
+            params.project.as_deref(),
+            date_lo.as_deref(),
+            date_hi.as_deref(),
+            limit,
+        )
+        .await
+        .map_err(|e| McpError::internal_error(format!("Index error: {e}"), None))?;
 
         let json = serde_json::to_string_pretty(&serde_json::json!({
-            "scanned": files.len(),
-            "matched": matched.len(),
-            "items": matched,
+            "scanned": 0,
+            "matched": metadatas.len(),
+            "items": metadatas,
         }))
         .unwrap_or_default();
 

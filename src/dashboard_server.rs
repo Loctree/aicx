@@ -27,7 +27,6 @@ use tokio::sync::RwLock;
 
 use crate::dashboard::{self, DashboardConfig, DashboardStats};
 use crate::rank;
-use crate::store;
 
 /// Guard that prevents concurrent `aicx store` child-process spawns from dashboard search.
 static DASHBOARD_RESCAN_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -801,8 +800,7 @@ fn parse_date_bounds(date: &str) -> (Option<String>, Option<String>) {
 }
 
 fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSearchResponse> {
-    let files = store::scan_context_files()?;
-    let total = files.len();
+    let rt = tokio::runtime::Runtime::new()?;
 
     let (date_lo, date_hi) = if let Some(ref d) = params.date {
         parse_date_bounds(d)
@@ -810,95 +808,97 @@ fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSear
         (None, None)
     };
 
-    let project_lower = params.project.as_deref().map(str::to_ascii_lowercase);
-    let agent_lower = params.agent.as_deref().map(str::to_ascii_lowercase);
-    let kind_lower = params.kind.as_deref().map(str::to_ascii_lowercase);
+    let metadatas = rt.block_on(crate::steer_index::search_steer_index(
+        params.run_id.as_deref(),
+        params.prompt_id.as_deref(),
+        params.agent.as_deref(),
+        params.kind.as_deref(),
+        params.project.as_deref(),
+        date_lo.as_deref(),
+        date_hi.as_deref(),
+        limit,
+    ))?;
 
     let mut items = Vec::new();
 
-    for file in &files {
-        if items.len() >= limit {
-            break;
-        }
+    for meta in metadatas {
+        let path = meta
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let project = meta
+            .get("project")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let agent = meta
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let kind = meta
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let date = meta
+            .get("date")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let session_id = meta
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
-        if let Some(ref needle) = project_lower {
-            if !file.project.to_ascii_lowercase().contains(needle) {
-                continue;
-            }
-        }
-        if let Some(ref needle) = agent_lower {
-            if file.agent.to_ascii_lowercase() != *needle {
-                continue;
-            }
-        }
-        if let Some(ref needle) = kind_lower {
-            if file.kind.dir_name() != *needle {
-                continue;
-            }
-        }
-        if let Some(ref lo) = date_lo {
-            if file.date_iso.as_str() < lo.as_str() {
-                continue;
-            }
-        }
-        if let Some(ref hi) = date_hi {
-            if file.date_iso.as_str() > hi.as_str() {
-                continue;
-            }
-        }
+        let run_id = meta
+            .get("run_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let prompt_id = meta
+            .get("prompt_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let agent_model = meta
+            .get("agent_model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let started_at = meta
+            .get("started_at")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let completed_at = meta
+            .get("completed_at")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let token_usage = meta.get("token_usage").and_then(|v| v.as_u64());
+        let findings_count = meta
+            .get("findings_count")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
 
-        if params.run_id.is_some() || params.prompt_id.is_some() {
-            let sidecar = store::load_sidecar(&file.path);
-            if let Some(ref sc) = sidecar {
-                if let Some(ref wanted) = params.run_id {
-                    if sc.run_id.as_deref() != Some(wanted.as_str()) {
-                        continue;
-                    }
-                }
-                if let Some(ref wanted) = params.prompt_id {
-                    if sc.prompt_id.as_deref() != Some(wanted.as_str()) {
-                        continue;
-                    }
-                }
-                items.push(SteerSearchResult {
-                    path: file.path.display().to_string(),
-                    project: file.project.clone(),
-                    agent: file.agent.clone(),
-                    kind: file.kind.dir_name().to_string(),
-                    date: file.date_iso.clone(),
-                    session_id: file.session_id.clone(),
-                    run_id: sc.run_id.clone(),
-                    prompt_id: sc.prompt_id.clone(),
-                    agent_model: sc.agent_model.clone(),
-                    started_at: sc.started_at.clone(),
-                    completed_at: sc.completed_at.clone(),
-                    token_usage: sc.token_usage,
-                    findings_count: sc.findings_count,
-                });
-            }
-        } else {
-            let sidecar = store::load_sidecar(&file.path);
-            items.push(SteerSearchResult {
-                path: file.path.display().to_string(),
-                project: file.project.clone(),
-                agent: file.agent.clone(),
-                kind: file.kind.dir_name().to_string(),
-                date: file.date_iso.clone(),
-                session_id: file.session_id.clone(),
-                run_id: sidecar.as_ref().and_then(|s| s.run_id.clone()),
-                prompt_id: sidecar.as_ref().and_then(|s| s.prompt_id.clone()),
-                agent_model: sidecar.as_ref().and_then(|s| s.agent_model.clone()),
-                started_at: sidecar.as_ref().and_then(|s| s.started_at.clone()),
-                completed_at: sidecar.as_ref().and_then(|s| s.completed_at.clone()),
-                token_usage: sidecar.as_ref().and_then(|s| s.token_usage),
-                findings_count: sidecar.as_ref().and_then(|s| s.findings_count),
-            });
-        }
+        items.push(SteerSearchResult {
+            path,
+            project,
+            agent,
+            kind,
+            date,
+            session_id,
+            run_id,
+            prompt_id,
+            agent_model,
+            started_at,
+            completed_at,
+            token_usage,
+            findings_count,
+        });
     }
 
     Ok(SteerSearchResponse {
         ok: true,
-        scanned: total,
+        scanned: 0,
         matched: items.len(),
         items,
     })
