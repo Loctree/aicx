@@ -5,8 +5,8 @@
 - normalizes them into a single timeline schema,
 - deduplicates and chunks the timeline into “agent-readable” context files,
 - attaches steering metadata (frontmatter) for selective re-entry by orchestration,
-- optionally syncs those chunks into a semantic index (memex) for vector-based retrieval,
-- optionally bootstraps a repo-local `.ai-context/` workspace for multi-agent workflows.
+- optionally syncs those chunks into a semantic index (memex) for semantic retrieval,
+- exposes those chunks through CLI, MCP, and dashboard search surfaces.
 
 ```mermaid
 flowchart TD
@@ -28,10 +28,10 @@ Library modules (see `src/lib.rs`):
 - `src/store.rs`: central store layout under `~/.aicx/` + `index.json`
 - `src/chunker.rs`: semantic windowing chunker (token heuristic + overlap + highlight extraction)
 - `src/output.rs`: local report writer (`-o`) + optional loctree snapshot inclusion
-- `src/memex.rs`: memex sync (`rmcp-memex index/upsert`) + sync state
+- `src/memex.rs`: memex sync (`rmcp-memex import/upsert`) + sync state
 - `src/redact.rs`: secret redaction (regex engine)
 - `src/sanitize.rs`: path validation for reads/writes (defense against traversal)
-- `src/init.rs`: `.ai-context/` bootstrap + agent dispatch
+- `src/steer_index.rs`: fast metadata index for steering-aware retrieval
 
 Binary orchestration:
 - `src/main.rs`: clap CLI, wires flows together, handles stdout emission (`--emit`).
@@ -53,19 +53,22 @@ High-level sequence (see `src/main.rs::run_extraction`):
 5. Redact secrets (default) via `src/redact.rs` unless `--no-redact-secrets`.
 6. Store-first chunking:
    - group by `(repo-from-cwd, agent, date)`
-   - chunk per group (~1500 tokens, overlap), write `.md` chunks into `~/.ai-contexters/`
+   - chunk per group (~1500 tokens, overlap), write canonical `.md` chunks into `~/.aicx/store/` or `~/.aicx/non-repository-contexts/`
 7. Stdout emission:
    - `--emit none` prints nothing (default for extractors and `store`)
    - `--emit paths` prints stored chunk paths, one per line
    - `--emit json` prints a single JSON payload including `store_paths`
    - `--emit none` prints nothing
 8. Optional local output (`-o`): write a report to the given directory.
-9. Optional memex sync (`--memex`): chunk again and push into memex (see note below).
+9. Optional memex sync (`--memex`): sync the canonical chunks into memex (see note below).
 
 Note on memex sync:
-- `--memex` in extractors creates chunk files in the memex chunks directory and then calls memex sync.
-- These are separate from the “store-first” chunks. This is intentional separation: store chunks are the source of truth for humans/agents to read; memex chunks feed the semantic index for vector-based retrieval.
+- `--memex` reads from the same canonical chunk + sidecar store that the CLI, MCP, and dashboard use.
+- Batch import and per-chunk upsert share the same metadata contract from `.meta.json` sidecars.
 - Memex is an add-on semantic index layered on top of the file store — not primary storage.
+
+Framework note:
+- Repo-local `.ai-context/` artifacts are now owned by higher-level workflow tooling such as `/vc-init`, not by the retired `aicx init` flow.
 
 ## Frontmatter Steering Contract
 
@@ -94,36 +97,18 @@ Frontmatter is not just telemetry — it is part of the steering and selective r
 
 1. Extract selected agents + projects for a lookback window.
 2. Redact secrets (default).
-3. Chunk and write into `~/.ai-contexters/`.
+3. Chunk and write into the canonical `~/.aicx/` store.
 4. Optional memex sync (`--memex`).
-
-## Data Flow: `init`
-
-`init` creates `.ai-context/` in the current repo and optionally runs an agent (see `src/init.rs`):
-
-1. Detect repo root (git root).
-2. Build local context:
-   - extracted memories (via aicx store)
-   - loctree snapshot (requires `loct` in `PATH` or `LOCT_BIN`)
-3. Write `.ai-context/share/artifacts/*`:
-   - `SUMMARY.md` (curated append-only)
-   - `TIMELINE.md` (full append-only)
-   - `TRIAGE.md` (P0/P1/P2)
-   - `prompts/` (task prompts in “Emil Kurier” format)
-4. Optionally dispatch an agent run:
-   - Terminal mode (macOS) or subprocess mode, depending on environment.
 
 ## MCP Surface (`src/mcp.rs`)
 
-The MCP server exposes five tools via stdio and streamable HTTP transports:
+The MCP server exposes three tools via stdio and streamable HTTP transports:
 
-- `aicx_search` — fuzzy text search across stored chunks with quality scoring
-- `aicx_rank` — rank chunks by signal density for a project
-- `aicx_refs` — list stored context file paths filtered by recency
+- `aicx_search` — fuzzy text search across stored chunks with quality scoring; returns compact JSON using the same rich fields as CLI `aicx search --json`
+- `aicx_rank` — rank chunks by signal density for a project as compact JSON
 - `aicx_steer` — retrieve chunks by steering metadata (run_id, prompt_id, agent, kind, project, date) using sidecar data; the primary metadata-aware retrieval path for orchestration
-- `aicx_store` — trigger incremental rescan and centralize new chunks
 
-Recency in `aicx_steer` and `aicx_refs` uses canonical chunk dates from the store layout, not filesystem `mtime` accidents.
+Recency filtering in `aicx_search` and `aicx_steer` uses canonical chunk dates from the store layout, not filesystem `mtime` accidents.
 
 ## Security Model (Pragmatic)
 

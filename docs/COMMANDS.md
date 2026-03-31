@@ -73,7 +73,7 @@ aicx claude -p CodeScribe -H 24 --emit json | jq .
   "total_entries": 123,
   "sessions": ["..."],
   "entries": [{ "...": "..." }],
-  "store_paths": ["~/.ai-contexters/..."]
+  "store_paths": ["~/.aicx/..."]
 }
 ```
 
@@ -143,7 +143,7 @@ aicx extract --format gemini-antigravity ~/.gemini/antigravity/conversations/<uu
 
 ## `aicx store`
 
-Write chunked contexts into the global store (`~/.ai-contexters/`) and optionally sync to memex.
+Write chunked contexts into the global store (`~/.aicx/`) and optionally sync to memex.
 
 ```bash
 aicx store [OPTIONS]
@@ -165,6 +165,39 @@ Example:
 
 ```bash
 aicx store -p CodeScribe --agent claude -H 720 --emit paths
+```
+
+## `aicx search`
+
+Ad-hoc terminal fuzzy search across the `aicx` store. Uses `rmcp-memex` fast index (LanceDB + BM25) if available, falling back to sequential file scans.
+
+```bash
+aicx search [OPTIONS] <QUERY>
+```
+
+Options:
+- `<QUERY>` search query string
+- `-p, --project <PROJECT>` project filter (substring match)
+- `-H, --hours <HOURS>` lookback window (`0` = all time)
+- `-d, --date <DATE>` filter by date (single day, range, or open-ended)
+- `-l, --limit <N>` max results (default: `10`)
+- `-s, --score <SCORE>` minimum quality threshold (`0..=100`)
+- `-j, --json` emit compact JSON instead of plain text
+
+Examples:
+
+```bash
+# Fast semantic search
+aicx search "auth middleware regression"
+
+# Scoped to a project and date range
+aicx search "refactor" -p ai-contexters --date 2026-03-20..2026-03-28
+
+# Compact JSON for agents or scripts
+aicx search "dashboard" -p ai-contexters --score 60 --json
+
+# Search for a specific day mentioned in query
+aicx search "decisions march 2026"
 ```
 
 ## `aicx steer`
@@ -200,6 +233,25 @@ aicx steer --agent claude --date 2026-03-20..2026-03-28
 aicx steer --prompt-id api-redesign_20260327
 ```
 
+## `aicx migrate`
+
+Truthfully rebuild legacy contexts into canonical AICX store or salvage them under legacy-store.
+
+```bash
+aicx migrate [OPTIONS]
+```
+
+Options:
+- `--dry-run` show what would be moved without modifying files
+- `--legacy-root <DIR>` override legacy input store root (default: `~/.ai-contexters`)
+- `--store-root <DIR>` override AICX store root (default: `~/.aicx`)
+
+Example:
+
+```bash
+aicx migrate --dry-run
+```
+
 ## `aicx memex-sync`
 
 Sync stored chunks to `rmcp-memex` semantic index.
@@ -210,7 +262,7 @@ aicx memex-sync [OPTIONS]
 
 Options:
 - `-n, --namespace <NAMESPACE>` vector namespace (default: `ai-contexts`)
-- `--per-chunk` use per-chunk upsert instead of batch index; preserves structured metadata (`project`, `agent`, `date`, `session_id`, `kind`) via sidecars
+- `--per-chunk` use per-chunk upsert instead of batch import; preserves structured metadata via sidecars
 - `--db-path <DB_PATH>` override LanceDB path
 
 Example:
@@ -220,8 +272,8 @@ aicx memex-sync --namespace ai-contexts
 ```
 
 Notes:
-- Default batch sync now enables `rmcp-memex index --preprocess` to strip common boilerplate before embedding.
-- `--per-chunk` is slower, but it keeps metadata-rich upserts ready for future project/agent/date-aware filtering.
+- Default batch sync now uses a metadata-rich import via JSONL, ensuring `project`, `agent`, `date`, and `session_id` are preserved for semantic filtering without the overhead of per-file CLI calls.
+- Recursive indexing is enabled by default to handle the nested canonical store structure.
 
 ## `aicx refs`
 
@@ -245,23 +297,11 @@ aicx refs -H 72 -p CodeScribe
 
 ## `aicx rank`
 
-Rank and filter artifacts by content quality.
+There is currently no `aicx rank` CLI subcommand.
 
-```bash
-aicx rank [OPTIONS] --project <PROJECT>
-```
-
-Options:
-- `-p, --project <PROJECT>` project filter (required)
-- `-H, --hours <HOURS>` lookback window (default: `48`)
-- `--strict` only show chunks scoring >= 5
-- `--top <N>` show only top N bundles
-
-Example:
-
-```bash
-aicx rank -p CodeScribe --strict --top 10
-```
+Ranking is exposed through the MCP surface as `aicx_rank`. For terminal use,
+prefer `aicx search`, `aicx refs --strict`, or the dashboard views until a CLI
+rank surface is intentionally reintroduced.
 
 ## `aicx intents`
 
@@ -316,7 +356,7 @@ Options:
 - `--store-root <DIR>` override store root
 - `--host <HOST>` bind host (default: `127.0.0.1`)
 - `--port <PORT>` bind TCP port (default: `8033`)
-- `--artifact <ARTIFACT>` artifact path written on startup and regeneration
+- `--artifact <ARTIFACT>` legacy compatibility path surfaced in status; not written in server mode
 - `--title <TITLE>` document title
 - `--preview-chars <N>` max preview characters per record
 
@@ -363,32 +403,14 @@ Example:
 aicx serve --transport sse --port 8044
 ```
 
-## `aicx init`
+## `aicx init` (Retired)
 
-Initialize repo context and run an agent.
+`aicx init` has been retired. Context initialisation is now handled by `/vc-init` inside Claude Code.
 
-```bash
-aicx init [OPTIONS]
-```
-
-Options:
-- `-p, --project <PROJECT>` project name override
-- `-a, --agent <AGENT>` `claude` or `codex`
-- `--model <MODEL>` model override
-- `-H, --hours <HOURS>` context horizon (default: `4800`)
-- `--max-lines <MAX_LINES>` max lines per section (default: `1200`)
-- `--user-only` exclude assistant + reasoning messages from context (default: assistant included)
-- `--action <ACTION>` append a focus/action to the prompt
-- `--agent-prompt <PROMPT>` append additional prompt text after core rules (verbatim)
-- `--agent-prompt-file <PATH>` append prompt text loaded from a file (verbatim)
-- `--no-run` build context/prompt only
-- `--no-confirm` skip interactive confirmation
-- `--no-gitignore` do not auto-modify `.gitignore`
-
-Example:
+See: [vibecrafted.io](https://vibecrafted.io/)
 
 ```bash
-aicx init --agent codex --no-confirm --action "Audit memory and propose a plan"
+# aicx init [OPTIONS] -- retired
 ```
 
 ## Exit Codes

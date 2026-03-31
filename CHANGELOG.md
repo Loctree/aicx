@@ -6,14 +6,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [0.5.4] - 2026-03-31
+## [0.5.5] - 2026-03-31
 
 ### Performance
 - **Steer Indexing:** Integrated `rmcp-memex` (LanceDB backend) to dramatically speed up `aicx steer` and `aicx_steer` MCP queries. Metadata searches now take milliseconds instead of seconds by bypassing filesystem sidecar parsing in favor of a columnar metadata index.
 - **Fast Text Search:** Upgraded `aicx_search` MCP tool to use the embedded `BM25Index` and `StorageManager` from `rmcp-memex`. Full-text searches across all stored contexts are now instantaneous, replacing the slow sequential file scans.
 
+### Added
+- **Frontmatter steering metadata** (`workflow_phase`, `mode`, `skill_code`, `framework_version`) on `Chunk` and `ChunkMetadataSidecar`.
+- **`aicx steer` CLI command** — retrieves chunks by steering/sidecar metadata (run_id, prompt_id, agent, kind, project, date range).
+- **`aicx_steer` MCP tool** — same steering-aware retrieval for MCP clients.
+- **`/api/search/steer` dashboard endpoint** — HTTP GET with the same filtering surface.
+- **Live search** with CLI `aicx search` subcommand and real-time result deduplication.
+- **Resizable dashboard** with drag-to-resize panels.
+- **Store progress reporting** on stderr (TTY-gated `Chunking... N/M segments`).
+- Session metadata (agent, model, cwd) included in search output.
+- `cwd` field on `Chunk` for working-directory awareness.
+
 ### Changed
-- `aicx store` now automatically synchronizes newly processed chunks directly into the local `steer_db` LanceDB table.
+- Frontmatter parser now separates `telemetry` from `steering` and strips detected frontmatter from chunk text even when YAML is malformed.
+- Extracted shared types (`types.rs`) to break the `segmentation ↔ store` cycle; `segmentation` no longer depends on `store`.
+- Removed `init` submodule and deprecated `Init` command (returns naturally instead of `process::exit`).
+- Search results now strip aicx boilerplate for cleaner output.
+- Docs: "memory extraction" → "timeline extraction", "vector memory" → "semantic index" across README, ARCHITECTURE, COMMANDS, and help text.
+
+### Removed
+- `src/init.rs` deleted (`git rm`); init flow fully retired.
+
+## [0.5.4] - 2026-03-31 (Pre-release)
+
+### Fixed
+- Sync result reporting precise enough for framework orchestration.
+- Hardened `aicx` to `rmcp-memex` transport seam.
 
 ## [0.5.3] - 2026-03-30
 

@@ -6,8 +6,7 @@ Timeline extraction + context distillation for AI agent sessions.
 - a clean, deduped timeline,
 - chunked “agent-readable” context stored in `~/.aicx/`,
 - steering metadata (frontmatter) for selective re-entry by orchestration,
-- optional `.ai-context/` artifacts for repo-level “bring new agent up to speed” workflows,
-- optional sync into memex (semantic index for vector-based retrieval).
+- optional sync into memex (semantic index for semantic retrieval).
 
 Supported sources:
 - Claude Code: `~/.claude/projects/*/*.jsonl`
@@ -54,7 +53,7 @@ cargo install --path . --locked --bin aicx --bin aicx-mcp
 
 ## Quickstart
 
-Store recent context from the last 4 hours. Extractor/store commands are quiet on stdout by default (`--emit none`), but still write chunked context into `~/.ai-contexters/`.
+Store recent context from the last 4 hours. Extractor/store commands are quiet on stdout by default (`--emit none`), but still write chunked context into `~/.aicx/`.
 
 ```bash
 aicx all -H 4 --incremental
@@ -73,24 +72,18 @@ Pipe one JSON payload (handy for automation):
 aicx all -H 4 --emit json | jq '.store_paths'
 ```
 
-Bootstrap a repo context (`.ai-context/`) and run an agent:
-
-```bash
-aicx init --agent codex --no-confirm --action "Map the repo and propose next steps"
-```
-
 ## What Gets Written Where
 
 Central store (always, for extractors):
-- `~/.ai-contexters/<project>/<date>/<time>_<agent>-<seq>.md`
-- `~/.ai-contexters/index.json`
-- `~/.ai-contexters/memex/chunks/` (when memex is used)
+- `~/.aicx/store/<organization>/<repository>/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
+- `~/.aicx/non-repository-contexts/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
+- `~/.aicx/index.json`
+- `~/.aicx/memex/sync_state.json` (when memex is used)
 
-Repo-local init artifacts:
+Framework-owned repo-local context artifacts (not written by the `aicx` CLI itself):
 - `.ai-context/share/artifacts/SUMMARY.md`
 - `.ai-context/share/artifacts/TIMELINE.md`
 - `.ai-context/share/artifacts/TRIAGE.md`
-- `.ai-context/share/artifacts/prompts/`
 
 ## Common Workflows
 
@@ -129,7 +122,7 @@ aicx memex-sync --namespace ai-contexts
 aicx memex-sync --namespace ai-contexts --per-chunk
 ```
 
-Batch sync preprocesses common boilerplate before indexing. Use `--per-chunk` when you want richer per-document metadata forwarded to memex (`project`, `agent`, `date`, `session_id`, `kind`).
+Default batch sync now uses a metadata-rich JSONL import, preserving `project`, `agent`, `date`, `session_id`, and `kind` without the overhead of per-file CLI calls. Use `--per-chunk` when you explicitly want single-document upserts.
 
 Single-session Gemini Antigravity extract (conversation artifacts first, explicit step-output fallback):
 
@@ -143,7 +136,7 @@ aicx extract --format gemini-antigravity \
 
 - `docs/ARCHITECTURE.md` (module map + data flows)
 - `docs/COMMANDS.md` (exact CLI reference + examples)
-- `docs/STORE_LAYOUT.md` (store + `.ai-context/` layouts)
+- `docs/STORE_LAYOUT.md` (store + framework-owned `.ai-context/` layouts)
 - `docs/REDACTION.md` (secret redaction, regex engine notes)
 - `docs/DISTILLATION.md` (chunking/distillation model + tuning ideas)
 - `docs/RELEASES.md` (release/distribution workflow + maintainer checklist)
@@ -151,7 +144,7 @@ aicx extract --format gemini-antigravity \
 ## Notes
 
 - Secrets are redacted by default. Disable only if you know what you’re doing: `--no-redact-secrets`.
-- `init` expects `loct` in `PATH` (or `LOCT_BIN=/full/path/to/loct`).
+- Framework integration expects `aicx` or `aicx-mcp` in `PATH`.
 
 ---
 

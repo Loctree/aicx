@@ -1,10 +1,8 @@
 # Store Layout
 
-`aicx` writes two kinds of artifacts:
-- Central store under `~/.ai-contexters/` (cross-repo, global, machine-local).
-- Repo-local init workspace under `.ai-context/` (meant for collaboration within a repo).
+`aicx` writes artifacts to the central store under `~/.aicx/` (cross-repo, global, machine-local).
 
-## Central Store: `~/.ai-contexters/`
+## Central Store: `~/.aicx/`
 
 Created and managed by `src/store.rs`.
 
@@ -13,54 +11,56 @@ Created and managed by `src/store.rs`.
 Contexts are chunked and stored by project and date:
 
 ```
-~/.ai-contexters/
+~/.aicx/
   index.json
-  <project>/
-    2026-02-08/
-      031122_claude-001.md
-      031122_claude-002.md
-      031122_codex-001.md
+  store/
+    <organization>/
+      <repository>/
+        <YYYY_MMDD>/
+          <kind>/
+            <agent>/
+              <YYYY_MMDD>_<agent>_<session-id>_<chunk>.md
+              <YYYY_MMDD>_<agent>_<session-id>_<chunk>.meta.json
+  non-repository-contexts/
+    <YYYY_MMDD>/
+      <kind>/
+        <agent>/
+          <YYYY_MMDD>_<agent>_<session-id>_<chunk>.md
   memex/
-    chunks/
-      <chunk_id>.txt
+    sync_state.json
+  steer_db/
+    (LanceDB metadata index)
 ```
 
 Notes:
-- `<project>` is derived from entry `cwd` via `repo_name_from_cwd` (`src/sources.rs`), so mixed runs across repos end up separated automatically.
-- Chunk filenames are tied to the run timestamp (`HHMMSS`) and chunk sequence (`001`, `002`, ...).
-- The content is “agent-readable” (compact, line-based, consistent header) and safe-truncated for huge messages (UTF-8 safe).
+- Repository identity is derived from entry `cwd` via `repo_name_from_cwd` (`src/sources.rs`).
+- Chunks are stored in a canonical hierarchy: `store/<org>/<repo>/<date>/<kind>/<agent>/`.
+- If no repository can be inferred, chunks fall back to `non-repository-contexts/`.
+- Each `.md` chunk has a sibling `.meta.json` sidecar containing steering and telemetry metadata.
+- `steer_db` is a fast LanceDB-backed index of all sidecar metadata, enabling millisecond filtering by `run_id`, `prompt_id`, `agent`, etc.
 
 ### `index.json`
 
 `index.json` is a manifest used to quickly list stored projects, dates and totals.
 It is updated on every store write.
 
-### `memex/chunks/`
+### Memex Integration
 
-`memex/chunks/` contains pre-chunked `.txt` files written by `src/chunker.rs::write_chunks_to_dir`.
-Each chunk also gets a sibling `.meta.json` sidecar with structured metadata (`project`, `agent`, `date`, `session_id`, `kind`).
-
-These are meant for indexing via `rmcp-memex`:
-- batch mode: `rmcp-memex index <dir> ...`
-- per-chunk mode: `rmcp-memex upsert <chunk_id> ...`
-
-The `aicx memex-sync` command wraps this behavior and maintains a minimal sync state (see `src/memex.rs`).
-Batch sync uses `rmcp-memex index --preprocess`; per-chunk sync reads the sidecars and forwards structured metadata with each upsert.
+The `aicx memex-sync` command (and `--memex` flag) syncs stored chunks to `rmcp-memex`:
+- It maintains sync state in `~/.aicx/memex/sync_state.json`.
+- It performs metadata-rich imports, ensuring `project`, `agent`, `date`, `session_id`, and `kind` are preserved in the semantic index.
 
 ## Identity Model & Compatibility Rules (v0.5.0+)
 
-Historically, `aicx` grouped contexts directly extracted from specific files under a file-centric identity (e.g., `file: session.jsonl`). Starting in v0.5.0, AICX has shifted to a strictly repo-centric identity model:
-- Project directories and memex namespaces are now grouped by the inferred repository name first.
-- The source file path is retained only as secondary metadata (`provenance`).
+Historically, `aicx` grouped contexts under a file-centric identity (e.g., `file: session.jsonl`). Starting in v0.5.0, AICX shifted to a strictly repo-centric identity model.
 
 **Compatibility Rules:**
-- If you have scripts, queries, or memex pipelines that rely on the old `file: <name>` groupings, you should update them to query by your repository name.
 - Older stored artifacts are NOT automatically orphaned or silently broken on read. However, they will no longer be updated.
-- To maintain a single coherent history, run `aicx migrate`. This command will cleanly move your older `file: *` contexts into the correct repository-named directories and update your `index.json`.
+- To maintain a single coherent history, run `aicx migrate`. This command will cleanly move your older `~/.ai-contexters` contexts into the correct repository-named directories in `~/.aicx/` and update your `index.json`.
 
-## Repo Init Workspace: `.ai-context/`
+## Repo-local Context Artifacts: `.ai-context/`
 
-Created by `aicx init` (see `src/init.rs`).
+While `aicx init` has been retired in favor of framework-level orchestration (`/vc-init`), the framework still produces repo-local artifacts for agent awareness:
 
 ```
 .ai-context/
@@ -69,18 +69,8 @@ Created by `aicx init` (see `src/init.rs`).
       SUMMARY.md
       TIMELINE.md
       TRIAGE.md
-      prompts/
-  local/
-    config/
-    context/
-    logs/
-    memex/
-    prompts/
-    runs/
-    state/
 ```
 
 Recommended sharing rules:
-- Commit `share/artifacts/SUMMARY.md` and `share/artifacts/TIMELINE.md` by default.
-- Decide case-by-case for `TRIAGE.md` and `prompts/` (often useful for multi-agent teams).
-- Keep `.ai-context/local/` uncommitted.
+- Commit `share/artifacts/SUMMARY.md` and `share/artifacts/TIMELINE.md` to help onboarding new agents.
+- Keep other artifacts local or share case-by-case.
