@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use dirs;
 use rmcp_memex::compute_content_hash;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -62,8 +62,31 @@ pub struct MemexSyncState {
     pub last_synced: Option<DateTime<Utc>>,
     /// Set of chunk IDs already pushed to memex.
     pub synced_chunks: HashSet<String>,
+    /// Stable hash of the last synced payload for each chunk ID.
+    ///
+    /// The payload includes the canonical chunk text plus sidecar-owned
+    /// metadata, so metadata-only changes still force a real refresh.
+    #[serde(default)]
+    pub chunk_payload_hashes: HashMap<String, String>,
     /// Total number of pushes across all syncs.
     pub total_pushes: usize,
+}
+
+impl MemexSyncState {
+    fn knows_chunk(&self, chunk_id: &str) -> bool {
+        self.synced_chunks.contains(chunk_id) || self.chunk_payload_hashes.contains_key(chunk_id)
+    }
+
+    fn payload_matches(&self, chunk_id: &str, payload_hash: &str) -> bool {
+        self.chunk_payload_hashes
+            .get(chunk_id)
+            .is_some_and(|stored| stored == payload_hash)
+    }
+
+    fn record_synced_payload(&mut self, chunk_id: String, payload_hash: String) {
+        self.synced_chunks.insert(chunk_id.clone());
+        self.chunk_payload_hashes.insert(chunk_id, payload_hash);
+    }
 }
 
 /// Result of a sync operation.
@@ -90,6 +113,13 @@ struct ImportStats {
     imported: usize,
     skipped: usize,
     errors: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SyncCandidate {
+    path: PathBuf,
+    id: String,
+    payload_hash: String,
 }
 
 // ============================================================================
@@ -119,7 +149,11 @@ pub fn load_sync_state() -> MemexSyncState {
         Err(_) => return MemexSyncState::default(),
     };
 
-    serde_json::from_str(&contents).unwrap_or_default()
+    let mut state: MemexSyncState = serde_json::from_str(&contents).unwrap_or_default();
+    state
+        .synced_chunks
+        .extend(state.chunk_payload_hashes.keys().cloned());
+    state
 }
 
 /// Persist sync state to disk.
@@ -334,6 +368,29 @@ fn parse_import_stats(output: &str) -> ImportStats {
     stats
 }
 
+fn build_sync_candidate(path: &Path) -> Result<SyncCandidate> {
+    let validated_path = sanitize::validate_read_path(path)?;
+    let id = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let text = sanitize::read_to_string_validated(&validated_path)?;
+    let payload_hash = chunk_payload_hash(&validated_path, &id, &text)?;
+
+    Ok(SyncCandidate {
+        path: path.to_path_buf(),
+        id,
+        payload_hash,
+    })
+}
+
+fn chunk_payload_hash(chunk_path: &Path, chunk_id: &str, text: &str) -> Result<String> {
+    let record = chunk_import_record(chunk_path, chunk_id, text);
+    let serialized =
+        serde_json::to_string(&record).context("Failed to serialize memex import payload")?;
+    Ok(compute_content_hash(&serialized))
+}
+
 #[cfg(test)]
 fn chunk_sidecar_path(chunk_path: &Path) -> PathBuf {
     chunk_path.with_extension("meta.json")
@@ -525,10 +582,11 @@ pub fn sync_chunk_single(
 // High-level sync
 // ============================================================================
 
-/// Sync only new chunks (not previously synced) to memex.
+/// Sync new or changed canonical chunks to memex.
 ///
-/// Loads sync state, determines which chunk files are new,
-/// syncs them via batch mode, and updates state.
+/// Sync state tracks the last payload hash per chunk ID, so stable IDs do not
+/// hide real content or sidecar metadata changes. New IDs go through batch
+/// import when available; changed IDs are refreshed with explicit upserts.
 pub fn sync_new_chunk_paths(chunk_paths: &[PathBuf], config: &MemexConfig) -> Result<SyncResult> {
     let mut state = load_sync_state();
 
@@ -542,85 +600,115 @@ pub fn sync_new_chunk_paths(chunk_paths: &[PathBuf], config: &MemexConfig) -> Re
         .cloned()
         .collect();
 
-    let new_files: Vec<PathBuf> = all_files
-        .iter()
-        .filter(|p| {
-            let id = p
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            !state.synced_chunks.contains(&id)
-        })
-        .cloned()
-        .collect();
+    let mut import_candidates = Vec::new();
+    let mut upsert_candidates = Vec::new();
+    let mut candidate_errors = Vec::new();
+    let mut exact_match_skips = 0usize;
 
-    if new_files.is_empty() {
+    for file in &all_files {
+        match build_sync_candidate(file) {
+            Ok(candidate) => {
+                if state.payload_matches(&candidate.id, &candidate.payload_hash) {
+                    exact_match_skips += 1;
+                } else if state.knows_chunk(&candidate.id) {
+                    upsert_candidates.push(candidate);
+                } else {
+                    import_candidates.push(candidate);
+                }
+            }
+            Err(e) => {
+                let id = file
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                candidate_errors.push(format!("{}: {}", id, e));
+            }
+        }
+    }
+
+    if import_candidates.is_empty() && upsert_candidates.is_empty() {
         return Ok(SyncResult {
             chunks_pushed: 0,
-            chunks_skipped: all_files.len(),
-            errors: vec![],
+            chunks_skipped: exact_match_skips,
+            errors: candidate_errors,
         });
     }
 
-    let (result, synced_files): (SyncResult, Vec<PathBuf>) = if config.batch_mode {
-        let result = sync_chunks_import(&new_files, config)?;
-        let can_advance_state = result.errors.is_empty()
-            && result.chunks_pushed + result.chunks_skipped == new_files.len();
-        let synced_files = if can_advance_state {
-            new_files.clone()
-        } else {
-            Vec::new()
-        };
-        (result, synced_files)
-    } else {
-        let mut result = SyncResult::default();
-        let mut synced_files = Vec::new();
-        for file in &new_files {
-            let id = file
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let validated_file = match sanitize::validate_read_path(file) {
-                Ok(p) => p,
-                Err(e) => {
-                    result.errors.push(format!("{}: {}", id, e));
-                    continue;
-                }
-            };
-            let text = match fs::read_to_string(&validated_file) {
-                Ok(t) => t,
-                Err(e) => {
-                    result.errors.push(format!("{}: {}", id, e));
-                    continue;
-                }
-            };
+    let mut result = SyncResult {
+        chunks_pushed: 0,
+        chunks_skipped: exact_match_skips,
+        errors: candidate_errors,
+    };
+    let mut synced_candidates = Vec::new();
 
-            let metadata = chunk_metadata_for_upsert(&validated_file, &id, &text);
+    if config.batch_mode {
+        if !import_candidates.is_empty() {
+            let import_paths: Vec<PathBuf> = import_candidates
+                .iter()
+                .map(|candidate| candidate.path.clone())
+                .collect();
+            let import_result = sync_chunks_import(&import_paths, config)?;
+            let can_advance_state = import_result.errors.is_empty()
+                && import_result.chunks_pushed + import_result.chunks_skipped
+                    == import_candidates.len();
 
-            match sync_chunk_single(&id, &text, &metadata, config) {
-                Ok(()) => {
-                    result.chunks_pushed += 1;
-                    synced_files.push(file.clone());
-                }
-                Err(e) => result.errors.push(format!("{}: {}", id, e)),
+            result.chunks_pushed += import_result.chunks_pushed;
+            result.chunks_skipped += import_result.chunks_skipped;
+            result.errors.extend(import_result.errors);
+
+            if can_advance_state {
+                synced_candidates.extend(import_candidates.clone());
             }
         }
-        (result, synced_files)
-    };
+    } else {
+        upsert_candidates.extend(import_candidates.clone());
+    }
+
+    for candidate in &upsert_candidates {
+        let validated_file = match sanitize::validate_read_path(&candidate.path) {
+            Ok(p) => p,
+            Err(e) => {
+                result.errors.push(format!("{}: {}", candidate.id, e));
+                continue;
+            }
+        };
+        let text = match fs::read_to_string(&validated_file) {
+            Ok(t) => t,
+            Err(e) => {
+                result.errors.push(format!("{}: {}", candidate.id, e));
+                continue;
+            }
+        };
+
+        let metadata = chunk_metadata_for_upsert(&validated_file, &candidate.id, &text);
+
+        match sync_chunk_single(&candidate.id, &text, &metadata, config) {
+            Ok(()) => {
+                result.chunks_pushed += 1;
+                synced_candidates.push(candidate.clone());
+            }
+            Err(e) => result.errors.push(format!("{}: {}", candidate.id, e)),
+        }
+    }
 
     if let Ok(rt) = tokio::runtime::Runtime::new() {
-        let path_refs: Vec<&PathBuf> = new_files.iter().collect();
+        let changed_paths: Vec<PathBuf> = import_candidates
+            .iter()
+            .map(|candidate| candidate.path.clone())
+            .chain(
+                upsert_candidates
+                    .iter()
+                    .map(|candidate| candidate.path.clone()),
+            )
+            .collect();
+        let path_refs: Vec<&PathBuf> = changed_paths.iter().collect();
         if let Err(e) = rt.block_on(crate::steer_index::sync_steer_index(&path_refs)) {
             tracing::warn!("Failed to sync steer index: {}", e);
         }
     }
 
-    for file in &synced_files {
-        let id = file
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        state.synced_chunks.insert(id);
+    for candidate in synced_candidates {
+        state.record_synced_payload(candidate.id, candidate.payload_hash);
     }
     state.last_synced = Some(Utc::now());
     state.total_pushes += result.chunks_pushed;
@@ -868,10 +956,15 @@ mod tests {
         let mut synced_chunks = HashSet::new();
         synced_chunks.insert("chunk_001".to_string());
         synced_chunks.insert("chunk_002".to_string());
+        let chunk_payload_hashes = HashMap::from([
+            ("chunk_001".to_string(), "hash-1".to_string()),
+            ("chunk_002".to_string(), "hash-2".to_string()),
+        ]);
 
         let state = MemexSyncState {
             last_synced: Some(Utc::now()),
             synced_chunks,
+            chunk_payload_hashes,
             total_pushes: 42,
         };
 
@@ -882,6 +975,13 @@ mod tests {
         assert_eq!(restored.synced_chunks.len(), 2);
         assert!(restored.synced_chunks.contains("chunk_001"));
         assert!(restored.synced_chunks.contains("chunk_002"));
+        assert_eq!(
+            restored
+                .chunk_payload_hashes
+                .get("chunk_001")
+                .map(String::as_str),
+            Some("hash-1")
+        );
         assert_eq!(restored.total_pushes, 42);
     }
 
@@ -890,12 +990,32 @@ mod tests {
         let mut state = MemexSyncState::default();
         assert!(state.synced_chunks.is_empty());
 
-        state.synced_chunks.insert("a".to_string());
+        state.record_synced_payload("a".to_string(), "hash-a".to_string());
         assert!(state.synced_chunks.contains("a"));
+        assert_eq!(
+            state.chunk_payload_hashes.get("a").map(String::as_str),
+            Some("hash-a")
+        );
         assert!(!state.synced_chunks.contains("b"));
 
-        state.synced_chunks.insert("b".to_string());
+        state.record_synced_payload("b".to_string(), "hash-b".to_string());
         assert_eq!(state.synced_chunks.len(), 2);
+    }
+
+    #[test]
+    fn test_sync_state_deserializes_legacy_payload_without_hashes() {
+        let json = r#"{
+          "last_synced":"2026-03-31T12:00:00Z",
+          "synced_chunks":["chunk_001"],
+          "total_pushes":1
+        }"#;
+
+        let state: MemexSyncState = serde_json::from_str(json).unwrap();
+
+        assert!(state.synced_chunks.contains("chunk_001"));
+        assert!(state.chunk_payload_hashes.is_empty());
+        assert!(state.knows_chunk("chunk_001"));
+        assert!(!state.payload_matches("chunk_001", "new-hash"));
     }
 
     #[test]
@@ -1013,6 +1133,58 @@ mod tests {
 
         assert_eq!(record.id, "chunk");
         assert_eq!(record.content_hash, compute_content_hash("body"));
+    }
+
+    #[test]
+    fn test_chunk_payload_hash_changes_when_sidecar_changes() {
+        let tmp =
+            std::env::temp_dir().join(format!("ai-ctx-memex-payload-hash-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let chunk_path = tmp.join("chunk.txt");
+        fs::write(&chunk_path, "body").unwrap();
+        fs::write(
+            chunk_sidecar_path(&chunk_path),
+            serde_json::to_vec_pretty(&crate::chunker::ChunkMetadataSidecar {
+                id: "chunk".to_string(),
+                project: "prview-rs".to_string(),
+                agent: "claude".to_string(),
+                date: "2026-03-24".to_string(),
+                session_id: "sess-1".to_string(),
+                cwd: Some("/Users/tester/workspaces/prview-rs".to_string()),
+                kind: crate::store::Kind::Conversations,
+                run_id: Some("mrbl-001".to_string()),
+                prompt_id: Some("api-redesign_20260327".to_string()),
+                agent_model: Some("gpt-5.4".to_string()),
+                started_at: Some("2026-03-27T10:00:00Z".to_string()),
+                completed_at: Some("2026-03-27T10:01:00Z".to_string()),
+                token_usage: Some(1234),
+                findings_count: Some(4),
+                workflow_phase: Some("implement".to_string()),
+                mode: Some("session-first".to_string()),
+                skill_code: Some("vc-workflow".to_string()),
+                framework_version: Some("2026-03".to_string()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let first = chunk_payload_hash(&chunk_path, "chunk", "body").unwrap();
+
+        let mut updated_sidecar = crate::store::load_sidecar(&chunk_path).unwrap();
+        updated_sidecar.prompt_id = Some("api-redesign_20260328".to_string());
+        fs::write(
+            chunk_sidecar_path(&chunk_path),
+            serde_json::to_vec_pretty(&updated_sidecar).unwrap(),
+        )
+        .unwrap();
+
+        let second = chunk_payload_hash(&chunk_path, "chunk", "body").unwrap();
+
+        assert_ne!(first, second);
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

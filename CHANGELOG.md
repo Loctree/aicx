@@ -8,36 +8,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.5.5] - 2026-03-31
 
-### Performance
-- **Steer Indexing:** Integrated `rmcp-memex` (LanceDB backend) to dramatically speed up `aicx steer` and `aicx_steer` MCP queries. Metadata searches now take milliseconds instead of seconds by bypassing filesystem sidecar parsing in favor of a columnar metadata index.
-- **Fast Text Search:** Upgraded `aicx_search` MCP tool to use the embedded `BM25Index` and `StorageManager` from `rmcp-memex`. Full-text searches across all stored contexts are now instantaneous, replacing the slow sequential file scans.
-
 ### Added
-- **Frontmatter steering metadata** (`workflow_phase`, `mode`, `skill_code`, `framework_version`) on `Chunk` and `ChunkMetadataSidecar`.
-- **`aicx steer` CLI command** — retrieves chunks by steering/sidecar metadata (run_id, prompt_id, agent, kind, project, date range).
 - **`aicx_steer` MCP tool** — same steering-aware retrieval for MCP clients.
-- **`/api/search/steer` dashboard endpoint** — HTTP GET with the same filtering surface.
-- **Live search** with CLI `aicx search` subcommand and real-time result deduplication.
-- **Resizable dashboard** with drag-to-resize panels.
-- **Store progress reporting** on stderr (TTY-gated `Chunking... N/M segments`).
-- Session metadata (agent, model, cwd) included in search output.
-- `cwd` field on `Chunk` for working-directory awareness.
+- **Fast text search via `rmcp-memex` internals** for `aicx_search`, using the embedded BM25 + LanceDB path before falling back to sequential scans.
+- **`/api/search/steer` dashboard endpoint** with the same metadata-aware filters as CLI/MCP steering retrieval.
+- **Manifest portability gate** in `make check` / release readiness, rejecting local path dependencies before publish.
 
 ### Changed
-- Frontmatter parser now separates `telemetry` from `steering` and strips detected frontmatter from chunk text even when YAML is malformed.
-- Extracted shared types (`types.rs`) to break the `segmentation ↔ store` cycle; `segmentation` no longer depends on `store`.
-- Removed `init` submodule and deprecated `Init` command (returns naturally instead of `process::exit`).
-- Search results now strip aicx boilerplate for cleaner output.
-- Docs: "memory extraction" → "timeline extraction", "vector memory" → "semantic index" across README, ARCHITECTURE, COMMANDS, and help text.
+- CLI surface was simplified around the live product shape: `aicx search` became a first-class terminal command, `aicx init` was retired into a compatibility shim, and main dispatch/help text were updated accordingly.
+- Dashboard server mode now serves a server-shell UI with API-backed regeneration instead of pretending to regenerate a static artifact.
+- `install.sh` now shows live compile progress, completes full bootstrap, and detects legacy store layouts more honestly.
+- Public docs were aligned with the real doctrine: timeline extraction + semantic index wording, current CLI commands, and internal planning docs moved under `docs/internal/`.
+- `rmcp-memex` now comes from crates.io in release packaging, keeping the install/publish path portable.
 
-### Removed
-- `src/init.rs` deleted (`git rm`); init flow fully retired.
+### Performance
+- **Steer indexing remains fast at runtime** via the `rmcp-memex` LanceDB-backed metadata index instead of repeated sidecar scans.
+- **Search output now keeps richer session metadata** (agent, model, cwd) without falling back to slower filesystem-heavy read paths.
 
 ## [0.5.4] - 2026-03-31 (Pre-release)
 
 ### Fixed
-- Sync result reporting precise enough for framework orchestration.
-- Hardened `aicx` to `rmcp-memex` transport seam.
+- Sync result reporting became precise enough for framework orchestration (`pushed`, `skipped`, `failed`).
+- Hardened the `aicx` to `rmcp-memex` transport seam around one canonical chunk + sidecar metadata contract.
 
 ## [0.5.3] - 2026-03-30
 

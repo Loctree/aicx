@@ -1,5 +1,7 @@
 use serde_json::{Value, json};
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,12 +48,68 @@ fn write_codex_history(
 }
 
 fn run_aicx(home: &Path, args: &[&str]) -> Output {
+    run_aicx_with_env(home, args, &[])
+}
+
+fn run_aicx_with_env(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     fs::create_dir_all(home).expect("create temp HOME");
-    Command::new(env!("CARGO_BIN_EXE_aicx"))
-        .args(args)
-        .env("HOME", home)
-        .output()
-        .expect("run aicx")
+    let mut command = Command::new(env!("CARGO_BIN_EXE_aicx"));
+    command.args(args).env("HOME", home);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.output().expect("run aicx")
+}
+
+#[cfg(unix)]
+fn write_fake_rmcp_memex(path: &Path) {
+    write_file(
+        path,
+        r#"#!/bin/sh
+if [ -n "${AICX_MEMEX_LOG_PATH:-}" ]; then
+  echo "$*" >> "$AICX_MEMEX_LOG_PATH"
+fi
+
+if [ "$1" = "--version" ]; then
+  echo "rmcp-memex test stub"
+  exit 0
+fi
+
+if [ "$1" = "import" ]; then
+  input=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -i)
+        shift
+        input="$1"
+        ;;
+    esac
+    shift
+  done
+  count=0
+  if [ -n "$input" ] && [ -f "$input" ]; then
+    count=$(wc -l < "$input" | tr -d '[:space:]')
+  fi
+  printf 'Imported: %s documents\n' "$count"
+  printf 'Skipped: 0\n'
+  printf 'Errors: 0\n'
+  exit 0
+fi
+
+if [ "$1" = "upsert" ]; then
+  exit 0
+fi
+
+echo "unsupported rmcp-memex invocation: $*" >&2
+exit 1
+"#,
+    );
+
+    let mut permissions = fs::metadata(path)
+        .expect("stat fake rmcp-memex")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("chmod fake rmcp-memex");
 }
 
 fn assert_success(output: &Output) {
@@ -239,6 +297,173 @@ fn store_cli_store_command_emits_repo_and_non_repo_canonical_roots() {
             .any(|path| { path.starts_with(home.join(".aicx").join("non-repository-contexts")) })
     );
     assert!(store_paths.iter().all(|path| path.exists()));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn store_cli_memex_updates_shared_sync_state() {
+    let root = unique_test_dir("store-command-memex");
+    let home = root.join("home");
+    let repo_root = home.join("hosted").join("VetCoders").join("ai-contexters");
+    let history = home.join(".codex").join("history.jsonl");
+    let bin_dir = root.join("bin");
+    let stub_path = bin_dir.join("rmcp-memex");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs() as i64;
+
+    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
+    fs::create_dir_all(&bin_dir).expect("create fake bin dir");
+    write_fake_rmcp_memex(&stub_path);
+    write_codex_history(
+        &history,
+        "memex-store-sess",
+        Some(&repo_root),
+        &[
+            ("user", now - 120, "Please sync this seam to memex."),
+            ("assistant", now - 110, "Sending canonical chunks now."),
+        ],
+    );
+
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = run_aicx_with_env(
+        &home,
+        &[
+            "store", "--agent", "codex", "-H", "24", "--memex", "--emit", "json",
+        ],
+        &[("PATH", &path_env)],
+    );
+    let payload = parse_stdout_json(&output);
+    let store_paths = json_paths(&payload, "store_paths");
+    assert_eq!(store_paths.len(), 1);
+
+    let sync_state_path = home.join(".aicx").join("memex").join("sync_state.json");
+    let sync_state: ai_contexters::memex::MemexSyncState =
+        serde_json::from_str(&fs::read_to_string(&sync_state_path).expect("read memex sync state"))
+            .expect("parse memex sync state");
+
+    let chunk_id = store_paths[0]
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .expect("chunk file stem");
+    assert_eq!(sync_state.total_pushes, 1);
+    assert!(sync_state.last_synced.is_some());
+    assert!(sync_state.synced_chunks.contains(chunk_id));
+    assert!(sync_state.chunk_payload_hashes.contains_key(chunk_id));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn store_cli_memex_resyncs_changed_chunk_payloads() {
+    let root = unique_test_dir("store-command-memex-resync");
+    let home = root.join("home");
+    let repo_root = home.join("hosted").join("VetCoders").join("ai-contexters");
+    let history = home.join(".codex").join("history.jsonl");
+    let bin_dir = root.join("bin");
+    let stub_path = bin_dir.join("rmcp-memex");
+    let memex_log = root.join("memex.log");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs() as i64;
+
+    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
+    fs::create_dir_all(&bin_dir).expect("create fake bin dir");
+    write_fake_rmcp_memex(&stub_path);
+
+    write_codex_history(
+        &history,
+        "memex-store-sess",
+        Some(&repo_root),
+        &[
+            ("user", now - 120, "Please sync this seam to memex."),
+            ("assistant", now - 110, "Sending canonical chunks now."),
+        ],
+    );
+
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let log_env = memex_log.display().to_string();
+    let envs = [
+        ("PATH", path_env.as_str()),
+        ("AICX_MEMEX_LOG_PATH", log_env.as_str()),
+    ];
+
+    let first = run_aicx_with_env(
+        &home,
+        &[
+            "store", "--agent", "codex", "-H", "24", "--memex", "--emit", "json",
+        ],
+        &envs,
+    );
+    let first_payload = parse_stdout_json(&first);
+    let store_paths = json_paths(&first_payload, "store_paths");
+    assert_eq!(store_paths.len(), 1);
+
+    write_codex_history(
+        &history,
+        "memex-store-sess",
+        Some(&repo_root),
+        &[
+            ("user", now - 120, "Please sync this seam to memex."),
+            (
+                "assistant",
+                now - 110,
+                "Sending canonical chunks now, with updated steering metadata.",
+            ),
+        ],
+    );
+
+    let second = run_aicx_with_env(
+        &home,
+        &[
+            "store", "--agent", "codex", "-H", "24", "--memex", "--emit", "json",
+        ],
+        &envs,
+    );
+    assert_success(&second);
+    let second_stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        second_stderr.contains("Memex: 1 pushed, 0 skipped"),
+        "expected changed chunk to re-sync\nstderr:\n{}",
+        second_stderr
+    );
+
+    let sync_state_path = home.join(".aicx").join("memex").join("sync_state.json");
+    let sync_state: ai_contexters::memex::MemexSyncState =
+        serde_json::from_str(&fs::read_to_string(&sync_state_path).expect("read memex sync state"))
+            .expect("parse memex sync state");
+
+    let chunk_id = store_paths[0]
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .expect("chunk file stem");
+    assert_eq!(sync_state.total_pushes, 2);
+    assert!(sync_state.chunk_payload_hashes.contains_key(chunk_id));
+
+    let log = fs::read_to_string(&memex_log).expect("read memex log");
+    assert!(
+        log.lines().any(|line| line.starts_with("import ")),
+        "expected initial batch import\nlog:\n{}",
+        log
+    );
+    assert!(
+        log.lines().any(|line| line.starts_with("upsert ")),
+        "expected changed chunk to use upsert\nlog:\n{}",
+        log
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

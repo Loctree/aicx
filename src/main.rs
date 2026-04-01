@@ -428,10 +428,6 @@ enum Commands {
         #[arg(long, default_value = "8033")]
         port: u16,
 
-        /// Legacy compatibility path retained for status surfaces; not written in server mode
-        #[arg(long, default_value = "aicx-dashboard.html")]
-        artifact: PathBuf,
-
         /// Document title
         #[arg(long, default_value = "AI Contexters Dashboard")]
         title: String,
@@ -847,7 +843,6 @@ fn main() -> Result<()> {
             store_root,
             host,
             port,
-            artifact,
             title,
             preview_chars,
         }) => {
@@ -855,7 +850,6 @@ fn main() -> Result<()> {
                 store_root,
                 host,
                 port,
-                artifact,
                 title,
                 preview_chars,
             })?;
@@ -2218,7 +2212,6 @@ struct DashboardServerRunArgs {
     store_root: Option<PathBuf>,
     host: String,
     port: u16,
-    artifact: PathBuf,
     title: String,
     preview_chars: usize,
 }
@@ -2242,13 +2235,11 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
             host
         ));
     }
-    let artifact_path = args.artifact;
 
     let config = DashboardServerConfig {
         store_root: root,
         title: args.title,
         preview_chars: args.preview_chars,
-        artifact_path,
         host,
         port: args.port,
     };
@@ -2478,6 +2469,18 @@ mod tests {
         assert!(!rendered.contains("--action"));
         assert!(!rendered.contains("--no-run"));
         assert!(!rendered.contains("Initialize repo context and run an agent"));
+    }
+
+    #[test]
+    fn dashboard_serve_help_omits_dead_artifact_flag() {
+        let mut cmd = Cli::command();
+        let dashboard_serve = cmd
+            .find_subcommand_mut("dashboard-serve")
+            .expect("dashboard-serve subcommand should exist");
+        let rendered = dashboard_serve.render_long_help().to_string();
+
+        assert!(rendered.contains("server-shell UI"));
+        assert!(!rendered.contains("--artifact"));
     }
 
     #[test]

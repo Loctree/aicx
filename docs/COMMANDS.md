@@ -187,7 +187,7 @@ Options:
 Examples:
 
 ```bash
-# Fast semantic search
+# Fast text search
 aicx search "auth middleware regression"
 
 # Scoped to a project and date range
@@ -261,7 +261,7 @@ aicx memex-sync [OPTIONS]
 ```
 
 Options:
-- `-n, --namespace <NAMESPACE>` vector namespace (default: `ai-contexts`)
+- `-n, --namespace <NAMESPACE>` semantic index namespace (default: `ai-contexts`)
 - `--per-chunk` use per-chunk upsert instead of batch import; preserves structured metadata via sidecars
 - `--db-path <DB_PATH>` override LanceDB path
 
@@ -272,8 +272,8 @@ aicx memex-sync --namespace ai-contexts
 ```
 
 Notes:
-- Default batch sync now uses a metadata-rich import via JSONL, ensuring `project`, `agent`, `date`, and `session_id` are preserved for semantic filtering without the overhead of per-file CLI calls.
-- Recursive indexing is enabled by default to handle the nested canonical store structure.
+- Default batch sync now uses a metadata-rich JSONL import from the canonical chunk + sidecar store, keeping batch sync aligned with per-chunk upsert.
+- The import contract preserves the same sidecar-owned metadata that steering-aware retrieval surfaces depend on.
 
 ## `aicx refs`
 
@@ -284,7 +284,7 @@ aicx refs [OPTIONS]
 ```
 
 Options:
-- `-H, --hours <HOURS>` filter by file mtime (default: `48`)
+- `-H, --hours <HOURS>` filter by canonical chunk date (default: `48`)
 - `-p, --project <PROJECT>` filter by project
 - `--emit <summary|paths>` stdout mode (default: `summary`)
 - `--strict` exclude low-signal noise artifacts
@@ -341,12 +341,12 @@ Options:
 Example:
 
 ```bash
-aicx dashboard -p CodeScribe -H 168 -o ./aicx-dashboard.html
+aicx dashboard -o ./aicx-dashboard.html --title "AI Contexters Dashboard"
 ```
 
 ## `aicx dashboard-serve`
 
-Run the dashboard HTTP server with on-demand regeneration endpoints.
+Run the dashboard HTTP server with a server-shell UI and API-backed regeneration.
 
 ```bash
 aicx dashboard-serve [OPTIONS]
@@ -356,7 +356,6 @@ Options:
 - `--store-root <DIR>` override store root
 - `--host <HOST>` bind host (default: `127.0.0.1`)
 - `--port <PORT>` bind TCP port (default: `8033`)
-- `--artifact <ARTIFACT>` legacy compatibility path surfaced in status; not written in server mode
 - `--title <TITLE>` document title
 - `--preview-chars <N>` max preview characters per record
 

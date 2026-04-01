@@ -42,8 +42,6 @@ pub struct DashboardServerConfig {
     pub store_root: PathBuf,
     pub title: String,
     pub preview_chars: usize,
-    /// Legacy compatibility path surfaced in status; server mode does not write it.
-    pub artifact_path: PathBuf,
     pub host: IpAddr,
     pub port: u16,
 }
@@ -95,8 +93,6 @@ struct DashboardStatusResponse {
     generated_at: String,
     build_count: u64,
     store_root: String,
-    artifact_path: String,
-    artifact_written: bool,
     title: String,
     preview_chars: usize,
     stats: DashboardStats,
@@ -110,8 +106,6 @@ struct DashboardRegenerateResponse {
     mode: &'static str,
     regenerated_at: String,
     build_count: u64,
-    artifact_path: String,
-    artifact_written: bool,
     stats: DashboardStats,
 }
 
@@ -304,10 +298,6 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         "  Required header: {}: {}",
         REGENERATE_HEADER_NAME, REGENERATE_HEADER_VALUE
     );
-    eprintln!(
-        "  Artifact arg (unused in server mode): {}",
-        config.artifact_path.display()
-    );
     eprintln!("  Store: {}", config.store_root.display());
 
     axum::serve(listener, app)
@@ -351,8 +341,6 @@ async fn get_status(
         generated_at: snapshot.generated_at.to_rfc3339(),
         build_count: snapshot.build_count,
         store_root: state.config.store_root.display().to_string(),
-        artifact_path: state.config.artifact_path.display().to_string(),
-        artifact_written: false,
         title: state.config.title.clone(),
         preview_chars: state.config.preview_chars,
         stats: snapshot.stats.clone(),
@@ -414,8 +402,6 @@ async fn regenerate_dashboard(
                 mode: "server-shell",
                 regenerated_at: snapshot.generated_at.to_rfc3339(),
                 build_count: snapshot.build_count,
-                artifact_path: state.config.artifact_path.display().to_string(),
-                artifact_written: false,
                 stats: snapshot.stats.clone(),
             };
 
@@ -1225,13 +1211,12 @@ mod tests {
         .expect("seed file");
     }
 
-    fn mk_state(root: PathBuf, artifact_path: PathBuf) -> Arc<DashboardServerState> {
+    fn mk_state(root: PathBuf) -> Arc<DashboardServerState> {
         Arc::new(DashboardServerState {
             config: DashboardServerConfig {
                 store_root: root,
                 title: "test".to_string(),
                 preview_chars: 120,
-                artifact_path,
                 host: "127.0.0.1".parse().expect("host"),
                 port: 8033,
             },
@@ -1287,9 +1272,8 @@ mod tests {
     #[test]
     fn regenerate_rejects_missing_header() {
         let root = mk_tmp_dir("dashboard_server_missing_header");
-        let artifact_path = root.join("dashboard.html");
         seed_store(&root);
-        let state = mk_state(root.clone(), artifact_path);
+        let state = mk_state(root.clone());
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1307,9 +1291,8 @@ mod tests {
     #[test]
     fn regenerate_rejects_when_rebuild_in_progress() {
         let root = mk_tmp_dir("dashboard_server_rebuild_conflict");
-        let artifact_path = root.join("dashboard.html");
         seed_store(&root);
-        let state = mk_state(root.clone(), artifact_path);
+        let state = mk_state(root.clone());
         state.rebuilding.store(true, Ordering::SeqCst);
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1332,9 +1315,8 @@ mod tests {
     #[test]
     fn regenerate_accepts_required_header() {
         let root = mk_tmp_dir("dashboard_server_header_ok");
-        let artifact_path = root.join("dashboard.html");
         seed_store(&root);
-        let state = mk_state(root.clone(), artifact_path.clone());
+        let state = mk_state(root.clone());
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
