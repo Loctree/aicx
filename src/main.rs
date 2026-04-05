@@ -1,12 +1,20 @@
-//! AI Contexters
+//! AI Contexters — the operator front door for agent session history.
 //!
-//! Extracts timeline and decisions from AI agent session files:
+//! `aicx` builds a canonical corpus from local AI agent logs, then optionally
+//! materializes that corpus into a semantic index (memex) for retrieval.
+//!
+//! Two-layer architecture:
+//!   1. **Canonical store** (`~/.aicx/`) — deduplicated, chunked, steerable markdown.
+//!      Built by extractors (`claude`, `codex`, `all`) and `store`.
+//!   2. **Semantic index** (memex / rmcp-memex) — vector + BM25 materialization of
+//!      the canonical store for embedding-aware search and MCP retrieval.
+//!      Built by `memex-sync` or the `--memex` shortcut on extractors.
+//!
+//! Supported sources:
 //! - Claude Code: ~/.claude/projects/*/*.jsonl
 //! - Codex: ~/.codex/history.jsonl
 //! - Gemini: ~/.gemini/tmp/<hash>/chats/session-*.json
 //! - Gemini Antigravity: ~/.gemini/antigravity/{conversations/<uuid>.pb,brain/<uuid>/}
-//!
-//! Features: incremental extraction, deduplication, rotation, append mode.
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
@@ -29,7 +37,15 @@ use ai_contexters::sources::{self, ExtractionConfig};
 use ai_contexters::state::StateManager;
 use ai_contexters::store;
 
-/// AI Contexters - timeline and decisions from AI sessions
+/// aicx — operator surface for agent session history.
+///
+/// Builds a canonical corpus from AI agent logs (layer 1), then optionally
+/// materializes it into a semantic index via memex (layer 2).
+///
+/// Quick start:
+///   aicx all -H 4 --incremental        # build canonical store
+///   aicx memex-sync                     # materialize into semantic index
+///   aicx all -H 4 --incremental --memex # both in one shot
 #[derive(Debug, Parser)]
 #[command(name = "aicx")]
 #[command(author = "M&K (c)2026 VetCoders")]
@@ -86,7 +102,7 @@ enum ExtractInputFormat {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Extract timeline from Claude Code sessions
+    /// Extract + store Claude Code sessions into canonical corpus
     Claude {
         /// Project directory filter(s): -p foo bar baz
         #[arg(short, long, num_args = 1..)]
@@ -132,7 +148,7 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
 
-        /// Also chunk and sync to memex after extraction
+        /// Also materialize into memex semantic index (shortcut for memex-sync)
         #[arg(long)]
         memex: bool,
 
@@ -149,7 +165,7 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract timeline from Codex history
+    /// Extract + store Codex sessions into canonical corpus
     Codex {
         /// Project/repo filter(s): -p foo bar baz
         #[arg(short, long, num_args = 1..)]
@@ -195,7 +211,7 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
 
-        /// Also chunk and sync to memex after extraction
+        /// Also materialize into memex semantic index (shortcut for memex-sync)
         #[arg(long)]
         memex: bool,
 
@@ -212,7 +228,7 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract from all agents (Claude + Codex + Gemini)
+    /// Extract + store from all agents (Claude + Codex + Gemini) into canonical corpus
     All {
         /// Project filter(s): -p foo bar baz
         #[arg(short, long, num_args = 1..)]
@@ -254,7 +270,7 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
 
-        /// Also chunk and sync to memex after extraction
+        /// Also materialize into memex semantic index (shortcut for memex-sync)
         #[arg(long)]
         memex: bool,
 
@@ -271,7 +287,7 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract timeline from a single agent session file (direct path).
+    /// Extract a single agent session file into canonical corpus (direct path).
     ///
     /// Example:
     ///   aicx extract --format claude /path/to/session.jsonl -o /tmp/report.md
@@ -308,7 +324,11 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Store contexts in central store (~/.aicx/) and optionally sync to memex
+    /// Build canonical corpus in ~/.aicx/ from agent logs.
+    ///
+    /// This is the first layer: extract, deduplicate, chunk, and write steerable
+    /// markdown into the central store. Add --memex to also push chunks into the
+    /// semantic index (equivalent to running memex-sync separately).
     Store {
         /// Project name(s): -p foo bar baz
         #[arg(short, long, num_args = 1..)]
@@ -330,7 +350,7 @@ enum Commands {
         #[arg(long, hide = true, conflicts_with = "user_only")]
         include_assistant: bool,
 
-        /// Also chunk and sync to memex
+        /// Also materialize into memex semantic index (shortcut for memex-sync)
         #[arg(long)]
         memex: bool,
 
@@ -339,13 +359,21 @@ enum Commands {
         emit: StdoutEmit,
     },
 
-    /// Sync stored chunks to rmcp-memex semantic index
+    /// Materialize canonical store into memex semantic index (layer 2).
+    ///
+    /// Reads chunks from ~/.aicx/, embeds them, and upserts into the rmcp-memex
+    /// vector + BM25 index. This is what makes stored context searchable via
+    /// embedding-aware queries and the MCP retrieval surface.
+    ///
+    /// First build:  aicx memex-sync
+    /// Rebuild:      aicx memex-sync --reindex
+    /// Fine-grained: aicx memex-sync --per-chunk
     MemexSync {
         /// Namespace in the semantic index
         #[arg(short, long, default_value = "ai-contexts")]
         namespace: String,
 
-        /// Use per-chunk upsert instead of batch import
+        /// Use per-chunk upsert instead of batch JSONL import (slower, more granular)
         #[arg(long)]
         per_chunk: bool,
 
@@ -353,8 +381,9 @@ enum Commands {
         #[arg(long)]
         db_path: Option<PathBuf>,
 
-        /// Explicitly wipe the current rmcp-memex store + BM25 index before rebuilding.
-        /// Use this when the embedding model or dimension changed.
+        /// Wipe the current rmcp-memex store + BM25 index before rebuilding.
+        /// Use this when the embedding model or dimension changed, or when the
+        /// index drifted from the canonical store.
         #[arg(long)]
         reindex: bool,
     },
@@ -362,7 +391,7 @@ enum Commands {
     /// List available projects/sessions
     List,
 
-    /// List context files from global store (references)
+    /// List chunks in the canonical store (quick inventory)
     Refs {
         /// Hours to look back (filter by canonical chunk date)
         #[arg(short = 'H', long, default_value = "48")]
@@ -400,7 +429,7 @@ enum Commands {
         info: bool,
     },
 
-    /// Generate a searchable HTML dashboard from the aicx store.
+    /// Generate a searchable HTML dashboard from the canonical store.
     Dashboard {
         /// Store root directory (default: ~/.aicx)
         #[arg(long)]
@@ -446,7 +475,7 @@ enum Commands {
         preview_chars: usize,
     },
 
-    /// Extract structured intents and decisions from stored context
+    /// Extract structured intents and decisions from canonical store
     Intents {
         /// Project filter (required)
         #[arg(short, long)]
@@ -538,7 +567,7 @@ enum Commands {
         no_gitignore: bool,
     },
 
-    /// Ad-hoc terminal fuzzy search across the aicx store (no dashboard needed)
+    /// Fuzzy search across the canonical store (no dashboard needed)
     Search {
         /// Search query string
         query: String,

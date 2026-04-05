@@ -1,9 +1,15 @@
-//! Integration with rmcp-memex for semantic indexing.
+//! Integration boundary with the published `rmcp-memex` crate.
 //!
-//! Shells out to the `rmcp-memex` CLI binary for:
+//! Library-backed paths in this module:
+//! - Resolve runtime truth from `rmcp-memex` config defaults
+//! - Keep embedding-dimension/reindex mismatches explicit before reads or writes
+//! - Run fast read-only BM25 + LanceDB search without shelling out
+//!
+//! CLI-backed paths in this module:
+//! - Legacy recursive indexing (`rmcp-memex index`)
 //! - Batch import of canonical chunk records (`rmcp-memex import`)
 //! - Single chunk upsert (`rmcp-memex upsert`)
-//! - Semantic search (`rmcp-memex search`)
+//! - Debugging utility search (`rmcp-memex search`)
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
@@ -508,7 +514,7 @@ pub fn save_sync_state(state: &MemexSyncState) -> Result<()> {
 // Availability check
 // ============================================================================
 
-/// Check if the `rmcp-memex` binary is available in PATH.
+/// Check if the external `rmcp-memex` binary is available for CLI-backed paths.
 pub fn check_memex_available() -> bool {
     Command::new("rmcp-memex")
         .arg("--version")
@@ -1043,31 +1049,7 @@ use crate::rank::{FuzzyResult, score_chunk_content};
 // High-level fast search via rmcp-memex library
 // ============================================================================
 
-/// Compatibility shim for `rmcp-memex` BM25 search tuples.
-///
-/// The local checkout currently returns `(id, namespace, score)`, while the
-/// published crate used during `cargo publish --dry-run` still returns
-/// `(id, score)`. We keep the seam inside AICX so the transport boundary stays
-/// explicit and ship verification does not depend on matching local checkout
-/// state.
-trait Bm25SearchHit {
-    fn into_hit(self) -> (String, f32);
-}
-
-impl Bm25SearchHit for (String, f32) {
-    fn into_hit(self) -> (String, f32) {
-        self
-    }
-}
-
-impl Bm25SearchHit for (String, String, f32) {
-    fn into_hit(self) -> (String, f32) {
-        let (id, _namespace, score) = self;
-        (id, score)
-    }
-}
-
-/// Fast semantic/keyword search using `rmcp_memex`'s embedded LanceDB and Tantivy index.
+/// Fast semantic/keyword search using `rmcp_memex`'s published BM25 + LanceDB APIs.
 pub async fn fast_memex_search(
     query: &str,
     limit: usize,
@@ -1089,14 +1071,12 @@ pub async fn fast_memex_search(
     let mut results = Vec::new();
     let project_lower = project_filter.map(|s| s.to_lowercase());
 
-    for raw_result in raw_results {
+    for (id, hit_namespace, score) in raw_results {
         if results.len() >= limit {
             break;
         }
 
-        let (id, score) = raw_result.into_hit();
-
-        if let Ok(Some(doc)) = storage.get_document(DEFAULT_MEMEX_NAMESPACE, &id).await {
+        if let Ok(Some(doc)) = storage.get_document(&hit_namespace, &id).await {
             // Apply project filter if any
             let doc_project = doc
                 .metadata
@@ -1200,7 +1180,7 @@ pub async fn fast_memex_search(
 // Search (utility)
 // ============================================================================
 
-/// Search memex for relevant chunks. Utility for testing/debugging.
+/// Search memex via the external CLI. Utility for testing/debugging only.
 ///
 /// Runs: `rmcp-memex search -n <namespace> -q <query>`
 pub fn search_memex(query: &str, namespace: &str) -> Result<String> {
@@ -1532,17 +1512,5 @@ model = "qwen3-embedding:4b"
                 errors: 3,
             }
         );
-    }
-
-    #[test]
-    fn test_bm25_search_hit_supports_published_tuple_shape() {
-        let hit = ("chunk-1".to_string(), 0.42_f32);
-        assert_eq!(hit.into_hit(), ("chunk-1".to_string(), 0.42_f32));
-    }
-
-    #[test]
-    fn test_bm25_search_hit_supports_checkout_tuple_shape() {
-        let hit = ("chunk-1".to_string(), "ai-contexts".to_string(), 0.42_f32);
-        assert_eq!(hit.into_hit(), ("chunk-1".to_string(), 0.42_f32));
     }
 }

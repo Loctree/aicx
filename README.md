@@ -1,12 +1,18 @@
 # AI Contexters
 
-Timeline extraction + context distillation for AI agent sessions.
+Operator front door for agent session history.
 
-`aicx` is the ledger and control surface for agent session history. It turns local agent logs into:
-- a clean, deduped timeline,
-- chunked “agent-readable” context stored in `~/.aicx/`,
-- steering metadata (frontmatter) for selective re-entry by orchestration,
-- optional sync into memex (semantic index for semantic retrieval).
+`aicx` orchestrates a two-layer pipeline:
+
+1. **Canonical corpus** (`~/.aicx/`) — extract, deduplicate, chunk, and store
+   agent session logs as steerable markdown with frontmatter metadata.
+   This is ground truth. Built by extractors (`claude`, `codex`, `all`) and `store`.
+
+2. **Semantic materialization** (memex) — embed the canonical corpus into a
+   vector + BM25 index for retrieval by agents and MCP tools.
+   Built by `memex-sync`, or the `--memex` shortcut on any extractor.
+
+`aicx` is the operator; memex is the retrieval kernel.
 
 Supported sources:
 - Claude Code: `~/.claude/projects/*/*.jsonl`
@@ -53,17 +59,33 @@ cargo install --path . --locked --bin aicx --bin aicx-mcp
 
 ## Quickstart
 
-Store recent context from the last 4 hours. Extractor/store commands are quiet on stdout by default (`--emit none`), but still write chunked context into `~/.aicx/`.
+### Layer 1 — build the canonical corpus
+
+Extract the last 4 hours into `~/.aicx/`. Extractors are quiet on stdout by default (`--emit none`).
 
 ```bash
 aicx all -H 4 --incremental
 ```
 
-See what landed in the store:
+See what landed:
 
 ```bash
 aicx refs -H 4
 aicx refs -H 4 --emit paths
+```
+
+### Layer 2 — materialize into memex
+
+Push canonical chunks into the semantic index (vector + BM25):
+
+```bash
+aicx memex-sync
+```
+
+Or do both layers in one shot:
+
+```bash
+aicx all -H 4 --incremental --memex
 ```
 
 Pipe one JSON payload (handy for automation):
@@ -74,11 +96,14 @@ aicx all -H 4 --emit json | jq '.store_paths'
 
 ## What Gets Written Where
 
-Central store (always, for extractors):
+### Layer 1 — canonical store (extractors, `store`)
 - `~/.aicx/store/<organization>/<repository>/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
 - `~/.aicx/non-repository-contexts/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
 - `~/.aicx/index.json`
-- `~/.aicx/memex/sync_state.json` (when memex is used)
+
+### Layer 2 — semantic index (`memex-sync`, `--memex`)
+- `~/.aicx/memex/sync_state.json` (sync watermark)
+- LanceDB tables + Tantivy BM25 index (managed by rmcp-memex)
 
 Framework-owned repo-local context artifacts (not written by the `aicx` CLI itself):
 - `.ai-context/share/artifacts/SUMMARY.md`
@@ -114,15 +139,23 @@ aicx steer --project ai-contexters --kind reports --date 2026-03-28
 aicx steer --agent claude --date 2026-03-20..2026-03-28
 ```
 
-Memex sync (semantic index):
+Semantic materialization (memex):
 
 ```bash
+# First build: materialize canonical store into the semantic index
+aicx memex-sync
+
+# Rebuild from scratch (e.g. after embedding model change)
+aicx memex-sync --reindex
+
+# One-shot: extract + materialize in a single pass
 aicx all -H 48 --memex
-aicx memex-sync --namespace ai-contexts
-aicx memex-sync --namespace ai-contexts --per-chunk
+
+# Fine-grained: per-chunk upsert instead of batch JSONL import
+aicx memex-sync --per-chunk
 ```
 
-Default batch sync now uses a metadata-rich JSONL import, preserving `project`, `agent`, `date`, `session_id`, and `kind` without the overhead of per-file CLI calls. Use `--per-chunk` when you explicitly want single-document upserts.
+Batch sync (default) uses metadata-rich JSONL import, preserving `project`, `agent`, `date`, `session_id`, and `kind`. Use `--per-chunk` only when you need single-document granularity.
 
 Single-session Gemini Antigravity extract (conversation artifacts first, explicit step-output fallback):
 

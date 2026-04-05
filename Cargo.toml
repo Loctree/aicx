@@ -32,7 +32,9 @@ axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "signal"] }
 rmcp = { version = "1.2", features = ["server", "schemars", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 libc = "0.2.183"
-# Remote integration boundary: consume the published crate instead of the local workspace checkout.
+# Remote integration boundary: consume the published crate instead of any local workspace checkout.
+# This dependency is library-only here; CLI-backed sync/search paths still require an installed
+# `rmcp-memex` binary at runtime.
 rmcp-memex = { version = "0.4.1", default-features = false }
 
 [dev-dependencies]
