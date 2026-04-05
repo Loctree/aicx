@@ -722,6 +722,7 @@ fn run_fuzzy_search(
             project_filter,
         )) {
             Ok((res, scan)) if !res.is_empty() => (res, scan),
+            Err(err) if crate::memex::is_compatibility_error(&err) => return Err(err),
             _ => rank::fuzzy_search_store(store_root, query, fetch_limit, project_filter)?,
         }
     } else {

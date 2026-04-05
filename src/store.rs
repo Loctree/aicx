@@ -915,16 +915,33 @@ fn collect_leaf_files(
 }
 
 fn parse_session_basename(name: &str, agent: &str, date_compact: &str) -> Option<(String, u32)> {
-    let escaped_agent = regex::escape(agent);
-    let escaped_date = regex::escape(date_compact);
-    let pattern = format!(
-        r"^(?P<date>{escaped_date})_(?P<agent>{escaped_agent})_(?P<session>[A-Za-z0-9-]+)_(?P<chunk>\d{{3}})\.(md|json)$"
-    );
-    let re = Regex::new(&pattern).ok()?;
-    let captures = re.captures(name)?;
-    let session_id = captures.name("session")?.as_str().to_string();
-    let chunk = captures.name("chunk")?.as_str().parse().ok()?;
-    Some((session_id, chunk))
+    let ext = if name.ends_with(".md") {
+        ".md"
+    } else if name.ends_with(".json") {
+        ".json"
+    } else {
+        return None;
+    };
+
+    let stem = name.strip_suffix(ext)?;
+    let prefix = format!("{date_compact}_{agent}_");
+    let remainder = stem.strip_prefix(&prefix)?;
+    let (session_id, chunk_str) = remainder.rsplit_once('_')?;
+
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        return None;
+    }
+
+    if chunk_str.len() != 3 || !chunk_str.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+
+    let chunk = chunk_str.parse().ok()?;
+    Some((session_id.to_string(), chunk))
 }
 
 pub fn expand_compact_date(compact: &str) -> String {

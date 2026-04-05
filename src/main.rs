@@ -352,6 +352,11 @@ enum Commands {
         /// Override LanceDB path
         #[arg(long)]
         db_path: Option<PathBuf>,
+
+        /// Explicitly wipe the current rmcp-memex store + BM25 index before rebuilding.
+        /// Use this when the embedding model or dimension changed.
+        #[arg(long)]
+        reindex: bool,
     },
 
     /// List available projects/sessions
@@ -787,8 +792,9 @@ fn main() -> Result<()> {
             namespace,
             per_chunk,
             db_path,
+            reindex,
         }) => {
-            run_memex_sync(&namespace, per_chunk, db_path)?;
+            run_memex_sync(&namespace, per_chunk, db_path, reindex)?;
         }
         Some(Commands::List) => {
             let sources = sources::list_available_sources()?;
@@ -1838,6 +1844,7 @@ fn run_search(
             project,
         )) {
             Ok((res, scan)) if !res.is_empty() => (res, scan),
+            Err(err) if memex::is_compatibility_error(&err) => return Err(err),
             _ => rank::fuzzy_search_store(&root, &search_query, fetch_limit, project)?,
         }
     } else {
@@ -2158,10 +2165,17 @@ fn run_state(reset: bool, project: Option<String>, info: bool) -> Result<()> {
 }
 
 /// Sync stored chunks to rmcp-memex semantic index.
-fn run_memex_sync(namespace: &str, per_chunk: bool, db_path: Option<PathBuf>) -> Result<()> {
+fn run_memex_sync(
+    namespace: &str,
+    per_chunk: bool,
+    db_path: Option<PathBuf>,
+    reindex: bool,
+) -> Result<()> {
     if !memex::check_memex_available() {
         anyhow::bail!("rmcp-memex not found in PATH. Install with: cargo install rmcp-memex");
     }
+
+    let truth = memex::resolve_runtime_truth(db_path.as_deref())?;
 
     let canonical_root = store::canonical_store_dir()?;
     let chunk_paths: Vec<PathBuf> = store::scan_context_files()?
@@ -2179,7 +2193,7 @@ fn run_memex_sync(namespace: &str, per_chunk: bool, db_path: Option<PathBuf>) ->
 
     let config = MemexConfig {
         namespace: namespace.to_string(),
-        db_path,
+        db_path: db_path.clone(),
         batch_mode: !per_chunk,
         preprocess: true,
     };
@@ -2190,6 +2204,13 @@ fn run_memex_sync(namespace: &str, per_chunk: bool, db_path: Option<PathBuf>) ->
     );
     eprintln!("  Chunk files: {}", chunk_paths.len());
     eprintln!("  Namespace: {}", config.namespace);
+    eprintln!("  Embedding model: {}", truth.embedding_model);
+    eprintln!("  Embedding dims: {}", truth.embedding_dimension);
+    eprintln!("  LanceDB path: {}", truth.db_path.display());
+    eprintln!("  BM25 path: {}", truth.bm25_path.display());
+    if let Some(path) = truth.config_path.as_ref() {
+        eprintln!("  Config: {}", path.display());
+    }
     eprintln!(
         "  Mode: {}",
         if config.batch_mode {
@@ -2198,6 +2219,15 @@ fn run_memex_sync(namespace: &str, per_chunk: bool, db_path: Option<PathBuf>) ->
             "per-chunk (metadata-rich)"
         }
     );
+
+    if reindex {
+        eprintln!("  Reindex: wiping current rmcp-memex store before import");
+        eprintln!(
+            "  Warning: Lance vector schema is shared across the whole store, so other namespaces in {} will need a rebuild too.",
+            truth.db_path.display()
+        );
+        memex::reset_semantic_index(namespace, db_path.as_deref())?;
+    }
 
     let result = memex::sync_new_chunk_paths(&chunk_paths, &config)?;
 

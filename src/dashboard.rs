@@ -1014,6 +1014,14 @@ body {
   font-size: 0.88rem;
 }
 
+.result-preview {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.35;
+  white-space: pre-wrap;
+}
+
 .detail-pane {
   display: flex;
   flex-direction: column;
@@ -1076,6 +1084,22 @@ body {
   font-size: 0.86rem;
   flex: 1;
   min-height: 280px;
+}
+
+mark.hl {
+  background: #facc15;
+  color: #0a0f19;
+  border-radius: 2px;
+  padding: 0 2px;
+  font-style: normal;
+}
+
+mark.hl-fuzzy {
+  background: #fb923c;
+  color: #0a0f19;
+  border-radius: 2px;
+  padding: 0 2px;
+  font-style: normal;
 }
 
 .assumptions {
@@ -1163,6 +1187,7 @@ const DASHBOARD_SCRIPT: &str = r#"
 
   const state = {
     query: '',
+    queryRaw: '',
     project: '',
     agent: '',
     kind: '',
@@ -1172,10 +1197,23 @@ const DASHBOARD_SCRIPT: &str = r#"
     selectedRecord: null,
   };
 
-  const normalize = (value) =>
-    (value || '')
+  const normalizeText = (text) => {
+    const map = {
+      '\u0104':'A','\u0105':'a','\u0106':'C','\u0107':'c',
+      '\u0118':'E','\u0119':'e','\u0141':'L','\u0142':'l',
+      '\u0143':'N','\u0144':'n','\u00D3':'O','\u00F3':'o',
+      '\u015A':'S','\u015B':'s','\u0179':'Z','\u017A':'z',
+      '\u017B':'Z','\u017C':'z'
+    };
+    return (text || '')
       .toString()
-      .toLowerCase()
+      .replace(/[\u0104\u0105\u0106\u0107\u0118\u0119\u0141\u0142\u0143\u0144\u00D3\u00F3\u015A\u015B\u0179\u017A\u017B\u017C]/g,
+        function(c) { return map[c] || c; })
+      .toLowerCase();
+  };
+
+  const normalize = (value) =>
+    normalizeText(value)
       .normalize('NFKD')
       .replace(/[\u0300-\u036f]/g, '')
       .replace(/\s+/g, ' ')
@@ -1286,6 +1324,62 @@ const DASHBOARD_SCRIPT: &str = r#"
     }, value);
   };
 
+  const escapeHtml = (text) => {
+    const div = document.createElement('div');
+    div.appendChild(document.createTextNode(text));
+    return div.innerHTML;
+  };
+
+  const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  const highlightQuery = () => state.queryRaw || state.query;
+
+  const highlightTerms = (text, query) => {
+    if (!query || !text) return escapeHtml(text || '');
+    const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    if (!terms.length) return escapeHtml(text);
+
+    const kinds = new Array(text.length).fill('');
+    const markRange = (start, len, cls, overwrite) => {
+      const end = Math.min(text.length, start + len);
+      for (let i = start; i < end; i += 1) {
+        if (overwrite || !kinds[i]) kinds[i] = cls;
+      }
+    };
+
+    terms.forEach((term) => {
+      const re = new RegExp(escapeRegex(term), 'gi');
+      let match;
+      while ((match = re.exec(text)) !== null) {
+        if (!match[0]) break;
+        markRange(match.index, match[0].length, 'hl', true);
+      }
+    });
+
+    const normalizedText = normalizeText(text);
+    terms.map(normalizeText).filter(Boolean).forEach((term) => {
+      let searchFrom = 0;
+      while (searchFrom < normalizedText.length) {
+        const idx = normalizedText.indexOf(term, searchFrom);
+        if (idx === -1) break;
+        markRange(idx, term.length, 'hl-fuzzy', false);
+        searchFrom = idx + Math.max(term.length, 1);
+      }
+    });
+
+    let html = '';
+    let start = 0;
+    while (start < text.length) {
+      const cls = kinds[start];
+      let end = start + 1;
+      while (end < text.length && kinds[end] === cls) end += 1;
+      const chunk = escapeHtml(text.slice(start, end));
+      html += cls ? '<mark class="' + cls + '">' + chunk + '</mark>' : chunk;
+      start = end;
+    }
+    return html;
+  };
+
   const renderDetail = (record, score) => {
     state.selectedRecord = record || null;
 
@@ -1298,11 +1392,22 @@ const DASHBOARD_SCRIPT: &str = r#"
       return;
     }
 
-    ui.detailTitle.textContent = record.file_name || '(unnamed file)';
-    ui.detailMeta.textContent = `${record.project || 'unknown'} | ${record.agent || 'unknown'} | ${record.kind || 'unknown'} | score ${Math.round(Number(score || 0) * 100)}/100`;
-    ui.detailPath.textContent = record.absolute_path || record.relative_path || '';
-    ui.detailPreview.textContent = record.preview || '';
-    ui.detailContent.textContent = record.detail_text || record.preview || '(no content)';
+    const detailTitle = record.file_name || '(unnamed file)';
+    const detailMeta = `${record.project || 'unknown'} | ${record.agent || 'unknown'} | ${record.kind || 'unknown'} | score ${Math.round(Number(score || 0) * 100)}/100`;
+    const detailPath = record.absolute_path || record.relative_path || '';
+    ui.detailTitle.innerHTML = highlightTerms(detailTitle, highlightQuery());
+    ui.detailMeta.innerHTML = highlightTerms(detailMeta, highlightQuery());
+    ui.detailPath.innerHTML = highlightTerms(detailPath, highlightQuery());
+    ui.detailPreview.innerHTML = highlightTerms(record.preview || '', highlightQuery());
+    ui.detailContent.innerHTML =
+      highlightTerms(record.detail_text || record.preview || '(no content)', highlightQuery());
+  };
+
+  const mkBadge = (txt) => {
+    const node = document.createElement('span');
+    node.className = 'badge';
+    node.innerHTML = highlightTerms(String(txt || ''), highlightQuery());
+    return node;
   };
 
   const renderList = (rows) => {
@@ -1331,13 +1436,6 @@ const DASHBOARD_SCRIPT: &str = r#"
       const top = document.createElement('div');
       top.className = 'result-top';
 
-      const mkBadge = (txt) => {
-        const node = document.createElement('span');
-        node.className = 'badge';
-        node.textContent = txt;
-        return node;
-      };
-
       top.appendChild(mkBadge(record.project || 'project'));
       top.appendChild(mkBadge(record.agent || 'agent'));
       top.appendChild(mkBadge(record.kind || 'kind'));
@@ -1346,10 +1444,17 @@ const DASHBOARD_SCRIPT: &str = r#"
 
       const name = document.createElement('div');
       name.className = 'result-name';
-      name.textContent = `${record.file_name || '(unnamed)'} • ${record.size_human || ''}`;
+      const nameText = `${record.file_name || '(unnamed)'} • ${record.size_human || ''}`;
+      name.innerHTML = highlightTerms(nameText, highlightQuery());
 
       item.appendChild(top);
       item.appendChild(name);
+      if (state.query && record.preview) {
+        const preview = document.createElement('div');
+        preview.className = 'result-preview';
+        preview.innerHTML = highlightTerms(record.preview, highlightQuery());
+        item.appendChild(preview);
+      }
 
       item.addEventListener('click', () => {
         state.selectedId = record.id;
@@ -1368,6 +1473,7 @@ const DASHBOARD_SCRIPT: &str = r#"
   };
 
   const refresh = () => {
+    state.queryRaw = ui.search.value || '';
     state.query = normalize(ui.search.value);
     state.project = ui.project.value;
     state.agent = ui.agent.value;
@@ -1567,6 +1673,72 @@ const DASHBOARD_SERVER_SCRIPT: &str = r#"
     }, value);
   };
 
+  const escapeHtml = (text) => {
+    const div = document.createElement('div');
+    div.appendChild(document.createTextNode(text));
+    return div.innerHTML;
+  };
+
+  const normalizeText = (text) => {
+    const map = {
+      '\u0104':'A','\u0105':'a','\u0106':'C','\u0107':'c',
+      '\u0118':'E','\u0119':'e','\u0141':'L','\u0142':'l',
+      '\u0143':'N','\u0144':'n','\u00D3':'O','\u00F3':'o',
+      '\u015A':'S','\u015B':'s','\u0179':'Z','\u017A':'z',
+      '\u017B':'Z','\u017C':'z'
+    };
+    return text.replace(/[\u0104\u0105\u0106\u0107\u0118\u0119\u0141\u0142\u0143\u0144\u00D3\u00F3\u015A\u015B\u0179\u017A\u017B\u017C]/g,
+      function(c) { return map[c] || c; }).toLowerCase();
+  };
+
+  const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  const highlightTerms = (text, query) => {
+    if (!query || !text) return escapeHtml(text || '');
+    const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    if (!terms.length) return escapeHtml(text);
+
+    const kinds = new Array(text.length).fill('');
+    const markRange = (start, len, cls, overwrite) => {
+      const end = Math.min(text.length, start + len);
+      for (let i = start; i < end; i += 1) {
+        if (overwrite || !kinds[i]) kinds[i] = cls;
+      }
+    };
+
+    terms.forEach(function(term) {
+      const re = new RegExp(escapeRegex(term), 'gi');
+      let match;
+      while ((match = re.exec(text)) !== null) {
+        if (!match[0]) break;
+        markRange(match.index, match[0].length, 'hl', true);
+      }
+    });
+
+    const normalizedText = normalizeText(text);
+    terms.map(normalizeText).filter(Boolean).forEach(function(term) {
+      let searchFrom = 0;
+      while (searchFrom < normalizedText.length) {
+        const idx = normalizedText.indexOf(term, searchFrom);
+        if (idx === -1) break;
+        markRange(idx, term.length, 'hl-fuzzy', false);
+        searchFrom = idx + Math.max(term.length, 1);
+      }
+    });
+
+    let html = '';
+    let start = 0;
+    while (start < text.length) {
+      const cls = kinds[start];
+      let end = start + 1;
+      while (end < text.length && kinds[end] === cls) end += 1;
+      const chunk = escapeHtml(text.slice(start, end));
+      html += cls ? '<mark class="' + cls + '">' + chunk + '</mark>' : chunk;
+      start = end;
+    }
+    return html;
+  };
+
   const renderDetail = (record, score) => {
     state.selectedRecord = record || null;
     if (!record) {
@@ -1577,13 +1749,16 @@ const DASHBOARD_SERVER_SCRIPT: &str = r#"
       ui.detailContent.textContent = 'Use search or filters to pick a note.';
       return;
     }
-    ui.detailTitle.textContent = record.file_name || record.file || '(unnamed)';
+    const detailTitle = record.file_name || record.file || '(unnamed)';
     const scoreTxt = typeof score === 'number' && score > 0 ? 'score ' + score + '/100' : '';
-    ui.detailMeta.textContent = [record.project, record.agent, record.kind, scoreTxt].filter(Boolean).join(' | ');
-    ui.detailPath.textContent = record.absolute_path || record.path || record.relative_path || '';
-    ui.detailPreview.textContent = record.preview || record.excerpt || '';
+    const detailMeta = [record.project, record.agent, record.kind, scoreTxt].filter(Boolean).join(' | ');
+    const detailPath = record.absolute_path || record.path || record.relative_path || '';
+    ui.detailTitle.innerHTML = highlightTerms(detailTitle, state.query);
+    ui.detailMeta.innerHTML = highlightTerms(detailMeta, state.query);
+    ui.detailPath.innerHTML = highlightTerms(detailPath, state.query);
+    ui.detailPreview.innerHTML = highlightTerms(record.preview || record.excerpt || '', state.query);
     if (record._detail_loaded) {
-      ui.detailContent.textContent = record._detail_text || record.preview || '(no content)';
+      ui.detailContent.innerHTML = highlightTerms(record._detail_text || record.preview || '(no content)', state.query);
     } else if (record.id !== undefined) {
       ui.detailContent.textContent = 'Loading\u2026';
       fetch('/api/detail?id=' + record.id)
@@ -1593,25 +1768,27 @@ const DASHBOARD_SERVER_SCRIPT: &str = r#"
             record._detail_loaded = true;
             record._detail_text = data.detail_text;
             if (state.selectedRecord === record) {
-              ui.detailContent.textContent = data.detail_text || '(no content)';
+              ui.detailContent.innerHTML = highlightTerms(data.detail_text || '(no content)', state.query);
             }
           } else {
-            ui.detailContent.textContent = record.preview || '(no content)';
+            ui.detailContent.innerHTML = highlightTerms(record.preview || '(no content)', state.query);
           }
         })
         .catch(function() {
-          ui.detailContent.textContent = record.preview || '(detail fetch failed)';
+          ui.detailContent.innerHTML = highlightTerms(record.preview || '(detail fetch failed)', state.query);
         });
     } else {
-      ui.detailContent.textContent = record.matched_lines
-        ? record.matched_lines.join('\n---\n')
-        : (record.excerpt || '(no content)');
+      ui.detailContent.innerHTML = highlightTerms(
+        record.matched_lines ? record.matched_lines.join('\n---\n') : (record.excerpt || '(no content)'),
+        state.query
+      );
     }
   };
 
   const mkBadge = (txt) => {
     const n = document.createElement('span');
-    n.className = 'badge'; n.textContent = txt;
+    n.className = 'badge';
+    n.innerHTML = highlightTerms(String(txt || ''), state.query);
     return n;
   };
 
@@ -1646,9 +1823,17 @@ const DASHBOARD_SERVER_SCRIPT: &str = r#"
       if (typeof score === 'number' && score > 0) top.appendChild(mkBadge(score + '/100'));
       const name = document.createElement('div');
       name.className = 'result-name';
-      name.textContent = (record.file_name || record.file || '(unnamed)') + (record.size_human ? ' \u2022 ' + record.size_human : '');
+      const fname = (record.file_name || record.file || '(unnamed)') + (record.size_human ? ' \u2022 ' + record.size_human : '');
+      name.innerHTML = highlightTerms(fname, state.query);
       item.appendChild(top);
       item.appendChild(name);
+      const previewText = record.excerpt || record.preview || '';
+      if (state.query && previewText) {
+        const preview = document.createElement('div');
+        preview.className = 'result-preview';
+        preview.innerHTML = highlightTerms(previewText, state.query);
+        item.appendChild(preview);
+      }
       item.addEventListener('click', function() {
         state.selectedId = rid;
         renderList(state.rows);
@@ -1934,6 +2119,112 @@ mod tests {
         assert!(artifact.html.contains("AIContextersDashboard"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn server_shell_includes_highlight_styles_and_wiring() {
+        let html = render_server_shell_html("AI Context Browser");
+
+        assert!(html.contains("mark.hl"));
+        assert!(html.contains("mark.hl-fuzzy"));
+        assert!(html.contains("const escapeRegex = (s) =>"));
+        assert!(html.contains("const highlightTerms = (text, query) => {"));
+        assert!(
+            html.contains("ui.detailTitle.innerHTML = highlightTerms(detailTitle, state.query);")
+        );
+        assert!(
+            html.contains("ui.detailMeta.innerHTML = highlightTerms(detailMeta, state.query);")
+        );
+        assert!(
+            html.contains("ui.detailPath.innerHTML = highlightTerms(detailPath, state.query);")
+        );
+        assert!(html.contains("n.innerHTML = highlightTerms(String(txt || ''), state.query);"));
+        assert!(html.contains("name.innerHTML = highlightTerms(fname, state.query);"));
+        assert!(html.contains(".result-preview {"));
+        assert!(html.contains("preview.className = 'result-preview';"));
+        assert!(html.contains("preview.innerHTML = highlightTerms(previewText, state.query);"));
+    }
+
+    #[test]
+    fn static_dashboard_includes_highlight_styles_and_wiring() {
+        let payload = DashboardPayload {
+            generated_at: "2026-04-02T17:43:00Z".to_string(),
+            store_root: "/tmp/aicx".to_string(),
+            records: Vec::new(),
+            stats: DashboardStats::default(),
+            assumptions: Vec::new(),
+            projects: Vec::new(),
+            agents: Vec::new(),
+            kinds: Vec::new(),
+        };
+
+        let html = render_dashboard_html(&payload, "AI Context Browser").expect("static html");
+
+        assert!(html.contains("mark.hl"));
+        assert!(html.contains("mark.hl-fuzzy"));
+        assert!(html.contains("const escapeRegex = (s) =>"));
+        assert!(html.contains("const highlightTerms = (text, query) => {"));
+        assert!(html.contains("queryRaw: ''"));
+        assert!(html.contains("const highlightQuery = () => state.queryRaw || state.query;"));
+        assert!(
+            html.contains(
+                "ui.detailTitle.innerHTML = highlightTerms(detailTitle, highlightQuery());"
+            )
+        );
+        assert!(
+            html.contains(
+                "ui.detailMeta.innerHTML = highlightTerms(detailMeta, highlightQuery());"
+            )
+        );
+        assert!(
+            html.contains(
+                "ui.detailPath.innerHTML = highlightTerms(detailPath, highlightQuery());"
+            )
+        );
+        assert!(
+            html.contains("node.innerHTML = highlightTerms(String(txt || ''), highlightQuery());")
+        );
+        assert!(html.contains("name.innerHTML = highlightTerms(nameText, highlightQuery());"));
+        assert!(html.contains(".result-preview {"));
+        assert!(html.contains("preview.className = 'result-preview';"));
+        assert!(
+            html.contains("preview.innerHTML = highlightTerms(record.preview, highlightQuery());")
+        );
+        assert!(html.contains("state.queryRaw = ui.search.value || '';"));
+    }
+
+    #[test]
+    fn static_dashboard_includes_polish_normalization_map_for_l_stroke() {
+        let payload = DashboardPayload {
+            generated_at: "2026-04-02T17:43:00Z".to_string(),
+            store_root: "/tmp/aicx".to_string(),
+            records: Vec::new(),
+            stats: DashboardStats::default(),
+            assumptions: Vec::new(),
+            projects: Vec::new(),
+            agents: Vec::new(),
+            kinds: Vec::new(),
+        };
+
+        let html = render_dashboard_html(&payload, "AI Context Browser").expect("static html");
+
+        assert!(html.contains("const normalizeText = (text) => {"));
+        assert!(html.contains("'\\u0141':'L','\\u0142':'l'"));
+        assert!(html.contains("normalizeText(value)"));
+        assert!(html.contains("const normalizedText = normalizeText(text);"));
+        assert!(html.contains("terms.map(normalizeText).filter(Boolean).forEach((term) => {"));
+        assert!(!html.contains("const normalizedText = normalize(text);"));
+    }
+
+    #[test]
+    fn server_shell_includes_polish_normalization_map_for_l_stroke() {
+        let html = render_server_shell_html("AI Context Browser");
+
+        assert!(html.contains("const normalizeText = (text) => {"));
+        assert!(html.contains("'\\u0141':'L','\\u0142':'l'"));
+        assert!(html.contains("const normalizedText = normalizeText(text);"));
+        assert!(html.contains("terms.map(normalizeText).filter(Boolean).forEach(function(term) {"));
+        assert!(!html.contains("const normalizedText = normalize(text);"));
     }
 
     #[test]

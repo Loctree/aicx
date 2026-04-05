@@ -69,6 +69,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
@@ -5457,8 +5458,6 @@ dependencies = [
 [[package]]
 name = "rmcp-memex"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdbc9672b78a74b8a563394d53a269a8474e0a058a217ca7dc0a1e8ce521f039"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -5469,7 +5468,6 @@ dependencies = [
  "futures",
  "glob",
  "lancedb",
- "lazy_static",
  "pdf-extract",
  "protoc-bin-vendored",
  "regex",
