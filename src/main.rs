@@ -1,7 +1,8 @@
 //! AI Contexters — the operator front door for agent session history.
 //!
 //! `aicx` orchestrates a two-layer pipeline: canonical corpus first,
-//! semantic materialization second. Materialization is always explicit.
+//! semantic materialization second. Materialization can stay explicit or run
+//! behind the background daemon.
 //!
 //! Two-layer architecture:
 //!   1. **Canonical corpus** (`~/.aicx/`) — deduplicated, chunked, steerable markdown.
@@ -27,6 +28,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+use ai_contexters::daemon::{self, ControlOutcome, DaemonConfig, DaemonStatusSnapshot};
 use ai_contexters::dashboard::{self, DashboardConfig};
 use ai_contexters::dashboard_server::{self, DashboardServerConfig};
 use ai_contexters::intents;
@@ -39,12 +41,12 @@ use ai_contexters::store;
 
 /// aicx — operator front door for agent session history.
 ///
-/// Two-layer pipeline, both operator-driven:
+/// Two-layer pipeline with explicit canonical truth and optional background sync:
 ///   Layer 1 (canonical corpus): extract, deduplicate, and chunk agent logs
 ///     into steerable markdown at ~/.aicx/. This is ground truth.
 ///   Layer 2 (semantic materialization): embed the corpus into a vector + BM25
-///     index (memex) for retrieval by agents and MCP tools. Nothing syncs
-///     automatically — you decide when to materialize.
+///     index (memex) for retrieval by agents and MCP tools. Use one-shot
+///     `memex-sync` or hand the loop to `memex-aicx daemon`.
 ///
 /// aicx is the orchestrator; memex is the retrieval kernel.
 ///
@@ -388,9 +390,9 @@ enum Commands {
     /// Materialize the canonical corpus into the memex retrieval kernel (layer 2).
     ///
     /// Reads chunks from ~/.aicx/, embeds them, and upserts into the rmcp-memex
-    /// vector + BM25 index. Materialization is always operator-driven — nothing
-    /// syncs automatically. You either run this command explicitly, or use
-    /// `--memex` on any extractor as a one-shot shortcut.
+    /// vector + BM25 index. Use this for explicit one-shot syncs and rebuilds,
+    /// or run `memex-aicx daemon` / `aicx daemon` to keep the semantic layer
+    /// fresh in the background.
     ///
     /// First build:    aicx memex-sync                (embed + index all unsynced chunks)
     /// Incremental:    aicx memex-sync                (only new chunks since last sync)
@@ -414,6 +416,102 @@ enum Commands {
         /// index has drifted from the canonical store.
         #[arg(long)]
         reindex: bool,
+    },
+
+    /// Start the background memex/steer daemon on a Unix socket.
+    ///
+    /// The daemon keeps the canonical store fresh via incremental extraction,
+    /// repairs steer indexing, and incrementally materializes chunks into memex.
+    /// By default this command detaches into the background; use `--foreground`
+    /// to keep logs in the current terminal.
+    Daemon {
+        /// Custom Unix socket path
+        #[arg(long)]
+        socket_path: Option<PathBuf>,
+
+        /// Keep the daemon in the current terminal instead of detaching
+        #[arg(long)]
+        foreground: bool,
+
+        /// Poll interval between refresh cycles
+        #[arg(long, default_value = "300")]
+        poll_seconds: u64,
+
+        /// Lookback window for the incremental canonical refresh
+        #[arg(long, default_value = "720")]
+        refresh_hours: u64,
+
+        /// Optional project filter(s) for the refresh loop
+        #[arg(short, long, num_args = 1..)]
+        project: Vec<String>,
+
+        /// Namespace in the semantic index
+        #[arg(short, long, default_value = "ai-contexts")]
+        namespace: String,
+
+        /// Override LanceDB path
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+
+        /// Use per-chunk library writes instead of batch memex sync
+        #[arg(long)]
+        per_chunk: bool,
+
+        /// Skip the initial bootstrap cycle after daemon start
+        #[arg(long)]
+        no_bootstrap: bool,
+    },
+
+    #[command(hide = true)]
+    DaemonRun {
+        #[arg(long)]
+        socket_path: Option<PathBuf>,
+
+        #[arg(long, default_value = "300")]
+        poll_seconds: u64,
+
+        #[arg(long, default_value = "720")]
+        refresh_hours: u64,
+
+        #[arg(short, long, num_args = 1..)]
+        project: Vec<String>,
+
+        #[arg(short, long, default_value = "ai-contexts")]
+        namespace: String,
+
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+
+        #[arg(long)]
+        per_chunk: bool,
+
+        #[arg(long)]
+        no_bootstrap: bool,
+    },
+
+    /// Show daemon status from the Unix-socket control plane.
+    DaemonStatus {
+        /// Custom Unix socket path
+        #[arg(long)]
+        socket_path: Option<PathBuf>,
+
+        /// Emit compact JSON instead of plain text
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
+
+    /// Queue an immediate daemon sync cycle.
+    DaemonSync {
+        /// Custom Unix socket path
+        #[arg(long)]
+        socket_path: Option<PathBuf>,
+    },
+
+    /// Stop the background daemon.
+    DaemonStop {
+        /// Custom Unix socket path
+        #[arg(long)]
+        socket_path: Option<PathBuf>,
     },
 
     /// List raw agent session sources on disk (pre-extraction inputs).
@@ -869,6 +967,67 @@ fn main() -> Result<()> {
         }) => {
             run_memex_sync(&namespace, per_chunk, db_path, reindex)?;
         }
+        Some(Commands::Daemon {
+            socket_path,
+            foreground,
+            poll_seconds,
+            refresh_hours,
+            project,
+            namespace,
+            db_path,
+            per_chunk,
+            no_bootstrap,
+        }) => {
+            let config = build_daemon_config(
+                socket_path,
+                poll_seconds,
+                refresh_hours,
+                project,
+                namespace,
+                db_path,
+                per_chunk,
+                !no_bootstrap,
+            );
+            if foreground {
+                daemon::run_foreground(config)?;
+            } else {
+                daemon::spawn_detached(&config)?;
+                let socket_path = daemon_socket_display(config.socket_path.as_ref())?;
+                eprintln!("✓ memex-aicx daemon started");
+                eprintln!("  Socket: {}", socket_path.display());
+            }
+        }
+        Some(Commands::DaemonRun {
+            socket_path,
+            poll_seconds,
+            refresh_hours,
+            project,
+            namespace,
+            db_path,
+            per_chunk,
+            no_bootstrap,
+        }) => {
+            let config = build_daemon_config(
+                socket_path,
+                poll_seconds,
+                refresh_hours,
+                project,
+                namespace,
+                db_path,
+                per_chunk,
+                !no_bootstrap,
+            );
+            daemon::run_foreground(config)?;
+        }
+        Some(Commands::DaemonStatus { socket_path, json }) => {
+            run_daemon_status(socket_path.as_deref(), json)?;
+        }
+        Some(Commands::DaemonSync { socket_path }) => {
+            run_daemon_sync(socket_path.as_deref())?;
+        }
+        Some(Commands::DaemonStop { socket_path }) => {
+            run_daemon_stop(socket_path.as_deref())?;
+        }
         Some(Commands::List) => {
             let sources = sources::list_available_sources()?;
             if sources.is_empty() {
@@ -1054,6 +1213,153 @@ fn run_intents(
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_daemon_config(
+    socket_path: Option<PathBuf>,
+    poll_seconds: u64,
+    refresh_hours: u64,
+    project: Vec<String>,
+    namespace: String,
+    db_path: Option<PathBuf>,
+    per_chunk: bool,
+    bootstrap: bool,
+) -> DaemonConfig {
+    DaemonConfig {
+        socket_path,
+        poll_seconds,
+        refresh_hours,
+        projects: project,
+        namespace,
+        db_path,
+        per_chunk,
+        bootstrap,
+    }
+}
+
+fn daemon_socket_display(socket_path: Option<&PathBuf>) -> Result<PathBuf> {
+    match socket_path {
+        Some(path) => Ok(path.clone()),
+        None => daemon::default_socket_path(),
+    }
+}
+
+fn run_daemon_status(socket_path: Option<&Path>, json: bool) -> Result<()> {
+    let resolved_socket = match socket_path {
+        Some(path) => path.to_path_buf(),
+        None => daemon::default_socket_path()?,
+    };
+    let live = daemon::request_status_at(&resolved_socket);
+
+    match live {
+        Ok(ControlOutcome::Status(snapshot)) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            } else {
+                print_daemon_status(&snapshot, true);
+            }
+            Ok(())
+        }
+        Err(err) => {
+            let fallback = daemon::load_last_known_status(socket_path)?;
+            if let Some(snapshot) = fallback {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                } else {
+                    eprintln!("Daemon is not currently reachable: {err:#}");
+                    print_daemon_status(&snapshot, false);
+                }
+                Ok(())
+            } else {
+                Err(err)
+            }
+        }
+        Ok(other) => unreachable!(
+            "status endpoint returned unexpected outcome: {}",
+            other.message()
+        ),
+    }
+}
+
+fn run_daemon_sync(socket_path: Option<&Path>) -> Result<()> {
+    let outcome = daemon::request_sync(socket_path, Some("manual CLI request".to_string()))?;
+    match &outcome {
+        ControlOutcome::SyncQueued(snapshot)
+        | ControlOutcome::SyncAlreadyQueued(snapshot)
+        | ControlOutcome::SyncAlreadyRunning(snapshot) => {
+            eprintln!("✓ {}", outcome.message());
+            eprintln!("  Phase: {}", snapshot.phase);
+        }
+        ControlOutcome::Status(_) | ControlOutcome::StopQueued(_) => {}
+    }
+    Ok(())
+}
+
+fn run_daemon_stop(socket_path: Option<&Path>) -> Result<()> {
+    let outcome = daemon::request_stop(socket_path)?;
+    if let ControlOutcome::StopQueued(snapshot) = outcome {
+        eprintln!("✓ stop queued");
+        eprintln!("  PID: {}", snapshot.pid);
+    }
+    Ok(())
+}
+
+fn print_daemon_status(snapshot: &DaemonStatusSnapshot, live: bool) {
+    println!(
+        "memex-aicx daemon: {}",
+        if live {
+            "running"
+        } else {
+            "offline (last known state)"
+        }
+    );
+    println!("  pid: {}", snapshot.pid);
+    println!("  socket: {}", snapshot.socket_path);
+    println!("  phase: {}", snapshot.phase);
+    println!("  detail: {}", snapshot.phase_detail);
+    println!("  started_at: {}", snapshot.started_at);
+    println!("  poll_seconds: {}", snapshot.poll_seconds);
+    println!("  refresh_hours: {}", snapshot.refresh_hours);
+    println!("  namespace: {}", snapshot.namespace);
+    println!(
+        "  projects: {}",
+        if snapshot.projects.is_empty() {
+            "all".to_string()
+        } else {
+            snapshot.projects.join(", ")
+        }
+    );
+    println!(
+        "  last_cycle_started_at: {}",
+        snapshot
+            .last_cycle_started_at
+            .map(|ts| ts.to_rfc3339())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!(
+        "  last_cycle_completed_at: {}",
+        snapshot
+            .last_cycle_completed_at
+            .map(|ts| ts.to_rfc3339())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!(
+        "  last_cycle_reason: {}",
+        snapshot.last_cycle_reason.as_deref().unwrap_or("-")
+    );
+    println!(
+        "  last_cycle_summary: {}",
+        snapshot.last_cycle_summary.as_deref().unwrap_or("-")
+    );
+    println!(
+        "  last_error: {}",
+        snapshot.last_error.as_deref().unwrap_or("-")
+    );
+    println!(
+        "  cycles: {} ok / {} failed",
+        snapshot.successful_cycles, snapshot.failed_cycles
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1960,6 +2266,8 @@ fn run_search(
     score: Option<u8>,
     json: bool,
 ) -> Result<()> {
+    let _ = daemon::ensure_running_and_kick(Some("cli search refresh".to_string()));
+
     // Extract inline date hints from query if no explicit --date given
     let (effective_query, inline_date) = if date.is_none() {
         extract_date_from_query(query)
@@ -2064,6 +2372,8 @@ fn run_steer(
     date: Option<&str>,
     limit: usize,
 ) -> Result<()> {
+    let _ = daemon::ensure_running_and_kick(Some("cli steer refresh".to_string()));
+
     let rt = tokio::runtime::Runtime::new()?;
 
     let (date_lo, date_hi) = if let Some(d) = date {

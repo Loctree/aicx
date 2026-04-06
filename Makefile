@@ -3,6 +3,7 @@
 
 .PHONY: all build install install-bin install-config install-cargo
 .PHONY: precheck test check fmt fmt-check clippy semgrep ci clean help manifest-check
+.PHONY: check-parser check-memex check-root test-parser test-memex test-root publish-dry-run
 .PHONY: version-show version-check release-plan release-check release-tag release-push package-check
 
 all: build
@@ -12,13 +13,13 @@ VERSION := $(shell python3 -c 'import tomllib; print(tomllib.load(open("Cargo.to
 TAG := v$(VERSION)
 
 build:
-	cargo build --locked --release --bin aicx --bin aicx-mcp
+	cargo build --locked --release --bin aicx --bin aicx-mcp --bin memex-aicx
 
 install:
 	./install.sh
 
 install-bin:
-	cargo install --path . --locked --force --bin aicx --bin aicx-mcp
+	cargo install --path . --locked --force --bin aicx --bin aicx-mcp --bin memex-aicx
 
 install-config:
 	./install.sh --skip-install
@@ -27,14 +28,40 @@ install-cargo:
 	cargo install $(PACKAGE_NAME) --locked
 
 precheck:
-	cargo check --locked --all-targets
+	@$(MAKE) check-parser
+	@$(MAKE) check-memex
+	@$(MAKE) check-root
 
 manifest-check:
-	@python3 -c 'import tomllib; data = tomllib.load(open("Cargo.toml", "rb")); bad = [(section, name, spec["path"]) for section in ("dependencies", "dev-dependencies", "build-dependencies") for name, spec in data.get(section, {}).items() if isinstance(spec, dict) and "path" in spec]; \
-print("Manifest portability: ok") if not bad else (_ for _ in ()).throw(SystemExit("Manifest portability check failed:\n" + "\n".join(f"  - {section}.{name} uses local path dependency {path}" for section, name, path in bad)))'
+	@python3 -c 'import tomllib; allowed = {"crates/aicx-parser", "crates/aicx-memex"}; data = tomllib.load(open("Cargo.toml", "rb")); bad = [(section, name, spec["path"], spec.get("version")) for section in ("dependencies", "dev-dependencies", "build-dependencies") for name, spec in data.get(section, {}).items() if isinstance(spec, dict) and "path" in spec and (spec["path"] not in allowed or not spec.get("version"))]; print("Manifest portability: ok") if not bad else (_ for _ in ()).throw(SystemExit("Manifest portability check failed:\n" + "\n".join(f"  - {section}.{name} uses path dependency {path} with version={version!r}" for section, name, path, version in bad)))'
+
+check-parser:
+	cargo check --locked -p aicx-parser
+
+check-memex:
+	cargo check --locked -p aicx-memex
+
+check-root:
+	cargo check --locked -p ai-contexters --bin aicx --bin aicx-mcp --bin memex-aicx
+
+test-parser:
+	cargo test --locked -p aicx-parser
+
+test-memex:
+	cargo test --locked -p aicx-memex
+
+test-root:
+	cargo test --locked --bin aicx --bin aicx-mcp --bin memex-aicx
+
+publish-dry-run:
+	cargo publish --locked --dry-run -p aicx-parser
+	cargo publish --locked --dry-run -p aicx-memex
+	cargo publish --locked --dry-run -p ai-contexters
 
 test:
-	cargo test --locked --all-targets
+	@$(MAKE) test-parser
+	@$(MAKE) test-memex
+	@$(MAKE) test-root
 
 check:
 	@echo "=== AICX Quality Gate ==="
@@ -43,13 +70,13 @@ check:
 	@echo "[2/7] Checking formatting..."
 	@cargo fmt --all --check || (echo "Run 'make fmt' to fix formatting." && exit 1)
 	@echo "[3/7] Running cargo check..."
-	@cargo check --locked --all-targets
+	@$(MAKE) precheck
 	@echo "[4/7] Running clippy..."
 	@cargo clippy --locked --all-features --all-targets -- -D warnings
 	@echo "[5/7] Running tests..."
-	@cargo test --locked --all-targets
+	@$(MAKE) test
 	@echo "[6/7] Building release binaries..."
-	@cargo build --locked --release --bin aicx --bin aicx-mcp
+	@$(MAKE) build
 	@echo "[7/7] Running Semgrep (if available)..."
 	@if command -v semgrep >/dev/null 2>&1 || command -v pipx >/dev/null 2>&1; then \
 		SEMGREP=$$(command -v semgrep || echo "pipx run semgrep"); \
@@ -109,8 +136,9 @@ release-plan:
 
 release-check: version-check
 	@echo "[extra] Verifying release package..."
-	@cargo package --locked
+	@$(MAKE) package-check
 	@$(MAKE) check
+	@$(MAKE) publish-dry-run
 	@echo "Release readiness passed."
 
 release-tag:
@@ -125,7 +153,9 @@ release-push:
 	git push origin "$(TAG)"
 
 package-check:
-	cargo package --locked
+	cargo package --locked -p aicx-parser
+	cargo package --locked -p aicx-memex
+	cargo package --locked -p ai-contexters
 
 clean:
 	cargo clean
@@ -134,15 +164,22 @@ help:
 	@echo "AICX Build System"
 	@echo ""
 	@echo "Core Commands:"
-	@echo "  make build           - Build release binaries (aicx + aicx-mcp)"
+	@echo "  make build           - Build release binaries (aicx + aicx-mcp + memex-aicx)"
 	@echo "  make install         - Install binaries + configure local MCP clients via install.sh"
-	@echo "  make install-bin     - Install only aicx + aicx-mcp from the current checkout"
+	@echo "  make install-bin     - Install only aicx + aicx-mcp + memex-aicx from the current checkout"
 	@echo "  make install-config  - Configure local MCP clients without reinstalling binaries"
 	@echo "  make install-cargo   - Install published crate from crates.io"
-	@echo "  make precheck        - Quick cargo check"
-	@echo "  make manifest-check  - Fail if Cargo.toml uses local path dependencies"
+	@echo "  make precheck        - Run package-scoped cargo checks for parser, memex, and root"
+	@echo "  make manifest-check  - Allow only versioned internal workspace path dependencies"
 	@echo "  make check           - Full local gate (fmt, check, clippy, test, build, semgrep)"
 	@echo "  make test            - Run all tests"
+	@echo "  make check-parser    - Check parser package only"
+	@echo "  make check-memex     - Check memex package only"
+	@echo "  make check-root      - Check shipped root binaries only"
+	@echo "  make test-parser     - Test parser package only"
+	@echo "  make test-memex      - Test memex package only"
+	@echo "  make test-root       - Test shipped root binaries only"
+	@echo "  make publish-dry-run - Run publish dry-runs for all workspace packages"
 	@echo "  make fmt             - Format all Rust code"
 	@echo "  make clean           - Clean build artifacts"
 	@echo ""

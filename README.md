@@ -10,7 +10,8 @@ Operator front door for agent session history.
 
 2. **Semantic materialization** (memex) — embed the canonical corpus into a
    vector + BM25 index for retrieval by agents and MCP tools.
-   Built by `memex-sync`, or the `--memex` shortcut on any extractor.
+   Built by `memex-sync`, the `--memex` shortcut on any extractor, or the
+   background `memex-aicx daemon`.
 
 `aicx` is the operator; memex is the retrieval kernel.
 
@@ -34,7 +35,7 @@ From a local checkout:
 ./install.sh
 ```
 
-`install.sh` installs `aicx` + `aicx-mcp` from the current checkout and configures Claude Code, Codex, and Gemini when their MCP settings directories already exist.
+`install.sh` installs `aicx`, `aicx-mcp`, and `memex-aicx` from the current checkout, configures Claude Code, Codex, and Gemini when their MCP settings directories already exist, then bootstraps the canonical store and starts or nudges the background `memex-aicx daemon` so semantic indexing can catch up without another manual step.
 
 From an accessible GitHub repo when you want unreleased source:
 
@@ -51,11 +52,37 @@ Already installed the binaries?
 Manual fallback:
 
 ```bash
-cargo install --path . --locked --bin aicx --bin aicx-mcp
+cargo install --path . --locked --bin aicx --bin aicx-mcp --bin memex-aicx
 ./install.sh --skip-install
 ```
 
-`install.sh` prefers the local checkout when one is present. Outside a checkout, it now defaults to the published crates.io package.
+`install.sh` prefers the local checkout when one is present. Outside a checkout, it now defaults to the published crates.io package. After install, use `memex-aicx status` to inspect the daemon's current phase.
+
+## Workspace Boundaries
+
+The shared workspace is now split into three explicit Cargo packages:
+
+- `aicx-parser` owns canonical extraction, chunking, frontmatter, store layout, ranking, and the parser-side heuristics reused by higher layers.
+- `aicx-memex` owns steer indexing, memex materialization/search, and the daemonized background sync surface.
+- `ai-contexters` stays thin and orchestration-focused: CLI entrypoints, MCP surface, dashboard server, local output/reporting, intents extraction, and compatibility binaries.
+
+Boundary rule:
+
+- `aicx-parser` must not depend on `rmcp-memex`.
+- `aicx-memex` may depend on parser-side canonical contracts.
+- `ai-contexters` is the glue layer that composes both surfaces for shipped binaries and operator-only UX.
+
+Contributor loops can now target the relevant cone directly:
+
+```bash
+cargo check -p aicx-parser
+cargo check -p aicx-memex
+cargo check -p ai-contexters --bin aicx --bin aicx-mcp --bin memex-aicx
+
+cargo test -p aicx-parser
+cargo test -p aicx-memex
+cargo test --bin aicx --bin aicx-mcp --bin memex-aicx
+```
 
 ## Quickstart
 
@@ -76,14 +103,19 @@ aicx refs -H 4 --emit paths
 
 ### Layer 2 — materialize into memex
 
-Materialization is operator-driven — nothing syncs automatically.
-You decide when to embed the canonical corpus into the memex retrieval
-kernel (vector + BM25):
+Run one-shot syncs when you want explicit control, or hand the loop to the
+background daemon when you do not want to think about indexing day to day:
 
 ```bash
 aicx memex-sync              # first build or incremental update
 aicx memex-sync --reindex    # full rebuild (after model/dimension change)
+memex-aicx daemon            # background refresh + steer repair + memex sync
+aicx daemon-status           # inspect daemon health / last cycle
 ```
+
+The daemon bootstraps once on startup and auto-reindexes the semantic layer
+when runtime embedding truth drifts, while keeping canonical `.md` outputs as
+the source of truth.
 
 Or do both layers in one shot:
 
@@ -104,9 +136,11 @@ aicx all -H 4 --emit json | jq '.store_paths'
 - `~/.aicx/non-repository-contexts/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
 - `~/.aicx/index.json`
 
-### Layer 2 — semantic index (`memex-sync`, `--memex`) — operator-driven
+### Layer 2 — semantic index (`memex-sync`, `--memex`, `memex-aicx daemon`)
 - `~/.aicx/memex/sync_state.json` (sync watermark — tracks what has been materialized)
 - LanceDB tables + Tantivy BM25 index (managed by rmcp-memex)
+- `~/.aicx/daemon/memex-aicx.sock` (Unix socket control plane)
+- `~/.aicx/daemon/memex-aicx.status.json` (last known daemon status snapshot)
 
 Framework-owned repo-local context artifacts (not written by the `aicx` CLI itself):
 - `.ai-context/share/artifacts/SUMMARY.md`
@@ -152,7 +186,7 @@ aicx steer --agent claude --date 2026-03-20..2026-03-28
 ```
 
 Semantic materialization (memex — the retrieval kernel).
-Materialization is always operator-driven; nothing happens until you run it:
+Choose explicit one-shot syncs or a background daemon:
 
 ```bash
 # First build: embed all unsynced canonical chunks into the memex index
@@ -170,9 +204,18 @@ aicx all -H 48 --memex
 
 # Fine-grained: per-chunk upsert instead of batch JSONL import
 aicx memex-sync --per-chunk
+
+# Background loop: one startup bootstrap, then periodic refresh/sync on a Unix socket
+memex-aicx daemon
+
+# Inspect / control the daemon
+aicx daemon-status
+aicx daemon-sync
+aicx daemon-stop
 ```
 
 Batch sync (default) uses metadata-rich JSONL import, preserving `project`, `agent`, `date`, `session_id`, and `kind`. Use `--per-chunk` only when you need single-document granularity.
+The daemon uses the same `.aicxignore` contract and will auto-reindex memex if an install/update changes runtime embedding truth.
 
 Single-session Gemini Antigravity extract (conversation artifacts first, explicit step-output fallback):
 
@@ -194,7 +237,7 @@ aicx extract --format gemini-antigravity \
 ## Notes
 
 - Secrets are redacted by default. Disable only if you know what you’re doing: `--no-redact-secrets`.
-- Framework integration expects `aicx` or `aicx-mcp` in `PATH`.
+- Framework integration expects `aicx` or `aicx-mcp` in `PATH`; background upkeep uses `memex-aicx` when installed.
 - `aicx memex-sync` now emits live scan/embed/index progress on TTY stderr instead of going silent after preflight.
 
 ---

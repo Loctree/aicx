@@ -16,27 +16,24 @@ exclude = ["*.html", "*.patch", "*.orig", ".ai-agents/", ".ai-context/", "script
 autobins = false
 default-run = "aicx"
 
+[workspace]
+members = ["crates/aicx-parser", "crates/aicx-memex"]
+
 [dependencies]
+aicx-memex = { version = "=0.5.6", path = "crates/aicx-memex" }
+aicx-parser = { version = "=0.5.6", path = "crates/aicx-parser" }
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-dirs = "6"
+regex = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yaml = "0.9"
-toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-regex = "1"
-globset = "0.4"
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "signal"] }
 rmcp = { version = "1.2", features = ["server", "schemars", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 libc = "0.2.183"
-# Remote integration boundary: consume the published crate instead of any local workspace checkout.
-# This dependency is library-only here; the legacy CLI compatibility shims and debug search still
-# require an installed `rmcp-memex` binary at runtime.
-rmcp-memex = { version = "0.4.1", default-features = false }
 
 [dev-dependencies]
 filetime = "0.2"
@@ -48,6 +45,10 @@ path = "src/main.rs"
 [[bin]]
 name = "aicx-mcp"
 path = "src/bin/aicx_mcp.rs"
+
+[[bin]]
+name = "memex-aicx"
+path = "crates/aicx-memex/src/bin/memex_aicx.rs"
 
 [profile.release]
 lto = true

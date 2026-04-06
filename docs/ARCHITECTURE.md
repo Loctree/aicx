@@ -10,31 +10,62 @@
 
 ```mermaid
 flowchart TD
-  CLI[aicx CLI] --> SRC[sources.rs: extract_*]
-  SRC --> DEDUP[state.rs: dedup + watermark]
-  DEDUP --> RED[redact.rs: redact_secrets]
-  RED --> STORE[store.rs: write_context_chunked]
+  CLI[ai-contexters glue: CLI / MCP / dashboard] --> PARSER[aicx-parser: canonical extract/store/read]
+  PARSER --> STORE[store.rs: write_context_chunked]
   STORE --> EMIT[stdout: --emit paths/json/none]
-  RED --> LOCAL[output.rs: write_report (-o)]
-  STORE --> MEMEX[memex.rs: sync_new_chunks (--memex)]
+  CLI --> LOCAL[output.rs / intents.rs: operator surfaces]
+  STORE --> MEMEX[aicx-memex: steer + memex sync/search]
 ```
+
+## Workspace Package Boundaries
+
+The repository still lives in one shared tree, but ownership is now explicit at
+the Cargo-package boundary:
+
+- `crates/aicx-parser`: canonical extraction, chunking, store, steering metadata parsing, ranking, and parser-side heuristics reused above the core.
+- `crates/aicx-memex`: steer index, semantic materialization, fast memex search, and the background daemon.
+- root `ai-contexters`: glue/orchestration and operator UX (`aicx`, `aicx-mcp`, `memex-aicx`, MCP server, dashboard server, local output, intents, static dashboard generation).
+
+The split is now physical as well as conceptual: parser and memex modules live
+under their own crate trees, while the root package only re-exports those
+boundaries and hosts the orchestration-specific modules. That means parser work
+no longer needs to link the memex stack unless it crosses the indexer boundary
+on purpose, and root-only UX edits do not belong in parser-core.
+
+Boundary law:
+
+- Parser side does not link `rmcp-memex`.
+- Indexer side may consume parser-side canonical contracts (`store`, `chunker`, `rank`, `sanitize`).
+- Glue code composes both packages and should stay thin.
 
 ## Module Map (Codebase Mapping)
 
-Library modules (see `src/lib.rs`):
+Parser package (`crates/aicx-parser`, re-exported through `src/lib.rs`):
 
-- `src/sources.rs`: source discovery + extraction
-- `src/state.rs`: dedup hashes + incremental watermarks
-- `src/store.rs`: central store layout under `~/.aicx/` + `index.json`
-- `src/chunker.rs`: semantic windowing chunker (token heuristic + overlap + highlight extraction)
-- `src/output.rs`: local report writer (`-o`) + optional loctree snapshot inclusion
-- `src/memex.rs`: memex sync (`rmcp-memex import/upsert`) + sync state
-- `src/redact.rs`: secret redaction (regex engine)
-- `src/sanitize.rs`: path validation for reads/writes (defense against traversal)
-- `src/steer_index.rs`: fast metadata index for steering-aware retrieval
+- `crates/aicx-parser/src/sources.rs`: source discovery + extraction
+- `crates/aicx-parser/src/state.rs`: dedup hashes + incremental watermarks
+- `crates/aicx-parser/src/store.rs`: central store layout under `~/.aicx/` + `index.json`
+- `crates/aicx-parser/src/chunker.rs`: semantic windowing chunker (token heuristic + overlap + highlight extraction)
+- `crates/aicx-parser/src/redact.rs`: secret redaction (regex engine)
+- `crates/aicx-parser/src/sanitize.rs`: path validation for reads/writes (defense against traversal)
+- `crates/aicx-parser/src/frontmatter.rs`: frontmatter parsing for steering metadata
+- `crates/aicx-parser/src/rank.rs`: fuzzy ranking and store search helpers
+- `crates/aicx-parser/src/types.rs`: shared parser-side contracts and enums
 
-Binary orchestration:
+Indexer package (`crates/aicx-memex`, re-exported through `src/lib.rs`):
+
+- `crates/aicx-memex/src/memex.rs`: memex sync/search + runtime truth
+- `crates/aicx-memex/src/steer_index.rs`: fast metadata index for steering-aware retrieval
+- `crates/aicx-memex/src/daemon.rs`: background refresh/sync control plane
+
+Glue/orchestration package (root `ai-contexters`):
+
 - `src/main.rs`: clap CLI, wires flows together, handles stdout emission (`--emit`).
+- `src/mcp.rs`: MCP server surface that composes parser search/rank with memex-backed acceleration when available.
+- `src/dashboard_server.rs`: live dashboard/search API bridge over parser + memex packages.
+- `src/output.rs`: local report writer (`-o`) + optional loctree snapshot inclusion.
+- `src/intents.rs`: operator-facing intention extraction built on parser heuristics.
+- `src/dashboard.rs`: static dashboard payload + HTML generation.
 
 ## Data Flow: Extractors (`claude`, `codex`, `all`)
 

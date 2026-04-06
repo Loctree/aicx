@@ -18,8 +18,8 @@ This document is the maintainer path from green CI to public release artifacts.
 Tagging `vX.Y.Z` triggers `.github/workflows/release.yml`, which:
 
 - verifies the tag matches `Cargo.toml`
-- reruns the required release gates: `semgrep`, `cargo clippy --all-features --all-targets -- -D warnings`, `cargo test --bin aicx`, `cargo test --bin aicx-mcp`, `cargo fmt -- --check`, and `cargo publish --dry-run`
-- builds both shipped binaries: `aicx` and `aicx-mcp`
+- reruns the required release gates: `semgrep`, `cargo clippy --all-features --all-targets -- -D warnings`, targeted `cargo check`/`cargo test` passes for `aicx-parser`, `aicx-memex`, and shipped root binaries, `cargo fmt -- --check`, and `cargo publish --dry-run` for all three workspace packages
+- builds all shipped binaries: `aicx`, `aicx-mcp`, and `memex-aicx`
 - packages archives plus `LICENSE`, `README.md`, and command docs
 - uploads SHA-256 checksum files alongside each archive
 - creates or updates the matching GitHub Release
@@ -42,6 +42,7 @@ Each archive contains:
 
 - `aicx`
 - `aicx-mcp`
+- `memex-aicx`
 - `LICENSE`
 - `README.md`
 - `docs/COMMANDS.md`
@@ -63,10 +64,12 @@ git push origin v0.4.3
 
 ## Publish-Ready Crate Flow
 
-The repo is configured so `cargo publish --dry-run` is part of CI and release verification. When crates.io publication becomes part of the release lane, a maintainer only has one manual step left:
+The repo is configured so `cargo publish --dry-run` is part of CI and release verification for all three workspace packages. When crates.io publication becomes part of the release lane, publish in dependency order:
 
 ```bash
-cargo publish
+cargo publish -p aicx-parser
+cargo publish -p aicx-memex
+cargo publish -p ai-contexters
 ```
 
 Keep crates.io publication manual until the team is ready to store `CRATES_IO_API_TOKEN` in repository secrets and automate that final step.
@@ -75,4 +78,4 @@ Keep crates.io publication manual until the team is ready to store `CRATES_IO_AP
 
 - To rebuild a release for an existing tag, rerun the failed workflow or use `workflow_dispatch` with the same `vX.Y.Z` tag.
 - If the tag does not match `Cargo.toml`, the workflow fails before any binaries are published.
-- If `cargo publish --dry-run` fails, treat that as a publish-surface regression even if normal CI is green.
+- If any package-level `cargo publish --dry-run` fails, treat that as a publish-surface regression even if normal CI is green.

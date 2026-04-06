@@ -55,24 +55,52 @@ dependencies = [
 name = "ai-contexters"
 version = "0.5.6"
 dependencies = [
+ "aicx-memex",
+ "aicx-parser",
  "anyhow",
  "axum",
  "chrono",
  "clap",
- "dirs",
  "filetime",
- "globset",
  "libc",
  "regex",
  "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "aicx-memex"
+version = "0.5.6"
+dependencies = [
+ "aicx-parser",
+ "anyhow",
+ "chrono",
+ "dirs",
  "rmcp-memex",
  "serde",
  "serde_json",
- "serde_yaml",
  "tokio",
  "toml",
  "tracing",
- "tracing-subscriber",
+]
+
+[[package]]
+name = "aicx-parser"
+version = "0.5.6"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "filetime",
+ "globset",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]

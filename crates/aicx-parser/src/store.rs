@@ -20,10 +20,9 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::chunker::{self, ChunkerConfig};
-use crate::output::TimelineEntry;
 use crate::sanitize;
 use crate::segmentation::semantic_segments;
-use crate::sources::{self, ExtractionConfig};
+use crate::sources::{self, ExtractionConfig, TimelineEntry};
 pub use crate::types::Kind;
 use crate::types::{RepoIdentity, SemanticSegment};
 
@@ -139,7 +138,7 @@ pub fn session_basename(date: &str, agent: &str, session_id: &str, chunk: u32) -
 }
 
 /// Compact a YYYY-MM-DD date to YYYY_MMDD form.
-pub(crate) fn compact_date(date: &str) -> String {
+pub fn compact_date(date: &str) -> String {
     // Handle both "2026-03-21" and "2026_0321" input
     let digits: String = date.chars().filter(|c| c.is_ascii_digit()).collect();
     if digits.len() >= 8 {
@@ -245,7 +244,7 @@ impl StoreIgnoreMatcher {
             });
         }
 
-        let raw = fs::read_to_string(&path)
+        let raw = sanitize::read_to_string_validated(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
         let mut rules = Vec::new();
 
@@ -828,12 +827,12 @@ fn scan_context_files_with_ignore(
 
     let canonical_root = base.join(CANONICAL_STORE_DIRNAME);
     if canonical_root.is_dir() {
-        scan_repo_store(&canonical_root, &ignore, &mut files)?;
+        scan_repo_store(&canonical_root, ignore, &mut files)?;
     }
 
     let non_repo_root = base.join(NON_REPOSITORY_CONTEXTS);
     if non_repo_root.is_dir() {
-        scan_non_repository_store(&non_repo_root, &ignore, &mut files)?;
+        scan_non_repository_store(&non_repo_root, ignore, &mut files)?;
     }
 
     files.sort_by(|left, right| {
@@ -1039,6 +1038,7 @@ fn scan_non_repository_store(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_leaf_files(
     dir: &Path,
     repo: Option<RepoIdentity>,

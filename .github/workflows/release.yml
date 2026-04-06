@@ -105,17 +105,38 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --locked --all-features --all-targets -- -D warnings
 
+      - name: cargo check -p aicx-parser
+        run: cargo check --locked -p aicx-parser
+
+      - name: cargo check -p aicx-memex
+        run: cargo check --locked -p aicx-memex
+
+      - name: cargo check -p ai-contexters
+        run: cargo check --locked -p ai-contexters --bin aicx --bin aicx-mcp --bin memex-aicx
+
+      - name: cargo test -p aicx-parser
+        run: cargo test --locked -p aicx-parser
+
+      - name: cargo test -p aicx-memex
+        run: cargo test --locked -p aicx-memex
+
       - name: cargo test --bin aicx
         run: cargo test --locked --bin aicx
 
       - name: cargo test --bin aicx-mcp
         run: cargo test --locked --bin aicx-mcp
 
+      - name: cargo test --bin memex-aicx
+        run: cargo test --locked --bin memex-aicx
+
       - name: cargo fmt
         run: cargo fmt -- --check
 
       - name: cargo publish --dry-run
-        run: cargo publish --locked --dry-run
+        run: |
+          cargo publish --locked --dry-run -p aicx-parser
+          cargo publish --locked --dry-run -p aicx-memex
+          cargo publish --locked --dry-run -p ai-contexters
 
   build:
     name: Build ${{ matrix.target }}
@@ -164,7 +185,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --yes musl-tools
 
       - name: Build release binaries
-        run: cargo build --locked --release --target ${{ matrix.target }} --bin aicx --bin aicx-mcp
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin aicx --bin aicx-mcp --bin memex-aicx
 
       - name: Package release archive
         id: package
@@ -201,7 +222,7 @@ jobs:
           docs_dir = bundle_dir / "docs"
           docs_dir.mkdir()
 
-          for binary in ("aicx", "aicx-mcp"):
+          for binary in ("aicx", "aicx-mcp", "memex-aicx"):
               shutil.copy2(release_dir / f"{binary}{binary_ext}", bundle_dir / f"{binary}{binary_ext}")
 
           for source in ("LICENSE", "README.md"):

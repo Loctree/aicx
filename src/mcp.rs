@@ -137,6 +137,46 @@ fn incremental_rescan_args(hours: u64, project: Option<&str>) -> Vec<String> {
     args
 }
 
+fn kick_background_refresh(project: Option<&str>, reason: &str) {
+    if RESCAN_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    match crate::daemon::ensure_running_and_kick(Some(reason.to_string())) {
+        Ok(outcome) => {
+            tracing::debug!(
+                "Delegated background refresh to memex-aicx daemon: {}",
+                outcome.message()
+            );
+        }
+        Err(daemon_err) => {
+            let args = incremental_rescan_args(24, project);
+            match std::process::Command::new("aicx")
+                .args(&args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(_) => {
+                    tracing::warn!(
+                        "memex-aicx daemon unavailable, fell back to one-shot refresh: {daemon_err:#}"
+                    );
+                }
+                Err(spawn_err) => {
+                    tracing::warn!(
+                        "Failed to notify daemon ({daemon_err:#}) and failed to spawn fallback refresh: {spawn_err}"
+                    );
+                }
+            }
+        }
+    }
+
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        RESCAN_RUNNING.store(false, Ordering::SeqCst);
+    });
+}
+
 // ============================================================================
 // MCP Server
 // ============================================================================
@@ -180,27 +220,7 @@ impl AicxMcpServer {
             limit
         };
 
-        // Non-blocking auto-rescan with rate-limit guard.
-        if !RESCAN_RUNNING.swap(true, Ordering::SeqCst) {
-            let args = incremental_rescan_args(24, project.as_deref());
-            match std::process::Command::new("aicx")
-                .args(&args)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                Ok(_) => {
-                    std::thread::spawn(|| {
-                        std::thread::sleep(std::time::Duration::from_secs(30));
-                        RESCAN_RUNNING.store(false, Ordering::SeqCst);
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to spawn aicx background refresh: {e}");
-                    RESCAN_RUNNING.store(false, Ordering::SeqCst);
-                }
-            }
-        }
+        kick_background_refresh(project.as_deref(), "mcp search refresh");
 
         // Try fast search with rmcp_memex first (instant), fallback to brute-force if it fails
         let (results, scanned) =
@@ -331,6 +351,7 @@ impl AicxMcpServer {
         Parameters(params): Parameters<SteerParams>,
     ) -> Result<CallToolResult, McpError> {
         let limit = params.limit.min(100);
+        kick_background_refresh(params.project.as_deref(), "mcp steer refresh");
 
         let (date_lo, date_hi) = if let Some(ref d) = params.date {
             parse_date_filter_mcp(d)

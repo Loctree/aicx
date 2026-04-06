@@ -1,0 +1,24 @@
+[package]
+name = "aicx-memex"
+version = "0.5.6"
+edition = "2024"
+rust-version = "1.85"
+description = "Memex/indexer boundary for ai-contexters"
+authors = ["Maciej Gad <void@div0.space>", "Monika Szymanska <hello@vetcoders.io>"]
+license = "MIT"
+
+[lib]
+name = "aicx_memex"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+aicx-parser = { path = "../aicx-parser" }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+rmcp-memex = { version = "0.4.1", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "signal"] }
+toml = "0.8"
+tracing = "0.1"
