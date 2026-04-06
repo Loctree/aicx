@@ -105,6 +105,24 @@ print_prefixed_block() {
   done <<<"$text"
 }
 
+run_with_heartbeat() {
+  local message="$1"
+  shift
+  local heartbeat_seconds="${AICX_HEARTBEAT_SECONDS:-15}"
+
+  "$@" &
+  local cmd_pid=$!
+
+  while kill -0 "$cmd_pid" 2>/dev/null; do
+    sleep "$heartbeat_seconds"
+    if kill -0 "$cmd_pid" 2>/dev/null; then
+      echo "  $message"
+    fi
+  done
+
+  wait "$cmd_pid"
+}
+
 bootstrap_memex_daemon() {
   if ! resolve_aicx_memex; then
     echo "  Warning: aicx-memex not found. Skipping background memex bootstrap."
@@ -179,32 +197,103 @@ if [ "$SKIP_INSTALL" -eq 0 ]; then
     exit 1
   fi
 
-  # Show live compilation progress: count Compiling lines → [1/4] Compiling... (N crates)
+  # Show live compilation progress and keep a heartbeat visible during long LTO/link phases.
   cargo_install_with_progress() {
     local total=0
-    "$@" 2>&1 | while IFS= read -r line; do
-      case "$line" in
-        *Compiling*)
-          total=$((total + 1))
-          printf '\r  Compiling... (%d crates)' "$total" >&2
-          ;;
-        *Finished*|*Installing*|*Installed*|*Replacing*)
-          printf '\r  %s\n' "$line" >&2
-          ;;
-      esac
+    local heartbeat_seconds=15
+    local last_update
+    local temp_dir
+    local stream_path
+    local log_path
+    local line=""
+    local status=0
+
+    temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/aicx-install.XXXXXX")
+    stream_path="$temp_dir/stream"
+    log_path="$temp_dir/cargo-install.log"
+    mkfifo "$stream_path"
+
+    "$@" >"$stream_path" 2>&1 &
+    local cmd_pid=$!
+
+    exec 3<"$stream_path"
+    last_update=$(date +%s)
+
+    while true; do
+      if IFS= read -r -u 3 -t 1 line; then
+        printf '%s\n' "$line" >>"$log_path"
+        last_update=$(date +%s)
+        case "$line" in
+          *Compiling*)
+            total=$((total + 1))
+            printf '\r  Compiling... (%d crates)' "$total" >&2
+            ;;
+          *Finished*|*Installing*|*Installed*|*Replacing*)
+            printf '\r  %s\n' "$line" >&2
+            ;;
+          *error:*|*failed*|*Failed*)
+            printf '\r  %s\n' "$line" >&2
+            ;;
+        esac
+        continue
+      fi
+
+      if kill -0 "$cmd_pid" 2>/dev/null; then
+        if [ $(( $(date +%s) - last_update )) -ge "$heartbeat_seconds" ]; then
+          if [ "$total" -gt 0 ]; then
+            printf '\r  Still building release binaries... (%d crates compiled so far)\n' "$total" >&2
+          else
+            printf '\r  Still building release binaries...\n' >&2
+          fi
+          last_update=$(date +%s)
+        fi
+        continue
+      fi
+
+      while IFS= read -r -u 3 line; do
+        printf '%s\n' "$line" >>"$log_path"
+        case "$line" in
+          *Compiling*)
+            total=$((total + 1))
+            printf '\r  Compiling... (%d crates)' "$total" >&2
+            ;;
+          *Finished*|*Installing*|*Installed*|*Replacing*)
+            printf '\r  %s\n' "$line" >&2
+            ;;
+          *error:*|*failed*|*Failed*)
+            printf '\r  %s\n' "$line" >&2
+            ;;
+        esac
+      done
+      break
     done
+
+    wait "$cmd_pid"
+    status=$?
+
+    if [ "$status" -ne 0 ] && [ -f "$log_path" ]; then
+      echo "  cargo install failed. Last output:" >&2
+      tail -n 20 "$log_path" >&2
+    fi
+
+    exec 3<&-
+    rm -rf "$temp_dir"
     printf '\n' >&2
+    return "$status"
   }
 
   INSTALL_MODE=$(resolve_install_mode)
   if [ "$INSTALL_MODE" = "local" ]; then
     echo "[1/4] Installing aicx + aicx-mcp + aicx-memex from this checkout..."
+    echo "  release build can go quiet during LTO linking; heartbeat will continue below"
     cargo_install_with_progress cargo install --path "$SCRIPT_DIR" --locked --force --bin aicx --bin aicx-mcp --bin aicx-memex
   elif [ "$INSTALL_MODE" = "crates" ]; then
     echo "[1/4] Installing aicx + aicx-mcp + aicx-memex from crates.io..."
+    echo "  release build can go quiet during LTO linking; heartbeat will continue below"
     cargo_install_with_progress cargo install ai-contexters --locked
   else
     echo "[1/4] Installing aicx + aicx-mcp + aicx-memex from git..."
+    echo "  release build can go quiet during LTO linking; heartbeat will continue below"
     if ! cargo_install_with_progress cargo install --git "$AICX_GIT_URL" --locked ai-contexters; then
       echo "Error: git install failed."
       echo "  If you only need the published release, use AICX_INSTALL_MODE=crates or run 'cargo install ai-contexters --locked'."
@@ -328,7 +417,8 @@ configure_mcp "gemini" "$HOME/.gemini/settings.json"
 
 # --- Step 4: Full store bootstrap + daemon kickoff ---
 echo "[4/4] Full context extraction + memex daemon bootstrap (this may take a moment)..."
-"${AICX_RUN[@]}" all -H 10000 --incremental --emit none
+echo "  canonical store bootstrap heartbeat will continue below if extraction goes quiet"
+run_with_heartbeat "Still bootstrapping canonical store..." "${AICX_RUN[@]}" all -H 10000 --incremental --emit none
 echo "  store bootstrap complete"
 bootstrap_memex_daemon
 echo ""
