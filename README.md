@@ -11,7 +11,7 @@ Operator front door for agent session history.
 2. **Semantic materialization** (memex) — embed the canonical corpus into a
    vector + BM25 index for retrieval by agents and MCP tools.
    Built by `memex-sync`, the `--memex` shortcut on any extractor, or the
-   background `memex-aicx daemon`.
+   background `aicx-memex daemon`.
 
 `aicx` is the operator; memex is the retrieval kernel.
 
@@ -35,7 +35,7 @@ From a local checkout:
 ./install.sh
 ```
 
-`install.sh` installs `aicx`, `aicx-mcp`, and `memex-aicx` from the current checkout, configures Claude Code, Codex, and Gemini when their MCP settings directories already exist, then bootstraps the canonical store and starts or nudges the background `memex-aicx daemon` so semantic indexing can catch up without another manual step.
+`install.sh` installs `aicx`, `aicx-mcp`, and `aicx-memex` from the current checkout, configures Claude Code, Codex, and Gemini when their MCP settings directories already exist, then bootstraps the canonical store and starts or nudges the background `aicx-memex daemon` so semantic indexing can catch up without another manual step.
 
 From an accessible GitHub repo when you want unreleased source:
 
@@ -52,11 +52,11 @@ Already installed the binaries?
 Manual fallback:
 
 ```bash
-cargo install --path . --locked --bin aicx --bin aicx-mcp --bin memex-aicx
+cargo install --path . --locked --bin aicx --bin aicx-mcp --bin aicx-memex
 ./install.sh --skip-install
 ```
 
-`install.sh` prefers the local checkout when one is present. Outside a checkout, it now defaults to the published crates.io package. After install, use `memex-aicx status` to inspect the daemon's current phase.
+`install.sh` prefers the local checkout when one is present. Outside a checkout, it now defaults to the published crates.io package. After install, use `aicx-memex status` to inspect the daemon's current phase.
 
 ## Workspace Boundaries
 
@@ -77,11 +77,11 @@ Contributor loops can now target the relevant cone directly:
 ```bash
 cargo check -p aicx-parser
 cargo check -p aicx-memex
-cargo check -p ai-contexters --bin aicx --bin aicx-mcp --bin memex-aicx
+cargo check -p ai-contexters --bin aicx --bin aicx-mcp --bin aicx-memex
 
 cargo test -p aicx-parser
 cargo test -p aicx-memex
-cargo test --bin aicx --bin aicx-mcp --bin memex-aicx
+cargo test --bin aicx --bin aicx-mcp --bin aicx-memex
 ```
 
 ## Quickstart
@@ -109,7 +109,7 @@ background daemon when you do not want to think about indexing day to day:
 ```bash
 aicx memex-sync              # first build or incremental update
 aicx memex-sync --reindex    # full rebuild (after model/dimension change)
-memex-aicx daemon            # background refresh + steer repair + memex sync
+aicx-memex daemon            # background refresh + steer repair + memex sync
 aicx daemon-status           # inspect daemon health / last cycle
 ```
 
@@ -136,11 +136,11 @@ aicx all -H 4 --emit json | jq '.store_paths'
 - `~/.aicx/non-repository-contexts/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
 - `~/.aicx/index.json`
 
-### Layer 2 — semantic index (`memex-sync`, `--memex`, `memex-aicx daemon`)
+### Layer 2 — semantic index (`memex-sync`, `--memex`, `aicx-memex daemon`)
 - `~/.aicx/memex/sync_state.json` (sync watermark — tracks what has been materialized)
 - LanceDB tables + Tantivy BM25 index (managed by rmcp-memex)
-- `~/.aicx/daemon/memex-aicx.sock` (Unix socket control plane)
-- `~/.aicx/daemon/memex-aicx.status.json` (last known daemon status snapshot)
+- `~/.aicx/daemon/aicx-memex.sock` (Unix socket control plane)
+- `~/.aicx/daemon/aicx-memex.status.json` (last known daemon status snapshot)
 
 Framework-owned repo-local context artifacts (not written by the `aicx` CLI itself):
 - `.ai-context/share/artifacts/SUMMARY.md`
@@ -206,7 +206,7 @@ aicx all -H 48 --memex
 aicx memex-sync --per-chunk
 
 # Background loop: one startup bootstrap, then periodic refresh/sync on a Unix socket
-memex-aicx daemon
+aicx-memex daemon
 
 # Inspect / control the daemon
 aicx daemon-status
@@ -237,7 +237,7 @@ aicx extract --format gemini-antigravity \
 ## Notes
 
 - Secrets are redacted by default. Disable only if you know what you’re doing: `--no-redact-secrets`.
-- Framework integration expects `aicx` or `aicx-mcp` in `PATH`; background upkeep uses `memex-aicx` when installed.
+- Framework integration expects `aicx` or `aicx-mcp` in `PATH`; background upkeep uses `aicx-memex` when installed.
 - `aicx memex-sync` now emits live scan/embed/index progress on TTY stderr instead of going silent after preflight.
 
 ---

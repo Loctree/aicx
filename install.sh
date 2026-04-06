@@ -25,7 +25,7 @@ for arg in "$@"; do
     --skip-install) SKIP_INSTALL=1 ;;
     --help|-h)
       echo "Usage: install.sh [--skip-install]"
-      echo "  Install aicx + aicx-mcp + memex-aicx, configure MCP, and bootstrap background memex indexing."
+      echo "  Install aicx + aicx-mcp + aicx-memex, configure MCP, and bootstrap background memex indexing."
       echo "  Run from the repo root or any local checkout that contains Cargo.toml."
       echo ""
       echo "Install source is controlled by AICX_INSTALL_MODE:"
@@ -82,14 +82,14 @@ PY
   return 1
 }
 
-resolve_memex_aicx() {
-  if command -v memex-aicx >/dev/null 2>&1; then
-    MEMEX_AICX_RUN=("memex-aicx")
+resolve_aicx_memex() {
+  if command -v aicx-memex >/dev/null 2>&1; then
+    AICX_MEMEX_RUN=("aicx-memex")
     return 0
   fi
 
   if [ "$HAS_LOCAL_MANIFEST" -eq 1 ] && command -v cargo >/dev/null 2>&1; then
-    MEMEX_AICX_RUN=("cargo" "run" "--quiet" "--manifest-path" "$MANIFEST_PATH" "--bin" "memex-aicx" "--")
+    AICX_MEMEX_RUN=("cargo" "run" "--quiet" "--manifest-path" "$MANIFEST_PATH" "--bin" "aicx-memex" "--")
     return 0
   fi
 
@@ -106,8 +106,8 @@ print_prefixed_block() {
 }
 
 bootstrap_memex_daemon() {
-  if ! resolve_memex_aicx; then
-    echo "  Warning: memex-aicx not found. Skipping background memex bootstrap."
+  if ! resolve_aicx_memex; then
+    echo "  Warning: aicx-memex not found. Skipping background memex bootstrap."
     return 0
   fi
 
@@ -117,21 +117,21 @@ bootstrap_memex_daemon() {
   local phase=""
   local socket=""
 
-  if command_output=$("${MEMEX_AICX_RUN[@]}" sync 2>&1); then
-    echo "  memex-aicx daemon already running; refresh requested"
+  if command_output=$("${AICX_MEMEX_RUN[@]}" sync 2>&1); then
+    echo "  aicx-memex daemon already running; refresh requested"
     print_prefixed_block "  " "$command_output"
   else
-    echo "  starting memex-aicx daemon..."
-    if command_output=$("${MEMEX_AICX_RUN[@]}" daemon 2>&1); then
+    echo "  starting aicx-memex daemon..."
+    if command_output=$("${AICX_MEMEX_RUN[@]}" daemon 2>&1); then
       print_prefixed_block "  " "$command_output"
     else
-      echo "  Warning: failed to start memex-aicx daemon."
+      echo "  Warning: failed to start aicx-memex daemon."
       print_prefixed_block "    " "$command_output"
       return 0
     fi
   fi
 
-  if status_json=$("${MEMEX_AICX_RUN[@]}" status --json 2>/dev/null); then
+  if status_json=$("${AICX_MEMEX_RUN[@]}" status --json 2>/dev/null); then
     read -r pid phase socket < <(
       DAEMON_STATUS_JSON="$status_json" python3 - <<'PY'
 import json
@@ -145,7 +145,7 @@ PY
     if [ -n "$socket" ]; then
       echo "  daemon socket: $socket"
     fi
-    echo "  inspect progress with: memex-aicx status"
+    echo "  inspect progress with: aicx-memex status"
   else
     echo "  Warning: daemon started but status probe is not reachable yet."
   fi
@@ -198,13 +198,13 @@ if [ "$SKIP_INSTALL" -eq 0 ]; then
 
   INSTALL_MODE=$(resolve_install_mode)
   if [ "$INSTALL_MODE" = "local" ]; then
-    echo "[1/4] Installing aicx + aicx-mcp + memex-aicx from this checkout..."
-    cargo_install_with_progress cargo install --path "$SCRIPT_DIR" --locked --force --bin aicx --bin aicx-mcp --bin memex-aicx
+    echo "[1/4] Installing aicx + aicx-mcp + aicx-memex from this checkout..."
+    cargo_install_with_progress cargo install --path "$SCRIPT_DIR" --locked --force --bin aicx --bin aicx-mcp --bin aicx-memex
   elif [ "$INSTALL_MODE" = "crates" ]; then
-    echo "[1/4] Installing aicx + aicx-mcp + memex-aicx from crates.io..."
+    echo "[1/4] Installing aicx + aicx-mcp + aicx-memex from crates.io..."
     cargo_install_with_progress cargo install ai-contexters --locked
   else
-    echo "[1/4] Installing aicx + aicx-mcp + memex-aicx from git..."
+    echo "[1/4] Installing aicx + aicx-mcp + aicx-memex from git..."
     if ! cargo_install_with_progress cargo install --git "$AICX_GIT_URL" --locked ai-contexters; then
       echo "Error: git install failed."
       echo "  If you only need the published release, use AICX_INSTALL_MODE=crates or run 'cargo install ai-contexters --locked'."
@@ -220,7 +220,7 @@ echo "[2/4] Verifying..."
 if ! resolve_aicx; then
   echo "Error: aicx is not available."
   if [ "$HAS_LOCAL_MANIFEST" -eq 1 ]; then
-    echo "  From this checkout, run './install.sh' or 'cargo install --path . --locked --bin aicx --bin aicx-mcp --bin memex-aicx'."
+    echo "  From this checkout, run './install.sh' or 'cargo install --path . --locked --bin aicx --bin aicx-mcp --bin aicx-memex'."
   else
     echo "  Ensure ~/.cargo/bin is in your PATH."
   fi
@@ -245,15 +245,15 @@ else
   echo "  Warning: aicx-mcp not found. MCP config will be skipped."
 fi
 
-MEMEX_AICX_RUN=()
-if resolve_memex_aicx; then
-  if [ "${MEMEX_AICX_RUN[0]}" = "cargo" ]; then
-    echo "  memex-aicx via cargo run (local checkout fallback)"
+AICX_MEMEX_RUN=()
+if resolve_aicx_memex; then
+  if [ "${AICX_MEMEX_RUN[0]}" = "cargo" ]; then
+    echo "  aicx-memex via cargo run (local checkout fallback)"
   else
-    echo "  memex-aicx $(command -v memex-aicx)"
+    echo "  aicx-memex $(command -v aicx-memex)"
   fi
 else
-  echo "  Warning: memex-aicx not found. Background daemon bootstrap will be skipped."
+  echo "  Warning: aicx-memex not found. Background daemon bootstrap will be skipped."
 fi
 
 # --- Step 3: Configure MCP ---
@@ -344,7 +344,7 @@ fi
 echo "Installed:"
 echo "  aicx      — CLI for extraction, search, steer, dashboard"
 echo "  aicx-mcp  — MCP server (3 tools: search, rank, steer)"
-echo "  memex-aicx — background daemon launcher for steer/memex upkeep"
+echo "  aicx-memex — background daemon launcher for steer/memex upkeep"
 echo ""
 echo "MCP tools available in Claude Code / Codex / Gemini:"
 echo "  aicx_search  — fuzzy search across session history"
@@ -356,4 +356,4 @@ echo "  aicx store -H 24                   # rescan last 24h from all agents"
 echo "  aicx search 'query terms'          # fuzzy search across session history"
 echo "  aicx refs -H 24                    # compact summary of recent files"
 echo "  aicx steer --project ai-contexters # metadata-aware retrieval"
-echo "  memex-aicx daemon                  # start background indexer on Unix socket"
+echo "  aicx-memex daemon                  # start background indexer on Unix socket"

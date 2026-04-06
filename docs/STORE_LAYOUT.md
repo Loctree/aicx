@@ -32,8 +32,8 @@ Contexts are chunked and stored by project and date:
   memex/
     sync_state.json
   daemon/
-    memex-aicx.sock
-    memex-aicx.status.json
+    aicx-memex.sock
+    aicx-memex.status.json
   steer_db/
     (LanceDB metadata index)
 ```
@@ -52,12 +52,12 @@ It is updated on every store write.
 
 ### Memex Integration
 
-The `aicx memex-sync` command, extractor `--memex` flag, and `memex-aicx daemon`
+The `aicx memex-sync` command, extractor `--memex` flag, and `aicx-memex daemon`
 all sync stored chunks to `rmcp-memex`:
 - It maintains sync state in `~/.aicx/memex/sync_state.json`.
 - It honors `~/.aicx/.aicxignore` before queueing chunks for embed/index work.
 - It performs metadata-rich imports, ensuring `project`, `agent`, `date`, `session_id`, and `kind` are preserved in the semantic index.
-- The daemon persists its last known control-plane snapshot in `~/.aicx/daemon/memex-aicx.status.json`.
+- The daemon persists its last known control-plane snapshot in `~/.aicx/daemon/aicx-memex.status.json`.
 - When runtime embedding truth changes, the daemon can wipe and rebuild the semantic index while preserving canonical `.md` outputs as source of truth.
 
 ## Identity Model & Compatibility Rules (v0.5.0+)

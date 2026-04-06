@@ -26,8 +26,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use crate::memex::{self, MemexConfig, SyncProgress, SyncProgressPhase};
 use crate::store;
 
-const DEFAULT_SOCKET_FILENAME: &str = "memex-aicx.sock";
-const DEFAULT_STATUS_FILENAME: &str = "memex-aicx.status.json";
+const DEFAULT_SOCKET_FILENAME: &str = "aicx-memex.sock";
+const DEFAULT_STATUS_FILENAME: &str = "aicx-memex.status.json";
 const DEFAULT_POLL_SECONDS: u64 = 300;
 const DEFAULT_REFRESH_HOURS: u64 = 720;
 const SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -246,7 +246,7 @@ pub fn find_aicx_binary() -> PathBuf {
 
 #[cfg(not(unix))]
 pub fn spawn_detached(_config: &DaemonConfig) -> Result<()> {
-    bail!("memex-aicx daemon requires Unix domain sockets")
+    bail!("aicx-memex daemon requires Unix domain sockets")
 }
 
 #[cfg(unix)]
@@ -308,7 +308,7 @@ fn append_daemon_args(command: &mut Command, config: &DaemonConfig) {
 
 #[cfg(not(unix))]
 pub fn run_foreground(_config: DaemonConfig) -> Result<()> {
-    bail!("memex-aicx daemon requires Unix domain sockets")
+    bail!("aicx-memex daemon requires Unix domain sockets")
 }
 
 #[cfg(unix)]
@@ -349,7 +349,7 @@ pub fn run_foreground(config: DaemonConfig) -> Result<()> {
             "Idle".to_string()
         };
     })?;
-    tracing::info!("memex-aicx daemon listening on {}", socket_path.display());
+    tracing::info!("aicx-memex daemon listening on {}", socket_path.display());
 
     let poll_interval = Duration::from_secs(config.poll_seconds.max(1));
     let mut next_poll = Instant::now() + poll_interval;
@@ -418,7 +418,7 @@ fn accept_pending_requests(
         match listener.accept() {
             Ok((stream, _addr)) => {
                 if let Err(err) = handle_client(stream, shared, status_path) {
-                    tracing::warn!("memex-aicx client handling failed: {err:#}");
+                    tracing::warn!("aicx-memex client handling failed: {err:#}");
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
@@ -619,7 +619,7 @@ fn run_cycle(
     let completed_at = Utc::now();
     match cycle_result {
         Ok(summary) => {
-            tracing::info!("memex-aicx cycle complete: {summary}");
+            tracing::info!("aicx-memex cycle complete: {summary}");
             let _ = update_snapshot(shared, status_path, |snapshot| {
                 snapshot.phase = DaemonPhase::Idle;
                 snapshot.phase_detail = "Idle".to_string();
@@ -631,7 +631,7 @@ fn run_cycle(
             });
         }
         Err(err) => {
-            tracing::warn!("memex-aicx cycle failed: {err:#}");
+            tracing::warn!("aicx-memex cycle failed: {err:#}");
             let _ = update_snapshot(shared, status_path, |snapshot| {
                 snapshot.phase = DaemonPhase::Idle;
                 snapshot.phase_detail = "Idle after failed cycle".to_string();
@@ -784,7 +784,7 @@ fn format_memex_progress(progress: &SyncProgress) -> String {
 
 #[cfg(not(unix))]
 pub fn request_status() -> Result<ControlOutcome> {
-    bail!("memex-aicx daemon requires Unix domain sockets")
+    bail!("aicx-memex daemon requires Unix domain sockets")
 }
 
 #[cfg(unix)]
@@ -804,7 +804,7 @@ pub fn request_sync(
     _socket_path: Option<&Path>,
     _reason: Option<String>,
 ) -> Result<ControlOutcome> {
-    bail!("memex-aicx daemon requires Unix domain sockets")
+    bail!("aicx-memex daemon requires Unix domain sockets")
 }
 
 #[cfg(unix)]
@@ -823,7 +823,7 @@ pub fn request_sync(socket_path: Option<&Path>, reason: Option<String>) -> Resul
 
 #[cfg(not(unix))]
 pub fn request_stop(_socket_path: Option<&Path>) -> Result<ControlOutcome> {
-    bail!("memex-aicx daemon requires Unix domain sockets")
+    bail!("aicx-memex daemon requires Unix domain sockets")
 }
 
 #[cfg(unix)]

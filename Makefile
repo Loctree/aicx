@@ -13,13 +13,13 @@ VERSION := $(shell python3 -c 'import tomllib; print(tomllib.load(open("Cargo.to
 TAG := v$(VERSION)
 
 build:
-	cargo build --locked --release --bin aicx --bin aicx-mcp --bin memex-aicx
+	cargo build --locked --release --bin aicx --bin aicx-mcp --bin aicx-memex
 
 install:
 	./install.sh
 
 install-bin:
-	cargo install --path . --locked --force --bin aicx --bin aicx-mcp --bin memex-aicx
+	cargo install --path . --locked --force --bin aicx --bin aicx-mcp --bin aicx-memex
 
 install-config:
 	./install.sh --skip-install
@@ -42,7 +42,7 @@ check-memex:
 	cargo check --locked -p aicx-memex
 
 check-root:
-	cargo check --locked -p ai-contexters --bin aicx --bin aicx-mcp --bin memex-aicx
+	cargo check --locked -p ai-contexters --bin aicx --bin aicx-mcp --bin aicx-memex
 
 test-parser:
 	cargo test --locked -p aicx-parser
@@ -51,7 +51,7 @@ test-memex:
 	cargo test --locked -p aicx-memex
 
 test-root:
-	cargo test --locked --bin aicx --bin aicx-mcp --bin memex-aicx
+	cargo test --locked --bin aicx --bin aicx-mcp --bin aicx-memex
 
 publish-dry-run:
 	cargo publish --locked --dry-run -p aicx-parser
@@ -164,9 +164,9 @@ help:
 	@echo "AICX Build System"
 	@echo ""
 	@echo "Core Commands:"
-	@echo "  make build           - Build release binaries (aicx + aicx-mcp + memex-aicx)"
+	@echo "  make build           - Build release binaries (aicx + aicx-mcp + aicx-memex)"
 	@echo "  make install         - Install binaries + configure local MCP clients via install.sh"
-	@echo "  make install-bin     - Install only aicx + aicx-mcp + memex-aicx from the current checkout"
+	@echo "  make install-bin     - Install only aicx + aicx-mcp + aicx-memex from the current checkout"
 	@echo "  make install-config  - Configure local MCP clients without reinstalling binaries"
 	@echo "  make install-cargo   - Install published crate from crates.io"
 	@echo "  make precheck        - Run package-scoped cargo checks for parser, memex, and root"

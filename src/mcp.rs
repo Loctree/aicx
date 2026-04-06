@@ -145,7 +145,7 @@ fn kick_background_refresh(project: Option<&str>, reason: &str) {
     match crate::daemon::ensure_running_and_kick(Some(reason.to_string())) {
         Ok(outcome) => {
             tracing::debug!(
-                "Delegated background refresh to memex-aicx daemon: {}",
+                "Delegated background refresh to aicx-memex daemon: {}",
                 outcome.message()
             );
         }
@@ -159,7 +159,7 @@ fn kick_background_refresh(project: Option<&str>, reason: &str) {
             {
                 Ok(_) => {
                     tracing::warn!(
-                        "memex-aicx daemon unavailable, fell back to one-shot refresh: {daemon_err:#}"
+                        "aicx-memex daemon unavailable, fell back to one-shot refresh: {daemon_err:#}"
                     );
                 }
                 Err(spawn_err) => {

@@ -1,6 +1,6 @@
 //! Compatibility front door for the background memex/steer daemon surface.
 //!
-//! `memex-aicx` keeps a daemon-first operator experience while delegating the
+//! `aicx-memex` keeps a daemon-first operator experience while delegating the
 //! real implementation to the main `aicx` CLI.
 
 use std::ffi::OsString;
@@ -10,10 +10,10 @@ const ROOT_HELP: &str = "\
 Background memex/steer daemon front door.
 
 Usage:
-  memex-aicx daemon [OPTIONS]
-  memex-aicx status [OPTIONS]
-  memex-aicx sync [OPTIONS]
-  memex-aicx stop [OPTIONS]
+  aicx-memex daemon [OPTIONS]
+  aicx-memex status [OPTIONS]
+  aicx-memex sync [OPTIONS]
+  aicx-memex stop [OPTIONS]
 
 Commands:
   daemon   Start the background indexer (alias for `aicx daemon`)
@@ -22,13 +22,13 @@ Commands:
   stop     Stop the background daemon cleanly
 
 Examples:
-  memex-aicx daemon
-  memex-aicx daemon --foreground --project ai-contexters
-  memex-aicx status --json
-  memex-aicx sync
-  memex-aicx stop
+  aicx-memex daemon
+  aicx-memex daemon --foreground --project ai-contexters
+  aicx-memex status --json
+  aicx-memex sync
+  aicx-memex stop
 
-Use `memex-aicx <command> --help` for the full delegated help.
+Use `aicx-memex <command> --help` for the full delegated help.
 ";
 
 #[derive(Debug)]
@@ -101,7 +101,7 @@ fn dispatch_args(args: &[OsString]) -> Result<Dispatch, String> {
             Ok(Dispatch::Args(prefix_command("daemon-stop", &args[1..])))
         }
         Some("run" | "daemon-run") => Ok(Dispatch::Args(prefix_command("daemon-run", &args[1..]))),
-        Some(other) => Err(format!("Unknown memex-aicx subcommand '{other}'")),
+        Some(other) => Err(format!("Unknown aicx-memex subcommand '{other}'")),
     }
 }
 
@@ -151,6 +151,6 @@ mod tests {
     #[test]
     fn dispatch_args_rejects_unknown_subcommands() {
         let err = dispatch_args(&os_vec(&["explode"])).expect_err("unknown command should fail");
-        assert!(err.contains("Unknown memex-aicx subcommand"));
+        assert!(err.contains("Unknown aicx-memex subcommand"));
     }
 }

@@ -276,15 +276,15 @@ Notes:
 - Recursive indexing is enabled by default to handle the nested canonical store structure.
 - If `~/.aicx/.aicxignore` exists, matching chunk paths are excluded before memex materialization and the final summary reports how many were ignored.
 - On interactive terminals, `memex-sync` emits live scan/embed/index progress to stderr so large reindexes do not look hung.
-- For always-on upkeep, prefer `memex-aicx daemon` or `aicx daemon`; the daemon bootstraps once, then keeps canonical refresh, steer repair, and memex sync moving in the background.
+- For always-on upkeep, prefer `aicx-memex daemon` or `aicx daemon`; the daemon bootstraps once, then keeps canonical refresh, steer repair, and memex sync moving in the background.
 
 ## `aicx daemon`
 
-Start the background indexer daemon on a Unix socket. `memex-aicx daemon` is a compatibility-friendly alias for the same surface.
+Start the background indexer daemon on a Unix socket. `aicx-memex daemon` is the dedicated daemon-first surface for the same control plane.
 
 ```bash
 aicx daemon [OPTIONS]
-memex-aicx daemon [OPTIONS]
+aicx-memex daemon [OPTIONS]
 ```
 
 Options:
@@ -302,7 +302,7 @@ Examples:
 
 ```bash
 # Daily-driver mode: detach into the background
-memex-aicx daemon
+aicx-memex daemon
 
 # Keep logs in the current terminal
 aicx daemon --foreground --project ai-contexters
@@ -310,17 +310,17 @@ aicx daemon --foreground --project ai-contexters
 
 Notes:
 - Startup bootstrap runs one full refresh/repair/materialization pass unless you opt out with `--no-bootstrap`.
-- The daemon persists status in `~/.aicx/daemon/memex-aicx.status.json`.
+- The daemon persists status in `~/.aicx/daemon/aicx-memex.status.json`.
 - If memex runtime truth drifts after an install/update, the daemon can automatically reset and rebuild the semantic index from canonical store outputs.
 - `./install.sh` now starts this daemon when needed, or queues a fresh sync on an already-running instance, so upgrades get a background catch-up pass automatically.
 
 ## `aicx daemon-status`
 
-Show live daemon status from the Unix-socket control plane, or the last known persisted snapshot when the daemon is offline. `memex-aicx status` is an alias for the same surface.
+Show live daemon status from the Unix-socket control plane, or the last known persisted snapshot when the daemon is offline. `aicx-memex status` is the daemon-first surface for the same endpoint.
 
 ```bash
 aicx daemon-status [OPTIONS]
-memex-aicx status [OPTIONS]
+aicx-memex status [OPTIONS]
 ```
 
 Options:
@@ -335,11 +335,11 @@ aicx daemon-status --json
 
 ## `aicx daemon-sync`
 
-Queue an immediate sync cycle on the background daemon. `memex-aicx sync` is an alias for the same surface.
+Queue an immediate sync cycle on the background daemon. `aicx-memex sync` is the daemon-first surface for the same endpoint.
 
 ```bash
 aicx daemon-sync [OPTIONS]
-memex-aicx sync [OPTIONS]
+aicx-memex sync [OPTIONS]
 ```
 
 Options:
@@ -353,11 +353,11 @@ aicx daemon-sync
 
 ## `aicx daemon-stop`
 
-Stop the background daemon cleanly. `memex-aicx stop` is an alias for the same surface.
+Stop the background daemon cleanly. `aicx-memex stop` is the daemon-first surface for the same endpoint.
 
 ```bash
 aicx daemon-stop [OPTIONS]
-memex-aicx stop [OPTIONS]
+aicx-memex stop [OPTIONS]
 ```
 
 Options:

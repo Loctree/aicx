@@ -24,7 +24,7 @@ the Cargo-package boundary:
 
 - `crates/aicx-parser`: canonical extraction, chunking, store, steering metadata parsing, ranking, and parser-side heuristics reused above the core.
 - `crates/aicx-memex`: steer index, semantic materialization, fast memex search, and the background daemon.
-- root `ai-contexters`: glue/orchestration and operator UX (`aicx`, `aicx-mcp`, `memex-aicx`, MCP server, dashboard server, local output, intents, static dashboard generation).
+- root `ai-contexters`: glue/orchestration and operator UX (`aicx`, `aicx-mcp`, `aicx-memex`, MCP server, dashboard server, local output, intents, static dashboard generation).
 
 The split is now physical as well as conceptual: parser and memex modules live
 under their own crate trees, while the root package only re-exports those

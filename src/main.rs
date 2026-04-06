@@ -46,7 +46,7 @@ use ai_contexters::store;
 ///     into steerable markdown at ~/.aicx/. This is ground truth.
 ///   Layer 2 (semantic materialization): embed the corpus into a vector + BM25
 ///     index (memex) for retrieval by agents and MCP tools. Use one-shot
-///     `memex-sync` or hand the loop to `memex-aicx daemon`.
+///     `memex-sync` or hand the loop to `aicx-memex daemon`.
 ///
 /// aicx is the orchestrator; memex is the retrieval kernel.
 ///
@@ -391,7 +391,7 @@ enum Commands {
     ///
     /// Reads chunks from ~/.aicx/, embeds them, and upserts into the rmcp-memex
     /// vector + BM25 index. Use this for explicit one-shot syncs and rebuilds,
-    /// or run `memex-aicx daemon` / `aicx daemon` to keep the semantic layer
+    /// or run `aicx-memex daemon` / `aicx daemon` to keep the semantic layer
     /// fresh in the background.
     ///
     /// First build:    aicx memex-sync                (embed + index all unsynced chunks)
@@ -993,7 +993,7 @@ fn main() -> Result<()> {
             } else {
                 daemon::spawn_detached(&config)?;
                 let socket_path = daemon_socket_display(config.socket_path.as_ref())?;
-                eprintln!("✓ memex-aicx daemon started");
+                eprintln!("✓ aicx-memex daemon started");
                 eprintln!("  Socket: {}", socket_path.display());
             }
         }
@@ -1307,7 +1307,7 @@ fn run_daemon_stop(socket_path: Option<&Path>) -> Result<()> {
 
 fn print_daemon_status(snapshot: &DaemonStatusSnapshot, live: bool) {
     println!(
-        "memex-aicx daemon: {}",
+        "aicx-memex daemon: {}",
         if live {
             "running"
         } else {

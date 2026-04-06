@@ -47,8 +47,8 @@ name = "aicx-mcp"
 path = "src/bin/aicx_mcp.rs"
 
 [[bin]]
-name = "memex-aicx"
-path = "crates/aicx-memex/src/bin/memex_aicx.rs"
+name = "aicx-memex"
+path = "crates/aicx-memex/src/bin/aicx_memex.rs"
 
 [profile.release]
 lto = true

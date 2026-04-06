@@ -19,7 +19,7 @@ Tagging `vX.Y.Z` triggers `.github/workflows/release.yml`, which:
 
 - verifies the tag matches `Cargo.toml`
 - reruns the required release gates: `semgrep`, `cargo clippy --all-features --all-targets -- -D warnings`, targeted `cargo check`/`cargo test` passes for `aicx-parser`, `aicx-memex`, and shipped root binaries, `cargo fmt -- --check`, and `cargo publish --dry-run` for all three workspace packages
-- builds all shipped binaries: `aicx`, `aicx-mcp`, and `memex-aicx`
+- builds all shipped binaries: `aicx`, `aicx-mcp`, and `aicx-memex`
 - packages archives plus `LICENSE`, `README.md`, and command docs
 - uploads SHA-256 checksum files alongside each archive
 - creates or updates the matching GitHub Release
@@ -42,7 +42,7 @@ Each archive contains:
 
 - `aicx`
 - `aicx-mcp`
-- `memex-aicx`
+- `aicx-memex`
 - `LICENSE`
 - `README.md`
 - `docs/COMMANDS.md`
