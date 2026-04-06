@@ -76,10 +76,13 @@ aicx refs -H 4 --emit paths
 
 ### Layer 2 — materialize into memex
 
-Push canonical chunks into the semantic index (vector + BM25):
+Materialization is operator-driven — nothing syncs automatically.
+You decide when to embed the canonical corpus into the memex retrieval
+kernel (vector + BM25):
 
 ```bash
-aicx memex-sync
+aicx memex-sync              # first build or incremental update
+aicx memex-sync --reindex    # full rebuild (after model/dimension change)
 ```
 
 Or do both layers in one shot:
@@ -101,8 +104,8 @@ aicx all -H 4 --emit json | jq '.store_paths'
 - `~/.aicx/non-repository-contexts/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
 - `~/.aicx/index.json`
 
-### Layer 2 — semantic index (`memex-sync`, `--memex`)
-- `~/.aicx/memex/sync_state.json` (sync watermark)
+### Layer 2 — semantic index (`memex-sync`, `--memex`) — operator-driven
+- `~/.aicx/memex/sync_state.json` (sync watermark — tracks what has been materialized)
 - LanceDB tables + Tantivy BM25 index (managed by rmcp-memex)
 
 Framework-owned repo-local context artifacts (not written by the `aicx` CLI itself):
@@ -139,16 +142,21 @@ aicx steer --project ai-contexters --kind reports --date 2026-03-28
 aicx steer --agent claude --date 2026-03-20..2026-03-28
 ```
 
-Semantic materialization (memex):
+Semantic materialization (memex — the retrieval kernel).
+Materialization is always operator-driven; nothing happens until you run it:
 
 ```bash
-# First build: materialize canonical store into the semantic index
+# First build: embed all unsynced canonical chunks into the memex index
 aicx memex-sync
 
-# Rebuild from scratch (e.g. after embedding model change)
+# Incremental: only new chunks since last sync (same command, watermark-tracked)
+aicx memex-sync
+
+# Full rebuild: wipe the index and re-embed everything
+# Use after an embedding model or dimension change
 aicx memex-sync --reindex
 
-# One-shot: extract + materialize in a single pass
+# One-shot shortcut: extract + materialize in a single pass
 aicx all -H 48 --memex
 
 # Fine-grained: per-chunk upsert instead of batch JSONL import

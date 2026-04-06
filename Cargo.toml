@@ -3,7 +3,7 @@ name = "ai-contexters"
 version = "0.5.6"
 edition = "2024"
 rust-version = "1.85"
-description = "CLI + MCP server for extracting, searching, and browsing AI agent session context (Claude Code, Codex, Gemini)"
+description = "Operator CLI + MCP server: canonical corpus first, semantic materialization via memex second (Claude Code, Codex, Gemini)"
 authors = ["Maciej Gad <void@div0.space>", "Monika Szymanska <hello@vetcoders.io>"]
 license = "MIT"
 repository = "https://github.com/VetCoders/ai-contexters"
@@ -33,8 +33,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "signal"]
 rmcp = { version = "1.2", features = ["server", "schemars", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 libc = "0.2.183"
 # Remote integration boundary: consume the published crate instead of any local workspace checkout.
-# This dependency is library-only here; CLI-backed sync/search paths still require an installed
-# `rmcp-memex` binary at runtime.
+# This dependency is library-only here; the legacy CLI compatibility shims and debug search still
+# require an installed `rmcp-memex` binary at runtime.
 rmcp-memex = { version = "0.4.1", default-features = false }
 
 [dev-dependencies]
