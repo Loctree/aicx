@@ -133,9 +133,10 @@ Frontmatter is not just telemetry — it is part of the steering and selective r
 
 ## MCP Surface (`src/mcp.rs`)
 
-The MCP server exposes three tools via stdio and streamable HTTP transports:
+The MCP server exposes four tools via stdio and streamable HTTP transports:
 
 - `aicx_search` — fuzzy text search across stored chunks with quality scoring; returns compact JSON using the same rich fields as CLI `aicx search --json`
+- `aicx_read` — open one stored chunk by AICX ref or absolute path; returns metadata plus readable content for selective re-entry
 - `aicx_rank` — rank chunks by signal density for a project as compact JSON
 - `aicx_steer` — retrieve chunks by steering metadata (run_id, prompt_id, agent, kind, project, date) using sidecar data; the primary metadata-aware retrieval path for orchestration
 

@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Release archives for macOS/Linux now include `install.sh`, so extracted bundles can bootstrap `aicx`, `aicx-mcp`, and `aicx-memex` without a Rust toolchain.
+- Release archives now include the `presence/` one-pager, so the bundle can explain itself locally after extraction.
+- `aicx dashboard --open` now turns the static dashboard into a browser-first local front door with one command.
+- `aicx dashboard-serve --open` now opens the live local UI automatically after startup.
+
+### Changed
+- `install.sh` now supports `AICX_INSTALL_MODE=archive`, copies bundled binaries into `~/.local/bin` by default (or `AICX_BIN_DIR`), and prints PATH guidance when needed.
+- README, release docs, and the repo-local presence page now point to the bundled archive install path instead of assuming Cargo everywhere.
+- `aicx doctor` now gives an operator-facing verdict, clearer language, and next steps that acknowledge when file-backed search already works before the daemon is running.
+- `aicx doctor --fix` now turns the readiness check into an opt-in self-heal front door, so visible sources can be refreshed and background indexing can be nudged without stitching commands together manually.
+- `aicx doctor`, the installer, and the docs now point store-ready operators toward the browser dashboard path instead of assuming terminal-first navigation.
+
 ## [0.5.5] - 2026-03-31
 
 ### Performance

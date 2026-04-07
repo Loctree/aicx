@@ -1,7 +1,7 @@
 //! MCP (Model Context Protocol) server for aicx.
 //!
 //! Exposes aicx functionality as MCP tools so any AI agent can query
-//! search chunks, rank artifacts, and retrieve steer metadata.
+//! search chunks, read them back, rank artifacts, and retrieve steer metadata.
 //!
 //! Supports stdio and SSE transports.
 //!
@@ -64,6 +64,16 @@ pub struct RankParams {
 
 fn default_rank_hours() -> u64 {
     72
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadParams {
+    /// Store-relative ref under ~/.aicx/ or absolute chunk path
+    pub target: String,
+    /// Truncate content after N UTF-8 characters (0 = full chunk)
+    pub max_chars: Option<usize>,
+    /// Truncate content after N lines (0 = full chunk)
+    pub max_lines: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -202,7 +212,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_search",
-        description = "Fuzzy search across stored AI session chunks. Returns quality-scored results with matched lines. Supports Polish diacritics normalization and optional project filtering."
+        description = "Fuzzy search across stored AI session chunks. Returns quality-scored results with matched lines and paths you can open with aicx_read. Supports Polish diacritics normalization and optional project filtering."
     )]
     async fn search(
         &self,
@@ -273,6 +283,29 @@ impl AicxMcpServer {
 
         let json = rank::render_search_json(&results, scanned)
             .map_err(|e| McpError::internal_error(format!("Serialize search JSON: {e}"), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "aicx_read",
+        description = "Open one stored AI session chunk by AICX ref or absolute path. Returns metadata plus readable content for selective re-entry after search or steer."
+    )]
+    async fn read_chunk(
+        &self,
+        Parameters(params): Parameters<ReadParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let read = store::read_stored_chunk(
+            &params.target,
+            store::ReadChunkOptions {
+                max_chars: params.max_chars.unwrap_or(0),
+                max_lines: params.max_lines.unwrap_or(0),
+            },
+        )
+        .map_err(|e| McpError::invalid_params(format!("Invalid chunk target: {e}"), None))?;
+
+        let json = serde_json::to_string(&read)
+            .map_err(|e| McpError::internal_error(format!("Serialize read JSON: {e}"), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
@@ -497,7 +530,7 @@ fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, McpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SCORE_FILTER, RankItem, RankResponse, SearchParams, SteerResponse,
+        MAX_SCORE_FILTER, RankItem, RankResponse, ReadParams, SearchParams, SteerResponse,
         incremental_rescan_args, parse_date_filter_mcp, validate_score_filter,
     };
 
@@ -621,6 +654,18 @@ mod tests {
         assert!(params.score.is_none());
         assert!(params.hours.is_none());
         assert!(params.date.is_none());
+    }
+
+    #[test]
+    fn read_params_accept_optional_truncation_controls() {
+        let params: ReadParams = serde_json::from_str(
+            r#"{"target":"store/VetCoders/ai-contexters/2026_0331/reports/codex/2026_0331_codex_sess-read01_001.md","max_chars":800,"max_lines":20}"#,
+        )
+        .expect("read params should parse");
+
+        assert!(params.target.contains("store/VetCoders/ai-contexters"));
+        assert_eq!(params.max_chars, Some(800));
+        assert_eq!(params.max_lines, Some(20));
     }
 
     #[test]

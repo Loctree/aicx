@@ -112,7 +112,7 @@ jobs:
         run: cargo check --locked -p aicx-memex
 
       - name: cargo check -p ai-contexters
-        run: cargo check --locked -p ai-contexters --bin aicx --bin aicx-mcp --bin memex-aicx
+        run: cargo check --locked -p ai-contexters --bin aicx --bin aicx-mcp --bin aicx-memex
 
       - name: cargo test -p aicx-parser
         run: cargo test --locked -p aicx-parser
@@ -126,8 +126,8 @@ jobs:
       - name: cargo test --bin aicx-mcp
         run: cargo test --locked --bin aicx-mcp
 
-      - name: cargo test --bin memex-aicx
-        run: cargo test --locked --bin memex-aicx
+      - name: cargo test --bin aicx-memex
+        run: cargo test --locked --bin aicx-memex
 
       - name: cargo fmt
         run: cargo fmt -- --check
@@ -185,7 +185,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --yes musl-tools
 
       - name: Build release binaries
-        run: cargo build --locked --release --target ${{ matrix.target }} --bin aicx --bin aicx-mcp --bin memex-aicx
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin aicx --bin aicx-mcp --bin aicx-memex
 
       - name: Package release archive
         id: package
@@ -221,15 +221,20 @@ jobs:
 
           docs_dir = bundle_dir / "docs"
           docs_dir.mkdir()
+          presence_dir = bundle_dir / "presence"
+          presence_dir.mkdir()
 
-          for binary in ("aicx", "aicx-mcp", "memex-aicx"):
+          for binary in ("aicx", "aicx-mcp", "aicx-memex"):
               shutil.copy2(release_dir / f"{binary}{binary_ext}", bundle_dir / f"{binary}{binary_ext}")
 
-          for source in ("LICENSE", "README.md"):
+          for source in ("LICENSE", "README.md", "install.sh"):
               shutil.copy2(source, bundle_dir / Path(source).name)
 
           for source in ("docs/COMMANDS.md", "docs/RELEASES.md"):
               shutil.copy2(source, docs_dir / Path(source).name)
+
+          for source in ("presence/index.html", "presence/app.js", "presence/styles.css"):
+              shutil.copy2(source, presence_dir / Path(source).name)
 
           archive_path = dist_dir / f"{bundle_name}.{archive_ext}"
           if archive_ext == "tar.gz":

@@ -19,6 +19,34 @@ fi
 AICX_INSTALL_MODE="${AICX_INSTALL_MODE:-auto}"
 AICX_GIT_URL="${AICX_GIT_URL:-https://github.com/VetCoders/ai-contexters}"
 
+choose_bin_dir() {
+  local candidate=""
+  for candidate in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
+    if [[ ":$PATH:" == *":$candidate:"* ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  for candidate in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
+    if [ -d "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  printf '%s\n' "$HOME/.local/bin"
+}
+
+AICX_BIN_DIR="${AICX_BIN_DIR:-$(choose_bin_dir)}"
+RELEASE_BUNDLE_BIN_DIR=""
+if [ -x "$SCRIPT_DIR/aicx" ] && [ -x "$SCRIPT_DIR/aicx-mcp" ] && [ -x "$SCRIPT_DIR/aicx-memex" ]; then
+  RELEASE_BUNDLE_BIN_DIR="$SCRIPT_DIR"
+fi
+PATH_GUIDANCE_NEEDED=0
+AICX_DISPLAY_COMMAND="aicx"
+AICX_MEMEX_DISPLAY_COMMAND="aicx-memex"
+
 SKIP_INSTALL=0
 for arg in "$@"; do
   case "$arg" in
@@ -29,18 +57,88 @@ for arg in "$@"; do
       echo "  Run from the repo root or any local checkout that contains Cargo.toml."
       echo ""
       echo "Install source is controlled by AICX_INSTALL_MODE:"
-      echo "  auto   - prefer local checkout, otherwise install from crates.io"
-      echo "  local - cargo install --path <checkout> --locked"
-      echo "  crates - cargo install ai-contexters --locked"
-      echo "  git    - cargo install --git \$AICX_GIT_URL --locked ai-contexters"
+      echo "  auto    - prefer local checkout, then bundled release binaries, otherwise install from crates.io"
+      echo "  local   - cargo install --path <checkout> --locked"
+      echo "  archive - copy bundled release binaries into \$AICX_BIN_DIR (default: $AICX_BIN_DIR)"
+      echo "  crates  - cargo install ai-contexters --locked"
+      echo "  git     - cargo install --git \$AICX_GIT_URL --locked ai-contexters"
+      echo ""
+      echo "Useful environment overrides:"
+      echo "  AICX_BIN_DIR       - where release-bundle binaries should be copied (default: $AICX_BIN_DIR)"
+      echo "  AICX_INSTALL_MODE  - auto | local | archive | crates | git"
       exit 0
       ;;
   esac
 done
 
+find_binary_path() {
+  local name="$1"
+  local candidate=""
+
+  if command -v "$name" >/dev/null 2>&1; then
+    command -v "$name"
+    return 0
+  fi
+
+  for candidate in \
+    "$AICX_BIN_DIR/$name" \
+    "$SCRIPT_DIR/$name" \
+    "$HOME/.local/bin/$name" \
+    "$HOME/.cargo/bin/$name"; do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+display_binary_path() {
+  local name="$1"
+  local resolved_path="$2"
+
+  if command -v "$name" >/dev/null 2>&1 && [ "$(command -v "$name")" = "$resolved_path" ]; then
+    printf '%s\n' "$name"
+  else
+    printf '%s\n' "$resolved_path"
+  fi
+}
+
+install_release_bundle() {
+  local target_dir="$AICX_BIN_DIR"
+  local binary=""
+  local source_path=""
+  local target_path=""
+
+  if [ -z "$RELEASE_BUNDLE_BIN_DIR" ]; then
+    echo "Error: AICX_INSTALL_MODE=archive was requested, but this folder does not contain bundled aicx binaries." >&2
+    echo "  Download a GitHub Release archive, extract it, and run ./install.sh from inside that folder." >&2
+    exit 1
+  fi
+
+  mkdir -p "$target_dir"
+
+  for binary in aicx aicx-mcp aicx-memex; do
+    source_path="$RELEASE_BUNDLE_BIN_DIR/$binary"
+    target_path="$target_dir/$binary"
+    if [ "$source_path" != "$target_path" ]; then
+      cp "$source_path" "$target_path"
+    fi
+    chmod 755 "$target_path"
+    echo "  installed $binary -> $target_path"
+  done
+
+  if [[ ":$PATH:" != *":$target_dir:"* ]]; then
+    PATH_GUIDANCE_NEEDED=1
+  fi
+}
+
 resolve_aicx() {
-  if command -v aicx >/dev/null 2>&1; then
-    AICX_RUN=("aicx")
+  local aicx_path=""
+
+  if aicx_path=$(find_binary_path "aicx"); then
+    AICX_RUN=("$aicx_path")
     return 0
   fi
 
@@ -53,8 +151,10 @@ resolve_aicx() {
 }
 
 resolve_aicx_mcp() {
-  if command -v aicx-mcp >/dev/null 2>&1; then
-    AICX_MCP_COMMAND=$(command -v aicx-mcp)
+  local aicx_mcp_path=""
+
+  if aicx_mcp_path=$(find_binary_path "aicx-mcp"); then
+    AICX_MCP_COMMAND="$aicx_mcp_path"
     AICX_MCP_ARGS_JSON='[]'
     return 0
   fi
@@ -83,8 +183,10 @@ PY
 }
 
 resolve_aicx_memex() {
-  if command -v aicx-memex >/dev/null 2>&1; then
-    AICX_MEMEX_RUN=("aicx-memex")
+  local aicx_memex_path=""
+
+  if aicx_memex_path=$(find_binary_path "aicx-memex"); then
+    AICX_MEMEX_RUN=("$aicx_memex_path")
     return 0
   fi
 
@@ -163,7 +265,7 @@ PY
     if [ -n "$socket" ]; then
       echo "  daemon socket: $socket"
     fi
-    echo "  inspect progress with: aicx-memex status"
+    echo "  inspect progress with: $AICX_MEMEX_DISPLAY_COMMAND status"
   else
     echo "  Warning: daemon started but status probe is not reachable yet."
   fi
@@ -176,15 +278,17 @@ resolve_install_mode() {
     auto)
       if [ "$HAS_LOCAL_MANIFEST" -eq 1 ]; then
         echo "local"
+      elif [ -n "$RELEASE_BUNDLE_BIN_DIR" ]; then
+        echo "archive"
       else
         echo "crates"
       fi
       ;;
-    local|crates|git)
+    local|archive|crates|git)
       echo "$AICX_INSTALL_MODE"
       ;;
     *)
-      echo "Error: unsupported AICX_INSTALL_MODE='$AICX_INSTALL_MODE' (expected auto, local, crates, or git)." >&2
+      echo "Error: unsupported AICX_INSTALL_MODE='$AICX_INSTALL_MODE' (expected auto, local, archive, crates, or git)." >&2
       exit 1
       ;;
   esac
@@ -192,8 +296,10 @@ resolve_install_mode() {
 
 # --- Step 1: Install binaries ---
 if [ "$SKIP_INSTALL" -eq 0 ]; then
-  if ! command -v cargo >/dev/null 2>&1; then
+  INSTALL_MODE=$(resolve_install_mode)
+  if [ "$INSTALL_MODE" != "archive" ] && ! command -v cargo >/dev/null 2>&1; then
     echo "Error: cargo not found. Install Rust first: https://rustup.rs"
+    echo "  If you downloaded a release archive, rerun with AICX_INSTALL_MODE=archive from the extracted bundle."
     exit 1
   fi
 
@@ -282,8 +388,11 @@ if [ "$SKIP_INSTALL" -eq 0 ]; then
     return "$status"
   }
 
-  INSTALL_MODE=$(resolve_install_mode)
-  if [ "$INSTALL_MODE" = "local" ]; then
+  if [ "$INSTALL_MODE" = "archive" ]; then
+    echo "[1/4] Installing aicx + aicx-mcp + aicx-memex from this release bundle..."
+    echo "  binaries will be copied into: $AICX_BIN_DIR"
+    install_release_bundle
+  elif [ "$INSTALL_MODE" = "local" ]; then
     echo "[1/4] Installing aicx + aicx-mcp + aicx-memex from this checkout..."
     echo "  release build can go quiet during LTO linking; heartbeat will continue below"
     cargo_install_with_progress cargo install --path "$SCRIPT_DIR" --locked --force --bin aicx --bin aicx-mcp --bin aicx-memex
@@ -310,12 +419,17 @@ if ! resolve_aicx; then
   echo "Error: aicx is not available."
   if [ "$HAS_LOCAL_MANIFEST" -eq 1 ]; then
     echo "  From this checkout, run './install.sh' or 'cargo install --path . --locked --bin aicx --bin aicx-mcp --bin aicx-memex'."
+  elif [ -n "$RELEASE_BUNDLE_BIN_DIR" ]; then
+    echo "  From this release archive, rerun './install.sh' without --skip-install so the bundled binaries are copied into $AICX_BIN_DIR."
   else
-    echo "  Ensure ~/.cargo/bin is in your PATH."
+    echo "  Ensure ~/.cargo/bin or ~/.local/bin is in your PATH."
   fi
   exit 1
 fi
 echo "  aicx $("${AICX_RUN[@]}" --version 2>/dev/null | awk '{print $2}')"
+if [ "${AICX_RUN[0]}" != "cargo" ]; then
+  AICX_DISPLAY_COMMAND=$(display_binary_path "aicx" "${AICX_RUN[0]}")
+fi
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "Error: python3 not found. install.sh uses python3 to update MCP settings."
@@ -339,7 +453,8 @@ if resolve_aicx_memex; then
   if [ "${AICX_MEMEX_RUN[0]}" = "cargo" ]; then
     echo "  aicx-memex via cargo run (local checkout fallback)"
   else
-    echo "  aicx-memex $(command -v aicx-memex)"
+    echo "  aicx-memex ${AICX_MEMEX_RUN[0]}"
+    AICX_MEMEX_DISPLAY_COMMAND=$(display_binary_path "aicx-memex" "${AICX_MEMEX_RUN[0]}")
   fi
 else
   echo "  Warning: aicx-memex not found. Background daemon bootstrap will be skipped."
@@ -428,22 +543,40 @@ echo "=== Setup complete ==="
 echo ""
 if [ -d "$HOME/.ai-contexters" ]; then
   echo "Legacy store detected at ~/.ai-contexters/"
-  echo "Run 'aicx migrate' to move your history to the new canonical ~/.aicx/ store."
+  echo "Run '$AICX_DISPLAY_COMMAND migrate' to move your history to the new canonical ~/.aicx/ store."
   echo ""
 fi
+if [ "$PATH_GUIDANCE_NEEDED" -eq 1 ]; then
+  echo "PATH note:"
+  echo "  aicx binaries were copied to $AICX_BIN_DIR"
+  echo "  MCP clients are configured with the absolute aicx-mcp path, so they are ready now."
+  echo "  To use 'aicx' directly in future shells, add this to ~/.zshrc or ~/.bashrc:"
+  echo "    export PATH=\"$AICX_BIN_DIR:\$PATH\""
+  echo ""
+fi
+echo "Guided front door:"
+"${AICX_RUN[@]}" -H 72 || true
+echo ""
 echo "Installed:"
-echo "  aicx      — CLI for extraction, search, steer, dashboard"
-echo "  aicx-mcp  — MCP server (3 tools: search, rank, steer)"
+echo "  aicx      — CLI for extraction, search, read, steer, dashboard"
+echo "  aicx-mcp  — MCP server (4 tools: search, read, rank, steer)"
 echo "  aicx-memex — background daemon launcher for steer/memex upkeep"
 echo ""
 echo "MCP tools available in Claude Code / Codex / Gemini:"
-echo "  aicx_search  — fuzzy search across session history"
+echo "  aicx_search  — fuzzy search across stored chunks"
+echo "  aicx_read    — open one stored chunk by ref or path"
 echo "  aicx_rank    — quality-score stored chunks"
 echo "  aicx_steer   — retrieve chunks by run/prompt/project/agent/date metadata"
 echo ""
 echo "Quick start:"
-echo "  aicx store -H 24                   # rescan last 24h from all agents"
-echo "  aicx search 'query terms'          # fuzzy search across session history"
-echo "  aicx refs -H 24                    # compact summary of recent files"
-echo "  aicx steer --project ai-contexters # metadata-aware retrieval"
-echo "  aicx-memex daemon                  # start background indexer on Unix socket"
+echo "  $AICX_DISPLAY_COMMAND                              # guided front door + suggested next moves"
+echo "  $AICX_DISPLAY_COMMAND doctor                       # one-command readiness + next steps"
+echo "  $AICX_DISPLAY_COMMAND doctor --fix                 # repair what can be repaired automatically"
+echo "  $AICX_DISPLAY_COMMAND dashboard --open             # local browser snapshot for non-terminal browsing"
+echo "  $AICX_DISPLAY_COMMAND dashboard-serve --open       # live local UI that opens in your browser"
+echo "  $AICX_DISPLAY_COMMAND latest --project ai-contexters # newest readable chunks for one repo"
+echo "  $AICX_DISPLAY_COMMAND all -H 24 --incremental      # refresh last 24h from all agents"
+echo "  $AICX_DISPLAY_COMMAND search 'query terms'         # fuzzy search across session history"
+echo "  $AICX_DISPLAY_COMMAND read <ref-or-path>           # open one stored chunk directly"
+echo "  $AICX_DISPLAY_COMMAND steer --project ai-contexters # metadata-aware retrieval"
+echo "  $AICX_MEMEX_DISPLAY_COMMAND daemon                 # start background indexer on Unix socket"

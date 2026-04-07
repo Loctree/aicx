@@ -55,7 +55,7 @@ jobs:
         run: cargo check --locked -p aicx-memex
 
       - name: cargo check -p ai-contexters
-        run: cargo check --locked -p ai-contexters --bin aicx --bin aicx-mcp --bin memex-aicx
+        run: cargo check --locked -p ai-contexters --bin aicx --bin aicx-mcp --bin aicx-memex
 
       - name: cargo clippy
         run: cargo clippy --locked --all-features --all-targets -- -D warnings
@@ -72,8 +72,8 @@ jobs:
       - name: cargo test --bin aicx-mcp
         run: cargo test --locked --bin aicx-mcp
 
-      - name: cargo test --bin memex-aicx
-        run: cargo test --locked --bin memex-aicx
+      - name: cargo test --bin aicx-memex
+        run: cargo test --locked --bin aicx-memex
 
       - name: cargo fmt
         run: cargo fmt -- --check

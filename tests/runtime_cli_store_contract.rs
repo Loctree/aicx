@@ -244,6 +244,101 @@ fn store_cli_store_command_emits_repo_and_non_repo_canonical_roots() {
 }
 
 #[test]
+fn latest_cli_orders_by_event_time_and_returns_chainable_refs() {
+    let root = unique_test_dir("latest-command");
+    let home = root.join("home");
+    let base = home
+        .join(".aicx")
+        .join("store")
+        .join("VetCoders")
+        .join("ai-contexters")
+        .join("2026_0401")
+        .join("reports")
+        .join("codex");
+
+    let earlier = base.join("2026_0401_codex_sess-early_001.md");
+    let later = base.join("2026_0401_codex_sess-late_001.md");
+
+    write_file(
+        &earlier,
+        "[project: ai-contexters | agent: codex | date: 2026-04-01]\n\n## Report\nEarlier chunk preview.\n",
+    );
+    write_file(
+        &later,
+        "[project: ai-contexters | agent: codex | date: 2026-04-01]\n\n## Report\nLatest chunk preview.\n",
+    );
+
+    write_file(
+        &earlier.with_extension("meta.json"),
+        &json!({
+            "id": "chunk-early",
+            "project": "ai-contexters",
+            "agent": "codex",
+            "date": "2026-04-01",
+            "session_id": "sess-early",
+            "kind": "reports",
+            "completed_at": "2026-04-01T08:00:00Z"
+        })
+        .to_string(),
+    );
+    write_file(
+        &later.with_extension("meta.json"),
+        &json!({
+            "id": "chunk-late",
+            "project": "ai-contexters",
+            "agent": "codex",
+            "date": "2026-04-01",
+            "session_id": "sess-late",
+            "kind": "reports",
+            "completed_at": "2026-04-01T10:00:00Z"
+        })
+        .to_string(),
+    );
+
+    let output = run_aicx(
+        &home,
+        &[
+            "latest",
+            "--project",
+            "ai-contexters",
+            "-H",
+            "100000",
+            "--limit",
+            "2",
+            "--json",
+        ],
+    );
+    let payload = parse_stdout_json(&output);
+    let items = payload.as_array().expect("latest json array");
+
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[0]["store_ref"].as_str(),
+        Some(
+            "store/VetCoders/ai-contexters/2026_0401/reports/codex/2026_0401_codex_sess-late_001.md"
+        )
+    );
+    assert_eq!(
+        items[0]["event_time"].as_str(),
+        Some("2026-04-01T10:00:00Z")
+    );
+    assert!(
+        items[0]["preview"]
+            .as_str()
+            .expect("latest preview string")
+            .contains("Latest chunk preview.")
+    );
+    assert_eq!(
+        items[1]["store_ref"].as_str(),
+        Some(
+            "store/VetCoders/ai-contexters/2026_0401/reports/codex/2026_0401_codex_sess-early_001.md"
+        )
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn migration_cli_rebuilds_and_salvages_realistic_bundle() {
     let root = unique_test_dir("migration-rebuild-salvage");
     let home = root.join("home");

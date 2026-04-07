@@ -39,26 +39,53 @@ use ai_contexters::sources::{self, ExtractionConfig};
 use ai_contexters::state::StateManager;
 use ai_contexters::store;
 
+const CLI_AFTER_HELP: &str = "\
+Most people want one of these:
+  aicx
+      Guided front door: quick state, suggested next moves, and the shortest path forward.
+
+  aicx doctor
+      One honest readiness check plus the next command to run.
+
+  aicx doctor --fix
+      Repair what can be repaired automatically, then rerun the check.
+
+  aicx dashboard --open
+      Write a local HTML snapshot and open it in your browser.
+
+  aicx latest -p <project>
+      Show the newest stored chunks with readable previews and chainable refs.
+
+  aicx all -H 24 --incremental --memex
+      Refresh the canonical corpus and catch memex up in one pass.
+
+  aicx search \"query\"
+      Fast recall across the canonical store on disk.
+
+  aicx read <ref-or-path>
+      Open one stored chunk directly after discovery.
+
+  aicx steer --project <project>
+      Exact retrieval by run, prompt, project, agent, or date metadata.
+";
+
 /// aicx — operator front door for agent session history.
 ///
-/// Two-layer pipeline with explicit canonical truth and optional background sync:
-///   Layer 1 (canonical corpus): extract, deduplicate, and chunk agent logs
-///     into steerable markdown at ~/.aicx/. This is ground truth.
-///   Layer 2 (semantic materialization): embed the corpus into a vector + BM25
-///     index (memex) for retrieval by agents and MCP tools. Use one-shot
-///     `memex-sync` or hand the loop to `aicx-memex daemon`.
+/// Two-layer pipeline with explicit canonical truth and optional background sync.
+///
+/// Layer 1 (canonical corpus): extract, deduplicate, and chunk agent logs
+/// into steerable markdown at ~/.aicx/. This is ground truth.
+///
+/// Layer 2 (semantic materialization): embed the corpus into a vector + BM25
+/// index (memex) for retrieval by agents and MCP tools. Use one-shot
+/// `memex-sync` or hand the loop to `aicx-memex daemon`.
 ///
 /// aicx is the orchestrator; memex is the retrieval kernel.
-///
-/// Quick start:
-///   aicx all -H 4 --incremental        # build canonical corpus (layer 1)
-///   aicx memex-sync                     # materialize into memex (layer 2)
-///   aicx all -H 4 --incremental --memex # both layers in one shot
-///   aicx memex-sync --reindex           # full rebuild after model change
 #[derive(Debug, Parser)]
 #[command(name = "aicx")]
 #[command(author = "M&K (c)2026 VetCoders")]
 #[command(version)]
+#[command(after_help = CLI_AFTER_HELP, after_long_help = CLI_AFTER_HELP)]
 struct Cli {
     /// Redact secrets (tokens/keys) from outputs before writing/syncing.
     ///
@@ -521,6 +548,29 @@ enum Commands {
     /// see what is already in the canonical store after extraction.
     List,
 
+    /// Human-friendly readiness check for sources, canonical store, and daemon.
+    ///
+    /// Use this when you want one obvious answer to "is aicx actually ready,
+    /// and what should I do next?" without stitching together `list`, `refs`,
+    /// and `daemon-status` manually.
+    Doctor {
+        /// Hours to use for the "recent activity" window
+        #[arg(short = 'H', long, default_value = "72")]
+        hours: u64,
+
+        /// Project filter for the canonical store summary
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Emit compact JSON instead of the human-readable summary
+        #[arg(short = 'j', long)]
+        json: bool,
+
+        /// Repair what can be repaired automatically, then rerun the check
+        #[arg(long, conflicts_with = "json")]
+        fix: bool,
+    },
+
     /// List chunks in the canonical store (layer 1 inventory).
     ///
     /// Shows what extractors have already written to ~/.aicx/.
@@ -578,6 +628,10 @@ enum Commands {
         /// Max preview characters per record (0 = no truncation)
         #[arg(long, default_value = "320")]
         preview_chars: usize,
+
+        /// Open the generated dashboard in your default browser
+        #[arg(long)]
+        open: bool,
     },
 
     /// Run dashboard HTTP server with server-shell UI and on-demand data regeneration (layer 1).
@@ -605,6 +659,10 @@ enum Commands {
         /// Max preview characters per record (0 = no truncation)
         #[arg(long, default_value = "320")]
         preview_chars: usize,
+
+        /// Open the live dashboard URL in your default browser
+        #[arg(long)]
+        open: bool,
     },
 
     /// Extract structured intents and decisions from canonical store (layer 1).
@@ -632,8 +690,8 @@ enum Commands {
 
     /// Run aicx as an MCP server (stdio or streamable HTTP).
     ///
-    /// Exposes search, steer, and rank tools over MCP for agent retrieval.
-    /// Layer 1 tools (steer, search) work immediately — they query the
+    /// Exposes search, read, steer, and rank tools over MCP for agent retrieval.
+    /// Layer 1 tools (steer, search, read) work immediately — they query the
     /// canonical corpus on disk. Layer 2 tools (embedding-aware semantic
     /// search) require a materialized memex index — run `memex-sync` first.
     Serve {
@@ -648,7 +706,7 @@ enum Commands {
 
     #[command(
         about = "Retired compatibility shim; prints migration guidance",
-        long_about = "aicx init has been retired.\n\nContext initialisation is now handled by /vc-init inside Claude Code.\nSee: https://vibecrafted.io/\n\nLegacy flags are still accepted for compatibility, but they have no effect."
+        long_about = "aicx init has been retired.\n\nContext initialisation is now handled by /vc-init inside Claude Code.\nIf you want a local operator readiness check instead, run `aicx doctor`.\nSee: https://vibecrafted.io/\n\nLegacy flags are still accepted for compatibility, but they have no effect."
     )]
     Init {
         /// Project name override
@@ -704,12 +762,39 @@ enum Commands {
         no_gitignore: bool,
     },
 
+    /// Show the newest stored chunks with readable previews and chainable refs.
+    ///
+    /// Use this when you want the fastest answer to "what was I just working
+    /// on?" without stitching together `refs`, `search`, and `read` manually.
+    Latest {
+        /// Hours to look back (filter by canonical chunk date)
+        #[arg(short = 'H', long, default_value = "168")]
+        hours: u64,
+
+        /// Project filter (org/repo substring, case-insensitive)
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Maximum chunks to show (0 = unlimited)
+        #[arg(short = 'l', long, default_value = "5")]
+        limit: usize,
+
+        /// Filter out low-signal noise (<15 lines, task-notifications only)
+        #[arg(long)]
+        strict: bool,
+
+        /// Emit compact JSON instead of the human-readable summary
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
+
     /// Fuzzy search across the canonical corpus (layer 1, filesystem-only).
     ///
     /// Searches chunk content and frontmatter directly in ~/.aicx/ — works
     /// immediately, no memex index needed. For embedding-aware semantic
     /// retrieval, materialize the index with `memex-sync` first, then use
-    /// MCP tools via `aicx serve`.
+    /// MCP tools via `aicx serve`. Use `aicx read <ref-or-path>` to open one
+    /// promising chunk after discovery.
     Search {
         /// Search query string
         query: String,
@@ -736,6 +821,29 @@ enum Commands {
         score: Option<u8>,
 
         /// Emit compact JSON instead of plain text
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
+
+    /// Open one stored chunk by AICX ref or absolute path.
+    ///
+    /// This is the "I found it, now show it" step after `search`, `refs`, or
+    /// `steer`. Pass either a store-relative ref such as
+    /// `store/VetCoders/ai-contexters/.../chunk.md` or a full path copied from
+    /// another command.
+    Read {
+        /// Store-relative ref under ~/.aicx/ or absolute chunk path
+        target: String,
+
+        /// Truncate the returned content after N UTF-8 characters (0 = full chunk)
+        #[arg(long, default_value = "0")]
+        max_chars: usize,
+
+        /// Truncate the returned content after N lines (0 = full chunk)
+        #[arg(long, default_value = "0")]
+        max_lines: usize,
+
+        /// Emit compact JSON instead of the human-readable view
         #[arg(short = 'j', long)]
         json: bool,
     },
@@ -1046,10 +1154,28 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Some(Commands::Doctor {
+            hours,
+            project,
+            json,
+            fix,
+        }) => {
+            run_doctor(hours, project, json, fix)?;
+        }
         Some(Commands::Init { .. }) => {
             eprintln!("aicx init has been retired.");
             eprintln!("Context initialisation is now handled by /vc-init inside Claude Code.");
+            eprintln!("For a local readiness check, run: aicx doctor");
             eprintln!("See: https://vibecrafted.io/");
+        }
+        Some(Commands::Latest {
+            hours,
+            project,
+            limit,
+            strict,
+            json,
+        }) => {
+            run_latest(hours, project, limit, strict, json)?;
         }
         Some(Commands::Refs {
             hours,
@@ -1073,12 +1199,14 @@ fn main() -> Result<()> {
             output,
             title,
             preview_chars,
+            open,
         }) => {
             run_dashboard(DashboardRunArgs {
                 store_root,
                 output,
                 title,
                 preview_chars,
+                open,
             })?;
         }
         Some(Commands::DashboardServe {
@@ -1088,6 +1216,7 @@ fn main() -> Result<()> {
             artifact,
             title,
             preview_chars,
+            open,
         }) => {
             run_dashboard_server(DashboardServerRunArgs {
                 store_root,
@@ -1096,6 +1225,7 @@ fn main() -> Result<()> {
                 artifact,
                 title,
                 preview_chars,
+                open,
             })?;
         }
         Some(Commands::Intents {
@@ -1135,6 +1265,14 @@ fn main() -> Result<()> {
                 json,
             )?;
         }
+        Some(Commands::Read {
+            target,
+            max_chars,
+            max_lines,
+            json,
+        }) => {
+            run_read(&target, max_chars, max_lines, json)?;
+        }
         Some(Commands::Steer {
             run_id,
             prompt_id,
@@ -1162,7 +1300,12 @@ fn main() -> Result<()> {
             ai_contexters::store::run_migration_with_paths(dry_run, legacy_root, store_root)?;
         }
         None => {
-            Cli::command().print_help()?;
+            if let Err(err) = run_front_door(cli.hours, cli.project.clone()) {
+                eprintln!(
+                    "Warning: could not build the guided front door ({err:#}). Showing full help instead."
+                );
+                Cli::command().print_help()?;
+            }
         }
     }
 
@@ -1245,6 +1388,692 @@ fn daemon_socket_display(socket_path: Option<&PathBuf>) -> Result<PathBuf> {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DoctorStatus {
+    Ok,
+    Partial,
+    Missing,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorSourceFamily {
+    family: String,
+    locations: usize,
+    sessions: usize,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorSourcesSummary {
+    status: DoctorStatus,
+    locations: usize,
+    total_sessions: usize,
+    total_size_bytes: u64,
+    families: Vec<DoctorSourceFamily>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorStoreSummary {
+    status: DoctorStatus,
+    recent_files: usize,
+    total_files: usize,
+    project_count: usize,
+    latest_chunk: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorDaemonSummary {
+    status: DoctorStatus,
+    mode: String,
+    socket_path: Option<String>,
+    phase: Option<String>,
+    detail: Option<String>,
+    last_cycle_summary: Option<String>,
+    last_error: Option<String>,
+    bootstrap_completed: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorReport {
+    generated_at: String,
+    hours: u64,
+    project_filter: Option<String>,
+    sources: DoctorSourcesSummary,
+    canonical_store: DoctorStoreSummary,
+    daemon: DoctorDaemonSummary,
+    next_steps: Vec<String>,
+}
+
+struct DaemonProbe {
+    mode: &'static str,
+    snapshot: Option<DaemonStatusSnapshot>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct DoctorRepairOutcome {
+    actions: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn run_doctor(hours: u64, project: Option<String>, json: bool, fix: bool) -> Result<()> {
+    let report = build_doctor_report(hours, project.clone())?;
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else if fix {
+        println!("Pre-fix check:");
+        print_doctor_report(&report);
+        println!();
+        let repair = run_doctor_fix(&report);
+        print_doctor_fix_outcome(&repair);
+        println!();
+        println!("Post-fix check:");
+        let post_fix_report = build_doctor_report(hours, project)?;
+        print_doctor_report(&post_fix_report);
+    } else {
+        print_doctor_report(&report);
+    }
+    Ok(())
+}
+
+fn run_front_door(hours: u64, project: Option<String>) -> Result<()> {
+    let report = build_doctor_report(hours, project)?;
+    print!("{}", render_front_door(&report));
+    Ok(())
+}
+
+fn build_doctor_report(hours: u64, project: Option<String>) -> Result<DoctorReport> {
+    let sources = summarize_sources(&sources::list_available_sources()?);
+    let canonical_store = summarize_store(hours, project.as_deref())?;
+    let daemon = summarize_daemon(&probe_daemon_status(None)?);
+
+    let mut report = DoctorReport {
+        generated_at: Utc::now().to_rfc3339(),
+        hours,
+        project_filter: project,
+        sources,
+        canonical_store,
+        daemon,
+        next_steps: Vec::new(),
+    };
+    report.next_steps = doctor_next_steps(&report);
+    Ok(report)
+}
+
+fn render_front_door(report: &DoctorReport) -> String {
+    let mut lines = Vec::new();
+    lines.push("aicx".to_string());
+    lines.push("  guided front door for agent session history".to_string());
+    lines.push("  full command list: aicx --help".to_string());
+    lines.push(format!("  window: last {}h", report.hours));
+    if let Some(project) = &report.project_filter {
+        lines.push(format!("  project filter: {project}"));
+    }
+    lines.push(format!(
+        "  verdict: {}",
+        doctor_verdict_label(doctor_overall_status(report))
+    ));
+    lines.push(format!("  summary: {}", doctor_overall_summary(report)));
+    if let Some(latest) = &report.canonical_store.latest_chunk {
+        lines.push(format!("  latest chunk: {latest}"));
+    }
+    lines.push(String::new());
+    lines.push("Start here:".to_string());
+    lines.push("  - aicx doctor".to_string());
+    lines.push("    Full readiness report with the detailed section breakdown.".to_string());
+    for step in report.next_steps.iter().take(3) {
+        lines.push(format!("  - {step}"));
+    }
+    lines.push(String::new());
+    lines.push("Useful shortcuts:".to_string());
+    lines.push("  - aicx dashboard --open".to_string());
+    lines.push("    Local browser snapshot when terminal-first is not the right mood.".to_string());
+    lines.push(format!(
+        "  - {}",
+        front_door_latest_command(report.project_filter.as_deref())
+    ));
+    lines.push("    Fastest way back to the newest readable chunks.".to_string());
+    lines.push(format!(
+        "  - {}",
+        front_door_search_command(report.project_filter.as_deref())
+    ));
+    lines.push(
+        "    Search the saved canonical corpus without needing the daemon first.".to_string(),
+    );
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn front_door_latest_command(project: Option<&str>) -> String {
+    match project {
+        Some(project) => format!("aicx latest --project {project}"),
+        None => "aicx latest".to_string(),
+    }
+}
+
+fn front_door_search_command(project: Option<&str>) -> String {
+    match project {
+        Some(project) => format!("aicx search \"query\" --project {project}"),
+        None => "aicx search \"query\"".to_string(),
+    }
+}
+
+fn summarize_sources(found_sources: &[sources::SourceInfo]) -> DoctorSourcesSummary {
+    let mut families: BTreeMap<String, DoctorSourceFamily> = BTreeMap::new();
+    let mut total_sessions = 0usize;
+    let mut total_size_bytes = 0u64;
+
+    for source in found_sources {
+        total_sessions += source.sessions;
+        total_size_bytes += source.size_bytes;
+
+        let family = source_family_name(&source.agent).to_string();
+        let entry = families
+            .entry(family.clone())
+            .or_insert_with(|| DoctorSourceFamily {
+                family,
+                locations: 0,
+                sessions: 0,
+                size_bytes: 0,
+            });
+        entry.locations += 1;
+        entry.sessions += source.sessions;
+        entry.size_bytes += source.size_bytes;
+    }
+
+    DoctorSourcesSummary {
+        status: if found_sources.is_empty() {
+            DoctorStatus::Missing
+        } else {
+            DoctorStatus::Ok
+        },
+        locations: found_sources.len(),
+        total_sessions,
+        total_size_bytes,
+        families: families.into_values().collect(),
+    }
+}
+
+fn summarize_store(hours: u64, project_filter: Option<&str>) -> Result<DoctorStoreSummary> {
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
+    let recent_files = store::context_files_since(cutoff, project_filter)?;
+    let total_files =
+        store::context_files_since(std::time::SystemTime::UNIX_EPOCH, project_filter)?;
+
+    let latest_chunk = recent_files
+        .last()
+        .or_else(|| total_files.last())
+        .map(|file| file.path.display().to_string());
+
+    let project_count = total_files
+        .iter()
+        .map(|file| file.project.clone())
+        .collect::<BTreeSet<_>>()
+        .len();
+
+    let status = if !recent_files.is_empty() {
+        DoctorStatus::Ok
+    } else if !total_files.is_empty() {
+        DoctorStatus::Partial
+    } else {
+        DoctorStatus::Missing
+    };
+
+    Ok(DoctorStoreSummary {
+        status,
+        recent_files: recent_files.len(),
+        total_files: total_files.len(),
+        project_count,
+        latest_chunk,
+    })
+}
+
+fn summarize_daemon(probe: &DaemonProbe) -> DoctorDaemonSummary {
+    match &probe.snapshot {
+        Some(snapshot) => DoctorDaemonSummary {
+            status: match probe.mode {
+                "live" => DoctorStatus::Ok,
+                "busy" => DoctorStatus::Partial,
+                "snapshot" => DoctorStatus::Partial,
+                _ => DoctorStatus::Missing,
+            },
+            mode: probe.mode.to_string(),
+            socket_path: Some(snapshot.socket_path.clone()),
+            phase: Some(snapshot.phase.to_string()),
+            detail: Some(snapshot.phase_detail.clone()),
+            last_cycle_summary: snapshot.last_cycle_summary.clone(),
+            last_error: snapshot.last_error.clone().or_else(|| probe.error.clone()),
+            bootstrap_completed: Some(snapshot.bootstrap_completed),
+        },
+        None => DoctorDaemonSummary {
+            status: DoctorStatus::Missing,
+            mode: probe.mode.to_string(),
+            socket_path: None,
+            phase: None,
+            detail: None,
+            last_cycle_summary: None,
+            last_error: probe.error.clone(),
+            bootstrap_completed: None,
+        },
+    }
+}
+
+fn probe_daemon_status(socket_path: Option<&Path>) -> Result<DaemonProbe> {
+    let resolved_socket = match socket_path {
+        Some(path) => path.to_path_buf(),
+        None => daemon::default_socket_path()?,
+    };
+
+    match daemon::request_status_at(&resolved_socket) {
+        Ok(ControlOutcome::Status(snapshot)) => Ok(DaemonProbe {
+            mode: "live",
+            snapshot: Some(snapshot),
+            error: None,
+        }),
+        Ok(other) => unreachable!(
+            "status endpoint returned unexpected outcome: {}",
+            other.message()
+        ),
+        Err(err) => {
+            let fallback = daemon::load_last_known_status(socket_path)?;
+            Ok(match fallback {
+                Some(snapshot) => DaemonProbe {
+                    mode: if daemon::is_control_plane_timeout(&err) {
+                        "busy"
+                    } else {
+                        "snapshot"
+                    },
+                    snapshot: Some(snapshot),
+                    error: Some(format!("{err:#}")),
+                },
+                None => DaemonProbe {
+                    mode: "missing",
+                    snapshot: None,
+                    error: Some(format!("{err:#}")),
+                },
+            })
+        }
+    }
+}
+
+fn print_doctor_report(report: &DoctorReport) {
+    println!("aicx doctor");
+    println!("  window: last {}h", report.hours);
+    if let Some(project) = &report.project_filter {
+        println!("  project filter: {}", project);
+    }
+    println!(
+        "  verdict: {}",
+        doctor_verdict_label(doctor_overall_status(report))
+    );
+    println!("  summary: {}", doctor_overall_summary(report));
+    println!();
+
+    println!(
+        "[{}] raw session history",
+        doctor_status_label(report.sources.status)
+    );
+    println!(
+        "  {} source locations, {} sessions, {} total",
+        report.sources.locations,
+        report.sources.total_sessions,
+        format_bytes_compact(report.sources.total_size_bytes)
+    );
+    for family in &report.sources.families {
+        println!(
+            "  {}: {} locations, {} sessions, {}",
+            family.family,
+            family.locations,
+            family.sessions,
+            format_bytes_compact(family.size_bytes)
+        );
+    }
+    if report.sources.status == DoctorStatus::Missing {
+        println!("  expected sources live under ~/.claude/, ~/.codex/, and ~/.gemini/");
+    }
+    println!();
+
+    println!(
+        "[{}] saved AI context (~/.aicx/)",
+        doctor_status_label(report.canonical_store.status)
+    );
+    println!(
+        "  recent chunks: {} in the last {}h",
+        report.canonical_store.recent_files, report.hours
+    );
+    println!(
+        "  total chunks: {} across {} project(s)",
+        report.canonical_store.total_files, report.canonical_store.project_count
+    );
+    if let Some(latest) = &report.canonical_store.latest_chunk {
+        println!("  latest chunk: {}", latest);
+    } else {
+        println!("  latest chunk: none yet");
+    }
+    println!();
+
+    println!(
+        "[{}] background memex service",
+        doctor_status_label(report.daemon.status)
+    );
+    match report.daemon.mode.as_str() {
+        "live" => println!("  always-on semantic indexing is reachable right now"),
+        "busy" => {
+            println!("  background service is busy right now; showing the last known snapshot")
+        }
+        "snapshot" => {
+            println!("  background service is offline right now, showing the last known snapshot")
+        }
+        _ => println!("  background service is not running yet; file-backed search still works"),
+    }
+    if let Some(socket_path) = &report.daemon.socket_path {
+        println!("  socket: {}", socket_path);
+    }
+    if let Some(phase) = &report.daemon.phase {
+        println!("  phase: {}", phase);
+    }
+    if let Some(detail) = &report.daemon.detail {
+        println!("  detail: {}", detail);
+    }
+    if let Some(summary) = &report.daemon.last_cycle_summary {
+        println!("  last cycle: {}", summary);
+    }
+    if let Some(last_error) = &report.daemon.last_error {
+        println!("  last error: {}", last_error);
+    }
+    if let Some(bootstrap_completed) = report.daemon.bootstrap_completed {
+        println!(
+            "  bootstrap: {}",
+            if bootstrap_completed {
+                "completed"
+            } else {
+                "not completed yet"
+            }
+        );
+    }
+    println!();
+
+    println!("What to do next:");
+    for step in &report.next_steps {
+        println!("  - {}", step);
+    }
+}
+
+fn run_doctor_fix(report: &DoctorReport) -> DoctorRepairOutcome {
+    let mut outcome = DoctorRepairOutcome::default();
+    let project = report
+        .project_filter
+        .as_ref()
+        .map(|name| vec![name.clone()])
+        .unwrap_or_default();
+    let mut store_ready = report.canonical_store.status != DoctorStatus::Missing;
+
+    if report.sources.status == DoctorStatus::Ok
+        && report.canonical_store.status != DoctorStatus::Ok
+    {
+        println!("doctor --fix: refreshing saved AI context from visible sources...");
+        match run_extraction(ExtractionParams {
+            agents: &["claude", "codex", "gemini"],
+            project,
+            hours: report.hours,
+            output_dir: None,
+            format: "both",
+            append_to: None,
+            rotate: 0,
+            incremental: true,
+            include_assistant: true,
+            include_loctree: false,
+            project_root: None,
+            sync_memex: true,
+            force: false,
+            conversation: false,
+            redact_secrets: true,
+            emit: StdoutEmit::None,
+        }) {
+            Ok(()) => {
+                store_ready = true;
+                outcome.actions.push(format!(
+                    "Refreshed the saved AI context for the last {}h and synced memex from visible sources.",
+                    report.hours
+                ));
+            }
+            Err(err) => outcome.warnings.push(format!(
+                "Could not refresh the saved AI context automatically: {err:#}"
+            )),
+        }
+    } else if report.sources.status == DoctorStatus::Missing
+        && report.canonical_store.status == DoctorStatus::Missing
+    {
+        outcome.warnings.push(
+            "No raw agent session logs are visible yet, so aicx cannot build the saved AI context automatically."
+                .to_string(),
+        );
+    }
+
+    if store_ready && report.daemon.status != DoctorStatus::Ok {
+        println!("doctor --fix: starting or nudging background memex service...");
+        match daemon::ensure_running_and_kick(Some("doctor --fix".to_string())) {
+            Ok(control) => outcome.actions.push(match control {
+                ControlOutcome::Status(_) => {
+                    "Background memex service is already reachable.".to_string()
+                }
+                ControlOutcome::SyncQueued(_) => {
+                    "Started or nudged background memex service and queued a sync.".to_string()
+                }
+                ControlOutcome::SyncAlreadyQueued(_) => {
+                    "Background memex service was already waking up; sync is already queued."
+                        .to_string()
+                }
+                ControlOutcome::SyncAlreadyRunning(_) => {
+                    "Background memex service is already running and syncing.".to_string()
+                }
+                ControlOutcome::StopQueued(_) => {
+                    "Background memex service reported a stop request instead of a sync."
+                        .to_string()
+                }
+            }),
+            Err(err) => outcome.warnings.push(format!(
+                "Could not start or nudge the background memex service automatically: {err:#}"
+            )),
+        }
+    }
+
+    if outcome.actions.is_empty() && outcome.warnings.is_empty() {
+        outcome
+            .actions
+            .push("Nothing had to change: the operator surface is already ready.".to_string());
+    }
+
+    outcome
+}
+
+fn print_doctor_fix_outcome(outcome: &DoctorRepairOutcome) {
+    println!("Doctor repair:");
+    for action in &outcome.actions {
+        println!("  - {}", action);
+    }
+    for warning in &outcome.warnings {
+        println!("  warning: {}", warning);
+    }
+}
+
+fn doctor_next_steps(report: &DoctorReport) -> Vec<String> {
+    let mut steps = Vec::new();
+    let store_ready = report.canonical_store.status != DoctorStatus::Missing;
+
+    if report.sources.status == DoctorStatus::Missing {
+        if store_ready {
+            steps.push(
+                "Open Claude Code, Codex, or Gemini once if you want fresh sessions to land automatically, then rerun `aicx doctor`."
+                    .to_string(),
+            );
+        } else {
+            steps.push(
+                "Open Claude Code, Codex, or Gemini once so local session logs exist, then rerun `aicx doctor`."
+                    .to_string(),
+            );
+            steps.push(
+                "For a one-off file, use `aicx extract --format claude /path/to/session.jsonl -o /tmp/report.md`."
+                    .to_string(),
+            );
+        }
+    }
+
+    if report.canonical_store.status == DoctorStatus::Missing {
+        if report.sources.status == DoctorStatus::Missing {
+            steps.push(format!(
+                "Once logs are available, run `aicx all -H {} --incremental --memex` to build the saved AI context and seed semantic search.",
+                report.hours
+            ));
+        } else {
+            steps.push(format!(
+                "Run `aicx all -H {} --incremental --memex` to build the saved AI context and seed semantic search in one pass.",
+                report.hours
+            ));
+        }
+    } else if report.canonical_store.status == DoctorStatus::Partial {
+        steps.push(format!(
+            "Run `aicx all -H {} --incremental --memex` to refresh recent history and catch semantic search up.",
+            report.hours
+        ));
+    }
+
+    if doctor_can_self_heal(report) {
+        steps.push(
+            "Prefer the one-command repair path? Run `aicx doctor --fix` and let aicx repair what it can automatically."
+                .to_string(),
+        );
+    }
+
+    if store_ready {
+        steps.push(
+            "Prefer a browser surface? Run `aicx dashboard --open` for a local snapshot or `aicx dashboard-serve --open` for a live local UI."
+                .to_string(),
+        );
+    }
+
+    if report.daemon.mode == "busy" && store_ready {
+        steps.push(
+            "You can already use `aicx latest` for the newest chunks or `aicx search \"query\"` against the saved file-backed context right now."
+                .to_string(),
+        );
+        steps.push(
+            "Background indexing is already working on a cycle; let it finish, then rerun `aicx doctor`."
+                .to_string(),
+        );
+    } else if report.daemon.status != DoctorStatus::Ok && store_ready {
+        steps.push(
+            "You can already use `aicx latest` for the newest chunks or `aicx search \"query\"` against the saved file-backed context right now."
+                .to_string(),
+        );
+        steps.push(
+            "Optional but recommended: run `aicx-memex daemon` to keep semantic search and metadata repair fresh in the background."
+                .to_string(),
+        );
+    }
+
+    if steps.is_empty() {
+        let steer_hint = report
+            .project_filter
+            .as_deref()
+            .map(|project| format!("`aicx steer --project {project}`"))
+            .unwrap_or_else(|| "`aicx steer --project <your-project>`".to_string());
+        steps.push(format!(
+            "You're ready: use `aicx latest` for the newest chunks, `aicx search \"query\"` for fast recall, or {steer_hint} for metadata-grounded retrieval."
+        ));
+    }
+
+    steps
+}
+
+fn doctor_can_self_heal(report: &DoctorReport) -> bool {
+    (report.sources.status == DoctorStatus::Ok && report.canonical_store.status != DoctorStatus::Ok)
+        || (report.canonical_store.status != DoctorStatus::Missing
+            && report.daemon.status != DoctorStatus::Ok
+            && report.daemon.mode != "busy")
+}
+
+fn doctor_overall_status(report: &DoctorReport) -> DoctorStatus {
+    if report.canonical_store.status == DoctorStatus::Missing {
+        DoctorStatus::Missing
+    } else if report.sources.status != DoctorStatus::Ok
+        || report.canonical_store.status != DoctorStatus::Ok
+        || report.daemon.status != DoctorStatus::Ok
+    {
+        DoctorStatus::Partial
+    } else {
+        DoctorStatus::Ok
+    }
+}
+
+fn doctor_overall_summary(report: &DoctorReport) -> String {
+    if report.canonical_store.status == DoctorStatus::Missing {
+        if report.sources.status == DoctorStatus::Missing {
+            "No saved AI context exists yet, and no raw session logs are visible yet.".to_string()
+        } else {
+            "Raw session logs are visible, but the saved AI context in ~/.aicx/ still needs its first refresh."
+                .to_string()
+        }
+    } else if report.sources.status == DoctorStatus::Missing {
+        "Saved AI context already exists, but no fresh raw session locations are visible right now. You can still search what is already in ~/.aicx/.".to_string()
+    } else if report.canonical_store.status == DoctorStatus::Partial {
+        format!(
+            "Saved AI context exists, but nothing new landed in the last {}h window yet.",
+            report.hours
+        )
+    } else if report.daemon.status != DoctorStatus::Ok {
+        "Raw session history and saved AI context are ready. You can work now, and the daemon is only needed for always-on semantic indexing and repair.".to_string()
+    } else {
+        "Sources, saved AI context, and background indexing are all ready.".to_string()
+    }
+}
+
+fn doctor_verdict_label(status: DoctorStatus) -> &'static str {
+    match status {
+        DoctorStatus::Ok => "ready",
+        DoctorStatus::Partial => "usable, but not fully automatic yet",
+        DoctorStatus::Missing => "needs setup",
+    }
+}
+
+fn doctor_status_label(status: DoctorStatus) -> &'static str {
+    match status {
+        DoctorStatus::Ok => "OK",
+        DoctorStatus::Partial => "PARTIAL",
+        DoctorStatus::Missing => "MISSING",
+    }
+}
+
+fn source_family_name(agent: &str) -> &'static str {
+    if agent.contains("claude") {
+        "Claude"
+    } else if agent.contains("codex") {
+        "Codex"
+    } else if agent.contains("gemini") {
+        "Gemini"
+    } else {
+        "Other"
+    }
+}
+
+fn format_bytes_compact(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit_idx = 0usize;
+
+    while value >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit_idx += 1;
+    }
+
+    if unit_idx == 0 {
+        format!("{} {}", bytes, UNITS[unit_idx])
+    } else {
+        format!("{value:.1} {}", UNITS[unit_idx])
+    }
+}
+
 fn run_daemon_status(socket_path: Option<&Path>, json: bool) -> Result<()> {
     let resolved_socket = match socket_path {
         Some(path) => path.to_path_buf(),
@@ -1257,7 +2086,7 @@ fn run_daemon_status(socket_path: Option<&Path>, json: bool) -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&snapshot)?);
             } else {
-                print_daemon_status(&snapshot, true);
+                print_daemon_status(&snapshot, "running");
             }
             Ok(())
         }
@@ -1266,9 +2095,12 @@ fn run_daemon_status(socket_path: Option<&Path>, json: bool) -> Result<()> {
             if let Some(snapshot) = fallback {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                } else if daemon::is_control_plane_timeout(&err) {
+                    eprintln!("Daemon is busy right now; showing the last known state.");
+                    print_daemon_status(&snapshot, "busy (last known state)");
                 } else {
                     eprintln!("Daemon is not currently reachable: {err:#}");
-                    print_daemon_status(&snapshot, false);
+                    print_daemon_status(&snapshot, "offline (last known state)");
                 }
                 Ok(())
             } else {
@@ -1305,15 +2137,8 @@ fn run_daemon_stop(socket_path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn print_daemon_status(snapshot: &DaemonStatusSnapshot, live: bool) {
-    println!(
-        "aicx-memex daemon: {}",
-        if live {
-            "running"
-        } else {
-            "offline (last known state)"
-        }
-    );
+fn print_daemon_status(snapshot: &DaemonStatusSnapshot, state_label: &str) {
+    println!("aicx-memex daemon: {}", state_label);
     println!("  pid: {}", snapshot.pid);
     println!("  socket: {}", snapshot.socket_path);
     println!("  phase: {}", snapshot.phase);
@@ -2362,6 +3187,313 @@ fn run_search(
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct LatestChunkItem {
+    store_ref: String,
+    path: String,
+    project: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo: Option<String>,
+    kind: String,
+    agent: String,
+    date: String,
+    event_time: String,
+    session_id: String,
+    chunk: u32,
+    preview: String,
+    preview_truncated: bool,
+}
+
+struct LatestChunkCandidate {
+    store_ref: String,
+    event_time: String,
+    file: store::StoredContextFile,
+}
+
+fn run_latest(
+    hours: u64,
+    project: Option<String>,
+    limit: usize,
+    strict: bool,
+    json: bool,
+) -> Result<()> {
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
+    let mut files = store::context_files_since(cutoff, project.as_deref())?;
+    if strict {
+        files.retain(|file| !is_noise_artifact(&file.path));
+    }
+
+    let store_base = store::store_base_dir()?;
+    let mut candidates = files
+        .into_iter()
+        .map(|file| build_latest_candidate(&store_base, file))
+        .collect::<Result<Vec<_>>>()?;
+
+    candidates.sort_by(|left, right| {
+        right
+            .event_time
+            .cmp(&left.event_time)
+            .then_with(|| right.file.date_iso.cmp(&left.file.date_iso))
+            .then_with(|| right.file.session_id.cmp(&left.file.session_id))
+            .then_with(|| right.file.chunk.cmp(&left.file.chunk))
+            .then_with(|| right.store_ref.cmp(&left.store_ref))
+    });
+
+    if limit > 0 && candidates.len() > limit {
+        candidates.truncate(limit);
+    }
+
+    let items = candidates
+        .into_iter()
+        .map(latest_item_from_candidate)
+        .collect::<Result<Vec<_>>>()?;
+
+    if json {
+        println!("{}", serde_json::to_string(&items)?);
+        return Ok(());
+    }
+
+    print_latest_items(hours, project.as_deref(), strict, &items)
+}
+
+fn build_latest_candidate(
+    store_base: &Path,
+    file: store::StoredContextFile,
+) -> Result<LatestChunkCandidate> {
+    let store_ref = chunk_store_ref(store_base, &file.path)?;
+    let sidecar = store::load_sidecar(&file.path);
+    let event_time = sidecar
+        .as_ref()
+        .and_then(|meta| meta.completed_at.clone())
+        .or_else(|| sidecar.as_ref().and_then(|meta| meta.started_at.clone()))
+        .unwrap_or_else(|| format!("{}T00:00:00Z", file.date_iso));
+
+    Ok(LatestChunkCandidate {
+        store_ref,
+        event_time,
+        file,
+    })
+}
+
+fn latest_item_from_candidate(candidate: LatestChunkCandidate) -> Result<LatestChunkItem> {
+    let (preview, preview_truncated) = latest_chunk_preview(&candidate.file.path)?;
+
+    Ok(LatestChunkItem {
+        store_ref: candidate.store_ref,
+        path: candidate.file.path.display().to_string(),
+        project: candidate.file.project,
+        repo: candidate.file.repo.as_ref().map(|repo| repo.slug()),
+        kind: candidate.file.kind.dir_name().to_string(),
+        agent: candidate.file.agent,
+        date: candidate.file.date_iso,
+        event_time: candidate.event_time,
+        session_id: candidate.file.session_id,
+        chunk: candidate.file.chunk,
+        preview,
+        preview_truncated,
+    })
+}
+
+fn print_latest_items(
+    hours: u64,
+    project: Option<&str>,
+    strict: bool,
+    items: &[LatestChunkItem],
+) -> Result<()> {
+    println!("aicx latest");
+    println!("  window: last {}h", hours);
+    if let Some(project) = project {
+        println!("  project filter: {}", project);
+    }
+    println!(
+        "  mode: {}",
+        if strict {
+            "noise-filtered"
+        } else {
+            "all stored chunks"
+        }
+    );
+    println!("  results: {}", items.len());
+    println!();
+
+    if items.is_empty() {
+        println!("No stored chunks matched this latest view.");
+        return Ok(());
+    }
+
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    for (index, item) in items.iter().enumerate() {
+        writeln!(
+            out,
+            "{}. {} | {} | {} | {}",
+            index + 1,
+            item.project,
+            item.agent,
+            item.date,
+            item.kind
+        )?;
+        if let Some(repo) = &item.repo {
+            writeln!(out, "   repo: {}", repo)?;
+        }
+        writeln!(out, "   ref: {}", item.store_ref)?;
+        writeln!(out, "   event_time: {}", item.event_time)?;
+        writeln!(
+            out,
+            "   session: {}  chunk: {}",
+            item.session_id, item.chunk
+        )?;
+        writeln!(out, "   preview: {}", item.preview)?;
+        if item.preview_truncated {
+            writeln!(out, "   hint: aicx read {}", item.store_ref)?;
+        }
+        writeln!(out)?;
+    }
+
+    if let Some(first) = items.first() {
+        writeln!(out, "Open one now: aicx read {}", first.store_ref)?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+fn latest_chunk_preview(path: &Path) -> Result<(String, bool)> {
+    const MAX_LINES: usize = 3;
+    const MAX_CHARS: usize = 220;
+
+    let content = ai_contexters::sanitize::read_to_string_validated(path)?;
+    let mut preview_lines = Vec::new();
+    let mut in_frontmatter = false;
+    let mut skipped_frontmatter = false;
+
+    for raw_line in content.lines() {
+        let mut line = raw_line.trim();
+        if line.is_empty() || line.starts_with("[project:") {
+            continue;
+        }
+
+        if line == "---" {
+            skipped_frontmatter = true;
+            in_frontmatter = !in_frontmatter;
+            continue;
+        }
+        if in_frontmatter {
+            continue;
+        }
+
+        if line == "[signals]" || line == "[/signals]" {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("[signals]") {
+            line = rest.trim();
+            if line.is_empty() {
+                continue;
+            }
+        }
+        if line.starts_with('[') {
+            if let Some((_, rest)) = line.split_once("] ") {
+                line = rest.trim();
+            }
+        }
+        if line.is_empty() {
+            continue;
+        }
+
+        preview_lines.push(line.to_string());
+        if preview_lines.len() >= MAX_LINES {
+            break;
+        }
+    }
+
+    if preview_lines.is_empty() && skipped_frontmatter {
+        preview_lines
+            .push("Frontmatter-only chunk; open with `aicx read` for full details.".to_string());
+    } else if preview_lines.is_empty() {
+        preview_lines.push("No readable preview available.".to_string());
+    }
+
+    let joined = preview_lines.join(" ");
+    if joined.chars().count() > MAX_CHARS {
+        let shortened = joined
+            .chars()
+            .take(MAX_CHARS.saturating_sub(1))
+            .collect::<String>();
+        Ok((format!("{shortened}..."), true))
+    } else {
+        Ok((joined, false))
+    }
+}
+
+fn chunk_store_ref(store_base: &Path, path: &Path) -> Result<String> {
+    let store_base = ai_contexters::sanitize::validate_dir_path(store_base)?;
+    let path = ai_contexters::sanitize::validate_read_path(path)?;
+
+    path.strip_prefix(&store_base)
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .map_err(|_| anyhow::anyhow!("Chunk path does not live under {}", store_base.display()))
+}
+
+fn run_read(target: &str, max_chars: usize, max_lines: usize, json: bool) -> Result<()> {
+    let chunk = store::read_stored_chunk(
+        target,
+        store::ReadChunkOptions {
+            max_chars,
+            max_lines,
+        },
+    )?;
+
+    if json {
+        println!("{}", serde_json::to_string(&chunk)?);
+        return Ok(());
+    }
+
+    println!("aicx read");
+    println!("  ref: {}", chunk.store_ref);
+    println!("  path: {}", chunk.path);
+    println!("  project: {}", chunk.project);
+    if let Some(repo) = &chunk.repo {
+        println!("  repo: {}", repo);
+    }
+    println!("  kind: {}", chunk.kind.dir_name());
+    println!("  agent: {}", chunk.agent);
+    println!("  date: {}", chunk.date);
+    println!("  session_id: {}", chunk.session_id);
+    println!("  chunk: {}", chunk.chunk);
+    if let Some(run_id) = &chunk.run_id {
+        println!("  run_id: {}", run_id);
+    }
+    if let Some(prompt_id) = &chunk.prompt_id {
+        println!("  prompt_id: {}", prompt_id);
+    }
+    if let Some(model) = &chunk.agent_model {
+        println!("  model: {}", model);
+    }
+    if let Some(phase) = &chunk.workflow_phase {
+        println!("  phase: {}", phase);
+    }
+    if let Some(mode) = &chunk.mode {
+        println!("  mode: {}", mode);
+    }
+    if chunk.truncated {
+        println!(
+            "  content: truncated from {} lines / {} chars",
+            chunk.original_lines, chunk.original_chars
+        );
+    } else {
+        println!(
+            "  content: full chunk ({} lines / {} chars)",
+            chunk.original_lines, chunk.original_chars
+        );
+    }
+    println!();
+    print!("{}", chunk.content);
+    if !chunk.content.ends_with('\n') {
+        println!();
+    }
+
+    Ok(())
+}
+
 /// Retrieve chunks by steering metadata (frontmatter sidecar fields).
 fn run_steer(
     run_id: Option<&str>,
@@ -2710,6 +3842,7 @@ struct DashboardServerRunArgs {
     artifact: PathBuf,
     title: String,
     preview_chars: usize,
+    open: bool,
 }
 
 /// Run dashboard server mode with server-shell HTML and API-backed regeneration.
@@ -2732,6 +3865,20 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
         ));
     }
     let artifact_path = args.artifact;
+    let dashboard_url = format!("http://{host}:{}", args.port);
+
+    if args.open {
+        let url = dashboard_url.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(450));
+            if let Err(err) = open_browser_target(&url) {
+                eprintln!(
+                    "  Warning: dashboard server is running, but the browser could not be opened automatically: {err:#}"
+                );
+                eprintln!("  Open this URL manually: {url}");
+            }
+        });
+    }
 
     let config = DashboardServerConfig {
         store_root: root,
@@ -2756,6 +3903,7 @@ struct DashboardRunArgs {
     output: PathBuf,
     title: String,
     preview_chars: usize,
+    open: bool,
 }
 
 /// Build and write an AI context dashboard HTML file.
@@ -2805,8 +3953,58 @@ fn run_dashboard(args: DashboardRunArgs) -> Result<()> {
         }
     }
 
+    if args.open {
+        let browser_path = output_path
+            .canonicalize()
+            .unwrap_or_else(|_| output_path.clone());
+        let browser_target = browser_path.to_string_lossy().into_owned();
+        match open_browser_target(&browser_target) {
+            Ok(()) => eprintln!("  Opening: {}", browser_path.display()),
+            Err(err) => {
+                eprintln!(
+                    "  Warning: dashboard was generated, but the browser could not be opened automatically: {err:#}"
+                );
+                eprintln!("  Open this file manually: {}", browser_path.display());
+            }
+        }
+    }
+
     println!("{}", output_path.display());
     Ok(())
+}
+
+fn open_browser_target(target: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(target)
+            .spawn()
+            .with_context(|| format!("Failed to launch `open` for {target}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", target])
+            .spawn()
+            .with_context(|| format!("Failed to launch `start` for {target}"))?;
+        return Ok(());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(target)
+            .spawn()
+            .with_context(|| format!("Failed to launch `xdg-open` for {target}"))?;
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    Err(anyhow::anyhow!(
+        "Automatic browser opening is not supported on this platform yet. Open it manually: {target}"
+    ))
 }
 
 #[cfg(test)]
@@ -2876,6 +4074,47 @@ mod tests {
             }),
             "  Completed: 10 pushed, 2 skipped, 3 ignored"
         );
+    }
+
+    fn sample_doctor_report(project_filter: Option<&str>) -> DoctorReport {
+        let project_filter = project_filter.map(str::to_string);
+        let mut report = DoctorReport {
+            generated_at: "2026-04-07T00:00:00Z".to_string(),
+            hours: 72,
+            project_filter,
+            sources: DoctorSourcesSummary {
+                status: DoctorStatus::Ok,
+                locations: 1,
+                total_sessions: 5,
+                total_size_bytes: 1024,
+                families: vec![DoctorSourceFamily {
+                    family: "Codex".to_string(),
+                    locations: 1,
+                    sessions: 5,
+                    size_bytes: 1024,
+                }],
+            },
+            canonical_store: DoctorStoreSummary {
+                status: DoctorStatus::Ok,
+                recent_files: 4,
+                total_files: 20,
+                project_count: 1,
+                latest_chunk: Some("/tmp/chunk.md".to_string()),
+            },
+            daemon: DoctorDaemonSummary {
+                status: DoctorStatus::Missing,
+                mode: "missing".to_string(),
+                socket_path: None,
+                phase: None,
+                detail: None,
+                last_cycle_summary: None,
+                last_error: Some("socket missing".to_string()),
+                bootstrap_completed: None,
+            },
+            next_steps: Vec::new(),
+        };
+        report.next_steps = doctor_next_steps(&report);
+        report
     }
 
     #[test]
@@ -2965,6 +4204,83 @@ mod tests {
     }
 
     #[test]
+    fn doctor_accepts_hours_project_and_json() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "doctor",
+            "-H",
+            "96",
+            "--project",
+            "ai-contexters",
+            "--json",
+        ])
+        .expect("doctor command should parse");
+
+        match cli.command {
+            Some(Commands::Doctor {
+                hours,
+                project,
+                json,
+                fix,
+            }) => {
+                assert_eq!(hours, 96);
+                assert_eq!(project.as_deref(), Some("ai-contexters"));
+                assert!(json);
+                assert!(!fix);
+            }
+            _ => panic!("expected doctor command"),
+        }
+    }
+
+    #[test]
+    fn doctor_accepts_fix_flag() {
+        let cli = Cli::try_parse_from(["aicx", "doctor", "--fix"])
+            .expect("doctor command with --fix should parse");
+
+        match cli.command {
+            Some(Commands::Doctor { fix, json, .. }) => {
+                assert!(fix);
+                assert!(!json);
+            }
+            _ => panic!("expected doctor command"),
+        }
+    }
+
+    #[test]
+    fn latest_accepts_limit_strict_and_json() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "latest",
+            "-H",
+            "240",
+            "--project",
+            "ai-contexters",
+            "--limit",
+            "7",
+            "--strict",
+            "--json",
+        ])
+        .expect("latest command should parse");
+
+        match cli.command {
+            Some(Commands::Latest {
+                hours,
+                project,
+                limit,
+                strict,
+                json,
+            }) => {
+                assert_eq!(hours, 240);
+                assert_eq!(project.as_deref(), Some("ai-contexters"));
+                assert_eq!(limit, 7);
+                assert!(strict);
+                assert!(json);
+            }
+            _ => panic!("expected latest command"),
+        }
+    }
+
+    #[test]
     fn search_accepts_score_and_json_flags() {
         let cli = Cli::try_parse_from(["aicx", "search", "dashboard", "--score", "60", "--json"])
             .expect("search command with score/json should parse");
@@ -2975,6 +4291,36 @@ mod tests {
                 assert!(json);
             }
             _ => panic!("expected search command"),
+        }
+    }
+
+    #[test]
+    fn read_accepts_ref_and_truncation_flags() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "read",
+            "store/VetCoders/ai-contexters/2026_0331/reports/codex/2026_0331_codex_sess-read01_001.md",
+            "--max-chars",
+            "1200",
+            "--max-lines",
+            "40",
+            "--json",
+        ])
+        .expect("read command should parse");
+
+        match cli.command {
+            Some(Commands::Read {
+                target,
+                max_chars,
+                max_lines,
+                json,
+            }) => {
+                assert!(target.contains("store/VetCoders/ai-contexters"));
+                assert_eq!(max_chars, 1200);
+                assert_eq!(max_lines, 40);
+                assert!(json);
+            }
+            _ => panic!("expected read command"),
         }
     }
 
@@ -2998,6 +4344,196 @@ mod tests {
     }
 
     #[test]
+    fn top_level_help_includes_guided_examples() {
+        let mut cmd = Cli::command();
+        let rendered = cmd.render_help().to_string();
+
+        assert!(rendered.contains("Most people want one of these:"));
+        assert!(rendered.contains("  aicx"));
+        assert!(rendered.contains("aicx doctor --fix"));
+        assert!(rendered.contains("aicx dashboard --open"));
+        assert!(rendered.contains("aicx latest -p <project>"));
+        assert!(rendered.contains("aicx all -H 24 --incremental --memex"));
+        assert!(rendered.contains("aicx search \"query\""));
+        assert!(rendered.contains("aicx read <ref-or-path>"));
+    }
+
+    #[test]
+    fn front_door_render_includes_guided_shortcuts() {
+        let rendered = render_front_door(&sample_doctor_report(None));
+
+        assert!(rendered.contains("guided front door"));
+        assert!(rendered.contains("aicx --help"));
+        assert!(rendered.contains("aicx doctor"));
+        assert!(rendered.contains("aicx dashboard --open"));
+        assert!(rendered.contains("aicx latest"));
+        assert!(rendered.contains("aicx search \"query\""));
+    }
+
+    #[test]
+    fn front_door_render_scopes_latest_and_search_when_project_is_set() {
+        let rendered = render_front_door(&sample_doctor_report(Some("ai-contexters")));
+
+        assert!(rendered.contains("project filter: ai-contexters"));
+        assert!(rendered.contains("aicx latest --project ai-contexters"));
+        assert!(rendered.contains("aicx search \"query\" --project ai-contexters"));
+    }
+
+    #[test]
+    fn dashboard_accepts_open_flag() {
+        let cli = Cli::try_parse_from(["aicx", "dashboard", "--open"])
+            .expect("dashboard command with --open should parse");
+
+        match cli.command {
+            Some(Commands::Dashboard { open, .. }) => assert!(open),
+            _ => panic!("expected dashboard command"),
+        }
+    }
+
+    #[test]
+    fn dashboard_serve_accepts_open_flag() {
+        let cli = Cli::try_parse_from(["aicx", "dashboard-serve", "--open"])
+            .expect("dashboard-serve command with --open should parse");
+
+        match cli.command {
+            Some(Commands::DashboardServe { open, .. }) => assert!(open),
+            _ => panic!("expected dashboard-serve command"),
+        }
+    }
+
+    #[test]
+    fn doctor_verdict_is_partial_when_store_is_ready_but_daemon_is_missing() {
+        let report = DoctorReport {
+            generated_at: "2026-04-07T00:00:00Z".to_string(),
+            hours: 72,
+            project_filter: Some("ai-contexters".to_string()),
+            sources: DoctorSourcesSummary {
+                status: DoctorStatus::Ok,
+                locations: 1,
+                total_sessions: 5,
+                total_size_bytes: 1024,
+                families: vec![DoctorSourceFamily {
+                    family: "Codex".to_string(),
+                    locations: 1,
+                    sessions: 5,
+                    size_bytes: 1024,
+                }],
+            },
+            canonical_store: DoctorStoreSummary {
+                status: DoctorStatus::Ok,
+                recent_files: 4,
+                total_files: 20,
+                project_count: 1,
+                latest_chunk: Some("/tmp/chunk.md".to_string()),
+            },
+            daemon: DoctorDaemonSummary {
+                status: DoctorStatus::Missing,
+                mode: "missing".to_string(),
+                socket_path: None,
+                phase: None,
+                detail: None,
+                last_cycle_summary: None,
+                last_error: None,
+                bootstrap_completed: None,
+            },
+            next_steps: Vec::new(),
+        };
+
+        assert_eq!(doctor_overall_status(&report), DoctorStatus::Partial);
+        assert_eq!(
+            doctor_verdict_label(doctor_overall_status(&report)),
+            "usable, but not fully automatic yet"
+        );
+        assert!(doctor_overall_summary(&report).contains("You can work now"));
+    }
+
+    #[test]
+    fn doctor_next_steps_keep_search_available_when_daemon_is_missing() {
+        let report = DoctorReport {
+            generated_at: "2026-04-07T00:00:00Z".to_string(),
+            hours: 24,
+            project_filter: None,
+            sources: DoctorSourcesSummary {
+                status: DoctorStatus::Ok,
+                locations: 1,
+                total_sessions: 3,
+                total_size_bytes: 2048,
+                families: Vec::new(),
+            },
+            canonical_store: DoctorStoreSummary {
+                status: DoctorStatus::Ok,
+                recent_files: 3,
+                total_files: 8,
+                project_count: 1,
+                latest_chunk: Some("/tmp/chunk.md".to_string()),
+            },
+            daemon: DoctorDaemonSummary {
+                status: DoctorStatus::Missing,
+                mode: "missing".to_string(),
+                socket_path: None,
+                phase: None,
+                detail: None,
+                last_cycle_summary: None,
+                last_error: Some("socket missing".to_string()),
+                bootstrap_completed: None,
+            },
+            next_steps: Vec::new(),
+        };
+
+        let steps = doctor_next_steps(&report);
+
+        assert!(steps.iter().any(|step| step.contains("doctor --fix")));
+        assert!(steps.iter().any(|step| step.contains("dashboard --open")));
+        assert!(steps.iter().any(|step| step.contains("aicx search")));
+        assert!(steps.iter().any(|step| step.contains("aicx-memex daemon")));
+    }
+
+    #[test]
+    fn doctor_next_steps_treat_busy_daemon_as_in_progress() {
+        let report = DoctorReport {
+            generated_at: "2026-04-07T00:00:00Z".to_string(),
+            hours: 24,
+            project_filter: None,
+            sources: DoctorSourcesSummary {
+                status: DoctorStatus::Ok,
+                locations: 1,
+                total_sessions: 3,
+                total_size_bytes: 2048,
+                families: Vec::new(),
+            },
+            canonical_store: DoctorStoreSummary {
+                status: DoctorStatus::Ok,
+                recent_files: 3,
+                total_files: 8,
+                project_count: 1,
+                latest_chunk: Some("/tmp/chunk.md".to_string()),
+            },
+            daemon: DoctorDaemonSummary {
+                status: DoctorStatus::Partial,
+                mode: "busy".to_string(),
+                socket_path: Some("/tmp/aicx.sock".to_string()),
+                phase: Some("refreshing_sources".to_string()),
+                detail: Some("Refreshing canonical store (startup bootstrap)".to_string()),
+                last_cycle_summary: None,
+                last_error: Some("timed out".to_string()),
+                bootstrap_completed: Some(false),
+            },
+            next_steps: Vec::new(),
+        };
+
+        let steps = doctor_next_steps(&report);
+
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.contains("already working on a cycle"))
+        );
+        assert!(steps.iter().any(|step| step.contains("dashboard --open")));
+        assert!(!steps.iter().any(|step| step.contains("doctor --fix")));
+        assert!(!steps.iter().any(|step| step.contains("aicx-memex daemon")));
+    }
+
+    #[test]
     fn init_help_explains_retirement_and_hides_legacy_flags() {
         let mut cmd = Cli::command();
         let init = cmd
@@ -3007,6 +4543,7 @@ mod tests {
 
         assert!(rendered.contains("aicx init has been retired."));
         assert!(rendered.contains("/vc-init inside Claude Code."));
+        assert!(rendered.contains("aicx doctor"));
         assert!(!rendered.contains("--agent"));
         assert!(!rendered.contains("--action"));
         assert!(!rendered.contains("--no-run"));

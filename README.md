@@ -29,6 +29,19 @@ Public install from crates.io:
 cargo install ai-contexters --locked
 ```
 
+Toolchain-free release archive on macOS/Linux:
+
+1. Download the right archive from [GitHub Releases](https://github.com/VetCoders/ai-contexters/releases).
+2. Extract it.
+3. Run the bundled installer from inside the extracted folder:
+
+```bash
+./install.sh
+```
+
+The bundled installer copies `aicx`, `aicx-mcp`, and `aicx-memex` into `~/.local/bin` by default (override with `AICX_BIN_DIR`), configures MCP clients with the absolute `aicx-mcp` path, bootstraps the canonical store, and starts or nudges the background memex daemon.
+Each extracted bundle also includes `presence/index.html`, a local one-pager you can open in a browser before touching the terminal.
+
 From a local checkout:
 
 ```bash
@@ -57,6 +70,41 @@ cargo install --path . --locked --bin aicx --bin aicx-mcp --bin aicx-memex
 ```
 
 `install.sh` prefers the local checkout when one is present. Outside a checkout, it now defaults to the published crates.io package. After install, use `aicx-memex status` to inspect the daemon's current phase.
+If you want the calmest front door instead of memorizing commands, run:
+
+```bash
+aicx
+```
+
+If you want the full section-by-section readiness report, run:
+
+```bash
+aicx doctor
+```
+
+If you want the tool to repair the obvious gaps it can handle by itself, run:
+
+```bash
+aicx doctor --fix
+```
+
+If you prefer a browser-first local view instead of starting in terminal output, run:
+
+```bash
+aicx dashboard --open
+```
+
+If you want the richer live local UI with on-demand regeneration, run:
+
+```bash
+aicx dashboard-serve --open
+```
+
+If you want the fastest re-entry path after that, run:
+
+```bash
+aicx latest -p ai-contexters
+```
 
 ## Workspace Boundaries
 
@@ -85,6 +133,24 @@ cargo test --bin aicx --bin aicx-mcp --bin aicx-memex
 ```
 
 ## Quickstart
+
+Start with the guided front door:
+
+```bash
+aicx
+```
+
+It gives you the current verdict, suggested next moves, and the shortest command path forward.
+If you want the full readiness breakdown, run `aicx doctor`.
+If you want the same front door to also repair what it can automatically, use `aicx doctor --fix`.
+If you would rather browse than memorize commands, use `aicx dashboard --open` for a local HTML snapshot or `aicx dashboard-serve --open` for the live local UI.
+If you want the newest readable chunks after the readiness check, use `aicx latest -p <project>` and open one result directly with `aicx read <ref-or-path>`.
+
+If you prefer to start with the sectioned health check immediately, run:
+
+```bash
+aicx doctor
+```
 
 ### Layer 1 — build the canonical corpus
 
@@ -162,7 +228,7 @@ Daily “what changed?” with incremental refresh plus compact summary:
 
 ```bash
 aicx all -H 24 --incremental --emit none
-aicx refs -H 24
+aicx latest -H 24 -l 5
 ```
 
 Incremental mode (watermark per source, avoids re-processing):
@@ -183,6 +249,15 @@ Steering retrieval (filter chunks by frontmatter metadata):
 aicx steer --run-id mrbl-001
 aicx steer --project ai-contexters --kind reports --date 2026-03-28
 aicx steer --agent claude --date 2026-03-20..2026-03-28
+```
+
+Open one chunk directly after discovery:
+
+```bash
+aicx read store/VetCoders/ai-contexters/2026_0331/reports/codex/2026_0331_codex_sess-read01_001.md
+
+# or paste an absolute path copied from `aicx search` / `aicx refs --emit paths`
+aicx read /Users/you/.aicx/store/VetCoders/ai-contexters/2026_0331/reports/codex/2026_0331_codex_sess-read01_001.md
 ```
 
 Semantic materialization (memex — the retrieval kernel).
@@ -233,6 +308,7 @@ aicx extract --format gemini-antigravity \
 - `docs/REDACTION.md` (secret redaction, regex engine notes)
 - `docs/DISTILLATION.md` (chunking/distillation model + tuning ideas)
 - `docs/RELEASES.md` (release/distribution workflow + maintainer checklist)
+- `presence/index.html` (repo-local product face / one-pager for demos and packaging)
 
 ## Notes
 

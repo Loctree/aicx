@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI Contexters | Operator front door for agent session history</title>
+    <meta
+      name="description"
+      content="AI Contexters turns Claude Code, Codex, and Gemini session history into a canonical corpus first, then a semantic memex second."
+    />
+    <meta property="og:title" content="AI Contexters" />
+    <meta
+      property="og:description"
+      content="Canonical corpus first. Semantic memex second. One operator front door for agent session history."
+    />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero fade-up">
+        <div class="hero-copy">
+          <p class="eyebrow">VetCoders / Vibecrafted foundation</p>
+          <h1>Agent history with one honest front door.</h1>
+          <p class="lede">
+            <strong>AI Contexters</strong> turns raw session logs from Claude Code,
+            Codex, and Gemini into a canonical corpus you can trust, then keeps a
+            semantic memex ready for retrieval.
+          </p>
+          <p class="lede">
+            Extracted release bundles include this page plus bundled docs, so a
+            human can understand the product before remembering any commands.
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="https://crates.io/crates/ai-contexters">Install from crates.io</a>
+            <a class="button button-secondary" href="https://github.com/VetCoders/ai-contexters/releases">Download release archives</a>
+          </div>
+        </div>
+        <section class="command-panel fade-up" aria-label="Quick commands">
+          <div class="command-card">
+            <p class="command-label">Install</p>
+            <pre><code>cargo install ai-contexters --locked</code></pre>
+            <button class="copy-button" data-copy="cargo install ai-contexters --locked">Copy</button>
+          </div>
+          <div class="command-card">
+            <p class="command-label">Archive install</p>
+            <pre><code>./install.sh</code></pre>
+            <button class="copy-button" data-copy="./install.sh">Copy</button>
+          </div>
+          <div class="command-card">
+            <p class="command-label">Start here</p>
+            <pre><code>aicx</code></pre>
+            <button class="copy-button" data-copy="aicx">Copy</button>
+          </div>
+          <div class="command-card">
+            <p class="command-label">Repair obvious gaps</p>
+            <pre><code>aicx doctor --fix</code></pre>
+            <button
+              class="copy-button"
+              data-copy="aicx doctor --fix"
+            >
+              Copy
+            </button>
+          </div>
+          <div class="command-card">
+            <p class="command-label">Browser snapshot</p>
+            <pre><code>aicx dashboard --open</code></pre>
+            <button class="copy-button" data-copy="aicx dashboard --open">Copy</button>
+          </div>
+          <div class="command-card">
+            <p class="command-label">Latest re-entry</p>
+            <pre><code>aicx latest -p ai-contexters</code></pre>
+            <button class="copy-button" data-copy="aicx latest -p ai-contexters">Copy</button>
+          </div>
+        </section>
+      </header>
+
+      <main>
+        <section class="grid-section fade-up">
+          <article class="feature-card">
+            <p class="card-kicker">Layer 1</p>
+            <h2>Canonical corpus first</h2>
+            <p>
+              Extract, deduplicate, chunk, and store agent sessions as steerable
+              markdown in <code>~/.aicx/</code>. This is the ground truth.
+            </p>
+          </article>
+          <article class="feature-card">
+            <p class="card-kicker">Layer 2</p>
+            <h2>Semantic memex second</h2>
+            <p>
+              Materialize the canonical corpus into vector + BM25 retrieval for
+              agents and MCP tools without giving up the file-backed source of truth.
+            </p>
+          </article>
+          <article class="feature-card">
+            <p class="card-kicker">Operator UX</p>
+            <h2>Built for humans who want one obvious next move</h2>
+            <p>
+              <code>aicx</code>, <code>aicx doctor</code>,
+              <code>aicx dashboard --open</code>, <code>aicx latest</code>,
+              <code>aicx read</code>, guided install paths, and background
+              memex upkeep make the capability surface stronger and easier at
+              the same time.
+            </p>
+          </article>
+        </section>
+
+        <section class="story fade-up">
+          <div>
+            <p class="section-label">Why it exists</p>
+            <h2>Capability surface and user friendliness do not need to fight.</h2>
+          </div>
+          <p>
+            AI Contexters is opinionated on purpose: keep canonical truth visible,
+            keep semantic retrieval optional but close at hand, and give the operator
+            a surface that explains itself instead of forcing them to memorize internals.
+          </p>
+        </section>
+
+        <section class="steps fade-up" aria-labelledby="three-step-title">
+          <div class="steps-header">
+            <p class="section-label">Three-step flow</p>
+            <h2 id="three-step-title">From raw logs to useful recall</h2>
+          </div>
+          <div class="steps-grid">
+            <article class="step-card">
+              <span class="step-number">01</span>
+              <h3>Install once</h3>
+              <p>Use crates.io, or extract a release archive and run <code>./install.sh</code> if you do not want a Rust toolchain.</p>
+            </article>
+            <article class="step-card">
+              <span class="step-number">02</span>
+              <h3>Run <code>aicx</code></h3>
+              <p>Let the guided front door tell you the current verdict, the next recommended move, and when it makes sense to open the deeper <code>aicx doctor</code> report or use <code>--fix</code>.</p>
+            </article>
+            <article class="step-card">
+              <span class="step-number">03</span>
+              <h3>Open the browser or go straight to recall</h3>
+              <p>Use <code>aicx dashboard --open</code> when you want a calmer browser front door, or start with <code>aicx latest</code> when you want the newest readable chunks right away.</p>
+            </article>
+          </div>
+        </section>
+
+        <section class="links-strip fade-up" aria-labelledby="links-title">
+          <div>
+            <p class="section-label">Public surfaces</p>
+            <h2 id="links-title">Everything important in one place</h2>
+          </div>
+          <div class="link-grid">
+            <a class="link-card" href="https://github.com/VetCoders/ai-contexters">
+              <span>GitHub repository</span>
+              <strong>Source, issues, changelog</strong>
+            </a>
+            <a class="link-card" href="https://docs.rs/ai-contexters">
+              <span>docs.rs</span>
+              <strong>API docs</strong>
+            </a>
+            <a class="link-card" href="../docs/COMMANDS.md">
+              <span>Bundled command guide</span>
+              <strong>CLI reference and examples, even offline</strong>
+            </a>
+            <a class="link-card" href="../docs/RELEASES.md">
+              <span>Bundled release guide</span>
+              <strong>Install and shipping path from the extracted bundle</strong>
+            </a>
+          </div>
+        </section>
+      </main>
+    </div>
+    <script src="./app.js"></script>
+  </body>
+</html>

@@ -16,6 +16,170 @@ For the shortest “it works” path, see `README.md`.
 - Default behavior is redaction enabled.
 - Passing this flag disables redaction (not recommended unless you fully trust inputs and outputs).
 
+## `aicx` (no subcommand)
+
+Guided front door for the whole operator surface.
+
+```bash
+aicx [OPTIONS]
+```
+
+What it does:
+- builds a doctor-style summary of sources, canonical store health, and daemon state
+- suggests the next few actions instead of dumping the full command list first
+- points to the shortest follow-up paths: `doctor`, `dashboard`, `latest`, and `search`
+
+Examples:
+
+```bash
+# Default guided front door
+aicx
+
+# Same front door, scoped to one repo
+aicx --project ai-contexters
+
+# Same front door, but with a wider recent-activity window
+aicx -H 168
+```
+
+Use `aicx --help` when you want the full command catalog instead of the guided start.
+
+## `aicx doctor`
+
+Human-friendly readiness summary for the whole operator surface.
+
+```bash
+aicx doctor [OPTIONS]
+```
+
+What it checks:
+- raw local sources (`~/.claude`, `~/.codex`, `~/.gemini`)
+- recent canonical store activity in `~/.aicx/`
+- memex daemon reachability or last known snapshot
+- recommended next steps based on what is missing
+
+Options:
+- `-H, --hours <HOURS>` recent activity window for the canonical store summary (default: `72`)
+- `-p, --project <PROJECT>` project filter for canonical store checks
+- `-j, --json` emit compact JSON instead of the human-readable summary
+- `--fix` repair what can be repaired automatically, then rerun the check
+
+Examples:
+
+```bash
+# One obvious "what is ready?" check
+aicx doctor
+
+# Same check, scoped to one repo
+aicx doctor --project ai-contexters
+
+# Let doctor refresh/store/start background indexing when it can
+aicx doctor --fix
+
+# Agent-friendly JSON output
+aicx doctor -H 168 --json
+```
+
+## `aicx dashboard`
+
+Generate a browser-friendly HTML snapshot from the canonical store.
+
+```bash
+aicx dashboard [OPTIONS]
+```
+
+Options:
+- `--store-root <STORE_ROOT>` override the canonical store root (default: `~/.aicx`)
+- `-o, --output <OUTPUT>` output HTML path (default: `aicx-dashboard.html`)
+- `--title <TITLE>` page title (default: `AI Contexters Dashboard`)
+- `--preview-chars <N>` preview length per record (default: `320`)
+- `--open` open the generated snapshot in your default browser
+
+Examples:
+
+```bash
+# Write a local snapshot in the current directory
+aicx dashboard
+
+# Generate and open the snapshot immediately
+aicx dashboard --open
+
+# Keep one project-focused snapshot elsewhere
+aicx dashboard --project ai-contexters --output ~/Desktop/aicx-ai-contexters.html --open
+```
+
+Use this when you want a shareable or offline-friendly browser surface without leaving a long-running process behind.
+
+## `aicx dashboard-serve`
+
+Run the live local dashboard UI with API-backed regeneration and search helpers.
+
+```bash
+aicx dashboard-serve [OPTIONS]
+```
+
+Options:
+- `--store-root <STORE_ROOT>` override the canonical store root (default: `~/.aicx`)
+- `--host <HOST>` loopback host to bind (default: `127.0.0.1`)
+- `--port <PORT>` TCP port for the local UI (default: `8033`)
+- `--artifact <ARTIFACT>` legacy compatibility path retained for status surfaces
+- `--title <TITLE>` page title (default: `AI Contexters Dashboard`)
+- `--preview-chars <N>` preview length per record (default: `320`)
+- `--open` open the local dashboard URL in your default browser
+
+Examples:
+
+```bash
+# Start the live local dashboard
+aicx dashboard-serve
+
+# Start it and open the browser automatically
+aicx dashboard-serve --open
+
+# Run a project-scoped local UI on a different port
+aicx dashboard-serve --project ai-contexters --port 8034 --open
+```
+
+Use this when you want the lowest-friction browser front door for a less technical operator while keeping the richer live search and regenerate surface.
+
+## `aicx latest`
+
+Fastest re-entry view for the newest stored chunks.
+
+```bash
+aicx latest [OPTIONS]
+```
+
+What it does:
+- reads the newest canonical chunks from `~/.aicx/`
+- orders them by canonical event time when sidecar telemetry is present, falling back to the canonical chunk date
+- returns chainable refs plus a short preview so you can decide what to open next
+
+Options:
+- `-H, --hours <HOURS>` lookback window by canonical chunk date (default: `168`)
+- `-p, --project <PROJECT>` project filter (substring match)
+- `-l, --limit <LIMIT>` max chunks to show (`0` = unlimited, default: `5`)
+- `--strict` filter out low-signal task-notification noise
+- `-j, --json` emit compact JSON instead of the human-readable summary
+
+Examples:
+
+```bash
+# Show the newest five chunks across everything visible
+aicx latest
+
+# Re-enter one repo quickly
+aicx latest --project ai-contexters
+
+# Keep the list tight and noise-filtered
+aicx latest --project ai-contexters --strict --limit 3
+
+# Agent-friendly JSON for scripting
+aicx latest --project ai-contexters --json
+```
+
+The `store_ref` values returned by `latest` are chainable into `aicx read`.
+
 ## `aicx list`
 
 List available local sources and their sizes.
@@ -200,6 +364,35 @@ aicx search "dashboard" -p ai-contexters --score 60 --json
 aicx search "decisions march 2026"
 ```
 
+After `search`, open one promising chunk directly with `aicx read <ref-or-path>`.
+
+## `aicx read`
+
+Open one stored chunk by AICX ref or absolute path. This is the selective re-entry step after `search`, `refs`, or `steer`.
+
+```bash
+aicx read [OPTIONS] <TARGET>
+```
+
+Options:
+- `<TARGET>` store-relative ref under `~/.aicx/` or absolute chunk path
+- `--max-chars <N>` truncate content after N UTF-8 characters (`0` = full chunk)
+- `--max-lines <N>` truncate content after N lines (`0` = full chunk)
+- `-j, --json` emit compact JSON instead of the human-readable view
+
+Examples:
+
+```bash
+# Read by store-relative ref
+aicx read store/VetCoders/ai-contexters/2026_0331/reports/codex/2026_0331_codex_sess-read01_001.md
+
+# Read by absolute path copied from another command
+aicx read /Users/you/.aicx/store/VetCoders/ai-contexters/2026_0331/reports/codex/2026_0331_codex_sess-read01_001.md
+
+# Keep the payload short for scripting or agent handoff
+aicx read store/VetCoders/ai-contexters/.../chunk.md --max-lines 40 --json
+```
+
 ## `aicx steer`
 
 Retrieve chunks by steering metadata (frontmatter sidecar fields). Filters by `run_id`, `prompt_id`, agent, kind, project, and/or date range using sidecar metadata — no filesystem grep needed.
@@ -232,6 +425,8 @@ aicx steer --agent claude --date 2026-03-20..2026-03-28
 # Chunks from a specific prompt
 aicx steer --prompt-id api-redesign_20260327
 ```
+
+Paths returned by `steer` are chainable into `aicx read`.
 
 ## `aicx migrate`
 

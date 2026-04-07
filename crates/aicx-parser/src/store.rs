@@ -9,7 +9,7 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeZone, Utc};
 use globset::{Glob, GlobMatcher};
 use regex::Regex;
@@ -510,6 +510,51 @@ pub struct StoredContextFile {
     pub chunk: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReadChunkOptions {
+    pub max_chars: usize,
+    pub max_lines: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredChunkRead {
+    pub store_ref: String,
+    pub path: String,
+    pub project: String,
+    pub repo: Option<String>,
+    pub date: String,
+    pub kind: Kind,
+    pub agent: String,
+    pub session_id: String,
+    pub chunk: u32,
+    pub content: String,
+    pub truncated: bool,
+    pub original_chars: usize,
+    pub original_lines: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub findings_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub framework_version: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StoreWriteSummary {
     pub total_entries: usize,
@@ -854,6 +899,10 @@ pub fn context_files_since(
     context_files_since_at(&store_base_dir()?, cutoff, project_filter)
 }
 
+pub fn read_stored_chunk(target: &str, options: ReadChunkOptions) -> Result<StoredChunkRead> {
+    read_stored_chunk_at(&store_base_dir()?, target, options)
+}
+
 fn context_files_since_at(
     base: &Path,
     cutoff: SystemTime,
@@ -872,6 +921,146 @@ fn context_files_since_at(
         matches_project && matches_cutoff
     });
     Ok(files)
+}
+
+fn read_stored_chunk_at(
+    base: &Path,
+    target: &str,
+    options: ReadChunkOptions,
+) -> Result<StoredChunkRead> {
+    let base = sanitize::validate_dir_path(base)?;
+    let (path, store_ref) = resolve_chunk_target_at(&base, target)?;
+    let file = scan_context_files_raw_at(&base)?
+        .into_iter()
+        .find(|candidate| candidate.path == path)
+        .ok_or_else(|| {
+            anyhow!(
+                "Chunk target does not point to a stored AICX chunk: {}",
+                path.display()
+            )
+        })?;
+
+    let content = sanitize::read_to_string_validated(&path)?;
+    let original_chars = content.chars().count();
+    let original_lines = content.lines().count();
+    let (content, truncated) = truncate_chunk_content(&content, options);
+    let sidecar = load_sidecar(&path);
+
+    Ok(StoredChunkRead {
+        store_ref,
+        path: path.display().to_string(),
+        project: file.project,
+        repo: file.repo.as_ref().map(RepoIdentity::slug),
+        date: file.date_iso,
+        kind: file.kind,
+        agent: file.agent,
+        session_id: file.session_id,
+        chunk: file.chunk,
+        content,
+        truncated,
+        original_chars,
+        original_lines,
+        run_id: sidecar.as_ref().and_then(|meta| meta.run_id.clone()),
+        prompt_id: sidecar.as_ref().and_then(|meta| meta.prompt_id.clone()),
+        agent_model: sidecar.as_ref().and_then(|meta| meta.agent_model.clone()),
+        started_at: sidecar.as_ref().and_then(|meta| meta.started_at.clone()),
+        completed_at: sidecar.as_ref().and_then(|meta| meta.completed_at.clone()),
+        token_usage: sidecar.as_ref().and_then(|meta| meta.token_usage),
+        findings_count: sidecar.as_ref().and_then(|meta| meta.findings_count),
+        workflow_phase: sidecar
+            .as_ref()
+            .and_then(|meta| meta.workflow_phase.clone()),
+        mode: sidecar.as_ref().and_then(|meta| meta.mode.clone()),
+        skill_code: sidecar.as_ref().and_then(|meta| meta.skill_code.clone()),
+        framework_version: sidecar
+            .as_ref()
+            .and_then(|meta| meta.framework_version.clone()),
+    })
+}
+
+fn resolve_chunk_target_at(base: &Path, target: &str) -> Result<(PathBuf, String)> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("Chunk target cannot be empty"));
+    }
+
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let candidate = Path::new(trimmed);
+    let raw_path = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        base.join(candidate)
+    };
+
+    let validated = sanitize::validate_read_path(&raw_path)?;
+    if !validated.starts_with(base) {
+        return Err(anyhow!(
+            "Chunk target must live under the AICX store root: {}",
+            base.display()
+        ));
+    }
+
+    validate_chunk_file(&validated)?;
+
+    let store_ref = validated
+        .strip_prefix(base)
+        .map_err(|_| {
+            anyhow!(
+                "Could not derive AICX store ref for {}",
+                validated.display()
+            )
+        })?
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    Ok((validated, store_ref))
+}
+
+fn validate_chunk_file(path: &Path) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("Chunk target must point to a readable file"))?;
+
+    if file_name.ends_with(".meta.json") {
+        return Err(anyhow!(
+            "Chunk target points to a metadata sidecar. Pass the matching .md or .json chunk file instead."
+        ));
+    }
+
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("md") | Some("json") => Ok(()),
+        _ => Err(anyhow!(
+            "Chunk target must point to a .md or .json chunk file"
+        )),
+    }
+}
+
+fn truncate_chunk_content(content: &str, options: ReadChunkOptions) -> (String, bool) {
+    let mut truncated = false;
+    let mut text = content.to_string();
+
+    if options.max_lines > 0 {
+        let total_lines = text.lines().count();
+        if total_lines > options.max_lines {
+            text = text
+                .lines()
+                .take(options.max_lines)
+                .collect::<Vec<_>>()
+                .join("\n");
+            truncated = true;
+        }
+    }
+
+    if options.max_chars > 0 {
+        let total_chars = text.chars().count();
+        if total_chars > options.max_chars {
+            text = text.chars().take(options.max_chars).collect();
+            truncated = true;
+        }
+    }
+
+    (text, truncated)
 }
 
 /// Load the metadata sidecar for a context file, if it exists.
@@ -3222,6 +3411,139 @@ mod tests {
                 .unwrap(),
             "2026_0331_claude_sess-new_001.md"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_stored_chunk_accepts_store_relative_ref_and_sidecar_metadata() {
+        let root = retrieval_test_root("read-relative-ref");
+        let _ = fs::remove_dir_all(&root);
+
+        let chunk = root
+            .join("store")
+            .join("VetCoders")
+            .join("ai-contexters")
+            .join("2026_0331")
+            .join("reports")
+            .join("codex")
+            .join("2026_0331_codex_sess-read01_001.md");
+        write_chunk_file(
+            &chunk,
+            "## Findings\nOne obvious thing to fix.\nSecond line.",
+        );
+        fs::write(
+            chunk.with_extension("meta.json"),
+            serde_json::to_vec_pretty(&chunker::ChunkMetadataSidecar {
+                id: "read-001".to_string(),
+                project: "VetCoders/ai-contexters".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-03-31".to_string(),
+                session_id: "sess-read01".to_string(),
+                cwd: Some("/Users/maciejgad/vc-workspace/VetCoders/ai-contexters".to_string()),
+                kind: Kind::Reports,
+                run_id: Some("mrbl-001".to_string()),
+                prompt_id: Some("read-surface".to_string()),
+                agent_model: Some("gpt-5.4".to_string()),
+                started_at: Some("2026-03-31T06:00:00Z".to_string()),
+                completed_at: Some("2026-03-31T06:02:00Z".to_string()),
+                token_usage: Some(321),
+                findings_count: Some(2),
+                workflow_phase: Some("implement".to_string()),
+                mode: Some("session-first".to_string()),
+                skill_code: Some("vc-release".to_string()),
+                framework_version: Some("2026-03".to_string()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let read = read_stored_chunk_at(
+            &root,
+            "store/VetCoders/ai-contexters/2026_0331/reports/codex/2026_0331_codex_sess-read01_001.md",
+            ReadChunkOptions::default(),
+        )
+        .expect("read should succeed");
+
+        assert_eq!(
+            read.store_ref,
+            "store/VetCoders/ai-contexters/2026_0331/reports/codex/2026_0331_codex_sess-read01_001.md"
+        );
+        assert_eq!(read.project, "VetCoders/ai-contexters");
+        assert_eq!(read.repo.as_deref(), Some("VetCoders/ai-contexters"));
+        assert_eq!(read.kind, Kind::Reports);
+        assert_eq!(read.agent, "codex");
+        assert_eq!(read.session_id, "sess-read01");
+        assert_eq!(read.chunk, 1);
+        assert!(read.content.contains("One obvious thing to fix."));
+        assert!(!read.truncated);
+        assert_eq!(read.run_id.as_deref(), Some("mrbl-001"));
+        assert_eq!(read.prompt_id.as_deref(), Some("read-surface"));
+        assert_eq!(read.skill_code.as_deref(), Some("vc-release"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_stored_chunk_supports_truncation_controls() {
+        let root = retrieval_test_root("read-truncation");
+        let _ = fs::remove_dir_all(&root);
+
+        let chunk = root
+            .join("store")
+            .join("VetCoders")
+            .join("loctree")
+            .join("2026_0331")
+            .join("conversations")
+            .join("claude")
+            .join("2026_0331_claude_sess-read02_001.md");
+        write_chunk_file(&chunk, "alpha\nbeta\ngamma\ndelta");
+
+        let read = read_stored_chunk_at(
+            &root,
+            &chunk.display().to_string(),
+            ReadChunkOptions {
+                max_chars: 9,
+                max_lines: 3,
+            },
+        )
+        .expect("read should succeed");
+
+        assert!(read.truncated);
+        assert_eq!(read.original_lines, 4);
+        assert_eq!(
+            read.original_chars,
+            "alpha\nbeta\ngamma\ndelta".chars().count()
+        );
+        assert_eq!(read.content, "alpha\nbet");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_stored_chunk_rejects_sidecar_targets() {
+        let root = retrieval_test_root("read-sidecar-reject");
+        let _ = fs::remove_dir_all(&root);
+
+        let chunk = root
+            .join("store")
+            .join("VetCoders")
+            .join("ai-contexters")
+            .join("2026_0331")
+            .join("reports")
+            .join("codex")
+            .join("2026_0331_codex_sess-read03_001.md");
+        write_chunk_file(&chunk, "body");
+        write_chunk_file(&chunk.with_extension("meta.json"), "{\"id\":\"oops\"}");
+
+        let err = read_stored_chunk_at(
+            &root,
+            &chunk.with_extension("meta.json").display().to_string(),
+            ReadChunkOptions::default(),
+        )
+        .expect_err("sidecar target should be rejected");
+
+        assert!(err.to_string().contains("metadata sidecar"));
 
         let _ = fs::remove_dir_all(&root);
     }

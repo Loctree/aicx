@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use crate::memex::{self, MemexConfig, SyncProgress, SyncProgressPhase};
 use crate::store;
@@ -31,6 +33,7 @@ const DEFAULT_STATUS_FILENAME: &str = "aicx-memex.status.json";
 const DEFAULT_POLL_SECONDS: u64 = 300;
 const DEFAULT_REFRESH_HOURS: u64 = 720;
 const SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
 const LOOP_SLEEP: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
@@ -258,6 +261,17 @@ pub fn spawn_detached(config: &DaemonConfig) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // Detached mode must survive the parent CLI process exiting, otherwise
+    // the command appears to work but the daemon dies with the parent.
+    unsafe {
+        child.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
     append_daemon_args(&mut child, config);
 
     let mut child = child.spawn().context("Failed to start daemon process")?;
@@ -839,6 +853,12 @@ pub fn request_stop(socket_path: Option<&Path>) -> Result<ControlOutcome> {
 fn send_request(socket_path: &Path, request: &DaemonRequest) -> Result<DaemonResponse> {
     let mut stream = UnixStream::connect(socket_path)
         .with_context(|| format!("Failed to connect to {}", socket_path.display()))?;
+    stream
+        .set_read_timeout(Some(CONTROL_REQUEST_TIMEOUT))
+        .context("Failed to set daemon read timeout")?;
+    stream
+        .set_write_timeout(Some(CONTROL_REQUEST_TIMEOUT))
+        .context("Failed to set daemon write timeout")?;
     writeln!(stream, "{}", serde_json::to_string(request)?)
         .context("Failed to write daemon request")?;
     stream.flush().context("Failed to flush daemon request")?;
@@ -871,15 +891,44 @@ pub fn ensure_running_and_kick(reason: Option<String>) -> Result<ControlOutcome>
 
     match request_sync(None, Some(request_reason.clone())) {
         Ok(outcome) => Ok(outcome),
+        Err(err) if is_control_plane_timeout(&err) => {
+            if let Some(snapshot) = load_last_known_status(None)? {
+                Ok(ControlOutcome::SyncAlreadyRunning(snapshot))
+            } else {
+                Err(err)
+            }
+        }
         Err(err) => {
             let config = DaemonConfig::default();
             spawn_detached(&config)?;
-            request_sync(
-                None,
-                Some(format!("{request_reason} (after autostart): {err:#}")),
-            )
+
+            if config.bootstrap {
+                let socket_path = socket_path_for(&config)?;
+                let mut snapshot = load_last_known_status(Some(&socket_path))?
+                    .unwrap_or_else(|| DaemonStatusSnapshot::new(&config, &socket_path));
+                if snapshot.last_error.is_none() {
+                    snapshot.last_error = Some(format!("{err:#}"));
+                }
+                Ok(ControlOutcome::SyncQueued(snapshot))
+            } else {
+                request_sync(
+                    None,
+                    Some(format!("{request_reason} (after autostart): {err:#}")),
+                )
+            }
         }
     }
+}
+
+pub fn is_control_plane_timeout(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+        })
+    })
 }
 
 pub fn ensure_running_and_kick_default() -> Result<ControlOutcome> {

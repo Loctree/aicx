@@ -80,6 +80,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "dirs",
+ "libc",
  "rmcp-memex",
  "serde",
  "serde_json",
