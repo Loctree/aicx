@@ -1,12 +1,21 @@
 # Commands
 
-This is the current CLI surface for `aicx`.
+`aicx` is the operator front door for agent session history. It orchestrates a
+two-layer pipeline — both layers are operator-driven, nothing happens automatically:
+
+| Layer | What | Command surface |
+|-------|------|-----------------|
+| **1 — Canonical corpus** | Extract, deduplicate, chunk agent logs into steerable markdown at `~/.aicx/`. This is ground truth. | `claude`, `codex`, `all`, `store`, `extract` |
+| **2 — Semantic materialization** | Embed the canonical corpus into a vector + BM25 index (memex) for retrieval by agents and MCP tools. | `memex-sync`, or `--memex` on any extractor |
+
+`aicx` is the orchestrator; memex is the retrieval kernel.
 
 For the shortest “it works” path, see `README.md`.
 
 ## Defaults Worth Knowing
 
-- `claude`, `codex`, `all`, and `store` write to the central store and print nothing to stdout unless you pass `--emit`.
+- **Layer 1 commands** (`claude`, `codex`, `all`, `store`) write to the canonical store and print nothing to stdout unless you pass `--emit`.
+- **Layer 2** never runs automatically — you either call `memex-sync` explicitly or add `--memex` to an extractor.
 - `refs` prints a compact summary by default; use `--emit paths` for raw file paths.
 - `all --incremental` is the watermark-driven refresh path. `store` is store-first and non-incremental.
 
@@ -18,7 +27,11 @@ For the shortest “it works” path, see `README.md`.
 
 ## `aicx list`
 
-List available local sources and their sizes.
+List raw agent session sources on disk (pre-extraction inputs).
+
+Shows Claude Code, Codex, and Gemini log paths with session counts and sizes.
+This is what extractors will read from — use `refs` to see what is already in
+the canonical store after extraction.
 
 ```bash
 aicx list
@@ -26,7 +39,7 @@ aicx list
 
 ## `aicx claude`
 
-Extract timeline from Claude Code sessions.
+Extract + store Claude Code sessions into the canonical corpus (layer 1).
 
 ```bash
 aicx claude [OPTIONS]
@@ -43,7 +56,7 @@ Common options:
 - `--user-only` exclude assistant + reasoning messages (default: assistant included)
 - `--loctree` include loctree snapshot in local output
 - `--project-root <DIR>` project root for loctree snapshot (defaults to cwd)
-- `--memex` also chunk + sync to memex after extraction
+- `--memex` also materialize new chunks into the memex retrieval kernel (layer 2)
 - `--force` ignore dedup hashes for this run
 - `--emit <paths|json|none>` stdout mode (default: `none`)
 
@@ -79,7 +92,7 @@ aicx claude -p CodeScribe -H 24 --emit json | jq .
 
 ## `aicx codex`
 
-Extract timeline from Codex history.
+Extract + store Codex sessions into the canonical corpus (layer 1).
 
 ```bash
 aicx codex [OPTIONS]
@@ -95,7 +108,7 @@ aicx codex -p CodeScribe -H 48 --loctree --emit json | jq .
 
 ## `aicx all`
 
-Extract from all supported agents (Claude + Codex + Gemini).
+Extract + store from all agents (Claude + Codex + Gemini) into the canonical corpus (layer 1).
 
 ```bash
 aicx all [OPTIONS]
@@ -120,7 +133,9 @@ aicx all -H 48 --user-only
 
 ## `aicx extract`
 
-Extract timeline from a single agent session file (direct path).
+Extract a single session file and write to a specific output path (layer 1, direct).
+
+Bypasses the canonical store — useful for one-off inspection or piping.
 
 ```bash
 aicx extract --format <claude|codex|gemini|gemini-antigravity> --output <FILE> <INPUT>
@@ -143,7 +158,11 @@ aicx extract --format gemini-antigravity ~/.gemini/antigravity/conversations/<uu
 
 ## `aicx store`
 
-Write chunked contexts into the global store (`~/.aicx/`) and optionally sync to memex.
+Build the canonical corpus in `~/.aicx/` from agent logs (layer 1).
+
+The primary corpus-building command: extracts, deduplicates, chunks, and writes
+steerable markdown. Add `--memex` to also push new chunks into the memex
+retrieval kernel (layer 2) — a shortcut for running `memex-sync` separately.
 
 ```bash
 aicx store [OPTIONS]
@@ -154,7 +173,7 @@ Options:
 - `-a, --agent <AGENT>` `claude`, `codex`, `gemini` (default: all)
 - `-H, --hours <HOURS>` lookback window (default: `48`)
 - `--user-only` exclude assistant + reasoning messages (default: assistant included)
-- `--memex` also chunk + sync to memex
+- `--memex` also materialize new chunks into the memex retrieval kernel (layer 2)
 - `--emit <paths|json|none>` stdout mode (default: `none`)
 
 Notes:
@@ -169,7 +188,12 @@ aicx store -p CodeScribe --agent claude -H 720 --emit paths
 
 ## `aicx search`
 
-Ad-hoc terminal fuzzy search across the `aicx` store. Uses `rmcp-memex` fast index (LanceDB + BM25) if available, falling back to sequential file scans.
+Fuzzy search across the canonical corpus (layer 1, filesystem-only).
+
+Searches chunk content and frontmatter directly in `~/.aicx/` — works
+immediately, no memex index needed. For embedding-aware semantic retrieval,
+materialize the index with `memex-sync` first, then use MCP tools via
+`aicx serve`.
 
 ```bash
 aicx search [OPTIONS] <QUERY>
@@ -187,7 +211,7 @@ Options:
 Examples:
 
 ```bash
-# Fast semantic search
+# Fuzzy content search across canonical chunks (no memex needed)
 aicx search "auth middleware regression"
 
 # Scoped to a project and date range
@@ -254,7 +278,12 @@ aicx migrate --dry-run
 
 ## `aicx memex-sync`
 
-Sync stored chunks to `rmcp-memex` semantic index.
+Materialize the canonical corpus into the memex retrieval kernel (layer 2).
+
+Reads chunks from `~/.aicx/`, embeds them, and upserts into the rmcp-memex
+vector + BM25 index. Materialization is always operator-driven — nothing
+syncs automatically. You either run this command explicitly, or use `--memex`
+on any extractor as a one-shot shortcut.
 
 ```bash
 aicx memex-sync [OPTIONS]
@@ -262,34 +291,49 @@ aicx memex-sync [OPTIONS]
 
 Options:
 - `-n, --namespace <NAMESPACE>` vector namespace (default: `ai-contexts`)
-- `--per-chunk` use per-chunk upsert instead of batch import; preserves structured metadata via sidecars
+- `--per-chunk` use per-chunk library writes instead of batch store (slower, more granular)
 - `--db-path <DB_PATH>` override LanceDB path
+- `--reindex` wipe the memex index and re-embed the entire canonical corpus; use after an embedding model or dimension change, or when the index has drifted from the canonical store
 
-Example:
+Typical flows:
 
 ```bash
-aicx memex-sync --namespace ai-contexts
+# First build: embed all unsynced canonical chunks into the memex index
+aicx memex-sync
+
+# Incremental: only new chunks since last sync (same command, watermark-tracked)
+aicx memex-sync
+
+# Full rebuild: wipe index, re-embed everything
+aicx memex-sync --reindex
+
+# One-shot shortcut: extract + materialize in a single pass
+aicx all -H 48 --memex
 ```
 
 Notes:
-- Default batch sync now uses a metadata-rich import via JSONL, ensuring `project`, `agent`, `date`, and `session_id` are preserved for semantic filtering without the overhead of per-file CLI calls.
+- Default batch sync uses metadata-rich JSONL import, preserving `project`, `agent`, `date`, `session_id`, and `kind` for semantic filtering without the overhead of per-file CLI calls.
 - Recursive indexing is enabled by default to handle the nested canonical store structure.
-- If `~/.aicx/.aicxignore` exists, matching chunk paths are excluded before memex materialization and the final summary reports how many were ignored.
+- If `~/.aicx/.aicxignore` exists, matching chunk paths are excluded before materialization and the final summary reports how many were ignored.
 - On interactive terminals, `memex-sync` emits live scan/embed/index progress to stderr so large reindexes do not look hung.
 
 ## `aicx refs`
 
-List reference context files from the global store.
+List chunks in the canonical store (layer 1 inventory).
+
+Shows what extractors have already written to `~/.aicx/`. Use this to verify
+corpus contents after extraction — `refs` operates on canonical chunks, not
+raw agent logs (see `list` for raw source discovery).
 
 ```bash
 aicx refs [OPTIONS]
 ```
 
 Options:
-- `-H, --hours <HOURS>` filter by file mtime (default: `48`)
+- `-H, --hours <HOURS>` filter by canonical chunk date (default: `48`)
 - `-p, --project <PROJECT>` filter by project
 - `--emit <summary|paths>` stdout mode (default: `summary`)
-- `--strict` exclude low-signal noise artifacts
+- `--strict` filter out low-signal noise (<15 lines, task-notifications only)
 
 Example:
 
@@ -307,7 +351,7 @@ rank surface is intentionally reintroduced.
 
 ## `aicx intents`
 
-Extract structured intents and decisions from stored context.
+Extract structured intents and decisions from the canonical store (layer 1).
 
 ```bash
 aicx intents [OPTIONS] --project <PROJECT>
@@ -328,7 +372,7 @@ aicx intents -p CodeScribe --strict --kind decision
 
 ## `aicx dashboard`
 
-Generate a searchable HTML dashboard from the store.
+Generate a searchable HTML dashboard from the canonical store (layer 1).
 
 ```bash
 aicx dashboard [OPTIONS]
@@ -370,7 +414,7 @@ aicx dashboard-serve --port 8033
 
 ## `aicx state`
 
-Manage dedup state.
+Manage extraction dedup state (watermarks and hashes).
 
 ```bash
 aicx state [OPTIONS]
@@ -390,6 +434,11 @@ aicx state --info
 ## `aicx serve`
 
 Run `aicx` as an MCP server (stdio or streamable HTTP/SSE transport).
+
+Exposes search, steer, and rank tools over MCP for agent retrieval.
+Layer 1 tools (steer, search) work immediately — they query the canonical
+corpus on disk. Layer 2 tools (embedding-aware semantic search) require a
+materialized memex index — run `memex-sync` first.
 
 ```bash
 aicx serve [OPTIONS]
