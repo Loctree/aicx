@@ -2666,14 +2666,15 @@ mod tests {
 
     #[test]
     fn test_extract_claude_file_parses_text_only_blocks() {
-        let tmp = std::env::temp_dir().join("ai-ctx-claude-direct.jsonl");
-        let _ = fs::remove_file(&tmp);
+        let root = unique_test_dir("claude-direct");
+        let tmp = root.join("session.jsonl");
+        let _ = fs::remove_dir_all(&root);
 
         let content = r#"{"type":"user","message":{"role":"user","content":"Hello"},"timestamp":"2026-02-09T22:03:06.765Z","sessionId":"sess123","gitBranch":"main","cwd":"/tmp"}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hi"}]},"timestamp":"2026-02-09T22:03:07.765Z","sessionId":"sess123"}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"echo hi"}}]},"timestamp":"2026-02-09T22:03:08.765Z","sessionId":"sess123"}
 {"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]},"timestamp":"2026-02-09T22:03:09.765Z","sessionId":"sess123"}"#;
-        fs::write(&tmp, content).unwrap();
+        write_file(&tmp, content);
 
         let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
         let config = ExtractionConfig {
@@ -2690,18 +2691,19 @@ mod tests {
         assert_eq!(entries[1].role, "assistant");
         assert_eq!(entries[1].message, "Hi");
 
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn test_extract_codex_file_history_format() {
-        let tmp = std::env::temp_dir().join("ai-ctx-codex-direct-history.jsonl");
-        let _ = fs::remove_file(&tmp);
+        let root = unique_test_dir("codex-direct-history");
+        let tmp = root.join("history.jsonl");
+        let _ = fs::remove_dir_all(&root);
 
         let content = r#"{"session_id":"s1","text":"hello","ts":1000,"role":"user","cwd":"/tmp/a"}
 {"session_id":"s1","text":"hi back","ts":1001,"role":"assistant","cwd":"/tmp/a"}
 {"session_id":"s2","text":"unrelated","ts":2000,"role":"user","cwd":"/tmp/b"}"#;
-        fs::write(&tmp, content).unwrap();
+        write_file(&tmp, content);
 
         let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
         let config = ExtractionConfig {
@@ -2717,17 +2719,18 @@ mod tests {
         assert_eq!(entries[0].role, "user");
         assert_eq!(entries[1].role, "assistant");
 
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn test_extract_codex_file_session_format_detects() {
-        let tmp = std::env::temp_dir().join("ai-ctx-codex-direct-session.jsonl");
-        let _ = fs::remove_file(&tmp);
+        let root = unique_test_dir("codex-direct-session");
+        let tmp = root.join("session.jsonl");
+        let _ = fs::remove_dir_all(&root);
 
         // Minimal session file (no event_msg) should parse and yield 0 entries.
         let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"sess","cwd":"/tmp/x"}}"#;
-        fs::write(&tmp, content).unwrap();
+        write_file(&tmp, content);
 
         let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
         let config = ExtractionConfig {
@@ -2740,13 +2743,14 @@ mod tests {
         let entries = extract_codex_file(&tmp, &config).unwrap();
         assert!(entries.is_empty());
 
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn test_extract_gemini_file_session_json() {
-        let tmp = std::env::temp_dir().join("ai-ctx-gemini-direct.json");
-        let _ = fs::remove_file(&tmp);
+        let root = unique_test_dir("gemini-direct");
+        let tmp = root.join("session.json");
+        let _ = fs::remove_dir_all(&root);
 
         let content = r#"{
   "sessionId": "sess-1",
@@ -2757,7 +2761,7 @@ mod tests {
     {"type":"info","content":"skip me","timestamp":"2026-02-01T00:00:02Z","thoughts":[]}
   ]
 }"#;
-        fs::write(&tmp, content).unwrap();
+        write_file(&tmp, content);
 
         let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
         let config = ExtractionConfig {
@@ -2773,7 +2777,7 @@ mod tests {
         assert_eq!(entries[0].role, "user");
         assert_eq!(entries[1].role, "assistant");
 
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3272,8 +3276,9 @@ mod tests {
 
     #[test]
     fn test_extract_gemini_file_preserves_user_array_content() {
-        let tmp = std::env::temp_dir().join("ai-ctx-gemini-array-user.json");
-        let _ = fs::remove_file(&tmp);
+        let root = unique_test_dir("gemini-array-user");
+        let tmp = root.join("session.json");
+        let _ = fs::remove_dir_all(&root);
 
         let content = r##"{
   "sessionId": "sess-array",
@@ -3293,7 +3298,7 @@ mod tests {
     }
   ]
 }"##;
-        fs::write(&tmp, content).unwrap();
+        write_file(&tmp, content);
 
         let config = ExtractionConfig {
             project_filter: vec![],
@@ -3311,13 +3316,14 @@ mod tests {
         );
         assert_eq!(entries[1].role, "assistant");
 
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn test_extract_gemini_file_keeps_inline_data_as_explicit_placeholder() {
-        let tmp = std::env::temp_dir().join("ai-ctx-gemini-inline-data.json");
-        let _ = fs::remove_file(&tmp);
+        let root = unique_test_dir("gemini-inline-data");
+        let tmp = root.join("session.json");
+        let _ = fs::remove_dir_all(&root);
 
         let content = r#"{
   "sessionId": "sess-inline",
@@ -3342,7 +3348,7 @@ mod tests {
     }
   ]
 }"#;
-        fs::write(&tmp, content).unwrap();
+        write_file(&tmp, content);
 
         let config = ExtractionConfig {
             project_filter: vec![],
@@ -3361,7 +3367,7 @@ mod tests {
         );
         assert!(entries[1].message.contains("humanoidalny robot"));
 
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_dir_all(&root);
     }
 }
 
@@ -3502,7 +3508,11 @@ mod conversation_tests {
     #[test]
     fn test_extract_claude_excludes_tool_blocks_then_conversation_clean() {
         use std::fs;
-        let tmp = std::env::temp_dir().join("ai-ctx-conv-tool-blocks.jsonl");
+        let tmp = std::env::temp_dir().join(format!(
+            "ai-ctx-conv-tool-blocks-{}-{}.jsonl",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
         let _ = fs::remove_file(&tmp);
 
         let content = concat!(
