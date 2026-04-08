@@ -34,7 +34,7 @@ Library modules (see `src/lib.rs`):
 - `src/store.rs`: canonical store layout under `~/.aicx/` + `index.json`
 - `src/chunker.rs`: semantic windowing chunker (token heuristic + overlap + highlight extraction)
 - `src/output.rs`: local report writer (`-o`) + optional loctree snapshot inclusion
-- `src/memex.rs`: memex sync (`rmcp-memex import/upsert`) + sync state
+- `src/memex.rs`: memex materialization (in-process via `rmcp-memex` library) + sync state
 - `src/redact.rs`: secret redaction (regex engine)
 - `src/sanitize.rs`: path validation for reads/writes (defense against traversal)
 - `src/steer_index.rs`: fast metadata index for steering-aware retrieval

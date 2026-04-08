@@ -312,8 +312,8 @@ aicx all -H 48 --memex
 ```
 
 Notes:
-- Default batch sync uses metadata-rich JSONL import, preserving `project`, `agent`, `date`, `session_id`, and `kind` for semantic filtering without the overhead of per-file CLI calls.
-- Recursive indexing is enabled by default to handle the nested canonical store structure.
+- Default batch materialization embeds and upserts chunks in-process via the `rmcp-memex` library, preserving `project`, `agent`, `date`, `session_id`, and `kind` metadata for semantic filtering.
+- The canonical store's nested structure is traversed automatically during materialization.
 - If `~/.aicx/.aicxignore` exists, matching chunk paths are excluded before materialization and the final summary reports how many were ignored.
 - On interactive terminals, `memex-sync` emits live scan/embed/index progress to stderr so large reindexes do not look hung.
 
