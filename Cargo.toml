@@ -1,6 +1,6 @@
 [package]
 name = "ai-contexters"
-version = "0.5.6"
+version = "0.5.7"
 edition = "2024"
 rust-version = "1.85"
 description = "Operator CLI + MCP server: canonical corpus first, semantic materialization via memex second (Claude Code, Codex, Gemini)"

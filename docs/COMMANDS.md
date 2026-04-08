@@ -17,7 +17,7 @@ For the shortest “it works” path, see `README.md`.
 - **Layer 1 commands** (`claude`, `codex`, `all`, `store`) write to the canonical store and print nothing to stdout unless you pass `--emit`.
 - **Layer 2** never runs automatically — you either call `memex-sync` explicitly or add `--memex` to an extractor.
 - `refs` prints a compact summary by default; use `--emit paths` for raw file paths.
-- `all --incremental` is the watermark-driven refresh path. `store` is store-first and non-incremental.
+- `all --incremental` is the daily-driver watermark-tracked refresh path. `store` is store-first with no watermarks — best for backfills and targeted re-extraction.
 
 ## Global Options
 
@@ -160,9 +160,11 @@ aicx extract --format gemini-antigravity ~/.gemini/antigravity/conversations/<uu
 
 Build the canonical corpus in `~/.aicx/` from agent logs (layer 1).
 
-The primary corpus-building command: extracts, deduplicates, chunks, and writes
-steerable markdown. Add `--memex` to also materialize new chunks into the memex
-retrieval kernel (layer 2) — a shortcut for running `memex-sync` separately.
+Store-first corpus builder: extracts, deduplicates, chunks, and writes steerable
+markdown. Unlike `all --incremental`, does not use watermarks — re-processes the
+full lookback window every time. Best for backfills and targeted re-extraction.
+Add `--memex` to also materialize new chunks into the memex retrieval kernel
+(layer 2) — a shortcut for running `memex-sync` separately.
 
 ```bash
 aicx store [OPTIONS]
@@ -436,9 +438,9 @@ aicx state --info
 Run `aicx` as an MCP server (stdio or streamable HTTP/SSE transport).
 
 Exposes search, steer, and rank tools over MCP for agent retrieval.
-Layer 1 tools (steer, search) work immediately — they query the canonical
-corpus on disk. Layer 2 tools (embedding-aware semantic search) require a
-materialized memex index — run `memex-sync` first.
+Layer 1 tools (`aicx_steer`, `aicx_search`) work immediately — they query the
+canonical corpus on disk. Layer 2 (`aicx_search` with embedding mode) requires a
+materialized memex index — run `aicx memex-sync` first to embed the corpus.
 
 ```bash
 aicx serve [OPTIONS]

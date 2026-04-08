@@ -245,9 +245,7 @@ impl StoreIgnoreMatcher {
             });
         }
 
-        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-        // Rationale: `base` is the hardcoded ~/.aicx store root, not user input.
-        let raw = fs::read_to_string(&path)
+        let raw = sanitize::read_to_string_validated(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
         let mut rules = Vec::new();
 
@@ -3279,6 +3277,23 @@ mod tests {
                 .expect("ignore filter should succeed");
         assert_eq!(ignored_count, 1);
         assert_eq!(filtered, vec![kept]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_ignore_matcher_rejects_traversal_base() {
+        let root = retrieval_test_root("context-files-ignore-traversal");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join(AICX_IGNORE_FILENAME), "store/**\n").unwrap();
+
+        let traversal_base = root.join("nested").join("..");
+        let err = load_ignore_matcher_at(&traversal_base)
+            .expect_err("traversal base should be rejected by validated read");
+        let message = err.to_string().to_lowercase();
+        assert!(message.contains("traversal"), "unexpected error: {err:#}");
 
         let _ = fs::remove_dir_all(&root);
     }

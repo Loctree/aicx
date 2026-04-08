@@ -12,7 +12,7 @@ Operator front door for agent session history.
    vector + BM25 index for retrieval by agents and MCP tools.
    Built by `memex-sync`, or the `--memex` shortcut on any extractor.
 
-`aicx` is the operator; memex is the retrieval kernel.
+`aicx` is the orchestrator; memex is the retrieval kernel.
 
 Supported sources:
 - Claude Code: `~/.claude/projects/*/*.jsonl`
@@ -64,7 +64,8 @@ cargo install --path . --locked --bin aicx --bin aicx-mcp
 Extract the last 4 hours into `~/.aicx/`. Extractors are quiet on stdout by default (`--emit none`).
 
 ```bash
-aicx all -H 4 --incremental
+aicx all -H 4 --incremental        # daily driver: watermark-tracked, skips already-processed entries
+aicx store -p MyProject -H 720     # store-first: full re-extraction, no watermark, good for backfills
 ```
 
 See what landed:
@@ -151,7 +152,7 @@ aicx steer --project ai-contexters --kind reports --date 2026-03-28
 aicx steer --agent claude --date 2026-03-20..2026-03-28
 ```
 
-Semantic materialization (memex — the retrieval kernel).
+Semantic materialization — turning canonical chunks into an embedding index.
 Materialization is always operator-driven; nothing happens until you run it:
 
 ```bash

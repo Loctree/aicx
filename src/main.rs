@@ -109,11 +109,13 @@ enum ExtractInputFormat {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    // ── Layer 1: Canonical corpus ─────────────────────────────────────
     /// Extract + store Claude Code sessions into the canonical corpus (layer 1).
     ///
     /// Reads ~/.claude/projects/ logs, deduplicates, chunks, and writes
     /// steerable markdown to ~/.aicx/. Add --memex to also materialize new
     /// chunks into the memex retrieval kernel (layer 2).
+    #[command(display_order = 2)]
     Claude {
         /// Project directory filter(s): -p foo bar baz
         #[arg(short, long, num_args = 1..)]
@@ -182,6 +184,7 @@ enum Commands {
     /// Reads ~/.codex/history.jsonl, deduplicates, chunks, and writes
     /// steerable markdown to ~/.aicx/. Add --memex to also materialize new
     /// chunks into the memex retrieval kernel (layer 2).
+    #[command(display_order = 3)]
     Codex {
         /// Project/repo filter(s): -p foo bar baz
         #[arg(short, long, num_args = 1..)]
@@ -247,9 +250,11 @@ enum Commands {
 
     /// Extract + store from all agents (Claude + Codex + Gemini) into the canonical corpus (layer 1).
     ///
-    /// Runs each extractor, deduplicates, chunks, and writes steerable
-    /// markdown to ~/.aicx/. Add --memex to also materialize new chunks into
-    /// the memex retrieval kernel (layer 2).
+    /// The daily-driver command: runs each extractor, deduplicates, chunks, and
+    /// writes steerable markdown to ~/.aicx/. With --incremental, uses per-source
+    /// watermarks to skip already-processed entries. Add --memex to also
+    /// materialize new chunks into the memex retrieval kernel (layer 2).
+    #[command(display_order = 1)]
     All {
         /// Project filter(s): -p foo bar baz
         #[arg(short, long, num_args = 1..)]
@@ -315,6 +320,7 @@ enum Commands {
     ///
     /// Example:
     ///   aicx extract --format claude /path/to/session.jsonl -o /tmp/report.md
+    #[command(display_order = 5)]
     Extract {
         /// Input format (agent): claude | codex | gemini | gemini-antigravity
         #[arg(long, value_enum, alias = "input-format")]
@@ -350,10 +356,15 @@ enum Commands {
 
     /// Build the canonical corpus in ~/.aicx/ from agent logs (layer 1).
     ///
-    /// The primary corpus-building command: extracts, deduplicates, chunks,
-    /// and writes steerable markdown. Optional agent filter narrows the scope.
+    /// Store-first corpus builder: extracts, deduplicates, chunks, and writes
+    /// steerable markdown. Unlike `all --incremental`, this command does not use
+    /// watermarks — it re-processes the full lookback window every time.
+    /// Best for backfills and targeted re-extraction; use `all --incremental`
+    /// for daily watermark-tracked refreshes.
+    ///
     /// Add --memex to also materialize new chunks into the memex retrieval
     /// kernel (layer 2) — a shortcut for running `memex-sync` separately.
+    #[command(display_order = 4)]
     Store {
         /// Project name(s): -p foo bar baz
         #[arg(short, long, num_args = 1..)]
@@ -385,6 +396,7 @@ enum Commands {
         emit: StdoutEmit,
     },
 
+    // ── Layer 2: Semantic materialization ──────────────────────────────
     /// Materialize the canonical corpus into the memex retrieval kernel (layer 2).
     ///
     /// Reads chunks from ~/.aicx/, embeds them, and upserts into the rmcp-memex
@@ -396,6 +408,7 @@ enum Commands {
     /// Incremental:    aicx memex-sync                (only new chunks since last sync)
     /// Full rebuild:   aicx memex-sync --reindex      (wipe index, re-embed everything)
     /// Per-chunk mode: aicx memex-sync --per-chunk    (granular library writes instead of batch store)
+    #[command(display_order = 20)]
     MemexSync {
         /// Namespace in the semantic index
         #[arg(short, long, default_value = "ai-contexts")]
@@ -416,16 +429,19 @@ enum Commands {
         reindex: bool,
     },
 
+    // ── Layer 1: Query & inspect ──────────────────────────────────────
     /// List raw agent session sources on disk (pre-extraction inputs).
     ///
     /// Shows Claude Code, Codex, and Gemini log paths with session counts
     /// and sizes. This is what extractors will read from — use `refs` to
     /// see what is already in the canonical store after extraction.
+    #[command(display_order = 10)]
     List,
 
     /// List chunks in the canonical store (layer 1 inventory).
     ///
     /// Shows what extractors have already written to ~/.aicx/.
+    #[command(display_order = 11)]
     Refs {
         /// Hours to look back (filter by canonical chunk date)
         #[arg(short = 'H', long, default_value = "48")]
@@ -535,9 +551,10 @@ enum Commands {
     /// Run aicx as an MCP server (stdio or streamable HTTP).
     ///
     /// Exposes search, steer, and rank tools over MCP for agent retrieval.
-    /// Layer 1 tools (steer, search) work immediately — they query the
-    /// canonical corpus on disk. Layer 2 tools (embedding-aware semantic
-    /// search) require a materialized memex index — run `memex-sync` first.
+    /// Layer 1 tools (aicx_steer, aicx_search) work immediately — they query
+    /// the canonical corpus on disk.
+    /// Layer 2 (aicx_search with embedding mode) requires a materialized memex
+    /// index — run `aicx memex-sync` first to embed the corpus.
     Serve {
         /// Transport: stdio (default) or sse
         #[arg(long, default_value = "stdio", value_parser = ["stdio", "sse"])]
@@ -612,6 +629,7 @@ enum Commands {
     /// immediately, no memex index needed. For embedding-aware semantic
     /// retrieval, materialize the index with `memex-sync` first, then use
     /// MCP tools via `aicx serve`.
+    #[command(display_order = 12)]
     Search {
         /// Search query string
         query: String,

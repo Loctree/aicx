@@ -2,6 +2,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn unique_test_dir(name: &str) -> PathBuf {
@@ -45,9 +46,74 @@ fn write_codex_history(
     write_file(path, &lines.join("\n"));
 }
 
+fn current_profile_dir() -> PathBuf {
+    let test_exe = std::env::current_exe().expect("resolve current test executable");
+    test_exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("resolve cargo profile dir")
+        .to_path_buf()
+}
+
+fn fallback_aicx_path() -> PathBuf {
+    let mut path = current_profile_dir().join("aicx");
+    if cfg!(windows) {
+        path.set_extension("exe");
+    }
+    path
+}
+
+fn ensure_aicx_binary_exists() -> PathBuf {
+    static BIN_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+    BIN_PATH
+        .get_or_init(|| {
+            if let Some(env_path) = std::env::var_os("CARGO_BIN_EXE_aicx").map(PathBuf::from)
+                && env_path.is_file()
+            {
+                return env_path;
+            }
+
+            let env_path = PathBuf::from(env!("CARGO_BIN_EXE_aicx"));
+            if env_path.is_file() {
+                return env_path;
+            }
+
+            let fallback = fallback_aicx_path();
+            if fallback.is_file() {
+                return fallback;
+            }
+
+            let cargo = std::env::var_os("CARGO")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("cargo"));
+            let output = Command::new(&cargo)
+                .args(["build", "--locked", "--bin", "aicx"])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .output()
+                .expect("build fallback aicx binary");
+
+            assert!(
+                output.status.success(),
+                "fallback cargo build --bin aicx failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                fallback.is_file(),
+                "fallback cargo build succeeded but binary missing at {}",
+                fallback.display()
+            );
+
+            fallback
+        })
+        .clone()
+}
+
 fn run_aicx(home: &Path, args: &[&str]) -> Output {
     fs::create_dir_all(home).expect("create temp HOME");
-    Command::new(env!("CARGO_BIN_EXE_aicx"))
+    Command::new(ensure_aicx_binary_exists())
         .args(args)
         .env("HOME", home)
         .output()
