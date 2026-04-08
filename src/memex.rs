@@ -1,24 +1,21 @@
 //! Memex integration — the retrieval kernel behind `aicx memex-sync` and `--memex`.
 //!
 //! This module is the boundary between the aicx orchestrator and the published
-//! rmcp-memex 0.4.1 engine. It handles runtime truth, sync, and search across
-//! two integration styles:
+//! `rmcp-memex` 0.4.1 library. Live ai-contexters flows stay inside that
+//! library boundary:
 //!
-//! **Library-backed** (fast, in-process):
-//! - Config discovery, embedding resolution, content hashing
-//! - Primary canonical sync path via published storage + BM25 APIs
-//! - Read-only BM25 search + LanceDB document lookups (no subprocess)
-//! - Embedding-dimension/reindex mismatch detection
+//! - Config discovery, embedding resolution, and content hashing
+//! - Canonical chunk materialization via published storage + BM25 APIs
+//! - Read-only BM25 search + LanceDB document lookups without subprocesses
+//! - Explicit embedding-dimension/reindex mismatch detection at the boundary
 //!
-//! **CLI-backed** (subprocess, `rmcp-memex` binary required at runtime):
-//! - Batch JSONL import (`rmcp-memex import`) — compatibility shim
-//! - Per-chunk upsert (`rmcp-memex upsert`) — compatibility shim
-//! - Legacy recursive indexing (`rmcp-memex index`)
-//! - Debug search (`rmcp-memex search`)
+//! The user-facing rebuild command is still `aicx memex-sync --reindex`, but it
+//! resolves runtime truth and rewrites storage in-process instead of shelling
+//! out to an `rmcp-memex` binary.
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rmcp_memex::{
     BM25Config, ChromaDocument, DEFAULT_REQUIRED_DIMENSION, EmbeddingClient,
@@ -30,9 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::sanitize;
 
@@ -179,10 +174,10 @@ pub struct MemexConfig {
     pub db_path: Option<PathBuf>,
     /// Use batched library-backed stores (true) or per-chunk library writes (false).
     pub batch_mode: bool,
-    /// Compatibility flag for legacy `rmcp-memex index` callers.
+    /// Compatibility flag retained for older callers and CLI surface stability.
     ///
-    /// Live AICX sync paths ignore this because they use the published library
-    /// boundary. It is only forwarded to the legacy recursive CLI shim.
+    /// The published `rmcp-memex` library boundary does not consume this value,
+    /// so live ai-contexters sync paths ignore it.
     pub preprocess: bool,
 }
 
@@ -639,15 +634,16 @@ pub struct MemexSyncState {
     pub last_synced: Option<DateTime<Utc>>,
     /// Set of chunk IDs already materialized into memex.
     pub synced_chunks: HashSet<String>,
-    /// Total number of pushes across all syncs.
-    pub total_pushes: usize,
+    /// Total number of chunks materialized across all syncs.
+    #[serde(alias = "total_pushes")]
+    pub total_materialized: usize,
 }
 
 /// Result of a sync operation.
 #[derive(Debug, Default)]
 pub struct SyncResult {
     /// Number of chunks successfully materialized.
-    pub chunks_pushed: usize,
+    pub chunks_materialized: usize,
     /// Number of chunks skipped (already synced or dedup).
     pub chunks_skipped: usize,
     /// Number of chunks excluded by `.aicxignore`.
@@ -675,7 +671,7 @@ pub struct SyncProgress {
 const EMBEDDING_BATCH_SIZE: usize = 64;
 
 #[derive(Debug, Serialize)]
-struct ImportRecord {
+struct MemexRecord {
     id: String,
     text: String,
     metadata: serde_json::Value,
@@ -689,13 +685,6 @@ struct PendingSyncRecord {
     text: String,
     metadata: serde_json::Value,
     content_hash: String,
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct ImportStats {
-    imported: usize,
-    skipped: usize,
-    errors: usize,
 }
 
 // ============================================================================
@@ -732,18 +721,6 @@ pub fn save_sync_state(state: &MemexSyncState) -> Result<()> {
     let json = serde_json::to_string_pretty(state).context("Failed to serialize sync state")?;
     fs::write(&path, json)?;
     Ok(())
-}
-
-// ============================================================================
-// Availability check
-// ============================================================================
-
-/// Check if the external `rmcp-memex` binary is available for CLI-backed paths.
-pub fn check_memex_available() -> bool {
-    Command::new("rmcp-memex")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
 }
 
 // ============================================================================
@@ -821,7 +798,7 @@ where
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
         let text = sanitize::read_to_string_validated(&validated_path)?;
-        let record = chunk_import_record(&validated_path, &id, &text);
+        let record = chunk_memex_record(&validated_path, &id, &text);
 
         if !seen_hashes.insert(record.content_hash.clone())
             || storage
@@ -894,17 +871,17 @@ where
             storage.add_to_store(docs).await?;
             bm25.add_documents(&bm25_docs).await?;
 
-            result.chunks_pushed += chunk_batch.len();
+            result.chunks_materialized += chunk_batch.len();
             completed_paths.extend(chunk_batch.iter().map(|record| record.chunk_path.clone()));
 
             emit_sync_progress(
                 &mut progress,
                 SyncProgressPhase::Writing,
-                result.chunks_pushed,
+                result.chunks_materialized,
                 pending_total,
                 format!(
                     "Indexed {} of {} chunks",
-                    result.chunks_pushed, pending_total
+                    result.chunks_materialized, pending_total
                 ),
             );
         }
@@ -927,16 +904,16 @@ where
 
         match sync_chunk_library(&storage, &bm25, &mut embedding_client, namespace, record).await {
             Ok(()) => {
-                result.chunks_pushed += 1;
+                result.chunks_materialized += 1;
                 completed_paths.push(chunk_path);
                 emit_sync_progress(
                     &mut progress,
                     SyncProgressPhase::Writing,
-                    result.chunks_pushed,
+                    result.chunks_materialized,
                     pending_total,
                     format!(
                         "Indexed {} of {} chunks",
-                        result.chunks_pushed, pending_total
+                        result.chunks_materialized, pending_total
                     ),
                 );
             }
@@ -945,205 +922,6 @@ where
     }
 
     Ok((result, completed_paths))
-}
-
-// ============================================================================
-// CLI-backed sync methods
-// ============================================================================
-
-/// Legacy shim: sync all chunk files in a directory via `rmcp-memex index`.
-///
-/// Live AICX flows use the library-backed sync path so BM25 and content-hash
-/// dedup stay in lockstep. This helper remains only for callers that still want
-/// the CLI's recursive folder indexing behavior, but it still validates the
-/// active embedding/runtime truth before shelling out so reindex requirements
-/// stay explicit.
-pub fn sync_chunks_batch(chunks_dir: &Path, config: &MemexConfig) -> Result<SyncResult> {
-    if !check_memex_available() {
-        bail!("rmcp-memex not found in PATH. Install with: cargo install rmcp-memex");
-    }
-
-    if !chunks_dir.exists() || !chunks_dir.is_dir() {
-        return Ok(SyncResult::default());
-    }
-
-    let validated_dir = sanitize::validate_dir_path(chunks_dir)?;
-
-    // SECURITY: dir sanitized via validate_dir_path (traversal + canonicalize + allowlist)
-    let file_count = fs::read_dir(&validated_dir)? // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let path = e.path();
-            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-            ext == "txt" || ext == "md"
-        })
-        .count();
-
-    if file_count == 0 {
-        return Ok(SyncResult::default());
-    }
-
-    let _ = ensure_semantic_index_compatible(&config.namespace, config.db_path.as_deref())?;
-
-    let mut cmd = Command::new("rmcp-memex");
-    cmd.arg("index")
-        .arg(chunks_dir)
-        .arg("-n")
-        .arg(&config.namespace)
-        .arg("-s")
-        .arg("flat")
-        .arg("-r") // Recursive support for nested canonical store
-        .arg("--dedup")
-        .arg("true");
-
-    if config.preprocess {
-        cmd.arg("--preprocess");
-    }
-
-    if let Some(ref db_path) = config.db_path {
-        cmd.arg("--db-path").arg(db_path);
-    }
-
-    let output = cmd.output().context("Failed to run rmcp-memex index")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("rmcp-memex index failed: {}", stderr.trim());
-    }
-
-    // Parse output for stats
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr_str = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{}\n{}", stdout, stderr_str);
-
-    let chunks_pushed = parse_indexed_count(&combined).unwrap_or(file_count);
-
-    Ok(SyncResult {
-        chunks_pushed,
-        chunks_skipped: file_count.saturating_sub(chunks_pushed),
-        chunks_ignored: 0,
-        errors: vec![],
-    })
-}
-
-/// Sync a specific list of chunk files to memex using a temporary JSONL import.
-/// This is a CLI-backed compatibility shim for callers that want the published
-/// `rmcp-memex import` JSONL contract verbatim while still surfacing
-/// compatibility/reindex mismatches before the subprocess runs.
-pub fn sync_chunks_import(chunk_paths: &[PathBuf], config: &MemexConfig) -> Result<SyncResult> {
-    if !check_memex_available() {
-        bail!("rmcp-memex not found in PATH. Install with: cargo install rmcp-memex");
-    }
-
-    if chunk_paths.is_empty() {
-        return Ok(SyncResult::default());
-    }
-
-    let _ = ensure_semantic_index_compatible(&config.namespace, config.db_path.as_deref())?;
-
-    let tmp_jsonl = std::env::temp_dir().join(format!("aicx-sync-{}.jsonl", std::process::id()));
-    let mut file = fs::File::create(&tmp_jsonl)?;
-
-    let mut count = 0;
-    for path in chunk_paths {
-        let validated_path = sanitize::validate_read_path(path)?;
-        let id = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let text = sanitize::read_to_string_validated(&validated_path)?;
-        let line = chunk_import_record(&validated_path, &id, &text);
-        serde_json::to_writer(&file, &line)?;
-        writeln!(&mut file)?;
-        count += 1;
-    }
-
-    let mut cmd = Command::new("rmcp-memex");
-    cmd.arg("import")
-        .arg("-n")
-        .arg(&config.namespace)
-        .arg("-i")
-        .arg(&tmp_jsonl)
-        .arg("--skip-existing");
-
-    if let Some(ref db_path) = config.db_path {
-        cmd.arg("--db-path").arg(db_path);
-    }
-
-    let output = cmd
-        .output()
-        .context("Failed to run rmcp-memex import via external dependency 'rmcp-memex'")?;
-    let _ = fs::remove_file(&tmp_jsonl);
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("rmcp-memex import failed: {}", stderr.trim());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stats = parse_import_stats(&format!("{}\n{}", stdout, stderr));
-
-    Ok(SyncResult {
-        chunks_pushed: if stats == ImportStats::default() {
-            count
-        } else {
-            stats.imported
-        },
-        chunks_skipped: stats.skipped,
-        chunks_ignored: 0,
-        errors: if stats.errors > 0 {
-            vec![format!(
-                "rmcp-memex import reported {} record error(s); inspect rmcp-memex stderr for details",
-                stats.errors
-            )]
-        } else {
-            vec![]
-        },
-    })
-}
-
-/// Try to parse the number of indexed documents from rmcp-memex output.
-fn parse_indexed_count(output: &str) -> Option<usize> {
-    // Look for patterns like "Indexed 42 documents" or "42 chunks indexed"
-    for line in output.lines() {
-        let lower = line.to_lowercase();
-        if lower.contains("index") || lower.contains("chunk") || lower.contains("document") {
-            // Try to find a number in this line
-            for word in line.split_whitespace() {
-                if let Ok(n) = word.parse::<usize>() {
-                    return Some(n);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn parse_import_stats(output: &str) -> ImportStats {
-    let mut stats = ImportStats::default();
-
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if let Some(value) = trimmed.strip_prefix("Imported:") {
-            stats.imported = value
-                .split_whitespace()
-                .find_map(|word| word.parse::<usize>().ok())
-                .unwrap_or(0);
-        } else if let Some(value) = trimmed.strip_prefix("Skipped:") {
-            stats.skipped = value
-                .split_whitespace()
-                .find_map(|word| word.parse::<usize>().ok())
-                .unwrap_or(0);
-        } else if let Some(value) = trimmed.strip_prefix("Errors:") {
-            stats.errors = value
-                .split_whitespace()
-                .find_map(|word| word.parse::<usize>().ok())
-                .unwrap_or(0);
-        }
-    }
-
-    stats
 }
 
 #[cfg(test)]
@@ -1210,7 +988,7 @@ fn chunk_metadata_from_header(text: &str) -> serde_json::Map<String, serde_json:
     metadata
 }
 
-fn chunk_metadata_for_upsert(chunk_path: &Path, chunk_id: &str, text: &str) -> serde_json::Value {
+fn chunk_metadata_for_memex(chunk_path: &Path, chunk_id: &str, text: &str) -> serde_json::Value {
     let content_hash = compute_content_hash(text);
     let mut metadata = serde_json::Map::from_iter([
         (
@@ -1274,69 +1052,13 @@ fn chunk_metadata_for_upsert(chunk_path: &Path, chunk_id: &str, text: &str) -> s
     serde_json::Value::Object(metadata)
 }
 
-fn chunk_import_record(chunk_path: &Path, chunk_id: &str, text: &str) -> ImportRecord {
-    ImportRecord {
+fn chunk_memex_record(chunk_path: &Path, chunk_id: &str, text: &str) -> MemexRecord {
+    MemexRecord {
         id: chunk_id.to_string(),
         text: text.to_string(),
-        metadata: chunk_metadata_for_upsert(chunk_path, chunk_id, text),
+        metadata: chunk_metadata_for_memex(chunk_path, chunk_id, text),
         content_hash: compute_content_hash(text),
     }
-}
-
-// ============================================================================
-// Single chunk sync
-// ============================================================================
-
-/// Materialize a single chunk into memex using the `upsert` command.
-///
-/// This is a CLI-backed compatibility shim. Live AICX sync paths use the
-/// library-backed writer so BM25 and content-hash dedup stay aligned, but this
-/// shim still preflights the active embedding/runtime truth before shelling out.
-///
-/// Runs: `rmcp-memex upsert -n <ns> -i <id> -t <text> -m <metadata>`
-pub fn sync_chunk_single(
-    chunk_id: &str,
-    text: &str,
-    metadata: &serde_json::Value,
-    config: &MemexConfig,
-) -> Result<()> {
-    if !check_memex_available() {
-        bail!("rmcp-memex not found in PATH");
-    }
-
-    let _ = ensure_semantic_index_compatible(&config.namespace, config.db_path.as_deref())?;
-
-    let meta_str = serde_json::to_string(metadata)?;
-
-    let mut cmd = Command::new("rmcp-memex");
-    cmd.arg("upsert")
-        .arg("-n")
-        .arg(&config.namespace)
-        .arg("-i")
-        .arg(chunk_id)
-        .arg("-t")
-        .arg(text)
-        .arg("-m")
-        .arg(&meta_str);
-
-    if let Some(ref db_path) = config.db_path {
-        cmd.arg("--db-path").arg(db_path);
-    }
-
-    let output = cmd
-        .output()
-        .with_context(|| format!("Failed to upsert chunk: {}", chunk_id))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "rmcp-memex upsert failed for {}: {}",
-            chunk_id,
-            stderr.trim()
-        );
-    }
-
-    Ok(())
 }
 
 // ============================================================================
@@ -1460,7 +1182,7 @@ where
             ),
         );
         return Ok(SyncResult {
-            chunks_pushed: 0,
+            chunks_materialized: 0,
             chunks_skipped: all_files.len(),
             chunks_ignored: ignored_count,
             errors: vec![],
@@ -1499,17 +1221,17 @@ where
         state.synced_chunks.insert(id);
     }
     state.last_synced = Some(Utc::now());
-    state.total_pushes += result.chunks_pushed;
+    state.total_materialized += result.chunks_materialized;
     save_sync_state(&state)?;
 
     emit_sync_progress(
         &mut progress,
         SyncProgressPhase::Completed,
-        result.chunks_pushed + result.chunks_skipped + result.chunks_ignored,
+        result.chunks_materialized + result.chunks_skipped + result.chunks_ignored,
         total_candidates + ignored_count,
         format!(
             "Completed: {} materialized, {} skipped, {} ignored",
-            result.chunks_pushed, result.chunks_skipped, result.chunks_ignored
+            result.chunks_materialized, result.chunks_skipped, result.chunks_ignored
         ),
     );
 
@@ -1670,49 +1392,6 @@ pub async fn fast_memex_search(
     results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
 
     Ok((results, total_scanned))
-}
-
-// ============================================================================
-// Search (utility)
-// ============================================================================
-
-/// Search memex via the external CLI. Utility for testing/debugging only.
-///
-/// Runs: `rmcp-memex search -n <namespace> -q <query>`
-pub fn search_memex(query: &str, namespace: &str) -> Result<String> {
-    if !check_memex_available() {
-        bail!("rmcp-memex not found in PATH");
-    }
-
-    let _ = ensure_semantic_index_compatible(namespace, None)?;
-
-    let output = Command::new("rmcp-memex")
-        .arg("search")
-        .arg("-n")
-        .arg(namespace)
-        .arg("-q")
-        .arg(query)
-        .output()
-        .context("Failed to run rmcp-memex search")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("rmcp-memex search failed: {}", stderr.trim());
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-fn ensure_semantic_index_compatible(
-    namespace: &str,
-    db_path_override: Option<&Path>,
-) -> Result<MemexRuntimeTruth> {
-    let rt = tokio::runtime::Runtime::new()
-        .context("Failed to start Tokio runtime for memex compatibility check")?;
-    rt.block_on(validate_semantic_index_compatibility(
-        namespace,
-        db_path_override,
-    ))
 }
 
 // ============================================================================
@@ -2072,7 +1751,7 @@ model = "qwen3-embedding:4b"
         let state = MemexSyncState {
             last_synced: Some(Utc::now()),
             synced_chunks,
-            total_pushes: 42,
+            total_materialized: 42,
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -2082,7 +1761,22 @@ model = "qwen3-embedding:4b"
         assert_eq!(restored.synced_chunks.len(), 2);
         assert!(restored.synced_chunks.contains("chunk_001"));
         assert!(restored.synced_chunks.contains("chunk_002"));
-        assert_eq!(restored.total_pushes, 42);
+        assert_eq!(restored.total_materialized, 42);
+    }
+
+    #[test]
+    fn test_sync_state_deserializes_legacy_total_pushes() {
+        let restored: MemexSyncState = serde_json::from_str(
+            r#"{
+                "last_synced": null,
+                "synced_chunks": ["chunk_001"],
+                "total_pushes": 7
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(restored.total_materialized, 7);
+        assert!(restored.synced_chunks.contains("chunk_001"));
     }
 
     #[test]
@@ -2101,27 +1795,10 @@ model = "qwen3-embedding:4b"
     #[test]
     fn test_sync_result_default() {
         let result = SyncResult::default();
-        assert_eq!(result.chunks_pushed, 0);
+        assert_eq!(result.chunks_materialized, 0);
         assert_eq!(result.chunks_skipped, 0);
         assert_eq!(result.chunks_ignored, 0);
         assert!(result.errors.is_empty());
-    }
-
-    #[test]
-    fn test_parse_indexed_count() {
-        assert_eq!(parse_indexed_count("Indexed 42 documents"), Some(42));
-        assert_eq!(
-            parse_indexed_count("Processing... 10 chunks indexed"),
-            Some(10)
-        );
-        assert_eq!(parse_indexed_count("no numbers here"), None);
-        assert_eq!(parse_indexed_count(""), None);
-    }
-
-    #[test]
-    fn test_check_memex_available() {
-        // Just verify it doesn't panic — actual result depends on system
-        let _ = check_memex_available();
     }
 
     #[test]
@@ -2135,7 +1812,7 @@ model = "qwen3-embedding:4b"
     }
 
     #[test]
-    fn test_chunk_metadata_for_upsert_prefers_sidecar() {
+    fn test_chunk_metadata_for_memex_prefers_sidecar() {
         let tmp = std::env::temp_dir().join(format!("ai-ctx-memex-sidecar-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
@@ -2172,7 +1849,7 @@ model = "qwen3-embedding:4b"
         )
         .unwrap();
 
-        let metadata = chunk_metadata_for_upsert(&chunk_path, "chunk", "body");
+        let metadata = chunk_metadata_for_memex(&chunk_path, "chunk", "body");
         let object = metadata.as_object().unwrap();
 
         assert_eq!(object.get("project").unwrap(), "prview-rs");
@@ -2208,27 +1885,11 @@ model = "qwen3-embedding:4b"
     }
 
     #[test]
-    fn test_chunk_import_record_includes_content_hash() {
+    fn test_chunk_memex_record_includes_content_hash() {
         let chunk_path = PathBuf::from("/tmp/ctx/chunk.md");
-        let record = chunk_import_record(&chunk_path, "chunk", "body");
+        let record = chunk_memex_record(&chunk_path, "chunk", "body");
 
         assert_eq!(record.id, "chunk");
         assert_eq!(record.content_hash, compute_content_hash("body"));
-    }
-
-    #[test]
-    fn test_parse_import_stats() {
-        let stats = parse_import_stats(
-            "Import complete:\n  Imported: 2 documents\n  Skipped:  1 (already exist)\n  Errors:   3",
-        );
-
-        assert_eq!(
-            stats,
-            ImportStats {
-                imported: 2,
-                skipped: 1,
-                errors: 3,
-            }
-        );
     }
 }
