@@ -31,7 +31,7 @@ Library modules (see `src/lib.rs`):
 
 - `src/sources.rs`: source discovery + extraction
 - `src/state.rs`: dedup hashes + incremental watermarks
-- `src/store.rs`: central store layout under `~/.aicx/` + `index.json`
+- `src/store.rs`: canonical store layout under `~/.aicx/` + `index.json`
 - `src/chunker.rs`: semantic windowing chunker (token heuristic + overlap + highlight extraction)
 - `src/output.rs`: local report writer (`-o`) + optional loctree snapshot inclusion
 - `src/memex.rs`: memex sync (`rmcp-memex import/upsert`) + sync state
@@ -99,7 +99,7 @@ Frontmatter is not just telemetry — it is part of the steering and selective r
 
 ## Data Flow: `store`
 
-`store` is the “centralize older history into the store” command (see `src/main.rs::run_store`):
+`store` is the “build the canonical corpus from older history” command (see `src/main.rs::run_store`):
 
 1. Extract selected agents + projects for a lookback window.
 2. Redact secrets (default).

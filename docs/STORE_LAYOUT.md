@@ -1,11 +1,11 @@
 # Store Layout
 
-`aicx` writes artifacts to the central store under `~/.aicx/` (cross-repo, global, machine-local).
+`aicx` writes artifacts to the canonical store under `~/.aicx/` (cross-repo, global, machine-local).
 
 Optional store control file:
 - `~/.aicx/.aicxignore` — glob patterns relative to `~/.aicx/`; matching chunk paths are excluded from memex materialization and steer indexing.
 
-## Central Store: `~/.aicx/`
+## Canonical Store: `~/.aicx/`
 
 Created and managed by `src/store.rs`.
 

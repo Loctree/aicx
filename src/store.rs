@@ -532,7 +532,7 @@ struct SessionWriteSpec<'a> {
 // Context writing
 // ============================================================================
 
-/// Write timeline entries to the central store.
+/// Write timeline entries to the canonical store.
 ///
 /// Creates two files:
 /// - `~/.aicx/store/<project>/<date>/<time>_<agent>-context.md`
@@ -576,7 +576,7 @@ pub fn write_context(
     Ok(written)
 }
 
-/// Write timeline entries as agent-friendly chunks to the central store.
+/// Write timeline entries as agent-friendly chunks to the canonical store.
 ///
 /// Instead of one monolithic file per (project, agent, date), splits entries
 /// into overlapping ~1500-token windows preserving conversation flow.
