@@ -1471,7 +1471,11 @@ use crate::rank::{FuzzyResult, score_chunk_content};
 // High-level fast search via rmcp-memex library
 // ============================================================================
 
-/// Fast semantic/keyword search using `rmcp_memex`'s published BM25 + LanceDB APIs.
+/// Fast keyword-first search using `rmcp_memex`'s published BM25 index and
+/// LanceDB document lookups.
+///
+/// This path stays fully library-backed and validates the embedding/runtime
+/// boundary up front, but it does not execute vector similarity search.
 pub async fn fast_memex_search(
     query: &str,
     limit: usize,

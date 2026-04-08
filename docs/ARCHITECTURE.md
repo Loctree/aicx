@@ -1,12 +1,18 @@
 # Architecture
 
-`aicx` is the ledger and control surface for AI agent session history. It:
-- reads local agent session logs,
-- normalizes them into a single timeline schema,
-- deduplicates and chunks the timeline into “agent-readable” context files,
-- attaches steering metadata (frontmatter) for selective re-entry by orchestration,
-- optionally syncs those chunks into a semantic index (memex) for semantic retrieval,
-- exposes those chunks through CLI, MCP, and dashboard search surfaces.
+`aicx` is the operator front door for agent session history. It orchestrates a
+two-layer pipeline — canonical corpus first, semantic materialization second:
+
+1. **Canonical corpus** (layer 1, `~/.aicx/`): read local agent session logs,
+   normalize into a single timeline schema, deduplicate, chunk into steerable
+   markdown with frontmatter metadata. This is ground truth.
+2. **Semantic materialization** (layer 2, memex): embed the canonical corpus into
+   a vector + BM25 index for retrieval by agents and MCP tools. Always
+   operator-driven — nothing syncs automatically.
+
+`aicx` is the orchestrator; memex is the retrieval kernel.
+
+The pipeline exposes chunks through CLI, MCP, and dashboard search surfaces.
 
 ```mermaid
 flowchart TD

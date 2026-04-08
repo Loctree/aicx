@@ -1637,7 +1637,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Store extracted contexts in central store and optionally sync to memex.
+/// Store extracted contexts in the canonical corpus and optionally materialize into the memex retrieval kernel.
 fn run_store(
     project: Vec<String>,
     agent: Option<String>,
@@ -2136,7 +2136,7 @@ fn run_steer(
     Ok(())
 }
 
-/// List context files from the global store, filtered by recency.
+/// List chunks in the canonical store, filtered by recency.
 fn run_refs(hours: u64, project: Option<String>, emit: RefsEmit, strict: bool) -> Result<()> {
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
     let mut files = store::context_files_since(cutoff, project.as_deref())?;
@@ -2392,7 +2392,7 @@ fn run_memex_sync(
     Ok(())
 }
 
-/// Run the dashboard server shell against the central store.
+/// Run the dashboard server shell against the canonical store.
 struct DashboardServerRunArgs {
     store_root: Option<PathBuf>,
     host: String,
