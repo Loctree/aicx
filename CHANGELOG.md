@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- Operator surface wording: "push" → "materialize" in CLI help text, progress messages, and doc comments to reinforce the two-layer mental model (canonical corpus first, semantic materialization second).
+- Semantic compatibility validation now detects stale metadata even when no documents exist yet in the memex index; reports diverged fields explicitly.
+- Compatibility validation runs before file scanning in `memex-sync`, failing fast on config mismatches.
+
+### Fixed
+- Test isolation: source extraction tests use unique temp directories per test to prevent cross-test interference on parallel runs.
+
 ## [0.5.5] - 2026-03-31
 
 ### Performance

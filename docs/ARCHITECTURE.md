@@ -66,12 +66,12 @@ High-level sequence (see `src/main.rs::run_extraction`):
    - `--emit json` prints a single JSON payload including `store_paths`
    - `--emit none` prints nothing
 8. Optional local output (`-o`): write a report to the given directory.
-9. Optional memex sync (`--memex`): sync the canonical chunks into memex (see note below).
+9. Optional memex materialization (`--memex`): materialize canonical chunks into the memex retrieval kernel (see note below).
 
-Note on memex sync:
+Note on memex materialization:
 - `--memex` reads from the same canonical chunk + sidecar store that the CLI, MCP, and dashboard use.
 - Batch import and per-chunk upsert share the same metadata contract from `.meta.json` sidecars.
-- Memex is an add-on semantic index layered on top of the file store — not primary storage.
+- Memex is the retrieval kernel layered on top of the canonical store — not primary storage. Nothing materializes automatically.
 
 Framework note:
 - Repo-local `.ai-context/` artifacts are now owned by higher-level workflow tooling such as `/vc-init`, not by the retired `aicx init` flow.

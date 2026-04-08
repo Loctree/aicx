@@ -112,8 +112,8 @@ enum Commands {
     /// Extract + store Claude Code sessions into the canonical corpus (layer 1).
     ///
     /// Reads ~/.claude/projects/ logs, deduplicates, chunks, and writes
-    /// steerable markdown to ~/.aicx/. Add --memex to also push new chunks
-    /// into the memex retrieval kernel (layer 2).
+    /// steerable markdown to ~/.aicx/. Add --memex to also materialize new
+    /// chunks into the memex retrieval kernel (layer 2).
     Claude {
         /// Project directory filter(s): -p foo bar baz
         #[arg(short, long, num_args = 1..)]
@@ -159,7 +159,7 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
 
-        /// After extraction, push new chunks into the memex retrieval kernel (layer 2).
+        /// After extraction, materialize new chunks into the memex retrieval kernel (layer 2).
         /// Shortcut for running `aicx memex-sync` as a separate step.
         #[arg(long)]
         memex: bool,
@@ -180,8 +180,8 @@ enum Commands {
     /// Extract + store Codex sessions into the canonical corpus (layer 1).
     ///
     /// Reads ~/.codex/history.jsonl, deduplicates, chunks, and writes
-    /// steerable markdown to ~/.aicx/. Add --memex to also push new chunks
-    /// into the memex retrieval kernel (layer 2).
+    /// steerable markdown to ~/.aicx/. Add --memex to also materialize new
+    /// chunks into the memex retrieval kernel (layer 2).
     Codex {
         /// Project/repo filter(s): -p foo bar baz
         #[arg(short, long, num_args = 1..)]
@@ -227,7 +227,7 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
 
-        /// After extraction, push new chunks into the memex retrieval kernel (layer 2).
+        /// After extraction, materialize new chunks into the memex retrieval kernel (layer 2).
         /// Shortcut for running `aicx memex-sync` as a separate step.
         #[arg(long)]
         memex: bool,
@@ -248,8 +248,8 @@ enum Commands {
     /// Extract + store from all agents (Claude + Codex + Gemini) into the canonical corpus (layer 1).
     ///
     /// Runs each extractor, deduplicates, chunks, and writes steerable
-    /// markdown to ~/.aicx/. Add --memex to also push new chunks into the
-    /// memex retrieval kernel (layer 2).
+    /// markdown to ~/.aicx/. Add --memex to also materialize new chunks into
+    /// the memex retrieval kernel (layer 2).
     All {
         /// Project filter(s): -p foo bar baz
         #[arg(short, long, num_args = 1..)]
@@ -291,7 +291,7 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
 
-        /// After extraction, push new chunks into the memex retrieval kernel (layer 2).
+        /// After extraction, materialize new chunks into the memex retrieval kernel (layer 2).
         /// Shortcut for running `aicx memex-sync` as a separate step.
         #[arg(long)]
         memex: bool,
@@ -375,7 +375,7 @@ enum Commands {
         #[arg(long, hide = true, conflicts_with = "user_only")]
         include_assistant: bool,
 
-        /// After extraction, push new chunks into the memex retrieval kernel (layer 2).
+        /// After extraction, materialize new chunks into the memex retrieval kernel (layer 2).
         /// Shortcut for running `aicx memex-sync` as a separate step.
         #[arg(long)]
         memex: bool,
@@ -1275,7 +1275,7 @@ fn sync_memex_if_requested(sync_memex: bool, all_written_paths: &[PathBuf]) -> R
         let result = sync_memex_paths(&memex_config, all_written_paths)
             .context("Failed to sync canonical chunks to external dependency rmcp-memex")?;
         eprintln!(
-            "  Memex: {} pushed, {} skipped, {} ignored",
+            "  Memex: {} materialized, {} skipped, {} ignored",
             result.chunks_pushed, result.chunks_skipped, result.chunks_ignored
         );
         for err in &result.errors {
@@ -2381,7 +2381,7 @@ fn run_memex_sync(
     let result = sync_memex_paths(&config, &chunk_paths)?;
 
     eprintln!(
-        "✓ Memex sync: {} pushed, {} skipped, {} ignored",
+        "✓ Memex sync: {} materialized, {} skipped, {} ignored",
         result.chunks_pushed, result.chunks_skipped, result.chunks_ignored,
     );
 
@@ -2562,9 +2562,9 @@ mod tests {
                 phase: SyncProgressPhase::Completed,
                 done: 0,
                 total: 0,
-                detail: "Completed: 10 pushed, 2 skipped, 3 ignored".to_string(),
+                detail: "Completed: 10 materialized, 2 skipped, 3 ignored".to_string(),
             }),
-            "  Completed: 10 pushed, 2 skipped, 3 ignored"
+            "  Completed: 10 materialized, 2 skipped, 3 ignored"
         );
     }
 

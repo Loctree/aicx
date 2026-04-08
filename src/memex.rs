@@ -637,7 +637,7 @@ pub fn reset_semantic_index(
 pub struct MemexSyncState {
     /// Last time a sync was performed.
     pub last_synced: Option<DateTime<Utc>>,
-    /// Set of chunk IDs already pushed to memex.
+    /// Set of chunk IDs already materialized into memex.
     pub synced_chunks: HashSet<String>,
     /// Total number of pushes across all syncs.
     pub total_pushes: usize,
@@ -646,7 +646,7 @@ pub struct MemexSyncState {
 /// Result of a sync operation.
 #[derive(Debug, Default)]
 pub struct SyncResult {
-    /// Number of chunks successfully pushed.
+    /// Number of chunks successfully materialized.
     pub chunks_pushed: usize,
     /// Number of chunks skipped (already synced or dedup).
     pub chunks_skipped: usize,
@@ -1287,7 +1287,7 @@ fn chunk_import_record(chunk_path: &Path, chunk_id: &str, text: &str) -> ImportR
 // Single chunk sync
 // ============================================================================
 
-/// Push a single chunk to memex using the `upsert` command.
+/// Materialize a single chunk into memex using the `upsert` command.
 ///
 /// This is a CLI-backed compatibility shim. Live AICX sync paths use the
 /// library-backed writer so BM25 and content-hash dedup stay aligned, but this
@@ -1412,7 +1412,10 @@ where
             SyncProgressPhase::Completed,
             ignored_count,
             ignored_count,
-            format!("Completed: 0 pushed, 0 skipped, {} ignored", ignored_count),
+            format!(
+                "Completed: 0 materialized, 0 skipped, {} ignored",
+                ignored_count
+            ),
         );
         return Ok(SyncResult {
             chunks_ignored: ignored_count,
@@ -1451,7 +1454,7 @@ where
             all_files.len() + ignored_count,
             all_files.len() + ignored_count,
             format!(
-                "Completed: 0 pushed, {} skipped, {} ignored",
+                "Completed: 0 materialized, {} skipped, {} ignored",
                 all_files.len(),
                 ignored_count
             ),
@@ -1505,7 +1508,7 @@ where
         result.chunks_pushed + result.chunks_skipped + result.chunks_ignored,
         total_candidates + ignored_count,
         format!(
-            "Completed: {} pushed, {} skipped, {} ignored",
+            "Completed: {} materialized, {} skipped, {} ignored",
             result.chunks_pushed, result.chunks_skipped, result.chunks_ignored
         ),
     );

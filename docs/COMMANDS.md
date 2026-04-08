@@ -161,7 +161,7 @@ aicx extract --format gemini-antigravity ~/.gemini/antigravity/conversations/<uu
 Build the canonical corpus in `~/.aicx/` from agent logs (layer 1).
 
 The primary corpus-building command: extracts, deduplicates, chunks, and writes
-steerable markdown. Add `--memex` to also push new chunks into the memex
+steerable markdown. Add `--memex` to also materialize new chunks into the memex
 retrieval kernel (layer 2) — a shortcut for running `memex-sync` separately.
 
 ```bash
