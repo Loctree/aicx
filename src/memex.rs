@@ -7,7 +7,7 @@
 //! **Library-backed** (fast, in-process):
 //! - Config discovery, embedding resolution, content hashing
 //! - Primary canonical sync path via published storage + BM25 APIs
-//! - Read-only BM25 + LanceDB search (no subprocess)
+//! - Read-only BM25 search + LanceDB document lookups (no subprocess)
 //! - Embedding-dimension/reindex mismatch detection
 //!
 //! **CLI-backed** (subprocess, `rmcp-memex` binary required at runtime):
@@ -445,9 +445,21 @@ fn semantic_compatibility_error(
 
     if let Some(metadata) = metadata {
         message.push_str(&format!(
-            " ai-contexters metadata still points at model '{}' ({} dims) recorded from {}.",
-            metadata.embedding_model, metadata.embedding_dimension, metadata.db_path
+            " ai-contexters metadata (format v{}) still points at model '{}' ({} dims) recorded from {} with BM25 at {}.",
+            metadata.format_version,
+            metadata.embedding_model,
+            metadata.embedding_dimension,
+            metadata.db_path,
+            metadata.bm25_path
         ));
+
+        let mismatched_fields = semantic_metadata_mismatch_fields(namespace, truth, metadata);
+        if !mismatched_fields.is_empty() {
+            message.push_str(&format!(
+                " Diverged fields: {}.",
+                mismatched_fields.join(", ")
+            ));
+        }
     }
 
     message.push_str(&format!(
@@ -482,21 +494,66 @@ async fn semantic_store_dimension(
         .map(|doc| doc.embedding.len()))
 }
 
+fn semantic_metadata_mismatch_fields(
+    namespace: &str,
+    truth: &MemexRuntimeTruth,
+    metadata: &SemanticIndexMetadata,
+) -> Vec<&'static str> {
+    let truth_db_path = truth.db_path.to_string_lossy();
+    let truth_bm25_path = truth.bm25_path.to_string_lossy();
+    let mut fields = Vec::new();
+
+    if metadata.format_version != SEMANTIC_INDEX_METADATA_VERSION {
+        fields.push("format_version");
+    }
+    if metadata.namespace != namespace {
+        fields.push("namespace");
+    }
+    if metadata.db_path != truth_db_path.as_ref() {
+        fields.push("db_path");
+    }
+    if metadata.bm25_path != truth_bm25_path.as_ref() {
+        fields.push("bm25_path");
+    }
+    if metadata.embedding_model != truth.embedding_model {
+        fields.push("embedding_model");
+    }
+    if metadata.embedding_dimension != truth.embedding_dimension {
+        fields.push("embedding_dimension");
+    }
+
+    fields
+}
+
+fn semantic_metadata_mismatch(
+    namespace: &str,
+    truth: &MemexRuntimeTruth,
+    metadata: Option<&SemanticIndexMetadata>,
+) -> bool {
+    metadata.is_some_and(|metadata| {
+        !semantic_metadata_mismatch_fields(namespace, truth, metadata).is_empty()
+    })
+}
+
 async fn validate_semantic_index_compatibility_truth(
     namespace: &str,
     truth: &MemexRuntimeTruth,
 ) -> Result<()> {
     let actual_dimension = semantic_store_dimension(truth, namespace).await?;
     let metadata = load_semantic_index_metadata(namespace);
+    let metadata_mismatch = semantic_metadata_mismatch(namespace, truth, metadata.as_ref());
+
+    if metadata_mismatch {
+        return Err(semantic_compatibility_error(
+            namespace,
+            truth,
+            metadata.as_ref(),
+            actual_dimension,
+        ));
+    }
 
     if let Some(actual_dimension) = actual_dimension {
-        let metadata_mismatch = metadata.as_ref().is_some_and(|metadata| {
-            metadata.namespace != namespace
-                || metadata.embedding_dimension != truth.embedding_dimension
-                || metadata.embedding_model != truth.embedding_model
-        });
-
-        if actual_dimension != truth.embedding_dimension || metadata_mismatch {
+        if actual_dimension != truth.embedding_dimension {
             return Err(semantic_compatibility_error(
                 namespace,
                 truth,
@@ -898,7 +955,9 @@ where
 ///
 /// Live AICX flows use the library-backed sync path so BM25 and content-hash
 /// dedup stay in lockstep. This helper remains only for callers that still want
-/// the CLI's recursive folder indexing behavior.
+/// the CLI's recursive folder indexing behavior, but it still validates the
+/// active embedding/runtime truth before shelling out so reindex requirements
+/// stay explicit.
 pub fn sync_chunks_batch(chunks_dir: &Path, config: &MemexConfig) -> Result<SyncResult> {
     if !check_memex_available() {
         bail!("rmcp-memex not found in PATH. Install with: cargo install rmcp-memex");
@@ -923,6 +982,8 @@ pub fn sync_chunks_batch(chunks_dir: &Path, config: &MemexConfig) -> Result<Sync
     if file_count == 0 {
         return Ok(SyncResult::default());
     }
+
+    let _ = ensure_semantic_index_compatible(&config.namespace, config.db_path.as_deref())?;
 
     let mut cmd = Command::new("rmcp-memex");
     cmd.arg("index")
@@ -967,7 +1028,8 @@ pub fn sync_chunks_batch(chunks_dir: &Path, config: &MemexConfig) -> Result<Sync
 
 /// Sync a specific list of chunk files to memex using a temporary JSONL import.
 /// This is a CLI-backed compatibility shim for callers that want the published
-/// `rmcp-memex import` JSONL contract verbatim.
+/// `rmcp-memex import` JSONL contract verbatim while still surfacing
+/// compatibility/reindex mismatches before the subprocess runs.
 pub fn sync_chunks_import(chunk_paths: &[PathBuf], config: &MemexConfig) -> Result<SyncResult> {
     if !check_memex_available() {
         bail!("rmcp-memex not found in PATH. Install with: cargo install rmcp-memex");
@@ -976,6 +1038,8 @@ pub fn sync_chunks_import(chunk_paths: &[PathBuf], config: &MemexConfig) -> Resu
     if chunk_paths.is_empty() {
         return Ok(SyncResult::default());
     }
+
+    let _ = ensure_semantic_index_compatible(&config.namespace, config.db_path.as_deref())?;
 
     let tmp_jsonl = std::env::temp_dir().join(format!("aicx-sync-{}.jsonl", std::process::id()));
     let mut file = fs::File::create(&tmp_jsonl)?;
@@ -1226,7 +1290,8 @@ fn chunk_import_record(chunk_path: &Path, chunk_id: &str, text: &str) -> ImportR
 /// Push a single chunk to memex using the `upsert` command.
 ///
 /// This is a CLI-backed compatibility shim. Live AICX sync paths use the
-/// library-backed writer so BM25 and content-hash dedup stay aligned.
+/// library-backed writer so BM25 and content-hash dedup stay aligned, but this
+/// shim still preflights the active embedding/runtime truth before shelling out.
 ///
 /// Runs: `rmcp-memex upsert -n <ns> -i <id> -t <text> -m <metadata>`
 pub fn sync_chunk_single(
@@ -1238,6 +1303,8 @@ pub fn sync_chunk_single(
     if !check_memex_available() {
         bail!("rmcp-memex not found in PATH");
     }
+
+    let _ = ensure_semantic_index_compatible(&config.namespace, config.db_path.as_deref())?;
 
     let meta_str = serde_json::to_string(metadata)?;
 
@@ -1372,6 +1439,11 @@ where
         })
         .collect();
 
+    let config_path = discover_memex_config_path();
+    let (truth, embedding_config) =
+        resolve_runtime_boundary_from_config(config.db_path.as_deref(), config_path.as_deref())?;
+    validate_semantic_index_compatibility_truth(&config.namespace, &truth).await?;
+
     if new_files.is_empty() {
         emit_sync_progress(
             &mut progress,
@@ -1391,11 +1463,6 @@ where
             errors: vec![],
         });
     }
-
-    let config_path = discover_memex_config_path();
-    let (truth, embedding_config) =
-        resolve_runtime_boundary_from_config(config.db_path.as_deref(), config_path.as_deref())?;
-    validate_semantic_index_compatibility_truth(&config.namespace, &truth).await?;
 
     let (mut result, synced_files) = sync_chunks_library(
         &new_files,
@@ -1664,6 +1731,14 @@ mod tests {
         std::env::temp_dir().join(format!("aicx-memex-{label}-{}-{nanos}", std::process::id()))
     }
 
+    fn unique_test_namespace(label: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        format!("aicx-test-{label}-{}-{nanos}", std::process::id())
+    }
+
     #[test]
     fn test_memex_config_default() {
         let config = MemexConfig::default();
@@ -1917,6 +1992,71 @@ model = "qwen3-embedding:4b"
         assert!(message.contains("4096 dims"));
         assert!(message.contains("aicx memex-sync --reindex"));
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_validate_semantic_index_compatibility_rejects_stale_metadata_without_documents() {
+        let root = unique_test_dir("metadata-mismatch");
+        let namespace = unique_test_namespace("metadata-mismatch");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let metadata_path =
+            semantic_index_metadata_path(&namespace).expect("metadata path should resolve");
+        let _ = remove_path_if_exists(&metadata_path);
+
+        let db_path = root.join("memex-db");
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+db_path = "{}"
+
+[embeddings]
+required_dimension = 2560
+
+[[embeddings.providers]]
+name = "ollama-local"
+base_url = "http://localhost:11434"
+model = "qwen3-embedding:4b"
+"#,
+                db_path.display()
+            ),
+        )
+        .expect("write config");
+
+        let stale_truth = MemexRuntimeTruth {
+            db_path: root.join("legacy-db"),
+            bm25_path: root.join("legacy-bm25"),
+            embedding_model: "legacy-embedding".to_string(),
+            embedding_dimension: 4096,
+            config_path: None,
+        };
+        save_semantic_index_metadata(&namespace, &stale_truth).expect("save stale metadata");
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let err = runtime
+            .block_on(validate_semantic_index_compatibility_from_config(
+                &namespace,
+                Some(db_path.as_path()),
+                Some(config_path.as_path()),
+            ))
+            .expect_err("stale metadata should force an explicit compatibility error");
+
+        assert!(is_compatibility_error(&err));
+        let message = err.to_string();
+        assert!(message.contains("qwen3-embedding:4b"));
+        assert!(message.contains("legacy-embedding"));
+        assert!(message.contains("Diverged fields:"));
+        assert!(message.contains("db_path"));
+        assert!(message.contains("bm25_path"));
+        assert!(message.contains("embedding_model"));
+        assert!(message.contains("embedding_dimension"));
+        assert!(message.contains("aicx memex-sync --reindex"));
+
+        let _ = remove_path_if_exists(&metadata_path);
         let _ = fs::remove_dir_all(&root);
     }
 
