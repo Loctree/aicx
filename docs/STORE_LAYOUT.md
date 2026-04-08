@@ -49,10 +49,12 @@ It is updated on every store write.
 
 ### Memex Integration
 
-The `aicx memex-sync` command (and `--memex` flag) syncs stored chunks to `rmcp-memex`:
-- It maintains sync state in `~/.aicx/memex/sync_state.json`.
-- It honors `~/.aicx/.aicxignore` before queueing chunks for embed/index work.
-- It performs metadata-rich imports, ensuring `project`, `agent`, `date`, `session_id`, and `kind` are preserved in the semantic index.
+The `aicx memex-sync` command (and `--memex` flag) materializes canonical chunks
+into the `rmcp-memex` retrieval kernel. Materialization is always operator-driven
+— nothing syncs automatically:
+- Sync state is maintained in `~/.aicx/memex/sync_state.json`.
+- `~/.aicx/.aicxignore` is honored before queueing chunks for embed/index work.
+- Metadata-rich imports preserve `project`, `agent`, `date`, `session_id`, and `kind` in the semantic index.
 
 ## Identity Model & Compatibility Rules (v0.5.0+)
 
