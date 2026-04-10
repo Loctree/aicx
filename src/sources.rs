@@ -766,15 +766,15 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
 
     // Check for legacy JSON format ({"session": {...}, "items": [...]})
     // We read the full file because it's usually formatted JSON.
-    if let Ok(content) = sanitize::read_to_string_validated(path) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-            if val.get("session").is_some() && val.get("items").is_some() {
-                anyhow::bail!(
-                    "Legacy Codex JSON rollout format is unsupported (no cwd available): {}",
-                    path.display()
-                );
-            }
-        }
+    if let Ok(content) = sanitize::read_to_string_validated(path)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
+        && val.get("session").is_some()
+        && val.get("items").is_some()
+    {
+        anyhow::bail!(
+            "Legacy Codex JSON rollout format is unsupported (no cwd available): {}",
+            path.display()
+        );
     }
 
     Err(anyhow::anyhow!(

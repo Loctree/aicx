@@ -1,16 +1,16 @@
 # Architecture
 
-`aicx` is the operator front door for agent session history. It orchestrates a
-two-layer pipeline — canonical corpus first, semantic materialization second:
+`aicx` is the operator front door for agent session logs. It orchestrates a
+two-layer pipeline — canonical corpus first, optional semantic index second:
 
 1. **Canonical corpus** (layer 1, `~/.aicx/`): read local agent session logs,
    normalize into a single timeline schema, deduplicate, chunk into steerable
    markdown with frontmatter metadata. This is ground truth.
-2. **Semantic materialization** (layer 2, memex): embed the canonical corpus into
-   a vector + BM25 index for retrieval by agents and MCP tools. Always
+2. **Optional semantic index** (layer 2, memex): embed the canonical corpus into
+   a vector + BM25 index for semantic retrieval by agents and MCP tools. Always
    operator-driven — nothing syncs automatically.
 
-`aicx` is the orchestrator; memex is the retrieval kernel.
+`aicx` owns the canonical corpus; memex is an optional semantic index layered on top.
 
 The pipeline exposes chunks through CLI, MCP, and dashboard search surfaces.
 
@@ -67,12 +67,12 @@ High-level sequence (see `src/main.rs::run_extraction`):
    - `--emit json` prints a single JSON payload including `store_paths`, `requested_source_filters`, and `resolved_store_buckets`
    - `--emit none` prints nothing
 8. Optional local output (`-o`): write a report to the given directory.
-9. Optional memex materialization (`--memex`): materialize canonical chunks into the memex retrieval kernel (see note below).
+9. Optional memex materialization (`--memex`): materialize canonical chunks into the optional memex semantic index (see note below).
 
 Note on memex materialization:
 - `--memex` reads from the same canonical chunk + sidecar store that the CLI, MCP, and dashboard use.
 - Batch import and per-chunk upsert share the same metadata contract from `.meta.json` sidecars.
-- Memex is the retrieval kernel layered on top of the canonical store — not primary storage. Nothing materializes automatically.
+- Memex is an optional semantic index layered on top of the canonical store — not primary storage. Nothing materializes automatically.
 
 Framework note:
 - Repo-local `.ai-context/` artifacts are now owned by higher-level workflow tooling such as `/vc-init`, not by the retired `aicx init` flow.
@@ -111,7 +111,7 @@ Frontmatter is not just telemetry — it is part of the steering and selective r
 
 The MCP server exposes three tools via stdio and streamable HTTP transports:
 
-- `aicx_search` — fuzzy text search across stored chunks with quality scoring; returns compact JSON using the same rich fields as CLI `aicx search --json`
+- `aicx_search` — search stored chunks with quality scoring; widens with memex semantic retrieval when available and otherwise falls back to canonical-store fuzzy search
 - `aicx_rank` — rank chunks by signal density for a project as compact JSON
 - `aicx_steer` — retrieve chunks by steering metadata (run_id, prompt_id, agent, kind, project, date) using sidecar data; the primary metadata-aware retrieval path for orchestration
 

@@ -1,14 +1,14 @@
 # Commands
 
-`aicx` is the operator front door for agent session history. It orchestrates a
+`aicx` is the operator front door for agent session logs. It orchestrates a
 two-layer pipeline — both layers are operator-driven, nothing happens automatically:
 
 | Layer | What | Command surface |
 |-------|------|-----------------|
 | **1 — Canonical corpus** | Extract, deduplicate, chunk agent logs into steerable markdown at `~/.aicx/`. This is ground truth. | `claude`, `codex`, `all`, `store`, `extract` |
-| **2 — Semantic materialization** | Embed the canonical corpus into a vector + BM25 index (memex) for retrieval by agents and MCP tools. | `memex-sync`, or `--memex` on any extractor |
+| **2 — Optional semantic index** | Embed the canonical corpus into a vector + BM25 index (memex) for semantic retrieval by agents and MCP tools. | `memex-sync`, or `--memex` on any extractor |
 
-`aicx` is the orchestrator; memex is the retrieval kernel.
+`aicx` owns the canonical corpus; memex is an optional semantic index layered on top.
 
 For the shortest “it works” path, see `README.md`.
 
@@ -59,7 +59,7 @@ Common options:
 - `--user-only` exclude assistant + reasoning messages (default: assistant included)
 - `--loctree` include loctree snapshot in local output
 - `--project-root <DIR>` project root for loctree snapshot (defaults to cwd)
-- `--memex` also materialize new chunks into the memex retrieval kernel (layer 2)
+- `--memex` also materialize new chunks into the optional memex semantic index (layer 2)
 - `--force` ignore dedup hashes for this run
 - `--emit <paths|json|none>` stdout mode (default: `none`)
 
@@ -172,7 +172,7 @@ Build the canonical corpus in `~/.aicx/` from agent logs (layer 1).
 Store-first corpus builder: extracts, deduplicates, chunks, and writes steerable
 markdown. Unlike `all --incremental`, does not use watermarks — re-processes the
 full lookback window every time. Best for backfills and targeted re-extraction.
-Add `--memex` to also materialize new chunks into the memex retrieval kernel
+Add `--memex` to also materialize new chunks into the optional memex semantic index
 (layer 2) — a shortcut for running `memex-sync` separately.
 
 ```bash
@@ -184,7 +184,7 @@ Options:
 - `-a, --agent <AGENT>` `claude`, `codex`, `gemini` (default: all)
 - `-H, --hours <HOURS>` lookback window (default: `48`)
 - `--user-only` exclude assistant + reasoning messages (default: assistant included)
-- `--memex` also materialize new chunks into the memex retrieval kernel (layer 2)
+- `--memex` also materialize new chunks into the optional memex semantic index (layer 2)
 - `--emit <paths|json|none>` stdout mode (default: `none`)
 
 Notes:
@@ -290,7 +290,7 @@ aicx migrate --dry-run
 
 ## `aicx memex-sync`
 
-Materialize the canonical corpus into the memex retrieval kernel (layer 2).
+Materialize the canonical corpus into the optional memex semantic index (layer 2).
 
 Reads chunks from `~/.aicx/`, embeds them, and upserts into the rmcp-memex
 vector + BM25 index. Materialization is always operator-driven — nothing
@@ -405,7 +405,7 @@ aicx dashboard -o ./aicx-dashboard.html
 
 ## `aicx dashboard-serve`
 
-Run the dashboard HTTP server with on-demand regeneration endpoints.
+Run a local dashboard server with live search and regeneration endpoints.
 
 ```bash
 aicx dashboard-serve [OPTIONS]
@@ -449,9 +449,9 @@ aicx state --info
 Run `aicx` as an MCP server (stdio or streamable HTTP/SSE transport).
 
 Exposes search, steer, and rank tools over MCP for agent retrieval.
-Layer 1 tools (`aicx_steer`, `aicx_search`) work immediately — they query the
-canonical corpus on disk. Layer 2 (`aicx_search` with embedding mode) requires a
-materialized memex index — run `aicx memex-sync` first to embed the corpus.
+`aicx_steer` and `aicx_rank` query the canonical corpus on disk.
+`aicx_search` widens with memex semantic retrieval when a materialized index
+exists, and otherwise falls back to canonical-store fuzzy search.
 
 ```bash
 aicx serve [OPTIONS]

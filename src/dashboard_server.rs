@@ -1,6 +1,6 @@
 //! AI Contexters dashboard HTTP server runtime.
 //!
-//! Serves the dashboard server-shell UI and supports on-demand data regeneration.
+//! Serves the local dashboard UI and supports live search/regeneration APIs.
 
 use anyhow::{Context, Result, anyhow};
 use axum::{

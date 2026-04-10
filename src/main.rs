@@ -1,14 +1,14 @@
-//! AI Contexters — the operator front door for agent session history.
+//! AI Contexters — the operator front door for agent session logs.
 //!
 //! `aicx` orchestrates a two-layer pipeline: canonical corpus first,
-//! semantic materialization second. Materialization is always explicit.
+//! optional semantic index second. Materialization is always explicit.
 //!
 //! Two-layer architecture:
 //!   1. **Canonical corpus** (`~/.aicx/`) — deduplicated, chunked, steerable markdown.
 //!      Built by extractors (`claude`, `codex`, `all`) and `store`. This is ground truth.
-//!   2. **Semantic materialization** (memex) — vector + BM25 index for embedding-aware
+//!   2. **Optional semantic index** (memex) — vector + BM25 index for semantic
 //!      retrieval by agents and MCP tools. Built by `memex-sync` or `--memex` on extractors.
-//!      Memex is the retrieval kernel; `aicx` is the orchestrator.
+//!      `aicx` owns the canonical corpus; memex is layered on top.
 //!
 //! Supported sources:
 //! - Claude Code: ~/.claude/projects/*/*.jsonl
@@ -37,16 +37,16 @@ use ai_contexters::sources::{self, ExtractionConfig};
 use ai_contexters::state::StateManager;
 use ai_contexters::store;
 
-/// aicx — operator front door for agent session history.
+/// aicx — operator front door for agent session logs.
 ///
 /// Two-layer pipeline, both operator-driven:
 ///   Layer 1 (canonical corpus): extract, deduplicate, and chunk agent logs
 ///     into steerable markdown at ~/.aicx/. This is ground truth.
-///   Layer 2 (semantic materialization): embed the corpus into a vector + BM25
-///     index (memex) for retrieval by agents and MCP tools. Nothing syncs
-///     automatically — you decide when to materialize.
+///   Layer 2 (optional semantic index): embed the corpus into a vector + BM25
+///     index (memex) for semantic retrieval by agents and MCP tools. Nothing
+///     syncs automatically — you decide when to materialize.
 ///
-/// aicx is the orchestrator; memex is the retrieval kernel.
+/// aicx owns the canonical corpus; memex is an optional semantic index layered on top.
 ///
 /// Quick start:
 ///   aicx all -H 4 --incremental        # build canonical corpus (layer 1)
@@ -57,6 +57,7 @@ use ai_contexters::store;
 #[command(name = "aicx")]
 #[command(author = "M&K (c)2026 VetCoders")]
 #[command(version)]
+#[command(verbatim_doc_comment)]
 struct Cli {
     /// Redact secrets (tokens/keys) from outputs before writing/syncing.
     ///
@@ -114,7 +115,7 @@ enum Commands {
     ///
     /// Reads ~/.claude/projects/ logs, deduplicates, chunks, and writes
     /// steerable markdown to ~/.aicx/. Add --memex to also materialize new
-    /// chunks into the memex retrieval kernel (layer 2).
+    /// chunks into the optional memex semantic index (layer 2).
     #[command(display_order = 2)]
     Claude {
         /// Source cwd/project filter(s): narrows session discovery before repo segmentation
@@ -161,7 +162,7 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
 
-        /// After extraction, materialize new chunks into the memex retrieval kernel (layer 2).
+        /// After extraction, materialize new chunks into the optional memex semantic index (layer 2).
         /// Shortcut for running `aicx memex-sync` as a separate step.
         #[arg(long)]
         memex: bool,
@@ -183,7 +184,7 @@ enum Commands {
     ///
     /// Reads ~/.codex/history.jsonl, deduplicates, chunks, and writes
     /// steerable markdown to ~/.aicx/. Add --memex to also materialize new
-    /// chunks into the memex retrieval kernel (layer 2).
+    /// chunks into the optional memex semantic index (layer 2).
     #[command(display_order = 3)]
     Codex {
         /// Source cwd/project filter(s): narrows session discovery before repo segmentation
@@ -230,7 +231,7 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
 
-        /// After extraction, materialize new chunks into the memex retrieval kernel (layer 2).
+        /// After extraction, materialize new chunks into the optional memex semantic index (layer 2).
         /// Shortcut for running `aicx memex-sync` as a separate step.
         #[arg(long)]
         memex: bool,
@@ -253,7 +254,7 @@ enum Commands {
     /// The daily-driver command: runs each extractor, deduplicates, chunks, and
     /// writes steerable markdown to ~/.aicx/. With --incremental, uses per-source
     /// watermarks to skip already-processed entries. Add --memex to also
-    /// materialize new chunks into the memex retrieval kernel (layer 2).
+    /// materialize new chunks into the optional memex semantic index (layer 2).
     #[command(display_order = 1)]
     All {
         /// Source cwd/project filter(s): narrows session discovery before repo segmentation
@@ -296,7 +297,7 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
 
-        /// After extraction, materialize new chunks into the memex retrieval kernel (layer 2).
+        /// After extraction, materialize new chunks into the optional memex semantic index (layer 2).
         /// Shortcut for running `aicx memex-sync` as a separate step.
         #[arg(long)]
         memex: bool,
@@ -362,8 +363,8 @@ enum Commands {
     /// Best for backfills and targeted re-extraction; use `all --incremental`
     /// for daily watermark-tracked refreshes.
     ///
-    /// Add --memex to also materialize new chunks into the memex retrieval
-    /// kernel (layer 2) — a shortcut for running `memex-sync` separately.
+    /// Add --memex to also materialize new chunks into the optional memex
+    /// semantic index (layer 2) — a shortcut for running `memex-sync` separately.
     #[command(display_order = 4)]
     Store {
         /// Source cwd/project filter(s): narrows session discovery before repo segmentation
@@ -386,7 +387,7 @@ enum Commands {
         #[arg(long, hide = true, conflicts_with = "user_only")]
         include_assistant: bool,
 
-        /// After extraction, materialize new chunks into the memex retrieval kernel (layer 2).
+        /// After extraction, materialize new chunks into the optional memex semantic index (layer 2).
         /// Shortcut for running `aicx memex-sync` as a separate step.
         #[arg(long)]
         memex: bool,
@@ -397,7 +398,7 @@ enum Commands {
     },
 
     // ── Layer 2: Semantic materialization ──────────────────────────────
-    /// Materialize the canonical corpus into the memex retrieval kernel (layer 2).
+    /// Materialize the canonical corpus into the optional memex semantic index (layer 2).
     ///
     /// Reads chunks from ~/.aicx/, embeds them, and upserts into the rmcp-memex
     /// vector + BM25 index. Materialization is always operator-driven — nothing
@@ -408,7 +409,7 @@ enum Commands {
     /// Incremental:    aicx memex-sync                (only new chunks since last sync)
     /// Full rebuild:   aicx memex-sync --reindex      (wipe index, re-embed everything)
     /// Per-chunk mode: aicx memex-sync --per-chunk    (granular library writes instead of batch store)
-    #[command(display_order = 20)]
+    #[command(display_order = 20, verbatim_doc_comment)]
     MemexSync {
         /// Namespace in the semantic index
         #[arg(short, long, default_value = "ai-contexts")]
@@ -498,13 +499,13 @@ enum Commands {
         preview_chars: usize,
     },
 
-    /// Run dashboard HTTP server with server-shell UI and on-demand data regeneration (layer 1).
+    /// Run a local dashboard server with live search and regeneration endpoints (layer 1).
     DashboardServe {
         /// Store root directory (default: ~/.aicx)
         #[arg(long)]
         store_root: Option<PathBuf>,
 
-        /// Bind host IP address (example: 127.0.0.1)
+        /// Bind host IP address (loopback only; example: 127.0.0.1)
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
 
@@ -551,10 +552,10 @@ enum Commands {
     /// Run aicx as an MCP server (stdio or streamable HTTP).
     ///
     /// Exposes search, steer, and rank tools over MCP for agent retrieval.
-    /// Layer 1 tools (aicx_steer, aicx_search) work immediately — they query
-    /// the canonical corpus on disk.
-    /// Layer 2 (aicx_search with embedding mode) requires a materialized memex
-    /// index — run `aicx memex-sync` first to embed the corpus.
+    /// `aicx_steer` and `aicx_rank` query the canonical corpus on disk.
+    /// `aicx_search` widens with memex semantic retrieval when a materialized
+    /// index exists, and otherwise falls back to canonical-store fuzzy search.
+    #[command(verbatim_doc_comment)]
     Serve {
         /// Transport: stdio (default) or sse
         #[arg(long, default_value = "stdio", value_parser = ["stdio", "sse"])]
@@ -668,6 +669,7 @@ enum Commands {
     /// Example:
     ///   aicx steer --run-id mrbl-001
     ///   aicx steer --project ai-contexters --kind reports --date 2026-03-28
+    #[command(verbatim_doc_comment)]
     Steer {
         /// Filter by run_id (exact match)
         #[arg(long)]
@@ -1366,7 +1368,7 @@ fn sync_memex_if_requested(sync_memex: bool, all_written_paths: &[PathBuf]) -> R
         // the dedicated `memex-sync` command so sync state and observability do
         // not drift between code paths.
         let result = sync_memex_paths(&memex_config, all_written_paths)
-            .context("Failed to materialize canonical chunks into memex retrieval kernel")?;
+            .context("Failed to materialize canonical chunks into memex semantic index")?;
         eprintln!(
             "  Memex: {} materialized, {} skipped, {} ignored",
             result.chunks_materialized, result.chunks_skipped, result.chunks_ignored
@@ -1748,7 +1750,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Store extracted contexts in the canonical corpus and optionally materialize into the memex retrieval kernel.
+/// Store extracted contexts in the canonical corpus and optionally materialize into the memex semantic index.
 fn run_store(
     project: Vec<String>,
     agent: Option<String>,
@@ -2516,7 +2518,7 @@ fn run_memex_sync(
     Ok(())
 }
 
-/// Run the dashboard server shell against the canonical store.
+/// Run the local dashboard server against the canonical store.
 struct DashboardServerRunArgs {
     store_root: Option<PathBuf>,
     host: String,
@@ -2526,7 +2528,7 @@ struct DashboardServerRunArgs {
     preview_chars: usize,
 }
 
-/// Run dashboard server mode with server-shell HTML and API-backed regeneration.
+/// Run dashboard server mode with lightweight HTML shell and API-backed regeneration.
 fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
     let root = if let Some(path) = args.store_root {
         path
@@ -2812,6 +2814,15 @@ mod tests {
     }
 
     #[test]
+    fn top_level_help_uses_semantic_index_language() {
+        let mut cmd = Cli::command();
+        let rendered = cmd.render_long_help().to_string();
+
+        assert!(rendered.contains("Layer 2 (optional semantic index)"));
+        assert!(!rendered.contains("retrieval kernel"));
+    }
+
+    #[test]
     fn init_help_explains_retirement_and_hides_legacy_flags() {
         let mut cmd = Cli::command();
         let init = cmd
@@ -2825,6 +2836,34 @@ mod tests {
         assert!(!rendered.contains("--action"));
         assert!(!rendered.contains("--no-run"));
         assert!(!rendered.contains("Initialize repo context and run an agent"));
+    }
+
+    #[test]
+    fn serve_help_explains_search_fallback_without_embedding_mode_jargon() {
+        let mut cmd = Cli::command();
+        let serve = cmd
+            .find_subcommand_mut("serve")
+            .expect("serve subcommand should exist");
+        let rendered = serve.render_long_help().to_string();
+
+        assert!(rendered.contains("falls back to canonical-store fuzzy search"));
+        assert!(!rendered.contains("embedding mode"));
+    }
+
+    #[test]
+    fn steer_help_keeps_examples_split() {
+        let mut cmd = Cli::command();
+        let steer = cmd
+            .find_subcommand_mut("steer")
+            .expect("steer subcommand should exist");
+        let rendered = steer.render_long_help().to_string();
+
+        assert!(rendered.contains("aicx steer --run-id mrbl-001"));
+        assert!(
+            rendered
+                .contains("aicx steer --project ai-contexters --kind reports --date 2026-03-28")
+        );
+        assert!(!rendered.contains("mrbl-001 aicx steer"));
     }
 
     #[test]

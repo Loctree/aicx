@@ -1,6 +1,6 @@
 # AI Contexters
 
-Operator front door for agent session history.
+Operator front door for agent session logs.
 
 `aicx` orchestrates a two-layer pipeline:
 
@@ -8,11 +8,11 @@ Operator front door for agent session history.
    agent session logs as steerable markdown with frontmatter metadata.
    This is ground truth. Built by extractors (`claude`, `codex`, `all`) and `store`.
 
-2. **Semantic materialization** (memex) — embed the canonical corpus into a
-   vector + BM25 index for retrieval by agents and MCP tools.
+2. **Optional semantic index** (memex) — embed the canonical corpus into a
+   vector + BM25 index for semantic retrieval by agents and MCP tools.
    Built by `memex-sync`, or the `--memex` shortcut on any extractor.
 
-`aicx` is the orchestrator; memex is the retrieval kernel.
+`aicx` owns the canonical corpus; memex is an optional semantic index layered on top.
 
 Supported sources:
 - Claude Code: `~/.claude/projects/*/*.jsonl`
@@ -88,8 +88,8 @@ Surface contract:
 ### Layer 2 — materialize into memex
 
 Materialization is operator-driven — nothing syncs automatically.
-You decide when to embed the canonical corpus into the memex retrieval
-kernel (vector + BM25):
+You decide when to build the optional memex semantic index
+(vector + BM25):
 
 ```bash
 aicx memex-sync              # first build or incremental update
@@ -163,7 +163,7 @@ aicx steer --project ai-contexters --kind reports --date 2026-03-28
 aicx steer --agent claude --date 2026-03-20..2026-03-28
 ```
 
-Semantic materialization — turning canonical chunks into an embedding index.
+Semantic materialization — turning canonical chunks into the optional memex semantic index.
 Materialization is always operator-driven; nothing happens until you run it:
 
 ```bash

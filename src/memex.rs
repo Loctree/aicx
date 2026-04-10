@@ -1,4 +1,4 @@
-//! Memex integration — the retrieval kernel behind `aicx memex-sync` and `--memex`.
+//! Memex integration — the optional semantic index behind `aicx memex-sync` and `--memex`.
 //!
 //! This module is the boundary between the aicx orchestrator and the published
 //! `rmcp-memex` 0.4.1 library. Live ai-contexters flows stay inside that
@@ -1321,10 +1321,10 @@ pub async fn fast_memex_search(
                 .unwrap_or("")
                 .to_string();
 
-            if let Some(ref pf) = project_lower {
-                if !doc_project.to_lowercase().contains(pf) {
-                    continue;
-                }
+            if let Some(ref pf) = project_lower
+                && !doc_project.to_lowercase().contains(pf)
+            {
+                continue;
             }
 
             let kind = doc

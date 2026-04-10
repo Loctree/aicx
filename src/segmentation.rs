@@ -184,10 +184,10 @@ pub fn infer_tiered_identity_from_entry(
 
     // Last resort: try projectHash registry for Gemini sessions.
     // The cwd field for Gemini sessions is often the projectHash itself.
-    if let Some(cwd) = entry.cwd.as_deref() {
-        if looks_like_weak_source_identifier(cwd) {
-            return registry.resolve(cwd);
-        }
+    if let Some(cwd) = entry.cwd.as_deref()
+        && looks_like_weak_source_identifier(cwd)
+    {
+        return registry.resolve(cwd);
     }
 
     None

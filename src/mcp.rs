@@ -1,7 +1,7 @@
 //! MCP (Model Context Protocol) server for aicx.
 //!
-//! Exposes aicx functionality as MCP tools so any AI agent can query
-//! search chunks, rank artifacts, and retrieve steer metadata.
+//! Exposes aicx functionality as MCP tools so agents can search canonical
+//! chunks, rank artifacts, and retrieve steer metadata.
 //!
 //! Supports stdio and SSE transports.
 //!
@@ -162,7 +162,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_search",
-        description = "Fuzzy search across stored AI session chunks. Returns quality-scored results with matched lines. Supports Polish diacritics normalization and optional project filtering."
+        description = "Search stored AI session chunks. Uses memex semantic retrieval when available and otherwise falls back to canonical-store fuzzy search. Returns quality-scored results with matched lines."
     )]
     async fn search(
         &self,

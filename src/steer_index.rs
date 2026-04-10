@@ -178,13 +178,12 @@ fn build_steer_metadata(file: &Path) -> serde_json::Value {
         "path".to_string(),
         serde_json::Value::String(file.display().to_string()),
     );
-    if let Some(s) = sidecar {
-        if let Ok(val) = serde_json::to_value(s) {
-            if let Some(obj) = val.as_object() {
-                for (k, v) in obj {
-                    meta.insert(k.clone(), v.clone());
-                }
-            }
+    if let Some(s) = sidecar
+        && let Ok(val) = serde_json::to_value(s)
+        && let Some(obj) = val.as_object()
+    {
+        for (k, v) in obj {
+            meta.insert(k.clone(), v.clone());
         }
     }
 
