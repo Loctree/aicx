@@ -22,11 +22,14 @@ For the shortest “it works” path, see `README.md`.
 - `init` is retired; framework bootstrap now lives in `/vc-init`.
 - `all --incremental` is the daily-driver watermark-tracked refresh path. `store` is store-first with no watermarks — best for backfills and targeted re-extraction.
 
-## Global Options
+## Redaction Scope
 
-`--no-redact-secrets`
-- Default behavior is redaction enabled.
-- Passing this flag disables redaction (not recommended unless you fully trust inputs and outputs).
+Secret redaction is enabled by default on corpus-building commands that read raw
+session logs or emit fresh artifacts: `claude`, `codex`, `all`, `extract`, and
+`store`.
+
+Use `--no-redact-secrets` only on those commands when you intentionally want to
+disable redaction.
 
 ## `aicx list`
 
@@ -51,6 +54,7 @@ aicx claude [OPTIONS]
 Common options:
 - `-p, --project <PROJECT>...` source cwd/project filter(s)
 - `-H, --hours <HOURS>` lookback window (default: `48`)
+- `--no-redact-secrets` disable secret redaction for this run
 - `-o, --output <DIR>` write local report files (omit to only write to store)
 - `-f, --format <md|json|both>` local output format (default: `both`)
 - `--append-to <FILE>` append local output to a single file
@@ -126,6 +130,7 @@ aicx all [OPTIONS]
 Options are similar to `claude`, with two important details:
 - `all` does not expose `--format` because local report writing is hardcoded to `both`.
 - `all` defaults to `--emit none`, so stdout stays quiet unless you opt in.
+- `all` still supports `--no-redact-secrets` when you intentionally want raw output.
 
 Examples:
 
@@ -152,6 +157,7 @@ aicx extract --format <claude|codex|gemini|gemini-antigravity> --output <FILE> <
 
 Options:
 - `--format <FORMAT>` input format / agent
+- `--no-redact-secrets` disable secret redaction for this one-off extract
 - `gemini` reads classic Gemini CLI JSON sessions from `~/.gemini/tmp/.../session-*.json`
 - `gemini-antigravity` resolves either `conversations/<uuid>.pb` or `brain/<uuid>/`, prefers readable conversation artifacts inside `brain/<uuid>/`, and explicitly falls back to `.system_generated/steps/*/output.txt` when no chat-grade artifact is readable
 - `-o, --output <OUTPUT>` output file path
@@ -183,6 +189,7 @@ Options:
 - `-p, --project <PROJECT>...` source cwd/project filter(s)
 - `-a, --agent <AGENT>` `claude`, `codex`, `gemini` (default: all)
 - `-H, --hours <HOURS>` lookback window (default: `48`)
+- `--no-redact-secrets` disable secret redaction for this corpus build
 - `--user-only` exclude assistant + reasoning messages (default: assistant included)
 - `--memex` also materialize new chunks into the optional memex semantic index (layer 2)
 - `--emit <paths|json|none>` stdout mode (default: `none`)
@@ -203,9 +210,8 @@ aicx store -p CodeScribe --agent claude -H 720 --emit paths
 Fuzzy search across the canonical corpus (layer 1, filesystem-only).
 
 Searches chunk content and frontmatter directly in `~/.aicx/` — works
-immediately, no memex index needed. For embedding-aware semantic retrieval,
-materialize the index with `memex-sync` first, then use MCP tools via
-`aicx serve`.
+immediately, no memex index needed. For semantic retrieval through MCP tools,
+materialize the index with `memex-sync` first, then use `aicx serve`.
 
 ```bash
 aicx search [OPTIONS] <QUERY>

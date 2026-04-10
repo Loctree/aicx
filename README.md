@@ -205,7 +205,7 @@ aicx extract --format gemini-antigravity \
 
 ## Notes
 
-- Secrets are redacted by default. Disable only if you know what you’re doing: `--no-redact-secrets`.
+- Secrets are redacted by default on corpus-building commands (`claude`, `codex`, `all`, `extract`, `store`). Disable only if you know what you’re doing: `--no-redact-secrets`.
 - Framework integration expects `aicx` or `aicx-mcp` in `PATH`.
 - `aicx memex-sync` now emits live scan/embed/index progress on TTY stderr instead of going silent after preflight.
 

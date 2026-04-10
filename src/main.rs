@@ -20,7 +20,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -59,27 +59,21 @@ use ai_contexters::store;
 #[command(version)]
 #[command(verbatim_doc_comment)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Clone, Copy, Debug, Args)]
+struct RedactionArgs {
     /// Redact secrets (tokens/keys) from outputs before writing/syncing.
     ///
     /// Use `--no-redact-secrets` to disable (not recommended).
     #[arg(
         long = "no-redact-secrets",
         action = ArgAction::SetFalse,
-        default_value_t = true,
-        global = true
+        default_value_t = true
     )]
     redact_secrets: bool,
-
-    /// Project filter (used if no subcommand is provided)
-    #[arg(short, long, global = true)]
-    project: Option<String>,
-
-    /// Hours to look back (used if no subcommand is provided)
-    #[arg(short = 'H', long, default_value = "48", global = true)]
-    hours: u64,
-
-    #[command(subcommand)]
-    command: Option<Commands>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -118,6 +112,9 @@ enum Commands {
     /// chunks into the optional memex semantic index (layer 2).
     #[command(display_order = 2)]
     Claude {
+        #[command(flatten)]
+        redaction: RedactionArgs,
+
         /// Source cwd/project filter(s): narrows session discovery before repo segmentation
         #[arg(short, long, num_args = 1..)]
         project: Vec<String>,
@@ -187,6 +184,9 @@ enum Commands {
     /// chunks into the optional memex semantic index (layer 2).
     #[command(display_order = 3)]
     Codex {
+        #[command(flatten)]
+        redaction: RedactionArgs,
+
         /// Source cwd/project filter(s): narrows session discovery before repo segmentation
         #[arg(short, long, num_args = 1..)]
         project: Vec<String>,
@@ -257,6 +257,9 @@ enum Commands {
     /// materialize new chunks into the optional memex semantic index (layer 2).
     #[command(display_order = 1)]
     All {
+        #[command(flatten)]
+        redaction: RedactionArgs,
+
         /// Source cwd/project filter(s): narrows session discovery before repo segmentation
         #[arg(short, long, num_args = 1..)]
         project: Vec<String>,
@@ -323,6 +326,9 @@ enum Commands {
     ///   aicx extract --format claude /path/to/session.jsonl -o /tmp/report.md
     #[command(display_order = 5)]
     Extract {
+        #[command(flatten)]
+        redaction: RedactionArgs,
+
         /// Input format (agent): claude | codex | gemini | gemini-antigravity
         #[arg(long, value_enum, alias = "input-format")]
         format: ExtractInputFormat,
@@ -367,6 +373,9 @@ enum Commands {
     /// semantic index (layer 2) — a shortcut for running `memex-sync` separately.
     #[command(display_order = 4)]
     Store {
+        #[command(flatten)]
+        redaction: RedactionArgs,
+
         /// Source cwd/project filter(s): narrows session discovery before repo segmentation
         #[arg(short, long, num_args = 1..)]
         project: Vec<String>,
@@ -627,9 +636,9 @@ enum Commands {
     /// Fuzzy search across the canonical corpus (layer 1, filesystem-only).
     ///
     /// Searches chunk content and frontmatter directly in ~/.aicx/ — works
-    /// immediately, no memex index needed. For embedding-aware semantic
-    /// retrieval, materialize the index with `memex-sync` first, then use
-    /// MCP tools via `aicx serve`.
+    /// immediately, no memex index needed. For semantic retrieval through MCP
+    /// tools, materialize the index with `memex-sync` first, then use
+    /// `aicx serve`.
     #[command(display_order = 12)]
     Search {
         /// Search query string
@@ -726,10 +735,10 @@ fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let redact_secrets = cli.redact_secrets;
 
     match cli.command {
         Some(Commands::Claude {
+            redaction,
             project,
             hours,
             output,
@@ -761,12 +770,13 @@ fn main() -> Result<()> {
                 project_root,
                 sync_memex: memex,
                 force,
-                redact_secrets,
+                redact_secrets: redaction.redact_secrets,
                 emit,
                 conversation,
             })?;
         }
         Some(Commands::Codex {
+            redaction,
             project,
             hours,
             output,
@@ -798,12 +808,13 @@ fn main() -> Result<()> {
                 project_root,
                 sync_memex: memex,
                 force,
-                redact_secrets,
+                redact_secrets: redaction.redact_secrets,
                 emit,
                 conversation,
             })?;
         }
         Some(Commands::All {
+            redaction,
             project,
             hours,
             output,
@@ -834,12 +845,13 @@ fn main() -> Result<()> {
                 project_root,
                 sync_memex: memex,
                 force,
-                redact_secrets,
+                redact_secrets: redaction.redact_secrets,
                 emit,
                 conversation,
             })?;
         }
         Some(Commands::Extract {
+            redaction,
             format,
             project,
             input,
@@ -857,11 +869,12 @@ fn main() -> Result<()> {
                 output,
                 include_assistant,
                 max_message_chars,
-                redact_secrets,
+                redaction.redact_secrets,
                 conversation,
             )?;
         }
         Some(Commands::Store {
+            redaction,
             project,
             agent,
             hours,
@@ -878,7 +891,7 @@ fn main() -> Result<()> {
                 include_assistant,
                 memex,
                 emit,
-                redact_secrets,
+                redaction.redact_secrets,
             )?;
         }
         Some(Commands::MemexSync {
@@ -2814,6 +2827,16 @@ mod tests {
     }
 
     #[test]
+    fn top_level_help_does_not_advertise_dead_root_flags() {
+        let mut cmd = Cli::command();
+        let rendered = cmd.render_long_help().to_string();
+
+        assert!(!rendered.contains("used if no subcommand is provided"));
+        assert!(!rendered.contains("Project filter (used if no subcommand is provided)"));
+        assert!(!rendered.contains("Hours to look back (used if no subcommand is provided)"));
+    }
+
+    #[test]
     fn top_level_help_uses_semantic_index_language() {
         let mut cmd = Cli::command();
         let rendered = cmd.render_long_help().to_string();
@@ -2851,6 +2874,18 @@ mod tests {
     }
 
     #[test]
+    fn search_help_explains_semantic_path_without_embedding_jargon() {
+        let mut cmd = Cli::command();
+        let search = cmd
+            .find_subcommand_mut("search")
+            .expect("search subcommand should exist");
+        let rendered = search.render_long_help().to_string();
+
+        assert!(rendered.contains("semantic retrieval through MCP tools"));
+        assert!(!rendered.contains("embedding-aware"));
+    }
+
+    #[test]
     fn steer_help_keeps_examples_split() {
         let mut cmd = Cli::command();
         let steer = cmd
@@ -2864,6 +2899,39 @@ mod tests {
                 .contains("aicx steer --project ai-contexters --kind reports --date 2026-03-28")
         );
         assert!(!rendered.contains("mrbl-001 aicx steer"));
+        assert!(!rendered.contains("--no-redact-secrets"));
+        assert!(!rendered.contains("--hours <HOURS>"));
+    }
+
+    #[test]
+    fn root_only_shortcuts_without_subcommand_are_rejected() {
+        let err = Cli::try_parse_from(["aicx", "-H", "24"])
+            .expect_err("root-only shortcut mode should not parse");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("unexpected argument '-H'"));
+    }
+
+    #[test]
+    fn non_corpus_commands_reject_redaction_flags() {
+        let err = Cli::try_parse_from(["aicx", "search", "dashboard", "--no-redact-secrets"])
+            .expect_err("search should not accept corpus-building-only redaction flags");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("--no-redact-secrets"));
+    }
+
+    #[test]
+    fn corpus_builders_accept_redaction_flags() {
+        let cli = Cli::try_parse_from(["aicx", "claude", "--no-redact-secrets"])
+            .expect("claude should accept corpus-building redaction flags");
+
+        match cli.command {
+            Some(Commands::Claude { redaction, .. }) => {
+                assert!(!redaction.redact_secrets);
+            }
+            _ => panic!("expected claude command"),
+        }
     }
 
     #[test]

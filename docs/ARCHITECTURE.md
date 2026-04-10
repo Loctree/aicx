@@ -56,7 +56,8 @@ High-level sequence (see `src/main.rs::run_extraction`):
 4. Deduplicate:
    - exact hash: `(agent, timestamp, message)`
    - overlap hash: `(timestamp_bucket_60s, message)` across agents
-5. Redact secrets (default) via `src/redact.rs` unless `--no-redact-secrets`.
+5. On corpus-building commands, redact secrets by default via `src/redact.rs`
+   unless `--no-redact-secrets`.
 6. Store-first chunking:
    - use the source-side `--project` filter only to narrow session discovery
    - then group the surviving entries by resolved repo identity `(repo-from-cwd, agent, date)`
@@ -123,4 +124,4 @@ Two mechanisms protect your machine and your data:
 - Path validation (read/write) in `src/sanitize.rs`.
 - Best-effort secret redaction in `src/redact.rs` (enabled by default).
 
-Redaction is conservative by design: it’s OK to over-redact sometimes; it’s not OK to leak tokens into committed artifacts.
+Redaction is conservative by design: it’s OK to over-redact sometimes; it’s not OK to leak tokens into committed artifacts. The flag lives only on corpus-building commands that create or rewrite artifacts, not on read-only search and steering surfaces.
