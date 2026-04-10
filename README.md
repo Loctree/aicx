@@ -68,6 +68,11 @@ aicx all -H 4 --incremental        # daily driver: watermark-tracked, skips alre
 aicx store -p MyProject -H 720     # store-first: full re-extraction, no watermark, good for backfills
 ```
 
+`-p/--project` on extractors and `store` narrows source session discovery before
+repo segmentation. One run can still resolve into multiple canonical repo buckets
+or `non-repository-contexts`; `--emit json` makes that explicit through
+`requested_source_filters` and `resolved_store_buckets`.
+
 See what landed:
 
 ```bash
@@ -101,6 +106,7 @@ Pipe one JSON payload (handy for automation):
 
 ```bash
 aicx all -H 4 --emit json | jq '.store_paths'
+aicx all -H 4 --emit json | jq '.resolved_store_buckets'
 ```
 
 ## What Gets Written Where

@@ -150,6 +150,15 @@ fn json_paths(value: &Value, key: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+fn json_strings(value: &Value, key: &str) -> Vec<String> {
+    value[key]
+        .as_array()
+        .expect("json array")
+        .iter()
+        .map(|entry| entry.as_str().expect("json string").to_string())
+        .collect()
+}
+
 #[test]
 fn store_cli_codex_emits_repo_and_non_repo_canonical_roots() {
     let root = unique_test_dir("codex-command");
@@ -207,8 +216,20 @@ fn store_cli_codex_emits_repo_and_non_repo_canonical_roots() {
     let output = run_aicx(&home, &["codex", "-H", "24", "--emit", "json"]);
     let payload = parse_stdout_json(&output);
     let store_paths = json_paths(&payload, "store_paths");
+    let resolved_repositories = json_strings(&payload, "resolved_repositories");
 
     assert_eq!(store_paths.len(), 2);
+    assert!(payload["requested_source_filters"].is_null());
+    assert_eq!(
+        resolved_repositories,
+        vec!["VetCoders/ai-contexters".to_string()]
+    );
+    assert_eq!(
+        payload["includes_non_repository_contexts"].as_bool(),
+        Some(true)
+    );
+    assert!(payload["resolved_store_buckets"]["VetCoders/ai-contexters"].is_object());
+    assert!(payload["resolved_store_buckets"]["non-repository-contexts"].is_object());
     assert!(store_paths.iter().any(|path| {
         path.starts_with(
             home.join(".aicx")
@@ -287,9 +308,20 @@ fn store_cli_store_command_emits_repo_and_non_repo_canonical_roots() {
     );
     let payload = parse_stdout_json(&output);
     let store_paths = json_paths(&payload, "store_paths");
+    let resolved_repositories = json_strings(&payload, "resolved_repositories");
 
     assert_eq!(payload["total_entries"].as_u64(), Some(4));
     assert_eq!(payload["total_chunks"].as_u64(), Some(2));
+    assert!(payload["requested_source_filters"].is_null());
+    assert_eq!(resolved_repositories, vec!["VetCoders/loctree".to_string()]);
+    assert_eq!(
+        payload["includes_non_repository_contexts"].as_bool(),
+        Some(true)
+    );
+    assert!(payload["resolved_store_buckets"]["VetCoders/loctree"].is_object());
+    assert!(payload["resolved_store_buckets"]["non-repository-contexts"].is_object());
+    assert!(payload["repos"]["VetCoders/loctree"].is_object());
+    assert!(payload["repos"].get("non-repository-contexts").is_none());
     assert_eq!(store_paths.len(), 2);
     assert!(store_paths.iter().any(|path| {
         path.starts_with(

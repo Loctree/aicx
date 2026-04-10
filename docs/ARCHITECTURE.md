@@ -58,12 +58,13 @@ High-level sequence (see `src/main.rs::run_extraction`):
    - overlap hash: `(timestamp_bucket_60s, message)` across agents
 5. Redact secrets (default) via `src/redact.rs` unless `--no-redact-secrets`.
 6. Store-first chunking:
-   - group by `(repo-from-cwd, agent, date)`
+   - use the source-side `--project` filter only to narrow session discovery
+   - then group the surviving entries by resolved repo identity `(repo-from-cwd, agent, date)`
    - chunk per group (~1500 tokens, overlap), write canonical `.md` chunks into `~/.aicx/store/` or `~/.aicx/non-repository-contexts/`
 7. Stdout emission:
    - `--emit none` prints nothing (default for extractors and `store`)
    - `--emit paths` prints stored chunk paths, one per line
-   - `--emit json` prints a single JSON payload including `store_paths`
+   - `--emit json` prints a single JSON payload including `store_paths`, `requested_source_filters`, and `resolved_store_buckets`
    - `--emit none` prints nothing
 8. Optional local output (`-o`): write a report to the given directory.
 9. Optional memex materialization (`--memex`): materialize canonical chunks into the memex retrieval kernel (see note below).
@@ -101,9 +102,9 @@ Frontmatter is not just telemetry — it is part of the steering and selective r
 
 `store` is the “build the canonical corpus from older history” command (see `src/main.rs::run_store`):
 
-1. Extract selected agents + projects for a lookback window.
+1. Extract selected agents + source filters for a lookback window.
 2. Redact secrets (default).
-3. Chunk and write into the canonical `~/.aicx/` store.
+3. Chunk and write into the canonical `~/.aicx/` store, which may resolve into multiple repo buckets plus `non-repository-contexts`.
 4. Optional memex sync (`--memex`).
 
 ## MCP Surface (`src/mcp.rs`)

@@ -117,7 +117,7 @@ enum Commands {
     /// chunks into the memex retrieval kernel (layer 2).
     #[command(display_order = 2)]
     Claude {
-        /// Project directory filter(s): -p foo bar baz
+        /// Source cwd/project filter(s): narrows session discovery before repo segmentation
         #[arg(short, long, num_args = 1..)]
         project: Vec<String>,
 
@@ -186,7 +186,7 @@ enum Commands {
     /// chunks into the memex retrieval kernel (layer 2).
     #[command(display_order = 3)]
     Codex {
-        /// Project/repo filter(s): -p foo bar baz
+        /// Source cwd/project filter(s): narrows session discovery before repo segmentation
         #[arg(short, long, num_args = 1..)]
         project: Vec<String>,
 
@@ -256,7 +256,7 @@ enum Commands {
     /// materialize new chunks into the memex retrieval kernel (layer 2).
     #[command(display_order = 1)]
     All {
-        /// Project filter(s): -p foo bar baz
+        /// Source cwd/project filter(s): narrows session discovery before repo segmentation
         #[arg(short, long, num_args = 1..)]
         project: Vec<String>,
 
@@ -366,7 +366,7 @@ enum Commands {
     /// kernel (layer 2) — a shortcut for running `memex-sync` separately.
     #[command(display_order = 4)]
     Store {
-        /// Project name(s): -p foo bar baz
+        /// Source cwd/project filter(s): narrows session discovery before repo segmentation
         #[arg(short, long, num_args = 1..)]
         project: Vec<String>,
 
@@ -447,7 +447,7 @@ enum Commands {
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
-        /// Project filter
+        /// Repo or store-bucket filter (case-insensitive substring)
         #[arg(short, long)]
         project: Option<String>,
 
@@ -634,7 +634,7 @@ enum Commands {
         /// Search query string
         query: String,
 
-        /// Project filter (org/repo substring, case-insensitive)
+        /// Repo or store-bucket filter (case-insensitive substring)
         #[arg(short, long)]
         project: Option<String>,
 
@@ -685,7 +685,7 @@ enum Commands {
         #[arg(short, long)]
         kind: Option<String>,
 
-        /// Filter by project (case-insensitive substring)
+        /// Filter by repo or store bucket (case-insensitive substring)
         #[arg(short, long)]
         project: Option<String>,
 
@@ -1190,6 +1190,81 @@ fn run_extract_file(
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct StoreScopeSurface {
+    requested_source_filters: Option<Vec<String>>,
+    resolved_repositories: Vec<String>,
+    includes_non_repository_contexts: bool,
+    resolved_store_buckets: BTreeMap<String, BTreeMap<String, usize>>,
+}
+
+impl StoreScopeSurface {
+    fn empty(requested_filters: &[String]) -> Self {
+        Self {
+            requested_source_filters: normalized_requested_source_filters(requested_filters),
+            resolved_repositories: Vec::new(),
+            includes_non_repository_contexts: false,
+            resolved_store_buckets: BTreeMap::new(),
+        }
+    }
+
+    fn from_store_summary(
+        requested_filters: &[String],
+        store_summary: &store::StoreWriteSummary,
+    ) -> Self {
+        Self {
+            requested_source_filters: normalized_requested_source_filters(requested_filters),
+            resolved_repositories: store_summary
+                .project_summary
+                .keys()
+                .filter(|bucket| bucket.as_str() != store::NON_REPOSITORY_CONTEXTS)
+                .cloned()
+                .collect(),
+            includes_non_repository_contexts: store_summary
+                .project_summary
+                .contains_key(store::NON_REPOSITORY_CONTEXTS),
+            resolved_store_buckets: store_summary.project_summary.clone(),
+        }
+    }
+
+    fn repository_buckets(&self) -> BTreeMap<String, BTreeMap<String, usize>> {
+        self.resolved_store_buckets
+            .iter()
+            .filter(|(bucket, _)| bucket.as_str() != store::NON_REPOSITORY_CONTEXTS)
+            .map(|(bucket, counts)| (bucket.clone(), counts.clone()))
+            .collect()
+    }
+}
+
+fn normalized_requested_source_filters(requested_filters: &[String]) -> Option<Vec<String>> {
+    if requested_filters.is_empty() {
+        None
+    } else {
+        Some(requested_filters.to_vec())
+    }
+}
+
+fn render_requested_source_filters(requested_filters: &[String]) -> String {
+    if requested_filters.is_empty() {
+        "(all sources)".to_string()
+    } else {
+        requested_filters.join(", ")
+    }
+}
+
+fn render_resolved_store_buckets(scope: &StoreScopeSurface) -> String {
+    if scope.resolved_store_buckets.is_empty() {
+        "(none written)".to_string()
+    } else {
+        scope
+            .resolved_store_buckets
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 struct ExtractionParams<'a> {
     agents: &'a [&'a str],
     project: Vec<String>,
@@ -1355,6 +1430,10 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         include_assistant,
         watermark,
     };
+    eprintln!(
+        "  Requested source filters: {}",
+        render_requested_source_filters(&project)
+    );
 
     // Extract from requested sources
     let mut entries = Vec::new();
@@ -1450,16 +1529,20 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
 
     let chunker_config = ai_contexters::chunker::ChunkerConfig::default();
     let mut all_written_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut scope_surface = StoreScopeSurface::empty(&project);
 
     if !output_entries.is_empty() {
         let store_summary = store::store_semantic_segments(&output_entries, &chunker_config)?;
+        scope_surface = StoreScopeSurface::from_store_summary(&project, &store_summary);
         let newly_written_paths = store_summary.written_paths.clone();
         all_written_paths.extend(newly_written_paths.iter().cloned());
 
         // Update fast local metadata index
         if let Ok(rt) = tokio::runtime::Runtime::new() {
             let path_refs: Vec<&PathBuf> = newly_written_paths.iter().collect();
-            let _ = rt.block_on(ai_contexters::steer_index::sync_steer_index(&path_refs));
+            if let Err(e) = rt.block_on(ai_contexters::steer_index::sync_steer_index(&path_refs)) {
+                eprintln!("⚠ steer index sync failed (search may be stale): {e}");
+            }
         }
 
         // Summary to stderr (diagnostics)
@@ -1476,6 +1559,10 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                 .collect();
             eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
         }
+        eprintln!(
+            "  Resolved store buckets: {}",
+            render_resolved_store_buckets(&scope_surface)
+        );
 
         sync_memex_if_requested(sync_memex, &newly_written_paths)?;
     }
@@ -1502,6 +1589,8 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                     hours_back: u64,
                     total_messages: usize,
                     sessions: &'a [String],
+                    #[serde(flatten)]
+                    scope: &'a StoreScopeSurface,
                     messages: Vec<sources::ConversationMessage>,
                     store_paths: Vec<String>,
                 }
@@ -1513,6 +1602,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                     hours_back: metadata.hours_back,
                     total_messages: conv_msgs.len(),
                     sessions: &metadata.sessions,
+                    scope: &scope_surface,
                     messages: conv_msgs,
                     store_paths,
                 };
@@ -1525,6 +1615,8 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                     hours_back: u64,
                     total_entries: usize,
                     sessions: &'a [String],
+                    #[serde(flatten)]
+                    scope: &'a StoreScopeSurface,
                     entries: &'a [output::TimelineEntry],
                     store_paths: Vec<String>,
                 }
@@ -1535,6 +1627,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                     hours_back: metadata.hours_back,
                     total_entries: metadata.total_entries,
                     sessions: &metadata.sessions,
+                    scope: &scope_surface,
                     entries: &output_entries,
                     store_paths,
                 };
@@ -1680,6 +1773,10 @@ fn run_store(
         include_assistant,
         watermark: None,
     };
+    eprintln!(
+        "  Requested source filters: {}",
+        render_requested_source_filters(&project)
+    );
 
     let mut all_entries = Vec::new();
     for &ag in &agents {
@@ -1739,11 +1836,14 @@ fn run_store(
     let store_summary = store_result?;
     let stored_count = store_summary.total_entries;
     let all_written_paths = store_summary.written_paths.clone();
+    let scope_surface = StoreScopeSurface::from_store_summary(&project, &store_summary);
 
     // Update fast local metadata index
     if let Ok(rt) = tokio::runtime::Runtime::new() {
         let path_refs: Vec<&PathBuf> = all_written_paths.iter().collect();
-        let _ = rt.block_on(ai_contexters::steer_index::sync_steer_index(&path_refs));
+        if let Err(e) = rt.block_on(ai_contexters::steer_index::sync_steer_index(&path_refs)) {
+            eprintln!("⚠ steer index sync failed (search may be stale): {e}");
+        }
     }
 
     eprintln!(
@@ -1759,6 +1859,10 @@ fn run_store(
             .collect();
         eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
     }
+    eprintln!(
+        "  Resolved store buckets: {}",
+        render_resolved_store_buckets(&scope_surface)
+    );
 
     sync_memex_if_requested(sync_memex, &all_written_paths)?;
 
@@ -1778,8 +1882,12 @@ fn run_store(
                 serde_json::to_string_pretty(&serde_json::json!({
                     "total_entries": stored_count,
                     "total_chunks": all_written_paths.len(),
+                    "requested_source_filters": scope_surface.requested_source_filters,
+                    "resolved_repositories": scope_surface.resolved_repositories,
+                    "includes_non_repository_contexts": scope_surface.includes_non_repository_contexts,
+                    "resolved_store_buckets": scope_surface.resolved_store_buckets,
+                    "repos": scope_surface.repository_buckets(),
                     "store_paths": store_paths,
-                    "repos": store_summary.project_summary,
                 }))?
             );
         }
@@ -1861,34 +1969,32 @@ fn extract_date_from_query(query: &str) -> (String, Option<String>) {
 
     // Pattern 1: "<month> <year>" e.g. "january 2026"
     for i in 0..words.len().saturating_sub(1) {
-        if let Some(m) = month_number(&lower[i]) {
-            if let Ok(y) = lower[i + 1].parse::<u32>() {
-                if (2020..=2099).contains(&y) {
-                    let days = days_in_month(y, m);
-                    let lo = format!("{y:04}-{m:02}-01");
-                    let hi = format!("{y:04}-{m:02}-{days:02}");
-                    date_filter = Some(format!("{lo}..{hi}"));
-                    used[i] = true;
-                    used[i + 1] = true;
-                }
-            }
+        if let Some(m) = month_number(&lower[i])
+            && let Ok(y) = lower[i + 1].parse::<u32>()
+            && (2020..=2099).contains(&y)
+        {
+            let days = days_in_month(y, m);
+            let lo = format!("{y:04}-{m:02}-01");
+            let hi = format!("{y:04}-{m:02}-{days:02}");
+            date_filter = Some(format!("{lo}..{hi}"));
+            used[i] = true;
+            used[i + 1] = true;
         }
     }
 
     // Pattern 2: "<year> <month>" e.g. "2026 january"
     if date_filter.is_none() {
         for i in 0..words.len().saturating_sub(1) {
-            if let Ok(y) = lower[i].parse::<u32>() {
-                if (2020..=2099).contains(&y) {
-                    if let Some(m) = month_number(&lower[i + 1]) {
-                        let days = days_in_month(y, m);
-                        let lo = format!("{y:04}-{m:02}-01");
-                        let hi = format!("{y:04}-{m:02}-{days:02}");
-                        date_filter = Some(format!("{lo}..{hi}"));
-                        used[i] = true;
-                        used[i + 1] = true;
-                    }
-                }
+            if let Ok(y) = lower[i].parse::<u32>()
+                && (2020..=2099).contains(&y)
+                && let Some(m) = month_number(&lower[i + 1])
+            {
+                let days = days_in_month(y, m);
+                let lo = format!("{y:04}-{m:02}-01");
+                let hi = format!("{y:04}-{m:02}-{days:02}");
+                date_filter = Some(format!("{lo}..{hi}"));
+                used[i] = true;
+                used[i + 1] = true;
             }
         }
     }
@@ -1937,7 +2043,7 @@ fn days_in_month(year: u32, month: u32) -> u32 {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
         2 => {
-            if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+            if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) {
                 29
             } else {
                 28
