@@ -304,10 +304,6 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         "  Required header: {}: {}",
         REGENERATE_HEADER_NAME, REGENERATE_HEADER_VALUE
     );
-    eprintln!(
-        "  Artifact arg (unused in server mode): {}",
-        config.artifact_path.display()
-    );
     eprintln!("  Store: {}", config.store_root.display());
 
     axum::serve(listener, app)

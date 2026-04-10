@@ -421,9 +421,11 @@ Options:
 - `--store-root <DIR>` override store root
 - `--host <HOST>` bind host (default: `127.0.0.1`)
 - `--port <PORT>` bind TCP port (default: `8033`)
-- `--artifact <ARTIFACT>` legacy compatibility path surfaced in status; not written in server mode
 - `--title <TITLE>` document title
 - `--preview-chars <N>` max preview characters per record
+
+Compatibility note:
+The server still reports a legacy artifact path in status responses for older wrappers, but server mode does not write a static HTML artifact.
 
 Example:
 
@@ -452,7 +454,7 @@ aicx state --info
 
 ## `aicx serve`
 
-Run `aicx` as an MCP server (stdio or streamable HTTP/SSE transport).
+Run `aicx` as an MCP server (stdio or streamable HTTP transport).
 
 Exposes search, steer, and rank tools over MCP for agent retrieval.
 `aicx_steer` and `aicx_rank` query the canonical corpus on disk.
@@ -464,13 +466,13 @@ aicx serve [OPTIONS]
 ```
 
 Options:
-- `--transport <stdio|sse>` transport (default: `stdio`)
-- `--port <PORT>` SSE/HTTP port (default: `8044`)
+- `--transport <stdio|http>` transport (default: `stdio`; legacy alias `sse` is still accepted)
+- `--port <PORT>` streamable HTTP port (default: `8044`)
 
 Example:
 
 ```bash
-aicx serve --transport sse --port 8044
+aicx serve --transport http --port 8044
 ```
 
 ## `aicx init` (Retired)

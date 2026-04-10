@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use ai_contexters::dashboard::{self, DashboardConfig};
 use ai_contexters::dashboard_server::{self, DashboardServerConfig};
 use ai_contexters::intents;
+use ai_contexters::mcp::{self, McpTransport};
 use ai_contexters::memex::{self, MemexConfig, SyncProgress, SyncProgressPhase};
 use ai_contexters::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
 use ai_contexters::rank;
@@ -523,7 +524,7 @@ enum Commands {
         port: u16,
 
         /// Legacy compatibility path retained for status surfaces; not written in server mode
-        #[arg(long, default_value = "aicx-dashboard.html")]
+        #[arg(long, default_value = "aicx-dashboard.html", hide = true)]
         artifact: PathBuf,
 
         /// Document title
@@ -566,16 +567,17 @@ enum Commands {
     /// index exists, and otherwise falls back to canonical-store fuzzy search.
     #[command(verbatim_doc_comment)]
     Serve {
-        /// Transport: stdio (default) or sse
-        #[arg(long, default_value = "stdio", value_parser = ["stdio", "sse"])]
-        transport: String,
+        /// Transport: stdio (default) or http. Legacy alias: sse.
+        #[arg(long, value_enum, default_value_t = McpTransport::Stdio)]
+        transport: McpTransport,
 
-        /// Port for SSE transport (default: 8044)
+        /// Port for streamable HTTP transport (default: 8044)
         #[arg(long, default_value = "8044")]
         port: u16,
     },
 
     #[command(
+        hide = true,
         about = "Retired compatibility shim; prints migration guidance",
         long_about = "aicx init has been retired.\n\nContext initialisation is now handled by /vc-init inside Claude Code.\nSee: https://vibecrafted.io/\n\nLegacy flags are still accepted for compatibility, but they have no effect."
     )]
@@ -983,12 +985,7 @@ fn main() -> Result<()> {
         }
         Some(Commands::Serve { transport, port }) => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async {
-                match transport.as_str() {
-                    "sse" => ai_contexters::mcp::run_sse(port).await,
-                    _ => ai_contexters::mcp::run_stdio().await,
-                }
-            })?;
+            rt.block_on(async { mcp::run_transport(transport, port).await })?;
         }
         Some(Commands::Search {
             query,
@@ -2817,12 +2814,12 @@ mod tests {
     }
 
     #[test]
-    fn top_level_help_marks_init_as_retired() {
+    fn top_level_help_hides_retired_init_from_primary_surface() {
         let mut cmd = Cli::command();
         let rendered = cmd.render_help().to_string();
 
-        assert!(rendered.contains("init"));
-        assert!(rendered.contains("Retired compatibility shim"));
+        assert!(!rendered.contains("\n  init "));
+        assert!(!rendered.contains("Retired compatibility shim"));
         assert!(!rendered.contains("Initialize repo context and run an agent"));
     }
 
@@ -2862,13 +2859,37 @@ mod tests {
     }
 
     #[test]
-    fn serve_help_explains_search_fallback_without_embedding_mode_jargon() {
+    fn serve_accepts_http_and_legacy_sse_transport_names() {
+        let http = Cli::try_parse_from(["aicx", "serve", "--transport", "http"])
+            .expect("http transport should parse");
+        let legacy = Cli::try_parse_from(["aicx", "serve", "--transport", "sse"])
+            .expect("legacy sse alias should parse");
+
+        match http.command {
+            Some(Commands::Serve { transport, .. }) => {
+                assert_eq!(transport, McpTransport::Http);
+            }
+            _ => panic!("expected serve command for http transport"),
+        }
+
+        match legacy.command {
+            Some(Commands::Serve { transport, .. }) => {
+                assert_eq!(transport, McpTransport::Http);
+            }
+            _ => panic!("expected serve command for legacy sse transport"),
+        }
+    }
+
+    #[test]
+    fn serve_help_prefers_http_name_and_explains_search_fallback() {
         let mut cmd = Cli::command();
         let serve = cmd
             .find_subcommand_mut("serve")
             .expect("serve subcommand should exist");
         let rendered = serve.render_long_help().to_string();
 
+        assert!(rendered.contains("Transport: stdio (default) or http."));
+        assert!(!rendered.contains("Transport: stdio (default) or sse"));
         assert!(rendered.contains("falls back to canonical-store fuzzy search"));
         assert!(!rendered.contains("embedding mode"));
     }
@@ -2901,6 +2922,18 @@ mod tests {
         assert!(!rendered.contains("mrbl-001 aicx steer"));
         assert!(!rendered.contains("--no-redact-secrets"));
         assert!(!rendered.contains("--hours <HOURS>"));
+    }
+
+    #[test]
+    fn dashboard_serve_help_hides_legacy_artifact_flag() {
+        let mut cmd = Cli::command();
+        let dashboard_serve = cmd
+            .find_subcommand_mut("dashboard-serve")
+            .expect("dashboard-serve subcommand should exist");
+        let rendered = dashboard_serve.render_long_help().to_string();
+
+        assert!(!rendered.contains("--artifact"));
+        assert!(rendered.contains("Run a local dashboard server"));
     }
 
     #[test]

@@ -3,10 +3,11 @@
 //! Exposes aicx functionality as MCP tools so agents can search canonical
 //! chunks, rank artifacts, and retrieve steer metadata.
 //!
-//! Supports stdio and SSE transports.
+//! Supports stdio and streamable HTTP transports.
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
+use clap::ValueEnum;
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::{
     ErrorData as McpError, handler::server::tool::ToolRouter, handler::server::wrapper::Parameters,
@@ -24,6 +25,13 @@ use crate::store;
 // ============================================================================
 // Tool parameter & result types
 // ============================================================================
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum McpTransport {
+    Stdio,
+    #[value(alias = "sse")]
+    Http,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchParams {
@@ -400,7 +408,7 @@ pub async fn run_stdio() -> anyhow::Result<()> {
 }
 
 /// Run MCP server over streamable HTTP transport on given port.
-pub async fn run_sse(port: u16) -> anyhow::Result<()> {
+pub async fn run_http(port: u16) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
@@ -437,6 +445,19 @@ pub async fn run_sse(port: u16) -> anyhow::Result<()> {
     axum::serve(listener, app)
         .await
         .map_err(|e| anyhow::anyhow!("MCP HTTP server error: {e}"))
+}
+
+/// Legacy compatibility wrapper for callers that still use the old `run_sse` name.
+pub async fn run_sse(port: u16) -> anyhow::Result<()> {
+    run_http(port).await
+}
+
+/// Run the selected MCP transport.
+pub async fn run_transport(transport: McpTransport, port: u16) -> anyhow::Result<()> {
+    match transport {
+        McpTransport::Stdio => run_stdio().await,
+        McpTransport::Http => run_http(port).await,
+    }
 }
 
 /// Parse a date filter string into (optional_low, optional_high) bounds.
@@ -477,9 +498,10 @@ fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, McpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SCORE_FILTER, RankItem, RankResponse, SearchParams, SteerResponse,
+        MAX_SCORE_FILTER, McpTransport, RankItem, RankResponse, SearchParams, SteerResponse,
         incremental_rescan_args, parse_date_filter_mcp, validate_score_filter,
     };
+    use clap::ValueEnum as _;
 
     #[test]
     fn incremental_rescan_args_use_all_incremental_and_quiet_stdout() {
@@ -608,5 +630,23 @@ mod tests {
         let err = validate_score_filter(Some(MAX_SCORE_FILTER + 1))
             .expect_err("score above 100 should be rejected");
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn mcp_transport_prefers_http_but_accepts_legacy_sse_alias() {
+        let possible = McpTransport::value_variants()
+            .iter()
+            .map(|variant| {
+                variant
+                    .to_possible_value()
+                    .expect("possible value")
+                    .get_name()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(possible, vec!["stdio".to_string(), "http".to_string()]);
+        assert_eq!(McpTransport::from_str("http", true), Ok(McpTransport::Http));
+        assert_eq!(McpTransport::from_str("sse", true), Ok(McpTransport::Http));
     }
 }
