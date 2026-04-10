@@ -270,7 +270,8 @@ impl AicxMcpServer {
         let strict = params.strict;
         let top = params.top;
 
-        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
+        let cutoff = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(hours.saturating_mul(3600).min(365 * 24 * 3600));
         let mut scored = Vec::new();
 
         let files = store::context_files_since(cutoff, Some(&project))
