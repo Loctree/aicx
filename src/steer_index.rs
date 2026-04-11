@@ -402,7 +402,7 @@ async fn bootstrap_steer_index_if_missing_at(base: &Path) -> Result<bool> {
         expected_docs
     );
     let bm25_writer = BM25Index::new(&steer_bm25_config(base, false))?;
-    let _ = bm25_writer.purge_namespace(STEER_NAMESPACE).await;
+    let _ = bm25_writer.delete_namespace_term(STEER_NAMESPACE).await;
     sync_steer_bm25_at(base, &docs).await?;
 
     Ok(true)
@@ -720,9 +720,9 @@ async fn rebuild_steer_index_if_needed_at(base: &Path) -> Result<()> {
 
         let db_path = steer_db_path(base);
         let storage = StorageManager::new_lance_only(&db_path.to_string_lossy()).await?;
-        let _ = storage.purge_namespace(STEER_NAMESPACE).await;
+        let _ = storage.delete_namespace_documents(STEER_NAMESPACE).await;
         let bm25 = BM25Index::new(&steer_bm25_config(base, false))?;
-        let _ = bm25.purge_namespace(STEER_NAMESPACE).await;
+        let _ = bm25.delete_namespace_term(STEER_NAMESPACE).await;
 
         let paths: Vec<PathBuf> = all_files.into_iter().map(|f| f.path).collect();
         let path_refs: Vec<&PathBuf> = paths.iter().collect();
