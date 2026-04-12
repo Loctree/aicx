@@ -418,14 +418,6 @@ fn finalize_candidate(
         return Ok(None);
     }
 
-    let (lane, workflow) = derive_lane_and_workflow(&path_parts);
-    if let Some(filter) = config.workflow.as_ref() {
-        let haystack = format!("{workflow} {lane} {}", relative.display());
-        if !contains_case_insensitive(&haystack, filter) {
-            return Ok(None);
-        }
-    }
-
     let meta = if let Some(meta_path) = candidate.meta_path.as_ref() {
         Some(read_meta(meta_path)?)
     } else {
@@ -441,9 +433,22 @@ fn finalize_candidate(
     let title = derive_title(
         markdown.as_ref().map(|item| item.body.as_str()),
         primary_path,
-        &workflow,
+        "day-root",
         meta.as_ref(),
     );
+    let (lane, workflow) = derive_lane_and_workflow(
+        &path_parts,
+        primary_path,
+        &title,
+        markdown.as_ref(),
+        meta.as_ref(),
+    );
+    if let Some(filter) = config.workflow.as_ref() {
+        let haystack = format!("{workflow} {lane} {}", relative.display());
+        if !contains_case_insensitive(&haystack, filter) {
+            return Ok(None);
+        }
+    }
 
     let agent = derive_agent(&title, &path_parts, markdown.as_ref(), meta.as_ref());
 
@@ -651,7 +656,13 @@ fn parse_artifact_frontmatter(text: &str) -> (Option<ArtifactFrontmatterEnvelope
     (frontmatter, body)
 }
 
-fn derive_lane_and_workflow(path_parts: &[String]) -> (String, String) {
+fn derive_lane_and_workflow(
+    path_parts: &[String],
+    primary_path: &Path,
+    title: &str,
+    markdown: Option<&ParsedMarkdown>,
+    meta: Option<&ArtifactMeta>,
+) -> (String, String) {
     let lane = if let Some(idx) = path_parts.iter().position(|segment| segment == "reports") {
         if idx >= 2 && path_parts[idx - 1] == "marbles" {
             "marbles/reports".to_string()
@@ -681,10 +692,98 @@ fn derive_lane_and_workflow(path_parts: &[String]) -> (String, String) {
             "pipeline".to_string()
         }
     } else {
-        "day-root".to_string()
+        infer_day_root_workflow(primary_path, title, markdown, meta)
+            .unwrap_or_else(|| "day-root".to_string())
     };
 
     (lane, workflow)
+}
+
+fn infer_day_root_workflow(
+    primary_path: &Path,
+    title: &str,
+    markdown: Option<&ParsedMarkdown>,
+    meta: Option<&ArtifactMeta>,
+) -> Option<String> {
+    prompt_workflow_slug(
+        markdown
+            .and_then(|item| item.frontmatter.report.telemetry.prompt_id.as_deref())
+            .or_else(|| meta.and_then(|item| item.prompt_id.as_deref())),
+    )
+    .or_else(|| stem_workflow_slug(primary_path))
+    .or_else(|| title_workflow_slug(title))
+}
+
+fn prompt_workflow_slug(prompt_id: Option<&str>) -> Option<String> {
+    let prompt_id = prompt_id?;
+    let prompt_id = prompt_id.trim();
+    if prompt_id.is_empty() {
+        return None;
+    }
+
+    let base = prompt_id
+        .split_once('_')
+        .map(|(left, _)| left)
+        .unwrap_or(prompt_id);
+    normalize_workflow_slug(base)
+}
+
+fn stem_workflow_slug(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let filtered = stem
+        .split('_')
+        .filter(|segment| !segment.is_empty())
+        .filter(|segment| !looks_like_timestamp_segment(segment))
+        .filter(|segment| !is_known_artifact_suffix(segment))
+        .filter(|segment| !is_known_agent(segment))
+        .collect::<Vec<_>>()
+        .join("-");
+    normalize_workflow_slug(&filtered)
+}
+
+fn title_workflow_slug(title: &str) -> Option<String> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let normalized = trimmed
+        .replace([':', '/'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-");
+    normalize_workflow_slug(&normalized)
+}
+
+fn normalize_workflow_slug(value: &str) -> Option<String> {
+    let slug = value
+        .trim_matches(|ch: char| ch == '_' || ch == '-' || ch.is_whitespace())
+        .to_lowercase();
+    let slug = slug
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let slug = slug
+        .replace('_', "-")
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+
+    if slug.is_empty() { None } else { Some(slug) }
+}
+
+fn looks_like_timestamp_segment(segment: &str) -> bool {
+    let digits_only = segment.chars().all(|ch| ch.is_ascii_digit());
+    digits_only && matches!(segment.len(), 4 | 6 | 8 | 12 | 14)
+}
+
+fn is_known_artifact_suffix(segment: &str) -> bool {
+    matches!(
+        segment.to_ascii_lowercase().as_str(),
+        "context" | "research" | "report" | "reports" | "plan" | "plans" | "summary"
+    )
 }
 
 fn path_contains_segment(path_parts: &[String], needle: &str) -> bool {
@@ -1943,9 +2042,40 @@ mod tests {
                 .iter()
                 .any(|record| !record.has_markdown && record.has_meta)
         );
+        assert!(
+            payload
+                .records
+                .iter()
+                .any(|record| record.workflow == "report-artifacts")
+        );
+        assert!(
+            payload
+                .records
+                .iter()
+                .all(|record| record.workflow != "day-root")
+        );
         assert!(artifact.html.contains("Workflow Report Explorer"));
         assert!(artifact.html.contains("Import JSON Bundle"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn infers_day_root_workflow_from_prompt_ids_and_file_stems() {
+        assert_eq!(
+            prompt_workflow_slug(Some("report-artifacts-dashboard_20260412")).as_deref(),
+            Some("report-artifacts-dashboard")
+        );
+        assert_eq!(
+            stem_workflow_slug(Path::new(
+                "/tmp/20260412_2031_report-artifacts-dashboard_codex.md"
+            ))
+            .as_deref(),
+            Some("report-artifacts-dashboard")
+        );
+        assert_eq!(
+            title_workflow_slug("Examination: report artifacts dashboard").as_deref(),
+            Some("examination-report-artifacts-dashboard")
+        );
     }
 }

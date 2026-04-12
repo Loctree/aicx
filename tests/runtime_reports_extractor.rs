@@ -202,6 +202,23 @@ fn reports_extractor_builds_html_and_default_bundle_from_vibecrafted_artifacts()
     assert_eq!(bundle["stats"]["total_records"].as_u64(), Some(2));
     assert_eq!(bundle["stats"]["completed_records"].as_u64(), Some(1));
     assert_eq!(bundle["stats"]["incomplete_records"].as_u64(), Some(1));
+    let workflows = bundle["records"]
+        .as_array()
+        .expect("records array")
+        .iter()
+        .map(|record| {
+            record["workflow"]
+                .as_str()
+                .expect("workflow string")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        workflows
+            .iter()
+            .any(|workflow| workflow == "report-artifacts")
+    );
+    assert!(!workflows.iter().any(|workflow| workflow == "day-root"));
 
     let _ = fs::remove_dir_all(&root);
 }

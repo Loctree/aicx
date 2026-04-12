@@ -29,3 +29,4 @@ CLAUDE.md
 *.out
 /.vibecrafted
 /.claude/
+/release-bundles
