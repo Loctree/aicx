@@ -194,6 +194,22 @@ aicx extract --format gemini-antigravity \
   -o /tmp/antigravity-report.md
 ```
 
+Review Vibecrafted workflow and marbles artifacts as a standalone dossier:
+
+```bash
+aicx reports-extractor \
+  --repo ai-contexters \
+  --workflow marbles \
+  --date-from 2026-04-10 \
+  --date-to 2026-04-12 \
+  -o ./aicx-reports.html \
+  --bundle-output ./aicx-reports.bundle.json
+```
+
+The generated HTML embeds the selected slice directly and can also import/export
+compatible JSON bundles client-side, so you can merge multiple workflow slices
+without standing up a server.
+
 ## Docs
 
 - `docs/ARCHITECTURE.md` (module map + data flows)

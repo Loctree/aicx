@@ -169,9 +169,7 @@ struct DateFilter {
 }
 
 /// Build a standalone HTML explorer and JSON bundle from Vibecrafted artifacts.
-pub fn build_reports_explorer(
-    config: &ReportsExtractorConfig,
-) -> Result<ReportsExtractorArtifact> {
+pub fn build_reports_explorer(config: &ReportsExtractorConfig) -> Result<ReportsExtractorArtifact> {
     let artifacts_root = crate::sanitize::validate_dir_path(&config.artifacts_root)?;
     let repo_root = artifacts_root.join(&config.org).join(&config.repo);
     let repo_root = crate::sanitize::validate_dir_path(&repo_root).with_context(|| {
@@ -205,7 +203,8 @@ fn scan_reports(
         "Meta-only or transcript-backed runs are surfaced honestly instead of being dropped from the explorer.".to_string(),
         "Standalone HTML includes an embedded JSON payload and can merge additional bundle files client-side.".to_string(),
     ];
-    assumptions.push("Legacy artifacts are skipped by default in this first explorer pass.".to_string());
+    assumptions
+        .push("Legacy artifacts are skipped by default in this first explorer pass.".to_string());
     if let Some(workflow) = config.workflow.as_ref() {
         assumptions.push(format!(
             "Workflow filter applied during extraction: {}",
@@ -386,7 +385,7 @@ fn path_string_without_suffix(path: &Path, suffix: &str) -> String {
 
 fn finalize_candidate(
     candidate: &Candidate,
-    resolved: &ResolvedRepoRoot,
+    repo_root: &Path,
     config: &ReportsExtractorConfig,
     date_filter: &DateFilter,
 ) -> Result<Option<ReportsExplorerRecord>> {
@@ -396,7 +395,7 @@ fn finalize_candidate(
         .or(candidate.meta_path.as_ref())
         .ok_or_else(|| anyhow!("artifact candidate without markdown or metadata path"))?;
     let relative = primary_path
-        .strip_prefix(&resolved.path)
+        .strip_prefix(repo_root)
         .with_context(|| {
             format!(
                 "Failed to resolve relative artifact path for {}",
@@ -410,7 +409,7 @@ fn finalize_candidate(
         return Ok(None);
     }
     let date_bucket = path_parts[0].clone();
-    if date_bucket == "legacy" && !config.include_legacy {
+    if date_bucket == "legacy" {
         return Ok(None);
     }
 
@@ -447,18 +446,8 @@ fn finalize_candidate(
     );
 
     let agent = derive_agent(&title, &path_parts, markdown.as_ref(), meta.as_ref());
-    if let Some(filter) = config.agent.as_ref()
-        && !contains_case_insensitive(&agent, filter)
-    {
-        return Ok(None);
-    }
 
     let status = derive_status(&lane, markdown.as_ref(), meta.as_ref());
-    if let Some(filter) = config.status.as_ref()
-        && !contains_case_insensitive(&status, filter)
-    {
-        return Ok(None);
-    }
 
     let transcript_path = meta
         .as_ref()
@@ -555,8 +544,8 @@ fn finalize_candidate(
             &relative_path,
             meta_path_string.as_deref(),
         ),
-        org: resolved.org.clone(),
-        repo: resolved.repo.clone(),
+        org: config.org.clone(),
+        repo: config.repo.clone(),
         workflow,
         lane,
         record_kind: if path_contains_segment(&path_parts, "plans") {
@@ -799,9 +788,6 @@ fn build_detail_text(
         if let Some(status) = meta.status.as_deref() {
             lines.push(format!("status: {}", status));
         }
-        if let Some(root) = meta.root.as_deref() {
-            lines.push(format!("root: {}", root));
-        }
         if let Some(run_id) = meta.run_id.as_deref() {
             lines.push(format!("run_id: {}", run_id));
         }
@@ -816,9 +802,6 @@ fn build_detail_text(
         }
         if let Some(updated_at) = meta.updated_at.as_deref() {
             lines.push(format!("updated_at: {}", updated_at));
-        }
-        if let Some(framework_version) = meta.framework_version.as_deref() {
-            lines.push(format!("framework_version: {}", framework_version));
         }
         if let Some(report) = meta.report.as_deref() {
             lines.push(format!("report: {}", report));
@@ -884,14 +867,7 @@ fn extract_headings(body: &str) -> Vec<String> {
 }
 
 fn humanize_stem(stem: &str) -> String {
-    collapse_ws(
-        &stem
-            .replace('_', " ")
-            .replace('-', " ")
-            .replace("codex", "codex")
-            .replace("claude", "claude")
-            .replace("gemini", "gemini"),
-    )
+    collapse_ws(&stem.replace(['_', '-'], " "))
 }
 
 fn agent_from_title(title: &str) -> Option<String> {
@@ -937,36 +913,18 @@ fn normalize_date_bucket(bucket: &str) -> Option<String> {
         .map(|_| iso)
 }
 
-fn parse_date_filter(raw: Option<&str>) -> Result<DateFilter> {
-    let Some(raw) = raw else {
-        return Ok(DateFilter::default());
-    };
-    if let Some((start, end)) = raw.split_once("..") {
-        return Ok(DateFilter {
-            start: parse_filter_date_token(start.trim())?,
-            end: parse_filter_date_token(end.trim())?,
-        });
+fn format_date_window(start: Option<NaiveDate>, end: Option<NaiveDate>) -> Option<String> {
+    if start.is_none() && end.is_none() {
+        return None;
     }
-
-    let exact = parse_filter_date_token(raw.trim())?;
-    Ok(DateFilter {
-        start: exact,
-        end: exact,
-    })
-}
-
-fn parse_filter_date_token(raw: &str) -> Result<Option<NaiveDate>> {
-    if raw.is_empty() {
-        return Ok(None);
-    }
-    let normalized = if raw.contains('_') {
-        normalize_date_bucket(raw).ok_or_else(|| anyhow!("Invalid date token '{}'", raw))?
-    } else {
-        raw.to_string()
-    };
-    let date = NaiveDate::parse_from_str(&normalized, "%Y-%m-%d")
-        .with_context(|| format!("Invalid date token '{}'", raw))?;
-    Ok(Some(date))
+    Some(format!(
+        "{}..{}",
+        start
+            .map(|date| date.format("%Y-%m-%d").to_string())
+            .unwrap_or_default(),
+        end.map(|date| date.format("%Y-%m-%d").to_string())
+            .unwrap_or_default()
+    ))
 }
 
 fn matches_date_filter(date_iso: &str, filter: &DateFilter) -> bool {
@@ -1907,7 +1865,7 @@ mod tests {
     }
 
     #[test]
-    fn build_reports_extractor_merges_markdown_and_meta_and_keeps_meta_only_runs() {
+    fn build_reports_explorer_merges_markdown_and_meta_and_keeps_meta_only_runs() {
         let root = tmp_dir("merge-meta");
         let repo_root = root.join("VetCoders").join("ai-contexters");
         let report_path = repo_root
@@ -1959,18 +1917,16 @@ mod tests {
 
         let config = ReportsExtractorConfig {
             artifacts_root: root.clone(),
-            org: Some("VetCoders".to_string()),
+            org: "VetCoders".to_string(),
             repo: "ai-contexters".to_string(),
-            date: Some("2026-04-11..2026-04-12".to_string()),
+            date_from: Some(NaiveDate::from_ymd_opt(2026, 4, 11).expect("date")),
+            date_to: Some(NaiveDate::from_ymd_opt(2026, 4, 12).expect("date")),
             workflow: None,
-            agent: None,
-            status: None,
-            include_legacy: false,
             title: "AICX Reports Explorer".to_string(),
             preview_chars: 120,
         };
 
-        let artifact = build_reports_extractor(&config).expect("build reports extractor");
+        let artifact = build_reports_explorer(&config).expect("build reports explorer");
         let payload: ReportsExplorerPayload =
             serde_json::from_str(&artifact.bundle_json).expect("parse bundle");
 

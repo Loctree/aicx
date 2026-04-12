@@ -2731,53 +2731,42 @@ fn run_reports_extractor(args: ReportsExtractorRunArgs) -> Result<()> {
     };
     let date_from = parse_cli_date(args.date_from.as_deref(), "--date-from")?;
     let date_to = parse_cli_date(args.date_to.as_deref(), "--date-to")?;
-    let date = match (date_from, date_to) {
-        (Some(from), Some(to)) => Some(format!(
-            "{}..{}",
-            from.format("%Y-%m-%d"),
-            to.format("%Y-%m-%d")
-        )),
-        (Some(from), None) => Some(from.format("%Y-%m-%d").to_string()),
-        (None, Some(to)) => Some(format!("..{}", to.format("%Y-%m-%d"))),
-        (None, None) => None,
-    };
+    let bundle_output = args
+        .bundle_output
+        .clone()
+        .unwrap_or_else(|| default_reports_bundle_path(&args.output));
     let config = ReportsExtractorConfig {
         artifacts_root: artifacts_root.clone(),
-        org: Some(args.org),
+        org: args.org,
         repo: repo.clone(),
-        date,
+        date_from,
+        date_to,
         workflow: args.workflow,
-        agent: None,
-        status: None,
-        include_legacy: false,
         title: args.title,
         preview_chars: args.preview_chars,
     };
 
-    let artifact = reports_extractor::build_reports_extractor(&config)?;
+    let artifact = reports_extractor::build_reports_explorer(&config)?;
     write_text_output(&args.output, &artifact.html, "report explorer HTML")?;
-    if let Some(bundle_output) = args.bundle_output.as_ref() {
-        write_text_output(
-            bundle_output,
-            &artifact.bundle_json,
-            "report explorer JSON bundle",
-        )?;
-    }
+    write_text_output(
+        &bundle_output,
+        &artifact.bundle_json,
+        "report explorer JSON bundle",
+    )?;
 
     eprintln!("✓ Vibecrafted reports extracted");
-    eprintln!("  Repo: {}/{}", config.org.as_deref().unwrap_or("*"), repo);
+    eprintln!("  Repo: {}/{}", config.org, repo);
     eprintln!("  Artifacts: {}", artifacts_root.display());
     eprintln!("  HTML: {}", args.output.display());
-    if let Some(bundle_output) = args.bundle_output {
-        eprintln!("  Bundle: {}", bundle_output.display());
-    }
+    eprintln!("  Bundle: {}", bundle_output.display());
     eprintln!(
         "  Stats: {} records, {} completed, {} incomplete, {} workflows",
         artifact.stats.total_records,
-        artifact.stats.total_completed,
-        artifact.stats.total_incomplete,
+        artifact.stats.completed_records,
+        artifact.stats.incomplete_records,
         artifact.stats.total_workflows
     );
+    println!("{}", args.output.display());
     Ok(())
 }
 
@@ -2787,8 +2776,33 @@ fn default_vibecrafted_artifacts_root() -> Result<PathBuf> {
     Ok(home.join(".vibecrafted").join("artifacts"))
 }
 
+fn default_reports_bundle_path(output: &Path) -> PathBuf {
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let stem = output
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("aicx-reports");
+    parent.join(format!("{stem}.bundle.json"))
+}
+
 fn infer_repo_name_from_cwd() -> Result<String> {
     let cwd = std::env::current_dir().context("Cannot determine current directory")?;
+    let mut probe = cwd.as_path();
+    loop {
+        if probe.join(".git").exists() {
+            let repo = probe
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Could not infer --repo from git root"))?;
+            return Ok(repo.to_string());
+        }
+        let Some(parent) = probe.parent() else {
+            break;
+        };
+        probe = parent;
+    }
+
     let repo = cwd
         .file_name()
         .and_then(|name| name.to_str())
@@ -3124,6 +3138,22 @@ mod tests {
 
         assert!(!rendered.contains("--artifact"));
         assert!(rendered.contains("Run a local dashboard server"));
+    }
+
+    #[test]
+    fn reports_extractor_help_describes_embedded_html_and_bundle() {
+        let mut cmd = Cli::command();
+        let reports = cmd
+            .find_subcommand_mut("reports-extractor")
+            .expect("reports-extractor subcommand should exist");
+        let rendered = reports.render_long_help().to_string();
+
+        assert!(rendered.contains("standalone HTML explorer"));
+        assert!(rendered.contains("~/.vibecrafted/artifacts"));
+        assert!(rendered.contains("--bundle-output"));
+        assert!(rendered.contains("--date-from"));
+        assert!(rendered.contains("--date-to"));
+        assert!(!rendered.contains("canonical store"));
     }
 
     #[test]

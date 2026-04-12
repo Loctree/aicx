@@ -12,7 +12,8 @@ two-layer pipeline — canonical corpus first, optional semantic index second:
 
 `aicx` owns the canonical corpus; memex is an optional semantic index layered on top.
 
-The pipeline exposes chunks through CLI, MCP, and dashboard search surfaces.
+The pipeline exposes chunks through CLI, MCP, dashboard search surfaces, and an
+adjacent Vibecrafted artifact explorer for workflow/marbles reports.
 
 ```mermaid
 flowchart TD
@@ -38,6 +39,7 @@ Library modules (see `src/lib.rs`):
 - `src/redact.rs`: secret redaction (regex engine)
 - `src/sanitize.rs`: path validation for reads/writes (defense against traversal)
 - `src/steer_index.rs`: fast metadata index for steering-aware retrieval
+- `src/reports_extractor.rs`: scans `~/.vibecrafted/artifacts` and renders a standalone HTML/JSON dossier for workflow and marbles artifact review
 
 Binary orchestration:
 - `src/main.rs`: clap CLI, wires flows together, handles stdout emission (`--emit`).

@@ -409,6 +409,41 @@ Example:
 aicx dashboard -o ./aicx-dashboard.html
 ```
 
+## `aicx reports-extractor`
+
+Extract Vibecrafted workflow and marbles artifacts into a standalone HTML explorer.
+
+The explorer embeds the selected report slice directly and also supports
+client-side JSON bundle import/export from inside the HTML.
+
+```bash
+aicx reports-extractor [OPTIONS]
+```
+
+Options:
+- `--artifacts-root <DIR>` override the Vibecrafted artifact root (default: `~/.vibecrafted/artifacts`)
+- `--org <ORG>` artifact organization bucket (default: `VetCoders`)
+- `--repo <REPO>` repo bucket (defaults to current directory name)
+- `--workflow <FILTER>` case-insensitive filter across workflow label, skill code, run/prompt IDs, lane, and title
+- `--date-from <YYYY-MM-DD|YYYY_MMDD>` inclusive start date
+- `--date-to <YYYY-MM-DD|YYYY_MMDD>` inclusive end date
+- `-o, --output <OUTPUT>` output HTML path (default: `aicx-reports.html`)
+- `--bundle-output <OUTPUT>` optional JSON bundle path for later import/merge
+- `--title <TITLE>` document title
+- `--preview-chars <N>` max preview characters per record (`0` = no truncation)
+
+Example:
+
+```bash
+aicx reports-extractor \
+  --repo ai-contexters \
+  --workflow marbles \
+  --date-from 2026-04-10 \
+  --date-to 2026-04-12 \
+  -o ./aicx-reports.html \
+  --bundle-output ./aicx-reports.bundle.json
+```
+
 ## `aicx dashboard-serve`
 
 Run a local dashboard server with live search and regeneration endpoints.
