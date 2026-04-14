@@ -10,7 +10,7 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-use ai_contexters::mcp::{self, McpTransport};
+use aicx::mcp::{self, McpTransport};
 use std::io::Write as _;
 use std::panic;
 use std::process::ExitCode;

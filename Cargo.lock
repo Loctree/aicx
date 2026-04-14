@@ -52,8 +52,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "ai-contexters"
-version = "0.5.8"
+name = "aicx"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
