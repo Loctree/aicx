@@ -28,17 +28,17 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use ai_contexters::dashboard::{self, DashboardConfig};
-use ai_contexters::dashboard_server::{self, DashboardServerConfig};
-use ai_contexters::intents;
-use ai_contexters::mcp::{self, McpTransport};
-use ai_contexters::memex::{self, MemexConfig, SyncProgress, SyncProgressPhase};
-use ai_contexters::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
-use ai_contexters::rank;
-use ai_contexters::reports_extractor::{self, ReportsExtractorConfig};
-use ai_contexters::sources::{self, ExtractionConfig};
-use ai_contexters::state::StateManager;
-use ai_contexters::store;
+use aicx::dashboard::{self, DashboardConfig};
+use aicx::dashboard_server::{self, DashboardServerConfig};
+use aicx::intents;
+use aicx::mcp::{self, McpTransport};
+use aicx::memex::{self, MemexConfig, SyncProgress, SyncProgressPhase};
+use aicx::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
+use aicx::rank;
+use aicx::reports_extractor::{self, ReportsExtractorConfig};
+use aicx::sources::{self, ExtractionConfig};
+use aicx::state::StateManager;
+use aicx::store;
 
 /// aicx — operator front door for agent session logs.
 ///
@@ -128,7 +128,7 @@ struct RetrievalFilters {
     #[arg(long)]
     until: Option<String>,
     #[arg(long, value_enum)]
-    frame_kind: Option<ai_contexters::types::FrameKind>,
+    frame_kind: Option<aicx::types::FrameKind>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1172,7 +1172,7 @@ fn main() -> Result<()> {
             legacy_root,
             store_root,
         }) => {
-            ai_contexters::store::run_migration_with_paths(dry_run, legacy_root, store_root)?;
+            aicx::store::run_migration_with_paths(dry_run, legacy_root, store_root)?;
         }
         None => {
             Cli::command().print_help()?;
@@ -1446,7 +1446,7 @@ fn run_extract_file(
     // Apply secret redaction in-place (TimelineEntry is now single definition in sources)
     if redact_secrets {
         for e in &mut entries {
-            e.message = ai_contexters::redact::redact_secrets(&e.message);
+            e.message = aicx::redact::redact_secrets(&e.message);
         }
     }
     // Collect derived data from entries before moving them.
@@ -1833,7 +1833,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
 
     // Filter self-echo (aicx's own search/rank/store calls that create feedback loops)
     let pre_echo = entries.len();
-    entries.retain(|e| !ai_contexters::sanitize::is_self_echo(&e.message));
+    entries.retain(|e| !aicx::sanitize::is_self_echo(&e.message));
     let echo_filtered = pre_echo - entries.len();
     if echo_filtered > 0 {
         eprintln!("  Filtered {echo_filtered} self-echo entries");
@@ -1842,7 +1842,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     // Apply secret redaction in-place (TimelineEntry is now single definition in sources)
     if redact_secrets {
         for e in &mut entries {
-            e.message = ai_contexters::redact::redact_secrets(&e.message);
+            e.message = aicx::redact::redact_secrets(&e.message);
         }
     }
     // Collect derived data from entries before moving them.
@@ -1864,7 +1864,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         sessions,
     };
 
-    let chunker_config = ai_contexters::chunker::ChunkerConfig::default();
+    let chunker_config = aicx::chunker::ChunkerConfig::default();
     let mut all_written_paths: Vec<std::path::PathBuf> = Vec::new();
     let mut scope_surface = StoreScopeSurface::empty(&project);
 
@@ -1877,7 +1877,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         // Update fast local metadata index
         if let Ok(rt) = tokio::runtime::Runtime::new() {
             let path_refs: Vec<&PathBuf> = newly_written_paths.iter().collect();
-            if let Err(e) = rt.block_on(ai_contexters::steer_index::sync_steer_index(&path_refs)) {
+            if let Err(e) = rt.block_on(aicx::steer_index::sync_steer_index(&path_refs)) {
                 eprintln!("⚠ steer index sync failed (search may be stale): {e}");
             }
         }
@@ -2133,7 +2133,7 @@ fn run_store(
 
     // Filter self-echo (prevents feedback loops from aicx's own tool calls)
     let pre_echo = all_entries.len();
-    all_entries.retain(|e| !ai_contexters::sanitize::is_self_echo(&e.message));
+    all_entries.retain(|e| !aicx::sanitize::is_self_echo(&e.message));
     let echo_filtered = pre_echo - all_entries.len();
     if echo_filtered > 0 {
         eprintln!("  Filtered {echo_filtered} self-echo entries");
@@ -2147,10 +2147,10 @@ fn run_store(
     // Apply redaction in-place (single TimelineEntry type)
     if redact_secrets {
         for e in &mut all_entries {
-            e.message = ai_contexters::redact::redact_secrets(&e.message);
+            e.message = aicx::redact::redact_secrets(&e.message);
         }
     }
-    let chunker_config = ai_contexters::chunker::ChunkerConfig::default();
+    let chunker_config = aicx::chunker::ChunkerConfig::default();
     let stderr_is_tty = io::stderr().is_terminal();
     let mut progress_width = 0usize;
     let store_result = if stderr_is_tty {
@@ -2180,7 +2180,7 @@ fn run_store(
     // Update fast local metadata index
     if let Ok(rt) = tokio::runtime::Runtime::new() {
         let path_refs: Vec<&PathBuf> = all_written_paths.iter().collect();
-        if let Err(e) = rt.block_on(ai_contexters::steer_index::sync_steer_index(&path_refs)) {
+        if let Err(e) = rt.block_on(aicx::steer_index::sync_steer_index(&path_refs)) {
             eprintln!("⚠ steer index sync failed (search may be stale): {e}");
         }
     }
@@ -2240,7 +2240,7 @@ fn is_noise_artifact(path: &std::path::Path) -> bool {
     if !path.is_file() || path.extension().is_none_or(|ext| ext != "md") {
         return false;
     }
-    let Ok(content) = ai_contexters::sanitize::read_to_string_validated(path) else {
+    let Ok(content) = aicx::sanitize::read_to_string_validated(path) else {
         return false;
     };
 
@@ -2578,7 +2578,7 @@ fn run_steer(
         (filters.since.clone(), filters.until.clone())
     };
 
-    let mut metadatas = rt.block_on(ai_contexters::steer_index::search_steer_index(
+    let mut metadatas = rt.block_on(aicx::steer_index::search_steer_index(
         run_id,
         prompt_id,
         filters.agent.as_deref(),
@@ -3003,12 +3003,12 @@ fn run_dashboard(args: DashboardRunArgs) -> Result<()> {
 
     let artifact = dashboard::build_dashboard(&config)?;
 
-    let mut output_path = ai_contexters::sanitize::validate_write_path(&args.output)?;
+    let mut output_path = aicx::sanitize::validate_write_path(&args.output)?;
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create output directory: {}", parent.display()))?;
     }
-    output_path = ai_contexters::sanitize::validate_write_path(&output_path)?;
+    output_path = aicx::sanitize::validate_write_path(&output_path)?;
     fs::write(&output_path, artifact.html)
         .with_context(|| format!("Failed to write dashboard: {}", output_path.display()))?;
 
@@ -3163,12 +3163,12 @@ fn parse_cli_date(value: Option<&str>, flag_name: &str) -> Result<Option<NaiveDa
 }
 
 fn write_text_output(path: &Path, content: &str, label: &str) -> Result<()> {
-    let mut validated = ai_contexters::sanitize::validate_write_path(path)?;
+    let mut validated = aicx::sanitize::validate_write_path(path)?;
     if let Some(parent) = validated.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create output directory: {}", parent.display()))?;
     }
-    validated = ai_contexters::sanitize::validate_write_path(&validated)?;
+    validated = aicx::sanitize::validate_write_path(&validated)?;
     fs::write(&validated, content)
         .with_context(|| format!("Failed to write {}: {}", label, validated.display()))
 }
@@ -3357,7 +3357,7 @@ mod tests {
             Some(Commands::Search { filters, .. }) => {
                 assert_eq!(
                     filters.frame_kind,
-                    Some(ai_contexters::types::FrameKind::InternalThought)
+                    Some(aicx::types::FrameKind::InternalThought)
                 );
             }
             _ => panic!("expected search command"),
@@ -3371,7 +3371,7 @@ mod tests {
 
         match cli.command {
             Some(Commands::Steer { filters, .. }) => {
-                assert_eq!(filters.frame_kind, Some(ai_contexters::types::FrameKind::UserMsg));
+                assert_eq!(filters.frame_kind, Some(aicx::types::FrameKind::UserMsg));
             }
             _ => panic!("expected steer command"),
         }
@@ -3391,7 +3391,7 @@ mod tests {
 
         match cli.command {
             Some(Commands::Intents { filters, .. }) => {
-                assert_eq!(filters.frame_kind, Some(ai_contexters::types::FrameKind::ToolCall));
+                assert_eq!(filters.frame_kind, Some(aicx::types::FrameKind::ToolCall));
             }
             _ => panic!("expected intents command"),
         }

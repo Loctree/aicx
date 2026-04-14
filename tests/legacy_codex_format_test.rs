@@ -1,4 +1,4 @@
-use ai_contexters::sources::{ExtractionConfig, extract_codex_file};
+use aicx::sources::{ExtractionConfig, extract_codex_file};
 use chrono::Utc;
 use std::fs;
 
