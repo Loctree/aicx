@@ -2,6 +2,8 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
+use clap::ValueEnum;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -48,6 +50,52 @@ impl Kind {
 impl fmt::Display for Kind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.dir_name())
+    }
+}
+
+/// Canonical stream/frame classification for a timeline entry or stored chunk.
+///
+/// This axis is intentionally orthogonal to `role`: source formats drift in how
+/// they spell assistant reasoning or tool payloads, but downstream retrieval
+/// needs one stable vocabulary for "which channel is this?".
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ValueEnum, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum FrameKind {
+    UserMsg,
+    AgentReply,
+    InternalThought,
+    ToolCall,
+}
+
+impl FrameKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserMsg => "user_msg",
+            Self::AgentReply => "agent_reply",
+            Self::InternalThought => "internal_thought",
+            Self::ToolCall => "tool_call",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "user_msg" | "user" => Some(Self::UserMsg),
+            "agent_reply" | "assistant" | "reply" => Some(Self::AgentReply),
+            "internal_thought" | "thought" | "thinking" | "reasoning" => {
+                Some(Self::InternalThought)
+            }
+            "tool_call" | "tool" | "tool_result" | "function_call" => Some(Self::ToolCall),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for FrameKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

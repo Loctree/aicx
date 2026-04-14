@@ -1,6 +1,6 @@
 [package]
 name = "ai-contexters"
-version = "0.5.7"
+version = "0.5.8"
 edition = "2024"
 rust-version = "1.88"
 description = "Operator CLI + MCP server: canonical corpus first, optional semantic index second (Claude Code, Codex, Gemini)"
@@ -36,6 +36,7 @@ libc = "0.2.183"
 # Remote integration boundary: consume the published crate instead of any local workspace checkout
 # or path patching. ai-contexters uses the library surface from crates.io here.
 rmcp-memex = { version = "0.5.0", default-features = false }
+schemars = "1.2.1"
 
 [dev-dependencies]
 filetime = "0.2"

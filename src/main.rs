@@ -106,6 +106,29 @@ enum ExtractInputFormat {
     Junie,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+enum SortOrder {
+    Newest,
+    Oldest,
+    Score,
+}
+
+#[derive(Debug, Args, Clone)]
+struct RetrievalFilters {
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
+    #[arg(long, value_enum)]
+    sort: Option<SortOrder>,
+    #[arg(long)]
+    score: Option<u8>,
+    #[arg(long)]
+    agent: Option<String>,
+    #[arg(long)]
+    since: Option<String>,
+    #[arg(long)]
+    until: Option<String>,
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     // ── Layer 1: Canonical corpus ─────────────────────────────────────
@@ -566,8 +589,12 @@ enum Commands {
         host: String,
 
         /// Bind TCP port
-        #[arg(long, default_value = "8033")]
+        #[arg(long, default_value = "9478")]
         port: u16,
+
+        /// Suppress automatic browser open on startup
+        #[arg(long)]
+        no_open: bool,
 
         /// Legacy compatibility path retained for status surfaces; not written in server mode
         #[arg(long, default_value = "aicx-dashboard.html", hide = true)]
@@ -705,13 +732,8 @@ enum Commands {
         #[arg(short, long)]
         date: Option<String>,
 
-        /// Maximum results to return
-        #[arg(short, long, default_value = "10")]
-        limit: usize,
-
-        /// Minimum score threshold (0-100)
-        #[arg(short, long, value_parser = clap::value_parser!(u8).range(0..=100))]
-        score: Option<u8>,
+        #[command(flatten)]
+        filters: RetrievalFilters,
 
         /// Emit compact JSON instead of plain text
         #[arg(short = 'j', long)]
@@ -736,10 +758,6 @@ enum Commands {
         #[arg(long)]
         prompt_id: Option<String>,
 
-        /// Filter by agent: claude, codex, gemini
-        #[arg(short, long)]
-        agent: Option<String>,
-
         /// Filter by kind: conversations, plans, reports, other
         #[arg(short, long)]
         kind: Option<String>,
@@ -753,9 +771,8 @@ enum Commands {
         #[arg(short, long)]
         date: Option<String>,
 
-        /// Maximum results
-        #[arg(short, long, default_value = "20")]
-        limit: usize,
+        #[command(flatten)]
+        filters: RetrievalFilters,
     },
 
     /// Migrate legacy ~/.ai-contexters/ data into the canonical AICX store.
@@ -1032,6 +1049,7 @@ fn main() -> Result<()> {
             store_root,
             host,
             port,
+            no_open,
             artifact,
             title,
             preview_chars,
@@ -1040,6 +1058,7 @@ fn main() -> Result<()> {
                 store_root,
                 host,
                 port,
+                no_open,
                 artifact,
                 title,
                 preview_chars,
@@ -1048,11 +1067,32 @@ fn main() -> Result<()> {
         Some(Commands::Intents {
             project,
             hours,
+            filters,
+            unresolved,
+            collapse_session,
             emit,
             strict,
             kind,
         }) => {
-            run_intents(&project, hours, &emit, strict, kind.as_deref())?;
+            run_intents(
+                &project,
+                hours,
+                &emit,
+                strict,
+                kind.as_deref(),
+                filters,
+                unresolved,
+                collapse_session,
+            )?;
+        }
+        Some(Commands::Tail {
+            project,
+            hours,
+            follow,
+            kind,
+            filters,
+        }) => {
+            run_tail(&project, hours, follow, kind.as_deref(), filters)?;
         }
         Some(Commands::Serve { transport, port }) => {
             let rt = tokio::runtime::Runtime::new()?;
@@ -1063,8 +1103,7 @@ fn main() -> Result<()> {
             project,
             hours,
             date,
-            limit,
-            score,
+            filters,
             json,
         }) => {
             run_search(
@@ -1072,28 +1111,25 @@ fn main() -> Result<()> {
                 project.as_deref(),
                 hours,
                 date.as_deref(),
-                limit,
-                score,
                 json,
+                filters,
             )?;
         }
         Some(Commands::Steer {
             run_id,
             prompt_id,
-            agent,
             kind,
             project,
             date,
-            limit,
+            filters,
         }) => {
             run_steer(
                 run_id.as_deref(),
                 prompt_id.as_deref(),
-                agent.as_deref(),
                 kind.as_deref(),
                 project.as_deref(),
                 date.as_deref(),
-                limit,
+                filters,
             )?;
         }
         Some(Commands::Migrate {
@@ -1117,6 +1153,9 @@ fn run_intents(
     emit: &str,
     strict: bool,
     kind: Option<&str>,
+    filters: RetrievalFilters,
+    unresolved: bool,
+    collapse_session: bool,
 ) -> Result<()> {
     let kind_filter = kind.map(|k| match k {
         "decision" => intents::IntentKind::Decision,
@@ -1133,7 +1172,78 @@ fn run_intents(
         kind_filter,
     };
 
-    let records = intents::extract_intents(&config)?;
+    let mut records = intents::extract_intents(&config)?;
+
+    if unresolved {
+        use std::collections::HashSet;
+        let mut resolved_sessions = HashSet::new();
+        for rec in &records {
+            if rec.kind == intents::IntentKind::Outcome {
+                resolved_sessions.insert(rec.session_id.clone());
+            }
+        }
+        records.retain(|r| {
+            r.kind != intents::IntentKind::Intent || !resolved_sessions.contains(&r.session_id)
+        });
+    }
+
+    if collapse_session {
+        use std::collections::HashMap;
+        let mut map = HashMap::new();
+        let mut order = Vec::new();
+        for rec in records {
+            let key = rec.session_id.clone();
+            if !map.contains_key(&key) {
+                order.push(key.clone());
+                let mut clone = rec.clone();
+                clone.count = Some(1);
+                map.insert(key, clone);
+            } else {
+                let existing = map.get_mut(&key).unwrap();
+                *existing.count.as_mut().unwrap() += 1;
+                if !existing.evidence.contains(&rec.summary) {
+                    existing.evidence.push(rec.summary);
+                }
+                if !existing.source_chunk.contains(&rec.source_chunk) {
+                    existing.source_chunk =
+                        format!("{}, {}", existing.source_chunk, rec.source_chunk);
+                }
+            }
+        }
+        records = order.into_iter().filter_map(|k| map.remove(&k)).collect();
+    }
+
+    if let Some(agent_filter) = &filters.agent {
+        records.retain(|r| r.agent == *agent_filter);
+    }
+
+    let (lo, hi) = if let Some(ref d) = filters.since {
+        let bounds = parse_date_filter(d)?;
+        (bounds.0, bounds.1)
+    } else {
+        (None, filters.until.clone())
+    };
+
+    if lo.is_some() || hi.is_some() {
+        records.retain(|r| {
+            lo.as_ref().is_none_or(|lo| r.date.as_str() >= lo.as_str())
+                && hi.as_ref().is_none_or(|hi| r.date.as_str() <= hi.as_str())
+        });
+    }
+
+    if let Some(sort_order) = filters.sort {
+        records.sort_by(|a, b| {
+            let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
+            let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
+            match sort_order {
+                SortOrder::Newest => t_b.cmp(t_a),
+                SortOrder::Oldest => t_a.cmp(t_b),
+                SortOrder::Score => std::cmp::Ordering::Equal, // Not supported
+            }
+        });
+    }
+
+    records.truncate(filters.limit);
 
     if records.is_empty() {
         eprintln!(
@@ -1155,6 +1265,107 @@ fn run_intents(
     }
 
     Ok(())
+}
+
+fn run_tail(
+    project: &str,
+    hours: u64,
+    follow: bool,
+    kind: Option<&str>,
+    mut filters: RetrievalFilters,
+) -> Result<()> {
+    if !follow {
+        // One-shot mode
+        if filters.limit == 10 {
+            filters.limit = 20; // default 20 for tail
+        }
+        filters.sort = Some(SortOrder::Newest);
+        return run_intents(
+            project, hours, "markdown", false, kind, filters, false, false,
+        );
+    }
+
+    let kind_filter = kind.map(|k| match k {
+        "decision" => intents::IntentKind::Decision,
+        "intent" => intents::IntentKind::Intent,
+        "outcome" => intents::IntentKind::Outcome,
+        "task" => intents::IntentKind::Task,
+        _ => unreachable!("clap validates this"),
+    });
+
+    let mut config = intents::IntentsConfig {
+        project: project.to_string(),
+        hours,
+        strict: false,
+        kind_filter,
+    };
+
+    let mut last_seen = std::collections::HashSet::new();
+    eprintln!("Watching for new intents in project '{}'...", project);
+
+    loop {
+        if let Ok(mut records) = intents::extract_intents(&config) {
+            // Apply filtering identical to run_intents
+            if let Some(agent_filter) = &filters.agent {
+                records.retain(|r| r.agent == *agent_filter);
+            }
+            let (lo, hi) = if let Some(ref d) = filters.since {
+                (
+                    parse_date_filter(d).ok().and_then(|b| b.0),
+                    parse_date_filter(d).ok().and_then(|b| b.1),
+                )
+            } else {
+                (None, filters.until.clone())
+            };
+            if lo.is_some() || hi.is_some() {
+                records.retain(|r| {
+                    lo.as_ref().is_none_or(|lo| r.date.as_str() >= lo.as_str())
+                        && hi.as_ref().is_none_or(|hi| r.date.as_str() <= hi.as_str())
+                });
+            }
+
+            records.sort_by(|a, b| {
+                let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
+                let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
+                t_a.cmp(t_b) // Oldest to newest for streaming
+            });
+
+            let mut new_records = Vec::new();
+            for rec in records {
+                let key = format!(
+                    "{}|{}|{}|{}",
+                    rec.source_chunk,
+                    rec.timestamp.as_deref().unwrap_or(""),
+                    rec.summary,
+                    rec.agent
+                );
+                if last_seen.insert(key) {
+                    new_records.push(rec);
+                }
+            }
+
+            if !new_records.is_empty() {
+                for rec in new_records {
+                    let mut out = String::new();
+                    out.push_str(&format!("### {} | {}\n", rec.kind.heading(), rec.agent));
+                    out.push_str(&format!("{}: {}\n", rec.kind.heading(), rec.summary));
+                    out.push_str(&format!(
+                        "WHY: {}\n",
+                        rec.context.as_deref().unwrap_or("not captured")
+                    ));
+                    out.push_str("EVIDENCE:\n");
+                    out.push_str(&format!("- source_chunk: {}\n", rec.source_chunk));
+                    for evidence in &rec.evidence {
+                        out.push_str(&format!("- {}\n", evidence));
+                    }
+                    println!("{}\n", out);
+                }
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        config.hours = 1; // shrink window after first pass
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2167,9 +2378,8 @@ fn run_search(
     project: Option<&str>,
     hours: u64,
     date: Option<&str>,
-    limit: usize,
-    score: Option<u8>,
     json: bool,
+    filters: RetrievalFilters,
 ) -> Result<()> {
     // Extract inline date hints from query if no explicit --date given
     let (effective_query, inline_date) = if date.is_none() {
@@ -2189,10 +2399,15 @@ fn run_search(
 
     let root = store::store_base_dir()?;
     // Fetch more results pre-filter so score/date/hours filtering has material to work with.
-    let fetch_limit = if effective_date.is_some() || score.is_some() || hours > 0 {
-        limit.saturating_mul(5).max(50)
+    let fetch_limit = if effective_date.is_some()
+        || filters.score.is_some()
+        || hours > 0
+        || filters.since.is_some()
+        || filters.until.is_some()
+    {
+        filters.limit.saturating_mul(5).max(50)
     } else {
-        limit
+        filters.limit
     };
 
     // Try fast search with rmcp_memex first (instant), fallback to brute-force if it fails or returns nothing
@@ -2212,13 +2427,22 @@ fn run_search(
 
     let mut results = results;
 
-    if let Some(min_score) = score {
+    if let Some(min_score) = filters.score {
         results.retain(|r| r.score >= min_score);
+    }
+    if let Some(agent_filter) = &filters.agent {
+        results.retain(|r| r.agent == *agent_filter);
     }
 
     // Apply date filter (day granularity) — takes priority over hours.
-    let results: Vec<_> = if let Some(ref d) = effective_date {
-        let (lo, hi) = parse_date_filter(d)?;
+    let (lo, hi) = if let Some(ref d) = effective_date {
+        let bounds = parse_date_filter(d)?;
+        (bounds.0, bounds.1)
+    } else {
+        (filters.since.clone(), filters.until.clone())
+    };
+
+    let mut results: Vec<_> = if lo.is_some() || hi.is_some() {
         results
             .into_iter()
             .filter(|r| {
@@ -2236,8 +2460,24 @@ fn run_search(
     } else {
         results
     };
+
+    if let Some(sort_order) = filters.sort {
+        results.sort_by(|a, b| {
+            let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
+            let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
+            match sort_order {
+                SortOrder::Newest => t_b.cmp(t_a),
+                SortOrder::Oldest => t_a.cmp(t_b),
+                SortOrder::Score => b.score.cmp(&a.score).then(t_b.cmp(t_a)),
+            }
+        });
+    } else {
+        // default sort
+        results.sort_by(|a, b| b.score.cmp(&a.score));
+    }
+
     // Truncate to requested limit after date filtering
-    let results: Vec<_> = results.into_iter().take(limit).collect();
+    let results: Vec<_> = results.into_iter().take(filters.limit).collect();
 
     if json {
         println!("{}", rank::render_search_json(&results, scanned)?);
@@ -2269,31 +2509,51 @@ fn run_search(
 fn run_steer(
     run_id: Option<&str>,
     prompt_id: Option<&str>,
-    agent: Option<&str>,
     kind: Option<&str>,
     project: Option<&str>,
     date: Option<&str>,
-    limit: usize,
+    filters: RetrievalFilters,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
-    let (date_lo, date_hi) = if let Some(d) = date {
+    let effective_date = date;
+    let (date_lo, date_hi) = if let Some(d) = effective_date {
         let bounds = parse_date_filter(d)?;
         (bounds.0, bounds.1)
     } else {
-        (None, None)
+        (filters.since.clone(), filters.until.clone())
     };
 
-    let metadatas = rt.block_on(ai_contexters::steer_index::search_steer_index(
+    let mut metadatas = rt.block_on(ai_contexters::steer_index::search_steer_index(
         run_id,
         prompt_id,
-        agent,
+        filters.agent.as_deref(),
         kind,
         project,
         date_lo.as_deref(),
         date_hi.as_deref(),
-        limit,
+        filters.limit,
     ))?;
+
+    if let Some(sort_order) = filters.sort {
+        metadatas.sort_by(|a, b| {
+            let t_a = a
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .or_else(|| a.get("date").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            let t_b = b
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .or_else(|| b.get("date").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            match sort_order {
+                SortOrder::Newest => t_b.cmp(t_a),
+                SortOrder::Oldest => t_a.cmp(t_b),
+                SortOrder::Score => std::cmp::Ordering::Equal, // steer_index has no score natively, ignore
+            }
+        });
+    }
 
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
@@ -2608,6 +2868,7 @@ struct DashboardServerRunArgs {
     store_root: Option<PathBuf>,
     host: String,
     port: u16,
+    no_open: bool,
     artifact: PathBuf,
     title: String,
     preview_chars: usize,
@@ -2642,6 +2903,18 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
         host,
         port: args.port,
     };
+
+    if !args.no_open {
+        let url = format!("http://{}:{}", host, args.port);
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg(&url).spawn();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+        }
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
