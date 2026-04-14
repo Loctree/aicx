@@ -2159,20 +2159,13 @@ mod tests {
         assert!(html.contains("mark.hl-fuzzy"));
         assert!(html.contains("const escapeRegex = (s) =>"));
         assert!(html.contains("const highlightTerms = (text, query) => {"));
-        assert!(
-            html.contains("ui.detailTitle.innerHTML = highlightTerms(detailTitle, state.query);")
-        );
-        assert!(
-            html.contains("ui.detailMeta.innerHTML = highlightTerms(detailMeta, state.query);")
-        );
-        assert!(
-            html.contains("ui.detailPath.innerHTML = highlightTerms(detailPath, state.query);")
-        );
+        assert!(html.contains("ui.detailTitle.innerHTML = highlightTerms(title, state.query);"));
+        assert!(html.contains("ui.detailMeta.innerHTML = highlightTerms(meta, state.query);"));
         assert!(html.contains("n.innerHTML = highlightTerms(String(txt || ''), state.query);"));
         assert!(html.contains("name.innerHTML = highlightTerms(fname, state.query);"));
         assert!(html.contains(".result-preview {"));
         assert!(html.contains("preview.className = 'result-preview';"));
-        assert!(html.contains("preview.innerHTML = highlightTerms(previewText, state.query);"));
+        assert!(html.contains("preview.innerHTML = highlightTerms(truncated, state.query);"));
     }
 
     #[test]

@@ -17,6 +17,7 @@ use crate::chunker::{
 };
 use crate::sanitize;
 use crate::store;
+use crate::types::FrameKind;
 
 const STRICT_CONFIDENCE: u8 = 3;
 
@@ -30,7 +31,7 @@ pub enum IntentKind {
 }
 
 impl IntentKind {
-    fn heading(self) -> &'static str {
+    pub fn heading(self) -> &'static str {
         match self {
             Self::Decision => "DECISION",
             Self::Intent => "INTENT",
@@ -59,15 +60,18 @@ pub struct IntentRecord {
     pub project: String,
     pub agent: String,
     pub date: String,
+    pub timestamp: Option<String>,
+    pub session_id: String,
+    pub count: Option<usize>,
     pub source_chunk: String,
 }
-
 #[derive(Debug, Clone)]
 pub struct IntentsConfig {
     pub project: String,
     pub hours: u64,
     pub strict: bool,
     pub kind_filter: Option<IntentKind>,
+    pub frame_kind: Option<crate::types::FrameKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +81,7 @@ struct StoredChunkFile {
     path: PathBuf,
     sequence: u32,
     timestamp: DateTime<Utc>,
+    session_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -174,7 +179,7 @@ fn extract_intents_from_root_at(
 ) -> Result<Vec<IntentRecord>> {
     let cutoff_hours = config.hours.min(i64::MAX as u64) as i64;
     let cutoff = now - Duration::hours(cutoff_hours);
-    let files = collect_chunk_files(store_root, &config.project, cutoff)?;
+    let files = collect_chunk_files(store_root, &config.project, cutoff, config.frame_kind)?;
 
     let mut candidates = Vec::new();
     let mut task_events = Vec::new();
@@ -221,6 +226,7 @@ fn collect_chunk_files(
     store_root: &Path,
     project: &str,
     cutoff: DateTime<Utc>,
+    frame_kind: Option<FrameKind>,
 ) -> Result<Vec<StoredChunkFile>> {
     let mut files = Vec::new();
 
@@ -234,6 +240,14 @@ fn collect_chunk_files(
             .contains(&project.to_ascii_lowercase())
         {
             continue;
+        }
+        if let Some(expected) = frame_kind {
+            let matches_frame = store::load_sidecar(&file.path)
+                .and_then(|sidecar| sidecar.frame_kind)
+                .is_some_and(|kind| kind == expected);
+            if !matches_frame {
+                continue;
+            }
         }
 
         let timestamp = file
@@ -260,6 +274,7 @@ fn collect_chunk_files(
             path: file.path,
             sequence: file.chunk,
             timestamp,
+            session_id: file.session_id,
         });
     }
 
@@ -576,7 +591,10 @@ fn build_candidate(
             project: project.to_string(),
             agent: file.agent.clone(),
             date: file.date.clone(),
+            session_id: file.session_id.clone(),
+            count: None,
             source_chunk: source_chunk.to_string(),
+            timestamp: Some(file.timestamp.to_rfc3339()),
         },
         confidence,
         timestamp: file.timestamp,
@@ -953,8 +971,9 @@ fn push_unique(target: &mut Vec<String>, value: String) {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
 
-    fn write_chunk(root: &Path, project: &str, date: &str, name: &str, body: &str) {
+    fn chunk_path(root: &Path, project: &str, date: &str, name: &str) -> PathBuf {
         let date_compact = crate::store::compact_date(date);
         let agent = if name.contains("_claude") || name.contains("claude") {
             "claude"
@@ -977,7 +996,60 @@ mod tests {
             .join("conversations")
             .join(agent);
         fs::create_dir_all(&dir).expect("create chunk dir");
-        fs::write(dir.join(basename), body).expect("write chunk");
+        dir.join(basename)
+    }
+
+    fn write_chunk(root: &Path, project: &str, date: &str, name: &str, body: &str) {
+        let path = chunk_path(root, project, date, name);
+        fs::write(path, body).expect("write chunk");
+    }
+
+    fn write_chunk_with_sidecar(
+        root: &Path,
+        project: &str,
+        date: &str,
+        name: &str,
+        body: &str,
+        frame_kind: Option<FrameKind>,
+    ) {
+        let path = chunk_path(root, project, date, name);
+        fs::write(&path, body).expect("write chunk");
+        let sidecar = crate::chunker::ChunkMetadataSidecar {
+            id: path
+                .file_stem()
+                .expect("chunk file stem")
+                .to_string_lossy()
+                .to_string(),
+            project: format!("local/{project}"),
+            agent: if name.contains("_claude") || name.contains("claude") {
+                "claude".to_string()
+            } else if name.contains("_gemini") || name.contains("gemini") {
+                "gemini".to_string()
+            } else {
+                "codex".to_string()
+            },
+            date: date.to_string(),
+            session_id: "intentstest01".to_string(),
+            cwd: None,
+            kind: crate::store::Kind::Conversations,
+            run_id: None,
+            prompt_id: None,
+            frame_kind,
+            agent_model: None,
+            started_at: None,
+            completed_at: None,
+            token_usage: None,
+            findings_count: None,
+            workflow_phase: None,
+            mode: None,
+            skill_code: None,
+            framework_version: None,
+        };
+        fs::write(
+            path.with_extension("meta.json"),
+            serde_json::to_vec_pretty(&sidecar).expect("serialize sidecar"),
+        )
+        .expect("write sidecar");
     }
 
     #[test]
@@ -1028,6 +1100,7 @@ RED LIGHT: checklist detected (open: 0, done: 1)
             hours: 24,
             strict: false,
             kind_filter: None,
+            frame_kind: None,
         };
         let now = DateTime::<Utc>::from_naive_utc_and_offset(
             NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -1081,6 +1154,7 @@ commit abcdef1 proves the old path was wrong.
             hours: 48,
             strict: false,
             kind_filter: None,
+            frame_kind: None,
         };
         let now = DateTime::<Utc>::from_naive_utc_and_offset(
             NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -1138,6 +1212,7 @@ commit abcdef1 proves the old path was wrong.
             hours: 24,
             strict: true,
             kind_filter: None,
+            frame_kind: None,
         };
         let now = DateTime::<Utc>::from_naive_utc_and_offset(
             NaiveDate::from_ymd_opt(2026, 3, 15)
@@ -1152,6 +1227,54 @@ commit abcdef1 proves the old path was wrong.
     }
 
     #[test]
+    fn frame_kind_filter_keeps_only_matching_chunks() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ai-contexters-intents-{}-frame-kind",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+
+        write_chunk_with_sidecar(
+            &tmp,
+            "demo",
+            "2026-03-15",
+            "120000_codex-001.md",
+            "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:00:00] user: Let's keep only user intent truth.\n",
+            Some(FrameKind::UserMsg),
+        );
+        write_chunk_with_sidecar(
+            &tmp,
+            "demo",
+            "2026-03-15",
+            "120100_codex-002.md",
+            "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:01:00] assistant: decision: assistant-only steering\n",
+            Some(FrameKind::AgentReply),
+        );
+
+        let config = IntentsConfig {
+            project: "demo".to_string(),
+            hours: 24,
+            strict: false,
+            kind_filter: None,
+            frame_kind: Some(FrameKind::UserMsg),
+        };
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 3, 15)
+                .expect("date")
+                .and_hms_opt(13, 0, 0)
+                .expect("time"),
+            Utc,
+        );
+
+        let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, IntentKind::Intent);
+        assert_eq!(records[0].summary, "Let's keep only user intent truth.");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn formats_markdown_with_required_sections() {
         let records = vec![IntentRecord {
             kind: IntentKind::Decision,
@@ -1161,6 +1284,9 @@ commit abcdef1 proves the old path was wrong.
             project: "demo".to_string(),
             agent: "codex".to_string(),
             date: "2026-03-15".to_string(),
+            timestamp: None,
+            session_id: "test".to_string(),
+            count: None,
             source_chunk: "/tmp/demo/2026-03-15/120000_codex-001.md".to_string(),
         }];
 
@@ -1181,6 +1307,9 @@ commit abcdef1 proves the old path was wrong.
             project: "demo".to_string(),
             agent: "claude".to_string(),
             date: "2026-03-15".to_string(),
+            timestamp: None,
+            session_id: "test".to_string(),
+            count: None,
             source_chunk: "/tmp/demo/2026-03-15/120500_claude-002.md".to_string(),
         }];
 

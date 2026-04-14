@@ -127,6 +127,8 @@ struct RetrievalFilters {
     since: Option<String>,
     #[arg(long)]
     until: Option<String>,
+    #[arg(long, value_enum)]
+    frame_kind: Option<ai_contexters::types::FrameKind>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -619,6 +621,17 @@ enum Commands {
         #[arg(short = 'H', long, default_value = "720")]
         hours: u64,
 
+        #[command(flatten)]
+        filters: RetrievalFilters,
+
+        /// Return only intent entries without a matching outcome within the same session
+        #[arg(long)]
+        unresolved: bool,
+
+        /// Collapse multiple intents from the same session into one entry
+        #[arg(long)]
+        collapse_session: bool,
+
         /// Output format: markdown or json
         #[arg(long, default_value = "markdown", value_parser = ["markdown", "json"])]
         emit: String,
@@ -630,6 +643,28 @@ enum Commands {
         /// Filter by kind: decision, intent, outcome, task
         #[arg(long, value_parser = ["decision", "intent", "outcome", "task"])]
         kind: Option<String>,
+    },
+
+    /// Stream newly-arriving intents/chunks in a follow-like mode.
+    Tail {
+        /// Project filter (required)
+        #[arg(short, long)]
+        project: String,
+
+        /// Hours to look back (default: 48)
+        #[arg(short = 'H', long, default_value = "48")]
+        hours: u64,
+
+        /// Subscribe to filesystem events and stream new entries
+        #[arg(long)]
+        follow: bool,
+
+        /// Filter by kind: decision, intent, outcome, task
+        #[arg(short, long)]
+        kind: Option<String>,
+
+        #[command(flatten)]
+        filters: RetrievalFilters,
     },
 
     /// Run aicx as an MCP server (stdio or streamable HTTP).
@@ -1147,6 +1182,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_intents(
     project: &str,
     hours: u64,
@@ -1170,6 +1206,7 @@ fn run_intents(
         hours,
         strict,
         kind_filter,
+        frame_kind: filters.frame_kind,
     };
 
     let mut records = intents::extract_intents(&config)?;
@@ -1193,20 +1230,23 @@ fn run_intents(
         let mut order = Vec::new();
         for rec in records {
             let key = rec.session_id.clone();
-            if !map.contains_key(&key) {
-                order.push(key.clone());
-                let mut clone = rec.clone();
-                clone.count = Some(1);
-                map.insert(key, clone);
-            } else {
-                let existing = map.get_mut(&key).unwrap();
-                *existing.count.as_mut().unwrap() += 1;
-                if !existing.evidence.contains(&rec.summary) {
-                    existing.evidence.push(rec.summary);
+            match map.entry(key.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    order.push(key);
+                    let mut clone = rec.clone();
+                    clone.count = Some(1);
+                    entry.insert(clone);
                 }
-                if !existing.source_chunk.contains(&rec.source_chunk) {
-                    existing.source_chunk =
-                        format!("{}, {}", existing.source_chunk, rec.source_chunk);
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let existing = entry.get_mut();
+                    *existing.count.as_mut().unwrap() += 1;
+                    if !existing.evidence.contains(&rec.summary) {
+                        existing.evidence.push(rec.summary);
+                    }
+                    if !existing.source_chunk.contains(&rec.source_chunk) {
+                        existing.source_chunk =
+                            format!("{}, {}", existing.source_chunk, rec.source_chunk);
+                    }
                 }
             }
         }
@@ -1298,6 +1338,7 @@ fn run_tail(
         hours,
         strict: false,
         kind_filter,
+        frame_kind: filters.frame_kind,
     };
 
     let mut last_seen = std::collections::HashSet::new();
@@ -2416,13 +2457,26 @@ fn run_search(
             &search_query,
             fetch_limit,
             project,
+            filters.frame_kind,
         )) {
             Ok((res, scan)) if !res.is_empty() => (res, scan),
             Err(err) if memex::is_compatibility_error(&err) => return Err(err),
-            _ => rank::fuzzy_search_store(&root, &search_query, fetch_limit, project)?,
+            _ => rank::fuzzy_search_store(
+                &root,
+                &search_query,
+                fetch_limit,
+                project,
+                filters.frame_kind,
+            )?,
         }
     } else {
-        rank::fuzzy_search_store(&root, &search_query, fetch_limit, project)?
+        rank::fuzzy_search_store(
+            &root,
+            &search_query,
+            fetch_limit,
+            project,
+            filters.frame_kind,
+        )?
     };
 
     let mut results = results;
@@ -2529,6 +2583,7 @@ fn run_steer(
         prompt_id,
         filters.agent.as_deref(),
         kind,
+        filters.frame_kind,
         project,
         date_lo.as_deref(),
         date_hi.as_deref(),
@@ -3279,11 +3334,66 @@ mod tests {
             .expect("search command with score/json should parse");
 
         match cli.command {
-            Some(Commands::Search { score, json, .. }) => {
-                assert_eq!(score, Some(60));
+            Some(Commands::Search { filters, json, .. }) => {
+                assert_eq!(filters.score, Some(60));
                 assert!(json);
             }
             _ => panic!("expected search command"),
+        }
+    }
+
+    #[test]
+    fn search_accepts_frame_kind_filter() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "search",
+            "dashboard",
+            "--frame-kind",
+            "internal_thought",
+        ])
+        .expect("search command with frame-kind should parse");
+
+        match cli.command {
+            Some(Commands::Search { filters, .. }) => {
+                assert_eq!(
+                    filters.frame_kind,
+                    Some(ai_contexters::types::FrameKind::InternalThought)
+                );
+            }
+            _ => panic!("expected search command"),
+        }
+    }
+
+    #[test]
+    fn steer_accepts_frame_kind_filter() {
+        let cli = Cli::try_parse_from(["aicx", "steer", "--frame-kind", "user_msg"])
+            .expect("steer command with frame-kind should parse");
+
+        match cli.command {
+            Some(Commands::Steer { filters, .. }) => {
+                assert_eq!(filters.frame_kind, Some(ai_contexters::types::FrameKind::UserMsg));
+            }
+            _ => panic!("expected steer command"),
+        }
+    }
+
+    #[test]
+    fn intents_accepts_frame_kind_filter() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "intents",
+            "--project",
+            "ai-contexters",
+            "--frame-kind",
+            "tool_call",
+        ])
+        .expect("intents command with frame-kind should parse");
+
+        match cli.command {
+            Some(Commands::Intents { filters, .. }) => {
+                assert_eq!(filters.frame_kind, Some(ai_contexters::types::FrameKind::ToolCall));
+            }
+            _ => panic!("expected intents command"),
         }
     }
 

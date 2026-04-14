@@ -2,6 +2,8 @@
 
 use serde::Deserialize;
 
+use crate::types::FrameKind;
+
 /// Parsed frontmatter fields from an agent report.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct ReportFrontmatter {
@@ -18,6 +20,7 @@ pub struct ReportFrontmatterTelemetry {
     pub run_id: Option<String>,
     pub prompt_id: Option<String>,
     pub status: Option<String>,
+    pub frame_kind: Option<FrameKind>,
     pub model: Option<String>,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
@@ -72,7 +75,7 @@ mod tests {
 
     #[test]
     fn parses_valid_frontmatter() {
-        let input = "---\nagent: codex\nrun_id: mrbl-001\nprompt_id: api-redesign_20260327\nstatus: completed\nphase: implement\nmode: session-first\nskill: vc-workflow\nframework_version: 2026-03\n---\n# Report\nContent here";
+        let input = "---\nagent: codex\nrun_id: mrbl-001\nprompt_id: api-redesign_20260327\nstatus: completed\nframe_kind: agent_reply\nphase: implement\nmode: session-first\nskill: vc-workflow\nframework_version: 2026-03\n---\n# Report\nContent here";
         let (frontmatter, body) = parse(input);
         let frontmatter = frontmatter.unwrap();
 
@@ -83,6 +86,10 @@ mod tests {
             Some("api-redesign_20260327")
         );
         assert_eq!(frontmatter.telemetry.status.as_deref(), Some("completed"));
+        assert_eq!(
+            frontmatter.telemetry.frame_kind,
+            Some(FrameKind::AgentReply)
+        );
         assert_eq!(
             frontmatter.steering.workflow_phase.as_deref(),
             Some("implement")

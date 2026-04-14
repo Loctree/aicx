@@ -2497,6 +2497,7 @@ mod tests {
                 message: "hello world".to_string(),
                 branch: None,
                 cwd: None,
+                frame_kind: None,
             },
             TimelineEntry {
                 timestamp: Utc.with_ymd_and_hms(2026, 1, 22, 14, 30, 12).unwrap(),
@@ -2506,6 +2507,7 @@ mod tests {
                 message: "hi there\nsecond line".to_string(),
                 branch: None,
                 cwd: None,
+                frame_kind: None,
             },
         ];
 
@@ -2608,6 +2610,7 @@ mod tests {
             message: message.to_string(),
             branch: None,
             cwd: None,
+            frame_kind: None,
         }
     }
 
@@ -2855,9 +2858,10 @@ mod tests {
             agent: "codex".to_string(),
             session_id: "sess-telemetry".to_string(),
             role: "assistant".to_string(),
-            message: "---\nrun_id: mrbl-001\nprompt_id: api-redesign_20260327\nmodel: gpt-5.4\nstarted_at: 2026-03-27T10:00:00Z\ncompleted_at: 2026-03-27T10:01:00Z\ntoken_usage: 1234\nfindings_count: 4\nphase: implement\nmode: session-first\nskill_code: vc-workflow\nframework_version: 2026-03\n---\n## Findings\nTelemetry wiring landed.\n".to_string(),
+            message: "---\nrun_id: mrbl-001\nprompt_id: api-redesign_20260327\nmodel: gpt-5.4\nstarted_at: 2026-03-27T10:00:00Z\ncompleted_at: 2026-03-27T10:01:00Z\ntoken_usage: 1234\nfindings_count: 4\nframe_kind: agent_reply\nphase: implement\nmode: session-first\nskill_code: vc-workflow\nframework_version: 2026-03\n---\n## Findings\nTelemetry wiring landed.\n".to_string(),
             branch: None,
             cwd: None,
+            frame_kind: None,
         }];
 
         let written = write_context_session_first_at(
@@ -2897,6 +2901,10 @@ mod tests {
         );
         assert_eq!(sidecar.token_usage, Some(1234));
         assert_eq!(sidecar.findings_count, Some(4));
+        assert_eq!(
+            sidecar.frame_kind,
+            Some(crate::types::FrameKind::AgentReply)
+        );
         assert_eq!(sidecar.workflow_phase.as_deref(), Some("implement"));
         assert_eq!(sidecar.mode.as_deref(), Some("session-first"));
         assert_eq!(sidecar.skill_code.as_deref(), Some("vc-workflow"));
@@ -2935,6 +2943,7 @@ mod tests {
             message: message.to_string(),
             branch: None,
             cwd: cwd.map(ToOwned::to_owned),
+            frame_kind: None,
         }
     }
 

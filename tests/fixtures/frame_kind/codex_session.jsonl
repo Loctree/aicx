@@ -1,0 +1,6 @@
+{"timestamp":"2026-04-14T10:00:00Z","type":"session_meta","payload":{"id":"codex-frame-kind","cwd":"/Users/tester/workspaces/VetCoders/ai-contexters"}}
+{"timestamp":"2026-04-14T10:00:00Z","type":"turn_context","payload":{"cwd":"/Users/tester/workspaces/VetCoders/ai-contexters"}}
+{"timestamp":"2026-04-14T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"User asks for frame separation"}}
+{"timestamp":"2026-04-14T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"Visible assistant reply"}}
+{"timestamp":"2026-04-14T10:00:03Z","type":"event_msg","payload":{"type":"thinking_delta","text":"Hidden chain of thought"}}
+{"timestamp":"2026-04-14T10:00:04Z","type":"event_msg","payload":{"type":"tool_call","message":"searchDocs({\"query\":\"frame_kind\"})"}}

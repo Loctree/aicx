@@ -15,6 +15,7 @@ use std::path::Path;
 use crate::sanitize;
 use crate::sanitize::normalize_query;
 use crate::store;
+use crate::types::FrameKind;
 
 // ============================================================================
 // Noise patterns — lines that inflate chunk size without adding value
@@ -233,8 +234,10 @@ pub struct FuzzyResult {
     pub path: String,
     pub project: String,
     pub kind: String,
+    pub frame_kind: Option<String>,
     pub agent: String,
     pub date: String,
+    pub timestamp: Option<String>,
     pub score: u8,
     pub label: String,
     pub density: f32,
@@ -257,6 +260,8 @@ struct CompactSearchItem {
     project: String,
     agent: String,
     date: String,
+    timestamp: Option<String>,
+    frame_kind: Option<String>,
     session: String,
     cwd: String,
     matches: Vec<String>,
@@ -275,6 +280,8 @@ pub fn render_search_json(results: &[FuzzyResult], scanned: usize) -> serde_json
             project: result.project.clone(),
             agent: result.agent.clone(),
             date: result.date.clone(),
+            timestamp: result.timestamp.clone(),
+            frame_kind: result.frame_kind.clone(),
             session: result.session_id.clone().unwrap_or_else(|| "-".to_string()),
             cwd: result.cwd.clone().unwrap_or_else(|| "-".to_string()),
             matches: display_search_matches(result),
@@ -295,6 +302,7 @@ pub fn render_search_text(results: &[FuzzyResult], color: bool) -> String {
     for result in results {
         let session_str = result.session_id.as_deref().unwrap_or("-");
         let cwd_str = result.cwd.as_deref().unwrap_or("-");
+        let frame_str = result.frame_kind.as_deref().unwrap_or("-");
         let matches = display_search_matches(result);
 
         if color {
@@ -310,6 +318,7 @@ pub fn render_search_text(results: &[FuzzyResult], color: bool) -> String {
             );
             let _ = writeln!(out, "session(s): \x1b[90m{session_str}\x1b[0m");
             let _ = writeln!(out, "cwd: \x1b[90m{cwd_str}\x1b[0m");
+            let _ = writeln!(out, "frame_kind: \x1b[90m{frame_str}\x1b[0m");
             let _ = writeln!(out, "search result:");
             for line in &matches {
                 let _ = writeln!(out, "  \x1b[90m>\x1b[0m \x1b[90m{}\x1b[0m", line);
@@ -325,6 +334,7 @@ pub fn render_search_text(results: &[FuzzyResult], color: bool) -> String {
             );
             let _ = writeln!(out, "session(s): {session_str}");
             let _ = writeln!(out, "cwd: {cwd_str}");
+            let _ = writeln!(out, "frame_kind: {frame_str}");
             let _ = writeln!(out, "search result:");
             for line in &matches {
                 let _ = writeln!(out, "  > {}", line);
@@ -361,6 +371,7 @@ pub fn fuzzy_search_store(
     query: &str,
     limit: usize,
     project_filter: Option<&str>,
+    frame_kind_filter: Option<FrameKind>,
 ) -> std::io::Result<(Vec<FuzzyResult>, usize)> {
     let normalized_query = normalize_query(query);
     let query_terms: Vec<&str> = normalized_query.split_whitespace().collect();
@@ -428,9 +439,9 @@ pub fn fuzzy_search_store(
         let match_ratio = matched_terms as f32 / query_terms.len() as f32;
         let final_score = ((chunk_score.score as f32 * 5.0 + 50.0 * match_ratio) as u8).min(100);
 
-        // Read sidecar for session_id and cwd (best-effort)
+        // Read sidecar for session_id, cwd, timestamp, and frame kind (best-effort)
         let sidecar_path = stored_file.path.with_extension("meta.json");
-        let (session_id, cwd) = if sidecar_path.exists() {
+        let (session_id, cwd, timestamp, frame_kind) = if sidecar_path.exists() {
             sanitize::read_to_string_validated(&sidecar_path)
                 .ok()
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -440,12 +451,40 @@ pub fn fuzzy_search_store(
                             .and_then(|s| s.as_str())
                             .map(String::from),
                         v.get("cwd").and_then(|s| s.as_str()).map(String::from),
+                        v.get("started_at")
+                            .and_then(|s| s.as_str())
+                            .map(String::from)
+                            .or_else(|| {
+                                v.get("timestamp")
+                                    .and_then(|s| s.as_str())
+                                    .map(String::from)
+                            }),
+                        v.get("frame_kind")
+                            .and_then(|s| s.as_str())
+                            .and_then(FrameKind::parse)
+                            .map(|kind| kind.to_string()),
                     )
                 })
-                .unwrap_or((None, None))
+                .unwrap_or((None, None, None, None))
         } else {
-            (None, None)
+            (None, None, None, None)
         };
+
+        if let Some(expected) = frame_kind_filter
+            && frame_kind.as_deref() != Some(expected.as_str())
+        {
+            continue;
+        }
+
+        let final_timestamp = timestamp.or_else(|| {
+            stored_file
+                .path
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(chrono::DateTime::<chrono::Utc>::from)
+                .map(|d| d.to_rfc3339())
+        });
 
         results.push(FuzzyResult {
             file: stored_file
@@ -457,8 +496,10 @@ pub fn fuzzy_search_store(
             path: stored_file.path.display().to_string(),
             project: stored_file.project,
             kind: stored_file.kind.dir_name().to_string(),
+            frame_kind,
             agent: stored_file.agent,
             date: stored_file.date_iso,
+            timestamp: final_timestamp,
             score: final_score,
             label: if final_score >= 80 {
                 "HIGH".to_string()
@@ -1057,8 +1098,8 @@ Some boilerplate text.
             "Decision: adopt repo-centric store layout for session recovery",
         );
 
-        let (results, scanned) =
-            fuzzy_search_store(&root, "repo-centric store", 10, None).expect("search should work");
+        let (results, scanned) = fuzzy_search_store(&root, "repo-centric store", 10, None, None)
+            .expect("search should work");
 
         assert!(scanned > 0, "should scan at least one file");
         assert_eq!(results.len(), 1, "should find the matching chunk");
@@ -1094,8 +1135,8 @@ Some boilerplate text.
             "Migration plan: adopt repo-centric layout for all agents",
         );
 
-        let (results, scanned) =
-            fuzzy_search_store(&root, "migration plan", 10, None).expect("search should work");
+        let (results, scanned) = fuzzy_search_store(&root, "migration plan", 10, None, None)
+            .expect("search should work");
 
         assert!(scanned > 0);
         assert_eq!(results.len(), 1);
@@ -1140,12 +1181,13 @@ Some boilerplate text.
 
         // Unfiltered: both match
         let (all, _) =
-            fuzzy_search_store(&root, "decision adopt", 10, None).expect("unfiltered search");
+            fuzzy_search_store(&root, "decision adopt", 10, None, None).expect("unfiltered search");
         assert_eq!(all.len(), 2);
 
         // Filter by ai-contexters: only one match
-        let (filtered, _) = fuzzy_search_store(&root, "decision adopt", 10, Some("ai-contexters"))
-            .expect("filtered search");
+        let (filtered, _) =
+            fuzzy_search_store(&root, "decision adopt", 10, Some("ai-contexters"), None)
+                .expect("filtered search");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].project, "VetCoders/ai-contexters");
 
@@ -1161,8 +1203,10 @@ Some boilerplate text.
                 path: "/tmp/chunk.md".to_string(),
                 project: "VetCoders/ai-contexters".to_string(),
                 kind: "reports".to_string(),
+                frame_kind: None,
                 agent: "codex".to_string(),
                 date: "2026-03-31".to_string(),
+                timestamp: None,
                 score: 88,
                 label: "HIGH".to_string(),
                 density: 0.8,

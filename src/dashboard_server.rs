@@ -134,6 +134,8 @@ struct FuzzySearchParams {
     project: Option<String>,
     /// Optional minimum score threshold (0-100)
     score: Option<u8>,
+    /// Optional frame/channel filter
+    frame_kind: Option<crate::types::FrameKind>,
 }
 
 fn default_search_limit() -> usize {
@@ -174,6 +176,7 @@ struct FuzzySearchResult {
     path: String,
     project: String,
     kind: String,
+    frame_kind: Option<String>,
     agent: String,
     date: String,
     score: u8,
@@ -209,6 +212,8 @@ struct SteerSearchParams {
     agent: Option<String>,
     /// Filter by kind
     kind: Option<String>,
+    /// Filter by frame/channel
+    frame_kind: Option<crate::types::FrameKind>,
     /// Filter by project (case-insensitive substring)
     project: Option<String>,
     /// Filter by date (YYYY-MM-DD or range)
@@ -223,6 +228,7 @@ struct SteerSearchResult {
     project: String,
     agent: String,
     kind: String,
+    frame_kind: Option<String>,
     date: String,
     session_id: String,
     run_id: Option<String>,
@@ -533,10 +539,10 @@ fn parse_relative_time(s: &str) -> Option<i64> {
         return None;
     }
     let now = Utc::now().timestamp();
-    let (num, unit) = if s.ends_with('h') {
-        (s[..s.len() - 1].parse::<i64>().ok()?, 3600)
-    } else if s.ends_with('d') {
-        (s[..s.len() - 1].parse::<i64>().ok()?, 86400)
+    let (num, unit) = if let Some(h) = s.strip_suffix('h') {
+        (h.parse::<i64>().ok()?, 3600)
+    } else if let Some(d) = s.strip_suffix('d') {
+        (d.parse::<i64>().ok()?, 86400)
     } else {
         return None;
     };
@@ -589,25 +595,25 @@ async fn get_browse(
         .records
         .iter()
         .filter(|r| {
-            if let Some(ref p) = params.project {
-                if !r.project.eq_ignore_ascii_case(p) {
-                    return false;
-                }
+            if let Some(ref p) = params.project
+                && !r.project.eq_ignore_ascii_case(p)
+            {
+                return false;
             }
-            if let Some(ref a) = params.agent {
-                if !r.agent.eq_ignore_ascii_case(a) {
-                    return false;
-                }
+            if let Some(ref a) = params.agent
+                && !r.agent.eq_ignore_ascii_case(a)
+            {
+                return false;
             }
-            if let Some(ref k) = params.kind {
-                if r.kind != *k {
-                    return false;
-                }
+            if let Some(ref k) = params.kind
+                && r.kind != *k
+            {
+                return false;
             }
-            if let Some(ts) = since_ts {
-                if r.sort_ts < ts {
-                    return false;
-                }
+            if let Some(ts) = since_ts
+                && r.sort_ts < ts
+            {
+                return false;
             }
             true
         })
@@ -927,6 +933,7 @@ async fn fuzzy_search(
     let limit = params.limit.min(100);
     let store_root = state.config.store_root.clone();
     let project_filter = params.project;
+    let frame_kind = params.frame_kind;
     let score = match validate_score_filter(params.score) {
         Ok(score) => score,
         Err(error) => {
@@ -946,6 +953,7 @@ async fn fuzzy_search(
             limit,
             project_filter.as_deref(),
             score,
+            frame_kind,
         )
     })
     .await;
@@ -986,6 +994,7 @@ fn run_fuzzy_search(
     limit: usize,
     project_filter: Option<&str>,
     score: Option<u8>,
+    frame_kind: Option<crate::types::FrameKind>,
 ) -> Result<(Vec<FuzzySearchResult>, usize)> {
     // Non-blocking auto-rescan with rate-limit guard.
     if !DASHBOARD_RESCAN_RUNNING.swap(true, Ordering::SeqCst) {
@@ -1019,13 +1028,20 @@ fn run_fuzzy_search(
             query,
             fetch_limit,
             project_filter,
+            frame_kind,
         )) {
             Ok((res, scan)) if !res.is_empty() => (res, scan),
             Err(err) if crate::memex::is_compatibility_error(&err) => return Err(err),
-            _ => rank::fuzzy_search_store(store_root, query, fetch_limit, project_filter)?,
+            _ => rank::fuzzy_search_store(
+                store_root,
+                query,
+                fetch_limit,
+                project_filter,
+                frame_kind,
+            )?,
         }
     } else {
-        rank::fuzzy_search_store(store_root, query, fetch_limit, project_filter)?
+        rank::fuzzy_search_store(store_root, query, fetch_limit, project_filter, frame_kind)?
     };
 
     let mut results = results;
@@ -1043,6 +1059,7 @@ fn run_fuzzy_search(
                 path: result.path,
                 project: result.project,
                 kind: result.kind,
+                frame_kind: result.frame_kind,
                 agent: result.agent,
                 date: result.date,
                 score: result.score,
@@ -1322,6 +1339,7 @@ fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSear
         params.prompt_id.as_deref(),
         params.agent.as_deref(),
         params.kind.as_deref(),
+        params.frame_kind,
         params.project.as_deref(),
         date_lo.as_deref(),
         date_hi.as_deref(),
@@ -1393,6 +1411,10 @@ fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSear
             project,
             agent,
             kind,
+            frame_kind: meta
+                .get("frame_kind")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             date,
             session_id,
             run_id,
