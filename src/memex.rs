@@ -1,7 +1,7 @@
 //! Memex integration — the optional semantic index behind `aicx memex-sync` and `--memex`.
 //!
 //! This module is the boundary between the aicx orchestrator and the published
-//! `rmcp-memex` 0.4.1 library. Live ai-contexters flows stay inside that
+//! `rmcp-memex` 0.5.0 library. Live ai-contexters flows stay inside that
 //! library boundary:
 //!
 //! - Config discovery, embedding resolution, and content hashing
