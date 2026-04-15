@@ -103,6 +103,8 @@ pub struct ChunkMetadataSidecar {
     pub skill_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub framework_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intent_entries: Vec<crate::types::IntentEntry>,
 }
 
 impl From<&Chunk> for ChunkMetadataSidecar {
@@ -127,6 +129,7 @@ impl From<&Chunk> for ChunkMetadataSidecar {
             mode: chunk.mode.clone(),
             skill_code: chunk.skill_code.clone(),
             framework_version: chunk.framework_version.clone(),
+            intent_entries: Vec::new(),
         }
     }
 }

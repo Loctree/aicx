@@ -210,6 +210,30 @@ The generated HTML embeds the selected slice directly and can also import/export
 compatible JSON bundles client-side, so you can merge multiple workflow slices
 without standing up a server.
 
+## Intent Taxonomy
+
+The intent engine classifies stored chunks into 9 semantic types with typed link relations:
+
+| Type | What it captures | Initial state |
+|------|-----------------|---------------|
+| `intent` | User-expressed goal or proposal | proposed |
+| `why` | Motivation behind a decision | active |
+| `argue` | Multi-voice disagreement or trade-off | active |
+| `decision` | Crystallized choice from discussion | active |
+| `assumption` | Hypothesis treated as true until verified | proposed |
+| `outcome` | Broad result of an action | done |
+| `result` | Concrete measurable data point | done |
+| `question` | Open knowledge gap | proposed |
+| `insight` | Reframe backed by research evidence | active |
+
+Link types: `derived_from`, `supersedes`, `verifies`, `contradicts`, `supports`, `results_in`, `answers`, `links_to`.
+
+State transitions: Proposed → Active → Done/Superseded/Contradicted. Session-level post-processing detects unresolved intents (no outcome after 7 days), supersedes chains (newer entry on same topic), contradicted assumptions (result + failure signal), and insight sourcing (DerivedFrom links to research chunks).
+
+```bash
+aicx migrate-intent-schema --project MyProject --dry-run
+```
+
 ## Docs
 
 - `docs/ARCHITECTURE.md` (module map + data flows)

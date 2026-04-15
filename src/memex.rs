@@ -1913,6 +1913,7 @@ model = "qwen3-embedding:4b"
                 mode: Some("session-first".to_string()),
                 skill_code: Some("vc-workflow".to_string()),
                 framework_version: Some("2026-03".to_string()),
+                intent_entries: Vec::new(),
             })
             .unwrap(),
         )

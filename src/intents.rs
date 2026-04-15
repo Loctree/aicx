@@ -17,7 +17,7 @@ use crate::chunker::{
 };
 use crate::sanitize;
 use crate::store;
-use crate::types::FrameKind;
+use crate::types::{EntryState, EntryType, FrameKind, IntentEntry, Link, LinkType};
 
 const STRICT_CONFIDENCE: u8 = 3;
 
@@ -63,6 +63,10 @@ pub struct IntentRecord {
     pub timestamp: Option<String>,
     pub session_id: String,
     pub count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_chunk: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_chunk: Option<String>,
     pub source_chunk: String,
 }
 #[derive(Debug, Clone)]
@@ -593,6 +597,8 @@ fn build_candidate(
             date: file.date.clone(),
             session_id: file.session_id.clone(),
             count: None,
+            first_chunk: None,
+            last_chunk: None,
             source_chunk: source_chunk.to_string(),
             timestamp: Some(file.timestamp.to_rfc3339()),
         },
@@ -967,6 +973,680 @@ fn push_unique(target: &mut Vec<String>, value: String) {
     }
 }
 
+// ── 9-type intent entry classifier ──────────────────────────────────
+
+const CLASSIFIER_ABSTAIN_THRESHOLD: f32 = 0.5;
+
+const QUESTION_MARKERS: &[&str] = &[
+    "how do",
+    "how does",
+    "how to",
+    "what is",
+    "what are",
+    "why does",
+    "why is",
+    "can we",
+    "should we",
+    "is it possible",
+    "does it",
+    "do we",
+    "jak ",
+    "dlaczego ",
+    "czy ",
+    "co to ",
+    "co jest",
+    "w jaki sposób",
+];
+
+const ASSUMPTION_MARKERS: &[&str] = &[
+    "i assume",
+    "assuming",
+    "i believe",
+    "we assume",
+    "hypothesis:",
+    "zakładam",
+    "założenie:",
+    "hipoteza:",
+    "przypuszczam",
+];
+
+const WHY_MARKERS: &[&str] = &[
+    "because",
+    "the reason",
+    "this is needed",
+    "motivated by",
+    "driven by",
+    "root cause",
+    "underlying issue",
+    "bo ",
+    "ponieważ",
+    "dlatego że",
+    "przyczyna:",
+    "powód:",
+];
+
+const ARGUE_MARKERS: &[&str] = &[
+    "on the other hand",
+    "alternatively",
+    "disagree",
+    "counterpoint",
+    "trade-off",
+    "tradeoff",
+    "but if we",
+    "however,",
+    "z drugiej strony",
+    "alternatywnie",
+    "spór:",
+    "kontrargument",
+];
+
+const INSIGHT_MARKERS: &[&str] = &[
+    "insight:",
+    "realization:",
+    "key finding:",
+    "★ insight",
+    "the real issue is",
+    "fundamentally,",
+    "odkrycie:",
+    "wniosek:",
+    "kluczowe:",
+];
+
+const RESULT_STRICT_MARKERS: &[&str] = &[
+    "passed",
+    "failed",
+    "error:",
+    "score=",
+    "score:",
+    "latency",
+    "p0=",
+    "p1=",
+    "p2=",
+    "/10",
+    "tests ",
+    "clippy",
+    "cargo test",
+    "✓",
+    "✗",
+    "0 warnings",
+    "0 errors",
+];
+
+pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType, f32)> {
+    let lower = line.to_lowercase();
+    let trimmed = lower.trim();
+
+    if trimmed.starts_with("decision:") || trimmed.contains("[decision]") {
+        return Some((EntryType::Decision, 0.95));
+    }
+
+    if trimmed.starts_with("question:") || trimmed.ends_with('?') && trimmed.len() > 15 {
+        let conf = if trimmed.starts_with("question:") {
+            0.95
+        } else {
+            0.7
+        };
+        if QUESTION_MARKERS.iter().any(|m| lower.contains(m)) || trimmed.ends_with('?') {
+            return Some((EntryType::Question, conf));
+        }
+    }
+
+    if trimmed.starts_with("assumption:")
+        || trimmed.starts_with("hypothesis:")
+        || trimmed.starts_with("zakładam")
+        || trimmed.starts_with("założenie:")
+        || trimmed.starts_with("hipoteza:")
+    {
+        return Some((EntryType::Assumption, 0.9));
+    }
+    if ASSUMPTION_MARKERS.iter().any(|m| lower.contains(m)) {
+        return Some((EntryType::Assumption, 0.65));
+    }
+
+    if trimmed.starts_with("insight:")
+        || trimmed.starts_with("odkrycie:")
+        || trimmed.starts_with("wniosek:")
+        || trimmed.starts_with("kluczowe:")
+        || trimmed.contains("★ insight")
+    {
+        return Some((EntryType::Insight, 0.9));
+    }
+    if INSIGHT_MARKERS.iter().any(|m| lower.contains(m)) {
+        return Some((EntryType::Insight, 0.65));
+    }
+
+    if is_outcome_tag(line) || trimmed.starts_with("[skill_outcome]") {
+        return Some((EntryType::Outcome, 0.9));
+    }
+
+    if trimmed.starts_with("result:") || trimmed.starts_with("wynik:") {
+        return Some((EntryType::Result, 0.95));
+    }
+    if is_result_line(line) || RESULT_STRICT_MARKERS.iter().any(|m| lower.contains(m)) {
+        return Some((EntryType::Result, 0.75));
+    }
+
+    if ARGUE_MARKERS.iter().any(|m| lower.contains(m)) {
+        return Some((EntryType::Argue, 0.6));
+    }
+
+    if WHY_MARKERS.iter().any(|m| lower.contains(m)) {
+        return Some((EntryType::Why, 0.7));
+    }
+
+    if is_user && INTENT_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        return Some((EntryType::Intent, 0.7));
+    }
+    if is_decision_tag(line) {
+        return Some((EntryType::Decision, 0.9));
+    }
+
+    None
+}
+
+pub fn classify_chunk_entries(
+    content: &str,
+    source_chunk: &str,
+    project: Option<&str>,
+    agent: Option<&str>,
+    session_id: Option<&str>,
+    date: &str,
+) -> Vec<IntentEntry> {
+    let mut entries = Vec::new();
+    let mut byte_offset = 0usize;
+
+    let (signal_lines, transcript_entries) = parse_chunk_document(content);
+
+    for line in &signal_lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed == "[signals]"
+            || trimmed == "[/signals]"
+            || trimmed == "=== SKILL ENTER ==="
+            || trimmed == "==================="
+        {
+            byte_offset += line.len() + 1;
+            continue;
+        }
+
+        if let Some((entry_type, conf)) = classify_signal_line(trimmed)
+            && conf >= CLASSIFIER_ABSTAIN_THRESHOLD
+        {
+            let title = clean_entry_title(entry_type, trimmed);
+            if !title.is_empty() {
+                let id = IntentEntry::stable_id(source_chunk, byte_offset, entry_type);
+                let evidence = extract_evidence(&title);
+                let tags = infer_tags(&title);
+                entries.push(IntentEntry {
+                    id,
+                    entry_type,
+                    state: initial_state(entry_type),
+                    title: truncate_signal_line(&title),
+                    body: None,
+                    evidence,
+                    links: Vec::new(),
+                    confidence: conf,
+                    tags,
+                    project: project.map(String::from),
+                    agent: agent.map(String::from),
+                    session_id: session_id.map(String::from),
+                    timestamp: None,
+                    date: date.to_string(),
+                    source_chunk: source_chunk.to_string(),
+                });
+            }
+        }
+        byte_offset += line.len() + 1;
+    }
+
+    for entry in &transcript_entries {
+        let is_user = entry.role.eq_ignore_ascii_case("user");
+        for raw_line in &entry.lines {
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty() {
+                byte_offset += raw_line.len() + 1;
+                continue;
+            }
+
+            if let Some((entry_type, conf)) = classify_line_entry_type(trimmed, is_user)
+                && conf >= CLASSIFIER_ABSTAIN_THRESHOLD
+            {
+                let title = clean_entry_title(entry_type, trimmed);
+                if !title.is_empty() {
+                    let id = IntentEntry::stable_id(source_chunk, byte_offset, entry_type);
+                    let evidence = extract_evidence(&title);
+                    let tags = infer_tags(&title);
+                    entries.push(IntentEntry {
+                        id,
+                        entry_type,
+                        state: initial_state(entry_type),
+                        title: truncate_signal_line(&title),
+                        body: None,
+                        evidence,
+                        links: Vec::new(),
+                        confidence: conf,
+                        tags,
+                        project: project.map(String::from),
+                        agent: agent.map(String::from),
+                        session_id: session_id.map(String::from),
+                        timestamp: None,
+                        date: date.to_string(),
+                        source_chunk: source_chunk.to_string(),
+                    });
+                }
+            }
+            byte_offset += raw_line.len() + 1;
+        }
+    }
+
+    entries
+}
+
+fn classify_signal_line(line: &str) -> Option<(EntryType, f32)> {
+    let lower = line.to_lowercase();
+    let trimmed = lower.trim();
+    let payload = strip_signal_bullet(line);
+
+    if trimmed == "intent:"
+        || trimmed == "decision:"
+        || trimmed == "results:"
+        || trimmed == "outcome:"
+        || trimmed == "ultrathink:"
+        || trimmed == "insight:"
+        || trimmed == "plan mode:"
+        || trimmed == "notes:"
+    {
+        return None;
+    }
+
+    if let Some(result) = classify_line_entry_type(payload, false) {
+        return Some(result);
+    }
+
+    if is_decision_tag(line) {
+        return Some((EntryType::Decision, 0.9));
+    }
+    if is_outcome_tag(line) || is_result_line(line) {
+        return Some((EntryType::Outcome, 0.75));
+    }
+
+    None
+}
+
+fn initial_state(entry_type: EntryType) -> EntryState {
+    match entry_type {
+        EntryType::Intent | EntryType::Question | EntryType::Assumption => EntryState::Proposed,
+        EntryType::Decision | EntryType::Insight => EntryState::Active,
+        EntryType::Outcome | EntryType::Result => EntryState::Done,
+        EntryType::Why | EntryType::Argue => EntryState::Active,
+    }
+}
+
+fn clean_entry_title(entry_type: EntryType, raw: &str) -> String {
+    let text = strip_signal_bullet(raw);
+    let stripped = match entry_type {
+        EntryType::Decision => {
+            let t = strip_case_insensitive_prefix(text, "[decision]");
+            strip_case_insensitive_prefix(t, "decision:")
+        }
+        EntryType::Outcome => {
+            let t = strip_case_insensitive_prefix(text, "[skill_outcome]");
+            let t = strip_case_insensitive_prefix(t, "outcome:");
+            strip_case_insensitive_prefix(t, "validation:")
+        }
+        EntryType::Result => strip_case_insensitive_prefix(text, "result:"),
+        EntryType::Question => strip_case_insensitive_prefix(text, "question:"),
+        EntryType::Assumption => {
+            let t = strip_case_insensitive_prefix(text, "assumption:");
+            strip_case_insensitive_prefix(t, "hypothesis:")
+        }
+        EntryType::Insight => {
+            let t = strip_case_insensitive_prefix(text, "insight:");
+            strip_case_insensitive_prefix(t, "★ insight")
+        }
+        EntryType::Why => {
+            let t = strip_case_insensitive_prefix(text, "because ");
+            strip_case_insensitive_prefix(t, "why:")
+        }
+        EntryType::Intent | EntryType::Argue => text,
+    };
+    normalize_display_text(stripped)
+}
+
+fn infer_tags(title: &str) -> Vec<String> {
+    let lower = title.to_lowercase();
+    let mut tags = Vec::new();
+
+    let tag_map: &[(&[&str], &str)] = &[
+        (
+            &["auth", "login", "session", "token", "jwt", "oauth"],
+            "auth",
+        ),
+        (
+            &[
+                "database",
+                "sql",
+                "migration",
+                "schema",
+                "table",
+                "query",
+                "db",
+            ],
+            "db",
+        ),
+        (
+            &[
+                "ui",
+                "frontend",
+                "component",
+                "css",
+                "tailwind",
+                "react",
+                "button",
+            ],
+            "ui",
+        ),
+        (
+            &["api", "endpoint", "route", "handler", "rest", "graphql"],
+            "api",
+        ),
+        (
+            &["test", "spec", "assert", "fixture", "coverage"],
+            "testing",
+        ),
+        (
+            &["deploy", "ci", "cd", "pipeline", "docker", "release"],
+            "devops",
+        ),
+        (&["license", "licensing", "busl", "copyright"], "licensing"),
+        (&["brand", "rebrand", "naming", "identity"], "brand"),
+        (
+            &["perf", "latency", "performance", "cache", "optimize"],
+            "performance",
+        ),
+    ];
+
+    for (keywords, tag) in tag_map {
+        if keywords.iter().any(|kw| lower.contains(kw)) {
+            tags.push((*tag).to_string());
+            if tags.len() >= 5 {
+                break;
+            }
+        }
+    }
+
+    tags
+}
+
+// ── Session-level post-processing ───────────────────────────────────
+
+pub fn postprocess_session_entries(entries: &mut [IntentEntry], age_days: Option<i64>) {
+    detect_unresolved(entries, age_days.unwrap_or(7));
+    detect_supersedes(entries);
+    detect_contradicted_assumptions(entries);
+    link_insights_to_sources(entries);
+}
+
+fn detect_unresolved(entries: &mut [IntentEntry], threshold_days: i64) {
+    let outcome_keys: HashSet<String> = entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.entry_type,
+                EntryType::Outcome | EntryType::Result | EntryType::Decision
+            )
+        })
+        .filter_map(|e| e.session_id.clone())
+        .collect();
+
+    let has_outcome_for_session = |session_id: &Option<String>| -> bool {
+        session_id
+            .as_ref()
+            .is_some_and(|sid| outcome_keys.contains(sid))
+    };
+
+    let today = chrono::Utc::now().date_naive();
+
+    for entry in entries.iter_mut() {
+        if entry.entry_type == EntryType::Intent && entry.state == EntryState::Proposed {
+            let is_old = NaiveDate::parse_from_str(&entry.date, "%Y-%m-%d")
+                .ok()
+                .is_some_and(|d| (today - d).num_days() >= threshold_days);
+
+            if is_old && !has_outcome_for_session(&entry.session_id) {
+                entry.tags.push("unresolved".to_string());
+                entry.tags.dedup();
+            }
+        }
+    }
+}
+
+fn detect_supersedes(entries: &mut [IntentEntry]) {
+    struct SupersedesAction {
+        superseded_idx: usize,
+        newer_idx: usize,
+        superseded_id: String,
+    }
+
+    let mut topic_latest: HashMap<String, (usize, String, String)> = HashMap::new();
+    let mut actions: Vec<SupersedesAction> = Vec::new();
+
+    for (idx, entry) in entries.iter().enumerate() {
+        if !matches!(
+            entry.entry_type,
+            EntryType::Intent | EntryType::Decision | EntryType::Insight
+        ) {
+            continue;
+        }
+        let topic_key = format!(
+            "{}:{}:{}",
+            entry.project.as_deref().unwrap_or(""),
+            entry.entry_type.as_str(),
+            normalize_key(&entry.title)
+                .split_whitespace()
+                .take(5)
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+
+        if let Some((prev_idx, prev_id, prev_date)) = topic_latest.get(&topic_key) {
+            if entry.date > *prev_date
+                || (entry.date == *prev_date && entry.confidence > entries[*prev_idx].confidence)
+            {
+                let old_idx = *prev_idx;
+                let old_id = prev_id.clone();
+                actions.push(SupersedesAction {
+                    superseded_idx: old_idx,
+                    newer_idx: idx,
+                    superseded_id: old_id,
+                });
+                topic_latest.insert(topic_key, (idx, entry.id.clone(), entry.date.clone()));
+            } else {
+                actions.push(SupersedesAction {
+                    superseded_idx: idx,
+                    newer_idx: *prev_idx,
+                    superseded_id: entry.id.clone(),
+                });
+            }
+        } else {
+            topic_latest.insert(topic_key, (idx, entry.id.clone(), entry.date.clone()));
+        }
+    }
+
+    for action in actions {
+        entries[action.superseded_idx].state = EntryState::Superseded;
+        let already = entries[action.newer_idx]
+            .links
+            .iter()
+            .any(|l| l.target == action.superseded_id);
+        if !already {
+            entries[action.newer_idx].links.push(Link {
+                relation: LinkType::Supersedes,
+                target: action.superseded_id,
+                confidence: Some(0.7),
+            });
+        }
+    }
+}
+
+fn detect_contradicted_assumptions(entries: &mut [IntentEntry]) {
+    let assumptions: Vec<(usize, String)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.entry_type == EntryType::Assumption)
+        .map(|(i, e)| (i, normalize_key(&e.title)))
+        .collect();
+
+    let results: Vec<(usize, String)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.entry_type == EntryType::Result)
+        .map(|(i, e)| (i, e.title.to_lowercase()))
+        .collect();
+
+    let contradiction_words = ["fail", "broken", "wrong", "error", "invalid", "rejected"];
+
+    for (a_idx, a_key) in &assumptions {
+        let a_words: HashSet<&str> = a_key.split_whitespace().collect();
+        for (r_idx, r_title) in &results {
+            if !contradiction_words.iter().any(|w| r_title.contains(w)) {
+                continue;
+            }
+            let r_words: HashSet<&str> = r_title.split_whitespace().collect();
+            let overlap = a_words.intersection(&r_words).count();
+            if overlap >= 2 {
+                entries[*a_idx].state = EntryState::Contradicted;
+                let r_id = entries[*r_idx].id.clone();
+                entries[*a_idx].links.push(Link {
+                    relation: LinkType::Contradicts,
+                    target: r_id,
+                    confidence: Some(0.6),
+                });
+            }
+        }
+    }
+}
+
+fn link_insights_to_sources(entries: &mut [IntentEntry]) {
+    let source_indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            matches!(
+                e.entry_type,
+                EntryType::Result | EntryType::Outcome | EntryType::Why
+            )
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    let insight_indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.entry_type == EntryType::Insight)
+        .map(|(i, _)| i)
+        .collect();
+
+    for &i_idx in &insight_indices {
+        let insight_session = entries[i_idx].session_id.clone();
+        let mut linked_count = 0;
+        for &s_idx in &source_indices {
+            if linked_count >= 3 {
+                break;
+            }
+            if entries[s_idx].session_id == insight_session {
+                let target_id = entries[s_idx].id.clone();
+                let already = entries[i_idx].links.iter().any(|l| l.target == target_id);
+                if !already {
+                    entries[i_idx].links.push(Link {
+                        relation: LinkType::DerivedFrom,
+                        target: target_id,
+                        confidence: Some(0.65),
+                    });
+                    linked_count += 1;
+                }
+            }
+        }
+    }
+}
+
+// ── Migration support ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MigrationReport {
+    pub total_chunks: usize,
+    pub entries_found: usize,
+    pub per_type: HashMap<String, usize>,
+    pub per_project: HashMap<String, usize>,
+    pub unresolved_count: usize,
+}
+
+pub fn migrate_intent_schema_dry_run(project_filter: &str) -> Result<MigrationReport> {
+    let store_root = store::store_base_dir()?;
+    let files = collect_chunk_files(
+        &store_root,
+        project_filter,
+        DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2020, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            Utc,
+        ),
+        None,
+    )?;
+
+    let mut all_entries = Vec::new();
+    let total_chunks = files.len();
+
+    for file in &files {
+        let content = sanitize::read_to_string_validated(&file.path)
+            .with_context(|| format!("Failed to read chunk file: {}", file.path.display()))?;
+        let source_chunk = file.path.to_string_lossy().to_string();
+        let mut chunk_entries = classify_chunk_entries(
+            &content,
+            &source_chunk,
+            Some(&file.agent),
+            Some(&file.agent),
+            Some(&file.session_id),
+            &file.date,
+        );
+        for e in &mut chunk_entries {
+            e.timestamp = Some(file.timestamp.to_rfc3339());
+            if e.project.is_none() {
+                e.project = Some(project_filter.to_string());
+            }
+        }
+        all_entries.extend(chunk_entries);
+    }
+
+    postprocess_session_entries(&mut all_entries, Some(7));
+
+    let mut per_type: HashMap<String, usize> = HashMap::new();
+    let mut per_project: HashMap<String, usize> = HashMap::new();
+    let mut unresolved_count = 0;
+
+    for entry in &all_entries {
+        *per_type
+            .entry(entry.entry_type.as_str().to_string())
+            .or_default() += 1;
+        if let Some(ref proj) = entry.project {
+            *per_project.entry(proj.clone()).or_default() += 1;
+        }
+        if entry.tags.contains(&"unresolved".to_string()) {
+            unresolved_count += 1;
+        }
+    }
+
+    Ok(MigrationReport {
+        total_chunks,
+        entries_found: all_entries.len(),
+        per_type,
+        per_project,
+        unresolved_count,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1044,6 +1724,7 @@ mod tests {
             mode: None,
             skill_code: None,
             framework_version: None,
+            intent_entries: Vec::new(),
         };
         fs::write(
             path.with_extension("meta.json"),
@@ -1287,6 +1968,8 @@ commit abcdef1 proves the old path was wrong.
             timestamp: None,
             session_id: "test".to_string(),
             count: None,
+            first_chunk: None,
+            last_chunk: None,
             source_chunk: "/tmp/demo/2026-03-15/120000_codex-001.md".to_string(),
         }];
 
@@ -1310,6 +1993,8 @@ commit abcdef1 proves the old path was wrong.
             timestamp: None,
             session_id: "test".to_string(),
             count: None,
+            first_chunk: None,
+            last_chunk: None,
             source_chunk: "/tmp/demo/2026-03-15/120500_claude-002.md".to_string(),
         }];
 
@@ -1323,5 +2008,372 @@ commit abcdef1 proves the old path was wrong.
     fn strip_case_prefix_is_utf8_safe() {
         let text = "Działa pięknie — pełny artifact pack z Rust flow...";
         assert_eq!(strip_case_insensitive_prefix(text, "validation:"), text);
+    }
+
+    // ── classifier tests ────────────────────────────────────────────
+
+    mod classifier {
+        use super::*;
+        use crate::types::{EntryState, EntryType};
+
+        #[test]
+        fn classifies_decision_marker() {
+            let result = classify_line_entry_type("[decision] Use flat parser", false);
+            assert_eq!(result.map(|r| r.0), Some(EntryType::Decision));
+        }
+
+        #[test]
+        fn classifies_decision_prefix() {
+            let result = classify_line_entry_type("decision: keep normalize_key", false);
+            assert_eq!(result.map(|r| r.0), Some(EntryType::Decision));
+        }
+
+        #[test]
+        fn classifies_question_mark() {
+            let result =
+                classify_line_entry_type("How does the auth middleware handle sessions?", false);
+            assert_eq!(result.map(|r| r.0), Some(EntryType::Question));
+        }
+
+        #[test]
+        fn classifies_question_prefix() {
+            let result = classify_line_entry_type("question: can we reuse normalize_key?", false);
+            assert_eq!(result.map(|r| r.0), Some(EntryType::Question));
+        }
+
+        #[test]
+        fn classifies_assumption() {
+            let result =
+                classify_line_entry_type("assumption: the store root is always ~/.aicx", false);
+            assert_eq!(result.map(|r| r.0), Some(EntryType::Assumption));
+        }
+
+        #[test]
+        fn classifies_polish_assumption() {
+            let result = classify_line_entry_type("zakładam że ścieżka zawsze istnieje", false);
+            assert_eq!(result.map(|r| r.0), Some(EntryType::Assumption));
+        }
+
+        #[test]
+        fn classifies_insight_marker() {
+            let result = classify_line_entry_type(
+                "insight: aicx is an intention engine not a formatter",
+                false,
+            );
+            assert_eq!(result.map(|r| r.0), Some(EntryType::Insight));
+        }
+
+        #[test]
+        fn classifies_result_marker() {
+            let result = classify_line_entry_type("result: latency 450ms p99", false);
+            assert_eq!(result.map(|r| r.0), Some(EntryType::Result));
+        }
+
+        #[test]
+        fn classifies_result_from_keywords() {
+            let result = classify_line_entry_type("tests 276/276 passed, 0 warnings", false);
+            assert_eq!(result.map(|r| r.0), Some(EntryType::Result));
+        }
+
+        #[test]
+        fn classifies_outcome_tag() {
+            let result = classify_line_entry_type("[skill_outcome] p0=0 after cargo test", false);
+            assert_eq!(result.map(|r| r.0), Some(EntryType::Outcome));
+        }
+
+        #[test]
+        fn classifies_why_marker() {
+            let result = classify_line_entry_type(
+                "because the old auth middleware stores tokens wrong",
+                false,
+            );
+            assert_eq!(result.map(|r| r.0), Some(EntryType::Why));
+        }
+
+        #[test]
+        fn classifies_argue_marker() {
+            let result = classify_line_entry_type(
+                "on the other hand, rewriting is cheaper than patching",
+                false,
+            );
+            assert_eq!(result.map(|r| r.0), Some(EntryType::Argue));
+        }
+
+        #[test]
+        fn classifies_user_intent() {
+            let result =
+                classify_line_entry_type("Let's ship the intention engine this week", true);
+            assert_eq!(result.map(|r| r.0), Some(EntryType::Intent));
+        }
+
+        #[test]
+        fn classifies_polish_user_intent() {
+            let result = classify_line_entry_type("Proponuję uprościć parser chunków", true);
+            assert_eq!(result.map(|r| r.0), Some(EntryType::Intent));
+        }
+
+        #[test]
+        fn abstains_on_ambiguous_line() {
+            let result = classify_line_entry_type("some random code comment", false);
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn abstains_on_short_question() {
+            let result = classify_line_entry_type("what?", false);
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn classify_chunk_all_nine_types() {
+            let content = r#"[project: demo | agent: claude | date: 2026-04-15]
+
+[signals]
+Decision:
+- [decision] Use 9-type taxonomy
+Intent:
+- Let's ship intent engine
+Outcome:
+- outcome: migration completed successfully
+[/signals]
+
+[12:00:00] user: Proponuję dodać link graph
+[12:01:00] assistant: assumption: store root always at ~/.aicx
+[12:02:00] assistant: insight: aicx is an intention retrieval engine
+[12:03:00] assistant: result: tests 276/276 passed
+[12:04:00] user: How does the chunker handle overlap?
+[12:05:00] assistant: because the old approach created duplicates
+[12:06:00] assistant: on the other hand, flat parsing is simpler
+"#;
+
+            let entries = classify_chunk_entries(
+                content,
+                "/tmp/test/chunk-001.md",
+                Some("demo"),
+                Some("claude"),
+                Some("sess-01"),
+                "2026-04-15",
+            );
+
+            let types: HashSet<EntryType> = entries.iter().map(|e| e.entry_type).collect();
+            assert!(types.contains(&EntryType::Decision), "missing Decision");
+            assert!(types.contains(&EntryType::Outcome), "missing Outcome");
+            assert!(types.contains(&EntryType::Intent), "missing Intent");
+            assert!(types.contains(&EntryType::Assumption), "missing Assumption");
+            assert!(types.contains(&EntryType::Insight), "missing Insight");
+            assert!(types.contains(&EntryType::Result), "missing Result");
+            assert!(types.contains(&EntryType::Question), "missing Question");
+            assert!(types.contains(&EntryType::Why), "missing Why");
+            assert!(types.contains(&EntryType::Argue), "missing Argue");
+
+            for entry in &entries {
+                assert!(!entry.id.is_empty());
+                assert!(!entry.title.is_empty());
+                assert!(entry.confidence >= CLASSIFIER_ABSTAIN_THRESHOLD);
+                assert_eq!(entry.date, "2026-04-15");
+                assert_eq!(entry.source_chunk, "/tmp/test/chunk-001.md");
+            }
+        }
+
+        #[test]
+        fn stable_ids_are_deterministic() {
+            let content = "[12:00:00] user: Let's ship intent engine\n";
+            let a = classify_chunk_entries(content, "/chunk.md", None, None, None, "2026-04-15");
+            let b = classify_chunk_entries(content, "/chunk.md", None, None, None, "2026-04-15");
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert_eq!(x.id, y.id);
+            }
+        }
+
+        #[test]
+        fn tags_are_inferred() {
+            let content = "[12:00:00] assistant: result: auth login tests passed\n";
+            let entries = classify_chunk_entries(content, "/c.md", None, None, None, "2026-04-15");
+            let result_entry = entries.iter().find(|e| e.entry_type == EntryType::Result);
+            assert!(result_entry.is_some());
+            let tags = &result_entry.unwrap().tags;
+            assert!(tags.contains(&"auth".to_string()) || tags.contains(&"testing".to_string()));
+        }
+
+        #[test]
+        fn initial_state_mapping() {
+            assert_eq!(initial_state(EntryType::Intent), EntryState::Proposed);
+            assert_eq!(initial_state(EntryType::Question), EntryState::Proposed);
+            assert_eq!(initial_state(EntryType::Assumption), EntryState::Proposed);
+            assert_eq!(initial_state(EntryType::Decision), EntryState::Active);
+            assert_eq!(initial_state(EntryType::Insight), EntryState::Active);
+            assert_eq!(initial_state(EntryType::Outcome), EntryState::Done);
+            assert_eq!(initial_state(EntryType::Result), EntryState::Done);
+            assert_eq!(initial_state(EntryType::Why), EntryState::Active);
+            assert_eq!(initial_state(EntryType::Argue), EntryState::Active);
+        }
+    }
+
+    mod session_level {
+        use super::*;
+        use crate::types::{EntryState, EntryType};
+
+        fn make_entry(
+            entry_type: EntryType,
+            title: &str,
+            date: &str,
+            session_id: &str,
+            project: &str,
+        ) -> IntentEntry {
+            IntentEntry {
+                id: IntentEntry::stable_id(title, 0, entry_type),
+                entry_type,
+                state: initial_state(entry_type),
+                title: title.to_string(),
+                body: None,
+                evidence: Vec::new(),
+                links: Vec::new(),
+                confidence: 0.9,
+                tags: Vec::new(),
+                project: Some(project.to_string()),
+                agent: Some("claude".to_string()),
+                session_id: Some(session_id.to_string()),
+                timestamp: None,
+                date: date.to_string(),
+                source_chunk: "/test/chunk.md".to_string(),
+            }
+        }
+
+        #[test]
+        fn supersedes_marks_older_entry() {
+            let mut entries = vec![
+                make_entry(
+                    EntryType::Intent,
+                    "ship the new intent engine soon with basic features",
+                    "2026-04-10",
+                    "s1",
+                    "demo",
+                ),
+                make_entry(
+                    EntryType::Intent,
+                    "ship the new intent engine soon with full taxonomy",
+                    "2026-04-15",
+                    "s2",
+                    "demo",
+                ),
+            ];
+
+            postprocess_session_entries(&mut entries, Some(30));
+
+            assert_eq!(entries[0].state, EntryState::Superseded);
+            assert_eq!(entries[1].state, EntryState::Proposed);
+            assert!(
+                entries[1]
+                    .links
+                    .iter()
+                    .any(|l| l.relation == LinkType::Supersedes)
+            );
+        }
+
+        #[test]
+        fn contradicted_assumption() {
+            let mut entries = vec![
+                make_entry(
+                    EntryType::Assumption,
+                    "store root always exists",
+                    "2026-04-10",
+                    "s1",
+                    "demo",
+                ),
+                make_entry(
+                    EntryType::Result,
+                    "store root failed validation error",
+                    "2026-04-11",
+                    "s1",
+                    "demo",
+                ),
+            ];
+
+            postprocess_session_entries(&mut entries, Some(30));
+
+            assert_eq!(entries[0].state, EntryState::Contradicted);
+            assert!(
+                entries[0]
+                    .links
+                    .iter()
+                    .any(|l| l.relation == LinkType::Contradicts)
+            );
+        }
+
+        #[test]
+        fn insight_links_to_sources() {
+            let mut entries = vec![
+                make_entry(
+                    EntryType::Result,
+                    "tests 276/276 passed",
+                    "2026-04-15",
+                    "s1",
+                    "demo",
+                ),
+                make_entry(
+                    EntryType::Outcome,
+                    "migration complete",
+                    "2026-04-15",
+                    "s1",
+                    "demo",
+                ),
+                make_entry(
+                    EntryType::Insight,
+                    "aicx is an intention engine",
+                    "2026-04-15",
+                    "s1",
+                    "demo",
+                ),
+            ];
+
+            postprocess_session_entries(&mut entries, Some(30));
+
+            let insight = &entries[2];
+            assert!(!insight.links.is_empty());
+            assert!(
+                insight
+                    .links
+                    .iter()
+                    .all(|l| l.relation == LinkType::DerivedFrom)
+            );
+        }
+
+        #[test]
+        fn unresolved_intent_tagged_after_threshold() {
+            let old_date = (chrono::Utc::now().date_naive() - chrono::Duration::days(10))
+                .format("%Y-%m-%d")
+                .to_string();
+            let mut entries = vec![make_entry(
+                EntryType::Intent,
+                "implement dark mode",
+                &old_date,
+                "s-old",
+                "demo",
+            )];
+
+            postprocess_session_entries(&mut entries, Some(7));
+
+            assert!(entries[0].tags.contains(&"unresolved".to_string()));
+        }
+
+        #[test]
+        fn recent_intent_not_tagged_unresolved() {
+            let today = chrono::Utc::now()
+                .date_naive()
+                .format("%Y-%m-%d")
+                .to_string();
+            let mut entries = vec![make_entry(
+                EntryType::Intent,
+                "implement dark mode",
+                &today,
+                "s-today",
+                "demo",
+            )];
+
+            postprocess_session_entries(&mut entries, Some(7));
+
+            assert!(!entries[0].tags.contains(&"unresolved".to_string()));
+        }
     }
 }

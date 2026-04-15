@@ -824,6 +824,18 @@ enum Commands {
         #[arg(long)]
         store_root: Option<PathBuf>,
     },
+
+    /// Classify stored chunks into 9-type intent entries and report counts.
+    #[command(name = "migrate-intent-schema")]
+    MigrateIntentSchema {
+        /// Project filter (case-insensitive substring)
+        #[arg(short, long)]
+        project: String,
+
+        /// Dry run: show classification counts without writing sidecars
+        #[arg(long, default_value_t = true)]
+        dry_run: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -1173,6 +1185,31 @@ fn main() -> Result<()> {
             store_root,
         }) => {
             aicx::store::run_migration_with_paths(dry_run, legacy_root, store_root)?;
+        }
+        Some(Commands::MigrateIntentSchema { project, dry_run }) => {
+            let report = intents::migrate_intent_schema_dry_run(&project)?;
+            if dry_run {
+                eprintln!("=== Intent Schema Migration (dry run) ===");
+                eprintln!("Chunks scanned:   {}", report.total_chunks);
+                eprintln!("Entries found:    {}", report.entries_found);
+                eprintln!("Unresolved:       {}", report.unresolved_count);
+                eprintln!();
+                eprintln!("Per type:");
+                let mut types: Vec<_> = report.per_type.iter().collect();
+                types.sort_by(|a, b| b.1.cmp(a.1));
+                for (t, count) in &types {
+                    eprintln!("  {:<12} {}", t, count);
+                }
+                eprintln!();
+                eprintln!("Per project:");
+                let mut projects: Vec<_> = report.per_project.iter().collect();
+                projects.sort_by(|a, b| b.1.cmp(a.1));
+                for (p, count) in &projects {
+                    eprintln!("  {:<30} {}", p, count);
+                }
+            }
+            let json = serde_json::to_string_pretty(&report)?;
+            println!("{json}");
         }
         None => {
             Cli::command().print_help()?;
