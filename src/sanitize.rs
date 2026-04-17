@@ -453,6 +453,7 @@ const SELF_ECHO_PATTERNS: &[&str] = &[
     "aicx rank -p",
     "aicx refs -H",
     "aicx serve",
+    "aicx dashboard --serve",
     "aicx dashboard-serve",
 ];
 

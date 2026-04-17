@@ -198,18 +198,28 @@ aicx extract --format gemini-antigravity \
 Review Vibecrafted workflow and marbles artifacts as a standalone dossier:
 
 ```bash
-aicx reports-extractor \
+aicx reports \
   --repo ai-contexters \
   --workflow marbles \
   --date-from 2026-04-10 \
   --date-to 2026-04-12 \
-  -o ./aicx-reports.html \
-  --bundle-output ./aicx-reports.bundle.json
+  -o ~/.aicx/aicx-reports.html \
+  --bundle-output ~/.aicx/aicx-reports.bundle.json
 ```
 
 The generated HTML embeds the selected slice directly and can also import/export
 compatible JSON bundles client-side, so you can merge multiple workflow slices
 without standing up a server.
+
+Local browsing now shares one surface:
+
+```bash
+# Static HTML artifact (default output: ~/.aicx/aicx-dashboard.html)
+aicx dashboard --generate-html
+
+# Live local server
+aicx dashboard --serve
+```
 
 ## Intent Taxonomy
 

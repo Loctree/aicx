@@ -152,6 +152,119 @@ struct RetrievalFilters {
     frame_kind: Option<aicx::types::FrameKind>,
 }
 
+#[derive(Debug, Clone, Args)]
+struct DashboardArgs {
+    /// Run the live local HTTP dashboard instead of generating a static HTML file
+    #[arg(long, conflicts_with = "generate_html")]
+    serve: bool,
+
+    /// Generate a standalone HTML file (default mode when no mode flag is passed)
+    #[arg(long)]
+    generate_html: bool,
+
+    /// Store root directory (default: ~/.aicx)
+    #[arg(long)]
+    store_root: Option<PathBuf>,
+
+    /// Output HTML path (default: ~/.aicx/aicx-dashboard.html)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Bind host IP address (default: 127.0.0.1, server mode only)
+    #[arg(long)]
+    host: Option<String>,
+
+    /// Bind TCP port (default: 9478, server mode only)
+    #[arg(long)]
+    port: Option<u16>,
+
+    /// Suppress automatic browser open on startup (server mode only)
+    #[arg(long)]
+    no_open: bool,
+
+    /// Document title
+    #[arg(long, default_value = "AI Contexters Dashboard")]
+    title: String,
+
+    /// Max preview characters per record (0 = no truncation)
+    #[arg(long, default_value = "320")]
+    preview_chars: usize,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ReportsArgs {
+    /// Vibecrafted artifact root (default: ~/.vibecrafted/artifacts)
+    #[arg(long)]
+    artifacts_root: Option<PathBuf>,
+
+    /// Artifact organization bucket
+    #[arg(long, default_value = "VetCoders")]
+    org: String,
+
+    /// Repository bucket (defaults to the current directory name)
+    #[arg(long)]
+    repo: Option<String>,
+
+    /// Workflow filter (matches workflow label, skill code, run/prompt IDs, lane, and title)
+    #[arg(long)]
+    workflow: Option<String>,
+
+    /// Inclusive start date (YYYY-MM-DD or YYYY_MMDD)
+    #[arg(long)]
+    date_from: Option<String>,
+
+    /// Inclusive end date (YYYY-MM-DD or YYYY_MMDD)
+    #[arg(long)]
+    date_to: Option<String>,
+
+    /// Output HTML path (default: ~/.aicx/aicx-reports.html)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Optional JSON bundle output path for later import/merge
+    #[arg(long)]
+    bundle_output: Option<PathBuf>,
+
+    /// Document title
+    #[arg(long, default_value = "AI Contexters Report Explorer")]
+    title: String,
+
+    /// Max preview characters per record (0 = no truncation)
+    #[arg(long, default_value = "280")]
+    preview_chars: usize,
+}
+
+#[derive(Debug, Clone, Args)]
+struct DashboardServeLegacyArgs {
+    /// Store root directory (default: ~/.aicx)
+    #[arg(long)]
+    store_root: Option<PathBuf>,
+
+    /// Bind host IP address (loopback only; example: 127.0.0.1)
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+
+    /// Bind TCP port
+    #[arg(long, default_value = "9478")]
+    port: u16,
+
+    /// Suppress automatic browser open on startup
+    #[arg(long)]
+    no_open: bool,
+
+    /// Legacy compatibility path retained for status surfaces; not written in server mode
+    #[arg(long, hide = true)]
+    artifact: Option<PathBuf>,
+
+    /// Document title
+    #[arg(long, default_value = "AI Contexters Dashboard")]
+    title: String,
+
+    /// Max preview characters per record (0 = no truncation)
+    #[arg(long, default_value = "320")]
+    preview_chars: usize,
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     // ── Layer 1: Canonical corpus ─────────────────────────────────────
@@ -559,98 +672,19 @@ enum Commands {
         info: bool,
     },
 
-    /// Generate a searchable HTML dashboard from the canonical store (layer 1).
-    Dashboard {
-        /// Store root directory (default: ~/.aicx)
-        #[arg(long)]
-        store_root: Option<PathBuf>,
-
-        /// Output HTML path
-        #[arg(short, long, default_value = "aicx-dashboard.html")]
-        output: PathBuf,
-
-        /// Document title
-        #[arg(long, default_value = "AI Contexters Dashboard")]
-        title: String,
-
-        /// Max preview characters per record (0 = no truncation)
-        #[arg(long, default_value = "320")]
-        preview_chars: usize,
-    },
+    /// Generate a searchable HTML dashboard from the canonical store (layer 1), or serve it locally.
+    Dashboard(#[command(flatten)] DashboardArgs),
 
     /// Extract Vibecrafted workflow and marbles reports into a standalone HTML explorer.
-    ReportsExtractor {
-        /// Vibecrafted artifact root (default: ~/.vibecrafted/artifacts)
-        #[arg(long)]
-        artifacts_root: Option<PathBuf>,
+    Reports(#[command(flatten)] ReportsArgs),
 
-        /// Artifact organization bucket
-        #[arg(long, default_value = "VetCoders")]
-        org: String,
+    /// Deprecated compatibility shim for `aicx reports`.
+    #[command(name = "reports-extractor", hide = true)]
+    ReportsExtractorLegacy(#[command(flatten)] ReportsArgs),
 
-        /// Repository bucket (defaults to the current directory name)
-        #[arg(long)]
-        repo: Option<String>,
-
-        /// Workflow filter (matches workflow label, skill code, run/prompt IDs, lane, and title)
-        #[arg(long)]
-        workflow: Option<String>,
-
-        /// Inclusive start date (YYYY-MM-DD or YYYY_MMDD)
-        #[arg(long)]
-        date_from: Option<String>,
-
-        /// Inclusive end date (YYYY-MM-DD or YYYY_MMDD)
-        #[arg(long)]
-        date_to: Option<String>,
-
-        /// Output HTML path
-        #[arg(short, long, default_value = "aicx-reports.html")]
-        output: PathBuf,
-
-        /// Optional JSON bundle output path for later import/merge
-        #[arg(long)]
-        bundle_output: Option<PathBuf>,
-
-        /// Document title
-        #[arg(long, default_value = "AI Contexters Report Explorer")]
-        title: String,
-
-        /// Max preview characters per record (0 = no truncation)
-        #[arg(long, default_value = "280")]
-        preview_chars: usize,
-    },
-
-    /// Run a local dashboard server with live search and regeneration endpoints (layer 1).
-    DashboardServe {
-        /// Store root directory (default: ~/.aicx)
-        #[arg(long)]
-        store_root: Option<PathBuf>,
-
-        /// Bind host IP address (loopback only; example: 127.0.0.1)
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-
-        /// Bind TCP port
-        #[arg(long, default_value = "9478")]
-        port: u16,
-
-        /// Suppress automatic browser open on startup
-        #[arg(long)]
-        no_open: bool,
-
-        /// Legacy compatibility path retained for status surfaces; not written in server mode
-        #[arg(long, default_value = "aicx-dashboard.html", hide = true)]
-        artifact: PathBuf,
-
-        /// Document title
-        #[arg(long, default_value = "AI Contexters Dashboard")]
-        title: String,
-
-        /// Max preview characters per record (0 = no truncation)
-        #[arg(long, default_value = "320")]
-        preview_chars: usize,
-    },
+    /// Deprecated compatibility shim for `aicx dashboard --serve`.
+    #[command(name = "dashboard-serve", hide = true)]
+    DashboardServeLegacy(#[command(flatten)] DashboardServeLegacyArgs),
 
     /// Extract structured intents and decisions from canonical store (layer 1).
     Intents {
@@ -1113,61 +1147,26 @@ fn main() -> Result<()> {
         }) => {
             run_state(reset, project, info)?;
         }
-        Some(Commands::Dashboard {
-            store_root,
-            output,
-            title,
-            preview_chars,
-        }) => {
-            run_dashboard(DashboardRunArgs {
-                store_root,
-                output,
-                title,
-                preview_chars,
-            })?;
+        Some(Commands::Dashboard(args)) => {
+            run_dashboard_command(args)?;
         }
-        Some(Commands::ReportsExtractor {
-            artifacts_root,
-            org,
-            repo,
-            workflow,
-            date_from,
-            date_to,
-            output,
-            bundle_output,
-            title,
-            preview_chars,
-        }) => {
-            run_reports_extractor(ReportsExtractorRunArgs {
-                artifacts_root,
-                org,
-                repo,
-                workflow,
-                date_from,
-                date_to,
-                output,
-                bundle_output,
-                title,
-                preview_chars,
-            })?;
+        Some(Commands::Reports(args)) => {
+            run_reports_command(args)?;
         }
-        Some(Commands::DashboardServe {
-            store_root,
-            host,
-            port,
-            no_open,
-            artifact,
-            title,
-            preview_chars,
-        }) => {
+        Some(Commands::ReportsExtractorLegacy(args)) => {
+            warn_legacy_subcommand("reports-extractor", "reports");
+            run_reports_command(args)?;
+        }
+        Some(Commands::DashboardServeLegacy(args)) => {
+            warn_legacy_subcommand("dashboard-serve", "dashboard --serve");
             run_dashboard_server(DashboardServerRunArgs {
-                store_root,
-                host,
-                port,
-                no_open,
-                artifact,
-                title,
-                preview_chars,
+                store_root: args.store_root,
+                host: args.host,
+                port: args.port,
+                no_open: args.no_open,
+                artifact: args.artifact.unwrap_or(default_dashboard_output_path()?),
+                title: args.title,
+                preview_chars: args.preview_chars,
             })?;
         }
         Some(Commands::Intents {
@@ -1719,6 +1718,10 @@ fn warn_incremental_legacy_flag(flag_used: bool) {
     if flag_used {
         eprintln!("{INCREMENTAL_LEGACY_NOTE}");
     }
+}
+
+fn warn_legacy_subcommand(legacy: &str, replacement: &str) {
+    eprintln!("# Note: `aicx {legacy}` is deprecated; use `aicx {replacement}` instead.");
 }
 
 struct ExtractionParams<'a> {
@@ -3136,6 +3139,53 @@ struct DashboardRunArgs {
     preview_chars: usize,
 }
 
+fn default_dashboard_output_path() -> Result<PathBuf> {
+    Ok(store::store_base_dir()?.join("aicx-dashboard.html"))
+}
+
+fn run_dashboard_command(args: DashboardArgs) -> Result<()> {
+    if args.serve && args.generate_html {
+        return Err(anyhow::anyhow!(
+            "Choose either --serve or --generate-html, not both."
+        ));
+    }
+
+    if args.serve {
+        if args.output.is_some() {
+            return Err(anyhow::anyhow!(
+                "--output is only valid with generated HTML mode. Use `aicx dashboard --generate-html -o <path>`."
+            ));
+        }
+
+        return run_dashboard_server(DashboardServerRunArgs {
+            store_root: args.store_root,
+            host: args.host.unwrap_or_else(|| "127.0.0.1".to_string()),
+            port: args.port.unwrap_or(9478),
+            no_open: args.no_open,
+            artifact: default_dashboard_output_path()?,
+            title: args.title,
+            preview_chars: args.preview_chars,
+        });
+    }
+
+    if args.host.is_some() || args.port.is_some() || args.no_open {
+        return Err(anyhow::anyhow!(
+            "--host, --port, and --no-open are only valid with --serve."
+        ));
+    }
+
+    if !args.generate_html {
+        eprintln!("# Tip: add --serve for live HTTP server mode");
+    }
+
+    run_dashboard(DashboardRunArgs {
+        store_root: args.store_root,
+        output: args.output.unwrap_or(default_dashboard_output_path()?),
+        title: args.title,
+        preview_chars: args.preview_chars,
+    })
+}
+
 /// Build and write an AI context dashboard HTML file.
 fn run_dashboard(args: DashboardRunArgs) -> Result<()> {
     let root = if let Some(path) = args.store_root {
@@ -3199,6 +3249,25 @@ struct ReportsExtractorRunArgs {
     bundle_output: Option<PathBuf>,
     title: String,
     preview_chars: usize,
+}
+
+fn default_reports_output_path() -> Result<PathBuf> {
+    Ok(store::store_base_dir()?.join("aicx-reports.html"))
+}
+
+fn run_reports_command(args: ReportsArgs) -> Result<()> {
+    run_reports_extractor(ReportsExtractorRunArgs {
+        artifacts_root: args.artifacts_root,
+        org: args.org,
+        repo: args.repo,
+        workflow: args.workflow,
+        date_from: args.date_from,
+        date_to: args.date_to,
+        output: args.output.unwrap_or(default_reports_output_path()?),
+        bundle_output: args.bundle_output,
+        title: args.title,
+        preview_chars: args.preview_chars,
+    })
 }
 
 fn run_reports_extractor(args: ReportsExtractorRunArgs) -> Result<()> {
@@ -3667,31 +3736,71 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_serve_help_hides_legacy_artifact_flag() {
+    fn top_level_help_hides_legacy_dashboard_and_reports_commands() {
         let mut cmd = Cli::command();
-        let dashboard_serve = cmd
-            .find_subcommand_mut("dashboard-serve")
-            .expect("dashboard-serve subcommand should exist");
-        let rendered = dashboard_serve.render_long_help().to_string();
+        let rendered = cmd.render_long_help().to_string();
 
-        assert!(!rendered.contains("--artifact"));
-        assert!(rendered.contains("Run a local dashboard server"));
+        assert!(!rendered.contains("dashboard-serve"));
+        assert!(!rendered.contains("reports-extractor"));
+        assert!(rendered.contains("\n  dashboard "));
+        assert!(rendered.contains("\n  reports "));
     }
 
     #[test]
-    fn reports_extractor_help_describes_embedded_html_and_bundle() {
+    fn dashboard_help_describes_generate_and_serve_modes() {
+        let mut cmd = Cli::command();
+        let dashboard = cmd
+            .find_subcommand_mut("dashboard")
+            .expect("dashboard subcommand should exist");
+        let rendered = dashboard.render_long_help().to_string();
+
+        assert!(rendered.contains("--serve"));
+        assert!(rendered.contains("--generate-html"));
+        assert!(rendered.contains("~/.aicx/aicx-dashboard.html"));
+        assert!(!rendered.contains("--artifact"));
+    }
+
+    #[test]
+    fn reports_help_describes_embedded_html_and_bundle() {
         let mut cmd = Cli::command();
         let reports = cmd
-            .find_subcommand_mut("reports-extractor")
-            .expect("reports-extractor subcommand should exist");
+            .find_subcommand_mut("reports")
+            .expect("reports subcommand should exist");
         let rendered = reports.render_long_help().to_string();
 
         assert!(rendered.contains("standalone HTML explorer"));
         assert!(rendered.contains("~/.vibecrafted/artifacts"));
+        assert!(rendered.contains("~/.aicx/aicx-reports.html"));
         assert!(rendered.contains("--bundle-output"));
         assert!(rendered.contains("--date-from"));
         assert!(rendered.contains("--date-to"));
         assert!(!rendered.contains("canonical store"));
+    }
+
+    #[test]
+    fn legacy_dashboard_serve_subcommand_still_parses_hidden_compatibility_path() {
+        let cli = Cli::try_parse_from(["aicx", "dashboard-serve", "--port", "9480"])
+            .expect("legacy dashboard-serve alias should parse");
+
+        match cli.command {
+            Some(Commands::DashboardServeLegacy(args)) => {
+                assert_eq!(args.port, 9480);
+            }
+            _ => panic!("expected hidden dashboard-serve compatibility command"),
+        }
+    }
+
+    #[test]
+    fn legacy_reports_extractor_subcommand_still_parses_hidden_compatibility_path() {
+        let cli = Cli::try_parse_from(["aicx", "reports-extractor", "--repo", "demo"])
+            .expect("legacy reports-extractor alias should parse");
+
+        match cli.command {
+            Some(Commands::ReportsExtractorLegacy(args)) => {
+                assert_eq!(args.repo.as_deref(), Some("demo"));
+            }
+            _ => panic!("expected hidden reports-extractor compatibility command"),
+        }
     }
 
     #[test]

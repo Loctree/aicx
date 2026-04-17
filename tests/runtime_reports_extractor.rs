@@ -108,7 +108,7 @@ fn assert_success(output: &Output) {
 }
 
 #[test]
-fn reports_extractor_builds_html_and_default_bundle_from_vibecrafted_artifacts() {
+fn reports_builds_html_and_default_bundle_from_vibecrafted_artifacts() {
     let root = unique_test_dir("reports-extractor");
     let home = root.join("home");
     let artifacts_root = root.join("artifacts");
@@ -170,7 +170,7 @@ fn reports_extractor_builds_html_and_default_bundle_from_vibecrafted_artifacts()
     let output = run_aicx(
         &home,
         &[
-            "reports-extractor",
+            "reports",
             "--artifacts-root",
             &artifacts_root.display().to_string(),
             "--org",

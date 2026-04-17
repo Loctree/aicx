@@ -881,7 +881,7 @@ return fetch(e.request).catch(()=>{if(e.request.mode==='navigate')\
 return new Response('<html><body style=\"background:#0a0f19;color:#e5e7eb;\
 font-family:system-ui;display:flex;align-items:center;justify-content:center;\
 height:100vh;margin:0\"><div style=\"text-align:center\"><h1>aicx store not \
-reachable</h1><p>Start the server with <code>aicx dashboard-serve</code></p>\
+reachable</h1><p>Start the server with <code>aicx dashboard --serve</code></p>\
 </div></body></html>',{headers:{'Content-Type':'text/html'}});});}));});";
     let mut headers = HeaderMap::new();
     headers.insert(
