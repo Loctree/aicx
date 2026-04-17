@@ -159,6 +159,38 @@ fn json_strings(value: &Value, key: &str) -> Vec<String> {
         .collect()
 }
 
+fn read_state(home: &Path) -> Value {
+    serde_json::from_str(
+        &fs::read_to_string(home.join(".aicx").join("state.json")).expect("read state.json"),
+    )
+    .expect("parse state.json")
+}
+
+fn append_codex_entry(
+    path: &Path,
+    session_id: &str,
+    cwd: Option<&Path>,
+    role: &str,
+    ts: i64,
+    text: &str,
+) {
+    let mut payload = serde_json::Map::new();
+    payload.insert("session_id".to_string(), json!(session_id));
+    payload.insert("text".to_string(), json!(text));
+    payload.insert("ts".to_string(), json!(ts));
+    payload.insert("role".to_string(), json!(role));
+    if let Some(cwd) = cwd {
+        payload.insert("cwd".to_string(), json!(cwd.display().to_string()));
+    }
+
+    let mut existing = fs::read_to_string(path).unwrap_or_default();
+    if !existing.is_empty() {
+        existing.push('\n');
+    }
+    existing.push_str(&Value::Object(payload).to_string());
+    write_file(path, &existing);
+}
+
 #[test]
 fn store_cli_codex_emits_repo_and_non_repo_canonical_roots() {
     let root = unique_test_dir("codex-command");
@@ -495,6 +527,182 @@ fn migration_cli_rebuilds_and_salvages_realistic_bundle() {
         json_paths(loose_state, "salvage_paths")
             .iter()
             .any(|path| { path.ends_with(Path::new("legacy-store").join("state.json")) })
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn all_cli_defaults_to_incremental_and_full_rescan_recovers_backfill() {
+    let root = unique_test_dir("all-incremental-default");
+    let home = root.join("home");
+    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let history = home.join(".codex").join("history.jsonl");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs() as i64;
+
+    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
+    write_codex_history(
+        &history,
+        "warm-state-sess",
+        Some(&repo_root),
+        &[
+            ("user", now - 300, "old context: inspect the runtime seam"),
+            (
+                "assistant",
+                now - 290,
+                "old reply: inspecting the runtime seam now",
+            ),
+        ],
+    );
+
+    let first = parse_stdout_json(&run_aicx(&home, &["all", "-H", "24", "--emit", "json"]));
+    assert_eq!(first["total_entries"].as_u64(), Some(2));
+
+    append_codex_entry(
+        &history,
+        "warm-state-sess",
+        Some(&repo_root),
+        "user",
+        now - 120,
+        "new context: only this should land on the next incremental run",
+    );
+
+    let second = parse_stdout_json(&run_aicx(&home, &["all", "-H", "24", "--emit", "json"]));
+    assert_eq!(second["total_entries"].as_u64(), Some(1));
+    let second_entries = second["entries"].as_array().expect("entries array");
+    assert_eq!(second_entries.len(), 1);
+    assert_eq!(
+        second_entries[0]["message"].as_str(),
+        Some("new context: only this should land on the next incremental run")
+    );
+
+    append_codex_entry(
+        &history,
+        "warm-state-sess",
+        Some(&repo_root),
+        "user",
+        now - 240,
+        "late backfill: older than watermark but still inside the lookback window",
+    );
+
+    let third = parse_stdout_json(&run_aicx(&home, &["all", "-H", "24", "--emit", "json"]));
+    assert_eq!(third["total_entries"].as_u64(), Some(0));
+
+    let fourth = parse_stdout_json(&run_aicx(
+        &home,
+        &["all", "-H", "24", "--full-rescan", "--emit", "json"],
+    ));
+    assert_eq!(fourth["total_entries"].as_u64(), Some(1));
+    let fourth_entries = fourth["entries"].as_array().expect("entries array");
+    assert_eq!(fourth_entries.len(), 1);
+    assert_eq!(
+        fourth_entries[0]["message"].as_str(),
+        Some("late backfill: older than watermark but still inside the lookback window")
+    );
+
+    let state = read_state(&home);
+    let expected_watermark = chrono::DateTime::<chrono::Utc>::from_timestamp(now - 120, 0)
+        .expect("valid timestamp")
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    assert_eq!(
+        state["last_processed"]["claude+codex+gemini+junie:all"].as_str(),
+        Some(expected_watermark.as_str())
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn store_cli_defaults_to_incremental_and_full_rescan_recovers_backfill() {
+    let root = unique_test_dir("store-incremental-default");
+    let home = root.join("home");
+    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let history = home.join(".codex").join("history.jsonl");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs() as i64;
+
+    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
+    write_codex_history(
+        &history,
+        "store-watermark-sess",
+        Some(&repo_root),
+        &[
+            ("user", now - 300, "store old context"),
+            ("assistant", now - 290, "store old reply"),
+        ],
+    );
+
+    let first = parse_stdout_json(&run_aicx(
+        &home,
+        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
+    ));
+    assert_eq!(first["total_entries"].as_u64(), Some(2));
+
+    append_codex_entry(
+        &history,
+        "store-watermark-sess",
+        Some(&repo_root),
+        "user",
+        now - 120,
+        "store new context",
+    );
+
+    let second = parse_stdout_json(&run_aicx(
+        &home,
+        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
+    ));
+    assert_eq!(second["total_entries"].as_u64(), Some(1));
+
+    append_codex_entry(
+        &history,
+        "store-watermark-sess",
+        Some(&repo_root),
+        "user",
+        now - 240,
+        "store late backfill",
+    );
+
+    let third = parse_stdout_json(&run_aicx(
+        &home,
+        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
+    ));
+    assert_eq!(third["total_entries"].as_u64(), Some(0));
+
+    let fourth = parse_stdout_json(&run_aicx(
+        &home,
+        &[
+            "store",
+            "--agent",
+            "codex",
+            "-H",
+            "24",
+            "--full-rescan",
+            "--emit",
+            "json",
+        ],
+    ));
+    assert_eq!(fourth["total_entries"].as_u64(), Some(4));
+
+    let store_paths = json_paths(&fourth, "store_paths");
+    let combined_store = store_paths
+        .iter()
+        .map(|path| fs::read_to_string(path).expect("read store chunk"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(combined_store.contains("store late backfill"));
+
+    let state = read_state(&home);
+    let expected_watermark = chrono::DateTime::<chrono::Utc>::from_timestamp(now - 120, 0)
+        .expect("valid timestamp")
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    assert_eq!(
+        state["last_processed"]["codex:all"].as_str(),
+        Some(expected_watermark.as_str())
     );
 
     let _ = fs::remove_dir_all(&root);

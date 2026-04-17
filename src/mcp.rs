@@ -157,12 +157,11 @@ struct SteerResponse {
     items: Vec<serde_json::Value>,
 }
 
-fn incremental_rescan_args(hours: u64, project: Option<&str>) -> Vec<String> {
+fn background_refresh_args(hours: u64, project: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "all".to_string(),
         "-H".to_string(),
         hours.to_string(),
-        "--incremental".to_string(),
         "--emit".to_string(),
         "none".to_string(),
     ];
@@ -221,7 +220,7 @@ impl AicxMcpServer {
 
         // Non-blocking auto-rescan with rate-limit guard.
         if !RESCAN_RUNNING.swap(true, Ordering::SeqCst) {
-            let args = incremental_rescan_args(24, project.as_deref());
+            let args = background_refresh_args(24, project.as_deref());
             match std::process::Command::new("aicx")
                 .args(&args)
                 .stdout(std::process::Stdio::null())
@@ -664,19 +663,18 @@ fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, McpError> {
 mod tests {
     use super::{
         MAX_SCORE_FILTER, McpTransport, RankItem, RankResponse, SearchParams, SteerResponse,
-        incremental_rescan_args, parse_date_filter_mcp, validate_score_filter,
+        background_refresh_args, parse_date_filter_mcp, validate_score_filter,
     };
     use clap::ValueEnum as _;
 
     #[test]
-    fn incremental_rescan_args_use_all_incremental_and_quiet_stdout() {
+    fn background_refresh_args_use_all_and_quiet_stdout() {
         assert_eq!(
-            incremental_rescan_args(24, None),
+            background_refresh_args(24, None),
             vec![
                 "all".to_string(),
                 "-H".to_string(),
                 "24".to_string(),
-                "--incremental".to_string(),
                 "--emit".to_string(),
                 "none".to_string(),
             ]
@@ -709,14 +707,13 @@ mod tests {
     }
 
     #[test]
-    fn incremental_rescan_args_include_project_filter() {
+    fn background_refresh_args_include_project_filter() {
         assert_eq!(
-            incremental_rescan_args(72, Some("ai-contexters")),
+            background_refresh_args(72, Some("ai-contexters")),
             vec![
                 "all".to_string(),
                 "-H".to_string(),
                 "72".to_string(),
-                "--incremental".to_string(),
                 "--emit".to_string(),
                 "none".to_string(),
                 "-p".to_string(),

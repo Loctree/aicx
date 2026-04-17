@@ -73,9 +73,9 @@ fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
 /// aicx owns the canonical corpus; memex is an optional semantic index layered on top.
 ///
 /// Quick start:
-///   aicx all -H 4 --incremental        # build canonical corpus (layer 1)
+///   aicx all -H 4                      # build canonical corpus (layer 1)
 ///   aicx memex-sync                     # materialize into memex (layer 2)
-///   aicx all -H 4 --incremental --memex # both layers in one shot
+///   aicx all -H 4 --memex              # both layers in one shot
 ///   aicx memex-sync --reindex           # full rebuild after model change
 #[derive(Debug, Parser)]
 #[command(name = "aicx")]
@@ -189,8 +189,12 @@ enum Commands {
         #[arg(long, default_value = "0")]
         rotate: usize,
 
-        /// Use incremental mode (skip already-processed entries)
+        /// Ignore stored watermark and rescan the full lookback window
         #[arg(long)]
+        full_rescan: bool,
+
+        /// Legacy no-op: incremental mode is now the default
+        #[arg(long, hide = true, conflicts_with = "full_rescan")]
         incremental: bool,
 
         /// Only include user messages (exclude assistant + reasoning)
@@ -261,8 +265,12 @@ enum Commands {
         #[arg(long, default_value = "0")]
         rotate: usize,
 
-        /// Use incremental mode
+        /// Ignore stored watermark and rescan the full lookback window
         #[arg(long)]
+        full_rescan: bool,
+
+        /// Legacy no-op: incremental mode is now the default
+        #[arg(long, hide = true, conflicts_with = "full_rescan")]
         incremental: bool,
 
         /// Only include user messages (exclude assistant + reasoning)
@@ -302,8 +310,9 @@ enum Commands {
     /// Extract + store from all agents (Claude + Codex + Gemini + Junie) into the canonical corpus (layer 1).
     ///
     /// The daily-driver command: runs each extractor, deduplicates, chunks, and
-    /// writes steerable markdown to ~/.aicx/. With --incremental, uses per-source
-    /// watermarks to skip already-processed entries. Add --memex to also
+    /// writes steerable markdown to ~/.aicx/. By default, uses per-source
+    /// watermarks to skip already-processed entries. Use --full-rescan to
+    /// ignore the watermark and scan the full lookback window again. Add --memex to also
     /// materialize new chunks into the optional memex semantic index (layer 2).
     #[command(display_order = 1)]
     All {
@@ -330,8 +339,12 @@ enum Commands {
         #[arg(long, default_value = "0")]
         rotate: usize,
 
-        /// Use incremental mode
+        /// Ignore stored watermark and rescan the full lookback window
         #[arg(long)]
+        full_rescan: bool,
+
+        /// Legacy no-op: incremental mode is now the default
+        #[arg(long, hide = true, conflicts_with = "full_rescan")]
         incremental: bool,
 
         /// Only include user messages (exclude assistant + reasoning)
@@ -414,10 +427,9 @@ enum Commands {
     /// Build the canonical corpus in ~/.aicx/ from agent logs (layer 1).
     ///
     /// Store-first corpus builder: extracts, deduplicates, chunks, and writes
-    /// steerable markdown. Unlike `all --incremental`, this command does not use
-    /// watermarks — it re-processes the full lookback window every time.
-    /// Best for backfills and targeted re-extraction; use `all --incremental`
-    /// for daily watermark-tracked refreshes.
+    /// steerable markdown. By default, this command uses per-source watermarks
+    /// to skip previously scanned history. Use --full-rescan for backfills
+    /// and targeted re-extraction when you need to ignore the watermark.
     ///
     /// Add --memex to also materialize new chunks into the optional memex
     /// semantic index (layer 2) — a shortcut for running `memex-sync` separately.
@@ -437,6 +449,14 @@ enum Commands {
         /// Hours to look back (default: 48)
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
+
+        /// Ignore stored watermark and rescan the full lookback window
+        #[arg(long)]
+        full_rescan: bool,
+
+        /// Legacy no-op: incremental mode is now the default
+        #[arg(long, hide = true, conflicts_with = "full_rescan")]
+        incremental: bool,
 
         /// Only include user messages (exclude assistant + reasoning)
         #[arg(long)]
@@ -886,6 +906,7 @@ fn main() -> Result<()> {
             format,
             append_to,
             rotate,
+            full_rescan,
             incremental,
             user_only,
             include_assistant: include_assistant_flag,
@@ -897,6 +918,7 @@ fn main() -> Result<()> {
             conversation,
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
+            warn_incremental_legacy_flag(incremental);
             run_extraction(ExtractionParams {
                 agents: &["claude"],
                 project,
@@ -905,7 +927,7 @@ fn main() -> Result<()> {
                 format: &format,
                 append_to,
                 rotate,
-                incremental,
+                full_rescan,
                 include_assistant,
                 include_loctree: loctree,
                 project_root,
@@ -924,6 +946,7 @@ fn main() -> Result<()> {
             format,
             append_to,
             rotate,
+            full_rescan,
             incremental,
             user_only,
             include_assistant: include_assistant_flag,
@@ -935,6 +958,7 @@ fn main() -> Result<()> {
             conversation,
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
+            warn_incremental_legacy_flag(incremental);
             run_extraction(ExtractionParams {
                 agents: &["codex"],
                 project,
@@ -943,7 +967,7 @@ fn main() -> Result<()> {
                 format: &format,
                 append_to,
                 rotate,
-                incremental,
+                full_rescan,
                 include_assistant,
                 include_loctree: loctree,
                 project_root,
@@ -961,6 +985,7 @@ fn main() -> Result<()> {
             output,
             append_to,
             rotate,
+            full_rescan,
             incremental,
             user_only,
             include_assistant: include_assistant_flag,
@@ -972,6 +997,7 @@ fn main() -> Result<()> {
             conversation,
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
+            warn_incremental_legacy_flag(incremental);
             run_extraction(ExtractionParams {
                 agents: &["claude", "codex", "gemini", "junie"],
                 project,
@@ -980,7 +1006,7 @@ fn main() -> Result<()> {
                 format: "both",
                 append_to,
                 rotate,
-                incremental,
+                full_rescan,
                 include_assistant,
                 include_loctree: loctree,
                 project_root,
@@ -1019,21 +1045,25 @@ fn main() -> Result<()> {
             project,
             agent,
             hours,
+            full_rescan,
+            incremental,
             user_only,
             include_assistant: include_assistant_flag,
             memex,
             emit,
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
-            run_store(
+            warn_incremental_legacy_flag(incremental);
+            run_store(StoreRunArgs {
                 project,
                 agent,
                 hours,
+                full_rescan,
                 include_assistant,
-                memex,
+                sync_memex: memex,
                 emit,
-                redaction.redact_secrets,
-            )?;
+                redact_secrets: redaction.redact_secrets,
+            })?;
         }
         Some(Commands::MemexSync {
             namespace,
@@ -1670,6 +1700,27 @@ fn render_resolved_store_buckets(scope: &StoreScopeSurface) -> String {
     }
 }
 
+const INCREMENTAL_LEGACY_NOTE: &str =
+    "# Note: --incremental is now the default and will be removed in 0.8.0";
+
+fn extraction_source_key(agents: &[&str], project: &[String]) -> String {
+    format!(
+        "{}:{}",
+        agents.join("+"),
+        if project.is_empty() {
+            "all".to_string()
+        } else {
+            project.join("+")
+        }
+    )
+}
+
+fn warn_incremental_legacy_flag(flag_used: bool) {
+    if flag_used {
+        eprintln!("{INCREMENTAL_LEGACY_NOTE}");
+    }
+}
+
 struct ExtractionParams<'a> {
     agents: &'a [&'a str],
     project: Vec<String>,
@@ -1678,7 +1729,7 @@ struct ExtractionParams<'a> {
     format: &'a str,
     append_to: Option<PathBuf>,
     rotate: usize,
-    incremental: bool,
+    full_rescan: bool,
     include_assistant: bool,
     include_loctree: bool,
     project_root: Option<PathBuf>,
@@ -1687,6 +1738,17 @@ struct ExtractionParams<'a> {
     conversation: bool,
     redact_secrets: bool,
     emit: StdoutEmit,
+}
+
+struct StoreRunArgs {
+    project: Vec<String>,
+    agent: Option<String>,
+    hours: u64,
+    full_rescan: bool,
+    include_assistant: bool,
+    sync_memex: bool,
+    emit: StdoutEmit,
+    redact_secrets: bool,
 }
 
 struct MemexProgressPrinter {
@@ -1792,7 +1854,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         format,
         append_to,
         rotate,
-        incremental,
+        full_rescan,
         include_assistant,
         include_loctree,
         project_root,
@@ -1813,20 +1875,12 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
 
     let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
 
-    // Determine watermark (incremental mode uses per-source watermark)
-    let watermark = if incremental {
-        let source_key = format!(
-            "{}:{}",
-            agents.join("+"),
-            if project.is_empty() {
-                "all".to_string()
-            } else {
-                project.join("+")
-            }
-        );
-        state.get_watermark(&source_key)
-    } else {
+    // Default behavior is incremental; --full-rescan explicitly ignores the watermark.
+    let source_key = extraction_source_key(agents, &project);
+    let watermark = if full_rescan {
         None
+    } else {
+        state.get_watermark(&source_key)
     };
 
     let config = ExtractionConfig {
@@ -2120,19 +2174,8 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             }
         }
 
-        if incremental {
-            let source_key = format!(
-                "{}:{}",
-                agents.join("+"),
-                if project.is_empty() {
-                    "all".to_string()
-                } else {
-                    project.join("+")
-                }
-            );
-            if let Some(latest) = output_entries.last() {
-                state.update_watermark(&source_key, latest.timestamp);
-            }
+        if let Some(latest) = output_entries.last() {
+            state.update_watermark(&source_key, latest.timestamp);
         }
 
         state.record_run(
@@ -2155,15 +2198,18 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
 }
 
 /// Store extracted contexts in the canonical corpus and optionally materialize into the memex semantic index.
-fn run_store(
-    project: Vec<String>,
-    agent: Option<String>,
-    hours: u64,
-    include_assistant: bool,
-    sync_memex: bool,
-    emit: StdoutEmit,
-    redact_secrets: bool,
-) -> Result<()> {
+fn run_store(args: StoreRunArgs) -> Result<()> {
+    let StoreRunArgs {
+        project,
+        agent,
+        hours,
+        full_rescan,
+        include_assistant,
+        sync_memex,
+        emit,
+        redact_secrets,
+    } = args;
+
     let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
 
     let agents: Vec<&str> = match agent.as_deref() {
@@ -2174,11 +2220,19 @@ fn run_store(
         _ => vec!["claude", "codex", "gemini", "junie"],
     };
 
+    let mut state = StateManager::load();
+    let source_key = extraction_source_key(&agents, &project);
+    let watermark = if full_rescan {
+        None
+    } else {
+        state.get_watermark(&source_key)
+    };
+
     let config = ExtractionConfig {
         project_filter: project.clone(),
         cutoff,
         include_assistant,
-        watermark: None,
+        watermark,
     };
     eprintln!(
         "  Requested source filters: {}",
@@ -2210,6 +2264,22 @@ fn run_store(
 
     if all_entries.is_empty() {
         eprintln!("No entries found.");
+        if let StdoutEmit::Json = emit {
+            let scope_surface = StoreScopeSurface::empty(&project);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "total_entries": 0,
+                    "total_chunks": 0,
+                    "requested_source_filters": scope_surface.requested_source_filters,
+                    "resolved_repositories": scope_surface.resolved_repositories,
+                    "includes_non_repository_contexts": scope_surface.includes_non_repository_contexts,
+                    "resolved_store_buckets": scope_surface.resolved_store_buckets,
+                    "repos": scope_surface.repository_buckets(),
+                    "store_paths": Vec::<String>::new(),
+                }))?
+            );
+        }
         return Ok(());
     }
 
@@ -2273,6 +2343,16 @@ fn run_store(
     );
 
     sync_memex_if_requested(sync_memex, &all_written_paths)?;
+
+    if let Some(latest) = all_entries.last() {
+        state.update_watermark(&source_key, latest.timestamp);
+    }
+    state.record_run(
+        stored_count,
+        agents.iter().map(|agent| (*agent).to_string()).collect(),
+    );
+    state.prune_old_hashes(50_000);
+    state.save()?;
 
     match emit {
         StdoutEmit::Paths => {

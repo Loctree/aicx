@@ -64,8 +64,9 @@ cargo install --path . --locked --bin aicx --bin aicx-mcp
 Extract the last 4 hours into `~/.aicx/`. Extractors are quiet on stdout by default (`--emit none`).
 
 ```bash
-aicx all -H 4 --incremental        # daily driver: watermark-tracked, skips already-processed entries
-aicx store -p MyProject -H 720     # store-first: full re-extraction, no watermark, good for backfills
+aicx all -H 4                      # daily driver: watermark-tracked, skips already-processed entries
+aicx store -p MyProject -H 720     # store-first: watermark-tracked refresh into the canonical corpus
+aicx store -p MyProject -H 720 --full-rescan  # explicit backfill / recovery pass
 ```
 
 `-p/--project` on extractors and `store` narrows source session discovery before
@@ -99,7 +100,7 @@ aicx memex-sync --reindex    # full rebuild (after model/dimension change)
 Or do both layers in one shot:
 
 ```bash
-aicx all -H 4 --incremental --memex
+aicx all -H 4 --memex
 ```
 
 Pipe one JSON payload (handy for automation):
@@ -139,14 +140,14 @@ store/VetCoders/ai-contexters/**/reports/**
 Daily “what changed?” with incremental refresh plus compact summary:
 
 ```bash
-aicx all -H 24 --incremental --emit none
+aicx all -H 24 --emit none
 aicx refs -H 24
 ```
 
-Incremental mode (watermark per source, avoids re-processing):
+Full-window backfill (ignore the stored watermark explicitly):
 
 ```bash
-aicx all -H 168 --incremental
+aicx all -H 168 --full-rescan
 ```
 
 User-only mode (smaller output; excludes assistant + reasoning):
