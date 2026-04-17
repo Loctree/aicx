@@ -1020,7 +1020,7 @@ Some boilerplate text.
         content.push_str("- Starting implementation without running init\n");
         content.push_str("## Fallback\n");
         content.push_str("If aicx unavailable: skip memory steps.\n");
-        content.push_str("```bash\naicx all -p project --incremental\n```\n");
+        content.push_str("```bash\naicx all -p project\n```\n");
 
         let score = score_chunk_content(&content);
         assert!(

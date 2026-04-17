@@ -248,7 +248,7 @@ configure_mcp "gemini" "$HOME/.gemini/settings.json"
 
 # --- Step 4: Full store bootstrap ---
 echo "[4/4] Full context extraction (this may take a moment)..."
-"${AICX_RUN[@]}" all -H 10000 --incremental --emit none
+"${AICX_RUN[@]}" all -H 10000 --emit none
 echo "  store bootstrap complete"
 echo ""
 
