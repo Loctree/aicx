@@ -30,7 +30,7 @@ use std::{fs, io::Write};
 
 use crate::dashboard::{
     self, DashboardPayload, DashboardRecord, DashboardScope, DashboardStats,
-    date_matches_hours_scope, project_matches_filter,
+    project_matches_filter, timestamp_matches_hours_scope,
 };
 use crate::rank;
 
@@ -1189,7 +1189,6 @@ async fn fuzzy_search(
                 .filter(|result| {
                     project_matches_filter(&result.project, request_project.as_deref())
                         && project_matches_filter(&result.project, scope.project.as_deref())
-                        && date_matches_hours_scope(&result.date, scope.hours)
                 })
                 .collect();
 
@@ -1294,6 +1293,13 @@ fn run_fuzzy_search(
     if let Some(min_score) = score {
         results.retain(|result| result.score >= min_score);
     }
+    results.retain(|result| {
+        timestamp_matches_hours_scope(
+            result.timestamp.as_deref(),
+            &result.date,
+            refresh_scope.hours,
+        )
+    });
 
     let results = results
         .into_iter()

@@ -8,7 +8,7 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -48,11 +48,8 @@ impl DashboardScope {
     }
 
     pub fn cutoff_date(&self) -> Option<String> {
-        self.normalized().hours.map(|hours| {
-            (Utc::now() - chrono::Duration::hours(hours as i64))
-                .format("%Y-%m-%d")
-                .to_string()
-        })
+        hours_scope_cutoff(self.normalized().hours)
+            .map(|cutoff| cutoff.format("%Y-%m-%d").to_string())
     }
 }
 
@@ -65,14 +62,68 @@ pub fn project_matches_filter(project: &str, filter: Option<&str>) -> bool {
 }
 
 pub fn date_matches_hours_scope(date_iso: &str, hours: Option<u64>) -> bool {
-    if let Some(hours) = hours.filter(|hours| *hours > 0) {
-        let cutoff = (Utc::now() - chrono::Duration::hours(hours as i64))
-            .format("%Y-%m-%d")
-            .to_string();
-        date_iso >= cutoff.as_str()
-    } else {
-        true
+    sort_ts_matches_hours_scope(None, date_iso, hours)
+}
+
+pub fn timestamp_matches_hours_scope(
+    timestamp: Option<&str>,
+    date_iso: &str,
+    hours: Option<u64>,
+) -> bool {
+    timestamp_matches_hours_scope_at(timestamp, date_iso, hours, Utc::now())
+}
+
+pub fn sort_ts_matches_hours_scope(
+    sort_ts: Option<i64>,
+    date_iso: &str,
+    hours: Option<u64>,
+) -> bool {
+    sort_ts_matches_hours_scope_at(sort_ts, date_iso, hours, Utc::now())
+}
+
+fn timestamp_matches_hours_scope_at(
+    timestamp: Option<&str>,
+    date_iso: &str,
+    hours: Option<u64>,
+    now: DateTime<Utc>,
+) -> bool {
+    let sort_ts = timestamp
+        .and_then(parse_rfc3339_timestamp)
+        .map(|parsed| parsed.timestamp());
+    sort_ts_matches_hours_scope_at(sort_ts, date_iso, hours, now)
+}
+
+fn sort_ts_matches_hours_scope_at(
+    sort_ts: Option<i64>,
+    date_iso: &str,
+    hours: Option<u64>,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(cutoff) = hours_scope_cutoff_at(now, hours) else {
+        return true;
+    };
+
+    if let Some(timestamp) = sort_ts.and_then(|ts| Utc.timestamp_opt(ts, 0).single()) {
+        return timestamp >= cutoff;
     }
+
+    date_iso >= cutoff.format("%Y-%m-%d").to_string().as_str()
+}
+
+fn hours_scope_cutoff(hours: Option<u64>) -> Option<DateTime<Utc>> {
+    hours_scope_cutoff_at(Utc::now(), hours)
+}
+
+fn hours_scope_cutoff_at(now: DateTime<Utc>, hours: Option<u64>) -> Option<DateTime<Utc>> {
+    hours
+        .filter(|hours| *hours > 0)
+        .map(|hours| now - chrono::Duration::hours(hours as i64))
+}
+
+fn parse_rfc3339_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|parsed| parsed.with_timezone(&Utc))
 }
 
 /// Configuration for dashboard generation.
@@ -382,15 +433,13 @@ fn scan_store(
     }
     if let Some(hours) = scope.hours {
         assumptions.push(format!(
-            "Startup scope narrows dashboard payload to the last {} hour(s) using canonical chunk dates.",
+            "Startup scope narrows dashboard payload to the last {} hour(s) using extracted event timestamps when available, falling back to canonical chunk dates.",
             hours
         ));
     }
 
     for stored_file in crate::store::scan_context_files_at(&store_root)? {
-        if !project_matches_filter(&stored_file.project, scope.project.as_deref())
-            || !date_matches_hours_scope(&stored_file.date_iso, scope.hours)
-        {
+        if !project_matches_filter(&stored_file.project, scope.project.as_deref()) {
             continue;
         }
 
@@ -414,18 +463,21 @@ fn scan_store(
             .and_then(|name| name.to_str())
             .unwrap_or("unknown-file")
             .to_string();
-        let (entry_count, preview, search_excerpt, detail_text) =
+        let (entry_count, preview, search_excerpt, detail_text, content_sort_ts) =
             read_preview_and_search_excerpt(&file_path, &extension, metadata.len(), preview_chars);
 
         let modified = metadata.modified().ok();
         let modified_utc = format_modified_utc(modified);
-        let time = modified
-            .map(DateTime::<Utc>::from)
+        let modified_sort_ts = modified.map(|mtime| DateTime::<Utc>::from(mtime).timestamp());
+        let effective_sort_ts = content_sort_ts.or(modified_sort_ts);
+        if !sort_ts_matches_hours_scope(effective_sort_ts, &stored_file.date_iso, scope.hours) {
+            continue;
+        }
+        let sort_ts = effective_sort_ts.unwrap_or_default();
+        let time = effective_sort_ts
+            .and_then(|timestamp| Utc.timestamp_opt(timestamp, 0).single())
             .map(|datetime| datetime.format("%H:%M:%S").to_string())
             .unwrap_or_else(|| "00:00:00".to_string());
-        let sort_ts = modified
-            .map(|mtime| DateTime::<Utc>::from(mtime).timestamp())
-            .unwrap_or_default();
         let relative_path = file_path
             .strip_prefix(&store_root)
             .map(|path| path.display().to_string())
@@ -544,29 +596,30 @@ fn read_preview_and_search_excerpt(
     extension: &str,
     size: u64,
     preview_chars: usize,
-) -> (Option<usize>, String, String, String) {
+) -> (Option<usize>, String, String, String, Option<i64>) {
     if extension == "json" {
         return read_json_preview_and_search(path, size, preview_chars);
     }
 
     let raw = read_text_limited(path, SEARCH_READ_BYTES);
     if raw.is_empty() {
-        return (None, "".to_string(), "".to_string(), "".to_string());
+        return (None, "".to_string(), "".to_string(), "".to_string(), None);
     }
 
     let detail = trim_chars(&sanitize_detail_text(&raw), MAX_DETAIL_CHARS);
     let collapsed = collapse_ws(&raw);
     let preview = trim_chars(&collapsed, preview_chars);
     let search_excerpt = trim_chars(&collapsed, MAX_SEARCH_TEXT_CHARS);
+    let sort_ts = extract_latest_timestamp_from_text(&raw);
 
-    (None, preview, search_excerpt, detail)
+    (None, preview, search_excerpt, detail, sort_ts)
 }
 
 fn read_json_preview_and_search(
     path: &Path,
     size: u64,
     max_preview_chars: usize,
-) -> (Option<usize>, String, String, String) {
+) -> (Option<usize>, String, String, String, Option<i64>) {
     if size > MAX_JSON_PARSE_BYTES {
         let raw = read_text_limited(path, SEARCH_READ_BYTES);
         let collapsed = collapse_ws(&raw);
@@ -584,6 +637,7 @@ fn read_json_preview_and_search(
             preview,
             trim_chars(&collapsed, MAX_SEARCH_TEXT_CHARS),
             detail,
+            None,
         );
     }
 
@@ -595,6 +649,7 @@ fn read_json_preview_and_search(
                 "Failed to read JSON preview.".to_string(),
                 "".to_string(),
                 "".to_string(),
+                None,
             );
         }
     };
@@ -609,6 +664,7 @@ fn read_json_preview_and_search(
                 trim_chars(&collapsed, max_preview_chars),
                 trim_chars(&collapsed, MAX_SEARCH_TEXT_CHARS),
                 trim_chars(&sanitize_detail_text(&raw), MAX_DETAIL_CHARS),
+                None,
             );
         }
     };
@@ -638,8 +694,9 @@ fn read_json_preview_and_search(
 
     let pretty = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
     let detail = trim_chars(&sanitize_detail_text(&pretty), MAX_DETAIL_CHARS);
+    let sort_ts = extract_latest_timestamp_from_json(&value);
 
-    (entry_count, preview, search_excerpt, detail)
+    (entry_count, preview, search_excerpt, detail, sort_ts)
 }
 
 fn collect_json_strings(
@@ -681,6 +738,73 @@ fn collect_json_strings(
                 if out.len() >= max_items || *total_chars >= max_total_chars {
                     break;
                 }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_latest_timestamp_from_text(raw: &str) -> Option<i64> {
+    let mut latest: Option<i64> = None;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+
+        if let Some(value) = trimmed.strip_prefix("### ")
+            && let Some(timestamp) = value.split(" UTC |").next()
+            && let Ok(parsed) = NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S")
+        {
+            latest = Some(latest.map_or(parsed.and_utc().timestamp(), |current| {
+                current.max(parsed.and_utc().timestamp())
+            }));
+            continue;
+        }
+
+        for prefix in ["timestamp:", "started_at:", "completed_at:"] {
+            if let Some(value) = trimmed.strip_prefix(prefix)
+                && let Some(parsed) = parse_rfc3339_timestamp(value.trim())
+            {
+                latest = Some(latest.map_or(parsed.timestamp(), |current| {
+                    current.max(parsed.timestamp())
+                }));
+            }
+        }
+    }
+
+    latest
+}
+
+fn extract_latest_timestamp_from_json(value: &Value) -> Option<i64> {
+    let mut latest: Option<i64> = None;
+    collect_json_timestamps(value, &mut latest);
+    latest
+}
+
+fn collect_json_timestamps(value: &Value, latest: &mut Option<i64>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if matches!(
+                    key.as_str(),
+                    "timestamp" | "started_at" | "completed_at" | "ts"
+                ) {
+                    let parsed = match child {
+                        Value::String(text) => {
+                            parse_rfc3339_timestamp(text).map(|dt| dt.timestamp())
+                        }
+                        Value::Number(number) => number.as_i64(),
+                        _ => None,
+                    };
+                    if let Some(parsed) = parsed {
+                        *latest = Some(latest.map_or(parsed, |current| current.max(parsed)));
+                    }
+                }
+                collect_json_timestamps(child, latest);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_json_timestamps(item, latest);
             }
         }
         _ => {}
@@ -2457,5 +2581,72 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hours_scope_uses_precise_same_day_timestamps_when_available() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 17, 12, 0, 0).unwrap();
+        let recent = Utc.with_ymd_and_hms(2026, 4, 17, 11, 30, 0).unwrap();
+        let stale_same_day = Utc.with_ymd_and_hms(2026, 4, 17, 7, 0, 0).unwrap();
+
+        assert!(sort_ts_matches_hours_scope_at(
+            Some(recent.timestamp()),
+            "2026-04-17",
+            Some(2),
+            now,
+        ));
+        assert!(!sort_ts_matches_hours_scope_at(
+            Some(stale_same_day.timestamp()),
+            "2026-04-17",
+            Some(2),
+            now,
+        ));
+        assert!(!timestamp_matches_hours_scope_at(
+            Some("2026-04-17T07:00:00Z"),
+            "2026-04-17",
+            Some(2),
+            now,
+        ));
+    }
+
+    #[test]
+    fn extract_latest_timestamp_helpers_prefer_newest_event_time() {
+        let json_ts = Utc
+            .with_ymd_and_hms(2026, 4, 17, 9, 0, 0)
+            .unwrap()
+            .timestamp();
+        let markdown = "\
+# sample
+
+### 2026-04-17 09:15:00 UTC | user
+> hello
+
+### 2026-04-17 11:45:00 UTC | assistant
+> updated
+";
+        assert_eq!(
+            extract_latest_timestamp_from_text(markdown),
+            Some(
+                Utc.with_ymd_and_hms(2026, 4, 17, 11, 45, 0)
+                    .unwrap()
+                    .timestamp()
+            )
+        );
+
+        let value = serde_json::json!({
+            "items": [
+                {"timestamp": "2026-04-17T08:00:00Z"},
+                {"ts": json_ts}
+            ],
+            "completed_at": "2026-04-17T10:30:00Z"
+        });
+        assert_eq!(
+            extract_latest_timestamp_from_json(&value),
+            Some(
+                Utc.with_ymd_and_hms(2026, 4, 17, 10, 30, 0)
+                    .unwrap()
+                    .timestamp()
+            )
+        );
     }
 }
