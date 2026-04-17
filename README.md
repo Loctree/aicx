@@ -215,10 +215,10 @@ Local browsing now shares one surface:
 
 ```bash
 # Static HTML artifact (default output: ~/.aicx/aicx-dashboard.html)
-aicx dashboard --generate-html
+aicx dashboard --generate-html -p ai-contexters -H 24
 
 # Live local server
-aicx dashboard --serve
+aicx dashboard --serve -p ai-contexters -H 24
 ```
 
 ## Intent Taxonomy

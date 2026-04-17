@@ -25,6 +25,56 @@ const SEARCH_READ_BYTES: u64 = 256 * 1024;
 const MAX_SEARCH_TEXT_CHARS: usize = 12_000;
 const MAX_DETAIL_CHARS: usize = 32_000;
 
+/// Optional dataset scope applied before dashboard generation or server startup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DashboardScope {
+    /// Case-insensitive substring match against canonical project/store bucket.
+    pub project: Option<String>,
+    /// Relative lookback window in hours; `None` means all time.
+    pub hours: Option<u64>,
+}
+
+impl DashboardScope {
+    /// Normalize empty project filters and treat `0` hours as "all time".
+    pub fn normalized(&self) -> Self {
+        Self {
+            project: self
+                .project
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            hours: self.hours.filter(|hours| *hours > 0),
+        }
+    }
+
+    pub fn cutoff_date(&self) -> Option<String> {
+        self.normalized().hours.map(|hours| {
+            (Utc::now() - chrono::Duration::hours(hours as i64))
+                .format("%Y-%m-%d")
+                .to_string()
+        })
+    }
+}
+
+pub fn project_matches_filter(project: &str, filter: Option<&str>) -> bool {
+    filter.is_none_or(|needle| {
+        project
+            .to_ascii_lowercase()
+            .contains(&needle.to_ascii_lowercase())
+    })
+}
+
+pub fn date_matches_hours_scope(date_iso: &str, hours: Option<u64>) -> bool {
+    if let Some(hours) = hours.filter(|hours| *hours > 0) {
+        let cutoff = (Utc::now() - chrono::Duration::hours(hours as i64))
+            .format("%Y-%m-%d")
+            .to_string();
+        date_iso >= cutoff.as_str()
+    } else {
+        true
+    }
+}
+
 /// Configuration for dashboard generation.
 #[derive(Debug, Clone)]
 pub struct DashboardConfig {
@@ -34,6 +84,8 @@ pub struct DashboardConfig {
     pub title: String,
     /// Max characters in per-record preview.
     pub preview_chars: usize,
+    /// Optional pre-filter applied before the payload is built.
+    pub scope: DashboardScope,
 }
 
 /// Dashboard generation output.
@@ -106,7 +158,7 @@ struct ScanResult {
 
 /// Build a complete HTML dashboard from store data.
 pub fn build_dashboard(config: &DashboardConfig) -> Result<DashboardArtifact> {
-    let scan = scan_store(&config.store_root, config.preview_chars)?;
+    let scan = scan_store(&config.store_root, config.preview_chars, &config.scope)?;
     let html = render_dashboard_html(&scan.payload, &config.title)?;
 
     Ok(DashboardArtifact {
@@ -118,7 +170,17 @@ pub fn build_dashboard(config: &DashboardConfig) -> Result<DashboardArtifact> {
 
 /// Scan the store and return the raw payload (for server mode).
 pub fn scan_store_payload(store_root: &Path, preview_chars: usize) -> Result<DashboardPayload> {
-    let scan = scan_store(store_root, preview_chars)?;
+    let scan = scan_store(store_root, preview_chars, &DashboardScope::default())?;
+    Ok(scan.payload)
+}
+
+/// Scan the store with an explicit scope and return the raw payload (for server mode).
+pub fn scan_store_payload_scoped(
+    store_root: &Path,
+    preview_chars: usize,
+    scope: &DashboardScope,
+) -> Result<DashboardPayload> {
+    let scan = scan_store(store_root, preview_chars, scope)?;
     Ok(scan.payload)
 }
 
@@ -271,8 +333,13 @@ pub fn render_server_shell_html(title: &str) -> String {
     )
 }
 
-fn scan_store(store_root: &Path, preview_chars: usize) -> Result<ScanResult> {
+fn scan_store(
+    store_root: &Path,
+    preview_chars: usize,
+    scope: &DashboardScope,
+) -> Result<ScanResult> {
     let store_root = crate::sanitize::validate_dir_path(store_root)?;
+    let scope = scope.normalized();
 
     let mut stats = DashboardStats {
         search_backend: "raw-notes-fuzzy".to_string(),
@@ -307,7 +374,26 @@ fn scan_store(store_root: &Path, preview_chars: usize) -> Result<ScanResult> {
             .push("state.json not found; dedup history is not surfaced in dashboard.".to_string());
     }
 
+    if let Some(project) = scope.project.as_ref() {
+        assumptions.push(format!(
+            "Startup scope narrows dashboard payload to project/store buckets containing: {}",
+            project
+        ));
+    }
+    if let Some(hours) = scope.hours {
+        assumptions.push(format!(
+            "Startup scope narrows dashboard payload to the last {} hour(s) using canonical chunk dates.",
+            hours
+        ));
+    }
+
     for stored_file in crate::store::scan_context_files_at(&store_root)? {
+        if !project_matches_filter(&stored_file.project, scope.project.as_deref())
+            || !date_matches_hours_scope(&stored_file.date_iso, scope.hours)
+        {
+            continue;
+        }
+
         let file_path = stored_file.path.clone();
         let extension = file_path
             .extension()
@@ -2102,7 +2188,7 @@ mod tests {
         )
         .expect("state");
 
-        let scan = scan_store(&root, 120).expect("scan");
+        let scan = scan_store(&root, 120, &DashboardScope::default()).expect("scan");
         assert_eq!(scan.payload.stats.total_projects, 1);
         assert_eq!(scan.payload.stats.total_files, 2);
         assert_eq!(scan.payload.stats.search_backend, "raw-notes-fuzzy");
@@ -2137,6 +2223,7 @@ mod tests {
             store_root: root.clone(),
             title: "AI Context Dashboard".to_string(),
             preview_chars: 100,
+            scope: DashboardScope::default(),
         };
 
         let artifact = build_dashboard(&cfg).expect("dashboard");
@@ -2297,7 +2384,7 @@ mod tests {
         let symlink_path = proj.join("2026_0224_codex_symlink001_001.md");
         std::os::unix::fs::symlink(&outside_file, &symlink_path).expect("symlink");
 
-        let scan = scan_store(&root, 120).expect("scan");
+        let scan = scan_store(&root, 120, &DashboardScope::default()).expect("scan");
         assert_eq!(scan.payload.stats.total_files, 1);
         assert!(
             scan.payload
@@ -2308,5 +2395,67 @@ mod tests {
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn scan_store_scope_filters_by_project_and_hours() {
+        let root = mk_tmp_dir("ai_ctx_dashboard_scope");
+
+        let alpha = root
+            .join("store")
+            .join("local")
+            .join("alpha-project")
+            .join("2026_0416")
+            .join("conversations")
+            .join("codex");
+        fs::create_dir_all(&alpha).expect("alpha dirs");
+        fs::write(
+            alpha.join("2026_0416_codex_scopealpha001_001.md"),
+            "# alpha\n\n### 2026-04-16 10:11:12 UTC | user\n> alpha kept\n",
+        )
+        .expect("alpha file");
+
+        let beta = root
+            .join("store")
+            .join("local")
+            .join("beta-project")
+            .join("2026_0210")
+            .join("conversations")
+            .join("claude");
+        fs::create_dir_all(&beta).expect("beta dirs");
+        fs::write(
+            beta.join("2026_0210_claude_scopebeta001_001.md"),
+            "# beta\n\n### 2026-02-10 08:00:00 UTC | user\n> beta excluded\n",
+        )
+        .expect("beta file");
+
+        let scoped = scan_store(
+            &root,
+            120,
+            &DashboardScope {
+                project: Some("alpha".to_string()),
+                hours: Some(72),
+            },
+        )
+        .expect("scoped scan");
+
+        assert_eq!(scoped.payload.records.len(), 1);
+        assert_eq!(scoped.payload.records[0].project, "local/alpha-project");
+        assert!(
+            scoped
+                .payload
+                .assumptions
+                .iter()
+                .any(|line| line.contains("project/store buckets containing: alpha"))
+        );
+        assert!(
+            scoped
+                .payload
+                .assumptions
+                .iter()
+                .any(|line| line.contains("last 72 hour(s)"))
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 }

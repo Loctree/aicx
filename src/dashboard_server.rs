@@ -26,7 +26,10 @@ use tokio::sync::RwLock;
 #[cfg(test)]
 use std::{fs, io::Write};
 
-use crate::dashboard::{self, DashboardPayload, DashboardRecord, DashboardStats};
+use crate::dashboard::{
+    self, DashboardPayload, DashboardRecord, DashboardScope, DashboardStats,
+    date_matches_hours_scope, project_matches_filter,
+};
 use crate::rank;
 
 /// Guard that prevents concurrent `aicx store` child-process spawns from dashboard search.
@@ -40,6 +43,7 @@ const MAX_SCORE_FILTER: u8 = 100;
 #[derive(Debug, Clone)]
 pub struct DashboardServerConfig {
     pub store_root: PathBuf,
+    pub scope: DashboardScope,
     pub title: String,
     pub preview_chars: usize,
     /// Legacy compatibility path surfaced in status; server mode does not write it.
@@ -549,6 +553,21 @@ fn parse_relative_time(s: &str) -> Option<i64> {
     Some(now - num * unit)
 }
 
+fn merge_project_scope(scope: Option<&str>, request: Option<&str>) -> Option<String> {
+    match (scope, request) {
+        (Some(scope), Some(request))
+            if request
+                .to_ascii_lowercase()
+                .contains(&scope.to_ascii_lowercase()) =>
+        {
+            Some(request.to_string())
+        }
+        (Some(scope), _) => Some(scope.to_string()),
+        (None, Some(request)) => Some(request.to_string()),
+        (None, None) => None,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ChunkParams {
     id: Option<usize>,
@@ -932,7 +951,10 @@ async fn fuzzy_search(
 
     let limit = params.limit.min(100);
     let store_root = state.config.store_root.clone();
-    let project_filter = params.project;
+    let scope = state.config.scope.normalized();
+    let request_project = params.project;
+    let merged_project_filter =
+        merge_project_scope(scope.project.as_deref(), request_project.as_deref());
     let frame_kind = params.frame_kind;
     let score = match validate_score_filter(params.score) {
         Ok(score) => score,
@@ -945,30 +967,43 @@ async fn fuzzy_search(
         }
     };
     let query_clone = query.clone();
+    let refresh_scope = scope.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         run_fuzzy_search(
             &store_root,
             &query_clone,
             limit,
-            project_filter.as_deref(),
+            merged_project_filter.as_deref(),
             score,
             frame_kind,
+            refresh_scope,
         )
     })
     .await;
 
     match result {
-        Ok(Ok((results, total_scanned))) => (
-            StatusCode::OK,
-            Json(FuzzySearchResponse {
-                ok: true,
-                query,
-                results,
-                total_scanned,
-            }),
-        )
-            .into_response(),
+        Ok(Ok((results, total_scanned))) => {
+            let results = results
+                .into_iter()
+                .filter(|result| {
+                    project_matches_filter(&result.project, request_project.as_deref())
+                        && project_matches_filter(&result.project, scope.project.as_deref())
+                        && date_matches_hours_scope(&result.date, scope.hours)
+                })
+                .collect();
+
+            (
+                StatusCode::OK,
+                Json(FuzzySearchResponse {
+                    ok: true,
+                    query,
+                    results,
+                    total_scanned,
+                }),
+            )
+                .into_response()
+        }
         Ok(Err(err)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -995,11 +1030,22 @@ fn run_fuzzy_search(
     project_filter: Option<&str>,
     score: Option<u8>,
     frame_kind: Option<crate::types::FrameKind>,
+    refresh_scope: DashboardScope,
 ) -> Result<(Vec<FuzzySearchResult>, usize)> {
     // Non-blocking auto-rescan with rate-limit guard.
     if !DASHBOARD_RESCAN_RUNNING.swap(true, Ordering::SeqCst) {
-        match std::process::Command::new("aicx")
-            .args(["store", "-H", "24", "--incremental"])
+        let normalized_scope = refresh_scope.normalized();
+        let mut command = std::process::Command::new("aicx");
+        command
+            .arg("store")
+            .arg("-H")
+            .arg(normalized_scope.hours.unwrap_or(24).to_string())
+            .arg("--emit")
+            .arg("none");
+        if let Some(project) = normalized_scope.project {
+            command.arg("--project").arg(project);
+        }
+        match command
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -1439,7 +1485,11 @@ fn rebuild_dashboard(config: &DashboardServerConfig) -> Result<BuildOutput> {
     // Server mode: scan only — no static HTML rendering, no artifact write.
     // The server shell HTML is pre-built once at startup; all data reaches
     // clients through the /api/* endpoints.
-    let payload = dashboard::scan_store_payload(&config.store_root, config.preview_chars)?;
+    let payload = dashboard::scan_store_payload_scoped(
+        &config.store_root,
+        config.preview_chars,
+        &config.scope,
+    )?;
 
     Ok(BuildOutput {
         payload,
@@ -1551,6 +1601,7 @@ mod tests {
         Arc::new(DashboardServerState {
             config: DashboardServerConfig {
                 store_root: root,
+                scope: DashboardScope::default(),
                 title: "test".to_string(),
                 preview_chars: 120,
                 artifact_path,

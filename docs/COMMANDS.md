@@ -20,7 +20,7 @@ For the shortest “it works” path, see `README.md`.
 - `refs` is the active CLI inventory command for canonical chunks. It prints a compact summary by default; use `--emit paths` for raw file paths.
 - There is currently no `aicx rank` CLI subcommand. Ranking stays on the MCP surface as `aicx_rank`.
 - `init` is retired; framework bootstrap now lives in `/vc-init`.
-- `all --incremental` is the daily-driver watermark-tracked refresh path. `store` is store-first with no watermarks — best for backfills and targeted re-extraction.
+- `claude`, `codex`, `all`, and `store` all use watermark-tracked incremental refresh by default. Use `--full-rescan` when you intentionally want a backfill that ignores the stored watermark.
 
 ## Redaction Scope
 
@@ -59,7 +59,7 @@ Common options:
 - `-f, --format <md|json|both>` local output format (default: `both`)
 - `--append-to <FILE>` append local output to a single file
 - `--rotate <N>` keep only last N local output files (default: `0` = unlimited)
-- `--incremental` incremental mode using a per-source watermark
+- `--full-rescan` ignore the stored watermark and rescan the full lookback window
 - `--user-only` exclude assistant + reasoning messages (default: assistant included)
 - `--loctree` include loctree snapshot in local output
 - `--project-root <DIR>` project root for loctree snapshot (defaults to cwd)
@@ -135,11 +135,11 @@ Options are similar to `claude`, with two important details:
 Examples:
 
 ```bash
-# Everything, last 7 days, incremental
-aicx all -H 168 --incremental --emit none
+# Everything, last 7 days, incremental by default
+aicx all -H 168 --emit none
 
 # Same run, but print raw store chunk paths too
-aicx all -H 168 --incremental --emit paths
+aicx all -H 168 --emit paths
 
 # User-only mode (exclude assistant + reasoning)
 aicx all -H 48 --user-only
@@ -176,10 +176,11 @@ aicx extract --format gemini-antigravity ~/.gemini/antigravity/conversations/<uu
 Build the canonical corpus in `~/.aicx/` from agent logs (layer 1).
 
 Store-first corpus builder: extracts, deduplicates, chunks, and writes steerable
-markdown. Unlike `all --incremental`, does not use watermarks — re-processes the
-full lookback window every time. Best for backfills and targeted re-extraction.
-Add `--memex` to also materialize new chunks into the optional memex semantic index
-(layer 2) — a shortcut for running `memex-sync` separately.
+markdown. Like `claude`, `codex`, and `all`, it uses per-source watermarks by
+default so repeat runs stay incremental. Use `--full-rescan` for backfills and
+targeted re-extraction when you need to ignore the watermark. Add `--memex` to
+also materialize new chunks into the optional memex semantic index (layer 2) —
+a shortcut for running `memex-sync` separately.
 
 ```bash
 aicx store [OPTIONS]
@@ -189,14 +190,15 @@ Options:
 - `-p, --project <PROJECT>...` source cwd/project filter(s)
 - `-a, --agent <AGENT>` `claude`, `codex`, `gemini` (default: all)
 - `-H, --hours <HOURS>` lookback window (default: `48`)
+- `--full-rescan` ignore the stored watermark and rescan the full lookback window
 - `--no-redact-secrets` disable secret redaction for this corpus build
 - `--user-only` exclude assistant + reasoning messages (default: assistant included)
 - `--memex` also materialize new chunks into the optional memex semantic index (layer 2)
 - `--emit <paths|json|none>` stdout mode (default: `none`)
 
 Notes:
-- `store` is store-first, not watermark-driven.
-- For incremental refreshes, use `aicx all --incremental --emit none`.
+- `store` is store-first, but still watermark-driven by default.
+- For a deliberate backfill, use `aicx store --full-rescan`.
 - `--emit json` distinguishes requested source filters from resolved canonical output buckets with `requested_source_filters`, `resolved_repositories`, and `resolved_store_buckets`.
 
 Example:
@@ -418,7 +420,7 @@ aicx intents -p CodeScribe --strict --kind decision
 
 ## `aicx dashboard`
 
-Generate a searchable HTML dashboard from the canonical store (layer 1).
+Generate a searchable HTML dashboard from the canonical store (layer 1), or serve it locally.
 
 ```bash
 aicx dashboard [OPTIONS]
@@ -426,17 +428,25 @@ aicx dashboard [OPTIONS]
 
 Options:
 - `--store-root <DIR>` override store root
-- `-o, --output <OUTPUT>` output HTML path (default: `aicx-dashboard.html`)
+- `-p, --project <PROJECT>` narrow the dataset to project/store buckets containing this string
+- `-H, --hours <HOURS>` narrow the dataset to the last N hours (omit for all time)
+- `--serve` run the live local HTTP dashboard instead of generating static HTML
+- `--generate-html` generate a standalone HTML file (default when no mode is passed)
+- `-o, --output <OUTPUT>` output HTML path (default: `~/.aicx/aicx-dashboard.html`, generate mode only)
+- `--host <HOST>` bind host (server mode only, default: `127.0.0.1`)
+- `--port <PORT>` bind TCP port (server mode only, default: `9478`)
+- `--no-open` suppress automatic browser open on startup (server mode only)
 - `--title <TITLE>` document title
 - `--preview-chars <N>` max preview characters per record (`0` = no truncation)
 
 Example:
 
 ```bash
-aicx dashboard -o ./aicx-dashboard.html
+aicx dashboard --generate-html -p ai-contexters -H 24 -o ./aicx-dashboard.html
+aicx dashboard --serve -p ai-contexters -H 24 --port 9478
 ```
 
-## `aicx reports-extractor`
+## `aicx reports`
 
 Extract Vibecrafted workflow and marbles artifacts into a standalone HTML explorer.
 
@@ -444,7 +454,7 @@ The explorer embeds the selected report slice directly and also supports
 client-side JSON bundle import/export from inside the HTML.
 
 ```bash
-aicx reports-extractor [OPTIONS]
+aicx reports [OPTIONS]
 ```
 
 Options:
@@ -454,7 +464,7 @@ Options:
 - `--workflow <FILTER>` case-insensitive filter across workflow label, skill code, run/prompt IDs, lane, and title
 - `--date-from <YYYY-MM-DD|YYYY_MMDD>` inclusive start date
 - `--date-to <YYYY-MM-DD|YYYY_MMDD>` inclusive end date
-- `-o, --output <OUTPUT>` output HTML path (default: `aicx-reports.html`)
+- `-o, --output <OUTPUT>` output HTML path (default: `~/.aicx/aicx-reports.html`)
 - `--bundle-output <OUTPUT>` optional JSON bundle path for later import/merge
 - `--title <TITLE>` document title
 - `--preview-chars <N>` max preview characters per record (`0` = no truncation)
@@ -462,38 +472,19 @@ Options:
 Example:
 
 ```bash
-aicx reports-extractor \
+aicx reports \
   --repo ai-contexters \
   --workflow marbles \
   --date-from 2026-04-10 \
   --date-to 2026-04-12 \
-  -o ./aicx-reports.html \
-  --bundle-output ./aicx-reports.bundle.json
+  -o ~/.aicx/aicx-reports.html \
+  --bundle-output ~/.aicx/aicx-reports.bundle.json
 ```
-
-## `aicx dashboard-serve`
-
-Run a local dashboard server with live search and regeneration endpoints.
-
-```bash
-aicx dashboard-serve [OPTIONS]
-```
-
-Options:
-- `--store-root <DIR>` override store root
-- `--host <HOST>` bind host (default: `127.0.0.1`)
-- `--port <PORT>` bind TCP port (default: `8033`)
-- `--title <TITLE>` document title
-- `--preview-chars <N>` max preview characters per record
 
 Compatibility note:
-The server still reports a legacy artifact path in status responses for older wrappers, but server mode does not write a static HTML artifact.
-
-Example:
-
-```bash
-aicx dashboard-serve --port 8033
-```
+The hidden legacy aliases `aicx dashboard-serve` and `aicx reports-extractor`
+still parse, but the supported operator surface is `aicx dashboard` and
+`aicx reports`.
 
 ## `aicx state`
 

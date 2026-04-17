@@ -28,7 +28,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use aicx::dashboard::{self, DashboardConfig};
+use aicx::dashboard::{self, DashboardConfig, DashboardScope};
 use aicx::dashboard_server::{self, DashboardServerConfig};
 use aicx::intents;
 use aicx::mcp::{self, McpTransport};
@@ -165,6 +165,14 @@ struct DashboardArgs {
     /// Store root directory (default: ~/.aicx)
     #[arg(long)]
     store_root: Option<PathBuf>,
+
+    /// Narrow the dashboard dataset to project/store buckets containing this string
+    #[arg(short, long)]
+    project: Option<String>,
+
+    /// Narrow the dashboard dataset to the last N hours (omit for all time)
+    #[arg(short = 'H', long)]
+    hours: Option<u64>,
 
     /// Output HTML path (default: ~/.aicx/aicx-dashboard.html)
     #[arg(short, long)]
@@ -1161,6 +1169,7 @@ fn main() -> Result<()> {
             warn_legacy_subcommand("dashboard-serve", "dashboard --serve");
             run_dashboard_server(DashboardServerRunArgs {
                 store_root: args.store_root,
+                scope: DashboardScope::default(),
                 host: args.host,
                 port: args.port,
                 no_open: args.no_open,
@@ -3073,6 +3082,7 @@ fn run_memex_sync(
 /// Run the local dashboard server against the canonical store.
 struct DashboardServerRunArgs {
     store_root: Option<PathBuf>,
+    scope: DashboardScope,
     host: String,
     port: u16,
     no_open: bool,
@@ -3104,6 +3114,7 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
 
     let config = DashboardServerConfig {
         store_root: root,
+        scope: args.scope,
         title: args.title,
         preview_chars: args.preview_chars,
         artifact_path,
@@ -3134,6 +3145,7 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
 /// Build and write an AI context dashboard HTML file.
 struct DashboardRunArgs {
     store_root: Option<PathBuf>,
+    scope: DashboardScope,
     output: PathBuf,
     title: String,
     preview_chars: usize,
@@ -3159,6 +3171,10 @@ fn run_dashboard_command(args: DashboardArgs) -> Result<()> {
 
         return run_dashboard_server(DashboardServerRunArgs {
             store_root: args.store_root,
+            scope: DashboardScope {
+                project: args.project,
+                hours: args.hours,
+            },
             host: args.host.unwrap_or_else(|| "127.0.0.1".to_string()),
             port: args.port.unwrap_or(9478),
             no_open: args.no_open,
@@ -3180,6 +3196,10 @@ fn run_dashboard_command(args: DashboardArgs) -> Result<()> {
 
     run_dashboard(DashboardRunArgs {
         store_root: args.store_root,
+        scope: DashboardScope {
+            project: args.project,
+            hours: args.hours,
+        },
         output: args.output.unwrap_or(default_dashboard_output_path()?),
         title: args.title,
         preview_chars: args.preview_chars,
@@ -3198,6 +3218,7 @@ fn run_dashboard(args: DashboardRunArgs) -> Result<()> {
         store_root: root.clone(),
         title: args.title,
         preview_chars: args.preview_chars,
+        scope: args.scope,
     };
 
     let artifact = dashboard::build_dashboard(&config)?;
@@ -3757,6 +3778,8 @@ mod tests {
         assert!(rendered.contains("--serve"));
         assert!(rendered.contains("--generate-html"));
         assert!(rendered.contains("~/.aicx/aicx-dashboard.html"));
+        assert!(rendered.contains("--project <PROJECT>"));
+        assert!(rendered.contains("--hours <HOURS>"));
         assert!(!rendered.contains("--artifact"));
     }
 
