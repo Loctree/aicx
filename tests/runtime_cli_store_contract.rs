@@ -595,12 +595,21 @@ fn all_cli_defaults_to_incremental_and_full_rescan_recovers_backfill() {
         &home,
         &["all", "-H", "24", "--full-rescan", "--emit", "json"],
     ));
-    assert_eq!(fourth["total_entries"].as_u64(), Some(1));
+    assert_eq!(fourth["total_entries"].as_u64(), Some(4));
     let fourth_entries = fourth["entries"].as_array().expect("entries array");
-    assert_eq!(fourth_entries.len(), 1);
+    assert_eq!(fourth_entries.len(), 4);
+    let fourth_messages = fourth_entries
+        .iter()
+        .filter_map(|entry| entry["message"].as_str())
+        .collect::<Vec<_>>();
     assert_eq!(
-        fourth_entries[0]["message"].as_str(),
-        Some("late backfill: older than watermark but still inside the lookback window")
+        fourth_messages,
+        vec![
+            "old context: inspect the runtime seam",
+            "old reply: inspecting the runtime seam now",
+            "late backfill: older than watermark but still inside the lookback window",
+            "new context: only this should land on the next incremental run",
+        ]
     );
 
     let state = read_state(&home);

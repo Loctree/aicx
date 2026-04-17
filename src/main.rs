@@ -322,7 +322,7 @@ enum Commands {
         #[arg(long, default_value = "0")]
         rotate: usize,
 
-        /// Ignore stored watermark and rescan the full lookback window
+        /// Ignore the stored watermark and previously-seen hashes for this run
         #[arg(long)]
         full_rescan: bool,
 
@@ -398,7 +398,7 @@ enum Commands {
         #[arg(long, default_value = "0")]
         rotate: usize,
 
-        /// Ignore stored watermark and rescan the full lookback window
+        /// Ignore the stored watermark and previously-seen hashes for this run
         #[arg(long)]
         full_rescan: bool,
 
@@ -472,7 +472,7 @@ enum Commands {
         #[arg(long, default_value = "0")]
         rotate: usize,
 
-        /// Ignore stored watermark and rescan the full lookback window
+        /// Ignore the stored watermark and previously-seen hashes for this run
         #[arg(long)]
         full_rescan: bool,
 
@@ -583,7 +583,7 @@ enum Commands {
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
-        /// Ignore stored watermark and rescan the full lookback window
+        /// Ignore the stored watermark and previously-seen hashes for this run
         #[arg(long)]
         full_rescan: bool,
 
@@ -1950,19 +1950,31 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     let overlap_project = format!("_overlap:{project_name}");
     if !force {
         let mut deduped = Vec::with_capacity(entries.len());
+        let mut exact_seen_this_run = std::collections::HashSet::new();
+        let mut overlap_seen_this_run = std::collections::HashSet::new();
         for e in entries {
             let exact = StateManager::content_hash(&e.agent, e.timestamp.timestamp(), &e.message);
-            if !state.is_new(&project_name, exact) {
+            if full_rescan {
+                if !exact_seen_this_run.insert(exact) {
+                    continue; // exact duplicate within the same rescan window
+                }
+            } else if !state.is_new(&project_name, exact) {
                 continue; // exact duplicate
             }
 
             let overlap = StateManager::overlap_hash(e.timestamp.timestamp(), &e.message);
-            if !state.is_new(&overlap_project, overlap) {
+            if full_rescan {
+                if !overlap_seen_this_run.insert(overlap) {
+                    continue; // cross-agent overlap duplicate within the same rescan window
+                }
+            } else if !state.is_new(&overlap_project, overlap) {
                 continue; // cross-agent overlap duplicate
             }
 
-            state.mark_seen(&project_name, exact);
-            state.mark_seen(&overlap_project, overlap);
+            if !full_rescan {
+                state.mark_seen(&project_name, exact);
+                state.mark_seen(&overlap_project, overlap);
+            }
             deduped.push(e);
         }
         entries = deduped;
@@ -2189,8 +2201,9 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
 
     // Update state (hashes already marked during dedup filtering above)
     if !output_entries.is_empty() {
-        if force {
-            // When --force skips dedup, we still mark entries as seen for future runs
+        if force || full_rescan {
+            // When --force or --full-rescan bypasses persisted dedup state, we still
+            // mark entries as seen so future incremental runs remain honest.
             for e in &output_entries {
                 let exact =
                     StateManager::content_hash(&e.agent, e.timestamp.timestamp(), &e.message);
