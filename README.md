@@ -224,6 +224,8 @@ aicx dashboard --serve -p ai-contexters -H 24
 aicx dashboard --serve --host 0.0.0.0 --allow-cors-origins tailscale --bg
 ```
 
+The `tailscale` CORS preset accepts both tailnet IP origins and MagicDNS browser origins (`*.ts.net`).
+
 ## Intent Taxonomy
 
 The intent engine classifies stored chunks into 9 semantic types with typed link relations:

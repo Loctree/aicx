@@ -41,6 +41,7 @@ const REGENERATE_HEADER_NAME: &str = "x-ai-contexters-action";
 const REGENERATE_HEADER_VALUE: &str = "regenerate";
 const MAX_SCORE_FILTER: u8 = 100;
 const LOCALHOST_ORIGINS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+const TAILSCALE_MAGICDNS_SUFFIX: &str = ".ts.net";
 const TAILSCALE_RANGE_BASE: u32 = u32::from_be_bytes([100, 64, 0, 0]);
 const TAILSCALE_RANGE_END: u32 = u32::from_be_bytes([100, 127, 255, 255]);
 
@@ -49,7 +50,7 @@ const TAILSCALE_RANGE_END: u32 = u32::from_be_bytes([100, 127, 255, 255]);
 pub enum DashboardCorsPolicy {
     /// Default developer-local mode; accepts localhost + loopback browser origins.
     Local,
-    /// Accept origins served from Tailscale CGNAT IPs.
+    /// Accept origins served from Tailscale CGNAT IPs or MagicDNS hostnames.
     Tailscale,
     /// Wildcard CORS, intended for trusted reverse-proxy or lab setups.
     All,
@@ -513,7 +514,17 @@ fn matches_local_origin(origin: &str) -> bool {
 
 fn matches_tailscale_origin(origin: &str) -> bool {
     origin_host(origin)
-        .and_then(|host| host.parse::<IpAddr>().ok())
+        .is_some_and(|host| matches_tailscale_magicdns_host(&host) || matches_tailscale_ip(&host))
+}
+
+fn matches_tailscale_magicdns_host(host: &str) -> bool {
+    host.to_ascii_lowercase()
+        .ends_with(TAILSCALE_MAGICDNS_SUFFIX)
+}
+
+fn matches_tailscale_ip(host: &str) -> bool {
+    host.parse::<IpAddr>()
+        .ok()
         .and_then(|ip| match ip {
             IpAddr::V4(ipv4) => Some(u32::from_be_bytes(ipv4.octets())),
             IpAddr::V6(_) => None,
@@ -1858,7 +1869,9 @@ mod tests {
         assert!(!local.allows_origin("https://dashboard.example.com"));
 
         assert!(tailscale.allows_origin("http://100.96.12.4:9478"));
+        assert!(tailscale.allows_origin("https://vetcoders-mbp.tail2c9f.ts.net"));
         assert!(!tailscale.allows_origin("http://192.168.0.4:9478"));
+        assert!(!tailscale.allows_origin("https://dashboard.example.com"));
 
         assert!(all.allows_origin("https://anything.example"));
 
