@@ -231,6 +231,8 @@ Link types: `derived_from`, `supersedes`, `verifies`, `contradicts`, `supports`,
 State transitions: Proposed → Active → Done/Superseded/Contradicted. Session-level post-processing detects unresolved intents (no outcome after 7 days), supersedes chains (newer entry on same topic), contradicted assumptions (result + failure signal), and insight sourcing (DerivedFrom links to research chunks).
 
 ```bash
+aicx migrate
+aicx migrate-intent-schema
 aicx migrate-intent-schema --project MyProject --dry-run
 ```
 

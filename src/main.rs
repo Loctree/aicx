@@ -40,6 +40,27 @@ use aicx::sources::{self, ExtractionConfig};
 use aicx::state::StateManager;
 use aicx::store;
 
+fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
+    eprintln!("=== Intent Schema Migration (dry run) ===");
+    eprintln!("Chunks scanned:   {}", report.total_chunks);
+    eprintln!("Entries found:    {}", report.entries_found);
+    eprintln!("Unresolved:       {}", report.unresolved_count);
+    eprintln!();
+    eprintln!("Per type:");
+    let mut types: Vec<_> = report.per_type.iter().collect();
+    types.sort_by(|a, b| b.1.cmp(a.1));
+    for (t, count) in &types {
+        eprintln!("  {:<12} {}", t, count);
+    }
+    eprintln!();
+    eprintln!("Per project:");
+    let mut projects: Vec<_> = report.per_project.iter().collect();
+    projects.sort_by(|a, b| b.1.cmp(a.1));
+    for (p, count) in &projects {
+        eprintln!("  {:<30} {}", p, count);
+    }
+}
+
 /// aicx — operator front door for agent session logs.
 ///
 /// Two-layer pipeline, both operator-driven:
@@ -823,14 +844,22 @@ enum Commands {
         /// Override AICX store root (default: ~/.aicx)
         #[arg(long)]
         store_root: Option<PathBuf>,
+
+        /// Skip post-migration intent schema scan on the canonical store
+        #[arg(long, default_value_t = false)]
+        no_intent_schema: bool,
     },
 
     /// Classify stored chunks into 9-type intent entries and report counts.
     #[command(name = "migrate-intent-schema")]
     MigrateIntentSchema {
-        /// Project filter (case-insensitive substring)
+        /// Project filter (case-insensitive substring, defaults to scanning the whole store)
         #[arg(short, long)]
-        project: String,
+        project: Option<String>,
+
+        /// Override AICX store root (default: ~/.aicx)
+        #[arg(long)]
+        store_root: Option<PathBuf>,
 
         /// Dry run: show classification counts without writing sidecars
         #[arg(long, default_value_t = true)]
@@ -1183,30 +1212,33 @@ fn main() -> Result<()> {
             dry_run,
             legacy_root,
             store_root,
+            no_intent_schema,
         }) => {
-            aicx::store::run_migration_with_paths(dry_run, legacy_root, store_root)?;
+            let manifest =
+                aicx::store::run_migration_with_paths(dry_run, legacy_root, store_root.clone())?;
+            if !no_intent_schema {
+                let intent_report = intents::migrate_intent_schema_dry_run_at(
+                    &PathBuf::from(&manifest.store_root).join(store::CANONICAL_STORE_DIRNAME),
+                    None,
+                )?;
+                print_intent_schema_migration_report(&intent_report);
+            }
         }
-        Some(Commands::MigrateIntentSchema { project, dry_run }) => {
-            let report = intents::migrate_intent_schema_dry_run(&project)?;
+        Some(Commands::MigrateIntentSchema {
+            project,
+            store_root,
+            dry_run,
+        }) => {
+            let report = if let Some(store_root) = store_root {
+                intents::migrate_intent_schema_dry_run_at(
+                    &store_root.join(store::CANONICAL_STORE_DIRNAME),
+                    project.as_deref(),
+                )?
+            } else {
+                intents::migrate_intent_schema_dry_run(project.as_deref())?
+            };
             if dry_run {
-                eprintln!("=== Intent Schema Migration (dry run) ===");
-                eprintln!("Chunks scanned:   {}", report.total_chunks);
-                eprintln!("Entries found:    {}", report.entries_found);
-                eprintln!("Unresolved:       {}", report.unresolved_count);
-                eprintln!();
-                eprintln!("Per type:");
-                let mut types: Vec<_> = report.per_type.iter().collect();
-                types.sort_by(|a, b| b.1.cmp(a.1));
-                for (t, count) in &types {
-                    eprintln!("  {:<12} {}", t, count);
-                }
-                eprintln!();
-                eprintln!("Per project:");
-                let mut projects: Vec<_> = report.per_project.iter().collect();
-                projects.sort_by(|a, b| b.1.cmp(a.1));
-                for (p, count) in &projects {
-                    eprintln!("  {:<30} {}", p, count);
-                }
+                print_intent_schema_migration_report(&report);
             }
             let json = serde_json::to_string_pretty(&report)?;
             println!("{json}");
@@ -3661,6 +3693,7 @@ mod tests {
             "aicx",
             "migrate",
             "--dry-run",
+            "--no-intent-schema",
             "--legacy-root",
             "/tmp/legacy",
             "--store-root",
@@ -3673,12 +3706,33 @@ mod tests {
                 dry_run,
                 legacy_root,
                 store_root,
+                no_intent_schema,
             }) => {
                 assert!(dry_run);
+                assert!(no_intent_schema);
                 assert_eq!(legacy_root, Some(PathBuf::from("/tmp/legacy")));
                 assert_eq!(store_root, Some(PathBuf::from("/tmp/aicx")));
             }
             _ => panic!("expected migrate command"),
+        }
+    }
+
+    #[test]
+    fn migrate_intent_schema_accepts_missing_project_and_defaults_to_dry_run() {
+        let cli = Cli::try_parse_from(["aicx", "migrate-intent-schema"])
+            .expect("migrate-intent-schema should parse without explicit project");
+
+        match cli.command {
+            Some(Commands::MigrateIntentSchema {
+                project,
+                store_root,
+                dry_run,
+            }) => {
+                assert_eq!(project, None);
+                assert_eq!(store_root, None);
+                assert!(dry_run);
+            }
+            _ => panic!("expected migrate-intent-schema command"),
         }
     }
 

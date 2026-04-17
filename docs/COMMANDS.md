@@ -287,11 +287,38 @@ Options:
 - `--dry-run` show what would be moved without modifying files
 - `--legacy-root <DIR>` override legacy input store root (default: `~/.ai-contexters`)
 - `--store-root <DIR>` override AICX store root (default: `~/.aicx`)
+- `--no-intent-schema` skip the post-migration intent schema scan on the canonical store
 
 Example:
 
 ```bash
 aicx migrate --dry-run
+
+# Full legacy -> canonical migration plus intent-schema pass from home directory
+aicx migrate
+```
+
+## `aicx migrate-intent-schema`
+
+Classify canonical chunks into the intent schema report. By default it scans the entire canonical store, so it can be launched from `~` just like `aicx migrate` or `aicx store`.
+
+```bash
+aicx migrate-intent-schema [OPTIONS]
+```
+
+Options:
+- `-p, --project <PROJECT>` optional repo/store-bucket filter (case-insensitive substring)
+- `--store-root <DIR>` override AICX root (default: `~/.aicx`)
+- `--dry-run` show counts without writing changes
+
+Examples:
+
+```bash
+# Scan every migrated project in the canonical store
+aicx migrate-intent-schema
+
+# Restrict the report to one project bucket
+aicx migrate-intent-schema --project ai-contexters
 ```
 
 ## `aicx memex-sync`

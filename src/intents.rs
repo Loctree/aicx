@@ -83,6 +83,7 @@ struct StoredChunkFile {
     agent: String,
     date: String,
     path: PathBuf,
+    project: String,
     sequence: u32,
     timestamp: DateTime<Utc>,
     session_id: String,
@@ -233,8 +234,9 @@ fn collect_chunk_files(
     frame_kind: Option<FrameKind>,
 ) -> Result<Vec<StoredChunkFile>> {
     let mut files = Vec::new();
+    let scan_root = normalize_scan_root(store_root);
 
-    for file in store::scan_context_files_at(store_root)? {
+    for file in store::scan_context_files_at(&scan_root)? {
         if file.path.extension().and_then(|ext| ext.to_str()) != Some("md") {
             continue;
         }
@@ -276,6 +278,7 @@ fn collect_chunk_files(
             agent: file.agent,
             date: file.date_iso,
             path: file.path,
+            project: file.project,
             sequence: file.chunk,
             timestamp,
             session_id: file.session_id,
@@ -290,6 +293,20 @@ fn collect_chunk_files(
     });
 
     Ok(files)
+}
+
+fn normalize_scan_root(store_root: &Path) -> PathBuf {
+    if store_root
+        .file_name()
+        .is_some_and(|name| name == store::CANONICAL_STORE_DIRNAME)
+    {
+        return store_root
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| store_root.to_path_buf());
+    }
+
+    store_root.to_path_buf()
 }
 
 fn combine_date_time(date: NaiveDate, time: &str) -> Option<DateTime<Utc>> {
@@ -1581,11 +1598,18 @@ pub struct MigrationReport {
     pub unresolved_count: usize,
 }
 
-pub fn migrate_intent_schema_dry_run(project_filter: &str) -> Result<MigrationReport> {
-    let store_root = store::store_base_dir()?;
+pub fn migrate_intent_schema_dry_run(project_filter: Option<&str>) -> Result<MigrationReport> {
+    migrate_intent_schema_dry_run_at(&store::store_base_dir()?, project_filter)
+}
+
+pub fn migrate_intent_schema_dry_run_at(
+    store_root: &Path,
+    project_filter: Option<&str>,
+) -> Result<MigrationReport> {
+    let inferred_project = project_filter.map(str::to_string);
     let files = collect_chunk_files(
-        &store_root,
-        project_filter,
+        store_root,
+        project_filter.unwrap_or(""),
         DateTime::<Utc>::from_naive_utc_and_offset(
             NaiveDate::from_ymd_opt(2020, 1, 1)
                 .unwrap()
@@ -1603,19 +1627,20 @@ pub fn migrate_intent_schema_dry_run(project_filter: &str) -> Result<MigrationRe
         let content = sanitize::read_to_string_validated(&file.path)
             .with_context(|| format!("Failed to read chunk file: {}", file.path.display()))?;
         let source_chunk = file.path.to_string_lossy().to_string();
+        let project_label = inferred_project
+            .clone()
+            .unwrap_or_else(|| normalize_migration_project_label(&file.project));
         let mut chunk_entries = classify_chunk_entries(
             &content,
             &source_chunk,
-            Some(&file.agent),
+            Some(project_label.as_str()),
             Some(&file.agent),
             Some(&file.session_id),
             &file.date,
         );
         for e in &mut chunk_entries {
             e.timestamp = Some(file.timestamp.to_rfc3339());
-            if e.project.is_none() {
-                e.project = Some(project_filter.to_string());
-            }
+            e.project = Some(project_label.clone());
         }
         all_entries.extend(chunk_entries);
     }
@@ -1645,6 +1670,13 @@ pub fn migrate_intent_schema_dry_run(project_filter: &str) -> Result<MigrationRe
         per_project,
         unresolved_count,
     })
+}
+
+fn normalize_migration_project_label(project: &str) -> String {
+    project
+        .strip_prefix("local/")
+        .unwrap_or(project)
+        .to_string()
 }
 
 #[cfg(test)]
@@ -1682,6 +1714,43 @@ mod tests {
     fn write_chunk(root: &Path, project: &str, date: &str, name: &str, body: &str) {
         let path = chunk_path(root, project, date, name);
         fs::write(path, body).expect("write chunk");
+    }
+
+    fn migration_test_root(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("unix time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("aicx-intents-{label}-{nanos}"))
+    }
+
+    #[test]
+    fn migrate_intent_schema_dry_run_at_scans_all_projects_without_filter() {
+        let root = migration_test_root("intent-migration-all-projects");
+        write_chunk(
+            &root,
+            "alpha",
+            "2026-04-14",
+            "093000_claude-001.md",
+            "[09:30:00] assistant: result: alpha migration passed\n",
+        );
+        write_chunk(
+            &root,
+            "beta",
+            "2026-04-15",
+            "101500_codex-001.md",
+            "[10:15:00] user: question: should beta keep legacy links?\n",
+        );
+
+        let report = migrate_intent_schema_dry_run_at(&root.join("store"), None)
+            .expect("global migration dry run should work");
+
+        assert_eq!(report.total_chunks, 2);
+        assert_eq!(report.entries_found, 2);
+        assert_eq!(report.per_project.get("alpha"), Some(&1));
+        assert_eq!(report.per_project.get("beta"), Some(&1));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     fn write_chunk_with_sidecar(
