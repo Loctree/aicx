@@ -5,8 +5,10 @@
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Query, State, rejection::QueryRejection},
     http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
@@ -38,6 +40,66 @@ static DASHBOARD_RESCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 const REGENERATE_HEADER_NAME: &str = "x-ai-contexters-action";
 const REGENERATE_HEADER_VALUE: &str = "regenerate";
 const MAX_SCORE_FILTER: u8 = 100;
+const LOCALHOST_ORIGINS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+const TAILSCALE_RANGE_BASE: u32 = u32::from_be_bytes([100, 64, 0, 0]);
+const TAILSCALE_RANGE_END: u32 = u32::from_be_bytes([100, 127, 255, 255]);
+
+/// CORS policy for dashboard HTTP serving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DashboardCorsPolicy {
+    /// Default developer-local mode; accepts localhost + loopback browser origins.
+    Local,
+    /// Accept origins served from Tailscale CGNAT IPs.
+    Tailscale,
+    /// Wildcard CORS, intended for trusted reverse-proxy or lab setups.
+    All,
+    /// Exact origin match such as https://dashboard.example.com.
+    Exact(String),
+}
+
+impl DashboardCorsPolicy {
+    pub fn from_cli(raw: Option<&str>) -> Result<Self> {
+        let Some(raw_value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::Local);
+        };
+
+        match raw_value.to_ascii_lowercase().as_str() {
+            "local" => Ok(Self::Local),
+            "tailscale" => Ok(Self::Tailscale),
+            "all" => Ok(Self::All),
+            _ => {
+                normalize_origin(raw_value)?;
+                Ok(Self::Exact(raw_value.to_string()))
+            }
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Local => "local".to_string(),
+            Self::Tailscale => "tailscale".to_string(),
+            Self::All => "all".to_string(),
+            Self::Exact(origin) => origin.clone(),
+        }
+    }
+
+    fn allows_origin(&self, origin: &str) -> bool {
+        match self {
+            Self::Local => matches_local_origin(origin),
+            Self::Tailscale => matches_tailscale_origin(origin),
+            Self::All => true,
+            Self::Exact(allowed) => allowed.eq_ignore_ascii_case(origin),
+        }
+    }
+
+    fn response_allow_origin(&self, origin: &str) -> Option<HeaderValue> {
+        match self {
+            Self::All => Some(HeaderValue::from_static("*")),
+            _ if self.allows_origin(origin) => HeaderValue::from_str(origin).ok(),
+            _ => None,
+        }
+    }
+}
 
 /// Runtime configuration for dashboard server mode.
 #[derive(Debug, Clone)]
@@ -48,6 +110,7 @@ pub struct DashboardServerConfig {
     pub preview_chars: usize,
     /// Legacy compatibility path surfaced in status; server mode does not write it.
     pub artifact_path: PathBuf,
+    pub cors_policy: DashboardCorsPolicy,
     pub host: IpAddr,
     pub port: u16,
 }
@@ -270,7 +333,7 @@ impl Drop for RebuildFlagGuard<'_> {
 
 /// Run dashboard server and block until process is terminated.
 pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
-    ensure_loopback_host(config.host)?;
+    validate_dashboard_host_policy(config.host, &config.cors_policy, true)?;
 
     let initial = rebuild_dashboard(&config).context("Initial dashboard build failed")?;
     let shell_html = dashboard::render_server_shell_html(&config.title);
@@ -297,6 +360,10 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         .route("/api/search/steer", get(steer_search))
         .route("/manifest.webmanifest", get(get_manifest))
         .route("/service-worker.js", get(get_service_worker))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            dashboard_cors_middleware,
+        ))
         .with_state(state);
 
     let addr = SocketAddr::new(config.host, config.port);
@@ -322,21 +389,143 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         REGENERATE_HEADER_NAME, REGENERATE_HEADER_VALUE
     );
     eprintln!("  Store: {}", config.store_root.display());
+    eprintln!("  CORS: {}", config.cors_policy.describe());
 
     axum::serve(listener, app)
         .await
         .context("Dashboard server runtime terminated unexpectedly")
 }
 
-fn ensure_loopback_host(host: IpAddr) -> Result<()> {
+pub fn validate_dashboard_host_policy(
+    host: IpAddr,
+    cors_policy: &DashboardCorsPolicy,
+    cors_policy_was_explicit: bool,
+) -> Result<()> {
     if host.is_loopback() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "Refusing to bind dashboard server to non-loopback address '{}'. Use --host 127.0.0.1 or ::1.",
-            host
-        ))
+        return Ok(());
     }
+
+    if !cors_policy_was_explicit || matches!(cors_policy, DashboardCorsPolicy::Local) {
+        return Err(anyhow!(
+            "Binding dashboard server to non-loopback address '{}' requires an explicit non-local CORS policy. Re-run with `--allow-cors-origins tailscale`, `--allow-cors-origins all`, or an explicit URL.",
+            host
+        ));
+    }
+
+    Ok(())
+}
+
+async fn dashboard_cors_middleware(
+    State(state): State<Arc<DashboardServerState>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let is_preflight = request.method() == axum::http::Method::OPTIONS;
+
+    if is_preflight {
+        return match origin.as_deref() {
+            Some(origin) => {
+                if let Some(allow_origin) = state.config.cors_policy.response_allow_origin(origin) {
+                    let mut response = Response::new(Body::empty());
+                    *response.status_mut() = StatusCode::NO_CONTENT;
+                    apply_cors_headers(response.headers_mut(), allow_origin, true);
+                    response
+                } else {
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(ErrorResponse {
+                            ok: false,
+                            error: format!(
+                                "Origin '{}' is not permitted by dashboard CORS policy '{}'.",
+                                origin,
+                                state.config.cors_policy.describe()
+                            ),
+                        }),
+                    )
+                        .into_response()
+                }
+            }
+            None => next.run(request).await,
+        };
+    }
+
+    let mut response = next.run(request).await;
+    if let Some(origin) = origin.as_deref()
+        && let Some(allow_origin) = state.config.cors_policy.response_allow_origin(origin)
+    {
+        apply_cors_headers(response.headers_mut(), allow_origin, false);
+    }
+    response
+}
+
+fn apply_cors_headers(headers: &mut HeaderMap, allow_origin: HeaderValue, preflight: bool) {
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, allow_origin);
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("content-type, x-ai-contexters-action"),
+    );
+    headers.insert(header::VARY, HeaderValue::from_static("Origin"));
+    if preflight {
+        headers.insert(
+            header::ACCESS_CONTROL_MAX_AGE,
+            HeaderValue::from_static("600"),
+        );
+    }
+}
+
+fn normalize_origin(origin: &str) -> Result<()> {
+    let uri = origin
+        .parse::<axum::http::Uri>()
+        .with_context(|| format!("Invalid CORS origin URL '{}'", origin))?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| anyhow!("CORS origin '{}' is missing a scheme", origin))?;
+    if scheme != "http" && scheme != "https" {
+        return Err(anyhow!(
+            "CORS origin '{}' must use http:// or https://",
+            origin
+        ));
+    }
+    if uri.authority().is_none() {
+        return Err(anyhow!("CORS origin '{}' is missing a host", origin));
+    }
+    Ok(())
+}
+
+fn matches_local_origin(origin: &str) -> bool {
+    origin_host(origin)
+        .map(|host| {
+            LOCALHOST_ORIGINS
+                .iter()
+                .any(|allowed| host.eq_ignore_ascii_case(allowed))
+        })
+        .unwrap_or(false)
+}
+
+fn matches_tailscale_origin(origin: &str) -> bool {
+    origin_host(origin)
+        .and_then(|host| host.parse::<IpAddr>().ok())
+        .and_then(|ip| match ip {
+            IpAddr::V4(ipv4) => Some(u32::from_be_bytes(ipv4.octets())),
+            IpAddr::V6(_) => None,
+        })
+        .is_some_and(|addr| (TAILSCALE_RANGE_BASE..=TAILSCALE_RANGE_END).contains(&addr))
+}
+
+fn origin_host(origin: &str) -> Option<String> {
+    let uri = origin.parse::<axum::http::Uri>().ok()?;
+    let authority = uri.authority()?;
+    let host = authority.host().trim_matches(['[', ']']);
+    Some(host.to_string())
 }
 
 async fn get_dashboard_html(State(state): State<Arc<DashboardServerState>>) -> impl IntoResponse {
@@ -1605,6 +1794,7 @@ mod tests {
                 title: "test".to_string(),
                 preview_chars: 120,
                 artifact_path,
+                cors_policy: DashboardCorsPolicy::Local,
                 host: "127.0.0.1".parse().expect("host"),
                 port: 8033,
             },
@@ -1631,10 +1821,56 @@ mod tests {
     }
 
     #[test]
-    fn ensure_loopback_host_accepts_loopback_only() {
-        assert!(ensure_loopback_host("127.0.0.1".parse().expect("ipv4")).is_ok());
-        assert!(ensure_loopback_host("::1".parse().expect("ipv6")).is_ok());
-        assert!(ensure_loopback_host("0.0.0.0".parse().expect("any")).is_err());
+    fn validate_dashboard_host_policy_requires_explicit_non_local_cors_for_remote_hosts() {
+        let local = DashboardCorsPolicy::Local;
+        let all = DashboardCorsPolicy::All;
+        let exact =
+            DashboardCorsPolicy::from_cli(Some("https://dashboard.example.com")).expect("exact");
+
+        assert!(
+            validate_dashboard_host_policy("127.0.0.1".parse().expect("ipv4"), &local, false)
+                .is_ok()
+        );
+        assert!(
+            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &local, false).is_err()
+        );
+        assert!(
+            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &local, true).is_err()
+        );
+        assert!(
+            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &all, true).is_ok()
+        );
+        assert!(
+            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &exact, true).is_ok()
+        );
+    }
+
+    #[test]
+    fn cors_policy_matches_supported_origin_sets() {
+        let local = DashboardCorsPolicy::from_cli(None).expect("default local");
+        let tailscale = DashboardCorsPolicy::from_cli(Some("tailscale")).expect("tailscale");
+        let all = DashboardCorsPolicy::from_cli(Some("all")).expect("all");
+        let exact =
+            DashboardCorsPolicy::from_cli(Some("https://dashboard.example.com")).expect("exact");
+
+        assert!(local.allows_origin("http://localhost:3000"));
+        assert!(local.allows_origin("http://127.0.0.1:9478"));
+        assert!(!local.allows_origin("https://dashboard.example.com"));
+
+        assert!(tailscale.allows_origin("http://100.96.12.4:9478"));
+        assert!(!tailscale.allows_origin("http://192.168.0.4:9478"));
+
+        assert!(all.allows_origin("https://anything.example"));
+
+        assert!(exact.allows_origin("https://dashboard.example.com"));
+        assert!(!exact.allows_origin("https://other.example.com"));
+    }
+
+    #[test]
+    fn invalid_exact_cors_origin_is_rejected() {
+        let err = DashboardCorsPolicy::from_cli(Some("dashboard.example.com"))
+            .expect_err("missing scheme");
+        assert!(err.to_string().contains("scheme"));
     }
 
     #[test]

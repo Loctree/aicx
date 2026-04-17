@@ -27,9 +27,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use aicx::dashboard::{self, DashboardConfig, DashboardScope};
-use aicx::dashboard_server::{self, DashboardServerConfig};
+use aicx::dashboard_server::{self, DashboardCorsPolicy, DashboardServerConfig};
 use aicx::intents;
 use aicx::mcp::{self, McpTransport};
 use aicx::memex::{self, MemexConfig, SyncProgress, SyncProgressPhase};
@@ -179,16 +180,24 @@ struct DashboardArgs {
     output: Option<PathBuf>,
 
     /// Bind host IP address (default: 127.0.0.1, server mode only)
-    #[arg(long)]
+    #[arg(long, requires = "serve")]
     host: Option<String>,
 
     /// Bind TCP port (default: 9478, server mode only)
-    #[arg(long)]
+    #[arg(long, requires = "serve")]
     port: Option<u16>,
 
     /// Suppress automatic browser open on startup (server mode only)
-    #[arg(long)]
+    #[arg(long, requires = "serve")]
     no_open: bool,
+
+    /// Detach the dashboard server into the background (`--serve` implies `--no-open`)
+    #[arg(long, requires = "serve")]
+    bg: bool,
+
+    /// CORS origin policy for server mode: `local` (default), `tailscale`, `all`, or an explicit URL
+    #[arg(long, requires = "serve", value_name = "PRESET|URL")]
+    allow_cors_origins: Option<String>,
 
     /// Document title
     #[arg(long, default_value = "AI Contexters Dashboard")]
@@ -1173,6 +1182,8 @@ fn main() -> Result<()> {
                 host: args.host,
                 port: args.port,
                 no_open: args.no_open,
+                bg: false,
+                allow_cors_origins: None,
                 artifact: args.artifact.unwrap_or(default_dashboard_output_path()?),
                 title: args.title,
                 preview_chars: args.preview_chars,
@@ -3086,6 +3097,8 @@ struct DashboardServerRunArgs {
     host: String,
     port: u16,
     no_open: bool,
+    bg: bool,
+    allow_cors_origins: Option<String>,
     artifact: PathBuf,
     title: String,
     preview_chars: usize,
@@ -3104,13 +3117,33 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
             args.host
         )
     })?;
-    if !host.is_loopback() {
-        return Err(anyhow::anyhow!(
-            "Refusing non-loopback --host '{}'. Dashboard server is local-only for safety.",
-            host
-        ));
-    }
+    let cors_policy = DashboardCorsPolicy::from_cli(args.allow_cors_origins.as_deref())?;
+    dashboard_server::validate_dashboard_host_policy(
+        host,
+        &cors_policy,
+        args.allow_cors_origins.is_some(),
+    )?;
     let artifact_path = args.artifact;
+
+    if args.bg {
+        return spawn_dashboard_server_background(
+            root,
+            args.scope,
+            host,
+            args.port,
+            &args.title,
+            args.preview_chars,
+            args.allow_cors_origins.as_deref(),
+        );
+    }
+
+    if !host.is_loopback() {
+        eprintln!(
+            "! Warning: dashboard server is binding beyond loopback on http://{}:{}",
+            host, args.port
+        );
+        eprintln!("  CORS policy: {}", cors_policy.describe());
+    }
 
     let config = DashboardServerConfig {
         store_root: root,
@@ -3118,6 +3151,7 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
         title: args.title,
         preview_chars: args.preview_chars,
         artifact_path,
+        cors_policy,
         host,
         port: args.port,
     };
@@ -3140,6 +3174,71 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
         .context("Failed to create tokio runtime for dashboard server")?;
 
     runtime.block_on(dashboard_server::run_dashboard_server(config))
+}
+
+fn spawn_dashboard_server_background(
+    store_root: PathBuf,
+    scope: DashboardScope,
+    host: std::net::IpAddr,
+    port: u16,
+    title: &str,
+    preview_chars: usize,
+    allow_cors_origins: Option<&str>,
+) -> Result<()> {
+    let current_exe = std::env::current_exe().context("Resolve current aicx executable")?;
+    let mut command = std::process::Command::new(&current_exe);
+    command
+        .arg("dashboard")
+        .arg("--serve")
+        .arg("--no-open")
+        .arg("--host")
+        .arg(host.to_string())
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--store-root")
+        .arg(store_root.as_os_str());
+
+    if let Some(project) = scope.project.as_deref() {
+        command.arg("--project").arg(project);
+    }
+    if let Some(hours) = scope.hours {
+        command.arg("--hours").arg(hours.to_string());
+    }
+    if let Some(policy) = allow_cors_origins {
+        command.arg("--allow-cors-origins").arg(policy);
+    }
+    if title != "AI Contexters Dashboard" {
+        command.arg("--title").arg(title);
+    }
+    if preview_chars != 320 {
+        command
+            .arg("--preview-chars")
+            .arg(preview_chars.to_string());
+    }
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    let child = command.spawn().with_context(|| {
+        format!(
+            "Spawn background dashboard server via {}",
+            current_exe.display()
+        )
+    })?;
+
+    eprintln!("✓ Dashboard server launched in background");
+    eprintln!("  PID: {}", child.id());
+    eprintln!("  URL: http://{}:{}", host, port);
+    eprintln!("  Store: {}", store_root.display());
+    Ok(())
 }
 
 /// Build and write an AI context dashboard HTML file.
@@ -3178,15 +3277,22 @@ fn run_dashboard_command(args: DashboardArgs) -> Result<()> {
             host: args.host.unwrap_or_else(|| "127.0.0.1".to_string()),
             port: args.port.unwrap_or(9478),
             no_open: args.no_open,
+            bg: args.bg,
+            allow_cors_origins: args.allow_cors_origins,
             artifact: default_dashboard_output_path()?,
             title: args.title,
             preview_chars: args.preview_chars,
         });
     }
 
-    if args.host.is_some() || args.port.is_some() || args.no_open {
+    if args.host.is_some()
+        || args.port.is_some()
+        || args.no_open
+        || args.bg
+        || args.allow_cors_origins.is_some()
+    {
         return Err(anyhow::anyhow!(
-            "--host, --port, and --no-open are only valid with --serve."
+            "--host, --port, --no-open, --bg, and --allow-cors-origins are only valid with --serve."
         ));
     }
 
@@ -3780,7 +3886,43 @@ mod tests {
         assert!(rendered.contains("~/.aicx/aicx-dashboard.html"));
         assert!(rendered.contains("--project <PROJECT>"));
         assert!(rendered.contains("--hours <HOURS>"));
+        assert!(rendered.contains("--bg"));
+        assert!(rendered.contains("--allow-cors-origins"));
         assert!(!rendered.contains("--artifact"));
+    }
+
+    #[test]
+    fn dashboard_server_only_flags_require_serve_mode() {
+        let err = Cli::try_parse_from(["aicx", "dashboard", "--host", "0.0.0.0"])
+            .expect_err("server-only host flag should require --serve");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("--serve"));
+    }
+
+    #[test]
+    fn dashboard_server_remote_flags_parse_with_explicit_cors_policy() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "dashboard",
+            "--serve",
+            "--host",
+            "0.0.0.0",
+            "--allow-cors-origins",
+            "all",
+            "--bg",
+        ])
+        .expect("remote dashboard serve flags should parse");
+
+        match cli.command {
+            Some(Commands::Dashboard(args)) => {
+                assert!(args.serve);
+                assert!(args.bg);
+                assert_eq!(args.host.as_deref(), Some("0.0.0.0"));
+                assert_eq!(args.allow_cors_origins.as_deref(), Some("all"));
+            }
+            _ => panic!("expected dashboard command"),
+        }
     }
 
     #[test]

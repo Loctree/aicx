@@ -219,6 +219,9 @@ aicx dashboard --generate-html -p ai-contexters -H 24
 
 # Live local server
 aicx dashboard --serve -p ai-contexters -H 24
+
+# Remote / Tailscale server with explicit CORS policy
+aicx dashboard --serve --host 0.0.0.0 --allow-cors-origins tailscale --bg
 ```
 
 ## Intent Taxonomy

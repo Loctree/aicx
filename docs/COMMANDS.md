@@ -435,6 +435,8 @@ Options:
 - `-o, --output <OUTPUT>` output HTML path (default: `~/.aicx/aicx-dashboard.html`, generate mode only)
 - `--host <HOST>` bind host (server mode only, default: `127.0.0.1`)
 - `--port <PORT>` bind TCP port (server mode only, default: `9478`)
+- `--bg` detach the server into the background (`--serve` implies `--no-open`)
+- `--allow-cors-origins <PRESET|URL>` CORS policy for server mode: `local` (default), `tailscale`, `all`, or an explicit URL
 - `--no-open` suppress automatic browser open on startup (server mode only)
 - `--title <TITLE>` document title
 - `--preview-chars <N>` max preview characters per record (`0` = no truncation)
@@ -444,6 +446,7 @@ Example:
 ```bash
 aicx dashboard --generate-html -p ai-contexters -H 24 -o ./aicx-dashboard.html
 aicx dashboard --serve -p ai-contexters -H 24 --port 9478
+aicx dashboard --serve --host 0.0.0.0 --allow-cors-origins tailscale --bg
 ```
 
 ## `aicx reports`
