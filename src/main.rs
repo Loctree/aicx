@@ -135,6 +135,9 @@ enum SortOrder {
     Score,
 }
 
+const DEFAULT_DASHBOARD_TITLE: &str = "AICX Dashboard";
+const DEFAULT_REPORTS_TITLE: &str = "AICX Report Explorer";
+
 #[derive(Debug, Args, Clone)]
 struct RetrievalFilters {
     #[arg(long, default_value_t = 10)]
@@ -200,7 +203,7 @@ struct DashboardArgs {
     allow_cors_origins: Option<String>,
 
     /// Document title
-    #[arg(long, default_value = "AI Contexters Dashboard")]
+    #[arg(long, default_value = DEFAULT_DASHBOARD_TITLE)]
     title: String,
 
     /// Max preview characters per record (0 = no truncation)
@@ -243,7 +246,7 @@ struct ReportsArgs {
     bundle_output: Option<PathBuf>,
 
     /// Document title
-    #[arg(long, default_value = "AI Contexters Report Explorer")]
+    #[arg(long, default_value = DEFAULT_REPORTS_TITLE)]
     title: String,
 
     /// Max preview characters per record (0 = no truncation)
@@ -274,7 +277,7 @@ struct DashboardServeLegacyArgs {
     artifact: Option<PathBuf>,
 
     /// Document title
-    #[arg(long, default_value = "AI Contexters Dashboard")]
+    #[arg(long, default_value = DEFAULT_DASHBOARD_TITLE)]
     title: String,
 
     /// Max preview characters per record (0 = no truncation)
@@ -3207,7 +3210,7 @@ fn spawn_dashboard_server_background(
     if let Some(policy) = allow_cors_origins {
         command.arg("--allow-cors-origins").arg(policy);
     }
-    if title != "AI Contexters Dashboard" {
+    if title != DEFAULT_DASHBOARD_TITLE {
         command.arg("--title").arg(title);
     }
     if preview_chars != 320 {
