@@ -1276,7 +1276,6 @@ fn run_fuzzy_search(
             frame_kind,
         )) {
             Ok((res, scan)) if !res.is_empty() => (res, scan),
-            Err(err) if crate::memex::is_compatibility_error(&err) => return Err(err),
             _ => rank::fuzzy_search_store(
                 store_root,
                 query,

@@ -7,16 +7,8 @@ agents/state/
 
 # AI Context
 /.vibecrafted
-.ai-context/*
-!.ai-context/share/
-!.ai-context/share/artifacts/
-!.ai-context/share/artifacts/SUMMARY.md
-!.ai-context/share/artifacts/TIMELINE.md
-!.ai-context/share/artifacts/TRIAGE.md
-!.ai-context/share/artifacts/prompts/
-!.ai-context/share/artifacts/prompts/*.md
 *.log
-/.ai-context
+/.ai-context*
 *.zip
 /.ai-agents
 /skills
@@ -27,6 +19,9 @@ GEMINI.md
 CLAUDE.md
 /*.rs
 *.out
-/.vibecrafted
 /.claude/
 /release-bundles
+/docs/internal/
+/.junie/
+/*.txt
+/*.py

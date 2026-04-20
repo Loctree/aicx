@@ -250,12 +250,6 @@ impl AicxMcpServer {
         .await
         {
             Ok((res, scan)) if !res.is_empty() => (res, scan),
-            Err(err) if crate::memex::is_compatibility_error(&err) => {
-                return Err(McpError::internal_error(
-                    format!("Search index incompatible: {err}"),
-                    None,
-                ));
-            }
             _ => {
                 // Fallback to reading all markdown files sequentially (slow)
                 let store_root = store::store_base_dir()
