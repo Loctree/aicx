@@ -455,28 +455,32 @@ async fn ensure_steer_index_compatible_at(base: &Path) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_candidate_query(
-    run_id: Option<&str>,
-    prompt_id: Option<&str>,
-    agent: Option<&str>,
-    kind: Option<&str>,
-    frame_kind: Option<FrameKind>,
-    project: Option<&str>,
-    date_lo: Option<&str>,
-    date_hi: Option<&str>,
-) -> Option<String> {
+/// Steer index filter — all 8 optional filters in one bag so helpers don't
+/// need long argument lists and callers can build the filter once.
+#[derive(Debug, Default, Clone)]
+pub struct SteerFilter<'a> {
+    pub run_id: Option<&'a str>,
+    pub prompt_id: Option<&'a str>,
+    pub agent: Option<&'a str>,
+    pub kind: Option<&'a str>,
+    pub frame_kind: Option<FrameKind>,
+    pub project: Option<&'a str>,
+    pub date_lo: Option<&'a str>,
+    pub date_hi: Option<&'a str>,
+}
+
+fn build_candidate_query(filter: &SteerFilter<'_>) -> Option<String> {
     let mut terms = Vec::new();
 
-    add_query_value(&mut terms, project);
-    add_query_value(&mut terms, agent);
-    add_query_value(&mut terms, kind);
-    add_query_value(&mut terms, frame_kind.map(FrameKind::as_str));
-    add_query_value(&mut terms, run_id);
-    add_query_value(&mut terms, prompt_id);
+    add_query_value(&mut terms, filter.project);
+    add_query_value(&mut terms, filter.agent);
+    add_query_value(&mut terms, filter.kind);
+    add_query_value(&mut terms, filter.frame_kind.map(FrameKind::as_str));
+    add_query_value(&mut terms, filter.run_id);
+    add_query_value(&mut terms, filter.prompt_id);
 
-    if matches!((date_lo, date_hi), (Some(lo), Some(hi)) if lo == hi) {
-        add_query_value(&mut terms, date_lo);
+    if matches!((filter.date_lo, filter.date_hi), (Some(lo), Some(hi)) if lo == hi) {
+        add_query_value(&mut terms, filter.date_lo);
     }
 
     if terms.is_empty() {
@@ -486,21 +490,10 @@ fn build_candidate_query(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn metadata_matches(
-    meta: &serde_json::Value,
-    run_id: Option<&str>,
-    prompt_id: Option<&str>,
-    agent: Option<&str>,
-    kind: Option<&str>,
-    frame_kind: Option<FrameKind>,
-    project: Option<&str>,
-    date_lo: Option<&str>,
-    date_hi: Option<&str>,
-) -> bool {
-    let project_lower = project.map(str::to_ascii_lowercase);
-    let agent_lower = agent.map(str::to_ascii_lowercase);
-    let kind_lower = kind.map(str::to_ascii_lowercase);
+fn metadata_matches(meta: &serde_json::Value, filter: &SteerFilter<'_>) -> bool {
+    let project_lower = filter.project.map(str::to_ascii_lowercase);
+    let agent_lower = filter.agent.map(str::to_ascii_lowercase);
+    let kind_lower = filter.kind.map(str::to_ascii_lowercase);
 
     if let Some(ref needle) = project_lower {
         if let Some(p) = meta.get("project").and_then(|v| v.as_str()) {
@@ -529,12 +522,12 @@ fn metadata_matches(
             return false;
         }
     }
-    if let Some(expected) = frame_kind
+    if let Some(expected) = filter.frame_kind
         && meta.get("frame_kind").and_then(|v| v.as_str()) != Some(expected.as_str())
     {
         return false;
     }
-    if let Some(lo) = date_lo {
+    if let Some(lo) = filter.date_lo {
         if let Some(d) = meta.get("date").and_then(|v| v.as_str()) {
             if d < lo {
                 return false;
@@ -543,7 +536,7 @@ fn metadata_matches(
             return false;
         }
     }
-    if let Some(hi) = date_hi {
+    if let Some(hi) = filter.date_hi {
         if let Some(d) = meta.get("date").and_then(|v| v.as_str()) {
             if d > hi {
                 return false;
@@ -552,12 +545,12 @@ fn metadata_matches(
             return false;
         }
     }
-    if let Some(wanted) = run_id
+    if let Some(wanted) = filter.run_id
         && meta.get("run_id").and_then(|v| v.as_str()) != Some(wanted)
     {
         return false;
     }
-    if let Some(wanted) = prompt_id
+    if let Some(wanted) = filter.prompt_id
         && meta.get("prompt_id").and_then(|v| v.as_str()) != Some(wanted)
     {
         return false;
@@ -605,17 +598,9 @@ fn build_store_scan_metadata(file: &crate::store::StoredContextFile) -> serde_js
     serde_json::Value::Object(meta)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn search_store_scan_at(
     base: &Path,
-    run_id: Option<&str>,
-    prompt_id: Option<&str>,
-    agent: Option<&str>,
-    kind: Option<&str>,
-    frame_kind: Option<FrameKind>,
-    project: Option<&str>,
-    date_lo: Option<&str>,
-    date_hi: Option<&str>,
+    filter: &SteerFilter<'_>,
     limit: usize,
 ) -> Result<Vec<serde_json::Value>> {
     let files = crate::store::scan_context_files_at(base)?;
@@ -623,9 +608,7 @@ fn search_store_scan_at(
 
     for file in files.into_iter().rev() {
         let meta = build_store_scan_metadata(&file);
-        if !metadata_matches(
-            &meta, run_id, prompt_id, agent, kind, frame_kind, project, date_lo, date_hi,
-        ) {
+        if !metadata_matches(&meta, filter) {
             continue;
         }
 
@@ -638,22 +621,12 @@ fn search_store_scan_at(
     Ok(results)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn search_bm25_candidates_at(
     base: &Path,
-    run_id: Option<&str>,
-    prompt_id: Option<&str>,
-    agent: Option<&str>,
-    kind: Option<&str>,
-    frame_kind: Option<FrameKind>,
-    project: Option<&str>,
-    date_lo: Option<&str>,
-    date_hi: Option<&str>,
+    filter: &SteerFilter<'_>,
     limit: usize,
 ) -> Result<Vec<serde_json::Value>> {
-    let Some(query) = build_candidate_query(
-        run_id, prompt_id, agent, kind, frame_kind, project, date_lo, date_hi,
-    ) else {
+    let Some(query) = build_candidate_query(filter) else {
         return Ok(vec![]);
     };
 
@@ -691,17 +664,7 @@ async fn search_bm25_candidates_at(
             continue;
         };
 
-        if !metadata_matches(
-            &doc.metadata,
-            run_id,
-            prompt_id,
-            agent,
-            kind,
-            frame_kind,
-            project,
-            date_lo,
-            date_hi,
-        ) {
+        if !metadata_matches(&doc.metadata, filter) {
             continue;
         }
 
@@ -774,33 +737,20 @@ pub async fn rebuild_steer_index_if_needed() -> Result<()> {
     rebuild_steer_index_if_needed_at(&base).await
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn search_steer_index(
-    run_id: Option<&str>,
-    prompt_id: Option<&str>,
-    agent: Option<&str>,
-    kind: Option<&str>,
-    frame_kind: Option<FrameKind>,
-    project: Option<&str>,
-    date_lo: Option<&str>,
-    date_hi: Option<&str>,
+    filter: &SteerFilter<'_>,
     limit: usize,
 ) -> Result<Vec<serde_json::Value>> {
     let base = crate::store::store_base_dir()?;
     ensure_steer_index_compatible_at(&base).await?;
 
-    let candidate_results = search_bm25_candidates_at(
-        &base, run_id, prompt_id, agent, kind, frame_kind, project, date_lo, date_hi, limit,
-    )
-    .await?;
+    let candidate_results = search_bm25_candidates_at(&base, filter, limit).await?;
 
     if candidate_results.len() >= limit || !candidate_results.is_empty() {
         return Ok(candidate_results);
     }
 
-    search_store_scan_at(
-        &base, run_id, prompt_id, agent, kind, frame_kind, project, date_lo, date_hi, limit,
-    )
+    search_store_scan_at(&base, filter, limit)
 }
 
 #[cfg(test)]
@@ -1043,17 +993,14 @@ mod tests {
 
     #[test]
     fn candidate_query_uses_filter_terms() {
-        let query = build_candidate_query(
-            Some("mrbl-001"),
-            None,
-            Some("claude"),
-            Some("reports"),
-            None,
-            Some("VetCoders/vibecrafted"),
-            None,
-            None,
-        )
-        .unwrap();
+        let filter = SteerFilter {
+            run_id: Some("mrbl-001"),
+            agent: Some("claude"),
+            kind: Some("reports"),
+            project: Some("VetCoders/vibecrafted"),
+            ..SteerFilter::default()
+        };
+        let query = build_candidate_query(&filter).unwrap();
 
         assert!(query.contains("mrbl"));
         assert!(query.contains("claude"));

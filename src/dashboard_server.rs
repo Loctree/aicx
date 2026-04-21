@@ -1586,17 +1586,17 @@ fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSear
         (None, None)
     };
 
-    let metadatas = rt.block_on(crate::steer_index::search_steer_index(
-        params.run_id.as_deref(),
-        params.prompt_id.as_deref(),
-        params.agent.as_deref(),
-        params.kind.as_deref(),
-        params.frame_kind,
-        params.project.as_deref(),
-        date_lo.as_deref(),
-        date_hi.as_deref(),
-        limit,
-    ))?;
+    let filter = crate::steer_index::SteerFilter {
+        run_id: params.run_id.as_deref(),
+        prompt_id: params.prompt_id.as_deref(),
+        agent: params.agent.as_deref(),
+        kind: params.kind.as_deref(),
+        frame_kind: params.frame_kind,
+        project: params.project.as_deref(),
+        date_lo: date_lo.as_deref(),
+        date_hi: date_hi.as_deref(),
+    };
+    let metadatas = rt.block_on(crate::steer_index::search_steer_index(&filter, limit))?;
 
     let mut items = Vec::new();
 

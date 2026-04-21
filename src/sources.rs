@@ -128,7 +128,6 @@ struct ClaudeEntry {
     message: Option<serde_json::Value>,
     #[serde(default)]
     timestamp: Option<String>,
-    #[allow(dead_code)] // Deserialized but we use filename stem as session_id instead
     #[serde(rename = "sessionId", default)]
     session_id: Option<String>,
     #[serde(rename = "gitBranch", default)]
@@ -156,9 +155,6 @@ struct CodexEntry {
 struct GeminiSession {
     #[serde(default)]
     session_id: Option<String>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    project_hash: Option<String>,
     #[serde(default)]
     messages: Vec<GeminiMessage>,
 }
@@ -232,16 +228,22 @@ struct ClassifiedFrameBlock {
     message: String,
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Optional trailing metadata for `build_timeline_entry` — bundled so the
+/// constructor stays under the clippy argument ceiling without `#[allow]`.
+#[derive(Debug, Default, Clone)]
+struct TimelineEntryMeta {
+    branch: Option<String>,
+    cwd: Option<String>,
+    frame_kind: Option<FrameKind>,
+}
+
 fn build_timeline_entry(
     timestamp: DateTime<Utc>,
     agent: &str,
     session_id: &str,
     role: &str,
     message: String,
-    branch: Option<String>,
-    cwd: Option<String>,
-    frame_kind: Option<FrameKind>,
+    meta: TimelineEntryMeta,
 ) -> TimelineEntry {
     TimelineEntry {
         timestamp,
@@ -249,9 +251,9 @@ fn build_timeline_entry(
         session_id: session_id.to_string(),
         role: role.to_string(),
         message,
-        frame_kind,
-        branch,
-        cwd,
+        frame_kind: meta.frame_kind,
+        branch: meta.branch,
+        cwd: meta.cwd,
     }
 }
 
@@ -496,9 +498,11 @@ fn extract_claude_line_entries(
                 &session_id,
                 &block.role,
                 block.message,
-                entry.git_branch.clone(),
-                entry.cwd.clone(),
-                Some(block.frame_kind),
+                TimelineEntryMeta {
+                    branch: entry.git_branch.clone(),
+                    cwd: entry.cwd.clone(),
+                    frame_kind: Some(block.frame_kind),
+                },
             ));
         }
         return entries;
@@ -521,9 +525,11 @@ fn extract_claude_line_entries(
         &session_id,
         fallback_role,
         message,
-        entry.git_branch,
-        entry.cwd,
-        frame_kind,
+        TimelineEntryMeta {
+            branch: entry.git_branch,
+            cwd: entry.cwd,
+            frame_kind,
+        },
     ));
     entries
 }
@@ -1110,9 +1116,11 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                     session_id,
                     &role,
                     msg.text.clone(),
-                    None,
-                    msg.cwd.clone(),
-                    frame_kind,
+                    TimelineEntryMeta {
+                        branch: None,
+                        cwd: msg.cwd.clone(),
+                        frame_kind,
+                    },
                 ));
             }
         }
@@ -1371,9 +1379,12 @@ fn extract_gemini_antigravity_step_outputs(
                 path.display(),
                 trimmed
             ),
-            None,
-            infer_project_hint_from_text(trimmed).or_else(|| session_default_cwd.clone()),
-            None,
+            TimelineEntryMeta {
+                branch: None,
+                cwd: infer_project_hint_from_text(trimmed)
+                    .or_else(|| session_default_cwd.clone()),
+                frame_kind: None,
+            },
         ));
     }
 
@@ -1622,9 +1633,11 @@ fn antigravity_json_message_to_entries(
                 session_id,
                 &block.role,
                 block.message,
-                None,
-                cwd.clone(),
-                Some(block.frame_kind),
+                TimelineEntryMeta {
+                    branch: None,
+                    cwd: cwd.clone(),
+                    frame_kind: Some(block.frame_kind),
+                },
             ));
         }
     }
@@ -1743,9 +1756,11 @@ fn parse_antigravity_transcript_text(
             session_id,
             role,
             message.to_string(),
-            None,
-            default_cwd.clone(),
-            frame_kind_from_role(role),
+            TimelineEntryMeta {
+                branch: None,
+                cwd: default_cwd.clone(),
+                frame_kind: frame_kind_from_role(role),
+            },
         ));
     }
 
@@ -1801,9 +1816,7 @@ fn build_gemini_antigravity_summary(
                 used_paths
             }
         ),
-        None,
-        None,
-        None,
+        TimelineEntryMeta::default(),
     )
 }
 
@@ -2055,9 +2068,11 @@ pub fn extract_claude_history(config: &ExtractionConfig) -> Result<Vec<TimelineE
             entry.session_id.as_deref().unwrap_or("history"),
             "user",
             message,
-            None,
-            entry.project,
-            Some(FrameKind::UserMsg),
+            TimelineEntryMeta {
+                branch: None,
+                cwd: entry.project,
+                frame_kind: Some(FrameKind::UserMsg),
+            },
         ));
     }
 
@@ -2173,9 +2188,11 @@ pub fn extract_codex(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
                 session_id,
                 &role,
                 msg.text.clone(),
-                None,
-                msg.cwd.clone(),
-                frame_kind_from_role(&role),
+                TimelineEntryMeta {
+                    branch: None,
+                    cwd: msg.cwd.clone(),
+                    frame_kind: frame_kind_from_role(&role),
+                },
             ));
         }
     }
@@ -2387,9 +2404,11 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
             &session_id,
             role,
             message,
-            None,
-            current_cwd.clone(),
-            frame_kind,
+            TimelineEntryMeta {
+                branch: None,
+                cwd: current_cwd.clone(),
+                frame_kind,
+            },
         ));
     }
 
@@ -2578,9 +2597,11 @@ fn parse_gemini_session(
                 &session_id,
                 &block.role,
                 block.message,
-                None,
-                inferred_cwd.clone(),
-                Some(block.frame_kind),
+                TimelineEntryMeta {
+                    branch: None,
+                    cwd: inferred_cwd.clone(),
+                    frame_kind: Some(block.frame_kind),
+                },
             ));
         }
 
@@ -2614,9 +2635,11 @@ fn parse_gemini_session(
                     &session_id,
                     "reasoning",
                     text,
-                    None,
-                    inferred_cwd.clone(),
-                    Some(FrameKind::InternalThought),
+                    TimelineEntryMeta {
+                        branch: None,
+                        cwd: inferred_cwd.clone(),
+                        frame_kind: Some(FrameKind::InternalThought),
+                    },
                 ));
             }
         }
@@ -2702,9 +2725,11 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                         &session_id,
                         "user",
                         message,
-                        None,
-                        current_cwd.clone(),
-                        Some(FrameKind::UserMsg),
+                        TimelineEntryMeta {
+                            branch: None,
+                            cwd: current_cwd.clone(),
+                            frame_kind: Some(FrameKind::UserMsg),
+                        },
                     ));
                 }
             }
@@ -2728,9 +2753,11 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                         &session_id,
                         "user",
                         message,
-                        None,
-                        current_cwd.clone(),
-                        Some(FrameKind::UserMsg),
+                        TimelineEntryMeta {
+                            branch: None,
+                            cwd: current_cwd.clone(),
+                            frame_kind: Some(FrameKind::UserMsg),
+                        },
                     ));
                 }
             }
@@ -2785,9 +2812,11 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                         &session_id,
                         "assistant",
                         message,
-                        None,
-                        current_cwd.clone(),
-                        Some(FrameKind::AgentReply),
+                        TimelineEntryMeta {
+                            branch: None,
+                            cwd: current_cwd.clone(),
+                            frame_kind: Some(FrameKind::AgentReply),
+                        },
                     ));
                 }
             }
@@ -4246,10 +4275,6 @@ mod tests {
         assert_eq!(
             session.session_id.as_deref(),
             Some("a45ff16f-2a8c-4a45-b690-2c2aaf631b71")
-        );
-        assert_eq!(
-            session.project_hash.as_deref(),
-            Some("fef6ad02174d592d21e7f8a6143564388027ec0c38bbb44dec26e99f9cd9140f")
         );
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0].msg_type.as_deref(), Some("user"));

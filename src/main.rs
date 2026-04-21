@@ -1088,10 +1088,12 @@ fn main() -> Result<()> {
                 project,
                 input,
                 output,
-                include_assistant,
-                max_message_chars,
-                redaction.redact_secrets,
-                conversation,
+                ExtractFileOptions {
+                    include_assistant,
+                    max_message_chars,
+                    redact_secrets: redaction.redact_secrets,
+                    conversation,
+                },
             )?;
         }
         Some(Commands::Store {
@@ -1205,12 +1207,14 @@ fn main() -> Result<()> {
             run_intents(
                 &project,
                 hours,
-                &emit,
-                strict,
-                kind.as_deref(),
                 filters,
-                unresolved,
-                collapse_session,
+                IntentsDisplayOptions {
+                    emit: &emit,
+                    strict,
+                    kind: kind.as_deref(),
+                    unresolved,
+                    collapse_session,
+                },
             )?;
         }
         Some(Commands::Tail {
@@ -1303,17 +1307,29 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Display toggles for `run_intents`. Packed so the caller reads like a struct
+/// literal instead of a positional 8-tuple.
+struct IntentsDisplayOptions<'a> {
+    emit: &'a str,
+    strict: bool,
+    kind: Option<&'a str>,
+    unresolved: bool,
+    collapse_session: bool,
+}
+
 fn run_intents(
     project: &str,
     hours: u64,
-    emit: &str,
-    strict: bool,
-    kind: Option<&str>,
     filters: RetrievalFilters,
-    unresolved: bool,
-    collapse_session: bool,
+    display: IntentsDisplayOptions<'_>,
 ) -> Result<()> {
+    let IntentsDisplayOptions {
+        emit,
+        strict,
+        kind,
+        unresolved,
+        collapse_session,
+    } = display;
     let kind_filter = kind.map(|k| match k {
         "decision" => intents::IntentKind::Decision,
         "intent" => intents::IntentKind::Intent,
@@ -1442,7 +1458,16 @@ fn run_tail(
         }
         filters.sort = Some(SortOrder::Newest);
         return run_intents(
-            project, hours, "markdown", false, kind, filters, false, false,
+            project,
+            hours,
+            filters,
+            IntentsDisplayOptions {
+                emit: "markdown",
+                strict: false,
+                kind,
+                unresolved: false,
+                collapse_session: false,
+            },
         );
     }
 
@@ -1530,17 +1555,28 @@ fn run_tail(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Output-shaping toggles for `run_extract_file`. Keeps the constructor-like
+/// call readable without an argument-list ceiling waiver.
+struct ExtractFileOptions {
+    include_assistant: bool,
+    max_message_chars: usize,
+    redact_secrets: bool,
+    conversation: bool,
+}
+
 fn run_extract_file(
     format: ExtractInputFormat,
     explicit_project: Option<String>,
     input: PathBuf,
     output_path: PathBuf,
-    include_assistant: bool,
-    max_message_chars: usize,
-    redact_secrets: bool,
-    conversation: bool,
+    options: ExtractFileOptions,
 ) -> Result<()> {
+    let ExtractFileOptions {
+        include_assistant,
+        max_message_chars,
+        redact_secrets,
+        conversation,
+    } = options;
     // For direct file extraction we intentionally don't apply a time cutoff;
     // set cutoff far in the past.
     let cutoff = Utc::now() - chrono::Duration::days(365 * 200);
@@ -2766,17 +2802,18 @@ fn run_steer(
         (filters.since.clone(), filters.until.clone())
     };
 
-    let mut metadatas = rt.block_on(aicx::steer_index::search_steer_index(
+    let filter = aicx::steer_index::SteerFilter {
         run_id,
         prompt_id,
-        filters.agent.as_deref(),
+        agent: filters.agent.as_deref(),
         kind,
-        filters.frame_kind,
+        frame_kind: filters.frame_kind,
         project,
-        date_lo.as_deref(),
-        date_hi.as_deref(),
-        filters.limit,
-    ))?;
+        date_lo: date_lo.as_deref(),
+        date_hi: date_hi.as_deref(),
+    };
+    let mut metadatas =
+        rt.block_on(aicx::steer_index::search_steer_index(&filter, filters.limit))?;
 
     if let Some(sort_order) = filters.sort {
         metadatas.sort_by(|a, b| {
@@ -4128,10 +4165,12 @@ mod tests {
             None,
             brain,
             report.clone(),
-            true,
-            0,
-            false,
-            false,
+            ExtractFileOptions {
+                include_assistant: true,
+                max_message_chars: 0,
+                redact_secrets: false,
+                conversation: false,
+            },
         )
         .unwrap();
 
