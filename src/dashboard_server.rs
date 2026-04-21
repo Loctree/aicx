@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -1335,9 +1335,10 @@ fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, String> {
     }
 }
 
-/// Semantic search via rmcp-memex vector DB.
+/// Semantic search via the configured memex CLI.
 ///
-/// Shells out to `rmcp-memex search --json` for vector similarity.
+/// Prefers `rust-memex` and falls back to the legacy `rmcp-memex` binary when
+/// operators still have the old name on PATH.
 async fn semantic_search(params: Result<Query<SemanticSearchParams>, QueryRejection>) -> Response {
     let Query(params) = match params {
         Ok(q) => q,
@@ -1399,23 +1400,23 @@ fn run_memex_search(
     limit: usize,
     mode: &str,
 ) -> Result<MemexSearchResponse> {
-    let output = Command::new("rmcp-memex")
-        .arg("search")
-        .arg("-n")
-        .arg(namespace)
-        .arg("-q")
-        .arg(query)
-        .arg("-l")
-        .arg(limit.to_string())
-        .arg("-m")
-        .arg(mode)
-        .arg("--json")
-        .output()
-        .context("Failed to run rmcp-memex search. Is rmcp-memex installed?")?;
+    let args = [
+        "search",
+        "-n",
+        namespace,
+        "-q",
+        query,
+        "-l",
+        &limit.to_string(),
+        "-m",
+        mode,
+        "--json",
+    ];
+    let (binary, output) = run_memex_cli(&args, "search")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("rmcp-memex search failed: {}", stderr.trim());
+        anyhow::bail!("{binary} search failed: {}", stderr.trim());
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1425,12 +1426,39 @@ fn run_memex_search(
     Ok(MemexSearchResponse {
         ok: true,
         query: query.to_string(),
-        source: format!("rmcp-memex search -n {} --mode {}", namespace, mode),
+        source: format!("{binary} search -n {} --mode {}", namespace, mode),
         results,
     })
 }
 
-/// Cross-namespace semantic search via rmcp-memex.
+fn run_memex_cli(args: &[&str], action: &str) -> Result<(String, Output)> {
+    let candidates = ["rust-memex", "rmcp-memex"];
+    let mut last_not_found = None;
+
+    for binary in candidates {
+        match Command::new(binary).args(args).output() {
+            Ok(output) => return Ok((binary.to_string(), output)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                last_not_found = Some(err);
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("Failed to run {binary} {action}"));
+            }
+        }
+    }
+
+    let last_not_found = last_not_found.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no compatible memex CLI binary found",
+        )
+    });
+    Err(last_not_found).context(format!(
+        "Failed to run memex {action}. Tried rust-memex, then rmcp-memex."
+    ))
+}
+
+/// Cross-namespace semantic search via the configured memex CLI.
 ///
 /// Searches all namespaces at once, merging and ranking results.
 async fn cross_search(params: Result<Query<CrossSearchParams>, QueryRejection>) -> Response {
@@ -1487,20 +1515,20 @@ async fn cross_search(params: Result<Query<CrossSearchParams>, QueryRejection>) 
 }
 
 fn run_memex_cross_search(query: &str, limit: usize, mode: &str) -> Result<MemexSearchResponse> {
-    let output = Command::new("rmcp-memex")
-        .arg("cross-search")
-        .arg(query)
-        .arg("--limit")
-        .arg(limit.to_string())
-        .arg("--mode")
-        .arg(mode)
-        .arg("--json")
-        .output()
-        .context("Failed to run rmcp-memex cross-search. Is rmcp-memex installed?")?;
+    let args = [
+        "cross-search",
+        query,
+        "--limit",
+        &limit.to_string(),
+        "--mode",
+        mode,
+        "--json",
+    ];
+    let (binary, output) = run_memex_cli(&args, "cross-search")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("rmcp-memex cross-search failed: {}", stderr.trim());
+        anyhow::bail!("{binary} cross-search failed: {}", stderr.trim());
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1510,7 +1538,7 @@ fn run_memex_cross_search(query: &str, limit: usize, mode: &str) -> Result<Memex
     Ok(MemexSearchResponse {
         ok: true,
         query: query.to_string(),
-        source: format!("rmcp-memex cross-search --mode {}", mode),
+        source: format!("{binary} cross-search --mode {}", mode),
         results,
     })
 }

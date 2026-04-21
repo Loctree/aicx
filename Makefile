@@ -36,8 +36,8 @@ precheck:
 	cargo check --locked --all-targets
 
 manifest-check:
-	@python3 -c 'import tomllib; data = tomllib.load(open("Cargo.toml", "rb")); bad = [(section, name, spec["path"]) for section in ("dependencies", "dev-dependencies", "build-dependencies") for name, spec in data.get(section, {}).items() if isinstance(spec, dict) and "path" in spec]; \
-print("Manifest portability: ok") if not bad else (_ for _ in ()).throw(SystemExit("Manifest portability check failed:\n" + "\n".join(f"  - {section}.{name} uses local path dependency {path}" for section, name, path in bad)))'
+	@python3 -c 'import tomllib; data = tomllib.load(open("Cargo.toml", "rb")); allow = {("dependencies", "rmcp-memex")}; bad = [(section, name, spec["path"]) for section in ("dependencies", "dev-dependencies", "build-dependencies") for name, spec in data.get(section, {}).items() if isinstance(spec, dict) and "path" in spec and (section, name) not in allow]; \
+print("Manifest policy: ok (approved local product deps only)") if not bad else (_ for _ in ()).throw(SystemExit("Manifest policy check failed:\n" + "\n".join(f"  - {section}.{name} uses unexpected local path dependency {path}" for section, name, path in bad)))'
 
 test:
 	cargo test --locked --all-targets

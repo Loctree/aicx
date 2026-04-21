@@ -1,9 +1,9 @@
 [package]
 name = "aicx"
 
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.91.1"
 description = "Operator CLI + MCP server: canonical corpus first, optional semantic index second (Claude Code, Codex, Gemini)"
 authors = ["Maciej Gad <void@div0.space>", "Monika Szymanska <hello@vetcoders.io>"]
 license = "BUSL-1.1"
@@ -54,9 +54,9 @@ axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "signal"] }
 rmcp = { version = "1.2", features = ["server", "schemars", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 libc = "0.2.183"
-# Remote integration boundary: consume the published crate instead of any local workspace checkout
-# or path patching. ai-contexters uses the library surface from crates.io here.
-rmcp-memex = { version = "0.5.0", default-features = false }
+# Local product boundary: aicx now binds directly to the first-party rust-memex
+# workspace instead of consuming a published public crate.
+rmcp-memex = { package = "rust-memex", path = "../rust-memex/crates/rust-memex", default-features = false }
 schemars = "1.2.1"
 
 # Native embedder (optional, feature-gated)
@@ -71,6 +71,9 @@ dirs = "6"
 
 [dev-dependencies]
 filetime = "0.2"
+
+[patch.crates-io]
+lance-namespace-impls = { path = "../rust-memex/vendor/lance-namespace-impls" }
 
 [[bin]]
 name = "aicx"
