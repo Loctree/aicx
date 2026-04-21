@@ -5,7 +5,10 @@
 pub mod chunker;
 pub mod dashboard;
 pub mod dashboard_server;
+#[cfg(feature = "native-embedder")]
+pub mod embedder;
 pub mod frontmatter;
+pub mod hf_cache;
 pub mod intents;
 pub mod mcp;
 pub mod memex;

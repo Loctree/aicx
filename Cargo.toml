@@ -16,6 +16,26 @@ categories = ["command-line-utilities", "development-tools"]
 exclude = ["*.html", "*.patch", "*.orig", ".ai-agents/", ".ai-context/", "scripts/", "skills/"]
 autobins = false
 default-run = "aicx"
+build = "build.rs"
+
+[features]
+default = []
+# Native embedder — in-process BERT-style embeddings via Candle.
+# Ships a small embedder bundled into the binary when the model is present in
+# the HuggingFace cache at build time; falls back to runtime cache lookup.
+# Suggested include_bytes defaults (override with AICX_EMBEDDER_REPO):
+#   - harrier-oss/harrier-oss-0.6b      (~0.6B params, code-focused)
+#   - F2-LLM/F2-LLM-v2-1.7b             (~1.7B params, stronger recall)
+# Combined with a lean runtime this keeps a complete bundle under ~1.1 GB
+# for the 0.6B default. The 1.7B model stays runtime-loaded unless the
+# operator opts into a larger bundle.
+native-embedder = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:safetensors",
+]
 
 [dependencies]
 anyhow = "1.0"
@@ -38,6 +58,16 @@ libc = "0.2.183"
 # or path patching. ai-contexters uses the library surface from crates.io here.
 rmcp-memex = { version = "0.5.0", default-features = false }
 schemars = "1.2.1"
+
+# Native embedder (optional, feature-gated)
+candle-core = { version = "0.9", optional = true }
+candle-nn = { version = "0.9", optional = true }
+candle-transformers = { version = "0.9", optional = true }
+tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
+safetensors = { version = "0.5", optional = true }
+
+[build-dependencies]
+dirs = "6"
 
 [dev-dependencies]
 filetime = "0.2"

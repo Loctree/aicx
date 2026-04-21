@@ -26,7 +26,7 @@ use rmcp_memex::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -37,6 +37,7 @@ use crate::sanitize;
 // ============================================================================
 
 const DEFAULT_MEMEX_NAMESPACE: &str = "ai-contexts";
+const SEMANTIC_INDEX_METADATA_VERSION: u32 = 1;
 /// aicx-owned config paths. No fallback to memex server config.
 const AICX_CONFIG_SEARCH_PATHS: &[&str] = &["~/.aicx/memex/config.toml", "~/.aicx/config.toml"];
 
@@ -49,6 +50,30 @@ pub struct MemexRuntimeTruth {
     pub embedding_dimension: usize,
     pub config_path: Option<PathBuf>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SemanticIndexMetadata {
+    format_version: u32,
+    namespace: String,
+    db_path: String,
+    bm25_path: String,
+    embedding_model: String,
+    embedding_dimension: usize,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+struct MemexCompatibilityError {
+    message: String,
+}
+
+impl fmt::Display for MemexCompatibilityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for MemexCompatibilityError {}
 
 #[derive(Debug, Default, Deserialize)]
 struct MemexFileConfig {
@@ -323,6 +348,240 @@ pub fn resolve_runtime_truth(db_path_override: Option<&Path>) -> Result<MemexRun
     resolve_runtime_truth_from_config(db_path_override, config_path.as_deref())
 }
 
+// ============================================================================
+// Per-namespace semantic index metadata + compatibility checks
+// ============================================================================
+
+fn semantic_index_metadata_path(namespace: &str) -> Result<PathBuf> {
+    Ok(memex_state_dir()?.join(format!(
+        "semantic-index-{}.json",
+        namespace
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    )))
+}
+
+fn cli_display_arg(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn load_semantic_index_metadata(namespace: &str) -> Option<SemanticIndexMetadata> {
+    let path = semantic_index_metadata_path(namespace).ok()?;
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn save_semantic_index_metadata(namespace: &str, truth: &MemexRuntimeTruth) -> Result<()> {
+    let path = semantic_index_metadata_path(namespace)?;
+    let metadata = SemanticIndexMetadata {
+        format_version: SEMANTIC_INDEX_METADATA_VERSION,
+        namespace: namespace.to_string(),
+        db_path: truth.db_path.display().to_string(),
+        bm25_path: truth.bm25_path.display().to_string(),
+        embedding_model: truth.embedding_model.clone(),
+        embedding_dimension: truth.embedding_dimension,
+        updated_at: Utc::now(),
+    };
+
+    fs::write(path, serde_json::to_vec_pretty(&metadata)?)?;
+    Ok(())
+}
+
+fn semantic_reindex_command(namespace: &str, truth: &MemexRuntimeTruth) -> String {
+    let mut command = vec![
+        "aicx".to_string(),
+        "memex-sync".to_string(),
+        "--reindex".to_string(),
+    ];
+
+    if namespace != DEFAULT_MEMEX_NAMESPACE {
+        command.push("--namespace".to_string());
+        command.push(cli_display_arg(namespace));
+    }
+
+    if truth.db_path != default_memex_db_path() {
+        command.push("--db-path".to_string());
+        command.push(cli_display_arg(&truth.db_path.to_string_lossy()));
+    }
+
+    command.join(" ")
+}
+
+fn runtime_truth_source_message(truth: &MemexRuntimeTruth) -> String {
+    match truth.config_path.as_ref() {
+        Some(config_path) => format!(
+            " Embedding/runtime config was loaded from {}.",
+            config_path.display()
+        ),
+        None => " Embedding/runtime config fell back to published rmcp-memex defaults plus environment.".to_string(),
+    }
+}
+
+fn semantic_metadata_mismatch_fields(
+    namespace: &str,
+    truth: &MemexRuntimeTruth,
+    metadata: &SemanticIndexMetadata,
+) -> Vec<&'static str> {
+    let truth_db_path = truth.db_path.to_string_lossy();
+    let truth_bm25_path = truth.bm25_path.to_string_lossy();
+    let mut fields = Vec::new();
+
+    if metadata.format_version != SEMANTIC_INDEX_METADATA_VERSION {
+        fields.push("format_version");
+    }
+    if metadata.namespace != namespace {
+        fields.push("namespace");
+    }
+    if metadata.db_path != truth_db_path.as_ref() {
+        fields.push("db_path");
+    }
+    if metadata.bm25_path != truth_bm25_path.as_ref() {
+        fields.push("bm25_path");
+    }
+    if metadata.embedding_model != truth.embedding_model {
+        fields.push("embedding_model");
+    }
+    if metadata.embedding_dimension != truth.embedding_dimension {
+        fields.push("embedding_dimension");
+    }
+
+    fields
+}
+
+fn semantic_metadata_mismatch(
+    namespace: &str,
+    truth: &MemexRuntimeTruth,
+    metadata: Option<&SemanticIndexMetadata>,
+) -> bool {
+    metadata.is_some_and(|metadata| {
+        !semantic_metadata_mismatch_fields(namespace, truth, metadata).is_empty()
+    })
+}
+
+fn semantic_compatibility_error(
+    namespace: &str,
+    truth: &MemexRuntimeTruth,
+    metadata: Option<&SemanticIndexMetadata>,
+    actual_dimension: Option<usize>,
+) -> anyhow::Error {
+    let mut message = format!(
+        "Semantic index mismatch for namespace '{namespace}'. rmcp-memex currently expects model '{}' ({} dims) at {}.",
+        truth.embedding_model,
+        truth.embedding_dimension,
+        truth.db_path.display()
+    );
+    message.push_str(&runtime_truth_source_message(truth));
+
+    if let Some(actual_dimension) = actual_dimension {
+        message.push_str(&format!(
+            " Existing namespace data uses {actual_dimension} dims."
+        ));
+    }
+
+    if let Some(metadata) = metadata {
+        message.push_str(&format!(
+            " ai-contexters metadata (format v{}) still points at model '{}' ({} dims) recorded from {} with BM25 at {}.",
+            metadata.format_version,
+            metadata.embedding_model,
+            metadata.embedding_dimension,
+            metadata.db_path,
+            metadata.bm25_path
+        ));
+
+        let mismatched_fields = semantic_metadata_mismatch_fields(namespace, truth, metadata);
+        if !mismatched_fields.is_empty() {
+            message.push_str(&format!(
+                " Diverged fields: {}.",
+                mismatched_fields.join(", ")
+            ));
+        }
+    }
+
+    message.push_str(&format!(
+        " Run `{}` to rebuild this namespace for the new embedding truth. Other namespaces are not touched — aicx only drops per-namespace documents, keeping sibling namespaces intact.",
+        semantic_reindex_command(namespace, truth)
+    ));
+    message.push_str(
+        " This stays explicit because Lance vector schemas are shared across the whole store, so silent reuse would corrupt search semantics.",
+    );
+
+    MemexCompatibilityError { message }.into()
+}
+
+async fn semantic_store_dimension(
+    truth: &MemexRuntimeTruth,
+    namespace: &str,
+) -> Result<Option<usize>> {
+    let storage = StorageManager::new_lance_only(&truth.db_path.to_string_lossy())
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to open rmcp-memex LanceDB at {}",
+                truth.db_path.display()
+            )
+        })?;
+
+    Ok(storage
+        .all_documents(Some(namespace), 1)
+        .await?
+        .into_iter()
+        .next()
+        .map(|doc| doc.embedding.len()))
+}
+
+async fn validate_semantic_index_compatibility_truth(
+    namespace: &str,
+    truth: &MemexRuntimeTruth,
+) -> Result<()> {
+    let actual_dimension = semantic_store_dimension(truth, namespace).await?;
+    let metadata = load_semantic_index_metadata(namespace);
+    let metadata_mismatch = semantic_metadata_mismatch(namespace, truth, metadata.as_ref());
+
+    if metadata_mismatch {
+        return Err(semantic_compatibility_error(
+            namespace,
+            truth,
+            metadata.as_ref(),
+            actual_dimension,
+        ));
+    }
+
+    if let Some(actual_dimension) = actual_dimension {
+        if actual_dimension != truth.embedding_dimension {
+            return Err(semantic_compatibility_error(
+                namespace,
+                truth,
+                metadata.as_ref(),
+                Some(actual_dimension),
+            ));
+        }
+
+        save_semantic_index_metadata(namespace, truth)?;
+    }
+
+    Ok(())
+}
+
+/// Returns true when the error came from explicit memex compatibility checks.
+pub fn is_compatibility_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<MemexCompatibilityError>().is_some())
+}
+
 fn remove_path_if_exists(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -339,16 +598,58 @@ fn remove_path_if_exists(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Explicitly wipe the current rmcp-memex store so it can be rebuilt for a new embedding truth.
+/// Explicitly drop all documents for a single namespace so it can be rebuilt for a new embedding truth.
+///
+/// Non-destructive by design: only the target namespace's documents are removed from the
+/// shared LanceDB store. Sibling namespaces with different embedding dimensions stay intact.
+/// When the namespace is the only one in the store (or was missing entirely), the directory
+/// tree is cleaned up so the next sync starts from a clean slate.
 pub fn reset_semantic_index(
-    _namespace: &str,
+    namespace: &str,
     db_path_override: Option<&Path>,
 ) -> Result<MemexRuntimeTruth> {
     let truth = resolve_runtime_truth(db_path_override)?;
+    let runtime = tokio::runtime::Runtime::new()
+        .context("Failed to start Tokio runtime for semantic-index reset")?;
 
-    remove_path_if_exists(&truth.db_path)?;
-    remove_path_if_exists(&truth.bm25_path)?;
-    remove_path_if_exists(&sync_state_path()?)?;
+    let remaining_namespaces = runtime.block_on(async {
+        if !truth.db_path.exists() {
+            return Ok::<usize, anyhow::Error>(0);
+        }
+
+        let storage = StorageManager::new_lance_only(&truth.db_path.to_string_lossy())
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to open rmcp-memex LanceDB for reset at {}",
+                    truth.db_path.display()
+                )
+            })?;
+
+        // Best-effort: drop only documents for the requested namespace.
+        let _ = storage.delete_namespace_documents(namespace).await?;
+
+        let namespaces = storage
+            .list_namespaces()
+            .await
+            .context("Failed to list namespaces after per-namespace reset")?;
+        Ok(namespaces.len())
+    })?;
+
+    if remaining_namespaces == 0 {
+        // Nothing else lives in the store — safe to drop the full directories so the
+        // next sync starts from a clean slate.
+        remove_path_if_exists(&truth.db_path)?;
+        remove_path_if_exists(&truth.bm25_path)?;
+        remove_path_if_exists(&sync_state_path()?)?;
+    } else {
+        // BM25 index is keyed by namespace column, so we leave it intact for siblings.
+        // Sync state tracks chunk IDs, which are globally unique; purge the file to force
+        // a full re-scan on the next sync (other namespaces will no-op on re-ingest).
+        remove_path_if_exists(&sync_state_path()?)?;
+    }
+
+    remove_path_if_exists(&semantic_index_metadata_path(namespace)?)?;
 
     Ok(truth)
 }
@@ -902,6 +1203,7 @@ where
     let config_path = discover_memex_config_path();
     let (truth, embedding_config) =
         resolve_runtime_boundary_from_config(config.db_path.as_deref(), config_path.as_deref())?;
+    validate_semantic_index_compatibility_truth(&config.namespace, &truth).await?;
     if new_files.is_empty() {
         emit_sync_progress(
             &mut progress,
@@ -1153,8 +1455,6 @@ pub async fn fast_memex_search(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp_memex::ChromaDocument;
-    use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_test_dir(label: &str) -> PathBuf {
@@ -1409,11 +1709,14 @@ model = "qwen3-embedding:4b"
         save_semantic_index_metadata(&namespace, &stale_truth).expect("save stale metadata");
 
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let truth = resolve_runtime_truth_from_config(
+            Some(db_path.as_path()),
+            Some(config_path.as_path()),
+        )
+        .expect("resolve truth for test");
         let err = runtime
-            .block_on(validate_semantic_index_compatibility_from_config(
-                &namespace,
-                Some(db_path.as_path()),
-                Some(config_path.as_path()),
+            .block_on(validate_semantic_index_compatibility_truth(
+                &namespace, &truth,
             ))
             .expect_err("stale metadata should force an explicit compatibility error");
 

@@ -18,6 +18,7 @@ agents/state/
 GEMINI.md
 CLAUDE.md
 /*.rs
+!/build.rs
 *.out
 /.claude/
 /release-bundles

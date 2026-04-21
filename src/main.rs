@@ -2648,6 +2648,7 @@ fn run_search(
             filters.frame_kind,
         )) {
             Ok((res, scan)) if !res.is_empty() => (res, scan),
+            Err(err) if memex::is_compatibility_error(&err) => return Err(err),
             _ => rank::fuzzy_search_store(
                 &root,
                 &search_query,
