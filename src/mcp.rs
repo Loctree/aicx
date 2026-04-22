@@ -180,6 +180,7 @@ fn background_refresh_args(hours: u64, project: Option<&str>) -> Vec<String> {
 
 #[derive(Clone)]
 pub struct AicxMcpServer {
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
@@ -240,36 +241,17 @@ impl AicxMcpServer {
             }
         }
 
-        // Try fast search with rmcp_memex first (instant), fallback to brute-force if it fails
-        let (results, scanned) = match crate::memex::fast_memex_search(
+        // Fallback to reading all markdown files sequentially (slow)
+        let store_root = store::store_base_dir()
+            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+        let (results, scanned) = rank::fuzzy_search_store(
+            &store_root,
             &query,
             fetch_limit,
             project.as_deref(),
             frame_kind,
         )
-        .await
-        {
-            Ok((res, scan)) if !res.is_empty() => (res, scan),
-            Err(err) if crate::memex::is_compatibility_error(&err) => {
-                return Err(McpError::internal_error(
-                    format!("Search index incompatible: {err}"),
-                    None,
-                ));
-            }
-            _ => {
-                // Fallback to reading all markdown files sequentially (slow)
-                let store_root = store::store_base_dir()
-                    .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
-                rank::fuzzy_search_store(
-                    &store_root,
-                    &query,
-                    fetch_limit,
-                    project.as_deref(),
-                    frame_kind,
-                )
-                .map_err(|e| McpError::internal_error(format!("Read store: {e}"), None))?
-            }
-        };
+        .map_err(|e| McpError::internal_error(format!("Read store: {e}"), None))?;
 
         let mut results = results;
 

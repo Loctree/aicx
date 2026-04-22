@@ -11,7 +11,6 @@ pub mod frontmatter;
 pub mod hf_cache;
 pub mod intents;
 pub mod mcp;
-pub mod memex;
 pub mod output;
 pub mod rank;
 pub mod redact;

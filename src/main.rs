@@ -6,10 +6,6 @@
 //! Two-layer architecture:
 //!   1. **Canonical corpus** (`~/.aicx/`) — deduplicated, chunked, steerable markdown.
 //!      Built by extractors (`claude`, `codex`, `all`) and `store`. This is ground truth.
-//!   2. **Optional semantic index** (memex) — vector + BM25 index for semantic
-//!      retrieval by agents and MCP tools. Built by `memex-sync` or `--memex` on extractors.
-//!      `aicx` owns the canonical corpus; memex is layered on top.
-//!
 //! Supported sources:
 //! - Claude Code: ~/.claude/projects/*/*.jsonl
 //! - Codex: ~/.codex/history.jsonl
@@ -33,7 +29,6 @@ use aicx::dashboard::{self, DashboardConfig, DashboardScope};
 use aicx::dashboard_server::{self, DashboardCorsPolicy, DashboardServerConfig};
 use aicx::intents;
 use aicx::mcp::{self, McpTransport};
-use aicx::memex::{self, MemexConfig, MemexRuntimeProfile, SyncProgress, SyncProgressPhase};
 use aicx::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
 use aicx::rank;
 use aicx::reports_extractor::{self, ReportsExtractorConfig};
@@ -67,18 +62,8 @@ fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
 /// Two-layer pipeline, both operator-driven:
 ///   Layer 1 (canonical corpus): extract, deduplicate, and chunk agent logs
 ///     into steerable markdown at ~/.aicx/. This is ground truth.
-///   Layer 2 (optional semantic index): embed the corpus into a vector + BM25
-///     index (memex) for semantic retrieval by agents and MCP tools. Nothing
-///     syncs automatically — you decide when to materialize.
-///
-/// aicx owns the canonical corpus; memex is an optional semantic index layered on top.
-///
 /// Quick start:
 ///   aicx all -H 4                      # build canonical corpus (layer 1)
-///   aicx memex-sync                     # materialize into memex (layer 2, base profile)
-///   aicx all -H 4 --memex              # both layers in one shot
-///   aicx memex-sync --profile dev      # opt into the 2560-dim Qwen 4B preset
-///   aicx memex-sync --reindex           # full rebuild after model change
 #[derive(Debug, Parser)]
 #[command(name = "aicx")]
 #[command(author = "M&K (c)2026 VetCoders")]
@@ -292,8 +277,7 @@ enum Commands {
     /// Extract + store Claude Code sessions into the canonical corpus (layer 1).
     ///
     /// Reads ~/.claude/projects/ logs, deduplicates, chunks, and writes
-    /// steerable markdown to ~/.aicx/. Add --memex to also materialize new
-    /// chunks into the optional memex semantic index (layer 2).
+    /// steerable markdown to ~/.aicx/.
     #[command(display_order = 2)]
     Claude {
         #[command(flatten)]
@@ -347,11 +331,6 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
 
-        /// After extraction, materialize new chunks into the optional memex semantic index (layer 2).
-        /// Shortcut for running `aicx memex-sync` as a separate step.
-        #[arg(long)]
-        memex: bool,
-
         /// Force full extraction, ignore dedup hashes
         #[arg(long)]
         force: bool,
@@ -368,8 +347,7 @@ enum Commands {
     /// Extract + store Codex sessions into the canonical corpus (layer 1).
     ///
     /// Reads ~/.codex/history.jsonl, deduplicates, chunks, and writes
-    /// steerable markdown to ~/.aicx/. Add --memex to also materialize new
-    /// chunks into the optional memex semantic index (layer 2).
+    /// steerable markdown to ~/.aicx/.
     #[command(display_order = 3)]
     Codex {
         #[command(flatten)]
@@ -423,11 +401,6 @@ enum Commands {
         #[arg(long)]
         project_root: Option<PathBuf>,
 
-        /// After extraction, materialize new chunks into the optional memex semantic index (layer 2).
-        /// Shortcut for running `aicx memex-sync` as a separate step.
-        #[arg(long)]
-        memex: bool,
-
         /// Force full extraction, ignore dedup hashes
         #[arg(long)]
         force: bool,
@@ -446,8 +419,7 @@ enum Commands {
     /// The daily-driver command: runs each extractor, deduplicates, chunks, and
     /// writes steerable markdown to ~/.aicx/. By default, uses per-source
     /// watermarks to skip already-processed entries. Use --full-rescan to
-    /// ignore the watermark and scan the full lookback window again. Add --memex to also
-    /// materialize new chunks into the optional memex semantic index (layer 2).
+    /// ignore the watermark and scan the full lookback window again.
     #[command(display_order = 1)]
     All {
         #[command(flatten)]
@@ -496,11 +468,6 @@ enum Commands {
         /// Project root for loctree snapshot
         #[arg(long)]
         project_root: Option<PathBuf>,
-
-        /// After extraction, materialize new chunks into the optional memex semantic index (layer 2).
-        /// Shortcut for running `aicx memex-sync` as a separate step.
-        #[arg(long)]
-        memex: bool,
 
         /// Force full extraction, ignore dedup hashes
         #[arg(long)]
@@ -565,8 +532,6 @@ enum Commands {
     /// to skip previously scanned history. Use --full-rescan for backfills
     /// and targeted re-extraction when you need to ignore the watermark.
     ///
-    /// Add --memex to also materialize new chunks into the optional memex
-    /// semantic index (layer 2) — a shortcut for running `memex-sync` separately.
     #[command(display_order = 4)]
     Store {
         #[command(flatten)]
@@ -600,56 +565,9 @@ enum Commands {
         #[arg(long, hide = true, conflicts_with = "user_only")]
         include_assistant: bool,
 
-        /// After extraction, materialize new chunks into the optional memex semantic index (layer 2).
-        /// Shortcut for running `aicx memex-sync` as a separate step.
-        #[arg(long)]
-        memex: bool,
-
         /// What to print to stdout: paths, json, none (default: none)
         #[arg(long, value_enum, default_value_t = StdoutEmit::None)]
         emit: StdoutEmit,
-    },
-
-    // ── Layer 2: Semantic materialization ──────────────────────────────
-    /// Materialize the canonical corpus into the optional memex semantic index (layer 2).
-    ///
-    /// Reads chunks from ~/.aicx/, embeds them, and upserts into the rmcp-memex
-    /// vector + BM25 index. Materialization is always operator-driven — nothing
-    /// syncs automatically. You either run this command explicitly, or use
-    /// `--memex` on any extractor as a one-shot shortcut.
-    ///
-    /// First build:    aicx memex-sync                (embed + index all unsynced chunks)
-    /// Incremental:    aicx memex-sync                (only new chunks since last sync)
-    /// Full rebuild:   aicx memex-sync --reindex      (wipe index, re-embed everything)
-    /// Per-chunk mode: aicx memex-sync --per-chunk    (granular library writes instead of batch store)
-    /// Runtime preset: aicx memex-sync --profile dev  (opt into the 2560-dim Qwen 4B preset)
-    #[command(display_order = 20, verbatim_doc_comment)]
-    MemexSync {
-        /// Namespace in the semantic index
-        #[arg(short, long, default_value = "ai-contexts")]
-        namespace: String,
-
-        /// Use per-chunk library writes instead of batch store (slower, more granular)
-        #[arg(long)]
-        per_chunk: bool,
-
-        /// Override LanceDB path
-        #[arg(long)]
-        db_path: Option<PathBuf>,
-
-        /// Runtime profile for memex retrieval.
-        ///
-        /// `base` is the default portable preset. `dev` keeps the older
-        /// 2560-dim Qwen 4B behavior for stronger workstations. `premium`
-        /// opts into a 4096-dim Qwen 8B setup.
-        #[arg(long, value_enum)]
-        profile: Option<MemexRuntimeProfile>,
-
-        /// Wipe the memex index and re-embed the entire canonical corpus.
-        /// Use after an embedding model or dimension change, or when the
-        /// index has drifted from the canonical store.
-        #[arg(long)]
-        reindex: bool,
     },
 
     // ── Layer 1: Query & inspect ──────────────────────────────────────
@@ -976,7 +894,6 @@ fn main() -> Result<()> {
             include_assistant: include_assistant_flag,
             loctree,
             project_root,
-            memex,
             force,
             emit,
             conversation,
@@ -995,7 +912,6 @@ fn main() -> Result<()> {
                 include_assistant,
                 include_loctree: loctree,
                 project_root,
-                sync_memex: memex,
                 force,
                 redact_secrets: redaction.redact_secrets,
                 emit,
@@ -1016,7 +932,6 @@ fn main() -> Result<()> {
             include_assistant: include_assistant_flag,
             loctree,
             project_root,
-            memex,
             force,
             emit,
             conversation,
@@ -1035,7 +950,6 @@ fn main() -> Result<()> {
                 include_assistant,
                 include_loctree: loctree,
                 project_root,
-                sync_memex: memex,
                 force,
                 redact_secrets: redaction.redact_secrets,
                 emit,
@@ -1055,7 +969,6 @@ fn main() -> Result<()> {
             include_assistant: include_assistant_flag,
             loctree,
             project_root,
-            memex,
             force,
             emit,
             conversation,
@@ -1074,7 +987,6 @@ fn main() -> Result<()> {
                 include_assistant,
                 include_loctree: loctree,
                 project_root,
-                sync_memex: memex,
                 force,
                 redact_secrets: redaction.redact_secrets,
                 emit,
@@ -1115,7 +1027,6 @@ fn main() -> Result<()> {
             incremental,
             user_only,
             include_assistant: include_assistant_flag,
-            memex,
             emit,
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
@@ -1126,19 +1037,9 @@ fn main() -> Result<()> {
                 hours,
                 full_rescan,
                 include_assistant,
-                sync_memex: memex,
                 emit,
                 redact_secrets: redaction.redact_secrets,
             })?;
-        }
-        Some(Commands::MemexSync {
-            namespace,
-            per_chunk,
-            db_path,
-            profile,
-            reindex,
-        }) => {
-            run_memex_sync(&namespace, per_chunk, db_path, profile, reindex)?;
         }
         Some(Commands::List) => {
             let sources = sources::list_available_sources()?;
@@ -1806,7 +1707,6 @@ struct ExtractionParams<'a> {
     include_assistant: bool,
     include_loctree: bool,
     project_root: Option<PathBuf>,
-    sync_memex: bool,
     force: bool,
     conversation: bool,
     redact_secrets: bool,
@@ -1819,103 +1719,8 @@ struct StoreRunArgs {
     hours: u64,
     full_rescan: bool,
     include_assistant: bool,
-    sync_memex: bool,
     emit: StdoutEmit,
     redact_secrets: bool,
-}
-
-struct MemexProgressPrinter {
-    enabled: bool,
-    width: usize,
-}
-
-impl MemexProgressPrinter {
-    fn new() -> Self {
-        Self {
-            enabled: io::stderr().is_terminal(),
-            width: 0,
-        }
-    }
-
-    fn update(&mut self, progress: &SyncProgress) {
-        if !self.enabled {
-            return;
-        }
-
-        let message = render_memex_progress(progress);
-        let width = self.width.max(message.len());
-        self.width = width;
-        eprint!("\r{message:<width$}");
-        let _ = io::stderr().flush();
-    }
-
-    fn finish(&mut self) {
-        if self.enabled && self.width > 0 {
-            eprint!("\r{:<width$}\r", "", width = self.width);
-            let _ = io::stderr().flush();
-            self.width = 0;
-        }
-    }
-}
-
-fn render_memex_progress(progress: &SyncProgress) -> String {
-    match progress.phase {
-        SyncProgressPhase::Discovering => {
-            format!(
-                "  Memex scan... {}/{}",
-                progress.done.max(1),
-                progress.total.max(1)
-            )
-        }
-        SyncProgressPhase::Embedding => {
-            format!(
-                "  Memex embed... {}/{}",
-                progress.done.max(1),
-                progress.total.max(1)
-            )
-        }
-        SyncProgressPhase::Writing => {
-            format!(
-                "  Memex index... {}/{}",
-                progress.done.max(1),
-                progress.total.max(1)
-            )
-        }
-        SyncProgressPhase::Completed => format!("  {}", progress.detail),
-    }
-}
-
-fn sync_memex_paths(config: &MemexConfig, chunk_paths: &[PathBuf]) -> Result<memex::SyncResult> {
-    let mut printer = MemexProgressPrinter::new();
-    let enabled = printer.enabled;
-    let result = if enabled {
-        memex::sync_new_chunk_paths_with_progress(chunk_paths, config, |progress| {
-            printer.update(&progress);
-        })
-    } else {
-        memex::sync_new_chunk_paths(chunk_paths, config)
-    };
-    printer.finish();
-    result
-}
-
-fn sync_memex_if_requested(sync_memex: bool, all_written_paths: &[PathBuf]) -> Result<()> {
-    if sync_memex && !all_written_paths.is_empty() {
-        let memex_config = MemexConfig::default();
-        // Keep extractor/store `--memex` on the same stateful transport seam as
-        // the dedicated `memex-sync` command so sync state and observability do
-        // not drift between code paths.
-        let result = sync_memex_paths(&memex_config, all_written_paths)
-            .context("Failed to materialize canonical chunks into memex semantic index")?;
-        eprintln!(
-            "  Memex: {} materialized, {} skipped, {} ignored",
-            result.chunks_materialized, result.chunks_skipped, result.chunks_ignored
-        );
-        for err in &result.errors {
-            eprintln!("  Memex error: {}", err);
-        }
-    }
-    Ok(())
 }
 
 fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
@@ -1931,7 +1736,6 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         include_assistant,
         include_loctree,
         project_root,
-        sync_memex,
         force,
         conversation,
         redact_secrets,
@@ -2108,8 +1912,6 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             "  Resolved store buckets: {}",
             render_resolved_store_buckets(&scope_surface)
         );
-
-        sync_memex_if_requested(sync_memex, &newly_written_paths)?;
     }
 
     // stdout emission (integration-friendly).
@@ -2283,7 +2085,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Store extracted contexts in the canonical corpus and optionally materialize into the memex semantic index.
+/// Store extracted contexts in the canonical corpus.
 fn run_store(args: StoreRunArgs) -> Result<()> {
     let StoreRunArgs {
         project,
@@ -2291,7 +2093,6 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         hours,
         full_rescan,
         include_assistant,
-        sync_memex,
         emit,
         redact_secrets,
     } = args;
@@ -2427,8 +2228,6 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         "  Resolved store buckets: {}",
         render_resolved_store_buckets(&scope_surface)
     );
-
-    sync_memex_if_requested(sync_memex, &all_written_paths)?;
 
     if let Some(latest) = all_entries.last() {
         state.update_watermark(&source_key, latest.timestamp);
@@ -2686,33 +2485,14 @@ fn run_search(
         filters.limit
     };
 
-    // Try fast search with rmcp_memex first (instant), fallback to brute-force if it fails or returns nothing
-    let (results, scanned) = if let Ok(rt) = tokio::runtime::Runtime::new() {
-        match rt.block_on(memex::fast_memex_search(
-            &search_query,
-            fetch_limit,
-            project,
-            filters.frame_kind,
-        )) {
-            Ok((res, scan)) if !res.is_empty() => (res, scan),
-            Err(err) if memex::is_compatibility_error(&err) => return Err(err),
-            _ => rank::fuzzy_search_store(
-                &root,
-                &search_query,
-                fetch_limit,
-                project,
-                filters.frame_kind,
-            )?,
-        }
-    } else {
-        rank::fuzzy_search_store(
-            &root,
-            &search_query,
-            fetch_limit,
-            project,
-            filters.frame_kind,
-        )?
-    };
+    // Use fuzzy search across the canonical store
+    let (results, scanned) = rank::fuzzy_search_store(
+        &root,
+        &search_query,
+        fetch_limit,
+        project,
+        filters.frame_kind,
+    )?;
 
     let mut results = results;
 
@@ -3076,87 +2856,6 @@ fn run_state(reset: bool, project: Option<String>, info: bool) -> Result<()> {
     Ok(())
 }
 
-/// Sync stored chunks to rmcp-memex semantic index.
-fn run_memex_sync(
-    namespace: &str,
-    per_chunk: bool,
-    db_path: Option<PathBuf>,
-    profile: Option<MemexRuntimeProfile>,
-    reindex: bool,
-) -> Result<()> {
-    let truth = memex::resolve_runtime_truth_with_profile(db_path.as_deref(), profile)?;
-    let store_root = store::store_base_dir()?;
-
-    let canonical_root = store::canonical_store_dir()?;
-    let chunk_paths: Vec<PathBuf> = store::scan_context_files_raw()?
-        .into_iter()
-        .map(|file| file.path)
-        .collect();
-    if chunk_paths.is_empty() {
-        eprintln!(
-            "No canonical stored chunks found under: {}",
-            canonical_root.display()
-        );
-        eprintln!("Run `aicx store`, `aicx all`, or another extractor first.");
-        return Ok(());
-    }
-
-    let config = MemexConfig {
-        namespace: namespace.to_string(),
-        db_path: db_path.clone(),
-        batch_mode: !per_chunk,
-        preprocess: true,
-        runtime_profile: profile,
-    };
-
-    eprintln!(
-        "Syncing canonical chunks from: {}",
-        canonical_root.display()
-    );
-    eprintln!("  Chunk files: {}", chunk_paths.len());
-    eprintln!("  Namespace: {}", config.namespace);
-    eprintln!("  Runtime: {}", truth.runtime_summary);
-    eprintln!("  Embedding model: {}", truth.embedding_model);
-    eprintln!("  Embedding dims: {}", truth.embedding_dimension);
-    eprintln!("  LanceDB path: {}", truth.db_path.display());
-    eprintln!("  BM25 path: {}", truth.bm25_path.display());
-    let ignore_path = store_root.join(store::AICX_IGNORE_FILENAME);
-    if ignore_path.is_file() {
-        eprintln!("  Ignore file: {}", ignore_path.display());
-    }
-    eprintln!(
-        "  Mode: {}",
-        if config.batch_mode {
-            "batch store (library-backed, metadata-rich)"
-        } else {
-            "per-chunk store (library-backed)"
-        }
-    );
-
-    if reindex {
-        eprintln!("  Reindex: wiping current rmcp-memex store before rebuild");
-        eprintln!(
-            "  Warning: Lance vector schema is shared across the whole store, so other namespaces in {} will need a rebuild too.",
-            truth.db_path.display()
-        );
-        memex::reset_semantic_index_with_profile(namespace, db_path.as_deref(), profile)?;
-    }
-
-    let result = sync_memex_paths(&config, &chunk_paths)?;
-
-    eprintln!(
-        "✓ Memex sync: {} materialized, {} skipped, {} ignored",
-        result.chunks_materialized, result.chunks_skipped, result.chunks_ignored,
-    );
-
-    for err in &result.errors {
-        eprintln!("  Error: {}", err);
-    }
-
-    Ok(())
-}
-
-/// Run the local dashboard server against the canonical store.
 struct DashboardServerRunArgs {
     store_root: Option<PathBuf>,
     scope: DashboardScope,
@@ -3610,50 +3309,6 @@ mod tests {
     }
 
     #[test]
-    fn render_memex_progress_formats_live_stages() {
-        assert_eq!(
-            render_memex_progress(&SyncProgress {
-                phase: SyncProgressPhase::Discovering,
-                done: 12,
-                total: 48,
-                detail: String::new(),
-            }),
-            "  Memex scan... 12/48"
-        );
-        assert_eq!(
-            render_memex_progress(&SyncProgress {
-                phase: SyncProgressPhase::Embedding,
-                done: 64,
-                total: 256,
-                detail: String::new(),
-            }),
-            "  Memex embed... 64/256"
-        );
-        assert_eq!(
-            render_memex_progress(&SyncProgress {
-                phase: SyncProgressPhase::Writing,
-                done: 128,
-                total: 256,
-                detail: String::new(),
-            }),
-            "  Memex index... 128/256"
-        );
-    }
-
-    #[test]
-    fn render_memex_progress_passes_completed_detail_through() {
-        assert_eq!(
-            render_memex_progress(&SyncProgress {
-                phase: SyncProgressPhase::Completed,
-                done: 0,
-                total: 0,
-                detail: "Completed: 10 materialized, 2 skipped, 3 ignored".to_string(),
-            }),
-            "  Completed: 10 materialized, 2 skipped, 3 ignored"
-        );
-    }
-
-    #[test]
     fn claude_defaults_to_silent_stdout() {
         let cli = Cli::try_parse_from(["aicx", "claude"]).expect("claude command should parse");
 
@@ -3908,31 +3563,6 @@ mod tests {
 
         assert!(rendered.contains("semantic retrieval through MCP tools"));
         assert!(!rendered.contains("embedding-aware"));
-    }
-
-    #[test]
-    fn memex_sync_profile_flag_parses_and_help_mentions_presets() {
-        let cli = Cli::try_parse_from(["aicx", "memex-sync", "--profile", "premium"])
-            .expect("memex-sync profile flag should parse");
-
-        match cli.command {
-            Some(Commands::MemexSync { profile, .. }) => {
-                assert_eq!(profile, Some(MemexRuntimeProfile::Premium));
-            }
-            _ => panic!("expected memex-sync command"),
-        }
-
-        let mut cmd = Cli::command();
-        let memex_sync = cmd
-            .find_subcommand_mut("memex-sync")
-            .expect("memex-sync subcommand should exist");
-        let rendered = memex_sync.render_long_help().to_string();
-
-        assert!(rendered.contains("--profile <PROFILE>"));
-        assert!(rendered.contains("base"));
-        assert!(rendered.contains("dev"));
-        assert!(rendered.contains("premium"));
-        assert!(rendered.contains("default portable preset"));
     }
 
     #[test]

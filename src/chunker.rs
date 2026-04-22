@@ -68,7 +68,7 @@ pub struct Chunk {
     pub highlights: Vec<String>,
 }
 
-/// Structured metadata sidecar persisted alongside each memex chunk file.
+/// Structured metadata sidecar persisted alongside each chunk file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChunkMetadataSidecar {
     pub id: String,

@@ -10,29 +10,52 @@ set -euo pipefail
 #
 # Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SOURCE_PATH="${BASH_SOURCE[0]:-$0}"
+if [ -n "$SOURCE_PATH" ] && [ -e "$SOURCE_PATH" ]; then
+  SCRIPT_DIR=$(cd "$(dirname "$SOURCE_PATH")" && pwd)
+else
+  SCRIPT_DIR="$PWD"
+fi
 MANIFEST_PATH="$SCRIPT_DIR/Cargo.toml"
 HAS_LOCAL_MANIFEST=0
 if [ -f "$MANIFEST_PATH" ]; then
   HAS_LOCAL_MANIFEST=1
 fi
+HAS_BUNDLED_BINARIES=0
+if [ -x "$SCRIPT_DIR/aicx" ] && [ -x "$SCRIPT_DIR/aicx-mcp" ]; then
+  HAS_BUNDLED_BINARIES=1
+fi
 AICX_INSTALL_MODE="${AICX_INSTALL_MODE:-auto}"
-AICX_GIT_URL="${AICX_GIT_URL:-https://github.com/VetCoders/ai-contexters}"
+AICX_GIT_URL="${AICX_GIT_URL:-https://github.com/Loctree/aicx}"
+AICX_BIN_DIR="${AICX_BIN_DIR:-$HOME/.local/bin}"
+AICX_RELEASE_REPO="${AICX_RELEASE_REPO:-Loctree/aicx}"
+AICX_RELEASE_TAG="${AICX_RELEASE_TAG:-latest}"
 
 SKIP_INSTALL=0
 for arg in "$@"; do
   case "$arg" in
     --skip-install) SKIP_INSTALL=1 ;;
+    --release) AICX_INSTALL_MODE="release" ;;
+    --release-tag=*) AICX_RELEASE_TAG="${arg#*=}" ;;
     --help|-h)
       echo "Usage: install.sh [--skip-install]"
       echo "  Install aicx + aicx-mcp and configure MCP for Claude Code, Codex, and Gemini."
-      echo "  Run from the repo root or any local checkout that contains Cargo.toml."
+      echo "  Run from a release bundle or the repo root / local checkout."
       echo ""
       echo "Install source is controlled by AICX_INSTALL_MODE:"
-      echo "  auto   - prefer local checkout, otherwise install from crates.io"
-      echo "  local - cargo install --path <checkout> --locked"
-      echo "  crates - cargo install ai-contexters --locked"
-      echo "  git    - cargo install --git \$AICX_GIT_URL --locked ai-contexters"
+      echo "  auto    - prefer bundled binaries, then local checkout, otherwise crates.io"
+      echo "  release - download an official GitHub Release, verify SHA256, then install its bundle"
+      echo "  bundle  - copy bundled binaries into \$AICX_BIN_DIR"
+      echo "  local   - cargo install --path <checkout> --locked"
+      echo "  crates  - cargo install aicx --locked"
+      echo "  git     - cargo install --git \$AICX_GIT_URL --locked aicx"
+      echo ""
+      echo "Bundle install target:"
+      echo "  AICX_BIN_DIR=\$HOME/.local/bin   # default destination for bundled binaries"
+      echo ""
+      echo "Release download target:"
+      echo "  AICX_RELEASE_REPO=Loctree/aicx"
+      echo "  AICX_RELEASE_TAG=latest          # or vX.Y.Z"
       echo ""
       echo "Runtime/build profile shortcuts:"
       echo "  default runtime:  AICX_RUNTIME_PROFILE=base    # portable 1024-dim preset"
@@ -45,6 +68,11 @@ for arg in "$@"; do
 done
 
 resolve_aicx() {
+  if [ -x "$AICX_BIN_DIR/aicx" ]; then
+    AICX_RUN=("$AICX_BIN_DIR/aicx")
+    return 0
+  fi
+
   if command -v aicx >/dev/null 2>&1; then
     AICX_RUN=("aicx")
     return 0
@@ -59,6 +87,12 @@ resolve_aicx() {
 }
 
 resolve_aicx_mcp() {
+  if [ -x "$AICX_BIN_DIR/aicx-mcp" ]; then
+    AICX_MCP_COMMAND="$AICX_BIN_DIR/aicx-mcp"
+    AICX_MCP_ARGS_JSON='[]'
+    return 0
+  fi
+
   if command -v aicx-mcp >/dev/null 2>&1; then
     AICX_MCP_COMMAND=$(command -v aicx-mcp)
     AICX_MCP_ARGS_JSON='[]'
@@ -90,28 +124,215 @@ PY
 
 echo "=== aicx setup ==="
 
-resolve_install_mode() {
-  case "$AICX_INSTALL_MODE" in
-    auto)
-      if [ "$HAS_LOCAL_MANIFEST" -eq 1 ]; then
-        echo "local"
-      else
-        echo "crates"
-      fi
-      ;;
-    local|crates|git)
-      echo "$AICX_INSTALL_MODE"
-      ;;
+cleanup_old_binaries() {
+  local path="$1"
+  if [ -L "$path" ] || [ -f "$path" ]; then
+    rm -f "$path"
+    echo "  removed stale $(basename "$path") from $(dirname "$path")"
+  fi
+}
+
+path_has_dir() {
+  case ":$PATH:" in
+    *":$1:"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+install_bundle_binaries() {
+  local install_dir="$AICX_BIN_DIR"
+  local source_aicx="$SCRIPT_DIR/aicx"
+  local source_mcp="$SCRIPT_DIR/aicx-mcp"
+
+  if [ "$HAS_BUNDLED_BINARIES" -ne 1 ]; then
+    echo "Error: bundle install requested, but prebuilt aicx binaries are not present next to install.sh." >&2
+    exit 1
+  fi
+
+  mkdir -p "$install_dir"
+  echo "  target bin dir: $install_dir"
+  echo "  pruning stale user-local / cargo installs..."
+  cleanup_old_binaries "$install_dir/aicx"
+  cleanup_old_binaries "$install_dir/aicx-mcp"
+  cleanup_old_binaries "$install_dir/ai-contexters"
+  cleanup_old_binaries "$install_dir/ai-contexters-mcp"
+  cleanup_old_binaries "$HOME/.cargo/bin/aicx"
+  cleanup_old_binaries "$HOME/.cargo/bin/aicx-mcp"
+  cleanup_old_binaries "$HOME/.cargo/bin/ai-contexters"
+  cleanup_old_binaries "$HOME/.cargo/bin/ai-contexters-mcp"
+
+  install -m 755 "$source_aicx" "$install_dir/aicx"
+  install -m 755 "$source_mcp" "$install_dir/aicx-mcp"
+  echo "  installed bundled binaries into $install_dir"
+}
+
+detect_release_target() {
+  local os arch
+  os=$(uname -s)
+  arch=$(uname -m)
+  case "${os}:${arch}" in
+    Darwin:arm64) echo "aarch64-apple-darwin" ;;
+    Darwin:x86_64) echo "x86_64-apple-darwin" ;;
+    Linux:x86_64) echo "x86_64-unknown-linux-musl" ;;
     *)
-      echo "Error: unsupported AICX_INSTALL_MODE='$AICX_INSTALL_MODE' (expected auto, local, crates, or git)." >&2
+      echo "Error: unsupported platform for release installer: ${os}/${arch}" >&2
+      echo "  Use a local bundle install instead, or install from source with cargo." >&2
       exit 1
       ;;
   esac
 }
 
+detect_release_archive_ext() {
+  case "$(uname -s)" in
+    Darwin) echo "zip" ;;
+    Linux) echo "tar.gz" ;;
+    *)
+      echo "Error: unsupported archive format for platform $(uname -s)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+resolve_release_tag() {
+  if [ "$AICX_RELEASE_TAG" != "latest" ]; then
+    echo "$AICX_RELEASE_TAG"
+    return 0
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "Error: curl is required to resolve the latest GitHub release tag." >&2
+    exit 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "Error: python3 is required to resolve the latest GitHub release tag." >&2
+    exit 1
+  fi
+
+  curl -fsSL "https://api.github.com/repos/${AICX_RELEASE_REPO}/releases/latest" | python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+tag = data.get("tag_name")
+if not tag:
+    raise SystemExit("GitHub API response did not include tag_name")
+print(tag)
+'
+}
+
+download_release_bundle() {
+  local release_tag target version archive_ext archive_name base_url tmp_dir archive_path checksum_path bundle_dir
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "Error: curl is required for release installer mode." >&2
+    exit 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "Error: python3 is required for release installer mode." >&2
+    exit 1
+  fi
+  release_tag=$(resolve_release_tag)
+  target=$(detect_release_target)
+  version="${release_tag#v}"
+  archive_ext=$(detect_release_archive_ext)
+  archive_name="aicx-v${version}-${target}.${archive_ext}"
+  base_url="https://github.com/${AICX_RELEASE_REPO}/releases/download/${release_tag}"
+  tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/aicx-release-install.XXXXXX")
+  archive_path="$tmp_dir/$archive_name"
+  checksum_path="$tmp_dir/${archive_name}.sha256"
+
+  cleanup_release_tmp() {
+    rm -rf "$tmp_dir"
+  }
+  trap cleanup_release_tmp EXIT
+
+  echo "[1/4] Downloading verified release bundle..."
+  echo "  release tag: $release_tag"
+  echo "  target:      $target"
+  curl -fsSL "$base_url/$archive_name" -o "$archive_path"
+  curl -fsSL "$base_url/${archive_name}.sha256" -o "$checksum_path"
+
+  echo "[2/4] Verifying SHA256..."
+  ARCHIVE_PATH="$archive_path" CHECKSUM_PATH="$checksum_path" python3 - <<'PY'
+import hashlib
+import os
+from pathlib import Path
+
+archive = Path(os.environ["ARCHIVE_PATH"])
+checksum = Path(os.environ["CHECKSUM_PATH"]).read_text(encoding="utf-8").strip().split()[0]
+digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+if digest != checksum:
+    raise SystemExit(
+        f"SHA256 mismatch for {archive.name}: expected {checksum}, got {digest}"
+    )
+print(f"  checksum ok: {archive.name}")
+PY
+
+  echo "[3/4] Extracting release bundle..."
+  ARCHIVE_PATH="$archive_path" DEST_DIR="$tmp_dir" python3 - <<'PY'
+import os
+import tarfile
+import zipfile
+from pathlib import Path
+
+archive_path = Path(os.environ["ARCHIVE_PATH"])
+dest_dir = Path(os.environ["DEST_DIR"])
+
+if archive_path.name.endswith(".zip"):
+    with zipfile.ZipFile(archive_path) as archive:
+        archive.extractall(dest_dir)
+elif archive_path.name.endswith(".tar.gz"):
+    with tarfile.open(archive_path, "r:gz") as archive:
+        archive.extractall(dest_dir)
+else:
+    raise SystemExit(f"Unsupported archive format: {archive_path.name}")
+PY
+  bundle_dir="$tmp_dir/aicx-v${version}-${target}"
+  if [ ! -f "$bundle_dir/install.sh" ]; then
+    echo "Error: release bundle does not contain install.sh: $bundle_dir" >&2
+    exit 1
+  fi
+
+  echo "[4/4] Delegating to bundled installer..."
+  AICX_INSTALL_MODE="bundle" \
+  AICX_BIN_DIR="$AICX_BIN_DIR" \
+  bash "$bundle_dir/install.sh"
+  exit 0
+}
+
+resolve_install_mode() {
+  case "$AICX_INSTALL_MODE" in
+    auto)
+      if [ "$HAS_BUNDLED_BINARIES" -eq 1 ]; then
+        echo "bundle"
+      elif [ "$HAS_LOCAL_MANIFEST" -eq 1 ]; then
+        echo "local"
+      else
+        echo "crates"
+      fi
+      ;;
+    release|bundle|local|crates|git)
+      echo "$AICX_INSTALL_MODE"
+      ;;
+    *)
+      echo "Error: unsupported AICX_INSTALL_MODE='$AICX_INSTALL_MODE' (expected auto, release, bundle, local, crates, or git)." >&2
+      exit 1
+      ;;
+  esac
+}
+
+INSTALL_MODE=$(resolve_install_mode)
+if [ "$INSTALL_MODE" = "release" ]; then
+  if [ "$SKIP_INSTALL" -eq 1 ]; then
+    echo "Error: --skip-install cannot be combined with release download mode." >&2
+    exit 1
+  fi
+  download_release_bundle
+fi
+
 # --- Step 1: Install binaries ---
 if [ "$SKIP_INSTALL" -eq 0 ]; then
-  if ! command -v cargo >/dev/null 2>&1; then
+  if [ "$INSTALL_MODE" != "bundle" ] && ! command -v cargo >/dev/null 2>&1; then
     echo "Error: cargo not found. Install Rust first: https://rustup.rs"
     exit 1
   fi
@@ -133,18 +354,20 @@ if [ "$SKIP_INSTALL" -eq 0 ]; then
     printf '\n' >&2
   }
 
-  INSTALL_MODE=$(resolve_install_mode)
-  if [ "$INSTALL_MODE" = "local" ]; then
+  if [ "$INSTALL_MODE" = "bundle" ]; then
+    echo "[1/4] Installing bundled aicx + aicx-mcp into $AICX_BIN_DIR..."
+    install_bundle_binaries
+  elif [ "$INSTALL_MODE" = "local" ]; then
     echo "[1/4] Installing aicx + aicx-mcp from this checkout..."
     cargo_install_with_progress cargo install --path "$SCRIPT_DIR" --locked --force --bin aicx --bin aicx-mcp
   elif [ "$INSTALL_MODE" = "crates" ]; then
     echo "[1/4] Installing aicx + aicx-mcp from crates.io..."
-    cargo_install_with_progress cargo install ai-contexters --locked
+    cargo_install_with_progress cargo install aicx --locked
   else
     echo "[1/4] Installing aicx + aicx-mcp from git..."
-    if ! cargo_install_with_progress cargo install --git "$AICX_GIT_URL" --locked ai-contexters; then
+    if ! cargo_install_with_progress cargo install --git "$AICX_GIT_URL" --locked aicx; then
       echo "Error: git install failed."
-      echo "  If you only need the published release, use AICX_INSTALL_MODE=crates or run 'cargo install ai-contexters --locked'."
+      echo "  If you only need the published release, use AICX_INSTALL_MODE=crates or run 'cargo install aicx --locked'."
       exit 1
     fi
   fi
@@ -262,6 +485,15 @@ echo ""
 # --- Done ---
 echo "=== Setup complete ==="
 echo ""
+if path_has_dir "$AICX_BIN_DIR"; then
+  echo "Install path:"
+  echo "  $AICX_BIN_DIR is already on PATH"
+else
+  echo "PATH note:"
+  echo "  Add $AICX_BIN_DIR to PATH so new shells pick up the bundled install first."
+  echo "  Example: export PATH=\"$AICX_BIN_DIR:\$PATH\""
+  echo ""
+fi
 if [ -d "$HOME/.ai-contexters" ]; then
   echo "Legacy store detected at ~/.ai-contexters/"
   echo "Run 'aicx migrate' to move your history to the new canonical ~/.aicx/ store."
@@ -280,7 +512,7 @@ echo "Quick start:"
 echo "  aicx store -H 24                   # rescan last 24h from all agents"
 echo "  aicx search 'query terms'          # fuzzy search across session history"
 echo "  aicx refs -H 24                    # compact summary of recent files"
-echo "  aicx steer --project ai-contexters # metadata-aware retrieval"
+echo "  aicx steer --project aicx          # metadata-aware retrieval"
 echo "  aicx memex-sync                    # optional memex materialization (base profile)"
 echo ""
 echo "Heavier retrieval on strong machines:"

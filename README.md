@@ -25,7 +25,7 @@ Supported sources:
 Public install from crates.io:
 
 ```bash
-cargo install ai-contexters --locked
+cargo install aicx --locked
 ```
 
 From a local checkout:
@@ -36,10 +36,26 @@ From a local checkout:
 
 `install.sh` installs `aicx` + `aicx-mcp` from the current checkout and configures Claude Code, Codex, and Gemini when their MCP settings directories already exist.
 
+From a release bundle:
+
+```bash
+bash install.sh
+```
+
+Bundle install copies prebuilt `aicx` + `aicx-mcp` into `~/.local/bin`, removes stale user-local / cargo-installed copies, then refreshes MCP configuration.
+No Rust toolchain and no local memex compilation are required on the target machine.
+
+Directly from GitHub Releases with SHA-256 verification before unpacking:
+
+```bash
+AICX_INSTALL_MODE=release bash install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.6.1 bash install.sh
+```
+
 From an accessible GitHub repo when you want unreleased source:
 
 ```bash
-cargo install --git https://github.com/VetCoders/ai-contexters --locked ai-contexters
+cargo install --git https://github.com/Loctree/aicx --locked aicx
 ```
 
 Already installed the binaries?
@@ -55,7 +71,14 @@ cargo install --path . --locked --bin aicx --bin aicx-mcp
 ./install.sh --skip-install
 ```
 
-`install.sh` prefers the local checkout when one is present. Outside a checkout, it now defaults to the published crates.io package.
+`install.sh` prefers a colocated release bundle first, then a local checkout, and otherwise falls back to the published install path.
+
+Maintainer release bundle path on macOS:
+
+```bash
+make release-bundle KEYS=~/.keys
+make release-bundle KEYS=~/.keys NOTARY_PROFILE=vc-notary
+```
 
 Profile defaults:
 - Runtime default: `base` — portable 1024-dim Qwen 0.6B memex preset

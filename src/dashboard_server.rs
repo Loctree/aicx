@@ -1268,26 +1268,8 @@ fn run_fuzzy_search(
         limit
     };
 
-    let (results, total_scanned) = if let Ok(rt) = tokio::runtime::Runtime::new() {
-        match rt.block_on(crate::memex::fast_memex_search(
-            query,
-            fetch_limit,
-            project_filter,
-            frame_kind,
-        )) {
-            Ok((res, scan)) if !res.is_empty() => (res, scan),
-            Err(err) if crate::memex::is_compatibility_error(&err) => return Err(err),
-            _ => rank::fuzzy_search_store(
-                store_root,
-                query,
-                fetch_limit,
-                project_filter,
-                frame_kind,
-            )?,
-        }
-    } else {
-        rank::fuzzy_search_store(store_root, query, fetch_limit, project_filter, frame_kind)?
-    };
+    let (results, total_scanned) =
+        rank::fuzzy_search_store(store_root, query, fetch_limit, project_filter, frame_kind)?;
 
     let mut results = results;
     if let Some(min_score) = score {

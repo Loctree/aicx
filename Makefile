@@ -3,13 +3,15 @@
 
 .PHONY: all build install install-bin install-config install-cargo git-hooks
 .PHONY: precheck test check fmt fmt-check clippy semgrep ci clean help manifest-check
-.PHONY: version-show version-check version-bump changelog-close release-plan release-prepare release-check release-tag release-push release-publish package-check
+.PHONY: version-show version-check version-bump changelog-close release-plan release-prepare release-check release-tag release-push release-publish package-check release-bundle
 
 all: build
 
-PACKAGE_NAME := ai-contexters
+PACKAGE_NAME := $(shell python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["name"])')
 VERSION := $(shell python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
 TAG := v$(VERSION)
+KEYS ?= $(if $(AICX_KEYS_DIR),$(AICX_KEYS_DIR),$(HOME)/.keys)
+NOTARY_PROFILE ?= $(AICX_NOTARY_PROFILE)
 
 build:
 	cargo build --locked --release --bin aicx --bin aicx-mcp
@@ -106,7 +108,7 @@ ifeq ($(origin VERSION),command line)
 	@echo ""
 	@echo "Note: Cargo.lock is intentionally not touched by version-bump."
 	@echo "To sync the lockfile for this package only (no network):"
-	@echo "  cargo update --package ai-contexters --offline"
+	@echo "  cargo update --package $(PACKAGE_NAME) --offline"
 	@echo "Or rely on 'make release-prepare' to sync it for you."
 else
 	@echo "VERSION is required. Usage: make version-bump VERSION={patch|minor|major|x.y.z}" >&2 && exit 1
@@ -128,7 +130,10 @@ release-plan:
 	@echo "6. Push tag: make release-push"
 	@echo "7. Publish to crates.io: make release-publish (dry run)"
 	@echo "                         make release-publish CONFIRM=1 (actual push)"
-	@echo "8. GitHub Actions release workflow builds and publishes archives."
+	@echo "8. Optional local macOS signed bundle:"
+	@echo "     make release-bundle KEYS=$(HOME)/.keys"
+	@echo "     make release-bundle KEYS=$(HOME)/.keys NOTARY_PROFILE=my-notary-profile"
+	@echo "9. GitHub Actions release workflow builds and publishes archives."
 	@echo ""
 	@echo "Reference docs:"
 	@echo "  - docs/RELEASES.md"
@@ -138,7 +143,7 @@ release-prepare:
 ifeq ($(origin VERSION),command line)
 	@$(MAKE) version-bump VERSION=$(VERSION)
 	@$(MAKE) changelog-close
-	@cargo update --package ai-contexters --offline
+	@cargo update --package $(PACKAGE_NAME) --offline
 	@$(MAKE) precheck
 else
 	@echo "VERSION is required. Usage: make release-prepare VERSION={patch|minor|major|x.y.z}" >&2 && exit 1
@@ -180,6 +185,12 @@ release-publish:
 package-check:
 	cargo package --locked
 
+release-bundle:
+	@KEYS="$(KEYS)" \
+	NOTARY_PROFILE="$(NOTARY_PROFILE)" \
+	PACKAGE_NAME="$(PACKAGE_NAME)" \
+	./tools/release_bundle.sh
+
 clean:
 	cargo clean
 
@@ -212,6 +223,7 @@ help:
 	@echo "  make release-push          - Push the current release tag to origin"
 	@echo "  make release-publish       - cargo publish to crates.io (dry-run; CONFIRM=1 to actually push)"
 	@echo "  make package-check         - Run cargo package --locked"
+	@echo "  make release-bundle        - Local macOS bundle + codesign + notarize using KEYS/NOTARY_PROFILE"
 	@echo ""
 	@echo "Quick start:"
 	@echo "  make install         - Contributor/local operator setup"

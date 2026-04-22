@@ -1,16 +1,24 @@
 # Releases and Distribution
 
-`ai-contexters` now ships through two repo-owned channels:
+`aicx` now ships through two repo-owned channels:
 
 1. Source install from a local checkout or accessible git remote.
 2. GitHub Releases with prebuilt archives for users who do not want a Rust toolchain.
+
+There is also a maintainer-local macOS bundling path for signed + notarized
+production archives:
+
+```bash
+make release-bundle KEYS=~/.keys
+make release-bundle KEYS=~/.keys NOTARY_PROFILE=my-notary-profile
+```
 
 This document is the maintainer path from green CI to public release artifacts.
 
 ## Current Shape
 
-- Public install paths now exist through crates.io, GitHub Releases, and source checkout.
-- `install.sh` prefers a local checkout when one exists and otherwise installs from crates.io.
+- Public install paths now exist through crates.io, GitHub Releases, release bundles, and source checkout.
+- `install.sh` prefers a colocated release bundle first, then a local checkout, and otherwise falls back to the published install path.
 - `AICX_INSTALL_MODE=git` remains available for testing unreleased source directly from GitHub.
 
 ## What the Release Workflow Produces
@@ -20,7 +28,11 @@ Tagging `vX.Y.Z` triggers `.github/workflows/release.yml`, which:
 - verifies the tag matches `Cargo.toml`
 - reruns the required release gates: `semgrep`, `cargo clippy --all-features --all-targets -- -D warnings`, `cargo test --bin aicx`, `cargo test --bin aicx-mcp`, `cargo fmt -- --check`, and `cargo publish --dry-run`
 - builds both shipped binaries: `aicx` and `aicx-mcp`
-- packages archives plus `LICENSE`, `README.md`, and command docs
+- builds Linux artifacts on `ops-linux`
+- builds macOS artifacts on `dragon-macos`
+- imports the macOS signing certificate from GitHub org secrets on `dragon-macos`
+- signs and notarizes macOS release bundles before upload
+- packages archives plus `LICENSE`, `README.md`, `install.sh`, and command docs
 - uploads SHA-256 checksum files alongside each archive
 - creates or updates the matching GitHub Release
 
@@ -29,23 +41,85 @@ Current binary targets:
 - `x86_64-unknown-linux-musl`
 - `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
-- `x86_64-pc-windows-msvc`
 
 Archive naming is deterministic:
 
-- `ai-contexters-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz`
-- `ai-contexters-vX.Y.Z-x86_64-apple-darwin.tar.gz`
-- `ai-contexters-vX.Y.Z-aarch64-apple-darwin.tar.gz`
-- `ai-contexters-vX.Y.Z-x86_64-pc-windows-msvc.zip`
+- `aicx-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz`
+- `aicx-vX.Y.Z-x86_64-apple-darwin.zip`
+- `aicx-vX.Y.Z-aarch64-apple-darwin.zip`
 
 Each archive contains:
 
 - `aicx`
 - `aicx-mcp`
+- `install.sh`
 - `LICENSE`
 - `README.md`
 - `docs/COMMANDS.md`
 - `docs/RELEASES.md`
+
+GitHub macOS signing / notarization contract currently expects these org secrets:
+
+- `MACOS_CERT_P12_BASE64`
+- `MACOS_CERT_PASSWORD`
+- `MACOS_KEYCHAIN_PASSWORD`
+- `MACOS_DEVELOPER_ID_APPLICATION`
+- `APPLE_API_KEY_BASE64`
+- `APPLE_API_KEY_ID`
+- `APPLE_API_ISSUER_ID`
+
+## Local macOS Signed Bundle
+
+For local production-style macOS artifacts, use:
+
+```bash
+make release-bundle KEYS=/path/to/.keys
+```
+
+The target:
+
+- builds `aicx` and `aicx-mcp` for the local Apple target
+- assembles a release bundle in `dist/`
+- includes `install.sh` for post-download install into `~/.local/bin`
+- imports the signing certificate into a temporary keychain
+- signs both binaries with timestamps and hardened runtime
+- creates a notarization zip archive
+- submits the archive with `xcrun notarytool`
+- writes a SHA-256 checksum and notarization JSON log next to the archive
+
+Expected key layout matches the current daily operator structure under `~/.keys`:
+
+- `signing-identity.txt`
+- `Certificates.p12`
+- `cert_password.txt`
+- `.notary.env`
+
+Optional notarization auth paths:
+
+1. `NOTARY_PROFILE=<keychain-profile>` on the `make` command line.
+2. `AICX_NOTARY_PROFILE` in the shell environment.
+3. `NOTARY_KEYCHAIN_PROFILE` inside `KEYS/.notary.env`.
+4. Fallback to `NOTARY_APPLE_ID`, `NOTARY_TEAM_ID`, and `NOTARY_PASSWORD` from `KEYS/.notary.env`.
+
+Examples:
+
+```bash
+make release-bundle KEYS=~/.keys
+make release-bundle KEYS=~/.keys NOTARY_PROFILE=vc-notary
+AICX_KEYS_DIR=~/.keys AICX_NOTARY_PROFILE=vc-notary make release-bundle
+bash install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.6.1 bash install.sh
+```
+
+Notes:
+
+- This target is macOS-only.
+- The archive is notarized server-side. Zip archives cannot be stapled like `.pkg`, `.dmg`, or `.app`.
+- The target does not print secret values; it only reads the files from the operator-owned keys directory.
+- `install.sh` inside the bundle copies binaries into `~/.local/bin` and removes stale user-local / `~/.cargo/bin` copies before configuring MCP.
+- That install path does not require Rust or a local memex compile on the target machine.
+- `AICX_INSTALL_MODE=release` downloads the official release asset, fetches the adjacent `.sha256`, verifies the checksum, and only then delegates to the bundled installer.
+- On macOS, `AICX_INSTALL_MODE=release` now expects the signed/notarized `.zip` asset published by CI on `dragon-macos`.
 
 ## Maintainer Release Flow
 

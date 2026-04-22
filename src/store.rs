@@ -4,7 +4,7 @@
 //! - `store/<organization>/<repository>/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
 //! - `non-repository-contexts/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
 //! - `store/<project>/<date>/<time>_<agent>-context.{md,json}` — legacy monolithic helpers kept for library use/tests
-//! - `memex/sync_state.json` — sync bookkeeping for the semantic index add-on
+//! - `chunks/` — the base location for chunk content
 //! - `index.json` — manifest of stored contexts
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
@@ -371,9 +371,9 @@ pub fn project_dir(project: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Returns the chunks directory: `~/.aicx/memex/chunks/`
+/// Returns the chunks directory: `~/.aicx/chunks/`
 pub fn chunks_dir() -> Result<PathBuf> {
-    let dir = store_base_dir()?.join("memex").join("chunks");
+    let dir = store_base_dir()?.join("chunks");
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }

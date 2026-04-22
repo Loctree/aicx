@@ -16,7 +16,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  PACKAGE_NAME: ai-contexters
+  PACKAGE_NAME: aicx
 
 jobs:
   verify:
@@ -152,12 +152,12 @@ jobs:
           - runner_name: dragon-macos
             runner: '["self-hosted", "dragon-macos"]'
             target: x86_64-apple-darwin
-            archive_ext: tar.gz
+            archive_ext: zip
             binary_ext: ""
           - runner_name: dragon-macos
             runner: '["self-hosted", "dragon-macos"]'
             target: aarch64-apple-darwin
-            archive_ext: tar.gz
+            archive_ext: zip
             binary_ext: ""
 
     steps:
@@ -203,8 +203,39 @@ jobs:
       - name: Build release binaries
         run: cargo build --locked --release --target ${{ matrix.target }} --bin aicx --bin aicx-mcp
 
-      - name: Package release archive
-        id: package
+      - name: Import macOS signing certificate
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/aicx-release.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/aicx-release-cert.p12"
+          CA_PATH="$RUNNER_TEMP/DeveloperIDG2CA.cer"
+
+          CERT_PATH="$CERT_PATH" python3 - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          Path(os.environ["CERT_PATH"]).write_bytes(
+              base64.b64decode(os.environ["MACOS_CERT_P12_BASE64"])
+          )
+          PY
+
+          curl -fsSL "https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer" -o "$CA_PATH"
+          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT_PATH" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security import "$CA_PATH" -k "$KEYCHAIN" -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" /Library/Keychains/System.keychain /System/Library/Keychains/SystemRootCertificates.keychain login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "MACOS_KEYCHAIN_PATH=$KEYCHAIN" >> "$GITHUB_ENV"
+
+      - name: Assemble release bundle
+        id: bundle
         shell: bash
         env:
           VERSION: ${{ needs.verify.outputs.version }}
@@ -214,12 +245,9 @@ jobs:
           PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
         run: |
           python - <<'PY'
-          import hashlib
           import os
           from pathlib import Path
           import shutil
-          import tarfile
-          import zipfile
 
           version = os.environ["VERSION"]
           target = os.environ["TARGET"]
@@ -228,50 +256,94 @@ jobs:
           package_name = os.environ["PACKAGE_NAME"]
 
           release_dir = Path("target") / target / "release"
-          dist_dir = Path("dist")
-          dist_dir.mkdir(exist_ok=True)
-
           bundle_name = f"{package_name}-v{version}-{target}"
-          bundle_dir = dist_dir / bundle_name
+          bundle_dir = Path(os.environ["RUNNER_TEMP"]) / bundle_name
+          if bundle_dir.exists():
+              shutil.rmtree(bundle_dir)
           bundle_dir.mkdir()
 
           docs_dir = bundle_dir / "docs"
           docs_dir.mkdir()
 
           for binary in ("aicx", "aicx-mcp"):
-              shutil.copy2(release_dir / f"{binary}{binary_ext}", bundle_dir / f"{binary}{binary_ext}")
+              target_path = bundle_dir / f"{binary}{binary_ext}"
+              shutil.copy2(release_dir / f"{binary}{binary_ext}", target_path)
+              target_path.chmod(0o755)
 
-          for source in ("LICENSE", "README.md"):
-              shutil.copy2(source, bundle_dir / Path(source).name)
+          for source in ("LICENSE", "README.md", "install.sh"):
+              target_path = bundle_dir / Path(source).name
+              shutil.copy2(source, target_path)
+              if target_path.name == "install.sh":
+                  target_path.chmod(0o755)
 
           for source in ("docs/COMMANDS.md", "docs/RELEASES.md"):
               shutil.copy2(source, docs_dir / Path(source).name)
 
-          archive_path = dist_dir / f"{bundle_name}.{archive_ext}"
-          if archive_ext == "tar.gz":
-              with tarfile.open(archive_path, "w:gz") as archive:
-                  archive.add(bundle_dir, arcname=bundle_name)
-          else:
-              with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                  for path in bundle_dir.rglob("*"):
-                      archive.write(path, path.relative_to(dist_dir))
-
-          digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
-          checksum_path = Path(f"{archive_path}.sha256")
-          checksum_path.write_text(f"{digest}  {archive_path.name}\n", encoding="utf-8")
+          dist_dir = Path("dist")
+          dist_dir.mkdir(exist_ok=True)
 
           output_path = Path(os.environ["GITHUB_OUTPUT"])
           with output_path.open("a", encoding="utf-8") as fh:
-              fh.write(f"archive={archive_path.as_posix()}\n")
-              fh.write(f"checksum={checksum_path.as_posix()}\n")
+              fh.write(f"bundle_name={bundle_name}\n")
+              fh.write(f"bundle_dir={bundle_dir.as_posix()}\n")
+              fh.write(f"archive_path={(dist_dir / f'{bundle_name}.{archive_ext}').as_posix()}\n")
+              fh.write(f"checksum_path={(dist_dir / f'{bundle_name}.{archive_ext}.sha256').as_posix()}\n")
+              fh.write(f"notary_log_path={(dist_dir / f'{bundle_name}.notary.json').as_posix()}\n")
+          PY
+
+      - name: Sign and notarize macOS bundle
+        if: runner.os == 'macOS'
+        env:
+          MACOS_DEVELOPER_ID_APPLICATION: ${{ secrets.MACOS_DEVELOPER_ID_APPLICATION }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          MACOS_KEYCHAIN_PATH: ${{ env.MACOS_KEYCHAIN_PATH }}
+        run: |
+          bash tools/ci_macos_sign_and_notarize_bundle.sh \
+            "${{ steps.bundle.outputs.bundle_dir }}" \
+            "${{ steps.bundle.outputs.archive_path }}" \
+            "${{ steps.bundle.outputs.notary_log_path }}"
+          shasum -a 256 "${{ steps.bundle.outputs.archive_path }}" > "${{ steps.bundle.outputs.checksum_path }}"
+
+      - name: Package release archive
+        if: runner.os != 'macOS'
+        id: package
+        shell: bash
+        env:
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+          BUNDLE_NAME: ${{ steps.bundle.outputs.bundle_name }}
+          BUNDLE_DIR: ${{ steps.bundle.outputs.bundle_dir }}
+          ARCHIVE_PATH: ${{ steps.bundle.outputs.archive_path }}
+          CHECKSUM_PATH: ${{ steps.bundle.outputs.checksum_path }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import shutil
+          import tarfile
+          archive_ext = os.environ["ARCHIVE_EXT"]
+          bundle_name = os.environ["BUNDLE_NAME"]
+          bundle_dir = Path(os.environ["BUNDLE_DIR"])
+          archive_path = Path(os.environ["ARCHIVE_PATH"])
+          checksum_path = Path(os.environ["CHECKSUM_PATH"])
+
+          if archive_ext != "tar.gz":
+              raise SystemExit(f"Unsupported non-macOS archive format: {archive_ext}")
+
+          archive_path.parent.mkdir(exist_ok=True)
+          with tarfile.open(archive_path, "w:gz") as archive:
+              archive.add(bundle_dir, arcname=bundle_name)
+
+          digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+          checksum_path.write_text(f"{digest}  {archive_path.name}\n", encoding="utf-8")
           PY
 
       - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
-          path: |
-            ${{ steps.package.outputs.archive }}
-            ${{ steps.package.outputs.checksum }}
+          path: dist/*
           if-no-files-found: error
 
   github-release:

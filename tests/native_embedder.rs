@@ -10,7 +10,9 @@
 
 #![cfg(feature = "native-embedder")]
 
-use aicx::embedder::{EmbedderConfig, EmbedderEngine, NativeEmbeddingSource, is_embedded_available};
+use aicx::embedder::{
+    EmbedderConfig, EmbedderEngine, NativeEmbeddingSource, is_embedded_available,
+};
 
 #[test]
 fn embedded_dimension_hint_is_positive_when_available() {
@@ -59,10 +61,7 @@ fn engine_embeds_and_returns_unit_norm_vectors() {
         .embed("hello world")
         .expect("single embed should succeed");
     let sim = EmbedderEngine::similarity(&repeat, &vectors[0]);
-    assert!(
-        sim > 0.999,
-        "self-similarity should be ~1.0 (got {sim})"
-    );
+    assert!(sim > 0.999, "self-similarity should be ~1.0 (got {sim})");
 }
 
 #[test]
@@ -79,7 +78,10 @@ fn source_describes_runtime_provenance() {
         NativeEmbeddingSource::Embedded { repo } => assert!(!repo.is_empty()),
         NativeEmbeddingSource::HfCache { repo, path } => {
             assert!(!repo.is_empty());
-            assert!(path.exists(), "HF cache snapshot should point at a real dir");
+            assert!(
+                path.exists(),
+                "HF cache snapshot should point at a real dir"
+            );
         }
         NativeEmbeddingSource::ExplicitPath(p) => assert!(p.exists()),
     }

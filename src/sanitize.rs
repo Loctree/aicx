@@ -1,6 +1,6 @@
 //! Path and input sanitization for ai-contexters.
 //!
-//! Follows the established pattern from rmcp-memex/path_utils.rs:
+//! Follows the established pattern:
 //! traversal check → canonicalize → allowlist validation.
 //!
 //! Prevents path traversal and command injection from user-supplied inputs
