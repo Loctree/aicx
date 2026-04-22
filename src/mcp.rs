@@ -303,7 +303,7 @@ impl AicxMcpServer {
                 }
             });
         } else {
-            results.sort_by(|a, b| b.score.cmp(&a.score));
+            results.sort_by_key(|b| std::cmp::Reverse(b.score));
         }
 
         let results: Vec<_> = results.into_iter().take(limit).collect();
@@ -523,6 +523,10 @@ impl AicxMcpServer {
 #[rmcp::tool_handler]
 impl rmcp::handler::server::ServerHandler for AicxMcpServer {
     fn get_info(&self) -> ServerInfo {
+        // `tool_router` is read by the `#[tool_handler]`-expanded `call_tool`,
+        // `list_tools`, and `get_tool` methods; rust 1.95 dead_code analysis
+        // doesn't traverse macro expansions, so anchor the read here.
+        let _ = &self.tool_router;
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("aicx-mcp", env!("CARGO_PKG_VERSION")))
     }

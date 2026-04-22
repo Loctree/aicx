@@ -919,7 +919,7 @@ pub fn extract_claude(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
         Err(e) => eprintln!("Claude history extraction warning: {}", e),
     }
 
-    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    entries.sort_by_key(|a| a.timestamp);
     Ok(entries)
 }
 
@@ -998,7 +998,7 @@ pub fn extract_claude_file(path: &Path, config: &ExtractionConfig) -> Result<Vec
         ));
     }
 
-    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    entries.sort_by_key(|a| a.timestamp);
     Ok(entries)
 }
 
@@ -1125,14 +1125,14 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
             }
         }
 
-        entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        entries.sort_by_key(|a| a.timestamp);
         return Ok(entries);
     }
 
     // Session file: parse as CodexSessionEvent (delegate to existing parser).
     if serde_json::from_str::<CodexSessionEvent>(&first_line).is_ok() {
         let mut entries = parse_codex_session_file(path, config)?;
-        entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        entries.sort_by_key(|a| a.timestamp);
         return Ok(entries);
     }
 
@@ -1161,7 +1161,7 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
 /// `~/.gemini/tmp/<hash>/chats/session-*.json`
 pub fn extract_gemini_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     let mut entries = parse_gemini_session(path, config)?;
-    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    entries.sort_by_key(|a| a.timestamp);
     Ok(entries)
 }
 
@@ -1191,7 +1191,7 @@ pub fn extract_gemini_antigravity_file(
     }
 
     entries.push(summary);
-    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    entries.sort_by_key(|a| a.timestamp);
     Ok(entries)
 }
 
@@ -1326,7 +1326,7 @@ fn extract_gemini_antigravity_conversation_artifacts(
     }
 
     apply_default_project_hint(&mut entries);
-    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    entries.sort_by_key(|a| a.timestamp);
 
     Ok(Some(GeminiAntigravityRecovery {
         entries,
@@ -1396,7 +1396,7 @@ fn extract_gemini_antigravity_step_outputs(
     }
 
     apply_default_project_hint(&mut entries);
-    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    entries.sort_by_key(|a| a.timestamp);
 
     Ok(GeminiAntigravityRecovery {
         entries,
@@ -2076,7 +2076,7 @@ pub fn extract_claude_history(config: &ExtractionConfig) -> Result<Vec<TimelineE
         ));
     }
 
-    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    entries.sort_by_key(|a| a.timestamp);
     Ok(entries)
 }
 
@@ -2203,7 +2203,7 @@ pub fn extract_codex(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
         Err(e) => eprintln!("Codex sessions extraction warning: {}", e),
     }
 
-    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    entries.sort_by_key(|a| a.timestamp);
     Ok(entries)
 }
 
@@ -2245,7 +2245,7 @@ pub fn extract_codex_sessions(config: &ExtractionConfig) -> Result<Vec<TimelineE
         }
     }
 
-    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    entries.sort_by_key(|a| a.timestamp);
     Ok(entries)
 }
 
@@ -2493,7 +2493,7 @@ pub fn extract_gemini(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
         }
     }
 
-    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    entries.sort_by_key(|a| a.timestamp);
     Ok(entries)
 }
 
@@ -2826,7 +2826,7 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
         reset_stream_buffer(&mut line);
     }
 
-    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    entries.sort_by_key(|a| a.timestamp);
     Ok(entries)
 }
 
@@ -2862,7 +2862,7 @@ pub fn extract_junie(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
         }
     }
 
-    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    entries.sort_by_key(|a| a.timestamp);
     Ok(entries)
 }
 
@@ -3012,7 +3012,7 @@ pub fn extract_all(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     }
 
     // Sort by timestamp
-    all.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    all.sort_by_key(|a| a.timestamp);
 
     // Dedup: same timestamp + same first 100 chars of message -> keep first
     let mut seen: HashSet<(i64, String)> = HashSet::new();

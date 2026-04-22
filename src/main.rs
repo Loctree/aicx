@@ -1515,7 +1515,7 @@ fn run_extract_file(
     };
 
     // Sort by timestamp (extractors should already do this).
-    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    entries.sort_by_key(|a| a.timestamp);
 
     // Apply secret redaction in-place (TimelineEntry is now single definition in sources)
     if redact_secrets {
@@ -1846,7 +1846,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     }
 
     // Sort by timestamp
-    entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    entries.sort_by_key(|a| a.timestamp);
 
     // Filter self-echo (aicx's own search/rank/store calls that create feedback loops)
     let pre_echo = entries.len();
@@ -2144,7 +2144,7 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         all_entries.extend(agent_entries);
     }
 
-    all_entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    all_entries.sort_by_key(|a| a.timestamp);
 
     // Filter self-echo (prevents feedback loops from aicx's own tool calls)
     let pre_echo = all_entries.len();
@@ -2547,7 +2547,7 @@ fn run_search(
         });
     } else {
         // default sort
-        results.sort_by(|a, b| b.score.cmp(&a.score));
+        results.sort_by_key(|b| std::cmp::Reverse(b.score));
     }
 
     // Truncate to requested limit after date filtering

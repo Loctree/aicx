@@ -841,7 +841,7 @@ async fn get_browse(
 
     match params.sort.as_str() {
         "oldest" => records.sort_by_key(|r| r.sort_ts),
-        _ => records.sort_by(|a, b| b.sort_ts.cmp(&a.sort_ts)),
+        _ => records.sort_by_key(|b| std::cmp::Reverse(b.sort_ts)),
     }
 
     (

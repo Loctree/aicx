@@ -91,7 +91,7 @@ pub fn semantic_segments_with_registry(
     let mut ordered = Vec::new();
 
     for ((agent, session_id), mut session_entries) in sessions {
-        session_entries.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+        session_entries.sort_by_key(|left| left.timestamp);
 
         let mut current_tiered: Option<TieredIdentity> = None;
         let mut current_entries: Vec<TimelineEntry> = Vec::new();
