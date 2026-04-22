@@ -12,6 +12,7 @@ use anyhow::{Context, Result, anyhow};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
+use serde::Deserialize;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 use tracing::{debug, info};
 
@@ -20,6 +21,8 @@ use crate::hf_cache;
 
 const DEFAULT_MAX_LENGTH: usize = 512;
 const DEFAULT_FALLBACK_REPO: &str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2";
+const DEV_FALLBACK_REPO: &str = "harrier-oss/harrier-oss-0.6b";
+const PREMIUM_FALLBACK_REPO: &str = "F2-LLM/F2-LLM-v2-1.7b";
 
 /// Where the live embedder weights came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,8 +59,118 @@ pub struct EmbedderConfig {
     pub prefer_embedded: bool,
 }
 
+#[derive(Debug, Default, Deserialize, Clone)]
+struct NativeEmbedderConfigFile {
+    #[serde(default)]
+    native_embedder: Option<NativeEmbedderConfigSection>,
+    #[serde(default)]
+    embedder: Option<NativeEmbedderConfigSection>,
+    #[serde(flatten)]
+    top_level: NativeEmbedderConfigSection,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct NativeEmbedderConfigSection {
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    path: Option<PathBuf>,
+    #[serde(default)]
+    prefer_embedded: Option<bool>,
+    #[serde(default)]
+    max_length: Option<usize>,
+}
+
+impl NativeEmbedderConfigSection {
+    fn merge_from(&mut self, other: Self) {
+        if other.profile.is_some() {
+            self.profile = other.profile;
+        }
+        if other.repo.is_some() {
+            self.repo = other.repo;
+        }
+        if other.path.is_some() {
+            self.path = other.path;
+        }
+        if other.prefer_embedded.is_some() {
+            self.prefer_embedded = other.prefer_embedded;
+        }
+        if other.max_length.is_some() {
+            self.max_length = other.max_length;
+        }
+    }
+}
+
+fn profile_repo(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "base" => Some(DEFAULT_FALLBACK_REPO),
+        "dev" => Some(DEV_FALLBACK_REPO),
+        "premium" => Some(PREMIUM_FALLBACK_REPO),
+        _ => None,
+    }
+}
+
+fn config_search_paths() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(path) = std::env::var("AICX_EMBEDDER_CONFIG") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            out.push(PathBuf::from(trimmed));
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        out.push(home.join(".aicx").join("embedder.toml"));
+        out.push(home.join(".aicx").join("config.toml"));
+    }
+    out
+}
+
+fn load_config_file() -> Option<NativeEmbedderConfigSection> {
+    for path in config_search_paths() {
+        if !path.exists() {
+            continue;
+        }
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(err) => {
+                debug!(
+                    target: "aicx::embedder",
+                    "failed to read embedder config {}: {}",
+                    path.display(),
+                    err
+                );
+                continue;
+            }
+        };
+        let parsed: NativeEmbedderConfigFile = match toml::from_str(&raw) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                debug!(
+                    target: "aicx::embedder",
+                    "failed to parse embedder config {}: {}",
+                    path.display(),
+                    err
+                );
+                continue;
+            }
+        };
+        let mut merged = parsed.top_level;
+        if let Some(section) = parsed.embedder {
+            merged.merge_from(section);
+        }
+        if let Some(section) = parsed.native_embedder {
+            merged.merge_from(section);
+        }
+        return Some(merged);
+    }
+    None
+}
+
 impl EmbedderConfig {
     pub fn from_env() -> Self {
+        let file_cfg = load_config_file().unwrap_or_default();
         Self {
             repo: std::env::var("AICX_EMBEDDER_REPO")
                 .ok()
@@ -67,14 +180,26 @@ impl EmbedderConfig {
                 .ok()
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
-                .map(PathBuf::from),
-            max_length: None,
-            prefer_embedded: true,
+                .map(PathBuf::from)
+                .or(file_cfg.path),
+            max_length: file_cfg.max_length,
+            prefer_embedded: file_cfg.prefer_embedded.unwrap_or(true),
         }
+        .with_profile_fallback(file_cfg.profile.as_deref())
     }
 
     pub fn with_max_length(mut self, max_length: usize) -> Self {
         self.max_length = Some(max_length);
+        self
+    }
+
+    fn with_profile_fallback(mut self, profile: Option<&str>) -> Self {
+        if self.repo.is_none()
+            && let Some(profile) = profile
+            && let Some(repo) = profile_repo(profile)
+        {
+            self.repo = Some(repo.to_string());
+        }
         self
     }
 }
@@ -469,5 +594,36 @@ mod tests {
         unsafe {
             std::env::remove_var("AICX_EMBEDDER_REPO");
         }
+    }
+
+    #[test]
+    fn config_from_file_uses_profile_when_repo_missing() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("aicx-embedder-config-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let config_path = temp_dir.join("embedder.toml");
+        std::fs::write(
+            &config_path,
+            "[native_embedder]\nprofile = \"premium\"\nprefer_embedded = false\n",
+        )
+        .expect("write config");
+
+        // SAFETY: tests are single-process for this env access pattern.
+        unsafe {
+            std::env::remove_var("AICX_EMBEDDER_REPO");
+            std::env::remove_var("AICX_EMBEDDER_PATH");
+            std::env::set_var("AICX_EMBEDDER_CONFIG", &config_path);
+        }
+
+        let cfg = EmbedderConfig::from_env();
+        assert_eq!(cfg.repo.as_deref(), Some(PREMIUM_FALLBACK_REPO));
+        assert!(!cfg.prefer_embedded);
+
+        // SAFETY: tests are single-process for this env access pattern.
+        unsafe {
+            std::env::remove_var("AICX_EMBEDDER_CONFIG");
+        }
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

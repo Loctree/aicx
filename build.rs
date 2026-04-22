@@ -9,10 +9,12 @@
 //!   AICX_BUILD_PROFILE — embedder build preset: base (default), dev, premium
 //!   AICX_EMBEDDER_REPO  — HF repo (default: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2)
 //!   AICX_EMBEDDER_PATH  — explicit model directory (overrides HF cache)
+//!   AICX_EMBEDDER_CONFIG — explicit config file (default search: ~/.aicx/embedder.toml, ~/.aicx/config.toml)
 //!   AICX_NO_EMBED       — set to `1` to skip embedding even when available
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
+use serde::Deserialize;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -52,10 +54,125 @@ impl BuildProfile {
     }
 }
 
+#[derive(Debug, Default, Deserialize, Clone)]
+struct NativeEmbedderConfigFile {
+    #[serde(default)]
+    native_embedder: Option<NativeEmbedderConfigSection>,
+    #[serde(default)]
+    embedder: Option<NativeEmbedderConfigSection>,
+    #[serde(flatten)]
+    top_level: NativeEmbedderConfigSection,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+struct NativeEmbedderConfigSection {
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    path: Option<PathBuf>,
+}
+
+impl NativeEmbedderConfigSection {
+    fn merge_from(&mut self, other: Self) {
+        if other.profile.is_some() {
+            self.profile = other.profile;
+        }
+        if other.repo.is_some() {
+            self.repo = other.repo;
+        }
+        if other.path.is_some() {
+            self.path = other.path;
+        }
+    }
+}
+
+fn profile_repo(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "base" => Some(DEFAULT_EMBEDDER_REPO),
+        "dev" => Some(DEV_EMBEDDER_REPO),
+        "premium" => Some(PREMIUM_EMBEDDER_REPO),
+        _ => None,
+    }
+}
+
+fn config_search_paths() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(path) = env::var("AICX_EMBEDDER_CONFIG") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            out.push(PathBuf::from(trimmed));
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        out.push(home.join(".aicx").join("embedder.toml"));
+        out.push(home.join(".aicx").join("config.toml"));
+    }
+    out
+}
+
+fn load_config_file() -> Option<(PathBuf, NativeEmbedderConfigSection)> {
+    for path in config_search_paths() {
+        if !path.exists() {
+            continue;
+        }
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(err) => {
+                println!(
+                    "cargo:warning=aicx: failed to read embedder config {}: {}",
+                    path.display(),
+                    err
+                );
+                continue;
+            }
+        };
+        let parsed: NativeEmbedderConfigFile = match toml::from_str(&raw) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                println!(
+                    "cargo:warning=aicx: failed to parse embedder config {}: {}",
+                    path.display(),
+                    err
+                );
+                continue;
+            }
+        };
+        let mut merged = parsed.top_level;
+        if let Some(section) = parsed.embedder {
+            merged.merge_from(section);
+        }
+        if let Some(section) = parsed.native_embedder {
+            merged.merge_from(section);
+        }
+        return Some((path, merged));
+    }
+    None
+}
+
 fn resolve_embedder_repo() -> String {
     if let Ok(repo) = env::var("AICX_EMBEDDER_REPO") {
         let repo = repo.trim();
         if !repo.is_empty() {
+            return repo.to_string();
+        }
+    }
+
+    if let Some((_path, file_cfg)) = load_config_file() {
+        if let Some(repo) = file_cfg.repo.and_then(|repo| {
+            let trimmed = repo.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }) {
+            return repo;
+        }
+        if let Some(profile) = file_cfg.profile.as_deref()
+            && let Some(repo) = profile_repo(profile)
+        {
             return repo.to_string();
         }
     }
@@ -80,6 +197,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=AICX_BUILD_PROFILE");
     println!("cargo:rerun-if-env-changed=AICX_EMBEDDER_REPO");
     println!("cargo:rerun-if-env-changed=AICX_EMBEDDER_PATH");
+    println!("cargo:rerun-if-env-changed=AICX_EMBEDDER_CONFIG");
     println!("cargo:rerun-if-env-changed=AICX_NO_EMBED");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NATIVE_EMBEDDER");
 
@@ -97,6 +215,9 @@ fn main() {
     }
 
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR should be set by cargo");
+    if let Some((path, _)) = load_config_file() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
     let repo = resolve_embedder_repo();
 
     let model_path = resolve_model_path(repo.as_str());
@@ -161,6 +282,13 @@ fn resolve_model_path(repo: &str) -> Option<PathBuf> {
         if p.join("config.json").exists() {
             return Some(p);
         }
+    }
+
+    if let Some((_path, file_cfg)) = load_config_file()
+        && let Some(path) = file_cfg.path
+        && path.join("config.json").exists()
+    {
+        return Some(path);
     }
 
     for base in hf_cache_bases() {

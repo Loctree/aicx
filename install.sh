@@ -30,6 +30,9 @@ AICX_GIT_URL="${AICX_GIT_URL:-https://github.com/Loctree/aicx}"
 AICX_BIN_DIR="${AICX_BIN_DIR:-$HOME/.local/bin}"
 AICX_RELEASE_REPO="${AICX_RELEASE_REPO:-Loctree/aicx}"
 AICX_RELEASE_TAG="${AICX_RELEASE_TAG:-latest}"
+AICX_EMBEDDER_PICKER="${AICX_EMBEDDER_PICKER:-auto}"
+AICX_EMBEDDER_PROFILE="${AICX_EMBEDDER_PROFILE:-}"
+AICX_EMBEDDER_CONFIG_PATH="${AICX_EMBEDDER_CONFIG_PATH:-$HOME/.aicx/embedder.toml}"
 
 SKIP_INSTALL=0
 for arg in "$@"; do
@@ -37,6 +40,9 @@ for arg in "$@"; do
     --skip-install) SKIP_INSTALL=1 ;;
     --release) AICX_INSTALL_MODE="release" ;;
     --release-tag=*) AICX_RELEASE_TAG="${arg#*=}" ;;
+    --pick-embedder) AICX_EMBEDDER_PICKER="1" ;;
+    --no-embedder-prompt) AICX_EMBEDDER_PICKER="0" ;;
+    --embedder-profile=*) AICX_EMBEDDER_PROFILE="${arg#*=}" ;;
     --help|-h)
       echo "Usage: install.sh [--skip-install]"
       echo "  Install aicx + aicx-mcp and configure MCP for Claude Code, Codex, and Gemini."
@@ -62,6 +68,11 @@ for arg in "$@"; do
       echo "  heavier runtime:  AICX_RUNTIME_PROFILE=dev     # 2560-dim Qwen 4B preset"
       echo "  premium runtime:  AICX_RUNTIME_PROFILE=premium # 4096-dim Qwen 8B preset"
       echo "  native builds:    AICX_BUILD_PROFILE=dev cargo build --release --features native-embedder"
+      echo ""
+      echo "Optional native embedder picker:"
+      echo "  --pick-embedder                    # interactive config for ~/.aicx/embedder.toml"
+      echo "  --embedder-profile=base|dev|premium"
+      echo "  --no-embedder-prompt               # suppress interactive picker"
       exit 0
       ;;
   esac
@@ -123,6 +134,165 @@ PY
 }
 
 echo "=== aicx setup ==="
+
+normalise_bool() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) echo "1" ;;
+    0|false|FALSE|no|NO|off|OFF) echo "0" ;;
+    *) echo "${1:-}" ;;
+  esac
+}
+
+embedder_repo_for_profile() {
+  case "${1:-}" in
+    base) echo "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2" ;;
+    dev) echo "harrier-oss/harrier-oss-0.6b" ;;
+    premium) echo "F2-LLM/F2-LLM-v2-1.7b" ;;
+    *) return 1 ;;
+  esac
+}
+
+write_embedder_config() {
+  local profile="$1"
+  local repo="$2"
+  local path_override="$3"
+  local config_path="$AICX_EMBEDDER_CONFIG_PATH"
+
+  mkdir -p "$(dirname "$config_path")"
+  EMBEDDER_CONFIG_PATH="$config_path" \
+  EMBEDDER_PROFILE="$profile" \
+  EMBEDDER_REPO="$repo" \
+  EMBEDDER_PATH_OVERRIDE="$path_override" \
+  python3 - <<'PY'
+from pathlib import Path
+import os
+
+config_path = Path(os.environ["EMBEDDER_CONFIG_PATH"]).expanduser()
+profile = os.environ["EMBEDDER_PROFILE"].strip()
+repo = os.environ["EMBEDDER_REPO"].strip()
+path_override = os.environ["EMBEDDER_PATH_OVERRIDE"].strip()
+
+lines = [
+    "# aicx native embedder preferences",
+    "# This file is read by native-embedder builds and releases.",
+    "",
+    "[native_embedder]",
+]
+
+if profile:
+    lines.append(f'profile = "{profile}"')
+if repo:
+    lines.append(f'repo = "{repo}"')
+if path_override:
+    lines.append(f'path = "{path_override}"')
+lines.append("prefer_embedded = true")
+
+config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+print(config_path)
+PY
+}
+
+maybe_prime_embedder_cache() {
+  local repo="$1"
+
+  if [ -z "$repo" ] || ! [ -t 0 ] || ! [ -t 1 ]; then
+    return 0
+  fi
+
+  if ! command -v hf >/dev/null 2>&1; then
+    echo "  native embedder cache not primed automatically (missing 'hf' CLI)"
+    echo "  later, run: hf download $repo"
+    return 0
+  fi
+
+  printf "  Download native embedder model into local HF cache now? [y/N] "
+  read -r reply || true
+  case "${reply:-}" in
+    y|Y|yes|YES)
+      echo "  priming HF cache for $repo ..."
+      if hf download "$repo"; then
+        echo "  HF cache primed"
+      else
+        echo "  warning: hf download failed; config was still saved" >&2
+      fi
+      ;;
+    *)
+      echo "  skipping model download"
+      echo "  later, run: hf download $repo"
+      ;;
+  esac
+}
+
+maybe_configure_native_embedder() {
+  local picker explicit_profile selected_profile selected_repo config_written
+  picker=$(normalise_bool "$AICX_EMBEDDER_PICKER")
+  explicit_profile="${AICX_EMBEDDER_PROFILE:-}"
+  selected_profile=""
+  selected_repo="${AICX_EMBEDDER_REPO:-}"
+  config_written=""
+
+  if [ -n "${AICX_EMBEDDER_PATH:-}" ]; then
+    config_written=$(write_embedder_config "" "" "$AICX_EMBEDDER_PATH")
+    echo "  native embedder path pinned in $config_written"
+    return 0
+  fi
+
+  if [ -n "$selected_repo" ]; then
+    config_written=$(write_embedder_config "" "$selected_repo" "")
+    echo "  native embedder repo pinned in $config_written"
+    maybe_prime_embedder_cache "$selected_repo"
+    return 0
+  fi
+
+  if [ -n "$explicit_profile" ]; then
+    case "$explicit_profile" in
+      none|off|skip)
+        echo "  native embedder picker: skipped by explicit profile"
+        return 0
+        ;;
+      base|dev|premium)
+        selected_profile="$explicit_profile"
+        ;;
+      *)
+        echo "Error: unsupported --embedder-profile='$explicit_profile' (expected base, dev, premium, or none)." >&2
+        exit 1
+        ;;
+    esac
+  elif [ "$picker" = "1" ] || { [ "$picker" = "auto" ] && [ -t 0 ] && [ -t 1 ] && [ -z "${CI:-}" ]; }; then
+    echo ""
+    echo "Optional native embedder setup"
+    echo "  This does not bloat the installed bundle."
+    echo "  It only writes ~/.aicx/embedder.toml and can optionally prime the HF cache."
+    echo "  Current public release bundles stay slim; native-embedder activation remains opt-in."
+    echo ""
+    echo "  1) skip"
+    echo "  2) base    - MiniLM (~224 MB, safest default)"
+    echo "  3) dev     - Harrier 0.6B (~1.1 GB, stronger workstation tier)"
+    echo "  4) premium - F2 1.7B (~3.4 GB, runtime-only heavy tier)"
+    printf "Choose native embedder profile [1-4]: "
+    read -r reply || true
+    case "${reply:-1}" in
+      1|"")
+        echo "  native embedder picker: skipped"
+        return 0
+        ;;
+      2) selected_profile="base" ;;
+      3) selected_profile="dev" ;;
+      4) selected_profile="premium" ;;
+      *)
+        echo "  native embedder picker: invalid choice, skipping"
+        return 0
+        ;;
+    esac
+  else
+    return 0
+  fi
+
+  selected_repo=$(embedder_repo_for_profile "$selected_profile")
+  config_written=$(write_embedder_config "$selected_profile" "$selected_repo" "")
+  echo "  native embedder preference saved to $config_written"
+  maybe_prime_embedder_cache "$selected_repo"
+}
 
 cleanup_old_binaries() {
   local path="$1"
@@ -480,6 +650,7 @@ echo "[4/4] Full context extraction (this may take a moment)..."
 "${AICX_RUN[@]}" all -H 10000 --emit none
 echo "  store bootstrap complete"
 echo "  memex runtime default: base (portable 1024-dim preset)"
+maybe_configure_native_embedder
 echo ""
 
 # --- Done ---
@@ -518,3 +689,7 @@ echo ""
 echo "Heavier retrieval on strong machines:"
 echo "  AICX_RUNTIME_PROFILE=dev aicx memex-sync --reindex"
 echo "  AICX_RUNTIME_PROFILE=premium aicx memex-sync --reindex"
+echo ""
+echo "Native embedder config (optional, future native-embedder builds/releases):"
+echo "  ~/.aicx/embedder.toml"
+echo "  bash install.sh --pick-embedder"

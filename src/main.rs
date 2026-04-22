@@ -6,6 +6,7 @@
 //! Two-layer architecture:
 //!   1. **Canonical corpus** (`~/.aicx/`) — deduplicated, chunked, steerable markdown.
 //!      Built by extractors (`claude`, `codex`, `all`) and `store`. This is ground truth.
+//!
 //! Supported sources:
 //! - Claude Code: ~/.claude/projects/*/*.jsonl
 //! - Codex: ~/.codex/history.jsonl

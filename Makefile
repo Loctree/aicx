@@ -3,7 +3,7 @@
 
 .PHONY: all build install install-bin install-config install-cargo git-hooks
 .PHONY: precheck test check fmt fmt-check clippy semgrep ci clean help manifest-check
-.PHONY: version-show version-check version-bump changelog-close release-plan release-prepare release-check release-tag release-push release-publish package-check release-bundle
+.PHONY: version-show version-check version-bump changelog-close release-notes release-plan release-prepare release-check release-tag release-push release-publish package-check release-bundle
 
 all: build
 
@@ -12,6 +12,7 @@ VERSION := $(shell python3 -c 'import tomllib; print(tomllib.load(open("Cargo.to
 TAG := v$(VERSION)
 KEYS ?= $(if $(AICX_KEYS_DIR),$(AICX_KEYS_DIR),$(HOME)/.keys)
 NOTARY_PROFILE ?= $(AICX_NOTARY_PROFILE)
+CLEAN ?= 1
 
 build:
 	cargo build --locked --release --bin aicx --bin aicx-mcp
@@ -98,15 +99,14 @@ version-show:
 	fi
 
 version-check:
-	@python3 -c 'import pathlib, sys, tomllib; version = tomllib.load(open("Cargo.toml","rb"))["package"]["version"]; changelog = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8"); \
-assert "## [Unreleased]" in changelog or (_ for _ in ()).throw(SystemExit("CHANGELOG.md is missing '\''## [Unreleased]'\''")); \
-print(f"Current version {version} already has a dedicated changelog section." if f"## [{version}]" in changelog or f"## [v{version}]" in changelog else f"Cargo.toml version {version} present; CHANGELOG has Unreleased section.")'
+	@python3 tools/release_sync.py check
 
 version-bump:
 ifeq ($(origin VERSION),command line)
-	@python3 tools/version_bump.py "$(VERSION)"
+	@python3 tools/release_sync.py bump "$(VERSION)"
 	@echo ""
-	@echo "Note: Cargo.lock is intentionally not touched by version-bump."
+	@echo "Versioned release surfaces synced from Cargo.toml into docs + distribution/npm."
+	@echo "Cargo.lock is intentionally not touched by version-bump."
 	@echo "To sync the lockfile for this package only (no network):"
 	@echo "  cargo update --package $(PACKAGE_NAME) --offline"
 	@echo "Or rely on 'make release-prepare' to sync it for you."
@@ -115,7 +115,10 @@ else
 endif
 
 changelog-close:
-	@python3 tools/changelog_close.py
+	@python3 tools/changelog_close.py $(if $(CHANGELOG_GENERATE),--generate-if-empty)
+
+release-notes:
+	@python3 tools/release_sync.py notes $(if $(origin VERSION),$(VERSION),) $(if $(OUTPUT),--output $(OUTPUT),)
 
 release-plan:
 	@echo "AICX release flow"
@@ -123,8 +126,8 @@ release-plan:
 	@echo "1. Ensure branch is merged and green."
 	@echo "2. Prepare the release bundle:"
 	@echo "     make release-prepare VERSION={patch|minor|major|x.y.z}"
-	@echo "   (runs version-bump + changelog-close + precheck)"
-	@echo "3. Review diff, commit Cargo.toml + Cargo.lock + CHANGELOG.md."
+	@echo "   (runs version-bump + changelog-close + release-notes preview + precheck)"
+	@echo "3. Review diff, commit Cargo.toml + Cargo.lock + CHANGELOG.md + any synced docs/package manifests."
 	@echo "4. Run: make release-check"
 	@echo "5. Create annotated tag: make release-tag"
 	@echo "6. Push tag: make release-push"
@@ -133,7 +136,8 @@ release-plan:
 	@echo "8. Optional local macOS signed bundle:"
 	@echo "     make release-bundle KEYS=$(HOME)/.keys"
 	@echo "     make release-bundle KEYS=$(HOME)/.keys NOTARY_PROFILE=my-notary-profile"
-	@echo "9. GitHub Actions release workflow builds and publishes archives."
+	@echo "     make release-bundle KEYS=$(HOME)/.keys CLEAN=0    # keep local target artifacts"
+	@echo "9. GitHub Actions release workflow builds archives and derives GitHub release notes from CHANGELOG.md."
 	@echo ""
 	@echo "Reference docs:"
 	@echo "  - docs/RELEASES.md"
@@ -142,8 +146,10 @@ release-plan:
 release-prepare:
 ifeq ($(origin VERSION),command line)
 	@$(MAKE) version-bump VERSION=$(VERSION)
-	@$(MAKE) changelog-close
+	@$(MAKE) changelog-close CHANGELOG_GENERATE=1
 	@cargo update --package $(PACKAGE_NAME) --offline
+	@$(MAKE) version-check
+	@python3 tools/release_sync.py notes --output dist/release-notes.md
 	@$(MAKE) precheck
 else
 	@echo "VERSION is required. Usage: make release-prepare VERSION={patch|minor|major|x.y.z}" >&2 && exit 1
@@ -156,8 +162,11 @@ endif
 	@echo "  make release-push"
 	@echo "  make release-publish        # dry-run"
 	@echo "  make release-publish CONFIRM=1  # actual push to crates.io"
+	@echo "  cat dist/release-notes.md   # preview GitHub release body"
+	@echo "  make release-bundle KEYS=$(HOME)/.keys [CLEAN=0]"
 
-release-check: version-check
+release-check:
+	@python3 tools/release_sync.py check --require-version-section
 	@echo "[extra] Verifying release package..."
 	@cargo package --locked
 	@$(MAKE) check
@@ -188,6 +197,7 @@ package-check:
 release-bundle:
 	@KEYS="$(KEYS)" \
 	NOTARY_PROFILE="$(NOTARY_PROFILE)" \
+	AICX_CLEAN_AFTER_BUILD="$(CLEAN)" \
 	PACKAGE_NAME="$(PACKAGE_NAME)" \
 	./tools/release_bundle.sh
 
@@ -213,11 +223,12 @@ help:
 	@echo ""
 	@echo "Release / Version:"
 	@echo "  make version-show          - Show package version and tag state"
-	@echo "  make version-check         - Validate Cargo.toml + CHANGELOG release readiness basics"
-	@echo "  make version-bump VERSION=X - Bump Cargo.toml version. X={patch|minor|major|x.y.z}"
+	@echo "  make version-check         - Validate synced release surfaces (Cargo/docs/npm/changelog basics)"
+	@echo "  make version-bump VERSION=X - Bump version and sync docs/npm surfaces. X={patch|minor|major|x.y.z}"
 	@echo "  make changelog-close       - Close CHANGELOG '## [Unreleased]' to current version + date"
+	@echo "  make release-notes         - Print release notes body derived from CHANGELOG current version section"
 	@echo "  make release-plan          - Print the full post-merge release flow"
-	@echo "  make release-prepare VERSION=X - version-bump + changelog-close + precheck. X={patch|minor|major|x.y.z}"
+	@echo "  make release-prepare VERSION=X - version-bump + changelog-close + notes preview + precheck. X={patch|minor|major|x.y.z}"
 	@echo "  make release-check         - Strict release readiness gate"
 	@echo "  make release-tag           - Create annotated tag from Cargo.toml version"
 	@echo "  make release-push          - Push the current release tag to origin"

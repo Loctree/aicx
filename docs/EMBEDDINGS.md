@@ -1,7 +1,8 @@
 # aicx Native Embeddings
 
 > Foundation tool for the Vibecrafted framework — a lean, in-process embedder
-> that ships with the binary and gracefully falls back to the HuggingFace cache.
+> that can ship with the binary when explicitly embedded and otherwise
+> gracefully falls back to the HuggingFace cache.
 
 ## Why
 
@@ -21,6 +22,12 @@ MLX stack, but it has three failure modes on customer machines:
 The native embedder fixes all three: it runs locally, in-process, with a
 predictable memory footprint, and the compatibility checks refuse to corrupt
 namespaces whose embedding truth has diverged from the current runtime.
+
+Important shipping truth:
+
+- current public release bundles stay slim and do **not** auto-bundle model weights
+- current public release bundles do **not** silently download a heavy model during install
+- native embedder selection is therefore a preference + hydration story, not a hidden payload
 
 ## Feature flag
 
@@ -98,6 +105,31 @@ Cache lookup honours, in order:
 
 The newest snapshot with all three required files wins.
 
+## Operator config files
+
+Two different config surfaces exist today and they should not be conflated:
+
+1. Active memex retrieval provider config:
+   - usually `~/.rmcp-servers/rust-memex/config.toml`
+   - or an explicit file via `RUST_MEMEX_CONFIG`
+   - this governs the current `memex-sync` HTTP/provider path
+2. Native embedder preference config:
+   - `~/.aicx/embedder.toml`
+   - or an explicit file via `AICX_EMBEDDER_CONFIG`
+   - this governs which native embedder repo/path a native-embedder build will try to load
+
+Recommended native embedder config:
+
+```toml
+[native_embedder]
+profile = "base"
+repo = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+prefer_embedded = true
+```
+
+`install.sh --pick-embedder` writes that file for you without silently pulling a
+heavy model into the bundle.
+
 ## Environment variables
 
 | Variable                | Scope          | Effect                                                    |
@@ -105,6 +137,7 @@ The newest snapshot with all three required files wins.
 | `AICX_EMBEDDER_REPO`    | build + runtime| HF repo id to embed / load (`owner/name`).                |
 | `AICX_BUILD_PROFILE`    | build          | Build preset: `base`, `dev`, or `premium`.                |
 | `AICX_EMBEDDER_PATH`    | build + runtime| Absolute path to a model directory — bypasses HF cache.   |
+| `AICX_EMBEDDER_CONFIG`  | build + runtime| Explicit config file overriding `~/.aicx/embedder.toml`.  |
 | `AICX_NO_EMBED=1`       | build          | Skip `include_bytes!` even if cache has the model.        |
 | `AICX_HF_CACHE`         | build + runtime| Extra HF cache base to search first.                      |
 
@@ -165,7 +198,8 @@ On the HTTP memex path, `aicx` now also exposes explicit runtime presets:
 - `premium`: 4096-dim Qwen 8B
 
 Select them with `aicx memex-sync --profile ...`, `AICX_RUNTIME_PROFILE`, or
-`[runtime] profile = "..."` in the aicx config file.
+the active `rust-memex` config file (`RUST_MEMEX_CONFIG`, usually
+`~/.rmcp-servers/rust-memex/config.toml`).
 
 ## Credits
 

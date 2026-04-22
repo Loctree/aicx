@@ -366,8 +366,8 @@ aicx memex-sync --profile premium
 ```
 
 Notes:
-- Runtime preset resolution is, in order: explicit `[embeddings]`, `--profile`, `AICX_RUNTIME_PROFILE`, `[runtime].profile`, legacy `[mlx]` / MLX env overrides, then the default `base` preset.
-- Persist a preset by adding `[runtime] profile = "dev"` to `~/.aicx/memex/config.toml` or `~/.aicx/config.toml`.
+- Runtime preset helpers (`--profile`, `AICX_RUNTIME_PROFILE`) are convenience inputs around the active memex provider config; explicit `[embeddings]` and legacy `[mlx]` config remain authoritative.
+- Persist active memex provider choices in `rust-memex` config, usually `~/.rmcp-servers/rust-memex/config.toml`, or point `RUST_MEMEX_CONFIG` at an explicit file.
 - Default batch materialization embeds and upserts chunks in-process via the `rmcp-memex` library, preserving `project`, `agent`, `date`, `session_id`, and `kind` metadata for semantic filtering.
 - The canonical store's nested structure is traversed automatically during materialization.
 - If `~/.aicx/.aicxignore` exists, matching chunk paths are excluded before materialization and the final summary reports how many were ignored.

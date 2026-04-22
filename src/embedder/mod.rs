@@ -8,7 +8,9 @@
 //!   the model is present in the HuggingFace cache at build time.
 //! - **Runtime HF cache** — if no embedded model is present, the embedder is
 //!   hydrated from the user's HuggingFace cache at first use. `AICX_EMBEDDER_REPO`
-//!   and `AICX_EMBEDDER_PATH` control which model is loaded.
+//!   and `AICX_EMBEDDER_PATH` control which model is loaded. Persistent
+//!   operator preferences can also live in `~/.aicx/embedder.toml` or a file
+//!   pointed to by `AICX_EMBEDDER_CONFIG`.
 //!
 //! The module is compiled only when the `native-embedder` feature is enabled so
 //! that default builds stay lean (no Candle, no tokenizers crate pulled in).

@@ -1,0 +1,5 @@
+#!/usr/bin/env node
+
+const { execAicx } = require("../index.js");
+
+execAicx(process.argv.slice(2));

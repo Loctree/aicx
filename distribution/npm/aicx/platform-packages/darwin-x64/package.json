@@ -1,0 +1,29 @@
+{
+  "name": "@loctree/aicx-darwin-x64",
+  "version": "0.6.2",
+  "description": "aicx + aicx-mcp binaries for macOS Intel (x64)",
+  "keywords": [
+    "aicx",
+    "mcp",
+    "darwin",
+    "x64"
+  ],
+  "license": "BUSL-1.1",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Loctree/aicx.git",
+    "directory": "distribution/npm/aicx/platform-packages/darwin-x64"
+  },
+  "files": [
+    "postinstall.js"
+  ],
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  }
+}

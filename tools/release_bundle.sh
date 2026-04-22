@@ -22,6 +22,7 @@ NOTARY_PROFILE_VALUE="${NOTARY_PROFILE:-${AICX_NOTARY_PROFILE:-}}"
 DIST_DIR="${DIST_DIR:-$REPO_ROOT/dist}"
 PACKAGE_NAME="${PACKAGE_NAME:-}"
 BUILD_PROFILE="${AICX_BUILD_PROFILE:-base}"
+CLEAN_AFTER_BUILD="${AICX_CLEAN_AFTER_BUILD:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 
 usage() {
@@ -37,6 +38,7 @@ Environment:
   DIST_DIR                  Output directory (default: ./dist)
   PACKAGE_NAME              Bundle prefix (default: Cargo package name)
   AICX_BUILD_PROFILE        Build profile contract already used by the repo (default: base)
+  AICX_CLEAN_AFTER_BUILD    Run cargo clean --target <triple> after bundle creation (default: 1)
   DRY_RUN=1                 Print resolved actions without signing/notarizing
 
 Expected KEYS directory shape:
@@ -179,6 +181,7 @@ echo "Repo:            $REPO_ROOT"
 echo "Version:         $VERSION"
 echo "Target:          $TARGET"
 echo "Build profile:   $BUILD_PROFILE"
+echo "Cleanup target:  $CLEAN_AFTER_BUILD"
 echo "Keys dir:        $KEYS_DIR"
 echo "Dist dir:        $DIST_DIR"
 echo "Signing identity:$SIGNING_IDENTITY"
@@ -283,3 +286,16 @@ echo "Checksum:        $CHECKSUM_PATH"
 echo "Notary log:      $NOTARY_LOG_PATH"
 echo ""
 echo "Note: zip archives are notarized server-side but cannot be stapled like .pkg/.dmg/.app."
+
+if [[ "$CLEAN_AFTER_BUILD" == "1" ]]; then
+  echo ""
+  echo "[post] Cleaning Cargo target dir for $TARGET ..."
+  if (
+    cd "$REPO_ROOT"
+    cargo clean --target "$TARGET"
+  ); then
+    echo "[post] Cargo target cleaned."
+  else
+    echo "[post] Warning: cargo clean failed; release bundle is still valid." >&2
+  fi
+fi

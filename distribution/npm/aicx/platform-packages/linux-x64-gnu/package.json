@@ -1,0 +1,30 @@
+{
+  "name": "@loctree/aicx-linux-x64-gnu",
+  "version": "0.6.2",
+  "description": "aicx + aicx-mcp binaries for Linux x64 (glibc)",
+  "keywords": [
+    "aicx",
+    "mcp",
+    "linux",
+    "x64",
+    "gnu"
+  ],
+  "license": "BUSL-1.1",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Loctree/aicx.git",
+    "directory": "distribution/npm/aicx/platform-packages/linux-x64-gnu"
+  },
+  "files": [
+    "postinstall.js"
+  ],
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  }
+}

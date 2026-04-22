@@ -116,7 +116,6 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: release-verify-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             release-verify-
@@ -135,6 +134,10 @@ jobs:
 
       - name: cargo publish --dry-run
         run: cargo publish --locked --dry-run
+
+      - name: Clean Cargo artifacts
+        if: always()
+        run: cargo clean
 
   build:
     name: Build ${{ matrix.target }} on ${{ matrix.runner_name }}
@@ -191,7 +194,6 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: release-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             release-${{ runner.os }}-${{ matrix.target }}-
@@ -346,25 +348,67 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+      - name: Clean local build artifacts
+        if: always()
+        env:
+          BUNDLE_DIR: ${{ steps.bundle.outputs.bundle_dir }}
+          ARCHIVE_PATH: ${{ steps.bundle.outputs.archive_path }}
+          CHECKSUM_PATH: ${{ steps.bundle.outputs.checksum_path }}
+          NOTARY_LOG_PATH: ${{ steps.bundle.outputs.notary_log_path }}
+        run: |
+          cargo clean --target "${{ matrix.target }}" || true
+          rm -rf dist
+          if [[ -n "${BUNDLE_DIR}" ]]; then
+            rm -rf "${BUNDLE_DIR}"
+          fi
+          if [[ -n "${ARCHIVE_PATH}" ]]; then
+            rm -f "${ARCHIVE_PATH}"
+          fi
+          if [[ -n "${CHECKSUM_PATH}" ]]; then
+            rm -f "${CHECKSUM_PATH}"
+          fi
+          if [[ -n "${NOTARY_LOG_PATH}" ]]; then
+            rm -f "${NOTARY_LOG_PATH}"
+          fi
+
   github-release:
     name: Publish GitHub Release
     needs: [verify, build]
     runs-on: [self-hosted, ops-linux]
 
     steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: release-*
           merge-multiple: true
 
+      - name: Generate release notes from CHANGELOG
+        env:
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+          RELEASE_NOTES_PATH: ${{ runner.temp }}/release-notes.md
+        run: |
+          python3 tools/release_sync.py notes "${RELEASE_VERSION}" --output "${RELEASE_NOTES_PATH}"
+
       - name: Create or update GitHub release
         env:
           GITHUB_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
+          RELEASE_NOTES_PATH: ${{ runner.temp }}/release-notes.md
         run: |
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" --notes-file "${RELEASE_NOTES_PATH}"
             gh release upload "${RELEASE_TAG}" dist/* --clobber
           else
-            gh release create "${RELEASE_TAG}" dist/* --generate-notes
+            gh release create "${RELEASE_TAG}" dist/* --notes-file "${RELEASE_NOTES_PATH}"
           fi
+
+      - name: Clean downloaded release artifacts
+        if: always()
+        run: |
+          rm -rf dist
+          rm -f "${RUNNER_TEMP}/release-notes.md"

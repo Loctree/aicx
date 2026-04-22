@@ -1,0 +1,53 @@
+{
+  "name": "@loctree/aicx",
+  "version": "0.6.2",
+  "description": "aicx CLI + MCP server. Thin-release npm wrapper that installs both aicx and aicx-mcp from GitHub Releases.",
+  "keywords": [
+    "aicx",
+    "mcp",
+    "model-context-protocol",
+    "agents",
+    "cli",
+    "retrieval",
+    "codex",
+    "claude",
+    "gemini"
+  ],
+  "main": "index.js",
+  "types": "index.d.ts",
+  "bin": {
+    "aicx": "bin/aicx",
+    "aicx-mcp": "bin/aicx-mcp"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "bin/aicx",
+    "bin/aicx-mcp",
+    "install.js",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Loctree/aicx.git",
+    "directory": "distribution/npm/aicx"
+  },
+  "homepage": "https://github.com/Loctree/aicx",
+  "bugs": {
+    "url": "https://github.com/Loctree/aicx/issues"
+  },
+  "license": "BUSL-1.1",
+  "author": "Loctree",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "optionalDependencies": {
+    "@loctree/aicx-darwin-arm64": "0.6.2",
+    "@loctree/aicx-darwin-x64": "0.6.2",
+    "@loctree/aicx-linux-x64-gnu": "0.6.2",
+    "@loctree/aicx-linux-x64-musl": "0.6.2"
+  }
+}

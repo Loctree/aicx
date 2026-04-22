@@ -28,6 +28,19 @@ Public install from crates.io:
 cargo install aicx --locked
 ```
 
+Public install from npm:
+
+```bash
+npm install -g @loctree/aicx
+```
+
+This installs both shipped commands:
+
+```bash
+aicx --help
+aicx-mcp --version
+```
+
 From a local checkout:
 
 ```bash
@@ -49,8 +62,11 @@ Directly from GitHub Releases with SHA-256 verification before unpacking:
 
 ```bash
 AICX_INSTALL_MODE=release bash install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.6.1 bash install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.6.2 bash install.sh
 ```
+
+On macOS this consumes the signed/notarized release zip published by CI on the
+`dragon-macos` self-hosted runner. On Linux it consumes the release tarball.
 
 From an accessible GitHub repo when you want unreleased source:
 
@@ -80,10 +96,20 @@ make release-bundle KEYS=~/.keys
 make release-bundle KEYS=~/.keys NOTARY_PROFILE=vc-notary
 ```
 
+That release path cleans `target/<triple>` after the bundle is safely written so
+the self-hosted box does not keep hauling old release artifacts. Use `CLEAN=0`
+when you explicitly want to keep the local build outputs.
+
 Profile defaults:
 - Runtime default: `base` — portable 1024-dim Qwen 0.6B memex preset
 - Heavier runtime opt-ins: `AICX_RUNTIME_PROFILE=dev` (2560-dim Qwen 4B), `AICX_RUNTIME_PROFILE=premium` (4096-dim Qwen 8B)
 - Native embedder build default: `AICX_BUILD_PROFILE=base`; opt into larger bundles with `AICX_BUILD_PROFILE=dev` or `AICX_BUILD_PROFILE=premium`
+- Optional native embedder picker during install: `bash install.sh --pick-embedder`
+
+Config truth:
+- Active memex retrieval config lives in `rust-memex` discovery paths such as `~/.rmcp-servers/rust-memex/config.toml`
+- Native embedder preferences live in `~/.aicx/embedder.toml`
+- Current public release bundles stay slim; they do not auto-bundle model weights
 
 ## Quickstart
 
@@ -222,17 +248,23 @@ aicx memex-sync --profile premium
 Batch sync (default) uses metadata-rich JSONL import, preserving `project`, `agent`, `date`, `session_id`, and `kind`. Use `--per-chunk` only when you need single-document granularity.
 
 Runtime profile resolution:
-- Default with no explicit embedding config: `base`
-- One-off override: `aicx memex-sync --profile <base|dev|premium>`
-- Persistent override: set `AICX_RUNTIME_PROFILE=<base|dev|premium>`
-- Config override: add `[runtime] profile = "dev"` to `~/.aicx/memex/config.toml` or `~/.aicx/config.toml`
-- Explicit `[embeddings]` and legacy `[mlx]` config still win; profile presets do not silently override hand-pinned models or dimensions
+- Default with no explicit provider config: `base`
+- One-off helper override: `aicx memex-sync --profile <base|dev|premium>`
+- Env helper override: set `AICX_RUNTIME_PROFILE=<base|dev|premium>`
+- Config override: set `RUST_MEMEX_CONFIG=/path/to/config.toml` or edit the discovered `rust-memex` config file, usually `~/.rmcp-servers/rust-memex/config.toml`
+- Explicit `[embeddings]` and legacy `[mlx]` config remain authoritative; helper presets should be treated as convenience, not as hidden overrides of hand-pinned providers or dimensions
 
 Example persistent config:
 
 ```toml
-[runtime]
-profile = "dev"
+[embeddings]
+required_dimension = 2560
+
+[[embeddings.providers]]
+name = "mlx-local"
+base_url = "http://127.0.0.1:1234"
+model = "qwen3-embedding-4b"
+priority = 1
 ```
 
 Single-session Gemini Antigravity extract (conversation artifacts first, explicit step-output fallback):

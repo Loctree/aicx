@@ -26,3 +26,4 @@ CLAUDE.md
 /.junie/
 /*.txt
 /*.py
+/tools/__pycache__
