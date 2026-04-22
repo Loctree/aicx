@@ -33,6 +33,12 @@ for arg in "$@"; do
       echo "  local - cargo install --path <checkout> --locked"
       echo "  crates - cargo install ai-contexters --locked"
       echo "  git    - cargo install --git \$AICX_GIT_URL --locked ai-contexters"
+      echo ""
+      echo "Runtime/build profile shortcuts:"
+      echo "  default runtime:  AICX_RUNTIME_PROFILE=base    # portable 1024-dim preset"
+      echo "  heavier runtime:  AICX_RUNTIME_PROFILE=dev     # 2560-dim Qwen 4B preset"
+      echo "  premium runtime:  AICX_RUNTIME_PROFILE=premium # 4096-dim Qwen 8B preset"
+      echo "  native builds:    AICX_BUILD_PROFILE=dev cargo build --release --features native-embedder"
       exit 0
       ;;
   esac
@@ -250,6 +256,7 @@ configure_mcp "gemini" "$HOME/.gemini/settings.json"
 echo "[4/4] Full context extraction (this may take a moment)..."
 "${AICX_RUN[@]}" all -H 10000 --emit none
 echo "  store bootstrap complete"
+echo "  memex runtime default: base (portable 1024-dim preset)"
 echo ""
 
 # --- Done ---
@@ -274,3 +281,8 @@ echo "  aicx store -H 24                   # rescan last 24h from all agents"
 echo "  aicx search 'query terms'          # fuzzy search across session history"
 echo "  aicx refs -H 24                    # compact summary of recent files"
 echo "  aicx steer --project ai-contexters # metadata-aware retrieval"
+echo "  aicx memex-sync                    # optional memex materialization (base profile)"
+echo ""
+echo "Heavier retrieval on strong machines:"
+echo "  AICX_RUNTIME_PROFILE=dev aicx memex-sync --reindex"
+echo "  AICX_RUNTIME_PROFILE=premium aicx memex-sync --reindex"

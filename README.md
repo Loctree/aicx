@@ -57,6 +57,11 @@ cargo install --path . --locked --bin aicx --bin aicx-mcp
 
 `install.sh` prefers the local checkout when one is present. Outside a checkout, it now defaults to the published crates.io package.
 
+Profile defaults:
+- Runtime default: `base` — portable 1024-dim Qwen 0.6B memex preset
+- Heavier runtime opt-ins: `AICX_RUNTIME_PROFILE=dev` (2560-dim Qwen 4B), `AICX_RUNTIME_PROFILE=premium` (4096-dim Qwen 8B)
+- Native embedder build default: `AICX_BUILD_PROFILE=base`; opt into larger bundles with `AICX_BUILD_PROFILE=dev` or `AICX_BUILD_PROFILE=premium`
+
 ## Quickstart
 
 ### Layer 1 — build the canonical corpus
@@ -183,9 +188,29 @@ aicx all -H 48 --memex
 
 # Fine-grained: per-chunk upsert instead of batch JSONL import
 aicx memex-sync --per-chunk
+
+# Explicitly keep the older stronger-workstation preset
+aicx memex-sync --profile dev
+
+# Opt into the heaviest preset for 4096-dim / Qwen 8B setups
+aicx memex-sync --profile premium
 ```
 
 Batch sync (default) uses metadata-rich JSONL import, preserving `project`, `agent`, `date`, `session_id`, and `kind`. Use `--per-chunk` only when you need single-document granularity.
+
+Runtime profile resolution:
+- Default with no explicit embedding config: `base`
+- One-off override: `aicx memex-sync --profile <base|dev|premium>`
+- Persistent override: set `AICX_RUNTIME_PROFILE=<base|dev|premium>`
+- Config override: add `[runtime] profile = "dev"` to `~/.aicx/memex/config.toml` or `~/.aicx/config.toml`
+- Explicit `[embeddings]` and legacy `[mlx]` config still win; profile presets do not silently override hand-pinned models or dimensions
+
+Example persistent config:
+
+```toml
+[runtime]
+profile = "dev"
+```
 
 Single-session Gemini Antigravity extract (conversation artifacts first, explicit step-output fallback):
 

@@ -6,6 +6,7 @@
 //! reading from HF cache at load time.
 //!
 //! Controls:
+//!   AICX_BUILD_PROFILE — embedder build preset: base (default), dev, premium
 //!   AICX_EMBEDDER_REPO  — HF repo (default: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2)
 //!   AICX_EMBEDDER_PATH  — explicit model directory (overrides HF cache)
 //!   AICX_NO_EMBED       — set to `1` to skip embedding even when available
@@ -22,9 +23,61 @@ use std::path::{Path, PathBuf};
 ///   harrier-oss/harrier-oss-0.6b     (~0.6B params, code-focused)
 ///   F2-LLM/F2-LLM-v2-1.7b            (~1.7B params, larger recall budget)
 const DEFAULT_EMBEDDER_REPO: &str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2";
+const DEV_EMBEDDER_REPO: &str = "harrier-oss/harrier-oss-0.6b";
+const PREMIUM_EMBEDDER_REPO: &str = "F2-LLM/F2-LLM-v2-1.7b";
+
+#[derive(Clone, Copy)]
+enum BuildProfile {
+    Base,
+    Dev,
+    Premium,
+}
+
+impl BuildProfile {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "base" => Some(Self::Base),
+            "dev" => Some(Self::Dev),
+            "premium" => Some(Self::Premium),
+            _ => None,
+        }
+    }
+
+    fn repo(self) -> &'static str {
+        match self {
+            Self::Base => DEFAULT_EMBEDDER_REPO,
+            Self::Dev => DEV_EMBEDDER_REPO,
+            Self::Premium => PREMIUM_EMBEDDER_REPO,
+        }
+    }
+}
+
+fn resolve_embedder_repo() -> String {
+    if let Ok(repo) = env::var("AICX_EMBEDDER_REPO") {
+        let repo = repo.trim();
+        if !repo.is_empty() {
+            return repo.to_string();
+        }
+    }
+
+    match env::var("AICX_BUILD_PROFILE") {
+        Ok(raw) => match BuildProfile::parse(&raw) {
+            Some(profile) => profile.repo().to_string(),
+            None => {
+                println!(
+                    "cargo:warning=aicx: unknown AICX_BUILD_PROFILE='{}'. Falling back to base profile.",
+                    raw
+                );
+                DEFAULT_EMBEDDER_REPO.to_string()
+            }
+        },
+        Err(_) => DEFAULT_EMBEDDER_REPO.to_string(),
+    }
+}
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=AICX_BUILD_PROFILE");
     println!("cargo:rerun-if-env-changed=AICX_EMBEDDER_REPO");
     println!("cargo:rerun-if-env-changed=AICX_EMBEDDER_PATH");
     println!("cargo:rerun-if-env-changed=AICX_NO_EMBED");
@@ -44,11 +97,7 @@ fn main() {
     }
 
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR should be set by cargo");
-    let repo = env::var("AICX_EMBEDDER_REPO")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_EMBEDDER_REPO.to_string());
+    let repo = resolve_embedder_repo();
 
     let model_path = resolve_model_path(repo.as_str());
     let Some(model_path) = model_path else {

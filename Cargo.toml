@@ -23,12 +23,14 @@ default = []
 # Native embedder — in-process BERT-style embeddings via Candle.
 # Ships a small embedder bundled into the binary when the model is present in
 # the HuggingFace cache at build time; falls back to runtime cache lookup.
-# Suggested include_bytes defaults (override with AICX_EMBEDDER_REPO):
-#   - harrier-oss/harrier-oss-0.6b      (~0.6B params, code-focused)
-#   - F2-LLM/F2-LLM-v2-1.7b             (~1.7B params, stronger recall)
-# Combined with a lean runtime this keeps a complete bundle under ~1.1 GB
-# for the 0.6B default. The 1.7B model stays runtime-loaded unless the
-# operator opts into a larger bundle.
+# Build presets:
+#   - base (default, via AICX_BUILD_PROFILE=base): sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+#   - dev   (AICX_BUILD_PROFILE=dev):              harrier-oss/harrier-oss-0.6b
+#   - premium (AICX_BUILD_PROFILE=premium):        F2-LLM/F2-LLM-v2-1.7b
+# AICX_EMBEDDER_REPO still wins as the exact override.
+# Combined with the lightweight base runtime this keeps a complete bundle under
+# ~1.1 GB for the default path, while leaving stronger machines an explicit
+# opt-in route to larger local models.
 native-embedder = [
     "dep:candle-core",
     "dep:candle-nn",

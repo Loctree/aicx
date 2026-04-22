@@ -340,6 +340,7 @@ Options:
 - `-n, --namespace <NAMESPACE>` vector namespace (default: `ai-contexts`)
 - `--per-chunk` use per-chunk library writes instead of batch store (slower, more granular)
 - `--db-path <DB_PATH>` override LanceDB path
+- `--profile <PROFILE>` runtime preset: `base` (default portable 1024-dim Qwen 0.6B), `dev` (2560-dim Qwen 4B), or `premium` (4096-dim Qwen 8B)
 - `--reindex` wipe the memex index and re-embed the entire canonical corpus; use after an embedding model or dimension change, or when the index has drifted from the canonical store
 
 Typical flows:
@@ -356,9 +357,17 @@ aicx memex-sync --reindex
 
 # One-shot shortcut: extract + materialize in a single pass
 aicx all -H 48 --memex
+
+# Keep the legacy heavier workstation preset
+aicx memex-sync --profile dev
+
+# Opt into the heaviest Qwen-family preset
+aicx memex-sync --profile premium
 ```
 
 Notes:
+- Runtime preset resolution is, in order: explicit `[embeddings]`, `--profile`, `AICX_RUNTIME_PROFILE`, `[runtime].profile`, legacy `[mlx]` / MLX env overrides, then the default `base` preset.
+- Persist a preset by adding `[runtime] profile = "dev"` to `~/.aicx/memex/config.toml` or `~/.aicx/config.toml`.
 - Default batch materialization embeds and upserts chunks in-process via the `rmcp-memex` library, preserving `project`, `agent`, `date`, `session_id`, and `kind` metadata for semantic filtering.
 - The canonical store's nested structure is traversed automatically during materialization.
 - If `~/.aicx/.aicxignore` exists, matching chunk paths are excluded before materialization and the final summary reports how many were ignored.

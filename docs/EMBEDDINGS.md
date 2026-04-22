@@ -32,10 +32,16 @@ compile-time and binary-size cost when they opt in:
 cargo build --release --features native-embedder
 ```
 
-To keep a complete bundle under ~1.1 GB we default to the conservative
-`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` model
-(~224 MB fp16). Operators can swap in a stronger code-focused model via
-`AICX_EMBEDDER_REPO`:
+Build profile resolution:
+- `AICX_BUILD_PROFILE=base` or unset: embed `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
+- `AICX_BUILD_PROFILE=dev`: embed `harrier-oss/harrier-oss-0.6b`
+- `AICX_BUILD_PROFILE=premium`: embed `F2-LLM/F2-LLM-v2-1.7b`
+- `AICX_EMBEDDER_REPO=<owner/name>` still wins as the exact override
+
+To keep a complete bundle under ~1.1 GB the default `base` profile uses the
+conservative `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
+model (~224 MB fp16). Operators can opt into a stronger code-focused bundle or
+an even larger local model with the build profiles above:
 
 | Model                                  | Params | Size (fp16) | Include-in-bundle? |
 |----------------------------------------|-------:|------------:|--------------------|
@@ -97,6 +103,7 @@ The newest snapshot with all three required files wins.
 | Variable                | Scope          | Effect                                                    |
 |-------------------------|----------------|-----------------------------------------------------------|
 | `AICX_EMBEDDER_REPO`    | build + runtime| HF repo id to embed / load (`owner/name`).                |
+| `AICX_BUILD_PROFILE`    | build          | Build preset: `base`, `dev`, or `premium`.                |
 | `AICX_EMBEDDER_PATH`    | build + runtime| Absolute path to a model directory — bypasses HF cache.   |
 | `AICX_NO_EMBED=1`       | build          | Skip `include_bytes!` even if cache has the model.        |
 | `AICX_HF_CACHE`         | build + runtime| Extra HF cache base to search first.                      |
@@ -151,6 +158,14 @@ need deterministic, offline-capable embeddings. Future work will expose it as
 an additional `EmbeddingBackend` inside the sync pipeline so operators can
 choose between HTTP (Qwen3/MLX on the LAN) and in-process (Harrier/F2-LLM on
 the laptop) per project.
+
+On the HTTP memex path, `aicx` now also exposes explicit runtime presets:
+- `base` (default): 1024-dim Qwen 0.6B
+- `dev`: 2560-dim Qwen 4B
+- `premium`: 4096-dim Qwen 8B
+
+Select them with `aicx memex-sync --profile ...`, `AICX_RUNTIME_PROFILE`, or
+`[runtime] profile = "..."` in the aicx config file.
 
 ## Credits
 

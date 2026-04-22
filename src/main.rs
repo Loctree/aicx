@@ -33,7 +33,7 @@ use aicx::dashboard::{self, DashboardConfig, DashboardScope};
 use aicx::dashboard_server::{self, DashboardCorsPolicy, DashboardServerConfig};
 use aicx::intents;
 use aicx::mcp::{self, McpTransport};
-use aicx::memex::{self, MemexConfig, SyncProgress, SyncProgressPhase};
+use aicx::memex::{self, MemexConfig, MemexRuntimeProfile, SyncProgress, SyncProgressPhase};
 use aicx::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
 use aicx::rank;
 use aicx::reports_extractor::{self, ReportsExtractorConfig};
@@ -75,8 +75,9 @@ fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
 ///
 /// Quick start:
 ///   aicx all -H 4                      # build canonical corpus (layer 1)
-///   aicx memex-sync                     # materialize into memex (layer 2)
+///   aicx memex-sync                     # materialize into memex (layer 2, base profile)
 ///   aicx all -H 4 --memex              # both layers in one shot
+///   aicx memex-sync --profile dev      # opt into the 2560-dim Qwen 4B preset
 ///   aicx memex-sync --reindex           # full rebuild after model change
 #[derive(Debug, Parser)]
 #[command(name = "aicx")]
@@ -621,6 +622,7 @@ enum Commands {
     /// Incremental:    aicx memex-sync                (only new chunks since last sync)
     /// Full rebuild:   aicx memex-sync --reindex      (wipe index, re-embed everything)
     /// Per-chunk mode: aicx memex-sync --per-chunk    (granular library writes instead of batch store)
+    /// Runtime preset: aicx memex-sync --profile dev  (opt into the 2560-dim Qwen 4B preset)
     #[command(display_order = 20, verbatim_doc_comment)]
     MemexSync {
         /// Namespace in the semantic index
@@ -634,6 +636,14 @@ enum Commands {
         /// Override LanceDB path
         #[arg(long)]
         db_path: Option<PathBuf>,
+
+        /// Runtime profile for memex retrieval.
+        ///
+        /// `base` is the default portable preset. `dev` keeps the older
+        /// 2560-dim Qwen 4B behavior for stronger workstations. `premium`
+        /// opts into a 4096-dim Qwen 8B setup.
+        #[arg(long, value_enum)]
+        profile: Option<MemexRuntimeProfile>,
 
         /// Wipe the memex index and re-embed the entire canonical corpus.
         /// Use after an embedding model or dimension change, or when the
@@ -1125,9 +1135,10 @@ fn main() -> Result<()> {
             namespace,
             per_chunk,
             db_path,
+            profile,
             reindex,
         }) => {
-            run_memex_sync(&namespace, per_chunk, db_path, reindex)?;
+            run_memex_sync(&namespace, per_chunk, db_path, profile, reindex)?;
         }
         Some(Commands::List) => {
             let sources = sources::list_available_sources()?;
@@ -2812,8 +2823,10 @@ fn run_steer(
         date_lo: date_lo.as_deref(),
         date_hi: date_hi.as_deref(),
     };
-    let mut metadatas =
-        rt.block_on(aicx::steer_index::search_steer_index(&filter, filters.limit))?;
+    let mut metadatas = rt.block_on(aicx::steer_index::search_steer_index(
+        &filter,
+        filters.limit,
+    ))?;
 
     if let Some(sort_order) = filters.sort {
         metadatas.sort_by(|a, b| {
@@ -3068,9 +3081,10 @@ fn run_memex_sync(
     namespace: &str,
     per_chunk: bool,
     db_path: Option<PathBuf>,
+    profile: Option<MemexRuntimeProfile>,
     reindex: bool,
 ) -> Result<()> {
-    let truth = memex::resolve_runtime_truth(db_path.as_deref())?;
+    let truth = memex::resolve_runtime_truth_with_profile(db_path.as_deref(), profile)?;
     let store_root = store::store_base_dir()?;
 
     let canonical_root = store::canonical_store_dir()?;
@@ -3092,6 +3106,7 @@ fn run_memex_sync(
         db_path: db_path.clone(),
         batch_mode: !per_chunk,
         preprocess: true,
+        runtime_profile: profile,
     };
 
     eprintln!(
@@ -3100,13 +3115,11 @@ fn run_memex_sync(
     );
     eprintln!("  Chunk files: {}", chunk_paths.len());
     eprintln!("  Namespace: {}", config.namespace);
+    eprintln!("  Runtime: {}", truth.runtime_summary);
     eprintln!("  Embedding model: {}", truth.embedding_model);
     eprintln!("  Embedding dims: {}", truth.embedding_dimension);
     eprintln!("  LanceDB path: {}", truth.db_path.display());
     eprintln!("  BM25 path: {}", truth.bm25_path.display());
-    if let Some(path) = truth.config_path.as_ref() {
-        eprintln!("  Config: {}", path.display());
-    }
     let ignore_path = store_root.join(store::AICX_IGNORE_FILENAME);
     if ignore_path.is_file() {
         eprintln!("  Ignore file: {}", ignore_path.display());
@@ -3126,7 +3139,7 @@ fn run_memex_sync(
             "  Warning: Lance vector schema is shared across the whole store, so other namespaces in {} will need a rebuild too.",
             truth.db_path.display()
         );
-        memex::reset_semantic_index(namespace, db_path.as_deref())?;
+        memex::reset_semantic_index_with_profile(namespace, db_path.as_deref(), profile)?;
     }
 
     let result = sync_memex_paths(&config, &chunk_paths)?;
@@ -3895,6 +3908,31 @@ mod tests {
 
         assert!(rendered.contains("semantic retrieval through MCP tools"));
         assert!(!rendered.contains("embedding-aware"));
+    }
+
+    #[test]
+    fn memex_sync_profile_flag_parses_and_help_mentions_presets() {
+        let cli = Cli::try_parse_from(["aicx", "memex-sync", "--profile", "premium"])
+            .expect("memex-sync profile flag should parse");
+
+        match cli.command {
+            Some(Commands::MemexSync { profile, .. }) => {
+                assert_eq!(profile, Some(MemexRuntimeProfile::Premium));
+            }
+            _ => panic!("expected memex-sync command"),
+        }
+
+        let mut cmd = Cli::command();
+        let memex_sync = cmd
+            .find_subcommand_mut("memex-sync")
+            .expect("memex-sync subcommand should exist");
+        let rendered = memex_sync.render_long_help().to_string();
+
+        assert!(rendered.contains("--profile <PROFILE>"));
+        assert!(rendered.contains("base"));
+        assert!(rendered.contains("dev"));
+        assert!(rendered.contains("premium"));
+        assert!(rendered.contains("default portable preset"));
     }
 
     #[test]

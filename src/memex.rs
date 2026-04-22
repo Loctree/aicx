@@ -18,6 +18,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use clap::ValueEnum;
 use rmcp_memex::{
     BM25Config, ChromaDocument, DEFAULT_REQUIRED_DIMENSION, EmbeddingClient,
     EmbeddingConfig as RmcpEmbeddingConfig, MlxConfig, MlxMergeOptions,
@@ -40,6 +41,98 @@ const DEFAULT_MEMEX_NAMESPACE: &str = "ai-contexts";
 const SEMANTIC_INDEX_METADATA_VERSION: u32 = 1;
 /// aicx-owned config paths. No fallback to memex server config.
 const AICX_CONFIG_SEARCH_PATHS: &[&str] = &["~/.aicx/memex/config.toml", "~/.aicx/config.toml"];
+const AICX_RUNTIME_PROFILE_ENV: &str = "AICX_RUNTIME_PROFILE";
+const LEGACY_MLX_ENV_VARS: &[&str] = &[
+    "DISABLE_MLX",
+    "EMBEDDER_PORT",
+    "DRAGON_BASE_URL",
+    "DRAGON_EMBEDDER_PORT",
+    "RERANKER_PORT",
+    "EMBEDDER_MODEL",
+    "RERANKER_MODEL",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[value(rename_all = "kebab-case")]
+pub enum MemexRuntimeProfile {
+    Base,
+    Dev,
+    Premium,
+}
+
+impl Default for MemexRuntimeProfile {
+    fn default() -> Self {
+        Self::Base
+    }
+}
+
+impl fmt::Display for MemexRuntimeProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Base => "base",
+            Self::Dev => "dev",
+            Self::Premium => "premium",
+        })
+    }
+}
+
+impl MemexRuntimeProfile {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Base => "portable 1024-dim Qwen 0.6B preset",
+            Self::Dev => "legacy 2560-dim Qwen 4B preset",
+            Self::Premium => "heavy 4096-dim Qwen 8B preset",
+        }
+    }
+
+    fn required_dimension(self) -> usize {
+        match self {
+            Self::Base => 1024,
+            Self::Dev => 2560,
+            Self::Premium => 4096,
+        }
+    }
+
+    fn local_model(self) -> &'static str {
+        match self {
+            Self::Base => "qwen3-embedding:0.6b",
+            Self::Dev => "qwen3-embedding:4b",
+            Self::Premium => "qwen3-embedding:8b",
+        }
+    }
+
+    fn dragon_model(self) -> &'static str {
+        match self {
+            Self::Base => "Qwen/Qwen3-Embedding-0.6B",
+            Self::Dev => "Qwen/Qwen3-Embedding-4B",
+            Self::Premium => "Qwen/Qwen3-Embedding-8B",
+        }
+    }
+
+    fn matches_runtime(self, model: &str, dimension: usize) -> bool {
+        dimension == self.required_dimension()
+            && matches!(
+                model,
+                value if value.eq_ignore_ascii_case(self.local_model())
+                    || value.eq_ignore_ascii_case(self.dragon_model())
+            )
+    }
+
+    fn detect(model: &str, dimension: usize) -> Option<Self> {
+        [Self::Base, Self::Dev, Self::Premium]
+            .into_iter()
+            .find(|profile| profile.matches_runtime(model, dimension))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeProfileSource {
+    Default,
+    Config,
+    Env,
+    Cli,
+}
 
 /// Resolved rmcp-memex runtime truth as seen by ai-contexters.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +142,8 @@ pub struct MemexRuntimeTruth {
     pub embedding_model: String,
     pub embedding_dimension: usize,
     pub config_path: Option<PathBuf>,
+    pub runtime_profile: Option<MemexRuntimeProfile>,
+    pub runtime_summary: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,9 +174,16 @@ impl std::error::Error for MemexCompatibilityError {}
 struct MemexFileConfig {
     db_path: Option<String>,
     #[serde(default)]
+    runtime: Option<MemexRuntimeFileConfig>,
+    #[serde(default)]
     embeddings: Option<MemexEmbeddingsFileConfig>,
     #[serde(default)]
     mlx: Option<MemexMlxFileConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MemexRuntimeFileConfig {
+    profile: Option<MemexRuntimeProfile>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -177,6 +279,8 @@ pub struct MemexConfig {
     /// The published `rmcp-memex` library boundary does not consume this value,
     /// so live ai-contexters sync paths ignore it.
     pub preprocess: bool,
+    /// Optional runtime profile override for this sync.
+    pub runtime_profile: Option<MemexRuntimeProfile>,
 }
 
 impl Default for MemexConfig {
@@ -186,6 +290,7 @@ impl Default for MemexConfig {
             db_path: None,
             batch_mode: true,
             preprocess: true,
+            runtime_profile: None,
         }
     }
 }
@@ -304,18 +409,180 @@ fn resolve_embedding_config(file_cfg: &MemexFileConfig) -> RmcpEmbeddingConfig {
     )
 }
 
+fn legacy_mlx_env_override_present() -> bool {
+    LEGACY_MLX_ENV_VARS
+        .iter()
+        .any(|key| std::env::var_os(key).is_some())
+}
+
+fn runtime_profile_from_env() -> Result<Option<MemexRuntimeProfile>> {
+    let Some(raw) = std::env::var_os(AICX_RUNTIME_PROFILE_ENV) else {
+        return Ok(None);
+    };
+
+    let raw = raw.to_string_lossy();
+    MemexRuntimeProfile::from_str(raw.trim(), true).map(Some).map_err(|_| {
+        anyhow::anyhow!(
+            "Unsupported {AICX_RUNTIME_PROFILE_ENV}='{raw}'. Expected one of: base, dev, premium."
+        )
+    })
+}
+
+fn merged_mlx_config(file_cfg: Option<&MemexMlxFileConfig>) -> MlxConfig {
+    let mut config = MlxConfig::from_env();
+    if let Some(mlx) = file_cfg {
+        config.merge_file_config(MlxMergeOptions {
+            disabled: Some(mlx.disabled),
+            local_port: mlx.local_port,
+            dragon_url: mlx.dragon_url.clone(),
+            dragon_port: mlx.dragon_port,
+            embedder_model: mlx.embedder_model.clone(),
+            reranker_model: mlx.reranker_model.clone(),
+            reranker_port_offset: mlx.reranker_port_offset,
+        });
+    }
+    config
+}
+
+fn runtime_profile_embedding_config(
+    profile: MemexRuntimeProfile,
+    mlx: &MlxConfig,
+) -> RmcpEmbeddingConfig {
+    let reranker_port = mlx.local_port + mlx.reranker_port_offset;
+
+    RmcpEmbeddingConfig {
+        required_dimension: profile.required_dimension(),
+        max_batch_chars: mlx.max_batch_chars,
+        max_batch_items: mlx.max_batch_items,
+        providers: vec![
+            RmcpProviderConfig {
+                name: "local".to_string(),
+                base_url: format!("http://localhost:{}", mlx.local_port),
+                model: profile.local_model().to_string(),
+                priority: 1,
+                endpoint: default_provider_endpoint(),
+            },
+            RmcpProviderConfig {
+                name: "dragon".to_string(),
+                base_url: format!("{}:{}", mlx.dragon_url, mlx.dragon_port),
+                model: profile.dragon_model().to_string(),
+                priority: 2,
+                endpoint: default_provider_endpoint(),
+            },
+        ],
+        reranker: RmcpRerankerConfig {
+            base_url: Some(format!("{}:{}", mlx.dragon_url, reranker_port)),
+            model: Some(mlx.reranker_model.clone()),
+            endpoint: default_reranker_endpoint(),
+        },
+    }
+}
+
+fn runtime_profile_summary(
+    profile: MemexRuntimeProfile,
+    source: RuntimeProfileSource,
+    config_path: Option<&Path>,
+) -> String {
+    match source {
+        RuntimeProfileSource::Default => {
+            format!("aicx runtime profile '{profile}' ({})", profile.label())
+        }
+        RuntimeProfileSource::Env => format!(
+            "aicx runtime profile '{profile}' ({}) via {AICX_RUNTIME_PROFILE_ENV}",
+            profile.label()
+        ),
+        RuntimeProfileSource::Cli => format!(
+            "aicx runtime profile '{profile}' ({}) via --profile",
+            profile.label()
+        ),
+        RuntimeProfileSource::Config => match config_path {
+            Some(path) => format!(
+                "aicx runtime profile '{profile}' ({}) from [runtime].profile in {}",
+                profile.label(),
+                path.display()
+            ),
+            None => format!(
+                "aicx runtime profile '{profile}' ({}) from [runtime].profile",
+                profile.label()
+            ),
+        },
+    }
+}
+
+fn explicit_embeddings_summary(config_path: Option<&Path>) -> String {
+    match config_path {
+        Some(path) => format!("explicit [embeddings] config from {}", path.display()),
+        None => "explicit [embeddings] config".to_string(),
+    }
+}
+
+fn explicit_legacy_mlx_summary(config_path: Option<&Path>) -> String {
+    match config_path {
+        Some(path) => format!("explicit [mlx] config from {}", path.display()),
+        None => "explicit [mlx] config".to_string(),
+    }
+}
+
+fn explicit_legacy_env_summary() -> String {
+    "legacy MLX environment overrides (EMBEDDER_MODEL / EMBEDDER_PORT / DRAGON_BASE_URL / RERANKER_MODEL)"
+        .to_string()
+}
+
 fn resolve_runtime_boundary_from_config(
     db_path_override: Option<&Path>,
     config_path: Option<&Path>,
+    profile_override: Option<MemexRuntimeProfile>,
 ) -> Result<(MemexRuntimeTruth, RmcpEmbeddingConfig)> {
     let file_cfg = load_memex_file_config(config_path)?;
     let mut db_path = db_path_override
         .map(Path::to_path_buf)
         .unwrap_or_else(default_memex_db_path);
-    let embedding_config = file_cfg.as_ref().map_or_else(
-        || MlxConfig::from_env().to_embedding_config(),
-        resolve_embedding_config,
-    );
+    let mlx_config = merged_mlx_config(file_cfg.as_ref().and_then(|cfg| cfg.mlx.as_ref()));
+    let profile_from_file = file_cfg
+        .as_ref()
+        .and_then(|cfg| cfg.runtime.as_ref())
+        .and_then(|runtime| runtime.profile);
+    let selected_profile = if let Some(profile) = profile_override {
+        Some((profile, RuntimeProfileSource::Cli))
+    } else if let Some(profile) = runtime_profile_from_env()? {
+        Some((profile, RuntimeProfileSource::Env))
+    } else {
+        profile_from_file.map(|profile| (profile, RuntimeProfileSource::Config))
+    };
+
+    let (embedding_config, runtime_profile, runtime_summary) =
+        if let Some(file_cfg) = file_cfg.as_ref().filter(|cfg| cfg.embeddings.is_some()) {
+            (
+                resolve_embedding_config(file_cfg),
+                None,
+                explicit_embeddings_summary(config_path),
+            )
+        } else if let Some((profile, source)) = selected_profile {
+            (
+                runtime_profile_embedding_config(profile, &mlx_config),
+                Some(profile),
+                runtime_profile_summary(profile, source, config_path),
+            )
+        } else if file_cfg.as_ref().and_then(|cfg| cfg.mlx.as_ref()).is_some() {
+            (
+                mlx_config.to_embedding_config(),
+                None,
+                explicit_legacy_mlx_summary(config_path),
+            )
+        } else if legacy_mlx_env_override_present() {
+            (
+                MlxConfig::from_env().to_embedding_config(),
+                None,
+                explicit_legacy_env_summary(),
+            )
+        } else {
+            let profile = MemexRuntimeProfile::default();
+            (
+                runtime_profile_embedding_config(profile, &mlx_config),
+                Some(profile),
+                runtime_profile_summary(profile, RuntimeProfileSource::Default, config_path),
+            )
+        };
 
     if db_path_override.is_none()
         && let Some(path) = file_cfg.as_ref().and_then(|cfg| cfg.db_path.as_deref())
@@ -330,6 +597,8 @@ fn resolve_runtime_boundary_from_config(
             embedding_model: embedding_config.model_name(),
             embedding_dimension: embedding_config.dimension(),
             config_path: config_path.map(Path::to_path_buf),
+            runtime_profile,
+            runtime_summary,
         },
         embedding_config,
     ))
@@ -338,14 +607,24 @@ fn resolve_runtime_boundary_from_config(
 fn resolve_runtime_truth_from_config(
     db_path_override: Option<&Path>,
     config_path: Option<&Path>,
+    profile_override: Option<MemexRuntimeProfile>,
 ) -> Result<MemexRuntimeTruth> {
-    resolve_runtime_boundary_from_config(db_path_override, config_path).map(|(truth, _)| truth)
+    resolve_runtime_boundary_from_config(db_path_override, config_path, profile_override)
+        .map(|(truth, _)| truth)
 }
 
 /// Resolve the current rmcp-memex runtime truth from config + defaults.
 pub fn resolve_runtime_truth(db_path_override: Option<&Path>) -> Result<MemexRuntimeTruth> {
+    resolve_runtime_truth_with_profile(db_path_override, None)
+}
+
+/// Resolve the current rmcp-memex runtime truth from config + defaults, with an optional profile override.
+pub fn resolve_runtime_truth_with_profile(
+    db_path_override: Option<&Path>,
+    profile_override: Option<MemexRuntimeProfile>,
+) -> Result<MemexRuntimeTruth> {
     let config_path = discover_memex_config_path();
-    resolve_runtime_truth_from_config(db_path_override, config_path.as_deref())
+    resolve_runtime_truth_from_config(db_path_override, config_path.as_deref(), profile_override)
 }
 
 // ============================================================================
@@ -418,16 +697,52 @@ fn semantic_reindex_command(namespace: &str, truth: &MemexRuntimeTruth) -> Strin
         command.push(cli_display_arg(&truth.db_path.to_string_lossy()));
     }
 
+    if truth
+        .runtime_profile
+        .is_some_and(|profile| profile != MemexRuntimeProfile::Base)
+    {
+        command.push("--profile".to_string());
+        command.push(
+            truth
+                .runtime_profile
+                .expect("runtime profile should exist")
+                .to_string(),
+        );
+    }
+
     command.join(" ")
 }
 
 fn runtime_truth_source_message(truth: &MemexRuntimeTruth) -> String {
-    match truth.config_path.as_ref() {
-        Some(config_path) => format!(
-            " Embedding/runtime config was loaded from {}.",
-            config_path.display()
-        ),
-        None => " Embedding/runtime config fell back to published rmcp-memex defaults plus environment.".to_string(),
+    format!(" Runtime selection uses {}.", truth.runtime_summary)
+}
+
+fn compatibility_profile_note(
+    truth: &MemexRuntimeTruth,
+    metadata: Option<&SemanticIndexMetadata>,
+    actual_dimension: Option<usize>,
+) -> Option<String> {
+    let metadata_profile = metadata.and_then(|entry| {
+        MemexRuntimeProfile::detect(&entry.embedding_model, entry.embedding_dimension)
+    });
+    let actual_profile = match (metadata, actual_dimension) {
+        (Some(entry), Some(dimension)) => {
+            MemexRuntimeProfile::detect(&entry.embedding_model, dimension)
+        }
+        _ => None,
+    };
+
+    let previous_profile = metadata_profile.or(actual_profile);
+    let current_profile = truth.runtime_profile;
+
+    match (previous_profile, current_profile) {
+        (Some(previous), Some(current)) if previous != current => Some(format!(
+            " To keep the previous heavier preset instead of rebuilding right now, rerun with `AICX_RUNTIME_PROFILE={previous} aicx memex-sync` or set `[runtime].profile = \"{previous}\"`."
+        )),
+        (Some(previous), None) => Some(format!(
+            " If you want to keep the recorded preset, rerun with `AICX_RUNTIME_PROFILE={previous} aicx memex-sync` or set `[runtime].profile = \"{previous}\"`."
+        )),
+        _ => None,
     }
 }
 
@@ -515,6 +830,9 @@ fn semantic_compatibility_error(
         " Run `{}` to rebuild this namespace for the new embedding truth. Other namespaces are not touched — aicx only drops per-namespace documents, keeping sibling namespaces intact.",
         semantic_reindex_command(namespace, truth)
     ));
+    if let Some(note) = compatibility_profile_note(truth, metadata, actual_dimension) {
+        message.push_str(&note);
+    }
     message.push_str(
         " This stays explicit because Lance vector schemas are shared across the whole store, so silent reuse would corrupt search semantics.",
     );
@@ -608,7 +926,15 @@ pub fn reset_semantic_index(
     namespace: &str,
     db_path_override: Option<&Path>,
 ) -> Result<MemexRuntimeTruth> {
-    let truth = resolve_runtime_truth(db_path_override)?;
+    reset_semantic_index_with_profile(namespace, db_path_override, None)
+}
+
+pub fn reset_semantic_index_with_profile(
+    namespace: &str,
+    db_path_override: Option<&Path>,
+    profile_override: Option<MemexRuntimeProfile>,
+) -> Result<MemexRuntimeTruth> {
+    let truth = resolve_runtime_truth_with_profile(db_path_override, profile_override)?;
     let runtime = tokio::runtime::Runtime::new()
         .context("Failed to start Tokio runtime for semantic-index reset")?;
 
@@ -1201,8 +1527,11 @@ where
         .collect();
 
     let config_path = discover_memex_config_path();
-    let (truth, embedding_config) =
-        resolve_runtime_boundary_from_config(config.db_path.as_deref(), config_path.as_deref())?;
+    let (truth, embedding_config) = resolve_runtime_boundary_from_config(
+        config.db_path.as_deref(),
+        config_path.as_deref(),
+        config.runtime_profile,
+    )?;
     validate_semantic_index_compatibility_truth(&config.namespace, &truth).await?;
     if new_files.is_empty() {
         emit_sync_progress(
@@ -1509,25 +1838,26 @@ model = "qwen3-embedding:4b"
         )
         .expect("write config");
 
-        let truth =
-            resolve_runtime_truth_from_config(None, Some(&config_path)).expect("resolve truth");
+        let truth = resolve_runtime_truth_from_config(None, Some(&config_path), None)
+            .expect("resolve truth");
         assert_eq!(truth.db_path, db_path);
         assert_eq!(truth.embedding_model, "qwen3-embedding:4b");
         assert_eq!(truth.embedding_dimension, 2560);
         assert_eq!(truth.config_path.as_deref(), Some(config_path.as_path()));
+        assert!(truth.runtime_profile.is_none());
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn test_resolve_runtime_truth_without_config_matches_rmcp_memex_defaults() {
-        let truth = resolve_runtime_truth_from_config(None, None).expect("resolve truth");
-        let embedding_config = MlxConfig::from_env().to_embedding_config();
-
+    fn test_resolve_runtime_truth_without_config_defaults_to_base_profile() {
+        let truth = resolve_runtime_truth_from_config(None, None, None).expect("resolve truth");
         assert_eq!(truth.db_path, default_memex_db_path());
-        assert_eq!(truth.embedding_model, embedding_config.model_name());
-        assert_eq!(truth.embedding_dimension, embedding_config.dimension());
+        assert_eq!(truth.embedding_model, "qwen3-embedding:0.6b");
+        assert_eq!(truth.embedding_dimension, 1024);
         assert!(truth.config_path.is_none());
+        assert_eq!(truth.runtime_profile, Some(MemexRuntimeProfile::Base));
+        assert!(truth.runtime_summary.contains("runtime profile 'base'"));
     }
 
     #[test]
@@ -1550,11 +1880,12 @@ model = "nomic-embed-text"
         )
         .expect("write config");
 
-        let truth =
-            resolve_runtime_truth_from_config(None, Some(&config_path)).expect("resolve truth");
+        let truth = resolve_runtime_truth_from_config(None, Some(&config_path), None)
+            .expect("resolve truth");
 
         assert_eq!(truth.embedding_model, "nomic-embed-text");
         assert_eq!(truth.embedding_dimension, DEFAULT_REQUIRED_DIMENSION);
+        assert!(truth.runtime_profile.is_none());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1585,7 +1916,7 @@ model = "bge-reranker-v2"
         .expect("write config");
 
         let (_truth, embedding_config) =
-            resolve_runtime_boundary_from_config(None, Some(&config_path))
+            resolve_runtime_boundary_from_config(None, Some(&config_path), None)
                 .expect("resolve boundary");
 
         assert_eq!(
@@ -1620,7 +1951,7 @@ model = "nomic-embed-text"
         )
         .expect("write config");
 
-        let err = resolve_runtime_truth_from_config(None, Some(&config_path))
+        let err = resolve_runtime_truth_from_config(None, Some(&config_path), None)
             .expect_err("partial provider config should be rejected");
 
         assert!(
@@ -1647,8 +1978,8 @@ embedder_model = "nomic-embed-text"
         )
         .expect("write config");
 
-        let truth =
-            resolve_runtime_truth_from_config(None, Some(&config_path)).expect("resolve truth");
+        let truth = resolve_runtime_truth_from_config(None, Some(&config_path), None)
+            .expect("resolve truth");
         let mut mlx_config = MlxConfig::from_env();
         mlx_config.merge_file_config(MlxMergeOptions {
             disabled: Some(false),
@@ -1663,6 +1994,45 @@ embedder_model = "nomic-embed-text"
 
         assert_eq!(truth.embedding_model, embedding_config.model_name());
         assert_eq!(truth.embedding_dimension, embedding_config.dimension());
+        assert!(truth.runtime_profile.is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_resolve_runtime_truth_from_profile_override_uses_dev_preset() {
+        let truth = resolve_runtime_truth_from_config(None, None, Some(MemexRuntimeProfile::Dev))
+            .expect("resolve truth");
+
+        assert_eq!(truth.embedding_model, "qwen3-embedding:4b");
+        assert_eq!(truth.embedding_dimension, 2560);
+        assert_eq!(truth.runtime_profile, Some(MemexRuntimeProfile::Dev));
+        assert!(truth.runtime_summary.contains("via --profile"));
+    }
+
+    #[test]
+    fn test_runtime_profile_config_is_used_when_embeddings_are_absent() {
+        let root = unique_test_dir("runtime-profile-config");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp root");
+
+        let config_path = root.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[runtime]
+profile = "premium"
+"#,
+        )
+        .expect("write config");
+
+        let truth = resolve_runtime_truth_from_config(None, Some(&config_path), None)
+            .expect("resolve truth");
+
+        assert_eq!(truth.embedding_model, "qwen3-embedding:8b");
+        assert_eq!(truth.embedding_dimension, 4096);
+        assert_eq!(truth.runtime_profile, Some(MemexRuntimeProfile::Premium));
+        assert!(truth.runtime_summary.contains("[runtime].profile"));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1705,6 +2075,8 @@ model = "qwen3-embedding:4b"
             embedding_model: "legacy-embedding".to_string(),
             embedding_dimension: 4096,
             config_path: None,
+            runtime_profile: None,
+            runtime_summary: "legacy truth".to_string(),
         };
         save_semantic_index_metadata(&namespace, &stale_truth).expect("save stale metadata");
 
@@ -1712,6 +2084,7 @@ model = "qwen3-embedding:4b"
         let truth = resolve_runtime_truth_from_config(
             Some(db_path.as_path()),
             Some(config_path.as_path()),
+            None,
         )
         .expect("resolve truth for test");
         let err = runtime
