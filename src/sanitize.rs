@@ -9,7 +9,7 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Result, anyhow};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Known safe agent binary names.
 const ALLOWED_AGENTS: &[&str] = &["claude", "codex"];
@@ -19,9 +19,20 @@ const ALLOWED_AGENTS: &[&str] = &["claude", "codex"];
 // ============================================================================
 
 /// Check if a path string contains traversal sequences.
+///
+/// Genuine path traversal is `..` as its own path component (e.g. `../`,
+/// `foo/../bar`). Substring matching against `..` falsely flags innocent
+/// directory names like `...`, `foo..bar`, or `a..b/c`, which broke
+/// real corpus iteration when ingest stored a literal three-dot folder.
+/// We split the path into components and only flag the canonical
+/// `Component::ParentDir`, plus the usual control characters.
 fn contains_traversal(path: &str) -> bool {
-    let path_lower = path.to_lowercase();
-    path_lower.contains("..") || path.contains('\0') || path.contains('\n') || path.contains('\r')
+    if path.contains('\0') || path.contains('\n') || path.contains('\r') {
+        return true;
+    }
+    Path::new(path)
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
 }
 
 /// Get the user's home directory.
@@ -251,6 +262,31 @@ mod tests {
         assert!(!contains_traversal("/normal/path"));
         assert!(!contains_traversal("simple_name"));
         assert!(!contains_traversal("./relative/path"));
+    }
+
+    #[test]
+    fn test_contains_traversal_does_not_flag_three_dot_folder() {
+        // Regression: a literal `...` directory name (yes, it happens — we had
+        // a broken ingest that wrote `~/.aicx/store/...`) is NOT path traversal
+        // and must not nuke the entire corpus iteration.
+        assert!(!contains_traversal("..."));
+        assert!(!contains_traversal("/Users/foo/.aicx/store/..."));
+        assert!(!contains_traversal("foo/.../bar"));
+    }
+
+    #[test]
+    fn test_contains_traversal_does_not_flag_dot_dot_inside_name() {
+        // `..` as a substring inside a normal component is fine; only a
+        // standalone `..` component is genuine traversal.
+        assert!(!contains_traversal("foo..bar"));
+        assert!(!contains_traversal("a..b/c"));
+        assert!(!contains_traversal("normal..text"));
+        assert!(!contains_traversal("/srv/a..b/c"));
+    }
+
+    #[test]
+    fn test_contains_traversal_carriage_return() {
+        assert!(contains_traversal("path\rwith\rcr"));
     }
 
     #[test]
