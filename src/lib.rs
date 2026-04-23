@@ -5,6 +5,7 @@
 pub mod chunker;
 pub mod dashboard;
 pub mod dashboard_server;
+pub mod doctor;
 #[cfg(feature = "native-embedder")]
 pub mod embedder;
 pub mod frontmatter;

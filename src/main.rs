@@ -872,6 +872,30 @@ enum Commands {
         #[arg(long, default_value_t = true)]
         dry_run: bool,
     },
+
+    /// Diagnose and optionally repair the canonical store and steer index.
+    ///
+    /// Runs integrity checks on the Lance steer DB, BM25 index, state.json,
+    /// and sidecar coverage. With --fix, applies safe corrective actions:
+    /// corrupted steer indexes are deleted and rebuilt from the canonical
+    /// store (which is treated as ground truth and never modified).
+    ///
+    /// Exit codes: 0 on green/warning or after successful --fix; 1 if
+    /// critical issues are detected without --fix.
+    #[command(display_order = 12)]
+    Doctor {
+        /// Apply safe corrective actions for detected issues
+        #[arg(long)]
+        fix: bool,
+
+        /// Print recommendations for green checks too
+        #[arg(short, long)]
+        verbose: bool,
+
+        /// Output format: text (default), json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -1216,6 +1240,32 @@ fn main() -> Result<()> {
             let json = serde_json::to_string_pretty(&report)?;
             println!("{json}");
         }
+        Some(Commands::Doctor {
+            fix,
+            verbose,
+            format,
+        }) => {
+            let opts = aicx::doctor::DoctorOptions { fix, verbose };
+            let rt = tokio::runtime::Runtime::new()
+                .context("Failed to start tokio runtime for doctor")?;
+            let report = rt.block_on(aicx::doctor::run(&opts))?;
+
+            match format.as_str() {
+                "json" => {
+                    let json = serde_json::to_string_pretty(&report)?;
+                    println!("{json}");
+                }
+                _ => {
+                    print!("{}", aicx::doctor::format_report_text(&report, verbose));
+                }
+            }
+
+            let exit_code = match report.overall {
+                aicx::doctor::Severity::Critical if !fix => 1,
+                _ => 0,
+            };
+            std::process::exit(exit_code);
+        }
         None => {
             Cli::command().print_help()?;
         }
@@ -1263,81 +1313,31 @@ fn run_intents(
         frame_kind: filters.frame_kind,
     };
 
-    let mut records = intents::extract_intents(&config)?;
+    let records = intents::extract_intents(&config)?;
 
-    if unresolved {
-        use std::collections::HashSet;
-        let mut resolved_sessions = HashSet::new();
-        for rec in &records {
-            if rec.kind == intents::IntentKind::Outcome {
-                resolved_sessions.insert(rec.session_id.clone());
-            }
-        }
-        records.retain(|r| {
-            r.kind != intents::IntentKind::Intent || !resolved_sessions.contains(&r.session_id)
-        });
-    }
-
-    if collapse_session {
-        use std::collections::HashMap;
-        let mut map = HashMap::new();
-        let mut order = Vec::new();
-        for rec in records {
-            let key = rec.session_id.clone();
-            match map.entry(key.clone()) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    order.push(key);
-                    let mut clone = rec.clone();
-                    clone.count = Some(1);
-                    entry.insert(clone);
-                }
-                std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    let existing = entry.get_mut();
-                    *existing.count.as_mut().unwrap() += 1;
-                    if !existing.evidence.contains(&rec.summary) {
-                        existing.evidence.push(rec.summary);
-                    }
-                    if !existing.source_chunk.contains(&rec.source_chunk) {
-                        existing.source_chunk =
-                            format!("{}, {}", existing.source_chunk, rec.source_chunk);
-                    }
-                }
-            }
-        }
-        records = order.into_iter().filter_map(|k| map.remove(&k)).collect();
-    }
-
-    if let Some(agent_filter) = &filters.agent {
-        records.retain(|r| r.agent == *agent_filter);
-    }
-
-    let (lo, hi) = if let Some(ref d) = filters.since {
+    let (date_lo, date_hi) = if let Some(ref d) = filters.since {
         let bounds = parse_date_filter(d)?;
         (bounds.0, bounds.1)
     } else {
         (None, filters.until.clone())
     };
 
-    if lo.is_some() || hi.is_some() {
-        records.retain(|r| {
-            lo.as_ref().is_none_or(|lo| r.date.as_str() >= lo.as_str())
-                && hi.as_ref().is_none_or(|hi| r.date.as_str() <= hi.as_str())
-        });
-    }
+    let display_filters = intents::IntentDisplayFilters {
+        unresolved,
+        collapse_session,
+        agent: filters.agent.clone(),
+        date_lo,
+        date_hi,
+        sort: filters.sort.map(|s| match s {
+            SortOrder::Newest => intents::IntentSortOrder::Newest,
+            SortOrder::Oldest => intents::IntentSortOrder::Oldest,
+            // Score sort isn't meaningful for intents (no score field); fall back to newest.
+            SortOrder::Score => intents::IntentSortOrder::Newest,
+        }),
+        limit: Some(filters.limit),
+    };
 
-    if let Some(sort_order) = filters.sort {
-        records.sort_by(|a, b| {
-            let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
-            let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
-            match sort_order {
-                SortOrder::Newest => t_b.cmp(t_a),
-                SortOrder::Oldest => t_a.cmp(t_b),
-                SortOrder::Score => std::cmp::Ordering::Equal, // Not supported
-            }
-        });
-    }
-
-    records.truncate(filters.limit);
+    let records = intents::apply_display_filters(records, &display_filters);
 
     if records.is_empty() {
         eprintln!(

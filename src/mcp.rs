@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Guard that prevents concurrent background refresh child-process spawns.
 static RESCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 
+use crate::intents::{self, IntentKind, IntentsConfig};
 use crate::rank;
 use crate::store;
 use crate::types::FrameKind;
@@ -124,6 +125,55 @@ pub struct SteerParams {
 
 fn default_steer_limit() -> usize {
     20
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct IntentsParams {
+    /// Optional project filter (case-insensitive substring; empty/None = all projects)
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Hours to look back (default: 720 = 30 days, 0 = all time). Matches CLI default.
+    #[serde(default = "default_intents_hours")]
+    pub hours: u64,
+    /// Strict mode: only emit high-confidence intents (default: false)
+    #[serde(default)]
+    pub strict: bool,
+    /// Optional kind filter: decision, intent, outcome, task
+    pub kind: Option<String>,
+    /// Optional frame/channel filter: user_msg, agent_reply, internal_thought, tool_call
+    pub frame_kind: Option<FrameKind>,
+    /// Filter to intent entries lacking a matching outcome in the same session
+    #[serde(default)]
+    pub unresolved: bool,
+    /// Collapse multiple intents from the same session into one entry with count
+    #[serde(default)]
+    pub collapse_session: bool,
+    /// Optional agent filter (claude, codex, gemini, junie)
+    pub agent: Option<String>,
+    /// Optional lower date bound (YYYY-MM-DD or single-day shorthand like 2026-04-23..)
+    pub since: Option<String>,
+    /// Optional upper date bound (YYYY-MM-DD)
+    pub until: Option<String>,
+    /// Sort order: newest (default), oldest
+    pub sort: Option<String>,
+    /// Max records to return (default: 50, capped at 500)
+    #[serde(default = "default_intents_limit")]
+    pub limit: usize,
+    /// Output format: json (default), markdown. Matches CLI `emit` naming.
+    #[serde(default = "default_intents_emit")]
+    pub emit: String,
+}
+
+fn default_intents_hours() -> u64 {
+    720
+}
+
+fn default_intents_limit() -> usize {
+    50
+}
+
+fn default_intents_emit() -> String {
+    "json".to_string()
 }
 
 #[derive(Debug, Serialize)]
@@ -513,6 +563,81 @@ impl AicxMcpServer {
         .map_err(|e| McpError::internal_error(format!("Serialize steer JSON: {e}"), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "aicx_intents",
+        description = "Retrieve structured intentions, decisions, outcomes, and tasks extracted from the canonical store. Returns the third sense in the aicx perception/intention/ground-truth triad — surfaces what the team meant to build, decided, deferred, or completed, with source_chunk back-references for grounded follow-up. Mirrors the `aicx intents` CLI: filter by project, hours window (default 720 = 30 days), kind (decision/intent/outcome/task), frame_kind, agent, date range, plus unresolved (intents without matching outcome) and collapse_session (group by session with count). Default: 50 records, last 30 days, all projects, JSON. Cap: 500."
+    )]
+    async fn intents(
+        &self,
+        Parameters(params): Parameters<IntentsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let kind_filter = match params.kind.as_deref() {
+            None => None,
+            Some(s) => match s.to_lowercase().as_str() {
+                "decision" => Some(IntentKind::Decision),
+                "intent" => Some(IntentKind::Intent),
+                "outcome" => Some(IntentKind::Outcome),
+                "task" => Some(IntentKind::Task),
+                other => {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "Unknown intent kind: '{other}'. Expected one of: decision, intent, outcome, task"
+                        ),
+                        None,
+                    ));
+                }
+            },
+        };
+
+        let sort = match params.sort.as_deref() {
+            None => None,
+            Some(s) => match s.to_lowercase().as_str() {
+                "newest" => Some(intents::IntentSortOrder::Newest),
+                "oldest" => Some(intents::IntentSortOrder::Oldest),
+                other => {
+                    return Err(McpError::invalid_params(
+                        format!("Unknown sort order: '{other}'. Expected: newest, oldest"),
+                        None,
+                    ));
+                }
+            },
+        };
+
+        let config = IntentsConfig {
+            project: params.project.unwrap_or_default(),
+            hours: params.hours,
+            strict: params.strict,
+            kind_filter,
+            frame_kind: params.frame_kind,
+        };
+
+        let records = intents::extract_intents(&config)
+            .map_err(|e| McpError::internal_error(format!("Extract intents: {e}"), None))?;
+
+        let limit_capped = params.limit.min(500);
+
+        let display_filters = intents::IntentDisplayFilters {
+            unresolved: params.unresolved,
+            collapse_session: params.collapse_session,
+            agent: params.agent,
+            date_lo: params.since,
+            date_hi: params.until,
+            sort,
+            limit: Some(limit_capped),
+        };
+
+        let records = intents::apply_display_filters(records, &display_filters);
+
+        let body = match params.emit.as_str() {
+            "markdown" | "md" => intents::format_intents_markdown(&records),
+            _ => intents::format_intents_json(&records).map_err(|e| {
+                McpError::internal_error(format!("Serialize intents JSON: {e}"), None)
+            })?,
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 }
 

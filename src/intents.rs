@@ -135,6 +135,115 @@ pub fn extract_intents(config: &IntentsConfig) -> Result<Vec<IntentRecord>> {
     extract_intents_from_root_at(config, &store_root, Utc::now())
 }
 
+/// Sort order for `apply_display_filters`. Mirrors the CLI's `SortOrder`
+/// without importing main.rs types into the library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntentSortOrder {
+    Newest,
+    Oldest,
+}
+
+/// Display-time filters applied AFTER `extract_intents`.
+///
+/// Promoted from `main.rs::run_intents` so that both the CLI and the MCP
+/// `aicx_intents` tool can reuse the same post-processing pipeline. Without
+/// this, MCP would silently lose `unresolved`/`collapse_session`/`agent`/
+/// date-range/sort/limit semantics.
+#[derive(Debug, Clone, Default)]
+pub struct IntentDisplayFilters {
+    pub unresolved: bool,
+    pub collapse_session: bool,
+    pub agent: Option<String>,
+    pub date_lo: Option<String>,
+    pub date_hi: Option<String>,
+    pub sort: Option<IntentSortOrder>,
+    pub limit: Option<usize>,
+}
+
+/// Apply display-time filters to intent records.
+///
+/// Order matters: `unresolved` and `collapse_session` are session-scoped
+/// transformations and must run before `agent`/date filters or the count
+/// aggregation in `collapse_session` becomes inconsistent with the
+/// downstream filters.
+pub fn apply_display_filters(
+    mut records: Vec<IntentRecord>,
+    filters: &IntentDisplayFilters,
+) -> Vec<IntentRecord> {
+    if filters.unresolved {
+        let mut resolved_sessions = HashSet::new();
+        for rec in &records {
+            if rec.kind == IntentKind::Outcome {
+                resolved_sessions.insert(rec.session_id.clone());
+            }
+        }
+        records
+            .retain(|r| r.kind != IntentKind::Intent || !resolved_sessions.contains(&r.session_id));
+    }
+
+    if filters.collapse_session {
+        let mut map: HashMap<String, IntentRecord> = HashMap::new();
+        let mut order = Vec::new();
+        for rec in records {
+            let key = rec.session_id.clone();
+            match map.entry(key.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    order.push(key);
+                    let mut clone = rec.clone();
+                    clone.count = Some(1);
+                    entry.insert(clone);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let existing = entry.get_mut();
+                    *existing.count.as_mut().unwrap() += 1;
+                    if !existing.evidence.contains(&rec.summary) {
+                        existing.evidence.push(rec.summary);
+                    }
+                    if !existing.source_chunk.contains(&rec.source_chunk) {
+                        existing.source_chunk =
+                            format!("{}, {}", existing.source_chunk, rec.source_chunk);
+                    }
+                }
+            }
+        }
+        records = order.into_iter().filter_map(|k| map.remove(&k)).collect();
+    }
+
+    if let Some(agent_filter) = &filters.agent {
+        records.retain(|r| &r.agent == agent_filter);
+    }
+
+    if filters.date_lo.is_some() || filters.date_hi.is_some() {
+        records.retain(|r| {
+            filters
+                .date_lo
+                .as_ref()
+                .is_none_or(|lo| r.date.as_str() >= lo.as_str())
+                && filters
+                    .date_hi
+                    .as_ref()
+                    .is_none_or(|hi| r.date.as_str() <= hi.as_str())
+        });
+    }
+
+    if let Some(sort_order) = filters.sort {
+        records.sort_by(|a, b| {
+            let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
+            let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
+            match sort_order {
+                IntentSortOrder::Newest => t_b.cmp(t_a),
+                IntentSortOrder::Oldest => t_a.cmp(t_b),
+            }
+        });
+    }
+
+    if let Some(limit) = filters.limit {
+        records.truncate(limit);
+    }
+
+    records
+}
+
 pub fn format_intents_markdown(records: &[IntentRecord]) -> String {
     if records.is_empty() {
         return String::new();

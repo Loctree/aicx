@@ -343,8 +343,9 @@ async fn sync_steer_index_at(base: &Path, new_files: &[&PathBuf]) -> Result<()> 
         return Ok(());
     }
 
-    for doc in &docs {
-        let _ = storage.delete_document(STEER_NAMESPACE, &doc.id).await;
+    let ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
+    for id in ids {
+        let _ = storage.delete_document(STEER_NAMESPACE, id).await;
     }
 
     for chunk in docs.chunks(1000) {
