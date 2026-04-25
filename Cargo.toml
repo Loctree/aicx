@@ -25,8 +25,8 @@ default = []
 # the HuggingFace cache at build time; falls back to runtime cache lookup.
 # Build presets:
 #   - base (default, via AICX_BUILD_PROFILE=base): sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-#   - dev   (AICX_BUILD_PROFILE=dev):              harrier-oss/harrier-oss-0.6b
-#   - premium (AICX_BUILD_PROFILE=premium):        F2-LLM/F2-LLM-v2-1.7b
+#   - dev   (AICX_BUILD_PROFILE=dev):              microsoft/harrier-oss-v1-0.6b
+#   - premium (AICX_BUILD_PROFILE=premium):        codefuse-ai/F2LLM-v2-1.7B
 # AICX_EMBEDDER_REPO still wins as the exact override.
 # Combined with the lightweight base runtime this keeps a complete bundle under
 # ~1.1 GB for the default path, while leaving stronger machines an explicit

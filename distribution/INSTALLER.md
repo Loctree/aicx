@@ -31,6 +31,8 @@ If the product has an optional local embedder:
 - the picker should write a deterministic config file
 - the picker must not silently download a heavy model
 - if a model download is offered, it must be explicit and opt-in
+- the picker must not rewrite active rmcp/rust-memex provider settings
+- large retrieval profiles such as 4096-dim Qwen remain owned by the retrieval engine config, not by the installer picker
 
 Recommended picker outcomes:
 

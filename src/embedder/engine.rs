@@ -21,8 +21,8 @@ use crate::hf_cache;
 
 const DEFAULT_MAX_LENGTH: usize = 512;
 const DEFAULT_FALLBACK_REPO: &str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2";
-const DEV_FALLBACK_REPO: &str = "harrier-oss/harrier-oss-0.6b";
-const PREMIUM_FALLBACK_REPO: &str = "F2-LLM/F2-LLM-v2-1.7b";
+const DEV_FALLBACK_REPO: &str = "microsoft/harrier-oss-v1-0.6b";
+const PREMIUM_FALLBACK_REPO: &str = "codefuse-ai/F2LLM-v2-1.7B";
 
 /// Where the live embedder weights came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -587,10 +587,10 @@ mod tests {
     fn config_from_env_respects_repo_override() {
         // SAFETY: a cargo test process has no concurrent readers of AICX_EMBEDDER_REPO.
         unsafe {
-            std::env::set_var("AICX_EMBEDDER_REPO", "harrier-oss/harrier-oss-0.6b");
+            std::env::set_var("AICX_EMBEDDER_REPO", "microsoft/harrier-oss-v1-0.6b");
         }
         let cfg = EmbedderConfig::from_env();
-        assert_eq!(cfg.repo.as_deref(), Some("harrier-oss/harrier-oss-0.6b"));
+        assert_eq!(cfg.repo.as_deref(), Some("microsoft/harrier-oss-v1-0.6b"));
         unsafe {
             std::env::remove_var("AICX_EMBEDDER_REPO");
         }

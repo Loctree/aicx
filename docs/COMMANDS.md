@@ -368,6 +368,8 @@ aicx memex-sync --profile premium
 Notes:
 - Runtime preset helpers (`--profile`, `AICX_RUNTIME_PROFILE`) are convenience inputs around the active memex provider config; explicit `[embeddings]` and legacy `[mlx]` config remain authoritative.
 - Persist active memex provider choices in `rust-memex` config, usually `~/.rmcp-servers/rust-memex/config.toml`, or point `RUST_MEMEX_CONFIG` at an explicit file.
+- Large Qwen-family settings, including the 4096-dim premium path, stay on this memex provider plane. They are not configured through `~/.aicx/embedder.toml` or `AICX_EMBEDDER_CONFIG`.
+- Native embedder settings are only for optional in-process native-embedder builds/runtimes and do not change what `memex-sync` currently uses.
 - Default batch materialization embeds and upserts chunks in-process via the `rmcp-memex` library, preserving `project`, `agent`, `date`, `session_id`, and `kind` metadata for semantic filtering.
 - The canonical store's nested structure is traversed automatically during materialization.
 - If `~/.aicx/.aicxignore` exists, matching chunk paths are excluded before materialization and the final summary reports how many were ignored.

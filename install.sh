@@ -73,6 +73,7 @@ for arg in "$@"; do
       echo "  --pick-embedder                    # interactive config for ~/.aicx/embedder.toml"
       echo "  --embedder-profile=base|dev|premium"
       echo "  --no-embedder-prompt               # suppress interactive picker"
+      echo "  note: this does not change rust-memex/Qwen provider settings for memex-sync"
       exit 0
       ;;
   esac
@@ -146,8 +147,8 @@ normalise_bool() {
 embedder_repo_for_profile() {
   case "${1:-}" in
     base) echo "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2" ;;
-    dev) echo "harrier-oss/harrier-oss-0.6b" ;;
-    premium) echo "F2-LLM/F2-LLM-v2-1.7b" ;;
+    dev) echo "microsoft/harrier-oss-v1-0.6b" ;;
+    premium) echo "codefuse-ai/F2LLM-v2-1.7B" ;;
     *) return 1 ;;
   esac
 }
@@ -693,3 +694,4 @@ echo ""
 echo "Native embedder config (optional, future native-embedder builds/releases):"
 echo "  ~/.aicx/embedder.toml"
 echo "  bash install.sh --pick-embedder"
+echo "  Note: large memex/Qwen provider settings still live in rust-memex config."

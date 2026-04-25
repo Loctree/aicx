@@ -107,8 +107,8 @@ Profile defaults:
 - Optional native embedder picker during install: `bash install.sh --pick-embedder`
 
 Config truth:
-- Active memex retrieval config lives in `rust-memex` discovery paths such as `~/.rmcp-servers/rust-memex/config.toml`
-- Native embedder preferences live in `~/.aicx/embedder.toml`
+- Active memex retrieval config lives in `rust-memex` discovery paths such as `~/.rmcp-servers/rust-memex/config.toml`; this is where large Qwen / 4096-dim provider choices belong.
+- Native embedder preferences live in `~/.aicx/embedder.toml`; this is only for the optional native in-process embedder and does not replace rmcp/rust-memex settings.
 - Current public release bundles stay slim; they do not auto-bundle model weights
 
 ## Quickstart
@@ -253,6 +253,7 @@ Runtime profile resolution:
 - Env helper override: set `AICX_RUNTIME_PROFILE=<base|dev|premium>`
 - Config override: set `RUST_MEMEX_CONFIG=/path/to/config.toml` or edit the discovered `rust-memex` config file, usually `~/.rmcp-servers/rust-memex/config.toml`
 - Explicit `[embeddings]` and legacy `[mlx]` config remain authoritative; helper presets should be treated as convenience, not as hidden overrides of hand-pinned providers or dimensions
+- Native embedder config (`~/.aicx/embedder.toml`, `AICX_EMBEDDER_CONFIG`, `AICX_BUILD_PROFILE`) does not affect this memex provider path.
 
 Example persistent config:
 

@@ -28,6 +28,15 @@ Recommended user journey:
 
 ## Config contract
 
+There are two planes:
+
+- active retrieval/materialization config
+- optional local native embedder preference
+
+The native preference file is **not** the successor to rmcp/rust-memex settings.
+It exists so products can choose an in-process fallback model without making the
+core install heavy.
+
 Native embedder preference file:
 
 - `~/.aicx/embedder.toml`
@@ -67,7 +76,15 @@ the retrieval engine itself. In `aicx` today that is `rust-memex`, typically:
 - `~/.rmcp-servers/rust-memex/config.toml`
 - or `RUST_MEMEX_CONFIG`
 
-Do not pretend these are the same file. They govern different layers.
+This is also where the large/premium Qwen-family retrieval settings belong.
+The 4096-dim Qwen 8B path is not configured through `~/.aicx/embedder.toml`.
+
+Do not pretend these are the same file. They govern different layers:
+
+- `RUST_MEMEX_CONFIG` / rust-memex config: active semantic materialization and
+  provider selection for `memex-sync`
+- `AICX_EMBEDDER_CONFIG` / `~/.aicx/embedder.toml`: optional native embedder
+  repo/path selection for native-embedder builds or runtimes
 
 ## Download timing
 

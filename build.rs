@@ -22,11 +22,11 @@ use std::path::{Path, PathBuf};
 /// Default embedder repository. Conservative choice that fits the 1.1 GB bundle
 /// budget when embedded (fp16 ~224 MB). Operators can swap in suggested
 /// alternatives via `AICX_EMBEDDER_REPO`:
-///   harrier-oss/harrier-oss-0.6b     (~0.6B params, code-focused)
-///   F2-LLM/F2-LLM-v2-1.7b            (~1.7B params, larger recall budget)
+///   microsoft/harrier-oss-v1-0.6b     (~0.6B params, code-focused)
+///   codefuse-ai/F2LLM-v2-1.7B            (~1.7B params, larger recall budget)
 const DEFAULT_EMBEDDER_REPO: &str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2";
-const DEV_EMBEDDER_REPO: &str = "harrier-oss/harrier-oss-0.6b";
-const PREMIUM_EMBEDDER_REPO: &str = "F2-LLM/F2-LLM-v2-1.7b";
+const DEV_EMBEDDER_REPO: &str = "microsoft/harrier-oss-v1-0.6b";
+const PREMIUM_EMBEDDER_REPO: &str = "codefuse-ai/F2LLM-v2-1.7B";
 
 #[derive(Clone, Copy)]
 enum BuildProfile {

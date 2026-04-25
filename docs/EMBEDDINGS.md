@@ -41,9 +41,13 @@ cargo build --release --features native-embedder
 
 Build profile resolution:
 - `AICX_BUILD_PROFILE=base` or unset: embed `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
-- `AICX_BUILD_PROFILE=dev`: embed `harrier-oss/harrier-oss-0.6b`
-- `AICX_BUILD_PROFILE=premium`: embed `F2-LLM/F2-LLM-v2-1.7b`
+- `AICX_BUILD_PROFILE=dev`: embed `microsoft/harrier-oss-v1-0.6b`
+- `AICX_BUILD_PROFILE=premium`: embed `codefuse-ai/F2LLM-v2-1.7B`
 - `AICX_EMBEDDER_REPO=<owner/name>` still wins as the exact override
+
+These build profiles are **native-embedder profiles only**. They do not change
+the current `memex-sync` provider, the rust-memex HTTP/provider config, or the
+Qwen-family 1024/2560/4096-dim presets.
 
 To keep a complete bundle under ~1.1 GB the default `base` profile uses the
 conservative `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
@@ -53,8 +57,8 @@ an even larger local model with the build profiles above:
 | Model                                  | Params | Size (fp16) | Include-in-bundle? |
 |----------------------------------------|-------:|------------:|--------------------|
 | MiniLM L12 multilingual (default)      | 118M   | ~224 MB     | yes                |
-| `harrier-oss/harrier-oss-0.6b`         | 0.6B   | ~1.1 GB     | yes (bundle cap)   |
-| `F2-LLM/F2-LLM-v2-1.7b`                | 1.7B   | ~3.4 GB     | runtime-only       |
+| `microsoft/harrier-oss-v1-0.6b`         | 0.6B   | ~1.1 GB     | yes (bundle cap)   |
+| `codefuse-ai/F2LLM-v2-1.7B`                | 1.7B   | ~3.4 GB     | runtime-only       |
 
 For the 1.7B tier we recommend leaving the model in the HF cache and loading it
 at runtime — embedding a 3+ GB weights file would blow past our 1.1 GB total
@@ -107,16 +111,28 @@ The newest snapshot with all three required files wins.
 
 ## Operator config files
 
-Two different config surfaces exist today and they should not be conflated:
+Two different config surfaces exist today and they should not be conflated.
+The split is intentional because they govern different runtime planes:
 
 1. Active memex retrieval provider config:
    - usually `~/.rmcp-servers/rust-memex/config.toml`
    - or an explicit file via `RUST_MEMEX_CONFIG`
-   - this governs the current `memex-sync` HTTP/provider path
+   - this governs the current `memex-sync` provider path, including the large Qwen-family `dev` / `premium` setups
 2. Native embedder preference config:
    - `~/.aicx/embedder.toml`
    - or an explicit file via `AICX_EMBEDDER_CONFIG`
-   - this governs which native embedder repo/path a native-embedder build will try to load
+   - this governs only which local native embedder repo/path a native-embedder build or runtime will try to load
+
+Compatibility rule:
+
+- If you are configuring the 4096-dim Qwen 8B / premium memex path, use
+  `rust-memex` config, `RUST_MEMEX_CONFIG`, `AICX_RUNTIME_PROFILE=premium`, or
+  `aicx memex-sync --profile premium`.
+- Do not put that setting in `~/.aicx/embedder.toml`; that file is not read as
+  an rmcp/rust-memex provider config and should not be treated as a successor to
+  shared memex settings.
+- Conversely, `rust-memex` config does not decide which native model gets
+  embedded into an `aicx` binary via `include_bytes!`.
 
 Recommended native embedder config:
 
@@ -134,15 +150,16 @@ heavy model into the bundle.
 
 | Variable                | Scope          | Effect                                                    |
 |-------------------------|----------------|-----------------------------------------------------------|
-| `AICX_EMBEDDER_REPO`    | build + runtime| HF repo id to embed / load (`owner/name`).                |
-| `AICX_BUILD_PROFILE`    | build          | Build preset: `base`, `dev`, or `premium`.                |
+| `AICX_EMBEDDER_REPO`    | build + runtime| Native HF repo id to embed / load (`owner/name`).         |
+| `AICX_BUILD_PROFILE`    | build          | Native build preset: `base`, `dev`, or `premium`.         |
 | `AICX_EMBEDDER_PATH`    | build + runtime| Absolute path to a model directory — bypasses HF cache.   |
-| `AICX_EMBEDDER_CONFIG`  | build + runtime| Explicit config file overriding `~/.aicx/embedder.toml`.  |
+| `AICX_EMBEDDER_CONFIG`  | build + runtime| Explicit native config overriding `~/.aicx/embedder.toml`.|
 | `AICX_NO_EMBED=1`       | build          | Skip `include_bytes!` even if cache has the model.        |
 | `AICX_HF_CACHE`         | build + runtime| Extra HF cache base to search first.                      |
 
-All four are honoured by both `build.rs` and the runtime engine, so you never
-have to remember which one is which.
+These variables are honoured by both `build.rs` and the native runtime engine.
+They are deliberately not aliases for `RUST_MEMEX_CONFIG`, and they do not
+change the active `memex-sync` HTTP/provider path.
 
 ## Non-destructive namespace handling
 
@@ -191,6 +208,10 @@ need deterministic, offline-capable embeddings. Future work will expose it as
 an additional `EmbeddingBackend` inside the sync pipeline so operators can
 choose between HTTP (Qwen3/MLX on the LAN) and in-process (Harrier/F2-LLM on
 the laptop) per project.
+
+Until that backend switch exists, large retrieval settings remain rust-memex
+settings. `~/.aicx/embedder.toml` is a native-embedder preference file, not the
+place where the current rmcp/rust-memex provider stopped being configured.
 
 On the HTTP memex path, `aicx` now also exposes explicit runtime presets:
 - `base` (default): 1024-dim Qwen 0.6B
