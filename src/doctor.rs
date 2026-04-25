@@ -1,26 +1,31 @@
 //! Diagnostic and self-healing layer for aicx.
 //!
 //! `aicx doctor` performs an integrity audit of the canonical store, the
-//! steer index (Lance + BM25), state.json, and sidecar coverage. With
+//! steer index (Lance + BM25), state.json, sidecar coverage, and corpus
+//! bucket names. With
 //! `--fix`, safe corrective actions are applied: corrupted steer indexes
 //! are rebuilt from canonical store via `steer_index::rebuild_steer_index_if_needed`.
+//! With `--fix-buckets`, suspicious top-level store buckets are moved to
+//! timestamped quarantine.
 //!
-//! The canonical store (`~/.aicx/store/`) is treated as ground truth and
-//! never modified. Derived views (steer_db, steer_bm25) are rebuildable
-//! and may be deleted under `--fix`.
+//! The canonical store (`~/.aicx/store/`) is treated as ground truth: doctor
+//! never deletes store contents. Bucket quarantine is a rename into
+//! `~/.aicx/quarantine/<timestamp>/`, preserving the original payload.
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Context, Result};
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::steer_index;
 use crate::store;
+use crate::validation::is_valid_repo_bucket_name;
 
 #[derive(Debug, Clone)]
 pub struct DoctorOptions {
     pub fix: bool,
+    pub fix_buckets: bool,
     pub verbose: bool,
 }
 
@@ -47,6 +52,7 @@ pub struct DoctorReport {
     pub steer_bm25: CheckResult,
     pub state: CheckResult,
     pub sidecars: CheckResult,
+    pub corpus_buckets: CheckResult,
     pub fixes_applied: Vec<String>,
     pub overall: Severity,
 }
@@ -59,6 +65,7 @@ pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
     let steer_bm25 = check_steer_bm25(&base);
     let state = check_state(&base);
     let sidecars = check_sidecar_coverage(&base);
+    let corpus_buckets = check_corpus_buckets(&base);
 
     let mut fixes_applied = Vec::new();
 
@@ -71,12 +78,43 @@ pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
         }
     }
 
+    if opts.fix_buckets {
+        let store_root = base.join("store");
+        match suspicious_corpus_buckets(&store_root) {
+            Ok(suspicious) if suspicious.is_empty() => {
+                fixes_applied.push("no suspicious corpus buckets to quarantine".to_string());
+            }
+            Ok(suspicious) => {
+                let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+                let single_bucket = suspicious.len() == 1;
+                for bucket_name in suspicious {
+                    let result = if single_bucket {
+                        quarantine_bucket(&store_root, &bucket_name)
+                    } else {
+                        quarantine_bucket_with_timestamp(&store_root, &bucket_name, &timestamp)
+                    };
+                    match result {
+                        Ok(dst) => fixes_applied.push(format!(
+                            "quarantined corpus bucket `{bucket_name}` to {}",
+                            dst.display()
+                        )),
+                        Err(e) => fixes_applied.push(format!(
+                            "failed to quarantine corpus bucket `{bucket_name}`: {e}"
+                        )),
+                    }
+                }
+            }
+            Err(e) => fixes_applied.push(format!("bucket quarantine skipped: {e}")),
+        }
+    }
+
     let overall = max_severity(&[
         canonical_store.severity,
         steer_lance.severity,
         steer_bm25.severity,
         state.severity,
         sidecars.severity,
+        corpus_buckets.severity,
     ]);
 
     Ok(DoctorReport {
@@ -85,6 +123,7 @@ pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
         steer_bm25,
         state,
         sidecars,
+        corpus_buckets,
         fixes_applied,
         overall,
     })
@@ -267,6 +306,125 @@ fn check_sidecar_coverage(base: &Path) -> CheckResult {
     }
 }
 
+fn check_corpus_buckets(base: &Path) -> CheckResult {
+    let store_root = base.join("store");
+    if !store_root.exists() {
+        return CheckResult {
+            name: "corpus_buckets".to_string(),
+            severity: Severity::Green,
+            detail: format!("No corpus store exists at {}", store_root.display()),
+            recommendation: None,
+        };
+    }
+
+    let bucket_count = match count_corpus_buckets(&store_root) {
+        Ok(count) => count,
+        Err(e) => {
+            return CheckResult {
+                name: "corpus_buckets".to_string(),
+                severity: Severity::Critical,
+                detail: format!("Failed to read corpus buckets: {e}"),
+                recommendation: Some(format!(
+                    "Check filesystem permissions on {}",
+                    store_root.display()
+                )),
+            };
+        }
+    };
+
+    match suspicious_corpus_buckets(&store_root) {
+        Ok(suspicious) if suspicious.is_empty() => CheckResult {
+            name: "corpus_buckets".to_string(),
+            severity: Severity::Green,
+            detail: format!("All {bucket_count} top-level org buckets pass schema check"),
+            recommendation: None,
+        },
+        Ok(suspicious) => CheckResult {
+            name: "corpus_buckets".to_string(),
+            severity: Severity::Warning,
+            detail: format!(
+                "{} suspicious bucket(s): {}",
+                suspicious.len(),
+                suspicious.join(", ")
+            ),
+            recommendation: Some(
+                "Run `aicx doctor --fix-buckets` to move them to $HOME/.aicx/quarantine/"
+                    .to_string(),
+            ),
+        },
+        Err(e) => CheckResult {
+            name: "corpus_buckets".to_string(),
+            severity: Severity::Critical,
+            detail: format!("Failed to read corpus buckets: {e}"),
+            recommendation: Some(format!(
+                "Check filesystem permissions on {}",
+                store_root.display()
+            )),
+        },
+    }
+}
+
+fn count_corpus_buckets(store_root: &Path) -> Result<usize> {
+    let mut count = 0usize;
+    for entry in std::fs::read_dir(store_root).context("read corpus store root")? {
+        let entry = entry.context("read corpus store entry")?;
+        if entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn suspicious_corpus_buckets(store_root: &Path) -> Result<Vec<String>> {
+    if !store_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut suspicious = Vec::new();
+    for entry in std::fs::read_dir(store_root).context("read corpus store root")? {
+        let entry = entry.context("read corpus store entry")?;
+        if !entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !is_valid_repo_bucket_name(&name) {
+            suspicious.push(name);
+        }
+    }
+    suspicious.sort();
+    Ok(suspicious)
+}
+
+fn quarantine_bucket(store_root: &Path, bucket_name: &str) -> Result<PathBuf> {
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    quarantine_bucket_with_timestamp(store_root, bucket_name, &timestamp)
+}
+
+fn quarantine_bucket_with_timestamp(
+    store_root: &Path,
+    bucket_name: &str,
+    timestamp: &str,
+) -> Result<PathBuf> {
+    let quarantine_root = store_root
+        .parent()
+        .context("store root has no parent for quarantine")?
+        .join("quarantine")
+        .join(timestamp);
+    std::fs::create_dir_all(&quarantine_root).context("create quarantine root")?;
+    let src = store_root.join(bucket_name);
+    let dst = quarantine_root.join(bucket_name);
+    std::fs::rename(&src, &dst).with_context(|| {
+        format!(
+            "rename corpus bucket {} to {}",
+            src.display(),
+            dst.display()
+        )
+    })?;
+    Ok(dst)
+}
+
 async fn attempt_steer_rebuild(base: &Path) -> Result<String> {
     let steer_db = base.join("steer_db");
     let steer_bm25 = base.join("steer_bm25");
@@ -322,6 +480,7 @@ pub fn format_report_text(report: &DoctorReport, verbose: bool) -> String {
         &report.steer_bm25,
         &report.state,
         &report.sidecars,
+        &report.corpus_buckets,
     ];
     for check in checks {
         out.push_str(&format!(
@@ -367,5 +526,75 @@ mod tests {
         let result = check_canonical_store(&tmp);
         assert_eq!(result.severity, Severity::Warning);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn check_corpus_buckets_green_when_only_valid_names() {
+        let tmp = unique_test_dir("valid-buckets");
+        let store = tmp.join("store");
+        std::fs::create_dir_all(store.join("VetCoders")).unwrap();
+        std::fs::create_dir_all(store.join("LibraxisAI")).unwrap();
+        std::fs::create_dir_all(store.join("local")).unwrap();
+
+        let result = check_corpus_buckets(&tmp);
+        assert_eq!(result.severity, Severity::Green);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn check_corpus_buckets_flags_template_literals() {
+        let tmp = unique_test_dir("bad-buckets");
+        let store = tmp.join("store");
+        std::fs::create_dir_all(store.join("VetCoders")).unwrap();
+        std::fs::create_dir_all(store.join("{target_owner}")).unwrap();
+        std::fs::create_dir_all(store.join("...")).unwrap();
+
+        let result = check_corpus_buckets(&tmp);
+        assert_eq!(result.severity, Severity::Warning);
+        assert!(result.detail.contains("{target_owner}"));
+        assert!(result.detail.contains("..."));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn quarantine_moves_bucket_atomically() {
+        let tmp = unique_test_dir("quarantine-move");
+        let store = tmp.join("store");
+        let bad = store.join("{x}");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("test.md"), "content").unwrap();
+
+        let dest = quarantine_bucket(&store, "{x}").unwrap();
+        assert!(dest.exists());
+        assert!(!bad.exists());
+        assert!(dest.join("test.md").exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn quarantine_skips_when_no_buckets_match() {
+        let tmp = unique_test_dir("quarantine-noop");
+        let store = tmp.join("store");
+        std::fs::create_dir_all(store.join("VetCoders")).unwrap();
+        std::fs::create_dir_all(store.join("local")).unwrap();
+
+        let suspicious = suspicious_corpus_buckets(&store).unwrap();
+        assert!(suspicious.is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let tmp = std::env::temp_dir().join(format!(
+            "aicx-doctor-{label}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        tmp
     }
 }
