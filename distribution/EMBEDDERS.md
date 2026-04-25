@@ -8,7 +8,7 @@ should ship optional embedders without turning every binary into a giant blob.
 There are two separate concerns and they must stay separate:
 
 1. Shipping the product binary.
-2. Hydrating an optional local embedding model.
+2. Hydrating a local embedding model.
 
 Default rule:
 
@@ -24,18 +24,18 @@ Recommended user journey:
 2. Optionally run an installer picker.
 3. The picker writes a small deterministic config file.
 4. The picker may optionally prime the local model cache, but only with explicit user consent.
-5. Runtime loads the configured model from embedded bytes or from the local cache.
+5. Runtime loads the configured model from an explicit path or from the local cache.
 
 ## Config contract
 
 There are two planes:
 
-- active retrieval/materialization config
-- optional local native embedder preference
+- active heavy retrieval/operator config
+- local native embedder preference
 
 The native preference file is **not** the successor to rmcp/rust-memex settings.
-It exists so products can choose an in-process fallback model without making the
-core install heavy.
+It exists so products can choose the first-choice local embedding model without
+making the core install heavy.
 
 Native embedder preference file:
 
@@ -46,17 +46,21 @@ Suggested file shape:
 
 ```toml
 [native_embedder]
+backend = "gguf"
 profile = "base"
-repo = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-prefer_embedded = true
+repo = "mradermacher/F2LLM-v2-0.6B-GGUF"
+filename = "F2LLM-v2-0.6B.Q4_K_M.gguf"
+prefer_embedded = false
+max_length = 512
 ```
 
 Optional explicit path:
 
 ```toml
 [native_embedder]
-path = "/absolute/path/to/model-snapshot"
-prefer_embedded = true
+backend = "gguf"
+path = "/absolute/path/to/model.gguf"
+prefer_embedded = false
 ```
 
 ## Resolution order
@@ -64,40 +68,34 @@ prefer_embedded = true
 For native embedder selection:
 
 1. `AICX_EMBEDDER_PATH`
-2. `AICX_EMBEDDER_REPO`
+2. `AICX_EMBEDDER_REPO` + `AICX_EMBEDDER_FILENAME`
 3. `AICX_EMBEDDER_CONFIG`
 4. `~/.aicx/embedder.toml`
 5. `~/.aicx/config.toml`
 6. build/runtime defaults
 
-For active memex HTTP/provider retrieval, use the runtime provider config of
-the retrieval engine itself. In `aicx` today that is `rust-memex`, typically:
+For active heavy retrieval, use the runtime provider config of the retrieval
+engine itself. In VetCoders products that is Roost/rust-memex, typically:
 
 - `~/.rmcp-servers/rust-memex/config.toml`
 - or `RUST_MEMEX_CONFIG`
 
-This is also where the large/premium Qwen-family retrieval settings belong.
-The 4096-dim Qwen 8B path is not configured through `~/.aicx/embedder.toml`.
-
 Do not pretend these are the same file. They govern different layers:
 
-- `RUST_MEMEX_CONFIG` / rust-memex config: active semantic materialization and
-  provider selection for `memex-sync`
-- `AICX_EMBEDDER_CONFIG` / `~/.aicx/embedder.toml`: optional native embedder
-  repo/path selection for native-embedder builds or runtimes
+- `RUST_MEMEX_CONFIG` / rust-memex config: active heavy retrieval provider and
+  indexing settings
+- `AICX_EMBEDDER_CONFIG` / `~/.aicx/embedder.toml`: AICX local embedder
+  backend/profile/repo/filename/path selection
 
 ## Download timing
 
 Model hydration should happen in exactly one of these visible moments:
 
-1. Before build:
-   - the operator primes HuggingFace cache manually
-   - build embeds bytes if the repo and feature flags allow it
-2. During install:
+1. During install:
    - only if the picker explicitly asks and the operator says yes
-3. After install:
+2. After install:
    - operator runs the documented hydration command explicitly
-4. First runtime use:
+3. First runtime use:
    - allowed only when the runtime knows how to read from an already-present local cache
    - runtime should not silently fetch multi-GB payloads from the network
 

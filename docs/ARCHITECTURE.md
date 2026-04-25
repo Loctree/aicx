@@ -1,16 +1,16 @@
 # Architecture
 
-`aicx` is the operator front door for agent session logs. It orchestrates a
-two-layer pipeline — canonical corpus first, optional semantic index second:
+`aicx` is the operator front door for agent session logs. It is a store-first
+system with retrieval surfaces layered on top:
 
 1. **Canonical corpus** (layer 1, `~/.aicx/`): read local agent session logs,
    normalize into a single timeline schema, deduplicate, chunk into steerable
    markdown with frontmatter metadata. This is ground truth.
-2. **Optional semantic index** (layer 2, memex): embed the canonical corpus into
-   a vector + BM25 index for semantic retrieval by agents and MCP tools. Always
-   operator-driven — nothing syncs automatically.
+2. **Retrieval surfaces**: filesystem search, steering metadata, MCP tools, and
+   the reusable native embedding library in `crates/aicx-embeddings`.
 
-`aicx` owns the canonical corpus; memex is an optional semantic index layered on top.
+`aicx` owns the canonical corpus and portable local embedding foundation.
+Roost/rust-memex owns the advanced retrieval/operator plane.
 
 The pipeline exposes chunks through CLI, MCP, dashboard search surfaces, and an
 adjacent Vibecrafted artifact explorer for workflow/marbles reports.
@@ -23,7 +23,8 @@ flowchart TD
   RED --> STORE[store.rs: write_context_chunked]
   STORE --> EMIT[stdout: --emit paths/json/none]
   RED --> LOCAL[output.rs: write_report (-o)]
-  STORE --> MEMEX[memex.rs: sync_new_chunks (--memex)]
+  STORE --> STEER[steer_index.rs: sync_steer_index]
+  STORE --> MCP[mcp.rs: search/rank/steer tools]
 ```
 
 ## Module Map (Codebase Mapping)
@@ -35,11 +36,11 @@ Library modules (see `src/lib.rs`):
 - `src/store.rs`: canonical store layout under `~/.aicx/` + `index.json`
 - `src/chunker.rs`: semantic windowing chunker (token heuristic + overlap + highlight extraction)
 - `src/output.rs`: local report writer (`-o`) + optional loctree snapshot inclusion
-- `src/memex.rs`: memex materialization (in-process via `rmcp-memex` library) + sync state
 - `src/redact.rs`: secret redaction (regex engine)
 - `src/sanitize.rs`: path validation for reads/writes (defense against traversal)
 - `src/steer_index.rs`: fast metadata index for steering-aware retrieval
 - `src/reports_extractor.rs`: scans `~/.vibecrafted/artifacts` and renders a standalone HTML/JSON dossier for workflow and marbles artifact review
+- `crates/aicx-embeddings`: reusable local GGUF embedding provider library
 
 Binary orchestration:
 - `src/main.rs`: clap CLI, wires flows together, handles stdout emission (`--emit`).
@@ -70,12 +71,14 @@ High-level sequence (see `src/main.rs::run_extraction`):
    - `--emit json` prints a single JSON payload including `store_paths`, `requested_source_filters`, and `resolved_store_buckets`
    - `--emit none` prints nothing
 8. Optional local output (`-o`): write a report to the given directory.
-9. Optional memex materialization (`--memex`): materialize canonical chunks into the optional memex semantic index (see note below).
+9. Steer index refresh: sidecar metadata is available to CLI/MCP steering retrieval.
 
-Note on memex materialization:
-- `--memex` reads from the same canonical chunk + sidecar store that the CLI, MCP, and dashboard use.
-- Batch import and per-chunk upsert share the same metadata contract from `.meta.json` sidecars.
-- Memex is an optional semantic index layered on top of the canonical store — not primary storage. Nothing materializes automatically.
+Note on heavy retrieval:
+- AICX no longer exposes a `memex-sync` CLI command.
+- Roost/rust-memex remains the advanced retrieval plane and can consume the
+  canonical store externally.
+- AICX native embeddings are exposed as a reusable library, not as an automatic
+  background indexing daemon.
 
 Framework note:
 - Repo-local `.ai-context/` artifacts are now owned by higher-level workflow tooling such as `/vc-init`, not by the retired `aicx init` flow.
@@ -108,13 +111,13 @@ Frontmatter is not just telemetry — it is part of the steering and selective r
 1. Extract selected agents + source filters for a lookback window.
 2. Redact secrets (default).
 3. Chunk and write into the canonical `~/.aicx/` store, which may resolve into multiple repo buckets plus `non-repository-contexts`.
-4. Optional memex sync (`--memex`).
+4. Refresh sidecar/steering metadata surfaces.
 
 ## MCP Surface (`src/mcp.rs`)
 
 The MCP server exposes three tools via stdio and streamable HTTP transports:
 
-- `aicx_search` — search stored chunks with quality scoring; widens with memex semantic retrieval when available and otherwise falls back to canonical-store fuzzy search
+- `aicx_search` — search stored chunks with quality scoring; downstream retrieval providers may widen results, but the canonical-store fuzzy path remains the safe fallback
 - `aicx_rank` — rank chunks by signal density for a project as compact JSON
 - `aicx_steer` — retrieve chunks by steering metadata (run_id, prompt_id, agent, kind, project, date) using sidecar data; the primary metadata-aware retrieval path for orchestration
 

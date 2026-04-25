@@ -21,14 +21,15 @@ KEYS_DIR="${KEYS:-${AICX_KEYS_DIR:-$HOME/.keys}}"
 NOTARY_PROFILE_VALUE="${NOTARY_PROFILE:-${AICX_NOTARY_PROFILE:-}}"
 DIST_DIR="${DIST_DIR:-$REPO_ROOT/dist}"
 PACKAGE_NAME="${PACKAGE_NAME:-}"
-BUILD_PROFILE="${AICX_BUILD_PROFILE:-base}"
 CLEAN_AFTER_BUILD="${AICX_CLEAN_AFTER_BUILD:-1}"
 DRY_RUN="${DRY_RUN:-0}"
+FEATURES_VALUE="${FEATURES:-${AICX_CARGO_FEATURES:-}}"
+NATIVE_VALUE="${NATIVE:-0}"
 
 usage() {
   cat <<'EOF'
 Usage:
-  make release-bundle [KEYS=/path/to/.keys] [NOTARY_PROFILE=name] [TARGET=<triple>] [AICX_BUILD_PROFILE=base|dev|premium]
+  make release-bundle [KEYS=/path/to/.keys] [NOTARY_PROFILE=name] [TARGET=<triple>] [NATIVE=1]
 
 Environment:
   KEYS / AICX_KEYS_DIR      Path to keys directory (default: ~/.keys)
@@ -37,7 +38,8 @@ Environment:
   TARGET                    Rust target triple (default: host triple)
   DIST_DIR                  Output directory (default: ./dist)
   PACKAGE_NAME              Bundle prefix (default: Cargo package name)
-  AICX_BUILD_PROFILE        Build profile contract already used by the repo (default: base)
+  NATIVE=1                  Build with --features native-embedder (model weights are still not bundled)
+  FEATURES                  Explicit Cargo feature list for the bundle build
   AICX_CLEAN_AFTER_BUILD    Run cargo clean --target <triple> after bundle creation (default: 1)
   DRY_RUN=1                 Print resolved actions without signing/notarizing
 
@@ -170,7 +172,15 @@ PY
 mkdir -p "$DIST_DIR"
 
 RELEASE_DIR="$REPO_ROOT/target/$TARGET/release"
-BUNDLE_BASENAME="${PACKAGE_NAME}-v${VERSION}-${TARGET}-${BUILD_PROFILE}-signed"
+if [[ -z "$FEATURES_VALUE" && "$NATIVE_VALUE" == "1" ]]; then
+  FEATURES_VALUE="native-embedder"
+fi
+if [[ -n "$FEATURES_VALUE" ]]; then
+  BUILD_FLAVOR="${AICX_BUNDLE_FLAVOR:-native}"
+else
+  BUILD_FLAVOR="${AICX_BUNDLE_FLAVOR:-slim}"
+fi
+BUNDLE_BASENAME="${PACKAGE_NAME}-v${VERSION}-${TARGET}-${BUILD_FLAVOR}-signed"
 BUNDLE_DIR="$DIST_DIR/$BUNDLE_BASENAME"
 ARCHIVE_PATH="$DIST_DIR/${BUNDLE_BASENAME}.zip"
 CHECKSUM_PATH="${ARCHIVE_PATH}.sha256"
@@ -180,7 +190,8 @@ echo "=== AICX production release bundle ==="
 echo "Repo:            $REPO_ROOT"
 echo "Version:         $VERSION"
 echo "Target:          $TARGET"
-echo "Build profile:   $BUILD_PROFILE"
+echo "Build flavor:    $BUILD_FLAVOR"
+echo "Cargo features:  ${FEATURES_VALUE:-<none>}"
 echo "Cleanup target:  $CLEAN_AFTER_BUILD"
 echo "Keys dir:        $KEYS_DIR"
 echo "Dist dir:        $DIST_DIR"
@@ -197,7 +208,11 @@ fi
 if [[ "$DRY_RUN" == "1" ]]; then
   echo ""
   echo "[dry-run] Would:"
-  echo "  1. cargo build --locked --release --target $TARGET --bin aicx --bin aicx-mcp"
+  if [[ -n "$FEATURES_VALUE" ]]; then
+    echo "  1. cargo build --locked --release --target $TARGET --features $FEATURES_VALUE --bin aicx --bin aicx-mcp"
+  else
+    echo "  1. cargo build --locked --release --target $TARGET --bin aicx --bin aicx-mcp"
+  fi
   echo "  2. import $CERT_P12 into a temporary keychain"
   echo "  3. codesign target binaries"
   echo "  4. build $ARCHIVE_PATH"
@@ -213,7 +228,11 @@ fi
 echo "[1/6] Building release binaries..."
 (
   cd "$REPO_ROOT"
-  cargo build --locked --release --target "$TARGET" --bin aicx --bin aicx-mcp
+  if [[ -n "$FEATURES_VALUE" ]]; then
+    cargo build --locked --release --target "$TARGET" --features "$FEATURES_VALUE" --bin aicx --bin aicx-mcp
+  else
+    cargo build --locked --release --target "$TARGET" --bin aicx --bin aicx-mcp
+  fi
 )
 
 rm -rf "$BUNDLE_DIR"

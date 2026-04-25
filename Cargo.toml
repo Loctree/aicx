@@ -16,30 +16,22 @@ categories = ["command-line-utilities", "development-tools"]
 exclude = ["*.html", "*.patch", "*.orig", ".ai-agents/", ".ai-context/", "scripts/", "skills/"]
 autobins = false
 default-run = "aicx"
-build = "build.rs"
+
+[workspace]
+members = [".", "crates/aicx-embeddings"]
+resolver = "3"
 
 [features]
 default = []
-# Native embedder — in-process BERT-style embeddings via Candle.
-# Ships a small embedder bundled into the binary when the model is present in
-# the HuggingFace cache at build time; falls back to runtime cache lookup.
-# Build presets:
-#   - base (default, via AICX_BUILD_PROFILE=base): sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-#   - dev   (AICX_BUILD_PROFILE=dev):              microsoft/harrier-oss-v1-0.6b
-#   - premium (AICX_BUILD_PROFILE=premium):        codefuse-ai/F2LLM-v2-1.7B
-# AICX_EMBEDDER_REPO still wins as the exact override.
-# Combined with the lightweight base runtime this keeps a complete bundle under
-# ~1.1 GB for the default path, while leaving stronger machines an explicit
-# opt-in route to larger local models.
-native-embedder = [
-    "dep:candle-core",
-    "dep:candle-nn",
-    "dep:candle-transformers",
-    "dep:tokenizers",
-    "dep:safetensors",
-]
+# Native embedder — first-choice in-process local embeddings through the
+# reusable aicx-embeddings crate. The installed binary stays slim: models are
+# hydrated into the HF cache or pinned by path, not silently bundled.
+native-embedder = ["dep:aicx-embeddings", "aicx-embeddings/gguf"]
+native-embedder-metal = ["native-embedder", "aicx-embeddings/metal"]
+native-embedder-openmp = ["native-embedder", "aicx-embeddings/openmp"]
 
 [dependencies]
+aicx-embeddings = { path = "crates/aicx-embeddings", version = "0.6.2", optional = true, default-features = false }
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
@@ -60,18 +52,6 @@ libc = "0.2.183"
 # workspace instead of consuming a published public crate.
 rmcp-memex = { package = "rust-memex", path = "../rust-memex/crates/rust-memex", default-features = false }
 schemars = "1.2.1"
-
-# Native embedder (optional, feature-gated)
-candle-core = { version = "0.9", optional = true }
-candle-nn = { version = "0.9", optional = true }
-candle-transformers = { version = "0.9", optional = true }
-tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
-safetensors = { version = "0.5", optional = true }
-
-[build-dependencies]
-dirs = "6"
-serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
 
 [dev-dependencies]
 filetime = "0.2"

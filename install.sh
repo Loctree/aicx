@@ -6,7 +6,7 @@ set -euo pipefail
 # Usage:
 #   bash install.sh
 #   bash install.sh --skip-install  # MCP config only
-# Run from a local checkout when crates.io / release artifacts are not your install path yet.
+# Run from a local checkout when release artifacts are not your install path yet.
 #
 # Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
@@ -32,6 +32,7 @@ AICX_RELEASE_REPO="${AICX_RELEASE_REPO:-Loctree/aicx}"
 AICX_RELEASE_TAG="${AICX_RELEASE_TAG:-latest}"
 AICX_EMBEDDER_PICKER="${AICX_EMBEDDER_PICKER:-auto}"
 AICX_EMBEDDER_PROFILE="${AICX_EMBEDDER_PROFILE:-}"
+AICX_EMBEDDER_FILENAME="${AICX_EMBEDDER_FILENAME:-${AICX_EMBEDDER_FILE:-}}"
 AICX_EMBEDDER_CONFIG_PATH="${AICX_EMBEDDER_CONFIG_PATH:-$HOME/.aicx/embedder.toml}"
 
 SKIP_INSTALL=0
@@ -49,11 +50,11 @@ for arg in "$@"; do
       echo "  Run from a release bundle or the repo root / local checkout."
       echo ""
       echo "Install source is controlled by AICX_INSTALL_MODE:"
-      echo "  auto    - prefer bundled binaries, then local checkout, otherwise crates.io"
+      echo "  auto    - prefer bundled binaries, then local checkout, otherwise verified GitHub Release"
       echo "  release - download an official GitHub Release, verify SHA256, then install its bundle"
       echo "  bundle  - copy bundled binaries into \$AICX_BIN_DIR"
       echo "  local   - cargo install --path <checkout> --locked"
-      echo "  crates  - cargo install aicx --locked"
+      echo "  crates  - legacy/unsupported: crates.io is not the active AICX distribution path"
       echo "  git     - cargo install --git \$AICX_GIT_URL --locked aicx"
       echo ""
       echo "Bundle install target:"
@@ -63,17 +64,17 @@ for arg in "$@"; do
       echo "  AICX_RELEASE_REPO=Loctree/aicx"
       echo "  AICX_RELEASE_TAG=latest          # or vX.Y.Z"
       echo ""
-      echo "Runtime/build profile shortcuts:"
-      echo "  default runtime:  AICX_RUNTIME_PROFILE=base    # portable 1024-dim preset"
-      echo "  heavier runtime:  AICX_RUNTIME_PROFILE=dev     # 2560-dim Qwen 4B preset"
-      echo "  premium runtime:  AICX_RUNTIME_PROFILE=premium # 4096-dim Qwen 8B preset"
-      echo "  native builds:    AICX_BUILD_PROFILE=dev cargo build --release --features native-embedder"
+      echo "Native embedder profile shortcuts:"
+      echo "  default: AICX_EMBEDDER_PROFILE=base    # F2LLM 0.6B Q4_K_M GGUF"
+      echo "  dev:     AICX_EMBEDDER_PROFILE=dev     # F2LLM 1.7B Q4_K_M GGUF"
+      echo "  premium: AICX_EMBEDDER_PROFILE=premium # F2LLM 1.7B Q6_K GGUF"
+      echo "  build:   cargo build --release --features native-embedder"
       echo ""
-      echo "Optional native embedder picker:"
+      echo "Native embedder picker:"
       echo "  --pick-embedder                    # interactive config for ~/.aicx/embedder.toml"
       echo "  --embedder-profile=base|dev|premium"
       echo "  --no-embedder-prompt               # suppress interactive picker"
-      echo "  note: this does not change rust-memex/Qwen provider settings for memex-sync"
+      echo "  note: this writes AICX local embedder preferences; Roost/rust-memex remains the heavy retrieval plane"
       exit 0
       ;;
   esac
@@ -146,9 +147,18 @@ normalise_bool() {
 
 embedder_repo_for_profile() {
   case "${1:-}" in
-    base) echo "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2" ;;
-    dev) echo "microsoft/harrier-oss-v1-0.6b" ;;
-    premium) echo "codefuse-ai/F2LLM-v2-1.7B" ;;
+    base) echo "mradermacher/F2LLM-v2-0.6B-GGUF" ;;
+    dev) echo "mradermacher/F2LLM-v2-1.7B-GGUF" ;;
+    premium) echo "mradermacher/F2LLM-v2-1.7B-GGUF" ;;
+    *) return 1 ;;
+  esac
+}
+
+embedder_file_for_profile() {
+  case "${1:-}" in
+    base) echo "F2LLM-v2-0.6B.Q4_K_M.gguf" ;;
+    dev) echo "F2LLM-v2-1.7B.Q4_K_M.gguf" ;;
+    premium) echo "F2LLM-v2-1.7B.Q6_K.gguf" ;;
     *) return 1 ;;
   esac
 }
@@ -156,13 +166,15 @@ embedder_repo_for_profile() {
 write_embedder_config() {
   local profile="$1"
   local repo="$2"
-  local path_override="$3"
+  local filename="$3"
+  local path_override="$4"
   local config_path="$AICX_EMBEDDER_CONFIG_PATH"
 
   mkdir -p "$(dirname "$config_path")"
   EMBEDDER_CONFIG_PATH="$config_path" \
   EMBEDDER_PROFILE="$profile" \
   EMBEDDER_REPO="$repo" \
+  EMBEDDER_FILENAME="$filename" \
   EMBEDDER_PATH_OVERRIDE="$path_override" \
   python3 - <<'PY'
 from pathlib import Path
@@ -171,22 +183,27 @@ import os
 config_path = Path(os.environ["EMBEDDER_CONFIG_PATH"]).expanduser()
 profile = os.environ["EMBEDDER_PROFILE"].strip()
 repo = os.environ["EMBEDDER_REPO"].strip()
+filename = os.environ["EMBEDDER_FILENAME"].strip()
 path_override = os.environ["EMBEDDER_PATH_OVERRIDE"].strip()
 
 lines = [
     "# aicx native embedder preferences",
-    "# This file is read by native-embedder builds and releases.",
+    "# First-choice local embeddings. Heavy retrieval remains rust-memex/Roost.",
     "",
     "[native_embedder]",
+    'backend = "gguf"',
 ]
 
 if profile:
     lines.append(f'profile = "{profile}"')
 if repo:
     lines.append(f'repo = "{repo}"')
+if filename:
+    lines.append(f'filename = "{filename}"')
 if path_override:
     lines.append(f'path = "{path_override}"')
-lines.append("prefer_embedded = true")
+lines.append("prefer_embedded = false")
+lines.append("max_length = 512")
 
 config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 print(config_path)
@@ -195,6 +212,7 @@ PY
 
 maybe_prime_embedder_cache() {
   local repo="$1"
+  local filename="$2"
 
   if [ -z "$repo" ] || ! [ -t 0 ] || ! [ -t 1 ]; then
     return 0
@@ -202,7 +220,17 @@ maybe_prime_embedder_cache() {
 
   if ! command -v hf >/dev/null 2>&1; then
     echo "  native embedder cache not primed automatically (missing 'hf' CLI)"
-    echo "  later, run: hf download $repo"
+    if [ -n "$filename" ]; then
+      echo "  later, run: hf download $repo $filename"
+    else
+      echo "  later, run: hf download <repo> <model.gguf>"
+    fi
+    return 0
+  fi
+
+  if [ -z "$filename" ]; then
+    echo "  native embedder cache not primed automatically (custom repo has no GGUF filename)"
+    echo "  later, run: hf download $repo <model.gguf>"
     return 0
   fi
 
@@ -210,8 +238,8 @@ maybe_prime_embedder_cache() {
   read -r reply || true
   case "${reply:-}" in
     y|Y|yes|YES)
-      echo "  priming HF cache for $repo ..."
-      if hf download "$repo"; then
+      echo "  priming HF cache for $repo $filename ..."
+      if hf download "$repo" "$filename"; then
         echo "  HF cache primed"
       else
         echo "  warning: hf download failed; config was still saved" >&2
@@ -219,29 +247,30 @@ maybe_prime_embedder_cache() {
       ;;
     *)
       echo "  skipping model download"
-      echo "  later, run: hf download $repo"
+      echo "  later, run: hf download $repo $filename"
       ;;
   esac
 }
 
 maybe_configure_native_embedder() {
-  local picker explicit_profile selected_profile selected_repo config_written
+  local picker explicit_profile selected_profile selected_repo selected_filename config_written
   picker=$(normalise_bool "$AICX_EMBEDDER_PICKER")
   explicit_profile="${AICX_EMBEDDER_PROFILE:-}"
   selected_profile=""
   selected_repo="${AICX_EMBEDDER_REPO:-}"
+  selected_filename="${AICX_EMBEDDER_FILENAME:-}"
   config_written=""
 
   if [ -n "${AICX_EMBEDDER_PATH:-}" ]; then
-    config_written=$(write_embedder_config "" "" "$AICX_EMBEDDER_PATH")
+    config_written=$(write_embedder_config "" "" "" "$AICX_EMBEDDER_PATH")
     echo "  native embedder path pinned in $config_written"
     return 0
   fi
 
   if [ -n "$selected_repo" ]; then
-    config_written=$(write_embedder_config "" "$selected_repo" "")
+    config_written=$(write_embedder_config "" "$selected_repo" "$selected_filename" "")
     echo "  native embedder repo pinned in $config_written"
-    maybe_prime_embedder_cache "$selected_repo"
+    maybe_prime_embedder_cache "$selected_repo" "$selected_filename"
     return 0
   fi
 
@@ -261,15 +290,15 @@ maybe_configure_native_embedder() {
     esac
   elif [ "$picker" = "1" ] || { [ "$picker" = "auto" ] && [ -t 0 ] && [ -t 1 ] && [ -z "${CI:-}" ]; }; then
     echo ""
-    echo "Optional native embedder setup"
+    echo "Native embedder setup"
     echo "  This does not bloat the installed bundle."
-    echo "  It only writes ~/.aicx/embedder.toml and can optionally prime the HF cache."
-    echo "  Current public release bundles stay slim; native-embedder activation remains opt-in."
+    echo "  It writes ~/.aicx/embedder.toml and can prime exactly one GGUF file in the HF cache."
+    echo "  This is AICX's first-choice local embedding path; Roost/rust-memex remains the heavy retrieval plane."
     echo ""
     echo "  1) skip"
-    echo "  2) base    - MiniLM (~224 MB, safest default)"
-    echo "  3) dev     - Harrier 0.6B (~1.1 GB, stronger workstation tier)"
-    echo "  4) premium - F2 1.7B (~3.4 GB, runtime-only heavy tier)"
+    echo "  2) base    - F2LLM 0.6B Q4_K_M GGUF (~397 MB, portable default)"
+    echo "  3) dev     - F2LLM 1.7B Q4_K_M GGUF (~1.1 GB, workstation tier)"
+    echo "  4) premium - F2LLM 1.7B Q6_K GGUF (~1.4 GB, stronger local tier)"
     printf "Choose native embedder profile [1-4]: "
     read -r reply || true
     case "${reply:-1}" in
@@ -290,9 +319,10 @@ maybe_configure_native_embedder() {
   fi
 
   selected_repo=$(embedder_repo_for_profile "$selected_profile")
-  config_written=$(write_embedder_config "$selected_profile" "$selected_repo" "")
+  selected_filename=$(embedder_file_for_profile "$selected_profile")
+  config_written=$(write_embedder_config "$selected_profile" "$selected_repo" "$selected_filename" "")
   echo "  native embedder preference saved to $config_written"
-  maybe_prime_embedder_cache "$selected_repo"
+  maybe_prime_embedder_cache "$selected_repo" "$selected_filename"
 }
 
 cleanup_old_binaries() {
@@ -479,7 +509,7 @@ resolve_install_mode() {
       elif [ "$HAS_LOCAL_MANIFEST" -eq 1 ]; then
         echo "local"
       else
-        echo "crates"
+        echo "release"
       fi
       ;;
     release|bundle|local|crates|git)
@@ -532,13 +562,14 @@ if [ "$SKIP_INSTALL" -eq 0 ]; then
     echo "[1/4] Installing aicx + aicx-mcp from this checkout..."
     cargo_install_with_progress cargo install --path "$SCRIPT_DIR" --locked --force --bin aicx --bin aicx-mcp
   elif [ "$INSTALL_MODE" = "crates" ]; then
-    echo "[1/4] Installing aicx + aicx-mcp from crates.io..."
-    cargo_install_with_progress cargo install aicx --locked
+    echo "Error: crates.io is not the active AICX distribution path." >&2
+    echo "  Use AICX_INSTALL_MODE=release for verified GitHub Release assets, npm install -g @loctree/aicx, or install from a local checkout." >&2
+    exit 1
   else
     echo "[1/4] Installing aicx + aicx-mcp from git..."
     if ! cargo_install_with_progress cargo install --git "$AICX_GIT_URL" --locked aicx; then
       echo "Error: git install failed."
-      echo "  If you only need the published release, use AICX_INSTALL_MODE=crates or run 'cargo install aicx --locked'."
+      echo "  If you only need the published release, use AICX_INSTALL_MODE=release or npm install -g @loctree/aicx."
       exit 1
     fi
   fi
@@ -650,7 +681,7 @@ configure_mcp "gemini" "$HOME/.gemini/settings.json"
 echo "[4/4] Full context extraction (this may take a moment)..."
 "${AICX_RUN[@]}" all -H 10000 --emit none
 echo "  store bootstrap complete"
-echo "  memex runtime default: base (portable 1024-dim preset)"
+echo "  local embedder default: base (F2LLM 0.6B Q4_K_M GGUF, hydrated on demand)"
 maybe_configure_native_embedder
 echo ""
 
@@ -681,17 +712,14 @@ echo "  aicx_rank    — quality-score stored chunks"
 echo "  aicx_steer   — retrieve chunks by run/prompt/project/agent/date metadata"
 echo ""
 echo "Quick start:"
-echo "  aicx store -H 24                   # rescan last 24h from all agents"
+echo "  aicx all -H 24                     # rescan last 24h from all agents"
 echo "  aicx search 'query terms'          # fuzzy search across session history"
 echo "  aicx refs -H 24                    # compact summary of recent files"
 echo "  aicx steer --project aicx          # metadata-aware retrieval"
-echo "  aicx memex-sync                    # optional memex materialization (base profile)"
 echo ""
-echo "Heavier retrieval on strong machines:"
-echo "  AICX_RUNTIME_PROFILE=dev aicx memex-sync --reindex"
-echo "  AICX_RUNTIME_PROFILE=premium aicx memex-sync --reindex"
+echo "Native local embeddings:"
+echo "  bash install.sh --pick-embedder    # choose and optionally hydrate one GGUF model"
+echo "  config: ~/.aicx/embedder.toml      # backend/profile/repo/filename/path"
 echo ""
-echo "Native embedder config (optional, future native-embedder builds/releases):"
-echo "  ~/.aicx/embedder.toml"
-echo "  bash install.sh --pick-embedder"
-echo "  Note: large memex/Qwen provider settings still live in rust-memex config."
+echo "Heavy retrieval:"
+echo "  Use Roost/rust-memex for the advanced operator retrieval plane; AICX stays the portable corpus + local embedding foundation."

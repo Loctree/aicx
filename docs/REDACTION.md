@@ -4,7 +4,7 @@
 The goal is pragmatic safety: avoid accidentally persisting tokens/keys in:
 - `.ai-context/` artifacts,
 - `~/.aicx/` store,
-- memex chunks.
+- downstream retrieval chunks derived from the canonical store.
 
 Implementation lives in `src/redact.rs`.
 

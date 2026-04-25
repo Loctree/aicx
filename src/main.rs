@@ -770,9 +770,9 @@ enum Commands {
     /// Fuzzy search across the canonical corpus (layer 1, filesystem-only).
     ///
     /// Searches chunk content and frontmatter directly in ~/.aicx/ — works
-    /// immediately, no memex index needed. For semantic retrieval through MCP
-    /// tools, materialize the index with `memex-sync` first, then use
-    /// `aicx serve`.
+    /// immediately, no semantic index needed. For semantic retrieval through MCP
+    /// tools, use `aicx serve`; the MCP layer widens through available runtime
+    /// search providers and otherwise falls back to canonical-store fuzzy search.
     #[command(display_order = 12)]
     Search {
         /// Search query string

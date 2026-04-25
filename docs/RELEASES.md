@@ -5,12 +5,14 @@
 1. Source install from a local checkout or accessible git remote.
 2. GitHub Releases with prebuilt archives for users who do not want a Rust toolchain.
 3. npm wrapper distribution under `@loctree/aicx`.
+4. Homebrew tap packaging once the GitHub Release asset shape is promoted there.
 
 There is also a maintainer-local macOS bundling path for signed + notarized
 production archives:
 
 ```bash
 make release-bundle KEYS=~/.keys
+make release-bundle KEYS=~/.keys NATIVE=1
 make release-bundle KEYS=~/.keys NOTARY_PROFILE=my-notary-profile
 ```
 
@@ -18,7 +20,7 @@ This document is the maintainer path from green CI to public release artifacts.
 
 ## Current Shape
 
-- Public install paths now exist through crates.io, GitHub Releases, release bundles, and source checkout.
+- Public install paths now exist through GitHub Releases, release bundles, npm, and source checkout.
 - The npm surface now lives under `distribution/npm/` as a single wrapper package that installs both `aicx` and `aicx-mcp`.
 - Manual npm publication now has a dedicated workflow at `.github/workflows/npm-publish.yml`.
 - `Cargo.toml` is the semantic version source of truth; `tools/release_sync.py` propagates that version into npm manifests and the user-facing install examples.
@@ -31,7 +33,7 @@ This document is the maintainer path from green CI to public release artifacts.
 Tagging `vX.Y.Z` triggers `.github/workflows/release.yml`, which:
 
 - verifies the tag matches `Cargo.toml`
-- reruns the required release gates: `semgrep`, `cargo clippy --all-features --all-targets -- -D warnings`, `cargo test --bin aicx`, `cargo test --bin aicx-mcp`, `cargo fmt -- --check`, and `cargo publish --dry-run`
+- reruns the required release gates: `semgrep`, default clippy, native GGUF clippy, binary tests, native GGUF tests, and `cargo fmt -- --check`
 - builds both shipped binaries: `aicx` and `aicx-mcp`
 - builds Linux artifacts on `ops-linux`
 - builds macOS artifacts on `dragon-macos`
@@ -80,11 +82,13 @@ For local production-style macOS artifacts, use:
 
 ```bash
 make release-bundle KEYS=/path/to/.keys
+make release-bundle KEYS=/path/to/.keys NATIVE=1
 ```
 
 The target:
 
 - builds `aicx` and `aicx-mcp` for the local Apple target
+- builds slim binaries by default, or native GGUF-capable binaries with `NATIVE=1`
 - assembles a release bundle in `dist/`
 - includes `install.sh` for post-download install into `~/.local/bin`
 - imports the signing certificate into a temporary keychain
@@ -112,6 +116,7 @@ Examples:
 
 ```bash
 make release-bundle KEYS=~/.keys
+make release-bundle KEYS=~/.keys NATIVE=1
 make release-bundle KEYS=~/.keys NOTARY_PROFILE=vc-notary
 make release-bundle KEYS=~/.keys CLEAN=0
 AICX_KEYS_DIR=~/.keys AICX_NOTARY_PROFILE=vc-notary make release-bundle
@@ -143,18 +148,25 @@ git push origin v0.6.2
 4. Wait for the `Release` workflow to finish and confirm the GitHub Release has all archives, `.sha256` files, and the expected body copied from `CHANGELOG.md`.
 5. Smoke-test one archive on macOS or Linux before announcing it publicly.
 
-## Publish-Ready Crate Flow
+## Publish Track
 
-The repo is configured so `cargo publish --dry-run` is part of CI and release verification. When crates.io publication becomes part of the release lane, a maintainer only has one manual step left:
+The current publish track is binary-first:
 
-```bash
-cargo publish
-```
+1. Git tag triggers GitHub Release assets.
+2. macOS archives are signed/notarized on `dragon-macos`.
+3. Linux archives are built on `ops-linux`.
+4. Each archive gets an adjacent `.sha256`.
+5. npm platform packages publish after the matching GitHub Release assets exist.
+6. Homebrew should consume the same GitHub Release assets and checksums.
 
-Keep crates.io publication manual until the team is ready to store `CRATES_IO_API_TOKEN` in repository secrets and automate that final step.
+Crates.io publication is intentionally not the active release lane. The root
+crate depends on local first-party product crates (`rust-memex` and
+`aicx-embeddings`) that are not published to crates.io. Treat `cargo publish` /
+`cargo publish --dry-run` failures as expected unless the product decision
+changes and all first-party crates get a crates.io-compatible publication plan.
 
 ## Recovery and Reruns
 
 - To rebuild a release for an existing tag, rerun the failed workflow or use `workflow_dispatch` with the same `vX.Y.Z` tag.
 - If the tag does not match `Cargo.toml`, the workflow fails before any binaries are published.
-- If `cargo publish --dry-run` fails, treat that as a publish-surface regression even if normal CI is green.
+- If npm publish fails, verify the GitHub Release assets and `.sha256` files exist before republishing the wrapper.

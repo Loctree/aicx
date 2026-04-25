@@ -3,7 +3,7 @@
 `aicx` distills raw timelines into chunked “agent-readable” context files.
 
 This is the piece that makes the tool useful for:
-- vector indexing (memex),
+- downstream retrieval/indexing,
 - fast onboarding for new agents,
 - avoiding “paste 4000 lines of history” prompts.
 

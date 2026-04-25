@@ -9,7 +9,7 @@ installers.
 - keep the install path informative
 - clean up stale binaries
 - verify checksums for downloaded release artifacts
-- keep optional heavy model selection explicit
+- keep local model selection explicit
 
 ## Required installer behavior
 
@@ -21,18 +21,18 @@ installers.
    - fetch the adjacent `.sha256`
    - verify checksum before extraction
 5. Configure MCP/tooling integrations only after binaries are present.
-6. Keep optional embedder selection separate from core binary installation.
+6. Keep local embedder selection separate from core binary installation.
 
-## Optional embedder picker
+## Embedder picker
 
-If the product has an optional local embedder:
+If the product has a local embedder:
 
 - the installer may offer an interactive picker
 - the picker should write a deterministic config file
 - the picker must not silently download a heavy model
 - if a model download is offered, it must be explicit and opt-in
 - the picker must not rewrite active rmcp/rust-memex provider settings
-- large retrieval profiles such as 4096-dim Qwen remain owned by the retrieval engine config, not by the installer picker
+- heavy retrieval provider settings remain owned by the retrieval engine config, not by the installer picker
 
 Recommended picker outcomes:
 

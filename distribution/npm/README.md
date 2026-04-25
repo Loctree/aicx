@@ -45,7 +45,7 @@ That install surface is intentionally binary-only:
 
 - no repo checkout
 - no Rust toolchain
-- no hidden native-embedder model payload
+- no hidden local embedder model payload
 - no surprise multi-GB postinstall download
 
 ## Layout

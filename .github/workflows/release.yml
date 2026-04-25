@@ -120,8 +120,13 @@ jobs:
           restore-keys: |
             release-verify-
 
-      - name: cargo clippy
-        run: cargo clippy --locked --all-features --all-targets -- -D warnings
+      - name: cargo clippy default
+        run: cargo clippy --locked -p aicx --all-targets -- -D warnings
+
+      - name: cargo clippy native GGUF
+        run: |
+          cargo clippy --locked -p aicx-embeddings --features gguf -- -D warnings
+          cargo clippy --locked -p aicx --features native-embedder --all-targets -- -D warnings
 
       - name: cargo test --bin aicx
         run: cargo test --locked --bin aicx
@@ -129,11 +134,13 @@ jobs:
       - name: cargo test --bin aicx-mcp
         run: cargo test --locked --bin aicx-mcp
 
+      - name: cargo test native GGUF
+        run: |
+          cargo test --locked -p aicx-embeddings --features gguf
+          cargo test --locked -p aicx --features native-embedder --test native_embedder
+
       - name: cargo fmt
         run: cargo fmt -- --check
-
-      - name: cargo publish --dry-run
-        run: cargo publish --locked --dry-run
 
       - name: Clean Cargo artifacts
         if: always()

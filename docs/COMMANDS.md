@@ -1,21 +1,21 @@
 # Commands
 
-`aicx` is the operator front door for agent session logs. It orchestrates a
-two-layer pipeline — both layers are operator-driven, nothing happens automatically:
+`aicx` is the operator front door for agent session logs. It is store-first and
+operator-driven: nothing mutates your corpus unless you run a command.
 
 | Layer | What | Command surface |
 |-------|------|-----------------|
 | **1 — Canonical corpus** | Extract, deduplicate, chunk agent logs into steerable markdown at `~/.aicx/`. This is ground truth. | `claude`, `codex`, `all`, `store`, `extract` |
-| **2 — Optional semantic index** | Embed the canonical corpus into a vector + BM25 index (memex) for semantic retrieval by agents and MCP tools. | `memex-sync`, or `--memex` on any extractor |
+| **2 — Retrieval surfaces** | Query the corpus through filesystem search, steering metadata, MCP tools, and the reusable native embedding library. | `search`, `steer`, `serve`, `aicx-embeddings` |
 
-`aicx` owns the canonical corpus; memex is an optional semantic index layered on top.
+`aicx` owns the canonical corpus and portable local embedding foundation.
+Roost/rust-memex owns the advanced retrieval/operator plane.
 
 For the shortest “it works” path, see `README.md`.
 
 ## Defaults Worth Knowing
 
 - **Layer 1 commands** (`claude`, `codex`, `all`, `store`) write to the canonical store and print nothing to stdout unless you pass `--emit`.
-- **Layer 2** never runs automatically — you either call `memex-sync` explicitly or add `--memex` to an extractor.
 - `-p/--project` on extractors and `store` is a source-side discovery filter, not a promise that output will land in only one canonical repo bucket.
 - `refs` is the active CLI inventory command for canonical chunks. It prints a compact summary by default; use `--emit paths` for raw file paths.
 - There is currently no `aicx rank` CLI subcommand. Ranking stays on the MCP surface as `aicx_rank`.
@@ -63,7 +63,6 @@ Common options:
 - `--user-only` exclude assistant + reasoning messages (default: assistant included)
 - `--loctree` include loctree snapshot in local output
 - `--project-root <DIR>` project root for loctree snapshot (defaults to cwd)
-- `--memex` also materialize new chunks into the optional memex semantic index (layer 2)
 - `--force` ignore dedup hashes for this run
 - `--emit <paths|json|none>` stdout mode (default: `none`)
 
@@ -178,9 +177,7 @@ Build the canonical corpus in `~/.aicx/` from agent logs (layer 1).
 Store-first corpus builder: extracts, deduplicates, chunks, and writes steerable
 markdown. Like `claude`, `codex`, and `all`, it uses per-source watermarks by
 default so repeat runs stay incremental. Use `--full-rescan` for backfills and
-targeted re-extraction when you need to ignore the watermark. Add `--memex` to
-also materialize new chunks into the optional memex semantic index (layer 2) —
-a shortcut for running `memex-sync` separately.
+targeted re-extraction when you need to ignore the watermark.
 
 ```bash
 aicx store [OPTIONS]
@@ -193,7 +190,6 @@ Options:
 - `--full-rescan` ignore the stored watermark and rescan the full lookback window
 - `--no-redact-secrets` disable secret redaction for this corpus build
 - `--user-only` exclude assistant + reasoning messages (default: assistant included)
-- `--memex` also materialize new chunks into the optional memex semantic index (layer 2)
 - `--emit <paths|json|none>` stdout mode (default: `none`)
 
 Notes:
@@ -212,8 +208,9 @@ aicx store -p CodeScribe --agent claude -H 720 --emit paths
 Fuzzy search across the canonical corpus (layer 1, filesystem-only).
 
 Searches chunk content and frontmatter directly in `~/.aicx/` — works
-immediately, no memex index needed. For semantic retrieval through MCP tools,
-materialize the index with `memex-sync` first, then use `aicx serve`.
+immediately, no semantic index needed. For semantic retrieval through MCP
+tools, use `aicx serve`; the MCP layer widens through available runtime search
+providers and otherwise falls back to canonical-store fuzzy search.
 
 ```bash
 aicx search [OPTIONS] <QUERY>
@@ -323,57 +320,31 @@ aicx migrate-intent-schema
 aicx migrate-intent-schema --project ai-contexters
 ```
 
-## `aicx memex-sync`
+## Native Embeddings
 
-Materialize the canonical corpus into the optional memex semantic index (layer 2).
+Native embeddings are a library/runtime surface, not a CLI indexing command.
 
-Reads chunks from `~/.aicx/`, embeds them, and upserts into the rmcp-memex
-vector + BM25 index. Materialization is always operator-driven — nothing
-syncs automatically. You either run this command explicitly, or use `--memex`
-on any extractor as a one-shot shortcut.
+Use `install.sh --pick-embedder` or edit `~/.aicx/embedder.toml`:
 
-```bash
-aicx memex-sync [OPTIONS]
+```toml
+[native_embedder]
+backend = "gguf"
+profile = "base"
+repo = "mradermacher/F2LLM-v2-0.6B-GGUF"
+filename = "F2LLM-v2-0.6B.Q4_K_M.gguf"
+prefer_embedded = false
+max_length = 512
 ```
 
-Options:
-- `-n, --namespace <NAMESPACE>` vector namespace (default: `ai-contexts`)
-- `--per-chunk` use per-chunk library writes instead of batch store (slower, more granular)
-- `--db-path <DB_PATH>` override LanceDB path
-- `--profile <PROFILE>` runtime preset: `base` (default portable 1024-dim Qwen 0.6B), `dev` (2560-dim Qwen 4B), or `premium` (4096-dim Qwen 8B)
-- `--reindex` wipe the memex index and re-embed the entire canonical corpus; use after an embedding model or dimension change, or when the index has drifted from the canonical store
-
-Typical flows:
+Hydrate manually when needed:
 
 ```bash
-# First build: embed all unsynced canonical chunks into the memex index
-aicx memex-sync
-
-# Incremental: only new chunks since last sync (same command, watermark-tracked)
-aicx memex-sync
-
-# Full rebuild: wipe index, re-embed everything
-aicx memex-sync --reindex
-
-# One-shot shortcut: extract + materialize in a single pass
-aicx all -H 48 --memex
-
-# Keep the legacy heavier workstation preset
-aicx memex-sync --profile dev
-
-# Opt into the heaviest Qwen-family preset
-aicx memex-sync --profile premium
+hf download mradermacher/F2LLM-v2-0.6B-GGUF F2LLM-v2-0.6B.Q4_K_M.gguf
 ```
 
-Notes:
-- Runtime preset helpers (`--profile`, `AICX_RUNTIME_PROFILE`) are convenience inputs around the active memex provider config; explicit `[embeddings]` and legacy `[mlx]` config remain authoritative.
-- Persist active memex provider choices in `rust-memex` config, usually `~/.rmcp-servers/rust-memex/config.toml`, or point `RUST_MEMEX_CONFIG` at an explicit file.
-- Large Qwen-family settings, including the 4096-dim premium path, stay on this memex provider plane. They are not configured through `~/.aicx/embedder.toml` or `AICX_EMBEDDER_CONFIG`.
-- Native embedder settings are only for optional in-process native-embedder builds/runtimes and do not change what `memex-sync` currently uses.
-- Default batch materialization embeds and upserts chunks in-process via the `rmcp-memex` library, preserving `project`, `agent`, `date`, `session_id`, and `kind` metadata for semantic filtering.
-- The canonical store's nested structure is traversed automatically during materialization.
-- If `~/.aicx/.aicxignore` exists, matching chunk paths are excluded before materialization and the final summary reports how many were ignored.
-- On interactive terminals, `memex-sync` emits live scan/embed/index progress to stderr so large reindexes do not look hung.
+See `docs/EMBEDDINGS.md` for the reusable `aicx-embeddings` API, GGUF profile
+table, and the split between AICX local embeddings and Roost/rust-memex heavy
+retrieval.
 
 ## `aicx refs`
 
@@ -525,8 +496,9 @@ Run `aicx` as an MCP server (stdio or streamable HTTP transport).
 
 Exposes search, steer, and rank tools over MCP for agent retrieval.
 `aicx_steer` and `aicx_rank` query the canonical corpus on disk.
-`aicx_search` widens with memex semantic retrieval when a materialized index
-exists, and otherwise falls back to canonical-store fuzzy search.
+`aicx_search` uses canonical-store fuzzy search today; semantic widening belongs
+to configured downstream retrieval providers and must fall back cleanly to the
+canonical store.
 
 ```bash
 aicx serve [OPTIONS]

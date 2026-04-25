@@ -10,31 +10,16 @@
 
 #![cfg(feature = "native-embedder")]
 
-use aicx::embedder::{
-    EmbedderConfig, EmbedderEngine, NativeEmbeddingSource, is_embedded_available,
-};
-
-#[test]
-fn embedded_dimension_hint_is_positive_when_available() {
-    if !is_embedded_available() {
-        eprintln!("skip: embedded embedder bytes not present in this build");
-        return;
-    }
-    let dim = aicx::embedder::embedded_dimension();
-    assert!(
-        dim.is_some_and(|d| d > 0),
-        "embedded model should report a hidden_size >= 1, got {dim:?}"
-    );
-}
+use aicx::embedder::{EmbedderConfig, EmbedderEngine, NativeEmbeddingSource};
 
 #[test]
 fn engine_embeds_and_returns_unit_norm_vectors() {
     let engine = EmbedderEngine::with_config(EmbedderConfig {
-        prefer_embedded: true,
+        prefer_embedded: false,
         ..Default::default()
     });
     let Ok(mut engine) = engine else {
-        eprintln!("skip: no embedder model available (embedded absent + no HF cache snapshot)");
+        eprintln!("skip: no GGUF embedder model available in local HF cache");
         return;
     };
 
@@ -67,20 +52,24 @@ fn engine_embeds_and_returns_unit_norm_vectors() {
 #[test]
 fn source_describes_runtime_provenance() {
     let Ok(engine) = EmbedderEngine::with_config(EmbedderConfig {
-        prefer_embedded: true,
+        prefer_embedded: false,
         ..Default::default()
     }) else {
-        eprintln!("skip: no embedder model available for source check");
+        eprintln!("skip: no GGUF embedder model available for source check");
         return;
     };
 
     match engine.source() {
-        NativeEmbeddingSource::Embedded { repo } => assert!(!repo.is_empty()),
-        NativeEmbeddingSource::HfCache { repo, path } => {
+        NativeEmbeddingSource::HfCache {
+            repo,
+            path,
+            filename,
+        } => {
             assert!(!repo.is_empty());
+            assert!(filename.ends_with(".gguf"));
             assert!(
                 path.exists(),
-                "HF cache snapshot should point at a real dir"
+                "HF cache model file should point at a real file"
             );
         }
         NativeEmbeddingSource::ExplicitPath(p) => assert!(p.exists()),

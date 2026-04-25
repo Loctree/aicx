@@ -8,7 +8,7 @@ not "cargo publish the crate and hope for the best."
 - `npm/`
   Canonical npm wrapper and platform-package release flow.
 - `EMBEDDERS.md`
-  Canonical cross-repo contract for optional model hydration and native embedder selection.
+  Canonical cross-repo contract for local model hydration and native embedder selection.
 - `INSTALLER.md`
   Canonical installer contract for direct bundle/release installs.
 
@@ -18,7 +18,7 @@ One channel, one home.
 
 If a distribution path is real, it belongs in `distribution/`.
 
-The same rule applies to optional model delivery:
+The same rule applies to local model delivery:
 
 - keep shipping binaries lean
 - never hide heavy model payloads inside the default bundle

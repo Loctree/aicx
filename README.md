@@ -2,17 +2,18 @@
 
 Operator front door for agent session logs.
 
-`aicx` orchestrates a two-layer pipeline:
+`aicx` is store-first:
 
 1. **Canonical corpus** (`~/.aicx/`) — extract, deduplicate, chunk, and store
-   agent session logs as steerable markdown with frontmatter metadata.
-   This is ground truth. Built by extractors (`claude`, `codex`, `all`) and `store`.
+   agent session logs as steerable markdown with frontmatter metadata. This is
+   ground truth. Built by extractors (`claude`, `codex`, `all`) and `store`.
 
-2. **Optional semantic index** (memex) — embed the canonical corpus into a
-   vector + BM25 index for semantic retrieval by agents and MCP tools.
-   Built by `memex-sync`, or the `--memex` shortcut on any extractor.
+2. **Retrieval surfaces** — filesystem search, steering metadata, MCP tools, and
+   a reusable native embedding library. AICX stays portable; heavy retrieval
+   belongs to Roost/rust-memex.
 
-`aicx` owns the canonical corpus; memex is an optional semantic index layered on top.
+`aicx` owns the canonical corpus and the portable local embedding foundation.
+Roost/rust-memex owns the advanced retrieval/operator plane.
 
 Supported sources:
 - Claude Code: `~/.claude/projects/*/*.jsonl`
@@ -21,12 +22,6 @@ Supported sources:
 - Gemini Antigravity direct extract: `~/.gemini/antigravity/conversations/<uuid>.pb` or `~/.gemini/antigravity/brain/<uuid>/`
 
 ## Install
-
-Public install from crates.io:
-
-```bash
-cargo install aicx --locked
-```
 
 Public install from npm:
 
@@ -100,16 +95,17 @@ That release path cleans `target/<triple>` after the bundle is safely written so
 the self-hosted box does not keep hauling old release artifacts. Use `CLEAN=0`
 when you explicitly want to keep the local build outputs.
 
-Profile defaults:
-- Runtime default: `base` — portable 1024-dim Qwen 0.6B memex preset
-- Heavier runtime opt-ins: `AICX_RUNTIME_PROFILE=dev` (2560-dim Qwen 4B), `AICX_RUNTIME_PROFILE=premium` (4096-dim Qwen 8B)
-- Native embedder build default: `AICX_BUILD_PROFILE=base`; opt into larger bundles with `AICX_BUILD_PROFILE=dev` or `AICX_BUILD_PROFILE=premium`
-- Optional native embedder picker during install: `bash install.sh --pick-embedder`
+Native embedder profiles:
+- `base` — F2LLM-v2 0.6B `Q4_K_M` GGUF, 1024 dims, about 397 MB
+- `dev` — F2LLM-v2 1.7B `Q4_K_M` GGUF, 2048 dims, about 1.1 GB
+- `premium` — F2LLM-v2 1.7B `Q6_K` GGUF, 2048 dims, about 1.4 GB
+- Picker during install: `bash install.sh --pick-embedder`
 
 Config truth:
-- Active memex retrieval config lives in `rust-memex` discovery paths such as `~/.rmcp-servers/rust-memex/config.toml`; this is where large Qwen / 4096-dim provider choices belong.
-- Native embedder preferences live in `~/.aicx/embedder.toml`; this is only for the optional native in-process embedder and does not replace rmcp/rust-memex settings.
-- Current public release bundles stay slim; they do not auto-bundle model weights
+- AICX native embedder preferences live in `~/.aicx/embedder.toml` or `AICX_EMBEDDER_CONFIG`.
+- The picker writes `backend = "gguf"`, `profile`, `repo`, and exact `filename`; model hydration is explicit.
+- Roost/rust-memex retrieval config remains separate, usually `~/.rmcp-servers/rust-memex/config.toml` or `RUST_MEMEX_CONFIG`.
+- Current public release bundles stay slim; they do not auto-bundle model weights.
 
 ## Quickstart
 
@@ -140,21 +136,27 @@ Surface contract:
 - There is currently no `aicx rank` CLI subcommand; ranking stays on the MCP surface as `aicx_rank`.
 - `aicx init` is retired; framework bootstrap now lives in `/vc-init`.
 
-### Layer 2 — materialize into memex
+### Native local embeddings
 
-Materialization is operator-driven — nothing syncs automatically.
-You decide when to build the optional memex semantic index
-(vector + BM25):
+AICX ships the reusable `aicx-embeddings` library behind the
+`native-embedder` feature. The installed bundle does not carry model weights;
+the picker can write config and optionally hydrate exactly one GGUF file:
 
 ```bash
-aicx memex-sync              # first build or incremental update
-aicx memex-sync --reindex    # full rebuild (after model/dimension change)
+bash install.sh --pick-embedder
+hf download mradermacher/F2LLM-v2-0.6B-GGUF F2LLM-v2-0.6B.Q4_K_M.gguf
 ```
 
-Or do both layers in one shot:
+The config file is plain TOML:
 
-```bash
-aicx all -H 4 --memex
+```toml
+[native_embedder]
+backend = "gguf"
+profile = "base"
+repo = "mradermacher/F2LLM-v2-0.6B-GGUF"
+filename = "F2LLM-v2-0.6B.Q4_K_M.gguf"
+prefer_embedded = false
+max_length = 512
 ```
 
 Pipe one JSON payload (handy for automation):
@@ -171,9 +173,9 @@ aicx all -H 4 --emit json | jq '.resolved_store_buckets'
 - `~/.aicx/non-repository-contexts/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
 - `~/.aicx/index.json`
 
-### Layer 2 — semantic index (`memex-sync`, `--memex`) — operator-driven
-- `~/.aicx/memex/sync_state.json` (sync watermark — tracks what has been materialized)
-- LanceDB tables + Tantivy BM25 index (managed by rmcp-memex)
+### Native embedder config
+- `~/.aicx/embedder.toml` — local GGUF backend/profile/repo/filename/path preference
+- HuggingFace cache snapshots under `~/.cache/huggingface/hub/`
 
 Framework-owned repo-local context artifacts (not written by the `aicx` CLI itself):
 - `.ai-context/share/artifacts/SUMMARY.md`
@@ -181,7 +183,7 @@ Framework-owned repo-local context artifacts (not written by the `aicx` CLI itse
 - `.ai-context/share/artifacts/TRIAGE.md`
 
 Store ignore contract:
-- Optional `~/.aicx/.aicxignore` excludes matching canonical chunk paths from memex materialization and steer indexing.
+- Optional `~/.aicx/.aicxignore` excludes matching canonical chunk paths from steer indexing and downstream retrieval materialization.
 - Patterns are matched relative to `~/.aicx/` using glob syntax, for example:
 
 ```gitignore
@@ -218,44 +220,19 @@ aicx steer --project ai-contexters --kind reports --date 2026-03-28
 aicx steer --agent claude --date 2026-03-20..2026-03-28
 ```
 
-Semantic materialization — turning canonical chunks into the optional memex semantic index.
-Materialization is always operator-driven; nothing happens until you run it:
+Native embedder hydration — picking the local model without bloating the bundle:
 
 ```bash
-# First build: embed all unsynced canonical chunks into the memex index
-aicx memex-sync
-
-# Incremental: only new chunks since last sync (same command, watermark-tracked)
-aicx memex-sync
-
-# Full rebuild: wipe the index and re-embed everything
-# Use after an embedding model or dimension change
-aicx memex-sync --reindex
-
-# One-shot shortcut: extract + materialize in a single pass
-aicx all -H 48 --memex
-
-# Fine-grained: per-chunk upsert instead of batch JSONL import
-aicx memex-sync --per-chunk
-
-# Explicitly keep the older stronger-workstation preset
-aicx memex-sync --profile dev
-
-# Opt into the heaviest preset for 4096-dim / Qwen 8B setups
-aicx memex-sync --profile premium
+bash install.sh --pick-embedder
+cat ~/.aicx/embedder.toml
 ```
 
-Batch sync (default) uses metadata-rich JSONL import, preserving `project`, `agent`, `date`, `session_id`, and `kind`. Use `--per-chunk` only when you need single-document granularity.
+Heavy retrieval lives outside this CLI surface:
+- Use Roost/rust-memex for advanced retrieval pipelines, provider routing, and operator-scale indexing.
+- Keep Roost/rust-memex settings in its own config plane (`RUST_MEMEX_CONFIG`, usually `~/.rmcp-servers/rust-memex/config.toml`).
+- Do not put the heavy retrieval provider config into `~/.aicx/embedder.toml`; that file governs only AICX local embeddings.
 
-Runtime profile resolution:
-- Default with no explicit provider config: `base`
-- One-off helper override: `aicx memex-sync --profile <base|dev|premium>`
-- Env helper override: set `AICX_RUNTIME_PROFILE=<base|dev|premium>`
-- Config override: set `RUST_MEMEX_CONFIG=/path/to/config.toml` or edit the discovered `rust-memex` config file, usually `~/.rmcp-servers/rust-memex/config.toml`
-- Explicit `[embeddings]` and legacy `[mlx]` config remain authoritative; helper presets should be treated as convenience, not as hidden overrides of hand-pinned providers or dimensions
-- Native embedder config (`~/.aicx/embedder.toml`, `AICX_EMBEDDER_CONFIG`, `AICX_BUILD_PROFILE`) does not affect this memex provider path.
-
-Example persistent config:
+Example Roost/rust-memex provider config:
 
 ```toml
 [embeddings]
@@ -346,7 +323,7 @@ aicx migrate-intent-schema --project MyProject --dry-run
 
 - Secrets are redacted by default on corpus-building commands (`claude`, `codex`, `all`, `extract`, `store`). Disable only if you know what you’re doing: `--no-redact-secrets`.
 - Framework integration expects `aicx` or `aicx-mcp` in `PATH`.
-- `aicx memex-sync` now emits live scan/embed/index progress on TTY stderr instead of going silent after preflight.
+- Native embedding models are never downloaded silently by package install or MCP startup.
 
 ---
 

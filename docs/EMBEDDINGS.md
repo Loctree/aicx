@@ -1,230 +1,209 @@
-# aicx Native Embeddings
+# AICX Native Embeddings
 
-> Foundation tool for the Vibecrafted framework — a lean, in-process embedder
-> that can ship with the binary when explicitly embedded and otherwise
-> gracefully falls back to the HuggingFace cache.
+> Foundation layer for Vibecrafted products: local, explicit, portable
+> embeddings without turning every install into a multi-GB surprise.
 
-## Why
+## Product Truth
 
-`aicx` already speaks to an external rmcp-memex embedding service over HTTP.
-That path is excellent on developer workstations connected to the LibraxisAI
-MLX stack, but it has three failure modes on customer machines:
+AICX now treats the native embedder as its first-choice local embedding path,
+not as a fallback behind memex.
 
-1. `qwen3-embedding:8b` can push even a capable laptop to its knees — neither
-   Codex nor Claude users want to run an 8B model just to semantic-search their
-   own context.
-2. HTTP providers add a hard dependency on reachable infrastructure. Offline
-   installs, airgapped enterprise deployments, and CI environments can't wait
-   on a network endpoint that might not exist.
-3. Different namespaces inside a shared Lance store can drift in dimension
-   while the ingest path blindly overwrites vectors — a silent corruption.
+The split is:
 
-The native embedder fixes all three: it runs locally, in-process, with a
-predictable memory footprint, and the compatibility checks refuse to corrupt
-namespaces whose embedding truth has diverged from the current runtime.
+- **AICX** owns the canonical corpus, steering surfaces, MCP front door, and a
+  reusable local embedding library.
+- **Roost/rust-memex** owns the advanced retrieval/operator plane: heavier
+  provider routing, richer indexing, and premium retrieval workflows.
 
-Important shipping truth:
+This removes the old schizophrenia where AICX pretended to be memex while also
+depending on memex internals for the same job.
 
-- current public release bundles stay slim and do **not** auto-bundle model weights
-- current public release bundles do **not** silently download a heavy model during install
-- native embedder selection is therefore a preference + hydration story, not a hidden payload
+## Library Boundary
 
-## Feature flag
+The reusable code lives in `crates/aicx-embeddings`.
 
-Native embeddings live behind the `native-embedder` cargo feature. Default
-builds stay lean (no Candle, no Tokenizers pulled in) so operators only pay the
-compile-time and binary-size cost when they opt in:
+`aicx` re-exports it under `aicx::embedder::*` for compatibility, but
+rust-memex can depend on the smaller crate directly later:
+
+```rust
+use aicx_embeddings::{EmbeddingConfig, EmbeddingEngine};
+
+let mut engine = EmbeddingEngine::with_config(EmbeddingConfig::from_env())?;
+let vector = engine.embed("hello local retrieval")?;
+```
+
+Core API:
+
+- `LocalEmbeddingProvider` — minimal provider trait for future rust-memex adaptation.
+- `EmbeddingEngine` — backend-hiding runtime wrapper.
+- `EmbeddingConfig` — env/config-driven model selection.
+- `EmbeddingModelInfo` — model id, backend, dimension, profile, source.
+
+## Backend
+
+The production backend is GGUF through `llama-cpp-2`.
+
+Why GGUF:
+
+- quantized model files are dramatically smaller than fp16 safetensors
+- one model file is easier to hydrate, verify, and cache
+- llama.cpp already exposes pooled embeddings for BERT/F2LLM-style GGUF models
+- CodeScribe's Candle path is a good architectural precedent, but it was built
+  for MiniLM/BERT safetensors, not for the F2LLM quant line
+
+Runtime details:
+
+- llama.cpp runs with embeddings enabled
+- pooling is explicit `Mean`
+- attention is explicit `NonCausal`
+- vectors are L2-normalized before returning
+- models are loaded from an explicit `.gguf` path or from the local HF cache
+- the crate never downloads from the network at runtime
+
+## Profiles
+
+| Profile | Model file | Dim | Approx download | Role |
+|---|---:|---:|---:|---|
+| `base` | `F2LLM-v2-0.6B.Q4_K_M.gguf` | 1024 | ~397 MB | portable default |
+| `dev` | `F2LLM-v2-1.7B.Q4_K_M.gguf` | 2048 | ~1.1 GB | workstation tier |
+| `premium` | `F2LLM-v2-1.7B.Q6_K.gguf` | 2048 | ~1.4 GB | stronger local tier |
+
+Default repos:
+
+```text
+base:    mradermacher/F2LLM-v2-0.6B-GGUF
+dev:     mradermacher/F2LLM-v2-1.7B-GGUF
+premium: mradermacher/F2LLM-v2-1.7B-GGUF
+```
+
+The old MiniLM/Harrier/fp16 config values are treated as legacy. If a stale
+`~/.aicx/embedder.toml` still points at one of those repos without an explicit
+GGUF filename, the resolver falls back to the selected F2LLM GGUF profile
+instead of trying to load an incompatible safetensors snapshot as GGUF.
+
+## Feature Flags
+
+Default AICX builds stay lean.
 
 ```bash
+cargo build --release
 cargo build --release --features native-embedder
 ```
 
-Build profile resolution:
-- `AICX_BUILD_PROFILE=base` or unset: embed `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
-- `AICX_BUILD_PROFILE=dev`: embed `microsoft/harrier-oss-v1-0.6b`
-- `AICX_BUILD_PROFILE=premium`: embed `codefuse-ai/F2LLM-v2-1.7B`
-- `AICX_EMBEDDER_REPO=<owner/name>` still wins as the exact override
+Feature mapping:
 
-These build profiles are **native-embedder profiles only**. They do not change
-the current `memex-sync` provider, the rust-memex HTTP/provider config, or the
-Qwen-family 1024/2560/4096-dim presets.
+- `native-embedder` — enables `aicx-embeddings/gguf`
+- `native-embedder-metal` — enables the crate's Metal feature for macOS builds
+- `native-embedder-openmp` — enables OpenMP when the target has a known-good toolchain
 
-To keep a complete bundle under ~1.1 GB the default `base` profile uses the
-conservative `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
-model (~224 MB fp16). Operators can opt into a stronger code-focused bundle or
-an even larger local model with the build profiles above:
+The `llama-cpp-2` dependency is pinned at `0.1.145` and uses
+`default-features = false` to avoid accidental OpenMP/linker surprises in the
+portable path.
 
-| Model                                  | Params | Size (fp16) | Include-in-bundle? |
-|----------------------------------------|-------:|------------:|--------------------|
-| MiniLM L12 multilingual (default)      | 118M   | ~224 MB     | yes                |
-| `microsoft/harrier-oss-v1-0.6b`         | 0.6B   | ~1.1 GB     | yes (bundle cap)   |
-| `codefuse-ai/F2LLM-v2-1.7B`                | 1.7B   | ~3.4 GB     | runtime-only       |
+## Config
 
-For the 1.7B tier we recommend leaving the model in the HF cache and loading it
-at runtime — embedding a 3+ GB weights file would blow past our 1.1 GB total
-budget and tip the user experience into "enterprise-only" territory.
+`~/.aicx/embedder.toml` is the AICX native embedder config.
 
-## Build-time vs runtime
-
-There are two supply paths for the model and `aicx` transparently prefers the
-sealed one when both are present:
-
-### 1. Embedded (build-time include_bytes)
-
-`build.rs` inspects the HuggingFace cache on the host that compiles the binary.
-If a snapshot for `AICX_EMBEDDER_REPO` exists with `config.json`,
-`tokenizer.json`, and a safetensors weights file, it generates
-`OUT_DIR/embedded_embedder_data.rs` containing three `include_bytes!` slices
-and sets the custom `aicx_embed_embedder` cfg flag.
-
-From the consumer's point of view that means the binary is self-contained:
-
-```rust
-use aicx::embedder::{EmbedderEngine, EmbedderConfig};
-
-let mut engine = EmbedderEngine::with_config(EmbedderConfig::from_env())?;
-let vector = engine.embed("hello vibe")?;
-```
-
-No HTTP calls, no filesystem lookups, no runtime downloads — the model is
-literally part of the ELF.
-
-### 2. Runtime HF cache
-
-When no model was embedded (developer build, missing cache at build time, or
-`AICX_NO_EMBED=1`), the same API call reads from the HuggingFace cache at first
-use:
-
-```
-~/.aicx/embeddings/hub/models--*/snapshots/<sha>/
-~/.cache/huggingface/hub/models--*/snapshots/<sha>/
-```
-
-Cache lookup honours, in order:
-
-1. `AICX_EMBEDDER_PATH` — explicit directory override (bypasses repo lookup)
-2. `AICX_HF_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HUB_CACHE`, `HF_HOME/hub`
-3. `~/.cache/huggingface/hub`
-4. `~/.aicx/embeddings` and `~/.aicx/embeddings/hub`
-
-The newest snapshot with all three required files wins.
-
-## Operator config files
-
-Two different config surfaces exist today and they should not be conflated.
-The split is intentional because they govern different runtime planes:
-
-1. Active memex retrieval provider config:
-   - usually `~/.rmcp-servers/rust-memex/config.toml`
-   - or an explicit file via `RUST_MEMEX_CONFIG`
-   - this governs the current `memex-sync` provider path, including the large Qwen-family `dev` / `premium` setups
-2. Native embedder preference config:
-   - `~/.aicx/embedder.toml`
-   - or an explicit file via `AICX_EMBEDDER_CONFIG`
-   - this governs only which local native embedder repo/path a native-embedder build or runtime will try to load
-
-Compatibility rule:
-
-- If you are configuring the 4096-dim Qwen 8B / premium memex path, use
-  `rust-memex` config, `RUST_MEMEX_CONFIG`, `AICX_RUNTIME_PROFILE=premium`, or
-  `aicx memex-sync --profile premium`.
-- Do not put that setting in `~/.aicx/embedder.toml`; that file is not read as
-  an rmcp/rust-memex provider config and should not be treated as a successor to
-  shared memex settings.
-- Conversely, `rust-memex` config does not decide which native model gets
-  embedded into an `aicx` binary via `include_bytes!`.
-
-Recommended native embedder config:
+Recommended shape:
 
 ```toml
 [native_embedder]
+backend = "gguf"
 profile = "base"
-repo = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-prefer_embedded = true
+repo = "mradermacher/F2LLM-v2-0.6B-GGUF"
+filename = "F2LLM-v2-0.6B.Q4_K_M.gguf"
+prefer_embedded = false
+max_length = 512
 ```
 
-`install.sh --pick-embedder` writes that file for you without silently pulling a
-heavy model into the bundle.
+Explicit local file:
 
-## Environment variables
+```toml
+[native_embedder]
+backend = "gguf"
+path = "/absolute/path/to/F2LLM-v2-0.6B.Q4_K_M.gguf"
+max_length = 512
+```
 
-| Variable                | Scope          | Effect                                                    |
-|-------------------------|----------------|-----------------------------------------------------------|
-| `AICX_EMBEDDER_REPO`    | build + runtime| Native HF repo id to embed / load (`owner/name`).         |
-| `AICX_BUILD_PROFILE`    | build          | Native build preset: `base`, `dev`, or `premium`.         |
-| `AICX_EMBEDDER_PATH`    | build + runtime| Absolute path to a model directory — bypasses HF cache.   |
-| `AICX_EMBEDDER_CONFIG`  | build + runtime| Explicit native config overriding `~/.aicx/embedder.toml`.|
-| `AICX_NO_EMBED=1`       | build          | Skip `include_bytes!` even if cache has the model.        |
-| `AICX_HF_CACHE`         | build + runtime| Extra HF cache base to search first.                      |
+Resolution order:
 
-These variables are honoured by both `build.rs` and the native runtime engine.
-They are deliberately not aliases for `RUST_MEMEX_CONFIG`, and they do not
-change the active `memex-sync` HTTP/provider path.
+1. `AICX_EMBEDDER_PATH`
+2. `AICX_EMBEDDER_REPO` + `AICX_EMBEDDER_FILENAME`
+3. `AICX_EMBEDDER_CONFIG`
+4. `~/.aicx/embedder.toml`
+5. `~/.aicx/config.toml`
+6. profile defaults
 
-## Non-destructive namespace handling
+Useful env vars:
 
-`aicx` records per-namespace metadata under `~/.aicx/memex/semantic-index-<namespace>.json`
-and refuses to mix embeddings with conflicting dimensions. When the runtime
-truth (embedding model, dimension, paths) diverges from what was previously
-recorded for a namespace, `sync_new_chunk_paths` fails with an explicit error
-suggesting `aicx memex-sync --reindex --namespace <namespace>`.
+| Variable | Effect |
+|---|---|
+| `AICX_EMBEDDER_CONFIG` | explicit config file |
+| `AICX_EMBEDDER_PROFILE` | `base`, `dev`, or `premium` |
+| `AICX_EMBEDDER_PATH` | explicit `.gguf` file or directory |
+| `AICX_EMBEDDER_REPO` | HF repo override |
+| `AICX_EMBEDDER_FILENAME` | exact GGUF file in the repo |
+| `AICX_EMBEDDER_MAX_LENGTH` | max tokens per text |
+| `AICX_EMBEDDER_THREADS` | llama.cpp thread count |
+| `AICX_EMBEDDER_GPU_LAYERS` | optional GPU offload count |
+| `AICX_HF_CACHE` | extra HF cache base to search first |
 
-`reset_semantic_index(namespace)` is correspondingly narrow:
+`AICX_RUNTIME_PROFILE` is accepted as a compatibility alias for profile
+selection, but prefer `AICX_EMBEDDER_PROFILE` for new AICX-native flows.
 
-- If the target namespace is the **only** namespace in the Lance store, the
-  full `~/.aicx/lancedb`, BM25, and sync-state paths are wiped — identical to
-  the previous destructive behaviour.
-- If other namespaces exist, only documents whose `namespace` column matches
-  are deleted (via `StorageManager::delete_namespace_documents`). Sibling
-  namespaces with a different dimension are left intact.
-- Per-namespace metadata is always removed so the next ingest recomputes the
-  truth from scratch.
+## Hydration
 
-This keeps multi-project stores alive across embedder swaps. Flipping between
-MiniLM, Harrier, and F2-LLM on a single namespace is now a reindex command, not
-a hand-rolled dance around `rm -rf ~/.aicx/lancedb`.
+Install does not silently download a model.
+
+Interactive picker:
+
+```bash
+bash install.sh --pick-embedder
+```
+
+Manual hydration:
+
+```bash
+hf download mradermacher/F2LLM-v2-0.6B-GGUF F2LLM-v2-0.6B.Q4_K_M.gguf
+hf download mradermacher/F2LLM-v2-1.7B-GGUF F2LLM-v2-1.7B.Q4_K_M.gguf
+hf download mradermacher/F2LLM-v2-1.7B-GGUF F2LLM-v2-1.7B.Q6_K.gguf
+```
+
+Lookup paths:
+
+- `AICX_HF_CACHE`
+- `HUGGINGFACE_HUB_CACHE`
+- `HF_HUB_CACHE`
+- `HF_HOME/hub`
+- `~/.cache/huggingface/hub`
+- `~/.aicx/embeddings`
+- `~/.aicx/embeddings/hub`
+
+## Relationship To Roost/Rust-Memex
+
+Do not conflate config planes:
+
+- `~/.aicx/embedder.toml` controls AICX local embeddings.
+- `RUST_MEMEX_CONFIG` / `~/.rmcp-servers/rust-memex/config.toml` controls the
+  Roost/rust-memex retrieval plane.
+
+AICX local embeddings are enough for portable steering and lightweight local
+retrieval. Roost/rust-memex is still the right home for premium retrieval,
+operator settings, alternate providers, and larger indexing pipelines.
 
 ## Testing
 
 ```bash
-cargo test --features native-embedder --test native_embedder
+cargo test -p aicx-embeddings
+cargo test -p aicx-embeddings --features gguf
+cargo test -p aicx --features native-embedder --test native_embedder
 ```
 
-The integration tests self-skip when no model is available in either supply
-path, so the same command is safe on clean CI runners and on loaded developer
-machines. On a machine with the default MiniLM snapshot in `~/.cache/huggingface`
-they verify:
-
-- Embedded dimension hint is positive when `aicx_embed_embedder` fired.
-- `embed_batch` returns the configured dimension and L2-normalised vectors.
-- Identical input produces self-similarity ≥ 0.999.
-- `NativeEmbeddingSource` correctly reports Embedded / HfCache / ExplicitPath.
-
-## Relationship to `rmcp-memex`
-
-The native embedder is **not** a full replacement for the `rmcp-memex` HTTP
-path today. It is the foundation layer for Vibecrafted-native products that
-need deterministic, offline-capable embeddings. Future work will expose it as
-an additional `EmbeddingBackend` inside the sync pipeline so operators can
-choose between HTTP (Qwen3/MLX on the LAN) and in-process (Harrier/F2-LLM on
-the laptop) per project.
-
-Until that backend switch exists, large retrieval settings remain rust-memex
-settings. `~/.aicx/embedder.toml` is a native-embedder preference file, not the
-place where the current rmcp/rust-memex provider stopped being configured.
-
-On the HTTP memex path, `aicx` now also exposes explicit runtime presets:
-- `base` (default): 1024-dim Qwen 0.6B
-- `dev`: 2560-dim Qwen 4B
-- `premium`: 4096-dim Qwen 8B
-
-Select them with `aicx memex-sync --profile ...`, `AICX_RUNTIME_PROFILE`, or
-the active `rust-memex` config file (`RUST_MEMEX_CONFIG`, usually
-`~/.rmcp-servers/rust-memex/config.toml`).
+The integration test self-skips when the configured GGUF model is not present
+in the local cache, so the command is safe on clean CI runners.
 
 ## Credits
 
-Patterned after the `core/embedder` module of the sibling repo
-[`CodeScribe`](../../CodeScribe), which proved that shipping a
-Candle-powered BERT embedder inside a Rust binary is not only feasible but
-actively pleasant.
+CodeScribe proved the in-process local model shape is comfortable in Rust.
+AICX keeps that architectural lesson but switches the production model format
+to GGUF because quantized F2LLM is the sharper distribution path here.

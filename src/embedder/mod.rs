@@ -1,26 +1,34 @@
-//! Native embedder foundation for aicx and the Vibecrafted framework.
+//! Native embedder foundation for AICX and the Vibecrafted framework.
 //!
-//! Provides a BERT-style text embedder that runs fully in-process via Candle.
-//! Two provisioning modes are supported:
+//! This module re-exports the reusable `aicx-embeddings` crate so existing
+//! consumers can keep using `aicx::embedder::*` while rust-memex can depend on
+//! the provider crate directly.
 //!
-//! - **Embedded (build-time)** — weights and tokenizer are sealed into the
-//!   binary via `include_bytes!` when `native-embedder` feature is active and
-//!   the model is present in the HuggingFace cache at build time.
-//! - **Runtime HF cache** — if no embedded model is present, the embedder is
-//!   hydrated from the user's HuggingFace cache at first use. `AICX_EMBEDDER_REPO`
-//!   and `AICX_EMBEDDER_PATH` control which model is loaded. Persistent
-//!   operator preferences can also live in `~/.aicx/embedder.toml` or a file
-//!   pointed to by `AICX_EMBEDDER_CONFIG`.
-//!
-//! The module is compiled only when the `native-embedder` feature is enabled so
-//! that default builds stay lean (no Candle, no tokenizers crate pulled in).
+//! The first-choice backend is local GGUF/F2LLM through llama.cpp. Models are
+//! resolved from an explicit path or the local HuggingFace cache; release
+//! bundles stay slim and do not silently carry model payloads.
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 #![cfg(feature = "native-embedder")]
 
-mod embedded;
-mod engine;
+pub use aicx_embeddings::{
+    BackendPreference, EmbeddingConfig, EmbeddingEngine, EmbeddingModelInfo, EmbeddingProfile,
+    EmbeddingProfileSpec, LocalEmbeddingProvider, NativeEmbeddingSource, ResolvedEmbeddingModel,
+    config_search_paths, find_cached_model_file, l2_normalize, profile_spec, similarity,
+};
 
-pub use embedded::{EmbeddedModel, embedded_dimension, is_embedded_available};
-pub use engine::{EmbedderConfig, EmbedderEngine, NativeEmbeddingSource};
+pub type EmbedderConfig = EmbeddingConfig;
+pub type EmbedderEngine = EmbeddingEngine;
+
+/// Build-time include_bytes embedding is intentionally off for the production
+/// GGUF path. Keep this compatibility shim for old diagnostics/tests.
+pub fn is_embedded_available() -> bool {
+    false
+}
+
+/// GGUF release builds do not expose a static embedded dimension hint because
+/// the model is hydrated at install/runtime.
+pub fn embedded_dimension() -> Option<usize> {
+    None
+}

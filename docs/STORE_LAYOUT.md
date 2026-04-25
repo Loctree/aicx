@@ -3,7 +3,7 @@
 `aicx` writes artifacts to the canonical store under `~/.aicx/` (cross-repo, global, machine-local).
 
 Optional store control file:
-- `~/.aicx/.aicxignore` — glob patterns relative to `~/.aicx/`; matching chunk paths are excluded from memex materialization and steer indexing.
+- `~/.aicx/.aicxignore` — glob patterns relative to `~/.aicx/`; matching chunk paths are excluded from steer indexing and downstream retrieval materialization.
 
 ## Canonical Store: `~/.aicx/`
 
@@ -29,8 +29,6 @@ Contexts are chunked and stored by project and date:
       <kind>/
         <agent>/
           <YYYY_MMDD>_<agent>_<session-id>_<chunk>.md
-  memex/
-    sync_state.json
   steer_db/
     (LanceDB metadata index)
 ```
@@ -47,14 +45,16 @@ Notes:
 `index.json` is a manifest used to quickly list stored projects, dates and totals.
 It is updated on every store write.
 
-### Memex Integration
+### Retrieval Integration
 
-The `aicx memex-sync` command (and `--memex` flag) materializes canonical chunks
-into the optional `rmcp-memex` semantic index. Materialization is always operator-driven
-— nothing syncs automatically:
-- Sync state is maintained in `~/.aicx/memex/sync_state.json`.
-- `~/.aicx/.aicxignore` is honored before queueing chunks for embed/index work.
-- Metadata-rich imports preserve `project`, `agent`, `date`, `session_id`, and `kind` in the semantic index.
+AICX exposes canonical chunks through filesystem search, steering metadata,
+dashboard search, MCP tools, and the reusable `aicx-embeddings` library. Heavy
+semantic retrieval/indexing is owned by Roost/rust-memex outside this CLI
+surface.
+
+`~/.aicx/.aicxignore` is honored before queueing chunks for the steer index and
+should also be honored by downstream retrieval materializers that consume the
+canonical store.
 
 ## Identity Model & Compatibility Rules (v0.5.0+)
 
