@@ -109,6 +109,10 @@ Config truth:
 
 ## Quickstart
 
+`aicx wizard` opens the interactive entrypoint for browsing the corpus,
+running doctor, watching store progress, and viewing the intents timeline.
+Press `?` inside the wizard for the keymap.
+
 ### Layer 1 — build the canonical corpus
 
 Extract the last 4 hours into `~/.aicx/`. Extractors are quiet on stdout by default (`--emit none`).

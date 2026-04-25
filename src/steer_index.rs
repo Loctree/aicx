@@ -360,19 +360,14 @@ async fn sync_steer_index_at_with_reporter(
         return Ok(());
     }
 
-<<<<<<< HEAD
-    let ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
-    for id in ids {
-        let _ = storage.delete_document(STEER_NAMESPACE, id).await;
-    }
-=======
     let total_docs = docs.len() as u64;
->>>>>>> c16744e ([claude/aicx-progress] feat(progress): wire per-phase observability into aicx store pipeline)
 
     let steer_phase = Phase::start(reporter.clone(), "steer_sync", Some(total_docs));
     let lance_result: Result<()> = async {
         let ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
-        let _ = storage.delete_documents(STEER_NAMESPACE, &ids).await;
+        for id in ids {
+            let _ = storage.delete_document(STEER_NAMESPACE, id).await;
+        }
 
         let mut written: u64 = 0;
         for chunk in docs.chunks(1000) {
