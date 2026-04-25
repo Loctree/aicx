@@ -464,14 +464,26 @@ fn repo_identity_from_remote_path(path: &str) -> Option<RepoIdentity> {
     let mut parts = path.split('/');
     let organization = parts.next()?.trim();
     let repository = parts.next()?.trim().trim_end_matches(".git");
-    if !is_probably_repo_name(organization) || !is_probably_repo_name(repository) {
-        return None;
+
+    if is_probably_repo_name(organization) && is_probably_repo_name(repository) {
+        return Some(RepoIdentity {
+            organization: organization.to_string(),
+            repository: repository.to_string(),
+        });
     }
 
     Some(RepoIdentity {
-        organization: organization.to_string(),
-        repository: repository.to_string(),
+        organization: "local".to_string(),
+        repository: local_repo_fallback(repository),
     })
+}
+
+fn local_repo_fallback(repository: &str) -> String {
+    if is_probably_repo_name(repository) {
+        repository.to_string()
+    } else {
+        "unknown".to_string()
+    }
 }
 
 fn looks_like_weak_source_identifier(raw: &str) -> bool {
@@ -493,11 +505,45 @@ fn expand_home(raw: &str) -> PathBuf {
 }
 
 fn is_probably_repo_name(value: &str) -> bool {
-    !value.is_empty()
-        && !matches!(
-            value.to_ascii_lowercase().as_str(),
-            "tmp" | "temp" | "src" | "app" | "lib" | "docs" | "workspace" | "workspaces"
-        )
+    if value.is_empty() || value.len() > 64 {
+        return false;
+    }
+
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    if !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_')) {
+        return false;
+    }
+
+    let lower = value.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "." | ".."
+            | "..."
+            | "local"
+            | "tmp"
+            | "temp"
+            | "src"
+            | "app"
+            | "lib"
+            | "docs"
+            | "workspace"
+            | "workspaces"
+    ) {
+        return false;
+    }
+
+    let dot_count = value.chars().filter(|ch| *ch == '.').count();
+    if dot_count > value.chars().count() / 2 {
+        return false;
+    }
+
+    true
 }
 
 #[cfg(test)]
@@ -678,6 +724,76 @@ mod tests {
         assert_eq!(tiered.tier, SourceTier::Primary);
         assert_eq!(tiered.identity.slug(), "VetCoders/ai-contexters");
         assert!(tiered.tier.is_assertable());
+    }
+
+    #[test]
+    fn rejects_template_literals() {
+        assert!(!is_probably_repo_name("{target_owner}"));
+        assert!(!is_probably_repo_name("<YOUR_USERNAME>"));
+        assert!(!is_probably_repo_name("${RELEASE_REPO}"));
+        assert!(!is_probably_repo_name("$REPO"));
+        assert!(!is_probably_repo_name("{org}"));
+    }
+
+    #[test]
+    fn rejects_dot_only_and_traversal_strings() {
+        assert!(!is_probably_repo_name("..."));
+        assert!(!is_probably_repo_name(".."));
+        assert!(!is_probably_repo_name("."));
+        assert!(!is_probably_repo_name(".../"));
+        assert!(!is_probably_repo_name("..hidden"));
+    }
+
+    #[test]
+    fn rejects_control_chars_and_separators() {
+        assert!(!is_probably_repo_name("foo/bar"));
+        assert!(!is_probably_repo_name("foo\\bar"));
+        assert!(!is_probably_repo_name("foo\nbar"));
+        assert!(!is_probably_repo_name("foo bar"));
+        assert!(!is_probably_repo_name(""));
+    }
+
+    #[test]
+    fn accepts_real_repo_names() {
+        assert!(is_probably_repo_name("vibecrafted"));
+        assert!(is_probably_repo_name("rust-memex"));
+        assert!(is_probably_repo_name("ai-contexters"));
+        assert!(is_probably_repo_name("vc-runtime"));
+        assert!(is_probably_repo_name("CodeScribe"));
+        assert!(is_probably_repo_name("starship"));
+        assert!(is_probably_repo_name("01mf02"));
+        assert!(is_probably_repo_name("a"));
+    }
+
+    #[test]
+    fn fallback_routes_invalid_remote_owner_to_local_bucket() {
+        let e = entry(
+            (2026, 3, 22, 10, 0, 0),
+            "sess-local-fallback",
+            "user",
+            "Clone https://github.com/{target_owner}/vibecrafted.git before release.",
+            None,
+        );
+
+        let tiered = infer_tiered_identity_from_entry(&e, &ProjectHashRegistry::default())
+            .expect("malformed remote should resolve to local fallback");
+        assert_eq!(tiered.identity.slug(), "local/vibecrafted");
+        assert!(tiered.tier.is_assertable());
+
+        let segments = semantic_segments(&[e]);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].project_label(), "local/vibecrafted");
+        assert_ne!(segments[0].project_label(), "{target_owner}/vibecrafted");
+    }
+
+    #[test]
+    fn fallback_routes_invalid_remote_repo_to_unknown_local_bucket() {
+        let identity = infer_repo_identity_from_remote_like(
+            "https://github.com/VetCoders/${RELEASE_REPO}.git",
+        )
+        .expect("malformed repository should resolve to local unknown fallback");
+
+        assert_eq!(identity.slug(), "local/unknown");
     }
 
     #[test]
