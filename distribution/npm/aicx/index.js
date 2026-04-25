@@ -1,15 +1,32 @@
 #!/usr/bin/env node
 
 const { execFileSync, spawnSync } = require("child_process");
-const { existsSync } = require("fs");
-const { join } = require("path");
+const { existsSync, realpathSync } = require("fs");
+const { isAbsolute, relative, sep } = require("path");
 
-const PLATFORMS = {
-  "darwin-arm64": "@loctree/aicx-darwin-arm64",
-  "darwin-x64": "@loctree/aicx-darwin-x64",
-  "linux-x64-gnu": "@loctree/aicx-linux-x64-gnu",
-  "linux-x64-musl": "@loctree/aicx-linux-x64-musl",
-};
+const PLATFORM_PACKAGES = Object.freeze({
+  "darwin-arm64": Object.freeze({
+    name: "@loctree/aicx-darwin-arm64",
+    root: `${__dirname}/node_modules/@loctree/aicx-darwin-arm64`,
+  }),
+  "darwin-x64": Object.freeze({
+    name: "@loctree/aicx-darwin-x64",
+    root: `${__dirname}/node_modules/@loctree/aicx-darwin-x64`,
+  }),
+  "linux-x64-gnu": Object.freeze({
+    name: "@loctree/aicx-linux-x64-gnu",
+    root: `${__dirname}/node_modules/@loctree/aicx-linux-x64-gnu`,
+  }),
+  "linux-x64-musl": Object.freeze({
+    name: "@loctree/aicx-linux-x64-musl",
+    root: `${__dirname}/node_modules/@loctree/aicx-linux-x64-musl`,
+  }),
+});
+
+const BINARY_FILENAMES = Object.freeze({
+  aicx: process.platform === "win32" ? "aicx.exe" : "aicx",
+  "aicx-mcp": process.platform === "win32" ? "aicx-mcp.exe" : "aicx-mcp",
+});
 
 function isMuslLibc() {
   try {
@@ -46,23 +63,43 @@ function getPlatformKey() {
 }
 
 function getPlatformPackageName() {
+  return getPlatformPackage().name;
+}
+
+function getPlatformPackage() {
   const platformKey = getPlatformKey();
   if (!platformKey) {
     throw new Error(`Unsupported platform: ${process.platform}-${process.arch}`);
   }
 
-  const packageName = PLATFORMS[platformKey];
-  if (!packageName) {
+  const platformPackage = PLATFORM_PACKAGES[platformKey];
+  if (!platformPackage) {
     throw new Error(`No package available for platform: ${platformKey}`);
   }
 
-  return packageName;
+  return platformPackage;
+}
+
+function getBinaryFileName(binaryName) {
+  const binaryFileName = BINARY_FILENAMES[binaryName];
+  if (!binaryFileName) {
+    throw new Error(`Unsupported binary: ${binaryName}. Expected "aicx" or "aicx-mcp".`);
+  }
+  return binaryFileName;
+}
+
+function assertContainedPath(rootPath, candidatePath) {
+  const rel = relative(rootPath, candidatePath);
+  if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error(`Resolved binary path escapes package root: ${candidatePath}`);
+  }
 }
 
 function getBinaryPath(binaryName) {
-  const packageName = getPlatformPackageName();
-  const resolvedBinaryName = process.platform === "win32" ? `${binaryName}.exe` : binaryName;
-  const binaryPath = join(__dirname, "node_modules", packageName, resolvedBinaryName);
+  const platformPackage = getPlatformPackage();
+  const packageName = platformPackage.name;
+  const resolvedBinaryName = getBinaryFileName(binaryName);
+  const binaryPath = `${platformPackage.root}/${resolvedBinaryName}`;
 
   if (!existsSync(binaryPath)) {
     throw new Error(
@@ -72,7 +109,11 @@ function getBinaryPath(binaryName) {
     );
   }
 
-  return binaryPath;
+  const realPackageRoot = realpathSync(platformPackage.root);
+  const realBinaryPath = realpathSync(binaryPath);
+  assertContainedPath(realPackageRoot, realBinaryPath);
+
+  return realBinaryPath;
 }
 
 function execBinary(binaryName, args = [], options = {}) {

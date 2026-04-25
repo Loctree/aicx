@@ -6,6 +6,8 @@
 //! Two-layer architecture:
 //!   1. **Canonical corpus** (`~/.aicx/`) — deduplicated, chunked, steerable markdown.
 //!      Built by extractors (`claude`, `codex`, `all`) and `store`. This is ground truth.
+//!   2. **Optional semantic index** — local embedding-backed retrieval for builds that
+//!      opt into native embedder support. The corpus remains useful without it.
 //!
 //! Supported sources:
 //! - Claude Code: ~/.claude/projects/*/*.jsonl
@@ -63,6 +65,8 @@ fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
 /// Two-layer pipeline, both operator-driven:
 ///   Layer 1 (canonical corpus): extract, deduplicate, and chunk agent logs
 ///     into steerable markdown at ~/.aicx/. This is ground truth.
+///   Layer 2 (optional semantic index): local embedding-backed retrieval for native builds,
+///     while the canonical corpus stays portable and useful without it.
 /// Quick start:
 ///   aicx all -H 4                      # build canonical corpus (layer 1)
 #[derive(Debug, Parser)]

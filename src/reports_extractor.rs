@@ -230,7 +230,7 @@ fn scan_reports(
         end: config.date_to,
     };
     let mut candidates = BTreeMap::<String, Candidate>::new();
-    collect_candidates(repo_root, Path::new(""), &mut candidates)?;
+    collect_candidates(repo_root, repo_root, Path::new(""), &mut candidates)?;
 
     let mut records = Vec::<ReportsExplorerRecord>::new();
     let mut workflows = BTreeSet::<String>::new();
@@ -330,11 +330,13 @@ fn scan_reports(
 }
 
 fn collect_candidates(
+    scan_root: &Path,
     dir: &Path,
     relative: &Path,
     candidates: &mut BTreeMap<String, Candidate>,
 ) -> Result<()> {
-    let mut entries = fs::read_dir(dir)
+    let dir = validate_artifact_dir(scan_root, dir)?;
+    let mut entries = crate::sanitize::read_dir_validated(&dir)
         .with_context(|| format!("Failed to read artifact directory: {}", dir.display()))?
         .collect::<std::io::Result<Vec<_>>>()
         .with_context(|| format!("Failed to iterate artifact directory: {}", dir.display()))?;
@@ -345,12 +347,16 @@ fn collect_candidates(
         let rel = relative.join(entry.file_name());
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            collect_candidates(&path, &rel, candidates)?;
+            collect_candidates(scan_root, &path, &rel, candidates)?;
             continue;
         }
         if !file_type.is_file() {
             continue;
         }
+        let path = match validate_artifact_file(scan_root, &path) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
 
         let rel_string = rel.to_string_lossy();
         let contains_lane = rel_string.contains("/reports/") || rel_string.contains("/plans/");
@@ -375,6 +381,35 @@ fn collect_candidates(
         }
     }
 
+    Ok(())
+}
+
+fn validate_artifact_dir(scan_root: &Path, path: &Path) -> Result<PathBuf> {
+    let validated = crate::sanitize::validate_dir_path(path)?;
+    ensure_artifact_descendant(scan_root, &validated)?;
+    Ok(validated)
+}
+
+fn validate_artifact_file(scan_root: &Path, path: &Path) -> Result<PathBuf> {
+    let validated = crate::sanitize::validate_read_path(path)?;
+    ensure_artifact_descendant(scan_root, &validated)?;
+    if !validated.is_file() {
+        return Err(anyhow!(
+            "Artifact path is not a file: {}",
+            validated.display()
+        ));
+    }
+    Ok(validated)
+}
+
+fn ensure_artifact_descendant(scan_root: &Path, path: &Path) -> Result<()> {
+    if !path.starts_with(scan_root) {
+        return Err(anyhow!(
+            "Artifact path escapes scan root: {} is outside {}",
+            path.display(),
+            scan_root.display()
+        ));
+    }
     Ok(())
 }
 
@@ -419,13 +454,13 @@ fn finalize_candidate(
     }
 
     let meta = if let Some(meta_path) = candidate.meta_path.as_ref() {
-        Some(read_meta(meta_path)?)
+        Some(read_meta(repo_root, meta_path)?)
     } else {
         None
     };
 
     let markdown = if let Some(md_path) = candidate.md_path.as_ref() {
-        Some(read_markdown(md_path)?)
+        Some(read_markdown(repo_root, md_path)?)
     } else {
         None
     };
@@ -457,11 +492,20 @@ fn finalize_candidate(
     let transcript_path = meta
         .as_ref()
         .and_then(|item| item.transcript.as_ref())
-        .map(PathBuf::from)
-        .filter(|path| path.exists());
+        .and_then(|path| {
+            candidate
+                .meta_path
+                .as_ref()
+                .and_then(|origin| resolve_artifact_reference(repo_root, origin, path))
+        });
+    let has_transcript = transcript_path.is_some();
 
-    let detail_text =
-        build_detail_text(markdown.as_ref(), transcript_path.as_deref(), meta.as_ref());
+    let detail_text = build_detail_text(
+        repo_root,
+        markdown.as_ref(),
+        transcript_path.as_deref(),
+        meta.as_ref(),
+    );
     let preview = build_preview(
         markdown.as_ref(),
         detail_text.as_str(),
@@ -576,7 +620,9 @@ fn finalize_candidate(
         relative_path,
         absolute_path,
         meta_path: meta_path_string,
-        transcript_path: transcript_path.map(|path| path.display().to_string()),
+        transcript_path: transcript_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
         input_path: meta.as_ref().and_then(|item| item.input.clone()),
         launcher_path: meta.as_ref().and_then(|item| item.launcher.clone()),
         updated_at,
@@ -589,11 +635,7 @@ fn finalize_candidate(
         search_blob,
         has_markdown: candidate.md_path.is_some(),
         has_meta: candidate.meta_path.is_some(),
-        has_transcript: meta
-            .as_ref()
-            .and_then(|item| item.transcript.as_ref())
-            .map(|path| Path::new(path).exists())
-            .unwrap_or(false),
+        has_transcript,
         sort_ts,
     }))
 }
@@ -617,8 +659,9 @@ struct ParsedMarkdown {
     headings: Vec<String>,
 }
 
-fn read_markdown(path: &Path) -> Result<ParsedMarkdown> {
-    let raw = fs::read_to_string(path)
+fn read_markdown(scan_root: &Path, path: &Path) -> Result<ParsedMarkdown> {
+    let path = validate_artifact_file(scan_root, path)?;
+    let raw = crate::sanitize::read_to_string_validated(&path)
         .with_context(|| format!("Failed to read markdown artifact: {}", path.display()))?;
     let (frontmatter, body) = parse_artifact_frontmatter(&raw);
     let body = sanitize_text(body);
@@ -630,11 +673,22 @@ fn read_markdown(path: &Path) -> Result<ParsedMarkdown> {
     })
 }
 
-fn read_meta(path: &Path) -> Result<ArtifactMeta> {
-    let raw = fs::read_to_string(path)
+fn read_meta(scan_root: &Path, path: &Path) -> Result<ArtifactMeta> {
+    let path = validate_artifact_file(scan_root, path)?;
+    let raw = crate::sanitize::read_to_string_validated(&path)
         .with_context(|| format!("Failed to read artifact metadata: {}", path.display()))?;
     serde_json::from_str(&raw)
         .with_context(|| format!("Failed to parse artifact metadata: {}", path.display()))
+}
+
+fn resolve_artifact_reference(scan_root: &Path, origin: &Path, raw_path: &str) -> Option<PathBuf> {
+    let raw_path = Path::new(raw_path);
+    let candidate = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        origin.parent().unwrap_or(scan_root).join(raw_path)
+    };
+    validate_artifact_file(scan_root, &candidate).ok()
 }
 
 fn parse_artifact_frontmatter(text: &str) -> (Option<ArtifactFrontmatterEnvelope>, &str) {
@@ -867,6 +921,7 @@ fn derive_status(
 }
 
 fn build_detail_text(
+    scan_root: &Path,
     markdown: Option<&ParsedMarkdown>,
     transcript_path: Option<&Path>,
     meta: Option<&ArtifactMeta>,
@@ -876,7 +931,7 @@ fn build_detail_text(
     }
 
     if let Some(path) = transcript_path
-        && let Ok(text) = read_tail_string(path, MAX_TRANSCRIPT_TAIL_BYTES)
+        && let Ok(text) = read_tail_string(scan_root, path, MAX_TRANSCRIPT_TAIL_BYTES)
         && !text.trim().is_empty()
     {
         return sanitize_text(&text);
@@ -980,8 +1035,9 @@ fn is_known_agent(segment: &str) -> bool {
     matches!(segment, "codex" | "claude" | "gemini")
 }
 
-fn read_tail_string(path: &Path, max_bytes: u64) -> Result<String> {
-    let mut file = fs::File::open(path)
+fn read_tail_string(scan_root: &Path, path: &Path, max_bytes: u64) -> Result<String> {
+    let path = validate_artifact_file(scan_root, path)?;
+    let mut file = crate::sanitize::open_file_validated(&path)
         .with_context(|| format!("Failed to open transcript: {}", path.display()))?;
     let len = file.metadata()?.len();
     let start = len.saturating_sub(max_bytes);
@@ -2058,6 +2114,53 @@ mod tests {
         assert!(artifact.html.contains("Import JSON Bundle"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_reports_explorer_does_not_read_transcripts_outside_repo_root() {
+        let root = tmp_dir("outside-transcript");
+        let repo_root = root.join("VetCoders").join("ai-contexters");
+        let meta_path = repo_root
+            .join("2026_0411")
+            .join("reports")
+            .join("20260411_external_transcript.meta.json");
+        let outside = tmp_dir("outside-transcript-secret").join("secret.log");
+
+        write_file(&outside, "outside secret that must not be imported\n");
+        write_file(
+            &meta_path,
+            &r#"{
+  "status": "launching",
+  "agent": "codex",
+  "run_id": "marb-outside-transcript",
+  "prompt_id": "outside-transcript",
+  "transcript": "__TRANSCRIPT__"
+}"#
+            .replace("__TRANSCRIPT__", &outside.display().to_string()),
+        );
+
+        let config = ReportsExtractorConfig {
+            artifacts_root: root.clone(),
+            org: "VetCoders".to_string(),
+            repo: "ai-contexters".to_string(),
+            date_from: None,
+            date_to: None,
+            workflow: None,
+            title: "AICX Reports Explorer".to_string(),
+            preview_chars: 120,
+        };
+
+        let artifact = build_reports_explorer(&config).expect("build reports explorer");
+        let payload: ReportsExplorerPayload =
+            serde_json::from_str(&artifact.bundle_json).expect("parse bundle");
+        let record = payload.records.first().expect("record");
+
+        assert!(!record.has_transcript);
+        assert!(record.transcript_path.is_none());
+        assert!(!record.detail_text.contains("outside secret"));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(outside.parent().expect("outside parent"));
     }
 
     #[test]

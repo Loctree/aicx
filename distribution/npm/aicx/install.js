@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
-const { existsSync } = require("fs");
-const { spawnSync } = require("child_process");
+const { accessSync, constants, existsSync } = require("fs");
 const { getBinaryPath } = require("./index.js");
 
 function validateBinary(binaryName) {
@@ -12,12 +11,8 @@ function validateBinary(binaryName) {
       return;
     }
 
-    const result = spawnSync(binaryPath, ["--version"], { encoding: "utf8" });
-    if (result.status === 0) {
-      console.log(`${binaryName} binary installed successfully: ${result.stdout.trim()}`);
-    } else {
-      console.warn(`Warning: ${binaryName} binary may not be working correctly`);
-    }
+    accessSync(binaryPath, constants.X_OK);
+    console.log(`${binaryName} binary installed successfully at ${binaryPath}`);
   } catch (error) {
     console.warn(`Warning: Could not verify ${binaryName}: ${error.message}`);
   }

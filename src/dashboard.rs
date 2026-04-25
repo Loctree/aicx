@@ -2524,18 +2524,24 @@ mod tests {
     #[test]
     fn scan_store_scope_filters_by_project_and_hours() {
         let root = mk_tmp_dir("ai_ctx_dashboard_scope");
+        let now = Utc::now();
+        let alpha_date = now.format("%Y_%m%d").to_string();
+        let alpha_timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
+        let stale = now - chrono::Duration::days(30);
+        let beta_date = stale.format("%Y_%m%d").to_string();
+        let beta_timestamp = stale.format("%Y-%m-%d %H:%M:%S").to_string();
 
         let alpha = root
             .join("store")
             .join("local")
             .join("alpha-project")
-            .join("2026_0416")
+            .join(&alpha_date)
             .join("conversations")
             .join("codex");
         fs::create_dir_all(&alpha).expect("alpha dirs");
         fs::write(
-            alpha.join("2026_0416_codex_scopealpha001_001.md"),
-            "# alpha\n\n### 2026-04-16 10:11:12 UTC | user\n> alpha kept\n",
+            alpha.join(format!("{alpha_date}_codex_scopealpha001_001.md")),
+            format!("# alpha\n\n### {alpha_timestamp} UTC | user\n> alpha kept\n"),
         )
         .expect("alpha file");
 
@@ -2543,13 +2549,13 @@ mod tests {
             .join("store")
             .join("local")
             .join("beta-project")
-            .join("2026_0210")
+            .join(&beta_date)
             .join("conversations")
             .join("claude");
         fs::create_dir_all(&beta).expect("beta dirs");
         fs::write(
-            beta.join("2026_0210_claude_scopebeta001_001.md"),
-            "# beta\n\n### 2026-02-10 08:00:00 UTC | user\n> beta excluded\n",
+            beta.join(format!("{beta_date}_claude_scopebeta001_001.md")),
+            format!("# beta\n\n### {beta_timestamp} UTC | user\n> beta excluded\n"),
         )
         .expect("beta file");
 

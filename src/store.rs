@@ -2456,7 +2456,7 @@ mod tests {
     #[test]
     fn test_chunks_dir() {
         if let Ok(path) = chunks_dir() {
-            assert!(path.to_string_lossy().contains("memex"));
+            assert!(path.to_string_lossy().contains(".aicx"));
             assert!(path.to_string_lossy().contains("chunks"));
         }
     }
