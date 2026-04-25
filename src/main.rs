@@ -584,6 +584,14 @@ enum Commands {
     #[command(display_order = 10)]
     List,
 
+    /// Interactive daily-driver entrypoint for corpus, doctor, intents, and store.
+    #[command(display_order = 9)]
+    Wizard {
+        /// Render one frame and exit; used by automated smoke tests.
+        #[arg(long, hide = true)]
+        smoke_test: bool,
+    },
+
     /// List chunks in the canonical store (layer 1 inventory).
     ///
     /// Shows what extractors have already written to ~/.aicx/.
@@ -876,7 +884,7 @@ enum Commands {
     /// Diagnose and optionally repair the canonical store and steer index.
     ///
     /// Runs integrity checks on the Lance steer DB, BM25 index, state.json,
-    /// and sidecar coverage. With --fix, applies safe corrective actions:
+    /// sidecar coverage, and corpus bucket names. With --fix, applies safe corrective actions:
     /// corrupted steer indexes are deleted and rebuilt from the canonical
     /// store (which is treated as ground truth and never modified).
     ///
@@ -887,6 +895,10 @@ enum Commands {
         /// Apply safe corrective actions for detected issues
         #[arg(long)]
         fix: bool,
+
+        /// Move suspicious top-level corpus buckets to $HOME/.aicx/quarantine/
+        #[arg(long)]
+        fix_buckets: bool,
 
         /// Print recommendations for green checks too
         #[arg(short, long)]
@@ -1088,6 +1100,13 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Some(Commands::Wizard { smoke_test }) => {
+            if smoke_test {
+                aicx::wizard::smoke_test()?;
+            } else {
+                aicx::wizard::run()?;
+            }
+        }
         Some(Commands::Init { .. }) => {
             eprintln!("aicx init has been retired.");
             eprintln!("Context initialisation is now handled by /vc-init inside Claude Code.");
@@ -1242,10 +1261,15 @@ fn main() -> Result<()> {
         }
         Some(Commands::Doctor {
             fix,
+            fix_buckets,
             verbose,
             format,
         }) => {
-            let opts = aicx::doctor::DoctorOptions { fix, verbose };
+            let opts = aicx::doctor::DoctorOptions {
+                fix,
+                fix_buckets,
+                verbose,
+            };
             let rt = tokio::runtime::Runtime::new()
                 .context("Failed to start tokio runtime for doctor")?;
             let report = rt.block_on(aicx::doctor::run(&opts))?;
@@ -1261,7 +1285,7 @@ fn main() -> Result<()> {
             }
 
             let exit_code = match report.overall {
-                aicx::doctor::Severity::Critical if !fix => 1,
+                aicx::doctor::Severity::Critical if !fix && !fix_buckets => 1,
                 _ => 0,
             };
             std::process::exit(exit_code);
@@ -1885,8 +1909,29 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     let mut all_written_paths: Vec<std::path::PathBuf> = Vec::new();
     let mut scope_surface = StoreScopeSurface::empty(&project);
 
+    let structured_emit = matches!(emit, StdoutEmit::Json);
+    let reporter = aicx::progress::select_reporter(structured_emit);
+    let failures = aicx::progress::FailureLog::new();
+
     if !output_entries.is_empty() {
-        let store_summary = store::store_semantic_segments(&output_entries, &chunker_config)?;
+        let chunk_phase = aicx::progress::Phase::start(
+            reporter.clone(),
+            "chunk",
+            Some(output_entries.len() as u64),
+        );
+        let store_summary = match store::store_semantic_segments(&output_entries, &chunker_config) {
+            Ok(summary) => {
+                let written = summary.written_paths.len() as u64;
+                chunk_phase.finish_ok(format!("{written} chunks"));
+                summary
+            }
+            Err(e) => {
+                let record = chunk_phase.finish_err(&e, aicx::progress::recovery_hint_for("chunk"));
+                failures.record(record);
+                let _ = aicx::progress::render_failure_tail(&failures);
+                return Err(e);
+            }
+        };
         scope_surface = StoreScopeSurface::from_store_summary(&project, &store_summary);
         let newly_written_paths = store_summary.written_paths.clone();
         all_written_paths.extend(newly_written_paths.iter().cloned());
@@ -1894,7 +1939,11 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         // Update fast local metadata index
         if let Ok(rt) = tokio::runtime::Runtime::new() {
             let path_refs: Vec<&PathBuf> = newly_written_paths.iter().collect();
-            if let Err(e) = rt.block_on(aicx::steer_index::sync_steer_index(&path_refs)) {
+            if let Err(e) = rt.block_on(aicx::steer_index::sync_steer_index_with_progress(
+                &path_refs,
+                reporter.clone(),
+                &failures,
+            )) {
                 eprintln!("⚠ steer index sync failed (search may be stale): {e}");
             }
         }
@@ -2087,6 +2136,10 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         );
     }
 
+    if aicx::progress::render_failure_tail(&failures) {
+        std::process::exit(2);
+    }
+
     Ok(())
 }
 
@@ -2182,28 +2235,31 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         }
     }
     let chunker_config = aicx::chunker::ChunkerConfig::default();
-    let stderr_is_tty = io::stderr().is_terminal();
-    let mut progress_width = 0usize;
-    let store_result = if stderr_is_tty {
-        store::store_semantic_segments_with_progress(
-            &all_entries,
-            &chunker_config,
-            |done, total| {
-                let message = format!("  Chunking... {done}/{total} segments");
-                let width = progress_width.max(message.len());
-                progress_width = width;
-                eprint!("\r{message:<width$}");
-                let _ = io::stderr().flush();
-            },
-        )
-    } else {
-        store::store_semantic_segments(&all_entries, &chunker_config)
+
+    let structured_emit = matches!(emit, StdoutEmit::Json);
+    let reporter = aicx::progress::select_reporter(structured_emit);
+    let failures = aicx::progress::FailureLog::new();
+
+    let chunk_phase =
+        aicx::progress::Phase::start(reporter.clone(), "chunk", Some(all_entries.len() as u64));
+    let store_result = store::store_semantic_segments_with_progress(
+        &all_entries,
+        &chunker_config,
+        |done, _total| chunk_phase.tick(done as u64),
+    );
+    let store_summary = match store_result {
+        Ok(summary) => {
+            let written = summary.written_paths.len() as u64;
+            chunk_phase.finish_ok(format!("{written} chunks"));
+            summary
+        }
+        Err(e) => {
+            let record = chunk_phase.finish_err(&e, aicx::progress::recovery_hint_for("chunk"));
+            failures.record(record);
+            let _ = aicx::progress::render_failure_tail(&failures);
+            return Err(e);
+        }
     };
-    if stderr_is_tty && progress_width > 0 {
-        eprint!("\r{:<width$}\r", "", width = progress_width);
-        let _ = io::stderr().flush();
-    }
-    let store_summary = store_result?;
     let stored_count = store_summary.total_entries;
     let all_written_paths = store_summary.written_paths.clone();
     let scope_surface = StoreScopeSurface::from_store_summary(&project, &store_summary);
@@ -2211,7 +2267,11 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
     // Update fast local metadata index
     if let Ok(rt) = tokio::runtime::Runtime::new() {
         let path_refs: Vec<&PathBuf> = all_written_paths.iter().collect();
-        if let Err(e) = rt.block_on(aicx::steer_index::sync_steer_index(&path_refs)) {
+        if let Err(e) = rt.block_on(aicx::steer_index::sync_steer_index_with_progress(
+            &path_refs,
+            reporter.clone(),
+            &failures,
+        )) {
             eprintln!("⚠ steer index sync failed (search may be stale): {e}");
         }
     }
@@ -2270,6 +2330,10 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
             );
         }
         StdoutEmit::None => {}
+    }
+
+    if aicx::progress::render_failure_tail(&failures) {
+        std::process::exit(2);
     }
 
     Ok(())

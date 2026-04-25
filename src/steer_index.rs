@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::progress::{FailureLog, NoopReporter, Phase, Reporter, recovery_hint_for};
 use crate::types::FrameKind;
 
 const STEER_NAMESPACE: &str = "steer";
@@ -331,6 +333,21 @@ async fn sync_steer_bm25_at(base: &Path, docs: &[ChromaDocument]) -> Result<()> 
 }
 
 async fn sync_steer_index_at(base: &Path, new_files: &[&PathBuf]) -> Result<()> {
+    let reporter: Arc<dyn Reporter> = Arc::new(NoopReporter);
+    let failures = FailureLog::new();
+    sync_steer_index_at_with_reporter(base, new_files, reporter, &failures).await
+}
+
+/// Instrumented variant: emits separate `steer_sync` and `bm25_sync`
+/// Phase events through the supplied reporter and records phase
+/// failures into `failures` before propagating the error. Existing
+/// callers reach this via the no-op shim above.
+async fn sync_steer_index_at_with_reporter(
+    base: &Path,
+    new_files: &[&PathBuf],
+    reporter: Arc<dyn Reporter>,
+    failures: &FailureLog,
+) -> Result<()> {
     let db_path = steer_db_path(base);
     let storage = StorageManager::new_lance_only(&db_path.to_string_lossy()).await?;
     storage.ensure_collection().await?;
@@ -343,18 +360,54 @@ async fn sync_steer_index_at(base: &Path, new_files: &[&PathBuf]) -> Result<()> 
         return Ok(());
     }
 
+<<<<<<< HEAD
     let ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
     for id in ids {
         let _ = storage.delete_document(STEER_NAMESPACE, id).await;
     }
+=======
+    let total_docs = docs.len() as u64;
+>>>>>>> c16744e ([claude/aicx-progress] feat(progress): wire per-phase observability into aicx store pipeline)
 
-    for chunk in docs.chunks(1000) {
-        storage.add_to_store(chunk.to_vec()).await?;
+    let steer_phase = Phase::start(reporter.clone(), "steer_sync", Some(total_docs));
+    let lance_result: Result<()> = async {
+        let ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
+        let _ = storage.delete_documents(STEER_NAMESPACE, &ids).await;
+
+        let mut written: u64 = 0;
+        for chunk in docs.chunks(1000) {
+            storage.add_to_store(chunk.to_vec()).await?;
+            written += chunk.len() as u64;
+            steer_phase.tick(written);
+        }
+        Ok(())
+    }
+    .await;
+
+    match lance_result {
+        Ok(()) => {
+            steer_phase.finish_ok(format!("{total_docs} docs"));
+        }
+        Err(e) => {
+            let record = steer_phase.finish_err(&e, recovery_hint_for("steer_sync"));
+            failures.record(record);
+            return Err(e);
+        }
     }
 
-    sync_steer_bm25_at(base, &docs).await?;
-    write_steer_metadata(base)?;
+    let bm25_phase = Phase::start(reporter.clone(), "bm25_sync", Some(total_docs));
+    match sync_steer_bm25_at(base, &docs).await {
+        Ok(()) => {
+            bm25_phase.finish_ok(format!("{total_docs} docs"));
+        }
+        Err(e) => {
+            let record = bm25_phase.finish_err(&e, recovery_hint_for("bm25_sync"));
+            failures.record(record);
+            return Err(e);
+        }
+    }
 
+    write_steer_metadata(base)?;
     Ok(())
 }
 
@@ -725,6 +778,26 @@ pub async fn sync_steer_index(new_files: &[&PathBuf]) -> Result<()> {
     let base = crate::store::store_base_dir()?;
     ensure_steer_index_compatible_at(&base).await?;
     sync_steer_index_at(&base, new_files).await
+}
+
+/// Instrumented variant of [`sync_steer_index`] that emits Phase events
+/// (`steer_sync` and `bm25_sync`) through `reporter` and pushes any
+/// phase failure into `failures` before propagating the error to the
+/// caller. The existing [`sync_steer_index`] entry point keeps its
+/// signature and behavior; new code paths that want progress visibility
+/// should call this variant.
+pub async fn sync_steer_index_with_progress(
+    new_files: &[&PathBuf],
+    reporter: Arc<dyn Reporter>,
+    failures: &FailureLog,
+) -> Result<()> {
+    if new_files.is_empty() {
+        return Ok(());
+    }
+
+    let base = crate::store::store_base_dir()?;
+    ensure_steer_index_compatible_at(&base).await?;
+    sync_steer_index_at_with_reporter(&base, new_files, reporter, failures).await
 }
 
 pub async fn query_steer_index() -> Result<Vec<ChromaDocument>> {
