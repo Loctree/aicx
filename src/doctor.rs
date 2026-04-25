@@ -366,7 +366,9 @@ fn check_corpus_buckets(base: &Path) -> CheckResult {
 
 fn count_corpus_buckets(store_root: &Path) -> Result<usize> {
     let mut count = 0usize;
-    for entry in std::fs::read_dir(store_root).context("read corpus store root")? {
+    for entry in
+        crate::sanitize::read_dir_validated(store_root).context("read corpus store root")?
+    {
         let entry = entry.context("read corpus store entry")?;
         if entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false) {
             count += 1;
@@ -381,7 +383,9 @@ fn suspicious_corpus_buckets(store_root: &Path) -> Result<Vec<String>> {
     }
 
     let mut suspicious = Vec::new();
-    for entry in std::fs::read_dir(store_root).context("read corpus store root")? {
+    for entry in
+        crate::sanitize::read_dir_validated(store_root).context("read corpus store root")?
+    {
         let entry = entry.context("read corpus store entry")?;
         if !entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false) {
             continue;

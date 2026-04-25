@@ -33,7 +33,7 @@ impl IntentsScreen {
                     visible: Vec::new(),
                     selected: 0,
                     query: String::new(),
-                    project: project,
+                    project,
                     agent,
                     hours,
                     preview: String::new(),

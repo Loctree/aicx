@@ -2524,10 +2524,10 @@ mod tests {
     #[test]
     fn scan_store_scope_filters_by_project_and_hours() {
         let root = mk_tmp_dir("ai_ctx_dashboard_scope");
-        let now = Utc::now();
-        let alpha_date = now.format("%Y_%m%d").to_string();
-        let alpha_timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
-        let stale = now - chrono::Duration::days(30);
+        let recent = Utc::now() - chrono::Duration::hours(1);
+        let alpha_date = recent.format("%Y_%m%d").to_string();
+        let alpha_timestamp = recent.format("%Y-%m-%d %H:%M:%S").to_string();
+        let stale = Utc::now() - chrono::Duration::days(30);
         let beta_date = stale.format("%Y_%m%d").to_string();
         let beta_timestamp = stale.format("%Y-%m-%d %H:%M:%S").to_string();
 
