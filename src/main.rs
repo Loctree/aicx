@@ -1836,9 +1836,10 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
 
     let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
 
-    // Default behavior is incremental; --full-rescan explicitly ignores the watermark.
+    // Default behavior is incremental. --full-rescan and the legacy --force
+    // escape hatch both mean "scan the full lookback window".
     let source_key = extraction_source_key(agents, &project);
-    let watermark = if full_rescan {
+    let watermark = if full_rescan || force {
         None
     } else {
         state.get_watermark(&source_key)

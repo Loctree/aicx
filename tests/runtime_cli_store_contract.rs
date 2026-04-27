@@ -664,6 +664,59 @@ fn all_cli_defaults_to_incremental_and_full_rescan_recovers_backfill() {
 }
 
 #[test]
+fn all_cli_force_ignores_watermark_like_full_rescan() {
+    let root = unique_test_dir("all-force-watermark");
+    let home = root.join("home");
+    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let history = home.join(".codex").join("history.jsonl");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs() as i64;
+
+    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
+    write_codex_history(
+        &history,
+        "force-watermark-sess",
+        Some(&repo_root),
+        &[
+            ("user", now - 300, "force old context"),
+            ("assistant", now - 290, "force old reply"),
+        ],
+    );
+
+    let first = parse_stdout_json(&run_aicx(&home, &["all", "-H", "24", "--emit", "json"]));
+    assert_eq!(first["total_entries"].as_u64(), Some(2));
+
+    append_codex_entry(
+        &history,
+        "force-watermark-sess",
+        Some(&repo_root),
+        "user",
+        now - 295,
+        "force late backfill inside lookback",
+    );
+
+    let incremental = parse_stdout_json(&run_aicx(&home, &["all", "-H", "24", "--emit", "json"]));
+    assert_eq!(incremental["total_entries"].as_u64(), Some(0));
+
+    let forced = parse_stdout_json(&run_aicx(
+        &home,
+        &["all", "-H", "24", "--force", "--emit", "json"],
+    ));
+    assert_eq!(forced["total_entries"].as_u64(), Some(3));
+    let forced_messages = forced["entries"]
+        .as_array()
+        .expect("entries array")
+        .iter()
+        .filter_map(|entry| entry["message"].as_str())
+        .collect::<Vec<_>>();
+    assert!(forced_messages.contains(&"force late backfill inside lookback"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn store_cli_defaults_to_incremental_and_full_rescan_recovers_backfill() {
     let root = unique_test_dir("store-incremental-default");
     let home = root.join("home");
