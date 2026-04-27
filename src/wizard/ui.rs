@@ -49,7 +49,7 @@ fn render_bottombar(frame: &mut Frame, area: Rect, app: &App) {
         Screen::Intents => {
             " q quit | p project | a agent | t time | / filter | Enter chunk | ? help "
         }
-        Screen::Store => " q quit | s start store | Ctrl+C cancel | jk scroll | ? help ",
+        Screen::Store => " q quit | s start | t range | Ctrl+C cancel | jk scroll | ? help ",
     };
     let line = format!("{} | {}", text, app.status);
     frame.render_widget(
@@ -236,18 +236,33 @@ fn render_store(frame: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Length(3), Constraint::Min(8)])
         .split(area);
 
-    let ratio = if app.store.running { 0.5 } else { 0.0 };
-    let label = if app.store.running {
-        "store running (subprocess fallback)"
-    } else {
-        "idle"
+    let ratio = app
+        .store
+        .progress
+        .as_ref()
+        .map(|progress| progress.ratio())
+        .unwrap_or(0.0);
+    let label = match (app.store.running, app.store.progress.as_ref()) {
+        (true, Some(progress)) => match progress.total {
+            Some(total) if total > 0 => format!(
+                "{} {} {}/{} - last {}h",
+                progress.phase, progress.status, progress.current, total, app.store.hours
+            ),
+            _ => format!(
+                "{} {} - last {}h",
+                progress.phase, progress.status, app.store.hours
+            ),
+        },
+        (true, None) => format!("store starting - last {}h", app.store.hours),
+        (false, Some(progress)) => format!("last phase: {} {}", progress.phase, progress.status),
+        (false, None) => format!("idle - next run last {}h", app.store.hours),
     };
     frame.render_widget(
         Gauge::default()
             .block(block("Store"))
             .gauge_style(Style::default().fg(Color::Cyan))
             .ratio(ratio)
-            .label(label),
+            .label(label.as_str()),
         chunks[0],
     );
 
@@ -297,7 +312,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("hjkl / arrows navigate visible lists"),
         Line::from("/ filters corpus or intents"),
         Line::from("doctor: r refresh, f runs aicx doctor --fix, b shows Plan B deferral"),
-        Line::from("store: s runs aicx store -H 48 --emit none via subprocess fallback"),
+        Line::from("store: t changes range, s runs aicx store -H <range> --emit none"),
+        Line::from("store: Ctrl+C sends kill to the running subprocess"),
         Line::from("q quits when no long operation is in flight"),
     ];
     frame.render_widget(Paragraph::new(text).block(block("Help")), area);

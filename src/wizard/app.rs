@@ -82,7 +82,7 @@ impl App {
     pub fn handle_key_event(&mut self, key: crossterm::event::KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             if self.store.cancel() {
-                self.status = "store run cancelled".to_string();
+                self.status = self.store.status.clone();
             } else {
                 self.should_quit = true;
             }
@@ -152,6 +152,10 @@ impl App {
             }
             KeyCode::Char('s') if self.active == Screen::Store => {
                 self.store.start();
+                self.status = self.store.status.clone();
+            }
+            KeyCode::Char('t') if self.active == Screen::Store => {
+                self.store.cycle_hours();
                 self.status = self.store.status.clone();
             }
             KeyCode::Char('p') if self.active == Screen::Intents => {

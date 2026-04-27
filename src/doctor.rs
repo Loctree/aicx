@@ -60,12 +60,12 @@ pub struct DoctorReport {
 pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
     let base = store::store_base_dir().context("Failed to resolve aicx store base directory")?;
 
-    let canonical_store = check_canonical_store(&base);
-    let steer_lance = check_steer_lance(&base).await;
-    let steer_bm25 = check_steer_bm25(&base);
-    let state = check_state(&base);
-    let sidecars = check_sidecar_coverage(&base);
-    let corpus_buckets = check_corpus_buckets(&base);
+    let mut canonical_store = check_canonical_store(&base);
+    let mut steer_lance = check_steer_lance(&base).await;
+    let mut steer_bm25 = check_steer_bm25(&base);
+    let mut state = check_state(&base);
+    let mut sidecars = check_sidecar_coverage(&base);
+    let mut corpus_buckets = check_corpus_buckets(&base);
 
     let mut fixes_applied = Vec::new();
 
@@ -106,6 +106,15 @@ pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
             }
             Err(e) => fixes_applied.push(format!("bucket quarantine skipped: {e}")),
         }
+    }
+
+    if opts.fix || opts.fix_buckets {
+        canonical_store = check_canonical_store(&base);
+        steer_lance = check_steer_lance(&base).await;
+        steer_bm25 = check_steer_bm25(&base);
+        state = check_state(&base);
+        sidecars = check_sidecar_coverage(&base);
+        corpus_buckets = check_corpus_buckets(&base);
     }
 
     let overall = max_severity(&[

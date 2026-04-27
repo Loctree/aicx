@@ -25,6 +25,16 @@ fn wizard_switches_between_four_screens() {
 }
 
 #[test]
+fn wizard_store_range_cycles_without_starting_run() {
+    let mut app = App::new();
+    app.handle_key(KeyCode::Char('4'));
+    assert_eq!(app.store.hours, 48);
+    app.handle_key(KeyCode::Char('t'));
+    assert_eq!(app.store.hours, 168);
+    assert!(!app.store.running);
+}
+
+#[test]
 fn wizard_renders_to_test_backend() {
     let app = App::new();
     let backend = TestBackend::new(100, 32);
