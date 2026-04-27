@@ -578,7 +578,7 @@ enum Commands {
     // ── Layer 1: Query & inspect ──────────────────────────────────────
     /// List raw agent session sources on disk (pre-extraction inputs).
     ///
-    /// Shows Claude Code, Codex, and Gemini log paths with session counts
+    /// Shows Claude Code, Codex, Gemini, and Junie log paths with session counts
     /// and sizes. This is what extractors will read from — use `refs` to
     /// see what is already in the canonical store after extraction.
     #[command(display_order = 10)]
@@ -3813,6 +3813,17 @@ mod tests {
         let err = Cli::try_parse_from(["aicx", "store", "--agent", "oops"])
             .expect_err("store should reject unknown agent filters");
         assert!(err.to_string().contains("possible values"));
+    }
+
+    #[test]
+    fn list_help_names_all_discovered_agent_sources() {
+        let mut cmd = Cli::command();
+        let list = cmd
+            .find_subcommand_mut("list")
+            .expect("list subcommand should exist");
+        let rendered = list.render_long_help().to_string();
+
+        assert!(rendered.contains("Claude Code, Codex, Gemini, and Junie log paths"));
     }
 
     #[test]

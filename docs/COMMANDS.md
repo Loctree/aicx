@@ -35,7 +35,7 @@ disable redaction.
 
 List raw agent session sources on disk (pre-extraction inputs).
 
-Shows Claude Code, Codex, and Gemini log paths with session counts and sizes.
+Shows Claude Code, Codex, Gemini, and Junie log paths with session counts and sizes.
 This is what extractors will read from — use `refs` to see what is already in
 the canonical store after extraction.
 
@@ -120,7 +120,7 @@ aicx codex -p CodeScribe -H 48 --loctree --emit json | jq .
 
 ## `aicx all`
 
-Extract + store from all agents (Claude + Codex + Gemini) into the canonical corpus (layer 1).
+Extract + store from all agents (Claude + Codex + Gemini + Junie) into the canonical corpus (layer 1).
 
 ```bash
 aicx all [OPTIONS]
@@ -185,7 +185,7 @@ aicx store [OPTIONS]
 
 Options:
 - `-p, --project <PROJECT>...` source cwd/project filter(s)
-- `-a, --agent <AGENT>` `claude`, `codex`, `gemini` (default: all)
+- `-a, --agent <AGENT>` `claude`, `codex`, `gemini`, `junie` (default: all)
 - `-H, --hours <HOURS>` lookback window (default: `48`)
 - `--full-rescan` ignore the stored watermark and rescan the full lookback window
 - `--no-redact-secrets` disable secret redaction for this corpus build
