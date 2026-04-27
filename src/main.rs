@@ -1724,6 +1724,47 @@ fn warn_legacy_subcommand(legacy: &str, replacement: &str) {
     eprintln!("# Note: `aicx {legacy}` is deprecated; use `aicx {replacement}` instead.");
 }
 
+fn dedup_entries_for_state(
+    entries: Vec<sources::TimelineEntry>,
+    state: &mut StateManager,
+    project_name: &str,
+    overlap_project: &str,
+    full_rescan: bool,
+) -> Vec<sources::TimelineEntry> {
+    let mut deduped = Vec::with_capacity(entries.len());
+    let mut exact_seen_this_run = std::collections::HashSet::new();
+    let mut overlap_seen_this_run = std::collections::HashSet::new();
+
+    for entry in entries {
+        let exact =
+            StateManager::content_hash(&entry.agent, entry.timestamp.timestamp(), &entry.message);
+        if full_rescan {
+            if !exact_seen_this_run.insert(exact) {
+                continue; // exact duplicate within the same rescan window
+            }
+        } else if !state.is_new(project_name, exact) {
+            continue; // exact duplicate
+        }
+
+        let overlap = StateManager::overlap_hash(entry.timestamp.timestamp(), &entry.message);
+        if full_rescan {
+            if !overlap_seen_this_run.insert(overlap) {
+                continue; // cross-agent overlap duplicate within the same rescan window
+            }
+        } else if !state.is_new(overlap_project, overlap) {
+            continue; // cross-agent overlap duplicate
+        }
+
+        if !full_rescan {
+            state.mark_seen(project_name, exact);
+            state.mark_seen(overlap_project, overlap);
+        }
+        deduped.push(entry);
+    }
+
+    deduped
+}
+
 struct ExtractionParams<'a> {
     agents: &'a [&'a str],
     project: Vec<String>,
@@ -1829,35 +1870,13 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     let pre_dedup = entries.len();
     let overlap_project = format!("_overlap:{project_name}");
     if !force {
-        let mut deduped = Vec::with_capacity(entries.len());
-        let mut exact_seen_this_run = std::collections::HashSet::new();
-        let mut overlap_seen_this_run = std::collections::HashSet::new();
-        for e in entries {
-            let exact = StateManager::content_hash(&e.agent, e.timestamp.timestamp(), &e.message);
-            if full_rescan {
-                if !exact_seen_this_run.insert(exact) {
-                    continue; // exact duplicate within the same rescan window
-                }
-            } else if !state.is_new(&project_name, exact) {
-                continue; // exact duplicate
-            }
-
-            let overlap = StateManager::overlap_hash(e.timestamp.timestamp(), &e.message);
-            if full_rescan {
-                if !overlap_seen_this_run.insert(overlap) {
-                    continue; // cross-agent overlap duplicate within the same rescan window
-                }
-            } else if !state.is_new(&overlap_project, overlap) {
-                continue; // cross-agent overlap duplicate
-            }
-
-            if !full_rescan {
-                state.mark_seen(&project_name, exact);
-                state.mark_seen(&overlap_project, overlap);
-            }
-            deduped.push(e);
-        }
-        entries = deduped;
+        entries = dedup_entries_for_state(
+            entries,
+            &mut state,
+            &project_name,
+            &overlap_project,
+            full_rescan,
+        );
     }
 
     if pre_dedup != entries.len() {
@@ -2199,6 +2218,29 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
 
     all_entries.sort_by_key(|a| a.timestamp);
 
+    let project_name = if project.is_empty() {
+        "_global".to_string()
+    } else {
+        project.join("+")
+    };
+    let overlap_project = format!("_overlap:{project_name}");
+    let pre_dedup = all_entries.len();
+    all_entries = dedup_entries_for_state(
+        all_entries,
+        &mut state,
+        &project_name,
+        &overlap_project,
+        full_rescan,
+    );
+    if pre_dedup != all_entries.len() {
+        eprintln!(
+            "  Dedup: {} → {} entries (skipped {} seen)",
+            pre_dedup,
+            all_entries.len(),
+            pre_dedup - all_entries.len(),
+        );
+    }
+
     // Filter self-echo (prevents feedback loops from aicx's own tool calls)
     let pre_echo = all_entries.len();
     all_entries.retain(|e| !aicx::sanitize::is_self_echo(&e.message));
@@ -2296,6 +2338,14 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
 
     if let Some(latest) = all_entries.last() {
         state.update_watermark(&source_key, latest.timestamp);
+    }
+    if full_rescan {
+        for e in &all_entries {
+            let exact = StateManager::content_hash(&e.agent, e.timestamp.timestamp(), &e.message);
+            let overlap = StateManager::overlap_hash(e.timestamp.timestamp(), &e.message);
+            state.mark_seen(&project_name, exact);
+            state.mark_seen(&overlap_project, overlap);
+        }
     }
     state.record_run(
         stored_count,

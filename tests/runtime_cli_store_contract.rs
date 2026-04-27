@@ -192,6 +192,45 @@ fn append_codex_entry(
 }
 
 #[test]
+fn store_cli_deduplicates_exact_entries_on_first_run() {
+    let root = unique_test_dir("store-exact-dedup");
+    let home = root.join("home");
+    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let history = home.join(".codex").join("history.jsonl");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs() as i64;
+
+    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
+    write_codex_history(
+        &history,
+        "store-dedup-sess",
+        Some(&repo_root),
+        &[
+            ("user", now - 300, "duplicate store context"),
+            ("user", now - 300, "duplicate store context"),
+        ],
+    );
+
+    let output = parse_stdout_json(&run_aicx(
+        &home,
+        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
+    ));
+    assert_eq!(output["total_entries"].as_u64(), Some(1));
+
+    let store_paths = json_paths(&output, "store_paths");
+    let combined_store = store_paths
+        .iter()
+        .map(|path| fs::read_to_string(path).expect("read store chunk"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(combined_store.matches("duplicate store context").count(), 1);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn store_cli_codex_emits_repo_and_non_repo_canonical_roots() {
     let root = unique_test_dir("codex-command");
     let home = root.join("home");
