@@ -485,12 +485,27 @@ const SELF_ECHO_PATTERNS: &[&str] = &[
     "\"method\":\"tools/list\"",
     "\"method\":\"initialize\"",
     // CLI self-invocations
+    "aicx all -H",
+    "aicx all --hours",
+    "aicx claude -H",
+    "aicx claude --hours",
+    "aicx codex -H",
+    "aicx codex --hours",
+    "aicx gemini -H",
+    "aicx gemini --hours",
+    "aicx junie -H",
+    "aicx junie --hours",
     "aicx store -H",
+    "aicx store --hours",
     "aicx rank -p",
     "aicx refs -H",
+    "aicx refs --hours",
     "aicx serve",
+    "aicx dashboard --generate-html",
     "aicx dashboard --serve",
     "aicx dashboard-serve",
+    "aicx reports",
+    "aicx reports-extractor",
 ];
 
 /// Sentinel brackets for aicx read blocks injected by vc-init / vc-agents.
@@ -581,8 +596,16 @@ mod echo_tests {
 
     #[test]
     fn test_cli_self_invocation_is_echo() {
-        assert!(is_self_echo("aicx store -H 24 --incremental"));
+        assert!(is_self_echo("aicx all -H 24 --emit none"));
+        assert!(is_self_echo("aicx store -H 24 --full-rescan"));
+        assert!(is_self_echo("aicx store --hours 24"));
         assert!(is_self_echo("aicx rank -p ai-contexters -H 72 --strict"));
+        assert!(is_self_echo(
+            "aicx dashboard --generate-html -p ai-contexters -H 24"
+        ));
+        assert!(is_self_echo(
+            "aicx reports --repo ai-contexters --workflow marbles"
+        ));
     }
 
     #[test]
