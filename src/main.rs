@@ -546,8 +546,8 @@ enum Commands {
         #[arg(short, long, num_args = 1..)]
         project: Vec<String>,
 
-        /// Agent filter: claude, codex, gemini (default: all)
-        #[arg(short, long)]
+        /// Agent filter: claude, codex, gemini, junie (default: all)
+        #[arg(short, long, value_parser = ["claude", "codex", "gemini", "junie"])]
         agent: Option<String>,
 
         /// Hours to look back (default: 48)
@@ -1793,6 +1793,20 @@ struct StoreRunArgs {
     redact_secrets: bool,
 }
 
+fn resolve_store_agents(agent: Option<&str>) -> Result<Vec<&'static str>> {
+    match agent {
+        Some("claude") => Ok(vec!["claude"]),
+        Some("codex") => Ok(vec!["codex"]),
+        Some("gemini") => Ok(vec!["gemini"]),
+        Some("junie") => Ok(vec!["junie"]),
+        Some(other) => Err(anyhow::anyhow!(
+            "Unsupported --agent '{}'. Expected one of: claude, codex, gemini, junie.",
+            other
+        )),
+        None => Ok(vec!["claude", "codex", "gemini", "junie"]),
+    }
+}
+
 fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     let ExtractionParams {
         agents,
@@ -2176,13 +2190,7 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
 
     let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
 
-    let agents: Vec<&str> = match agent.as_deref() {
-        Some("claude") => vec!["claude"],
-        Some("codex") => vec!["codex"],
-        Some("gemini") => vec!["gemini"],
-        Some("junie") => vec!["junie"],
-        _ => vec!["claude", "codex", "gemini", "junie"],
-    };
+    let agents = resolve_store_agents(agent.as_deref())?;
 
     let mut state = StateManager::load();
     let source_key = extraction_source_key(&agents, &project);
@@ -3780,6 +3788,30 @@ mod tests {
         assert!(rendered.contains("--date-from"));
         assert!(rendered.contains("--date-to"));
         assert!(!rendered.contains("canonical store"));
+    }
+
+    #[test]
+    fn store_agent_filter_is_explicit_and_includes_junie() {
+        let mut cmd = Cli::command();
+        let store = cmd
+            .find_subcommand_mut("store")
+            .expect("store subcommand should exist");
+        let rendered = store.render_long_help().to_string();
+
+        assert!(rendered.contains("claude, codex, gemini, junie"));
+
+        let cli = Cli::try_parse_from(["aicx", "store", "--agent", "junie"])
+            .expect("store should accept junie agent filter");
+        match cli.command {
+            Some(Commands::Store { agent, .. }) => {
+                assert_eq!(agent.as_deref(), Some("junie"));
+            }
+            _ => panic!("expected store command"),
+        }
+
+        let err = Cli::try_parse_from(["aicx", "store", "--agent", "oops"])
+            .expect_err("store should reject unknown agent filters");
+        assert!(err.to_string().contains("possible values"));
     }
 
     #[test]
