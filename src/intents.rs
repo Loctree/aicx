@@ -17,7 +17,8 @@ use crate::chunker::{
 };
 use crate::sanitize;
 use crate::store;
-use crate::types::{EntryState, EntryType, FrameKind, IntentEntry, Link, LinkType};
+use crate::timeline::FrameKind;
+use crate::types::{EntryState, EntryType, IntentEntry, Link, LinkType};
 
 const STRICT_CONFIDENCE: u8 = 3;
 
@@ -75,7 +76,7 @@ pub struct IntentsConfig {
     pub hours: u64,
     pub strict: bool,
     pub kind_filter: Option<IntentKind>,
-    pub frame_kind: Option<crate::types::FrameKind>,
+    pub frame_kind: Option<FrameKind>,
 }
 
 #[derive(Debug, Clone)]

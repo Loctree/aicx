@@ -22,7 +22,7 @@ static RESCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 use crate::intents::{self, IntentKind, IntentsConfig};
 use crate::rank;
 use crate::store;
-use crate::types::FrameKind;
+use crate::timeline::FrameKind;
 
 // ============================================================================
 // Tool parameter & result types

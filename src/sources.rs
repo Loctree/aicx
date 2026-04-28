@@ -21,52 +21,8 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use crate::sanitize;
-use crate::types::FrameKind;
-
-// ============================================================================
-// Public types
-// ============================================================================
-
-/// Unified timeline entry from any AI agent source.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TimelineEntry {
-    pub timestamp: DateTime<Utc>,
-    pub agent: String,
-    pub session_id: String,
-    pub role: String,
-    pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frame_kind: Option<FrameKind>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
-}
-
-/// Denoised conversation message — the canonical projection of a TimelineEntry
-/// containing only user/assistant messages with repo-centric identity.
-///
-/// This is the primary unit for "recover the conversation" workflows.
-/// Tool calls, tool results, reasoning/thoughts, system noise, and artifact
-/// payloads are excluded. Artifact paths may appear as references only.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConversationMessage {
-    pub timestamp: DateTime<Utc>,
-    pub agent: String,
-    pub session_id: String,
-    /// Only "user" or "assistant" — reasoning and system roles are excluded.
-    pub role: String,
-    /// Raw, untrimmed, untruncated message body.
-    pub message: String,
-    /// Canonical project/repo identity (derived from cwd + project filter).
-    pub repo_project: String,
-    /// Secondary provenance: source working directory path.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_path: Option<String>,
-    /// Git branch at time of message (when available).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-}
+use crate::timeline::FrameKind;
+pub use crate::timeline::{ConversationMessage, TimelineEntry};
 
 /// Project timeline entries into a denoised conversation stream.
 ///

@@ -23,6 +23,7 @@ pub mod sources;
 pub mod state;
 pub mod steer_index;
 pub mod store;
+pub mod timeline;
 pub mod types;
 pub mod validation;
 pub mod wizard;

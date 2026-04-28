@@ -69,11 +69,11 @@ pub enum OutputMode {
     AppendTimeline(PathBuf),
 }
 
-/// Re-export from sources — single definition, no twin.
-pub use crate::sources::TimelineEntry;
+/// Re-export from timeline — single definition, no twin.
+pub use crate::timeline::TimelineEntry;
 
 /// Re-export the denoised conversation message type.
-pub use crate::sources::ConversationMessage;
+pub use crate::timeline::ConversationMessage;
 
 /// Metadata about the generated report.
 #[derive(Debug, Clone, Serialize)]

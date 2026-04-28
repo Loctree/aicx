@@ -38,6 +38,7 @@ use aicx::reports_extractor::{self, ReportsExtractorConfig};
 use aicx::sources::{self, ExtractionConfig};
 use aicx::state::StateManager;
 use aicx::store;
+use aicx::timeline;
 
 fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
     eprintln!("=== Intent Schema Migration (dry run) ===");
@@ -144,7 +145,7 @@ struct RetrievalFilters {
     #[arg(long)]
     until: Option<String>,
     #[arg(long, value_enum)]
-    frame_kind: Option<aicx::types::FrameKind>,
+    frame_kind: Option<timeline::FrameKind>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1541,7 +1542,7 @@ fn run_extract_file(
     // Sort by timestamp (extractors should already do this).
     entries.sort_by_key(|a| a.timestamp);
 
-    // Apply secret redaction in-place (TimelineEntry is now single definition in sources)
+    // Apply secret redaction in-place (TimelineEntry is now a single timeline type)
     if redact_secrets {
         for e in &mut entries {
             e.message = aicx::redact::redact_secrets(&e.message);
@@ -1725,12 +1726,12 @@ fn warn_legacy_subcommand(legacy: &str, replacement: &str) {
 }
 
 fn dedup_entries_for_state(
-    entries: Vec<sources::TimelineEntry>,
+    entries: Vec<timeline::TimelineEntry>,
     state: &mut StateManager,
     project_name: &str,
     overlap_project: &str,
     full_rescan: bool,
-) -> Vec<sources::TimelineEntry> {
+) -> Vec<timeline::TimelineEntry> {
     let mut deduped = Vec::with_capacity(entries.len());
     let mut exact_seen_this_run = std::collections::HashSet::new();
     let mut overlap_seen_this_run = std::collections::HashSet::new();
@@ -1914,7 +1915,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         eprintln!("  Filtered {echo_filtered} self-echo entries");
     }
 
-    // Apply secret redaction in-place (TimelineEntry is now single definition in sources)
+    // Apply secret redaction in-place (TimelineEntry is now a single timeline type)
     if redact_secrets {
         for e in &mut entries {
             e.message = aicx::redact::redact_secrets(&e.message);
@@ -2026,7 +2027,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                     sessions: &'a [String],
                     #[serde(flatten)]
                     scope: &'a StoreScopeSurface,
-                    messages: Vec<sources::ConversationMessage>,
+                    messages: Vec<timeline::ConversationMessage>,
                     store_paths: Vec<String>,
                 }
 
@@ -2052,7 +2053,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                     sessions: &'a [String],
                     #[serde(flatten)]
                     scope: &'a StoreScopeSurface,
-                    entries: &'a [output::TimelineEntry],
+                    entries: &'a [timeline::TimelineEntry],
                     store_paths: Vec<String>,
                 }
 
@@ -3551,7 +3552,7 @@ mod tests {
             Some(Commands::Search { filters, .. }) => {
                 assert_eq!(
                     filters.frame_kind,
-                    Some(aicx::types::FrameKind::InternalThought)
+                    Some(timeline::FrameKind::InternalThought)
                 );
             }
             _ => panic!("expected search command"),
@@ -3565,7 +3566,7 @@ mod tests {
 
         match cli.command {
             Some(Commands::Steer { filters, .. }) => {
-                assert_eq!(filters.frame_kind, Some(aicx::types::FrameKind::UserMsg));
+                assert_eq!(filters.frame_kind, Some(timeline::FrameKind::UserMsg));
             }
             _ => panic!("expected steer command"),
         }
@@ -3585,7 +3586,7 @@ mod tests {
 
         match cli.command {
             Some(Commands::Intents { filters, .. }) => {
-                assert_eq!(filters.frame_kind, Some(aicx::types::FrameKind::ToolCall));
+                assert_eq!(filters.frame_kind, Some(timeline::FrameKind::ToolCall));
             }
             _ => panic!("expected intents command"),
         }

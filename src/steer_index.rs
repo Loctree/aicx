@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::progress::{FailureLog, NoopReporter, Phase, Reporter, recovery_hint_for};
-use crate::types::FrameKind;
+use crate::timeline::FrameKind;
 
 const STEER_NAMESPACE: &str = "steer";
 const STEER_BM25_DIR: &str = "steer_bm25";

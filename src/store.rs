@@ -20,12 +20,11 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::chunker::{self, ChunkerConfig};
-use crate::output::TimelineEntry;
 use crate::sanitize;
 use crate::segmentation::semantic_segments;
 use crate::sources::{self, ExtractionConfig};
-pub use crate::types::Kind;
-use crate::types::{RepoIdentity, SemanticSegment};
+pub use crate::timeline::Kind;
+use crate::timeline::{RepoIdentity, SemanticSegment, TimelineEntry};
 
 // ============================================================================
 // Kind classification
@@ -2903,7 +2902,7 @@ mod tests {
         assert_eq!(sidecar.findings_count, Some(4));
         assert_eq!(
             sidecar.frame_kind,
-            Some(crate::types::FrameKind::AgentReply)
+            Some(crate::timeline::FrameKind::AgentReply)
         );
         assert_eq!(sidecar.workflow_phase.as_deref(), Some("implement"));
         assert_eq!(sidecar.mode.as_deref(), Some("session-first"));

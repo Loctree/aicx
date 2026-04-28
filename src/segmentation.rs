@@ -5,8 +5,7 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-use crate::sources::TimelineEntry;
-use crate::types::{Kind, RepoIdentity, SemanticSegment, SourceTier};
+use crate::timeline::{Kind, RepoIdentity, SemanticSegment, SourceTier, TimelineEntry};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

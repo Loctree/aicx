@@ -12,8 +12,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::output::TimelineEntry;
-use crate::types::FrameKind;
+use crate::timeline::{FrameKind, TimelineEntry};
 
 // ============================================================================
 // Types

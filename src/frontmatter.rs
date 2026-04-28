@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-use crate::types::FrameKind;
+use crate::timeline::FrameKind;
 
 /// Parsed frontmatter fields from an agent report.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]

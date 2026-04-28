@@ -15,7 +15,7 @@ use std::path::Path;
 use crate::sanitize;
 use crate::sanitize::normalize_query;
 use crate::store;
-use crate::types::FrameKind;
+use crate::timeline::FrameKind;
 
 // ============================================================================
 // Noise patterns — lines that inflate chunk size without adding value

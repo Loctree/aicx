@@ -203,7 +203,7 @@ struct FuzzySearchParams {
     /// Optional minimum score threshold (0-100)
     score: Option<u8>,
     /// Optional frame/channel filter
-    frame_kind: Option<crate::types::FrameKind>,
+    frame_kind: Option<crate::timeline::FrameKind>,
 }
 
 fn default_search_limit() -> usize {
@@ -281,7 +281,7 @@ struct SteerSearchParams {
     /// Filter by kind
     kind: Option<String>,
     /// Filter by frame/channel
-    frame_kind: Option<crate::types::FrameKind>,
+    frame_kind: Option<crate::timeline::FrameKind>,
     /// Filter by project (case-insensitive substring)
     project: Option<String>,
     /// Filter by date (YYYY-MM-DD or range)
@@ -1228,7 +1228,7 @@ fn run_fuzzy_search(
     limit: usize,
     project_filter: Option<&str>,
     score: Option<u8>,
-    frame_kind: Option<crate::types::FrameKind>,
+    frame_kind: Option<crate::timeline::FrameKind>,
     refresh_scope: DashboardScope,
 ) -> Result<(Vec<FuzzySearchResult>, usize)> {
     // Non-blocking auto-rescan with rate-limit guard.
