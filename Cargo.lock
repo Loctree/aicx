@@ -5304,6 +5304,7 @@ dependencies = [
 name = "rust-memex"
 version = "0.6.3"
 dependencies = [
+ "aicx-parser",
  "anyhow",
  "argon2",
  "arrow-array",
