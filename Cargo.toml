@@ -18,7 +18,7 @@ autobins = false
 default-run = "aicx"
 
 [workspace]
-members = [".", "crates/aicx-embeddings"]
+members = [".", "crates/aicx-embeddings", "crates/aicx-parser"]
 resolver = "3"
 
 [features]
@@ -32,6 +32,7 @@ native-embedder-openmp = ["native-embedder", "aicx-embeddings/openmp"]
 
 [dependencies]
 aicx-embeddings = { path = "crates/aicx-embeddings", version = "0.6.2", optional = true, default-features = false }
+aicx-parser = { path = "crates/aicx-parser", version = "0.1.0", features = ["json-schema"] }
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }

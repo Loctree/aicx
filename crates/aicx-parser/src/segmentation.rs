@@ -43,7 +43,7 @@ impl ProjectHashRegistry {
     /// Load from the default location (`~/.aicx/gemini-project-map.json`).
     /// Returns an empty registry if the file doesn't exist or can't be parsed.
     pub fn load_default() -> Self {
-        let Some(home) = dirs::home_dir() else {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
             return Self::default();
         };
         let path = home.join(".aicx").join("gemini-project-map.json");
@@ -495,7 +495,7 @@ fn looks_like_weak_source_identifier(raw: &str) -> bool {
 
 fn expand_home(raw: &str) -> PathBuf {
     if let Some(rest) = raw.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
+        && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
     {
         return home.join(rest);
     }

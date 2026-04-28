@@ -127,6 +127,26 @@ enum SortOrder {
     Score,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+#[value(rename_all = "snake_case")]
+enum FrameKindArg {
+    UserMsg,
+    AgentReply,
+    InternalThought,
+    ToolCall,
+}
+
+impl From<FrameKindArg> for timeline::FrameKind {
+    fn from(value: FrameKindArg) -> Self {
+        match value {
+            FrameKindArg::UserMsg => Self::UserMsg,
+            FrameKindArg::AgentReply => Self::AgentReply,
+            FrameKindArg::InternalThought => Self::InternalThought,
+            FrameKindArg::ToolCall => Self::ToolCall,
+        }
+    }
+}
+
 const DEFAULT_DASHBOARD_TITLE: &str = "AICX Dashboard";
 const DEFAULT_REPORTS_TITLE: &str = "AICX Report Explorer";
 
@@ -145,7 +165,7 @@ struct RetrievalFilters {
     #[arg(long)]
     until: Option<String>,
     #[arg(long, value_enum)]
-    frame_kind: Option<timeline::FrameKind>,
+    frame_kind: Option<FrameKindArg>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1335,7 +1355,7 @@ fn run_intents(
         hours,
         strict,
         kind_filter,
-        frame_kind: filters.frame_kind,
+        frame_kind: filters.frame_kind.map(Into::into),
     };
 
     let records = intents::extract_intents(&config)?;
@@ -1426,7 +1446,7 @@ fn run_tail(
         hours,
         strict: false,
         kind_filter,
-        frame_kind: filters.frame_kind,
+        frame_kind: filters.frame_kind.map(Into::into),
     };
 
     let mut last_seen = std::collections::HashSet::new();
@@ -2620,7 +2640,7 @@ fn run_search(
         &search_query,
         fetch_limit,
         project,
-        filters.frame_kind,
+        filters.frame_kind.map(Into::into),
     )?;
 
     let mut results = results;
@@ -2727,7 +2747,7 @@ fn run_steer(
         prompt_id,
         agent: filters.agent.as_deref(),
         kind,
-        frame_kind: filters.frame_kind,
+        frame_kind: filters.frame_kind.map(Into::into),
         project,
         date_lo: date_lo.as_deref(),
         date_hi: date_hi.as_deref(),
@@ -3550,10 +3570,7 @@ mod tests {
 
         match cli.command {
             Some(Commands::Search { filters, .. }) => {
-                assert_eq!(
-                    filters.frame_kind,
-                    Some(timeline::FrameKind::InternalThought)
-                );
+                assert_eq!(filters.frame_kind, Some(FrameKindArg::InternalThought));
             }
             _ => panic!("expected search command"),
         }
@@ -3566,7 +3583,7 @@ mod tests {
 
         match cli.command {
             Some(Commands::Steer { filters, .. }) => {
-                assert_eq!(filters.frame_kind, Some(timeline::FrameKind::UserMsg));
+                assert_eq!(filters.frame_kind, Some(FrameKindArg::UserMsg));
             }
             _ => panic!("expected steer command"),
         }
@@ -3586,7 +3603,7 @@ mod tests {
 
         match cli.command {
             Some(Commands::Intents { filters, .. }) => {
-                assert_eq!(filters.frame_kind, Some(timeline::FrameKind::ToolCall));
+                assert_eq!(filters.frame_kind, Some(FrameKindArg::ToolCall));
             }
             _ => panic!("expected intents command"),
         }

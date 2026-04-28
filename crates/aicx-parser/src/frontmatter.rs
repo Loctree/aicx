@@ -65,8 +65,65 @@ pub fn parse(text: &str) -> (Option<ReportFrontmatter>, &str) {
         return (None, text);
     };
 
-    let frontmatter = serde_yaml::from_str::<ReportFrontmatter>(yaml_str).ok();
+    let frontmatter = parse_frontmatter_fields(yaml_str);
     (frontmatter, body)
+}
+
+fn parse_frontmatter_fields(yaml_str: &str) -> Option<ReportFrontmatter> {
+    let mut parsed = ReportFrontmatter::default();
+    let mut saw_field = false;
+
+    for raw_line in yaml_str.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let (key, value) = line.split_once(':')?;
+        let key = key.trim();
+        if key.is_empty() || key.contains(char::is_whitespace) {
+            return None;
+        }
+
+        let value = value.trim();
+        if looks_like_unsupported_yaml_value(value) {
+            return None;
+        }
+        let value = normalize_scalar(value);
+        saw_field = true;
+
+        match key {
+            "agent" => parsed.telemetry.agent = string_value(value),
+            "run_id" => parsed.telemetry.run_id = string_value(value),
+            "prompt_id" => parsed.telemetry.prompt_id = string_value(value),
+            "status" => parsed.telemetry.status = string_value(value),
+            "frame_kind" => parsed.telemetry.frame_kind = FrameKind::parse(value),
+            "model" => parsed.telemetry.model = string_value(value),
+            "started_at" => parsed.telemetry.started_at = string_value(value),
+            "completed_at" => parsed.telemetry.completed_at = string_value(value),
+            "token_usage" => parsed.telemetry.token_usage = value.parse::<u64>().ok(),
+            "findings_count" => parsed.telemetry.findings_count = value.parse::<u32>().ok(),
+            "workflow_phase" | "phase" => parsed.steering.workflow_phase = string_value(value),
+            "mode" => parsed.steering.mode = string_value(value),
+            "skill_code" | "skill" => parsed.steering.skill_code = string_value(value),
+            "framework_version" => parsed.steering.framework_version = string_value(value),
+            _ => {}
+        }
+    }
+
+    saw_field.then_some(parsed)
+}
+
+fn normalize_scalar(value: &str) -> &str {
+    value.trim().trim_matches(|ch| matches!(ch, '"' | '\''))
+}
+
+fn looks_like_unsupported_yaml_value(value: &str) -> bool {
+    value.starts_with('[') || value.starts_with('{')
+}
+
+fn string_value(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 #[cfg(test)]

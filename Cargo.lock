@@ -56,6 +56,7 @@ name = "aicx"
 version = "0.6.2"
 dependencies = [
  "aicx-embeddings",
+ "aicx-parser",
  "anyhow",
  "axum",
  "chrono",
@@ -89,6 +90,18 @@ dependencies = [
  "serde",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "aicx-parser"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "regex",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::timeline::{FrameKind, TimelineEntry};
+use crate::timeline::{FrameKind, Kind, TimelineEntry};
 
 // ============================================================================
 // Types
@@ -32,7 +32,7 @@ pub struct Chunk {
     /// Working directory from the first message in the chunk window
     pub cwd: Option<String>,
     /// Classified kind for this chunk's content
-    pub kind: crate::store::Kind,
+    pub kind: Kind,
     /// Stable stream/channel classification for the chunk contents.
     pub frame_kind: Option<FrameKind>,
     /// Optional correlation ID for the originating run
@@ -77,7 +77,7 @@ pub struct ChunkMetadataSidecar {
     pub session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    pub kind: crate::store::Kind,
+    pub kind: Kind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_kind: Option<FrameKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -167,6 +167,93 @@ impl Default for ChunkerConfig {
 /// Rounds up to avoid underestimation.
 pub fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
+}
+
+// ── Kind heuristics ────────────────────────────────────────────────────────
+
+const PLAN_KEYWORDS: &[&str] = &[
+    "implementation plan",
+    "plan:",
+    "## plan",
+    "step 1:",
+    "step 2:",
+    "step 3:",
+    "action items",
+    "milestones",
+    "roadmap",
+    "todo list",
+    "acceptance criteria",
+    "## steps",
+    "## phases",
+];
+
+const REPORT_KEYWORDS: &[&str] = &[
+    "## findings",
+    "## summary",
+    "## report",
+    "audit report",
+    "coverage report",
+    "test results",
+    "## metrics",
+    "## recommendations",
+    "## conclusion",
+    "status report",
+    "incident report",
+    "pr review",
+    "code review",
+];
+
+/// Classify a set of timeline entries into a canonical `Kind`.
+///
+/// Uses a lightweight keyword-scoring approach:
+/// - Scans assistant messages (where classification signal is strongest)
+/// - Scores plan vs report keywords
+/// - Conversations win by default when neither plan nor report signal is strong
+///
+/// The approach is intentionally conservative: ambiguous content falls to
+/// `Conversations` (the most common kind), not `Other`.
+pub fn classify_kind(entries: &[TimelineEntry]) -> Kind {
+    if entries.is_empty() {
+        return Kind::Other;
+    }
+
+    let mut plan_score: u32 = 0;
+    let mut report_score: u32 = 0;
+    let mut has_conversation = false;
+
+    for entry in entries {
+        let lower = entry.message.to_lowercase();
+
+        // Only count strong signals from assistant messages.
+        if entry.role == "assistant" {
+            for kw in PLAN_KEYWORDS {
+                if lower.contains(kw) {
+                    plan_score += 1;
+                }
+            }
+            for kw in REPORT_KEYWORDS {
+                if lower.contains(kw) {
+                    report_score += 1;
+                }
+            }
+        }
+
+        if entry.role == "user" || entry.role == "assistant" {
+            has_conversation = true;
+        }
+    }
+
+    let threshold = 3;
+
+    if plan_score >= threshold && plan_score > report_score {
+        Kind::Plans
+    } else if report_score >= threshold && report_score > plan_score {
+        Kind::Reports
+    } else if has_conversation {
+        Kind::Conversations
+    } else {
+        Kind::Other
+    }
 }
 
 fn prepare_entries_for_chunking<'a>(
@@ -357,8 +444,7 @@ fn chunk_day_entries(
         let global_start = entries[start].0;
         let global_end = entries[end - 1].0 + 1;
 
-        let kind =
-            crate::store::classify_kind(&window.iter().map(|e| (*e).clone()).collect::<Vec<_>>());
+        let kind = classify_kind(&window.iter().map(|e| (*e).clone()).collect::<Vec<_>>());
 
         chunks.push(Chunk {
             id: format!("{}_{}_{}_{{:03}}", project, agent, date)
@@ -529,7 +615,7 @@ const MAX_INTENT_LINES: usize = 6;
 const MAX_RESULT_LINES: usize = 6;
 const MAX_TAG_BLOCK_LINES: usize = 4;
 
-pub(crate) const INTENT_KEYWORDS: &[&str] = &[
+pub const INTENT_KEYWORDS: &[&str] = &[
     // Polish
     "mam pomysl",
     "mam pomysł",
@@ -643,7 +729,7 @@ fn extract_checklist_items(entries: &[&TimelineEntry]) -> (Vec<String>, Vec<Stri
     (open, done)
 }
 
-pub(crate) fn parse_checklist_task(line: &str) -> Option<(bool, String)> {
+pub fn parse_checklist_task(line: &str) -> Option<(bool, String)> {
     let l = line.trim_start();
     let mut chars = l.chars();
     let bullet = chars.next()?;
@@ -730,19 +816,19 @@ fn extract_result_lines(entries: &[&TimelineEntry]) -> Vec<String> {
     out
 }
 
-pub(crate) fn is_result_line(line: &str) -> bool {
+pub fn is_result_line(line: &str) -> bool {
     let lower = line.to_lowercase();
     RESULT_KEYWORDS.iter().any(|kw| lower.contains(kw))
 }
 
-pub(crate) fn normalize_key(s: &str) -> String {
+pub fn normalize_key(s: &str) -> String {
     s.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
 }
 
-pub(crate) fn truncate_signal_line(line: &str) -> String {
+pub fn truncate_signal_line(line: &str) -> String {
     const MAX_BYTES: usize = 240;
     if line.len() <= MAX_BYTES {
         return line.to_string();
@@ -782,12 +868,12 @@ fn is_skill_tag(line: &str) -> bool {
         || lower.contains("vetcoders-workflow")
 }
 
-pub(crate) fn is_decision_tag(line: &str) -> bool {
+pub fn is_decision_tag(line: &str) -> bool {
     let lower = line.to_lowercase();
     lower.contains("[decision]") || lower.starts_with("decision:")
 }
 
-pub(crate) fn is_outcome_tag(line: &str) -> bool {
+pub fn is_outcome_tag(line: &str) -> bool {
     let lower = line.to_lowercase();
     lower.contains("[skill_outcome]")
         || lower.starts_with("outcome:")
@@ -1246,7 +1332,7 @@ mod tests {
                 date: "2026-01-22".to_string(),
                 session_id: "s1".to_string(),
                 cwd: Some("/Users/tester/workspaces/proj".to_string()),
-                kind: crate::store::Kind::Conversations,
+                kind: Kind::Conversations,
                 frame_kind: Some(FrameKind::UserMsg),
                 run_id: None,
                 prompt_id: None,
@@ -1271,7 +1357,7 @@ mod tests {
                 date: "2026-01-22".to_string(),
                 session_id: "s1".to_string(),
                 cwd: None,
-                kind: crate::store::Kind::Conversations,
+                kind: Kind::Conversations,
                 frame_kind: None,
                 run_id: None,
                 prompt_id: None,
@@ -1308,7 +1394,7 @@ mod tests {
             metadata.cwd.as_deref(),
             Some("/Users/tester/workspaces/proj")
         );
-        assert_eq!(metadata.kind, crate::store::Kind::Conversations);
+        assert_eq!(metadata.kind, Kind::Conversations);
         assert_eq!(metadata.frame_kind, Some(FrameKind::UserMsg));
         assert_eq!(metadata.workflow_phase.as_deref(), Some("implement"));
         assert_eq!(metadata.mode.as_deref(), Some("session-first"));
@@ -1384,7 +1470,7 @@ mod tests {
                 date: "2026-01-20".to_string(),
                 session_id: "s".to_string(),
                 cwd: None,
-                kind: crate::store::Kind::Conversations,
+                kind: Kind::Conversations,
                 frame_kind: None,
                 run_id: None,
                 prompt_id: None,
@@ -1409,7 +1495,7 @@ mod tests {
                 date: "2026-01-21".to_string(),
                 session_id: "s".to_string(),
                 cwd: None,
-                kind: crate::store::Kind::Conversations,
+                kind: Kind::Conversations,
                 frame_kind: None,
                 run_id: None,
                 prompt_id: None,

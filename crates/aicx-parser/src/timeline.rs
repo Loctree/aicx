@@ -3,7 +3,7 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use chrono::{DateTime, Utc};
-use clap::ValueEnum;
+#[cfg(feature = "json-schema")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -58,11 +58,9 @@ impl fmt::Display for Kind {
 /// This axis is intentionally orthogonal to `role`: source formats drift in how
 /// they spell assistant reasoning or tool payloads, but downstream retrieval
 /// needs one stable vocabulary for "which channel is this?".
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ValueEnum, JsonSchema,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
-#[value(rename_all = "snake_case")]
 pub enum FrameKind {
     UserMsg,
     AgentReply,
