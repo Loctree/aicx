@@ -7,6 +7,7 @@ use clap::ValueEnum;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::PathBuf;
 
 /// Canonical kind for a session segment in the store.
 ///
@@ -137,6 +138,24 @@ pub struct ConversationMessage {
     /// Git branch at time of message (when available).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+}
+
+/// Configuration for extraction.
+#[derive(Debug, Clone)]
+pub struct ExtractionConfig {
+    pub project_filter: Vec<String>,
+    pub cutoff: DateTime<Utc>,
+    pub include_assistant: bool,
+    pub watermark: Option<DateTime<Utc>>,
+}
+
+/// Info about an available source directory/file.
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceInfo {
+    pub agent: String,
+    pub path: PathBuf,
+    pub sessions: usize,
+    pub size_bytes: u64,
 }
 
 /// Explicit trust tier for a repo identity signal.
