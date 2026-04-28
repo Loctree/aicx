@@ -8,6 +8,7 @@ description = "Transcript parser, chunker, and slicer for AI session transcripts
 authors = ["Maciej Gad <void@div0.space>", "Monika Szymanska <hello@vetcoders.io>"]
 repository = "https://github.com/Loctree/aicx"
 homepage = "https://github.com/Loctree/aicx"
+documentation = "https://docs.rs/aicx-parser"
 readme = "README.md"
 keywords = ["ai", "transcript", "chunker", "parser", "claude"]
 categories = ["text-processing", "parsing"]
