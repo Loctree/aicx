@@ -591,6 +591,13 @@ enum Commands {
         #[arg(long, hide = true, conflicts_with = "user_only")]
         include_assistant: bool,
 
+        /// Disable structural-noise filter (line-numbered grep matches, tool
+        /// echoes, stray YAML delimiters). Default: filter is ON. Use this
+        /// for debugging or when raw upstream content must be preserved
+        /// verbatim in the chunk text.
+        #[arg(long)]
+        no_noise_filter: bool,
+
         /// What to print to stdout: paths, json, none (default: none)
         #[arg(long, value_enum, default_value_t = StdoutEmit::None)]
         emit: StdoutEmit,
@@ -1089,6 +1096,7 @@ fn main() -> Result<()> {
             incremental,
             user_only,
             include_assistant: include_assistant_flag,
+            no_noise_filter,
             emit,
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
@@ -1101,6 +1109,7 @@ fn main() -> Result<()> {
                 include_assistant,
                 emit,
                 redact_secrets: redaction.redact_secrets,
+                noise_filter_enabled: !no_noise_filter,
             })?;
         }
         Some(Commands::List) => {
@@ -1812,6 +1821,10 @@ struct StoreRunArgs {
     include_assistant: bool,
     emit: StdoutEmit,
     redact_secrets: bool,
+    /// Whether the chunker should strip structural noise. Mirrors
+    /// `ChunkerConfig::noise_filter_enabled`; the CLI surface is
+    /// `--no-noise-filter` (negated to keep the default ergonomic).
+    noise_filter_enabled: bool,
 }
 
 fn resolve_store_agents(agent: Option<&str>) -> Result<Vec<&'static str>> {
@@ -2208,6 +2221,7 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         include_assistant,
         emit,
         redact_secrets,
+        noise_filter_enabled,
     } = args;
 
     let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
@@ -2306,7 +2320,15 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
             e.message = aicx::redact::redact_secrets(&e.message);
         }
     }
-    let chunker_config = aicx::chunker::ChunkerConfig::default();
+    if !noise_filter_enabled {
+        eprintln!(
+            "  [warn] --no-noise-filter active: chunks will retain raw scaffolding (line-numbered grep, tool echoes, YAML delimiters)"
+        );
+    }
+    let chunker_config = aicx::chunker::ChunkerConfig {
+        noise_filter_enabled,
+        ..aicx::chunker::ChunkerConfig::default()
+    };
 
     let structured_emit = matches!(emit, StdoutEmit::Json);
     let reporter = aicx::progress::select_reporter(structured_emit);

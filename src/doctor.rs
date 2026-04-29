@@ -53,6 +53,7 @@ pub struct DoctorReport {
     pub state: CheckResult,
     pub sidecars: CheckResult,
     pub corpus_buckets: CheckResult,
+    pub noise_health: CheckResult,
     pub fixes_applied: Vec<String>,
     pub overall: Severity,
 }
@@ -66,6 +67,7 @@ pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
     let mut state = check_state(&base);
     let mut sidecars = check_sidecar_coverage(&base);
     let mut corpus_buckets = check_corpus_buckets(&base);
+    let mut noise_health = check_noise_health(&base);
 
     let mut fixes_applied = Vec::new();
 
@@ -115,6 +117,7 @@ pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
         state = check_state(&base);
         sidecars = check_sidecar_coverage(&base);
         corpus_buckets = check_corpus_buckets(&base);
+        noise_health = check_noise_health(&base);
     }
 
     let overall = max_severity(&[
@@ -124,6 +127,7 @@ pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
         state.severity,
         sidecars.severity,
         corpus_buckets.severity,
+        noise_health.severity,
     ]);
 
     Ok(DoctorReport {
@@ -133,6 +137,7 @@ pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
         state,
         sidecars,
         corpus_buckets,
+        noise_health,
         fixes_applied,
         overall,
     })
@@ -315,6 +320,93 @@ fn check_sidecar_coverage(base: &Path) -> CheckResult {
     }
 }
 
+/// Aggregate noise filter activity across all sidecars in the canonical
+/// store. Surfaces upstream emitters that produce excessive structural
+/// scaffolding. Sidecars without `noise_lines_dropped` (older than commit
+/// `ffe288a`) contribute `0` and are counted under `pre_filter_chunks`.
+///
+/// Severity policy:
+/// - `Green` when no chunks have any dropped noise (clean corpus or
+///   pre-filter-only).
+/// - `Warning` when >50% of post-filter chunks recorded >10 dropped noise
+///   lines — operator should investigate which agents/runs produced the
+///   scaffolding.
+/// - `Green` for any milder signal (filter doing its job invisibly).
+fn check_noise_health(base: &Path) -> CheckResult {
+    let files = store::scan_context_files_at(base).unwrap_or_default();
+    let total = files.len();
+    if total == 0 {
+        return CheckResult {
+            name: "noise_health".to_string(),
+            severity: Severity::Green,
+            detail: "no chunks to inspect".to_string(),
+            recommendation: None,
+        };
+    }
+
+    let mut total_dropped: u64 = 0;
+    let mut chunks_with_drops: usize = 0;
+    let mut chunks_with_heavy_drops: usize = 0;
+    let mut sidecars_read: usize = 0;
+    let mut sidecars_pre_filter: usize = 0;
+
+    for f in &files {
+        let sidecar_path = f.path.with_extension("meta.json");
+        let Ok(bytes) = std::fs::read(&sidecar_path) else {
+            continue;
+        };
+        sidecars_read += 1;
+        let Ok(sidecar) = serde_json::from_slice::<aicx_parser::ChunkMetadataSidecar>(&bytes)
+        else {
+            continue;
+        };
+        if sidecar.noise_lines_dropped == 0 {
+            // Either pre-filter-era sidecar (field absent → 0) or genuinely
+            // clean chunk. Indistinguishable here without a probe; surface
+            // as informational.
+            sidecars_pre_filter += 1;
+            continue;
+        }
+        total_dropped += sidecar.noise_lines_dropped as u64;
+        chunks_with_drops += 1;
+        if sidecar.noise_lines_dropped > 10 {
+            chunks_with_heavy_drops += 1;
+        }
+    }
+
+    let post_filter_chunks = sidecars_read.saturating_sub(sidecars_pre_filter);
+    let heavy_pct = if post_filter_chunks > 0 {
+        (chunks_with_heavy_drops as f64 / post_filter_chunks as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let severity = if post_filter_chunks > 0 && heavy_pct > 50.0 {
+        Severity::Warning
+    } else {
+        Severity::Green
+    };
+
+    let detail = format!(
+        "{total_dropped} noise lines dropped across {chunks_with_drops}/{post_filter_chunks} post-filter chunks ({heavy_pct:.0}% heavy >10 lines); {sidecars_pre_filter} pre-filter sidecars"
+    );
+
+    let recommendation = if matches!(severity, Severity::Warning) {
+        Some(
+            "Heavy structural scaffolding in upstream emitters. Investigate which agents/runs produced the noise (check `aicx doctor --verbose` and ingestion sources).".to_string(),
+        )
+    } else {
+        None
+    };
+
+    CheckResult {
+        name: "noise_health".to_string(),
+        severity,
+        detail,
+        recommendation,
+    }
+}
+
 fn check_corpus_buckets(base: &Path) -> CheckResult {
     let store_root = base.join("store");
     if !store_root.exists() {
@@ -494,6 +586,7 @@ pub fn format_report_text(report: &DoctorReport, verbose: bool) -> String {
         &report.state,
         &report.sidecars,
         &report.corpus_buckets,
+        &report.noise_health,
     ];
     for check in checks {
         out.push_str(&format!(
