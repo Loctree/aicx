@@ -1904,6 +1904,7 @@ mod tests {
             skill_code: None,
             framework_version: None,
             intent_entries: Vec::new(),
+            noise_lines_dropped: 0,
         };
         fs::write(
             path.with_extension("meta.json"),

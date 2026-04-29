@@ -58,16 +58,24 @@ pub fn is_noise_line(line: &str) -> bool {
 /// noise. Trailing newlines from the input are preserved on a best-effort
 /// basis (single trailing newline if the original ended with one).
 pub fn filter_noise_lines(text: &str) -> String {
+    filter_noise_lines_with_count(text).0
+}
+
+/// Like [`filter_noise_lines`] but additionally returns the number of lines
+/// that were dropped, for observability counters in chunker sidecars.
+pub fn filter_noise_lines_with_count(text: &str) -> (String, usize) {
     if text.is_empty() {
-        return String::new();
+        return (String::new(), 0);
     }
 
     let trailing_newline = text.ends_with('\n');
     let mut out = String::with_capacity(text.len());
     let mut wrote_any = false;
+    let mut dropped = 0usize;
 
     for line in text.lines() {
         if is_noise_line(line) {
+            dropped += 1;
             continue;
         }
         if wrote_any {
@@ -81,7 +89,7 @@ pub fn filter_noise_lines(text: &str) -> String {
         out.push('\n');
     }
 
-    out
+    (out, dropped)
 }
 
 #[cfg(test)]
@@ -176,6 +184,22 @@ mod tests {
         let input = "[14:32:01] user: actual message body\nfollow-up line";
         let out = filter_noise_lines(input);
         assert_eq!(out, input);
+    }
+
+    #[test]
+    fn count_helper_reports_dropped_lines() {
+        let input = "60 Passed:\nReal\ninput: {\"k\":1}\nMore\n---";
+        let (out, dropped) = filter_noise_lines_with_count(input);
+        assert_eq!(out, "Real\nMore");
+        assert_eq!(dropped, 3);
+    }
+
+    #[test]
+    fn count_helper_zero_for_clean_input() {
+        let input = "Real\nContent\nHere";
+        let (out, dropped) = filter_noise_lines_with_count(input);
+        assert_eq!(out, input);
+        assert_eq!(dropped, 0);
     }
 
     #[test]

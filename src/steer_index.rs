@@ -874,6 +874,7 @@ mod tests {
                 skill_code: None,
                 framework_version: Some("2026-04".to_string()),
                 intent_entries: Vec::new(),
+                noise_lines_dropped: 0,
             })
             .expect("serialize sidecar"),
         )
@@ -920,6 +921,7 @@ mod tests {
             skill_code: Some("vc-marbles".to_string()),
             framework_version: Some("2026-03".to_string()),
             intent_entries: Vec::new(),
+            noise_lines_dropped: 0,
         };
 
         fs::write(

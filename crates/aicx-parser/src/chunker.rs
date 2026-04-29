@@ -65,6 +65,12 @@ pub struct Chunk {
     pub token_estimate: usize,
     /// Decision/plan highlights extracted from the chunk
     pub highlights: Vec<String>,
+    /// Number of structural-noise lines (line-numbered grep matches, tool
+    /// echoes, stray YAML delimiters) dropped from the source entries while
+    /// building this chunk. Operators use this as observability — high values
+    /// flag corpora that should be re-ingested with the filter on, or
+    /// upstream emitters that produce excessive scaffolding.
+    pub noise_lines_dropped: usize,
 }
 
 /// Structured metadata sidecar persisted alongside each chunk file.
@@ -104,6 +110,14 @@ pub struct ChunkMetadataSidecar {
     pub framework_version: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intent_entries: Vec<crate::types::IntentEntry>,
+    /// Number of noise lines dropped during chunk construction. Defaults to
+    /// `0` when the field is absent in older sidecars.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub noise_lines_dropped: usize,
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 impl From<&Chunk> for ChunkMetadataSidecar {
@@ -129,6 +143,7 @@ impl From<&Chunk> for ChunkMetadataSidecar {
             skill_code: chunk.skill_code.clone(),
             framework_version: chunk.framework_version.clone(),
             intent_entries: Vec::new(),
+            noise_lines_dropped: chunk.noise_lines_dropped,
         }
     }
 }
@@ -144,6 +159,11 @@ pub struct ChunkerConfig {
     pub max_tokens: usize,
     /// Number of messages to overlap between consecutive windows (default: 2)
     pub overlap_messages: usize,
+    /// Whether to strip structural noise (line-numbered grep matches, tool
+    /// echoes, stray YAML delimiters) before signal/highlight extraction.
+    /// Default: `true`. Set to `false` for debugging or when raw upstream
+    /// content must be preserved verbatim.
+    pub noise_filter_enabled: bool,
 }
 
 impl Default for ChunkerConfig {
@@ -153,6 +173,7 @@ impl Default for ChunkerConfig {
             min_tokens: 500,
             max_tokens: 2500,
             overlap_messages: 2,
+            noise_filter_enabled: true,
         }
     }
 }
@@ -419,8 +440,16 @@ fn chunk_day_entries(
             }
         }
 
-        // Build chunk from entries[start..end]
+        // Build chunk from entries[start..end].
+        //
+        // Pre-sanitize each entry's message through the noise filter BEFORE
+        // signal/highlight extraction so the `[signals]` block and the
+        // entry-level body are both built from semantic content only. The
+        // filter can be disabled via `ChunkerConfig::noise_filter_enabled`
+        // for debugging/raw modes.
         let window: Vec<&TimelineEntry> = entries[start..end].iter().map(|(_, e)| *e).collect();
+        let (sanitized_owned, noise_lines_dropped) = sanitize_window(&window, config);
+        let window: Vec<&TimelineEntry> = sanitized_owned.iter().collect();
         let highlights = extract_highlights(&window);
         let signals = extract_signals(&window);
         let frame_kind = frame_kind_for_window(&window);
@@ -471,6 +500,7 @@ fn chunk_day_entries(
             text,
             token_estimate,
             highlights,
+            noise_lines_dropped,
         });
 
         seq += 1;
@@ -492,23 +522,61 @@ fn chunk_day_entries(
 }
 
 /// Format entries into chunk text with metadata header.
+///
+/// The public surface uses the chunker's default configuration; callers that
+/// need non-default behavior (e.g. disabled noise filter) should go through
+/// [`chunk_entries`] which threads [`ChunkerConfig`] in full.
 pub fn format_chunk_text(
     entries: &[&TimelineEntry],
     project: &str,
     agent: &str,
     date: &str,
 ) -> String {
-    let highlights = extract_highlights(entries);
-    let signals = extract_signals(entries);
+    let config = ChunkerConfig::default();
+    let (sanitized_owned, _dropped) = sanitize_window(entries, &config);
+    let entries: Vec<&TimelineEntry> = sanitized_owned.iter().collect();
+    let highlights = extract_highlights(&entries);
+    let signals = extract_signals(&entries);
     format_chunk_text_inner(
-        entries,
+        &entries,
         project,
         agent,
         date,
-        frame_kind_for_window(entries),
+        frame_kind_for_window(&entries),
         &signals,
         &highlights,
     )
+}
+
+/// Clone a window's entries with their messages run through
+/// [`crate::noise::filter_noise_lines_with_count`]. Used before any signal
+/// or highlight extraction so structural noise never leaks into the semantic
+/// surface. Returns the cloned window plus the aggregate count of dropped
+/// noise lines for observability sidecars.
+///
+/// When `config.noise_filter_enabled` is `false`, returns a plain clone of
+/// the input window with `dropped == 0`.
+fn sanitize_window(
+    window: &[&TimelineEntry],
+    config: &ChunkerConfig,
+) -> (Vec<TimelineEntry>, usize) {
+    if !config.noise_filter_enabled {
+        let cloned = window.iter().map(|entry| (*entry).clone()).collect();
+        return (cloned, 0);
+    }
+
+    let mut total_dropped = 0usize;
+    let cloned: Vec<TimelineEntry> = window
+        .iter()
+        .map(|entry| {
+            let mut cloned = (*entry).clone();
+            let (filtered, dropped) = crate::noise::filter_noise_lines_with_count(&entry.message);
+            cloned.message = filtered;
+            total_dropped += dropped;
+            cloned
+        })
+        .collect();
+    (cloned, total_dropped)
 }
 
 fn format_chunk_text_inner(
@@ -537,20 +605,20 @@ fn format_chunk_text_inner(
         text.push('\n');
     }
 
+    // Note: callers (`format_chunk_text`, `chunk_day_entries`) pass entries
+    // that have already been routed through `sanitize_window`, so message
+    // bodies here are noise-free. Skip empty messages so windows that reduced
+    // to pure scaffolding don't emit empty role lines.
     for entry in entries {
-        let time = entry.timestamp.format("%H:%M:%S");
-        // Strip structural noise (line-numbered grep matches, tool echoes,
-        // stray YAML delimiters) before truncation so semantic budget isn't
-        // burned on scaffolding.
-        let cleaned = crate::noise::filter_noise_lines(&entry.message);
-        if cleaned.is_empty() {
+        if entry.message.is_empty() {
             continue;
         }
+        let time = entry.timestamp.format("%H:%M:%S");
         // Truncate very long messages to avoid monster chunks (UTF-8 safe).
-        let msg = if cleaned.len() > 4000 {
-            truncate_message_bytes(&cleaned, 4000)
+        let msg = if entry.message.len() > 4000 {
+            truncate_message_bytes(&entry.message, 4000)
         } else {
-            cleaned
+            entry.message.clone()
         };
         text.push_str(&format!("[{}] {}: {}\n", time, entry.role, msg));
     }
@@ -1182,6 +1250,7 @@ mod tests {
             min_tokens: 50,
             max_tokens: 300,
             overlap_messages: 2,
+            noise_filter_enabled: true,
         };
 
         let chunks = chunk_entries(&entries, "proj", "claude", &config);
@@ -1206,6 +1275,7 @@ mod tests {
             min_tokens: 500,
             max_tokens: 2500,
             overlap_messages: 2,
+            noise_filter_enabled: true,
         };
 
         let chunks = chunk_entries(&entries, "proj", "claude", &config);
@@ -1356,6 +1426,7 @@ mod tests {
                 text: "chunk one content".to_string(),
                 token_estimate: 4,
                 highlights: vec![],
+                noise_lines_dropped: 0,
             },
             Chunk {
                 id: "proj_claude_2026-01-22_002".to_string(),
@@ -1381,6 +1452,7 @@ mod tests {
                 text: "chunk two content".to_string(),
                 token_estimate: 4,
                 highlights: vec![],
+                noise_lines_dropped: 0,
             },
         ];
 
@@ -1440,6 +1512,7 @@ mod tests {
             min_tokens: 20,
             max_tokens: 200,
             overlap_messages: 2,
+            noise_filter_enabled: true,
         };
 
         let chunks = chunk_entries(&entries, "p", "c", &config);
@@ -1494,6 +1567,7 @@ mod tests {
                 text: "x".repeat(100),
                 token_estimate: 25,
                 highlights: vec![],
+                noise_lines_dropped: 0,
             },
             Chunk {
                 id: "b".to_string(),
@@ -1519,6 +1593,7 @@ mod tests {
                 text: "y".repeat(200),
                 token_estimate: 50,
                 highlights: vec![],
+                noise_lines_dropped: 0,
             },
         ];
 
