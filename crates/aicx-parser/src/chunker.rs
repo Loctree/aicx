@@ -539,11 +539,18 @@ fn format_chunk_text_inner(
 
     for entry in entries {
         let time = entry.timestamp.format("%H:%M:%S");
+        // Strip structural noise (line-numbered grep matches, tool echoes,
+        // stray YAML delimiters) before truncation so semantic budget isn't
+        // burned on scaffolding.
+        let cleaned = crate::noise::filter_noise_lines(&entry.message);
+        if cleaned.is_empty() {
+            continue;
+        }
         // Truncate very long messages to avoid monster chunks (UTF-8 safe).
-        let msg = if entry.message.len() > 4000 {
-            truncate_message_bytes(&entry.message, 4000)
+        let msg = if cleaned.len() > 4000 {
+            truncate_message_bytes(&cleaned, 4000)
         } else {
-            entry.message.clone()
+            cleaned
         };
         text.push_str(&format!("[{}] {}: {}\n", time, entry.role, msg));
     }

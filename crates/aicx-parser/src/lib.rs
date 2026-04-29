@@ -4,6 +4,7 @@
 
 pub mod chunker;
 pub mod frontmatter;
+pub mod noise;
 pub mod sanitize;
 pub mod segmentation;
 pub mod timeline;
