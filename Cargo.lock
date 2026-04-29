@@ -5315,6 +5315,7 @@ dependencies = [
  "futures",
  "glob",
  "lancedb",
+ "libc",
  "memex-contracts",
  "openidconnect",
  "pdf-extract",
