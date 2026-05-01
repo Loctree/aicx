@@ -15,6 +15,7 @@
 //! - Gemini: ~/.gemini/tmp/<hash>/chats/session-*.json
 //! - Gemini Antigravity: ~/.gemini/antigravity/{conversations/<uuid>.pb,brain/<uuid>/}
 //! - Junie: ~/.junie/sessions/session-*/events.jsonl
+//! - CodeScribe: ~/.codescribe/transcriptions/YYYY-MM-DD/*.{txt,md,json}
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
@@ -440,7 +441,7 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract + store from all agents (Claude + Codex + Gemini + Junie) into the canonical corpus (layer 1).
+    /// Extract + store from all agents (Claude + Codex + Gemini + Junie + CodeScribe) into the canonical corpus (layer 1).
     ///
     /// The daily-driver command: runs each extractor, deduplicates, chunks, and
     /// writes steerable markdown to ~/.aicx/. By default, uses per-source
@@ -567,8 +568,8 @@ enum Commands {
         #[arg(short, long, num_args = 1..)]
         project: Vec<String>,
 
-        /// Agent filter: claude, codex, gemini, junie (default: all)
-        #[arg(short, long, value_parser = ["claude", "codex", "gemini", "junie"])]
+        /// Agent filter: claude, codex, gemini, junie, codescribe (default: all)
+        #[arg(short, long, value_parser = ["claude", "codex", "gemini", "junie", "codescribe"])]
         agent: Option<String>,
 
         /// Hours to look back (default: 48)
@@ -1045,7 +1046,7 @@ fn main() -> Result<()> {
             let include_assistant = include_assistant_flag || !user_only;
             warn_incremental_legacy_flag(incremental);
             run_extraction(ExtractionParams {
-                agents: &["claude", "codex", "gemini", "junie"],
+                agents: &["claude", "codex", "gemini", "junie", "codescribe"],
                 project,
                 hours,
                 output_dir: output.as_deref(),
@@ -1833,11 +1834,12 @@ fn resolve_store_agents(agent: Option<&str>) -> Result<Vec<&'static str>> {
         Some("codex") => Ok(vec!["codex"]),
         Some("gemini") => Ok(vec!["gemini"]),
         Some("junie") => Ok(vec!["junie"]),
+        Some("codescribe") => Ok(vec!["codescribe"]),
         Some(other) => Err(anyhow::anyhow!(
-            "Unsupported --agent '{}'. Expected one of: claude, codex, gemini, junie.",
+            "Unsupported --agent '{}'. Expected one of: claude, codex, gemini, junie, codescribe.",
             other
         )),
-        None => Ok(vec!["claude", "codex", "gemini", "junie"]),
+        None => Ok(vec!["claude", "codex", "gemini", "junie", "codescribe"]),
     }
 }
 
@@ -1899,6 +1901,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             "codex" => sources::extract_codex(&config)?,
             "gemini" => sources::extract_gemini(&config)?,
             "junie" => sources::extract_junie(&config)?,
+            "codescribe" => sources::extract_codescribe(&config)?,
             _ => Vec::new(),
         };
 
@@ -2254,6 +2257,7 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
             "codex" => sources::extract_codex(&config)?,
             "gemini" => sources::extract_gemini(&config)?,
             "junie" => sources::extract_junie(&config)?,
+            "codescribe" => sources::extract_codescribe(&config)?,
             _ => Vec::new(),
         };
         eprintln!("  [{}] {} entries", ag, agent_entries.len());
@@ -3840,12 +3844,22 @@ mod tests {
         let rendered = store.render_long_help().to_string();
 
         assert!(rendered.contains("claude, codex, gemini, junie"));
+        assert!(rendered.contains("codescribe"));
 
         let cli = Cli::try_parse_from(["aicx", "store", "--agent", "junie"])
             .expect("store should accept junie agent filter");
         match cli.command {
             Some(Commands::Store { agent, .. }) => {
                 assert_eq!(agent.as_deref(), Some("junie"));
+            }
+            _ => panic!("expected store command"),
+        }
+
+        let cli = Cli::try_parse_from(["aicx", "store", "--agent", "codescribe"])
+            .expect("store should accept codescribe agent filter");
+        match cli.command {
+            Some(Commands::Store { agent, .. }) => {
+                assert_eq!(agent.as_deref(), Some("codescribe"));
             }
             _ => panic!("expected store command"),
         }

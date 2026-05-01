@@ -666,6 +666,9 @@ fn infer_kind_from_line(line: &str, is_user_line: bool) -> Option<IntentKind> {
     if is_decision_tag(line) {
         return Some(IntentKind::Decision);
     }
+    if is_user_line && looks_like_operator_decision_line(line) {
+        return Some(IntentKind::Decision);
+    }
     if is_outcome_line(line) {
         return Some(IntentKind::Outcome);
     }
@@ -687,6 +690,26 @@ fn is_outcome_line(line: &str) -> bool {
 fn looks_like_intent_line(line: &str) -> bool {
     let lower = line.to_lowercase();
     INTENT_KEYWORDS.iter().any(|kw| lower.contains(kw))
+}
+
+fn looks_like_operator_decision_line(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    [
+        "nie może być",
+        "nie moze byc",
+        "ma być",
+        "ma byc",
+        "musi ",
+        "musimy ",
+        "trzeba ",
+        "zrób to testowalne",
+        "zrob to testowalne",
+        "pełny ownership",
+        "pelny ownership",
+        "teraz wypuszuj",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 fn build_candidate(
@@ -1205,6 +1228,9 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
 
     if trimmed.starts_with("decision:") || trimmed.contains("[decision]") {
         return Some((EntryType::Decision, 0.95));
+    }
+    if is_user && looks_like_operator_decision_line(line) {
+        return Some((EntryType::Decision, 0.75));
     }
 
     if trimmed.starts_with("question:") || trimmed.ends_with('?') && trimmed.len() > 15 {
@@ -1894,6 +1920,7 @@ mod tests {
             run_id: None,
             prompt_id: None,
             frame_kind,
+            speaker_hint: None,
             agent_model: None,
             started_at: None,
             completed_at: None,
@@ -2290,6 +2317,15 @@ commit abcdef1 proves the old path was wrong.
         fn classifies_polish_user_intent() {
             let result = classify_line_entry_type("Proponuję uprościć parser chunków", true);
             assert_eq!(result.map(|r| r.0), Some(EntryType::Intent));
+        }
+
+        #[test]
+        fn classifies_polish_operator_decision() {
+            let result = classify_line_entry_type(
+                "Nie może być tak, że ostatnie słowo gubi kolor akcentu",
+                true,
+            );
+            assert_eq!(result.map(|r| r.0), Some(EntryType::Decision));
         }
 
         #[test]

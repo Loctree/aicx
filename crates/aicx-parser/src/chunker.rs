@@ -87,6 +87,8 @@ pub struct ChunkMetadataSidecar {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_kind: Option<FrameKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_id: Option<String>,
@@ -131,6 +133,7 @@ impl From<&Chunk> for ChunkMetadataSidecar {
             cwd: chunk.cwd.clone(),
             kind: chunk.kind,
             frame_kind: chunk.frame_kind,
+            speaker_hint: speaker_hint_from_chunk_text(&chunk.text),
             run_id: chunk.run_id.clone(),
             prompt_id: chunk.prompt_id.clone(),
             agent_model: chunk.agent_model.clone(),
@@ -146,6 +149,14 @@ impl From<&Chunk> for ChunkMetadataSidecar {
             noise_lines_dropped: chunk.noise_lines_dropped,
         }
     }
+}
+
+fn speaker_hint_from_chunk_text(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("speaker_hint: "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 /// Configuration for the chunker.
