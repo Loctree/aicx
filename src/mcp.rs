@@ -60,10 +60,20 @@ pub struct SearchParams {
     pub sort: Option<String>,
     /// Optional frame/channel filter: user_msg, agent_reply, internal_thought, tool_call
     pub frame_kind: Option<FrameKind>,
+    /// Return only metadata without full snippet content
+    #[serde(default = "default_true")]
+    pub slim: bool,
+    /// Return snippet + full evidence
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 fn default_limit() -> usize {
-    10
+    20
+}
+
+fn default_true() -> bool {
+    true
 }
 
 const MAX_SCORE_FILTER: u8 = 100;
@@ -88,6 +98,15 @@ pub struct RankParams {
     pub sort: Option<String>,
     /// Show only top N bundles
     pub top: Option<usize>,
+    /// Max results to return
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    /// Return only metadata without full snippet content
+    #[serde(default = "default_true")]
+    pub slim: bool,
+    /// Return snippet + full evidence
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 fn default_rank_hours() -> u64 {
@@ -121,6 +140,12 @@ pub struct SteerParams {
     pub since: Option<String>,
     /// Date boundary
     pub until: Option<String>,
+    /// Return only metadata without full snippet content
+    #[serde(default = "default_true")]
+    pub slim: bool,
+    /// Return snippet + full evidence
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 fn default_steer_limit() -> usize {
@@ -156,12 +181,18 @@ pub struct IntentsParams {
     pub until: Option<String>,
     /// Sort order: newest (default), oldest
     pub sort: Option<String>,
-    /// Max records to return (default: 50, capped at 500)
+    /// Max records to return (default: 20, capped at 500)
     #[serde(default = "default_intents_limit")]
     pub limit: usize,
-    /// Output format: json (default), markdown. Matches CLI `emit` naming.
+    /// Output format: json, markdown (default). Matches CLI `emit` naming.
     #[serde(default = "default_intents_emit")]
     pub emit: String,
+    /// Return only metadata without full snippet content
+    #[serde(default = "default_true")]
+    pub slim: bool,
+    /// Return snippet + full evidence
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 fn default_intents_hours() -> u64 {
@@ -169,11 +200,11 @@ fn default_intents_hours() -> u64 {
 }
 
 fn default_intents_limit() -> usize {
-    50
+    20
 }
 
 fn default_intents_emit() -> String {
-    "json".to_string()
+    "markdown".to_string()
 }
 
 #[derive(Debug, Serialize)]
@@ -556,11 +587,29 @@ impl AicxMcpServer {
             });
         }
 
-        let json = serde_json::to_string(&SteerResponse {
-            results: metadatas.len(),
-            items: metadatas,
-        })
-        .map_err(|e| McpError::internal_error(format!("Serialize steer JSON: {e}"), None))?;
+        let json = if params.slim && !params.verbose {
+            let items: Vec<_> = metadatas.iter().map(|m| {
+                serde_json::json!({
+                    "path": m.get("path").or_else(|| m.get("source_chunk")).unwrap_or(&serde_json::Value::Null),
+                    "agent": m.get("agent").unwrap_or(&serde_json::Value::Null),
+                    "date": m.get("date").unwrap_or(&serde_json::Value::Null),
+                    "kind": m.get("kind").unwrap_or(&serde_json::Value::Null),
+                    "score": m.get("score").unwrap_or(&serde_json::Value::Null),
+                    "snippet_preview": "",
+                })
+            }).collect();
+            serde_json::to_string(&SteerResponse {
+                results: items.len(),
+                items,
+            })
+            .unwrap()
+        } else {
+            serde_json::to_string(&SteerResponse {
+                results: metadatas.len(),
+                items: metadatas,
+            })
+            .map_err(|e| McpError::internal_error(format!("Serialize steer JSON: {e}"), None))?
+        };
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
@@ -892,7 +941,7 @@ mod tests {
     fn search_params_roundtrip_include_new_optional_filters() {
         let params: SearchParams =
             serde_json::from_str(r#"{"query":"dashboard"}"#).expect("search params should parse");
-        assert_eq!(params.limit, 10);
+        assert_eq!(params.limit, 20);
         assert!(params.project.is_none());
         assert!(params.score.is_none());
         assert!(params.hours.is_none());
