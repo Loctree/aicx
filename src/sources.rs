@@ -31,6 +31,9 @@ const CODESCRIBE_NO_SPEECH_MARKERS: &[&str] = &[
     "no speech detected",
     "vad_no_speech_detected",
 ];
+const OPERATOR_MD_AGENT: &str = "operator";
+const OPERATOR_MD_KIND: &str = "operator-md";
+const OPERATOR_MD_RECENT_DAYS: i64 = 30;
 
 /// Project timeline entries into a denoised conversation stream.
 ///
@@ -181,6 +184,13 @@ pub struct CodescribeTranscript {
     pub date: NaiveDate,
 }
 
+/// A discovered operator-authored markdown document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorMarkdown {
+    pub path: PathBuf,
+    pub modified: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 struct CodescribeSegment {
     start_ms: u64,
@@ -230,6 +240,16 @@ struct WhisperSegment {
     text: Option<String>,
     #[serde(default)]
     speaker: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct OperatorMarkdownFrontmatter {
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    date: Option<String>,
+    #[serde(default)]
+    author: Option<String>,
 }
 
 /// Optional trailing metadata for `build_timeline_entry` — bundled so the
@@ -3385,6 +3405,460 @@ fn resolve_codescribe_cwd_hint(home: &Path, project_filter: &[String]) -> Option
         .map(|candidate| candidate.display().to_string())
 }
 
+/// Discover recent operator markdown files from the standard operator inboxes.
+pub fn discover_operator_markdown(home: &Path) -> Vec<OperatorMarkdown> {
+    discover_operator_markdown_from(home, None)
+}
+
+/// Discover recent operator markdown files, optionally including `<repo>/docs/operator`.
+pub fn discover_operator_markdown_from(
+    home: &Path,
+    repo_root: Option<&Path>,
+) -> Vec<OperatorMarkdown> {
+    let mut dirs = vec![
+        home.join("Downloads"),
+        home.join(".vibecrafted").join("inbox"),
+    ];
+    if let Some(repo_root) = repo_root {
+        dirs.push(repo_root.join("docs").join("operator"));
+    }
+
+    let cutoff = Utc::now() - Duration::days(OPERATOR_MD_RECENT_DAYS);
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+
+    for dir in dirs {
+        let Ok(read_dir) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+                continue;
+            }
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            let modified = DateTime::<Utc>::from(modified);
+            if modified < cutoff || !seen.insert(path.clone()) {
+                continue;
+            }
+            entries.push(OperatorMarkdown { path, modified });
+        }
+    }
+
+    entries.sort_by_key(|entry| (entry.modified, entry.path.clone()));
+    entries
+}
+
+/// Extract operator-authored markdown from Downloads, the Vibecrafted inbox,
+/// and the current repo's `docs/operator` directory when present.
+pub fn extract_operator_markdown(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
+    let home = dirs::home_dir().context("No home dir")?;
+    let repo_root = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| discover_git_root_from_path(&cwd));
+    extract_operator_markdown_from_home_and_repo(&home, repo_root.as_deref(), config)
+}
+
+/// Extract operator-authored markdown using an explicit home directory.
+pub fn extract_operator_markdown_from_home(
+    home: &Path,
+    config: &ExtractionConfig,
+) -> Result<Vec<TimelineEntry>> {
+    extract_operator_markdown_from_home_and_repo(home, None, config)
+}
+
+/// Extract operator-authored markdown using explicit home and repo roots.
+pub fn extract_operator_markdown_from_home_and_repo(
+    home: &Path,
+    repo_root: Option<&Path>,
+    config: &ExtractionConfig,
+) -> Result<Vec<TimelineEntry>> {
+    let mut entries = Vec::new();
+
+    for document in discover_operator_markdown_from(home, repo_root) {
+        match parse_operator_markdown_document(home, &document, config) {
+            Ok(mut parsed) => entries.append(&mut parsed),
+            Err(e) => eprintln!(
+                "Operator markdown extraction warning ({}): {}",
+                document.path.display(),
+                e
+            ),
+        }
+    }
+
+    entries.sort_by_key(|entry| entry.timestamp);
+    Ok(entries)
+}
+
+fn parse_operator_markdown_document(
+    home: &Path,
+    document: &OperatorMarkdown,
+    config: &ExtractionConfig,
+) -> Result<Vec<TimelineEntry>> {
+    let content = sanitize::read_to_string_validated(&document.path)?;
+    let (frontmatter, body) = split_operator_frontmatter(&content);
+    let project_hint = infer_operator_project_hint(&frontmatter, &body, &document.path, config);
+    let cwd_hint = resolve_operator_cwd_hint(home, &document.path, project_hint.as_deref());
+    let base_timestamp = frontmatter
+        .date
+        .as_deref()
+        .and_then(parse_operator_timestamp)
+        .unwrap_or(document.modified);
+    let session_id = format!(
+        "{}-{}",
+        operator_path_fingerprint(&document.path),
+        document
+            .path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy())
+            .unwrap_or_else(|| "operator-md".into())
+    );
+
+    let mut entries = Vec::new();
+    let mut heading: Option<String> = None;
+    let mut sequence = 0i64;
+
+    for raw_line in body.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(next_heading) = parse_markdown_heading(line) {
+            heading = Some(next_heading);
+            continue;
+        }
+
+        let parsed = if let Some((done, task)) = parse_operator_checklist_task(line) {
+            if done {
+                None
+            } else {
+                Some(OperatorMarkdownSignal {
+                    kind: "task",
+                    severity: None,
+                    display_line: format!("- [ ] {task}"),
+                    text: task,
+                })
+            }
+        } else if let Some(decision) = strip_operator_prefix(line, "Decision:") {
+            Some(OperatorMarkdownSignal {
+                kind: "decision",
+                severity: None,
+                text: decision.to_string(),
+                display_line: format!("Decision: {}", decision.trim()),
+            })
+        } else if let Some(outcome) = strip_operator_prefix(line, "Outcome:") {
+            Some(OperatorMarkdownSignal {
+                kind: "outcome",
+                severity: None,
+                text: outcome.to_string(),
+                display_line: format!("Outcome: {}", outcome.trim()),
+            })
+        } else {
+            operator_severity_marker(line).map(|severity| {
+                let text = strip_operator_severity_prefix(line, severity);
+                OperatorMarkdownSignal {
+                    kind: "intent",
+                    severity: Some(severity),
+                    text: text.to_string(),
+                    display_line: format!("Intent: [{severity}] {}", text.trim()),
+                }
+            })
+        };
+
+        let Some(signal) = parsed else {
+            continue;
+        };
+        let timestamp = base_timestamp + Duration::seconds(sequence);
+        sequence += 1;
+        if timestamp < config.cutoff || config.watermark.is_some_and(|w| timestamp <= w) {
+            continue;
+        }
+
+        entries.push(build_timeline_entry(
+            timestamp,
+            OPERATOR_MD_AGENT,
+            &session_id,
+            "user",
+            format_operator_markdown_message(
+                &document.path,
+                &frontmatter,
+                heading.as_deref(),
+                &signal,
+            ),
+            TimelineEntryMeta {
+                cwd: cwd_hint.clone(),
+                frame_kind: Some(FrameKind::UserMsg),
+                ..TimelineEntryMeta::default()
+            },
+        ));
+    }
+
+    Ok(entries)
+}
+
+#[derive(Debug, Clone)]
+struct OperatorMarkdownSignal {
+    kind: &'static str,
+    severity: Option<&'static str>,
+    text: String,
+    display_line: String,
+}
+
+fn format_operator_markdown_message(
+    path: &Path,
+    frontmatter: &OperatorMarkdownFrontmatter,
+    heading: Option<&str>,
+    signal: &OperatorMarkdownSignal,
+) -> String {
+    let mut message = format!(
+        "source: {OPERATOR_MD_KIND}\nkind: {}\nsource_file: {}",
+        signal.kind,
+        path.display()
+    );
+    if let Some(severity) = signal.severity {
+        message.push_str(&format!("\nseverity: {severity}"));
+    }
+    if let Some(project) = frontmatter
+        .project
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        message.push_str(&format!("\nproject: {}", project.trim()));
+    }
+    if let Some(author) = frontmatter
+        .author
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        message.push_str(&format!("\nauthor: {}", author.trim()));
+    }
+    if let Some(heading) = heading.filter(|value| !value.trim().is_empty()) {
+        message.push_str(&format!("\nheading: {}", heading.trim()));
+    }
+    message.push_str("\n\n");
+    message.push_str(signal.display_line.trim());
+    if !signal.text.trim().is_empty() && !signal.display_line.contains(signal.text.trim()) {
+        message.push_str(&format!("\n{}", signal.text.trim()));
+    }
+    message
+}
+
+fn split_operator_frontmatter(content: &str) -> (OperatorMarkdownFrontmatter, String) {
+    let mut lines = content.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return (OperatorMarkdownFrontmatter::default(), content.to_string());
+    }
+
+    let mut yaml = Vec::new();
+    let mut body = Vec::new();
+    let mut in_yaml = true;
+    for line in lines {
+        if in_yaml && line.trim() == "---" {
+            in_yaml = false;
+            continue;
+        }
+        if in_yaml {
+            yaml.push(line);
+        } else {
+            body.push(line);
+        }
+    }
+
+    if in_yaml {
+        return (OperatorMarkdownFrontmatter::default(), content.to_string());
+    }
+
+    let frontmatter =
+        serde_yaml::from_str::<OperatorMarkdownFrontmatter>(&yaml.join("\n")).unwrap_or_default();
+    (frontmatter, body.join("\n"))
+}
+
+fn parse_operator_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(timestamp) = DateTime::parse_from_rfc3339(value) {
+        return Some(timestamp.with_timezone(&Utc));
+    }
+    for format in ["%Y-%m-%d", "%Y_%m%d"] {
+        if let Ok(date) = NaiveDate::parse_from_str(value, format)
+            && let Some(time) = NaiveTime::from_hms_opt(0, 0, 0)
+        {
+            return Some(Utc.from_utc_datetime(&date.and_time(time)));
+        }
+    }
+    None
+}
+
+fn parse_markdown_heading(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let level = trimmed.chars().take_while(|ch| *ch == '#').count();
+    if level == 0 || level > 6 {
+        return None;
+    }
+    let text = trimmed.get(level..)?.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+fn parse_operator_checklist_task(line: &str) -> Option<(bool, String)> {
+    let line = line.trim_start();
+    let mut chars = line.chars();
+    if !matches!(chars.next()?, '-' | '*' | '+') {
+        return None;
+    }
+    let rest = chars.as_str().trim_start().strip_prefix('[')?;
+    let mut chars = rest.chars();
+    let state = chars.next()?;
+    let rest = chars.as_str().strip_prefix(']')?;
+    let task = rest.trim_start();
+    if task.is_empty() {
+        return None;
+    }
+    match state {
+        ' ' => Some((false, task.to_string())),
+        'x' | 'X' => Some((true, task.to_string())),
+        _ => None,
+    }
+}
+
+fn strip_operator_prefix<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    let trimmed = strip_operator_bullet(line);
+    if trimmed.len() < prefix.len() {
+        return None;
+    }
+    let candidate = trimmed.get(..prefix.len())?;
+    candidate
+        .eq_ignore_ascii_case(prefix)
+        .then(|| trimmed.get(prefix.len()..).unwrap_or("").trim())
+        .filter(|value| !value.is_empty())
+}
+
+fn strip_operator_bullet(line: &str) -> &str {
+    line.trim().trim_start_matches(['-', '*', '+']).trim_start()
+}
+
+fn operator_severity_marker(line: &str) -> Option<&'static str> {
+    let upper = line.to_ascii_uppercase();
+    let has_marker = |marker: &str| {
+        upper
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|token| token == marker)
+    };
+    ["P0", "P1", "P2"]
+        .into_iter()
+        .find(|marker| has_marker(marker))
+}
+
+fn strip_operator_severity_prefix<'a>(line: &'a str, severity: &str) -> &'a str {
+    let stripped = strip_operator_bullet(line);
+    let Some(rest) = stripped.get(severity.len()..) else {
+        return stripped.trim();
+    };
+    if stripped
+        .get(..severity.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(severity))
+    {
+        rest.trim_start_matches([' ', '-', ':', ']']).trim()
+    } else {
+        stripped.trim()
+    }
+}
+
+fn infer_operator_project_hint(
+    frontmatter: &OperatorMarkdownFrontmatter,
+    body: &str,
+    path: &Path,
+    config: &ExtractionConfig,
+) -> Option<String> {
+    if let Some(project) = frontmatter
+        .project
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Some(project.trim().to_string());
+    }
+    if config.project_filter.len() == 1 {
+        return config.project_filter.first().cloned();
+    }
+
+    let lower_path = path.to_string_lossy().to_ascii_lowercase();
+    let lower_body = body.to_ascii_lowercase();
+    for candidate in ["rust-memex", "aicx", "loctree", "vc-context-engine"] {
+        if lower_path.contains(candidate) || lower_body.contains(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn resolve_operator_cwd_hint(
+    home: &Path,
+    path: &Path,
+    project_hint: Option<&str>,
+) -> Option<String> {
+    if path
+        .components()
+        .any(|component| component.as_os_str().to_string_lossy() == "docs")
+        && path
+            .components()
+            .any(|component| component.as_os_str().to_string_lossy() == "operator")
+        && let Some(root) = discover_git_root_from_path(path)
+    {
+        return Some(root.display().to_string());
+    }
+
+    let project = project_hint?.trim();
+    if project.is_empty() {
+        return None;
+    }
+    let repo = project
+        .rsplit('/')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+
+    let candidates = [
+        home.join(repo),
+        home.join("Libraxis").join(repo),
+        home.join("Libraxis").join("vc-runtime").join(repo),
+        home.join("Libraxis")
+            .join("01_deployed_libraxis_vm")
+            .join(repo),
+        home.join("hosted").join("VetCoders").join(repo),
+        home.join("vc-workspace").join("VetCoders").join(repo),
+    ];
+
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_dir())
+        .map(|candidate| candidate.display().to_string())
+}
+
+fn discover_git_root_from_path(path: &Path) -> Option<PathBuf> {
+    let seed = if path.is_file() { path.parent()? } else { path };
+    seed.ancestors()
+        .find(|candidate| candidate.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+fn operator_path_fingerprint(path: &Path) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
 // ============================================================================
 // Combined extractor
 // ============================================================================
@@ -3421,6 +3895,12 @@ pub fn extract_all(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     match extract_codescribe(config) {
         Ok(entries) => all.extend(entries),
         Err(e) => eprintln!("CodeScribe extraction warning: {}", e),
+    }
+
+    // Operator markdown
+    match extract_operator_markdown(config) {
+        Ok(entries) => all.extend(entries),
+        Err(e) => eprintln!("Operator markdown extraction warning: {}", e),
     }
 
     // Claude history.jsonl
@@ -3618,6 +4098,22 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
             agent: CODESCRIBE_AGENT.to_string(),
             path: home.join(".codescribe").join("transcriptions"),
             sessions: codescribe_transcripts.len(),
+            size_bytes: total_size,
+        });
+    }
+
+    // Operator markdown: ~/Downloads/*.md and ~/.vibecrafted/inbox/*.md
+    let operator_markdown = discover_operator_markdown(&home);
+    if !operator_markdown.is_empty() {
+        let total_size: u64 = operator_markdown
+            .iter()
+            .filter_map(|document| fs::metadata(&document.path).ok())
+            .map(|metadata| metadata.len())
+            .sum();
+        sources.push(SourceInfo {
+            agent: "operator-md".to_string(),
+            path: home.join("Downloads"),
+            sessions: operator_markdown.len(),
             size_bytes: total_size,
         });
     }

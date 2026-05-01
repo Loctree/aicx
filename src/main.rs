@@ -16,11 +16,12 @@
 //! - Gemini Antigravity: ~/.gemini/antigravity/{conversations/<uuid>.pb,brain/<uuid>/}
 //! - Junie: ~/.junie/sessions/session-*/events.jsonl
 //! - CodeScribe: ~/.codescribe/transcriptions/YYYY-MM-DD/*.{txt,md,json}
+//! - Operator markdown: ~/Downloads/*.md, ~/.vibecrafted/inbox/*.md
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Context, Result};
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -150,6 +151,19 @@ impl From<FrameKindArg> for timeline::FrameKind {
 
 const DEFAULT_DASHBOARD_TITLE: &str = "AICX Dashboard";
 const DEFAULT_REPORTS_TITLE: &str = "AICX Report Explorer";
+
+#[derive(Debug, Clone, ValueEnum)]
+enum IngestSource {
+    OperatorMd,
+}
+
+impl IngestSource {
+    fn as_agent(&self) -> &'static str {
+        match self {
+            Self::OperatorMd => "operator-md",
+        }
+    }
+}
 
 #[derive(Debug, Args, Clone)]
 struct RetrievalFilters {
@@ -568,8 +582,8 @@ enum Commands {
         #[arg(short, long, num_args = 1..)]
         project: Vec<String>,
 
-        /// Agent filter: claude, codex, gemini, junie, codescribe (default: all)
-        #[arg(short, long, value_parser = ["claude", "codex", "gemini", "junie", "codescribe"])]
+        /// Agent filter: claude, codex, gemini, junie, codescribe, operator-md (default: all agents)
+        #[arg(short, long, value_parser = ["claude", "codex", "gemini", "junie", "codescribe", "operator-md"])]
         agent: Option<String>,
 
         /// Hours to look back (default: 48)
@@ -596,6 +610,41 @@ enum Commands {
         /// echoes, stray YAML delimiters). Default: filter is ON. Use this
         /// for debugging or when raw upstream content must be preserved
         /// verbatim in the chunk text.
+        #[arg(long)]
+        no_noise_filter: bool,
+
+        /// What to print to stdout: paths, json, none (default: none)
+        #[arg(long, value_enum, default_value_t = StdoutEmit::None)]
+        emit: StdoutEmit,
+    },
+
+    /// Ingest operator-owned source documents into the canonical corpus.
+    #[command(display_order = 5)]
+    Ingest {
+        #[command(flatten)]
+        redaction: RedactionArgs,
+
+        /// Source adapter to ingest
+        #[arg(long, value_enum)]
+        source: IngestSource,
+
+        /// Source cwd/project filter(s): narrows source discovery before repo segmentation
+        #[arg(short, long, num_args = 1..)]
+        project: Vec<String>,
+
+        /// Hours to look back when --since is omitted (default: 720 = 30 days)
+        #[arg(short = 'H', long, default_value = "720")]
+        hours: u64,
+
+        /// Lower date bound (YYYY-MM-DD or YYYY_MMDD)
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Ignore the stored watermark and previously-seen hashes for this run
+        #[arg(long)]
+        full_rescan: bool,
+
+        /// Disable structural-noise filter
         #[arg(long)]
         no_noise_filter: bool,
 
@@ -1106,8 +1155,33 @@ fn main() -> Result<()> {
                 project,
                 agent,
                 hours,
+                cutoff: None,
                 full_rescan,
                 include_assistant,
+                emit,
+                redact_secrets: redaction.redact_secrets,
+                noise_filter_enabled: !no_noise_filter,
+            })?;
+        }
+        Some(Commands::Ingest {
+            redaction,
+            source,
+            project,
+            hours,
+            since,
+            full_rescan,
+            no_noise_filter,
+            emit,
+        }) => {
+            let has_explicit_since = since.is_some();
+            let cutoff = parse_ingest_since(since.as_deref())?;
+            run_store(StoreRunArgs {
+                project,
+                agent: Some(source.as_agent().to_string()),
+                hours,
+                cutoff,
+                full_rescan: full_rescan || has_explicit_since,
+                include_assistant: true,
                 emit,
                 redact_secrets: redaction.redact_secrets,
                 noise_filter_enabled: !no_noise_filter,
@@ -1732,11 +1806,18 @@ fn render_resolved_store_buckets(scope: &StoreScopeSurface) -> String {
 
 const INCREMENTAL_LEGACY_NOTE: &str =
     "# Note: --incremental is now the default and will be removed in 0.8.0";
+const LEGACY_ALL_WATERMARK_AGENTS: &[&str] = &["claude", "codex", "gemini", "junie", "codescribe"];
+const LEGACY_ALL_WATERMARK_KEY: &str = "claude+codex+gemini+junie";
 
 fn extraction_source_key(agents: &[&str], project: &[String]) -> String {
+    let agent_key = if agents == LEGACY_ALL_WATERMARK_AGENTS {
+        LEGACY_ALL_WATERMARK_KEY.to_string()
+    } else {
+        agents.join("+")
+    };
     format!(
         "{}:{}",
-        agents.join("+"),
+        agent_key,
         if project.is_empty() {
             "all".to_string()
         } else {
@@ -1818,6 +1899,7 @@ struct StoreRunArgs {
     project: Vec<String>,
     agent: Option<String>,
     hours: u64,
+    cutoff: Option<DateTime<Utc>>,
     full_rescan: bool,
     include_assistant: bool,
     emit: StdoutEmit,
@@ -1835,12 +1917,25 @@ fn resolve_store_agents(agent: Option<&str>) -> Result<Vec<&'static str>> {
         Some("gemini") => Ok(vec!["gemini"]),
         Some("junie") => Ok(vec!["junie"]),
         Some("codescribe") => Ok(vec!["codescribe"]),
+        Some("operator-md") => Ok(vec!["operator-md"]),
         Some(other) => Err(anyhow::anyhow!(
-            "Unsupported --agent '{}'. Expected one of: claude, codex, gemini, junie, codescribe.",
+            "Unsupported --agent '{}'. Expected one of: claude, codex, gemini, junie, codescribe, operator-md.",
             other
         )),
         None => Ok(vec!["claude", "codex", "gemini", "junie", "codescribe"]),
     }
+}
+
+fn parse_ingest_since(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let date = parse_cli_date(Some(value), "--since")?
+        .ok_or_else(|| anyhow::anyhow!("Invalid --since value '{}'", value))?;
+    let datetime = date
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| anyhow::anyhow!("Invalid --since date '{}'", value))?;
+    Ok(Some(Utc.from_utc_datetime(&datetime)))
 }
 
 fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
@@ -1902,6 +1997,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             "gemini" => sources::extract_gemini(&config)?,
             "junie" => sources::extract_junie(&config)?,
             "codescribe" => sources::extract_codescribe(&config)?,
+            "operator-md" => sources::extract_operator_markdown(&config)?,
             _ => Vec::new(),
         };
 
@@ -2220,6 +2316,7 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         project,
         agent,
         hours,
+        cutoff,
         full_rescan,
         include_assistant,
         emit,
@@ -2227,7 +2324,7 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         noise_filter_enabled,
     } = args;
 
-    let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
+    let cutoff = cutoff.unwrap_or_else(|| Utc::now() - chrono::Duration::hours(hours as i64));
 
     let agents = resolve_store_agents(agent.as_deref())?;
 
@@ -2258,6 +2355,7 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
             "gemini" => sources::extract_gemini(&config)?,
             "junie" => sources::extract_junie(&config)?,
             "codescribe" => sources::extract_codescribe(&config)?,
+            "operator-md" => sources::extract_operator_markdown(&config)?,
             _ => Vec::new(),
         };
         eprintln!("  [{}] {} entries", ag, agent_entries.len());
@@ -3545,6 +3643,35 @@ mod tests {
     }
 
     #[test]
+    fn ingest_accepts_operator_markdown_source_and_since() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "ingest",
+            "--source",
+            "operator-md",
+            "--since",
+            "2026-05-01",
+            "--emit",
+            "json",
+        ])
+        .expect("operator markdown ingest command should parse");
+
+        match cli.command {
+            Some(Commands::Ingest {
+                source,
+                since,
+                emit,
+                ..
+            }) => {
+                assert!(matches!(source, IngestSource::OperatorMd));
+                assert_eq!(since.as_deref(), Some("2026-05-01"));
+                assert!(matches!(emit, StdoutEmit::Json));
+            }
+            other => panic!("expected ingest command, got {:?}", other.map(|_| "other")),
+        }
+    }
+
+    #[test]
     fn refs_default_to_summary_stdout() {
         let cli = Cli::try_parse_from(["aicx", "refs"]).expect("refs command should parse");
 
@@ -3845,6 +3972,7 @@ mod tests {
 
         assert!(rendered.contains("claude, codex, gemini, junie"));
         assert!(rendered.contains("codescribe"));
+        assert!(rendered.contains("operator-md"));
 
         let cli = Cli::try_parse_from(["aicx", "store", "--agent", "junie"])
             .expect("store should accept junie agent filter");
@@ -3860,6 +3988,15 @@ mod tests {
         match cli.command {
             Some(Commands::Store { agent, .. }) => {
                 assert_eq!(agent.as_deref(), Some("codescribe"));
+            }
+            _ => panic!("expected store command"),
+        }
+
+        let cli = Cli::try_parse_from(["aicx", "store", "--agent", "operator-md"])
+            .expect("store should accept operator-md agent filter");
+        match cli.command {
+            Some(Commands::Store { agent, .. }) => {
+                assert_eq!(agent.as_deref(), Some("operator-md"));
             }
             _ => panic!("expected store command"),
         }

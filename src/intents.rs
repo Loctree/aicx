@@ -578,6 +578,7 @@ fn extract_signal_candidates(
         if line.starts_with("RED LIGHT: checklist detected")
             || line.starts_with("Checklist detected")
             || line.starts_with("... (+")
+            || is_source_metadata_line(line)
         {
             continue;
         }
@@ -623,6 +624,9 @@ fn extract_transcript_candidates(
         for (index, raw_line) in entry.lines.iter().enumerate() {
             let line = raw_line.trim();
             if line.is_empty() {
+                continue;
+            }
+            if is_source_metadata_line(line) {
                 continue;
             }
 
@@ -689,7 +693,37 @@ fn is_outcome_line(line: &str) -> bool {
 
 fn looks_like_intent_line(line: &str) -> bool {
     let lower = line.to_lowercase();
-    INTENT_KEYWORDS.iter().any(|kw| lower.contains(kw))
+    lower.starts_with("intent:")
+        || lower.starts_with("[intent]")
+        || severity_marker(line).is_some()
+        || INTENT_KEYWORDS.iter().any(|kw| lower.contains(kw))
+}
+
+fn severity_marker(line: &str) -> Option<&'static str> {
+    let upper = line.to_ascii_uppercase();
+    let has_marker = |marker: &str| {
+        upper
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|token| token == marker)
+    };
+    ["P0", "P1", "P2"]
+        .into_iter()
+        .find(|marker| has_marker(marker))
+}
+
+fn is_source_metadata_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    [
+        "source:",
+        "kind:",
+        "source_file:",
+        "severity:",
+        "project:",
+        "author:",
+        "heading:",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
 }
 
 fn looks_like_operator_decision_line(line: &str) -> bool {
@@ -796,7 +830,11 @@ fn clean_summary(kind: IntentKind, raw: &str) -> String {
             text = strip_case_insensitive_prefix(text, "outcome:");
             text = strip_case_insensitive_prefix(text, "validation:");
         }
-        IntentKind::Intent | IntentKind::Task => {}
+        IntentKind::Intent => {
+            text = strip_case_insensitive_prefix(text, "[intent]");
+            text = strip_case_insensitive_prefix(text, "intent:");
+        }
+        IntentKind::Task => {}
     }
 
     normalize_display_text(text)

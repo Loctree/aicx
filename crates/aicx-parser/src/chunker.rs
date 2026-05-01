@@ -852,6 +852,9 @@ fn extract_intent_lines(entries: &[&TimelineEntry]) -> Vec<String> {
             if line.is_empty() {
                 continue;
             }
+            if is_source_metadata_line(line) {
+                continue;
+            }
             if !is_intent_line(line) {
                 continue;
             }
@@ -873,7 +876,37 @@ fn extract_intent_lines(entries: &[&TimelineEntry]) -> Vec<String> {
 
 pub(crate) fn is_intent_line(line: &str) -> bool {
     let lower = line.to_lowercase();
-    INTENT_KEYWORDS.iter().any(|kw| lower.contains(kw))
+    lower.starts_with("intent:")
+        || lower.starts_with("[intent]")
+        || severity_marker(line).is_some()
+        || INTENT_KEYWORDS.iter().any(|kw| lower.contains(kw))
+}
+
+fn severity_marker(line: &str) -> Option<&'static str> {
+    let upper = line.to_ascii_uppercase();
+    let has_marker = |marker: &str| {
+        upper
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|token| token == marker)
+    };
+    ["P0", "P1", "P2"]
+        .into_iter()
+        .find(|marker| has_marker(marker))
+}
+
+fn is_source_metadata_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    [
+        "source:",
+        "kind:",
+        "source_file:",
+        "severity:",
+        "project:",
+        "author:",
+        "heading:",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
 }
 
 fn extract_result_lines(entries: &[&TimelineEntry]) -> Vec<String> {
