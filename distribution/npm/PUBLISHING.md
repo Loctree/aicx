@@ -57,8 +57,8 @@ Then it:
 ### Step 1 - Sync versions
 
 ```bash
-node distribution/npm/sync-version.mjs 0.6.2
-node distribution/npm/sync-version.mjs --check 0.6.2
+node distribution/npm/sync-version.mjs 0.6.4
+node distribution/npm/sync-version.mjs --check 0.6.4
 ```
 
 ### Step 2 - Publish platform packages first
@@ -116,8 +116,8 @@ then publishes the wrapper.
 - Test download manually:
 
 ```bash
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.6.2/aicx-v0.6.2-aarch64-apple-darwin.zip
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.6.2/aicx-v0.6.2-aarch64-apple-darwin.zip.sha256
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.6.4/aicx-v0.6.4-aarch64-apple-darwin.zip
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.6.4/aicx-v0.6.4-aarch64-apple-darwin.zip.sha256
 ```
 
 ### optionalDependencies disabled

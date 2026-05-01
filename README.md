@@ -57,7 +57,7 @@ Directly from GitHub Releases with SHA-256 verification before unpacking:
 
 ```bash
 AICX_INSTALL_MODE=release bash install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.6.2 bash install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.6.4 bash install.sh
 ```
 
 On macOS this consumes the signed/notarized release zip published by CI on the
