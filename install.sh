@@ -704,10 +704,11 @@ if [ -d "$HOME/.ai-contexters" ]; then
 fi
 echo "Installed:"
 echo "  aicx      — CLI for extraction, search, steer, dashboard"
-echo "  aicx-mcp  — MCP server (3 tools: search, rank, steer)"
+echo "  aicx-mcp  — MCP server (4 tools: search, read, rank, steer)"
 echo ""
 echo "MCP tools available in Claude Code / Codex / Gemini:"
 echo "  aicx_search  — fuzzy search across session history"
+echo "  aicx_read    — read one canonical chunk by path or ref"
 echo "  aicx_rank    — quality-score stored chunks"
 echo "  aicx_steer   — retrieve chunks by run/prompt/project/agent/date metadata"
 echo ""

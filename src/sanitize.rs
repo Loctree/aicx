@@ -470,6 +470,7 @@ pub fn normalize_query(text: &str) -> String {
 const SELF_ECHO_PATTERNS: &[&str] = &[
     // MCP tool calls
     "aicx_search",
+    "aicx_read",
     "aicx_rank",
     "aicx_refs",
     "aicx_store",

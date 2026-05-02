@@ -192,6 +192,43 @@ fn append_codex_entry(
 }
 
 #[test]
+fn read_cli_returns_chunk_metadata_and_content() {
+    let root = unique_test_dir("read-command");
+    let home = root.join("home");
+    let chunk = home
+        .join(".aicx")
+        .join("store")
+        .join("VetCoders")
+        .join("aicx")
+        .join("2026_0502")
+        .join("reports")
+        .join("codex")
+        .join("2026_0502_codex_sess-read01_001.md");
+    write_file(&chunk, "Decision: make read the re-entry primitive.");
+
+    let output = parse_stdout_json(&run_aicx(
+        &home,
+        &[
+            "read",
+            "store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess-read01_001.md",
+            "--max-chars",
+            "13",
+            "--json",
+        ],
+    ));
+
+    assert_eq!(output["project"].as_str(), Some("VetCoders/aicx"));
+    assert_eq!(output["kind"].as_str(), Some("reports"));
+    assert_eq!(output["agent"].as_str(), Some("codex"));
+    assert_eq!(output["session_id"].as_str(), Some("sess-read01"));
+    assert_eq!(output["chunk"].as_u64(), Some(1));
+    assert_eq!(output["content"].as_str(), Some("Decision: mak"));
+    assert_eq!(output["truncated"].as_bool(), Some(true));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn store_cli_deduplicates_exact_entries_on_first_run() {
     let root = unique_test_dir("store-exact-dedup");
     let home = root.join("home");

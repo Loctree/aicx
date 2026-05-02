@@ -3991,7 +3991,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "memex-contracts"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -5302,7 +5302,7 @@ dependencies = [
 
 [[package]]
 name = "rust-memex"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "aicx-parser",
  "anyhow",

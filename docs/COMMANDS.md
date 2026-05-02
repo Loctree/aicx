@@ -241,6 +241,31 @@ aicx search "dashboard" -p ai-contexters --score 60 --json
 aicx search "decisions march 2026"
 ```
 
+## `aicx read`
+
+Read one canonical chunk after a discover step.
+
+Accepts an absolute path, a path relative to `~/.aicx/`, a chunk file name,
+or a compact reference in the form
+`<project>|<date>|<kind>|<agent>|<session_id>|<chunk>`.
+
+```bash
+aicx read [OPTIONS] <REFERENCE>
+```
+
+Options:
+- `<REFERENCE>` chunk path, file name, or compact reference
+- `--max-chars <N>` truncate content to `N` UTF-8 characters
+- `-j, --json` emit compact JSON instead of readable text
+
+Examples:
+
+```bash
+aicx refs -H 24 --emit paths
+aicx read /Users/polyversai/.aicx/store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md
+aicx read store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md --max-chars 4000 --json
+```
+
 ## `aicx steer`
 
 Retrieve chunks by steering metadata (frontmatter sidecar fields). Filters by `run_id`, `prompt_id`, agent, kind, repo/store bucket, and/or date range using sidecar metadata — no filesystem grep needed.
@@ -494,11 +519,13 @@ aicx state --info
 
 Run `aicx` as an MCP server (stdio or streamable HTTP transport).
 
-Exposes search, steer, and rank tools over MCP for agent retrieval.
+Exposes search, read, steer, and rank tools over MCP for agent retrieval.
 `aicx_steer` and `aicx_rank` query the canonical corpus on disk.
 `aicx_search` uses canonical-store fuzzy search today; semantic widening belongs
 to configured downstream retrieval providers and must fall back cleanly to the
 canonical store.
+`aicx_read` pulls the actual chunk content by path, file name, or compact
+reference after a discover step.
 
 ```bash
 aicx serve [OPTIONS]

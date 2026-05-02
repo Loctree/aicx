@@ -889,6 +889,24 @@ enum Commands {
         json: bool,
     },
 
+    /// Read one canonical chunk by path, file name, or compact chunk reference.
+    ///
+    /// This closes the discover -> read loop: pass a path from `aicx search`,
+    /// `aicx refs --emit paths`, dashboard `/api/chunk`, or MCP search results.
+    #[command(display_order = 13)]
+    Read {
+        /// Absolute path, store-relative path, file name, or compact chunk reference
+        reference: String,
+
+        /// Truncate chunk content to this many UTF-8 characters
+        #[arg(long)]
+        max_chars: Option<usize>,
+
+        /// Emit compact JSON instead of readable text
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
+
     /// Retrieve chunks by steering metadata (layer 1, frontmatter fields).
     ///
     /// Filters the canonical store by run_id, prompt_id, agent, kind, project,
@@ -1311,6 +1329,13 @@ fn main() -> Result<()> {
                 json,
                 filters,
             )?;
+        }
+        Some(Commands::Read {
+            reference,
+            max_chars,
+            json,
+        }) => {
+            run_read(&reference, max_chars, json)?;
         }
         Some(Commands::Steer {
             run_id,
@@ -2847,6 +2872,39 @@ fn run_search(
     Ok(())
 }
 
+/// Read one canonical chunk and print metadata plus content.
+fn run_read(reference: &str, max_chars: Option<usize>, json: bool) -> Result<()> {
+    let chunk = store::read_context_chunk(reference, max_chars)?;
+
+    if json {
+        println!("{}", serde_json::to_string(&chunk)?);
+        return Ok(());
+    }
+
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    writeln!(
+        out,
+        "{} | {} | {} | {} | chunk {:03}",
+        chunk.project, chunk.agent, chunk.date, chunk.kind, chunk.chunk
+    )?;
+    writeln!(out, "session: {}", chunk.session_id)?;
+    writeln!(out, "path: {}", chunk.path.display())?;
+    writeln!(out, "relative: {}", chunk.relative_path)?;
+    writeln!(out, "bytes: {}", chunk.bytes)?;
+    if chunk.truncated {
+        writeln!(out, "truncated: true")?;
+    }
+    writeln!(out)?;
+    write!(out, "{}", chunk.content)?;
+    if !chunk.content.ends_with('\n') {
+        writeln!(out)?;
+    }
+    out.flush()?;
+
+    Ok(())
+}
+
 /// Retrieve chunks by steering metadata (frontmatter sidecar fields).
 fn run_steer(
     run_id: Option<&str>,
@@ -3862,6 +3920,35 @@ mod tests {
 
         assert!(rendered.contains("semantic retrieval through MCP tools"));
         assert!(!rendered.contains("embedding-aware"));
+    }
+
+    #[test]
+    fn read_command_parses_discover_path_and_json_mode() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "read",
+            "store/VetCoders/aicx/2026_0502/reports/codex/chunk.md",
+            "--max-chars",
+            "400",
+            "--json",
+        ])
+        .expect("read command should parse");
+
+        match cli.command {
+            Some(Commands::Read {
+                reference,
+                max_chars,
+                json,
+            }) => {
+                assert_eq!(
+                    reference,
+                    "store/VetCoders/aicx/2026_0502/reports/codex/chunk.md"
+                );
+                assert_eq!(max_chars, Some(400));
+                assert!(json);
+            }
+            _ => panic!("expected read command"),
+        }
     }
 
     #[test]

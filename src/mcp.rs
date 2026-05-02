@@ -68,6 +68,14 @@ pub struct SearchParams {
     pub verbose: bool,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadParams {
+    /// Absolute path, store-relative path, file name, or compact chunk reference
+    pub reference: String,
+    /// Truncate chunk content to this many UTF-8 characters
+    pub max_chars: Option<usize>,
+}
+
 fn default_limit() -> usize {
     20
 }
@@ -391,6 +399,22 @@ impl AicxMcpServer {
 
         let json = rank::render_search_json(&results, scanned)
             .map_err(|e| McpError::internal_error(format!("Serialize search JSON: {e}"), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "aicx_read",
+        description = "Read one canonical AICX chunk by path, file name, or compact reference. Use after aicx_search, aicx_steer, or CLI refs/search output to pull the actual chunk content into context."
+    )]
+    async fn read_chunk(
+        &self,
+        Parameters(params): Parameters<ReadParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let chunk = store::read_context_chunk(&params.reference, params.max_chars)
+            .map_err(|e| McpError::internal_error(format!("Read chunk: {e}"), None))?;
+        let json = serde_json::to_string(&chunk)
+            .map_err(|e| McpError::internal_error(format!("Serialize chunk JSON: {e}"), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }

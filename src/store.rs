@@ -9,7 +9,7 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeZone, Utc};
 use globset::{Glob, GlobMatcher};
 use regex::Regex;
@@ -510,6 +510,21 @@ pub struct StoredContextFile {
     pub chunk: u32,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadContextChunk {
+    pub path: PathBuf,
+    pub relative_path: String,
+    pub project: String,
+    pub date: String,
+    pub kind: String,
+    pub agent: String,
+    pub session_id: String,
+    pub chunk: u32,
+    pub bytes: u64,
+    pub content: String,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StoreWriteSummary {
     pub total_entries: usize,
@@ -852,6 +867,108 @@ pub fn context_files_since(
     project_filter: Option<&str>,
 ) -> Result<Vec<StoredContextFile>> {
     context_files_since_at(&store_base_dir()?, cutoff, project_filter)
+}
+
+/// Read one canonical chunk by absolute path, store-relative path, file name,
+/// or compact chunk reference.
+pub fn read_context_chunk(reference: &str, max_chars: Option<usize>) -> Result<ReadContextChunk> {
+    read_context_chunk_at(&store_base_dir()?, reference, max_chars)
+}
+
+pub fn read_context_chunk_at(
+    base: &Path,
+    reference: &str,
+    max_chars: Option<usize>,
+) -> Result<ReadContextChunk> {
+    let base = sanitize::validate_dir_path(base)?;
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return Err(anyhow!("chunk reference is required"));
+    }
+
+    let files = scan_context_files_at(&base)?;
+    let Some(file) = files
+        .into_iter()
+        .find(|file| stored_file_matches_reference(&base, file, reference))
+    else {
+        return Err(anyhow!("chunk not found: {reference}"));
+    };
+
+    let relative_path = file
+        .path
+        .strip_prefix(&base)
+        .unwrap_or(&file.path)
+        .to_string_lossy()
+        .to_string();
+    let path = sanitize::validate_read_path(&file.path)?;
+    let bytes = path.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let content = sanitize::read_to_string_validated(&path)?;
+    let (content, truncated) = truncate_chars(content, max_chars);
+
+    Ok(ReadContextChunk {
+        path,
+        relative_path,
+        project: file.project,
+        date: file.date_iso,
+        kind: file.kind.dir_name().to_string(),
+        agent: file.agent,
+        session_id: file.session_id,
+        chunk: file.chunk,
+        bytes,
+        content,
+        truncated,
+    })
+}
+
+fn stored_file_matches_reference(base: &Path, file: &StoredContextFile, reference: &str) -> bool {
+    let path = file.path.to_string_lossy();
+    if path == reference {
+        return true;
+    }
+
+    let reference_path = Path::new(reference);
+    if reference_path.is_absolute() && reference_path == file.path {
+        return true;
+    }
+
+    if file
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == reference)
+    {
+        return true;
+    }
+
+    if file
+        .path
+        .strip_prefix(base)
+        .ok()
+        .is_some_and(|relative| relative.to_string_lossy() == reference)
+    {
+        return true;
+    }
+
+    let compact_ref = format!(
+        "{}|{}|{}|{}|{}|{:03}",
+        file.project,
+        file.date_iso,
+        file.kind.dir_name(),
+        file.agent,
+        file.session_id,
+        file.chunk
+    );
+    compact_ref == reference
+}
+
+fn truncate_chars(content: String, max_chars: Option<usize>) -> (String, bool) {
+    let Some(max_chars) = max_chars else {
+        return (content, false);
+    };
+    let mut iter = content.chars();
+    let truncated: String = iter.by_ref().take(max_chars).collect();
+    let was_truncated = iter.next().is_some();
+    (truncated, was_truncated)
 }
 
 fn context_files_since_at(
@@ -3131,6 +3248,49 @@ mod tests {
             file.repo.as_ref().unwrap().slug(),
             "VetCoders/ai-contexters"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_context_chunk_accepts_relative_path_file_name_and_compact_ref() {
+        let root = retrieval_test_root("read-chunk");
+        let _ = fs::remove_dir_all(&root);
+
+        let chunk_path = root
+            .join("store")
+            .join("VetCoders")
+            .join("ai-contexters")
+            .join("2026_0321")
+            .join("conversations")
+            .join("claude")
+            .join("2026_0321_claude_sess-abc123_001.md");
+        write_chunk_file(&chunk_path, "Decision: read is the re-entry primitive");
+
+        let by_relative = read_context_chunk_at(
+            &root,
+            "store/VetCoders/ai-contexters/2026_0321/conversations/claude/2026_0321_claude_sess-abc123_001.md",
+            Some(14),
+        )
+        .expect("read by relative path");
+        assert_eq!(by_relative.project, "VetCoders/ai-contexters");
+        assert_eq!(by_relative.kind, "conversations");
+        assert_eq!(by_relative.session_id, "sess-abc123");
+        assert_eq!(by_relative.chunk, 1);
+        assert_eq!(by_relative.content, "Decision: read");
+        assert!(by_relative.truncated);
+
+        let by_file = read_context_chunk_at(&root, "2026_0321_claude_sess-abc123_001.md", None)
+            .expect("read by file name");
+        assert!(by_file.content.contains("re-entry primitive"));
+
+        let by_compact = read_context_chunk_at(
+            &root,
+            "VetCoders/ai-contexters|2026-03-21|conversations|claude|sess-abc123|001",
+            None,
+        )
+        .expect("read by compact ref");
+        assert_eq!(by_compact.relative_path, by_relative.relative_path);
 
         let _ = fs::remove_dir_all(&root);
     }
