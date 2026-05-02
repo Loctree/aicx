@@ -86,6 +86,48 @@ fn write_codex_session(path: &Path, cwd: &Path) {
     write_file(path, &lines.join("\n"));
 }
 
+fn write_claude_session_with_empty_signature(path: &Path, cwd: &Path) {
+    let now = Utc::now();
+    let lines = [
+        json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": "Please answer visibly",
+            },
+            "timestamp": (now - chrono::Duration::seconds(2)).to_rfc3339_opts(SecondsFormat::Secs, true),
+            "sessionId": "claude-signature-contract",
+            "gitBranch": "main",
+            "cwd": cwd.display().to_string(),
+        })
+        .to_string(),
+        json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "",
+                        "signature": "abc123",
+                    },
+                    {
+                        "type": "text",
+                        "text": "Visible Claude answer",
+                    }
+                ],
+            },
+            "timestamp": (now - chrono::Duration::seconds(1)).to_rfc3339_opts(SecondsFormat::Secs, true),
+            "sessionId": "claude-signature-contract",
+            "gitBranch": "main",
+            "cwd": cwd.display().to_string(),
+        })
+        .to_string(),
+    ];
+
+    write_file(path, &lines.join("\n"));
+}
+
 fn current_profile_dir() -> PathBuf {
     let test_exe = std::env::current_exe().expect("resolve current test executable");
     test_exe
@@ -295,6 +337,70 @@ fn codex_store_round_trips_frame_kind_filters() {
             "steer output leaked {unexpected} path: {steer_stdout}"
         );
     }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn claude_store_does_not_emit_empty_thinking_signature() {
+    let root = unique_test_dir("claude-signature-store");
+    let home = root.join("home");
+    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let session_path = home
+        .join(".claude")
+        .join("projects")
+        .join("-Users-test-hosted-VetCoders-aicx")
+        .join("claude-signature-contract.jsonl");
+
+    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
+    write_claude_session_with_empty_signature(&session_path, &repo_root);
+
+    let store_output = run_aicx(
+        &home,
+        &["store", "--agent", "claude", "-H", "24", "--emit", "json"],
+    );
+    let payload = parse_stdout_json(&store_output);
+    let store_paths = json_paths(&payload, "store_paths");
+    assert_eq!(store_paths.len(), 2);
+
+    let mut saw_agent_reply = false;
+    for path in &store_paths {
+        let chunk = fs::read_to_string(path).expect("read stored chunk");
+        assert!(!chunk.contains("signature"));
+        assert!(!chunk.contains("abc123"));
+        assert!(!chunk.contains(r#""type":"thinking""#));
+
+        let sidecar: Value = serde_json::from_slice(
+            &fs::read(path.with_extension("meta.json")).expect("read sidecar"),
+        )
+        .expect("parse sidecar");
+        if sidecar["frame_kind"].as_str() == Some("agent_reply") {
+            saw_agent_reply = true;
+            assert!(chunk.contains("Visible Claude answer"));
+        }
+    }
+    assert!(saw_agent_reply, "expected an agent_reply chunk");
+
+    let input_arg = session_path.display().to_string();
+    let conversation_path = root.join("conversation.md");
+    let output_arg = conversation_path.display().to_string();
+    let conversation_output = run_aicx(
+        &home,
+        &[
+            "extract",
+            "--format",
+            "claude",
+            &input_arg,
+            "-o",
+            &output_arg,
+            "--conversation",
+        ],
+    );
+    assert_success(&conversation_output);
+    let conversation = fs::read_to_string(conversation_path).expect("read conversation markdown");
+    assert!(conversation.contains("Visible Claude answer"));
+    assert!(!conversation.contains(r#""signature""#));
+    assert!(!conversation.contains("abc123"));
 
     let _ = fs::remove_dir_all(&root);
 }

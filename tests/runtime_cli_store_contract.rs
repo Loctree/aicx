@@ -229,6 +229,171 @@ fn read_cli_returns_chunk_metadata_and_content() {
 }
 
 #[test]
+fn list_cli_reports_unprotected_sources_without_creating_git() {
+    let root = unique_test_dir("source-list-unprotected");
+    let home = root.join("home");
+    let history = home.join(".codex").join("history.jsonl");
+    write_codex_history(&history, "source-list-sess", None, &[("user", 1, "hello")]);
+
+    let output = run_aicx(&home, &["list"]);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("unprotected source material"));
+    assert!(
+        !home.join(".codex").join(".git").exists(),
+        "list must stay read-only and never initialize git"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn list_cli_detects_existing_git_protection() {
+    let root = unique_test_dir("source-list-protected");
+    let home = root.join("home");
+    let codex_root = home.join(".codex");
+    let history = codex_root.join("history.jsonl");
+    fs::create_dir_all(codex_root.join(".git")).expect("create local source git");
+    write_codex_history(
+        &history,
+        "source-list-protected-sess",
+        None,
+        &[("user", 1, "hello")],
+    );
+
+    let output = run_aicx(&home, &["list"]);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("protected by git-local"));
+    assert!(stdout.contains("no remote"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn sources_protect_dry_run_does_not_initialize_git() {
+    let root = unique_test_dir("source-protect-dry-run");
+    let source_root = root.join("home").join(".codex");
+    fs::create_dir_all(&source_root).expect("create source root");
+
+    let root_arg = source_root.to_string_lossy().to_string();
+    let output = run_aicx(
+        &root.join("home"),
+        &[
+            "sources",
+            "protect",
+            "--root",
+            &root_arg,
+            "--backend",
+            "git-local",
+        ],
+    );
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Dry run only"));
+    assert!(!source_root.join(".git").exists());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn sources_protect_apply_creates_only_local_git_without_remote() {
+    let root = unique_test_dir("source-protect-apply");
+    let home = root.join("home");
+    let source_root = home.join(".codex");
+    fs::create_dir_all(&source_root).expect("create source root");
+    write_file(
+        &source_root.join("history.jsonl"),
+        "{\"text\":\"private local session\"}\n",
+    );
+
+    let root_arg = source_root.to_string_lossy().to_string();
+    let output = run_aicx(
+        &home,
+        &[
+            "sources",
+            "protect",
+            "--root",
+            &root_arg,
+            "--backend",
+            "git-local",
+            "--apply",
+        ],
+    );
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("source root protected"));
+    assert!(stdout.contains("remote configured: no"));
+    assert!(source_root.join(".git").is_dir());
+    assert!(source_root.join(".gitignore").is_file());
+
+    let remotes = Command::new("git")
+        .arg("-C")
+        .arg(&source_root)
+        .args(["remote", "-v"])
+        .output()
+        .expect("git remote -v");
+    assert_success(&remotes);
+    assert!(remotes.stdout.is_empty());
+
+    let sibling = home.join(".claude");
+    assert!(!sibling.join(".git").exists());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn normal_store_and_extract_do_not_initialize_source_git() {
+    let root = unique_test_dir("source-normal-readonly");
+    let home = root.join("home");
+    let source_root = home.join(".codex");
+    let history = source_root.join("history.jsonl");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs() as i64;
+    write_codex_history(
+        &history,
+        "source-normal-readonly-sess",
+        None,
+        &[("user", now - 60, "private source root must stay read-only")],
+    );
+
+    let store_output = run_aicx(
+        &home,
+        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
+    );
+    assert_success(&store_output);
+    assert!(
+        !source_root.join(".git").exists(),
+        "store must not initialize git in source roots"
+    );
+
+    let input_arg = history.display().to_string();
+    let output_path = root.join("conversation.md");
+    let output_arg = output_path.display().to_string();
+    let extract_output = run_aicx(
+        &home,
+        &[
+            "extract",
+            "--format",
+            "codex",
+            &input_arg,
+            "-o",
+            &output_arg,
+            "--conversation",
+        ],
+    );
+    assert_success(&extract_output);
+    assert!(
+        !source_root.join(".git").exists(),
+        "extract must not initialize git in source roots"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn store_cli_deduplicates_exact_entries_on_first_run() {
     let root = unique_test_dir("store-exact-dedup");
     let home = root.join("home");

@@ -38,10 +38,33 @@ List raw agent session sources on disk (pre-extraction inputs).
 Shows Claude Code, Codex, Gemini, and Junie log paths with session counts and sizes.
 This is what extractors will read from — use `refs` to see what is already in
 the canonical store after extraction.
+It also reports source-protection status: existing local `.git` protection,
+remote presence, or an explicit unprotected-source warning. This command is
+read-only and never initializes git.
 
 ```bash
 aicx list
 ```
+
+## `aicx sources protect`
+
+Opt in to local source-root protection. Dry run is the default:
+
+```bash
+aicx sources protect --root "$HOME/.codex" --backend git-local
+```
+
+Apply explicitly:
+
+```bash
+aicx sources protect --root "$HOME/.codex" --backend git-local --apply
+```
+
+The `git-local` backend creates `.git` only under the requested root, adds safe
+`.gitignore` suggestions unless `--no-gitignore` is passed, and never configures
+a remote by default. Use `--initial-snapshot` only when retaining current
+source contents in local git history is intended. See
+`docs/SOURCE_PROTECTION.md` for the privacy and team-sharing policy.
 
 ## `aicx claude`
 

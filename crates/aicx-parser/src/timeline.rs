@@ -154,6 +154,12 @@ pub struct SourceInfo {
     pub path: PathBuf,
     pub sessions: usize,
     pub size_bytes: u64,
+    pub protected_by_git: bool,
+    pub protection_backend: String,
+    pub protection_root: Option<PathBuf>,
+    pub git_remote_count: usize,
+    pub git_remotes: Vec<String>,
+    pub protection_warning: Option<String>,
 }
 
 /// Explicit trust tier for a repo identity signal.

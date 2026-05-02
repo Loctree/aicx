@@ -330,6 +330,7 @@ aicx migrate-intent-schema --project MyProject --dry-run
 - `docs/COMMANDS.md` (exact CLI reference + examples)
 - `docs/STORE_LAYOUT.md` (store + framework-owned `.ai-context/` layouts)
 - `docs/REDACTION.md` (secret redaction, regex engine notes)
+- `docs/SOURCE_PROTECTION.md` (opt-in local source protection and sharing policy)
 - `docs/DISTILLATION.md` (chunking/distillation model + tuning ideas)
 - `docs/RELEASES.md` (release/distribution workflow + maintainer checklist)
 
