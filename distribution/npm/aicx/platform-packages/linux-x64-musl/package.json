@@ -1,6 +1,6 @@
 {
   "name": "@loctree/aicx-linux-x64-musl",
-  "version": "0.6.2",
+  "version": "0.6.4",
   "description": "aicx + aicx-mcp binaries for Linux x64 (musl)",
   "keywords": [
     "aicx",

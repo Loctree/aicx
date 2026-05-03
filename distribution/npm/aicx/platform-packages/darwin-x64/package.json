@@ -1,6 +1,6 @@
 {
   "name": "@loctree/aicx-darwin-x64",
-  "version": "0.6.2",
+  "version": "0.6.4",
   "description": "aicx + aicx-mcp binaries for macOS Intel (x64)",
   "keywords": [
     "aicx",
