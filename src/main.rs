@@ -370,6 +370,10 @@ struct CorpusRepairArgs {
     #[arg(long)]
     backup: bool,
 
+    /// Write the repair manifest to an explicit path, including dry-run previews.
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+
     /// Output format: text or json.
     #[arg(long, value_enum, default_value_t = CorpusEmit::Text)]
     emit: CorpusEmit,
@@ -3800,7 +3804,7 @@ fn run_corpus_command(args: CorpusArgs) -> Result<()> {
                 dry_run: repair_args.dry_run,
                 apply: repair_args.apply,
                 backup: repair_args.backup,
-                manifest_path: None,
+                manifest_path: repair_args.manifest,
             })?;
             if matches!(repair_args.emit, CorpusEmit::Json) {
                 println!("{}", serde_json::to_string_pretty(&repair_manifest)?);
@@ -4388,6 +4392,8 @@ mod tests {
             "/tmp/aicx-store",
             "--dry-run",
             "--backup",
+            "--manifest",
+            "/tmp/aicx-repair-preview.json",
         ])
         .expect("corpus repair should parse");
         match repair.command {
@@ -4398,6 +4404,10 @@ mod tests {
                 assert!(args.dry_run);
                 assert!(!args.apply);
                 assert!(args.backup);
+                assert_eq!(
+                    args.manifest,
+                    Some(PathBuf::from("/tmp/aicx-repair-preview.json"))
+                );
             }
             _ => panic!("expected corpus repair command"),
         }

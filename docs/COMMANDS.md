@@ -226,6 +226,33 @@ Example:
 aicx store -p CodeScribe --agent claude -H 720 --emit paths
 ```
 
+## `aicx corpus`
+
+Audit and deterministically repair derived markdown corpora. Raw JSONL and log
+files remain provenance; this surface is for cleaned-but-faithful markdown that
+feeds retrieval.
+
+```bash
+aicx corpus audit [OPTIONS]
+aicx corpus repair [OPTIONS]
+```
+
+Options:
+- `--root <DIR>...` corpus roots to scan (default: `$HOME/.aicx`, `$HOME/.ai-contexters`, optional `$HOME/.xcia`)
+- `--emit <text|json>` output format
+- `--dry-run` preview repair candidates without modifying markdown (repair default unless `--apply` is passed)
+- `--apply` rewrite derived markdown deterministically
+- `--backup` write backups before applying repairs
+- `--manifest <FILE>` write a repair manifest, including dry-run previews
+
+Examples:
+
+```bash
+aicx corpus audit --root "$HOME/.aicx" --emit json
+aicx corpus repair --root "$HOME/.aicx/store/Loctree/aicx/2026_0502" --dry-run --manifest /tmp/aicx-repair-preview.json
+aicx corpus repair --root "$HOME/.aicx/store/Loctree/aicx/2026_0502" --apply --backup
+```
+
 ## `aicx search`
 
 Fuzzy search across the canonical corpus (layer 1, filesystem-only).

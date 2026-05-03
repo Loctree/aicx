@@ -674,7 +674,9 @@ fn write_manifest(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    write_bytes_validated(&path, &serde_json::to_vec_pretty(manifest)?)?;
+    let mut written_manifest = manifest.clone();
+    written_manifest.manifest_path = Some(path.clone());
+    write_bytes_validated(&path, &serde_json::to_vec_pretty(&written_manifest)?)?;
     Ok(path)
 }
 
@@ -966,7 +968,14 @@ mod tests {
         assert_eq!(sidecar["repair_version"], REPAIR_VERSION);
         assert_eq!(sidecar["source_was_derived"], true);
         assert_eq!(sidecar["raw_source_missing"], true);
-        assert!(root.join(REPAIR_MANIFEST_DIR).exists());
+        let manifest_path = manifest
+            .manifest_path
+            .as_ref()
+            .expect("apply writes default manifest");
+        assert!(manifest_path.exists());
+        let manifest_json: Value =
+            serde_json::from_str(&fs::read_to_string(manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest_json["manifest_path"], json!(manifest_path));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1002,6 +1011,50 @@ mod tests {
         assert_eq!(manifest.repaired_files, 0);
         assert!(manifest.manifest_path.is_none());
         assert!(!root.join(REPAIR_MANIFEST_DIR).exists());
+        assert!(fs::read_to_string(&file).unwrap().contains("signature"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repair_dry_run_writes_requested_manifest() {
+        let root = tmp_root("dry-run-manifest");
+        let file = root
+            .join("store")
+            .join("Loctree")
+            .join("aicx")
+            .join("2026_0502")
+            .join("conversations")
+            .join("claude")
+            .join("2026_0502_claude_sess_001.md");
+        let manifest_path = root.join("repair-preview.json");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            &file,
+            "ok\n{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"abc123\"}\n",
+        )
+        .unwrap();
+
+        let manifest = repair(&CorpusRepairOptions {
+            roots: vec![root.clone()],
+            dry_run: true,
+            apply: false,
+            backup: false,
+            manifest_path: Some(manifest_path.clone()),
+        })
+        .unwrap();
+
+        assert_eq!(manifest.candidates, 1);
+        assert_eq!(manifest.repaired_files, 0);
+        assert_eq!(manifest.manifest_path, Some(manifest_path.clone()));
+        assert!(manifest_path.exists());
+        let raw = fs::read_to_string(manifest_path).unwrap();
+        assert!(raw.contains("\"would_repair\""));
+        let manifest_json: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            manifest_json["manifest_path"],
+            json!(manifest.manifest_path)
+        );
         assert!(fs::read_to_string(&file).unwrap().contains("signature"));
 
         let _ = fs::remove_dir_all(root);
