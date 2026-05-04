@@ -1,4 +1,4 @@
-use aicx::mcp::{IntentsParams, RankParams, SearchParams, SteerParams};
+use aicx::mcp::{IntentsParams, RankParams, ReadParams, SearchParams, SteerParams};
 
 #[test]
 fn test_mcp_slim_defaults() {
@@ -22,4 +22,9 @@ fn test_mcp_slim_defaults() {
     assert_eq!(params.emit, "markdown");
     assert!(params.slim);
     assert!(!params.verbose);
+
+    let params: ReadParams =
+        serde_json::from_str(r#"{"reference":"store/VetCoders/aicx/chunk.md"}"#).unwrap();
+    assert_eq!(params.reference, "store/VetCoders/aicx/chunk.md");
+    assert!(params.max_chars.is_none());
 }

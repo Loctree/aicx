@@ -28,8 +28,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command as ProcessCommand, Stdio};
 
+use aicx::corpus;
 use aicx::dashboard::{self, DashboardConfig, DashboardScope};
 use aicx::dashboard_server::{self, DashboardCorsPolicy, DashboardServerConfig};
 use aicx::intents;
@@ -114,6 +115,14 @@ enum RefsEmit {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
+enum CorpusEmit {
+    /// Print a readable text report.
+    Text,
+    /// Print compact JSON.
+    Json,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum ExtractInputFormat {
     Claude,
     Codex,
@@ -163,6 +172,46 @@ impl IngestSource {
             Self::OperatorMd => "operator-md",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SourceProtectionBackend {
+    #[value(name = "git-local")]
+    GitLocal,
+}
+
+impl SourceProtectionBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::GitLocal => "git-local",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum SourcesCommands {
+    /// Opt in to local source-root protection.
+    Protect {
+        /// Source root to protect. Must be an existing directory.
+        #[arg(long)]
+        root: PathBuf,
+
+        /// Protection backend to use.
+        #[arg(long, value_enum, default_value_t = SourceProtectionBackend::GitLocal)]
+        backend: SourceProtectionBackend,
+
+        /// Apply the plan. Omit for a dry run.
+        #[arg(long)]
+        apply: bool,
+
+        /// Create an initial local commit after git-local setup.
+        #[arg(long)]
+        initial_snapshot: bool,
+
+        /// Do not add safe local .gitignore suggestions.
+        #[arg(long)]
+        no_gitignore: bool,
+    },
 }
 
 #[derive(Debug, Args, Clone)]
@@ -279,6 +328,64 @@ struct ReportsArgs {
     /// Max preview characters per record (0 = no truncation)
     #[arg(long, default_value = "280")]
     preview_chars: usize,
+}
+
+#[derive(Debug, Clone, Args)]
+struct CorpusArgs {
+    #[command(subcommand)]
+    command: CorpusCommand,
+}
+
+#[derive(Debug, Clone, Args)]
+struct CorpusRootArgs {
+    /// Corpus root(s) to scan. Defaults to $HOME/.aicx, $HOME/.ai-contexters, and optional $HOME/.xcia.
+    #[arg(long, num_args = 1..)]
+    root: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct CorpusAuditArgs {
+    #[command(flatten)]
+    roots: CorpusRootArgs,
+
+    /// Output format: text or json.
+    #[arg(long, value_enum, default_value_t = CorpusEmit::Text)]
+    emit: CorpusEmit,
+}
+
+#[derive(Debug, Clone, Args)]
+struct CorpusRepairArgs {
+    #[command(flatten)]
+    roots: CorpusRootArgs,
+
+    /// Scan and report changes without modifying files. This is the default when --apply is omitted.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Apply deterministic markdown repairs.
+    #[arg(long, conflicts_with = "dry_run")]
+    apply: bool,
+
+    /// Write backups before applying repairs.
+    #[arg(long)]
+    backup: bool,
+
+    /// Write the repair manifest to an explicit path, including dry-run previews.
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+
+    /// Output format: text or json.
+    #[arg(long, value_enum, default_value_t = CorpusEmit::Text)]
+    emit: CorpusEmit,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum CorpusCommand {
+    /// Audit derived markdown corpora for Claude signature/thinking leakage and tool JSON noise.
+    Audit(CorpusAuditArgs),
+
+    /// Repair derived markdown without inventing or summarizing semantic content.
+    Repair(CorpusRepairArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -662,6 +769,13 @@ enum Commands {
     #[command(display_order = 10)]
     List,
 
+    /// Audit and explicitly protect raw source roots.
+    #[command(display_order = 10)]
+    Sources {
+        #[command(subcommand)]
+        command: SourcesCommands,
+    },
+
     /// Interactive daily-driver entrypoint for corpus, doctor, intents, and store.
     #[command(display_order = 9)]
     Wizard {
@@ -716,6 +830,9 @@ enum Commands {
 
     /// Extract Vibecrafted workflow and marbles reports into a standalone HTML explorer.
     Reports(#[command(flatten)] ReportsArgs),
+
+    /// Audit or repair derived corpus markdown.
+    Corpus(#[command(flatten)] CorpusArgs),
 
     /// Deprecated compatibility shim for `aicx reports`.
     #[command(name = "reports-extractor", hide = true)]
@@ -885,6 +1002,24 @@ enum Commands {
         filters: RetrievalFilters,
 
         /// Emit compact JSON instead of plain text
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
+
+    /// Read one canonical chunk by path, file name, or compact chunk reference.
+    ///
+    /// This closes the discover -> read loop: pass a path from `aicx search`,
+    /// `aicx refs --emit paths`, dashboard `/api/chunk`, or MCP search results.
+    #[command(display_order = 13)]
+    Read {
+        /// Absolute path, store-relative path, file name, or compact chunk reference
+        reference: String,
+
+        /// Truncate chunk content to this many UTF-8 characters
+        #[arg(long)]
+        max_chars: Option<usize>,
+
+        /// Emit compact JSON instead of readable text
         #[arg(short = 'j', long)]
         json: bool,
     },
@@ -1195,16 +1330,38 @@ fn main() -> Result<()> {
                 println!("=== Available Sources ===\n");
                 for info in &sources {
                     let size_mb = info.size_bytes as f64 / 1024.0 / 1024.0;
+                    let protection = if info.protected_by_git {
+                        format!(
+                            "protected by {} at {}{}",
+                            info.protection_backend,
+                            info.protection_root
+                                .as_deref()
+                                .map(Path::display)
+                                .map(|display| display.to_string())
+                                .unwrap_or_else(|| "<unknown>".to_string()),
+                            if info.git_remote_count > 0 {
+                                format!("; {} remote line(s)", info.git_remote_count)
+                            } else {
+                                "; no remote".to_string()
+                            }
+                        )
+                    } else {
+                        info.protection_warning
+                            .clone()
+                            .unwrap_or_else(|| "unprotected source material".to_string())
+                    };
                     println!(
-                        "  [{:>7}] {} ({} sessions, {:.1} MB)",
+                        "  [{:>14}] {} ({} sessions, {:.1} MB) - {}",
                         info.agent,
                         info.path.display(),
                         info.sessions,
                         size_mb,
+                        protection,
                     );
                 }
             }
         }
+        Some(Commands::Sources { command }) => run_sources_command(command)?,
         Some(Commands::Wizard { smoke_test }) => {
             if smoke_test {
                 aicx::wizard::smoke_test()?;
@@ -1239,6 +1396,9 @@ fn main() -> Result<()> {
         }
         Some(Commands::Reports(args)) => {
             run_reports_command(args)?;
+        }
+        Some(Commands::Corpus(args)) => {
+            run_corpus_command(args)?;
         }
         Some(Commands::ReportsExtractorLegacy(args)) => {
             warn_legacy_subcommand("reports-extractor", "reports");
@@ -1311,6 +1471,13 @@ fn main() -> Result<()> {
                 json,
                 filters,
             )?;
+        }
+        Some(Commands::Read {
+            reference,
+            max_chars,
+            json,
+        }) => {
+            run_read(&reference, max_chars, json)?;
         }
         Some(Commands::Steer {
             run_id,
@@ -1401,6 +1568,153 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_sources_command(command: SourcesCommands) -> Result<()> {
+    match command {
+        SourcesCommands::Protect {
+            root,
+            backend,
+            apply,
+            initial_snapshot,
+            no_gitignore,
+        } => run_source_protect(root, backend, apply, initial_snapshot, no_gitignore),
+    }
+}
+
+fn run_source_protect(
+    root: PathBuf,
+    backend: SourceProtectionBackend,
+    apply: bool,
+    initial_snapshot: bool,
+    no_gitignore: bool,
+) -> Result<()> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("source root does not exist: {}", root.display()))?;
+    if !root.is_dir() {
+        anyhow::bail!("source root must be a directory: {}", root.display());
+    }
+
+    let git_dir = root.join(".git");
+    let already_protected = git_dir.is_dir();
+    let will_init_git = matches!(backend, SourceProtectionBackend::GitLocal) && !already_protected;
+    let will_write_gitignore =
+        matches!(backend, SourceProtectionBackend::GitLocal) && !no_gitignore;
+
+    println!("=== Source Protection Plan ===");
+    println!("Root: {}", root.display());
+    println!("Backend: {}", backend.as_str());
+    println!("Mode: {}", if apply { "apply" } else { "dry-run" });
+    println!(
+        "Status: {}",
+        if already_protected {
+            "source root protected"
+        } else {
+            "unprotected source material"
+        }
+    );
+    println!(
+        "Create local .git: {}",
+        if will_init_git { "yes" } else { "no" }
+    );
+    println!(
+        "Add safe .gitignore suggestions: {}",
+        if will_write_gitignore { "yes" } else { "no" }
+    );
+    println!("Create remote: no (AICX never configures a remote by default)");
+    println!(
+        "Initial local snapshot: {}",
+        if initial_snapshot { "yes" } else { "no" }
+    );
+
+    if !apply {
+        println!();
+        println!("Dry run only. Re-run with --apply to modify this source root.");
+        return Ok(());
+    }
+
+    match backend {
+        SourceProtectionBackend::GitLocal => {
+            if will_init_git {
+                run_git(&root, &["init"])?;
+            }
+            if will_write_gitignore {
+                add_source_protection_gitignore(&root)?;
+            }
+            if initial_snapshot {
+                create_initial_source_snapshot(&root)?;
+            }
+        }
+    }
+
+    println!("source root protected: {}", root.display());
+    println!("remote configured: no");
+    Ok(())
+}
+
+fn run_git(root: &Path, args: &[&str]) -> Result<()> {
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run git in {}", root.display()))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {:?} failed in {}\nstdout:\n{}\nstderr:\n{}",
+            args,
+            root.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}
+
+fn add_source_protection_gitignore(root: &Path) -> Result<()> {
+    const MARKER: &str = "# AICX source protection local git";
+    const SUGGESTIONS: &str =
+        "\n# AICX source protection local git\n.DS_Store\n*.tmp\ntarget/\nnode_modules/\n";
+
+    let path = root.join(".gitignore");
+    let existing = aicx::sanitize::read_to_string_validated(&path).unwrap_or_default();
+    if existing.contains(MARKER) {
+        return Ok(());
+    }
+
+    let mut next = existing;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str(SUGGESTIONS);
+    let mut file = aicx::sanitize::create_file_validated(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    file.write_all(next.as_bytes())
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+fn create_initial_source_snapshot(root: &Path) -> Result<()> {
+    run_git(root, &["add", "-A"])?;
+    let diff_status = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["diff", "--cached", "--quiet"])
+        .status()
+        .with_context(|| format!("failed to inspect staged snapshot in {}", root.display()))?;
+
+    if diff_status.success() {
+        println!("initial snapshot skipped: no staged changes");
+        return Ok(());
+    }
+
+    run_git(
+        root,
+        &["commit", "-m", "aicx source protection initial snapshot"],
+    )
 }
 
 /// Display toggles for `run_intents`. Packed so the caller reads like a struct
@@ -1666,7 +1980,11 @@ fn run_extract_file(
     let inferred_repos = sources::repo_labels_from_entries(&entries, &[]);
     let project_identity = explicit_project.unwrap_or_else(|| {
         if inferred_repos.is_empty() {
-            format!("file: {file_label}")
+            if conversation {
+                "file input".to_string()
+            } else {
+                format!("file: {file_label}")
+            }
         } else {
             inferred_repos.join("+")
         }
@@ -2847,6 +3165,39 @@ fn run_search(
     Ok(())
 }
 
+/// Read one canonical chunk and print metadata plus content.
+fn run_read(reference: &str, max_chars: Option<usize>, json: bool) -> Result<()> {
+    let chunk = store::read_context_chunk(reference, max_chars)?;
+
+    if json {
+        println!("{}", serde_json::to_string(&chunk)?);
+        return Ok(());
+    }
+
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    writeln!(
+        out,
+        "{} | {} | {} | {} | chunk {:03}",
+        chunk.project, chunk.agent, chunk.date, chunk.kind, chunk.chunk
+    )?;
+    writeln!(out, "session: {}", chunk.session_id)?;
+    writeln!(out, "path: {}", chunk.path.display())?;
+    writeln!(out, "relative: {}", chunk.relative_path)?;
+    writeln!(out, "bytes: {}", chunk.bytes)?;
+    if chunk.truncated {
+        writeln!(out, "truncated: true")?;
+    }
+    writeln!(out)?;
+    write!(out, "{}", chunk.content)?;
+    if !chunk.content.ends_with('\n') {
+        writeln!(out)?;
+    }
+    out.flush()?;
+
+    Ok(())
+}
+
 /// Retrieve chunks by steering metadata (frontmatter sidecar fields).
 fn run_steer(
     run_id: Option<&str>,
@@ -3435,6 +3786,37 @@ fn run_reports_command(args: ReportsArgs) -> Result<()> {
     })
 }
 
+fn run_corpus_command(args: CorpusArgs) -> Result<()> {
+    match args.command {
+        CorpusCommand::Audit(audit_args) => {
+            let report = corpus::audit(&corpus::CorpusAuditOptions {
+                roots: audit_args.roots.root,
+            })?;
+            if matches!(audit_args.emit, CorpusEmit::Json) {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", corpus::format_audit_text(&report));
+            }
+        }
+        CorpusCommand::Repair(repair_args) => {
+            let repair_manifest = corpus::repair(&corpus::CorpusRepairOptions {
+                roots: repair_args.roots.root,
+                dry_run: repair_args.dry_run,
+                apply: repair_args.apply,
+                backup: repair_args.backup,
+                manifest_path: repair_args.manifest,
+            })?;
+            if matches!(repair_args.emit, CorpusEmit::Json) {
+                println!("{}", serde_json::to_string_pretty(&repair_manifest)?);
+            } else {
+                print!("{}", corpus::format_repair_text(&repair_manifest));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn run_reports_extractor(args: ReportsExtractorRunArgs) -> Result<()> {
     let artifacts_root = if let Some(path) = args.artifacts_root {
         path
@@ -3865,6 +4247,35 @@ mod tests {
     }
 
     #[test]
+    fn read_command_parses_discover_path_and_json_mode() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "read",
+            "store/VetCoders/aicx/2026_0502/reports/codex/chunk.md",
+            "--max-chars",
+            "400",
+            "--json",
+        ])
+        .expect("read command should parse");
+
+        match cli.command {
+            Some(Commands::Read {
+                reference,
+                max_chars,
+                json,
+            }) => {
+                assert_eq!(
+                    reference,
+                    "store/VetCoders/aicx/2026_0502/reports/codex/chunk.md"
+                );
+                assert_eq!(max_chars, Some(400));
+                assert!(json);
+            }
+            _ => panic!("expected read command"),
+        }
+    }
+
+    #[test]
     fn steer_help_keeps_examples_split() {
         let mut cmd = Cli::command();
         let steer = cmd
@@ -3960,6 +4371,46 @@ mod tests {
         assert!(rendered.contains("--date-from"));
         assert!(rendered.contains("--date-to"));
         assert!(!rendered.contains("canonical store"));
+    }
+
+    #[test]
+    fn corpus_audit_and_repair_commands_parse() {
+        let audit = Cli::try_parse_from(["aicx", "corpus", "audit", "--emit", "json"])
+            .expect("corpus audit should parse");
+        match audit.command {
+            Some(Commands::Corpus(CorpusArgs {
+                command: CorpusCommand::Audit(args),
+            })) => assert!(matches!(args.emit, CorpusEmit::Json)),
+            _ => panic!("expected corpus audit command"),
+        }
+
+        let repair = Cli::try_parse_from([
+            "aicx",
+            "corpus",
+            "repair",
+            "--root",
+            "/tmp/aicx-store",
+            "--dry-run",
+            "--backup",
+            "--manifest",
+            "/tmp/aicx-repair-preview.json",
+        ])
+        .expect("corpus repair should parse");
+        match repair.command {
+            Some(Commands::Corpus(CorpusArgs {
+                command: CorpusCommand::Repair(args),
+            })) => {
+                assert_eq!(args.roots.root, vec![PathBuf::from("/tmp/aicx-store")]);
+                assert!(args.dry_run);
+                assert!(!args.apply);
+                assert!(args.backup);
+                assert_eq!(
+                    args.manifest,
+                    Some(PathBuf::from("/tmp/aicx-repair-preview.json"))
+                );
+            }
+            _ => panic!("expected corpus repair command"),
+        }
     }
 
     #[test]

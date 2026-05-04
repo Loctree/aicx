@@ -133,10 +133,13 @@ See what landed:
 ```bash
 aicx refs -H 4
 aicx refs -H 4 --emit paths
+aicx read store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md
 ```
 
 Surface contract:
 - `aicx refs` is the active CLI inventory command for canonical chunks.
+- `aicx read` is the direct re-entry command for paths returned by `refs`,
+  `search`, dashboard chunk APIs, or MCP retrieval tools.
 - There is currently no `aicx rank` CLI subcommand; ranking stays on the MCP surface as `aicx_rank`.
 - `aicx init` is retired; framework bootstrap now lives in `/vc-init`.
 
@@ -222,6 +225,13 @@ Steering retrieval (filter chunks by frontmatter metadata):
 aicx steer --run-id mrbl-001
 aicx steer --project ai-contexters --kind reports --date 2026-03-28
 aicx steer --agent claude --date 2026-03-20..2026-03-28
+```
+
+Direct chunk re-entry:
+
+```bash
+aicx search "doctor sidecars" --json
+aicx read /Users/polyversai/.aicx/store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md --max-chars 4000
 ```
 
 Native embedder hydration — picking the local model without bloating the bundle:
@@ -320,6 +330,7 @@ aicx migrate-intent-schema --project MyProject --dry-run
 - `docs/COMMANDS.md` (exact CLI reference + examples)
 - `docs/STORE_LAYOUT.md` (store + framework-owned `.ai-context/` layouts)
 - `docs/REDACTION.md` (secret redaction, regex engine notes)
+- `docs/SOURCE_PROTECTION.md` (opt-in local source protection and sharing policy)
 - `docs/DISTILLATION.md` (chunking/distillation model + tuning ideas)
 - `docs/RELEASES.md` (release/distribution workflow + maintainer checklist)
 

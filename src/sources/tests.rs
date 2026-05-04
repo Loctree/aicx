@@ -184,6 +184,198 @@ fn test_extract_claude_file_classifies_frame_kinds_from_fixture() {
 }
 
 #[test]
+fn test_extract_claude_file_drops_signature_only_thinking_killer_case() {
+    let root = unique_test_dir("claude-empty-thinking-signature");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"type":"user","message":{"role":"user","content":"Hello"},"timestamp":"2026-04-14T10:00:00Z","sessionId":"sess-signature","gitBranch":"main","cwd":"/tmp/aicx"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":"abc123"},{"type":"text","text":"Visible answer"}]},"timestamp":"2026-04-14T10:00:01Z","sessionId":"sess-signature","gitBranch":"main","cwd":"/tmp/aicx"}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_claude_file(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        frame_kinds(&entries),
+        vec![Some(FrameKind::UserMsg), Some(FrameKind::AgentReply)]
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|entry| !entry.message.contains("signature"))
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|entry| !entry.message.contains("abc123"))
+    );
+    assert_eq!(entries[1].message, "Visible answer");
+
+    let conversation = to_conversation(&entries, &[]);
+    assert_eq!(conversation.len(), 2);
+    assert!(
+        conversation
+            .iter()
+            .all(|entry| !entry.message.contains("signature"))
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_extract_claude_file_keeps_visible_thinking_text_without_signature() {
+    let root = unique_test_dir("claude-thinking-text-signature");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Useful hidden note","signature":"abc123"}]},"timestamp":"2026-04-14T10:00:01Z","sessionId":"sess-signature","gitBranch":"main","cwd":"/tmp/aicx"}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_claude_file(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].frame_kind, Some(FrameKind::InternalThought));
+    assert_eq!(entries[0].message, "Useful hidden note");
+    assert!(!entries[0].message.contains("signature"));
+    assert!(!entries[0].message.contains("abc123"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_extract_claude_file_drops_signature_only_thinking_block() {
+    let root = unique_test_dir("claude-signature-thinking");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Visible assistant reply"},{"type":"thinking","thinking":"","signature":"abc123"}]},"timestamp":"2026-04-14T10:00:01Z","sessionId":"claude-signature","gitBranch":"main","cwd":"/tmp/aicx"}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_claude_file(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].frame_kind, Some(FrameKind::AgentReply));
+    assert_eq!(entries[0].message, "Visible assistant reply");
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry.message.contains("signature"))
+    );
+    assert!(!entries.iter().any(|entry| entry.message.contains("abc123")));
+
+    let conversation = to_conversation(&entries, &[]);
+    assert_eq!(conversation.len(), 1);
+    assert_eq!(conversation[0].message, "Visible assistant reply");
+    assert!(!conversation[0].message.contains("signature"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_extract_claude_file_drops_empty_thinking_signature_block() {
+    let root = unique_test_dir("claude-empty-signature-thinking");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Visible assistant reply"},{"type":"thinking","thinking":"","signature":"abc123"}]},"timestamp":"2026-04-14T10:00:01Z","sessionId":"claude-signature-regression","gitBranch":"main","cwd":"/Users/tester/workspaces/VetCoders/ai-contexters"}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_claude_file(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].frame_kind, Some(FrameKind::AgentReply));
+    assert_eq!(entries[0].message, "Visible assistant reply");
+    assert!(
+        entries
+            .iter()
+            .all(|entry| !entry.message.contains("signature")
+                && !entry.message.contains("abc123")
+                && !entry.message.contains("\"type\":\"thinking\"")),
+        "Claude empty thinking signature block leaked into entries: {entries:#?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_extract_claude_conversation_mode_stays_signature_clean() {
+    let root = unique_test_dir("claude-conversation-signature-clean");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"type":"user","message":{"role":"user","content":"Hello"},"timestamp":"2026-04-14T10:00:00Z","sessionId":"claude-conversation-clean","cwd":"/Users/tester/workspaces/VetCoders/ai-contexters"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Visible assistant reply"},{"type":"thinking","thinking":"","signature":"abc123"}]},"timestamp":"2026-04-14T10:00:01Z","sessionId":"claude-conversation-clean","cwd":"/Users/tester/workspaces/VetCoders/ai-contexters"}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_claude_file(&tmp, &config).unwrap();
+    let conversation = to_conversation(&entries, &[]);
+    assert_eq!(conversation.len(), 2);
+    assert!(
+        conversation
+            .iter()
+            .all(|entry| !entry.message.contains("signature") && !entry.message.contains("abc123")),
+        "conversation projection leaked signature: {conversation:#?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_extract_codex_file_preserves_signature_word() {
+    let root = unique_test_dir("codex-signature-preserved");
+    let tmp = root.join("history.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"session_id":"s1","text":"The API signature changed intentionally.","ts":1000,"role":"assistant","cwd":"/tmp/a"}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_codex_file(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].message,
+        "The API signature changed intentionally."
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn test_extract_codex_file_history_format() {
     let root = unique_test_dir("codex-direct-history");
     let tmp = root.join("history.jsonl");

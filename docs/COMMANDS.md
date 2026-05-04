@@ -38,10 +38,33 @@ List raw agent session sources on disk (pre-extraction inputs).
 Shows Claude Code, Codex, Gemini, and Junie log paths with session counts and sizes.
 This is what extractors will read from — use `refs` to see what is already in
 the canonical store after extraction.
+It also reports source-protection status: existing local `.git` protection,
+remote presence, or an explicit unprotected-source warning. This command is
+read-only and never initializes git.
 
 ```bash
 aicx list
 ```
+
+## `aicx sources protect`
+
+Opt in to local source-root protection. Dry run is the default:
+
+```bash
+aicx sources protect --root "$HOME/.codex" --backend git-local
+```
+
+Apply explicitly:
+
+```bash
+aicx sources protect --root "$HOME/.codex" --backend git-local --apply
+```
+
+The `git-local` backend creates `.git` only under the requested root, adds safe
+`.gitignore` suggestions unless `--no-gitignore` is passed, and never configures
+a remote by default. Use `--initial-snapshot` only when retaining current
+source contents in local git history is intended. See
+`docs/SOURCE_PROTECTION.md` for the privacy and team-sharing policy.
 
 ## `aicx claude`
 
@@ -203,6 +226,33 @@ Example:
 aicx store -p CodeScribe --agent claude -H 720 --emit paths
 ```
 
+## `aicx corpus`
+
+Audit and deterministically repair derived markdown corpora. Raw JSONL and log
+files remain provenance; this surface is for cleaned-but-faithful markdown that
+feeds retrieval.
+
+```bash
+aicx corpus audit [OPTIONS]
+aicx corpus repair [OPTIONS]
+```
+
+Options:
+- `--root <DIR>...` corpus roots to scan (default: `$HOME/.aicx`, `$HOME/.ai-contexters`, optional `$HOME/.xcia`)
+- `--emit <text|json>` output format
+- `--dry-run` preview repair candidates without modifying markdown (repair default unless `--apply` is passed)
+- `--apply` rewrite derived markdown deterministically
+- `--backup` write backups before applying repairs
+- `--manifest <FILE>` write a repair manifest, including dry-run previews
+
+Examples:
+
+```bash
+aicx corpus audit --root "$HOME/.aicx" --emit json
+aicx corpus repair --root "$HOME/.aicx/store/Loctree/aicx/2026_0502" --dry-run --manifest /tmp/aicx-repair-preview.json
+aicx corpus repair --root "$HOME/.aicx/store/Loctree/aicx/2026_0502" --apply --backup
+```
+
 ## `aicx search`
 
 Fuzzy search across the canonical corpus (layer 1, filesystem-only).
@@ -239,6 +289,31 @@ aicx search "dashboard" -p ai-contexters --score 60 --json
 
 # Search for a specific day mentioned in query
 aicx search "decisions march 2026"
+```
+
+## `aicx read`
+
+Read one canonical chunk after a discover step.
+
+Accepts an absolute path, a path relative to `~/.aicx/`, a chunk file name,
+or a compact reference in the form
+`<project>|<date>|<kind>|<agent>|<session_id>|<chunk>`.
+
+```bash
+aicx read [OPTIONS] <REFERENCE>
+```
+
+Options:
+- `<REFERENCE>` chunk path, file name, or compact reference
+- `--max-chars <N>` truncate content to `N` UTF-8 characters
+- `-j, --json` emit compact JSON instead of readable text
+
+Examples:
+
+```bash
+aicx refs -H 24 --emit paths
+aicx read /Users/polyversai/.aicx/store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md
+aicx read store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md --max-chars 4000 --json
 ```
 
 ## `aicx steer`
@@ -494,11 +569,13 @@ aicx state --info
 
 Run `aicx` as an MCP server (stdio or streamable HTTP transport).
 
-Exposes search, steer, and rank tools over MCP for agent retrieval.
+Exposes search, read, steer, and rank tools over MCP for agent retrieval.
 `aicx_steer` and `aicx_rank` query the canonical corpus on disk.
 `aicx_search` uses canonical-store fuzzy search today; semantic widening belongs
 to configured downstream retrieval providers and must fall back cleanly to the
 canonical store.
+`aicx_read` pulls the actual chunk content by path, file name, or compact
+reference after a discover step.
 
 ```bash
 aicx serve [OPTIONS]

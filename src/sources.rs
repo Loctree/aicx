@@ -19,6 +19,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::sanitize;
 use crate::timeline::FrameKind;
@@ -34,6 +35,7 @@ const CODESCRIBE_NO_SPEECH_MARKERS: &[&str] = &[
 const OPERATOR_MD_AGENT: &str = "operator";
 const OPERATOR_MD_KIND: &str = "operator-md";
 const OPERATOR_MD_RECENT_DAYS: i64 = 30;
+const UNPROTECTED_SOURCE_WARNING: &str = "unprotected source material; run `aicx sources protect --root <path> --backend git-local --apply` to opt in";
 
 /// Project timeline entries into a denoised conversation stream.
 ///
@@ -345,12 +347,15 @@ fn render_json_inline(value: &serde_json::Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
 
-fn render_claude_thinking_block(block: &serde_json::Map<String, serde_json::Value>) -> String {
+fn render_claude_thinking_block(
+    block: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
     ["thinking", "text", "content", "summary"]
         .iter()
         .filter_map(|key| block.get(*key))
         .find_map(extract_text_from_json_value)
-        .unwrap_or_else(|| render_json_inline(&serde_json::Value::Object(block.clone())))
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
 }
 
 fn render_claude_tool_block(block: &serde_json::Map<String, serde_json::Value>) -> String {
@@ -410,12 +415,14 @@ fn extract_claude_classified_blocks(
                         }
                     }
                     Some("thinking") => {
-                        push_classified_block(
-                            blocks,
-                            role_for_frame_kind(FrameKind::InternalThought),
-                            FrameKind::InternalThought,
-                            render_claude_thinking_block(block),
-                        );
+                        if let Some(thinking) = render_claude_thinking_block(block) {
+                            push_classified_block(
+                                blocks,
+                                role_for_frame_kind(FrameKind::InternalThought),
+                                FrameKind::InternalThought,
+                                thinking,
+                            );
+                        }
                     }
                     Some("tool_use") | Some("tool_result") => {
                         push_classified_block(
@@ -435,17 +442,14 @@ fn extract_claude_classified_blocks(
                         } else if block.get("thought").and_then(|value| value.as_bool())
                             == Some(true)
                         {
-                            push_classified_block(
-                                blocks,
-                                role_for_frame_kind(FrameKind::InternalThought),
-                                FrameKind::InternalThought,
-                                extract_text_from_json_value(&serde_json::Value::Object(
-                                    block.clone(),
-                                ))
-                                .unwrap_or_else(|| {
-                                    render_json_inline(&serde_json::Value::Object(block.clone()))
-                                }),
-                            );
+                            if let Some(thinking) = render_claude_thinking_block(block) {
+                                push_classified_block(
+                                    blocks,
+                                    role_for_frame_kind(FrameKind::InternalThought),
+                                    FrameKind::InternalThought,
+                                    thinking,
+                                );
+                            }
                         } else if let Some(text) =
                             extract_text_from_json_value(&serde_json::Value::Object(block.clone()))
                             && let Some(frame_kind) = frame_kind_from_role(role)
@@ -3937,7 +3941,88 @@ pub fn extract_all(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
 // List helper
 // ============================================================================
 
-/// List available sources with session counts and sizes.
+fn source_root_for_protection(path: &Path) -> PathBuf {
+    if path.is_file() {
+        path.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn discover_protecting_git_root(path: &Path, home: &Path) -> Option<PathBuf> {
+    let source_root = source_root_for_protection(path);
+    let mut current = Some(source_root.as_path());
+
+    while let Some(candidate) = current {
+        if candidate.join(".git").is_dir() {
+            return Some(candidate.to_path_buf());
+        }
+        if candidate == home {
+            break;
+        }
+        current = candidate.parent();
+    }
+
+    None
+}
+
+fn git_remote_lines(root: &Path) -> Vec<String> {
+    let Ok(output) = Command::new("git")
+        .args(["-C"])
+        .arg(root)
+        .args(["remote", "-v"])
+        .output()
+    else {
+        return Vec::new();
+    };
+
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn source_info(
+    home: &Path,
+    agent: impl Into<String>,
+    path: PathBuf,
+    sessions: usize,
+    size_bytes: u64,
+) -> SourceInfo {
+    let protection_root = discover_protecting_git_root(&path, home);
+    let git_remotes = protection_root
+        .as_deref()
+        .map(git_remote_lines)
+        .unwrap_or_default();
+    let protected_by_git = protection_root.is_some();
+
+    SourceInfo {
+        agent: agent.into(),
+        path,
+        sessions,
+        size_bytes,
+        protected_by_git,
+        protection_backend: if protected_by_git {
+            "git-local".to_string()
+        } else {
+            "none".to_string()
+        },
+        protection_root,
+        git_remote_count: git_remotes.len(),
+        git_remotes,
+        protection_warning: (!protected_by_git).then(|| UNPROTECTED_SOURCE_WARNING.to_string()),
+    }
+}
+
+/// List available sources with session counts, sizes, and read-only protection status.
 pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
     let home = dirs::home_dir().context("No home dir")?;
     let mut sources: Vec<SourceInfo> = Vec::new();
@@ -3967,12 +4052,13 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
             }
 
             if session_count > 0 {
-                sources.push(SourceInfo {
-                    agent: "claude".to_string(),
+                sources.push(source_info(
+                    &home,
+                    "claude",
                     path,
-                    sessions: session_count,
-                    size_bytes: total_size,
-                });
+                    session_count,
+                    total_size,
+                ));
             }
         }
     }
@@ -3981,12 +4067,13 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
     let claude_history = home.join(".claude").join("history.jsonl");
     if claude_history.exists() {
         let size = fs::metadata(&claude_history).map(|m| m.len()).unwrap_or(0);
-        sources.push(SourceInfo {
-            agent: "claude-history".to_string(),
-            path: claude_history,
-            sessions: 1,
-            size_bytes: size,
-        });
+        sources.push(source_info(
+            &home,
+            "claude-history",
+            claude_history,
+            1,
+            size,
+        ));
     }
 
     // Codex
@@ -3994,12 +4081,7 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
     if codex_path.exists() {
         let size = fs::metadata(&codex_path).map(|m| m.len()).unwrap_or(0);
         let sessions = count_codex_sessions(&codex_path).unwrap_or(0);
-        sources.push(SourceInfo {
-            agent: "codex".to_string(),
-            path: codex_path,
-            sessions,
-            size_bytes: size,
-        });
+        sources.push(source_info(&home, "codex", codex_path, sessions, size));
     }
 
     // Codex sessions: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
@@ -4012,12 +4094,13 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
             .map(|m| m.len())
             .sum();
         if !files.is_empty() {
-            sources.push(SourceInfo {
-                agent: "codex-sessions".to_string(),
-                path: codex_sessions_dir,
-                sessions: files.len(),
-                size_bytes: total_size,
-            });
+            sources.push(source_info(
+                &home,
+                "codex-sessions",
+                codex_sessions_dir,
+                files.len(),
+                total_size,
+            ));
         }
     }
 
@@ -4052,12 +4135,13 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
             }
 
             if session_count > 0 {
-                sources.push(SourceInfo {
-                    agent: "gemini".to_string(),
-                    path: project_path,
-                    sessions: session_count,
-                    size_bytes: total_size,
-                });
+                sources.push(source_info(
+                    &home,
+                    "gemini",
+                    project_path,
+                    session_count,
+                    total_size,
+                ));
             }
         }
     }
@@ -4077,12 +4161,13 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
             .map(|metadata| metadata.len())
             .sum();
         if !files.is_empty() {
-            sources.push(SourceInfo {
-                agent: "junie".to_string(),
-                path: junie_sessions,
-                sessions: files.len(),
-                size_bytes: total_size,
-            });
+            sources.push(source_info(
+                &home,
+                "junie",
+                junie_sessions,
+                files.len(),
+                total_size,
+            ));
         }
     }
 
@@ -4094,12 +4179,13 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
             .filter_map(|transcript| fs::metadata(&transcript.path).ok())
             .map(|metadata| metadata.len())
             .sum();
-        sources.push(SourceInfo {
-            agent: CODESCRIBE_AGENT.to_string(),
-            path: home.join(".codescribe").join("transcriptions"),
-            sessions: codescribe_transcripts.len(),
-            size_bytes: total_size,
-        });
+        sources.push(source_info(
+            &home,
+            CODESCRIBE_AGENT,
+            home.join(".codescribe").join("transcriptions"),
+            codescribe_transcripts.len(),
+            total_size,
+        ));
     }
 
     // Operator markdown: ~/Downloads/*.md and ~/.vibecrafted/inbox/*.md
@@ -4110,12 +4196,13 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
             .filter_map(|document| fs::metadata(&document.path).ok())
             .map(|metadata| metadata.len())
             .sum();
-        sources.push(SourceInfo {
-            agent: "operator-md".to_string(),
-            path: home.join("Downloads"),
-            sessions: operator_markdown.len(),
-            size_bytes: total_size,
-        });
+        sources.push(source_info(
+            &home,
+            "operator-md",
+            home.join("Downloads"),
+            operator_markdown.len(),
+            total_size,
+        ));
     }
 
     Ok(sources)
