@@ -80,6 +80,19 @@ pub struct IntentsConfig {
     pub frame_kind: Option<FrameKind>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntentExtractionStats {
+    pub scanned_count: usize,
+    pub candidate_count: usize,
+    pub source_paths_verified: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct IntentExtraction {
+    pub records: Vec<IntentRecord>,
+    pub stats: IntentExtractionStats,
+}
+
 #[derive(Debug, Clone)]
 struct StoredChunkFile {
     agent: String,
@@ -133,8 +146,12 @@ enum SignalSection {
 }
 
 pub fn extract_intents(config: &IntentsConfig) -> Result<Vec<IntentRecord>> {
+    Ok(extract_intents_with_stats(config)?.records)
+}
+
+pub fn extract_intents_with_stats(config: &IntentsConfig) -> Result<IntentExtraction> {
     let store_root = store::store_base_dir()?;
-    extract_intents_from_root_at(config, &store_root, Utc::now())
+    extract_intents_from_root_at_with_stats(config, &store_root, Utc::now())
 }
 
 /// Sort order for `apply_display_filters`. Mirrors the CLI's `SortOrder`
@@ -300,14 +317,25 @@ pub fn format_intents_oracle_json(
     .context("Failed to serialize intents oracle JSON")
 }
 
+#[cfg(test)]
 fn extract_intents_from_root_at(
     config: &IntentsConfig,
     store_root: &Path,
     now: DateTime<Utc>,
 ) -> Result<Vec<IntentRecord>> {
+    Ok(extract_intents_from_root_at_with_stats(config, store_root, now)?.records)
+}
+
+fn extract_intents_from_root_at_with_stats(
+    config: &IntentsConfig,
+    store_root: &Path,
+    now: DateTime<Utc>,
+) -> Result<IntentExtraction> {
     let cutoff_hours = config.hours.min(i64::MAX as u64) as i64;
     let cutoff = now - Duration::hours(cutoff_hours);
     let files = collect_chunk_files(store_root, &config.project, cutoff, config.frame_kind)?;
+    let scanned_count = files.len();
+    let source_paths_verified = verify_stored_chunk_paths(&files);
 
     let mut candidates = Vec::new();
     let mut task_events = Vec::new();
@@ -335,8 +363,11 @@ fn extract_intents_from_root_at(
     }
 
     let mut records = dedup_candidates(candidates, config.strict, config.kind_filter);
+    drop_truncated_duplicate_records(&mut records);
     let mut task_records = finalize_tasks(task_events, config.strict, config.kind_filter);
     records.append(&mut task_records);
+
+    reconcile_session_id_with_path(&mut records);
 
     records.sort_by(|left, right| {
         right
@@ -347,7 +378,17 @@ fn extract_intents_from_root_at(
             .then_with(|| left.summary.cmp(&right.summary))
     });
 
-    Ok(records)
+    let stats = IntentExtractionStats {
+        scanned_count,
+        candidate_count: records.len(),
+        source_paths_verified,
+    };
+
+    Ok(IntentExtraction { records, stats })
+}
+
+fn verify_stored_chunk_paths(files: &[StoredChunkFile]) -> bool {
+    files.iter().all(|file| file.path.exists())
 }
 
 fn collect_chunk_files(
@@ -769,13 +810,14 @@ fn build_candidate(
     confidence: u8,
 ) -> Option<IntentCandidate> {
     let summary = normalize_display_text(&clean_summary(kind, raw_summary));
-    if summary.is_empty() {
+    if summary.is_empty() || is_metadata_only_summary(&summary) {
         return None;
     }
 
     let context = context
         .map(|value| normalize_display_text(&value))
         .filter(|value| !value.is_empty() && normalize_key(value) != normalize_key(&summary))
+        .filter(|value| !is_section_heading_noise(value))
         .map(|value| truncate_signal_line(&value));
 
     let mut evidence = extract_evidence(&summary);
@@ -786,7 +828,7 @@ fn build_candidate(
     Some(IntentCandidate {
         record: IntentRecord {
             kind,
-            summary: truncate_signal_line(&summary),
+            summary: truncate_summary_for_display(&summary),
             context,
             evidence,
             project: project.to_string(),
@@ -959,12 +1001,189 @@ fn looks_like_score(token: &str) -> bool {
         || lower.starts_with("score:")
 }
 
+/// Drops candidates whose entire summary is a numeric list-item heading like
+/// "1 Wierność źródłu" or "4 Deterministyczność transformacji". These slip
+/// through `looks_like_operator_decision_line` because numbered headings
+/// inside long Polish reflective passages look like "musi"-bearing imperatives
+/// to the heuristic, but carry no decision content on their own.
+fn is_metadata_only_summary(text: &str) -> bool {
+    let trimmed = text.trim();
+    let residue = trimmed
+        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '.' | '`' | '-' | '_' | '*'));
+    if residue.is_empty() {
+        return true;
+    }
+
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return true;
+    }
+    if words.len() <= 4
+        && words[0]
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == ')')
+        && !words[0].is_empty()
+        && words[0].chars().any(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+    false
+}
+
+/// Detects the "1 Foo | 2 Bar" pattern that appears as `context` when the
+/// surrounding-context window (lines ±1) lands on numbered section headings
+/// inside a long paragraph. Such context offers no reasoning value and only
+/// adds noise to the human-readable output.
+fn is_section_heading_noise(text: &str) -> bool {
+    let parts: Vec<&str> = text.split('|').map(str::trim).collect();
+    if parts.is_empty() || parts.iter().any(|p| p.is_empty()) {
+        return false;
+    }
+    parts.iter().all(|part| {
+        let words: Vec<&str> = part.split_whitespace().collect();
+        if words.is_empty() || words.len() > 4 {
+            return false;
+        }
+        words[0]
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == ')')
+            && words[0].chars().any(|c| c.is_ascii_digit())
+    })
+}
+
+/// Sentence-aware truncation for human-readable summaries. The chunker's
+/// generic `truncate_signal_line` cuts mid-word at 240 bytes and appends
+/// "...[truncated]"; for an intent summary that destroys readability and
+/// often discards the verb that carries the decision. We allow up to 480
+/// bytes and prefer the last sentence terminator (or comma/space) within
+/// the trailing window so the output ends on a natural break.
+fn truncate_summary_for_display(text: &str) -> String {
+    const MAX_BYTES: usize = 480;
+    const TAIL_LOOKBACK: usize = 80;
+
+    if text.len() <= MAX_BYTES {
+        return text.to_string();
+    }
+
+    let mut cutoff = MAX_BYTES;
+    while cutoff > 0 && !text.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+
+    let look_start = cutoff.saturating_sub(TAIL_LOOKBACK);
+    let look_start = (0..=look_start)
+        .rev()
+        .find(|i| text.is_char_boundary(*i))
+        .unwrap_or(0);
+    let tail = &text[look_start..cutoff];
+
+    if let Some(rel) = tail.rfind(['.', '!', '?']) {
+        let abs_start = look_start + rel;
+        if let Some(ch) = text[abs_start..].chars().next() {
+            let abs_end = abs_start + ch.len_utf8();
+            return text[..abs_end].trim_end().to_string();
+        }
+    }
+
+    if let Some(rel) = tail.rfind([',', ';', ':']) {
+        let abs = look_start + rel;
+        let mut out = text[..abs].trim_end().to_string();
+        out.push_str(" …");
+        return out;
+    }
+
+    if let Some(rel) = tail.rfind(char::is_whitespace) {
+        let abs = look_start + rel;
+        let mut out = text[..abs].trim_end().to_string();
+        out.push_str(" …");
+        return out;
+    }
+
+    let mut out = text[..cutoff].to_string();
+    out.push_str(" …");
+    out
+}
+
+/// Walks the dedup output and replaces `session_id` with the value parsed from
+/// the source_chunk filename when the two disagree. Filenames are produced by
+/// `store::session_basename` and treated as ground truth — that file actually
+/// exists and was read. A mismatched `session_id` claim is a provenance lie
+/// (it tells the operator "this is from session X" while citing a file that
+/// belongs to session Y).
+fn reconcile_session_id_with_path(records: &mut [IntentRecord]) {
+    for record in records.iter_mut() {
+        let path = std::path::Path::new(&record.source_chunk);
+        let Some(stem) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        // basename layout: <YYYY_MMDD>_<agent>_<session-id>_<chunk>
+        // Strip trailing _NNN chunk suffix, then strip the leading
+        // <date>_<agent>_ prefix to recover the truncated session_id.
+        let Some((without_chunk, chunk_part)) = stem.rsplit_once('_') else {
+            continue;
+        };
+        if chunk_part.len() != 3 || !chunk_part.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        // Skip <date> tokens (YYYY_MMDD), find first non-numeric segment as agent
+        let segments: Vec<&str> = without_chunk.split('_').collect();
+        if segments.len() < 4 {
+            continue;
+        }
+        // segments[0]=YYYY, [1]=MMDD, [2]=agent, [3..]=session_id pieces
+        let session_id_from_path = segments[3..].join("_");
+        if session_id_from_path.is_empty() {
+            continue;
+        }
+        if record.session_id != session_id_from_path {
+            record.session_id = session_id_from_path;
+        }
+    }
+}
+
+fn drop_truncated_duplicate_records(records: &mut Vec<IntentRecord>) {
+    let keep: Vec<bool> = records
+        .iter()
+        .enumerate()
+        .map(|(idx, record)| {
+            let Some(prefix) = record.summary.split("...[truncated]").next() else {
+                return true;
+            };
+            let prefix = prefix.trim_end();
+            if prefix.is_empty() {
+                return true;
+            }
+
+            !records.iter().enumerate().any(|(other_idx, other)| {
+                idx != other_idx
+                    && other.kind == record.kind
+                    && other.session_id == record.session_id
+                    && other.source_chunk == record.source_chunk
+                    && !other.summary.contains("...[truncated]")
+                    && other.summary.len() > record.summary.len()
+                    && other.summary.starts_with(prefix)
+            })
+        })
+        .collect();
+
+    let mut index = 0;
+    records.retain(|_| {
+        let should_keep = keep[index];
+        index += 1;
+        should_keep
+    });
+}
+
 fn dedup_candidates(
     candidates: Vec<IntentCandidate>,
     strict: bool,
     kind_filter: Option<IntentKind>,
 ) -> Vec<IntentRecord> {
-    let mut map: HashMap<(IntentKind, String), CandidateAccumulator> = HashMap::new();
+    let mut map: HashMap<(IntentKind, String, String), CandidateAccumulator> = HashMap::new();
 
     for candidate in candidates {
         if kind_filter.is_some() && kind_filter != Some(candidate.record.kind) {
@@ -974,9 +1193,13 @@ fn dedup_candidates(
             continue;
         }
 
+        // Session-scoped key. Cross-session merges silently swap source_chunk
+        // while keeping the wrong session_id, lying about provenance. Keep
+        // identical text in different sessions as separate records.
         let key = (
             candidate.record.kind,
             normalize_key(&candidate.record.summary),
+            candidate.record.session_id.clone(),
         );
 
         if let Some(existing) = map.get_mut(&key) {
@@ -2068,6 +2291,57 @@ RED LIGHT: checklist detected (open: 0, done: 1)
             record.kind == IntentKind::Outcome && record.summary.contains("p0=0")
         }));
         assert!(!records.iter().any(|record| record.kind == IntentKind::Task));
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn extraction_stats_report_scanned_chunks_and_candidates_before_display_filters() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ai-contexters-intents-{}-stats",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+
+        write_chunk(
+            &tmp,
+            "demo",
+            "2026-03-15",
+            "120000_codex-001.md",
+            "[signals]\nDecision:\n- [decision] Keep canonical corpus first\n[/signals]\n",
+        );
+        write_chunk(
+            &tmp,
+            "demo",
+            "2026-03-15",
+            "120500_codex-002.md",
+            "[signals]\nOutcome:\n- outcome: canonical oracle JSON verified\n[/signals]\n",
+        );
+
+        let config = IntentsConfig {
+            project: "demo".to_string(),
+            hours: 24,
+            strict: false,
+            kind_filter: None,
+            frame_kind: None,
+        };
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 3, 15)
+                .expect("date")
+                .and_hms_opt(13, 0, 0)
+                .expect("time"),
+            Utc,
+        );
+
+        let extraction =
+            extract_intents_from_root_at_with_stats(&config, &tmp, now).expect("extract intents");
+
+        assert_eq!(extraction.stats.scanned_count, 2);
+        assert_eq!(extraction.stats.candidate_count, extraction.records.len());
+        assert!(extraction.stats.candidate_count >= 2);
+        assert!(extraction.stats.source_paths_verified);
+
+        let _ = fs::remove_dir_all(tmp);
     }
 
     #[test]
@@ -2260,6 +2534,44 @@ commit abcdef1 proves the old path was wrong.
         assert!(json.contains("\"kind\": \"outcome\""));
         assert!(json.contains("\"summary\": \"p0=0 after validation\""));
         assert!(json.contains("\"source_chunk\": \"/tmp/demo/2026-03-15/120500_claude-002.md\""));
+    }
+
+    #[test]
+    fn formats_oracle_json_as_canonical_corpus_not_semantic_fallback() {
+        let records = vec![IntentRecord {
+            kind: IntentKind::Decision,
+            summary: "Canonical corpus stays source of truth".to_string(),
+            context: None,
+            evidence: vec!["decision: canonical first".to_string()],
+            project: "Loctree/aicx".to_string(),
+            agent: "codex".to_string(),
+            date: "2026-05-04".to_string(),
+            timestamp: None,
+            session_id: "sess-canonical".to_string(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: "/tmp/aicx/chunk.md".to_string(),
+        }];
+
+        let status = OracleStatus::canonical_corpus_scan(Path::new("/tmp/aicx"), 1, 1, true);
+        let json = format_intents_oracle_json(&records, status).expect("serialize oracle intents");
+        let payload: serde_json::Value =
+            serde_json::from_str(&json).expect("oracle intents JSON should parse");
+
+        assert_eq!(payload["oracle_status"]["backend"], "canonical_corpus");
+        assert_eq!(payload["oracle_status"]["index_kind"], "canonical_chunks");
+        assert_eq!(
+            payload["oracle_status"]["fallback_reason"],
+            serde_json::Value::Null
+        );
+        assert_eq!(payload["oracle_status"]["loctree_scope_safe"], true);
+        assert!(
+            payload["oracle_status"]["loctree_scope_note"]
+                .as_str()
+                .unwrap()
+                .contains("not a semantic similarity oracle")
+        );
     }
 
     #[test]
@@ -2641,6 +2953,371 @@ Outcome:
             postprocess_session_entries(&mut entries, Some(7));
 
             assert!(!entries[0].tags.contains(&"unresolved".to_string()));
+        }
+    }
+
+    mod quality {
+        use super::*;
+
+        fn write_chunk_with_session(
+            root: &Path,
+            project: &str,
+            date: &str,
+            agent: &str,
+            session_id: &str,
+            sequence: u32,
+            body: &str,
+        ) -> PathBuf {
+            let date_compact = crate::store::compact_date(date);
+            let basename = crate::store::session_basename(date, agent, session_id, sequence);
+            let dir = root
+                .join("store")
+                .join("local")
+                .join(project)
+                .join(date_compact)
+                .join("conversations")
+                .join(agent);
+            fs::create_dir_all(&dir).expect("create chunk dir");
+            let path = dir.join(basename);
+            fs::write(&path, body).expect("write chunk");
+            path
+        }
+
+        // ── metadata-noise filter ───────────────────────────────────────
+
+        #[test]
+        fn metadata_only_summary_dropped() {
+            assert!(is_metadata_only_summary("1 Wierność źródłu"));
+            assert!(is_metadata_only_summary(
+                "4 Deterministyczność transformacji"
+            ));
+            assert!(is_metadata_only_summary("2."));
+            assert!(is_metadata_only_summary("3) Section heading"));
+            assert!(is_metadata_only_summary("..."));
+            assert!(is_metadata_only_summary("... ```"));
+            assert!(is_metadata_only_summary("```"));
+            assert!(is_metadata_only_summary("---"));
+        }
+
+        #[test]
+        fn real_decision_summary_kept() {
+            assert!(!is_metadata_only_summary(
+                "Materiał nie może dopowiadać, streszczać ani interpretować rozmowy",
+            ));
+            assert!(!is_metadata_only_summary(
+                "Keep canonical corpus as the source of truth",
+            ));
+            assert!(!is_metadata_only_summary(
+                "P1.2 — cache_scope_authority zawsze RepoVerified",
+            ));
+        }
+
+        #[test]
+        fn pipe_separated_numeric_headings_classified_as_noise() {
+            assert!(is_section_heading_noise(
+                "1 Wierność źródłu | 2 Retrieval quality",
+            ));
+            assert!(is_section_heading_noise("4 Deterministyczność | 5 Dedup"));
+            // Real prose with pipes is not noise:
+            assert!(!is_section_heading_noise(
+                "He said X and we agreed | She replied Y so we shipped Z",
+            ));
+            assert!(!is_section_heading_noise(
+                "Let's keep the parser flat | Avoid premature abstractions",
+            ));
+        }
+
+        // ── sentence-aware truncation ──────────────────────────────────
+
+        #[test]
+        fn short_summary_returned_unchanged() {
+            let text = "Keep the parser flat";
+            assert_eq!(truncate_summary_for_display(text), text);
+        }
+
+        #[test]
+        fn long_summary_ends_at_sentence_terminator_when_available() {
+            let mut text = String::new();
+            text.push_str("Pierwsza część decyzji o canonical corpus i jego znaczeniu dla całego stacku VetCoders w kontekście długoterminowej strategii AICX. ");
+            // Force length > 480 bytes; ensure a full sentence-terminator
+            // exists in the lookback window (last 80 bytes before cutoff).
+            text.push_str(
+                &"Druga część rozważań która dopisuje treść aż przekroczymy próg 480 bajtów. "
+                    .repeat(5),
+            );
+            assert!(text.len() > 480);
+
+            let out = truncate_summary_for_display(&text);
+            assert!(out.len() <= 480 + 4);
+            // Output must end on a strong terminator or an ellipsis,
+            // never mid-word with "...[truncated]".
+            assert!(
+                out.ends_with('.')
+                    || out.ends_with('!')
+                    || out.ends_with('?')
+                    || out.ends_with('…')
+            );
+            assert!(!out.contains("...[truncated]"));
+        }
+
+        #[test]
+        fn long_summary_without_terminator_falls_back_to_word_boundary() {
+            // Long text with no sentence terminators at all.
+            let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega ".repeat(5);
+            assert!(text.len() > 480);
+
+            let out = truncate_summary_for_display(&text);
+            assert!(out.ends_with('…'));
+            assert!(!out.contains("...[truncated]"));
+            // Ensure the cut landed on a word boundary (no partial word
+            // immediately before the ellipsis).
+            let stem = out.trim_end_matches(['…', ' ']);
+            assert!(
+                stem.chars().last().is_none_or(|c| !c.is_alphabetic())
+                    || stem.ends_with(|c: char| c.is_alphabetic())
+            );
+        }
+
+        // ── session-scoped dedup ───────────────────────────────────────
+
+        #[test]
+        fn cross_session_identical_summary_kept_separate() {
+            let tmp = std::env::temp_dir().join(format!(
+                "ai-contexters-intents-{}-cross-session",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&tmp);
+
+            let body = "[project: demo | agent: codex | date: 2026-05-02]\n\n\
+                        [11:00:00] user: Materiał ma być deterministyczny — musi mieć source_hash i być wygenerowany z raw JSONL.\n";
+
+            // Same operator-decision text appearing in two distinct sessions.
+            write_chunk_with_session(&tmp, "demo", "2026-05-02", "codex", "019dcceb-48c", 3, body);
+            write_chunk_with_session(
+                &tmp,
+                "demo",
+                "2026-05-04",
+                "codex",
+                "019df273-2c1",
+                27,
+                body,
+            );
+
+            let config = IntentsConfig {
+                project: "demo".to_string(),
+                hours: 240,
+                strict: false,
+                kind_filter: Some(IntentKind::Decision),
+                frame_kind: None,
+            };
+            let now = DateTime::<Utc>::from_naive_utc_and_offset(
+                NaiveDate::from_ymd_opt(2026, 5, 5)
+                    .expect("date")
+                    .and_hms_opt(0, 0, 0)
+                    .expect("time"),
+                Utc,
+            );
+
+            let records =
+                extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+
+            // Two sessions, two records — identical summary text but distinct
+            // provenance must NOT collapse into one entry that lies about its
+            // session (older session_id paired with newer source_chunk).
+            let decisions: Vec<&IntentRecord> = records
+                .iter()
+                .filter(|r| r.kind == IntentKind::Decision)
+                .collect();
+            assert_eq!(
+                decisions.len(),
+                2,
+                "expected one decision per session, got {decisions:?}",
+            );
+
+            let session_ids: HashSet<String> =
+                decisions.iter().map(|r| r.session_id.clone()).collect();
+            assert!(
+                session_ids.contains("019dcceb-48c"),
+                "missing session 019dcceb-48c in {session_ids:?}",
+            );
+            assert!(
+                session_ids.contains("019df273-2c1"),
+                "missing session 019df273-2c1 in {session_ids:?}",
+            );
+
+            // Provenance check: each record's session_id must match the
+            // session segment in its own source_chunk filename.
+            for record in &decisions {
+                let stem = std::path::Path::new(&record.source_chunk)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                assert!(
+                    stem.contains(&record.session_id),
+                    "session_id={} not found in source_chunk filename={}",
+                    record.session_id,
+                    stem,
+                );
+            }
+
+            let _ = fs::remove_dir_all(tmp);
+        }
+
+        #[test]
+        fn metadata_only_decision_filtered_at_extraction() {
+            let tmp = std::env::temp_dir().join(format!(
+                "ai-contexters-intents-{}-metadata-noise",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&tmp);
+
+            let body = "[project: demo | agent: codex | date: 2026-05-04]\n\n\
+                        [10:00:00] user: 4 Deterministyczność transformacji\n\
+                        [10:01:00] user: Materiał musi mieć source_hash i być deterministycznie wygenerowany z raw JSONL.\n";
+
+            write_chunk_with_session(
+                &tmp,
+                "demo",
+                "2026-05-04",
+                "codex",
+                "019df273-2c1",
+                27,
+                body,
+            );
+
+            let config = IntentsConfig {
+                project: "demo".to_string(),
+                hours: 240,
+                strict: false,
+                kind_filter: None,
+                frame_kind: None,
+            };
+            let now = DateTime::<Utc>::from_naive_utc_and_offset(
+                NaiveDate::from_ymd_opt(2026, 5, 5)
+                    .expect("date")
+                    .and_hms_opt(0, 0, 0)
+                    .expect("time"),
+                Utc,
+            );
+
+            let records =
+                extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+
+            // Numeric-list heading "4 Deterministyczność transformacji" must
+            // not appear as the top decision/intent.
+            assert!(
+                !records
+                    .iter()
+                    .any(|r| r.summary.starts_with("4 Deterministyczność")),
+                "metadata-only heading leaked into records: {records:?}",
+            );
+
+            // The real operator-decision line still survives.
+            assert!(
+                records
+                    .iter()
+                    .any(|r| r.summary.starts_with("Materiał musi mieć source_hash")),
+                "real decision line dropped: records={records:?}",
+            );
+
+            let _ = fs::remove_dir_all(tmp);
+        }
+
+        // ── path-derived session reconciliation ────────────────────────
+
+        #[test]
+        fn reconcile_session_id_uses_filename_when_record_disagrees() {
+            let mut records = vec![IntentRecord {
+                kind: IntentKind::Intent,
+                summary: "claim from session A but filename is from session B".to_string(),
+                context: None,
+                evidence: vec![],
+                project: "demo".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-05-04".to_string(),
+                timestamp: None,
+                session_id: "019dcceb-48c".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk:
+                    "/store/Loctree/aicx/2026_0504/conversations/codex/2026_0504_codex_019df273-2c1_027.md"
+                        .to_string(),
+            }];
+
+            reconcile_session_id_with_path(&mut records);
+
+            assert_eq!(
+                records[0].session_id, "019df273-2c1",
+                "session_id should reflect what the cited filename actually contains",
+            );
+        }
+
+        #[test]
+        fn reconcile_keeps_session_id_when_already_consistent() {
+            let mut records = vec![IntentRecord {
+                kind: IntentKind::Decision,
+                summary: "session_id matches filename".to_string(),
+                context: None,
+                evidence: vec![],
+                project: "demo".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-05-04".to_string(),
+                timestamp: None,
+                session_id: "019df273-2c1".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk:
+                    "/store/Loctree/aicx/2026_0504/conversations/codex/2026_0504_codex_019df273-2c1_027.md"
+                        .to_string(),
+            }];
+
+            reconcile_session_id_with_path(&mut records);
+
+            assert_eq!(records[0].session_id, "019df273-2c1");
+        }
+
+        #[test]
+        fn truncated_duplicate_record_is_dropped_when_full_source_twin_exists() {
+            let source_chunk = "/tmp/2026_0504_codex_019df273-2c1_067.md".to_string();
+            let mut records = vec![
+                IntentRecord {
+                    kind: IntentKind::Decision,
+                    summary: "nie mamy ani jednego użytkownika. Jesteśmy teraz w San Francisco i potrzebujemy strategii. Zrób sobie aicx search...[truncated]".to_string(),
+                    evidence: Vec::new(),
+                    project: "aicx".to_string(),
+                    agent: "codex".to_string(),
+                    date: "2026-05-04".to_string(),
+                    session_id: "019df273-2c1".to_string(),
+                    count: None,
+                    first_chunk: None,
+                    last_chunk: None,
+                    source_chunk: source_chunk.clone(),
+                    timestamp: None,
+                    context: None,
+                },
+                IntentRecord {
+                    kind: IntentKind::Decision,
+                    summary: "nie mamy ani jednego użytkownika. Jesteśmy teraz w San Francisco i potrzebujemy strategii. Zrób sobie aicx search 'repozytoria libraxis loctree vetcoders' i pomóż.".to_string(),
+                    evidence: Vec::new(),
+                    project: "aicx".to_string(),
+                    agent: "codex".to_string(),
+                    date: "2026-05-04".to_string(),
+                    session_id: "019df273-2c1".to_string(),
+                    count: None,
+                    first_chunk: None,
+                    last_chunk: None,
+                    source_chunk,
+                    timestamp: None,
+                    context: None,
+                },
+            ];
+
+            drop_truncated_duplicate_records(&mut records);
+
+            assert_eq!(records.len(), 1);
+            assert!(!records[0].summary.contains("...[truncated]"));
         }
     }
 }
