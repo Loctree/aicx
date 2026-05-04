@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static RESCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 
 use crate::intents::{self, IntentKind, IntentsConfig};
+use crate::oracle::OracleStatus;
 use crate::rank;
 use crate::store;
 use crate::timeline::FrameKind;
@@ -242,6 +243,7 @@ struct RankItem {
 
 #[derive(Debug, Serialize)]
 struct SteerResponse {
+    oracle_status: OracleStatus,
     results: usize,
     items: Vec<serde_json::Value>,
 }
@@ -397,7 +399,7 @@ impl AicxMcpServer {
 
         let results: Vec<_> = results.into_iter().take(limit).collect();
 
-        let json = rank::render_search_json(&results, scanned)
+        let json = rank::render_search_json(&store_root, &results, scanned)
             .map_err(|e| McpError::internal_error(format!("Serialize search JSON: {e}"), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
@@ -611,6 +613,20 @@ impl AicxMcpServer {
             });
         }
 
+        let store_root = store::store_base_dir()
+            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+        let oracle_status = OracleStatus::metadata_steer(
+            &store_root,
+            metadatas.len(),
+            metadatas.len(),
+            crate::oracle::verify_paths(metadatas.iter().filter_map(|m| {
+                m.get("path")
+                    .or_else(|| m.get("source_chunk"))
+                    .and_then(|value| value.as_str())
+                    .map(std::path::PathBuf::from)
+            })),
+        );
+
         let json = if params.slim && !params.verbose {
             let items: Vec<_> = metadatas.iter().map(|m| {
                 serde_json::json!({
@@ -623,12 +639,14 @@ impl AicxMcpServer {
                 })
             }).collect();
             serde_json::to_string(&SteerResponse {
+                oracle_status: oracle_status.clone(),
                 results: items.len(),
                 items,
             })
             .unwrap()
         } else {
             serde_json::to_string(&SteerResponse {
+                oracle_status,
                 results: metadatas.len(),
                 items: metadatas,
             })
@@ -705,9 +723,23 @@ impl AicxMcpServer {
 
         let body = match params.emit.as_str() {
             "markdown" | "md" => intents::format_intents_markdown(&records),
-            _ => intents::format_intents_json(&records).map_err(|e| {
-                McpError::internal_error(format!("Serialize intents JSON: {e}"), None)
-            })?,
+            _ => {
+                let store_root = store::store_base_dir()
+                    .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+                let oracle_status = OracleStatus::filesystem_fuzzy(
+                    &store_root,
+                    records.len(),
+                    records.len(),
+                    crate::oracle::verify_paths(
+                        records
+                            .iter()
+                            .map(|record| std::path::PathBuf::from(&record.source_chunk)),
+                    ),
+                );
+                intents::format_intents_oracle_json(&records, oracle_status).map_err(|e| {
+                    McpError::internal_error(format!("Serialize intents JSON: {e}"), None)
+                })?
+            }
         };
 
         Ok(CallToolResult::success(vec![Content::text(body)]))
@@ -849,6 +881,7 @@ mod tests {
         MAX_SCORE_FILTER, McpTransport, RankItem, RankResponse, SearchParams, SteerResponse,
         background_refresh_args, parse_date_filter_mcp, validate_score_filter,
     };
+    use crate::oracle::OracleStatus;
     use clap::ValueEnum as _;
 
     #[test]
@@ -942,6 +975,7 @@ mod tests {
     #[test]
     fn steer_response_serializes_as_compact_json() {
         let json = serde_json::to_string(&SteerResponse {
+            oracle_status: OracleStatus::metadata_steer(std::path::Path::new("/tmp"), 1, 1, true),
             results: 1,
             items: vec![serde_json::json!({
                 "path": "/tmp/chunk.md",

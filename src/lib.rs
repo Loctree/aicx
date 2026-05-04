@@ -11,6 +11,7 @@ pub mod embedder;
 pub mod hf_cache;
 pub mod intents;
 pub mod mcp;
+pub mod oracle;
 pub mod output;
 pub mod progress;
 pub mod rank;

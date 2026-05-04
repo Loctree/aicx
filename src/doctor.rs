@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
+use crate::oracle::OracleReadiness;
 use crate::steer_index;
 use crate::store;
 use crate::validation::is_valid_repo_bucket_name;
@@ -56,6 +57,18 @@ pub struct DoctorReport {
     pub noise_health: CheckResult,
     pub fixes_applied: Vec<String>,
     pub overall: Severity,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OracleReadinessReport {
+    pub readiness: OracleReadiness,
+    pub readiness_label: &'static str,
+    pub canonical_corpus_health: Severity,
+    pub metadata_steer_index_health: Severity,
+    pub content_semantic_index_health: Severity,
+    pub dashboard_semantic_route_health: Severity,
+    pub loctree_oracle_readiness: OracleReadiness,
+    pub reason: String,
 }
 
 pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
@@ -608,6 +621,57 @@ pub fn format_report_text(report: &DoctorReport, verbose: bool) -> String {
     out
 }
 
+pub fn oracle_readiness(report: &DoctorReport) -> OracleReadinessReport {
+    let canonical = report.canonical_store.severity;
+    let metadata = max_severity(&[report.steer_lance.severity, report.steer_bm25.severity]);
+    let content = Severity::Critical;
+    let dashboard = Severity::Warning;
+
+    let readiness = if canonical == Severity::Critical
+        || report.sidecars.severity == Severity::Critical
+        || content == Severity::Critical
+    {
+        OracleReadiness::UnsafeForLoctreeScope
+    } else if metadata != Severity::Green || dashboard != Severity::Green {
+        OracleReadiness::Degraded
+    } else {
+        OracleReadiness::Ready
+    };
+
+    let reason = match readiness {
+        OracleReadiness::Ready => "canonical corpus, metadata steer index, and semantic route are healthy".to_string(),
+        OracleReadiness::Degraded => "oracle usable with explicit degradation; metadata or dashboard route needs attention".to_string(),
+        OracleReadiness::UnsafeForLoctreeScope => "content semantic index is unavailable or corpus health is unsafe; Loctree must not use AICX to narrow scope".to_string(),
+    };
+
+    OracleReadinessReport {
+        readiness,
+        readiness_label: match readiness {
+            OracleReadiness::Ready => "ready",
+            OracleReadiness::Degraded => "degraded",
+            OracleReadiness::UnsafeForLoctreeScope => "unsafe_for_loctree_scope",
+        },
+        canonical_corpus_health: canonical,
+        metadata_steer_index_health: metadata,
+        content_semantic_index_health: content,
+        dashboard_semantic_route_health: dashboard,
+        loctree_oracle_readiness: readiness,
+        reason,
+    }
+}
+
+pub fn format_oracle_readiness_text(report: &OracleReadinessReport) -> String {
+    format!(
+        "canonical corpus health: {:?}\nmetadata steer index health: {:?}\ncontent semantic index health: {:?}\ndashboard semantic route health: {:?}\nLoctree oracle readiness: {}\nreason: {}\n",
+        report.canonical_corpus_health,
+        report.metadata_steer_index_health,
+        report.content_semantic_index_health,
+        report.dashboard_semantic_route_health,
+        report.readiness_label,
+        report.reason
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,6 +687,60 @@ mod tests {
             Severity::Warning
         );
         assert_eq!(max_severity(&[Severity::Green]), Severity::Green);
+    }
+
+    #[test]
+    fn oracle_readiness_is_unsafe_without_content_index() {
+        let report = DoctorReport {
+            canonical_store: CheckResult {
+                name: "canonical".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            steer_lance: CheckResult {
+                name: "metadata_steer_index lance".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            steer_bm25: CheckResult {
+                name: "metadata_steer_index bm25".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            state: CheckResult {
+                name: "state".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            sidecars: CheckResult {
+                name: "sidecars".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            corpus_buckets: CheckResult {
+                name: "buckets".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            noise_health: CheckResult {
+                name: "noise".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            fixes_applied: Vec::new(),
+            overall: Severity::Green,
+        };
+
+        let readiness = oracle_readiness(&report);
+        assert_eq!(readiness.readiness_label, "unsafe_for_loctree_scope");
+        assert_eq!(readiness.content_semantic_index_health, Severity::Critical);
     }
 
     #[test]

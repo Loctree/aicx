@@ -12,6 +12,7 @@ use std::fmt::Write as _;
 use std::io;
 use std::path::Path;
 
+use crate::oracle::OracleStatus;
 use crate::sanitize;
 use crate::sanitize::normalize_query;
 use crate::store;
@@ -248,6 +249,7 @@ pub struct FuzzyResult {
 
 #[derive(Debug, Serialize)]
 struct CompactSearchResponse {
+    oracle_status: OracleStatus,
     results: usize,
     scanned: usize,
     items: Vec<CompactSearchItem>,
@@ -271,7 +273,24 @@ struct CompactSearchItem {
 const SEARCH_MATCH_MAX_CHARS: usize = 200;
 const SEARCH_META_PREFIX: &str = "[project:";
 
-pub fn render_search_json(results: &[FuzzyResult], scanned: usize) -> serde_json::Result<String> {
+pub fn search_oracle_status(root: &Path, results: &[FuzzyResult], scanned: usize) -> OracleStatus {
+    OracleStatus::filesystem_fuzzy(
+        root,
+        scanned,
+        results.len(),
+        crate::oracle::verify_paths(
+            results
+                .iter()
+                .map(|result| Path::new(&result.path).to_path_buf()),
+        ),
+    )
+}
+
+pub fn render_search_json(
+    root: &Path,
+    results: &[FuzzyResult],
+    scanned: usize,
+) -> serde_json::Result<String> {
     let items = results
         .iter()
         .map(|result| CompactSearchItem {
@@ -290,6 +309,7 @@ pub fn render_search_json(results: &[FuzzyResult], scanned: usize) -> serde_json
         .collect();
 
     serde_json::to_string(&CompactSearchResponse {
+        oracle_status: search_oracle_status(root, results, scanned),
         results: results.len(),
         scanned,
         items,
@@ -1198,6 +1218,7 @@ Some boilerplate text.
     fn render_search_json_matches_cli_surface_fields() {
         let long_line = "x".repeat(205);
         let json = render_search_json(
+            Path::new("/tmp/aicx"),
             &[FuzzyResult {
                 file: "chunk.md".to_string(),
                 path: "/tmp/chunk.md".to_string(),
@@ -1229,6 +1250,11 @@ Some boilerplate text.
 
         assert_eq!(payload["results"], 1);
         assert_eq!(payload["scanned"], 127);
+        assert_eq!(payload["oracle_status"]["backend"], "filesystem_fuzzy");
+        assert_eq!(payload["oracle_status"]["index_kind"], "none");
+        assert_eq!(payload["oracle_status"]["scanned_count"], 127);
+        assert_eq!(payload["oracle_status"]["candidate_count"], 1);
+        assert_eq!(payload["oracle_status"]["stale_or_unknown"], true);
         assert_eq!(payload["items"][0]["score"], 88);
         assert_eq!(payload["items"][0]["label"], "HIGH");
         assert_eq!(payload["items"][0]["project"], "VetCoders/ai-contexters");

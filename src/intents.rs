@@ -15,6 +15,7 @@ use crate::chunker::{
     INTENT_KEYWORDS, is_decision_tag, is_outcome_tag, is_result_line, normalize_key,
     parse_checklist_task, truncate_signal_line,
 };
+use crate::oracle::{OracleEnvelope, OracleStatus};
 use crate::sanitize;
 use crate::store;
 use crate::timeline::FrameKind;
@@ -285,6 +286,18 @@ pub fn format_intents_markdown(records: &[IntentRecord]) -> String {
 
 pub fn format_intents_json(records: &[IntentRecord]) -> Result<String> {
     serde_json::to_string_pretty(records).context("Failed to serialize intents to JSON")
+}
+
+pub fn format_intents_oracle_json(
+    records: &[IntentRecord],
+    oracle_status: OracleStatus,
+) -> Result<String> {
+    serde_json::to_string_pretty(&OracleEnvelope {
+        oracle_status,
+        results: records.len(),
+        items: records,
+    })
+    .context("Failed to serialize intents oracle JSON")
 }
 
 fn extract_intents_from_root_at(

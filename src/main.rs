@@ -1055,6 +1055,10 @@ enum Commands {
         #[arg(short, long)]
         date: Option<String>,
 
+        /// Emit compact JSON with oracle_status instead of readable text
+        #[arg(short = 'j', long)]
+        json: bool,
+
         #[command(flatten)]
         filters: RetrievalFilters,
     },
@@ -1120,6 +1124,10 @@ enum Commands {
         /// Output format: text (default), json
         #[arg(long, default_value = "text")]
         format: String,
+
+        /// Report AICX Oracle readiness: ready | degraded | unsafe_for_loctree_scope
+        #[arg(long)]
+        oracle: bool,
     },
 }
 
@@ -1485,6 +1493,7 @@ fn main() -> Result<()> {
             kind,
             project,
             date,
+            json,
             filters,
         }) => {
             run_steer(
@@ -1493,6 +1502,7 @@ fn main() -> Result<()> {
                 kind.as_deref(),
                 project.as_deref(),
                 date.as_deref(),
+                json,
                 filters,
             )?;
         }
@@ -1536,6 +1546,7 @@ fn main() -> Result<()> {
             fix_buckets,
             verbose,
             format,
+            oracle,
         }) => {
             let opts = aicx::doctor::DoctorOptions {
                 fix,
@@ -1545,6 +1556,21 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Runtime::new()
                 .context("Failed to start tokio runtime for doctor")?;
             let report = rt.block_on(aicx::doctor::run(&opts))?;
+
+            if oracle {
+                let status = aicx::doctor::oracle_readiness(&report);
+                if format == "json" {
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                } else {
+                    println!("{}", status.readiness_label);
+                    print!("{}", aicx::doctor::format_oracle_readiness_text(&status));
+                }
+                std::process::exit(match status.readiness {
+                    aicx::oracle::OracleReadiness::Ready
+                    | aicx::oracle::OracleReadiness::Degraded => 0,
+                    aicx::oracle::OracleReadiness::UnsafeForLoctreeScope => 1,
+                });
+            }
 
             match format.as_str() {
                 "json" => {
@@ -1792,7 +1818,18 @@ fn run_intents(
 
     match emit {
         "json" => {
-            let json = intents::format_intents_json(&records)?;
+            let store_root = store::store_base_dir()?;
+            let oracle_status = aicx::oracle::OracleStatus::filesystem_fuzzy(
+                &store_root,
+                records.len(),
+                records.len(),
+                aicx::oracle::verify_paths(
+                    records
+                        .iter()
+                        .map(|record| std::path::PathBuf::from(&record.source_chunk)),
+                ),
+            );
+            let json = intents::format_intents_oracle_json(&records, oracle_status)?;
             println!("{}", json);
         }
         _ => {
@@ -3140,7 +3177,7 @@ fn run_search(
     let results: Vec<_> = results.into_iter().take(filters.limit).collect();
 
     if json {
-        println!("{}", rank::render_search_json(&results, scanned)?);
+        println!("{}", rank::render_search_json(&root, &results, scanned)?);
         return Ok(());
     }
 
@@ -3205,6 +3242,7 @@ fn run_steer(
     kind: Option<&str>,
     project: Option<&str>,
     date: Option<&str>,
+    json: bool,
     filters: RetrievalFilters,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -3256,6 +3294,28 @@ fn run_steer(
     let mut out = io::BufWriter::new(stdout.lock());
     let color = stdout.is_terminal();
     let matched = metadatas.len();
+    let store_root = store::store_base_dir()?;
+    let oracle_status = aicx::oracle::OracleStatus::metadata_steer(
+        &store_root,
+        matched,
+        matched,
+        aicx::oracle::verify_paths(metadatas.iter().filter_map(|meta| {
+            meta.get("path")
+                .or_else(|| meta.get("source_chunk"))
+                .and_then(|value| value.as_str())
+                .map(std::path::PathBuf::from)
+        })),
+    );
+
+    if json {
+        let json = serde_json::to_string_pretty(&aicx::oracle::OracleEnvelope {
+            oracle_status,
+            results: metadatas.len(),
+            items: &metadatas,
+        })?;
+        println!("{json}");
+        return Ok(());
+    }
 
     for meta in metadatas {
         let path = meta.get("path").and_then(|v| v.as_str()).unwrap_or("?");
