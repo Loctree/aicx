@@ -843,6 +843,8 @@ enum Commands {
     DashboardServeLegacy(#[command(flatten)] DashboardServeLegacyArgs),
 
     /// Extract structured intents and decisions from canonical store (layer 1).
+    /// `--emit json` includes oracle_status and is canonical corpus evidence,
+    /// not semantic oracle output.
     Intents {
         /// Project filter (required)
         #[arg(short, long)]
@@ -863,7 +865,7 @@ enum Commands {
         #[arg(long)]
         collapse_session: bool,
 
-        /// Output format: markdown or json
+        /// Output format: markdown or json (json includes oracle_status)
         #[arg(long, default_value = "markdown", value_parser = ["markdown", "json"])]
         emit: String,
 
@@ -902,8 +904,8 @@ enum Commands {
     ///
     /// Exposes search, steer, and rank tools over MCP for agent retrieval.
     /// `aicx_steer` and `aicx_rank` query the canonical corpus on disk.
-    /// `aicx_search` widens with memex semantic retrieval when a materialized
-    /// index exists, and otherwise falls back to canonical-store fuzzy search.
+    /// `aicx_search` is canonical-store fuzzy search and returns
+    /// `oracle_status` so callers cannot mistake it for semantic retrieval.
     #[command(verbatim_doc_comment)]
     Serve {
         /// Transport: stdio (default) or http. Legacy alias: sse.
@@ -977,9 +979,9 @@ enum Commands {
     /// Fuzzy search across the canonical corpus (layer 1, filesystem-only).
     ///
     /// Searches chunk content and frontmatter directly in ~/.aicx/ — works
-    /// immediately, no semantic index needed. For semantic retrieval through MCP
-    /// tools, use `aicx serve`; the MCP layer widens through available runtime
-    /// search providers and otherwise falls back to canonical-store fuzzy search.
+    /// immediately, no semantic index needed. JSON output includes
+    /// `oracle_status` and is explicitly marked as filesystem fuzzy, not a
+    /// semantic/content oracle.
     #[command(display_order = 12)]
     Search {
         /// Search query string
@@ -1782,7 +1784,8 @@ fn run_intents(
         frame_kind: filters.frame_kind.map(Into::into),
     };
 
-    let records = intents::extract_intents(&config)?;
+    let extraction = intents::extract_intents_with_stats(&config)?;
+    let records = extraction.records;
 
     let (date_lo, date_hi) = if let Some(ref d) = filters.since {
         let bounds = parse_date_filter(d)?;
@@ -1808,7 +1811,7 @@ fn run_intents(
 
     let records = intents::apply_display_filters(records, &display_filters);
 
-    if records.is_empty() {
+    if records.is_empty() && emit != "json" {
         eprintln!(
             "No intents found for project '{}' in last {} hours.",
             project, hours
@@ -1819,15 +1822,11 @@ fn run_intents(
     match emit {
         "json" => {
             let store_root = store::store_base_dir()?;
-            let oracle_status = aicx::oracle::OracleStatus::filesystem_fuzzy(
+            let oracle_status = aicx::oracle::OracleStatus::canonical_corpus_scan(
                 &store_root,
-                records.len(),
-                records.len(),
-                aicx::oracle::verify_paths(
-                    records
-                        .iter()
-                        .map(|record| std::path::PathBuf::from(&record.source_chunk)),
-                ),
+                extraction.stats.scanned_count,
+                extraction.stats.candidate_count,
+                extraction.stats.source_paths_verified,
             );
             let json = intents::format_intents_oracle_json(&records, oracle_status)?;
             println!("{}", json);
@@ -3194,7 +3193,7 @@ fn run_search(
 
     if io::stderr().is_terminal() {
         eprintln!(
-            "\n{} result(s) from {} scanned chunks.",
+            "\n{} result(s) from {} scanned chunks. oracle_status: backend=filesystem_fuzzy index=none fallback=fallback_filesystem_fuzzy loctree_scope_safe=false",
             results.len(),
             scanned
         );
@@ -3358,7 +3357,10 @@ fn run_steer(
 
     let _ = out.flush();
     if io::stderr().is_terminal() {
-        eprintln!("{matched} match(es) from steer index.");
+        eprintln!(
+            "{matched} match(es) from steer index. oracle_status: backend=steer_metadata index=metadata_steer derived=rebuildable_from_canonical_chunks loctree_scope_safe={}",
+            oracle_status.loctree_scope_safe
+        );
     }
 
     Ok(())
@@ -4290,19 +4292,20 @@ mod tests {
 
         assert!(rendered.contains("Transport: stdio (default) or http."));
         assert!(!rendered.contains("Transport: stdio (default) or sse"));
-        assert!(rendered.contains("falls back to canonical-store fuzzy search"));
+        assert!(rendered.contains("cannot mistake it for semantic retrieval"));
         assert!(!rendered.contains("embedding mode"));
     }
 
     #[test]
-    fn search_help_explains_semantic_path_without_embedding_jargon() {
+    fn search_help_marks_fuzzy_status_without_embedding_jargon() {
         let mut cmd = Cli::command();
         let search = cmd
             .find_subcommand_mut("search")
             .expect("search subcommand should exist");
         let rendered = search.render_long_help().to_string();
 
-        assert!(rendered.contains("semantic retrieval through MCP tools"));
+        assert!(rendered.contains("filesystem fuzzy"));
+        assert!(rendered.contains("not a semantic/content oracle"));
         assert!(!rendered.contains("embedding-aware"));
     }
 

@@ -825,6 +825,36 @@ pub fn scan_context_files_at(base: &Path) -> Result<Vec<StoredContextFile>> {
     scan_context_files_with_ignore(&base, &ignore)
 }
 
+pub fn scan_context_files_project_at(
+    base: &Path,
+    project_filter: Option<&str>,
+) -> Result<Vec<StoredContextFile>> {
+    let base = sanitize::validate_dir_path(base)?;
+    let Some(filter) = project_filter
+        .map(str::trim)
+        .filter(|filter| !filter.is_empty())
+    else {
+        return scan_context_files_at(&base);
+    };
+
+    let filter = filter.to_lowercase();
+    let ignore = load_ignore_matcher_at(&base)?;
+    let mut files = Vec::new();
+
+    let canonical_root = base.join(CANONICAL_STORE_DIRNAME);
+    if canonical_root.is_dir() {
+        scan_repo_store_filtered(&canonical_root, &ignore, &filter, &mut files)?;
+    }
+
+    let non_repo_root = base.join(NON_REPOSITORY_CONTEXTS);
+    if non_repo_root.is_dir() && NON_REPOSITORY_CONTEXTS.contains(&filter) {
+        scan_non_repository_store(&non_repo_root, &ignore, &mut files)?;
+    }
+
+    sort_context_files(&mut files);
+    Ok(files)
+}
+
 pub fn scan_context_files_raw_at(base: &Path) -> Result<Vec<StoredContextFile>> {
     let base = sanitize::validate_dir_path(base)?;
     let ignore = StoreIgnoreMatcher {
@@ -850,6 +880,12 @@ fn scan_context_files_with_ignore(
         scan_non_repository_store(&non_repo_root, ignore, &mut files)?;
     }
 
+    sort_context_files(&mut files);
+
+    Ok(files)
+}
+
+fn sort_context_files(files: &mut [StoredContextFile]) {
     files.sort_by(|left, right| {
         left.date_compact
             .cmp(&right.date_compact)
@@ -858,8 +894,6 @@ fn scan_context_files_with_ignore(
             .then_with(|| left.session_id.cmp(&right.session_id))
             .then_with(|| left.chunk.cmp(&right.chunk))
     });
-
-    Ok(files)
 }
 
 pub fn context_files_since(
@@ -867,6 +901,10 @@ pub fn context_files_since(
     project_filter: Option<&str>,
 ) -> Result<Vec<StoredContextFile>> {
     context_files_since_at(&store_base_dir()?, cutoff, project_filter)
+}
+
+fn read_store_dir(path: &Path) -> Result<fs::ReadDir> {
+    fs::read_dir(path).with_context(|| format!("Failed to read store dir {}", path.display()))
 }
 
 /// Read one canonical chunk by absolute path, store-relative path, file name,
@@ -1042,16 +1080,14 @@ fn scan_repo_store(
     ignore: &StoreIgnoreMatcher,
     files: &mut Vec<StoredContextFile>,
 ) -> Result<()> {
-    for organization_entry in sanitize::read_dir_validated(root)?.filter_map(|entry| entry.ok()) {
+    for organization_entry in read_store_dir(root)?.filter_map(|entry| entry.ok()) {
         let organization_path = organization_entry.path();
         if !organization_path.is_dir() {
             continue;
         }
         let organization = organization_entry.file_name().to_string_lossy().to_string();
 
-        for repository_entry in
-            sanitize::read_dir_validated(&organization_path)?.filter_map(|entry| entry.ok())
-        {
+        for repository_entry in read_store_dir(&organization_path)?.filter_map(|entry| entry.ok()) {
             let repository_path = repository_entry.path();
             if !repository_path.is_dir() {
                 continue;
@@ -1062,18 +1098,14 @@ fn scan_repo_store(
                 repository: repository.clone(),
             };
 
-            for date_entry in
-                sanitize::read_dir_validated(&repository_path)?.filter_map(|entry| entry.ok())
-            {
+            for date_entry in read_store_dir(&repository_path)?.filter_map(|entry| entry.ok()) {
                 let date_path = date_entry.path();
                 if !date_path.is_dir() {
                     continue;
                 }
                 let date_compact = date_entry.file_name().to_string_lossy().to_string();
 
-                for kind_entry in
-                    sanitize::read_dir_validated(&date_path)?.filter_map(|entry| entry.ok())
-                {
+                for kind_entry in read_store_dir(&date_path)?.filter_map(|entry| entry.ok()) {
                     let kind_path = kind_entry.path();
                     if !kind_path.is_dir() {
                         continue;
@@ -1082,9 +1114,7 @@ fn scan_repo_store(
                         continue;
                     };
 
-                    for agent_entry in
-                        sanitize::read_dir_validated(&kind_path)?.filter_map(|entry| entry.ok())
-                    {
+                    for agent_entry in read_store_dir(&kind_path)?.filter_map(|entry| entry.ok()) {
                         let agent_path = agent_entry.path();
                         if !agent_path.is_dir() {
                             continue;
@@ -1108,19 +1138,59 @@ fn scan_repo_store(
     Ok(())
 }
 
-fn scan_non_repository_store(
+fn scan_repo_store_filtered(
     root: &Path,
     ignore: &StoreIgnoreMatcher,
+    project_filter: &str,
     files: &mut Vec<StoredContextFile>,
 ) -> Result<()> {
-    for date_entry in sanitize::read_dir_validated(root)?.filter_map(|entry| entry.ok()) {
+    for organization_entry in read_store_dir(root)?.filter_map(|entry| entry.ok()) {
+        let organization_path = organization_entry.path();
+        if !organization_path.is_dir() {
+            continue;
+        }
+        let organization = organization_entry.file_name().to_string_lossy().to_string();
+
+        for repository_entry in read_store_dir(&organization_path)?.filter_map(|entry| entry.ok()) {
+            let repository_path = repository_entry.path();
+            if !repository_path.is_dir() {
+                continue;
+            }
+            let repository = repository_entry.file_name().to_string_lossy().to_string();
+            let repo = RepoIdentity {
+                organization: organization.clone(),
+                repository: repository.clone(),
+            };
+            let repo_slug = repo.slug();
+            if !repo_slug.to_lowercase().contains(project_filter)
+                && !repository.to_lowercase().contains(project_filter)
+                && !organization.to_lowercase().contains(project_filter)
+            {
+                continue;
+            }
+
+            scan_single_repo_store(&repository_path, ignore, &repo, &repo_slug, files)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn scan_single_repo_store(
+    repository_path: &Path,
+    ignore: &StoreIgnoreMatcher,
+    repo: &RepoIdentity,
+    repo_slug: &str,
+    files: &mut Vec<StoredContextFile>,
+) -> Result<()> {
+    for date_entry in read_store_dir(repository_path)?.filter_map(|entry| entry.ok()) {
         let date_path = date_entry.path();
         if !date_path.is_dir() {
             continue;
         }
         let date_compact = date_entry.file_name().to_string_lossy().to_string();
 
-        for kind_entry in sanitize::read_dir_validated(&date_path)?.filter_map(|entry| entry.ok()) {
+        for kind_entry in read_store_dir(&date_path)?.filter_map(|entry| entry.ok()) {
             let kind_path = kind_entry.path();
             if !kind_path.is_dir() {
                 continue;
@@ -1129,9 +1199,49 @@ fn scan_non_repository_store(
                 continue;
             };
 
-            for agent_entry in
-                sanitize::read_dir_validated(&kind_path)?.filter_map(|entry| entry.ok())
-            {
+            for agent_entry in read_store_dir(&kind_path)?.filter_map(|entry| entry.ok()) {
+                let agent_path = agent_entry.path();
+                if !agent_path.is_dir() {
+                    continue;
+                }
+                let agent = agent_entry.file_name().to_string_lossy().to_string();
+                let ctx = LeafScanContext {
+                    repo: Some(repo.clone()),
+                    project: repo_slug,
+                    date_compact: &date_compact,
+                    kind,
+                    agent: &agent,
+                };
+                collect_leaf_files(&agent_path, &ctx, ignore, files)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn scan_non_repository_store(
+    root: &Path,
+    ignore: &StoreIgnoreMatcher,
+    files: &mut Vec<StoredContextFile>,
+) -> Result<()> {
+    for date_entry in read_store_dir(root)?.filter_map(|entry| entry.ok()) {
+        let date_path = date_entry.path();
+        if !date_path.is_dir() {
+            continue;
+        }
+        let date_compact = date_entry.file_name().to_string_lossy().to_string();
+
+        for kind_entry in read_store_dir(&date_path)?.filter_map(|entry| entry.ok()) {
+            let kind_path = kind_entry.path();
+            if !kind_path.is_dir() {
+                continue;
+            }
+            let Some(kind) = Kind::parse(&kind_entry.file_name().to_string_lossy()) else {
+                continue;
+            };
+
+            for agent_entry in read_store_dir(&kind_path)?.filter_map(|entry| entry.ok()) {
                 let agent_path = agent_entry.path();
                 if !agent_path.is_dir() {
                     continue;
@@ -1167,7 +1277,7 @@ fn collect_leaf_files(
     ignore: &StoreIgnoreMatcher,
     files: &mut Vec<StoredContextFile>,
 ) -> Result<()> {
-    for file_entry in sanitize::read_dir_validated(dir)?.filter_map(|entry| entry.ok()) {
+    for file_entry in read_store_dir(dir)?.filter_map(|entry| entry.ok()) {
         let path = file_entry.path();
         let file_type = match file_entry.file_type() {
             Ok(file_type) => file_type,
@@ -1845,7 +1955,7 @@ fn collect_legacy_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         return Ok(());
     }
 
-    for entry in sanitize::read_dir_validated(root)?.filter_map(|entry| entry.ok()) {
+    for entry in read_store_dir(root)?.filter_map(|entry| entry.ok()) {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         if name.starts_with('.') {

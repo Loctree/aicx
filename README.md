@@ -14,6 +14,9 @@ Operator front door for agent session logs.
 
 `aicx` owns the canonical corpus and the portable local embedding foundation.
 Roost/rust-memex owns the advanced retrieval/operator plane.
+The operator-facing oracle contract is in `docs/ORACLE_CORPUS.md`: raw source
+logs and the canonical corpus are truth; indexes are derived, rebuildable views
+that must disclose fallback and Loctree scope safety.
 
 Supported sources:
 - Claude Code: `~/.claude/projects/*/*.jsonl`
@@ -57,7 +60,7 @@ Directly from GitHub Releases with SHA-256 verification before unpacking:
 
 ```bash
 AICX_INSTALL_MODE=release bash install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.6.4 bash install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.6.5 bash install.sh
 ```
 
 On macOS this consumes the signed/notarized release zip published by CI on the
@@ -233,6 +236,10 @@ Direct chunk re-entry:
 aicx search "doctor sidecars" --json
 aicx read /Users/polyversai/.aicx/store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md --max-chars 4000
 ```
+
+`aicx search --json`, `aicx steer --json`, `aicx intents --emit json`, and the
+matching MCP tools include `oracle_status`. Fuzzy search is visibly marked as a
+filesystem fallback, not semantic oracle readiness.
 
 Native embedder hydration — picking the local model without bloating the bundle:
 

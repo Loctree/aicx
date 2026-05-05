@@ -8,7 +8,9 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::fs;
 use std::io;
 use std::path::Path;
 
@@ -272,6 +274,8 @@ struct CompactSearchItem {
 
 const SEARCH_MATCH_MAX_CHARS: usize = 200;
 const SEARCH_META_PREFIX: &str = "[project:";
+const METADATA_CANDIDATE_FLOOR: usize = 200;
+const METADATA_CANDIDATE_MULTIPLIER: usize = 100;
 
 pub fn search_oracle_status(root: &Path, results: &[FuzzyResult], scanned: usize) -> OracleStatus {
     OracleStatus::filesystem_fuzzy(
@@ -385,6 +389,252 @@ fn truncate_search_match(line: &str, max_chars: usize) -> String {
     truncated
 }
 
+fn select_search_candidates(
+    files: Vec<store::StoredContextFile>,
+    query_terms: &[&str],
+    limit: usize,
+) -> Vec<store::StoredContextFile> {
+    if query_terms.is_empty() {
+        return files;
+    }
+
+    let mut scored = files
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, file)| {
+            let score = metadata_match_count(file, query_terms);
+            (score > 0).then_some((idx, score))
+        })
+        .collect::<Vec<_>>();
+
+    if scored.is_empty() {
+        return files;
+    }
+
+    let metadata_only_query = query_terms
+        .iter()
+        .any(|term| is_generic_metadata_query_term(term));
+
+    scored.sort_by(|(left_idx, left_score), (right_idx, right_score)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| {
+                files[*right_idx]
+                    .date_compact
+                    .cmp(&files[*left_idx].date_compact)
+            })
+            .then_with(|| files[*right_idx].chunk.cmp(&files[*left_idx].chunk))
+    });
+
+    let cap = if metadata_only_query {
+        limit
+            .saturating_mul(METADATA_CANDIDATE_MULTIPLIER)
+            .max(METADATA_CANDIDATE_FLOOR)
+    } else {
+        files.len()
+    };
+    scored
+        .into_iter()
+        .take(cap)
+        .map(|(idx, _)| files[idx].clone())
+        .collect()
+}
+
+fn metadata_match_count(file: &store::StoredContextFile, query_terms: &[&str]) -> usize {
+    let metadata = metadata_search_text(file);
+    query_terms
+        .iter()
+        .filter(|term| metadata.contains(**term))
+        .count()
+}
+
+fn metadata_search_text(file: &store::StoredContextFile) -> String {
+    normalize_query(&format!(
+        "{} {} {} {} {} {}",
+        file.project,
+        file.agent,
+        file.kind.dir_name(),
+        file.date_iso,
+        file.path.file_name().unwrap_or_default().to_string_lossy(),
+        file.path.display()
+    ))
+}
+
+fn metadata_matched_lines(
+    file: &store::StoredContextFile,
+    metadata_text: &str,
+    query_terms: &[&str],
+) -> Vec<String> {
+    if !query_terms.iter().any(|term| metadata_text.contains(*term)) {
+        return Vec::new();
+    }
+
+    metadata_line(file)
+}
+
+fn metadata_line(file: &store::StoredContextFile) -> Vec<String> {
+    vec![format!(
+        "[metadata] project: {} | agent: {} | date: {} | kind: {} | path: {}",
+        file.project,
+        file.agent,
+        file.date_iso,
+        file.kind.dir_name(),
+        file.path.display()
+    )]
+}
+
+fn metadata_covers_query(metadata_text: &str, query_terms: &[&str]) -> bool {
+    let required_terms = query_terms
+        .iter()
+        .filter(|term| !is_generic_metadata_query_term(term))
+        .collect::<Vec<_>>();
+    !required_terms.is_empty()
+        && required_terms
+            .iter()
+            .all(|term| metadata_text.contains(**term))
+}
+
+fn metadata_only_result(
+    stored_file: store::StoredContextFile,
+    metadata_text: &str,
+    query_terms: &[&str],
+) -> FuzzyResult {
+    let matched_lines = {
+        let lines = metadata_matched_lines(&stored_file, metadata_text, query_terms);
+        if lines.is_empty() {
+            metadata_line(&stored_file)
+        } else {
+            lines
+        }
+    };
+    FuzzyResult {
+        file: stored_file
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string(),
+        path: stored_file.path.display().to_string(),
+        project: stored_file.project,
+        kind: stored_file.kind.dir_name().to_string(),
+        frame_kind: None,
+        agent: stored_file.agent,
+        date: stored_file.date_iso,
+        timestamp: None,
+        score: 90,
+        label: "HIGH".to_string(),
+        density: 1.0,
+        matched_lines,
+        session_id: Some(stored_file.session_id),
+        cwd: None,
+    }
+}
+
+fn infer_project_filter_from_query(store_root: &Path, query_terms: &[&str]) -> Option<String> {
+    let tokens = project_hint_tokens(query_terms);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let canonical_root = store_root.join(store::CANONICAL_STORE_DIRNAME);
+    let mut scores: HashMap<String, u8> = HashMap::new();
+
+    let Ok(org_entries) = fs::read_dir(canonical_root) else {
+        return None;
+    };
+
+    for org_entry in org_entries.flatten() {
+        let org_path = org_entry.path();
+        if !org_path.is_dir() {
+            continue;
+        }
+        let org = org_entry.file_name().to_string_lossy().to_string();
+        let Ok(repo_entries) = fs::read_dir(&org_path) else {
+            continue;
+        };
+        for repo_entry in repo_entries.flatten() {
+            let repo_path = repo_entry.path();
+            if !repo_path.is_dir() {
+                continue;
+            }
+            let repo = repo_entry.file_name().to_string_lossy().to_string();
+            let slug = format!("{org}/{repo}");
+            let haystacks = [
+                normalize_query(&org),
+                normalize_query(&repo),
+                normalize_query(&slug),
+            ];
+            let compact_haystacks = haystacks
+                .iter()
+                .map(|value| compact_project_token(value))
+                .collect::<Vec<_>>();
+
+            let mut best_score = 0u8;
+            for token in &tokens {
+                let compact_token = compact_project_token(token);
+                for haystack in &haystacks {
+                    if haystack == token {
+                        best_score = best_score.max(4);
+                    } else if token.len() >= 5 && haystack.contains(token) {
+                        best_score = best_score.max(2);
+                    }
+                }
+                for haystack in &compact_haystacks {
+                    if haystack == &compact_token {
+                        best_score = best_score.max(3);
+                    } else if compact_token.len() >= 5 && haystack.contains(&compact_token) {
+                        best_score = best_score.max(1);
+                    }
+                }
+            }
+
+            if best_score > 0 {
+                scores
+                    .entry(slug)
+                    .and_modify(|score| *score = (*score).max(best_score))
+                    .or_insert(best_score);
+            }
+        }
+    }
+
+    let max_score = scores.values().copied().max()?;
+    let mut best = scores
+        .into_iter()
+        .filter(|(_, score)| *score == max_score)
+        .map(|(slug, _)| slug)
+        .collect::<Vec<_>>();
+    best.sort();
+
+    if best.len() == 1 {
+        best.into_iter().next()
+    } else {
+        tokens.into_iter().next()
+    }
+}
+
+fn project_hint_tokens(query_terms: &[&str]) -> Vec<String> {
+    query_terms
+        .iter()
+        .map(|term| term.trim())
+        .filter(|term| term.len() >= 4 && !is_generic_metadata_query_term(term))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn is_generic_metadata_query_term(term: &str) -> bool {
+    let generic = [
+        "path", "file", "files", "repo", "project", "store", "chunk", "chunks", "context",
+    ];
+    generic.contains(&term)
+}
+
+fn compact_project_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect()
+}
+
 /// Fuzzy-search stored chunk files with normalized AND-matching and quality scoring.
 pub fn fuzzy_search_store(
     store_root: &Path,
@@ -400,7 +650,16 @@ pub fn fuzzy_search_store(
     let mut results = Vec::new();
     let mut total_scanned = 0usize;
 
-    let stored_files = store::scan_context_files_at(store_root).map_err(io::Error::other)?;
+    let inferred_project_filter = if project_filter.is_none() {
+        infer_project_filter_from_query(store_root, &query_terms)
+    } else {
+        None
+    };
+    let effective_project_filter = project_filter.or(inferred_project_filter.as_deref());
+
+    let stored_files = store::scan_context_files_project_at(store_root, effective_project_filter)
+        .map_err(io::Error::other)?;
+    let stored_files = select_search_candidates(stored_files, &query_terms, limit);
     for stored_file in stored_files {
         if stored_file.path.extension().is_none_or(|ext| ext != "md") {
             continue;
@@ -413,6 +672,17 @@ pub fn fuzzy_search_store(
         }
 
         total_scanned += 1;
+        let metadata_text = metadata_search_text(&stored_file);
+        let metadata_matches = metadata_matched_lines(&stored_file, &metadata_text, &query_terms);
+
+        if metadata_covers_query(&metadata_text, &query_terms) {
+            results.push(metadata_only_result(
+                stored_file,
+                &metadata_text,
+                &query_terms,
+            ));
+            continue;
+        }
 
         let Ok(content) = sanitize::read_to_string_validated(&stored_file.path) else {
             continue;
@@ -433,7 +703,7 @@ pub fn fuzzy_search_store(
 
         let matched_terms = query_terms
             .iter()
-            .filter(|&term| signal_text.contains(term))
+            .filter(|&term| signal_text.contains(term) || metadata_text.contains(*term))
             .count();
 
         // Must match at least one term to be considered.
@@ -442,17 +712,23 @@ pub fn fuzzy_search_store(
             continue;
         }
 
-        let matched_lines = signal_lines
-            .iter()
-            .filter(|line| {
-                let normalized_line = normalize_query(line);
-                query_terms
-                    .iter()
-                    .any(|term| normalized_line.contains(term))
-            })
-            .take(5)
-            .map(|line| line.trim().to_string())
-            .collect();
+        let mut matched_lines: Vec<String> = metadata_matches;
+        matched_lines.extend(
+            signal_lines
+                .iter()
+                .filter(|line| {
+                    let normalized_line = normalize_query(line);
+                    query_terms
+                        .iter()
+                        .any(|term| normalized_line.contains(term))
+                })
+                .take(5)
+                .map(|line| line.trim().to_string()),
+        );
+        if matched_lines.is_empty() && metadata_match_count(&stored_file, &query_terms) > 0 {
+            matched_lines = metadata_line(&stored_file);
+        }
+        matched_lines.truncate(5);
 
         let chunk_score = score_chunk_content(&content);
 
@@ -588,6 +864,9 @@ pub fn fuzzy_search_store(
         }
         for r in &mut deduped {
             r.matched_lines.retain(|line| {
+                if line.trim().starts_with("[metadata]") {
+                    return true;
+                }
                 line_freq.get(&normalize_query(line)).copied().unwrap_or(0) < threshold
             });
         }
@@ -1215,6 +1494,153 @@ Some boilerplate text.
     }
 
     #[test]
+    fn fuzzy_search_infers_repo_filter_from_query_token() {
+        let root = search_test_root("fuzzy-infer-repo");
+        let _ = fs::remove_dir_all(&root);
+
+        let wanted = root
+            .join("store")
+            .join("Loctree")
+            .join("loctree-suite")
+            .join("2026_0503")
+            .join("conversations")
+            .join("codex")
+            .join("2026_0503_codex_sess-wanted_001.md");
+        write_chunk(&wanted, "Decision: keep the path contract fast and scoped");
+
+        let other = root
+            .join("store")
+            .join("VetCoders")
+            .join("CodeScribe")
+            .join("2026_0503")
+            .join("conversations")
+            .join("codex")
+            .join("2026_0503_codex_sess-other_001.md");
+        write_chunk(&other, "Decision: keep the path contract fast and scoped");
+
+        let (results, scanned) = fuzzy_search_store(&root, "loctree-suite path", 10, None, None)
+            .expect("search should infer repo from query token");
+
+        assert_eq!(
+            scanned, 1,
+            "repo token should avoid scanning unrelated repo buckets"
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].project, "Loctree/loctree-suite");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fuzzy_search_serves_metadata_query_without_content_match() {
+        let root = search_test_root("fuzzy-metadata-only");
+        let _ = fs::remove_dir_all(&root);
+
+        let chunk = root
+            .join("store")
+            .join("Loctree")
+            .join("loctree-suite")
+            .join("2026_0503")
+            .join("conversations")
+            .join("codex")
+            .join("2026_0503_codex_sess-meta_001.md");
+        write_chunk(
+            &chunk,
+            "This body intentionally does not include the searched repository token.",
+        );
+
+        let (results, scanned) = fuzzy_search_store(&root, "loctree-suite path", 10, None, None)
+            .expect("metadata search should not require body matches");
+
+        assert_eq!(scanned, 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].score, 90);
+        assert!(
+            results[0].matched_lines[0].starts_with("[metadata]"),
+            "metadata-only match should expose provenance"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fuzzy_search_keeps_metadata_provenance_after_dedup() {
+        let root = search_test_root("fuzzy-metadata-provenance");
+        let _ = fs::remove_dir_all(&root);
+
+        for idx in 0..8 {
+            let chunk = root
+                .join("store")
+                .join("LibraxisAI")
+                .join("mlx-batch-server")
+                .join("2026_0504")
+                .join("conversations")
+                .join("claude")
+                .join(format!("2026_0504_claude_session-{idx}_001.md"));
+            write_chunk(
+                &chunk,
+                "This body intentionally does not include the searched repository token.",
+            );
+        }
+
+        let (results, scanned) = fuzzy_search_store(&root, "mlx-batch-server path", 1, None, None)
+            .expect("metadata search should keep a visible reason");
+
+        assert_eq!(scanned, 8);
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0]
+                .matched_lines
+                .iter()
+                .any(|line| line.starts_with("[metadata]")),
+            "metadata-only result should not lose provenance during boilerplate filtering"
+        );
+        assert!(
+            display_search_matches(&results[0])
+                .iter()
+                .any(|line| line.starts_with("[metadata]")),
+            "rendered matches should include metadata provenance"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fuzzy_search_infers_short_exact_repo_name() {
+        let root = search_test_root("fuzzy-short-repo");
+        let _ = fs::remove_dir_all(&root);
+
+        let wanted = root
+            .join("store")
+            .join("Loctree")
+            .join("aicx")
+            .join("2026_0504")
+            .join("conversations")
+            .join("codex")
+            .join("2026_0504_codex_sess-aicx_001.md");
+        write_chunk(&wanted, "Decision: choose the GGUF model tier");
+
+        let other = root
+            .join("store")
+            .join("VetCoders")
+            .join("CodeScribe")
+            .join("2026_0504")
+            .join("conversations")
+            .join("codex")
+            .join("2026_0504_codex_sess-code_001.md");
+        write_chunk(&other, "Decision: choose the GGUF model tier");
+
+        let (results, scanned) = fuzzy_search_store(&root, "aicx gguf models", 10, None, None)
+            .expect("short exact repo token should narrow search");
+
+        assert_eq!(scanned, 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].project, "Loctree/aicx");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn render_search_json_matches_cli_surface_fields() {
         let long_line = "x".repeat(205);
         let json = render_search_json(
@@ -1252,9 +1678,28 @@ Some boilerplate text.
         assert_eq!(payload["scanned"], 127);
         assert_eq!(payload["oracle_status"]["backend"], "filesystem_fuzzy");
         assert_eq!(payload["oracle_status"]["index_kind"], "none");
+        assert_eq!(
+            payload["oracle_status"]["source_layer"],
+            "layer_1_canonical_corpus"
+        );
+        assert_eq!(
+            payload["oracle_status"]["derived_view"],
+            "none_filesystem_scan"
+        );
+        assert_eq!(
+            payload["oracle_status"]["fallback_reason"],
+            "fallback_filesystem_fuzzy: content index unavailable"
+        );
         assert_eq!(payload["oracle_status"]["scanned_count"], 127);
         assert_eq!(payload["oracle_status"]["candidate_count"], 1);
         assert_eq!(payload["oracle_status"]["stale_or_unknown"], true);
+        assert_eq!(payload["oracle_status"]["loctree_scope_safe"], false);
+        assert!(
+            payload["oracle_status"]["loctree_scope_note"]
+                .as_str()
+                .unwrap()
+                .contains("unsafe_for_scope_narrowing")
+        );
         assert_eq!(payload["items"][0]["score"], 88);
         assert_eq!(payload["items"][0]["label"], "HIGH");
         assert_eq!(payload["items"][0]["project"], "VetCoders/ai-contexters");

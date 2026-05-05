@@ -258,9 +258,8 @@ aicx corpus repair --root "$HOME/.aicx/store/Loctree/aicx/2026_0502" --apply --b
 Fuzzy search across the canonical corpus (layer 1, filesystem-only).
 
 Searches chunk content and frontmatter directly in `~/.aicx/` — works
-immediately, no semantic index needed. For semantic retrieval through MCP
-tools, use `aicx serve`; the MCP layer widens through available runtime search
-providers and otherwise falls back to canonical-store fuzzy search.
+immediately, no semantic index needed. JSON output includes `oracle_status`
+and is explicitly marked as filesystem fuzzy, not a semantic/content oracle.
 
 ```bash
 aicx search [OPTIONS] <QUERY>
@@ -318,7 +317,7 @@ aicx read store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.
 
 ## `aicx steer`
 
-Retrieve chunks by steering metadata (frontmatter sidecar fields). Filters by `run_id`, `prompt_id`, agent, kind, repo/store bucket, and/or date range using sidecar metadata — no filesystem grep needed.
+Retrieve chunks by steering metadata (frontmatter sidecar fields). Filters by `run_id`, `prompt_id`, agent, kind, repo/store bucket, and/or date range using sidecar metadata — no filesystem grep needed. JSON output includes `oracle_status` for the rebuildable metadata index.
 
 ```bash
 aicx steer [OPTIONS]
@@ -332,6 +331,7 @@ Options:
 - `-p, --project <PROJECT>` filter by repo or store bucket (case-insensitive substring)
 - `-d, --date <DATE>` filter by date: single day, range, or open-ended
 - `-l, --limit <N>` max results (default: `20`)
+- `-j, --json` emit JSON with `oracle_status`
 
 Examples:
 
@@ -457,6 +457,8 @@ rank surface is intentionally reintroduced.
 ## `aicx intents`
 
 Extract structured intents and decisions from the canonical store (layer 1).
+JSON output includes `oracle_status` and is canonical corpus evidence, not
+semantic oracle output.
 
 ```bash
 aicx intents [OPTIONS] --project <PROJECT>
@@ -465,7 +467,7 @@ aicx intents [OPTIONS] --project <PROJECT>
 Options:
 - `-p, --project <PROJECT>` project filter (required)
 - `-H, --hours <HOURS>` lookback window (default: `720`)
-- `--emit <markdown|json>` output format (default: `markdown`)
+- `--emit <markdown|json>` output format (default: `markdown`; `json` includes `oracle_status`)
 - `--strict` only show high-confidence intents
 - `--kind <decision|intent|outcome|task>` filter by kind
 
@@ -571,9 +573,8 @@ Run `aicx` as an MCP server (stdio or streamable HTTP transport).
 
 Exposes search, read, steer, and rank tools over MCP for agent retrieval.
 `aicx_steer` and `aicx_rank` query the canonical corpus on disk.
-`aicx_search` uses canonical-store fuzzy search today; semantic widening belongs
-to configured downstream retrieval providers and must fall back cleanly to the
-canonical store.
+`aicx_search` uses canonical-store fuzzy search today and returns
+`oracle_status` so callers cannot mistake it for semantic retrieval.
 `aicx_read` pulls the actual chunk content by path, file name, or compact
 reference after a discover step.
 

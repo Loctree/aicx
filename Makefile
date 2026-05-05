@@ -4,7 +4,7 @@
 .PHONY: all build build-native install install-bin install-config install-cargo git-hooks
 .PHONY: precheck precheck-native test test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
 .PHONY: embeddings-check embeddings-test embeddings-clippy embeddings-hydrate embeddings-info
-.PHONY: version-show version-check version-bump changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle
+.PHONY: version version-show version-check version-bump version-patch bump-patch changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle
 
 all: build
 
@@ -150,6 +150,8 @@ semgrep:
 ci: check
 	@echo "CI-equivalent local checks passed."
 
+version: version-show
+
 version-show:
 	@printf "package: %s\n" "$(PACKAGE_NAME)"
 	@printf "version: %s\n" "$(VERSION)"
@@ -175,6 +177,9 @@ ifeq ($(origin VERSION),command line)
 else
 	@echo "VERSION is required. Usage: make version-bump VERSION={patch|minor|major|x.y.z}" >&2 && exit 1
 endif
+
+version-patch bump-patch:
+	@$(MAKE) version-bump VERSION=patch
 
 changelog-close:
 	@python3 tools/changelog_close.py $(if $(CHANGELOG_GENERATE),--generate-if-empty)
@@ -292,9 +297,12 @@ help:
 	@echo "  make embeddings-clippy                                     - Clippy aicx-embeddings with GGUF backend"
 	@echo ""
 	@echo "Release / Version:"
+	@echo "  make version               - Alias for version-show"
 	@echo "  make version-show          - Show package version and tag state"
 	@echo "  make version-check         - Validate synced release surfaces (Cargo/docs/npm/changelog basics)"
 	@echo "  make version-bump VERSION=X - Bump version and sync docs/npm surfaces. X={patch|minor|major|x.y.z}"
+	@echo "  make version-patch         - Alias for version-bump VERSION=patch"
+	@echo "  make bump-patch            - Alias for version-bump VERSION=patch"
 	@echo "  make changelog-close       - Close CHANGELOG '## [Unreleased]' to current version + date"
 	@echo "  make release-notes         - Print release notes body derived from CHANGELOG current version section"
 	@echo "  make release-plan          - Print the full post-merge release flow"

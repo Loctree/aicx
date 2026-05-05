@@ -14,10 +14,6 @@ use rmcp::{
     model::*, tool, tool_router,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
-
-/// Guard that prevents concurrent background refresh child-process spawns.
-static RESCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 
 use crate::intents::{self, IntentKind, IntentsConfig};
 use crate::oracle::OracleStatus;
@@ -248,6 +244,7 @@ struct SteerResponse {
     items: Vec<serde_json::Value>,
 }
 
+#[cfg(test)]
 fn background_refresh_args(hours: u64, project: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "all".to_string(),
@@ -291,7 +288,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_search",
-        description = "Search stored AI session chunks. Uses memex semantic retrieval when available and otherwise falls back to canonical-store fuzzy search. Returns quality-scored results with matched lines."
+        description = "Search stored AI session chunks with fast metadata narrowing plus canonical-store fuzzy scoring. Returns oracle_status so callers can see that this is filesystem fuzzy, not semantic retrieval."
     )]
     async fn search(
         &self,
@@ -310,29 +307,6 @@ impl AicxMcpServer {
             limit
         };
 
-        // Non-blocking auto-rescan with rate-limit guard.
-        if !RESCAN_RUNNING.swap(true, Ordering::SeqCst) {
-            let args = background_refresh_args(24, project.as_deref());
-            match std::process::Command::new("aicx")
-                .args(&args)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                Ok(_) => {
-                    std::thread::spawn(|| {
-                        std::thread::sleep(std::time::Duration::from_secs(30));
-                        RESCAN_RUNNING.store(false, Ordering::SeqCst);
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to spawn aicx background refresh: {e}");
-                    RESCAN_RUNNING.store(false, Ordering::SeqCst);
-                }
-            }
-        }
-
-        // Fallback to reading all markdown files sequentially (slow)
         let store_root = store::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
         let (results, scanned) = rank::fuzzy_search_store(
@@ -552,7 +526,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_steer",
-        description = "Retrieve stored chunks by steering metadata (frontmatter fields). Filters by run_id, prompt_id, agent, kind, project, and/or date range using sidecar metadata — no filesystem grep needed. Returns chunk paths with their sidecar metadata for selective re-entry."
+        description = "Retrieve stored chunks by steering metadata (frontmatter fields). Filters by run_id, prompt_id, agent, kind, project, and/or date range using sidecar metadata — no filesystem grep needed. Returns oracle_status for the rebuildable metadata index and chunk paths for canonical re-entry."
     )]
     async fn steer(
         &self,
@@ -658,7 +632,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_intents",
-        description = "Retrieve structured intentions, decisions, outcomes, and tasks extracted from the canonical store. Returns the third sense in the aicx perception/intention/ground-truth triad — surfaces what the team meant to build, decided, deferred, or completed, with source_chunk back-references for grounded follow-up. Mirrors the `aicx intents` CLI: filter by project, hours window (default 720 = 30 days), kind (decision/intent/outcome/task), frame_kind, agent, date range, plus unresolved (intents without matching outcome) and collapse_session (group by session with count). Default: 50 records, last 30 days, all projects, JSON. Cap: 500."
+        description = "Retrieve structured intentions, decisions, outcomes, and tasks extracted from the canonical store. Returns oracle_status marking this as canonical corpus evidence, not semantic oracle output, with source_chunk back-references for grounded follow-up. Mirrors the `aicx intents` CLI: filter by project, hours window (default 720 = 30 days), kind (decision/intent/outcome/task), frame_kind, agent, date range, plus unresolved (intents without matching outcome) and collapse_session (group by session with count). Default: 50 records, last 30 days, all projects, JSON. Cap: 500."
     )]
     async fn intents(
         &self,
@@ -704,8 +678,9 @@ impl AicxMcpServer {
             frame_kind: params.frame_kind,
         };
 
-        let records = intents::extract_intents(&config)
+        let extraction = intents::extract_intents_with_stats(&config)
             .map_err(|e| McpError::internal_error(format!("Extract intents: {e}"), None))?;
+        let records = extraction.records;
 
         let limit_capped = params.limit.min(500);
 
@@ -726,15 +701,11 @@ impl AicxMcpServer {
             _ => {
                 let store_root = store::store_base_dir()
                     .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
-                let oracle_status = OracleStatus::filesystem_fuzzy(
+                let oracle_status = OracleStatus::canonical_corpus_scan(
                     &store_root,
-                    records.len(),
-                    records.len(),
-                    crate::oracle::verify_paths(
-                        records
-                            .iter()
-                            .map(|record| std::path::PathBuf::from(&record.source_chunk)),
-                    ),
+                    extraction.stats.scanned_count,
+                    extraction.stats.candidate_count,
+                    extraction.stats.source_paths_verified,
                 );
                 intents::format_intents_oracle_json(&records, oracle_status).map_err(|e| {
                     McpError::internal_error(format!("Serialize intents JSON: {e}"), None)
@@ -991,6 +962,9 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_str(&json).expect("steer JSON should parse");
         assert_eq!(payload["results"], 1);
+        assert_eq!(payload["oracle_status"]["backend"], "steer_metadata");
+        assert_eq!(payload["oracle_status"]["index_kind"], "metadata_steer");
+        assert_eq!(payload["oracle_status"]["loctree_scope_safe"], true);
         assert_eq!(payload["items"][0]["path"], "/tmp/chunk.md");
         assert_eq!(payload["items"][0]["agent"], "codex");
     }

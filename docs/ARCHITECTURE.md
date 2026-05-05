@@ -11,6 +11,9 @@ system with retrieval surfaces layered on top:
 
 `aicx` owns the canonical corpus and portable local embedding foundation.
 Roost/rust-memex owns the advanced retrieval/operator plane.
+See `docs/ORACLE_CORPUS.md` for the operator contract: raw/canonical corpus is
+truth; indexes are derived, rebuildable views that must disclose fallback,
+freshness, and Loctree scope safety.
 
 The pipeline exposes chunks through CLI, MCP, dashboard search surfaces, and an
 adjacent Vibecrafted artifact explorer for workflow/marbles reports.
@@ -117,10 +120,10 @@ Frontmatter is not just telemetry — it is part of the steering and selective r
 
 The MCP server exposes four tools via stdio and streamable HTTP transports:
 
-- `aicx_search` — search stored chunks with quality scoring; downstream retrieval providers may widen results, but the canonical-store fuzzy path remains the safe fallback
+- `aicx_search` — canonical-store filesystem fuzzy search with quality scoring and `oracle_status`; this is not semantic retrieval and is not safe for Loctree scope narrowing until callers read the canonical chunks
 - `aicx_read` — read one canonical chunk by path, file name, or compact reference; this is the direct re-entry step after search, refs, steer, or dashboard discovery
 - `aicx_rank` — rank chunks by signal density for a project as compact JSON
-- `aicx_steer` — retrieve chunks by steering metadata (run_id, prompt_id, agent, kind, project, date) using sidecar data; the primary metadata-aware retrieval path for orchestration
+- `aicx_steer` — retrieve chunks by steering metadata (run_id, prompt_id, agent, kind, project, date) using sidecar data; returns `oracle_status` for the rebuildable metadata index and is safe for Loctree metadata narrowing only when source paths verify
 
 Recency filtering in `aicx_search` and `aicx_steer` uses canonical chunk dates from the store layout, not filesystem `mtime` accidents.
 
