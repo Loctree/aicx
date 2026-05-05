@@ -630,31 +630,50 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract a single session file and write it to a specific output path (layer 1, direct).
+    /// Extract a single session — by file path or by session id.
     ///
-    /// Bypasses the canonical store — useful for one-off inspection or piping.
+    /// Two modes:
+    /// 1. File mode (legacy): `aicx extract --format claude /path/to/session.jsonl -o /tmp/report.md`
+    /// 2. Session mode: `aicx extract --session <uuid> --agent {claude,codex,gemini,junie} [-o FILE]`
     ///
-    /// Example:
-    ///   aicx extract --format claude /path/to/session.jsonl -o /tmp/report.md
+    /// In session mode, the chosen agent's source store is scanned, all timeline
+    /// entries matching `--session` are filtered, and a denoised conversation
+    /// Markdown transcript is written. Default output path is
+    /// `~/.aicx/extracts/<agent>/<session_id>.md`.
     #[command(display_order = 5)]
     Extract {
         #[command(flatten)]
         redaction: RedactionArgs,
 
-        /// Input format (agent): claude | codex | gemini | gemini-antigravity | junie
+        /// Input format (agent), required in file mode: claude | codex | gemini | gemini-antigravity | junie
         #[arg(long, value_enum, alias = "input-format")]
-        format: ExtractInputFormat,
+        format: Option<ExtractInputFormat>,
 
         /// Explicit project/repo name (overrides inference)
         #[arg(short, long)]
         project: Option<String>,
 
-        /// Input path (JSONL / JSON / Antigravity brain directory depending on agent)
-        input: PathBuf,
+        /// Session id (UUID or agent-native id) for session-mode extraction.
+        /// Mutually exclusive with positional `input`.
+        #[arg(long, conflicts_with = "input")]
+        session: Option<String>,
 
-        /// Output file path (e.g. /tmp/report.md)
+        /// Source agent for session-mode extraction. Required together with `--session`.
+        #[arg(long, value_enum, conflicts_with = "input")]
+        agent: Option<ExtractInputFormat>,
+
+        /// Hours to look back when scanning sources in session mode (default: 1 year).
+        #[arg(short = 'H', long, default_value = "8760")]
+        hours: u64,
+
+        /// Input path (JSONL / JSON / Antigravity brain directory depending on agent).
+        /// Used in file mode; mutually exclusive with `--session`.
+        input: Option<PathBuf>,
+
+        /// Output file path. In file mode this is required.
+        /// In session mode, defaults to `~/.aicx/extracts/<agent>/<session_id>.md`.
         #[arg(short, long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
 
         /// Only include user messages (exclude assistant + reasoning)
         #[arg(long)]
@@ -1261,6 +1280,9 @@ fn main() -> Result<()> {
             redaction,
             format,
             project,
+            session,
+            agent,
+            hours,
             input,
             output,
             user_only,
@@ -1269,18 +1291,44 @@ fn main() -> Result<()> {
             conversation,
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
-            run_extract_file(
-                format,
-                project,
-                input,
-                output,
-                ExtractFileOptions {
-                    include_assistant,
-                    max_message_chars,
-                    redact_secrets: redaction.redact_secrets,
-                    conversation,
-                },
-            )?;
+
+            // Session mode: --session [+ --agent] -> scan sources, filter by session_id.
+            if let Some(session_id) = session {
+                let agent = agent
+                    .or(format)
+                    .context("--session requires --agent {claude|codex|gemini|junie}")?;
+                run_extract_session(
+                    &session_id,
+                    agent,
+                    output,
+                    hours,
+                    project,
+                    ExtractFileOptions {
+                        include_assistant,
+                        max_message_chars,
+                        redact_secrets: redaction.redact_secrets,
+                        conversation: true, // session mode is conversation-first by default
+                    },
+                )?;
+            } else {
+                // File mode (legacy): --format <agent> + positional input + -o.
+                let format = format
+                    .context("file-mode extract requires --format {claude|codex|gemini|gemini-antigravity|junie}")?;
+                let input = input.context("file-mode extract requires a positional INPUT path")?;
+                let output = output.context("file-mode extract requires -o/--output <FILE>")?;
+                run_extract_file(
+                    format,
+                    project,
+                    input,
+                    output,
+                    ExtractFileOptions {
+                        include_assistant,
+                        max_message_chars,
+                        redact_secrets: redaction.redact_secrets,
+                        conversation,
+                    },
+                )?;
+            }
         }
         Some(Commands::Store {
             redaction,
@@ -1958,6 +2006,164 @@ struct ExtractFileOptions {
     max_message_chars: usize,
     redact_secrets: bool,
     conversation: bool,
+}
+
+fn extract_input_format_label(format: ExtractInputFormat) -> &'static str {
+    match format {
+        ExtractInputFormat::Claude => "claude",
+        ExtractInputFormat::Codex => "codex",
+        ExtractInputFormat::Gemini => "gemini",
+        ExtractInputFormat::GeminiAntigravity => "gemini",
+        ExtractInputFormat::Junie => "junie",
+    }
+}
+
+/// Resolve the default output path for `aicx extract --session ...`:
+/// `~/.aicx/extracts/<agent>/<session_id>.md`.
+fn default_session_extract_path(agent_label: &str, session_id: &str) -> Result<PathBuf> {
+    let base = aicx::store::store_base_dir()?;
+    let safe_session: String = session_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Ok(base
+        .join("extracts")
+        .join(agent_label)
+        .join(format!("{safe_session}.md")))
+}
+
+/// Run extraction filtered by `session_id` for a single agent and write a
+/// denoised conversation Markdown transcript. Default output path is
+/// `~/.aicx/extracts/<agent>/<session_id>.md`; override via `output`.
+fn run_extract_session(
+    session_id: &str,
+    agent: ExtractInputFormat,
+    output: Option<PathBuf>,
+    hours: u64,
+    explicit_project: Option<String>,
+    options: ExtractFileOptions,
+) -> Result<()> {
+    let ExtractFileOptions {
+        include_assistant,
+        max_message_chars,
+        redact_secrets,
+        conversation,
+    } = options;
+
+    let agent_label = extract_input_format_label(agent);
+    let cutoff = Utc::now() - chrono::Duration::hours(hours.max(1) as i64);
+    let config = ExtractionConfig {
+        project_filter: explicit_project
+            .as_ref()
+            .map(|p| vec![p.clone()])
+            .unwrap_or_default(),
+        cutoff,
+        include_assistant,
+        watermark: None,
+    };
+
+    let mut entries: Vec<timeline::TimelineEntry> = match agent {
+        ExtractInputFormat::Claude => sources::extract_claude(&config)?,
+        ExtractInputFormat::Codex => sources::extract_codex(&config)?,
+        ExtractInputFormat::Gemini | ExtractInputFormat::GeminiAntigravity => {
+            sources::extract_gemini(&config)?
+        }
+        ExtractInputFormat::Junie => sources::extract_junie(&config)?,
+    };
+
+    // Filter by session_id (exact match).
+    entries.retain(|e| e.session_id == session_id);
+
+    if entries.is_empty() {
+        anyhow::bail!(
+            "No entries found for session `{}` in agent `{}` within last {} hours.\n\
+             Try: increase --hours, verify the session id, or check that the source store is populated.",
+            session_id,
+            agent_label,
+            hours,
+        );
+    }
+
+    entries.sort_by_key(|e| e.timestamp);
+
+    if redact_secrets {
+        for e in &mut entries {
+            e.message = aicx::redact::redact_secrets(&e.message);
+        }
+    }
+
+    let output_path = match output {
+        Some(p) => p,
+        None => default_session_extract_path(agent_label, session_id)?,
+    };
+
+    let inferred_repos = sources::repo_labels_from_entries(&entries, &[]);
+    let project_identity = explicit_project.unwrap_or_else(|| {
+        if inferred_repos.is_empty() {
+            format!("{agent_label}/{session_id}")
+        } else {
+            inferred_repos.join("+")
+        }
+    });
+
+    let hours_back = entries
+        .first()
+        .map(|e| (Utc::now() - e.timestamp).num_hours().max(0) as u64)
+        .unwrap_or(0);
+
+    let metadata = ReportMetadata {
+        generated_at: Utc::now(),
+        project_filter: Some(project_identity.clone()),
+        hours_back,
+        total_entries: entries.len(),
+        sessions: vec![session_id.to_string()],
+    };
+
+    if conversation {
+        let conv_msgs = sources::to_conversation(&entries, &[project_identity]);
+        let ext = output_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("md")
+            .to_lowercase();
+        if ext == "json" {
+            output::write_conversation_json(&output_path, &conv_msgs, &metadata)?;
+        } else {
+            output::write_conversation_markdown(&output_path, &conv_msgs, &metadata)?;
+        }
+    } else {
+        let ext = output_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("md")
+            .to_lowercase();
+        if ext == "json" {
+            output::write_json_report_to_path(&output_path, &entries, &metadata)?;
+        } else {
+            output::write_markdown_report_to_path(
+                &output_path,
+                &entries,
+                &metadata,
+                max_message_chars,
+                None,
+            )?;
+        }
+    }
+
+    eprintln!(
+        "Extracted {} entries from session `{}` ({}) -> {}",
+        entries.len(),
+        session_id,
+        agent_label,
+        output_path.display()
+    );
+    Ok(())
 }
 
 fn run_extract_file(
@@ -4603,7 +4809,10 @@ mod tests {
 
         match cli.command {
             Some(Commands::Extract { format, .. }) => {
-                assert!(matches!(format, ExtractInputFormat::GeminiAntigravity));
+                assert!(matches!(
+                    format,
+                    Some(ExtractInputFormat::GeminiAntigravity)
+                ));
             }
             _ => panic!("expected extract command"),
         }
@@ -4624,10 +4833,59 @@ mod tests {
 
         match cli.command {
             Some(Commands::Extract { format, .. }) => {
-                assert!(matches!(format, ExtractInputFormat::Junie));
+                assert!(matches!(format, Some(ExtractInputFormat::Junie)));
             }
             _ => panic!("expected extract command"),
         }
+    }
+
+    #[test]
+    fn extract_accepts_session_mode() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "extract",
+            "--session",
+            "11111111-2222-3333-4444-555555555555",
+            "--agent",
+            "claude",
+        ])
+        .expect("extract --session should parse without positional input");
+
+        match cli.command {
+            Some(Commands::Extract {
+                session,
+                agent,
+                input,
+                output,
+                ..
+            }) => {
+                assert_eq!(
+                    session.as_deref(),
+                    Some("11111111-2222-3333-4444-555555555555")
+                );
+                assert!(matches!(agent, Some(ExtractInputFormat::Claude)));
+                assert!(input.is_none());
+                assert!(output.is_none());
+            }
+            _ => panic!("expected extract command"),
+        }
+    }
+
+    #[test]
+    fn extract_session_and_input_are_mutually_exclusive() {
+        let res = Cli::try_parse_from([
+            "aicx",
+            "extract",
+            "--session",
+            "abc",
+            "--agent",
+            "junie",
+            "/tmp/session/events.jsonl",
+        ]);
+        assert!(
+            res.is_err(),
+            "--session must conflict with positional INPUT path"
+        );
     }
 
     #[test]

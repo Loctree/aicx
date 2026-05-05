@@ -904,7 +904,10 @@ pub fn context_files_since(
 }
 
 fn read_store_dir(path: &Path) -> Result<fs::ReadDir> {
-    fs::read_dir(path).with_context(|| format!("Failed to read store dir {}", path.display()))
+    let validated = sanitize::validate_dir_path(path)?;
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    fs::read_dir(&validated)
+        .with_context(|| format!("Failed to read store dir {}", validated.display()))
 }
 
 /// Read one canonical chunk by absolute path, store-relative path, file name,
@@ -2160,7 +2163,7 @@ fn collect_source_hints_from_text(
     source_hints: &mut BTreeSet<String>,
 ) {
     let absolute_path_re = Regex::new(
-        r"(?:(?:file://)?(/(?:[A-Za-z0-9._~\-]+/)*[A-Za-z0-9._~\-]+(?:\.[A-Za-z0-9._~-]+)?))",
+        r"(?:file://)?(/(?:[A-Za-z0-9._~\-]+/)*[A-Za-z0-9._~\-]+(?:\.[A-Za-z0-9._~-]+)?)",
     )
     .expect("absolute legacy source hint regex should compile");
     let tilde_path_re =
