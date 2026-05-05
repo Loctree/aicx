@@ -121,11 +121,118 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
+require_cmd shasum
+
+if [[ "${AICX_RELEASE_BUNDLE_ONLY_BINARIES:-0}" == "1" ]]; then
+  echo "=== AICX unsigned bundle (binaries-only, no codesign/notarize) ==="
+  TARGET="${TARGET:-$(host_target)}"
+  if [[ "$TARGET" != *apple-darwin ]]; then
+    echo "Error: release-bundle-only-binaries requires an Apple target, got: $TARGET" >&2
+    exit 1
+  fi
+
+  VERSION="$(toml_value package.version)"
+  if [[ -z "$PACKAGE_NAME" ]]; then
+    PACKAGE_NAME="$(toml_value package.name)"
+  fi
+  DIST_DIR=$(python3 - "$DIST_DIR" <<'PY'
+import os, sys
+print(os.path.abspath(os.path.expanduser(sys.argv[1])))
+PY
+  )
+  mkdir -p "$DIST_DIR"
+
+  RELEASE_DIR="$REPO_ROOT/target/$TARGET/release"
+  if [[ -z "$FEATURES_VALUE" && "$NATIVE_VALUE" == "1" ]]; then
+    FEATURES_VALUE="native-embedder"
+  fi
+  if [[ -n "$FEATURES_VALUE" ]]; then
+    BUILD_FLAVOR="${AICX_BUNDLE_FLAVOR:-native}"
+  else
+    BUILD_FLAVOR="${AICX_BUNDLE_FLAVOR:-slim}"
+  fi
+  BUNDLE_BASENAME="${PACKAGE_NAME}-v${VERSION}-${TARGET}-${BUILD_FLAVOR}-unsigned"
+  BUNDLE_DIR="$DIST_DIR/$BUNDLE_BASENAME"
+  ARCHIVE_PATH="$DIST_DIR/${BUNDLE_BASENAME}.tar.gz"
+  CHECKSUM_PATH="${ARCHIVE_PATH}.sha256"
+
+  echo "Repo:            $REPO_ROOT"
+  echo "Version:         $VERSION"
+  echo "Target:          $TARGET"
+  echo "Build flavor:    $BUILD_FLAVOR"
+  echo "Cargo features:  ${FEATURES_VALUE:-<none>}"
+  echo "Cleanup target:  $CLEAN_AFTER_BUILD"
+  echo "Dist dir:        $DIST_DIR"
+  echo "Archive:         $ARCHIVE_PATH"
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    echo ""
+    echo "[dry-run] Would:"
+    if [[ -n "$FEATURES_VALUE" ]]; then
+      echo "  1. cargo build --locked --release --target $TARGET --features $FEATURES_VALUE --bin aicx --bin aicx-mcp"
+    else
+      echo "  1. cargo build --locked --release --target $TARGET --bin aicx --bin aicx-mcp"
+    fi
+    echo "  2. compose $BUNDLE_DIR layout (bin + LICENSE + README + install.sh + docs)"
+    echo "  3. tar -czf $ARCHIVE_PATH"
+    echo "  4. shasum -a 256 -> $CHECKSUM_PATH"
+    exit 0
+  fi
+
+  echo "[1/3] Building release binaries..."
+  (
+    cd "$REPO_ROOT"
+    if [[ -n "$FEATURES_VALUE" ]]; then
+      cargo build --locked --release --target "$TARGET" --features "$FEATURES_VALUE" --bin aicx --bin aicx-mcp
+    else
+      cargo build --locked --release --target "$TARGET" --bin aicx --bin aicx-mcp
+    fi
+  )
+
+  rm -rf "$BUNDLE_DIR"
+  mkdir -p "$BUNDLE_DIR/docs"
+  cp "$RELEASE_DIR/aicx" "$BUNDLE_DIR/aicx"
+  cp "$RELEASE_DIR/aicx-mcp" "$BUNDLE_DIR/aicx-mcp"
+  cp "$REPO_ROOT/LICENSE" "$BUNDLE_DIR/LICENSE"
+  cp "$REPO_ROOT/README.md" "$BUNDLE_DIR/README.md"
+  cp "$REPO_ROOT/install.sh" "$BUNDLE_DIR/install.sh"
+  cp "$REPO_ROOT/docs/COMMANDS.md" "$BUNDLE_DIR/docs/COMMANDS.md"
+  cp "$REPO_ROOT/docs/RELEASES.md" "$BUNDLE_DIR/docs/RELEASES.md"
+  chmod +x "$BUNDLE_DIR/install.sh"
+
+  echo "[2/3] Packaging tar.gz archive..."
+  rm -f "$ARCHIVE_PATH" "$CHECKSUM_PATH"
+  (cd "$DIST_DIR" && tar -czf "$ARCHIVE_PATH" "$BUNDLE_BASENAME")
+  shasum -a 256 "$ARCHIVE_PATH" > "$CHECKSUM_PATH"
+
+  echo "[3/3] Final artifact summary..."
+  echo "Bundle dir:      $BUNDLE_DIR"
+  echo "Archive:         $ARCHIVE_PATH"
+  echo "Checksum:        $CHECKSUM_PATH"
+  echo ""
+  echo "Note: this archive is intentionally unsigned. Consumers that need a notarized"
+  echo "      build should use \`make release-bundle KEYS=...\` instead."
+
+  if [[ "$CLEAN_AFTER_BUILD" == "1" ]]; then
+    echo ""
+    echo "[post] Cleaning Cargo target dir for $TARGET ..."
+    if (
+      cd "$REPO_ROOT"
+      cargo clean --target "$TARGET"
+    ); then
+      echo "[post] Cargo target cleaned."
+    else
+      echo "[post] Warning: cargo clean failed; bundle is still valid." >&2
+    fi
+  fi
+
+  exit 0
+fi
+
 require_cmd codesign
 require_cmd security
 require_cmd xcrun
 require_cmd ditto
-require_cmd shasum
 
 TARGET="${TARGET:-$(host_target)}"
 if [[ "$TARGET" != *apple-darwin ]]; then

@@ -4,7 +4,7 @@
 .PHONY: all build build-native install install-bin install-config install-cargo git-hooks
 .PHONY: precheck precheck-native test test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
 .PHONY: embeddings-check embeddings-test embeddings-clippy embeddings-hydrate embeddings-info
-.PHONY: version version-show version-check version-bump version-patch bump-patch changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle
+.PHONY: version version-show version-check version-bump version-patch bump-patch changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle release-bundle-only-binaries
 
 all: build
 
@@ -260,6 +260,14 @@ package-check:
 release-bundle:
 	@KEYS="$(KEYS)" \
 	NOTARY_PROFILE="$(NOTARY_PROFILE)" \
+	AICX_CLEAN_AFTER_BUILD="$(CLEAN)" \
+	NATIVE="$(NATIVE)" \
+	FEATURES="$(FEATURES)" \
+	PACKAGE_NAME="$(PACKAGE_NAME)" \
+	./tools/release_bundle.sh
+
+release-bundle-only-binaries:
+	@AICX_RELEASE_BUNDLE_ONLY_BINARIES=1 \
 	AICX_CLEAN_AFTER_BUILD="$(CLEAN)" \
 	NATIVE="$(NATIVE)" \
 	FEATURES="$(FEATURES)" \
