@@ -7,15 +7,76 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 /// Default maximum number of stored hashes before pruning.
 const DEFAULT_MAX_HASHES: usize = 50_000;
+
+/// Per-project dedup hashes with insertion/LRU order preserved.
+#[derive(Debug, Clone, Default)]
+pub struct SeenHashSet {
+    order: VecDeque<u64>,
+    set: HashSet<u64>,
+}
+
+impl SeenHashSet {
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    pub fn contains(&self, hash: &u64) -> bool {
+        self.set.contains(hash)
+    }
+
+    pub fn insert(&mut self, hash: u64) {
+        if self.set.remove(&hash) {
+            self.order.retain(|existing| *existing != hash);
+        }
+        self.set.insert(hash);
+        self.order.push_back(hash);
+    }
+
+    pub fn prune_oldest(&mut self, limit: usize) {
+        while self.set.len() > limit {
+            let Some(hash) = self.order.pop_front() else {
+                break;
+            };
+            self.set.remove(&hash);
+        }
+    }
+}
+
+impl Serialize for SeenHashSet {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.order.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SeenHashSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let hashes = Vec::<u64>::deserialize(deserializer)?;
+        let mut out = SeenHashSet::default();
+        for hash in hashes {
+            out.insert(hash);
+        }
+        Ok(out)
+    }
+}
 
 /// Record of a single extraction run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,7 +99,7 @@ pub struct StateManager {
     /// Key is project name, value is the set of hashes seen for that project.
     /// This prevents cross-project dedup pollution: entries extracted for
     /// project A won't be skipped when extracting project B.
-    pub seen_hashes: HashMap<String, HashSet<u64>>,
+    pub seen_hashes: HashMap<String, SeenHashSet>,
     /// History of extraction runs.
     pub runs: Vec<RunRecord>,
 }
@@ -158,6 +219,26 @@ impl StateManager {
         self.last_processed.get(source).copied()
     }
 
+    /// Carry a watermark forward from legacy source-key generations into the
+    /// canonical key so adding/removing extractor agents does not reset ingest.
+    pub fn migrate_watermark_aliases(&mut self, canonical: &str, aliases: &[String]) -> bool {
+        if self.last_processed.contains_key(canonical) {
+            return false;
+        }
+
+        let migrated = aliases
+            .iter()
+            .filter_map(|alias| self.last_processed.get(alias).copied())
+            .max();
+
+        if let Some(ts) = migrated {
+            self.last_processed.insert(canonical.to_string(), ts);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Update the watermark for a source, but only if the new timestamp
     /// is strictly newer than the existing one.
     pub fn update_watermark(&mut self, source: &str, ts: DateTime<Utc>) {
@@ -196,14 +277,7 @@ impl StateManager {
         };
 
         for set in self.seen_hashes.values_mut() {
-            if set.len() <= limit {
-                continue;
-            }
-            let excess = set.len() - limit;
-            let to_remove: Vec<u64> = set.iter().take(excess).copied().collect();
-            for hash in to_remove {
-                set.remove(&hash);
-            }
+            set.prune_oldest(limit);
         }
     }
 
@@ -381,6 +455,47 @@ mod tests {
 
         state.prune_old_hashes(30);
         assert_eq!(state.seen_hashes["proj"].len(), 30);
+    }
+
+    #[test]
+    fn lru_evicts_oldest_first() {
+        let mut state = StateManager::default();
+        for i in 0..10u64 {
+            state.mark_seen("proj", i);
+        }
+
+        state.prune_old_hashes(5);
+
+        for old in 0..5u64 {
+            assert!(
+                state.is_new("proj", old),
+                "old hash {old} should be evicted"
+            );
+        }
+        for fresh in 5..10u64 {
+            assert!(
+                !state.is_new("proj", fresh),
+                "fresh hash {fresh} should remain"
+            );
+        }
+    }
+
+    #[test]
+    fn watermark_migration_carries_timestamp_forward() {
+        let mut state = StateManager::default();
+        let ts = Utc.with_ymd_and_hms(2026, 5, 6, 11, 0, 0).unwrap();
+        state.update_watermark("claude+codex+gemini:all", ts);
+
+        let migrated = state.migrate_watermark_aliases(
+            "claude+codex+gemini+junie:all",
+            &["claude+codex+gemini:all".to_string()],
+        );
+
+        assert!(migrated);
+        assert_eq!(
+            state.get_watermark("claude+codex+gemini+junie:all"),
+            Some(ts)
+        );
     }
 
     #[test]

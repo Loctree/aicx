@@ -12,7 +12,7 @@ use anyhow::{Result, anyhow};
 use std::path::{Component, Path, PathBuf};
 
 /// Known safe agent binary names.
-const ALLOWED_AGENTS: &[&str] = &["claude", "codex"];
+pub use aicx_parser::sanitize::ALLOWED_AGENTS;
 
 // ============================================================================
 // Core helpers (mirroring rmcp-memex pattern)
@@ -418,6 +418,10 @@ mod tests {
     fn test_safe_agent_name_valid() {
         assert_eq!(safe_agent_name("claude").unwrap(), "claude");
         assert_eq!(safe_agent_name("codex").unwrap(), "codex");
+        assert_eq!(safe_agent_name("gemini").unwrap(), "gemini");
+        assert_eq!(safe_agent_name("junie").unwrap(), "junie");
+        assert_eq!(safe_agent_name("codescribe").unwrap(), "codescribe");
+        assert_eq!(safe_agent_name("operator-md").unwrap(), "operator-md");
     }
 
     #[test]

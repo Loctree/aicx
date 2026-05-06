@@ -15,8 +15,9 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use crate::oracle::OracleReadiness;
 use crate::steer_index;
@@ -30,15 +31,16 @@ pub struct DoctorOptions {
     pub verbose: bool,
 }
 
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Green,
+    #[default]
     Warning,
     Critical,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CheckResult {
     pub name: String,
     pub severity: Severity,
@@ -46,7 +48,18 @@ pub struct CheckResult {
     pub recommendation: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+impl Default for CheckResult {
+    fn default() -> Self {
+        Self {
+            name: "unknown".to_string(),
+            severity: Severity::Warning,
+            detail: "not checked".to_string(),
+            recommendation: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DoctorReport {
     pub canonical_store: CheckResult,
     pub steer_lance: CheckResult,
@@ -55,6 +68,14 @@ pub struct DoctorReport {
     pub sidecars: CheckResult,
     pub corpus_buckets: CheckResult,
     pub noise_health: CheckResult,
+    #[serde(default)]
+    pub semantic_health: CheckResult,
+    #[serde(default)]
+    pub index_freshness: CheckResult,
+    #[serde(default)]
+    pub sidecar_coverage: CheckResult,
+    #[serde(default)]
+    pub embedder_warmth: CheckResult,
     pub fixes_applied: Vec<String>,
     pub overall: Severity,
 }
@@ -81,6 +102,9 @@ pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
     let mut sidecars = check_sidecar_coverage(&base);
     let mut corpus_buckets = check_corpus_buckets(&base);
     let mut noise_health = check_noise_health(&base);
+    let mut semantic_health = check_semantic_health();
+    let mut index_freshness = check_index_freshness(&base);
+    let mut embedder_warmth = check_embedder_warmth();
 
     let mut fixes_applied = Vec::new();
 
@@ -131,6 +155,9 @@ pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
         sidecars = check_sidecar_coverage(&base);
         corpus_buckets = check_corpus_buckets(&base);
         noise_health = check_noise_health(&base);
+        semantic_health = check_semantic_health();
+        index_freshness = check_index_freshness(&base);
+        embedder_warmth = check_embedder_warmth();
     }
 
     let overall = max_severity(&[
@@ -141,6 +168,9 @@ pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
         sidecars.severity,
         corpus_buckets.severity,
         noise_health.severity,
+        semantic_health.severity,
+        index_freshness.severity,
+        embedder_warmth.severity,
     ]);
 
     Ok(DoctorReport {
@@ -151,9 +181,213 @@ pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
         sidecars,
         corpus_buckets,
         noise_health,
+        semantic_health,
+        index_freshness,
+        sidecar_coverage: check_sidecar_coverage(&base),
+        embedder_warmth,
         fixes_applied,
         overall,
     })
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn check_semantic_health() -> CheckResult {
+    let cfg = crate::embedder::EmbeddingConfig::from_env();
+    match cfg.backend {
+        crate::embedder::BackendPreference::Cloud => {
+            let Some(cloud) = cfg.cloud.as_ref() else {
+                return CheckResult {
+                    name: "semantic_health".to_string(),
+                    severity: Severity::Warning,
+                    detail: "cloud backend selected but [embedder.cloud] is not configured"
+                        .to_string(),
+                    recommendation: Some(
+                        "Run `aicx config init` and set provider details".to_string(),
+                    ),
+                };
+            };
+            if let Some(env_name) = cloud.api_key_env.as_deref()
+                && std::env::var(env_name).is_err()
+            {
+                return CheckResult {
+                    name: "semantic_health".to_string(),
+                    severity: Severity::Warning,
+                    detail: format!(
+                        "cloud backend configured for {}, but ${env_name} is unset",
+                        cloud.url
+                    ),
+                    recommendation: Some(format!("export {env_name}=<provider-api-key>")),
+                };
+            }
+            CheckResult {
+                name: "semantic_health".to_string(),
+                severity: Severity::Green,
+                detail: format!("cloud backend configured: {} ({})", cloud.url, cloud.model),
+                recommendation: None,
+            }
+        }
+        crate::embedder::BackendPreference::Gguf | crate::embedder::BackendPreference::Auto => {
+            let resolved = cfg.resolved_model();
+            let found = cfg
+                .model_path
+                .as_ref()
+                .filter(|path| path.exists())
+                .cloned()
+                .or_else(|| {
+                    crate::embedder::find_cached_model_file(&resolved.repo, &resolved.filename)
+                });
+            if let Some(path) = found {
+                CheckResult {
+                    name: "semantic_health".to_string(),
+                    severity: Severity::Green,
+                    detail: format!("native model available at {}", path.display()),
+                    recommendation: None,
+                }
+            } else {
+                CheckResult {
+                    name: "semantic_health".to_string(),
+                    severity: Severity::Warning,
+                    detail: format!(
+                        "native model not found: {}/{}",
+                        resolved.repo, resolved.filename
+                    ),
+                    recommendation: Some(
+                        "Hydrate the model cache or switch [embedder].backend = \"cloud\""
+                            .to_string(),
+                    ),
+                }
+            }
+        }
+        crate::embedder::BackendPreference::Candle => CheckResult {
+            name: "semantic_health".to_string(),
+            severity: Severity::Critical,
+            detail: "legacy candle backend is not supported by this build".to_string(),
+            recommendation: Some("Use backend = \"cloud\" or backend = \"gguf\"".to_string()),
+        },
+    }
+}
+
+#[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+fn check_semantic_health() -> CheckResult {
+    CheckResult {
+        name: "semantic_health".to_string(),
+        severity: Severity::Critical,
+        detail: "binary built without embedder features".to_string(),
+        recommendation: Some("Rebuild with cloud-embedder or native-embedder".to_string()),
+    }
+}
+
+fn check_index_freshness(base: &Path) -> CheckResult {
+    let newest_chunk = newest_mtime(&base.join("store"))
+        .into_iter()
+        .chain(newest_mtime(&base.join("non-repository-contexts")))
+        .max();
+    let index_mtime = newest_mtime(&base.join("steer_db"))
+        .into_iter()
+        .chain(newest_mtime(&base.join("steer_bm25")))
+        .max();
+
+    match (newest_chunk, index_mtime) {
+        (None, _) => CheckResult {
+            name: "index_freshness".to_string(),
+            severity: Severity::Green,
+            detail: "no canonical chunks found; no index lag".to_string(),
+            recommendation: None,
+        },
+        (Some(_), None) => CheckResult {
+            name: "index_freshness".to_string(),
+            severity: Severity::Critical,
+            detail: "canonical chunks exist but no semantic/steer index mtime was found"
+                .to_string(),
+            recommendation: Some(
+                "Run `aicx index --dry-run` to probe, then rebuild steer metadata".to_string(),
+            ),
+        },
+        (Some(chunk), Some(index)) => {
+            let lag = chunk.duration_since(index).unwrap_or(Duration::ZERO);
+            let severity = if lag > Duration::from_secs(72 * 3600) {
+                Severity::Critical
+            } else if lag > Duration::from_secs(24 * 3600) {
+                Severity::Warning
+            } else {
+                Severity::Green
+            };
+            CheckResult {
+                name: "index_freshness".to_string(),
+                severity,
+                detail: format!("semantic lag: {} seconds", lag.as_secs()),
+                recommendation: if severity == Severity::Green {
+                    None
+                } else {
+                    Some(
+                        "Run `aicx index --dry-run` and refresh the materialized index".to_string(),
+                    )
+                },
+            }
+        }
+    }
+}
+
+fn newest_mtime(root: &Path) -> Option<SystemTime> {
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut newest = root.metadata().ok().and_then(|meta| meta.modified().ok());
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let candidate = if path.is_dir() {
+            newest_mtime(&path)
+        } else {
+            entry.metadata().ok().and_then(|meta| meta.modified().ok())
+        };
+        newest = newest.into_iter().chain(candidate).max();
+    }
+    newest
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn check_embedder_warmth() -> CheckResult {
+    let cfg = crate::embedder::EmbeddingConfig::from_env();
+    if cfg.backend == crate::embedder::BackendPreference::Cloud {
+        let local = cfg
+            .cloud
+            .as_ref()
+            .is_some_and(|cloud| is_local_embedder_url(&cloud.url));
+        if !local {
+            return CheckResult {
+                name: "embedder_warmth".to_string(),
+                severity: Severity::Green,
+                detail: "remote cloud backend: warmth probe skipped to avoid paid/noisy calls"
+                    .to_string(),
+                recommendation: None,
+            };
+        }
+    }
+
+    CheckResult {
+        name: "embedder_warmth".to_string(),
+        severity: Severity::Warning,
+        detail: "local embedder warmth probe available via `aicx warmup`".to_string(),
+        recommendation: Some(
+            "Run `aicx warmup` before one-shot semantic search after idle".to_string(),
+        ),
+    }
+}
+
+#[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+fn check_embedder_warmth() -> CheckResult {
+    CheckResult {
+        name: "embedder_warmth".to_string(),
+        severity: Severity::Critical,
+        detail: "binary built without embedder features".to_string(),
+        recommendation: None,
+    }
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn is_local_embedder_url(url: &str) -> bool {
+    url.contains("localhost:")
+        || url.contains("127.0.0.1:")
+        || url.contains("0.0.0.0:")
+        || url.contains("[::1]:")
 }
 
 fn check_canonical_store(base: &Path) -> CheckResult {
@@ -600,6 +834,10 @@ pub fn format_report_text(report: &DoctorReport, verbose: bool) -> String {
         &report.sidecars,
         &report.corpus_buckets,
         &report.noise_health,
+        &report.semantic_health,
+        &report.index_freshness,
+        &report.sidecar_coverage,
+        &report.embedder_warmth,
     ];
     for check in checks {
         out.push_str(&format!(
@@ -730,6 +968,30 @@ mod tests {
             },
             noise_health: CheckResult {
                 name: "noise".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            semantic_health: CheckResult {
+                name: "semantic".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            index_freshness: CheckResult {
+                name: "freshness".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            sidecar_coverage: CheckResult {
+                name: "sidecar_coverage".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            embedder_warmth: CheckResult {
+                name: "warmth".to_string(),
                 severity: Severity::Green,
                 detail: "ok".to_string(),
                 recommendation: None,

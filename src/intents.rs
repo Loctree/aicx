@@ -2205,6 +2205,7 @@ mod tests {
             skill_code: None,
             framework_version: None,
             intent_entries: Vec::new(),
+            tags: Vec::new(),
             noise_lines_dropped: 0,
         };
         fs::write(

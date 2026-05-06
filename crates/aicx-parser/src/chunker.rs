@@ -112,6 +112,10 @@ pub struct ChunkMetadataSidecar {
     pub framework_version: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intent_entries: Vec<crate::types::IntentEntry>,
+    /// Weak repo/content mentions preserved for query/tag surfaces. This is
+    /// append-only so pre-tag sidecars deserialize with an empty vector.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     /// Number of noise lines dropped during chunk construction. Defaults to
     /// `0` when the field is absent in older sidecars.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
@@ -146,6 +150,7 @@ impl From<&Chunk> for ChunkMetadataSidecar {
             skill_code: chunk.skill_code.clone(),
             framework_version: chunk.framework_version.clone(),
             intent_entries: Vec::new(),
+            tags: Vec::new(),
             noise_lines_dropped: chunk.noise_lines_dropped,
         }
     }

@@ -90,7 +90,6 @@ impl CloudEmbeddingConfig {
 #[cfg(feature = "cloud")]
 mod cloud_impl {
     use super::*;
-    use std::path::PathBuf;
     use std::time::Duration;
 
     use anyhow::Context;
@@ -120,7 +119,7 @@ mod cloud_impl {
                 dimension: config.effective_dimension(),
                 backend: "cloud".to_string(),
                 profile: EmbeddingProfile::Base,
-                source: NativeEmbeddingSource::ExplicitPath(PathBuf::from(config.url.clone())),
+                source: NativeEmbeddingSource::CloudEndpoint(config.url.clone()),
             };
             Ok(Self {
                 info,

@@ -3202,14 +3202,14 @@ mod tests {
                 "sess-a",
                 "user",
                 "Switch to https://github.com/VetCoders/ai-contexters now.",
-                None,
+                Some("https://github.com/VetCoders/ai-contexters"),
             ),
             semantic_entry(
                 (2026, 3, 21, 9, 3, 0),
                 "sess-a",
                 "user",
                 "Then inspect https://github.com/VetCoders/loctree as well.",
-                None,
+                Some("https://github.com/VetCoders/loctree"),
             ),
         ];
 

@@ -1234,6 +1234,18 @@ enum Commands {
         #[arg(long)]
         oracle: bool,
     },
+
+    /// Emit the full AICX health report as JSON for automation.
+    #[command(display_order = 11)]
+    Health,
+
+    /// Warm/probe the configured local embedder before interactive search.
+    #[command(display_order = 15)]
+    Warmup {
+        /// Emit JSON instead of readable text
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -1734,6 +1746,24 @@ fn main() -> Result<()> {
                 _ => 0,
             };
             std::process::exit(exit_code);
+        }
+        Some(Commands::Health) => {
+            let opts = aicx::doctor::DoctorOptions {
+                fix: false,
+                fix_buckets: false,
+                verbose: true,
+            };
+            let rt = tokio::runtime::Runtime::new()
+                .context("Failed to start tokio runtime for health")?;
+            let report = rt.block_on(aicx::doctor::run(&opts))?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            std::process::exit(match report.overall {
+                aicx::doctor::Severity::Critical => 1,
+                _ => 0,
+            });
+        }
+        Some(Commands::Warmup { json }) => {
+            run_warmup(json)?;
         }
         None => {
             Cli::command().print_help()?;
@@ -2501,6 +2531,22 @@ fn extraction_source_key(agents: &[&str], project: &[String]) -> String {
     )
 }
 
+fn extraction_source_key_aliases(agents: &[&str], project: &[String]) -> Vec<String> {
+    let project_key = if project.is_empty() {
+        "all".to_string()
+    } else {
+        project.join("+")
+    };
+    let mut aliases = Vec::new();
+    if agents == LEGACY_ALL_WATERMARK_AGENTS {
+        aliases.push(format!(
+            "claude+codex+gemini+junie+codescribe:{project_key}"
+        ));
+        aliases.push(format!("claude+codex+gemini:{project_key}"));
+    }
+    aliases
+}
+
 fn warn_incremental_legacy_flag(flag_used: bool) {
     if flag_used {
         eprintln!("{INCREMENTAL_LEGACY_NOTE}");
@@ -2645,6 +2691,8 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     // Default behavior is incremental. --full-rescan and the legacy --force
     // escape hatch both mean "scan the full lookback window".
     let source_key = extraction_source_key(agents, &project);
+    let source_aliases = extraction_source_key_aliases(agents, &project);
+    state.migrate_watermark_aliases(&source_key, &source_aliases);
     let watermark = if full_rescan || force {
         None
     } else {
@@ -3005,6 +3053,8 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
 
     let mut state = StateManager::load();
     let source_key = extraction_source_key(&agents, &project);
+    let source_aliases = extraction_source_key_aliases(&agents, &project);
+    state.migrate_watermark_aliases(&source_key, &source_aliases);
     let watermark = if full_rescan {
         None
     } else {
@@ -3590,7 +3640,15 @@ profile = "base"
 #   Voyage AI:        https://api.voyageai.com/v1/embeddings
 #   Together AI:      https://api.together.xyz/v1/embeddings
 #   OpenRouter:       https://openrouter.ai/api/v1/embeddings
+#   Ollama local:     http://localhost:11434/v1/embeddings
 #   Local LM Studio:  http://localhost:1234/v1/embeddings
+#
+# Local provider caveat: Ollama measured ~38s first-call coldstart
+# from idle on 2026-05-06, then warm calls are much faster. Local
+# providers are excellent for batched `aicx index` workflows where
+# startup amortizes over many chunks. For one-shot CLI search, remote
+# cloud providers usually feel faster. Run `aicx warmup` after idle to
+# pre-load local daemons before an interactive search session.
 url = "https://api.openai.com/v1/embeddings"
 
 # Model identifier as accepted by the provider:
@@ -3750,6 +3808,68 @@ fn run_index(project: Option<&str>, sample: usize, json: bool, dry_run: bool) ->
         println!("{}", aicx::vector_index::render_stats_json(&stats)?);
     } else {
         eprint!("{}", aicx::vector_index::render_stats_text(&stats));
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn run_warmup(json: bool) -> Result<()> {
+    let cfg = aicx::embedder::EmbeddingConfig::from_env();
+    if cfg.backend == aicx::embedder::BackendPreference::Cloud
+        && cfg.cloud.as_ref().is_some_and(|cloud| {
+            !cloud.url.contains("localhost:")
+                && !cloud.url.contains("127.0.0.1:")
+                && !cloud.url.contains("0.0.0.0:")
+        })
+    {
+        let payload = serde_json::json!({
+            "skipped": true,
+            "reason": "remote cloud backend; warmth probe skipped to avoid paid/noisy calls",
+            "time_to_first_vector_ms": null,
+        });
+        if json {
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        } else {
+            eprintln!("aicx warmup skipped: remote cloud backend");
+        }
+        return Ok(());
+    }
+
+    let start = std::time::Instant::now();
+    let stats = aicx::vector_index::dry_run_index(None, 1)?;
+    let elapsed = start.elapsed();
+    let payload = serde_json::json!({
+        "skipped": false,
+        "time_to_first_vector_ms": elapsed.as_millis(),
+        "embedded_chunks": stats.embeddings_computed,
+        "model_id": stats.model_id,
+        "model_profile": stats.model_profile,
+    });
+    if json {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        eprintln!(
+            "aicx warmup: first vector in {} ms ({} chunk probe)",
+            elapsed.as_millis(),
+            stats.embeddings_computed
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+fn run_warmup(json: bool) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "skipped": true,
+                "reason": "binary built without embedder features",
+                "time_to_first_vector_ms": null,
+            }))?
+        );
+    } else {
+        eprintln!("aicx warmup unavailable: binary built without embedder features");
     }
     Ok(())
 }

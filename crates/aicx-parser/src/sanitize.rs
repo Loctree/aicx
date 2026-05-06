@@ -12,7 +12,14 @@ use anyhow::{Result, anyhow};
 use std::path::{Component, Path, PathBuf};
 
 /// Known safe extractor agent names.
-const ALLOWED_AGENTS: &[&str] = &["claude", "codex", "gemini", "junie"];
+pub const ALLOWED_AGENTS: &[&str] = &[
+    "claude",
+    "codex",
+    "gemini",
+    "junie",
+    "codescribe",
+    "operator-md",
+];
 
 // ============================================================================
 // Core helpers (mirroring rmcp-memex pattern)
@@ -420,6 +427,8 @@ mod tests {
         assert_eq!(safe_agent_name("codex").unwrap(), "codex");
         assert_eq!(safe_agent_name("gemini").unwrap(), "gemini");
         assert_eq!(safe_agent_name("junie").unwrap(), "junie");
+        assert_eq!(safe_agent_name("codescribe").unwrap(), "codescribe");
+        assert_eq!(safe_agent_name("operator-md").unwrap(), "operator-md");
     }
 
     #[test]

@@ -214,6 +214,8 @@ pub enum NativeEmbeddingSource {
     },
     /// Explicit operator-specified model file.
     ExplicitPath(PathBuf),
+    /// Remote or local HTTP endpoint for cloud-compatible embeddings.
+    CloudEndpoint(String),
 }
 
 impl NativeEmbeddingSource {
@@ -221,6 +223,7 @@ impl NativeEmbeddingSource {
         match self {
             Self::HfCache { repo, .. } => repo,
             Self::ExplicitPath(_) => "<explicit-path>",
+            Self::CloudEndpoint(_) => "<cloud-endpoint>",
         }
     }
 
@@ -228,6 +231,7 @@ impl NativeEmbeddingSource {
         match self {
             Self::HfCache { path, .. } => path,
             Self::ExplicitPath(path) => path,
+            Self::CloudEndpoint(_) => std::path::Path::new(""),
         }
     }
 }
