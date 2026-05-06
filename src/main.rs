@@ -2092,6 +2092,15 @@ fn run_extract_session(
 
     entries.sort_by_key(|e| e.timestamp);
 
+    let (mut entries, collapse_stats) =
+        aicx_parser::collapse_repeats(entries, aicx_parser::DEFAULT_THRESHOLD_LINES);
+    if collapse_stats.messages_collapsed > 0 {
+        eprintln!(
+            "Collapsed {} repeated message body/bodies (saved {} bytes)",
+            collapse_stats.messages_collapsed, collapse_stats.bytes_saved,
+        );
+    }
+
     if redact_secrets {
         for e in &mut entries {
             e.message = aicx::redact::redact_secrets(&e.message);
@@ -2201,6 +2210,15 @@ fn run_extract_file(
 
     // Sort by timestamp (extractors should already do this).
     entries.sort_by_key(|a| a.timestamp);
+
+    let (mut entries, collapse_stats) =
+        aicx_parser::collapse_repeats(entries, aicx_parser::DEFAULT_THRESHOLD_LINES);
+    if collapse_stats.messages_collapsed > 0 {
+        eprintln!(
+            "Collapsed {} repeated message body/bodies (saved {} bytes)",
+            collapse_stats.messages_collapsed, collapse_stats.bytes_saved,
+        );
+    }
 
     // Apply secret redaction in-place (TimelineEntry is now a single timeline type)
     if redact_secrets {
