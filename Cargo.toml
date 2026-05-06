@@ -22,17 +22,21 @@ members = [".", "crates/aicx-embeddings", "crates/aicx-parser"]
 resolver = "3"
 
 [features]
-# Native embedder is the project default: aicx aims to be semantic-first,
-# falling back to filesystem fuzzy only when the embedder cannot load.
-# Pulling rust-memex + aicx-embeddings statically removes the need to spawn
-# an external memex daemon for retrieval.
-default = ["native-embedder"]
+# aicx is semantic-by-default with two compiled-in backends: cloud HTTP
+# embedder (the recommended VetCoders production default — zero-install,
+# config-driven) and native GGUF (offline / dev workstations). Filesystem
+# fuzzy stays the graceful fallback when neither backend can serve a query.
+default = ["native-embedder", "cloud-embedder"]
 # Native embedder — first-choice in-process local embeddings through the
 # reusable aicx-embeddings crate. The installed binary stays slim: models are
 # hydrated into the HF cache or pinned by path, not silently bundled.
 native-embedder = ["dep:aicx-embeddings", "aicx-embeddings/gguf"]
 native-embedder-metal = ["native-embedder", "aicx-embeddings/metal"]
 native-embedder-openmp = ["native-embedder", "aicx-embeddings/openmp"]
+# Cloud embedder — HTTP POST against an OpenAI-compatible /v1/embeddings
+# endpoint. Recommended VetCoders default for production: no GGUF download
+# required; URL + model + api_key_env live in ~/.aicx/config.toml.
+cloud-embedder = ["dep:aicx-embeddings", "aicx-embeddings/cloud"]
 
 [dependencies]
 aicx-embeddings = { path = "crates/aicx-embeddings", version = "0.6.2", optional = true, default-features = false }

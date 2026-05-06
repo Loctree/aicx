@@ -108,7 +108,7 @@ pub fn dry_run_index(project: Option<&str>, sample: usize) -> Result<IndexStats>
         return Ok(stats);
     }
 
-    #[cfg(not(feature = "native-embedder"))]
+    #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
     {
         stats.fallback_reason =
             Some("native-embedder feature not compiled in this binary".to_string());
@@ -116,7 +116,7 @@ pub fn dry_run_index(project: Option<&str>, sample: usize) -> Result<IndexStats>
         return Ok(stats);
     }
 
-    #[cfg(feature = "native-embedder")]
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     {
         run_native_pass(&files, sample, &mut stats);
         stats.elapsed_ms = started.elapsed().as_millis();
@@ -124,7 +124,7 @@ pub fn dry_run_index(project: Option<&str>, sample: usize) -> Result<IndexStats>
     }
 }
 
-#[cfg(feature = "native-embedder")]
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn run_native_pass(
     files: &[crate::store::StoredContextFile],
     sample: usize,

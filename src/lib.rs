@@ -6,7 +6,7 @@ pub mod corpus;
 pub mod dashboard;
 pub mod dashboard_server;
 pub mod doctor;
-#[cfg(feature = "native-embedder")]
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub mod embedder;
 pub mod hf_cache;
 pub mod intents;

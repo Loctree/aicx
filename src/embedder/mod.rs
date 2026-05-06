@@ -1,22 +1,31 @@
-//! Native embedder foundation for AICX and the Vibecrafted framework.
+//! Embedder foundation for AICX and the Vibecrafted framework.
 //!
-//! This module re-exports the reusable `aicx-embeddings` crate so existing
-//! consumers can keep using `aicx::embedder::*` while rust-memex can depend on
-//! the provider crate directly.
+//! Re-exports the reusable [`aicx_embeddings`] crate so existing consumers
+//! keep using `aicx::embedder::*` while `rust-memex` and other workspaces
+//! depend on the provider crate directly.
 //!
-//! The first-choice backend is local GGUF/F2LLM through llama.cpp. Models are
-//! resolved from an explicit path or the local HuggingFace cache; release
-//! bundles stay slim and do not silently carry model payloads.
+//! Two production backends compile in by default:
+//! - **Cloud** (`cloud-embedder` feature) — HTTP POST against an
+//!   OpenAI-compatible `/v1/embeddings`. Recommended VetCoders production
+//!   default: zero-install, config-driven URL/model/api_key_env.
+//! - **Native GGUF** (`native-embedder` feature) — local llama.cpp
+//!   inference over an F2LLM/GGUF model resolved from `AICX_EMBEDDER_PATH`
+//!   or the local HuggingFace cache. Release bundles stay slim and do not
+//!   silently carry model payloads.
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-#![cfg(feature = "native-embedder")]
+#![cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 
 pub use aicx_embeddings::{
-    BackendPreference, EmbeddingConfig, EmbeddingEngine, EmbeddingModelInfo, EmbeddingProfile,
-    EmbeddingProfileSpec, LocalEmbeddingProvider, NativeEmbeddingSource, ResolvedEmbeddingModel,
-    config_search_paths, find_cached_model_file, l2_normalize, profile_spec, similarity,
+    BackendPreference, CloudEmbeddingConfig, EmbeddingConfig, EmbeddingEngine, EmbeddingModelInfo,
+    EmbeddingProfile, EmbeddingProfileSpec, LocalEmbeddingProvider, NativeEmbeddingSource,
+    ResolvedEmbeddingModel, config_search_paths, find_cached_model_file, l2_normalize,
+    profile_spec, similarity,
 };
+
+#[cfg(feature = "cloud-embedder")]
+pub use aicx_embeddings::CloudEmbeddingProvider;
 
 pub type EmbedderConfig = EmbeddingConfig;
 pub type EmbedderEngine = EmbeddingEngine;

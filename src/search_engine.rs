@@ -77,14 +77,14 @@ pub fn try_semantic_search(
     _project_filter: Option<&str>,
     _frame_kind_filter: Option<FrameKind>,
 ) -> Result<SearchPath> {
-    #[cfg(not(feature = "native-embedder"))]
+    #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
     {
         return Ok(SearchPath::Fallback {
             reason: "native-embedder feature not compiled in this binary".to_string(),
         });
     }
 
-    #[cfg(feature = "native-embedder")]
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     {
         try_semantic_search_native(
             _store_root,
@@ -96,7 +96,7 @@ pub fn try_semantic_search(
     }
 }
 
-#[cfg(feature = "native-embedder")]
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn try_semantic_search_native(
     _store_root: &Path,
     _query: &str,
