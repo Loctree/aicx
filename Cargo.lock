@@ -56,7 +56,7 @@ name = "aicx"
 version = "0.6.5"
 dependencies = [
  "aicx-embeddings",
- "aicx-parser",
+ "aicx-parser 0.2.0",
  "anyhow",
  "axum",
  "chrono",
@@ -96,6 +96,19 @@ dependencies = [
 [[package]]
 name = "aicx-parser"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86aa351bd10fdef70388b9bd1d831d8957a113eed2b4c0bdc009588e91035a43"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "aicx-parser"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5306,7 +5319,7 @@ dependencies = [
 name = "rust-memex"
 version = "0.6.4"
 dependencies = [
- "aicx-parser",
+ "aicx-parser 0.1.0",
  "anyhow",
  "argon2",
  "arrow-array",

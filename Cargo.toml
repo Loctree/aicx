@@ -40,7 +40,7 @@ cloud-embedder = ["dep:aicx-embeddings", "aicx-embeddings/cloud"]
 
 [dependencies]
 aicx-embeddings = { path = "crates/aicx-embeddings", version = "0.6.2", optional = true, default-features = false }
-aicx-parser = { path = "crates/aicx-parser", version = "0.1.0", features = ["json-schema"] }
+aicx-parser = { path = "crates/aicx-parser", version = "0.2.0", features = ["json-schema"] }
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
@@ -60,7 +60,7 @@ rmcp = { version = "1.2", features = ["server", "schemars", "transport-io", "tra
 libc = "0.2.183"
 # Local product boundary: aicx now binds directly to the first-party rust-memex
 # workspace instead of consuming a published public crate.
-rmcp-memex = { package = "rust-memex", path = "../rust-memex/crates/rust-memex", default-features = false }
+rmcp-memex = { package = "rust-memex", path = "../rust-memex/crates/rust-memex", version = "0.6.4", default-features = false }
 schemars = "1.2.1"
 
 [dev-dependencies]
