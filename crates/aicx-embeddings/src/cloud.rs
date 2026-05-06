@@ -15,13 +15,9 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-
-use crate::{EmbeddingModelInfo, EmbeddingProfile, LocalEmbeddingProvider, NativeEmbeddingSource};
 
 /// Default request timeout when not pinned in config.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -94,7 +90,15 @@ impl CloudEmbeddingConfig {
 #[cfg(feature = "cloud")]
 mod cloud_impl {
     use super::*;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use anyhow::Context;
     use reqwest::blocking::Client;
+
+    use crate::{
+        EmbeddingModelInfo, EmbeddingProfile, LocalEmbeddingProvider, NativeEmbeddingSource,
+    };
 
     /// Stateful cloud embedder. Holds the HTTP client (with keep-alive
     /// to amortize TLS handshake) plus the resolved config and info.
