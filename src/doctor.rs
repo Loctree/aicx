@@ -22,7 +22,7 @@ use std::time::{Duration, SystemTime};
 use crate::oracle::OracleReadiness;
 use crate::steer_index;
 use crate::store;
-use crate::validation::is_valid_repo_bucket_name;
+use crate::validation::{is_valid_repo_bucket_name, is_valid_repo_project_slug};
 
 #[derive(Debug, Clone)]
 pub struct DoctorOptions {
@@ -731,18 +731,39 @@ fn suspicious_corpus_buckets(store_root: &Path) -> Result<Vec<String>> {
     }
 
     let mut suspicious = Vec::new();
-    for entry in
+    for org_entry in
         crate::sanitize::read_dir_validated(store_root).context("read corpus store root")?
     {
-        let entry = entry.context("read corpus store entry")?;
-        if !entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false) {
+        let org_entry = org_entry.context("read corpus store entry")?;
+        if !org_entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false) {
             continue;
         }
-        let Ok(name) = entry.file_name().into_string() else {
+        let Ok(org) = org_entry.file_name().into_string() else {
             continue;
         };
-        if !is_valid_repo_bucket_name(&name) {
-            suspicious.push(name);
+        if !is_valid_repo_bucket_name(&org) {
+            suspicious.push(org);
+            continue;
+        }
+
+        for repo_entry in crate::sanitize::read_dir_validated(&org_entry.path())
+            .with_context(|| format!("read corpus org bucket `{org}`"))?
+        {
+            let repo_entry = repo_entry.context("read corpus repo entry")?;
+            if !repo_entry
+                .file_type()
+                .map(|ty| ty.is_dir())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Ok(repo) = repo_entry.file_name().into_string() else {
+                continue;
+            };
+            let slug = format!("{org}/{repo}");
+            if !is_valid_repo_project_slug(&slug) {
+                suspicious.push(slug);
+            }
         }
     }
     suspicious.sort();
@@ -767,6 +788,9 @@ fn quarantine_bucket_with_timestamp(
     std::fs::create_dir_all(&quarantine_root).context("create quarantine root")?;
     let src = store_root.join(bucket_name);
     let dst = quarantine_root.join(bucket_name);
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).context("create nested quarantine parent")?;
+    }
     std::fs::rename(&src, &dst).with_context(|| {
         format!(
             "rename corpus bucket {} to {}",
@@ -1033,6 +1057,8 @@ mod tests {
         let tmp = unique_test_dir("bad-buckets");
         let store = tmp.join("store");
         std::fs::create_dir_all(store.join("VetCoders")).unwrap();
+        std::fs::create_dir_all(store.join("VetCoders").join("vibecrafted.git`")).unwrap();
+        std::fs::create_dir_all(store.join("VetCoders").join("loctree\n\n**AICX")).unwrap();
         std::fs::create_dir_all(store.join("{target_owner}")).unwrap();
         std::fs::create_dir_all(store.join("...")).unwrap();
 
@@ -1040,6 +1066,8 @@ mod tests {
         assert_eq!(result.severity, Severity::Warning);
         assert!(result.detail.contains("{target_owner}"));
         assert!(result.detail.contains("..."));
+        assert!(result.detail.contains("VetCoders/vibecrafted.git`"));
+        assert!(result.detail.contains("VetCoders/loctree"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1053,6 +1081,22 @@ mod tests {
         std::fs::write(bad.join("test.md"), "content").unwrap();
 
         let dest = quarantine_bucket(&store, "{x}").unwrap();
+        assert!(dest.exists());
+        assert!(!bad.exists());
+        assert!(dest.join("test.md").exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn quarantine_moves_nested_repo_bucket_atomically() {
+        let tmp = unique_test_dir("quarantine-nested-move");
+        let store = tmp.join("store");
+        let bad = store.join("VetCoders").join("vc-skills.git\"><span");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("test.md"), "content").unwrap();
+
+        let dest = quarantine_bucket(&store, "VetCoders/vc-skills.git\"><span").unwrap();
         assert!(dest.exists());
         assert!(!bad.exists());
         assert!(dest.join("test.md").exists());

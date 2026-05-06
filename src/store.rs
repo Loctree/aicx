@@ -25,6 +25,7 @@ use crate::segmentation::semantic_segments;
 use crate::sources::{self, ExtractionConfig};
 pub use crate::timeline::Kind;
 use crate::timeline::{RepoIdentity, SemanticSegment, TimelineEntry};
+use crate::validation::is_valid_repo_project_slug;
 
 // ============================================================================
 // Kind classification
@@ -365,7 +366,7 @@ where
 
 /// Returns the project directory: `~/.aicx/store/<project>/`
 pub fn project_dir(project: &str) -> Result<PathBuf> {
-    let dir = canonical_store_dir()?.join(project);
+    let dir = validated_store_project_dir(&canonical_store_dir()?, project)?;
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -381,7 +382,7 @@ pub fn chunks_dir() -> Result<PathBuf> {
 ///
 /// Layout: `~/.aicx/store/<project>/<date>/<time>_<agent>-context.md`
 pub fn get_context_path(project: &str, agent: &str, date: &str, time: &str) -> Result<PathBuf> {
-    let dir = canonical_store_dir()?.join(project).join(date);
+    let dir = validated_store_project_dir(&canonical_store_dir()?, project)?.join(date);
     fs::create_dir_all(&dir)?;
     Ok(dir.join(format!("{}_{}-context.md", time, agent)))
 }
@@ -395,9 +396,19 @@ pub fn get_context_json_path(
     date: &str,
     time: &str,
 ) -> Result<PathBuf> {
-    let dir = canonical_store_dir()?.join(project).join(date);
+    let dir = validated_store_project_dir(&canonical_store_dir()?, project)?.join(date);
     fs::create_dir_all(&dir)?;
     Ok(dir.join(format!("{}_{}-context.json", time, agent)))
+}
+
+fn validated_store_project_dir(root: &Path, project: &str) -> Result<PathBuf> {
+    if !is_valid_repo_project_slug(project) {
+        anyhow::bail!(
+            "invalid canonical store project bucket {:?}; expected <bucket> or <org>/<repo> with [A-Za-z0-9][A-Za-z0-9._-]{{0,99}} segments",
+            project
+        );
+    }
+    Ok(root.join(project))
 }
 
 // ============================================================================
@@ -609,7 +620,7 @@ pub fn write_context_chunked(
     }
 
     let chunks = chunker::chunk_entries(entries, project, agent, chunker_config);
-    let dir = canonical_store_dir()?.join(project).join(date);
+    let dir = validated_store_project_dir(&canonical_store_dir()?, project)?.join(date);
     fs::create_dir_all(&dir)?;
 
     let mut written = Vec::new();
@@ -681,8 +692,7 @@ fn write_context_session_first_at(
         let chunk_num = (idx as u32) + 1;
         let mut dir = root.join(&date_dir).join(kind.dir_name()).join(spec.agent);
         if let Some(project) = spec.project {
-            dir = root
-                .join(project)
+            dir = validated_store_project_dir(root, project)?
                 .join(&date_dir)
                 .join(kind.dir_name())
                 .join(spec.agent);
@@ -2708,6 +2718,69 @@ mod tests {
             assert!(s.contains("2026-01-22"));
             assert!(s.ends_with("143005_claude-context.json"));
         }
+    }
+
+    #[test]
+    fn validated_store_project_dir_rejects_junk_bucket_segments() {
+        let root = retrieval_test_root("invalid-bucket-segments");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let bad = "VetCoders/vibecrafted.git`";
+        let err = validated_store_project_dir(&root, bad).expect_err("invalid repo bucket");
+        assert!(
+            err.to_string()
+                .contains("invalid canonical store project bucket")
+        );
+        assert!(!root.join("VetCoders").join("vibecrafted.git`").exists());
+
+        let bad = "VetCoders/loctree\n\n**AICX";
+        assert!(validated_store_project_dir(&root, bad).is_err());
+        assert!(!root.join("VetCoders").join("loctree\n\n**AICX").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_first_write_blocks_invalid_project_before_mkdir() {
+        let root = retrieval_test_root("invalid-session-write");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let entries = vec![semantic_entry(
+            (2026, 5, 6, 11, 0, 0),
+            "sess-invalid-bucket",
+            "user",
+            "This must not create a junk corpus bucket.",
+            None,
+        )];
+
+        let err = write_context_session_first_at(
+            &root,
+            SessionWriteSpec {
+                project: Some("VetCoders/vc-skills.git\"><span"),
+                agent: "codex",
+                date: "2026-05-06",
+                session_id: "sess-invalid-bucket",
+                kind: Some(Kind::Conversations),
+            },
+            &entries,
+            &ChunkerConfig::default(),
+        )
+        .expect_err("invalid repo segment should fail before mkdir");
+
+        assert!(
+            err.to_string()
+                .contains("invalid canonical store project bucket")
+        );
+        assert!(
+            !root
+                .join("VetCoders")
+                .join("vc-skills.git\"><span")
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
