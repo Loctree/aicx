@@ -770,7 +770,7 @@ where
     store_semantic_segments_at(&store_base_dir()?, entries, chunker_config, progress)
 }
 
-fn store_semantic_segments_at<F>(
+pub fn store_semantic_segments_at<F>(
     base: &Path,
     entries: &[TimelineEntry],
     chunker_config: &ChunkerConfig,

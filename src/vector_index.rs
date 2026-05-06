@@ -103,24 +103,29 @@ pub fn dry_run_index(project: Option<&str>, sample: usize) -> Result<IndexStats>
     let files = crate::store::scan_context_files_project_at(&root, project)?;
     stats.chunks_total = files.len();
 
+    // `sample` is consumed inside the embedder-enabled cfg branch below;
+    // bind it to `_` here so the no-embedder build does not warn about an
+    // unused argument while keeping the public signature stable.
+    let _ = sample;
+
     if files.is_empty() {
         stats.elapsed_ms = started.elapsed().as_millis();
-        return Ok(stats);
-    }
-
-    #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
-    {
-        stats.fallback_reason =
-            Some("native-embedder feature not compiled in this binary".to_string());
-        stats.elapsed_ms = started.elapsed().as_millis();
-        return Ok(stats);
-    }
-
-    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-    {
-        run_native_pass(&files, sample, &mut stats);
-        stats.elapsed_ms = started.elapsed().as_millis();
         Ok(stats)
+    } else {
+        #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+        {
+            stats.fallback_reason =
+                Some("native-embedder feature not compiled in this binary".to_string());
+            stats.elapsed_ms = started.elapsed().as_millis();
+            Ok(stats)
+        }
+
+        #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+        {
+            run_native_pass(&files, sample, &mut stats);
+            stats.elapsed_ms = started.elapsed().as_millis();
+            Ok(stats)
+        }
     }
 }
 
@@ -172,6 +177,13 @@ fn run_native_pass(
 
 /// Take the first `max_bytes` bytes of `s`, but never split a UTF-8
 /// codepoint. Returns owned `String`.
+///
+/// Cfg-gated with the same predicate as its sole caller `run_native_pass`
+/// so a no-embedder build does not warn about a dead helper. Tests below
+/// run under `#[cfg(test)]` which always picks up workspace defaults
+/// (where the embedder feature is enabled), so the helper stays
+/// reachable for unit coverage.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn take_prefix_bytes(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();

@@ -79,9 +79,9 @@ pub fn try_semantic_search(
 ) -> Result<SearchPath> {
     #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
     {
-        return Ok(SearchPath::Fallback {
+        Ok(SearchPath::Fallback {
             reason: "native-embedder feature not compiled in this binary".to_string(),
-        });
+        })
     }
 
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]

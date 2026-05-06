@@ -9,11 +9,12 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::chunker::ChunkerConfig;
 use crate::doctor::{DoctorOptions, DoctorReport};
 use crate::intents::{IntentExtraction, IntentsConfig};
 use crate::rank::FuzzyResult;
-use crate::store::{ReadContextChunk, StoredContextFile};
-use crate::timeline::FrameKind;
+use crate::store::{ReadContextChunk, StoreWriteSummary, StoredContextFile};
+use crate::timeline::{FrameKind, TimelineEntry};
 
 /// Configuration for an [`Aicx`] library handle.
 #[derive(Debug, Clone)]
@@ -75,6 +76,31 @@ impl Aicx {
         crate::store::read_context_chunk_at(&self.config.store_root, reference.as_ref(), max_chars)
     }
 
+    pub fn store_entries(
+        &self,
+        entries: &[TimelineEntry],
+        opts: &StoreOptions,
+    ) -> Result<StoreWriteSummary> {
+        self.store_entries_with_progress(entries, opts, |_, _| {})
+    }
+
+    pub fn store_entries_with_progress<F>(
+        &self,
+        entries: &[TimelineEntry],
+        opts: &StoreOptions,
+        progress: F,
+    ) -> Result<StoreWriteSummary>
+    where
+        F: FnMut(usize, usize),
+    {
+        crate::store::store_semantic_segments_at(
+            &self.config.store_root,
+            entries,
+            &opts.chunker,
+            progress,
+        )
+    }
+
     pub fn fuzzy_search(
         &self,
         query: impl AsRef<str>,
@@ -108,6 +134,11 @@ impl Aicx {
     pub fn index_status(&self, project: Option<&str>) -> Result<IndexStatus> {
         index_status_at(&self.config.store_root, project)
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StoreOptions {
+    pub chunker: ChunkerConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +239,7 @@ fn system_time_to_rfc3339(value: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Utc};
 
     #[test]
     fn client_can_scan_empty_store_root() {
@@ -222,6 +254,36 @@ mod tests {
         let status = client.index_status(None).expect("index status");
         assert_eq!(status.canonical_chunks, 0);
         assert!(!status.semantic_index_present);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn client_can_store_entries_without_cli_globals() {
+        let root = std::env::temp_dir().join(format!("aicx-api-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+
+        let client = Aicx::with_store_root(&root);
+        let entries = vec![TimelineEntry {
+            timestamp: Utc.with_ymd_and_hms(2026, 5, 6, 16, 0, 0).unwrap(),
+            agent: "codex".to_string(),
+            session_id: "api-lib-session".to_string(),
+            role: "user".to_string(),
+            message: "Decision: expose AICX as a real library surface.".to_string(),
+            frame_kind: Some(FrameKind::UserMsg),
+            branch: None,
+            cwd: None,
+        }];
+
+        let summary = client
+            .store_entries(&entries, &StoreOptions::default())
+            .expect("store entries through public facade");
+
+        assert_eq!(summary.total_entries, 1);
+        assert_eq!(summary.written_paths.len(), 1);
+        assert!(summary.written_paths[0].starts_with(root.join("non-repository-contexts")));
+        assert_eq!(client.list_chunks().expect("scan chunks").len(), 1);
 
         let _ = std::fs::remove_dir_all(root);
     }

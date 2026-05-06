@@ -116,6 +116,29 @@ Config truth:
 running doctor, watching store progress, and viewing the intents timeline.
 Press `?` inside the wizard for the keymap.
 
+### Library API
+
+`aicx` is also a Rust library. The supported facade is `aicx::Aicx`;
+callers do not need to import command-line internals from `main.rs`.
+
+```rust
+use aicx::prelude::*;
+
+let client = Aicx::from_env()?;
+let status = client.index_status(None)?;
+let chunks = client.list_chunks()?;
+```
+
+For embedding AICX into another service, construct a handle with an explicit
+store root and write timeline entries directly:
+
+```rust
+use aicx::prelude::*;
+
+let client = Aicx::with_store_root("/tmp/aicx");
+let summary = client.store_entries(&entries, &StoreOptions::default())?;
+```
+
 ### Layer 1 — build the canonical corpus
 
 Extract the last 4 hours into `~/.aicx/`. Extractors are quiet on stdout by default (`--emit none`).
