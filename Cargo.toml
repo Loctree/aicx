@@ -1,13 +1,15 @@
 [package]
-name = "ai-contexters"
-version = "0.4.3"
+name = "aicx"
+
+version = "0.6.5"
 edition = "2024"
-rust-version = "1.85"
-description = "Extract timeline and memory from AI agent sessions (Claude Code, Codex, Gemini)"
+rust-version = "1.91.1"
+description = "Operator CLI + MCP server: canonical corpus first, optional semantic index second (Claude Code, Codex, Gemini)"
 authors = ["Maciej Gad <void@div0.space>", "Monika Szymanska <hello@vetcoders.io>"]
-license = "MIT"
-repository = "https://github.com/VetCoders/ai-contexters"
-homepage = "https://github.com/VetCoders/ai-contexters"
+license = "BUSL-1.1"
+repository = "https://github.com/Loctree/aicx"
+homepage = "https://github.com/Loctree/aicx"
+documentation = "https://docs.rs/aicx"
 readme = "README.md"
 keywords = ["ai", "context", "timeline", "claude", "codex"]
 categories = ["command-line-utilities", "development-tools"]
@@ -15,22 +17,50 @@ exclude = ["*.html", "*.patch", "*.orig", ".ai-agents/", ".ai-context/", "script
 autobins = false
 default-run = "aicx"
 
+[workspace]
+members = [".", "crates/aicx-embeddings", "crates/aicx-parser"]
+resolver = "3"
+
+[features]
+default = []
+# Native embedder — first-choice in-process local embeddings through the
+# reusable aicx-embeddings crate. The installed binary stays slim: models are
+# hydrated into the HF cache or pinned by path, not silently bundled.
+native-embedder = ["dep:aicx-embeddings", "aicx-embeddings/gguf"]
+native-embedder-metal = ["native-embedder", "aicx-embeddings/metal"]
+native-embedder-openmp = ["native-embedder", "aicx-embeddings/openmp"]
+
 [dependencies]
+aicx-embeddings = { path = "crates/aicx-embeddings", version = "0.6.2", optional = true, default-features = false }
+aicx-parser = { version = "0.1.0", features = ["json-schema"] }
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1"
+globset = "0.4"
+ratatui = "0.29"
+crossterm = "0.29"
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "signal"] }
 rmcp = { version = "1.2", features = ["server", "schemars", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
+libc = "0.2.183"
+# Local product boundary: aicx now binds directly to the first-party rust-memex
+# workspace instead of consuming a published public crate.
+rmcp-memex = { package = "rust-memex", path = "../rust-memex/crates/rust-memex", default-features = false }
+schemars = "1.2.1"
 
 [dev-dependencies]
 filetime = "0.2"
+
+[patch.crates-io]
+aicx-parser = { path = "crates/aicx-parser" }
+lance-namespace-impls = { path = "../rust-memex/vendor/lance-namespace-impls" }
 
 [[bin]]
 name = "aicx"

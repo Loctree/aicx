@@ -6,11 +6,14 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::output::TimelineEntry;
+use crate::types::FrameKind;
 
 // ============================================================================
 // Types
@@ -27,6 +30,34 @@ pub struct Chunk {
     pub date: String,
     /// Session ID from first message in chunk
     pub session_id: String,
+    /// Working directory from the first message in the chunk window
+    pub cwd: Option<String>,
+    /// Classified kind for this chunk's content
+    pub kind: crate::store::Kind,
+    /// Stable stream/channel classification for the chunk contents.
+    pub frame_kind: Option<FrameKind>,
+    /// Optional correlation ID for the originating run
+    pub run_id: Option<String>,
+    /// Optional prompt or task identity for the originating run
+    pub prompt_id: Option<String>,
+    /// Optional agent model reported by the source frontmatter
+    pub agent_model: Option<String>,
+    /// Optional run start timestamp reported by the source frontmatter
+    pub started_at: Option<String>,
+    /// Optional run completion timestamp reported by the source frontmatter
+    pub completed_at: Option<String>,
+    /// Optional token usage reported by the source frontmatter
+    pub token_usage: Option<u64>,
+    /// Optional findings count reported by the source frontmatter
+    pub findings_count: Option<u32>,
+    /// Optional workflow phase reported by the source frontmatter
+    pub workflow_phase: Option<String>,
+    /// Optional routing mode reported by the source frontmatter
+    pub mode: Option<String>,
+    /// Optional framework skill code reported by the source frontmatter
+    pub skill_code: Option<String>,
+    /// Optional steering schema/framework version reported by the source frontmatter
+    pub framework_version: Option<String>,
     /// Index range in original day's entries (start, end exclusive)
     pub msg_range: (usize, usize),
     /// Formatted chunk text with header
@@ -35,6 +66,72 @@ pub struct Chunk {
     pub token_estimate: usize,
     /// Decision/plan highlights extracted from the chunk
     pub highlights: Vec<String>,
+}
+
+/// Structured metadata sidecar persisted alongside each chunk file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChunkMetadataSidecar {
+    pub id: String,
+    pub project: String,
+    pub agent: String,
+    pub date: String,
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    pub kind: crate::store::Kind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_kind: Option<FrameKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub findings_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub framework_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intent_entries: Vec<crate::types::IntentEntry>,
+}
+
+impl From<&Chunk> for ChunkMetadataSidecar {
+    fn from(chunk: &Chunk) -> Self {
+        Self {
+            id: chunk.id.clone(),
+            project: chunk.project.clone(),
+            agent: chunk.agent.clone(),
+            date: chunk.date.clone(),
+            session_id: chunk.session_id.clone(),
+            cwd: chunk.cwd.clone(),
+            kind: chunk.kind,
+            frame_kind: chunk.frame_kind,
+            run_id: chunk.run_id.clone(),
+            prompt_id: chunk.prompt_id.clone(),
+            agent_model: chunk.agent_model.clone(),
+            started_at: chunk.started_at.clone(),
+            completed_at: chunk.completed_at.clone(),
+            token_usage: chunk.token_usage,
+            findings_count: chunk.findings_count,
+            workflow_phase: chunk.workflow_phase.clone(),
+            mode: chunk.mode.clone(),
+            skill_code: chunk.skill_code.clone(),
+            framework_version: chunk.framework_version.clone(),
+            intent_entries: Vec::new(),
+        }
+    }
 }
 
 /// Configuration for the chunker.
@@ -73,6 +170,81 @@ pub fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
 }
 
+fn prepare_entries_for_chunking<'a>(
+    entries: &'a [TimelineEntry],
+) -> (
+    Option<crate::frontmatter::ReportFrontmatter>,
+    Cow<'a, [TimelineEntry]>,
+) {
+    let Some(first) = entries.first() else {
+        return (None, Cow::Borrowed(entries));
+    };
+
+    if !first.message.trim_start().starts_with("---") {
+        return (None, Cow::Borrowed(entries));
+    }
+
+    let (frontmatter, body) = crate::frontmatter::parse(&first.message);
+    if body == first.message {
+        return (None, Cow::Borrowed(entries));
+    }
+
+    let mut stripped_entries = entries.to_vec();
+    if let Some(stripped_first) = stripped_entries.first_mut() {
+        stripped_first.message = body.to_string();
+    }
+
+    (frontmatter, Cow::Owned(stripped_entries))
+}
+
+fn apply_frontmatter(chunk: &mut Chunk, frontmatter: &crate::frontmatter::ReportFrontmatter) {
+    if chunk.frame_kind.is_none() {
+        chunk.frame_kind = frontmatter.telemetry.frame_kind;
+    }
+    chunk.run_id = frontmatter.telemetry.run_id.clone();
+    chunk.prompt_id = frontmatter.telemetry.prompt_id.clone();
+    chunk.agent_model = frontmatter.telemetry.model.clone();
+    chunk.started_at = frontmatter.telemetry.started_at.clone();
+    chunk.completed_at = frontmatter.telemetry.completed_at.clone();
+    chunk.token_usage = frontmatter.telemetry.token_usage;
+    chunk.findings_count = frontmatter.telemetry.findings_count;
+    chunk.workflow_phase = frontmatter.steering.workflow_phase.clone();
+    chunk.mode = frontmatter.steering.mode.clone();
+    chunk.skill_code = frontmatter.steering.skill_code.clone();
+    chunk.framework_version = frontmatter.steering.framework_version.clone();
+}
+
+fn split_day_entries_by_frame_kind<'a>(
+    entries: &'a [(usize, &'a TimelineEntry)],
+) -> Vec<&'a [(usize, &'a TimelineEntry)]> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+
+    let mut groups = Vec::new();
+    let mut start = 0usize;
+
+    for idx in 1..entries.len() {
+        let previous = entries[idx - 1].1.frame_kind;
+        let current = entries[idx].1.frame_kind;
+        if previous != current {
+            groups.push(&entries[start..idx]);
+            start = idx;
+        }
+    }
+
+    groups.push(&entries[start..]);
+    groups
+}
+
+fn frame_kind_for_window(entries: &[&TimelineEntry]) -> Option<FrameKind> {
+    let first = entries.first().and_then(|entry| entry.frame_kind)?;
+    entries
+        .iter()
+        .all(|entry| entry.frame_kind == Some(first))
+        .then_some(first)
+}
+
 // ============================================================================
 // Chunking logic
 // ============================================================================
@@ -91,9 +263,12 @@ pub fn chunk_entries(
         return vec![];
     }
 
+    let (frontmatter, prepared_entries) = prepare_entries_for_chunking(entries);
+    let prepared_entries = prepared_entries.as_ref();
+
     // Group entries by date
     let mut by_date: BTreeMap<String, Vec<(usize, &TimelineEntry)>> = BTreeMap::new();
-    for (idx, entry) in entries.iter().enumerate() {
+    for (idx, entry) in prepared_entries.iter().enumerate() {
         let date = entry.timestamp.format("%Y-%m-%d").to_string();
         by_date.entry(date).or_default().push((idx, entry));
     }
@@ -101,7 +276,19 @@ pub fn chunk_entries(
     let mut chunks = Vec::new();
 
     for (date, day_entries) in &by_date {
-        let day_chunks = chunk_day_entries(day_entries, project, agent, date, config);
+        let mut day_chunks = Vec::new();
+        let mut next_seq = 1usize;
+        for frame_group in split_day_entries_by_frame_kind(day_entries) {
+            let (mut group_chunks, updated_seq) =
+                chunk_day_entries(frame_group, project, agent, date, config, next_seq);
+            next_seq = updated_seq;
+            day_chunks.append(&mut group_chunks);
+        }
+        if let Some(frontmatter) = frontmatter.as_ref() {
+            for chunk in &mut day_chunks {
+                apply_frontmatter(chunk, frontmatter);
+            }
+        }
         chunks.extend(day_chunks);
     }
 
@@ -115,13 +302,14 @@ fn chunk_day_entries(
     agent: &str,
     date: &str,
     config: &ChunkerConfig,
-) -> Vec<Chunk> {
+    start_seq: usize,
+) -> (Vec<Chunk>, usize) {
     if entries.is_empty() {
-        return vec![];
+        return (vec![], start_seq);
     }
 
     let mut chunks = Vec::new();
-    let mut seq = 1usize;
+    let mut seq = start_seq;
     let mut start = 0usize;
 
     while start < entries.len() {
@@ -149,16 +337,29 @@ fn chunk_day_entries(
         let window: Vec<&TimelineEntry> = entries[start..end].iter().map(|(_, e)| *e).collect();
         let highlights = extract_highlights(&window);
         let signals = extract_signals(&window);
-        let text = format_chunk_text_inner(&window, project, agent, date, &signals, &highlights);
+        let frame_kind = frame_kind_for_window(&window);
+        let text = format_chunk_text_inner(
+            &window,
+            project,
+            agent,
+            date,
+            frame_kind,
+            &signals,
+            &highlights,
+        );
         let token_estimate = estimate_tokens(&text);
 
         let session_id = window
             .first()
             .map(|e| e.session_id.clone())
             .unwrap_or_default();
+        let cwd = window.first().and_then(|entry| entry.cwd.clone());
 
         let global_start = entries[start].0;
         let global_end = entries[end - 1].0 + 1;
+
+        let kind =
+            crate::store::classify_kind(&window.iter().map(|e| (*e).clone()).collect::<Vec<_>>());
 
         chunks.push(Chunk {
             id: format!("{}_{}_{}_{{:03}}", project, agent, date)
@@ -167,6 +368,20 @@ fn chunk_day_entries(
             agent: agent.to_string(),
             date: date.to_string(),
             session_id,
+            cwd,
+            kind,
+            frame_kind,
+            run_id: None,
+            prompt_id: None,
+            agent_model: None,
+            started_at: None,
+            completed_at: None,
+            token_usage: None,
+            findings_count: None,
+            workflow_phase: None,
+            mode: None,
+            skill_code: None,
+            framework_version: None,
             msg_range: (global_start, global_end),
             text,
             token_estimate,
@@ -188,7 +403,7 @@ fn chunk_day_entries(
         start = next_start;
     }
 
-    chunks
+    (chunks, seq)
 }
 
 /// Format entries into chunk text with metadata header.
@@ -200,7 +415,15 @@ pub fn format_chunk_text(
 ) -> String {
     let highlights = extract_highlights(entries);
     let signals = extract_signals(entries);
-    format_chunk_text_inner(entries, project, agent, date, &signals, &highlights)
+    format_chunk_text_inner(
+        entries,
+        project,
+        agent,
+        date,
+        frame_kind_for_window(entries),
+        &signals,
+        &highlights,
+    )
 }
 
 fn format_chunk_text_inner(
@@ -208,13 +431,21 @@ fn format_chunk_text_inner(
     project: &str,
     agent: &str,
     date: &str,
+    frame_kind: Option<FrameKind>,
     signals: &ChunkSignals,
     highlights: &[String],
 ) -> String {
-    let mut text = format!(
-        "[project: {} | agent: {} | date: {}]\n\n",
-        project, agent, date
-    );
+    let mut text = if let Some(frame_kind) = frame_kind {
+        format!(
+            "[project: {} | agent: {} | date: {} | frame_kind: {}]\n\n",
+            project, agent, date, frame_kind
+        )
+    } else {
+        format!(
+            "[project: {} | agent: {} | date: {}]\n\n",
+            project, agent, date
+        )
+    };
 
     if let Some(block) = format_signals_block(signals, highlights) {
         text.push_str(&block);
@@ -762,6 +993,9 @@ pub fn write_chunks_to_dir(chunks: &[Chunk], dir: &Path) -> Result<Vec<PathBuf>>
         let filename = format!("{}.txt", chunk.id);
         let path = dir.join(&filename);
         fs::write(&path, &chunk.text)?;
+        let sidecar_path = dir.join(format!("{}.meta.json", chunk.id));
+        let sidecar = ChunkMetadataSidecar::from(chunk);
+        fs::write(&sidecar_path, serde_json::to_vec_pretty(&sidecar)?)?;
         paths.push(path);
     }
 
@@ -808,6 +1042,7 @@ mod tests {
             session_id: "sess-1".to_string(),
             role: role.to_string(),
             message: msg.to_string(),
+            frame_kind: None,
             branch: None,
             cwd: None,
         }
@@ -897,6 +1132,7 @@ mod tests {
                 session_id: "s1".to_string(),
                 role: "user".to_string(),
                 message: "day one".to_string(),
+                frame_kind: None,
                 branch: None,
                 cwd: None,
             },
@@ -906,6 +1142,7 @@ mod tests {
                 session_id: "s2".to_string(),
                 role: "user".to_string(),
                 message: "day two".to_string(),
+                frame_kind: None,
                 branch: None,
                 cwd: None,
             },
@@ -948,6 +1185,56 @@ mod tests {
     }
 
     #[test]
+    fn test_chunk_entries_extracts_frontmatter_telemetry() {
+        let entries = vec![make_entry(
+            14,
+            30,
+            "assistant",
+            "---\nrun_id: mrbl-001\nprompt_id: api-redesign_20260327\nmodel: gpt-5.4\nstarted_at: 2026-03-27T10:00:00Z\ncompleted_at: 2026-03-27T10:01:00Z\ntoken_usage: 1234\nfindings_count: 4\nframe_kind: agent_reply\nphase: implement\nmode: session-first\nskill_code: vc-workflow\nframework_version: 2026-03\n---\n## Report\nContent here",
+        )];
+
+        let chunks = chunk_entries(&entries, "proj", "claude", &ChunkerConfig::default());
+        assert_eq!(chunks.len(), 1);
+
+        let chunk = &chunks[0];
+        assert_eq!(chunk.run_id.as_deref(), Some("mrbl-001"));
+        assert_eq!(chunk.prompt_id.as_deref(), Some("api-redesign_20260327"));
+        assert_eq!(chunk.agent_model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(chunk.started_at.as_deref(), Some("2026-03-27T10:00:00Z"));
+        assert_eq!(chunk.completed_at.as_deref(), Some("2026-03-27T10:01:00Z"));
+        assert_eq!(chunk.token_usage, Some(1234));
+        assert_eq!(chunk.findings_count, Some(4));
+        assert_eq!(chunk.frame_kind, Some(FrameKind::AgentReply));
+        assert_eq!(chunk.workflow_phase.as_deref(), Some("implement"));
+        assert_eq!(chunk.mode.as_deref(), Some("session-first"));
+        assert_eq!(chunk.skill_code.as_deref(), Some("vc-workflow"));
+        assert_eq!(chunk.framework_version.as_deref(), Some("2026-03"));
+        assert!(chunk.text.contains("## Report"));
+        assert!(!chunk.text.contains("run_id: mrbl-001"));
+        assert!(!chunk.text.contains("phase: implement"));
+    }
+
+    #[test]
+    fn test_chunk_entries_strip_malformed_frontmatter_without_metadata() {
+        let entries = vec![make_entry(
+            14,
+            30,
+            "assistant",
+            "---\nrun_id: [nope\nmode: session-first\n---\n## Report\nBody survives",
+        )];
+
+        let chunks = chunk_entries(&entries, "proj", "claude", &ChunkerConfig::default());
+        assert_eq!(chunks.len(), 1);
+
+        let chunk = &chunks[0];
+        assert_eq!(chunk.run_id, None);
+        assert_eq!(chunk.mode, None);
+        assert!(chunk.text.contains("## Report"));
+        assert!(chunk.text.contains("Body survives"));
+        assert!(!chunk.text.contains("mode: session-first"));
+    }
+
+    #[test]
     fn test_write_chunks_to_dir() {
         let tmp = std::env::temp_dir().join("ai-ctx-chunker-test");
         let _ = fs::remove_dir_all(&tmp);
@@ -959,6 +1246,20 @@ mod tests {
                 agent: "claude".to_string(),
                 date: "2026-01-22".to_string(),
                 session_id: "s1".to_string(),
+                cwd: Some("/Users/tester/workspaces/proj".to_string()),
+                kind: crate::store::Kind::Conversations,
+                frame_kind: Some(FrameKind::UserMsg),
+                run_id: None,
+                prompt_id: None,
+                agent_model: None,
+                started_at: None,
+                completed_at: None,
+                token_usage: None,
+                findings_count: None,
+                workflow_phase: Some("implement".to_string()),
+                mode: Some("session-first".to_string()),
+                skill_code: Some("vc-workflow".to_string()),
+                framework_version: Some("2026-03".to_string()),
                 msg_range: (0, 5),
                 text: "chunk one content".to_string(),
                 token_estimate: 4,
@@ -970,6 +1271,20 @@ mod tests {
                 agent: "claude".to_string(),
                 date: "2026-01-22".to_string(),
                 session_id: "s1".to_string(),
+                cwd: None,
+                kind: crate::store::Kind::Conversations,
+                frame_kind: None,
+                run_id: None,
+                prompt_id: None,
+                agent_model: None,
+                started_at: None,
+                completed_at: None,
+                token_usage: None,
+                findings_count: None,
+                workflow_phase: None,
+                mode: None,
+                skill_code: None,
+                framework_version: None,
                 msg_range: (3, 8),
                 text: "chunk two content".to_string(),
                 token_estimate: 4,
@@ -984,6 +1299,38 @@ mod tests {
 
         let content = fs::read_to_string(&paths[0]).unwrap();
         assert_eq!(content, "chunk one content");
+
+        let sidecar = fs::read_to_string(tmp.join("proj_claude_2026-01-22_001.meta.json")).unwrap();
+        let metadata: ChunkMetadataSidecar = serde_json::from_str(&sidecar).unwrap();
+        assert_eq!(metadata.project, "proj");
+        assert_eq!(metadata.agent, "claude");
+        assert_eq!(metadata.date, "2026-01-22");
+        assert_eq!(
+            metadata.cwd.as_deref(),
+            Some("/Users/tester/workspaces/proj")
+        );
+        assert_eq!(metadata.kind, crate::store::Kind::Conversations);
+        assert_eq!(metadata.frame_kind, Some(FrameKind::UserMsg));
+        assert_eq!(metadata.workflow_phase.as_deref(), Some("implement"));
+        assert_eq!(metadata.mode.as_deref(), Some("session-first"));
+        assert_eq!(metadata.skill_code.as_deref(), Some("vc-workflow"));
+        assert_eq!(metadata.framework_version.as_deref(), Some("2026-03"));
+
+        let legacy: ChunkMetadataSidecar = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "project": "proj",
+            "agent": "claude",
+            "date": "2026-01-22",
+            "session_id": "s1",
+            "kind": "conversations",
+        }))
+        .unwrap();
+        assert_eq!(legacy.cwd, None);
+        assert_eq!(legacy.frame_kind, None);
+        assert_eq!(legacy.workflow_phase, None);
+        assert_eq!(legacy.mode, None);
+        assert_eq!(legacy.skill_code, None);
+        assert_eq!(legacy.framework_version, None);
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -1037,6 +1384,20 @@ mod tests {
                 agent: "c".to_string(),
                 date: "2026-01-20".to_string(),
                 session_id: "s".to_string(),
+                cwd: None,
+                kind: crate::store::Kind::Conversations,
+                frame_kind: None,
+                run_id: None,
+                prompt_id: None,
+                agent_model: None,
+                started_at: None,
+                completed_at: None,
+                token_usage: None,
+                findings_count: None,
+                workflow_phase: None,
+                mode: None,
+                skill_code: None,
+                framework_version: None,
                 msg_range: (0, 5),
                 text: "x".repeat(100),
                 token_estimate: 25,
@@ -1048,6 +1409,20 @@ mod tests {
                 agent: "c".to_string(),
                 date: "2026-01-21".to_string(),
                 session_id: "s".to_string(),
+                cwd: None,
+                kind: crate::store::Kind::Conversations,
+                frame_kind: None,
+                run_id: None,
+                prompt_id: None,
+                agent_model: None,
+                started_at: None,
+                completed_at: None,
+                token_usage: None,
+                findings_count: None,
+                workflow_phase: None,
+                mode: None,
+                skill_code: None,
+                framework_version: None,
                 msg_range: (5, 10),
                 text: "y".repeat(200),
                 token_estimate: 50,

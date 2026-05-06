@@ -1,0 +1,53 @@
+#!/bin/sh
+set -e
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT"
+
+remote="$1"
+url="$2"
+
+echo "=== Pre-push validation ==="
+echo "Pushing to: $remote ($url)"
+
+echo ""
+echo "[1/5] Manifest portability..."
+python3 -c 'import tomllib; data = tomllib.load(open("Cargo.toml", "rb")); allow = {("dependencies", "rmcp-memex"), ("dependencies", "aicx-embeddings")}; bad = [(section, name, spec["path"]) for section in ("dependencies", "dev-dependencies", "build-dependencies") for name, spec in data.get(section, {}).items() if isinstance(spec, dict) and "path" in spec and (section, name) not in allow]; print("Manifest portability: ok (approved first-party product deps only)") if not bad else (_ for _ in ()).throw(SystemExit("Manifest portability check failed:\n" + "\n".join(f"  - {section}.{name} uses unexpected local path dependency {path}" for section, name, path in bad)))'
+
+echo ""
+echo "[2/5] Format check..."
+cargo fmt --all --check || {
+  echo "Formatting issues. Run: cargo fmt --all"
+  exit 1
+}
+
+echo ""
+echo "[3/5] Clippy..."
+cargo clippy --locked -p aicx --all-targets -- -D warnings
+cargo clippy --locked -p aicx-embeddings --features gguf -- -D warnings
+cargo clippy --locked -p aicx --features native-embedder --all-targets -- -D warnings
+
+echo ""
+echo "[4/5] Tests..."
+cargo test --locked -p aicx --all-targets
+cargo test --locked -p aicx-embeddings --features gguf
+cargo test --locked -p aicx --features native-embedder --test native_embedder
+
+echo ""
+echo "[5/5] Semgrep (optional)..."
+if command -v semgrep >/dev/null 2>&1; then
+  semgrep --config auto --error --quiet . --exclude target || {
+    echo "Semgrep found issues. Fix before pushing."
+    exit 1
+  }
+elif command -v pipx >/dev/null 2>&1; then
+  pipx run semgrep --config auto --error --quiet . --exclude target || {
+    echo "Semgrep found issues. Fix before pushing."
+    exit 1
+  }
+else
+  echo "Semgrep not available; skipping."
+fi
+
+echo ""
+echo "=== All pre-push checks passed ==="

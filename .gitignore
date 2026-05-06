@@ -6,19 +6,25 @@
 agents/state/
 
 # AI Context
-.ai-context/*
-!.ai-context/share/
-!.ai-context/share/artifacts/
-!.ai-context/share/artifacts/SUMMARY.md
-!.ai-context/share/artifacts/TIMELINE.md
-!.ai-context/share/artifacts/TRIAGE.md
-!.ai-context/share/artifacts/prompts/
-!.ai-context/share/artifacts/prompts/*.md
+/.vibecrafted
 *.log
-/.ai-context
+/.ai-context*
 *.zip
 /.ai-agents
 /skills
 *.orig
-*.patch
-aicx-dashboard.html
+/*patch*
+/*.html
+GEMINI.md
+CLAUDE.md
+/*.rs
+!/build.rs
+*.out
+/.claude/
+/release-bundles
+/dist
+/docs/internal/
+/.junie/
+/*.txt
+/*.py
+/tools/__pycache__

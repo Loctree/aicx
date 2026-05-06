@@ -1,23 +1,23 @@
 //! AI Contexters dashboard HTTP server runtime.
 //!
-//! Serves the generated dashboard artifact and supports on-demand regeneration.
+//! Serves the local dashboard UI and supports live search/regeneration APIs.
 
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Query, State, rejection::QueryRejection},
     http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
-    io::Write,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -25,7 +25,13 @@ use std::{
 };
 use tokio::sync::RwLock;
 
-use crate::dashboard::{self, DashboardConfig, DashboardStats};
+#[cfg(test)]
+use std::{fs, io::Write};
+
+use crate::dashboard::{
+    self, DashboardPayload, DashboardRecord, DashboardScope, DashboardStats,
+    project_matches_filter, timestamp_matches_hours_scope,
+};
 use crate::rank;
 
 /// Guard that prevents concurrent `aicx store` child-process spawns from dashboard search.
@@ -33,21 +39,87 @@ static DASHBOARD_RESCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 
 const REGENERATE_HEADER_NAME: &str = "x-ai-contexters-action";
 const REGENERATE_HEADER_VALUE: &str = "regenerate";
+const MAX_SCORE_FILTER: u8 = 100;
+const LOCALHOST_ORIGINS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+const TAILSCALE_MAGICDNS_SUFFIX: &str = ".ts.net";
+const TAILSCALE_RANGE_BASE: u32 = u32::from_be_bytes([100, 64, 0, 0]);
+const TAILSCALE_RANGE_END: u32 = u32::from_be_bytes([100, 127, 255, 255]);
+
+/// CORS policy for dashboard HTTP serving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DashboardCorsPolicy {
+    /// Default developer-local mode; accepts localhost + loopback browser origins.
+    Local,
+    /// Accept origins served from Tailscale CGNAT IPs or MagicDNS hostnames.
+    Tailscale,
+    /// Wildcard CORS, intended for trusted reverse-proxy or lab setups.
+    All,
+    /// Exact origin match such as https://dashboard.example.com.
+    Exact(String),
+}
+
+impl DashboardCorsPolicy {
+    pub fn from_cli(raw: Option<&str>) -> Result<Self> {
+        let Some(raw_value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::Local);
+        };
+
+        match raw_value.to_ascii_lowercase().as_str() {
+            "local" => Ok(Self::Local),
+            "tailscale" => Ok(Self::Tailscale),
+            "all" => Ok(Self::All),
+            _ => {
+                normalize_origin(raw_value)?;
+                Ok(Self::Exact(raw_value.to_string()))
+            }
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Local => "local".to_string(),
+            Self::Tailscale => "tailscale".to_string(),
+            Self::All => "all".to_string(),
+            Self::Exact(origin) => origin.clone(),
+        }
+    }
+
+    fn allows_origin(&self, origin: &str) -> bool {
+        match self {
+            Self::Local => matches_local_origin(origin),
+            Self::Tailscale => matches_tailscale_origin(origin),
+            Self::All => true,
+            Self::Exact(allowed) => allowed.eq_ignore_ascii_case(origin),
+        }
+    }
+
+    fn response_allow_origin(&self, origin: &str) -> Option<HeaderValue> {
+        match self {
+            Self::All => Some(HeaderValue::from_static("*")),
+            _ if self.allows_origin(origin) => HeaderValue::from_str(origin).ok(),
+            _ => None,
+        }
+    }
+}
 
 /// Runtime configuration for dashboard server mode.
 #[derive(Debug, Clone)]
 pub struct DashboardServerConfig {
     pub store_root: PathBuf,
+    pub scope: DashboardScope,
     pub title: String,
     pub preview_chars: usize,
+    /// Legacy compatibility path surfaced in status; server mode does not write it.
     pub artifact_path: PathBuf,
+    pub cors_policy: DashboardCorsPolicy,
     pub host: IpAddr,
     pub port: u16,
 }
 
 #[derive(Debug, Clone)]
 struct DashboardSnapshot {
-    html: String,
+    /// Scanned payload (records, projects, agents, kinds, stats).
+    payload: DashboardPayload,
     generated_at: DateTime<Utc>,
     stats: DashboardStats,
     assumptions: Vec<String>,
@@ -58,10 +130,10 @@ struct DashboardSnapshot {
 impl DashboardSnapshot {
     fn from_build(build: BuildOutput) -> Self {
         Self {
-            html: build.artifact.html,
+            stats: build.payload.stats.clone(),
+            assumptions: build.payload.assumptions.clone(),
+            payload: build.payload,
             generated_at: build.generated_at,
-            stats: build.artifact.stats,
-            assumptions: build.artifact.assumptions,
             build_count: 1,
             last_error: None,
         }
@@ -71,24 +143,28 @@ impl DashboardSnapshot {
 #[derive(Debug)]
 struct DashboardServerState {
     config: DashboardServerConfig,
+    /// Lightweight server-mode HTML shell (no embedded data).
+    shell_html: String,
     snapshot: RwLock<DashboardSnapshot>,
     rebuilding: AtomicBool,
 }
 
 #[derive(Debug)]
 struct BuildOutput {
-    artifact: dashboard::DashboardArtifact,
+    payload: DashboardPayload,
     generated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]
 struct DashboardStatusResponse {
     ok: bool,
+    mode: &'static str,
     rebuilding: bool,
     generated_at: String,
     build_count: u64,
     store_root: String,
     artifact_path: String,
+    artifact_written: bool,
     title: String,
     preview_chars: usize,
     stats: DashboardStats,
@@ -99,9 +175,11 @@ struct DashboardStatusResponse {
 #[derive(Debug, Serialize)]
 struct DashboardRegenerateResponse {
     ok: bool,
+    mode: &'static str,
     regenerated_at: String,
     build_count: u64,
     artifact_path: String,
+    artifact_written: bool,
     stats: DashboardStats,
 }
 
@@ -122,6 +200,10 @@ struct FuzzySearchParams {
     limit: usize,
     /// Optional project filter (case-insensitive substring match)
     project: Option<String>,
+    /// Optional minimum score threshold (0-100)
+    score: Option<u8>,
+    /// Optional frame/channel filter
+    frame_kind: Option<crate::timeline::FrameKind>,
 }
 
 fn default_search_limit() -> usize {
@@ -159,12 +241,17 @@ struct CrossSearchParams {
 #[derive(Debug, Serialize)]
 struct FuzzySearchResult {
     file: String,
+    path: String,
     project: String,
+    kind: String,
+    frame_kind: Option<String>,
+    agent: String,
     date: String,
     score: u8,
     label: String,
     signal_density: f32,
     matched_lines: Vec<String>,
+    excerpt: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -181,6 +268,52 @@ struct MemexSearchResponse {
     query: String,
     source: String,
     results: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct SteerSearchParams {
+    /// Filter by run_id (exact)
+    run_id: Option<String>,
+    /// Filter by prompt_id (exact)
+    prompt_id: Option<String>,
+    /// Filter by agent name
+    agent: Option<String>,
+    /// Filter by kind
+    kind: Option<String>,
+    /// Filter by frame/channel
+    frame_kind: Option<crate::timeline::FrameKind>,
+    /// Filter by project (case-insensitive substring)
+    project: Option<String>,
+    /// Filter by date (YYYY-MM-DD or range)
+    date: Option<String>,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SteerSearchResult {
+    path: String,
+    project: String,
+    agent: String,
+    kind: String,
+    frame_kind: Option<String>,
+    date: String,
+    session_id: String,
+    run_id: Option<String>,
+    prompt_id: Option<String>,
+    agent_model: Option<String>,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    token_usage: Option<u64>,
+    findings_count: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct SteerSearchResponse {
+    ok: bool,
+    scanned: usize,
+    matched: usize,
+    items: Vec<SteerSearchResult>,
 }
 
 struct RebuildFlagGuard<'a> {
@@ -201,11 +334,13 @@ impl Drop for RebuildFlagGuard<'_> {
 
 /// Run dashboard server and block until process is terminated.
 pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
-    ensure_loopback_host(config.host)?;
+    validate_dashboard_host_policy(config.host, &config.cors_policy, true)?;
 
     let initial = rebuild_dashboard(&config).context("Initial dashboard build failed")?;
+    let shell_html = dashboard::render_server_shell_html(&config.title);
     let state = Arc::new(DashboardServerState {
         config: config.clone(),
+        shell_html,
         snapshot: RwLock::new(DashboardSnapshot::from_build(initial)),
         rebuilding: AtomicBool::new(false),
     });
@@ -215,10 +350,21 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         .route("/api/health", get(get_health))
         .route("/health", get(get_health))
         .route("/api/status", get(get_status))
+        .route("/api/browse", get(get_browse))
+        .route("/api/detail", get(get_detail))
+        .route("/api/chunk", get(get_chunk))
+        .route("/api/context", get(get_context))
         .route("/api/regenerate", post(regenerate_dashboard))
         .route("/api/search/fuzzy", get(fuzzy_search))
         .route("/api/search/semantic", get(semantic_search))
         .route("/api/search/cross", get(cross_search))
+        .route("/api/search/steer", get(steer_search))
+        .route("/manifest.webmanifest", get(get_manifest))
+        .route("/service-worker.js", get(get_service_worker))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            dashboard_cors_middleware,
+        ))
         .with_state(state);
 
     let addr = SocketAddr::new(config.host, config.port);
@@ -226,41 +372,177 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         .await
         .with_context(|| format!("Failed to bind dashboard server on http://{addr}"))?;
 
-    eprintln!("✓ Dashboard server started");
+    eprintln!("✓ Dashboard server started (PWA shell)");
     eprintln!("  URL: http://{addr}");
+    eprintln!("  Browse:    GET  http://{addr}/api/browse?sort=newest&since=24h&project=<p>");
+    eprintln!("  Detail:    GET  http://{addr}/api/detail?id=<n>");
+    eprintln!("  Chunk:     GET  http://{addr}/api/chunk?id=<n>");
+    eprintln!("  Context:   GET  http://{addr}/api/context");
     eprintln!("  Status:    GET  http://{addr}/api/status");
     eprintln!("  Regenerate: POST http://{addr}/api/regenerate");
-    eprintln!("  Fuzzy:     GET  http://{addr}/api/search/fuzzy?q=<query>");
+    eprintln!("  Fuzzy:     GET  http://{addr}/api/search/fuzzy?q=<query>&score=<min>");
     eprintln!("  Semantic:  GET  http://{addr}/api/search/semantic?q=<query>&ns=<namespace>");
     eprintln!("  Cross:     GET  http://{addr}/api/search/cross?q=<query>");
+    eprintln!("  Steer:     GET  http://{addr}/api/search/steer?run_id=<id>&project=<p>");
+    eprintln!("  PWA:       GET  http://{addr}/manifest.webmanifest");
     eprintln!(
         "  Required header: {}: {}",
         REGENERATE_HEADER_NAME, REGENERATE_HEADER_VALUE
     );
-    eprintln!("  Artifact: {}", config.artifact_path.display());
     eprintln!("  Store: {}", config.store_root.display());
+    eprintln!("  CORS: {}", config.cors_policy.describe());
 
     axum::serve(listener, app)
         .await
         .context("Dashboard server runtime terminated unexpectedly")
 }
 
-fn ensure_loopback_host(host: IpAddr) -> Result<()> {
+pub fn validate_dashboard_host_policy(
+    host: IpAddr,
+    cors_policy: &DashboardCorsPolicy,
+    cors_policy_was_explicit: bool,
+) -> Result<()> {
     if host.is_loopback() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "Refusing to bind dashboard server to non-loopback address '{}'. Use --host 127.0.0.1 or ::1.",
+        return Ok(());
+    }
+
+    if !cors_policy_was_explicit || matches!(cors_policy, DashboardCorsPolicy::Local) {
+        return Err(anyhow!(
+            "Binding dashboard server to non-loopback address '{}' requires an explicit non-local CORS policy. Re-run with `--allow-cors-origins tailscale`, `--allow-cors-origins all`, or an explicit URL.",
             host
-        ))
+        ));
+    }
+
+    Ok(())
+}
+
+async fn dashboard_cors_middleware(
+    State(state): State<Arc<DashboardServerState>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let is_preflight = request.method() == axum::http::Method::OPTIONS;
+
+    if is_preflight {
+        return match origin.as_deref() {
+            Some(origin) => {
+                if let Some(allow_origin) = state.config.cors_policy.response_allow_origin(origin) {
+                    let mut response = Response::new(Body::empty());
+                    *response.status_mut() = StatusCode::NO_CONTENT;
+                    apply_cors_headers(response.headers_mut(), allow_origin, true);
+                    response
+                } else {
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(ErrorResponse {
+                            ok: false,
+                            error: format!(
+                                "Origin '{}' is not permitted by dashboard CORS policy '{}'.",
+                                origin,
+                                state.config.cors_policy.describe()
+                            ),
+                        }),
+                    )
+                        .into_response()
+                }
+            }
+            None => next.run(request).await,
+        };
+    }
+
+    let mut response = next.run(request).await;
+    if let Some(origin) = origin.as_deref()
+        && let Some(allow_origin) = state.config.cors_policy.response_allow_origin(origin)
+    {
+        apply_cors_headers(response.headers_mut(), allow_origin, false);
+    }
+    response
+}
+
+fn apply_cors_headers(headers: &mut HeaderMap, allow_origin: HeaderValue, preflight: bool) {
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, allow_origin);
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("content-type, x-ai-contexters-action"),
+    );
+    headers.insert(header::VARY, HeaderValue::from_static("Origin"));
+    if preflight {
+        headers.insert(
+            header::ACCESS_CONTROL_MAX_AGE,
+            HeaderValue::from_static("600"),
+        );
     }
 }
 
+fn normalize_origin(origin: &str) -> Result<()> {
+    let uri = origin
+        .parse::<axum::http::Uri>()
+        .with_context(|| format!("Invalid CORS origin URL '{}'", origin))?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| anyhow!("CORS origin '{}' is missing a scheme", origin))?;
+    if scheme != "http" && scheme != "https" {
+        return Err(anyhow!(
+            "CORS origin '{}' must use http:// or https://",
+            origin
+        ));
+    }
+    if uri.authority().is_none() {
+        return Err(anyhow!("CORS origin '{}' is missing a host", origin));
+    }
+    Ok(())
+}
+
+fn matches_local_origin(origin: &str) -> bool {
+    origin_host(origin)
+        .map(|host| {
+            LOCALHOST_ORIGINS
+                .iter()
+                .any(|allowed| host.eq_ignore_ascii_case(allowed))
+        })
+        .unwrap_or(false)
+}
+
+fn matches_tailscale_origin(origin: &str) -> bool {
+    origin_host(origin)
+        .is_some_and(|host| matches_tailscale_magicdns_host(&host) || matches_tailscale_ip(&host))
+}
+
+fn matches_tailscale_magicdns_host(host: &str) -> bool {
+    host.to_ascii_lowercase()
+        .ends_with(TAILSCALE_MAGICDNS_SUFFIX)
+}
+
+fn matches_tailscale_ip(host: &str) -> bool {
+    host.parse::<IpAddr>()
+        .ok()
+        .and_then(|ip| match ip {
+            IpAddr::V4(ipv4) => Some(u32::from_be_bytes(ipv4.octets())),
+            IpAddr::V6(_) => None,
+        })
+        .is_some_and(|addr| (TAILSCALE_RANGE_BASE..=TAILSCALE_RANGE_END).contains(&addr))
+}
+
+fn origin_host(origin: &str) -> Option<String> {
+    let uri = origin.parse::<axum::http::Uri>().ok()?;
+    let authority = uri.authority()?;
+    let host = authority.host().trim_matches(['[', ']']);
+    Some(host.to_string())
+}
+
 async fn get_dashboard_html(State(state): State<Arc<DashboardServerState>>) -> impl IntoResponse {
-    let snapshot = state.snapshot.read().await;
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    (headers, Html(snapshot.html.clone()))
+    (headers, Html(state.shell_html.clone()))
 }
 
 async fn get_health() -> Json<serde_json::Value> {
@@ -277,11 +559,13 @@ async fn get_status(
     let snapshot = state.snapshot.read().await;
     Json(DashboardStatusResponse {
         ok: true,
+        mode: "server-shell",
         rebuilding: state.rebuilding.load(Ordering::SeqCst),
         generated_at: snapshot.generated_at.to_rfc3339(),
         build_count: snapshot.build_count,
         store_root: state.config.store_root.display().to_string(),
         artifact_path: state.config.artifact_path.display().to_string(),
+        artifact_written: false,
         title: state.config.title.clone(),
         preview_chars: state.config.preview_chars,
         stats: snapshot.stats.clone(),
@@ -331,18 +615,20 @@ async fn regenerate_dashboard(
     match rebuilt {
         Ok(Ok(build)) => {
             let mut snapshot = state.snapshot.write().await;
-            snapshot.html = build.artifact.html;
+            snapshot.stats = build.payload.stats.clone();
+            snapshot.assumptions = build.payload.assumptions.clone();
+            snapshot.payload = build.payload;
             snapshot.generated_at = build.generated_at;
-            snapshot.stats = build.artifact.stats.clone();
-            snapshot.assumptions = build.artifact.assumptions;
             snapshot.build_count = snapshot.build_count.saturating_add(1);
             snapshot.last_error = None;
 
             let response = DashboardRegenerateResponse {
                 ok: true,
+                mode: "server-shell",
                 regenerated_at: snapshot.generated_at.to_rfc3339(),
                 build_count: snapshot.build_count,
                 artifact_path: state.config.artifact_path.display().to_string(),
+                artifact_written: false,
                 stats: snapshot.stats.clone(),
             };
 
@@ -377,6 +663,452 @@ async fn regenerate_dashboard(
                 .into_response()
         }
     }
+}
+
+// ============================================================================
+// Browse & Detail handlers (server-mode API)
+// ============================================================================
+
+/// Lightweight record for browse listing (no search_blob, no detail_text).
+#[derive(Debug, Serialize)]
+struct BrowseRecord {
+    id: usize,
+    project: String,
+    agent: String,
+    date: String,
+    time: String,
+    kind: String,
+    file_name: String,
+    relative_path: String,
+    absolute_path: String,
+    bytes: u64,
+    size_human: String,
+    modified_utc: String,
+    sort_ts: i64,
+    entry_count: Option<usize>,
+    preview: String,
+}
+
+impl From<&DashboardRecord> for BrowseRecord {
+    fn from(r: &DashboardRecord) -> Self {
+        Self {
+            id: r.id,
+            project: r.project.clone(),
+            agent: r.agent.clone(),
+            date: r.date.clone(),
+            time: r.time.clone(),
+            kind: r.kind.clone(),
+            file_name: r.file_name.clone(),
+            relative_path: r.relative_path.clone(),
+            absolute_path: r.absolute_path.clone(),
+            bytes: r.bytes,
+            size_human: r.size_human.clone(),
+            modified_utc: r.modified_utc.clone(),
+            sort_ts: r.sort_ts,
+            entry_count: r.entry_count,
+            preview: r.preview.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct BrowseResponse {
+    ok: bool,
+    generated_at: String,
+    stats: DashboardStats,
+    assumptions: Vec<String>,
+    projects: Vec<String>,
+    agents: Vec<String>,
+    kinds: Vec<String>,
+    records: Vec<BrowseRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowseParams {
+    project: Option<String>,
+    agent: Option<String>,
+    kind: Option<String>,
+    #[serde(default = "default_browse_sort")]
+    sort: String,
+    since: Option<String>,
+}
+
+fn default_browse_sort() -> String {
+    "newest".to_string()
+}
+
+fn parse_relative_time(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let now = Utc::now().timestamp();
+    let (num, unit) = if let Some(h) = s.strip_suffix('h') {
+        (h.parse::<i64>().ok()?, 3600)
+    } else if let Some(d) = s.strip_suffix('d') {
+        (d.parse::<i64>().ok()?, 86400)
+    } else {
+        return None;
+    };
+    Some(now - num * unit)
+}
+
+fn merge_project_scope(scope: Option<&str>, request: Option<&str>) -> Option<String> {
+    match (scope, request) {
+        (Some(scope), Some(request))
+            if request
+                .to_ascii_lowercase()
+                .contains(&scope.to_ascii_lowercase()) =>
+        {
+            Some(request.to_string())
+        }
+        (Some(scope), _) => Some(scope.to_string()),
+        (None, Some(request)) => Some(request.to_string()),
+        (None, None) => None,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ChunkParams {
+    id: Option<usize>,
+    path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChunkResponse {
+    ok: bool,
+    id: Option<usize>,
+    path: String,
+    content: String,
+    project: String,
+    agent: String,
+    kind: String,
+    date: String,
+    bytes: u64,
+}
+
+/// Browse all records with optional server-side filtering.
+async fn get_browse(
+    State(state): State<Arc<DashboardServerState>>,
+    params: Result<Query<BrowseParams>, QueryRejection>,
+) -> Response {
+    let params = match params {
+        Ok(Query(p)) => p,
+        Err(rejection) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: format!("Invalid query parameters: {rejection}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let snapshot = state.snapshot.read().await;
+    let since_ts = params.since.as_deref().and_then(parse_relative_time);
+
+    let mut records: Vec<BrowseRecord> = snapshot
+        .payload
+        .records
+        .iter()
+        .filter(|r| {
+            if let Some(ref p) = params.project
+                && !r.project.eq_ignore_ascii_case(p)
+            {
+                return false;
+            }
+            if let Some(ref a) = params.agent
+                && !r.agent.eq_ignore_ascii_case(a)
+            {
+                return false;
+            }
+            if let Some(ref k) = params.kind
+                && r.kind != *k
+            {
+                return false;
+            }
+            if let Some(ts) = since_ts
+                && r.sort_ts < ts
+            {
+                return false;
+            }
+            true
+        })
+        .map(BrowseRecord::from)
+        .collect();
+
+    match params.sort.as_str() {
+        "oldest" => records.sort_by_key(|r| r.sort_ts),
+        _ => records.sort_by_key(|b| std::cmp::Reverse(b.sort_ts)),
+    }
+
+    (
+        StatusCode::OK,
+        Json(BrowseResponse {
+            ok: true,
+            generated_at: snapshot.payload.generated_at.clone(),
+            stats: snapshot.stats.clone(),
+            assumptions: snapshot.assumptions.clone(),
+            projects: snapshot.payload.projects.clone(),
+            agents: snapshot.payload.agents.clone(),
+            kinds: snapshot.payload.kinds.clone(),
+            records,
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct DetailParams {
+    id: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct DetailResponse {
+    ok: bool,
+    id: usize,
+    detail_text: String,
+}
+
+/// Fetch detail_text for a single record by id.
+async fn get_detail(
+    State(state): State<Arc<DashboardServerState>>,
+    params: Result<Query<DetailParams>, QueryRejection>,
+) -> Response {
+    let Query(params) = match params {
+        Ok(q) => q,
+        Err(rejection) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: format!("Invalid query parameters: {rejection}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let snapshot = state.snapshot.read().await;
+    // Record IDs are 1-based (assigned as idx+1 in scan_store), so look up by
+    // matching the id field rather than using it as a raw array index.
+    if let Some(record) = snapshot.payload.records.iter().find(|r| r.id == params.id) {
+        (
+            StatusCode::OK,
+            Json(DetailResponse {
+                ok: true,
+                id: params.id,
+                detail_text: record.detail_text.clone(),
+            }),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                ok: false,
+                error: format!("Record id {} not found", params.id),
+            }),
+        )
+            .into_response()
+    }
+}
+
+// ============================================================================
+// Chunk endpoint — bounded file reader for inline markdown rendering
+// ============================================================================
+
+async fn get_chunk(
+    State(state): State<Arc<DashboardServerState>>,
+    params: Result<Query<ChunkParams>, QueryRejection>,
+) -> Response {
+    let Query(params) = match params {
+        Ok(q) => q,
+        Err(rejection) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: format!("Invalid query parameters: {rejection}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let snapshot = state.snapshot.read().await;
+    let store_root = &state.config.store_root;
+
+    let record = if let Some(id) = params.id {
+        snapshot.payload.records.iter().find(|r| r.id == id)
+    } else if let Some(ref rel_path) = params.path {
+        snapshot
+            .payload
+            .records
+            .iter()
+            .find(|r| r.relative_path == *rel_path)
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                ok: false,
+                error: "Either 'id' or 'path' parameter is required".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let Some(record) = record else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                ok: false,
+                error: "Chunk not found".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let file_path = store_root.join(&record.relative_path);
+    let file_path = match resolve_bounded_path(store_root, &file_path) {
+        Ok(p) => p,
+        Err(err) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: format!("Path resolution rejected: {err}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let content = match std::fs::read_to_string(&file_path) {
+        Ok(c) => c,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: format!("Failed to read chunk: {err}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(ChunkResponse {
+            ok: true,
+            id: Some(record.id),
+            path: record.relative_path.clone(),
+            content,
+            project: record.project.clone(),
+            agent: record.agent.clone(),
+            kind: record.kind.clone(),
+            date: record.date.clone(),
+            bytes: record.bytes,
+        }),
+    )
+        .into_response()
+}
+
+fn resolve_bounded_path(root: &Path, target: &Path) -> Result<PathBuf> {
+    let target_str = target.to_string_lossy();
+    if target_str.contains("..") {
+        return Err(anyhow!("Path contains traversal sequence"));
+    }
+
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("Cannot canonicalize store root: {}", root.display()))?;
+
+    if !target.exists() {
+        return Err(anyhow!("Path does not exist: {}", target.display()));
+    }
+
+    let canonical_target = target
+        .canonicalize()
+        .with_context(|| format!("Cannot canonicalize target: {}", target.display()))?;
+
+    if !canonical_target.starts_with(&canonical_root) {
+        return Err(anyhow!(
+            "Path escapes store root: {} is not under {}",
+            canonical_target.display(),
+            canonical_root.display()
+        ));
+    }
+
+    Ok(canonical_target)
+}
+
+// ============================================================================
+// Context / PWA endpoints
+// ============================================================================
+
+async fn get_context(State(state): State<Arc<DashboardServerState>>) -> Json<serde_json::Value> {
+    let snapshot = state.snapshot.read().await;
+    Json(serde_json::json!({
+        "ok": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "store_root": state.config.store_root.display().to_string(),
+        "host": state.config.host.to_string(),
+        "port": state.config.port,
+        "generated_at": snapshot.generated_at.to_rfc3339(),
+        "build_count": snapshot.build_count,
+        "stats": snapshot.stats,
+    }))
+}
+
+async fn get_manifest() -> Response {
+    let manifest = serde_json::json!({
+        "name": "aicx Dashboard",
+        "short_name": "aicx",
+        "description": "AI Context Browser \u{2014} operator retrieval dashboard",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "theme_color": "#0a0f19",
+        "background_color": "#0a0f19",
+        "icons": []
+    });
+    let body = serde_json::to_string_pretty(&manifest).unwrap_or_default();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/manifest+json"),
+    );
+    (headers, body).into_response()
+}
+
+async fn get_service_worker() -> Response {
+    let sw_js = "const CACHE_NAME='aicx-shell-v1';\
+const SHELL_URLS=['/','/manifest.webmanifest'];\
+self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE_NAME)\
+.then(c=>c.addAll(SHELL_URLS)));self.skipWaiting();});\
+self.addEventListener('activate',e=>{e.waitUntil(caches.keys()\
+.then(ks=>Promise.all(ks.filter(k=>k!==CACHE_NAME).map(k=>caches.delete(k)))));\
+self.clients.claim();});\
+self.addEventListener('fetch',e=>{const u=new URL(e.request.url);\
+if(u.pathname.startsWith('/api/')||u.pathname==='/service-worker.js')return;\
+e.respondWith(caches.match(e.request).then(r=>{if(r)return r;\
+return fetch(e.request).catch(()=>{if(e.request.mode==='navigate')\
+return new Response('<html><body style=\"background:#0a0f19;color:#e5e7eb;\
+font-family:system-ui;display:flex;align-items:center;justify-content:center;\
+height:100vh;margin:0\"><div style=\"text-align:center\"><h1>aicx store not \
+reachable</h1><p>Start the server with <code>aicx dashboard --serve</code></p>\
+</div></body></html>',{headers:{'Content-Type':'text/html'}});});}));});";
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/javascript; charset=utf-8"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    (headers, sw_js).into_response()
 }
 
 // ============================================================================
@@ -419,25 +1151,58 @@ async fn fuzzy_search(
 
     let limit = params.limit.min(100);
     let store_root = state.config.store_root.clone();
-    let project_filter = params.project;
+    let scope = state.config.scope.normalized();
+    let request_project = params.project;
+    let merged_project_filter =
+        merge_project_scope(scope.project.as_deref(), request_project.as_deref());
+    let frame_kind = params.frame_kind;
+    let score = match validate_score_filter(params.score) {
+        Ok(score) => score,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse { ok: false, error }),
+            )
+                .into_response();
+        }
+    };
     let query_clone = query.clone();
+    let refresh_scope = scope.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        run_fuzzy_search(&store_root, &query_clone, limit, project_filter.as_deref())
+        run_fuzzy_search(
+            &store_root,
+            &query_clone,
+            limit,
+            merged_project_filter.as_deref(),
+            score,
+            frame_kind,
+            refresh_scope,
+        )
     })
     .await;
 
     match result {
-        Ok(Ok((results, total_scanned))) => (
-            StatusCode::OK,
-            Json(FuzzySearchResponse {
-                ok: true,
-                query,
-                results,
-                total_scanned,
-            }),
-        )
-            .into_response(),
+        Ok(Ok((results, total_scanned))) => {
+            let results = results
+                .into_iter()
+                .filter(|result| {
+                    project_matches_filter(&result.project, request_project.as_deref())
+                        && project_matches_filter(&result.project, scope.project.as_deref())
+                })
+                .collect();
+
+            (
+                StatusCode::OK,
+                Json(FuzzySearchResponse {
+                    ok: true,
+                    query,
+                    results,
+                    total_scanned,
+                }),
+            )
+                .into_response()
+        }
         Ok(Err(err)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -462,11 +1227,24 @@ fn run_fuzzy_search(
     query: &str,
     limit: usize,
     project_filter: Option<&str>,
+    score: Option<u8>,
+    frame_kind: Option<crate::timeline::FrameKind>,
+    refresh_scope: DashboardScope,
 ) -> Result<(Vec<FuzzySearchResult>, usize)> {
     // Non-blocking auto-rescan with rate-limit guard.
     if !DASHBOARD_RESCAN_RUNNING.swap(true, Ordering::SeqCst) {
-        match std::process::Command::new("aicx")
-            .args(["store", "-H", "24", "--incremental"])
+        let normalized_scope = refresh_scope.normalized();
+        let mut command = std::process::Command::new("aicx");
+        command
+            .arg("store")
+            .arg("-H")
+            .arg(normalized_scope.hours.unwrap_or(24).to_string())
+            .arg("--emit")
+            .arg("none");
+        if let Some(project) = normalized_scope.project {
+            command.arg("--project").arg(project);
+        }
+        match command
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -483,27 +1261,66 @@ fn run_fuzzy_search(
         }
     }
 
+    // Try fast search with rmcp_memex first (instant), fallback to brute-force if it fails or returns nothing
+    let fetch_limit = if score.is_some() {
+        limit.saturating_mul(5).max(50)
+    } else {
+        limit
+    };
+
     let (results, total_scanned) =
-        rank::fuzzy_search_store(store_root, query, limit, project_filter)?;
+        rank::fuzzy_search_store(store_root, query, fetch_limit, project_filter, frame_kind)?;
+
+    let mut results = results;
+    if let Some(min_score) = score {
+        results.retain(|result| result.score >= min_score);
+    }
+    results.retain(|result| {
+        timestamp_matches_hours_scope(
+            result.timestamp.as_deref(),
+            &result.date,
+            refresh_scope.hours,
+        )
+    });
+
     let results = results
         .into_iter()
-        .map(|result| FuzzySearchResult {
-            file: result.file,
-            project: result.project,
-            date: result.date,
-            score: result.score,
-            label: result.label,
-            signal_density: result.density,
-            matched_lines: result.matched_lines,
+        .take(limit)
+        .map(|result| {
+            let excerpt = result.matched_lines.join(" ... ");
+            FuzzySearchResult {
+                file: result.file,
+                path: result.path,
+                project: result.project,
+                kind: result.kind,
+                frame_kind: result.frame_kind,
+                agent: result.agent,
+                date: result.date,
+                score: result.score,
+                label: result.label,
+                signal_density: result.density,
+                matched_lines: result.matched_lines,
+                excerpt,
+            }
         })
         .collect();
 
     Ok((results, total_scanned))
 }
 
-/// Semantic search via rmcp-memex vector DB.
+fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, String> {
+    match score {
+        Some(score) if score > MAX_SCORE_FILTER => {
+            Err(format!("score must be between 0 and {MAX_SCORE_FILTER}"))
+        }
+        _ => Ok(score),
+    }
+}
+
+/// Semantic search via the configured memex CLI.
 ///
-/// Shells out to `rmcp-memex search --json` for vector similarity.
+/// Prefers `rust-memex` and falls back to the legacy `rmcp-memex` binary when
+/// operators still have the old name on PATH.
 async fn semantic_search(params: Result<Query<SemanticSearchParams>, QueryRejection>) -> Response {
     let Query(params) = match params {
         Ok(q) => q,
@@ -565,23 +1382,23 @@ fn run_memex_search(
     limit: usize,
     mode: &str,
 ) -> Result<MemexSearchResponse> {
-    let output = Command::new("rmcp-memex")
-        .arg("search")
-        .arg("-n")
-        .arg(namespace)
-        .arg("-q")
-        .arg(query)
-        .arg("-l")
-        .arg(limit.to_string())
-        .arg("-m")
-        .arg(mode)
-        .arg("--json")
-        .output()
-        .context("Failed to run rmcp-memex search. Is rmcp-memex installed?")?;
+    let args = [
+        "search",
+        "-n",
+        namespace,
+        "-q",
+        query,
+        "-l",
+        &limit.to_string(),
+        "-m",
+        mode,
+        "--json",
+    ];
+    let (binary, output) = run_memex_cli(&args, "search")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("rmcp-memex search failed: {}", stderr.trim());
+        anyhow::bail!("{binary} search failed: {}", stderr.trim());
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -591,12 +1408,39 @@ fn run_memex_search(
     Ok(MemexSearchResponse {
         ok: true,
         query: query.to_string(),
-        source: format!("rmcp-memex search -n {} --mode {}", namespace, mode),
+        source: format!("{binary} search -n {} --mode {}", namespace, mode),
         results,
     })
 }
 
-/// Cross-namespace semantic search via rmcp-memex.
+fn run_memex_cli(args: &[&str], action: &str) -> Result<(String, Output)> {
+    let candidates = ["rust-memex", "rmcp-memex"];
+    let mut last_not_found = None;
+
+    for binary in candidates {
+        match Command::new(binary).args(args).output() {
+            Ok(output) => return Ok((binary.to_string(), output)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                last_not_found = Some(err);
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("Failed to run {binary} {action}"));
+            }
+        }
+    }
+
+    let last_not_found = last_not_found.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no compatible memex CLI binary found",
+        )
+    });
+    Err(last_not_found).context(format!(
+        "Failed to run memex {action}. Tried rust-memex, then rmcp-memex."
+    ))
+}
+
+/// Cross-namespace semantic search via the configured memex CLI.
 ///
 /// Searches all namespaces at once, merging and ranking results.
 async fn cross_search(params: Result<Query<CrossSearchParams>, QueryRejection>) -> Response {
@@ -653,20 +1497,20 @@ async fn cross_search(params: Result<Query<CrossSearchParams>, QueryRejection>) 
 }
 
 fn run_memex_cross_search(query: &str, limit: usize, mode: &str) -> Result<MemexSearchResponse> {
-    let output = Command::new("rmcp-memex")
-        .arg("cross-search")
-        .arg(query)
-        .arg("--limit")
-        .arg(limit.to_string())
-        .arg("--mode")
-        .arg(mode)
-        .arg("--json")
-        .output()
-        .context("Failed to run rmcp-memex cross-search. Is rmcp-memex installed?")?;
+    let args = [
+        "cross-search",
+        query,
+        "--limit",
+        &limit.to_string(),
+        "--mode",
+        mode,
+        "--json",
+    ];
+    let (binary, output) = run_memex_cli(&args, "cross-search")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("rmcp-memex cross-search failed: {}", stderr.trim());
+        anyhow::bail!("{binary} cross-search failed: {}", stderr.trim());
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -676,25 +1520,200 @@ fn run_memex_cross_search(query: &str, limit: usize, mode: &str) -> Result<Memex
     Ok(MemexSearchResponse {
         ok: true,
         query: query.to_string(),
-        source: format!("rmcp-memex cross-search --mode {}", mode),
+        source: format!("{binary} cross-search --mode {}", mode),
         results,
     })
 }
 
+/// Steering-metadata search across stored chunks.
+///
+/// Filters by sidecar metadata (run_id, prompt_id, agent, kind, project, date)
+/// using canonical chunk dates instead of filesystem mtime.
+async fn steer_search(params: Result<Query<SteerSearchParams>, QueryRejection>) -> Response {
+    let Query(params) = match params {
+        Ok(q) => q,
+        Err(rejection) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: format!("Invalid query parameters: {rejection}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let limit = params.limit.min(100);
+
+    let result = tokio::task::spawn_blocking(move || run_steer_search(params, limit)).await;
+
+    match result {
+        Ok(Ok(response)) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(Err(err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                ok: false,
+                error: format!("{err:#}"),
+            }),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                ok: false,
+                error: format!("Steer search task failed: {err}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+fn parse_date_bounds(date: &str) -> (Option<String>, Option<String>) {
+    if let Some((lo, hi)) = date.split_once("..") {
+        let lo = if lo.is_empty() {
+            None
+        } else {
+            Some(lo.to_string())
+        };
+        let hi = if hi.is_empty() {
+            None
+        } else {
+            Some(hi.to_string())
+        };
+        (lo, hi)
+    } else {
+        (Some(date.to_string()), Some(date.to_string()))
+    }
+}
+
+fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSearchResponse> {
+    let rt = tokio::runtime::Runtime::new()?;
+
+    let (date_lo, date_hi) = if let Some(ref d) = params.date {
+        parse_date_bounds(d)
+    } else {
+        (None, None)
+    };
+
+    let filter = crate::steer_index::SteerFilter {
+        run_id: params.run_id.as_deref(),
+        prompt_id: params.prompt_id.as_deref(),
+        agent: params.agent.as_deref(),
+        kind: params.kind.as_deref(),
+        frame_kind: params.frame_kind,
+        project: params.project.as_deref(),
+        date_lo: date_lo.as_deref(),
+        date_hi: date_hi.as_deref(),
+    };
+    let metadatas = rt.block_on(crate::steer_index::search_steer_index(&filter, limit))?;
+
+    let mut items = Vec::new();
+
+    for meta in metadatas {
+        let path = meta
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let project = meta
+            .get("project")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let agent = meta
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let kind = meta
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let date = meta
+            .get("date")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let session_id = meta
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let run_id = meta
+            .get("run_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let prompt_id = meta
+            .get("prompt_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let agent_model = meta
+            .get("agent_model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let started_at = meta
+            .get("started_at")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let completed_at = meta
+            .get("completed_at")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let token_usage = meta.get("token_usage").and_then(|v| v.as_u64());
+        let findings_count = meta
+            .get("findings_count")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+
+        items.push(SteerSearchResult {
+            path,
+            project,
+            agent,
+            kind,
+            frame_kind: meta
+                .get("frame_kind")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            date,
+            session_id,
+            run_id,
+            prompt_id,
+            agent_model,
+            started_at,
+            completed_at,
+            token_usage,
+            findings_count,
+        });
+    }
+
+    Ok(SteerSearchResponse {
+        ok: true,
+        scanned: 0,
+        matched: items.len(),
+        items,
+    })
+}
+
 fn rebuild_dashboard(config: &DashboardServerConfig) -> Result<BuildOutput> {
-    let artifact = dashboard::build_dashboard(&DashboardConfig {
-        store_root: config.store_root.clone(),
-        title: config.title.clone(),
-        preview_chars: config.preview_chars,
-    })?;
-    write_dashboard_artifact(&config.artifact_path, &artifact.html)?;
+    // Server mode: scan only — no static HTML rendering, no artifact write.
+    // The server shell HTML is pre-built once at startup; all data reaches
+    // clients through the /api/* endpoints.
+    let payload = dashboard::scan_store_payload_scoped(
+        &config.store_root,
+        config.preview_chars,
+        &config.scope,
+    )?;
 
     Ok(BuildOutput {
-        artifact,
+        payload,
         generated_at: Utc::now(),
     })
 }
 
+#[cfg(test)]
 fn write_dashboard_artifact(path: &Path, html: &str) -> Result<()> {
     let mut output_path = crate::sanitize::validate_write_path(path)?;
     if let Some(parent) = output_path.parent() {
@@ -798,14 +1817,26 @@ mod tests {
         Arc::new(DashboardServerState {
             config: DashboardServerConfig {
                 store_root: root,
+                scope: DashboardScope::default(),
                 title: "test".to_string(),
                 preview_chars: 120,
                 artifact_path,
+                cors_policy: DashboardCorsPolicy::Local,
                 host: "127.0.0.1".parse().expect("host"),
                 port: 8033,
             },
+            shell_html: "<html>shell</html>".to_string(),
             snapshot: RwLock::new(DashboardSnapshot {
-                html: "<html></html>".to_string(),
+                payload: DashboardPayload {
+                    generated_at: String::new(),
+                    store_root: String::new(),
+                    stats: DashboardStats::default(),
+                    assumptions: Vec::new(),
+                    projects: Vec::new(),
+                    agents: Vec::new(),
+                    kinds: Vec::new(),
+                    records: Vec::new(),
+                },
                 generated_at: Utc::now(),
                 stats: DashboardStats::default(),
                 assumptions: Vec::new(),
@@ -817,10 +1848,58 @@ mod tests {
     }
 
     #[test]
-    fn ensure_loopback_host_accepts_loopback_only() {
-        assert!(ensure_loopback_host("127.0.0.1".parse().expect("ipv4")).is_ok());
-        assert!(ensure_loopback_host("::1".parse().expect("ipv6")).is_ok());
-        assert!(ensure_loopback_host("0.0.0.0".parse().expect("any")).is_err());
+    fn validate_dashboard_host_policy_requires_explicit_non_local_cors_for_remote_hosts() {
+        let local = DashboardCorsPolicy::Local;
+        let all = DashboardCorsPolicy::All;
+        let exact =
+            DashboardCorsPolicy::from_cli(Some("https://dashboard.example.com")).expect("exact");
+
+        assert!(
+            validate_dashboard_host_policy("127.0.0.1".parse().expect("ipv4"), &local, false)
+                .is_ok()
+        );
+        assert!(
+            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &local, false).is_err()
+        );
+        assert!(
+            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &local, true).is_err()
+        );
+        assert!(
+            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &all, true).is_ok()
+        );
+        assert!(
+            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &exact, true).is_ok()
+        );
+    }
+
+    #[test]
+    fn cors_policy_matches_supported_origin_sets() {
+        let local = DashboardCorsPolicy::from_cli(None).expect("default local");
+        let tailscale = DashboardCorsPolicy::from_cli(Some("tailscale")).expect("tailscale");
+        let all = DashboardCorsPolicy::from_cli(Some("all")).expect("all");
+        let exact =
+            DashboardCorsPolicy::from_cli(Some("https://dashboard.example.com")).expect("exact");
+
+        assert!(local.allows_origin("http://localhost:3000"));
+        assert!(local.allows_origin("http://127.0.0.1:9478"));
+        assert!(!local.allows_origin("https://dashboard.example.com"));
+
+        assert!(tailscale.allows_origin("http://100.96.12.4:9478"));
+        assert!(tailscale.allows_origin("https://vetcoders-mbp.tail2c9f.ts.net"));
+        assert!(!tailscale.allows_origin("http://192.168.0.4:9478"));
+        assert!(!tailscale.allows_origin("https://dashboard.example.com"));
+
+        assert!(all.allows_origin("https://anything.example"));
+
+        assert!(exact.allows_origin("https://dashboard.example.com"));
+        assert!(!exact.allows_origin("https://other.example.com"));
+    }
+
+    #[test]
+    fn invalid_exact_cors_origin_is_rejected() {
+        let err = DashboardCorsPolicy::from_cli(Some("dashboard.example.com"))
+            .expect_err("missing scheme");
+        assert!(err.to_string().contains("scheme"));
     }
 
     #[test]
@@ -907,8 +1986,15 @@ mod tests {
         );
         let response = runtime.block_on(regenerate_dashboard(State(state), headers));
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(artifact_path.exists());
+        // Server mode no longer writes a static HTML artifact — data is served via API.
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn score_filter_rejects_values_above_max() {
+        let err = validate_score_filter(Some(MAX_SCORE_FILTER + 1))
+            .expect_err("score above 100 should be rejected");
+        assert_eq!(err, "score must be between 0 and 100");
     }
 }

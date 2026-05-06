@@ -1,30 +1,36 @@
 //! MCP (Model Context Protocol) server for aicx.
 //!
-//! Exposes aicx functionality as MCP tools so any AI agent can query
-//! session history, search chunks, rank artifacts, and extract intents.
+//! Exposes aicx functionality as MCP tools so agents can search canonical
+//! chunks, rank artifacts, and retrieve steer metadata.
 //!
-//! Supports stdio and SSE transports.
+//! Supports stdio and streamable HTTP transports.
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
+use clap::ValueEnum;
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::{
     ErrorData as McpError, handler::server::tool::ToolRouter, handler::server::wrapper::Parameters,
     model::*, tool, tool_router,
 };
-use serde::Deserialize;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use serde::{Deserialize, Serialize};
 
-/// Guard that prevents concurrent background refresh child-process spawns.
-static RESCAN_RUNNING: AtomicBool = AtomicBool::new(false);
-
+use crate::intents::{self, IntentKind, IntentsConfig};
+use crate::oracle::OracleStatus;
 use crate::rank;
 use crate::store;
+use crate::timeline::FrameKind;
 
 // ============================================================================
 // Tool parameter & result types
 // ============================================================================
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum McpTransport {
+    Stdio,
+    #[value(alias = "sse")]
+    Http,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchParams {
@@ -35,11 +41,47 @@ pub struct SearchParams {
     pub limit: usize,
     /// Optional project filter (case-insensitive substring)
     pub project: Option<String>,
+    /// Minimum score threshold (0-100)
+    pub score: Option<u8>,
+    /// Hours to look back (0 = all time)
+    pub hours: Option<u64>,
+    /// Optional agent filter
+    pub agent: Option<String>,
+    /// Optional date filter (single day or range)
+    pub date: Option<String>,
+    /// Optional lower date bound or single-day shorthand
+    pub since: Option<String>,
+    /// Optional upper date bound
+    pub until: Option<String>,
+    /// Optional sort order: newest, oldest, score
+    pub sort: Option<String>,
+    /// Optional frame/channel filter: user_msg, agent_reply, internal_thought, tool_call
+    pub frame_kind: Option<FrameKind>,
+    /// Return only metadata without full snippet content
+    #[serde(default = "default_true")]
+    pub slim: bool,
+    /// Return snippet + full evidence
+    #[serde(default)]
+    pub verbose: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadParams {
+    /// Absolute path, store-relative path, file name, or compact chunk reference
+    pub reference: String,
+    /// Truncate chunk content to this many UTF-8 characters
+    pub max_chars: Option<usize>,
 }
 
 fn default_limit() -> usize {
-    10
+    20
 }
+
+fn default_true() -> bool {
+    true
+}
+
+const MAX_SCORE_FILTER: u8 = 100;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RankParams {
@@ -51,8 +93,25 @@ pub struct RankParams {
     /// Only show chunks scoring >= 5
     #[serde(default)]
     pub strict: bool,
+    /// Optional agent filter
+    pub agent: Option<String>,
+    /// Optional lower date bound or single-day shorthand
+    pub since: Option<String>,
+    /// Optional upper date bound
+    pub until: Option<String>,
+    /// Optional sort order: newest, oldest, score
+    pub sort: Option<String>,
     /// Show only top N bundles
     pub top: Option<usize>,
+    /// Max results to return
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    /// Return only metadata without full snippet content
+    #[serde(default = "default_true")]
+    pub slim: bool,
+    /// Return snippet + full evidence
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 fn default_rank_hours() -> u64 {
@@ -60,40 +119,137 @@ fn default_rank_hours() -> u64 {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct RefsParams {
-    /// Hours to look back (default: 168)
-    #[serde(default = "default_refs_hours")]
-    pub hours: u64,
-    /// Optional project filter
+pub struct SteerParams {
+    /// Filter by run_id (exact match against sidecar metadata)
+    pub run_id: Option<String>,
+    /// Filter by prompt_id (exact match against sidecar metadata)
+    pub prompt_id: Option<String>,
+    /// Filter by agent name: claude, codex, gemini (case-insensitive)
+    pub agent: Option<String>,
+    /// Filter by kind: conversations, plans, reports, other
+    pub kind: Option<String>,
+    /// Filter by frame/channel: user_msg, agent_reply, internal_thought, tool_call
+    pub frame_kind: Option<FrameKind>,
+    /// Filter by project (case-insensitive substring)
     pub project: Option<String>,
-    /// Exclude noise artifacts
+    /// Filter by date (YYYY-MM-DD, or range like 2026-03-20..2026-03-28)
+    pub date: Option<String>,
+    /// Max results (default: 20)
+    #[serde(default = "default_steer_limit")]
+    pub limit: usize,
+    /// Minimum score threshold (0-100)
+    pub score: Option<u8>,
+    /// Sort order (newest, oldest, score)
+    pub sort: Option<String>,
+    /// Date boundary
+    pub since: Option<String>,
+    /// Date boundary
+    pub until: Option<String>,
+    /// Return only metadata without full snippet content
+    #[serde(default = "default_true")]
+    pub slim: bool,
+    /// Return snippet + full evidence
     #[serde(default)]
-    pub strict: bool,
+    pub verbose: bool,
 }
 
-fn default_refs_hours() -> u64 {
-    168
+fn default_steer_limit() -> usize {
+    20
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct StoreParams {
-    /// Hours to look back (default: 24)
-    #[serde(default = "default_store_hours")]
-    pub hours: u64,
-    /// Optional project filter
+pub struct IntentsParams {
+    /// Optional project filter (case-insensitive substring; empty/None = all projects)
+    #[serde(default)]
     pub project: Option<String>,
+    /// Hours to look back (default: 720 = 30 days, 0 = all time). Matches CLI default.
+    #[serde(default = "default_intents_hours")]
+    pub hours: u64,
+    /// Strict mode: only emit high-confidence intents (default: false)
+    #[serde(default)]
+    pub strict: bool,
+    /// Optional kind filter: decision, intent, outcome, task
+    pub kind: Option<String>,
+    /// Optional frame/channel filter: user_msg, agent_reply, internal_thought, tool_call
+    pub frame_kind: Option<FrameKind>,
+    /// Filter to intent entries lacking a matching outcome in the same session
+    #[serde(default)]
+    pub unresolved: bool,
+    /// Collapse multiple intents from the same session into one entry with count
+    #[serde(default)]
+    pub collapse_session: bool,
+    /// Optional agent filter (claude, codex, gemini, junie)
+    pub agent: Option<String>,
+    /// Optional lower date bound (YYYY-MM-DD or single-day shorthand like 2026-04-23..)
+    pub since: Option<String>,
+    /// Optional upper date bound (YYYY-MM-DD)
+    pub until: Option<String>,
+    /// Sort order: newest (default), oldest
+    pub sort: Option<String>,
+    /// Max records to return (default: 20, capped at 500)
+    #[serde(default = "default_intents_limit")]
+    pub limit: usize,
+    /// Output format: json, markdown (default). Matches CLI `emit` naming.
+    #[serde(default = "default_intents_emit")]
+    pub emit: String,
+    /// Return only metadata without full snippet content
+    #[serde(default = "default_true")]
+    pub slim: bool,
+    /// Return snippet + full evidence
+    #[serde(default)]
+    pub verbose: bool,
 }
 
-fn default_store_hours() -> u64 {
-    24
+fn default_intents_hours() -> u64 {
+    720
 }
 
-fn incremental_rescan_args(hours: u64, project: Option<&str>) -> Vec<String> {
+fn default_intents_limit() -> usize {
+    20
+}
+
+fn default_intents_emit() -> String {
+    "markdown".to_string()
+}
+
+#[derive(Debug, Serialize)]
+struct RankResponse {
+    project: String,
+    hours: u64,
+    strict: bool,
+    results: usize,
+    items: Vec<RankItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct RankItem {
+    file: String,
+    project: String,
+    date: String,
+    timestamp: Option<String>,
+    kind: String,
+    agent: String,
+    score: u8,
+    label: String,
+    signal: usize,
+    noise: usize,
+    total: usize,
+    density: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SteerResponse {
+    oracle_status: OracleStatus,
+    results: usize,
+    items: Vec<serde_json::Value>,
+}
+
+#[cfg(test)]
+fn background_refresh_args(hours: u64, project: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "all".to_string(),
         "-H".to_string(),
         hours.to_string(),
-        "--incremental".to_string(),
         "--emit".to_string(),
         "none".to_string(),
     ];
@@ -112,6 +268,7 @@ fn incremental_rescan_args(hours: u64, project: Option<&str>) -> Vec<String> {
 
 #[derive(Clone)]
 pub struct AicxMcpServer {
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
@@ -131,7 +288,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_search",
-        description = "Fuzzy search across stored AI session chunks. Returns quality-scored results with matched lines. Supports Polish diacritics normalization and optional project filtering."
+        description = "Search stored AI session chunks with fast metadata narrowing plus canonical-store fuzzy scoring. Returns oracle_status so callers can see that this is filesystem fuzzy, not semantic retrieval."
     )]
     async fn search(
         &self,
@@ -140,41 +297,100 @@ impl AicxMcpServer {
         let query = params.query;
         let limit = params.limit.min(50);
         let project = params.project;
+        let score = validate_score_filter(params.score)?;
+        let hours = params.hours.unwrap_or(0);
+        let date = params.date;
+        let frame_kind = params.frame_kind;
+        let fetch_limit = if score.is_some() || date.is_some() || hours > 0 {
+            limit.saturating_mul(5).max(50)
+        } else {
+            limit
+        };
+
         let store_root = store::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+        let (results, scanned) = rank::fuzzy_search_store(
+            &store_root,
+            &query,
+            fetch_limit,
+            project.as_deref(),
+            frame_kind,
+        )
+        .map_err(|e| McpError::internal_error(format!("Read store: {e}"), None))?;
 
-        // Non-blocking auto-rescan with rate-limit guard.
-        if !RESCAN_RUNNING.swap(true, Ordering::SeqCst) {
-            let args = incremental_rescan_args(24, project.as_deref());
-            match std::process::Command::new("aicx")
-                .args(&args)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                Ok(_) => {
-                    std::thread::spawn(|| {
-                        std::thread::sleep(std::time::Duration::from_secs(30));
-                        RESCAN_RUNNING.store(false, Ordering::SeqCst);
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to spawn aicx background refresh: {e}");
-                    RESCAN_RUNNING.store(false, Ordering::SeqCst);
-                }
-            }
+        let mut results = results;
+
+        if let Some(min_score) = score {
+            results.retain(|result| result.score >= min_score);
+        }
+        if let Some(ref agent_filter) = params.agent {
+            results.retain(|r| r.agent == *agent_filter);
         }
 
-        let (results, scanned) =
-            rank::fuzzy_search_store(&store_root, &query, limit, project.as_deref())
-                .map_err(|e| McpError::internal_error(format!("Read store: {e}"), None))?;
+        let date_effective = date.or(params.since.clone());
+        let (lo, hi) = if let Some(ref date_filter) = date_effective {
+            parse_date_filter_mcp(date_filter)
+        } else {
+            (None, params.until.clone())
+        };
 
-        let json = serde_json::to_string_pretty(&serde_json::json!({
-            "scanned": scanned,
-            "results": results.len(),
-            "items": results,
-        }))
-        .unwrap_or_default();
+        let mut results: Vec<_> = if lo.is_some() || hi.is_some() {
+            results
+                .into_iter()
+                .filter(|result| {
+                    lo.as_ref()
+                        .is_none_or(|lo| result.date.as_str() >= lo.as_str())
+                        && hi
+                            .as_ref()
+                            .is_none_or(|hi| result.date.as_str() <= hi.as_str())
+                })
+                .collect()
+        } else if hours > 0 {
+            let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
+            let cutoff_date = cutoff.format("%Y-%m-%d").to_string();
+            results
+                .into_iter()
+                .filter(|result| result.date >= cutoff_date)
+                .collect()
+        } else {
+            results
+        };
+
+        if let Some(sort_order) = params.sort.as_deref() {
+            results.sort_by(|a, b| {
+                let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
+                let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
+                match sort_order {
+                    "newest" => t_b.cmp(t_a),
+                    "oldest" => t_a.cmp(t_b),
+                    "score" => b.score.cmp(&a.score).then(t_b.cmp(t_a)),
+                    _ => t_b.cmp(t_a),
+                }
+            });
+        } else {
+            results.sort_by_key(|b| std::cmp::Reverse(b.score));
+        }
+
+        let results: Vec<_> = results.into_iter().take(limit).collect();
+
+        let json = rank::render_search_json(&store_root, &results, scanned)
+            .map_err(|e| McpError::internal_error(format!("Serialize search JSON: {e}"), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(
+        name = "aicx_read",
+        description = "Read one canonical AICX chunk by path, file name, or compact reference. Use after aicx_search, aicx_steer, or CLI refs/search output to pull the actual chunk content into context."
+    )]
+    async fn read_chunk(
+        &self,
+        Parameters(params): Parameters<ReadParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let chunk = store::read_context_chunk(&params.reference, params.max_chars)
+            .map_err(|e| McpError::internal_error(format!("Read chunk: {e}"), None))?;
+        let json = serde_json::to_string(&chunk)
+            .map_err(|e| McpError::internal_error(format!("Serialize chunk JSON: {e}"), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
@@ -192,199 +408,312 @@ impl AicxMcpServer {
         let strict = params.strict;
         let top = params.top;
 
-        let store_root = store::store_base_dir()
-            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
-        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
+        let cutoff = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(hours.saturating_mul(3600).min(365 * 24 * 3600));
+        let mut scored = Vec::new();
 
-        let proj_dir = store_root.join(&project);
-        if !proj_dir.is_dir() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No data for project '{project}'"
-            ))]));
-        }
-
-        let mut scored: Vec<serde_json::Value> = Vec::new();
-
-        let Ok(dates) = std::fs::read_dir(&proj_dir) else {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "Cannot read project dir",
-            )]));
+        let (lo, hi) = if let Some(ref d) = params.since {
+            parse_date_filter_mcp(d)
+        } else {
+            (None, params.until.clone())
         };
 
-        for date_entry in dates.filter_map(|e| e.ok()) {
-            let date_path = date_entry.path();
-            if !date_path.is_dir() {
+        let files = store::context_files_since(cutoff, Some(&project))
+            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+
+        for file in files {
+            if file.path.extension().is_none_or(|ext| ext != "md") {
                 continue;
             }
-            let Ok(files) = std::fs::read_dir(&date_path) else {
+            if let Some(ref agent_filter) = params.agent
+                && file.agent != *agent_filter
+            {
                 continue;
+            }
+            if lo
+                .as_ref()
+                .is_some_and(|lo| file.date_iso.as_str() < lo.as_str())
+                || hi
+                    .as_ref()
+                    .is_some_and(|hi| file.date_iso.as_str() > hi.as_str())
+            {
+                continue;
+            }
+
+            let cs = rank::score_chunk_file(&file.path);
+            if strict && cs.score < 5 {
+                continue;
+            }
+
+            let sidecar_path = file.path.with_extension("meta.json");
+            let timestamp = if sidecar_path.exists() {
+                crate::sanitize::read_to_string_validated(&sidecar_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| {
+                        v.get("started_at")
+                            .and_then(|s| s.as_str())
+                            .map(String::from)
+                            .or_else(|| {
+                                v.get("timestamp")
+                                    .and_then(|s| s.as_str())
+                                    .map(String::from)
+                            })
+                    })
+            } else {
+                None
             };
-            for file_entry in files.filter_map(|e| e.ok()) {
-                let fpath = file_entry.path();
-                if fpath.extension().is_none_or(|ext| ext != "md") {
-                    continue;
-                }
-                if let Ok(meta) = fpath.metadata()
-                    && let Ok(mtime) = meta.modified()
-                    && mtime >= cutoff
-                {
-                    let cs = rank::score_chunk_file(&fpath);
-                    if strict && cs.score < 5 {
-                        continue;
-                    }
-                    scored.push(serde_json::json!({
-                        "file": fpath.file_name().unwrap_or_default().to_string_lossy(),
-                        "date": date_path.file_name().unwrap_or_default().to_string_lossy(),
-                        "score": cs.score,
-                        "label": cs.label,
-                        "signal": cs.signal_lines,
-                        "noise": cs.noise_lines,
-                        "total": cs.total_lines,
-                        "density": format!("{:.0}%", cs.density * 100.0),
-                    }));
-                }
-            }
+            let final_timestamp = timestamp.or_else(|| {
+                file.path
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map(chrono::DateTime::<chrono::Utc>::from)
+                    .map(|d| d.to_rfc3339())
+            });
+
+            scored.push(RankItem {
+                file: file
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                project: file.project,
+                date: file.date_iso,
+                timestamp: final_timestamp,
+                kind: file.kind.dir_name().to_string(),
+                agent: file.agent,
+                score: cs.score,
+                label: cs.label.to_string(),
+                signal: cs.signal_lines,
+                noise: cs.noise_lines,
+                total: cs.total_lines,
+                density: format!("{:.0}%", cs.density * 100.0),
+            });
         }
 
-        scored.sort_by(|a, b| b["score"].as_u64().cmp(&a["score"].as_u64()));
+        if let Some(sort_order) = params.sort.as_deref() {
+            scored.sort_by(|a, b| {
+                let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
+                let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
+                match sort_order {
+                    "newest" => t_b.cmp(t_a),
+                    "oldest" => t_a.cmp(t_b),
+                    "score" => b.score.cmp(&a.score).then(t_b.cmp(t_a)),
+                    _ => t_b.cmp(t_a),
+                }
+            });
+        } else {
+            scored.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
+        }
 
         if let Some(n) = top {
             scored.truncate(n);
         }
 
-        let output = serde_json::to_string_pretty(&serde_json::json!({
-            "project": project,
-            "hours": hours,
-            "strict": strict,
-            "chunks": scored.len(),
-            "items": scored,
-        }))
-        .unwrap_or_default();
+        let json = serde_json::to_string(&RankResponse {
+            project,
+            hours,
+            strict,
+            results: scored.len(),
+            items: scored,
+        })
+        .map_err(|e| McpError::internal_error(format!("Serialize rank JSON: {e}"), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
     #[tool(
-        name = "aicx_refs",
-        description = "List stored context files from the aicx central store, filtered by recency and optionally by project. Returns file paths."
+        name = "aicx_steer",
+        description = "Retrieve stored chunks by steering metadata (frontmatter fields). Filters by run_id, prompt_id, agent, kind, project, and/or date range using sidecar metadata — no filesystem grep needed. Returns oracle_status for the rebuildable metadata index and chunk paths for canonical re-entry."
     )]
-    async fn refs(
+    async fn steer(
         &self,
-        Parameters(params): Parameters<RefsParams>,
+        Parameters(params): Parameters<SteerParams>,
     ) -> Result<CallToolResult, McpError> {
-        let hours = params.hours;
-        let project = params.project;
-        let strict = params.strict;
+        let limit = params.limit.min(100);
+
+        let date_effective = params.date.or(params.since.clone());
+        let (date_lo, date_hi) = if let Some(ref d) = date_effective {
+            parse_date_filter_mcp(d)
+        } else {
+            (None, params.until.clone())
+        };
+
+        let filter = crate::steer_index::SteerFilter {
+            run_id: params.run_id.as_deref(),
+            prompt_id: params.prompt_id.as_deref(),
+            agent: params.agent.as_deref(),
+            kind: params.kind.as_deref(),
+            frame_kind: params.frame_kind,
+            project: params.project.as_deref(),
+            date_lo: date_lo.as_deref(),
+            date_hi: date_hi.as_deref(),
+        };
+        let mut metadatas = crate::steer_index::search_steer_index(&filter, limit)
+            .await
+            .map_err(|e| McpError::internal_error(format!("Index error: {e}"), None))?;
+
+        if let Some(min_score) = params.score {
+            metadatas.retain(|m| {
+                let score = m.get("score").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                score >= min_score
+            });
+        }
+
+        if let Some(sort_order) = params.sort.as_deref() {
+            metadatas.sort_by(|a, b| {
+                let t_a = a
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| a.get("date").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                let t_b = b
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| b.get("date").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                match sort_order {
+                    "newest" => t_b.cmp(t_a),
+                    "oldest" => t_a.cmp(t_b),
+                    "score" => {
+                        let s_a = a.get("score").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let s_b = b.get("score").and_then(|v| v.as_u64()).unwrap_or(0);
+                        s_b.cmp(&s_a).then(t_b.cmp(t_a))
+                    }
+                    _ => t_b.cmp(t_a),
+                }
+            });
+        }
 
         let store_root = store::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
-        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
+        let oracle_status = OracleStatus::metadata_steer(
+            &store_root,
+            metadatas.len(),
+            metadatas.len(),
+            crate::oracle::verify_paths(metadatas.iter().filter_map(|m| {
+                m.get("path")
+                    .or_else(|| m.get("source_chunk"))
+                    .and_then(|value| value.as_str())
+                    .map(std::path::PathBuf::from)
+            })),
+        );
 
-        let mut paths: Vec<PathBuf> = Vec::new();
-
-        let project_dirs: Vec<PathBuf> = if let Some(ref p) = project {
-            let d = store_root.join(p);
-            if d.is_dir() { vec![d] } else { vec![] }
+        let json = if params.slim && !params.verbose {
+            let items: Vec<_> = metadatas.iter().map(|m| {
+                serde_json::json!({
+                    "path": m.get("path").or_else(|| m.get("source_chunk")).unwrap_or(&serde_json::Value::Null),
+                    "agent": m.get("agent").unwrap_or(&serde_json::Value::Null),
+                    "date": m.get("date").unwrap_or(&serde_json::Value::Null),
+                    "kind": m.get("kind").unwrap_or(&serde_json::Value::Null),
+                    "score": m.get("score").unwrap_or(&serde_json::Value::Null),
+                    "snippet_preview": "",
+                })
+            }).collect();
+            serde_json::to_string(&SteerResponse {
+                oracle_status: oracle_status.clone(),
+                results: items.len(),
+                items,
+            })
+            .unwrap()
         } else {
-            std::fs::read_dir(&store_root)
-                .map_err(|e| McpError::internal_error(format!("{e}"), None))?
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.is_dir() && p.file_name().is_some_and(|n| n != "memex"))
-                .collect()
+            serde_json::to_string(&SteerResponse {
+                oracle_status,
+                results: metadatas.len(),
+                items: metadatas,
+            })
+            .map_err(|e| McpError::internal_error(format!("Serialize steer JSON: {e}"), None))?
         };
 
-        for proj_dir in project_dirs {
-            let Ok(dates) = std::fs::read_dir(&proj_dir) else {
-                continue;
-            };
-            for date_entry in dates.filter_map(|e| e.ok()) {
-                let date_path = date_entry.path();
-                if !date_path.is_dir() {
-                    continue;
-                }
-                let Ok(files) = std::fs::read_dir(&date_path) else {
-                    continue;
-                };
-                for file_entry in files.filter_map(|e| e.ok()) {
-                    let fpath = file_entry.path();
-                    if fpath
-                        .extension()
-                        .is_some_and(|ext| ext == "md" || ext == "json")
-                        && let Ok(meta) = fpath.metadata()
-                        && let Ok(mtime) = meta.modified()
-                        && mtime >= cutoff
-                    {
-                        if strict {
-                            let cs = rank::score_chunk_file(&fpath);
-                            if cs.score < 5 {
-                                continue;
-                            }
-                        }
-                        paths.push(fpath);
-                    }
-                }
-            }
-        }
-
-        paths.sort();
-        let text = paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        Ok(CallToolResult::success(vec![Content::text(
-            if text.is_empty() {
-                format!("No context files found within last {hours} hours.")
-            } else {
-                format!("{} files:\n{text}", paths.len())
-            },
-        )]))
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
     #[tool(
-        name = "aicx_store",
-        description = "Trigger a recent incremental rescan across AI agent sessions (Claude, Codex, Gemini) and store any new chunks centrally. Uses watermarks + dedup to skip already-processed history."
+        name = "aicx_intents",
+        description = "Retrieve structured intentions, decisions, outcomes, and tasks extracted from the canonical store. Returns oracle_status marking this as canonical corpus evidence, not semantic oracle output, with source_chunk back-references for grounded follow-up. Mirrors the `aicx intents` CLI: filter by project, hours window (default 720 = 30 days), kind (decision/intent/outcome/task), frame_kind, agent, date range, plus unresolved (intents without matching outcome) and collapse_session (group by session with count). Default: 50 records, last 30 days, all projects, JSON. Cap: 500."
     )]
-    async fn store_sync(
+    async fn intents(
         &self,
-        Parameters(params): Parameters<StoreParams>,
+        Parameters(params): Parameters<IntentsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let hours = params.hours;
-        let project = params.project;
-        let args = incremental_rescan_args(hours, project.as_deref());
+        let kind_filter = match params.kind.as_deref() {
+            None => None,
+            Some(s) => match s.to_lowercase().as_str() {
+                "decision" => Some(IntentKind::Decision),
+                "intent" => Some(IntentKind::Intent),
+                "outcome" => Some(IntentKind::Outcome),
+                "task" => Some(IntentKind::Task),
+                other => {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "Unknown intent kind: '{other}'. Expected one of: decision, intent, outcome, task"
+                        ),
+                        None,
+                    ));
+                }
+            },
+        };
 
-        let output = std::process::Command::new("aicx")
-            .args(&args)
-            .output()
-            .map_err(|e| McpError::internal_error(format!("Failed to run aicx: {e}"), None))?;
+        let sort = match params.sort.as_deref() {
+            None => None,
+            Some(s) => match s.to_lowercase().as_str() {
+                "newest" => Some(intents::IntentSortOrder::Newest),
+                "oldest" => Some(intents::IntentSortOrder::Oldest),
+                other => {
+                    return Err(McpError::invalid_params(
+                        format!("Unknown sort order: '{other}'. Expected: newest, oldest"),
+                        None,
+                    ));
+                }
+            },
+        };
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let status = output
-                .status
-                .code()
-                .map_or_else(|| "signal".to_string(), |code| code.to_string());
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "Incremental rescan failed (status: {status}).\n{}\n{}",
-                stdout.trim(),
-                stderr.trim(),
-            ))]));
-        }
+        let config = IntentsConfig {
+            project: params.project.unwrap_or_default(),
+            hours: params.hours,
+            strict: params.strict,
+            kind_filter,
+            frame_kind: params.frame_kind,
+        };
 
-        let scope = project
-            .as_deref()
-            .map_or_else(|| "all projects".to_string(), |p| format!("project '{p}'"));
-        let mut summary =
-            format!("Incremental rescan completed for {scope} over the last {hours}h.");
-        if !stderr.trim().is_empty() {
-            summary.push('\n');
-            summary.push_str(stderr.trim());
-        }
+        let extraction = intents::extract_intents_with_stats(&config)
+            .map_err(|e| McpError::internal_error(format!("Extract intents: {e}"), None))?;
+        let records = extraction.records;
 
-        Ok(CallToolResult::success(vec![Content::text(summary)]))
+        let limit_capped = params.limit.min(500);
+
+        let display_filters = intents::IntentDisplayFilters {
+            unresolved: params.unresolved,
+            collapse_session: params.collapse_session,
+            agent: params.agent,
+            date_lo: params.since,
+            date_hi: params.until,
+            sort,
+            limit: Some(limit_capped),
+        };
+
+        let records = intents::apply_display_filters(records, &display_filters);
+
+        let body = match params.emit.as_str() {
+            "markdown" | "md" => intents::format_intents_markdown(&records),
+            _ => {
+                let store_root = store::store_base_dir()
+                    .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+                let oracle_status = OracleStatus::canonical_corpus_scan(
+                    &store_root,
+                    extraction.stats.scanned_count,
+                    extraction.stats.candidate_count,
+                    extraction.stats.source_paths_verified,
+                );
+                intents::format_intents_oracle_json(&records, oracle_status).map_err(|e| {
+                    McpError::internal_error(format!("Serialize intents JSON: {e}"), None)
+                })?
+            }
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(body)]))
     }
 }
 
@@ -395,6 +724,10 @@ impl AicxMcpServer {
 #[rmcp::tool_handler]
 impl rmcp::handler::server::ServerHandler for AicxMcpServer {
     fn get_info(&self) -> ServerInfo {
+        // `tool_router` is read by the `#[tool_handler]`-expanded `call_tool`,
+        // `list_tools`, and `get_tool` methods; rust 1.95 dead_code analysis
+        // doesn't traverse macro expansions, so anchor the read here.
+        let _ = &self.tool_router;
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("aicx-mcp", env!("CARGO_PKG_VERSION")))
     }
@@ -426,7 +759,7 @@ pub async fn run_stdio() -> anyhow::Result<()> {
 }
 
 /// Run MCP server over streamable HTTP transport on given port.
-pub async fn run_sse(port: u16) -> anyhow::Result<()> {
+pub async fn run_http(port: u16) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
@@ -465,19 +798,71 @@ pub async fn run_sse(port: u16) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("MCP HTTP server error: {e}"))
 }
 
+/// Legacy compatibility wrapper for callers that still use the old `run_sse` name.
+pub async fn run_sse(port: u16) -> anyhow::Result<()> {
+    run_http(port).await
+}
+
+/// Run the selected MCP transport.
+pub async fn run_transport(transport: McpTransport, port: u16) -> anyhow::Result<()> {
+    match transport {
+        McpTransport::Stdio => run_stdio().await,
+        McpTransport::Http => run_http(port).await,
+    }
+}
+
+/// Parse a date filter string into (optional_low, optional_high) bounds.
+///
+/// Accepted formats:
+/// - `2026-03-28` → exact day
+/// - `2026-03-20..2026-03-28` → inclusive range
+/// - `2026-03-20..` → open-ended (from date onward)
+/// - `..2026-03-28` → open-ended (up to date)
+fn parse_date_filter_mcp(date: &str) -> (Option<String>, Option<String>) {
+    if let Some((lo, hi)) = date.split_once("..") {
+        let lo = if lo.is_empty() {
+            None
+        } else {
+            Some(lo.to_string())
+        };
+        let hi = if hi.is_empty() {
+            None
+        } else {
+            Some(hi.to_string())
+        };
+        (lo, hi)
+    } else {
+        (Some(date.to_string()), Some(date.to_string()))
+    }
+}
+
+fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, McpError> {
+    match score {
+        Some(score) if score > MAX_SCORE_FILTER => Err(McpError::invalid_params(
+            format!("score must be between 0 and {MAX_SCORE_FILTER}"),
+            None,
+        )),
+        _ => Ok(score),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::incremental_rescan_args;
+    use super::{
+        MAX_SCORE_FILTER, McpTransport, RankItem, RankResponse, SearchParams, SteerResponse,
+        background_refresh_args, parse_date_filter_mcp, validate_score_filter,
+    };
+    use crate::oracle::OracleStatus;
+    use clap::ValueEnum as _;
 
     #[test]
-    fn incremental_rescan_args_use_all_incremental_and_quiet_stdout() {
+    fn background_refresh_args_use_all_and_quiet_stdout() {
         assert_eq!(
-            incremental_rescan_args(24, None),
+            background_refresh_args(24, None),
             vec![
                 "all".to_string(),
                 "-H".to_string(),
                 "24".to_string(),
-                "--incremental".to_string(),
                 "--emit".to_string(),
                 "none".to_string(),
             ]
@@ -485,19 +870,138 @@ mod tests {
     }
 
     #[test]
-    fn incremental_rescan_args_include_project_filter() {
+    fn parse_date_filter_mcp_exact_day() {
+        let (lo, hi) = parse_date_filter_mcp("2026-03-28");
+        assert_eq!(lo.as_deref(), Some("2026-03-28"));
+        assert_eq!(hi.as_deref(), Some("2026-03-28"));
+    }
+
+    #[test]
+    fn parse_date_filter_mcp_range() {
+        let (lo, hi) = parse_date_filter_mcp("2026-03-20..2026-03-28");
+        assert_eq!(lo.as_deref(), Some("2026-03-20"));
+        assert_eq!(hi.as_deref(), Some("2026-03-28"));
+    }
+
+    #[test]
+    fn parse_date_filter_mcp_open_ended() {
+        let (lo, hi) = parse_date_filter_mcp("2026-03-20..");
+        assert_eq!(lo.as_deref(), Some("2026-03-20"));
+        assert!(hi.is_none());
+
+        let (lo, hi) = parse_date_filter_mcp("..2026-03-28");
+        assert!(lo.is_none());
+        assert_eq!(hi.as_deref(), Some("2026-03-28"));
+    }
+
+    #[test]
+    fn background_refresh_args_include_project_filter() {
         assert_eq!(
-            incremental_rescan_args(72, Some("ai-contexters")),
+            background_refresh_args(72, Some("ai-contexters")),
             vec![
                 "all".to_string(),
                 "-H".to_string(),
                 "72".to_string(),
-                "--incremental".to_string(),
                 "--emit".to_string(),
                 "none".to_string(),
                 "-p".to_string(),
                 "ai-contexters".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn rank_response_serializes_as_compact_json() {
+        let json = serde_json::to_string(&RankResponse {
+            project: "VetCoders/ai-contexters".to_string(),
+            hours: 72,
+            strict: true,
+            results: 1,
+            items: vec![RankItem {
+                file: "chunk.md".to_string(),
+                project: "VetCoders/ai-contexters".to_string(),
+                date: "2026-03-31".to_string(),
+                timestamp: Some("2026-03-31T10:00:00Z".to_string()),
+                kind: "reports".to_string(),
+                agent: "codex".to_string(),
+                score: 8,
+                label: "HIGH".to_string(),
+                signal: 14,
+                noise: 2,
+                total: 20,
+                density: "70%".to_string(),
+            }],
+        })
+        .expect("rank response should serialize");
+
+        assert!(!json.contains('\n'));
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&json).expect("rank JSON should parse");
+        assert_eq!(payload["results"], 1);
+        assert_eq!(payload["items"][0]["score"], 8);
+        assert_eq!(payload["items"][0]["label"], "HIGH");
+    }
+
+    #[test]
+    fn steer_response_serializes_as_compact_json() {
+        let json = serde_json::to_string(&SteerResponse {
+            oracle_status: OracleStatus::metadata_steer(std::path::Path::new("/tmp"), 1, 1, true),
+            results: 1,
+            items: vec![serde_json::json!({
+                "path": "/tmp/chunk.md",
+                "project": "VetCoders/ai-contexters",
+                "agent": "codex",
+                "kind": "reports",
+            })],
+        })
+        .expect("steer response should serialize");
+
+        assert!(!json.contains('\n'));
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&json).expect("steer JSON should parse");
+        assert_eq!(payload["results"], 1);
+        assert_eq!(payload["oracle_status"]["backend"], "steer_metadata");
+        assert_eq!(payload["oracle_status"]["index_kind"], "metadata_steer");
+        assert_eq!(payload["oracle_status"]["loctree_scope_safe"], true);
+        assert_eq!(payload["items"][0]["path"], "/tmp/chunk.md");
+        assert_eq!(payload["items"][0]["agent"], "codex");
+    }
+
+    #[test]
+    fn search_params_roundtrip_include_new_optional_filters() {
+        let params: SearchParams =
+            serde_json::from_str(r#"{"query":"dashboard"}"#).expect("search params should parse");
+        assert_eq!(params.limit, 20);
+        assert!(params.project.is_none());
+        assert!(params.score.is_none());
+        assert!(params.hours.is_none());
+        assert!(params.date.is_none());
+    }
+
+    #[test]
+    fn score_filter_rejects_values_above_max() {
+        let err = validate_score_filter(Some(MAX_SCORE_FILTER + 1))
+            .expect_err("score above 100 should be rejected");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn mcp_transport_prefers_http_but_accepts_legacy_sse_alias() {
+        let possible = McpTransport::value_variants()
+            .iter()
+            .map(|variant| {
+                variant
+                    .to_possible_value()
+                    .expect("possible value")
+                    .get_name()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(possible, vec!["stdio".to_string(), "http".to_string()]);
+        assert_eq!(McpTransport::from_str("http", true), Ok(McpTransport::Http));
+        assert_eq!(McpTransport::from_str("sse", true), Ok(McpTransport::Http));
     }
 }

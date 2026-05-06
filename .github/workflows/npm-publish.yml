@@ -1,0 +1,125 @@
+name: Publish npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (x.y.z, without leading v)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify npm publish input
+    runs-on: [self-hosted, ops-linux]
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Validate requested version
+        id: meta
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          version="${INPUT_VERSION}"
+          if [[ -z "${version}" ]]; then
+            echo "version is required" >&2
+            exit 1
+          fi
+          if [[ ! "${version}" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+            echo "version must look like x.y.z" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "release_tag=v${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check Cargo.toml version matches input
+        env:
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+
+          with open("Cargo.toml", "rb") as fh:
+              cargo_version = tomllib.load(fh)["package"]["version"]
+
+          release_version = os.environ["RELEASE_VERSION"]
+          if cargo_version != release_version:
+              raise SystemExit(
+                  f"Cargo.toml version {cargo_version} does not match requested npm publish version {release_version}"
+              )
+          PY
+
+      - name: Verify release assets exist
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+        run: |
+          base_url="https://github.com/Loctree/aicx/releases/download/${RELEASE_TAG}"
+          assets=(
+            "aicx-v${{ steps.meta.outputs.version }}-aarch64-apple-darwin.zip"
+            "aicx-v${{ steps.meta.outputs.version }}-x86_64-apple-darwin.zip"
+            "aicx-v${{ steps.meta.outputs.version }}-x86_64-unknown-linux-musl.tar.gz"
+          )
+          for asset in "${assets[@]}"; do
+            curl -fsLI "${base_url}/${asset}" >/dev/null
+            curl -fsLI "${base_url}/${asset}.sha256" >/dev/null
+          done
+
+  publish-platform-packages:
+    name: Publish platform package ${{ matrix.platform }}
+    needs: verify
+    runs-on: [self-hosted, ops-linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - darwin-arm64
+          - darwin-x64
+          - linux-x64-gnu
+          - linux-x64-musl
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Sync npm package versions
+        run: node distribution/npm/sync-version.mjs "${{ needs.verify.outputs.version }}"
+
+      - name: Publish platform package
+        working-directory: distribution/npm/aicx/platform-packages/${{ matrix.platform }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+
+  publish-wrapper:
+    name: Publish wrapper package
+    needs: [verify, publish-platform-packages]
+    runs-on: [self-hosted, ops-linux]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Sync npm package versions
+        run: node distribution/npm/sync-version.mjs "${{ needs.verify.outputs.version }}"
+
+      - name: Wait for npm registry propagation
+        run: sleep 30
+
+      - name: Publish wrapper package
+        working-directory: distribution/npm/aicx
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public

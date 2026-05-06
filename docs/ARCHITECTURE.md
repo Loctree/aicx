@@ -1,11 +1,22 @@
 # Architecture
 
-`aicx` is a single Rust CLI that:
-- reads local agent session logs,
-- normalizes them into a single timeline schema,
-- deduplicates and chunks the timeline into “agent-readable” context files,
-- optionally syncs those chunks into a vector store (memex),
-- optionally bootstraps a repo-local `.ai-context/` workspace for multi-agent workflows.
+`aicx` is the operator front door for agent session logs. It is a store-first
+system with retrieval surfaces layered on top:
+
+1. **Canonical corpus** (layer 1, `~/.aicx/`): read local agent session logs,
+   normalize into a single timeline schema, deduplicate, chunk into steerable
+   markdown with frontmatter metadata. This is ground truth.
+2. **Retrieval surfaces**: filesystem search, steering metadata, MCP tools, and
+   the reusable native embedding library in `crates/aicx-embeddings`.
+
+`aicx` owns the canonical corpus and portable local embedding foundation.
+Roost/rust-memex owns the advanced retrieval/operator plane.
+See `docs/ORACLE_CORPUS.md` for the operator contract: raw/canonical corpus is
+truth; indexes are derived, rebuildable views that must disclose fallback,
+freshness, and Loctree scope safety.
+
+The pipeline exposes chunks through CLI, MCP, dashboard search surfaces, and an
+adjacent Vibecrafted artifact explorer for workflow/marbles reports.
 
 ```mermaid
 flowchart TD
@@ -15,7 +26,8 @@ flowchart TD
   RED --> STORE[store.rs: write_context_chunked]
   STORE --> EMIT[stdout: --emit paths/json/none]
   RED --> LOCAL[output.rs: write_report (-o)]
-  STORE --> MEMEX[memex.rs: sync_new_chunks (--memex)]
+  STORE --> STEER[steer_index.rs: sync_steer_index]
+  STORE --> MCP[mcp.rs: search/rank/steer tools]
 ```
 
 ## Module Map (Codebase Mapping)
@@ -24,13 +36,14 @@ Library modules (see `src/lib.rs`):
 
 - `src/sources.rs`: source discovery + extraction
 - `src/state.rs`: dedup hashes + incremental watermarks
-- `src/store.rs`: central store layout under `~/.ai-contexters/` + `index.json`
+- `src/store.rs`: canonical store layout under `~/.aicx/` + `index.json`
 - `src/chunker.rs`: semantic windowing chunker (token heuristic + overlap + highlight extraction)
 - `src/output.rs`: local report writer (`-o`) + optional loctree snapshot inclusion
-- `src/memex.rs`: memex sync (`rmcp-memex index/upsert`) + sync state
 - `src/redact.rs`: secret redaction (regex engine)
 - `src/sanitize.rs`: path validation for reads/writes (defense against traversal)
-- `src/init.rs`: `.ai-context/` bootstrap + agent dispatch
+- `src/steer_index.rs`: fast metadata index for steering-aware retrieval
+- `src/reports_extractor.rs`: scans `~/.vibecrafted/artifacts` and renders a standalone HTML/JSON dossier for workflow and marbles artifact review
+- `crates/aicx-embeddings`: reusable local GGUF embedding provider library
 
 Binary orchestration:
 - `src/main.rs`: clap CLI, wires flows together, handles stdout emission (`--emit`).
@@ -44,50 +57,75 @@ High-level sequence (see `src/main.rs::run_extraction`):
    - Claude: `~/.claude/projects/*/*.jsonl`
    - Codex: `~/.codex/history.jsonl`
    - Gemini: `~/.gemini/tmp/<hash>/chats/session-*.json`
+   - Gemini Antigravity direct extract: `~/.gemini/antigravity/conversations/<uuid>.pb` or `~/.gemini/antigravity/brain/<uuid>/`
 3. Normalize into timeline entries.
 4. Deduplicate:
    - exact hash: `(agent, timestamp, message)`
    - overlap hash: `(timestamp_bucket_60s, message)` across agents
-5. Redact secrets (default) via `src/redact.rs` unless `--no-redact-secrets`.
+5. On corpus-building commands, redact secrets by default via `src/redact.rs`
+   unless `--no-redact-secrets`.
 6. Store-first chunking:
-   - group by `(repo-from-cwd, agent, date)`
-   - chunk per group (~1500 tokens, overlap), write `.md` chunks into `~/.ai-contexters/`
+   - use the source-side `--project` filter only to narrow session discovery
+   - then group the surviving entries by resolved repo identity `(repo-from-cwd, agent, date)`
+   - chunk per group (~1500 tokens, overlap), write canonical `.md` chunks into `~/.aicx/store/` or `~/.aicx/non-repository-contexts/`
 7. Stdout emission:
    - `--emit none` prints nothing (default for extractors and `store`)
    - `--emit paths` prints stored chunk paths, one per line
-   - `--emit json` prints a single JSON payload including `store_paths`
+   - `--emit json` prints a single JSON payload including `store_paths`, `requested_source_filters`, and `resolved_store_buckets`
    - `--emit none` prints nothing
 8. Optional local output (`-o`): write a report to the given directory.
-9. Optional memex sync (`--memex`): chunk again and push into memex (see note below).
+9. Steer index refresh: sidecar metadata is available to CLI/MCP steering retrieval.
 
-Note on memex sync:
-- `--memex` in extractors currently creates chunk files in `~/.ai-contexters/memex/chunks/` and then calls memex sync.
-- These are separate from the “store-first” chunks. This is intentional separation: store chunks are for humans/agents to read; memex chunks are for vector indexing.
+Note on heavy retrieval:
+- AICX no longer exposes a `memex-sync` CLI command.
+- Roost/rust-memex remains the advanced retrieval plane and can consume the
+  canonical store externally.
+- AICX native embeddings are exposed as a reusable library, not as an automatic
+  background indexing daemon.
+
+Framework note:
+- Repo-local `.ai-context/` artifacts are now owned by higher-level workflow tooling such as `/vc-init`, not by the retired `aicx init` flow.
+
+## Frontmatter Steering Contract
+
+Report files and chunk sidecars can include frontmatter metadata used for **steering** — targeted retrieval and selective re-entry by orchestration frameworks:
+
+```yaml
+---
+agent: codex
+run_id: mrbl-001
+prompt_id: api-redesign_20260327
+model: claude-3-5-sonnet
+started_at: “2026-03-24T10:00:00Z”
+completed_at: “2026-03-24T10:30:00Z”
+token_usage: 125000
+findings_count: 3
+---
+```
+
+These fields are parsed by `src/frontmatter.rs`, applied during chunking, and persisted as `.meta.json` sidecars alongside each chunk file. The `steer` command (CLI), `aicx_steer` tool (MCP), and `/api/search/steer` endpoint (dashboard) allow retrieval by these fields without filesystem grep.
+
+Frontmatter is not just telemetry — it is part of the steering and selective re-entry contract. Orchestration can use `run_id` to retrieve all chunks from a specific agent run, `prompt_id` to find outputs from a specific prompt, or combine filters to narrow scope precisely.
 
 ## Data Flow: `store`
 
-`store` is the “centralize older history into the store” command (see `src/main.rs::run_store`):
+`store` is the “build the canonical corpus from older history” command (see `src/main.rs::run_store`):
 
-1. Extract selected agents + projects for a lookback window.
+1. Extract selected agents + source filters for a lookback window.
 2. Redact secrets (default).
-3. Chunk and write into `~/.ai-contexters/`.
-4. Optional memex sync (`--memex`).
+3. Chunk and write into the canonical `~/.aicx/` store, which may resolve into multiple repo buckets plus `non-repository-contexts`.
+4. Refresh sidecar/steering metadata surfaces.
 
-## Data Flow: `init`
+## MCP Surface (`src/mcp.rs`)
 
-`init` creates `.ai-context/` in the current repo and optionally runs an agent (see `src/init.rs`):
+The MCP server exposes four tools via stdio and streamable HTTP transports:
 
-1. Detect repo root (git root).
-2. Build local context:
-   - extracted memories (via aicx store)
-   - loctree snapshot (requires `loct` in `PATH` or `LOCT_BIN`)
-3. Write `.ai-context/share/artifacts/*`:
-   - `SUMMARY.md` (curated append-only)
-   - `TIMELINE.md` (full append-only)
-   - `TRIAGE.md` (P0/P1/P2)
-   - `prompts/` (task prompts in “Emil Kurier” format)
-4. Optionally dispatch an agent run:
-   - Terminal mode (macOS) or subprocess mode, depending on environment.
+- `aicx_search` — canonical-store filesystem fuzzy search with quality scoring and `oracle_status`; this is not semantic retrieval and is not safe for Loctree scope narrowing until callers read the canonical chunks
+- `aicx_read` — read one canonical chunk by path, file name, or compact reference; this is the direct re-entry step after search, refs, steer, or dashboard discovery
+- `aicx_rank` — rank chunks by signal density for a project as compact JSON
+- `aicx_steer` — retrieve chunks by steering metadata (run_id, prompt_id, agent, kind, project, date) using sidecar data; returns `oracle_status` for the rebuildable metadata index and is safe for Loctree metadata narrowing only when source paths verify
+
+Recency filtering in `aicx_search` and `aicx_steer` uses canonical chunk dates from the store layout, not filesystem `mtime` accidents.
 
 ## Security Model (Pragmatic)
 
@@ -95,4 +133,4 @@ Two mechanisms protect your machine and your data:
 - Path validation (read/write) in `src/sanitize.rs`.
 - Best-effort secret redaction in `src/redact.rs` (enabled by default).
 
-Redaction is conservative by design: it’s OK to over-redact sometimes; it’s not OK to leak tokens into committed artifacts.
+Redaction is conservative by design: it’s OK to over-redact sometimes; it’s not OK to leak tokens into committed artifacts. The flag lives only on corpus-building commands that create or rewrite artifacts, not on read-only search and steering surfaces.

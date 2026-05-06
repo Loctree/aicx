@@ -3,8 +3,8 @@
 `aicx` redacts secrets by default before writing anything to disk.
 The goal is pragmatic safety: avoid accidentally persisting tokens/keys in:
 - `.ai-context/` artifacts,
-- `~/.ai-contexters/` store,
-- memex chunks.
+- `~/.aicx/` store,
+- downstream retrieval chunks derived from the canonical store.
 
 Implementation lives in `src/redact.rs`.
 

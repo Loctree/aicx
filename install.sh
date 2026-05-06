@@ -6,39 +6,86 @@ set -euo pipefail
 # Usage:
 #   bash install.sh
 #   bash install.sh --skip-install  # MCP config only
-# Run from a local checkout when crates.io / release artifacts are not your install path yet.
+# Run from a local checkout when release artifacts are not your install path yet.
 #
 # Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SOURCE_PATH="${BASH_SOURCE[0]:-$0}"
+if [ -n "$SOURCE_PATH" ] && [ -e "$SOURCE_PATH" ]; then
+  SCRIPT_DIR=$(cd "$(dirname "$SOURCE_PATH")" && pwd)
+else
+  SCRIPT_DIR="$PWD"
+fi
 MANIFEST_PATH="$SCRIPT_DIR/Cargo.toml"
 HAS_LOCAL_MANIFEST=0
 if [ -f "$MANIFEST_PATH" ]; then
   HAS_LOCAL_MANIFEST=1
 fi
+HAS_BUNDLED_BINARIES=0
+if [ -x "$SCRIPT_DIR/aicx" ] && [ -x "$SCRIPT_DIR/aicx-mcp" ]; then
+  HAS_BUNDLED_BINARIES=1
+fi
 AICX_INSTALL_MODE="${AICX_INSTALL_MODE:-auto}"
-AICX_GIT_URL="${AICX_GIT_URL:-https://github.com/VetCoders/ai-contexters}"
+AICX_GIT_URL="${AICX_GIT_URL:-https://github.com/Loctree/aicx}"
+AICX_BIN_DIR="${AICX_BIN_DIR:-$HOME/.local/bin}"
+AICX_RELEASE_REPO="${AICX_RELEASE_REPO:-Loctree/aicx}"
+AICX_RELEASE_TAG="${AICX_RELEASE_TAG:-latest}"
+AICX_EMBEDDER_PICKER="${AICX_EMBEDDER_PICKER:-auto}"
+AICX_EMBEDDER_PROFILE="${AICX_EMBEDDER_PROFILE:-}"
+AICX_EMBEDDER_FILENAME="${AICX_EMBEDDER_FILENAME:-${AICX_EMBEDDER_FILE:-}}"
+AICX_EMBEDDER_CONFIG_PATH="${AICX_EMBEDDER_CONFIG_PATH:-$HOME/.aicx/embedder.toml}"
 
 SKIP_INSTALL=0
 for arg in "$@"; do
   case "$arg" in
     --skip-install) SKIP_INSTALL=1 ;;
+    --release) AICX_INSTALL_MODE="release" ;;
+    --release-tag=*) AICX_RELEASE_TAG="${arg#*=}" ;;
+    --pick-embedder) AICX_EMBEDDER_PICKER="1" ;;
+    --no-embedder-prompt) AICX_EMBEDDER_PICKER="0" ;;
+    --embedder-profile=*) AICX_EMBEDDER_PROFILE="${arg#*=}" ;;
     --help|-h)
       echo "Usage: install.sh [--skip-install]"
       echo "  Install aicx + aicx-mcp and configure MCP for Claude Code, Codex, and Gemini."
-      echo "  Run from the repo root or any local checkout that contains Cargo.toml."
+      echo "  Run from a release bundle or the repo root / local checkout."
       echo ""
       echo "Install source is controlled by AICX_INSTALL_MODE:"
-      echo "  auto   - prefer local checkout, otherwise install from crates.io"
-      echo "  local - cargo install --path <checkout> --locked"
-      echo "  crates - cargo install ai-contexters --locked"
-      echo "  git    - cargo install --git \$AICX_GIT_URL --locked ai-contexters"
+      echo "  auto    - prefer bundled binaries, then local checkout, otherwise verified GitHub Release"
+      echo "  release - download an official GitHub Release, verify SHA256, then install its bundle"
+      echo "  bundle  - copy bundled binaries into \$AICX_BIN_DIR"
+      echo "  local   - cargo install --path <checkout> --locked"
+      echo "  crates  - legacy/unsupported: crates.io is not the active AICX distribution path"
+      echo "  git     - cargo install --git \$AICX_GIT_URL --locked aicx"
+      echo ""
+      echo "Bundle install target:"
+      echo "  AICX_BIN_DIR=\$HOME/.local/bin   # default destination for bundled binaries"
+      echo ""
+      echo "Release download target:"
+      echo "  AICX_RELEASE_REPO=Loctree/aicx"
+      echo "  AICX_RELEASE_TAG=latest          # or vX.Y.Z"
+      echo ""
+      echo "Native embedder profile shortcuts:"
+      echo "  default: AICX_EMBEDDER_PROFILE=base    # F2LLM 0.6B Q4_K_M GGUF"
+      echo "  dev:     AICX_EMBEDDER_PROFILE=dev     # F2LLM 1.7B Q4_K_M GGUF"
+      echo "  premium: AICX_EMBEDDER_PROFILE=premium # F2LLM 1.7B Q6_K GGUF"
+      echo "  build:   cargo build --release --features native-embedder"
+      echo ""
+      echo "Native embedder picker:"
+      echo "  --pick-embedder                    # interactive config for ~/.aicx/embedder.toml"
+      echo "  --embedder-profile=base|dev|premium"
+      echo "  --no-embedder-prompt               # suppress interactive picker"
+      echo "  note: this writes AICX local embedder preferences; Roost/rust-memex remains the heavy retrieval plane"
       exit 0
       ;;
   esac
 done
 
 resolve_aicx() {
+  if [ -x "$AICX_BIN_DIR/aicx" ]; then
+    AICX_RUN=("$AICX_BIN_DIR/aicx")
+    return 0
+  fi
+
   if command -v aicx >/dev/null 2>&1; then
     AICX_RUN=("aicx")
     return 0
@@ -53,6 +100,12 @@ resolve_aicx() {
 }
 
 resolve_aicx_mcp() {
+  if [ -x "$AICX_BIN_DIR/aicx-mcp" ]; then
+    AICX_MCP_COMMAND="$AICX_BIN_DIR/aicx-mcp"
+    AICX_MCP_ARGS_JSON='[]'
+    return 0
+  fi
+
   if command -v aicx-mcp >/dev/null 2>&1; then
     AICX_MCP_COMMAND=$(command -v aicx-mcp)
     AICX_MCP_ARGS_JSON='[]'
@@ -84,44 +137,439 @@ PY
 
 echo "=== aicx setup ==="
 
-resolve_install_mode() {
-  case "$AICX_INSTALL_MODE" in
-    auto)
-      if [ "$HAS_LOCAL_MANIFEST" -eq 1 ]; then
-        echo "local"
+normalise_bool() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) echo "1" ;;
+    0|false|FALSE|no|NO|off|OFF) echo "0" ;;
+    *) echo "${1:-}" ;;
+  esac
+}
+
+embedder_repo_for_profile() {
+  case "${1:-}" in
+    base) echo "mradermacher/F2LLM-v2-0.6B-GGUF" ;;
+    dev) echo "mradermacher/F2LLM-v2-1.7B-GGUF" ;;
+    premium) echo "mradermacher/F2LLM-v2-1.7B-GGUF" ;;
+    *) return 1 ;;
+  esac
+}
+
+embedder_file_for_profile() {
+  case "${1:-}" in
+    base) echo "F2LLM-v2-0.6B.Q4_K_M.gguf" ;;
+    dev) echo "F2LLM-v2-1.7B.Q4_K_M.gguf" ;;
+    premium) echo "F2LLM-v2-1.7B.Q6_K.gguf" ;;
+    *) return 1 ;;
+  esac
+}
+
+write_embedder_config() {
+  local profile="$1"
+  local repo="$2"
+  local filename="$3"
+  local path_override="$4"
+  local config_path="$AICX_EMBEDDER_CONFIG_PATH"
+
+  mkdir -p "$(dirname "$config_path")"
+  EMBEDDER_CONFIG_PATH="$config_path" \
+  EMBEDDER_PROFILE="$profile" \
+  EMBEDDER_REPO="$repo" \
+  EMBEDDER_FILENAME="$filename" \
+  EMBEDDER_PATH_OVERRIDE="$path_override" \
+  python3 - <<'PY'
+from pathlib import Path
+import os
+
+config_path = Path(os.environ["EMBEDDER_CONFIG_PATH"]).expanduser()
+profile = os.environ["EMBEDDER_PROFILE"].strip()
+repo = os.environ["EMBEDDER_REPO"].strip()
+filename = os.environ["EMBEDDER_FILENAME"].strip()
+path_override = os.environ["EMBEDDER_PATH_OVERRIDE"].strip()
+
+lines = [
+    "# aicx native embedder preferences",
+    "# First-choice local embeddings. Heavy retrieval remains rust-memex/Roost.",
+    "",
+    "[native_embedder]",
+    'backend = "gguf"',
+]
+
+if profile:
+    lines.append(f'profile = "{profile}"')
+if repo:
+    lines.append(f'repo = "{repo}"')
+if filename:
+    lines.append(f'filename = "{filename}"')
+if path_override:
+    lines.append(f'path = "{path_override}"')
+lines.append("prefer_embedded = false")
+lines.append("max_length = 512")
+
+config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+print(config_path)
+PY
+}
+
+maybe_prime_embedder_cache() {
+  local repo="$1"
+  local filename="$2"
+
+  if [ -z "$repo" ] || ! [ -t 0 ] || ! [ -t 1 ]; then
+    return 0
+  fi
+
+  if ! command -v hf >/dev/null 2>&1; then
+    echo "  native embedder cache not primed automatically (missing 'hf' CLI)"
+    if [ -n "$filename" ]; then
+      echo "  later, run: hf download $repo $filename"
+    else
+      echo "  later, run: hf download <repo> <model.gguf>"
+    fi
+    return 0
+  fi
+
+  if [ -z "$filename" ]; then
+    echo "  native embedder cache not primed automatically (custom repo has no GGUF filename)"
+    echo "  later, run: hf download $repo <model.gguf>"
+    return 0
+  fi
+
+  printf "  Download native embedder model into local HF cache now? [y/N] "
+  read -r reply || true
+  case "${reply:-}" in
+    y|Y|yes|YES)
+      echo "  priming HF cache for $repo $filename ..."
+      if hf download "$repo" "$filename"; then
+        echo "  HF cache primed"
       else
-        echo "crates"
+        echo "  warning: hf download failed; config was still saved" >&2
       fi
       ;;
-    local|crates|git)
-      echo "$AICX_INSTALL_MODE"
-      ;;
     *)
-      echo "Error: unsupported AICX_INSTALL_MODE='$AICX_INSTALL_MODE' (expected auto, local, crates, or git)." >&2
+      echo "  skipping model download"
+      echo "  later, run: hf download $repo $filename"
+      ;;
+  esac
+}
+
+maybe_configure_native_embedder() {
+  local picker explicit_profile selected_profile selected_repo selected_filename config_written
+  picker=$(normalise_bool "$AICX_EMBEDDER_PICKER")
+  explicit_profile="${AICX_EMBEDDER_PROFILE:-}"
+  selected_profile=""
+  selected_repo="${AICX_EMBEDDER_REPO:-}"
+  selected_filename="${AICX_EMBEDDER_FILENAME:-}"
+  config_written=""
+
+  if [ -n "${AICX_EMBEDDER_PATH:-}" ]; then
+    config_written=$(write_embedder_config "" "" "" "$AICX_EMBEDDER_PATH")
+    echo "  native embedder path pinned in $config_written"
+    return 0
+  fi
+
+  if [ -n "$selected_repo" ]; then
+    config_written=$(write_embedder_config "" "$selected_repo" "$selected_filename" "")
+    echo "  native embedder repo pinned in $config_written"
+    maybe_prime_embedder_cache "$selected_repo" "$selected_filename"
+    return 0
+  fi
+
+  if [ -n "$explicit_profile" ]; then
+    case "$explicit_profile" in
+      none|off|skip)
+        echo "  native embedder picker: skipped by explicit profile"
+        return 0
+        ;;
+      base|dev|premium)
+        selected_profile="$explicit_profile"
+        ;;
+      *)
+        echo "Error: unsupported --embedder-profile='$explicit_profile' (expected base, dev, premium, or none)." >&2
+        exit 1
+        ;;
+    esac
+  elif [ "$picker" = "1" ] || { [ "$picker" = "auto" ] && [ -t 0 ] && [ -t 1 ] && [ -z "${CI:-}" ]; }; then
+    echo ""
+    echo "Native embedder setup"
+    echo "  This does not bloat the installed bundle."
+    echo "  It writes ~/.aicx/embedder.toml and can prime exactly one GGUF file in the HF cache."
+    echo "  This is AICX's first-choice local embedding path; Roost/rust-memex remains the heavy retrieval plane."
+    echo ""
+    echo "  1) skip"
+    echo "  2) base    - F2LLM 0.6B Q4_K_M GGUF (~397 MB, portable default)"
+    echo "  3) dev     - F2LLM 1.7B Q4_K_M GGUF (~1.1 GB, workstation tier)"
+    echo "  4) premium - F2LLM 1.7B Q6_K GGUF (~1.4 GB, stronger local tier)"
+    printf "Choose native embedder profile [1-4]: "
+    read -r reply || true
+    case "${reply:-1}" in
+      1|"")
+        echo "  native embedder picker: skipped"
+        return 0
+        ;;
+      2) selected_profile="base" ;;
+      3) selected_profile="dev" ;;
+      4) selected_profile="premium" ;;
+      *)
+        echo "  native embedder picker: invalid choice, skipping"
+        return 0
+        ;;
+    esac
+  else
+    return 0
+  fi
+
+  selected_repo=$(embedder_repo_for_profile "$selected_profile")
+  selected_filename=$(embedder_file_for_profile "$selected_profile")
+  config_written=$(write_embedder_config "$selected_profile" "$selected_repo" "$selected_filename" "")
+  echo "  native embedder preference saved to $config_written"
+  maybe_prime_embedder_cache "$selected_repo" "$selected_filename"
+}
+
+cleanup_old_binaries() {
+  local path="$1"
+  if [ -L "$path" ] || [ -f "$path" ]; then
+    rm -f "$path"
+    echo "  removed stale $(basename "$path") from $(dirname "$path")"
+  fi
+}
+
+path_has_dir() {
+  case ":$PATH:" in
+    *":$1:"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+install_bundle_binaries() {
+  local install_dir="$AICX_BIN_DIR"
+  local source_aicx="$SCRIPT_DIR/aicx"
+  local source_mcp="$SCRIPT_DIR/aicx-mcp"
+
+  if [ "$HAS_BUNDLED_BINARIES" -ne 1 ]; then
+    echo "Error: bundle install requested, but prebuilt aicx binaries are not present next to install.sh." >&2
+    exit 1
+  fi
+
+  mkdir -p "$install_dir"
+  echo "  target bin dir: $install_dir"
+  echo "  pruning stale user-local / cargo installs..."
+  cleanup_old_binaries "$install_dir/aicx"
+  cleanup_old_binaries "$install_dir/aicx-mcp"
+  cleanup_old_binaries "$install_dir/ai-contexters"
+  cleanup_old_binaries "$install_dir/ai-contexters-mcp"
+  cleanup_old_binaries "$HOME/.cargo/bin/aicx"
+  cleanup_old_binaries "$HOME/.cargo/bin/aicx-mcp"
+  cleanup_old_binaries "$HOME/.cargo/bin/ai-contexters"
+  cleanup_old_binaries "$HOME/.cargo/bin/ai-contexters-mcp"
+
+  install -m 755 "$source_aicx" "$install_dir/aicx"
+  install -m 755 "$source_mcp" "$install_dir/aicx-mcp"
+  echo "  installed bundled binaries into $install_dir"
+}
+
+detect_release_target() {
+  local os arch
+  os=$(uname -s)
+  arch=$(uname -m)
+  case "${os}:${arch}" in
+    Darwin:arm64) echo "aarch64-apple-darwin" ;;
+    Darwin:x86_64) echo "x86_64-apple-darwin" ;;
+    Linux:x86_64) echo "x86_64-unknown-linux-musl" ;;
+    *)
+      echo "Error: unsupported platform for release installer: ${os}/${arch}" >&2
+      echo "  Use a local bundle install instead, or install from source with cargo." >&2
       exit 1
       ;;
   esac
 }
 
+detect_release_archive_ext() {
+  case "$(uname -s)" in
+    Darwin) echo "zip" ;;
+    Linux) echo "tar.gz" ;;
+    *)
+      echo "Error: unsupported archive format for platform $(uname -s)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+resolve_release_tag() {
+  if [ "$AICX_RELEASE_TAG" != "latest" ]; then
+    echo "$AICX_RELEASE_TAG"
+    return 0
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "Error: curl is required to resolve the latest GitHub release tag." >&2
+    exit 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "Error: python3 is required to resolve the latest GitHub release tag." >&2
+    exit 1
+  fi
+
+  curl -fsSL "https://api.github.com/repos/${AICX_RELEASE_REPO}/releases/latest" | python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+tag = data.get("tag_name")
+if not tag:
+    raise SystemExit("GitHub API response did not include tag_name")
+print(tag)
+'
+}
+
+download_release_bundle() {
+  local release_tag target version archive_ext archive_name base_url tmp_dir archive_path checksum_path bundle_dir
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "Error: curl is required for release installer mode." >&2
+    exit 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "Error: python3 is required for release installer mode." >&2
+    exit 1
+  fi
+  release_tag=$(resolve_release_tag)
+  target=$(detect_release_target)
+  version="${release_tag#v}"
+  archive_ext=$(detect_release_archive_ext)
+  archive_name="aicx-v${version}-${target}.${archive_ext}"
+  base_url="https://github.com/${AICX_RELEASE_REPO}/releases/download/${release_tag}"
+  tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/aicx-release-install.XXXXXX")
+  archive_path="$tmp_dir/$archive_name"
+  checksum_path="$tmp_dir/${archive_name}.sha256"
+
+  cleanup_release_tmp() {
+    rm -rf "$tmp_dir"
+  }
+  trap cleanup_release_tmp EXIT
+
+  echo "[1/4] Downloading verified release bundle..."
+  echo "  release tag: $release_tag"
+  echo "  target:      $target"
+  curl -fsSL "$base_url/$archive_name" -o "$archive_path"
+  curl -fsSL "$base_url/${archive_name}.sha256" -o "$checksum_path"
+
+  echo "[2/4] Verifying SHA256..."
+  ARCHIVE_PATH="$archive_path" CHECKSUM_PATH="$checksum_path" python3 - <<'PY'
+import hashlib
+import os
+from pathlib import Path
+
+archive = Path(os.environ["ARCHIVE_PATH"])
+checksum = Path(os.environ["CHECKSUM_PATH"]).read_text(encoding="utf-8").strip().split()[0]
+digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+if digest != checksum:
+    raise SystemExit(
+        f"SHA256 mismatch for {archive.name}: expected {checksum}, got {digest}"
+    )
+print(f"  checksum ok: {archive.name}")
+PY
+
+  echo "[3/4] Extracting release bundle..."
+  ARCHIVE_PATH="$archive_path" DEST_DIR="$tmp_dir" python3 - <<'PY'
+import os
+import tarfile
+import zipfile
+from pathlib import Path
+
+archive_path = Path(os.environ["ARCHIVE_PATH"])
+dest_dir = Path(os.environ["DEST_DIR"])
+
+if archive_path.name.endswith(".zip"):
+    with zipfile.ZipFile(archive_path) as archive:
+        archive.extractall(dest_dir)
+elif archive_path.name.endswith(".tar.gz"):
+    with tarfile.open(archive_path, "r:gz") as archive:
+        archive.extractall(dest_dir)
+else:
+    raise SystemExit(f"Unsupported archive format: {archive_path.name}")
+PY
+  bundle_dir="$tmp_dir/aicx-v${version}-${target}"
+  if [ ! -f "$bundle_dir/install.sh" ]; then
+    echo "Error: release bundle does not contain install.sh: $bundle_dir" >&2
+    exit 1
+  fi
+
+  echo "[4/4] Delegating to bundled installer..."
+  AICX_INSTALL_MODE="bundle" \
+  AICX_BIN_DIR="$AICX_BIN_DIR" \
+  bash "$bundle_dir/install.sh"
+  exit 0
+}
+
+resolve_install_mode() {
+  case "$AICX_INSTALL_MODE" in
+    auto)
+      if [ "$HAS_BUNDLED_BINARIES" -eq 1 ]; then
+        echo "bundle"
+      elif [ "$HAS_LOCAL_MANIFEST" -eq 1 ]; then
+        echo "local"
+      else
+        echo "release"
+      fi
+      ;;
+    release|bundle|local|crates|git)
+      echo "$AICX_INSTALL_MODE"
+      ;;
+    *)
+      echo "Error: unsupported AICX_INSTALL_MODE='$AICX_INSTALL_MODE' (expected auto, release, bundle, local, crates, or git)." >&2
+      exit 1
+      ;;
+  esac
+}
+
+INSTALL_MODE=$(resolve_install_mode)
+if [ "$INSTALL_MODE" = "release" ]; then
+  if [ "$SKIP_INSTALL" -eq 1 ]; then
+    echo "Error: --skip-install cannot be combined with release download mode." >&2
+    exit 1
+  fi
+  download_release_bundle
+fi
+
 # --- Step 1: Install binaries ---
 if [ "$SKIP_INSTALL" -eq 0 ]; then
-  if ! command -v cargo >/dev/null 2>&1; then
+  if [ "$INSTALL_MODE" != "bundle" ] && ! command -v cargo >/dev/null 2>&1; then
     echo "Error: cargo not found. Install Rust first: https://rustup.rs"
     exit 1
   fi
 
-  INSTALL_MODE=$(resolve_install_mode)
-  if [ "$INSTALL_MODE" = "local" ]; then
+  # Show live compilation progress: count Compiling lines → [1/4] Compiling... (N crates)
+  cargo_install_with_progress() {
+    local total=0
+    "$@" 2>&1 | while IFS= read -r line; do
+      case "$line" in
+        *Compiling*)
+          total=$((total + 1))
+          printf '\r  Compiling... (%d crates)' "$total" >&2
+          ;;
+        *Finished*|*Installing*|*Installed*|*Replacing*)
+          printf '\r  %s\n' "$line" >&2
+          ;;
+      esac
+    done
+    printf '\n' >&2
+  }
+
+  if [ "$INSTALL_MODE" = "bundle" ]; then
+    echo "[1/4] Installing bundled aicx + aicx-mcp into $AICX_BIN_DIR..."
+    install_bundle_binaries
+  elif [ "$INSTALL_MODE" = "local" ]; then
     echo "[1/4] Installing aicx + aicx-mcp from this checkout..."
-    cargo install --path "$SCRIPT_DIR" --locked --force --bin aicx --bin aicx-mcp 2>&1 | tail -5
+    cargo_install_with_progress cargo install --path "$SCRIPT_DIR" --locked --force --bin aicx --bin aicx-mcp
   elif [ "$INSTALL_MODE" = "crates" ]; then
-    echo "[1/4] Installing aicx + aicx-mcp from crates.io..."
-    cargo install ai-contexters --locked 2>&1 | tail -20
+    echo "Error: crates.io is not the active AICX distribution path." >&2
+    echo "  Use AICX_INSTALL_MODE=release for verified GitHub Release assets, npm install -g @loctree/aicx, or install from a local checkout." >&2
+    exit 1
   else
     echo "[1/4] Installing aicx + aicx-mcp from git..."
-    if ! cargo install --git "$AICX_GIT_URL" --locked ai-contexters 2>&1 | tail -20; then
+    if ! cargo_install_with_progress cargo install --git "$AICX_GIT_URL" --locked aicx; then
       echo "Error: git install failed."
-      echo "  If you only need the published release, use AICX_INSTALL_MODE=crates or run 'cargo install ai-contexters --locked'."
+      echo "  If you only need the published release, use AICX_INSTALL_MODE=release or npm install -g @loctree/aicx."
       exit 1
     fi
   fi
@@ -229,27 +677,50 @@ configure_mcp "codex" "$HOME/.codex/settings.json"
 # Gemini
 configure_mcp "gemini" "$HOME/.gemini/settings.json"
 
-# --- Step 4: Initial store ---
-echo "[4/4] Initial context extraction..."
-"${AICX_RUN[@]}" all -H 168 --incremental --emit none
-echo "  initial rescan complete"
+# --- Step 4: Full store bootstrap ---
+echo "[4/4] Full context extraction (this may take a moment)..."
+"${AICX_RUN[@]}" all -H 10000 --emit none
+echo "  store bootstrap complete"
+echo "  local embedder default: base (F2LLM 0.6B Q4_K_M GGUF, hydrated on demand)"
+maybe_configure_native_embedder
 echo ""
 
 # --- Done ---
 echo "=== Setup complete ==="
 echo ""
+if path_has_dir "$AICX_BIN_DIR"; then
+  echo "Install path:"
+  echo "  $AICX_BIN_DIR is already on PATH"
+else
+  echo "PATH note:"
+  echo "  Add $AICX_BIN_DIR to PATH so new shells pick up the bundled install first."
+  echo "  Example: export PATH=\"$AICX_BIN_DIR:\$PATH\""
+  echo ""
+fi
+if [ -d "$HOME/.ai-contexters" ]; then
+  echo "Legacy store detected at ~/.ai-contexters/"
+  echo "Run 'aicx migrate' to move your history to the new canonical ~/.aicx/ store."
+  echo ""
+fi
 echo "Installed:"
-echo "  aicx      — CLI for extraction, ranking, search, dashboard"
-echo "  aicx-mcp  — MCP server (4 tools: search, rank, refs, store)"
+echo "  aicx      — CLI for extraction, search, steer, dashboard"
+echo "  aicx-mcp  — MCP server (4 tools: search, read, rank, steer)"
 echo ""
 echo "MCP tools available in Claude Code / Codex / Gemini:"
 echo "  aicx_search  — fuzzy search across session history"
+echo "  aicx_read    — read one canonical chunk by path or ref"
 echo "  aicx_rank    — quality-score stored chunks"
-echo "  aicx_refs    — compact summary or raw path list of stored context files"
-echo "  aicx_store   — trigger recent incremental rescan"
+echo "  aicx_steer   — retrieve chunks by run/prompt/project/agent/date metadata"
 echo ""
 echo "Quick start:"
-echo "  aicx all -H 24 --incremental --emit none"
+echo "  aicx all -H 24                     # rescan last 24h from all agents"
+echo "  aicx search 'query terms'          # fuzzy search across session history"
 echo "  aicx refs -H 24                    # compact summary of recent files"
-echo "  aicx refs -H 24 --emit paths       # raw stored file paths"
-echo "  aicx rank -p <project> --strict    # see quality chunks"
+echo "  aicx steer --project aicx          # metadata-aware retrieval"
+echo ""
+echo "Native local embeddings:"
+echo "  bash install.sh --pick-embedder    # choose and optionally hydrate one GGUF model"
+echo "  config: ~/.aicx/embedder.toml      # backend/profile/repo/filename/path"
+echo ""
+echo "Heavy retrieval:"
+echo "  Use Roost/rust-memex for the advanced operator retrieval plane; AICX stays the portable corpus + local embedding foundation."

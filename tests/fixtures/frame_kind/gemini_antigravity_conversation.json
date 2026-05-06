@@ -1,0 +1,30 @@
+{
+  "projectRoot": "/Users/tester/workspace/VetCoders/ai-contexters",
+  "messages": [
+    {
+      "role": "user",
+      "timestamp": "2026-04-14T10:00:00Z",
+      "content": {
+        "parts": [
+          { "text": "User asks for frame separation" }
+        ]
+      }
+    },
+    {
+      "role": "assistant",
+      "timestamp": "2026-04-14T10:00:01Z",
+      "content": {
+        "parts": [
+          { "text": "Visible assistant reply" },
+          { "text": "Hidden chain of thought", "thought": true },
+          {
+            "functionCall": {
+              "name": "searchDocs",
+              "args": { "query": "frame_kind" }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

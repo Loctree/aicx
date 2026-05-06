@@ -1,0 +1,29 @@
+[package]
+name = "aicx-embeddings"
+version = "0.6.2"
+edition = "2024"
+rust-version = "1.88"
+description = "Reusable local embedding providers for AICX and rust-memex"
+authors = ["Maciej Gad <void@div0.space>", "Monika Szymanska <hello@vetcoders.io>"]
+license = "BUSL-1.1"
+repository = "https://github.com/Loctree/aicx"
+homepage = "https://github.com/Loctree/aicx"
+readme = "README.md"
+keywords = ["ai", "embeddings", "gguf", "retrieval"]
+categories = ["command-line-utilities", "development-tools"]
+
+[features]
+default = []
+gguf = ["dep:llama-cpp-2"]
+metal = ["gguf", "llama-cpp-2/metal"]
+openmp = ["gguf", "llama-cpp-2/openmp"]
+cuda = ["gguf", "llama-cpp-2/cuda"]
+vulkan = ["gguf", "llama-cpp-2/vulkan"]
+
+[dependencies]
+anyhow = "1.0"
+dirs = "6"
+llama-cpp-2 = { version = "0.1.145", optional = true, default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"

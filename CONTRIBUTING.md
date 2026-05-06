@@ -9,6 +9,12 @@ Thanks for your interest in contributing to aicx.
 
 ## Development
 
+Install the repo-local Git hooks:
+
+```bash
+make git-hooks
+```
+
 Build the release binary:
 
 ```bash

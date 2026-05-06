@@ -6,6 +6,117 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **9-type intent taxonomy** (`EntryType` enum): Intent, Why, Argue, Decision, Assumption, Outcome, Result, Question, Insight — replaces the flat 4-kind `IntentKind`.
+- **Intent entry state machine** (`EntryState` enum): Proposed → Active → Done/Superseded/Contradicted with explicit lifecycle transitions.
+- **Typed link graph** (`LinkType` + `Link`): DerivedFrom, Supersedes, Verifies, Contradicts, Supports, ResultsIn, Answers, LinksTo — first-class relations between intent entries.
+- **`IntentEntry` struct** in `types.rs` with stable deterministic IDs, confidence scoring, topic tags, and cross-project linking.
+- **`classify_chunk_entries()`** — per-chunk classifier covering all 9 types with marker-based and NL-pattern heuristics; abstain-first (confidence < 0.5 = skip).
+- **Session-level post-processing**: unresolved intent detection (7-day threshold), supersedes chain detection (same topic, newer date), contradicted assumption detection (Result + failure words), insight-to-source `DerivedFrom` linking (top-3 in session).
+- **`intent_entries` field** on `ChunkMetadataSidecar` for sidecar-level intent storage (backward compatible: empty Vec default).
+- **`aicx migrate-intent-schema`** CLI subcommand with `--dry-run` (default) for classification count reports per-type and per-project.
+- 25 new unit tests: 20 classifier tests (per-type + abstain + all-9 chunk + deterministic IDs + tag inference), 5 session-level tests (supersedes, contradicted, insight linking, unresolved threshold, recent not tagged).
+
+### Changed
+- Operator surface wording: "push" → "materialize" in CLI help text, progress messages, and doc comments to reinforce the two-layer mental model (canonical corpus first, semantic materialization second).
+- Semantic compatibility validation now detects stale metadata even when no documents exist yet in the memex index; reports diverged fields explicitly.
+- Compatibility validation runs before file scanning in `memex-sync`, failing fast on config mismatches.
+- `claude`, `codex`, `all`, and `store` now use watermark-tracked incremental refresh by default. `--full-rescan` is the explicit escape hatch for backfills, while legacy `--incremental` is accepted as a hidden no-op with a deprecation notice.
+- `aicx dashboard` now owns both static HTML generation and live serving. `dashboard-serve` is kept as a hidden compatibility shim while public help/doc surfaces point to `aicx dashboard --serve`, including explicit `--allow-cors-origins` policies for non-loopback binds and `--bg` background launch.
+- `aicx reports-extractor` is renamed to `aicx reports`, with default HTML output moved under `~/.aicx/` to avoid polluting the current working directory.
+
+### Fixed
+- Test isolation: source extraction tests use unique temp directories per test to prevent cross-test interference on parallel runs.
+
+## [0.5.5] - 2026-03-31
+
+### Performance
+- **Steer Indexing:** Integrated `rmcp-memex` (LanceDB backend) to dramatically speed up `aicx steer` and `aicx_steer` MCP queries. Metadata searches now take milliseconds instead of seconds by bypassing filesystem sidecar parsing in favor of a columnar metadata index.
+- **Fast Text Search:** Upgraded `aicx_search` MCP tool to use the embedded `BM25Index` and `StorageManager` from `rmcp-memex`. Full-text searches across all stored contexts are now instantaneous, replacing the slow sequential file scans.
+
+### Added
+- **Frontmatter steering metadata** (`workflow_phase`, `mode`, `skill_code`, `framework_version`) on `Chunk` and `ChunkMetadataSidecar`.
+- **`aicx steer` CLI command** — retrieves chunks by steering/sidecar metadata (run_id, prompt_id, agent, kind, project, date range).
+- **`aicx_steer` MCP tool** — same steering-aware retrieval for MCP clients.
+- **`/api/search/steer` dashboard endpoint** — HTTP GET with the same filtering surface.
+- **Live search** with CLI `aicx search` subcommand and real-time result deduplication.
+- **Resizable dashboard** with drag-to-resize panels.
+- **Store progress reporting** on stderr (TTY-gated `Chunking... N/M segments`).
+- Session metadata (agent, model, cwd) included in search output.
+- `cwd` field on `Chunk` for working-directory awareness.
+
+### Changed
+- Frontmatter parser now separates `telemetry` from `steering` and strips detected frontmatter from chunk text even when YAML is malformed.
+- Extracted shared types (`types.rs`) to break the `segmentation ↔ store` cycle; `segmentation` no longer depends on `store`.
+- Removed `init` submodule and deprecated `Init` command (returns naturally instead of `process::exit`).
+- Search results now strip aicx boilerplate for cleaner output.
+- Docs: "memory extraction" → "timeline extraction", "vector memory" → "semantic index" across README, ARCHITECTURE, COMMANDS, and help text.
+
+### Removed
+- `src/init.rs` deleted (`git rm`); init flow fully retired.
+
+## [0.5.4] - 2026-03-31 (Pre-release)
+
+### Fixed
+- Sync result reporting precise enough for framework orchestration.
+- Hardened `aicx` to `rmcp-memex` transport seam.
+
+## [0.5.3] - 2026-03-30
+
+### Added
+- **Frontmatter steering metadata** (`workflow_phase`, `mode`, `skill_code`, `framework_version`) on `Chunk` and `ChunkMetadataSidecar`.
+- **`aicx steer` CLI command** — retrieves chunks by steering/sidecar metadata (run_id, prompt_id, agent, kind, project, date range).
+- **`aicx_steer` MCP tool** — same steering-aware retrieval for MCP clients.
+- **`/api/search/steer` dashboard endpoint** — HTTP GET with the same filtering surface.
+- **Live search** with CLI `aicx search` subcommand and real-time result deduplication.
+- **Resizable dashboard** with drag-to-resize panels.
+- **Store progress reporting** on stderr (TTY-gated `Chunking... N/M segments`).
+- Session metadata (agent, model, cwd) included in search output.
+- `cwd` field on `Chunk` for working-directory awareness.
+
+### Changed
+- Frontmatter parser now separates `telemetry` from `steering` and strips detected frontmatter from chunk text even when YAML is malformed.
+- Extracted shared types (`types.rs`) to break the `segmentation ↔ store` cycle; `segmentation` no longer depends on `store`.
+- Removed `init` submodule and deprecated `Init` command (returns naturally instead of `process::exit`).
+- Search results now strip aicx boilerplate for cleaner output.
+- Docs: "memory extraction" → "timeline extraction", "vector memory" → "semantic index" across README, ARCHITECTURE, COMMANDS, and help text.
+
+### Removed
+- `src/init.rs` deleted (`git rm`); init flow fully retired.
+
+## [0.5.2] - 2026-03-28
+
+### Added
+- **YAML frontmatter parsing** for chunk metadata extraction.
+- **Sidecar files** (`.meta.yaml`) written alongside memex chunks for external tooling.
+
+## [0.5.1] - 2026-03-24
+
+### Added
+- **Repo-signal segmentation** in the store pipeline — chunks now carry repository identity signals.
+- **Memex chunk sidecars** and `--preprocess` flag for pre-processing before memex push.
+- **Makefile** with comprehensive build, test, lint, and release targets.
+- Gemini truncation support and improved fuzzy search scoring.
+- Test: repo-centric store runtime contract (`runtime_cli_store_contract.rs`).
+- Test: legacy Codex format rejection (`legacy_codex_format_test.rs`).
+
+### Changed
+- Store contracts and migration scaffolding landed for repo-centric retrieval.
+- Read/query surfaces hardened for repo-centric store paths.
+- Checkpoint extraction seam hardened.
+
+### Fixed
+- Gemini JSON message structures preserved instead of being flattened (`sources.rs`).
+
+## [0.5.0] - 2026-03-21
+
+### Added
+- **Repo-centric Migration Assistant:** Added the `aicx migrate` subcommand. This tool safely migrates older file-centric contexts (`file: <name>`) in your `~/.ai-contexters` store to the new canonical repo-centric directories. Use `aicx migrate --dry-run` to preview the changes.
+
+### Changed
+- **Behavioral Shift (Identity Model):** AICX now uses a canonical repo-centric identity model. Extracted contexts and stored artifacts are now grouped primarily by repository name rather than the raw filename of the agent log. This significantly improves retrieval quality and consistency, especially when syncing contexts to vector stores (memex) or running direct extractions.
+- Direct `extract` now infers repository identity when possible, demoting file provenance to secondary metadata.
+
 ## [0.4.3] - 2026-03-17
 
 ### Fixed
@@ -34,7 +145,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - Installer now prefers local checkout installs, supports a git fallback, and finishes setup with a quiet incremental refresh plus compact summary output.
-- MCP background refresh and `aicx_store` now use the real incremental rescan path (`aicx all --incremental --emit none`) instead of relying on a misleading stdout contract.
+- MCP background refresh and `aicx_store` now use the real incremental rescan path (`aicx all --emit none`, with `--full-rescan` reserved for backfills) instead of relying on a misleading stdout contract.
 - `docs/COMMANDS.md` has been expanded to cover the active CLI surface and current stdout defaults.
 
 ## [0.4.0] - 2026-03-16
@@ -60,7 +171,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added (Governance)
 
-- LICENSE (MIT), CONTRIBUTING.md, CHANGELOG.md, SECURITY.md.
+- LICENSE (BSL 1.1), CONTRIBUTING.md, CHANGELOG.md, SECURITY.md.
 - GitHub Actions CI workflow (ubuntu + macos-14).
 - Issue templates (bug report, feature request).
 - Cargo.toml: keywords, categories, homepage, excludes.

@@ -2,8 +2,8 @@
 //!
 //! Goal: avoid accidentally persisting sensitive tokens into:
 //! - `.ai-context/*` artifacts
-//! - `~/.ai-contexters/<project>/<date>/*`
-//! - memex chunks
+//! - `~/.aicx/store/<project>/<date>/*`
+//! - chunks
 //!
 //! This is best-effort and intentionally conservative.
 //!

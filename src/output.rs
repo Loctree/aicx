@@ -69,8 +69,11 @@ pub enum OutputMode {
     AppendTimeline(PathBuf),
 }
 
-/// Re-export from sources — single definition, no twin.
-pub use crate::sources::TimelineEntry;
+/// Re-export from timeline — single definition, no twin.
+pub use crate::timeline::TimelineEntry;
+
+/// Re-export the denoised conversation message type.
+pub use crate::timeline::ConversationMessage;
 
 /// Metadata about the generated report.
 #[derive(Debug, Clone, Serialize)]
@@ -683,6 +686,141 @@ fn write_markdown_footer(w: &mut impl Write) -> Result<()> {
 }
 
 // ============================================================================
+// Conversation-first output
+// ============================================================================
+
+/// Write a denoised conversation transcript as Markdown.
+///
+/// Groups messages by repo/project, then by session, then chronologically.
+/// Only user/assistant messages appear — no tool calls, reasoning, or system noise.
+pub fn write_conversation_markdown(
+    path: &Path,
+    messages: &[ConversationMessage],
+    metadata: &ReportMetadata,
+) -> Result<PathBuf> {
+    let validated = sanitize::validate_write_path(path)?;
+    if let Some(parent) = validated.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
+    }
+
+    let mut file = File::create(&validated) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        .with_context(|| format!("Failed to create: {}", path.display()))?;
+
+    // Header
+    writeln!(file, "# Conversation Transcript\n")?;
+    writeln!(file, "| Field | Value |")?;
+    writeln!(file, "|-------|-------|")?;
+    writeln!(
+        file,
+        "| Generated | {} |",
+        metadata.generated_at.format("%Y-%m-%d %H:%M:%S UTC")
+    )?;
+    writeln!(
+        file,
+        "| Filter | {} |",
+        metadata.project_filter.as_deref().unwrap_or("(all)")
+    )?;
+    writeln!(file, "| Period | last {} hours |", metadata.hours_back)?;
+    writeln!(file, "| Messages | {} |", messages.len())?;
+    writeln!(file, "| Sessions | {} |", metadata.sessions.len())?;
+    writeln!(file)?;
+    writeln!(file, "---\n")?;
+
+    // Group by repo_project -> session_id, preserving chronological order
+    let mut by_project: std::collections::BTreeMap<&str, Vec<&ConversationMessage>> =
+        std::collections::BTreeMap::new();
+    for msg in messages {
+        by_project.entry(&msg.repo_project).or_default().push(msg);
+    }
+
+    for (project, project_msgs) in &by_project {
+        writeln!(file, "## Project: {}\n", project)?;
+
+        // Sub-group by session (preserving insertion order)
+        let mut session_order: Vec<&str> = Vec::new();
+        let mut by_session: HashMap<&str, Vec<&&ConversationMessage>> = HashMap::new();
+        for msg in project_msgs {
+            let sid = msg.session_id.as_str();
+            if !by_session.contains_key(sid) {
+                session_order.push(sid);
+            }
+            by_session.entry(sid).or_default().push(msg);
+        }
+
+        for session_id in &session_order {
+            let session_msgs = &by_session[session_id];
+            let session_short = &session_id[..8.min(session_id.len())];
+            let agent = session_msgs
+                .first()
+                .map(|m| m.agent.as_str())
+                .unwrap_or("unknown");
+            writeln!(file, "### Session `{}` [{}]\n", session_short, agent)?;
+
+            if let Some(sp) = session_msgs.first().and_then(|m| m.source_path.as_deref()) {
+                writeln!(file, "CWD: `{}`\n", sp)?;
+            }
+
+            for msg in session_msgs {
+                let time = msg.timestamp.format("%H:%M:%S");
+                let role_label = if msg.role == "user" {
+                    "user"
+                } else {
+                    "assistant"
+                };
+                writeln!(file, "**[{}] {}:**\n", time, role_label)?;
+                write_formatted_message(&mut file, &msg.message)?;
+                writeln!(file)?;
+            }
+        }
+    }
+
+    write_markdown_footer(&mut file)?;
+    eprintln!("  -> {}", path.display());
+    Ok(validated)
+}
+
+/// Write a denoised conversation transcript as JSON.
+///
+/// Produces a structured JSON document with repo-centric grouping.
+pub fn write_conversation_json(
+    path: &Path,
+    messages: &[ConversationMessage],
+    metadata: &ReportMetadata,
+) -> Result<PathBuf> {
+    let validated = sanitize::validate_write_path(path)?;
+    if let Some(parent) = validated.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
+    }
+
+    #[derive(Serialize)]
+    struct ConversationReport<'a> {
+        generated_at: DateTime<Utc>,
+        project_filter: &'a Option<String>,
+        hours_back: u64,
+        total_messages: usize,
+        sessions: &'a [String],
+        messages: &'a [ConversationMessage],
+    }
+
+    let report = ConversationReport {
+        generated_at: metadata.generated_at,
+        project_filter: &metadata.project_filter,
+        hours_back: metadata.hours_back,
+        total_messages: messages.len(),
+        sessions: &metadata.sessions,
+        messages,
+    };
+
+    let file = File::create(&validated) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        .with_context(|| format!("Failed to create: {}", path.display()))?;
+    serde_json::to_writer_pretty(file, &report)?;
+    eprintln!("  -> {}", path.display());
+    Ok(validated)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -717,6 +855,7 @@ mod tests {
                 message: "Fix the build pipeline".to_string(),
                 branch: Some("feat/pipeline".to_string()),
                 cwd: Some("/home/project".to_string()),
+                frame_kind: None,
             },
             TimelineEntry {
                 timestamp: Utc.with_ymd_and_hms(2026, 1, 22, 10, 31, 0).unwrap(),
@@ -726,6 +865,7 @@ mod tests {
                 message: "decision: We should use incremental builds".to_string(),
                 branch: Some("feat/pipeline".to_string()),
                 cwd: None,
+                frame_kind: None,
             },
             TimelineEntry {
                 timestamp: Utc.with_ymd_and_hms(2026, 1, 23, 9, 0, 0).unwrap(),
@@ -735,6 +875,7 @@ mod tests {
                 message: "Show me the code structure".to_string(),
                 branch: None,
                 cwd: None,
+                frame_kind: None,
             },
         ]
     }
@@ -938,6 +1079,7 @@ mod tests {
             message: long_message.clone(),
             branch: None,
             cwd: None,
+            frame_kind: None,
         }];
         let metadata = ReportMetadata {
             generated_at: Utc.with_ymd_and_hms(2026, 1, 23, 13, 0, 0).unwrap(),
@@ -975,6 +1117,7 @@ mod tests {
             message: "a".repeat(200),
             branch: None,
             cwd: None,
+            frame_kind: None,
         }];
         let metadata = ReportMetadata {
             generated_at: Utc.with_ymd_and_hms(2026, 1, 23, 13, 0, 0).unwrap(),
@@ -1079,6 +1222,7 @@ mod tests {
             message: "First entry".to_string(),
             branch: None,
             cwd: None,
+            frame_kind: None,
         }];
         let metadata1 = ReportMetadata {
             generated_at: Utc.with_ymd_and_hms(2026, 1, 22, 12, 0, 0).unwrap(),
@@ -1099,6 +1243,7 @@ mod tests {
                 message: "First entry".to_string(), // duplicate
                 branch: None,
                 cwd: None,
+                frame_kind: None,
             },
             TimelineEntry {
                 timestamp: Utc.with_ymd_and_hms(2026, 1, 23, 16, 0, 0).unwrap(),
@@ -1108,6 +1253,7 @@ mod tests {
                 message: "New entry after sync".to_string(),
                 branch: None,
                 cwd: None,
+                frame_kind: None,
             },
         ];
         let metadata2 = ReportMetadata {
@@ -1151,6 +1297,7 @@ mod tests {
             message: msg.to_string(),
             branch: None,
             cwd: None,
+            frame_kind: None,
         }];
         let metadata = ReportMetadata {
             generated_at: Utc.with_ymd_and_hms(2026, 1, 23, 13, 0, 0).unwrap(),
@@ -1226,9 +1373,12 @@ mod tests {
 
     #[test]
     fn test_loctree_snapshot_missing_binary() {
+        let dir = unique_test_dir("loctree_missing_bin");
+        std::fs::create_dir_all(&dir).unwrap();
         // loct may or may not be on PATH -- either way this should not panic
-        let result = capture_loctree_snapshot(Path::new("/tmp")).unwrap();
+        let result = capture_loctree_snapshot(&dir).unwrap();
         let _ = result; // Just verify it doesn't error
+        cleanup(&dir);
     }
 
     // --- Config defaults ---
@@ -1262,6 +1412,7 @@ mod tests {
             message: "Line one\nLine two\nLine three".to_string(),
             branch: None,
             cwd: None,
+            frame_kind: None,
         }];
         let metadata = ReportMetadata {
             generated_at: Utc.with_ymd_and_hms(2026, 1, 23, 13, 0, 0).unwrap(),
