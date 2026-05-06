@@ -995,12 +995,15 @@ enum Commands {
         no_gitignore: bool,
     },
 
-    /// Fuzzy search across the canonical corpus (layer 1, filesystem-only).
+    /// Search the canonical corpus. Semantic-first when the embedder is
+    /// available, with explicit filesystem-fuzzy fallback otherwise.
     ///
-    /// Searches chunk content and frontmatter directly in ~/.aicx/ — works
-    /// immediately, no semantic index needed. JSON output includes
-    /// `oracle_status` and is explicitly marked as filesystem fuzzy, not a
-    /// semantic/content oracle.
+    /// `aicx` aims to be semantic by default: queries are encoded through
+    /// the in-process embedder ([`aicx_embeddings`] GGUF stack) and matched
+    /// against a materialized vector index. When the embedder cannot load
+    /// or no index has been built yet, the command falls back to
+    /// filesystem-fuzzy search and emits a precise `oracle_status` line so
+    /// the operator can tell which path actually ran.
     #[command(display_order = 12)]
     Search {
         /// Search query string
@@ -1025,6 +1028,12 @@ enum Commands {
         /// Emit compact JSON instead of plain text
         #[arg(short = 'j', long)]
         json: bool,
+
+        /// Force filesystem-fuzzy search; skip the embedded semantic path
+        /// even when the embedder is available. Useful for debugging
+        /// retrieval or comparing rankings.
+        #[arg(long)]
+        no_semantic: bool,
     },
 
     /// Read one canonical chunk by path, file name, or compact chunk reference.
@@ -1520,6 +1529,7 @@ fn main() -> Result<()> {
             date,
             filters,
             json,
+            no_semantic,
         }) => {
             run_search(
                 &query,
@@ -1528,6 +1538,7 @@ fn main() -> Result<()> {
                 date.as_deref(),
                 json,
                 filters,
+                no_semantic,
             )?;
         }
         Some(Commands::Read {
@@ -3306,6 +3317,7 @@ fn run_search(
     date: Option<&str>,
     json: bool,
     filters: RetrievalFilters,
+    no_semantic: bool,
 ) -> Result<()> {
     // Extract inline date hints from query if no explicit --date given
     let (effective_query, inline_date) = if date.is_none() {
@@ -3336,14 +3348,45 @@ fn run_search(
         filters.limit
     };
 
-    // Use fuzzy search across the canonical store
-    let (results, scanned) = rank::fuzzy_search_store(
-        &root,
-        &search_query,
-        fetch_limit,
-        project,
-        filters.frame_kind.map(Into::into),
-    )?;
+    // Try semantic-first dispatch unless operator forced fuzzy with
+    // `--no-semantic`. The semantic path resolves quickly to a typed
+    // SearchPath::Fallback when the embedder is unavailable or the
+    // vector index has not yet been built, so the cost of trying is
+    // bounded.
+    let semantic_path = if no_semantic {
+        aicx::search_engine::SearchPath::Fallback {
+            reason: "operator passed --no-semantic".to_string(),
+        }
+    } else {
+        match aicx::search_engine::try_semantic_search(
+            &root,
+            &search_query,
+            fetch_limit,
+            project,
+            filters.frame_kind.map(Into::into),
+        ) {
+            Ok(path) => path,
+            Err(err) => aicx::search_engine::SearchPath::Fallback {
+                reason: format!("semantic dispatch errored: {err}"),
+            },
+        }
+    };
+
+    // Iter 1 always lands in the Fallback arm because no vector index is
+    // wired yet. Iter 2 will materialize the index and the Semantic arm
+    // will start returning real hits.
+    let (results, scanned) = match &semantic_path {
+        aicx::search_engine::SearchPath::Semantic(outcome) => {
+            (outcome.results.clone(), outcome.scanned)
+        }
+        aicx::search_engine::SearchPath::Fallback { .. } => rank::fuzzy_search_store(
+            &root,
+            &search_query,
+            fetch_limit,
+            project,
+            filters.frame_kind.map(Into::into),
+        )?,
+    };
 
     let mut results = results;
 
@@ -3417,9 +3460,8 @@ fn run_search(
 
     if io::stderr().is_terminal() {
         eprintln!(
-            "\n{} result(s) from {} scanned chunks. oracle_status: backend=filesystem_fuzzy index=none fallback=fallback_filesystem_fuzzy loctree_scope_safe=false",
-            results.len(),
-            scanned
+            "\n{}",
+            aicx::search_engine::render_oracle_status_line(&semantic_path, results.len(), scanned)
         );
     }
     Ok(())

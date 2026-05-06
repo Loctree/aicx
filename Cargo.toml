@@ -22,7 +22,11 @@ members = [".", "crates/aicx-embeddings", "crates/aicx-parser"]
 resolver = "3"
 
 [features]
-default = []
+# Native embedder is the project default: aicx aims to be semantic-first,
+# falling back to filesystem fuzzy only when the embedder cannot load.
+# Pulling rust-memex + aicx-embeddings statically removes the need to spawn
+# an external memex daemon for retrieval.
+default = ["native-embedder"]
 # Native embedder — first-choice in-process local embeddings through the
 # reusable aicx-embeddings crate. The installed binary stays slim: models are
 # hydrated into the HF cache or pinned by path, not silently bundled.
