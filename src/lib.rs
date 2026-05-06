@@ -23,6 +23,7 @@ pub mod state;
 pub mod steer_index;
 pub mod store;
 pub mod validation;
+pub mod vector_index;
 pub mod wizard;
 
 pub use aicx_parser::{chunker, frontmatter, sanitize, segmentation, timeline, types};

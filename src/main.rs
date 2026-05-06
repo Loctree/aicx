@@ -1036,11 +1036,44 @@ enum Commands {
         no_semantic: bool,
     },
 
+    /// Build (or preview) the vector index used by semantic `aicx search`.
+    ///
+    /// Iter 2 ships dry-run only: probe the embedder, sample N chunks from
+    /// the canonical store, embed them, report stats (count / dimension /
+    /// model / ETA). Persistent Lance write of the per-chunk embeddings
+    /// lands in Iter 3 once this surface is validated against real input.
+    ///
+    /// Why dry-run first: it is the smallest unit of evidence that the
+    /// model loads, the corpus reads, and the embedder produces vectors
+    /// of the expected dimension. Operators get an honest ETA before
+    /// they commit to a full re-index that may take 10–30 minutes on CPU
+    /// for a 10 k chunk corpus.
+    #[command(display_order = 13, verbatim_doc_comment)]
+    Index {
+        /// Repo or store-bucket filter (case-insensitive substring)
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Stop after sampling this many chunks (0 = scan all)
+        #[arg(long, default_value = "16")]
+        sample: usize,
+
+        /// Emit JSON stats instead of plain text
+        #[arg(short = 'j', long)]
+        json: bool,
+
+        /// Dry-run only — Iter 2 ships this mode and only this mode. The
+        /// flag is here today so the CLI surface stays stable when Iter 3
+        /// adds the persistent Lance write under the same command.
+        #[arg(long, default_value = "true")]
+        dry_run: bool,
+    },
+
     /// Read one canonical chunk by path, file name, or compact chunk reference.
     ///
     /// This closes the discover -> read loop: pass a path from `aicx search`,
     /// `aicx refs --emit paths`, dashboard `/api/chunk`, or MCP search results.
-    #[command(display_order = 13)]
+    #[command(display_order = 14)]
     Read {
         /// Absolute path, store-relative path, file name, or compact chunk reference
         reference: String,
@@ -1540,6 +1573,14 @@ fn main() -> Result<()> {
                 filters,
                 no_semantic,
             )?;
+        }
+        Some(Commands::Index {
+            project,
+            sample,
+            json,
+            dry_run,
+        }) => {
+            run_index(project.as_deref(), sample, json, dry_run)?;
         }
         Some(Commands::Read {
             reference,
@@ -3463,6 +3504,23 @@ fn run_search(
             "\n{}",
             aicx::search_engine::render_oracle_status_line(&semantic_path, results.len(), scanned)
         );
+    }
+    Ok(())
+}
+
+/// Build (or preview) the vector index. Iter 2 ships dry-run only.
+fn run_index(project: Option<&str>, sample: usize, json: bool, dry_run: bool) -> Result<()> {
+    if !dry_run {
+        anyhow::bail!(
+            "Iter 2 ships dry-run only; persistent Lance write lands in Iter 3. \
+             Pass --dry-run=true (the default) for now."
+        );
+    }
+    let stats = aicx::vector_index::dry_run_index(project, sample)?;
+    if json {
+        println!("{}", aicx::vector_index::render_stats_json(&stats)?);
+    } else {
+        eprint!("{}", aicx::vector_index::render_stats_text(&stats));
     }
     Ok(())
 }
