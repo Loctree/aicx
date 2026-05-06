@@ -4621,16 +4621,39 @@ mod tests {
     }
 
     #[test]
-    fn search_help_marks_fuzzy_status_without_embedding_jargon() {
+    fn search_help_explains_semantic_first_with_fuzzy_fallback() {
+        // After the Iter 1 dispatch flip, `aicx search` is intentionally
+        // semantic-first with an explicit filesystem-fuzzy fallback. The
+        // help text must surface both legs of the contract so operators
+        // know which retrieval ran (and why) when reading `--help`.
         let mut cmd = Cli::command();
         let search = cmd
             .find_subcommand_mut("search")
             .expect("search subcommand should exist");
         let rendered = search.render_long_help().to_string();
 
-        assert!(rendered.contains("filesystem fuzzy"));
-        assert!(rendered.contains("not a semantic/content oracle"));
-        assert!(!rendered.contains("embedding-aware"));
+        // Semantic leg must be visible — this is the new default.
+        assert!(
+            rendered.to_lowercase().contains("semantic"),
+            "search --help must mention semantic retrieval (the new default)"
+        );
+        // Fuzzy leg must be visible too — operators need to know it is
+        // the fallback, not a hidden behaviour.
+        assert!(
+            rendered.to_lowercase().contains("fuzzy"),
+            "search --help must mention fuzzy as the explicit fallback"
+        );
+        // Fallback contract must be named, not implied.
+        assert!(
+            rendered.to_lowercase().contains("fallback"),
+            "search --help must call out the fallback path explicitly"
+        );
+        // Old "filesystem-only" framing must be gone — it would mislead
+        // operators about what a build with `native-embedder` actually does.
+        assert!(
+            !rendered.contains("filesystem-only"),
+            "search --help must not advertise the legacy filesystem-only contract"
+        );
     }
 
     #[test]
