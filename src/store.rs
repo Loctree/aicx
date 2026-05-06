@@ -540,6 +540,7 @@ pub struct ReadContextChunk {
 pub struct StoreWriteSummary {
     pub total_entries: usize,
     pub written_paths: Vec<PathBuf>,
+    pub skipped_empty_body: usize,
     pub project_summary: BTreeMap<String, BTreeMap<String, usize>>,
 }
 
@@ -689,6 +690,9 @@ fn write_context_session_first_at(
     let mut written = Vec::new();
 
     for (idx, chunk) in chunks.iter().enumerate() {
+        if chunk_body_is_empty(&chunk.text) {
+            continue;
+        }
         let chunk_num = (idx as u32) + 1;
         let mut dir = root.join(&date_dir).join(kind.dir_name()).join(spec.agent);
         if let Some(project) = spec.project {
@@ -709,6 +713,35 @@ fn write_context_session_first_at(
     }
 
     Ok(written)
+}
+
+fn chunk_body_after_header(content: &str) -> &str {
+    let Some(rest) = content.strip_prefix("[project:") else {
+        return content;
+    };
+    let Some((_, body)) = rest.split_once('\n') else {
+        return "";
+    };
+    body.trim_start_matches(['\r', '\n'])
+}
+
+fn chunk_body_is_empty(content: &str) -> bool {
+    !chunk_body_after_header(content)
+        .lines()
+        .any(chunk_line_has_signal)
+}
+
+fn chunk_line_has_signal(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() {
+        return false;
+    }
+    if let Some((_, rest)) = line.split_once("] ")
+        && let Some((_, message)) = rest.split_once(':')
+    {
+        return !message.trim().is_empty();
+    }
+    true
 }
 
 fn write_chunk_sidecar(path: &Path, chunk: &chunker::Chunk) -> Result<()> {
@@ -763,7 +796,15 @@ where
             .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
         let project = segment.project_label();
 
+        let before_count = chunker::chunk_entries(
+            &segment.entries,
+            segment.project_label().as_str(),
+            &segment.agent,
+            chunker_config,
+        )
+        .len();
         let paths = write_semantic_segment_at(base, &segment, &date, chunker_config)?;
+        summary.skipped_empty_body += before_count.saturating_sub(paths.len());
         update_index(
             &mut index,
             &project,
@@ -3226,6 +3267,42 @@ mod tests {
         assert_eq!(matched[0].path.file_name(), chunk_path.file_name());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_first_write_skips_empty_body_chunks() {
+        let root = retrieval_test_root("empty-body-guard");
+        let _ = fs::remove_dir_all(&root);
+
+        let entries = vec![TimelineEntry {
+            timestamp: Utc.with_ymd_and_hms(2026, 5, 6, 12, 0, 0).unwrap(),
+            agent: "claude".to_string(),
+            session_id: "sess-empty-body".to_string(),
+            role: "assistant".to_string(),
+            message: "   \n\t".to_string(),
+            branch: None,
+            cwd: None,
+            frame_kind: Some(crate::timeline::FrameKind::InternalThought),
+        }];
+
+        let written = write_context_session_first_at(
+            &root.join("store"),
+            SessionWriteSpec {
+                project: Some("VetCoders/aicx"),
+                agent: "claude",
+                date: "2026-05-06",
+                session_id: "sess-empty-body",
+                kind: Some(Kind::Conversations),
+            },
+            &entries,
+            &ChunkerConfig::default(),
+        )
+        .expect("write should succeed");
+
+        assert!(written.is_empty());
+        assert!(!root.join("store").join("VetCoders").join("aicx").exists());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     fn semantic_entry(

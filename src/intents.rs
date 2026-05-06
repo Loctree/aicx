@@ -326,7 +326,7 @@ fn extract_intents_from_root_at(
     Ok(extract_intents_from_root_at_with_stats(config, store_root, now)?.records)
 }
 
-fn extract_intents_from_root_at_with_stats(
+pub(crate) fn extract_intents_from_root_at_with_stats(
     config: &IntentsConfig,
     store_root: &Path,
     now: DateTime<Utc>,

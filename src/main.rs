@@ -443,6 +443,20 @@ enum ConfigAction {
     },
 }
 
+#[derive(Debug, Clone, Subcommand)]
+enum IndexAction {
+    /// Show freshness and pending-corpus status for the semantic index.
+    Status {
+        /// Repo or store-bucket filter (case-insensitive substring)
+        #[arg(short, long)]
+        project: Option<String>,
+
+        /// Emit JSON status instead of plain text
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     // ── Layer 1: Canonical corpus ─────────────────────────────────────
@@ -1074,6 +1088,9 @@ enum Commands {
     /// for a 10 k chunk corpus.
     #[command(display_order = 13, verbatim_doc_comment)]
     Index {
+        #[command(subcommand)]
+        action: Option<IndexAction>,
+
         /// Repo or store-bucket filter (case-insensitive substring)
         #[arg(short, long)]
         project: Option<String>,
@@ -1221,6 +1238,14 @@ enum Commands {
         /// Move suspicious top-level corpus buckets to $HOME/.aicx/quarantine/
         #[arg(long)]
         fix_buckets: bool,
+
+        /// Emit a reviewable bash script for missing sidecar backfill
+        #[arg(long)]
+        rebuild_sidecars: bool,
+
+        /// Emit a reviewable bash script for deleting empty-body chunks
+        #[arg(long)]
+        prune_empty_bodies: bool,
 
         /// Print recommendations for green checks too
         #[arg(short, long)]
@@ -1629,13 +1654,17 @@ fn main() -> Result<()> {
             )?;
         }
         Some(Commands::Index {
+            action,
             project,
             sample,
             json,
             dry_run,
-        }) => {
-            run_index(project.as_deref(), sample, json, dry_run)?;
-        }
+        }) => match action {
+            Some(IndexAction::Status { project, json }) => {
+                run_index_status(project.as_deref(), json)?;
+            }
+            None => run_index(project.as_deref(), sample, json, dry_run)?,
+        },
         Some(Commands::Config { action }) => {
             run_config(action)?;
         }
@@ -1703,6 +1732,8 @@ fn main() -> Result<()> {
         Some(Commands::Doctor {
             fix,
             fix_buckets,
+            rebuild_sidecars,
+            prune_empty_bodies,
             verbose,
             format,
             oracle,
@@ -1710,6 +1741,8 @@ fn main() -> Result<()> {
             let opts = aicx::doctor::DoctorOptions {
                 fix,
                 fix_buckets,
+                rebuild_sidecars,
+                prune_empty_bodies,
                 verbose,
             };
             let rt = tokio::runtime::Runtime::new()
@@ -1751,6 +1784,8 @@ fn main() -> Result<()> {
             let opts = aicx::doctor::DoctorOptions {
                 fix: false,
                 fix_buckets: false,
+                rebuild_sidecars: false,
+                prune_empty_bodies: false,
                 verbose: true,
             };
             let rt = tokio::runtime::Runtime::new()
@@ -2797,6 +2832,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
 
     let chunker_config = aicx::chunker::ChunkerConfig::default();
     let mut all_written_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut written_empty_body_skipped = 0usize;
     let mut scope_surface = StoreScopeSurface::empty(&project);
 
     let structured_emit = matches!(emit, StdoutEmit::Json);
@@ -2823,6 +2859,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             }
         };
         scope_surface = StoreScopeSurface::from_store_summary(&project, &store_summary);
+        written_empty_body_skipped = store_summary.skipped_empty_body;
         let newly_written_paths = store_summary.written_paths.clone();
         all_written_paths.extend(newly_written_paths.iter().cloned());
 
@@ -2844,6 +2881,9 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             output_entries.len(),
             all_written_paths.len(),
         );
+        if written_empty_body_skipped > 0 {
+            eprintln!("  Skipped {written_empty_body_skipped} empty-body chunk(s)");
+        }
         for (repo, agents_map) in &store_summary.project_summary {
             let total: usize = agents_map.values().sum();
             let detail: Vec<String> = agents_map
@@ -2884,6 +2924,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                     scope: &'a StoreScopeSurface,
                     messages: Vec<timeline::ConversationMessage>,
                     store_paths: Vec<String>,
+                    written_empty_body_skipped: usize,
                 }
 
                 let conv_msgs = sources::to_conversation(&output_entries, &project);
@@ -2896,6 +2937,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                     scope: &scope_surface,
                     messages: conv_msgs,
                     store_paths,
+                    written_empty_body_skipped,
                 };
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -2910,6 +2952,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                     scope: &'a StoreScopeSurface,
                     entries: &'a [timeline::TimelineEntry],
                     store_paths: Vec<String>,
+                    written_empty_body_skipped: usize,
                 }
 
                 let report = JsonStdoutReport {
@@ -2921,6 +2964,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                     scope: &scope_surface,
                     entries: &output_entries,
                     store_paths,
+                    written_empty_body_skipped,
                 };
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
@@ -3135,6 +3179,7 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
                     "resolved_store_buckets": scope_surface.resolved_store_buckets,
                     "repos": scope_surface.repository_buckets(),
                     "store_paths": Vec::<String>::new(),
+                    "written_empty_body_skipped": 0,
                 }))?
             );
         }
@@ -3202,6 +3247,12 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         stored_count,
         all_written_paths.len(),
     );
+    if store_summary.skipped_empty_body > 0 {
+        eprintln!(
+            "  Skipped {} empty-body chunk(s)",
+            store_summary.skipped_empty_body
+        );
+    }
     for (repo, agents_map) in &store_summary.project_summary {
         let total: usize = agents_map.values().sum();
         let detail: Vec<String> = agents_map
@@ -3255,6 +3306,7 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
                     "resolved_store_buckets": scope_surface.resolved_store_buckets,
                     "repos": scope_surface.repository_buckets(),
                     "store_paths": store_paths,
+                    "written_empty_body_skipped": store_summary.skipped_empty_body,
                 }))?
             );
         }
@@ -3808,6 +3860,38 @@ fn run_index(project: Option<&str>, sample: usize, json: bool, dry_run: bool) ->
         println!("{}", aicx::vector_index::render_stats_json(&stats)?);
     } else {
         eprint!("{}", aicx::vector_index::render_stats_text(&stats));
+    }
+    Ok(())
+}
+
+fn run_index_status(project: Option<&str>, json: bool) -> Result<()> {
+    let client = aicx::Aicx::from_env()?;
+    let status = client.index_status(project)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        eprintln!("aicx index status");
+        eprintln!("  canonical_chunks:       {}", status.canonical_chunks);
+        eprintln!(
+            "  semantic_index_present: {}",
+            status.semantic_index_present
+        );
+        eprintln!(
+            "  newest_chunk_mtime:     {}",
+            status.newest_chunk_mtime.as_deref().unwrap_or("<none>")
+        );
+        eprintln!(
+            "  semantic_index_mtime:   {}",
+            status.semantic_index_mtime.as_deref().unwrap_or("<none>")
+        );
+        eprintln!(
+            "  semantic_lag_secs:      {}",
+            status
+                .semantic_lag_secs
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string())
+        );
+        eprintln!("  pending_chunks:         {}", status.pending_chunks);
     }
     Ok(())
 }

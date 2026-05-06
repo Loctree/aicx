@@ -16,6 +16,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -28,6 +29,8 @@ use crate::validation::{is_valid_repo_bucket_name, is_valid_repo_project_slug};
 pub struct DoctorOptions {
     pub fix: bool,
     pub fix_buckets: bool,
+    pub rebuild_sidecars: bool,
+    pub prune_empty_bodies: bool,
     pub verbose: bool,
 }
 
@@ -76,6 +79,12 @@ pub struct DoctorReport {
     pub sidecar_coverage: CheckResult,
     #[serde(default)]
     pub embedder_warmth: CheckResult,
+    #[serde(default)]
+    pub empty_body_chunks: CheckResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rebuild_sidecars_script: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prune_empty_bodies_script: Option<String>,
     pub fixes_applied: Vec<String>,
     pub overall: Severity,
 }
@@ -94,24 +103,38 @@ pub struct OracleReadinessReport {
 
 pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
     let base = store::store_base_dir().context("Failed to resolve aicx store base directory")?;
+    run_at(&base, opts).await
+}
 
-    let mut canonical_store = check_canonical_store(&base);
-    let mut steer_lance = check_steer_lance(&base).await;
-    let mut steer_bm25 = check_steer_bm25(&base);
-    let mut state = check_state(&base);
-    let mut sidecars = check_sidecar_coverage(&base);
-    let mut corpus_buckets = check_corpus_buckets(&base);
-    let mut noise_health = check_noise_health(&base);
+pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
+    let mut canonical_store = check_canonical_store(base);
+    let mut steer_lance = check_steer_lance(base).await;
+    let mut steer_bm25 = check_steer_bm25(base);
+    let mut state = check_state(base);
+    let mut sidecars = check_sidecar_coverage(base);
+    let mut corpus_buckets = check_corpus_buckets(base);
+    let mut noise_health = check_noise_health(base);
     let mut semantic_health = check_semantic_health();
-    let mut index_freshness = check_index_freshness(&base);
+    let mut index_freshness = check_index_freshness(base);
     let mut embedder_warmth = check_embedder_warmth();
+    let mut empty_body_chunks = check_empty_body_chunks(base);
 
     let mut fixes_applied = Vec::new();
+    let rebuild_sidecars_script = if opts.rebuild_sidecars {
+        Some(render_rebuild_sidecars_script(base)?)
+    } else {
+        None
+    };
+    let prune_empty_bodies_script = if opts.prune_empty_bodies {
+        Some(render_prune_empty_bodies_script(base)?)
+    } else {
+        None
+    };
 
     if opts.fix
         && (steer_lance.severity == Severity::Critical || steer_bm25.severity == Severity::Critical)
     {
-        match attempt_steer_rebuild(&base).await {
+        match attempt_steer_rebuild(base).await {
             Ok(msg) => fixes_applied.push(msg),
             Err(e) => fixes_applied.push(format!("rebuild attempted but failed: {e}")),
         }
@@ -148,16 +171,17 @@ pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
     }
 
     if opts.fix || opts.fix_buckets {
-        canonical_store = check_canonical_store(&base);
-        steer_lance = check_steer_lance(&base).await;
-        steer_bm25 = check_steer_bm25(&base);
-        state = check_state(&base);
-        sidecars = check_sidecar_coverage(&base);
-        corpus_buckets = check_corpus_buckets(&base);
-        noise_health = check_noise_health(&base);
+        canonical_store = check_canonical_store(base);
+        steer_lance = check_steer_lance(base).await;
+        steer_bm25 = check_steer_bm25(base);
+        state = check_state(base);
+        sidecars = check_sidecar_coverage(base);
+        corpus_buckets = check_corpus_buckets(base);
+        noise_health = check_noise_health(base);
         semantic_health = check_semantic_health();
-        index_freshness = check_index_freshness(&base);
+        index_freshness = check_index_freshness(base);
         embedder_warmth = check_embedder_warmth();
+        empty_body_chunks = check_empty_body_chunks(base);
     }
 
     let overall = max_severity(&[
@@ -171,6 +195,7 @@ pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
         semantic_health.severity,
         index_freshness.severity,
         embedder_warmth.severity,
+        empty_body_chunks.severity,
     ]);
 
     Ok(DoctorReport {
@@ -183,8 +208,11 @@ pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
         noise_health,
         semantic_health,
         index_freshness,
-        sidecar_coverage: check_sidecar_coverage(&base),
+        sidecar_coverage: check_sidecar_coverage(base),
         embedder_warmth,
+        empty_body_chunks,
+        rebuild_sidecars_script,
+        prune_empty_bodies_script,
         fixes_applied,
         overall,
     })
@@ -567,6 +595,181 @@ fn check_sidecar_coverage(base: &Path) -> CheckResult {
     }
 }
 
+fn check_empty_body_chunks(base: &Path) -> CheckResult {
+    let report = empty_body_report(base);
+    let total = report.total;
+    if total == 0 {
+        return CheckResult {
+            name: "empty_body_chunks".to_string(),
+            severity: Severity::Green,
+            detail: "no chunks to inspect".to_string(),
+            recommendation: None,
+        };
+    }
+
+    let pct = (report.empty as f64 / total as f64) * 100.0;
+    let severity = if pct > 5.0 {
+        Severity::Critical
+    } else if pct >= 0.5 {
+        Severity::Warning
+    } else {
+        Severity::Green
+    };
+    let top_frames = report
+        .by_frame_kind
+        .iter()
+        .take(5)
+        .map(|(kind, count)| format!("{kind}:{count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sample = report
+        .sample_paths
+        .iter()
+        .take(3)
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    CheckResult {
+        name: "empty_body_chunks".to_string(),
+        severity,
+        detail: format!(
+            "{} empty-body candidate(s) / {} chunks ({pct:.2}%); frame_kind: {}; sample: {}",
+            report.empty,
+            total,
+            if top_frames.is_empty() {
+                "none"
+            } else {
+                &top_frames
+            },
+            if sample.is_empty() { "none" } else { &sample }
+        ),
+        recommendation: if report.empty > 0 {
+            Some(
+                "Run `aicx doctor --prune-empty-bodies` to emit a reviewable cleanup script"
+                    .to_string(),
+            )
+        } else {
+            None
+        },
+    }
+}
+
+#[derive(Debug, Default)]
+struct EmptyBodyReport {
+    total: usize,
+    empty: usize,
+    empty_paths: Vec<PathBuf>,
+    sample_paths: Vec<PathBuf>,
+    by_frame_kind: BTreeMap<String, usize>,
+}
+
+fn empty_body_report(base: &Path) -> EmptyBodyReport {
+    let files = store::scan_context_files_at(base).unwrap_or_default();
+    let mut report = EmptyBodyReport {
+        total: files.len(),
+        ..Default::default()
+    };
+
+    for file in files {
+        if file.path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&file.path) else {
+            continue;
+        };
+        if !chunk_body_is_empty(&content) && chunk_body_after_header(&content).trim().len() >= 50 {
+            continue;
+        }
+
+        report.empty += 1;
+        report.empty_paths.push(file.path.clone());
+        if report.sample_paths.len() < 20 {
+            report.sample_paths.push(file.path.clone());
+        }
+        let frame_kind = store::load_sidecar(&file.path)
+            .and_then(|sidecar| sidecar.frame_kind.map(|kind| kind.as_str().to_string()))
+            .unwrap_or_else(|| "unknown".to_string());
+        *report.by_frame_kind.entry(frame_kind).or_insert(0) += 1;
+    }
+
+    report
+}
+
+fn chunk_body_after_header(content: &str) -> &str {
+    let Some(rest) = content.strip_prefix("[project:") else {
+        return content;
+    };
+    let Some((_, body)) = rest.split_once('\n') else {
+        return "";
+    };
+    body.trim_start_matches(['\r', '\n'])
+}
+
+fn chunk_body_is_empty(content: &str) -> bool {
+    !chunk_body_after_header(content)
+        .lines()
+        .any(chunk_line_has_signal)
+}
+
+fn chunk_line_has_signal(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() {
+        return false;
+    }
+    if let Some((_, rest)) = line.split_once("] ")
+        && let Some((_, message)) = rest.split_once(':')
+    {
+        return !message.trim().is_empty();
+    }
+    true
+}
+
+pub fn render_prune_empty_bodies_script(base: &Path) -> Result<String> {
+    let report = empty_body_report(base);
+    let mut out = String::from("#!/usr/bin/env bash\nset -euo pipefail\n\n");
+    out.push_str("# Review before running. Generated by `aicx doctor --prune-empty-bodies`.\n");
+    for path in report.empty_paths {
+        out.push_str("rm -f -- ");
+        out.push_str(&shell_quote_path(&path));
+        out.push(' ');
+        out.push_str(&shell_quote_path(&path.with_extension("meta.json")));
+        out.push('\n');
+    }
+    if !out.contains("rm -f --") {
+        out.push_str("# No empty-body chunks detected.\n");
+    }
+    Ok(out)
+}
+
+pub fn render_rebuild_sidecars_script(base: &Path) -> Result<String> {
+    let files = store::scan_context_files_at(base).unwrap_or_default();
+    let mut out = String::from("#!/usr/bin/env bash\nset -euo pipefail\n\n");
+    out.push_str(
+        "# Review before running. Rebuilds missing sidecars by forcing a corpus rescan.\n",
+    );
+    let missing = files
+        .iter()
+        .filter(|file| !file.path.with_extension("meta.json").exists())
+        .take(20)
+        .map(|file| file.path.display().to_string())
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        out.push_str("# No missing sidecars detected.\n");
+    } else {
+        for path in missing {
+            out.push_str(&format!("# missing: {path}\n"));
+        }
+        out.push_str("aicx store --full-rescan\n");
+    }
+    Ok(out)
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    let value = path.display().to_string();
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// Aggregate noise filter activity across all sidecars in the canonical
 /// store. Surfaces upstream emitters that produce excessive structural
 /// scaffolding. Sidecars without `noise_lines_dropped` (older than commit
@@ -862,6 +1065,7 @@ pub fn format_report_text(report: &DoctorReport, verbose: bool) -> String {
         &report.index_freshness,
         &report.sidecar_coverage,
         &report.embedder_warmth,
+        &report.empty_body_chunks,
     ];
     for check in checks {
         out.push_str(&format!(
@@ -879,6 +1083,14 @@ pub fn format_report_text(report: &DoctorReport, verbose: bool) -> String {
         for fix in &report.fixes_applied {
             out.push_str(&format!("  + {}\n", fix));
         }
+    }
+    if let Some(script) = &report.rebuild_sidecars_script {
+        out.push_str("\nRebuild sidecars script:\n");
+        out.push_str(script);
+    }
+    if let Some(script) = &report.prune_empty_bodies_script {
+        out.push_str("\nPrune empty bodies script:\n");
+        out.push_str(script);
     }
     out
 }
@@ -1020,6 +1232,14 @@ mod tests {
                 detail: "ok".to_string(),
                 recommendation: None,
             },
+            empty_body_chunks: CheckResult {
+                name: "empty_body_chunks".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            rebuild_sidecars_script: None,
+            prune_empty_bodies_script: None,
             fixes_applied: Vec::new(),
             overall: Severity::Green,
         };
@@ -1113,6 +1333,44 @@ mod tests {
 
         let suspicious = suspicious_corpus_buckets(&store).unwrap();
         assert!(suspicious.is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn empty_body_chunks_red_when_over_threshold_and_script_is_reviewable() {
+        let tmp = unique_test_dir("empty-bodies");
+        let dir = tmp
+            .join("store")
+            .join("VetCoders")
+            .join("aicx")
+            .join("2026_0506")
+            .join("conversations")
+            .join("claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("2026_0506_claude_sess-empty_001.md");
+        let full = dir.join("2026_0506_claude_sess-full_001.md");
+        std::fs::write(
+            &empty,
+            "[project: VetCoders/aicx | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &full,
+            "[project: VetCoders/aicx | agent: claude | date: 2026-05-06]\n\nThis chunk carries enough real body content to avoid the empty-body threshold.",
+        )
+        .unwrap();
+
+        let check = check_empty_body_chunks(&tmp);
+        assert_eq!(check.severity, Severity::Critical);
+        assert!(check.detail.contains("1 empty-body"));
+
+        let script = render_prune_empty_bodies_script(&tmp).unwrap();
+        assert!(script.starts_with("#!/usr/bin/env bash"));
+        assert!(script.contains("rm -f --"));
+        assert!(script.contains("sess-empty"));
+        assert!(!script.contains("sess-full"));
+        assert!(empty.exists(), "script generation must not delete files");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

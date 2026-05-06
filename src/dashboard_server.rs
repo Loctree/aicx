@@ -54,7 +54,7 @@ pub enum DashboardCorsPolicy {
     Tailscale,
     /// Wildcard CORS, intended for trusted reverse-proxy or lab setups.
     All,
-    /// Exact origin match such as https://dashboard.example.com.
+    /// Exact origin match such as <https://dashboard.example.com>.
     Exact(String),
 }
 
