@@ -1,6 +1,6 @@
 [package]
 name = "aicx-embeddings"
-version = "0.6.2"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Reusable local embedding providers for AICX and rust-memex"

@@ -15,6 +15,7 @@ pub mod doctor;
 pub mod embedder;
 pub mod hf_cache;
 pub mod intents;
+pub mod locks;
 pub mod mcp;
 pub mod oracle;
 pub mod output;

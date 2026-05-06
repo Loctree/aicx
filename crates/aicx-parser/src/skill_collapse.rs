@@ -116,13 +116,13 @@ pub fn detect_skill_marker(message: &str) -> Option<String> {
 
 /// Stable hash of a message body for content-equality lookup.
 ///
-/// Uses [`std::hash::DefaultHasher`] for portability. Content-equality
-/// is enforced by the source string itself; the hash is only an index
-/// into the seen-set, so collision risk stays negligible at session
-/// scale (typically `<= O(10^4)` messages).
+/// Uses explicitly pinned SipHash-1-3. Content-equality is enforced by the
+/// source string itself; the hash is only an index into the seen-set, so
+/// collision risk stays negligible at session scale (typically `<= O(10^4)`
+/// messages).
 fn hash_message(message: &str) -> u64 {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-    let mut h = DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    let mut h = siphasher::sip::SipHasher13::new();
     message.hash(&mut h);
     h.finish()
 }

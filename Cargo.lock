@@ -53,10 +53,10 @@ dependencies = [
 
 [[package]]
 name = "aicx"
-version = "0.6.6"
+version = "0.7.0"
 dependencies = [
- "aicx-embeddings 0.6.2 (registry+https://github.com/rust-lang/crates.io-index)",
- "aicx-parser",
+ "aicx-embeddings",
+ "aicx-parser 0.3.0",
  "anyhow",
  "axum",
  "chrono",
@@ -74,6 +74,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "siphasher",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -81,23 +82,7 @@ dependencies = [
 
 [[package]]
 name = "aicx-embeddings"
-version = "0.6.2"
-dependencies = [
- "anyhow",
- "dirs",
- "llama-cpp-2",
- "reqwest",
- "serde",
- "serde_json",
- "toml 0.8.23",
- "tracing",
-]
-
-[[package]]
-name = "aicx-embeddings"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec98863ec43c4e13ac28ce742299e5bcd44b3709fa63fefa8f9caa95e3f2d391"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -112,6 +97,19 @@ dependencies = [
 [[package]]
 name = "aicx-parser"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5035ce698c57cc617cb3f035dee6987d456770516213745742758cd941d274ed"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "aicx-parser"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -119,6 +117,7 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "siphasher",
 ]
 
 [[package]]
@@ -5301,7 +5300,7 @@ version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88485d2e69b3712c18e77a8e26c626f6f8bb7f76aa007d5f6d1b0da1884bc2f4"
 dependencies = [
- "aicx-parser",
+ "aicx-parser 0.2.0",
  "anyhow",
  "argon2",
  "arrow-array",

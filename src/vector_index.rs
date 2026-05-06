@@ -176,15 +176,18 @@ fn run_native_pass(
 }
 
 /// Take the first `max_bytes` bytes of `s`, but never split a UTF-8
-/// codepoint. Returns owned `String`.
+/// codepoint. Returns owned `String` with no truncation marker.
 ///
-/// Cfg-gated with the same predicate as its sole caller `run_native_pass`
-/// so a no-embedder build does not warn about a dead helper. Tests below
-/// run under `#[cfg(test)]` which always picks up workspace defaults
-/// (where the embedder feature is enabled), so the helper stays
-/// reachable for unit coverage.
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn take_prefix_bytes(s: &str, max_bytes: usize) -> String {
+/// Distinct from [`aicx_parser::chunker`]'s display-oriented truncate
+/// (which appends `"...[truncated]"`) — this one returns raw bytes only,
+/// which is what embedders want: the marker would just become more
+/// tokens consuming context-window budget for zero retrieval value.
+///
+/// Public so downstream lib consumers (loctree, loct-io binary bundle)
+/// reuse the same codepoint-safe truncation logic when feeding the
+/// embedder, instead of each crate rolling its own slice + boundary
+/// loop.
+pub fn take_prefix_bytes(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }

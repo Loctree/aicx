@@ -3,7 +3,6 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
@@ -144,7 +143,7 @@ impl Eq for IntentEntry {}
 
 impl IntentEntry {
     pub fn stable_id(source_chunk: &str, byte_offset: usize, entry_type: EntryType) -> String {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = siphasher::sip::SipHasher13::new();
         source_chunk.hash(&mut hasher);
         byte_offset.hash(&mut hasher);
         entry_type.as_str().hash(&mut hasher);

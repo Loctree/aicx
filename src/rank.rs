@@ -818,7 +818,7 @@ pub fn fuzzy_search_store(
     let mut seen_hashes = std::collections::HashSet::new();
     results.retain(|r| {
         use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = siphasher::sip::SipHasher13::new();
         r.matched_lines.hash(&mut h);
         r.file.hash(&mut h);
         seen_hashes.insert(h.finish())

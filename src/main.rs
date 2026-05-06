@@ -3855,6 +3855,7 @@ fn run_index(project: Option<&str>, sample: usize, json: bool, dry_run: bool) ->
              Pass --dry-run=true (the default) for now."
         );
     }
+    let _lock = aicx::locks::acquire_exclusive(aicx::locks::lance_lock_path()?)?;
     let stats = aicx::vector_index::dry_run_index(project, sample)?;
     if json {
         println!("{}", aicx::vector_index::render_stats_json(&stats)?);

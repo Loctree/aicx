@@ -639,7 +639,7 @@ fn test_extract_gemini_antigravity_prefers_conversation_artifacts_for_brain_inpu
     let entries = extract_gemini_antigravity_file(&brain, &config).unwrap();
     assert_eq!(entries[0].role, "system");
     assert!(entries[0].message.contains("mode: conversation-artifacts"));
-    assert!(entries[0].message.contains("RepoAlpha"));
+    assert!(entries[0].message.contains("repoalpha"));
     assert!(
         entries[0]
             .message

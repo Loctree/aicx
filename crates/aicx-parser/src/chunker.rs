@@ -386,6 +386,7 @@ pub fn chunk_entries(
         return vec![];
     }
 
+    let project = canonical_project_label(project);
     let (frontmatter, prepared_entries) = prepare_entries_for_chunking(entries);
     let prepared_entries = prepared_entries.as_ref();
 
@@ -403,7 +404,7 @@ pub fn chunk_entries(
         let mut next_seq = 1usize;
         for frame_group in split_day_entries_by_frame_kind(day_entries) {
             let (mut group_chunks, updated_seq) =
-                chunk_day_entries(frame_group, project, agent, date, config, next_seq);
+                chunk_day_entries(frame_group, &project, agent, date, config, next_seq);
             next_seq = updated_seq;
             day_chunks.append(&mut group_chunks);
         }
@@ -553,15 +554,24 @@ pub fn format_chunk_text(
     let entries: Vec<&TimelineEntry> = sanitized_owned.iter().collect();
     let highlights = extract_highlights(&entries);
     let signals = extract_signals(&entries);
+    let project = canonical_project_label(project);
     format_chunk_text_inner(
         &entries,
-        project,
+        &project,
         agent,
         date,
         frame_kind_for_window(&entries),
         &signals,
         &highlights,
     )
+}
+
+fn canonical_project_label(project: &str) -> String {
+    project
+        .split('/')
+        .map(|segment| segment.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Clone a window's entries with their messages run through
@@ -1377,7 +1387,7 @@ mod tests {
 
         let text = format_chunk_text(&refs, "TestProj", "claude", "2026-01-22");
 
-        assert!(text.starts_with("[project: TestProj | agent: claude | date: 2026-01-22]"));
+        assert!(text.starts_with("[project: testproj | agent: claude | date: 2026-01-22]"));
         assert!(text.contains("[14:30:00] user: hello"));
         assert!(text.contains("[14:31:00] assistant: hi there"));
     }
@@ -1586,7 +1596,7 @@ mod tests {
         let config = ChunkerConfig::default();
         let chunks = chunk_entries(&entries, "MyProject", "gemini", &config);
 
-        assert_eq!(chunks[0].id, "MyProject_gemini_2026-01-22_001");
+        assert_eq!(chunks[0].id, "myproject_gemini_2026-01-22_001");
     }
 
     #[test]

@@ -771,6 +771,7 @@ pub async fn sync_steer_index(new_files: &[&PathBuf]) -> Result<()> {
     }
 
     let base = crate::store::store_base_dir()?;
+    let _lock = crate::locks::acquire_exclusive(crate::locks::steer_lock_path()?)?;
     ensure_steer_index_compatible_at(&base).await?;
     sync_steer_index_at(&base, new_files).await
 }
@@ -791,6 +792,7 @@ pub async fn sync_steer_index_with_progress(
     }
 
     let base = crate::store::store_base_dir()?;
+    let _lock = crate::locks::acquire_exclusive(crate::locks::steer_lock_path()?)?;
     ensure_steer_index_compatible_at(&base).await?;
     sync_steer_index_at_with_reporter(&base, new_files, reporter, failures).await
 }
@@ -803,6 +805,7 @@ pub async fn query_steer_index() -> Result<Vec<ChromaDocument>> {
 
 pub async fn rebuild_steer_index_if_needed() -> Result<()> {
     let base = crate::store::store_base_dir()?;
+    let _lock = crate::locks::acquire_exclusive(crate::locks::steer_lock_path()?)?;
     rebuild_steer_index_if_needed_at(&base).await
 }
 

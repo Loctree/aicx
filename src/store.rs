@@ -176,6 +176,14 @@ const MIGRATION_DIRNAME: &str = "migration";
 const MIGRATION_MANIFEST_FILENAME: &str = "manifest.json";
 const MIGRATION_REPORT_FILENAME: &str = "report.md";
 
+fn canonical_project_slug(project: &str) -> String {
+    project
+        .split('/')
+        .map(|segment| segment.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 #[derive(Debug, Clone)]
 struct IgnoreRule {
     negate: bool,
@@ -402,13 +410,14 @@ pub fn get_context_json_path(
 }
 
 fn validated_store_project_dir(root: &Path, project: &str) -> Result<PathBuf> {
-    if !is_valid_repo_project_slug(project) {
+    let canonical = canonical_project_slug(project);
+    if !is_valid_repo_project_slug(&canonical) {
         anyhow::bail!(
-            "invalid canonical store project bucket {:?}; expected <bucket> or <org>/<repo> with [A-Za-z0-9][A-Za-z0-9._-]{{0,99}} segments",
+            "invalid canonical store project bucket {:?}; expected lowercase <bucket> or <org>/<repo> with [a-z0-9][a-z0-9._-]{{0,99}} segments",
             project
         );
     }
-    Ok(root.join(project))
+    Ok(root.join(canonical))
 }
 
 // ============================================================================
@@ -448,6 +457,20 @@ pub fn load_index() -> StoreIndex {
         Ok(dir) => dir,
         Err(_) => return StoreIndex::default(),
     };
+    let lock_path = match crate::locks::index_lock_path() {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::warn!("failed to resolve index lock path: {err}");
+            return StoreIndex::default();
+        }
+    };
+    let _lock = match crate::locks::acquire_shared(lock_path) {
+        Ok(lock) => lock,
+        Err(err) => {
+            tracing::warn!("failed to acquire shared index lock: {err}");
+            return StoreIndex::default();
+        }
+    };
     load_index_at(&base)
 }
 
@@ -467,7 +490,11 @@ fn load_index_at(base: &Path) -> StoreIndex {
 
 /// Persist the store index to disk.
 pub fn save_index(index: &StoreIndex) -> Result<()> {
-    save_index_at(&store_base_dir()?, index)
+    let base = store_base_dir()?;
+    let lock = crate::locks::acquire_exclusive(crate::locks::index_lock_path()?)?;
+    let result = save_index_at(&base, index);
+    crate::locks::release(lock);
+    result
 }
 
 fn save_index_at(base: &Path, index: &StoreIndex) -> Result<()> {
@@ -488,7 +515,10 @@ pub fn update_index(
     let now = Utc::now();
     index.last_updated = now;
 
-    let project_idx = index.projects.entry(project.to_string()).or_default();
+    let project_idx = index
+        .projects
+        .entry(canonical_project_slug(project))
+        .or_default();
 
     let agent_idx = project_idx.agents.entry(agent.to_string()).or_default();
 
@@ -570,10 +600,11 @@ pub fn write_context(
     time: &str,
     entries: &[TimelineEntry],
 ) -> Result<Vec<PathBuf>> {
+    let project = canonical_project_slug(project);
     let mut written = Vec::new();
 
     // Markdown
-    let md_path = get_context_path(project, agent, date, time)?;
+    let md_path = get_context_path(&project, agent, date, time)?;
     let mut md_content = String::new();
     md_content.push_str(&format!("# {} | {} | {}\n\n", project, agent, date));
 
@@ -591,7 +622,7 @@ pub fn write_context(
     written.push(md_path);
 
     // JSON
-    let json_path = get_context_json_path(project, agent, date, time)?;
+    let json_path = get_context_json_path(&project, agent, date, time)?;
     let json_content = serde_json::to_string_pretty(entries)?;
     let write_path = sanitize::validate_write_path(&json_path)?;
     fs::write(&write_path, &json_content)?;
@@ -620,8 +651,9 @@ pub fn write_context_chunked(
         return Ok(vec![]);
     }
 
-    let chunks = chunker::chunk_entries(entries, project, agent, chunker_config);
-    let dir = validated_store_project_dir(&canonical_store_dir()?, project)?.join(date);
+    let project = canonical_project_slug(project);
+    let chunks = chunker::chunk_entries(entries, &project, agent, chunker_config);
+    let dir = validated_store_project_dir(&canonical_store_dir()?, &project)?.join(date);
     fs::create_dir_all(&dir)?;
 
     let mut written = Vec::new();
@@ -683,8 +715,11 @@ fn write_context_session_first_at(
     }
 
     let kind = spec.kind.unwrap_or_else(|| classify_kind(entries));
-    let project_label = spec.project.unwrap_or(NON_REPOSITORY_CONTEXTS);
-    let chunks = chunker::chunk_entries(entries, project_label, spec.agent, chunker_config);
+    let project_label = spec
+        .project
+        .map(canonical_project_slug)
+        .unwrap_or_else(|| NON_REPOSITORY_CONTEXTS.to_string());
+    let chunks = chunker::chunk_entries(entries, &project_label, spec.agent, chunker_config);
     let date_dir = compact_date(spec.date);
 
     let mut written = Vec::new();
@@ -695,8 +730,8 @@ fn write_context_session_first_at(
         }
         let chunk_num = (idx as u32) + 1;
         let mut dir = root.join(&date_dir).join(kind.dir_name()).join(spec.agent);
-        if let Some(project) = spec.project {
-            dir = validated_store_project_dir(root, project)?
+        if spec.project.is_some() {
+            dir = validated_store_project_dir(root, &project_label)?
                 .join(&date_dir)
                 .join(kind.dir_name())
                 .join(spec.agent);
@@ -784,6 +819,7 @@ where
         return Ok(summary);
     }
 
+    let _lock = crate::locks::acquire_exclusive(base.join("locks").join("index.lock"))?;
     let segments = semantic_segments(entries);
     let total_segments = segments.len();
     let mut index = load_index_at(base);
@@ -794,15 +830,11 @@ where
             .first()
             .map(|entry| entry.timestamp.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
-        let project = segment.project_label();
+        let project = canonical_project_slug(&segment.project_label());
 
-        let before_count = chunker::chunk_entries(
-            &segment.entries,
-            segment.project_label().as_str(),
-            &segment.agent,
-            chunker_config,
-        )
-        .len();
+        let before_count =
+            chunker::chunk_entries(&segment.entries, &project, &segment.agent, chunker_config)
+                .len();
         let paths = write_semantic_segment_at(base, &segment, &date, chunker_config)?;
         summary.skipped_empty_body += before_count.saturating_sub(paths.len());
         update_index(
@@ -2745,7 +2777,7 @@ mod tests {
     fn test_get_context_path_new_layout() {
         if let Ok(path) = get_context_path("CodeScribe", "claude", "2026-01-22", "143005") {
             let s = path.to_string_lossy();
-            assert!(s.contains("CodeScribe"));
+            assert!(s.contains("codescribe"));
             assert!(s.contains("2026-01-22"));
             assert!(s.ends_with("143005_claude-context.md"));
         }
@@ -2755,7 +2787,7 @@ mod tests {
     fn test_get_context_json_path_new_layout() {
         if let Ok(path) = get_context_json_path("CodeScribe", "claude", "2026-01-22", "143005") {
             let s = path.to_string_lossy();
-            assert!(s.contains("CodeScribe"));
+            assert!(s.contains("codescribe"));
             assert!(s.contains("2026-01-22"));
             assert!(s.ends_with("143005_claude-context.json"));
         }
@@ -2895,10 +2927,10 @@ mod tests {
         let restored: StoreIndex = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored.projects.len(), 2);
-        assert!(restored.projects.contains_key("CodeScribe"));
+        assert!(restored.projects.contains_key("codescribe"));
         assert!(restored.projects.contains_key("vista"));
 
-        let cs = &restored.projects["CodeScribe"];
+        let cs = &restored.projects["codescribe"];
         assert_eq!(cs.agents["claude"].total_entries, 42);
         assert_eq!(cs.agents["claude"].dates, vec!["2026-01-22"]);
         assert_eq!(cs.agents["gemini"].total_entries, 10);
@@ -3300,7 +3332,7 @@ mod tests {
         .expect("write should succeed");
 
         assert!(written.is_empty());
-        assert!(!root.join("store").join("VetCoders").join("aicx").exists());
+        assert!(!root.join("store").join("vetcoders").join("aicx").exists());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3375,10 +3407,10 @@ mod tests {
                 .any(|path| { path.starts_with(root.join("non-repository-contexts")) })
         );
         assert!(summary.written_paths.iter().any(|path| {
-            path.starts_with(root.join("store").join("VetCoders").join("ai-contexters"))
+            path.starts_with(root.join("store").join("vetcoders").join("ai-contexters"))
         }));
         assert!(summary.written_paths.iter().any(|path| {
-            path.starts_with(root.join("store").join("VetCoders").join("loctree"))
+            path.starts_with(root.join("store").join("vetcoders").join("loctree"))
         }));
 
         let scanned = scan_context_files_at(&root).expect("scan stored files");
@@ -3390,12 +3422,12 @@ mod tests {
         assert!(
             scanned
                 .iter()
-                .any(|file| file.project == "VetCoders/ai-contexters")
+                .any(|file| file.project == "vetcoders/ai-contexters")
         );
         assert!(
             scanned
                 .iter()
-                .any(|file| file.project == "VetCoders/loctree")
+                .any(|file| file.project == "vetcoders/loctree")
         );
 
         let _ = fs::remove_dir_all(&root);
@@ -3802,13 +3834,13 @@ mod tests {
         assert_eq!(manifest.totals.salvaged_items, 0);
         assert!(manifest.items.iter().any(|item| {
             item.canonical_paths.iter().any(|path| {
-                path.contains("/store/VetCoders/ai-contexters/2025_0321/conversations/codex/")
+                path.contains("/store/vetcoders/ai-contexters/2025_0321/conversations/codex/")
             })
         }));
         assert!(
             store_root
                 .join("store")
-                .join("VetCoders")
+                .join("vetcoders")
                 .join("ai-contexters")
                 .join("2025_0321")
                 .join("conversations")

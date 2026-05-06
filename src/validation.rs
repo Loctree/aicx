@@ -1,8 +1,9 @@
 //! Shared schema validation for repository-derived filesystem buckets.
 //!
 //! The canonical store bucket schema intentionally stays narrow: ASCII
-//! alphanumeric first character, then ASCII alphanumeric, dot, underscore,
-//! or dash. Semantic callers can add their own reserved-word rules on top.
+//! lowercase ASCII alphanumeric first character, then lowercase ASCII
+//! alphanumeric, dot, underscore, or dash. Semantic callers can add their own
+//! reserved-word rules on top.
 
 pub fn is_valid_repo_bucket_name(value: &str) -> bool {
     if value.len() > 100 {
@@ -14,8 +15,10 @@ pub fn is_valid_repo_bucket_name(value: &str) -> bool {
         return false;
     };
 
-    first.is_ascii_alphanumeric()
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars.all(|ch| {
+            ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-')
+        })
 }
 
 /// Validate a canonical store project slug before it becomes a filesystem path.
@@ -42,8 +45,6 @@ mod tests {
 
     #[test]
     fn valid_repo_bucket_names_allow_common_slugs() {
-        assert!(is_valid_repo_bucket_name("VetCoders"));
-        assert!(is_valid_repo_bucket_name("LibraxisAI"));
         assert!(is_valid_repo_bucket_name("local"));
         assert!(is_valid_repo_bucket_name("rust-memex"));
         assert!(is_valid_repo_bucket_name("foo.bar_baz"));
@@ -55,6 +56,8 @@ mod tests {
         assert!(!is_valid_repo_bucket_name(""));
         assert!(!is_valid_repo_bucket_name(&"a".repeat(101)));
         assert!(!is_valid_repo_bucket_name("..."));
+        assert!(!is_valid_repo_bucket_name("VetCoders"));
+        assert!(!is_valid_repo_bucket_name("LibraxisAI"));
         assert!(!is_valid_repo_bucket_name("{target_owner}"));
         assert!(!is_valid_repo_bucket_name("$RELEASE_REPO"));
         assert!(!is_valid_repo_bucket_name("<owner>"));
@@ -69,10 +72,11 @@ mod tests {
 
     #[test]
     fn valid_repo_project_slugs_validate_each_path_segment() {
-        assert!(is_valid_repo_project_slug("VetCoders/aicx"));
+        assert!(is_valid_repo_project_slug("vetcoders/aicx"));
         assert!(is_valid_repo_project_slug("local"));
-        assert!(is_valid_repo_project_slug("VetCoders/mlx-batch-server.git"));
+        assert!(is_valid_repo_project_slug("vetcoders/mlx-batch-server.git"));
 
+        assert!(!is_valid_repo_project_slug("VetCoders/aicx"));
         assert!(!is_valid_repo_project_slug("VetCoders/vibecrafted.git`"));
         assert!(!is_valid_repo_project_slug("VetCoders/loctree\n\n**AICX"));
         assert!(!is_valid_repo_project_slug("VetCoders/aicx/extra"));

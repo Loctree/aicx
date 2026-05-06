@@ -4217,11 +4217,11 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
 pub fn repo_name_from_cwd(cwd: Option<&str>, project_filter: &[String]) -> String {
     if !project_filter.is_empty() {
         if project_filter.len() == 1 {
-            return project_filter[0].clone();
+            return canonical_repo_label(&project_filter[0]);
         } else if let Some(c) = cwd {
             for p in project_filter {
                 if c.contains(p) {
-                    return p.clone();
+                    return canonical_repo_label(p);
                 }
             }
         }
@@ -4240,14 +4240,22 @@ pub fn repo_name_from_cwd(cwd: Option<&str>, project_filter: &[String]) -> Strin
             && p.join(".git").is_dir()
             && let Some(name) = p.file_name()
         {
-            return name.to_string_lossy().to_string();
+            return canonical_repo_label(&name.to_string_lossy());
         }
         current = p.parent();
     }
 
     path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
+        .map(|n| canonical_repo_label(&n.to_string_lossy()))
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn canonical_repo_label(value: &str) -> String {
+    value
+        .split('/')
+        .map(|segment| segment.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Derive canonical repo labels from extracted entries.
@@ -4279,7 +4287,7 @@ pub fn detect_project_name() -> String {
     {
         let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if let Some(name) = std::path::Path::new(&s).file_name() {
-            return name.to_string_lossy().to_string();
+            return canonical_repo_label(&name.to_string_lossy());
         }
     }
 
@@ -4287,7 +4295,7 @@ pub fn detect_project_name() -> String {
     if let Ok(cwd) = std::env::current_dir()
         && let Some(name) = cwd.file_name()
     {
-        return name.to_string_lossy().to_string();
+        return canonical_repo_label(&name.to_string_lossy());
     }
 
     "unknown".to_string()
