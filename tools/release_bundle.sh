@@ -220,7 +220,7 @@ EOF
   echo "[2/3] Packaging tar.gz archive..."
   rm -f "$ARCHIVE_PATH" "$CHECKSUM_PATH"
   (cd "$DIST_DIR" && tar -czf "$ARCHIVE_PATH" "$BUNDLE_BASENAME")
-  shasum -a 256 "$ARCHIVE_PATH" > "$CHECKSUM_PATH"
+  (cd "$DIST_DIR" && shasum -a 256 "$(basename "$ARCHIVE_PATH")") > "$CHECKSUM_PATH"
 
   echo "[3/3] Final artifact summary..."
   echo "Bundle dir:      $BUNDLE_DIR"
