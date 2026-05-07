@@ -62,7 +62,7 @@ From an existing checkout, you can force the same release path:
 
 ```bash
 AICX_INSTALL_MODE=release bash install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.6.5 bash install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.6.6 bash install.sh
 ```
 
 Current release assets are slim unsigned `.tar.gz` bundles for macOS arm64,

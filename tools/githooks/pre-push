@@ -12,7 +12,33 @@ echo "Pushing to: $remote ($url)"
 
 echo ""
 echo "[1/5] Manifest portability..."
-python3 -c 'import tomllib; data = tomllib.load(open("Cargo.toml", "rb")); allow = {("dependencies", "rmcp-memex"), ("dependencies", "aicx-embeddings")}; bad = [(section, name, spec["path"]) for section in ("dependencies", "dev-dependencies", "build-dependencies") for name, spec in data.get(section, {}).items() if isinstance(spec, dict) and "path" in spec and (section, name) not in allow]; print("Manifest portability: ok (approved first-party product deps only)") if not bad else (_ for _ in ()).throw(SystemExit("Manifest portability check failed:\n" + "\n".join(f"  - {section}.{name} uses unexpected local path dependency {path}" for section, name, path in bad)))'
+python3 - <<'PY'
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+with open("Cargo.toml", "rb") as fh:
+    data = tomllib.load(fh)
+
+bad = [
+    (section, name, spec["path"])
+    for section in ("dependencies", "dev-dependencies", "build-dependencies")
+    for name, spec in data.get(section, {}).items()
+    if isinstance(spec, dict) and "path" in spec
+]
+
+if bad:
+    raise SystemExit(
+        "Manifest portability check failed:\n"
+        + "\n".join(
+            f"  - {section}.{name} uses unexpected local path dependency {path}"
+            for section, name, path in bad
+        )
+    )
+
+print("Manifest portability: ok (root dependencies use registry versions)")
+PY
 
 echo ""
 echo "[2/5] Format check..."

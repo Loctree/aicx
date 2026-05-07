@@ -1,7 +1,7 @@
 [package]
 name = "aicx"
 
-version = "0.6.5"
+version = "0.6.6"
 edition = "2024"
 rust-version = "1.91.1"
 description = "Operator CLI + MCP server: canonical corpus first, optional semantic index second (Claude Code, Codex, Gemini)"
@@ -39,8 +39,8 @@ native-embedder-openmp = ["native-embedder", "aicx-embeddings/openmp"]
 cloud-embedder = ["dep:aicx-embeddings", "aicx-embeddings/cloud"]
 
 [dependencies]
-aicx-embeddings = { path = "crates/aicx-embeddings", version = "0.6.2", optional = true, default-features = false }
-aicx-parser = { path = "crates/aicx-parser", version = "0.2.0", features = ["json-schema"] }
+aicx-embeddings = { version = "0.6.2", optional = true, default-features = false }
+aicx-parser = { version = "0.2.0", features = ["json-schema"] }
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
@@ -58,9 +58,7 @@ axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "signal"] }
 rmcp = { version = "1.2", features = ["server", "schemars", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 libc = "0.2.183"
-# Local product boundary: aicx now binds directly to the first-party rust-memex
-# workspace instead of consuming a published public crate.
-rmcp-memex = { package = "rust-memex", path = "../rust-memex/crates/rust-memex", version = "0.6.4", default-features = false }
+rmcp-memex = { package = "rust-memex", version = "0.6.4", default-features = false }
 schemars = "1.2.1"
 
 [dev-dependencies]
