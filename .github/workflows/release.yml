@@ -128,7 +128,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: release-verify-${{ hashFiles('**/Cargo.lock') }}
+          key: release-verify-${{ hashFiles('aicx/Cargo.lock') }}
           restore-keys: |
             release-verify-
 
@@ -229,7 +229,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: release-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          key: release-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('aicx/Cargo.lock') }}
           restore-keys: |
             release-${{ runner.os }}-${{ matrix.target }}-
 

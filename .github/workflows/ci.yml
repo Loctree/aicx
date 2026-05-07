@@ -70,8 +70,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            aicx/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('aicx/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
