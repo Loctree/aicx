@@ -17,6 +17,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   PACKAGE_NAME: aicx
+  RUST_MEMEX_REF: 047e63bd9c89bb174fed6e69f9a3a9c203e04981
 
 jobs:
   verify:
@@ -30,6 +31,14 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          path: aicx
+
+      - name: Checkout rust-memex sibling
+        uses: actions/checkout@v6
+        with:
+          repository: Loctree/rust-memex
+          ref: ${{ env.RUST_MEMEX_REF }}
+          path: rust-memex
 
       - name: Ensure unzip on self-hosted Linux
         if: runner.os == 'Linux'
@@ -73,11 +82,13 @@ jobs:
           echo "version=${release_tag#v}" >> "${GITHUB_OUTPUT}"
 
       - name: Check git tag exists
+        working-directory: aicx
         env:
           RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
         run: git rev-parse --verify "refs/tags/${RELEASE_TAG}" >/dev/null
 
       - name: Check Cargo.toml version matches tag
+        working-directory: aicx
         env:
           RELEASE_VERSION: ${{ steps.meta.outputs.version }}
         run: |
@@ -103,6 +114,7 @@ jobs:
           python-version: '3.x'
 
       - name: semgrep
+        working-directory: aicx
         run: |
           python -m pip install --upgrade pip semgrep
           semgrep --config auto --error --quiet
@@ -121,29 +133,36 @@ jobs:
             release-verify-
 
       - name: cargo clippy default
+        working-directory: aicx
         run: cargo clippy --locked -p aicx --all-targets -- -D warnings
 
       - name: cargo clippy native GGUF
+        working-directory: aicx
         run: |
           cargo clippy --locked -p aicx-embeddings --features gguf -- -D warnings
           cargo clippy --locked -p aicx --features native-embedder --all-targets -- -D warnings
 
       - name: cargo test --bin aicx
+        working-directory: aicx
         run: cargo test --locked --bin aicx
 
       - name: cargo test --bin aicx-mcp
+        working-directory: aicx
         run: cargo test --locked --bin aicx-mcp
 
       - name: cargo test native GGUF
+        working-directory: aicx
         run: |
           cargo test --locked -p aicx-embeddings --features gguf
           cargo test --locked -p aicx --features native-embedder --test native_embedder
 
       - name: cargo fmt
+        working-directory: aicx
         run: cargo fmt -- --check
 
       - name: Clean Cargo artifacts
         if: always()
+        working-directory: aicx
         run: cargo clean
 
   build:
@@ -172,6 +191,15 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          path: aicx
+
+      - name: Checkout rust-memex sibling
+        uses: actions/checkout@v6
+        with:
+          repository: Loctree/rust-memex
+          ref: ${{ env.RUST_MEMEX_REF }}
+          path: rust-memex
 
       - name: Ensure unzip on self-hosted Linux
         if: runner.os == 'Linux'
@@ -210,6 +238,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --yes musl-tools
 
       - name: Build release binaries
+        working-directory: aicx
         run: cargo build --locked --release --target ${{ matrix.target }} --bin aicx --bin aicx-mcp
 
       - name: Import macOS signing certificate
@@ -246,6 +275,7 @@ jobs:
       - name: Assemble release bundle
         id: bundle
         shell: bash
+        working-directory: aicx
         env:
           VERSION: ${{ needs.verify.outputs.version }}
           TARGET: ${{ matrix.target }}
@@ -302,6 +332,7 @@ jobs:
 
       - name: Sign and notarize macOS bundle
         if: runner.os == 'macOS'
+        working-directory: aicx
         env:
           MACOS_DEVELOPER_ID_APPLICATION: ${{ secrets.MACOS_DEVELOPER_ID_APPLICATION }}
           APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
@@ -319,6 +350,7 @@ jobs:
         if: runner.os != 'macOS'
         id: package
         shell: bash
+        working-directory: aicx
         env:
           ARCHIVE_EXT: ${{ matrix.archive_ext }}
           BUNDLE_NAME: ${{ steps.bundle.outputs.bundle_name }}
@@ -352,11 +384,12 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
-          path: dist/*
+          path: aicx/dist/*
           if-no-files-found: error
 
       - name: Clean local build artifacts
         if: always()
+        working-directory: aicx
         env:
           BUNDLE_DIR: ${{ steps.bundle.outputs.bundle_dir }}
           ARCHIVE_PATH: ${{ steps.bundle.outputs.archive_path }}
