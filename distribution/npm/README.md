@@ -1,10 +1,15 @@
 # distribution/npm - aicx npm release surface
 
-This directory is the canonical npm distribution surface for `aicx`.
+This directory is the planned npm distribution surface for `aicx`.
 The source of truth for the product lives in
 [Loctree/aicx](https://github.com/Loctree/aicx); this folder contains only the
 thin JS wrapper and platform-package manifests that ship to the `@loctree` npm
 scope.
+
+> Status: not active for `v0.6.5`. The current GitHub Release publishes
+> `*-slim-unsigned.tar.gz` assets for macOS arm64, Linux x64 GNU, and Linux
+> arm64 GNU. The npm platform packages in this directory still describe the
+> older zip/musl/darwin-x64 matrix and must be realigned before publishing.
 
 ## Wrapper package
 
@@ -37,9 +42,9 @@ aicx --help
 aicx-mcp --version
 ```
 
-The wrapper's install flow validates that the matching platform package is
-present. The platform package then downloads the matching GitHub Release asset,
-verifies the adjacent `.sha256`, and extracts both binaries in place.
+This is the intended install shape after the npm platform packages are updated.
+For `v0.6.5`, use `AICX_INSTALL_MODE=release` with the GitHub Release assets
+instead.
 
 That install surface is intentionally binary-only:
 

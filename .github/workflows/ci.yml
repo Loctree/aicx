@@ -10,6 +10,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_MEMEX_REF: 047e63bd9c89bb174fed6e69f9a3a9c203e04981
 
 jobs:
   check:
@@ -26,6 +27,15 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          path: aicx
+
+      - name: Checkout rust-memex sibling
+        uses: actions/checkout@v6
+        with:
+          repository: Loctree/rust-memex
+          ref: ${{ env.RUST_MEMEX_REF }}
+          path: rust-memex
 
       - name: Ensure unzip on self-hosted Linux
         if: runner.os == 'Linux'
@@ -60,35 +70,41 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('aicx/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
       - name: semgrep
         if: runner.os == 'Linux'
+        working-directory: aicx
         run: |
           python -m pip install --upgrade pip semgrep
           semgrep --config auto --error --quiet
 
       - name: cargo check
+        working-directory: aicx
         run: cargo check --locked
 
       - name: cargo clippy default
+        working-directory: aicx
         run: cargo clippy --locked -p aicx --all-targets -- -D warnings
 
       - name: cargo clippy native GGUF
+        working-directory: aicx
         run: |
           cargo clippy --locked -p aicx-embeddings --features gguf -- -D warnings
           cargo clippy --locked -p aicx --features native-embedder --all-targets -- -D warnings
 
       - name: cargo test
+        working-directory: aicx
         run: cargo test --locked --all-targets
 
       - name: cargo test native GGUF
+        working-directory: aicx
         run: |
           cargo test --locked -p aicx-embeddings --features gguf
           cargo test --locked -p aicx --features native-embedder --test native_embedder
 
       - name: cargo fmt
+        working-directory: aicx
         run: cargo fmt -- --check

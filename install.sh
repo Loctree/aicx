@@ -6,7 +6,7 @@ set -euo pipefail
 # Usage:
 #   bash install.sh
 #   bash install.sh --skip-install  # MCP config only
-# Run from a local checkout when release artifacts are not your install path yet.
+# Run from a local checkout, or pass --release to install from GitHub Releases.
 #
 # Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
@@ -373,22 +373,16 @@ detect_release_target() {
   arch=$(uname -m)
   case "${os}:${arch}" in
     Darwin:arm64) echo "aarch64-apple-darwin" ;;
-    Darwin:x86_64) echo "x86_64-apple-darwin" ;;
-    Linux:x86_64) echo "x86_64-unknown-linux-musl" ;;
-    *)
-      echo "Error: unsupported platform for release installer: ${os}/${arch}" >&2
+    Darwin:x86_64)
+      echo "Error: x86_64-apple-darwin release assets are not published in the current AICX release asset set." >&2
       echo "  Use a local bundle install instead, or install from source with cargo." >&2
       exit 1
       ;;
-  esac
-}
-
-detect_release_archive_ext() {
-  case "$(uname -s)" in
-    Darwin) echo "zip" ;;
-    Linux) echo "tar.gz" ;;
+    Linux:x86_64) echo "x86_64-unknown-linux-gnu" ;;
+    Linux:aarch64|Linux:arm64) echo "aarch64-unknown-linux-gnu" ;;
     *)
-      echo "Error: unsupported archive format for platform $(uname -s)" >&2
+      echo "Error: unsupported platform for release installer: ${os}/${arch}" >&2
+      echo "  Use a local bundle install instead, or install from source with cargo." >&2
       exit 1
       ;;
   esac
@@ -422,7 +416,7 @@ print(tag)
 }
 
 download_release_bundle() {
-  local release_tag target version archive_ext archive_name base_url tmp_dir archive_path checksum_path bundle_dir
+  local release_tag target archive_name base_url tmp_dir archive_path checksum_path bundle_dir
 
   if ! command -v curl >/dev/null 2>&1; then
     echo "Error: curl is required for release installer mode." >&2
@@ -434,9 +428,7 @@ download_release_bundle() {
   fi
   release_tag=$(resolve_release_tag)
   target=$(detect_release_target)
-  version="${release_tag#v}"
-  archive_ext=$(detect_release_archive_ext)
-  archive_name="aicx-v${version}-${target}.${archive_ext}"
+  archive_name="aicx-${release_tag}-${target}-slim-unsigned.tar.gz"
   base_url="https://github.com/${AICX_RELEASE_REPO}/releases/download/${release_tag}"
   tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/aicx-release-install.XXXXXX")
   archive_path="$tmp_dir/$archive_name"
@@ -450,6 +442,7 @@ download_release_bundle() {
   echo "[1/4] Downloading verified release bundle..."
   echo "  release tag: $release_tag"
   echo "  target:      $target"
+  echo "  asset:       $archive_name"
   curl -fsSL "$base_url/$archive_name" -o "$archive_path"
   curl -fsSL "$base_url/${archive_name}.sha256" -o "$checksum_path"
 
@@ -488,7 +481,7 @@ elif archive_path.name.endswith(".tar.gz"):
 else:
     raise SystemExit(f"Unsupported archive format: {archive_path.name}")
 PY
-  bundle_dir="$tmp_dir/aicx-v${version}-${target}"
+  bundle_dir="$tmp_dir/aicx-${release_tag}-${target}-slim-unsigned"
   if [ ! -f "$bundle_dir/install.sh" ]; then
     echo "Error: release bundle does not contain install.sh: $bundle_dir" >&2
     exit 1
@@ -563,13 +556,13 @@ if [ "$SKIP_INSTALL" -eq 0 ]; then
     cargo_install_with_progress cargo install --path "$SCRIPT_DIR" --locked --force --bin aicx --bin aicx-mcp
   elif [ "$INSTALL_MODE" = "crates" ]; then
     echo "Error: crates.io is not the active AICX distribution path." >&2
-    echo "  Use AICX_INSTALL_MODE=release for verified GitHub Release assets, npm install -g @loctree/aicx, or install from a local checkout." >&2
+    echo "  Use AICX_INSTALL_MODE=release for verified GitHub Release assets, or install from a local checkout." >&2
     exit 1
   else
     echo "[1/4] Installing aicx + aicx-mcp from git..."
     if ! cargo_install_with_progress cargo install --git "$AICX_GIT_URL" --locked aicx; then
       echo "Error: git install failed."
-      echo "  If you only need the published release, use AICX_INSTALL_MODE=release or npm install -g @loctree/aicx."
+      echo "  If you only need the published release, use AICX_INSTALL_MODE=release."
       exit 1
     fi
   fi

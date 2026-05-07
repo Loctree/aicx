@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build a signed + notarized macOS release bundle for aicx.
+# Build an AICX release bundle.
+#
+# Modes:
+#   - default: signed + notarized macOS bundle
+#   - AICX_RELEASE_BUNDLE_ONLY_BINARIES=1: unsigned slim tar.gz for foundation
+#     bundles such as Loctree release packaging
 #
 # Inputs are read from either:
 #   - KEYS=/path/to/keys-dir
@@ -40,6 +45,8 @@ Environment:
   PACKAGE_NAME              Bundle prefix (default: Cargo package name)
   NATIVE=1                  Build with --features native-embedder (model weights are still not bundled)
   FEATURES                  Explicit Cargo feature list for the bundle build
+  AICX_CARGO_BUILD_CMD      Explicit build command for binary-only mode.
+                            Default: cargo build.
   AICX_CLEAN_AFTER_BUILD    Run cargo clean --target <triple> after bundle creation (default: 1)
   DRY_RUN=1                 Print resolved actions without signing/notarizing
 
@@ -116,20 +123,14 @@ fi
 require_cmd cargo
 require_cmd python3
 
-if [[ "$(uname -s)" != "Darwin" ]]; then
-  echo "Error: release-bundle is currently supported only on macOS hosts." >&2
-  exit 1
-fi
-
 require_cmd shasum
 
 if [[ "${AICX_RELEASE_BUNDLE_ONLY_BINARIES:-0}" == "1" ]]; then
   echo "=== AICX unsigned bundle (binaries-only, no codesign/notarize) ==="
   TARGET="${TARGET:-$(host_target)}"
-  if [[ "$TARGET" != *apple-darwin ]]; then
-    echo "Error: release-bundle-only-binaries requires an Apple target, got: $TARGET" >&2
-    exit 1
-  fi
+  case "$TARGET" in
+    *windows*) echo "Error: release-bundle-only-binaries does not support Windows targets yet: $TARGET" >&2; exit 1 ;;
+  esac
 
   VERSION="$(toml_value package.version)"
   if [[ -z "$PACKAGE_NAME" ]]; then
@@ -151,6 +152,19 @@ PY
   else
     BUILD_FLAVOR="${AICX_BUNDLE_FLAVOR:-slim}"
   fi
+  HOST_TARGET="$(host_target)"
+  BUILD_CMD="${AICX_CARGO_BUILD_CMD:-cargo build}"
+  if [[ -z "${AICX_CARGO_BUILD_CMD:-}" && "$TARGET" != "$HOST_TARGET" ]]; then
+    cat >&2 <<EOF
+Error: binary-only release bundles default to native builds.
+Host target: $HOST_TARGET
+Requested:   $TARGET
+
+Use a Linux runner matching TARGET for Linux release assets, or set
+AICX_CARGO_BUILD_CMD explicitly to opt into cross-compilation.
+EOF
+    exit 1
+  fi
   BUNDLE_BASENAME="${PACKAGE_NAME}-v${VERSION}-${TARGET}-${BUILD_FLAVOR}-unsigned"
   BUNDLE_DIR="$DIST_DIR/$BUNDLE_BASENAME"
   ARCHIVE_PATH="$DIST_DIR/${BUNDLE_BASENAME}.tar.gz"
@@ -159,6 +173,7 @@ PY
   echo "Repo:            $REPO_ROOT"
   echo "Version:         $VERSION"
   echo "Target:          $TARGET"
+  echo "Build command:   $BUILD_CMD"
   echo "Build flavor:    $BUILD_FLAVOR"
   echo "Cargo features:  ${FEATURES_VALUE:-<none>}"
   echo "Cleanup target:  $CLEAN_AFTER_BUILD"
@@ -169,9 +184,9 @@ PY
     echo ""
     echo "[dry-run] Would:"
     if [[ -n "$FEATURES_VALUE" ]]; then
-      echo "  1. cargo build --locked --release --target $TARGET --features $FEATURES_VALUE --bin aicx --bin aicx-mcp"
+      echo "  1. $BUILD_CMD --locked --release --target $TARGET --features $FEATURES_VALUE --bin aicx --bin aicx-mcp"
     else
-      echo "  1. cargo build --locked --release --target $TARGET --bin aicx --bin aicx-mcp"
+      echo "  1. $BUILD_CMD --locked --release --target $TARGET --bin aicx --bin aicx-mcp"
     fi
     echo "  2. compose $BUNDLE_DIR layout (bin + LICENSE + README + install.sh + docs)"
     echo "  3. tar -czf $ARCHIVE_PATH"
@@ -183,9 +198,11 @@ PY
   (
     cd "$REPO_ROOT"
     if [[ -n "$FEATURES_VALUE" ]]; then
-      cargo build --locked --release --target "$TARGET" --features "$FEATURES_VALUE" --bin aicx --bin aicx-mcp
+      # shellcheck disable=SC2086
+      $BUILD_CMD --locked --release --target "$TARGET" --features "$FEATURES_VALUE" --bin aicx --bin aicx-mcp
     else
-      cargo build --locked --release --target "$TARGET" --bin aicx --bin aicx-mcp
+      # shellcheck disable=SC2086
+      $BUILD_CMD --locked --release --target "$TARGET" --bin aicx --bin aicx-mcp
     fi
   )
 
@@ -203,7 +220,7 @@ PY
   echo "[2/3] Packaging tar.gz archive..."
   rm -f "$ARCHIVE_PATH" "$CHECKSUM_PATH"
   (cd "$DIST_DIR" && tar -czf "$ARCHIVE_PATH" "$BUNDLE_BASENAME")
-  shasum -a 256 "$ARCHIVE_PATH" > "$CHECKSUM_PATH"
+  (cd "$DIST_DIR" && shasum -a 256 "$(basename "$ARCHIVE_PATH")") > "$CHECKSUM_PATH"
 
   echo "[3/3] Final artifact summary..."
   echo "Bundle dir:      $BUNDLE_DIR"
@@ -227,6 +244,11 @@ PY
   fi
 
   exit 0
+fi
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "Error: release-bundle is currently supported only on macOS hosts." >&2
+  exit 1
 fi
 
 require_cmd codesign
