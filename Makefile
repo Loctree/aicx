@@ -19,6 +19,8 @@ NATIVE ?= 0
 FEATURES ?=
 TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
 CODESIGN ?= auto
+DIST_DIR ?= $(CURDIR)/dist
+DRY_RUN ?= 0
 RELEASE_BINARIES := aicx aicx-mcp
 
 build:
@@ -293,6 +295,9 @@ package-check:
 release-bundle:
 	@KEYS="$(KEYS)" \
 	NOTARY_PROFILE="$(NOTARY_PROFILE)" \
+	TARGET="$(TARGET)" \
+	DIST_DIR="$(DIST_DIR)" \
+	DRY_RUN="$(DRY_RUN)" \
 	AICX_CLEAN_AFTER_BUILD="$(CLEAN)" \
 	NATIVE="$(NATIVE)" \
 	FEATURES="$(FEATURES)" \
@@ -301,6 +306,9 @@ release-bundle:
 
 release-bundle-only-binaries:
 	@AICX_RELEASE_BUNDLE_ONLY_BINARIES=1 \
+	TARGET="$(TARGET)" \
+	DIST_DIR="$(DIST_DIR)" \
+	DRY_RUN="$(DRY_RUN)" \
 	AICX_CLEAN_AFTER_BUILD="$(CLEAN)" \
 	NATIVE="$(NATIVE)" \
 	FEATURES="$(FEATURES)" \
