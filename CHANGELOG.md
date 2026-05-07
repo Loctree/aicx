@@ -28,6 +28,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 - Test isolation: source extraction tests use unique temp directories per test to prevent cross-test interference on parallel runs.
 
+## [0.6.5] - 2026-05-06
+
+### Added
+- Public GitHub Release binaries for `aicx` and `aicx-mcp` on macOS arm64,
+  Linux x64 GNU, and Linux arm64 GNU.
+- Slim unsigned release archives with adjacent `.sha256` sidecars for each
+  published target.
+- Release-bundle install path that copies prebuilt `aicx` and `aicx-mcp`
+  without requiring a Rust toolchain on the target machine.
+
+### Changed
+- GitHub Releases are the supported public binary install lane for this
+  release. The npm wrapper lane remains present in-tree, but is not the active
+  v0.6.5 install path until its platform packages match the release asset
+  matrix.
+
 ## [0.5.5] - 2026-03-31
 
 ### Performance

@@ -1,5 +1,10 @@
 # Publishing Guide - aicx npm packages
 
+> Status: do not publish npm packages for `v0.6.5` from this directory as-is.
+> The public GitHub Release uses `*-slim-unsigned.tar.gz` assets for macOS
+> arm64, Linux x64 GNU, and Linux arm64 GNU. This npm surface still expects the
+> older zip/musl/darwin-x64 matrix and needs a dedicated realignment pass first.
+
 This guide describes the publish flow for the single wrapper package and its
 platform sub-packages under the `@loctree` npm scope.
 
@@ -44,11 +49,15 @@ Then it:
 
 ## Prerequisites
 
+Before publishing, update the platform matrix and postinstall asset names to
+match the GitHub Release being published.
+
 1. `@loctree` npm org exists and you have publish rights.
-2. GitHub releases exist for the target version with the expected asset names:
-   - `aicx-v{V}-aarch64-apple-darwin.zip`
-   - `aicx-v{V}-x86_64-apple-darwin.zip`
-   - `aicx-v{V}-x86_64-unknown-linux-musl.tar.gz`
+2. GitHub releases exist for the target version with the asset names expected
+   by the platform packages. For `v0.6.5`, the public assets are:
+   - `aicx-v0.6.5-aarch64-apple-darwin-slim-unsigned.tar.gz`
+   - `aicx-v0.6.5-x86_64-unknown-linux-gnu-slim-unsigned.tar.gz`
+   - `aicx-v0.6.5-aarch64-unknown-linux-gnu-slim-unsigned.tar.gz`
 3. Each asset has an adjacent `.sha256`.
 4. Node.js 14+.
 
@@ -115,9 +124,11 @@ then publishes the wrapper.
 - Verify the release assets and `.sha256` files exist.
 - Test download manually:
 
+For `v0.6.5`, the real asset shape is:
+
 ```bash
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.6.5/aicx-v0.6.5-aarch64-apple-darwin.zip
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.6.5/aicx-v0.6.5-aarch64-apple-darwin.zip.sha256
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.6.5/aicx-v0.6.5-aarch64-apple-darwin-slim-unsigned.tar.gz
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.6.5/aicx-v0.6.5-aarch64-apple-darwin-slim-unsigned.tar.gz.sha256
 ```
 
 ### optionalDependencies disabled
