@@ -26,13 +26,15 @@ Supported sources:
 
 ## Install
 
-Public install from npm:
+Public install from GitHub Releases:
 
 ```bash
-npm install -g @loctree/aicx
+curl -fsSLO https://raw.githubusercontent.com/Loctree/aicx/main/install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.6.5 bash install.sh
 ```
 
-This installs both shipped commands:
+The installer downloads the matching release archive, verifies its adjacent
+`.sha256` sidecar, and installs both shipped commands:
 
 ```bash
 aicx --help
@@ -56,15 +58,19 @@ bash install.sh
 Bundle install copies prebuilt `aicx` + `aicx-mcp` into `~/.local/bin`, removes stale user-local / cargo-installed copies, then refreshes MCP configuration.
 No Rust toolchain and no local memex compilation are required on the target machine.
 
-Directly from GitHub Releases with SHA-256 verification before unpacking:
+From an existing checkout, you can force the same release path:
 
 ```bash
 AICX_INSTALL_MODE=release bash install.sh
 AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.6.5 bash install.sh
 ```
 
-On macOS this consumes the signed/notarized release zip published by CI on the
-`dragon-macos` self-hosted runner. On Linux it consumes the release tarball.
+Current release assets are slim unsigned `.tar.gz` bundles for macOS arm64,
+Linux x64 GNU, and Linux arm64 GNU. The `.sha256` sidecar is mandatory.
+
+The npm wrapper track exists under `distribution/npm/`, but it is not the
+supported v0.6.5 install path until its platform packages are aligned with the
+current GitHub Release asset shape.
 
 From an accessible GitHub repo when you want unreleased source:
 
@@ -87,7 +93,7 @@ cargo install --path . --locked --bin aicx --bin aicx-mcp
 
 `install.sh` prefers a colocated release bundle first, then a local checkout, and otherwise falls back to the published install path.
 
-Maintainer release bundle path on macOS:
+Maintainer-local signed bundle path on macOS:
 
 ```bash
 make release-bundle KEYS=~/.keys
