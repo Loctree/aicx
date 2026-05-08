@@ -5544,7 +5544,7 @@ mod tests {
         .unwrap();
 
         let output = fs::read_to_string(&report).unwrap();
-        assert!(output.contains("| Filter | RepoDelta |"));
+        assert!(output.contains("| Filter | repodelta |"));
         assert!(output.contains("Gemini Antigravity recovery report"));
         assert!(!output.contains("| Filter | file:"));
 
