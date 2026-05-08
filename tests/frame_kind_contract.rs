@@ -288,6 +288,11 @@ fn codex_store_round_trips_frame_kind_filters() {
             "--json",
             "-p",
             "ai-contexters",
+            // Test asserts the lexical frame-kind filter contract; the
+            // hermetic test env has no embedder, so `--no-semantic`
+            // explicitly opts into the fuzzy path. Production search
+            // fails fast on missing embedder; this test does not.
+            "--no-semantic",
         ],
     );
     let search_payload = parse_stdout_json(&search_output);
