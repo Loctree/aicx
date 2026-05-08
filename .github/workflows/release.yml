@@ -123,15 +123,6 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: release-verify-${{ hashFiles('aicx/Cargo.lock') }}
-          restore-keys: |
-            release-verify-
-
       - name: cargo clippy default
         working-directory: aicx
         run: cargo clippy --locked -p aicx --all-targets -- -D warnings
@@ -223,15 +214,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: release-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('aicx/Cargo.lock') }}
-          restore-keys: |
-            release-${{ runner.os }}-${{ matrix.target }}-
 
       - name: Install musl tools
         if: runner.os == 'Linux'
