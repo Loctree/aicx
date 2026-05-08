@@ -64,24 +64,31 @@ during `mv skills archive/skills`. No content edits.
 ## Redaction note (2026-05-08)
 
 `bravesearch/brave_search.py` historically hardcoded a real Brave Search
-API key (`API_KEY = "<32-char token>"` at line 17). Operator caught
-the leak during the archive review and the value has been:
+API key (line 17, 32-char token). Two-step cleanup:
 
-1. Replaced in source with `os.environ.get("BRAVE_API_KEY", ...)` — the
-   env-var pattern matching every other API surface in the suite.
-2. **Rotated by the operator** at the Brave Search dashboard. The
-   leaked token is no longer accepted upstream.
+1. **Initial redact** of the constant to env-var lookup — caught the
+   leak before any `git push` could publish it.
+2. **Drop the file entirely.** A `.py` script is implementation detail,
+   not doctrine. The doctrine value of the bravesearch skill lives in
+   the sibling `SKILL.md` (description, trigger phrases, scope). The
+   script was a how-to artifact that does not need to be archived. The
+   alternative — keeping it with `archive/` excluded from semgrep —
+   would be a silencer (per `vc-prune` skill: rip every silencer). So
+   the file is dropped, semgrep gates remain active across the whole
+   repo, and live security policy stays uniform.
+3. **Rotated upstream** by the operator at the Brave Search dashboard.
+   The leaked token is no longer accepted.
 
-The pre-redaction commit was `git reset --soft HEAD~1`-ed before push,
-so the leaked token never entered the published git history of this
-repo. The conversation transcript that surfaced the value has been
-flagged separately to the operator for any necessary downstream cleanup
-(aicx corpus, dispatched-agent contexts, etc.).
+The pre-redaction commit (`7252629`) was unpushed when the leak was
+caught, so the leaked token never entered the published git history of
+this repo. Conversation transcript that surfaced the value has been
+flagged separately for any necessary downstream cleanup (aicx corpus,
+dispatched-agent contexts, etc.).
 
-If a future archive pass surfaces a similarly leaked value, the same
-rule applies: redact in source first, push history must NEVER carry
-secrets. `tools/githooks/pre-push` does not currently scan archive
-content for secret patterns; widening that gate is a follow-up.
+Future rule: archive content must pass the same security gates as live
+code. If an archive contender carries hardcoded secrets, the secret
+must be removed (or the file dropped) before the archive lands —
+silencers in `.semgrepignore` are not a substitute.
 
 ## Out of scope
 
