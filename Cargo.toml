@@ -37,6 +37,12 @@ native-embedder-openmp = ["native-embedder", "aicx-embeddings/openmp"]
 # endpoint. Recommended VetCoders default for production: no GGUF download
 # required; URL + model + api_key_env live in ~/.aicx/config.toml.
 cloud-embedder = ["dep:aicx-embeddings", "aicx-embeddings/cloud"]
+# Opt-in end-to-end pipeline test (`tests/e2e_pipeline.rs`). Requires the
+# canonical `~/.aicx/config.toml` (cloud cascade) or a hydrated GGUF model.
+# Fail-fast on missing preconditions per operator doctrine — no silent skip.
+# Run with `cargo test --features e2e-aicx --test e2e_pipeline` (or
+# `make test-e2e`). CI without these preconditions does not run it.
+e2e-aicx = ["native-embedder", "cloud-embedder"]
 
 [dependencies]
 aicx-embeddings = { version = "0.7.0", optional = true, default-features = false }

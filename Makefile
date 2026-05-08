@@ -4,7 +4,7 @@
 .PHONY: all build build-native release-binaries install install-bin install-config install-cargo git-hooks
 .PHONY: precheck precheck-native test test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
 .PHONY: embeddings-check embeddings-test embeddings-clippy embeddings-hydrate embeddings-info
-.PHONY: version version-show version-check version-bump version-patch bump-patch changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle release-bundle-only-binaries
+.PHONY: version version-show version-check version-bump version-patch bump-patch changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle release-bundle-only-binaries test-e2e
 
 all: build
 
@@ -98,6 +98,13 @@ test:
 test-native:
 	cargo test --locked -p aicx-embeddings --features gguf
 	cargo test --locked -p aicx --features native-embedder --test native_embedder
+
+# End-to-end pipeline test against operator's canonical ~/.aicx/config.toml.
+# Fail-fast when preconditions missing (no config, empty corpus, embedder
+# unreachable) per operator doctrine — distinct from a CI test that
+# silently skips on missing infra.
+test-e2e:
+	cargo test --locked -p aicx --features e2e-aicx --test e2e_pipeline -- --nocapture
 
 check:
 	@echo "=== AICX Quality Gate ==="
