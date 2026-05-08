@@ -3847,20 +3847,24 @@ fn run_config_show(_json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Build (or preview) the vector index. Iter 2 ships dry-run only.
+/// Build (or preview) the vector index. `dry_run=true` probes the
+/// embedder + samples chunks for ETA. `dry_run=false` writes a
+/// persistent NDJSON-backed index (Iter 3) that subsequent `aicx search`
+/// queries against via cosine similarity.
 fn run_index(project: Option<&str>, sample: usize, json: bool, dry_run: bool) -> Result<()> {
-    if !dry_run {
-        anyhow::bail!(
-            "Iter 2 ships dry-run only; persistent Lance write lands in Iter 3. \
-             Pass --dry-run=true (the default) for now."
-        );
-    }
-    let _lock = aicx::locks::acquire_exclusive(aicx::locks::lance_lock_path()?)?;
-    let stats = aicx::vector_index::dry_run_index(project, sample)?;
+    let stats = if dry_run {
+        let _lock = aicx::locks::acquire_exclusive(aicx::locks::lance_lock_path()?)?;
+        aicx::vector_index::dry_run_index(project, sample)?
+    } else {
+        aicx::vector_index::write_index(project, sample)?
+    };
     if json {
         println!("{}", aicx::vector_index::render_stats_json(&stats)?);
     } else {
         eprint!("{}", aicx::vector_index::render_stats_text(&stats));
+        if let Some(path) = &stats.index_path {
+            eprintln!("\n  index_path:          {}", path.display());
+        }
     }
     Ok(())
 }

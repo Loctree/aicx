@@ -99,14 +99,13 @@ pub fn try_semantic_search(
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn try_semantic_search_native(
     _store_root: &Path,
-    _query: &str,
-    _limit: usize,
-    _project_filter: Option<&str>,
+    query: &str,
+    limit: usize,
+    project_filter: Option<&str>,
     _frame_kind_filter: Option<FrameKind>,
 ) -> Result<SearchPath> {
-    // Probe the embedder before doing anything that touches the corpus.
-    // If the GGUF model is missing or initialization fails, we want to
-    // surface a precise reason rather than masking it as "no results".
+    // Probe the embedder first. If the model cannot load, surface the
+    // precise reason rather than masking it as "no results".
     let engine = match crate::embedder::EmbeddingEngine::new() {
         Ok(engine) => engine,
         Err(err) => {
@@ -116,18 +115,81 @@ fn try_semantic_search_native(
         }
     };
 
-    let _info = engine.info(); // touch to keep the value alive in scope
+    let info = engine.info().clone();
 
-    // Vector index materialization lands in the next iteration as
-    // `aicx index` (writes Lance vectors per chunk under
-    // `~/.aicx/index/<project>/embeddings.lance`). Until that command
-    // ships, the engine is provably loadable but there is no index to
-    // query — so we fall back with an actionable reason that points the
-    // operator at the next required step.
-    Ok(SearchPath::Fallback {
-        reason: "vector index not built yet (run `aicx index` after this iteration ships)"
-            .to_string(),
-    })
+    // Iter 3 wiring: query the persistent NDJSON-backed index when it
+    // exists. If the file is missing the operator hasn't run `aicx
+    // index` yet, so fall back with an actionable reason.
+    let path = match crate::vector_index::index_path(project_filter) {
+        Ok(p) => p,
+        Err(err) => {
+            return Ok(SearchPath::Fallback {
+                reason: format!("could not resolve index path: {err}"),
+            });
+        }
+    };
+
+    if !path.exists() {
+        return Ok(SearchPath::Fallback {
+            reason: format!(
+                "vector index not built yet at {} (run `aicx index --dry-run=false` to materialize it)",
+                path.display()
+            ),
+        });
+    }
+
+    let hits = match crate::vector_index::query_index(project_filter, query, limit) {
+        Ok(hits) => hits,
+        Err(err) => {
+            return Ok(SearchPath::Fallback {
+                reason: format!("index query failed: {err}"),
+            });
+        }
+    };
+
+    if hits.is_empty() {
+        return Ok(SearchPath::Fallback {
+            reason: format!(
+                "vector index at {} returned 0 hits for this query",
+                path.display()
+            ),
+        });
+    }
+
+    let scanned = hits.len();
+    let results: Vec<FuzzyResult> = hits
+        .into_iter()
+        .map(|h| {
+            // Map cosine [-1, 1] → unsigned 0..=100 score for FuzzyResult
+            // (downstream renderers assume the same shape as the lexical
+            // path). We clamp negatives to 0 since the lexical scorer
+            // never emits negatives either.
+            let score_pct = ((h.score.max(0.0) * 100.0).round() as u8).min(100);
+            FuzzyResult {
+                file: h.path.to_string_lossy().to_string(),
+                path: h.path.to_string_lossy().to_string(),
+                project: h.project,
+                kind: String::new(),
+                frame_kind: None,
+                agent: h.agent,
+                date: h.date,
+                timestamp: None,
+                score: score_pct,
+                label: format!("semantic:{}", h.id),
+                density: h.score,
+                matched_lines: Vec::new(),
+                session_id: None,
+                cwd: None,
+            }
+        })
+        .collect();
+
+    Ok(SearchPath::Semantic(SemanticSearchOutcome {
+        results,
+        scanned,
+        backend_label: "embedded_semantic",
+        model_id: info.model_id,
+    }))
 }
 
 /// Compose the canonical `oracle_status` line emitted to stderr after a

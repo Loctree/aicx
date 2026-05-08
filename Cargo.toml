@@ -40,7 +40,7 @@ cloud-embedder = ["dep:aicx-embeddings", "aicx-embeddings/cloud"]
 
 [dependencies]
 aicx-embeddings = { version = "0.7.0", optional = true, default-features = false }
-aicx-parser = { version = "0.3.0", features = ["json-schema"] }
+aicx-parser = { version = "0.7.0", features = ["json-schema"] }
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
