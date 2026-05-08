@@ -23,6 +23,29 @@ Supported sources:
 - Codex: `~/.codex/history.jsonl`
 - Gemini CLI: `~/.gemini/tmp/<hash>/chats/session-*.json`
 - Gemini Antigravity direct extract: `~/.gemini/antigravity/conversations/<uuid>.pb` or `~/.gemini/antigravity/brain/<uuid>/`
+- `loct-context-pack` (immutable structural-evidence packs from Loctree prism / polarize): `aicx ingest --source loct-context-pack <PACK_DIR>` writes into the parallel **Context Corpus** at `~/.aicx/context-corpus/`. See [`docs/CONTEXT_CORPUS.md`](./docs/CONTEXT_CORPUS.md).
+
+## Context Corpus
+
+Alongside the canonical session-log store, `aicx` maintains an **immutable
+context corpus** at `~/.aicx/context-corpus/` that retains `loct-context-pack`
+prism artifacts (structural evidence consumed by `vc-polarize` gating and
+doctrine drafting). The corpus is governed by a different contract:
+append-only, operator-driven (only `aicx ingest --source loct-context-pack`
+writes to it), excluded from `aicx intents` and live-truth retrieval, and
+materialized into a separate `context-corpus.embeddings.ndjson` namespace so
+example evidence never poisons live-session truth.
+
+```bash
+aicx ingest --source loct-context-pack /path/to/prism-pack
+aicx doctor --check-dedup   # cross-namespace duplicate report
+```
+
+Sidecars carry `artifact_family=loct-context-pack`,
+`schema_version=context_corpus.v1`, `truth_status.role=Example`, and
+`content_sha256`. Every ingest batch produces an `index.jsonl` manifest. Full
+contract, retention path layout, and immutability filter behavior in
+[`docs/CONTEXT_CORPUS.md`](./docs/CONTEXT_CORPUS.md).
 
 ## Install
 

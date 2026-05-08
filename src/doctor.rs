@@ -88,6 +88,8 @@ pub struct DoctorReport {
     pub empty_body_chunks: CheckResult,
     #[serde(default)]
     pub content_dedup: CheckResult,
+    #[serde(default)]
+    pub context_corpus: CheckResult,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rebuild_sidecars_script: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,6 +138,7 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
             recommendation: None,
         }
     };
+    let mut context_corpus = check_context_corpus(base);
 
     let mut fixes_applied = Vec::new();
     let rebuild_sidecars_script = if opts.rebuild_sidecars {
@@ -206,6 +209,7 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
         } else {
             content_dedup
         };
+        context_corpus = check_context_corpus(base);
     }
 
     let overall = max_severity(&[
@@ -222,6 +226,7 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
         embedder_warmth.severity,
         empty_body_chunks.severity,
         content_dedup.severity,
+        context_corpus.severity,
     ]);
 
     Ok(DoctorReport {
@@ -239,11 +244,82 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
         embedder_warmth,
         empty_body_chunks,
         content_dedup,
+        context_corpus,
         rebuild_sidecars_script,
         prune_empty_bodies_script,
         fixes_applied,
         overall,
     })
+}
+
+fn check_context_corpus(base: &Path) -> CheckResult {
+    let corpus_root = base.join(store::CONTEXT_CORPUS_DIRNAME);
+    if !corpus_root.exists() {
+        return CheckResult {
+            name: "context_corpus".to_string(),
+            severity: Severity::Green,
+            detail: format!(
+                "context-corpus: empty (will be created on first `aicx ingest --source loct-context-pack`) at {}",
+                corpus_root.display()
+            ),
+            recommendation: None,
+        };
+    }
+    let files = match store::scan_context_corpus_files_at(base) {
+        Ok(files) => files,
+        Err(err) => {
+            return CheckResult {
+                name: "context_corpus".to_string(),
+                severity: Severity::Warning,
+                detail: format!(
+                    "context-corpus: scan failed at {}: {err}",
+                    corpus_root.display()
+                ),
+                recommendation: Some(
+                    "Inspect ~/.aicx/context-corpus/ for permission or filesystem issues"
+                        .to_string(),
+                ),
+            };
+        }
+    };
+    if files.is_empty() {
+        return CheckResult {
+            name: "context_corpus".to_string(),
+            severity: Severity::Green,
+            detail: format!(
+                "context-corpus: empty (no batches yet; tree exists at {})",
+                corpus_root.display()
+            ),
+            recommendation: None,
+        };
+    }
+    let mut batches: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut repos: BTreeSet<PathBuf> = BTreeSet::new();
+    for file in &files {
+        if let Some(batch_dir) = file.raw_path.parent().and_then(|p| p.parent()) {
+            batches.insert(batch_dir.to_path_buf());
+            // batch_dir layout: <repo>/<date>/loct-context-pack/<batch>
+            // strip <date>/loct-context-pack/<batch> to find <org>/<repo>
+            if let Some(repo_dir) = batch_dir.ancestors().nth(3).map(|p| p.to_path_buf())
+                && repo_dir != corpus_root
+                && repo_dir.starts_with(&corpus_root)
+            {
+                repos.insert(repo_dir);
+            }
+        }
+    }
+    CheckResult {
+        name: "context_corpus".to_string(),
+        severity: Severity::Green,
+        detail: format!(
+            "context-corpus: {} chunks across {} batch(es) / {} repo(s) at {}",
+            files.len(),
+            batches.len(),
+            repos.len(),
+            corpus_root.display()
+        ),
+        recommendation: None,
+    }
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -1591,6 +1667,12 @@ mod tests {
             },
             content_dedup: CheckResult {
                 name: "content_dedup".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            context_corpus: CheckResult {
+                name: "context_corpus".to_string(),
                 severity: Severity::Green,
                 detail: "ok".to_string(),
                 recommendation: None,

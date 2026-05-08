@@ -56,6 +56,16 @@ surface.
 should also be honored by downstream retrieval materializers that consume the
 canonical store.
 
+### Sibling: Context Corpus (`~/.aicx/context-corpus/`)
+
+Immutable retention path for `loct-context-pack` prism artifacts. Lives next to
+`store/` under the same `~/.aicx/` root, but is governed by a different
+contract — append-only, operator-driven (via `aicx ingest --source
+loct-context-pack`), excluded from `aicx intents` and live-truth semantic
+indexes, and materialized into a separate `context-corpus.embeddings.ndjson`
+namespace. See [`CONTEXT_CORPUS.md`](./CONTEXT_CORPUS.md) for the layout,
+sidecar schema, and immutability filter.
+
 ## Identity Model & Compatibility Rules (v0.5.0+)
 
 Historically, `aicx` grouped contexts under a file-centric identity (e.g., `file: session.jsonl`). Starting in v0.5.0, AICX shifted to a strictly repo-centric identity model.

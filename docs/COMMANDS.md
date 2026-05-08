@@ -6,6 +6,7 @@ operator-driven: nothing mutates your corpus unless you run a command.
 | Layer | What | Command surface |
 |-------|------|-----------------|
 | **1 — Canonical corpus** | Extract, deduplicate, chunk agent logs into steerable markdown at `~/.aicx/`. This is ground truth. | `claude`, `codex`, `all`, `store`, `extract` |
+| **1b — Context corpus** | Append-only retention for `loct-context-pack` prism artifacts at `~/.aicx/context-corpus/`. Excluded from live-truth retrieval and `aicx intents`; materializes into a separate `context-corpus.embeddings.ndjson` namespace. See [`CONTEXT_CORPUS.md`](./CONTEXT_CORPUS.md). | `ingest --source loct-context-pack <PACK_DIR>`, `doctor --check-dedup` |
 | **2 — Retrieval surfaces** | Query the corpus through filesystem search, steering metadata, MCP tools, and the reusable native embedding library. | `search`, `steer`, `serve`, `aicx-embeddings` |
 
 `aicx` owns the canonical corpus and portable local embedding foundation.
