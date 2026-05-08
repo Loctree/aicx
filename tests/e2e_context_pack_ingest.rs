@@ -241,10 +241,8 @@ fn context_pack_ingest_retains_immutable_pack_and_live_reads_skip_examples() {
     assert!(stdout.contains("Live truth survives intent scan"));
     assert!(!stdout.contains("Frozen example must be filtered"));
 
-    let doctor = parse_stdout_json(&run_aicx(
-        &home,
-        &["doctor", "--check-dedup", "--format", "json"],
-    ));
+    let doctor_output = run_aicx(&home, &["doctor", "--check-dedup", "--format", "json"]);
+    let doctor: Value = serde_json::from_slice(&doctor_output.stdout).expect("parse doctor json");
     assert_eq!(doctor["content_dedup"]["severity"].as_str(), Some("green"));
 
     let live_index = aicx::vector_index::index_path(Some("vetcoders/aicx")).expect("live index");
