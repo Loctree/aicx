@@ -327,10 +327,14 @@ pub fn write_index(project: Option<&str>, sample: usize) -> Result<IndexStats> {
     }
 
     // Atomic-ish: write to `.tmp` then rename so a partial build cannot
-    // poison subsequent queries.
+    // poison subsequent queries. `create_file_validated` validates the
+    // path against canonical roots BEFORE opening the file — important
+    // because `project` flows from operator input into the index path
+    // components, and a malicious `../` segment must not escape the
+    // index tree.
     let tmp_path = target_path.with_extension("ndjson.tmp");
     let mut writer = BufWriter::new(
-        fs::File::create(&tmp_path)
+        crate::sanitize::create_file_validated(&tmp_path)
             .with_context(|| format!("open tmp index: {}", tmp_path.display()))?,
     );
 
@@ -441,7 +445,6 @@ fn chunk_id_from_path(path: &std::path::Path) -> String {
 /// behind the same `query_index` signature.
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub fn query_index(project: Option<&str>, query: &str, limit: usize) -> Result<Vec<QueryHit>> {
-    use std::fs;
     use std::io::{BufRead, BufReader};
 
     let path = index_path(project)?;
@@ -455,7 +458,12 @@ pub fn query_index(project: Option<&str>, query: &str, limit: usize) -> Result<V
         .with_context(|| "embedder init failed for query")?;
     let query_embedding = engine.embed(query).with_context(|| "embed query")?;
 
-    let file = fs::File::open(&path).with_context(|| format!("open index: {}", path.display()))?;
+    // `open_file_validated` validates the path against canonical roots
+    // BEFORE opening — blocks any path-traversal attempt that an
+    // operator-controlled `project` could inject into the lookup. Index
+    // files must always live under the canonical `~/.aicx/index` tree.
+    let file = crate::sanitize::open_file_validated(&path)
+        .with_context(|| format!("open index: {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
 
