@@ -1230,6 +1230,17 @@ pub fn sidecar_path_for_chunk(chunk_path: &Path) -> PathBuf {
         return adjacent;
     }
     if let (Some(parent), Some(stem)) = (chunk_path.parent(), chunk_path.file_stem()) {
+        if parent.file_name().and_then(|name| name.to_str()) == Some("raw")
+            && let Some(pack_dir) = parent.parent()
+        {
+            let sidecar = pack_dir
+                .join("sidecars")
+                .join(format!("{}.json", stem.to_string_lossy()));
+            if sidecar.exists() {
+                return sidecar;
+            }
+        }
+
         let sidecar = parent
             .join("sidecars")
             .join(format!("{}.json", stem.to_string_lossy()));
@@ -3910,6 +3921,107 @@ mod tests {
             file.repo.as_ref().unwrap().slug(),
             "VetCoders/ai-contexters"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_sidecar_accepts_context_corpus_raw_sibling_sidecars_layout() {
+        let root = retrieval_test_root("context-corpus-sidecar-sibling");
+        let _ = fs::remove_dir_all(&root);
+
+        let pack_dir = root
+            .join("context-corpus")
+            .join("vetcoders")
+            .join("aicx")
+            .join("2026_0508")
+            .join("loct-context-pack")
+            .join("batch-alpha");
+        let raw_path = pack_dir.join("raw").join("ctx-example.md");
+        let sidecar_path = pack_dir.join("sidecars").join("ctx-example.json");
+
+        write_text(&raw_path, "Decision: corpus examples are retrieval-only");
+        write_text(
+            &sidecar_path,
+            &serde_json::json!({
+                "id": "ctx-example",
+                "project": "vetcoders/aicx",
+                "agent": "loct-context-pack",
+                "date": "2026-05-08",
+                "session_id": "batch-alpha",
+                "kind": "reports",
+                "artifact_family": "loct-context-pack",
+                "schema_version": "context_corpus.v1",
+                "truth_status": {
+                    "role": "example",
+                    "runtime_authoritative": false,
+                    "stale_against_current_head": true
+                }
+            })
+            .to_string(),
+        );
+
+        assert_eq!(sidecar_path_for_chunk(&raw_path), sidecar_path);
+        let sidecar = load_sidecar(&raw_path).expect("load context-corpus sidecar");
+        assert_eq!(sidecar.id, "ctx-example");
+        assert!(is_context_corpus_sidecar(&sidecar));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_sidecar_keeps_adjacent_meta_json_priority_for_legacy_chunks() {
+        let root = retrieval_test_root("sidecar-adjacent-priority");
+        let _ = fs::remove_dir_all(&root);
+
+        let chunk_dir = root
+            .join("store")
+            .join("VetCoders")
+            .join("aicx")
+            .join("2026_0508")
+            .join("reports")
+            .join("codex");
+        let chunk_path = chunk_dir.join("2026_0508_codex_live-sess_001.md");
+        let adjacent = chunk_path.with_extension("meta.json");
+        let sidecars = chunk_dir
+            .join("sidecars")
+            .join("2026_0508_codex_live-sess_001.json");
+
+        write_text(&chunk_path, "Decision: live adjacent metadata wins");
+        write_text(
+            &adjacent,
+            &serde_json::json!({
+                "id": "legacy-live",
+                "project": "VetCoders/aicx",
+                "agent": "codex",
+                "date": "2026-05-08",
+                "session_id": "live-sess",
+                "kind": "reports"
+            })
+            .to_string(),
+        );
+        write_text(
+            &sidecars,
+            &serde_json::json!({
+                "id": "sidecars-example",
+                "project": "VetCoders/aicx",
+                "agent": "codex",
+                "date": "2026-05-08",
+                "session_id": "live-sess",
+                "kind": "reports",
+                "artifact_family": "loct-context-pack",
+                "truth_status": {
+                    "role": "example",
+                    "runtime_authoritative": false
+                }
+            })
+            .to_string(),
+        );
+
+        assert_eq!(sidecar_path_for_chunk(&chunk_path), adjacent);
+        let sidecar = load_sidecar(&chunk_path).expect("load adjacent sidecar");
+        assert_eq!(sidecar.id, "legacy-live");
+        assert!(!is_context_corpus_sidecar(&sidecar));
 
         let _ = fs::remove_dir_all(&root);
     }
