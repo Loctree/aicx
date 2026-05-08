@@ -11,7 +11,9 @@ pub mod skill_collapse;
 pub mod timeline;
 pub mod types;
 
-pub use chunker::{Chunk, ChunkMetadataSidecar, ChunkerConfig, classify_kind};
+pub use chunker::{
+    Chunk, ChunkMetadataSidecar, ChunkerConfig, LearningUse, TruthRole, TruthStatus, classify_kind,
+};
 pub use frontmatter::ReportFrontmatter;
 pub use sanitize::{filter_self_echo, is_self_echo, normalize_query};
 pub use segmentation::{

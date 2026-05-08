@@ -154,7 +154,7 @@ pub fn dry_run_index(project: Option<&str>, sample: usize) -> Result<IndexStats>
     };
 
     let root = crate::store::store_base_dir()?;
-    let files = crate::store::scan_context_files_project_at(&root, project)?;
+    let files = live_index_files(&root, project)?;
     stats.chunks_total = files.len();
 
     // `sample` is consumed inside the embedder-enabled cfg branch below;
@@ -235,6 +235,7 @@ fn run_native_pass(
 
 const INDEX_SCHEMA_VERSION: &str = "1.0";
 const INDEX_FILE_NAME: &str = "embeddings.ndjson";
+const CONTEXT_CORPUS_INDEX_FILE_NAME: &str = "context-corpus.embeddings.ndjson";
 const INDEX_DIR_NAME: &str = "index";
 const ALL_BUCKET_NAME: &str = "_all";
 
@@ -257,6 +258,27 @@ pub fn index_path(project: Option<&str>) -> Result<PathBuf> {
         })
         .collect::<String>();
     Ok(index_root.join(safe_bucket).join(INDEX_FILE_NAME))
+}
+
+pub fn context_corpus_index_path(project: Option<&str>) -> Result<PathBuf> {
+    Ok(index_path(project)?.with_file_name(CONTEXT_CORPUS_INDEX_FILE_NAME))
+}
+
+fn live_index_files(
+    root: &std::path::Path,
+    project: Option<&str>,
+) -> Result<Vec<crate::store::StoredContextFile>> {
+    let mut files = crate::store::scan_context_files_project_at(root, project)?;
+    files.retain(|file| {
+        !crate::store::load_sidecar(&file.path).is_some_and(|sidecar| {
+            sidecar.artifact_family.as_deref() == Some(crate::store::LOCT_CONTEXT_PACK_FAMILY)
+                || sidecar
+                    .truth_status
+                    .as_ref()
+                    .is_some_and(|status| status.role == crate::chunker::TruthRole::Example)
+        })
+    });
+    Ok(files)
 }
 
 /// Build (or rebuild) the persistent NDJSON-backed index for `project`.
@@ -297,7 +319,7 @@ pub fn write_index(project: Option<&str>, sample: usize) -> Result<IndexStats> {
     let _lock = crate::locks::acquire_exclusive(crate::locks::lance_lock_path()?)?;
 
     let root = crate::store::store_base_dir()?;
-    let files = crate::store::scan_context_files_project_at(&root, project)?;
+    let files = live_index_files(&root, project)?;
     stats.chunks_total = files.len();
 
     if files.is_empty() {
@@ -383,6 +405,65 @@ pub fn write_index(project: Option<&str>, sample: usize) -> Result<IndexStats> {
         };
         writeln!(writer, "{}", serde_json::to_string(&entry)?)?;
         stats.embeddings_computed += 1;
+    }
+
+    let context_files = crate::store::scan_context_corpus_files_at(&root)?;
+    if !context_files.is_empty() {
+        let context_target = context_corpus_index_path(project)?;
+        if let Some(parent) = context_target.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("create context-corpus index dir: {}", parent.display())
+            })?;
+        }
+        let context_tmp = context_target.with_extension("ndjson.tmp");
+        let mut context_writer = BufWriter::new(
+            crate::sanitize::create_file_validated(&context_tmp).with_context(|| {
+                format!("open context-corpus tmp index: {}", context_tmp.display())
+            })?,
+        );
+        let context_header = IndexHeader {
+            schema_version: INDEX_SCHEMA_VERSION.to_string(),
+            model_id: info.model_id.clone(),
+            model_profile: info.profile.to_string(),
+            dimension: info.dimension,
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            entry_count: 0,
+        };
+        writeln!(
+            context_writer,
+            "{}",
+            serde_json::to_string(&context_header)?
+        )?;
+        for stored in &context_files {
+            let content = match crate::sanitize::read_to_string_validated(&stored.raw_path) {
+                Ok(text) => text,
+                Err(_) => continue,
+            };
+            let prefix = take_prefix_bytes(&content, DEFAULT_EMBED_PREFIX_BYTES);
+            let Ok(embedding) = engine.embed(&prefix) else {
+                continue;
+            };
+            let entry = IndexEntry {
+                id: stored.sidecar.id.clone(),
+                project: stored.sidecar.project.clone(),
+                agent: stored.sidecar.agent.clone(),
+                date: stored.sidecar.date.clone(),
+                path: stored.raw_path.clone(),
+                embedding,
+            };
+            writeln!(context_writer, "{}", serde_json::to_string(&entry)?)?;
+        }
+        context_writer.flush().with_context(|| {
+            format!("flush context-corpus tmp index: {}", context_tmp.display())
+        })?;
+        drop(context_writer);
+        fs::rename(&context_tmp, &context_target).with_context(|| {
+            format!(
+                "commit context-corpus index: {} → {}",
+                context_tmp.display(),
+                context_target.display()
+            )
+        })?;
     }
 
     writer

@@ -164,12 +164,14 @@ const DEFAULT_REPORTS_TITLE: &str = "AICX Report Explorer";
 #[derive(Debug, Clone, ValueEnum)]
 enum IngestSource {
     OperatorMd,
+    LoctContextPack,
 }
 
 impl IngestSource {
     fn as_agent(&self) -> &'static str {
         match self {
             Self::OperatorMd => "operator-md",
+            Self::LoctContextPack => "loct-context-pack",
         }
     }
 }
@@ -780,6 +782,10 @@ enum Commands {
         /// What to print to stdout: paths, json, none (default: none)
         #[arg(long, value_enum, default_value_t = StdoutEmit::None)]
         emit: StdoutEmit,
+
+        /// Respect artifact_family metadata when routing immutable artifacts (default: true)
+        #[arg(long, default_value_t = true)]
+        respect_artifact_family: bool,
     },
 
     /// Ingest operator-owned source documents into the canonical corpus.
@@ -815,6 +821,9 @@ enum Commands {
         /// What to print to stdout: paths, json, none (default: none)
         #[arg(long, value_enum, default_value_t = StdoutEmit::None)]
         emit: StdoutEmit,
+
+        /// Source path for pack-style ingests such as --source loct-context-pack
+        input: Option<PathBuf>,
     },
 
     // ── Layer 1: Query & inspect ──────────────────────────────────────
@@ -1247,6 +1256,10 @@ enum Commands {
         #[arg(long)]
         prune_empty_bodies: bool,
 
+        /// Report duplicate content_sha256 groups across store and context-corpus
+        #[arg(long)]
+        check_dedup: bool,
+
         /// Print recommendations for green checks too
         #[arg(short, long)]
         verbose: bool,
@@ -1462,6 +1475,7 @@ fn main() -> Result<()> {
             include_assistant: include_assistant_flag,
             no_noise_filter,
             emit,
+            respect_artifact_family,
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
             warn_incremental_legacy_flag(incremental);
@@ -1475,6 +1489,7 @@ fn main() -> Result<()> {
                 emit,
                 redact_secrets: redaction.redact_secrets,
                 noise_filter_enabled: !no_noise_filter,
+                respect_artifact_family,
             })?;
         }
         Some(Commands::Ingest {
@@ -1486,7 +1501,26 @@ fn main() -> Result<()> {
             full_rescan,
             no_noise_filter,
             emit,
+            input,
         }) => {
+            if matches!(source, IngestSource::LoctContextPack) {
+                let input = input
+                    .as_deref()
+                    .context("aicx ingest --source loct-context-pack requires <PACK_DIR>")?;
+                let summary = store::ingest_loct_context_pack(input)?;
+                match emit {
+                    StdoutEmit::Paths => println!("{}", summary.target_dir.display()),
+                    StdoutEmit::Json => println!("{}", serde_json::to_string_pretty(&summary)?),
+                    StdoutEmit::None => {}
+                }
+                eprintln!(
+                    "aicx ingest: {} chunks new, {} deduped → {}",
+                    summary.raw_written,
+                    summary.deduped_chunks,
+                    summary.target_dir.display()
+                );
+                return Ok(());
+            }
             let has_explicit_since = since.is_some();
             let cutoff = parse_ingest_since(since.as_deref())?;
             run_store(StoreRunArgs {
@@ -1499,6 +1533,7 @@ fn main() -> Result<()> {
                 emit,
                 redact_secrets: redaction.redact_secrets,
                 noise_filter_enabled: !no_noise_filter,
+                respect_artifact_family: true,
             })?;
         }
         Some(Commands::List) => {
@@ -1734,6 +1769,7 @@ fn main() -> Result<()> {
             fix_buckets,
             rebuild_sidecars,
             prune_empty_bodies,
+            check_dedup,
             verbose,
             format,
             oracle,
@@ -1743,6 +1779,7 @@ fn main() -> Result<()> {
                 fix_buckets,
                 rebuild_sidecars,
                 prune_empty_bodies,
+                check_dedup,
                 verbose,
             };
             let rt = tokio::runtime::Runtime::new()
@@ -1786,6 +1823,7 @@ fn main() -> Result<()> {
                 fix_buckets: false,
                 rebuild_sidecars: false,
                 prune_empty_bodies: false,
+                check_dedup: false,
                 verbose: true,
             };
             let rt = tokio::runtime::Runtime::new()
@@ -2664,6 +2702,7 @@ struct StoreRunArgs {
     /// `ChunkerConfig::noise_filter_enabled`; the CLI surface is
     /// `--no-noise-filter` (negated to keep the default ergonomic).
     noise_filter_enabled: bool,
+    respect_artifact_family: bool,
 }
 
 fn resolve_store_agents(agent: Option<&str>) -> Result<Vec<&'static str>> {
@@ -3089,7 +3128,11 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         emit,
         redact_secrets,
         noise_filter_enabled,
+        respect_artifact_family,
     } = args;
+    if !respect_artifact_family {
+        eprintln!("  [warn] --respect-artifact-family=false: legacy routing mode active");
+    }
 
     let cutoff = cutoff.unwrap_or_else(|| Utc::now() - chrono::Duration::hours(hours as i64));
 
@@ -3180,6 +3223,7 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
                     "repos": scope_surface.repository_buckets(),
                     "store_paths": Vec::<String>::new(),
                     "written_empty_body_skipped": 0,
+                    "deduped_chunks": 0,
                 }))?
             );
         }
@@ -3253,6 +3297,12 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
             store_summary.skipped_empty_body
         );
     }
+    if store_summary.deduped_chunks > 0 {
+        eprintln!(
+            "  Deduped {} content-identical chunk(s)",
+            store_summary.deduped_chunks
+        );
+    }
     for (repo, agents_map) in &store_summary.project_summary {
         let total: usize = agents_map.values().sum();
         let detail: Vec<String> = agents_map
@@ -3307,6 +3357,7 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
                     "repos": scope_surface.repository_buckets(),
                     "store_paths": store_paths,
                     "written_empty_body_skipped": store_summary.skipped_empty_body,
+                    "deduped_chunks": store_summary.deduped_chunks,
                 }))?
             );
         }

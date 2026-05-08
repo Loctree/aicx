@@ -105,6 +105,7 @@ test-native:
 # silently skips on missing infra.
 test-e2e:
 	cargo test --locked -p aicx --features e2e-aicx --test e2e_pipeline -- --nocapture
+	cargo test --locked -p aicx --features e2e-aicx --test e2e_context_pack_ingest -- --nocapture
 
 check:
 	@echo "=== AICX Quality Gate ==="

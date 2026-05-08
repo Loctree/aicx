@@ -33,6 +33,7 @@ pub struct DoctorOptions {
     pub fix_buckets: bool,
     pub rebuild_sidecars: bool,
     pub prune_empty_bodies: bool,
+    pub check_dedup: bool,
     pub verbose: bool,
 }
 
@@ -85,6 +86,8 @@ pub struct DoctorReport {
     pub embedder_warmth: CheckResult,
     #[serde(default)]
     pub empty_body_chunks: CheckResult,
+    #[serde(default)]
+    pub content_dedup: CheckResult,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rebuild_sidecars_script: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,6 +126,16 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
     let mut index_consistency = check_index_consistency(base);
     let mut embedder_warmth = check_embedder_warmth();
     let mut empty_body_chunks = check_empty_body_chunks(base);
+    let mut content_dedup = if opts.check_dedup {
+        check_content_dedup(base)
+    } else {
+        CheckResult {
+            name: "content_dedup".to_string(),
+            severity: Severity::Green,
+            detail: "not requested".to_string(),
+            recommendation: None,
+        }
+    };
 
     let mut fixes_applied = Vec::new();
     let rebuild_sidecars_script = if opts.rebuild_sidecars {
@@ -188,6 +201,11 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
         index_consistency = check_index_consistency(base);
         embedder_warmth = check_embedder_warmth();
         empty_body_chunks = check_empty_body_chunks(base);
+        content_dedup = if opts.check_dedup {
+            check_content_dedup(base)
+        } else {
+            content_dedup
+        };
     }
 
     let overall = max_severity(&[
@@ -203,6 +221,7 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
         index_consistency.severity,
         embedder_warmth.severity,
         empty_body_chunks.severity,
+        content_dedup.severity,
     ]);
 
     Ok(DoctorReport {
@@ -219,6 +238,7 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
         sidecar_coverage: check_sidecar_coverage(base),
         embedder_warmth,
         empty_body_chunks,
+        content_dedup,
         rebuild_sidecars_script,
         prune_empty_bodies_script,
         fixes_applied,
@@ -817,7 +837,8 @@ fn check_state(base: &Path) -> CheckResult {
 
 fn check_sidecar_coverage(base: &Path) -> CheckResult {
     let files = store::scan_context_files_at(base).unwrap_or_default();
-    let total = files.len();
+    let context_corpus_files = store::scan_context_corpus_files_at(base).unwrap_or_default();
+    let total = files.len() + context_corpus_files.len();
     if total == 0 {
         return CheckResult {
             name: "sidecars".to_string(),
@@ -828,8 +849,13 @@ fn check_sidecar_coverage(base: &Path) -> CheckResult {
     }
     let mut missing = 0usize;
     for f in &files {
-        let sidecar = f.path.with_extension("meta.json");
+        let sidecar = store::sidecar_path_for_chunk(&f.path);
         if !sidecar.exists() {
+            missing += 1;
+        }
+    }
+    for f in &context_corpus_files {
+        if !f.sidecar_path.exists() {
             missing += 1;
         }
     }
@@ -855,6 +881,43 @@ fn check_sidecar_coverage(base: &Path) -> CheckResult {
                 "{} chunks missing sidecars; run `aicx store --full-rescan` to backfill",
                 missing
             ))
+        } else {
+            None
+        },
+    }
+}
+
+fn check_content_dedup(base: &Path) -> CheckResult {
+    let mut seen: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for file in store::scan_context_files_at(base).unwrap_or_default() {
+        if let Some(sidecar) = store::load_sidecar(&file.path)
+            && let Some(hash) = sidecar.content_sha256
+        {
+            seen.entry(hash)
+                .or_default()
+                .push(file.path.display().to_string());
+        }
+    }
+    for file in store::scan_context_corpus_files_at(base).unwrap_or_default() {
+        if let Some(hash) = file.sidecar.content_sha256 {
+            seen.entry(hash)
+                .or_default()
+                .push(file.raw_path.display().to_string());
+        }
+    }
+    let duplicates: Vec<_> = seen.values().filter(|paths| paths.len() > 1).collect();
+    let duplicate_chunks: usize = duplicates.iter().map(|paths| paths.len()).sum();
+    let duplicate_groups = duplicates.len();
+    CheckResult {
+        name: "content_dedup".to_string(),
+        severity: if duplicate_groups == 0 {
+            Severity::Green
+        } else {
+            Severity::Warning
+        },
+        detail: format!("{duplicate_groups} duplicate hash group(s), {duplicate_chunks} chunk(s)"),
+        recommendation: if duplicate_groups > 0 {
+            Some("Run `aicx store --full-rescan` only after pruning duplicate chunks or let content-hash dedup skip future writes".to_string())
         } else {
             None
         },
@@ -1333,6 +1396,7 @@ pub fn format_report_text(report: &DoctorReport, verbose: bool) -> String {
         &report.sidecar_coverage,
         &report.embedder_warmth,
         &report.empty_body_chunks,
+        &report.content_dedup,
     ];
     for check in checks {
         out.push_str(&format!(
@@ -1521,6 +1585,12 @@ mod tests {
             },
             empty_body_chunks: CheckResult {
                 name: "empty_body_chunks".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            content_dedup: CheckResult {
+                name: "content_dedup".to_string(),
                 severity: Severity::Green,
                 detail: "ok".to_string(),
                 recommendation: None,

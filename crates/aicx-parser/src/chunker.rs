@@ -116,10 +116,48 @@ pub struct ChunkMetadataSidecar {
     /// append-only so pre-tag sidecars deserialize with an empty vector.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truth_status: Option<TruthStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learning_use: Option<LearningUse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keywords: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
     /// Number of noise lines dropped during chunk construction. Defaults to
     /// `0` when the field is absent in older sidecars.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub noise_lines_dropped: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TruthStatus {
+    pub role: TruthRole,
+    #[serde(default)]
+    pub runtime_authoritative: bool,
+    #[serde(default)]
+    pub stale_against_current_head: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_head_when_ingested: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TruthRole {
+    Live,
+    Example,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LearningUse {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forbidden: Vec<String>,
 }
 
 fn is_zero_usize(value: &usize) -> bool {
@@ -151,6 +189,12 @@ impl From<&Chunk> for ChunkMetadataSidecar {
             framework_version: chunk.framework_version.clone(),
             intent_entries: Vec::new(),
             tags: Vec::new(),
+            artifact_family: None,
+            schema_version: None,
+            truth_status: None,
+            learning_use: None,
+            keywords: None,
+            content_sha256: None,
             noise_lines_dropped: chunk.noise_lines_dropped,
         }
     }
@@ -1554,8 +1598,56 @@ mod tests {
         assert_eq!(legacy.mode, None);
         assert_eq!(legacy.skill_code, None);
         assert_eq!(legacy.framework_version, None);
+        assert_eq!(legacy.artifact_family, None);
+        assert_eq!(legacy.schema_version, None);
+        assert_eq!(legacy.truth_status, None);
+        assert_eq!(legacy.learning_use, None);
+        assert_eq!(legacy.keywords, None);
+        assert_eq!(legacy.content_sha256, None);
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sidecar_deserializes_context_corpus_contract_fields() {
+        let sidecar: ChunkMetadataSidecar = serde_json::from_value(serde_json::json!({
+            "id": "ctx-001",
+            "project": "vetcoders/aicx",
+            "agent": "loct-context-pack",
+            "date": "2026-05-08",
+            "session_id": "batch-001",
+            "kind": "reports",
+            "artifact_family": "loct-context-pack",
+            "schema_version": "context_corpus.v1",
+            "truth_status": {
+                "role": "example",
+                "runtime_authoritative": false,
+                "stale_against_current_head": true,
+                "current_head_when_ingested": "269d13c"
+            },
+            "learning_use": {
+                "allowed": ["retrieval-test"],
+                "forbidden": ["live-truth"]
+            },
+            "keywords": ["prism", "context"],
+            "content_sha256": "abc123"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            sidecar.artifact_family.as_deref(),
+            Some("loct-context-pack")
+        );
+        assert_eq!(sidecar.schema_version.as_deref(), Some("context_corpus.v1"));
+        assert_eq!(
+            sidecar.truth_status.as_ref().map(|status| status.role),
+            Some(TruthRole::Example)
+        );
+        assert_eq!(
+            sidecar.keywords.as_deref(),
+            Some(&["prism".to_string(), "context".to_string()][..])
+        );
+        assert_eq!(sidecar.content_sha256.as_deref(), Some("abc123"));
     }
 
     #[test]

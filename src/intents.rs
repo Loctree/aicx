@@ -411,6 +411,15 @@ fn collect_chunk_files(
         {
             continue;
         }
+        if store::load_sidecar(&file.path).is_some_and(|sidecar| {
+            sidecar.artifact_family.as_deref() == Some(store::LOCT_CONTEXT_PACK_FAMILY)
+                || sidecar
+                    .truth_status
+                    .as_ref()
+                    .is_some_and(|status| status.role == crate::chunker::TruthRole::Example)
+        }) {
+            continue;
+        }
         if let Some(expected) = frame_kind {
             let matches_frame = store::load_sidecar(&file.path)
                 .and_then(|sidecar| sidecar.frame_kind)
@@ -2206,6 +2215,12 @@ mod tests {
             framework_version: None,
             intent_entries: Vec::new(),
             tags: Vec::new(),
+            artifact_family: None,
+            schema_version: None,
+            truth_status: None,
+            learning_use: None,
+            keywords: None,
+            content_sha256: None,
             noise_lines_dropped: 0,
         };
         fs::write(

@@ -879,6 +879,12 @@ mod tests {
                 framework_version: Some("2026-04".to_string()),
                 intent_entries: Vec::new(),
                 tags: Vec::new(),
+                artifact_family: None,
+                schema_version: None,
+                truth_status: None,
+                learning_use: None,
+                keywords: None,
+                content_sha256: None,
                 noise_lines_dropped: 0,
             })
             .expect("serialize sidecar"),
@@ -928,6 +934,12 @@ mod tests {
             framework_version: Some("2026-03".to_string()),
             intent_entries: Vec::new(),
             tags: Vec::new(),
+            artifact_family: None,
+            schema_version: None,
+            truth_status: None,
+            learning_use: None,
+            keywords: None,
+            content_sha256: None,
             noise_lines_dropped: 0,
         };
 

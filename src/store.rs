@@ -14,8 +14,10 @@ use chrono::{DateTime, TimeZone, Utc};
 use globset::{Glob, GlobMatcher};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -170,6 +172,9 @@ fn truncate_session_id(session_id: &str) -> String {
 
 pub const NON_REPOSITORY_CONTEXTS: &str = "non-repository-contexts";
 pub const CANONICAL_STORE_DIRNAME: &str = "store";
+pub const CONTEXT_CORPUS_DIRNAME: &str = "context-corpus";
+pub const LOCT_CONTEXT_PACK_FAMILY: &str = "loct-context-pack";
+pub const CONTEXT_CORPUS_SCHEMA_VERSION: &str = "context_corpus.v1";
 pub const LEGACY_SALVAGE_DIRNAME: &str = "legacy-store";
 pub const AICX_IGNORE_FILENAME: &str = ".aicxignore";
 const MIGRATION_DIRNAME: &str = "migration";
@@ -182,6 +187,21 @@ fn canonical_project_slug(project: &str) -> String {
         .map(|segment| segment.trim().to_ascii_lowercase())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn canonical_path_segment(value: &str, label: &str) -> Result<String> {
+    let cleaned = value.trim().to_ascii_lowercase();
+    if cleaned.is_empty()
+        || cleaned.contains('/')
+        || cleaned.contains('\\')
+        || cleaned.contains("..")
+        || !cleaned
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+    {
+        anyhow::bail!("invalid context corpus {label} segment: {value:?}");
+    }
+    Ok(cleaned)
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +230,29 @@ pub fn store_base_dir() -> Result<PathBuf> {
 pub fn canonical_store_dir() -> Result<PathBuf> {
     let dir = store_base_dir()?.join(CANONICAL_STORE_DIRNAME);
     fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Returns the immutable context-corpus root: `~/.aicx/context-corpus/`.
+pub fn context_corpus_root_dir() -> Result<PathBuf> {
+    let dir = store_base_dir()?.join(CONTEXT_CORPUS_DIRNAME);
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+pub fn aicx_context_corpus_dir(org: &str, repo: &str, date: &str, batch: &str) -> Result<PathBuf> {
+    let org = canonical_path_segment(org, "org")?;
+    let repo = canonical_path_segment(repo, "repo")?;
+    let date = compact_date(date);
+    let batch = canonical_path_segment(batch, "batch")?;
+    let dir = context_corpus_root_dir()?
+        .join(org)
+        .join(repo)
+        .join(date)
+        .join(LOCT_CONTEXT_PACK_FAMILY)
+        .join(batch);
+    fs::create_dir_all(dir.join("raw"))?;
+    fs::create_dir_all(dir.join("sidecars"))?;
     Ok(dir)
 }
 
@@ -571,7 +614,15 @@ pub struct StoreWriteSummary {
     pub total_entries: usize,
     pub written_paths: Vec<PathBuf>,
     pub skipped_empty_body: usize,
+    pub deduped_chunks: usize,
     pub project_summary: BTreeMap<String, BTreeMap<String, usize>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SessionWriteOutcome {
+    written_paths: Vec<PathBuf>,
+    skipped_empty_body: usize,
+    deduped_chunks: usize,
 }
 
 struct SessionWriteSpec<'a> {
@@ -690,7 +741,7 @@ pub fn write_context_session_first(
     chunker_config: &ChunkerConfig,
     kind: Option<Kind>,
 ) -> Result<Vec<PathBuf>> {
-    write_context_session_first_at(
+    Ok(write_context_session_first_outcome_at(
         &canonical_store_dir()?,
         SessionWriteSpec {
             project: Some(project),
@@ -701,17 +752,28 @@ pub fn write_context_session_first(
         },
         entries,
         chunker_config,
-    )
+    )?
+    .written_paths)
 }
 
+#[cfg(test)]
 fn write_context_session_first_at(
     root: &Path,
     spec: SessionWriteSpec<'_>,
     entries: &[TimelineEntry],
     chunker_config: &ChunkerConfig,
 ) -> Result<Vec<PathBuf>> {
+    Ok(write_context_session_first_outcome_at(root, spec, entries, chunker_config)?.written_paths)
+}
+
+fn write_context_session_first_outcome_at(
+    root: &Path,
+    spec: SessionWriteSpec<'_>,
+    entries: &[TimelineEntry],
+    chunker_config: &ChunkerConfig,
+) -> Result<SessionWriteOutcome> {
     if entries.is_empty() {
-        return Ok(vec![]);
+        return Ok(SessionWriteOutcome::default());
     }
 
     let kind = spec.kind.unwrap_or_else(|| classify_kind(entries));
@@ -722,10 +784,11 @@ fn write_context_session_first_at(
     let chunks = chunker::chunk_entries(entries, &project_label, spec.agent, chunker_config);
     let date_dir = compact_date(spec.date);
 
-    let mut written = Vec::new();
+    let mut outcome = SessionWriteOutcome::default();
 
     for (idx, chunk) in chunks.iter().enumerate() {
         if chunk_body_is_empty(&chunk.text) {
+            outcome.skipped_empty_body += 1;
             continue;
         }
         let chunk_num = (idx as u32) + 1;
@@ -740,14 +803,19 @@ fn write_context_session_first_at(
 
         let filename = session_basename(spec.date, spec.agent, spec.session_id, chunk_num);
         let path = dir.join(&filename);
+        let content_sha256 = content_sha256(&chunk.text);
+        if content_sha256_exists_in_dir(&dir, &content_sha256)? {
+            outcome.deduped_chunks += 1;
+            continue;
+        }
 
         let write_path = sanitize::validate_write_path(&path)?;
         fs::write(&write_path, &chunk.text)?;
-        write_chunk_sidecar(&path, chunk)?;
-        written.push(path);
+        write_chunk_sidecar(&path, chunk, Some(content_sha256))?;
+        outcome.written_paths.push(path);
     }
 
-    Ok(written)
+    Ok(outcome)
 }
 
 fn chunk_body_after_header(content: &str) -> &str {
@@ -779,10 +847,47 @@ fn chunk_line_has_signal(line: &str) -> bool {
     true
 }
 
-fn write_chunk_sidecar(path: &Path, chunk: &chunker::Chunk) -> Result<()> {
+fn content_sha256(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn content_sha256_exists_in_dir(dir: &Path, content_sha256: &str) -> Result<bool> {
+    if !dir.exists() {
+        return Ok(false);
+    }
+    for entry in read_store_dir(dir)?.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_none_or(|name| !name.ends_with(".meta.json"))
+        {
+            continue;
+        }
+        let Some(sidecar) = load_sidecar_from_path(&path) else {
+            continue;
+        };
+        if sidecar.content_sha256.as_deref() == Some(content_sha256) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn write_chunk_sidecar(
+    path: &Path,
+    chunk: &chunker::Chunk,
+    content_sha256: Option<String>,
+) -> Result<()> {
     let sidecar_path = path.with_extension("meta.json");
     let write_path = sanitize::validate_write_path(&sidecar_path)?;
-    let sidecar = chunker::ChunkMetadataSidecar::from(chunk);
+    let mut sidecar = chunker::ChunkMetadataSidecar::from(chunk);
+    sidecar.content_sha256 = content_sha256;
     fs::write(&write_path, serde_json::to_vec_pretty(&sidecar)?)?;
     Ok(())
 }
@@ -832,11 +937,9 @@ where
             .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
         let project = canonical_project_slug(&segment.project_label());
 
-        let before_count =
-            chunker::chunk_entries(&segment.entries, &project, &segment.agent, chunker_config)
-                .len();
-        let paths = write_semantic_segment_at(base, &segment, &date, chunker_config)?;
-        summary.skipped_empty_body += before_count.saturating_sub(paths.len());
+        let outcome = write_semantic_segment_at(base, &segment, &date, chunker_config)?;
+        summary.skipped_empty_body += outcome.skipped_empty_body;
+        summary.deduped_chunks += outcome.deduped_chunks;
         update_index(
             &mut index,
             &project,
@@ -851,7 +954,7 @@ where
             .entry(segment.agent.clone())
             .or_insert(0) += segment.entries.len();
         summary.total_entries += segment.entries.len();
-        summary.written_paths.extend(paths);
+        summary.written_paths.extend(outcome.written_paths);
         progress(segment_idx + 1, total_segments);
     }
 
@@ -864,7 +967,7 @@ fn write_semantic_segment_at(
     segment: &SemanticSegment,
     date: &str,
     chunker_config: &ChunkerConfig,
-) -> Result<Vec<PathBuf>> {
+) -> Result<SessionWriteOutcome> {
     // Only assertable identities (Primary/Secondary) earn canonical store placement.
     // Fallback/Opaque/None route to non-repository-contexts.
     let project = if segment.has_assertable_identity() {
@@ -878,7 +981,7 @@ fn write_semantic_segment_at(
         base.join(NON_REPOSITORY_CONTEXTS)
     };
 
-    write_context_session_first_at(
+    write_context_session_first_outcome_at(
         &root,
         SessionWriteSpec {
             project: project.as_deref(),
@@ -1117,10 +1220,274 @@ fn context_files_since_at(
 
 /// Load the metadata sidecar for a context file, if it exists.
 pub fn load_sidecar(chunk_path: &Path) -> Option<chunker::ChunkMetadataSidecar> {
-    let sidecar_path = chunk_path.with_extension("meta.json");
+    let sidecar_path = sidecar_path_for_chunk(chunk_path);
+    load_sidecar_from_path(&sidecar_path)
+}
+
+pub fn sidecar_path_for_chunk(chunk_path: &Path) -> PathBuf {
+    let adjacent = chunk_path.with_extension("meta.json");
+    if adjacent.exists() {
+        return adjacent;
+    }
+    if let (Some(parent), Some(stem)) = (chunk_path.parent(), chunk_path.file_stem()) {
+        let sidecar = parent
+            .join("sidecars")
+            .join(format!("{}.json", stem.to_string_lossy()));
+        if sidecar.exists() {
+            return sidecar;
+        }
+    }
+    adjacent
+}
+
+fn load_sidecar_from_path(sidecar_path: &Path) -> Option<chunker::ChunkMetadataSidecar> {
     let sidecar_path = sanitize::validate_read_path(&sidecar_path).ok()?;
     let content = fs::read_to_string(&sidecar_path).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+pub fn is_context_corpus_sidecar(sidecar: &chunker::ChunkMetadataSidecar) -> bool {
+    sidecar.artifact_family.as_deref() == Some(LOCT_CONTEXT_PACK_FAMILY)
+        || sidecar
+            .truth_status
+            .as_ref()
+            .is_some_and(|status| status.role == chunker::TruthRole::Example)
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextCorpusFile {
+    pub raw_path: PathBuf,
+    pub sidecar_path: PathBuf,
+    pub sidecar: chunker::ChunkMetadataSidecar,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ContextCorpusIngestSummary {
+    pub target_dir: PathBuf,
+    pub raw_written: usize,
+    pub sidecars_written: usize,
+    pub deduped_chunks: usize,
+    pub index_path: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextCorpusIndexRow {
+    id: String,
+    path: String,
+    artifact_family: Option<String>,
+    schema_version: Option<String>,
+    truth_status_role: Option<String>,
+    keywords: Option<Vec<String>>,
+    band: Option<String>,
+    content_sha256: Option<String>,
+}
+
+pub fn ingest_loct_context_pack(pack_dir: &Path) -> Result<ContextCorpusIngestSummary> {
+    let pack_dir = sanitize::validate_dir_path(pack_dir)?;
+    let raw_dir = pack_dir.join("raw");
+    let sidecars_dir = pack_dir.join("sidecars");
+    let raw_dir = sanitize::validate_dir_path(&raw_dir)
+        .with_context(|| format!("loct context pack missing raw/: {}", raw_dir.display()))?;
+    let sidecars_dir = sanitize::validate_dir_path(&sidecars_dir).with_context(|| {
+        format!(
+            "loct context pack missing sidecars/: {}",
+            sidecars_dir.display()
+        )
+    })?;
+
+    let mut items = Vec::new();
+    for entry in read_store_dir(&raw_dir)?.filter_map(|entry| entry.ok()) {
+        let raw_path = entry.path();
+        if raw_path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = raw_path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let sidecar_path = sidecars_dir.join(format!("{stem}.json"));
+        let mut sidecar = load_sidecar_from_path(&sidecar_path)
+            .with_context(|| format!("missing or invalid sidecar: {}", sidecar_path.display()))?;
+        sidecar.artifact_family = Some(LOCT_CONTEXT_PACK_FAMILY.to_string());
+        sidecar.schema_version = Some(CONTEXT_CORPUS_SCHEMA_VERSION.to_string());
+        if sidecar.truth_status.is_none() {
+            sidecar.truth_status = Some(chunker::TruthStatus {
+                role: chunker::TruthRole::Example,
+                runtime_authoritative: false,
+                stale_against_current_head: false,
+                current_head_when_ingested: None,
+            });
+        }
+        let raw = sanitize::read_to_string_validated(&raw_path)?;
+        let hash = content_sha256(&raw);
+        sidecar.content_sha256 = Some(hash);
+        items.push((raw_path, sidecar_path, sidecar));
+    }
+
+    if items.is_empty() {
+        anyhow::bail!("loct context pack contains no raw/*.md chunks");
+    }
+
+    let (org, repo) = context_corpus_repo_from_sidecar(&items[0].2)?;
+    let date = items[0].2.date.clone();
+    let batch = pack_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("batch");
+    let target = aicx_context_corpus_dir(&org, &repo, &date, batch)?;
+    let target_raw = target.join("raw");
+    let target_sidecars = target.join("sidecars");
+    let index_path = target.join("index.jsonl");
+
+    let mut seen_hashes = context_corpus_hashes_in_dir(&target_sidecars)?;
+    let mut index_rows = Vec::new();
+    let mut summary = ContextCorpusIngestSummary {
+        target_dir: target.clone(),
+        index_path: index_path.clone(),
+        ..ContextCorpusIngestSummary::default()
+    };
+
+    for (raw_path, _source_sidecar_path, sidecar) in items {
+        let hash = sidecar.content_sha256.clone().unwrap_or_default();
+        if !hash.is_empty() && seen_hashes.contains_key(&hash) {
+            summary.deduped_chunks += 1;
+            continue;
+        }
+        if !hash.is_empty() {
+            seen_hashes.insert(hash.clone(), sidecar.id.clone());
+        }
+
+        let file_name = raw_path
+            .file_name()
+            .ok_or_else(|| anyhow!("raw chunk missing filename: {}", raw_path.display()))?;
+        let raw_target = target_raw.join(file_name);
+        let sidecar_target = target_sidecars.join(format!(
+            "{}.json",
+            raw_target
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or(&sidecar.id)
+        ));
+
+        fs::copy(&raw_path, sanitize::validate_write_path(&raw_target)?)?;
+        let mut file = sanitize::create_file_validated(&sidecar_target)?;
+        file.write_all(serde_json::to_vec_pretty(&sidecar)?.as_slice())?;
+        summary.raw_written += 1;
+        summary.sidecars_written += 1;
+
+        index_rows.push(ContextCorpusIndexRow {
+            id: sidecar.id.clone(),
+            path: raw_target.display().to_string(),
+            artifact_family: sidecar.artifact_family.clone(),
+            schema_version: sidecar.schema_version.clone(),
+            truth_status_role: sidecar
+                .truth_status
+                .as_ref()
+                .map(|status| match status.role {
+                    chunker::TruthRole::Live => "live".to_string(),
+                    chunker::TruthRole::Example => "example".to_string(),
+                }),
+            keywords: sidecar.keywords.clone(),
+            band: sidecar.frame_kind.map(|kind| kind.as_str().to_string()),
+            content_sha256: sidecar.content_sha256.clone(),
+        });
+    }
+
+    write_context_corpus_index(&index_path, &index_rows)?;
+    Ok(summary)
+}
+
+pub fn scan_context_corpus_files_at(base: &Path) -> Result<Vec<ContextCorpusFile>> {
+    let base = sanitize::validate_dir_path(base)?;
+    let root = base.join(CONTEXT_CORPUS_DIRNAME);
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    scan_context_corpus_files_recursive(&root, &mut out)?;
+    out.sort_by(|left, right| left.raw_path.cmp(&right.raw_path));
+    Ok(out)
+}
+
+fn scan_context_corpus_files_recursive(dir: &Path, out: &mut Vec<ContextCorpusFile>) -> Result<()> {
+    for entry in read_store_dir(dir)?.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().and_then(|name| name.to_str()) == Some("raw") {
+                collect_context_corpus_raw_dir(&path, out)?;
+            } else {
+                scan_context_corpus_files_recursive(&path, out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_context_corpus_raw_dir(raw_dir: &Path, out: &mut Vec<ContextCorpusFile>) -> Result<()> {
+    let Some(pack_dir) = raw_dir.parent() else {
+        return Ok(());
+    };
+    let sidecars_dir = pack_dir.join("sidecars");
+    if !sidecars_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in read_store_dir(raw_dir)?.filter_map(|entry| entry.ok()) {
+        let raw_path = entry.path();
+        if raw_path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = raw_path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let sidecar_path = sidecars_dir.join(format!("{stem}.json"));
+        let Some(sidecar) = load_sidecar_from_path(&sidecar_path) else {
+            continue;
+        };
+        out.push(ContextCorpusFile {
+            raw_path,
+            sidecar_path,
+            sidecar,
+        });
+    }
+    Ok(())
+}
+
+fn context_corpus_repo_from_sidecar(
+    sidecar: &chunker::ChunkMetadataSidecar,
+) -> Result<(String, String)> {
+    let project = sidecar.project.trim();
+    if let Some((org, repo)) = project.split_once('/') {
+        return Ok((org.to_string(), repo.to_string()));
+    }
+    Ok(("unknown".to_string(), project.to_string()))
+}
+
+fn context_corpus_hashes_in_dir(sidecars_dir: &Path) -> Result<HashMap<String, String>> {
+    let mut hashes = HashMap::new();
+    if !sidecars_dir.exists() {
+        return Ok(hashes);
+    }
+    for entry in read_store_dir(sidecars_dir)?.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(sidecar) = load_sidecar_from_path(&path) else {
+            continue;
+        };
+        if let Some(hash) = sidecar.content_sha256 {
+            hashes.insert(hash, sidecar.id);
+        }
+    }
+    Ok(hashes)
+}
+
+fn write_context_corpus_index(path: &Path, rows: &[ContextCorpusIndexRow]) -> Result<()> {
+    let mut writer = sanitize::create_file_validated(path)?;
+    for row in rows {
+        writeln!(writer, "{}", serde_json::to_string(row)?)?;
+    }
+    Ok(())
 }
 
 /// Find stored chunks whose sidecar metadata matches a run ID.
