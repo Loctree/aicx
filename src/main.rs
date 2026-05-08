@@ -3536,11 +3536,13 @@ fn run_search(
         filters.limit
     };
 
-    // Try semantic-first dispatch unless operator forced fuzzy with
-    // `--no-semantic`. The semantic path resolves quickly to a typed
-    // SearchPath::Fallback when the embedder is unavailable or the
-    // vector index has not yet been built, so the cost of trying is
-    // bounded.
+    // Semantic-by-default with fail-fast diagnostics. Operator may opt
+    // out of semantic via `--no-semantic`, which dispatches to the
+    // legacy lexical fuzzy path. In the default semantic path a missing
+    // precondition (embedder not hydrated, index not built, dimension
+    // mismatch, ...) returns a typed [`SemanticError`] with an
+    // actionable recommendation; we render it and exit non-zero so the
+    // operator sees what to do instead of getting "0 results" silently.
     let semantic_path = if no_semantic {
         aicx::search_engine::SearchPath::Fallback {
             reason: "operator passed --no-semantic".to_string(),
@@ -3553,16 +3555,36 @@ fn run_search(
             project,
             filters.frame_kind.map(Into::into),
         ) {
-            Ok(path) => path,
-            Err(err) => aicx::search_engine::SearchPath::Fallback {
-                reason: format!("semantic dispatch errored: {err}"),
-            },
+            Ok(outcome) => aicx::search_engine::SearchPath::Semantic(outcome),
+            Err(err) => {
+                // Fail-fast path: render a human-readable error +
+                // recommendation to stderr, plus a structured JSON
+                // payload to stdout for scripted consumers, then exit
+                // non-zero. NO silent fallback.
+                let payload = serde_json::json!({
+                    "ok": false,
+                    "error": "semantic_search_unavailable",
+                    "kind": err.kind(),
+                    "reason": err.reason(),
+                    "recommendation": err.recommendation(),
+                });
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&payload)?);
+                } else {
+                    eprintln!("aicx search: semantic search unavailable.");
+                    eprintln!("  kind:           {}", err.kind());
+                    eprintln!("  reason:         {}", err.reason());
+                    eprintln!("  recommendation: {}", err.recommendation());
+                    eprintln!();
+                    eprintln!(
+                        "(operator-override: pass `--no-semantic` to fall back to lexical fuzzy on this corpus.)"
+                    );
+                }
+                std::process::exit(2);
+            }
         }
     };
 
-    // Iter 1 always lands in the Fallback arm because no vector index is
-    // wired yet. Iter 2 will materialize the index and the Semantic arm
-    // will start returning real hits.
     let (results, scanned) = match &semantic_path {
         aicx::search_engine::SearchPath::Semantic(outcome) => {
             (outcome.results.clone(), outcome.scanned)

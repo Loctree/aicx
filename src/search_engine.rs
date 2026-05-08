@@ -1,30 +1,28 @@
-//! Semantic-first search dispatch with explicit fuzzy fallback.
+//! Semantic-only search dispatch with fail-fast diagnostics.
 //!
-//! `aicx search` is intended to be semantic by default: a query is encoded
+//! `aicx search` is **semantic-by-contract** since v0.7: a query is encoded
 //! through the in-process embedder ([`crate::embedder`], which re-exports
-//! the local [`aicx_embeddings`] crate's GGUF stack) and matched against a
-//! materialized vector index of the canonical store. Fuzzy filesystem
-//! search ([`crate::rank::fuzzy_search_store`]) is the graceful fallback
-//! when:
+//! the local [`aicx_embeddings`] crate's GGUF + cloud HTTP stack) and
+//! matched against a materialized vector index of the canonical store.
 //!
-//! - the binary was built without the `native-embedder` feature,
-//! - the GGUF model cannot be resolved from `~/.aicx/embedder.toml`,
-//!   `~/.aicx/config.toml`, env (`AICX_EMBEDDER_*`), or the local HF cache,
-//! - the embedder fails to initialize (memory pressure, missing backend),
-//! - or the vector index has not yet been built (`aicx index` is the
-//!   shipping command for that).
+//! There is no silent fuzzy fallback. When a precondition is missing
+//! (embedder unhydrated, index not built, empty/low-signal corpus,
+//! dimension mismatch between query and index), [`try_semantic_search`]
+//! returns a typed [`SemanticError`] with a human-readable `reason` AND
+//! an actionable `recommendation`. The caller renders the error and
+//! exits non-zero so operators see exactly what to do, instead of
+//! receiving "0 results" without a story.
 //!
-//! Every attempt resolves to a typed [`SearchPath`] so the caller can emit
-//! an honest `oracle_status`: `backend=embedded_semantic` for a successful
-//! semantic hit, otherwise `backend=filesystem_fuzzy_fallback` plus a human-
-//! readable `fallback_reason`. Operators can therefore tell exactly which
-//! retrieval ran from a single line of stderr or one JSON field.
+//! Operators who explicitly want the legacy fuzzy path use the existing
+//! `--no-semantic` flag, which dispatches to [`crate::rank::fuzzy_search_store`]
+//! directly without consulting this module.
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use std::path::Path;
 
 use anyhow::Result;
+use serde::Serialize;
 
 use crate::rank::FuzzyResult;
 use crate::timeline::FrameKind;
@@ -47,112 +45,332 @@ pub struct SemanticSearchOutcome {
 }
 
 /// Outcome of a semantic-vs-fallback dispatch.
+///
+/// `Fallback` survives only for callers explicitly invoking
+/// [`crate::rank::fuzzy_search_store`] via `--no-semantic`. The default
+/// `aicx search` path uses [`SemanticOutcome`] / [`SemanticError`] and
+/// fails fast on missing preconditions — see module docs.
 #[derive(Debug)]
 pub enum SearchPath {
     /// Semantic search succeeded; caller should render `results` and emit
     /// `oracle_status` with `backend=embedded_semantic`.
     Semantic(SemanticSearchOutcome),
-    /// Semantic search is not currently available. Caller should fall
-    /// back to [`crate::rank::fuzzy_search_store`] and emit
-    /// `oracle_status` with `backend=filesystem_fuzzy_fallback` and the
-    /// returned `reason`.
+    /// Operator explicitly requested fuzzy via `--no-semantic`.
     Fallback { reason: String },
 }
 
-/// Attempt semantic search via the in-process embedder; otherwise return a
-/// typed fallback signal that the caller routes to fuzzy search.
-///
-/// This function never panics and never spawns external processes. It is
-/// safe to call on every `aicx search` invocation: in the absence of an
-/// index it short-circuits to [`SearchPath::Fallback`] in microseconds, so
-/// the cost of trying is bounded.
-///
-/// The function intentionally does not perform fuzzy search itself — that
-/// keeps [`crate::rank::fuzzy_search_store`] as the single source of truth
-/// for the lexical path and avoids accidental result-shape divergence.
-pub fn try_semantic_search(
-    _store_root: &Path,
-    _query: &str,
-    _limit: usize,
-    _project_filter: Option<&str>,
-    _frame_kind_filter: Option<FrameKind>,
-) -> Result<SearchPath> {
-    #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
-    {
-        Ok(SearchPath::Fallback {
-            reason: "native-embedder feature not compiled in this binary".to_string(),
-        })
+/// Result of a semantic search call.
+pub type SemanticOutcome = SemanticSearchOutcome;
+
+/// Fail-fast typed error for semantic-search preconditions. Each variant
+/// captures the diagnostic the operator needs to fix the problem and
+/// retry.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SemanticError {
+    /// Binary was compiled without any embedder feature flag.
+    EmbedderFeatureMissing {
+        reason: String,
+        recommendation: String,
+    },
+    /// Embedder feature is compiled in but [`crate::embedder::EmbeddingEngine::new`]
+    /// returned an error (model not hydrated, cloud endpoint unreachable, ...).
+    EmbedderUnavailable {
+        reason: String,
+        recommendation: String,
+    },
+    /// `index_path(project)` does not exist on disk yet — operator never ran
+    /// `aicx index --dry-run=false`.
+    IndexNotBuilt {
+        path: std::path::PathBuf,
+        reason: String,
+        recommendation: String,
+    },
+    /// Index file exists but cannot be read or parsed.
+    IndexCorrupt {
+        path: std::path::PathBuf,
+        reason: String,
+        recommendation: String,
+    },
+    /// Index file dimension does not match the current embedder dimension.
+    /// The corpus was indexed with a different model — semantic similarity
+    /// across the boundary is meaningless. Force a rebuild.
+    DimensionMismatch {
+        path: std::path::PathBuf,
+        index_dim: usize,
+        embedder_dim: usize,
+        reason: String,
+        recommendation: String,
+    },
+    /// Index file exists but contains zero entries (empty NDJSON body).
+    EmptyIndex {
+        path: std::path::PathBuf,
+        reason: String,
+        recommendation: String,
+    },
+    /// Index returned 0 hits for this query — distinct from EmptyIndex.
+    /// Indicates the corpus has chunks but none scored above threshold.
+    /// (Currently we surface ALL hits regardless of score, so this only
+    /// fires when the corpus is empty post-filter.)
+    NoResults {
+        path: std::path::PathBuf,
+        scanned: usize,
+        reason: String,
+        recommendation: String,
+    },
+}
+
+impl SemanticError {
+    /// One-line reason for terse logs / oracle_status.
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::EmbedderFeatureMissing { reason, .. }
+            | Self::EmbedderUnavailable { reason, .. }
+            | Self::IndexNotBuilt { reason, .. }
+            | Self::IndexCorrupt { reason, .. }
+            | Self::DimensionMismatch { reason, .. }
+            | Self::EmptyIndex { reason, .. }
+            | Self::NoResults { reason, .. } => reason,
+        }
     }
 
-    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-    {
-        try_semantic_search_native(
-            _store_root,
-            _query,
-            _limit,
-            _project_filter,
-            _frame_kind_filter,
+    /// Actionable recommendation the operator can paste into their shell.
+    pub fn recommendation(&self) -> &str {
+        match self {
+            Self::EmbedderFeatureMissing { recommendation, .. }
+            | Self::EmbedderUnavailable { recommendation, .. }
+            | Self::IndexNotBuilt { recommendation, .. }
+            | Self::IndexCorrupt { recommendation, .. }
+            | Self::DimensionMismatch { recommendation, .. }
+            | Self::EmptyIndex { recommendation, .. }
+            | Self::NoResults { recommendation, .. } => recommendation,
+        }
+    }
+
+    /// Stable kind label for `oracle_status: backend=fail_fast kind=...`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::EmbedderFeatureMissing { .. } => "embedder_feature_missing",
+            Self::EmbedderUnavailable { .. } => "embedder_unavailable",
+            Self::IndexNotBuilt { .. } => "index_not_built",
+            Self::IndexCorrupt { .. } => "index_corrupt",
+            Self::DimensionMismatch { .. } => "dimension_mismatch",
+            Self::EmptyIndex { .. } => "empty_index",
+            Self::NoResults { .. } => "no_results",
+        }
+    }
+}
+
+impl std::fmt::Display for SemanticError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "semantic search unavailable: {}\n  recommendation: {}",
+            self.reason(),
+            self.recommendation()
         )
     }
 }
 
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn try_semantic_search_native(
+impl std::error::Error for SemanticError {}
+
+/// Run a semantic search against the persistent vector index. Fails fast
+/// with a typed [`SemanticError`] when any precondition is missing — no
+/// silent fuzzy fallback. Each error variant carries an actionable
+/// `recommendation` the operator can paste into their shell.
+///
+/// This function never panics and never spawns external processes.
+pub fn try_semantic_search(
     _store_root: &Path,
     query: &str,
     limit: usize,
     project_filter: Option<&str>,
     _frame_kind_filter: Option<FrameKind>,
+) -> std::result::Result<SemanticOutcome, SemanticError> {
+    #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+    {
+        let _ = (query, limit, project_filter);
+        Err(SemanticError::EmbedderFeatureMissing {
+            reason: "this aicx binary was compiled without any embedder feature".to_string(),
+            recommendation:
+                "rebuild with `cargo install --path . --features native-embedder` (offline GGUF) \
+                 or `cargo install --path . --features cloud-embedder` (HTTP /v1/embeddings)"
+                    .to_string(),
+        })
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    {
+        try_semantic_search_native(query, limit, project_filter)
+    }
+}
+
+/// Compatibility shim: the legacy [`SearchPath`]-returning entrypoint for
+/// callers (e.g. `--no-semantic` dispatch) that still need the fallback
+/// shape. New code should use [`try_semantic_search`] directly and
+/// pattern-match on [`SemanticError`].
+pub fn try_semantic_search_path(
+    _store_root: &Path,
+    query: &str,
+    limit: usize,
+    project_filter: Option<&str>,
+    frame_kind_filter: Option<FrameKind>,
 ) -> Result<SearchPath> {
-    // Probe the embedder first. If the model cannot load, surface the
-    // precise reason rather than masking it as "no results".
+    match try_semantic_search(_store_root, query, limit, project_filter, frame_kind_filter) {
+        Ok(outcome) => Ok(SearchPath::Semantic(outcome)),
+        Err(err) => Ok(SearchPath::Fallback {
+            reason: err.reason().to_string(),
+        }),
+    }
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn try_semantic_search_native(
+    query: &str,
+    limit: usize,
+    project_filter: Option<&str>,
+) -> std::result::Result<SemanticOutcome, SemanticError> {
+    // Probe the embedder first.
     let engine = match crate::embedder::EmbeddingEngine::new() {
         Ok(engine) => engine,
         Err(err) => {
-            return Ok(SearchPath::Fallback {
-                reason: format!("embedder init failed: {err}"),
+            let msg = err.to_string();
+            let recommendation = if msg.contains("hydrated") || msg.contains("cache") {
+                "run `hf download mradermacher/F2LLM-v2-0.6B-GGUF F2LLM-v2-0.6B.Q4_K_M.gguf` \
+                 (or set `AICX_EMBEDDER_PATH=/path/to/your.gguf`), then retry"
+                    .to_string()
+            } else if msg.contains("cloud") || msg.contains("url") {
+                "verify `~/.aicx/config.toml` `[embedder.cloud]` url + api_key_env are set, \
+                 export the api key, retry"
+                    .to_string()
+            } else {
+                "check `aicx config show` for resolved backend; if unhealthy run `aicx doctor` \
+                 then retry"
+                    .to_string()
+            };
+            return Err(SemanticError::EmbedderUnavailable {
+                reason: format!("embedder init failed: {msg}"),
+                recommendation,
             });
         }
     };
 
     let info = engine.info().clone();
+    let embedder_dim = info.dimension;
 
-    // Iter 3 wiring: query the persistent NDJSON-backed index when it
-    // exists. If the file is missing the operator hasn't run `aicx
-    // index` yet, so fall back with an actionable reason.
-    let path = match crate::vector_index::index_path(project_filter) {
-        Ok(p) => p,
-        Err(err) => {
-            return Ok(SearchPath::Fallback {
-                reason: format!("could not resolve index path: {err}"),
-            });
+    let path = crate::vector_index::index_path(project_filter).map_err(|err| {
+        SemanticError::IndexNotBuilt {
+            path: std::path::PathBuf::new(),
+            reason: format!("could not resolve index path: {err}"),
+            recommendation:
+                "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index --dry-run=false`"
+                    .to_string(),
         }
-    };
+    })?;
 
     if !path.exists() {
-        return Ok(SearchPath::Fallback {
-            reason: format!(
-                "vector index not built yet at {} (run `aicx index --dry-run=false` to materialize it)",
+        let cmd = match project_filter {
+            Some(p) => format!("aicx index --dry-run=false --project {p}"),
+            None => "aicx index --dry-run=false".to_string(),
+        };
+        return Err(SemanticError::IndexNotBuilt {
+            path: path.clone(),
+            reason: format!("vector index not yet materialized at {}", path.display()),
+            recommendation: format!(
+                "run `{cmd}` (one-off; subsequent runs query the index in-process)"
+            ),
+        });
+    }
+
+    // Touch the file once to surface IO errors early with a readable
+    // recommendation.
+    if let Err(err) = std::fs::metadata(&path) {
+        return Err(SemanticError::IndexCorrupt {
+            path: path.clone(),
+            reason: format!("cannot stat index file: {err}"),
+            recommendation: format!(
+                "delete and rebuild: `rm -f {} && aicx index --dry-run=false`",
                 path.display()
             ),
         });
     }
 
+    // Read header line first so we can detect dimension mismatch BEFORE
+    // touching any vectors.
+    if let Some(header) = read_index_header(&path) {
+        if header.dimension != embedder_dim {
+            return Err(SemanticError::DimensionMismatch {
+                path: path.clone(),
+                index_dim: header.dimension,
+                embedder_dim,
+                reason: format!(
+                    "index built with dimension={} (model {}), current embedder is dimension={} (model {})",
+                    header.dimension, header.model_id, embedder_dim, info.model_id
+                ),
+                recommendation: format!(
+                    "rebuild the index with the current embedder: `rm -f {} && aicx index --dry-run=false`",
+                    path.display()
+                ),
+            });
+        }
+        if header.entry_count == 0 && index_appears_empty(&path) {
+            return Err(SemanticError::EmptyIndex {
+                path: path.clone(),
+                reason: format!(
+                    "index file at {} contains 0 entries — corpus may be empty or all chunks failed to embed",
+                    path.display()
+                ),
+                recommendation: "run `aicx extract --all` to populate the canonical corpus, \
+                     then rebuild: `aicx index --dry-run=false`"
+                    .to_string(),
+            });
+        }
+    }
+
+    // Probe the query string itself — empty / whitespace-only queries
+    // cannot produce a meaningful embedding.
+    if query.trim().is_empty() {
+        return Err(SemanticError::NoResults {
+            path: path.clone(),
+            scanned: 0,
+            reason: "query is empty or whitespace-only — embedder needs at least one token"
+                .to_string(),
+            recommendation:
+                "pass a non-empty query, e.g. `aicx search 'how does the noise filter work'`"
+                    .to_string(),
+        });
+    }
+
+    // Drop the engine handle before query_index opens its own (locks are
+    // shared so concurrent reads are fine).
+    drop(engine);
+
     let hits = match crate::vector_index::query_index(project_filter, query, limit) {
         Ok(hits) => hits,
         Err(err) => {
-            return Ok(SearchPath::Fallback {
+            return Err(SemanticError::IndexCorrupt {
+                path: path.clone(),
                 reason: format!("index query failed: {err}"),
+                recommendation: format!(
+                    "delete and rebuild: `rm -f {} && aicx index --dry-run=false`",
+                    path.display()
+                ),
             });
         }
     };
 
     if hits.is_empty() {
-        return Ok(SearchPath::Fallback {
+        return Err(SemanticError::NoResults {
+            path: path.clone(),
+            scanned: 0,
             reason: format!(
-                "vector index at {} returned 0 hits for this query",
+                "index at {} produced 0 ranked hits for this query",
                 path.display()
             ),
+            recommendation:
+                "either the index is empty (rebuild with `aicx index --dry-run=false`) \
+                 or your query has no semantic neighbours in the corpus — try broader phrasing"
+                    .to_string(),
         });
     }
 
@@ -161,9 +379,9 @@ fn try_semantic_search_native(
         .into_iter()
         .map(|h| {
             // Map cosine [-1, 1] → unsigned 0..=100 score for FuzzyResult
-            // (downstream renderers assume the same shape as the lexical
-            // path). We clamp negatives to 0 since the lexical scorer
-            // never emits negatives either.
+            // (downstream renderers share the shape with the lexical
+            // path). Negative scores clamp to 0; lexical never emits
+            // negatives either.
             let score_pct = ((h.score.max(0.0) * 100.0).round() as u8).min(100);
             FuzzyResult {
                 file: h.path.to_string_lossy().to_string(),
@@ -184,12 +402,37 @@ fn try_semantic_search_native(
         })
         .collect();
 
-    Ok(SearchPath::Semantic(SemanticSearchOutcome {
+    Ok(SemanticOutcome {
         results,
         scanned,
         backend_label: "embedded_semantic",
         model_id: info.model_id,
-    }))
+    })
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn read_index_header(path: &std::path::Path) -> Option<crate::vector_index::IndexHeader> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut first = String::new();
+    reader.read_line(&mut first).ok()?;
+    serde_json::from_str(first.trim()).ok()
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn index_appears_empty(path: &std::path::Path) -> bool {
+    use std::io::{BufRead, BufReader};
+    let Ok(file) = std::fs::File::open(path) else {
+        return true;
+    };
+    let reader = BufReader::new(file);
+    // Skip header (first line); if no second line, index is empty.
+    reader
+        .lines()
+        .skip(1)
+        .find(|line| matches!(line, Ok(s) if !s.trim().is_empty()))
+        .is_none()
 }
 
 /// Compose the canonical `oracle_status` line emitted to stderr after a
@@ -216,29 +459,45 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn fallback_path_returns_actionable_reason() {
+    fn fail_fast_carries_actionable_recommendation() {
         // In any test environment we either lack the feature flag, lack a
-        // built index, or both. The function must never panic and must
-        // return a non-empty diagnostic reason that an operator can act
-        // on.
+        // hydrated embedder, or lack a built index. The function must
+        // never panic, and the typed error must carry both a non-empty
+        // `reason` AND a non-empty `recommendation` so the operator
+        // knows what to do next.
         let result = try_semantic_search(
             Path::new("/tmp/aicx-search-engine-test"),
             "any query",
             10,
             None,
             None,
-        )
-        .expect("try_semantic_search must not return Err in fallback path");
+        );
 
         match result {
-            SearchPath::Fallback { reason } => {
-                assert!(!reason.is_empty(), "fallback reason must not be empty");
+            Err(err) => {
+                assert!(
+                    !err.reason().is_empty(),
+                    "fail-fast reason must not be empty"
+                );
+                assert!(
+                    !err.recommendation().is_empty(),
+                    "fail-fast recommendation must not be empty"
+                );
+                // `kind` is always a stable lowercase snake_case label.
+                assert!(
+                    !err.kind().is_empty()
+                        && err
+                            .kind()
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c == '_'),
+                    "kind label must be snake_case lowercase: {:?}",
+                    err.kind()
+                );
             }
-            SearchPath::Semantic(_) => {
-                // Allowed only if a developer has a fully wired index in
-                // this test env. Iter 1 ships before that exists, so this
-                // branch should not execute today; do not fail it though,
-                // since the path is legal once Iter 2 lands.
+            Ok(_) => {
+                // Only legal when a fully wired index exists in this
+                // test env (developer host). Don't fail in that case;
+                // the success branch is also a valid contract.
             }
         }
     }
