@@ -7469,7 +7469,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "lance-namespace-impls"
-version = "0.39.0"

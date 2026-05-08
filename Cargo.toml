@@ -39,7 +39,7 @@ native-embedder-openmp = ["native-embedder", "aicx-embeddings/openmp"]
 cloud-embedder = ["dep:aicx-embeddings", "aicx-embeddings/cloud"]
 
 [dependencies]
-aicx-embeddings = { path = "crates/aicx-embeddings", version = "0.7.0", optional = true, default-features = false }
+aicx-embeddings = { version = "0.7.0", optional = true, default-features = false }
 aicx-parser = { version = "0.3.0", features = ["json-schema"] }
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
@@ -67,7 +67,7 @@ filetime = "0.2"
 
 [patch.crates-io]
 aicx-parser = { path = "crates/aicx-parser" }
-lance-namespace-impls = { path = "../rust-memex/vendor/lance-namespace-impls" }
+aicx-embeddings = { path = "crates/aicx-embeddings" }
 
 [[bin]]
 name = "aicx"
