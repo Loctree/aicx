@@ -1241,7 +1241,7 @@ pub fn sidecar_path_for_chunk(chunk_path: &Path) -> PathBuf {
 }
 
 fn load_sidecar_from_path(sidecar_path: &Path) -> Option<chunker::ChunkMetadataSidecar> {
-    let sidecar_path = sanitize::validate_read_path(&sidecar_path).ok()?;
+    let sidecar_path = sanitize::validate_read_path(sidecar_path).ok()?;
     let content = fs::read_to_string(&sidecar_path).ok()?;
     serde_json::from_str(&content).ok()
 }
