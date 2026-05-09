@@ -3914,7 +3914,8 @@ fn run_config_show(json: bool) -> Result<()> {
 fn run_config_show(_json: bool) -> Result<()> {
     eprintln!(
         "aicx was built without any embedder feature. \
-         Rebuild with `cargo install --features cloud-embedder` (recommended) \
+         Install a pre-built release (e.g., `npm install -g @loctree/aicx`), \
+         or rebuild with `cargo install --features cloud-embedder` (recommended) \
          or `--features native-embedder` (offline GGUF)."
     );
     Ok(())

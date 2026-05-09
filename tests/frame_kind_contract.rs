@@ -318,29 +318,46 @@ fn codex_store_round_trips_frame_kind_filters() {
         Some(expected_thought_file.as_str())
     );
 
-    let steer_output = run_aicx(
-        &home,
-        &["steer", "-p", "ai-contexters", "--frame-kind", "user_msg"],
-    );
-    assert_success(&steer_output);
-    let steer_stdout = String::from_utf8_lossy(&steer_output.stdout);
+    #[cfg(feature = "lance")]
+    {
+        let steer_output = run_aicx(
+            &home,
+            &["steer", "-p", "ai-contexters", "--frame-kind", "user_msg"],
+        );
+        assert_success(&steer_output);
+        let steer_stdout = String::from_utf8_lossy(&steer_output.stdout);
 
-    let expected_user_file = paths_by_frame["user_msg"]
-        .file_name()
-        .expect("user chunk filename")
-        .to_string_lossy()
-        .into_owned();
-    assert!(steer_stdout.contains(&expected_user_file));
-    for unexpected in ["agent_reply", "internal_thought", "tool_call"] {
-        let unexpected_path = paths_by_frame[unexpected]
+        let expected_user_file = paths_by_frame["user_msg"]
             .file_name()
-            .expect("unexpected chunk filename")
+            .expect("user chunk filename")
             .to_string_lossy()
             .into_owned();
-        assert!(
-            !steer_stdout.contains(&unexpected_path),
-            "steer output leaked {unexpected} path: {steer_stdout}"
+        assert!(steer_stdout.contains(&expected_user_file));
+        for unexpected in ["agent_reply", "internal_thought", "tool_call"] {
+            let unexpected_path = paths_by_frame[unexpected]
+                .file_name()
+                .expect("unexpected chunk filename")
+                .to_string_lossy()
+                .into_owned();
+            assert!(
+                !steer_stdout.contains(&unexpected_path),
+                "steer output leaked {unexpected} path: {steer_stdout}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "lance"))]
+    {
+        let steer_output = run_aicx(
+            &home,
+            &["steer", "-p", "ai-contexters", "--frame-kind", "user_msg"],
         );
+        assert!(
+            !steer_output.status.success(),
+            "steer should fail when lance is disabled"
+        );
+        let steer_stderr = String::from_utf8_lossy(&steer_output.stderr);
+        assert!(steer_stderr.contains("not enabled in this aicx build"));
     }
 
     let _ = fs::remove_dir_all(&root);

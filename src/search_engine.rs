@@ -193,8 +193,9 @@ pub fn try_semantic_search(
         Err(SemanticError::EmbedderFeatureMissing {
             reason: "this aicx binary was compiled without any embedder feature".to_string(),
             recommendation:
-                "rebuild with `cargo install --path . --features native-embedder` (offline GGUF) \
-                 or `cargo install --path . --features cloud-embedder` (HTTP /v1/embeddings)"
+                "install a pre-built release from GitHub (e.g., `npm install -g @loctree/aicx`), \
+                 or rebuild from source with `cargo install --path . --features native-embedder` \
+                 (offline GGUF) or `cargo install --path . --features cloud-embedder` (HTTP /v1/embeddings)"
                     .to_string(),
         })
     }
