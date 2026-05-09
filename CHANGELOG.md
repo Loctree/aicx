@@ -3,8 +3,9 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-
 ## [Unreleased]
+
+## [0.7.0] - 2026-05-08
 
 ### Added
 - **Context Corpus Contract** for immutable `loct-context-pack` prism packs: sidecars now carry `artifact_family`, `schema_version`, `truth_status`, `learning_use`, `keywords`, and `content_sha256`; `aicx ingest --source loct-context-pack <PACK_DIR>` retains packs under `$HOME/.aicx/context-corpus/...` with `index.jsonl`.

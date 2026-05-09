@@ -66,8 +66,8 @@ match the GitHub Release being published.
 ### Step 1 - Sync versions
 
 ```bash
-node distribution/npm/sync-version.mjs 0.6.5
-node distribution/npm/sync-version.mjs --check 0.6.5
+node distribution/npm/sync-version.mjs 0.7.0
+node distribution/npm/sync-version.mjs --check 0.7.0
 ```
 
 ### Step 2 - Publish platform packages first
@@ -127,8 +127,8 @@ then publishes the wrapper.
 For `v0.6.5`, the real asset shape is:
 
 ```bash
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.6.5/aicx-v0.6.5-aarch64-apple-darwin-slim-unsigned.tar.gz
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.6.5/aicx-v0.6.5-aarch64-apple-darwin-slim-unsigned.tar.gz.sha256
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.7.0/aicx-v0.7.0-aarch64-apple-darwin-slim-unsigned.tar.gz
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.7.0/aicx-v0.7.0-aarch64-apple-darwin-slim-unsigned.tar.gz.sha256
 ```
 
 ### optionalDependencies disabled
