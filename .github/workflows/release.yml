@@ -87,6 +87,10 @@ jobs:
           RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
         run: git rev-parse --verify "refs/tags/${RELEASE_TAG}" >/dev/null
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
       - name: Check Cargo.toml version matches tag
         working-directory: aicx
         env:
@@ -108,10 +112,6 @@ jobs:
               )
               raise SystemExit(1)
           PY
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.x'
 
       - name: semgrep
         working-directory: aicx
