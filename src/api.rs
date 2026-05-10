@@ -101,12 +101,15 @@ impl Aicx {
         )
     }
 
-    pub fn fuzzy_search(
+    /// Run a semantic search against the canonical store's persistent vector
+    /// index. Fails fast with a descriptive error when any precondition is
+    /// missing (embedder unhydrated, index not built, dimension mismatch).
+    pub fn semantic_search(
         &self,
         query: impl AsRef<str>,
         opts: SearchOptions,
     ) -> Result<SearchResults> {
-        let (results, scanned) = crate::rank::fuzzy_search_store(
+        let outcome = crate::search_engine::try_semantic_search(
             &self.config.store_root,
             query.as_ref(),
             opts.limit,
@@ -114,9 +117,12 @@ impl Aicx {
             opts.frame_kind,
         )
         .map_err(anyhow::Error::from)
-        .context("fuzzy search failed")?;
+        .context("semantic search unavailable")?;
 
-        Ok(SearchResults { results, scanned })
+        Ok(SearchResults {
+            results: outcome.results,
+            scanned: outcome.scanned,
+        })
     }
 
     pub fn extract_intents(&self, config: &IntentsConfig) -> Result<IntentExtraction> {

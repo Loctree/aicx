@@ -13,15 +13,10 @@
 //! exits non-zero so operators see exactly what to do, instead of
 //! receiving "0 results" without a story.
 //!
-//! Operators who explicitly want the legacy fuzzy path use the existing
-//! `--no-semantic` flag, which dispatches to [`crate::rank::fuzzy_search_store`]
-//! directly without consulting this module.
-//!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use std::path::Path;
 
-use anyhow::Result;
 use serde::Serialize;
 
 use crate::rank::FuzzyResult;
@@ -42,21 +37,6 @@ pub struct SemanticSearchOutcome {
     /// Embedder model identifier surfaced for operator diagnostics
     /// (e.g. `"F2LLM-v2-0.6B.Q4_K_M.gguf"`).
     pub model_id: String,
-}
-
-/// Outcome of a semantic-vs-fallback dispatch.
-///
-/// `Fallback` survives only for callers explicitly invoking
-/// [`crate::rank::fuzzy_search_store`] via `--no-semantic`. The default
-/// `aicx search` path uses [`SemanticOutcome`] / [`SemanticError`] and
-/// fails fast on missing preconditions — see module docs.
-#[derive(Debug)]
-pub enum SearchPath {
-    /// Semantic search succeeded; caller should render `results` and emit
-    /// `oracle_status` with `backend=embedded_semantic`.
-    Semantic(SemanticSearchOutcome),
-    /// Operator explicitly requested fuzzy via `--no-semantic`.
-    Fallback { reason: String },
 }
 
 /// Result of a semantic search call.
@@ -203,25 +183,6 @@ pub fn try_semantic_search(
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     {
         try_semantic_search_native(query, limit, project_filter)
-    }
-}
-
-/// Compatibility shim: the legacy [`SearchPath`]-returning entrypoint for
-/// callers (e.g. `--no-semantic` dispatch) that still need the fallback
-/// shape. New code should use [`try_semantic_search`] directly and
-/// pattern-match on [`SemanticError`].
-pub fn try_semantic_search_path(
-    _store_root: &Path,
-    query: &str,
-    limit: usize,
-    project_filter: Option<&str>,
-    frame_kind_filter: Option<FrameKind>,
-) -> Result<SearchPath> {
-    match try_semantic_search(_store_root, query, limit, project_filter, frame_kind_filter) {
-        Ok(outcome) => Ok(SearchPath::Semantic(outcome)),
-        Err(err) => Ok(SearchPath::Fallback {
-            reason: err.reason().to_string(),
-        }),
     }
 }
 
@@ -437,21 +398,17 @@ fn index_appears_empty(path: &std::path::Path) -> bool {
 }
 
 /// Compose the canonical `oracle_status` line emitted to stderr after a
-/// search call, given the chosen path.
-///
-/// The shape mirrors the legacy hard-coded line so operators do not have
-/// to learn a new format; only the values change to reflect reality.
-pub fn render_oracle_status_line(path: &SearchPath, result_count: usize, scanned: usize) -> String {
-    match path {
-        SearchPath::Semantic(outcome) => format!(
-            "{} result(s) from {} candidate chunks. oracle_status: backend={} index=lance fallback=none model={} loctree_scope_safe=true",
-            result_count, scanned, outcome.backend_label, outcome.model_id
-        ),
-        SearchPath::Fallback { reason } => format!(
-            "{} result(s) from {} scanned chunks. oracle_status: backend=filesystem_fuzzy_fallback index=none fallback_reason=\"{}\" loctree_scope_safe=false",
-            result_count, scanned, reason
-        ),
-    }
+/// successful semantic search call.
+pub fn render_semantic_status_line(
+    backend_label: &str,
+    model_id: &str,
+    result_count: usize,
+    scanned: usize,
+) -> String {
+    format!(
+        "{} result(s) from {} candidate chunks. oracle_status: backend={} index=lance fallback=none model={} loctree_scope_safe=true",
+        result_count, scanned, backend_label, model_id
+    )
 }
 
 #[cfg(test)]
@@ -504,26 +461,13 @@ mod tests {
     }
 
     #[test]
-    fn oracle_status_line_for_fallback_includes_reason() {
-        let path = SearchPath::Fallback {
-            reason: "embedder init failed: no GGUF model found".to_string(),
-        };
-        let line = render_oracle_status_line(&path, 5, 421);
-        assert!(line.contains("backend=filesystem_fuzzy_fallback"));
-        assert!(line.contains("fallback_reason=\"embedder init failed: no GGUF model found\""));
-        assert!(line.contains("5 result"));
-        assert!(line.contains("421 scanned chunks"));
-    }
-
-    #[test]
-    fn oracle_status_line_for_semantic_marks_backend_and_index() {
-        let path = SearchPath::Semantic(SemanticSearchOutcome {
-            results: Vec::new(),
-            scanned: 11_237,
-            backend_label: "embedded_semantic",
-            model_id: "F2LLM-v2-0.6B.Q4_K_M.gguf".to_string(),
-        });
-        let line = render_oracle_status_line(&path, 0, 11_237);
+    fn semantic_status_line_marks_backend_and_index() {
+        let line = render_semantic_status_line(
+            "embedded_semantic",
+            "F2LLM-v2-0.6B.Q4_K_M.gguf",
+            0,
+            11_237,
+        );
         assert!(line.contains("backend=embedded_semantic"));
         assert!(line.contains("index=lance"));
         assert!(line.contains("model=F2LLM-v2-0.6B.Q4_K_M.gguf"));

@@ -1075,12 +1075,6 @@ enum Commands {
         /// Emit compact JSON instead of plain text
         #[arg(short = 'j', long)]
         json: bool,
-
-        /// Force filesystem-fuzzy search; skip the embedded semantic path
-        /// even when the embedder is available. Useful for debugging
-        /// retrieval or comparing rankings.
-        #[arg(long)]
-        no_semantic: bool,
     },
 
     /// Build (or preview) the vector index used by semantic `aicx search`.
@@ -1676,7 +1670,6 @@ fn main() -> Result<()> {
             date,
             filters,
             json,
-            no_semantic,
         }) => {
             run_search(
                 &query,
@@ -1685,7 +1678,6 @@ fn main() -> Result<()> {
                 date.as_deref(),
                 json,
                 filters,
-                no_semantic,
             )?;
         }
         Some(Commands::Index {
@@ -3548,7 +3540,9 @@ fn parse_date_filter(s: &str) -> Result<(Option<String>, Option<String>)> {
     }
 }
 
-/// Ad-hoc terminal fuzzy search across the aicx store.
+/// Semantic-only retrieval across the aicx canonical store. Fails fast
+/// (exit code 2) with `kind` + `reason` + `recommendation` when any
+/// precondition is missing — see [`aicx::search_engine::SemanticError`].
 fn run_search(
     query: &str,
     project: Option<&str>,
@@ -3556,7 +3550,6 @@ fn run_search(
     date: Option<&str>,
     json: bool,
     filters: RetrievalFilters,
-    no_semantic: bool,
 ) -> Result<()> {
     // Extract inline date hints from query if no explicit --date given
     let (effective_query, inline_date) = if date.is_none() {
@@ -3587,69 +3580,43 @@ fn run_search(
         filters.limit
     };
 
-    // Semantic-by-default with fail-fast diagnostics. Operator may opt
-    // out of semantic via `--no-semantic`, which dispatches to the
-    // legacy lexical fuzzy path. In the default semantic path a missing
-    // precondition (embedder not hydrated, index not built, dimension
-    // mismatch, ...) returns a typed [`SemanticError`] with an
-    // actionable recommendation; we render it and exit non-zero so the
-    // operator sees what to do instead of getting "0 results" silently.
-    let semantic_path = if no_semantic {
-        aicx::search_engine::SearchPath::Fallback {
-            reason: "operator passed --no-semantic".to_string(),
-        }
-    } else {
-        match aicx::search_engine::try_semantic_search(
-            &root,
-            &search_query,
-            fetch_limit,
-            project,
-            filters.frame_kind.map(Into::into),
-        ) {
-            Ok(outcome) => aicx::search_engine::SearchPath::Semantic(outcome),
-            Err(err) => {
-                // Fail-fast path: render a human-readable error +
-                // recommendation to stderr, plus a structured JSON
-                // payload to stdout for scripted consumers, then exit
-                // non-zero. NO silent fallback.
-                let payload = serde_json::json!({
-                    "ok": false,
-                    "error": "semantic_search_unavailable",
-                    "kind": err.kind(),
-                    "reason": err.reason(),
-                    "recommendation": err.recommendation(),
-                });
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&payload)?);
-                } else {
-                    eprintln!("aicx search: semantic search unavailable.");
-                    eprintln!("  kind:           {}", err.kind());
-                    eprintln!("  reason:         {}", err.reason());
-                    eprintln!("  recommendation: {}", err.recommendation());
-                    eprintln!();
-                    eprintln!(
-                        "(operator-override: pass `--no-semantic` to fall back to lexical fuzzy on this corpus.)"
-                    );
-                }
-                std::process::exit(2);
+    // Semantic-only: no fuzzy fallback, no operator escape hatch. When
+    // a precondition is missing (embedder unhydrated, index not built,
+    // dimension mismatch, ...) [`try_semantic_search`] returns a typed
+    // [`SemanticError`] with an actionable recommendation; we render
+    // it and exit non-zero so the operator sees what to do instead of
+    // receiving "0 results" silently.
+    let outcome = match aicx::search_engine::try_semantic_search(
+        &root,
+        &search_query,
+        fetch_limit,
+        project,
+        filters.frame_kind.map(Into::into),
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let payload = serde_json::json!({
+                "ok": false,
+                "error": "semantic_search_unavailable",
+                "kind": err.kind(),
+                "reason": err.reason(),
+                "recommendation": err.recommendation(),
+            });
+            if json {
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else {
+                eprintln!("aicx search: semantic search unavailable.");
+                eprintln!("  kind:           {}", err.kind());
+                eprintln!("  reason:         {}", err.reason());
+                eprintln!("  recommendation: {}", err.recommendation());
             }
+            std::process::exit(2);
         }
     };
-
-    let (results, scanned) = match &semantic_path {
-        aicx::search_engine::SearchPath::Semantic(outcome) => {
-            (outcome.results.clone(), outcome.scanned)
-        }
-        aicx::search_engine::SearchPath::Fallback { .. } => rank::fuzzy_search_store(
-            &root,
-            &search_query,
-            fetch_limit,
-            project,
-            filters.frame_kind.map(Into::into),
-        )?,
-    };
-
-    let mut results = results;
+    let semantic_backend = outcome.backend_label;
+    let semantic_model_id = outcome.model_id;
+    let scanned = outcome.scanned;
+    let mut results = outcome.results;
 
     if let Some(min_score) = filters.score {
         results.retain(|r| r.score >= min_score);
@@ -3722,7 +3689,12 @@ fn run_search(
     if io::stderr().is_terminal() {
         eprintln!(
             "\n{}",
-            aicx::search_engine::render_oracle_status_line(&semantic_path, results.len(), scanned)
+            aicx::search_engine::render_semantic_status_line(
+                semantic_backend,
+                &semantic_model_id,
+                results.len(),
+                scanned
+            )
         );
     }
     Ok(())

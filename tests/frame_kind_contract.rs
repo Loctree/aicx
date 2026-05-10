@@ -278,6 +278,12 @@ fn codex_store_round_trips_frame_kind_filters() {
         ]
     );
 
+    // `aicx search` is semantic-only since v0.7. In this hermetic test env
+    // there's no hydrated embedder or built index, so the CLI must fail
+    // fast with a typed error payload (exit code 2) rather than silently
+    // returning empty results. End-to-end frame_kind round-trip with a
+    // real index lives in `tests/e2e_pipeline.rs` (feature-gated against
+    // the operator's canonical ~/.aicx config).
     let search_output = run_aicx(
         &home,
         &[
@@ -288,34 +294,45 @@ fn codex_store_round_trips_frame_kind_filters() {
             "--json",
             "-p",
             "ai-contexters",
-            // Test asserts the lexical frame-kind filter contract; the
-            // hermetic test env has no embedder, so `--no-semantic`
-            // explicitly opts into the fuzzy path. Production search
-            // fails fast on missing embedder; this test does not.
-            "--no-semantic",
         ],
     );
-    let search_payload = parse_stdout_json(&search_output);
-    assert_eq!(search_payload["results"].as_u64(), Some(1));
     assert_eq!(
-        search_payload["items"][0]["frame_kind"].as_str(),
-        Some("internal_thought")
+        search_output.status.code(),
+        Some(2),
+        "semantic-only search must fail fast with exit 2 when preconditions are missing\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&search_output.stdout),
+        String::from_utf8_lossy(&search_output.stderr)
     );
-    let expected_thought_file = paths_by_frame["internal_thought"]
-        .file_name()
-        .expect("thought chunk filename")
-        .to_string_lossy()
-        .into_owned();
+    let search_payload: Value =
+        serde_json::from_slice(&search_output.stdout).expect("fail-fast emits JSON payload");
+    assert_eq!(search_payload["ok"].as_bool(), Some(false));
     assert_eq!(
-        Path::new(
-            search_payload["items"][0]["path"]
-                .as_str()
-                .expect("search result path"),
-        )
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .as_deref(),
-        Some(expected_thought_file.as_str())
+        search_payload["error"].as_str(),
+        Some("semantic_search_unavailable")
+    );
+    let kind = search_payload["kind"]
+        .as_str()
+        .expect("fail-fast payload carries kind label");
+    assert!(
+        matches!(
+            kind,
+            "embedder_feature_missing" | "embedder_unavailable" | "index_not_built" | "empty_index"
+        ),
+        "unexpected fail-fast kind: {kind}"
+    );
+    assert!(
+        !search_payload["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "fail-fast reason must not be empty"
+    );
+    assert!(
+        !search_payload["recommendation"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "fail-fast recommendation must not be empty"
     );
 
     #[cfg(feature = "lance")]
