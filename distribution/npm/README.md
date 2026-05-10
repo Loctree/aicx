@@ -72,6 +72,7 @@ distribution/npm/
 ```bash
 node distribution/npm/sync-version.mjs 0.7.0
 node distribution/npm/sync-version.mjs --check 0.7.0
+node distribution/npm/verify-metadata.mjs 0.7.0
 ```
 
 See [PUBLISHING.md](./PUBLISHING.md) for the publish flow.

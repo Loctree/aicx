@@ -44,6 +44,7 @@ pub async fn search_steer_index(
     anyhow::bail!(
         "The LanceDB vector steer index is not enabled in this aicx build.\n\
          To use `aicx steer` and MCP `aicx_steer`, please install a pre-built binary \
-         from GitHub Releases, or re-compile from source with `cargo build --release --features lance`."
+         from GitHub Releases, or re-compile from source with `cargo build --release --features lance`.\n\
+         Alternatively, use `aicx search` for fast filesystem-based semantic/fuzzy fallback."
     )
 }

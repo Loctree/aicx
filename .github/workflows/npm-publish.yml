@@ -70,6 +70,15 @@ jobs:
             curl -fsLI "${base_url}/${asset}.sha256" >/dev/null
           done
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Verify npm package metadata
+        run: |
+          node distribution/npm/sync-version.mjs "${{ steps.meta.outputs.version }}"
+          node distribution/npm/verify-metadata.mjs "${{ steps.meta.outputs.version }}"
+
   publish-platform-packages:
     name: Publish platform package ${{ matrix.platform }}
     needs: verify
