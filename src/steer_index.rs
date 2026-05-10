@@ -797,10 +797,11 @@ pub async fn sync_steer_index_with_progress(
     sync_steer_index_at_with_reporter(&base, new_files, reporter, failures).await
 }
 
-pub async fn query_steer_index() -> Result<Vec<ChromaDocument>> {
+pub async fn query_steer_index_count() -> Result<usize> {
     let base = crate::store::store_base_dir()?;
     ensure_steer_index_compatible_at(&base).await?;
-    query_steer_index_at(&base).await
+    let docs = query_steer_index_at(&base).await?;
+    Ok(docs.len())
 }
 
 pub async fn rebuild_steer_index_if_needed() -> Result<()> {

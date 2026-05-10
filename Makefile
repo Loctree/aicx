@@ -19,6 +19,7 @@ NATIVE ?= 0
 FEATURES ?=
 TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
 CODESIGN ?= auto
+CARGO_BUILD ?= cargo build
 DIST_DIR ?= $(CURDIR)/dist
 DRY_RUN ?= 0
 RELEASE_BINARIES := aicx aicx-mcp
@@ -34,7 +35,7 @@ release-binaries:
 		echo "STAGING_DIR is required. Usage: make release-binaries STAGING_DIR=/tmp/stage TARGET=$(TARGET)" >&2; \
 		exit 1; \
 	fi
-	cargo build --locked --release --target "$(TARGET)" --bin aicx --bin aicx-mcp
+	$(CARGO_BUILD) --locked --release --target "$(TARGET)" --bin aicx --bin aicx-mcp
 	@mkdir -p "$(STAGING_DIR)/bin" "$(STAGING_DIR)/components"
 	@for bin in $(RELEASE_BINARIES); do \
 		install -m 0755 "target/$(TARGET)/release/$$bin" "$(STAGING_DIR)/bin/$$bin"; \

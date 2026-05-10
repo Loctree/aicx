@@ -1436,7 +1436,7 @@ fn run_memex_cli(args: &[&str], action: &str) -> Result<(String, Output)> {
         )
     });
     Err(last_not_found).context(format!(
-        "Failed to run memex {action}. Tried rust-memex, then rmcp-memex."
+        "Semantic search (vector backend) is an optional capability. Failed to run memex {action}: missing compatible memex CLI (\rust-memex or \rmcp-memex). Please install the vector backend or fall back to default lexical search."
     ))
 }
 

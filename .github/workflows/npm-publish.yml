@@ -62,9 +62,8 @@ jobs:
         run: |
           base_url="https://github.com/Loctree/aicx/releases/download/${RELEASE_TAG}"
           assets=(
-            "aicx-v${{ steps.meta.outputs.version }}-aarch64-apple-darwin.zip"
-            "aicx-v${{ steps.meta.outputs.version }}-x86_64-apple-darwin.zip"
-            "aicx-v${{ steps.meta.outputs.version }}-x86_64-unknown-linux-musl.tar.gz"
+            "aicx-v${{ steps.meta.outputs.version }}-aarch64-apple-darwin-slim-unsigned.tar.gz"
+            "aicx-v${{ steps.meta.outputs.version }}-x86_64-unknown-linux-gnu-slim-unsigned.tar.gz"
           )
           for asset in "${assets[@]}"; do
             curl -fsLI "${base_url}/${asset}" >/dev/null
@@ -80,9 +79,7 @@ jobs:
       matrix:
         platform:
           - darwin-arm64
-          - darwin-x64
           - linux-x64-gnu
-          - linux-x64-musl
     steps:
       - uses: actions/checkout@v6
 

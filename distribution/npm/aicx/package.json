@@ -46,8 +46,6 @@
   },
   "optionalDependencies": {
     "@loctree/aicx-darwin-arm64": "0.7.0",
-    "@loctree/aicx-darwin-x64": "0.7.0",
-    "@loctree/aicx-linux-x64-gnu": "0.7.0",
-    "@loctree/aicx-linux-x64-musl": "0.7.0"
+    "@loctree/aicx-linux-x64-gnu": "0.7.0"
   }
 }

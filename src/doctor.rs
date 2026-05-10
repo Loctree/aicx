@@ -799,6 +799,17 @@ fn check_canonical_store(base: &Path) -> CheckResult {
     }
 }
 
+#[cfg(not(feature = "lance"))]
+async fn check_steer_lance(_base: &Path) -> CheckResult {
+    CheckResult {
+        name: "steer_lance".to_string(),
+        severity: Severity::Green,
+        detail: "steer_index (Lance/BM25) feature is disabled".to_string(),
+        recommendation: None,
+    }
+}
+
+#[cfg(feature = "lance")]
 async fn check_steer_lance(base: &Path) -> CheckResult {
     let lance_dir = base.join("steer_db").join("mcp_documents.lance");
     if !lance_dir.exists() {
@@ -809,11 +820,11 @@ async fn check_steer_lance(base: &Path) -> CheckResult {
             recommendation: None,
         };
     }
-    match steer_index::query_steer_index().await {
-        Ok(docs) => CheckResult {
+    match steer_index::query_steer_index_count().await {
+        Ok(count) => CheckResult {
             name: "steer_lance".to_string(),
             severity: Severity::Green,
-            detail: format!("Lance steer table healthy, {} documents", docs.len()),
+            detail: format!("Lance steer table healthy, {} documents", count),
             recommendation: None,
         },
         Err(e) => {
@@ -841,6 +852,17 @@ async fn check_steer_lance(base: &Path) -> CheckResult {
     }
 }
 
+#[cfg(not(feature = "lance"))]
+fn check_steer_bm25(_base: &Path) -> CheckResult {
+    CheckResult {
+        name: "steer_bm25".to_string(),
+        severity: Severity::Green,
+        detail: "steer_index (Lance/BM25) feature is disabled".to_string(),
+        recommendation: None,
+    }
+}
+
+#[cfg(feature = "lance")]
 fn check_steer_bm25(base: &Path) -> CheckResult {
     let bm25_dir = base.join("steer_bm25");
     if !bm25_dir.exists() {

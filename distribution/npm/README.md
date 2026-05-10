@@ -6,10 +6,9 @@ The source of truth for the product lives in
 thin JS wrapper and platform-package manifests that ship to the `@loctree` npm
 scope.
 
-> Status: not active for `v0.6.5`. The current GitHub Release publishes
-> `*-slim-unsigned.tar.gz` assets for macOS arm64, Linux x64 GNU, and Linux
-> arm64 GNU. The npm platform packages in this directory still describe the
-> older zip/musl/darwin-x64 matrix and must be realigned before publishing.
+> Status: aligned to the current `*-slim-unsigned.tar.gz` GitHub Release asset
+> shape for macOS arm64 and Linux x64 GNU. Do not publish npm packages until the
+> matching release assets and `.sha256` sidecars exist for the target version.
 
 ## Wrapper package
 
@@ -17,17 +16,15 @@ scope.
 | --- | --- | --- | --- |
 | `@loctree/aicx` | `aicx`, `aicx-mcp` | CLI + MCP server | `Loctree/aicx` |
 
-The wrapper declares 4 platform sub-packages as `optionalDependencies`
+The wrapper declares active platform sub-packages as `optionalDependencies`
 (esbuild/swc pattern).
 
 Current platform matrix:
 
 - `darwin-arm64`
-- `darwin-x64`
 - `linux-x64-gnu`
-- `linux-x64-musl`
 
-Total: **1 wrapper + 4 platform packages = 5 npm packages.**
+Total: **1 wrapper + 2 active platform packages = 3 npm packages.**
 
 ## Install
 
@@ -41,10 +38,6 @@ Then:
 aicx --help
 aicx-mcp --version
 ```
-
-This is the intended install shape after the npm platform packages are updated.
-For `v0.6.5`, use `AICX_INSTALL_MODE=release` with the GitHub Release assets
-instead.
 
 That install surface is intentionally binary-only:
 
@@ -71,9 +64,7 @@ distribution/npm/
     │   └── aicx-mcp
     └── platform-packages/
         ├── darwin-arm64/
-        ├── darwin-x64/
-        ├── linux-x64-gnu/
-        └── linux-x64-musl/
+        └── linux-x64-gnu/
 ```
 
 ## Repo maintenance workflow
