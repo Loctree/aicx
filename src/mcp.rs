@@ -288,7 +288,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_search",
-        description = "Search stored AI session chunks with fast metadata narrowing plus canonical-store fuzzy scoring. Returns oracle_status so callers can see that this is filesystem fuzzy, not semantic retrieval."
+        description = "Search stored AI session chunks via semantic vector similarity over the canonical corpus. Fails fast with kind/reason/recommendation when preconditions are missing (embedder unhydrated, vector index not built, dimension mismatch) — no silent fuzzy fallback. The returned oracle_status carries backend=embedded_semantic on success."
     )]
     async fn search(
         &self,
@@ -309,14 +309,41 @@ impl AicxMcpServer {
 
         let store_root = store::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
-        let (results, scanned) = rank::fuzzy_search_store(
+
+        // Semantic-only dispatch. No fuzzy fallback. When a precondition
+        // is missing (embedder unhydrated, index not built, ...) return
+        // a structured McpError carrying the same `kind` + `reason` +
+        // `recommendation` triple the CLI fail-fast surface emits, so an
+        // MCP caller has the same diagnostic to act on.
+        let outcome = match crate::search_engine::try_semantic_search(
             &store_root,
             &query,
             fetch_limit,
             project.as_deref(),
             frame_kind,
-        )
-        .map_err(|e| McpError::internal_error(format!("Read store: {e}"), None))?;
+        ) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                let payload = serde_json::json!({
+                    "ok": false,
+                    "error": "semantic_search_unavailable",
+                    "kind": err.kind(),
+                    "reason": err.reason(),
+                    "recommendation": err.recommendation(),
+                });
+                return Err(McpError::invalid_params(
+                    format!(
+                        "semantic search unavailable [{}]: {} — recommendation: {}",
+                        err.kind(),
+                        err.reason(),
+                        err.recommendation()
+                    ),
+                    Some(payload),
+                ));
+            }
+        };
+        let scanned = outcome.scanned;
+        let results = outcome.results;
 
         let mut results = results;
 

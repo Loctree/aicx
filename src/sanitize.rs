@@ -479,7 +479,6 @@ const SELF_ECHO_PATTERNS: &[&str] = &[
     "aicx_refs",
     "aicx_store",
     // Dashboard API calls
-    "/api/search/fuzzy",
     "/api/search/semantic",
     "/api/search/cross",
     "/api/health",
@@ -580,7 +579,7 @@ mod echo_tests {
     #[test]
     fn test_api_call_is_echo() {
         assert!(is_self_echo(
-            r#"curl -s "http://127.0.0.1:8033/api/search/fuzzy?q=deploy+vistacare&limit=3""#
+            r#"curl -s "http://127.0.0.1:8033/api/search/semantic?q=deploy+vistacare&limit=3""#
         ));
     }
 

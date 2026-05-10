@@ -29,13 +29,8 @@ use tokio::sync::RwLock;
 use std::{fs, io::Write};
 
 use crate::dashboard::{
-    self, DashboardPayload, DashboardRecord, DashboardScope, DashboardStats,
-    project_matches_filter, timestamp_matches_hours_scope,
+    self, DashboardPayload, DashboardRecord, DashboardScope, DashboardStats, project_matches_filter,
 };
-use crate::rank;
-
-/// Guard that prevents concurrent `aicx store` child-process spawns from dashboard search.
-static DASHBOARD_RESCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 
 const REGENERATE_HEADER_NAME: &str = "x-ai-contexters-action";
 const REGENERATE_HEADER_VALUE: &str = "regenerate";
@@ -193,8 +188,16 @@ struct ErrorResponse {
 // Search types
 // ============================================================================
 
+// FuzzySearchParams removed 2026-05-10: dashboard is semantic-only.
+// The `/api/search/semantic` endpoint accepts project/score/frame_kind
+// filters directly via [`SemanticSearchParams`].
+
+fn default_search_limit() -> usize {
+    20
+}
+
 #[derive(Debug, Deserialize)]
-struct FuzzySearchParams {
+struct SemanticSearchParams {
     q: String,
     #[serde(default = "default_search_limit")]
     limit: usize,
@@ -206,25 +209,10 @@ struct FuzzySearchParams {
     frame_kind: Option<crate::timeline::FrameKind>,
 }
 
-fn default_search_limit() -> usize {
-    20
-}
-
-#[derive(Debug, Deserialize)]
-struct SemanticSearchParams {
-    q: String,
-    #[serde(default = "default_namespace")]
-    ns: String,
-    #[serde(default = "default_search_limit")]
-    limit: usize,
-    #[serde(default = "default_search_mode")]
-    mode: String,
-}
-
-fn default_namespace() -> String {
-    "ai-contexts".to_string()
-}
-
+// default_namespace / default_search_mode removed 2026-05-10: the
+// `ns` + `mode` fields they backed lived on the old memex-CLI shim and
+// have no meaning for the in-process semantic dispatch. Cross-search
+// keeps `default_search_mode` inline via its own struct's default.
 fn default_search_mode() -> String {
     "hybrid".to_string()
 }
@@ -355,7 +343,6 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         .route("/api/chunk", get(get_chunk))
         .route("/api/context", get(get_context))
         .route("/api/regenerate", post(regenerate_dashboard))
-        .route("/api/search/fuzzy", get(fuzzy_search))
         .route("/api/search/semantic", get(semantic_search))
         .route("/api/search/cross", get(cross_search))
         .route("/api/search/steer", get(steer_search))
@@ -380,8 +367,9 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
     eprintln!("  Context:   GET  http://{addr}/api/context");
     eprintln!("  Status:    GET  http://{addr}/api/status");
     eprintln!("  Regenerate: POST http://{addr}/api/regenerate");
-    eprintln!("  Fuzzy:     GET  http://{addr}/api/search/fuzzy?q=<query>&score=<min>");
-    eprintln!("  Semantic:  GET  http://{addr}/api/search/semantic?q=<query>&ns=<namespace>");
+    eprintln!(
+        "  Semantic:  GET  http://{addr}/api/search/semantic?q=<query>&project=<p>&score=<min>"
+    );
     eprintln!("  Cross:     GET  http://{addr}/api/search/cross?q=<query>");
     eprintln!("  Steer:     GET  http://{addr}/api/search/steer?run_id=<id>&project=<p>");
     eprintln!("  PWA:       GET  http://{addr}/manifest.webmanifest");
@@ -1115,13 +1103,33 @@ reachable</h1><p>Start the server with <code>aicx dashboard --serve</code></p>\
 // Search handlers
 // ============================================================================
 
-/// Fuzzy text search across all stored chunks.
+// fuzzy_search handler + run_fuzzy_search removed 2026-05-10:
+// dashboard is semantic-only. `/api/search/semantic` (in-process via
+// `crate::search_engine::try_semantic_search`) is the single retrieval
+// path. `--no-semantic` survives only as an explicit operator CLI
+// override, not as an HTTP surface.
+
+fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, String> {
+    match score {
+        Some(score) if score > MAX_SCORE_FILTER => {
+            Err(format!("score must be between 0 and {MAX_SCORE_FILTER}"))
+        }
+        _ => Ok(score),
+    }
+}
+
+/// In-process semantic search against the persistent NDJSON vector
+/// index ([`crate::vector_index::query_index`]). No external memex CLI
+/// spawn — the dashboard ships with the same `try_semantic_search`
+/// dispatch the CLI and MCP surfaces use.
 ///
-/// Reads chunk files from the store, matches lines against the query,
-/// and scores each match using the rank module.
-async fn fuzzy_search(
+/// Fails fast (HTTP 422) with `kind` + `reason` + `recommendation`
+/// when a precondition is missing (embedder unhydrated, vector index
+/// not built, dimension mismatch). Operators see the same diagnostic
+/// they would see from `aicx search` directly.
+async fn semantic_search(
     State(state): State<Arc<DashboardServerState>>,
-    params: Result<Query<FuzzySearchParams>, QueryRejection>,
+    params: Result<Query<SemanticSearchParams>, QueryRejection>,
 ) -> Response {
     let Query(params) = match params {
         Ok(q) => q,
@@ -1152,11 +1160,11 @@ async fn fuzzy_search(
     let limit = params.limit.min(100);
     let store_root = state.config.store_root.clone();
     let scope = state.config.scope.normalized();
-    let request_project = params.project;
+    let request_project = params.project.clone();
     let merged_project_filter =
         merge_project_scope(scope.project.as_deref(), request_project.as_deref());
     let frame_kind = params.frame_kind;
-    let score = match validate_score_filter(params.score) {
+    let score_filter = match validate_score_filter(params.score) {
         Ok(score) => score,
         Err(error) => {
             return (
@@ -1167,31 +1175,49 @@ async fn fuzzy_search(
         }
     };
     let query_clone = query.clone();
-    let refresh_scope = scope.clone();
+    let project_owned = merged_project_filter.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        run_fuzzy_search(
+        crate::search_engine::try_semantic_search(
             &store_root,
             &query_clone,
             limit,
-            merged_project_filter.as_deref(),
-            score,
+            project_owned.as_deref(),
             frame_kind,
-            refresh_scope,
         )
     })
     .await;
 
     match result {
-        Ok(Ok((results, total_scanned))) => {
-            let results = results
+        Ok(Ok(outcome)) => {
+            let mut results: Vec<_> = outcome
+                .results
                 .into_iter()
-                .filter(|result| {
-                    project_matches_filter(&result.project, request_project.as_deref())
-                        && project_matches_filter(&result.project, scope.project.as_deref())
+                .filter(|r| {
+                    project_matches_filter(&r.project, request_project.as_deref())
+                        && project_matches_filter(&r.project, scope.project.as_deref())
+                })
+                .filter(|r| score_filter.is_none_or(|min| r.score >= min))
+                .map(|result| {
+                    let excerpt = result.matched_lines.join(" ... ");
+                    FuzzySearchResult {
+                        file: result.file,
+                        path: result.path,
+                        project: result.project,
+                        kind: result.kind,
+                        frame_kind: result.frame_kind,
+                        agent: result.agent,
+                        date: result.date,
+                        score: result.score,
+                        label: result.label,
+                        signal_density: result.density,
+                        matched_lines: result.matched_lines,
+                        excerpt,
+                    }
                 })
                 .collect();
-
+            results.truncate(limit);
+            let total_scanned = outcome.scanned;
             (
                 StatusCode::OK,
                 Json(FuzzySearchResponse {
@@ -1203,14 +1229,20 @@ async fn fuzzy_search(
             )
                 .into_response()
         }
-        Ok(Err(err)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                ok: false,
-                error: format!("{err:#}"),
-            }),
-        )
-            .into_response(),
+        Ok(Err(err)) => {
+            // Fail-fast with the same kind/reason/recommendation triple
+            // that the CLI and MCP surfaces emit. Status 422 to signal
+            // "request was valid but a precondition is missing" rather
+            // than 500 (server bug).
+            let payload = serde_json::json!({
+                "ok": false,
+                "error": "semantic_search_unavailable",
+                "kind": err.kind(),
+                "reason": err.reason(),
+                "recommendation": err.recommendation(),
+            });
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(payload)).into_response()
+        }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -1222,196 +1254,12 @@ async fn fuzzy_search(
     }
 }
 
-fn run_fuzzy_search(
-    store_root: &Path,
-    query: &str,
-    limit: usize,
-    project_filter: Option<&str>,
-    score: Option<u8>,
-    frame_kind: Option<crate::timeline::FrameKind>,
-    refresh_scope: DashboardScope,
-) -> Result<(Vec<FuzzySearchResult>, usize)> {
-    // Non-blocking auto-rescan with rate-limit guard.
-    if !DASHBOARD_RESCAN_RUNNING.swap(true, Ordering::SeqCst) {
-        let normalized_scope = refresh_scope.normalized();
-        let mut command = std::process::Command::new("aicx");
-        command
-            .arg("store")
-            .arg("-H")
-            .arg(normalized_scope.hours.unwrap_or(24).to_string())
-            .arg("--emit")
-            .arg("none");
-        if let Some(project) = normalized_scope.project {
-            command.arg("--project").arg(project);
-        }
-        match command
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(_) => {
-                std::thread::spawn(|| {
-                    std::thread::sleep(std::time::Duration::from_secs(30));
-                    DASHBOARD_RESCAN_RUNNING.store(false, Ordering::SeqCst);
-                });
-            }
-            Err(_) => {
-                DASHBOARD_RESCAN_RUNNING.store(false, Ordering::SeqCst);
-            }
-        }
-    }
-
-    // Try fast search with rmcp_memex first (instant), fallback to brute-force if it fails or returns nothing
-    let fetch_limit = if score.is_some() {
-        limit.saturating_mul(5).max(50)
-    } else {
-        limit
-    };
-
-    let (results, total_scanned) =
-        rank::fuzzy_search_store(store_root, query, fetch_limit, project_filter, frame_kind)?;
-
-    let mut results = results;
-    if let Some(min_score) = score {
-        results.retain(|result| result.score >= min_score);
-    }
-    results.retain(|result| {
-        timestamp_matches_hours_scope(
-            result.timestamp.as_deref(),
-            &result.date,
-            refresh_scope.hours,
-        )
-    });
-
-    let results = results
-        .into_iter()
-        .take(limit)
-        .map(|result| {
-            let excerpt = result.matched_lines.join(" ... ");
-            FuzzySearchResult {
-                file: result.file,
-                path: result.path,
-                project: result.project,
-                kind: result.kind,
-                frame_kind: result.frame_kind,
-                agent: result.agent,
-                date: result.date,
-                score: result.score,
-                label: result.label,
-                signal_density: result.density,
-                matched_lines: result.matched_lines,
-                excerpt,
-            }
-        })
-        .collect();
-
-    Ok((results, total_scanned))
-}
-
-fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, String> {
-    match score {
-        Some(score) if score > MAX_SCORE_FILTER => {
-            Err(format!("score must be between 0 and {MAX_SCORE_FILTER}"))
-        }
-        _ => Ok(score),
-    }
-}
-
-/// Semantic search via the configured memex CLI.
-///
-/// Prefers `rust-memex` and falls back to the legacy `rmcp-memex` binary when
-/// operators still have the old name on PATH.
-async fn semantic_search(params: Result<Query<SemanticSearchParams>, QueryRejection>) -> Response {
-    let Query(params) = match params {
-        Ok(q) => q,
-        Err(rejection) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    ok: false,
-                    error: format!("Invalid query parameters: {rejection}"),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    let query = params.q.trim().to_string();
-    if query.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                ok: false,
-                error: "Query parameter 'q' is required".to_string(),
-            }),
-        )
-            .into_response();
-    }
-
-    let ns = params.ns;
-    let limit = params.limit;
-    let mode = params.mode;
-
-    let result =
-        tokio::task::spawn_blocking(move || run_memex_search(&query, &ns, limit, &mode)).await;
-
-    match result {
-        Ok(Ok(response)) => (StatusCode::OK, Json(response)).into_response(),
-        Ok(Err(err)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                ok: false,
-                error: format!("{err:#}"),
-            }),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                ok: false,
-                error: format!("Search task failed: {err}"),
-            }),
-        )
-            .into_response(),
-    }
-}
-
-fn run_memex_search(
-    query: &str,
-    namespace: &str,
-    limit: usize,
-    mode: &str,
-) -> Result<MemexSearchResponse> {
-    let args = [
-        "search",
-        "-n",
-        namespace,
-        "-q",
-        query,
-        "-l",
-        &limit.to_string(),
-        "-m",
-        mode,
-        "--json",
-    ];
-    let (binary, output) = run_memex_cli(&args, "search")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("{binary} search failed: {}", stderr.trim());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let results: serde_json::Value =
-        serde_json::from_str(&stdout).unwrap_or(serde_json::Value::String(stdout.to_string()));
-
-    Ok(MemexSearchResponse {
-        ok: true,
-        query: query.to_string(),
-        source: format!("{binary} search -n {} --mode {}", namespace, mode),
-        results,
-    })
-}
+// run_memex_search removed 2026-05-10: dashboard semantic search is
+// now in-process via `crate::search_engine::try_semantic_search`.
+// External `rust-memex` / `rmcp-memex` CLI spawn is no longer used for
+// the `/api/search/semantic` path. `run_memex_cli` + `run_memex_cross_search`
+// survive only for the cross-search endpoint (separate doctrine; lands
+// in its own cut when that surface migrates in-process).
 
 fn run_memex_cli(args: &[&str], action: &str) -> Result<(String, Output)> {
     let candidates = ["rust-memex", "rmcp-memex"];
