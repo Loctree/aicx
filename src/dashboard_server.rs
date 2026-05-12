@@ -1182,7 +1182,7 @@ async fn semantic_search(
             &store_root,
             &query_clone,
             limit,
-            project_owned.as_deref(),
+            &[project_owned.as_deref()],
             frame_kind,
         )
     })

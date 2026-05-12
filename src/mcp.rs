@@ -319,7 +319,7 @@ impl AicxMcpServer {
             &store_root,
             &query,
             fetch_limit,
-            project.as_deref(),
+            &[project.as_deref()],
             frame_kind,
         ) {
             Ok(outcome) => outcome,

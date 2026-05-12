@@ -113,7 +113,7 @@ impl Aicx {
             &self.config.store_root,
             query.as_ref(),
             opts.limit,
-            opts.project.as_deref(),
+            &[opts.project.as_deref()],
             opts.frame_kind,
         )
         .map_err(anyhow::Error::from)

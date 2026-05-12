@@ -745,7 +745,11 @@ pub fn take_prefix_bytes(s: &str, max_bytes: usize) -> String {
 /// Render a human-friendly summary of [`IndexStats`] for stderr.
 pub fn render_stats_text(stats: &IndexStats) -> String {
     let mut out = String::new();
-    out.push_str("aicx index — dry-run report\n");
+    if stats.dry_run {
+        out.push_str("aicx index — dry-run report\n");
+    } else {
+        out.push_str("aicx index — materialization report\n");
+    }
     out.push_str(&format!("  chunks_total:        {}\n", stats.chunks_total));
     out.push_str(&format!(
         "  chunks_sampled:      {}\n",
@@ -773,7 +777,7 @@ pub fn render_stats_text(stats: &IndexStats) -> String {
         out.push_str(&format!("  fallback_reason:     {}\n", reason));
     }
     if stats.dry_run {
-        out.push_str("  note: dry-run only; persistent Lance write lands in Iter 3.\n");
+        out.push_str("  note: dry-run only; omit `--dry-run` to materialize the semantic index.\n");
     }
     out
 }

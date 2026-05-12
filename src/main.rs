@@ -1048,17 +1048,20 @@ enum Commands {
     /// `aicx` aims to be semantic by default: queries are encoded through
     /// the in-process embedder ([`aicx_embeddings`] GGUF stack) and matched
     /// against a materialized vector index. When the embedder cannot load
-    /// or no index has been built yet, the command falls back to
-    /// filesystem-fuzzy search and emits a precise `oracle_status` line so
-    /// the operator can tell which path actually ran.
+    /// or no index has been built yet, the command fails fast with a typed
+    /// reason. Pass `--no-semantic` to intentionally run filesystem-fuzzy
+    /// search instead.
     #[command(display_order = 12)]
     Search {
         /// Search query string
         query: String,
 
-        /// Repo or store-bucket filter (case-insensitive substring)
-        #[arg(short, long)]
-        project: Option<String>,
+        /// Repo or store-bucket filters. Omit to search all projects.
+        ///
+        /// Accepts repeated flags (`-p repo-a -p repo-b`), comma-separated
+        /// values (`-p repo-a,repo-b`), or a space list (`-p repo-a repo-b`).
+        #[arg(short, long, num_args = 1.., value_delimiter = ',')]
+        project: Vec<String>,
 
         /// Hours to look back (0 = all time)
         #[arg(short = 'H', long, default_value = "0")]
@@ -1072,6 +1075,10 @@ enum Commands {
         #[command(flatten)]
         filters: RetrievalFilters,
 
+        /// Bypass semantic vector search and run filesystem-fuzzy search.
+        #[arg(long)]
+        no_semantic: bool,
+
         /// Emit compact JSON instead of plain text
         #[arg(short = 'j', long)]
         json: bool,
@@ -1079,12 +1086,11 @@ enum Commands {
 
     /// Build (or preview) the vector index used by semantic `aicx search`.
     ///
-    /// Iter 2 ships dry-run only: probe the embedder, sample N chunks from
-    /// the canonical store, embed them, report stats (count / dimension /
-    /// model / ETA). Persistent Lance write of the per-chunk embeddings
-    /// lands in Iter 3 once this surface is validated against real input.
+    /// By default this writes the persistent NDJSON-backed semantic index
+    /// queried by `aicx search`. Pass `--dry-run` to probe the embedder,
+    /// sample chunks, and report stats without writing the index.
     ///
-    /// Why dry-run first: it is the smallest unit of evidence that the
+    /// Why dry-run exists: it is the smallest unit of evidence that the
     /// model loads, the corpus reads, and the embedder produces vectors
     /// of the expected dimension. Operators get an honest ETA before
     /// they commit to a full re-index that may take 10–30 minutes on CPU
@@ -1094,9 +1100,12 @@ enum Commands {
         #[command(subcommand)]
         action: Option<IndexAction>,
 
-        /// Repo or store-bucket filter (case-insensitive substring)
-        #[arg(short, long)]
-        project: Option<String>,
+        /// Repo or store-bucket filters. Omit to index all projects.
+        ///
+        /// Accepts repeated flags (`-p repo-a -p repo-b`), comma-separated
+        /// values (`-p repo-a,repo-b`), or a space list (`-p repo-a repo-b`).
+        #[arg(short, long, num_args = 1.., value_delimiter = ',')]
+        project: Vec<String>,
 
         /// Stop after sampling this many chunks (0 = scan all)
         #[arg(long, default_value = "16")]
@@ -1106,10 +1115,15 @@ enum Commands {
         #[arg(short = 'j', long)]
         json: bool,
 
-        /// Dry-run only — Iter 2 ships this mode and only this mode. The
-        /// flag is here today so the CLI surface stays stable when Iter 3
-        /// adds the persistent Lance write under the same command.
-        #[arg(long, default_value = "true")]
+        /// Preview only. Omit this flag to materialize the persistent
+        /// semantic index used by `aicx search`.
+        #[arg(
+            long,
+            default_value_t = false,
+            default_missing_value = "true",
+            num_args = 0..=1,
+            value_parser = clap::builder::BoolishValueParser::new()
+        )]
         dry_run: bool,
     },
 
@@ -1680,15 +1694,17 @@ fn main() -> Result<()> {
             hours,
             date,
             filters,
+            no_semantic,
             json,
         }) => {
             run_search(
                 &query,
-                project.as_deref(),
+                &project,
                 hours,
                 date.as_deref(),
                 json,
                 filters,
+                no_semantic,
             )?;
         }
         Some(Commands::Index {
@@ -1701,7 +1717,7 @@ fn main() -> Result<()> {
             Some(IndexAction::Status { project, json }) => {
                 run_index_status(project.as_deref(), json)?;
             }
-            None => run_index(project.as_deref(), sample, json, dry_run)?,
+            None => run_index(&project, sample, json, dry_run)?,
         },
         Some(Commands::Config { action }) => {
             run_config(action)?;
@@ -3559,11 +3575,12 @@ fn parse_date_filter(s: &str) -> Result<(Option<String>, Option<String>)> {
 /// precondition is missing — see [`aicx::search_engine::SemanticError`].
 fn run_search(
     query: &str,
-    project: Option<&str>,
+    projects: &[String],
     hours: u64,
     date: Option<&str>,
     json: bool,
     filters: RetrievalFilters,
+    no_semantic: bool,
 ) -> Result<()> {
     // Extract inline date hints from query if no explicit --date given
     let (effective_query, inline_date) = if date.is_none() {
@@ -3594,43 +3611,62 @@ fn run_search(
         filters.limit
     };
 
-    // Semantic-only: no fuzzy fallback, no operator escape hatch. When
-    // a precondition is missing (embedder unhydrated, index not built,
-    // dimension mismatch, ...) [`try_semantic_search`] returns a typed
-    // [`SemanticError`] with an actionable recommendation; we render
-    // it and exit non-zero so the operator sees what to do instead of
-    // receiving "0 results" silently.
-    let outcome = match aicx::search_engine::try_semantic_search(
-        &root,
-        &search_query,
-        fetch_limit,
-        project,
-        filters.frame_kind.map(Into::into),
-    ) {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            let payload = serde_json::json!({
-                "ok": false,
-                "error": "semantic_search_unavailable",
-                "kind": err.kind(),
-                "reason": err.reason(),
-                "recommendation": err.recommendation(),
-            });
-            if json {
-                println!("{}", serde_json::to_string_pretty(&payload)?);
-            } else {
-                eprintln!("aicx search: semantic search unavailable.");
-                eprintln!("  kind:           {}", err.kind());
-                eprintln!("  reason:         {}", err.reason());
-                eprintln!("  recommendation: {}", err.recommendation());
+    let scopes: Vec<Option<&str>> = if projects.is_empty() {
+        vec![None]
+    } else {
+        projects.iter().map(String::as_str).map(Some).collect()
+    };
+
+    let (mut results, scanned, semantic_status) = if no_semantic {
+        let (results, scanned) = rank::fuzzy_search_store(
+            &root,
+            &search_query,
+            fetch_limit,
+            &scopes,
+            filters.frame_kind.map(Into::into),
+        )?;
+        (results, scanned, None)
+    } else {
+        match aicx::search_engine::try_semantic_search(
+            &root,
+            &search_query,
+            fetch_limit,
+            &scopes,
+            filters.frame_kind.map(Into::into),
+        ) {
+            Ok(outcome) => {
+                let status = (
+                    outcome.backend_label,
+                    outcome.model_id.clone(),
+                    outcome.scanned,
+                );
+                (outcome.results, outcome.scanned, Some(status))
             }
-            std::process::exit(2);
+            Err(err) => {
+                let payload = serde_json::json!({
+                    "ok": false,
+                    "error": "semantic_search_unavailable",
+                    "kind": err.kind(),
+                    "reason": err.reason(),
+                    "recommendation": err.recommendation(),
+                    "fallback": {
+                        "available": true,
+                        "command": format!("aicx search --no-semantic {:?}", query),
+                    },
+                });
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&payload)?);
+                } else {
+                    eprintln!("aicx search: semantic search unavailable.");
+                    eprintln!("  kind:           {}", err.kind());
+                    eprintln!("  reason:         {}", err.reason());
+                    eprintln!("  recommendation: {}", err.recommendation());
+                    eprintln!("  fallback:       aicx search --no-semantic {:?}", query);
+                }
+                std::process::exit(2);
+            }
         }
     };
-    let semantic_backend = outcome.backend_label;
-    let semantic_model_id = outcome.model_id;
-    let scanned = outcome.scanned;
-    let mut results = outcome.results;
 
     if let Some(min_score) = filters.score {
         results.retain(|r| r.score >= min_score);
@@ -3703,12 +3739,21 @@ fn run_search(
     if io::stderr().is_terminal() {
         eprintln!(
             "\n{}",
-            aicx::search_engine::render_semantic_status_line(
-                semantic_backend,
-                &semantic_model_id,
-                results.len(),
-                scanned
-            )
+            match semantic_status {
+                Some((semantic_backend, semantic_model_id, semantic_scanned)) => {
+                    aicx::search_engine::render_semantic_status_line(
+                        semantic_backend,
+                        &semantic_model_id,
+                        results.len(),
+                        semantic_scanned,
+                    )
+                }
+                None => format!(
+                    "{} result(s) from {} scanned chunks. oracle_status: backend=filesystem_fuzzy index=none fallback=operator_requested loctree_scope_safe=false",
+                    results.len(),
+                    scanned
+                ),
+            }
         );
     }
     Ok(())
@@ -3911,19 +3956,61 @@ fn run_config_show(_json: bool) -> Result<()> {
 /// embedder + samples chunks for ETA. `dry_run=false` writes a
 /// persistent NDJSON-backed index (Iter 3) that subsequent `aicx search`
 /// queries against via cosine similarity.
-fn run_index(project: Option<&str>, sample: usize, json: bool, dry_run: bool) -> Result<()> {
-    let stats = if dry_run {
-        let _lock = aicx::locks::acquire_exclusive(aicx::locks::lance_lock_path()?)?;
-        aicx::vector_index::dry_run_index(project, sample)?
+fn run_index(projects: &[String], sample: usize, json: bool, dry_run: bool) -> Result<()> {
+    let scopes: Vec<Option<&str>> = if projects.is_empty() {
+        vec![None]
     } else {
-        aicx::vector_index::write_index(project, sample)?
+        projects
+            .iter()
+            .map(String::as_str)
+            .map(Some)
+            .collect::<Vec<_>>()
     };
+
+    let mut reports = Vec::with_capacity(scopes.len());
+    for scope in scopes {
+        let stats = if dry_run {
+            let _lock = aicx::locks::acquire_exclusive(aicx::locks::lance_lock_path()?)?;
+            aicx::vector_index::dry_run_index(scope, sample)?
+        } else {
+            aicx::vector_index::write_index(scope, sample)?
+        };
+        reports.push((scope.map(ToString::to_string), stats));
+    }
+
     if json {
-        println!("{}", aicx::vector_index::render_stats_json(&stats)?);
+        if reports.len() == 1 {
+            println!("{}", aicx::vector_index::render_stats_json(&reports[0].1)?);
+        } else {
+            let payload = reports
+                .iter()
+                .map(|(project, stats)| {
+                    serde_json::json!({
+                        "project": project.as_deref().unwrap_or("_all"),
+                        "stats": stats,
+                    })
+                })
+                .collect::<Vec<_>>();
+            println!("{}", serde_json::to_string(&payload)?);
+        }
     } else {
-        eprint!("{}", aicx::vector_index::render_stats_text(&stats));
-        if let Some(path) = &stats.index_path {
-            eprintln!("\n  index_path:          {}", path.display());
+        for (idx, (project, stats)) in reports.iter().enumerate() {
+            if reports.len() > 1 {
+                if idx > 0 {
+                    eprintln!();
+                }
+                eprintln!(
+                    "scope: {}",
+                    project
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("_all")
+                );
+            }
+            eprint!("{}", aicx::vector_index::render_stats_text(stats));
+            if let Some(path) = &stats.index_path {
+                eprintln!("\n  index_path:          {}", path.display());
+            }
         }
     }
     Ok(())
@@ -4968,9 +5055,28 @@ mod tests {
             .expect("search command with score/json should parse");
 
         match cli.command {
-            Some(Commands::Search { filters, json, .. }) => {
+            Some(Commands::Search {
+                filters,
+                json,
+                project,
+                ..
+            }) => {
                 assert_eq!(filters.score, Some(60));
                 assert!(json);
+                assert!(project.is_empty());
+            }
+            _ => panic!("expected search command"),
+        }
+    }
+
+    #[test]
+    fn search_accepts_no_semantic_escape_hatch() {
+        let cli = Cli::try_parse_from(["aicx", "search", "dashboard", "--no-semantic"])
+            .expect("search command with --no-semantic should parse");
+
+        match cli.command {
+            Some(Commands::Search { no_semantic, .. }) => {
+                assert!(no_semantic);
             }
             _ => panic!("expected search command"),
         }
@@ -4992,6 +5098,93 @@ mod tests {
                 assert_eq!(filters.frame_kind, Some(FrameKindArg::InternalThought));
             }
             _ => panic!("expected search command"),
+        }
+    }
+
+    #[test]
+    fn search_accepts_multiple_project_filters() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "search",
+            "rust-mux",
+            "-p",
+            "vc-operator",
+            "vibecrafted",
+            "-p",
+            "loctree",
+        ])
+        .expect("search should accept repeated and space-list project filters");
+
+        match cli.command {
+            Some(Commands::Search { project, .. }) => {
+                assert_eq!(project, vec!["vc-operator", "vibecrafted", "loctree"]);
+            }
+            _ => panic!("expected search command"),
+        }
+    }
+
+    #[test]
+    fn index_accepts_explicit_dry_run_false_for_materialization() {
+        let cli = Cli::try_parse_from(["aicx", "index", "--dry-run=false"])
+            .expect("index --dry-run=false should parse");
+
+        match cli.command {
+            Some(Commands::Index {
+                dry_run, project, ..
+            }) => {
+                assert!(!dry_run);
+                assert!(project.is_empty());
+            }
+            _ => panic!("expected index command"),
+        }
+    }
+
+    #[test]
+    fn index_defaults_to_materialization() {
+        let cli = Cli::try_parse_from(["aicx", "index"]).expect("index command should parse");
+
+        match cli.command {
+            Some(Commands::Index {
+                dry_run, project, ..
+            }) => {
+                assert!(!dry_run);
+                assert!(project.is_empty());
+            }
+            _ => panic!("expected index command"),
+        }
+    }
+
+    #[test]
+    fn index_accepts_dry_run_preview() {
+        let cli =
+            Cli::try_parse_from(["aicx", "index", "--dry-run"]).expect("index --dry-run parses");
+
+        match cli.command {
+            Some(Commands::Index { dry_run, .. }) => {
+                assert!(dry_run);
+            }
+            _ => panic!("expected index command"),
+        }
+    }
+
+    #[test]
+    fn index_accepts_multiple_project_filters() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "index",
+            "-p",
+            "vc-operator",
+            "vibecrafted",
+            "-p",
+            "loctree",
+        ])
+        .expect("index should accept repeated and space-list project filters");
+
+        match cli.command {
+            Some(Commands::Index { project, .. }) => {
+                assert_eq!(project, vec!["vc-operator", "vibecrafted", "loctree"]);
+            }
+            _ => panic!("expected index command"),
         }
     }
 

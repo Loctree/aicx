@@ -53,7 +53,7 @@ Public install from GitHub Releases:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/Loctree/aicx/main/install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.7.1 bash install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.7.2 bash install.sh
 ```
 
 The installer downloads the matching release archive, verifies its adjacent

@@ -60,7 +60,7 @@ pub enum SemanticError {
         recommendation: String,
     },
     /// `index_path(project)` does not exist on disk yet — operator never ran
-    /// `aicx index --dry-run=false`.
+    /// `aicx index`.
     IndexNotBuilt {
         path: std::path::PathBuf,
         reason: String,
@@ -164,12 +164,12 @@ pub fn try_semantic_search(
     _store_root: &Path,
     query: &str,
     limit: usize,
-    project_filter: Option<&str>,
+    project_filters: &[Option<&str>],
     _frame_kind_filter: Option<FrameKind>,
 ) -> std::result::Result<SemanticOutcome, SemanticError> {
     #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
     {
-        let _ = (query, limit, project_filter);
+        let _ = (query, limit, project_filters);
         Err(SemanticError::EmbedderFeatureMissing {
             reason: "this aicx binary was compiled without any embedder feature".to_string(),
             recommendation:
@@ -182,7 +182,29 @@ pub fn try_semantic_search(
 
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     {
-        try_semantic_search_native(query, limit, project_filter)
+        let scopes = if project_filters.is_empty() {
+            vec![None]
+        } else {
+            project_filters.to_vec()
+        };
+        let per_scope_limit = limit.max(1);
+        let mut merged_results = Vec::new();
+        let mut scanned = 0usize;
+        let mut model_id = None;
+        for scope in scopes {
+            let mut outcome = try_semantic_search_native(query, per_scope_limit, scope)?;
+            scanned += outcome.scanned;
+            model_id.get_or_insert(outcome.model_id.clone());
+            merged_results.append(&mut outcome.results);
+        }
+        merged_results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
+        merged_results.truncate(limit);
+        Ok(SemanticOutcome {
+            results: merged_results,
+            scanned,
+            backend_label: "embedded_semantic",
+            model_id: model_id.unwrap_or_else(|| "unknown".to_string()),
+        })
     }
 }
 
@@ -224,16 +246,15 @@ fn try_semantic_search_native(
         SemanticError::IndexNotBuilt {
             path: std::path::PathBuf::new(),
             reason: format!("could not resolve index path: {err}"),
-            recommendation:
-                "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index --dry-run=false`"
-                    .to_string(),
+            recommendation: "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index`"
+                .to_string(),
         }
     })?;
 
     if !path.exists() {
         let cmd = match project_filter {
-            Some(p) => format!("aicx index --dry-run=false --project {p}"),
-            None => "aicx index --dry-run=false".to_string(),
+            Some(p) => format!("aicx index --project {p}"),
+            None => "aicx index".to_string(),
         };
         return Err(SemanticError::IndexNotBuilt {
             path: path.clone(),
@@ -251,7 +272,7 @@ fn try_semantic_search_native(
             path: path.clone(),
             reason: format!("cannot stat index file: {err}"),
             recommendation: format!(
-                "delete and rebuild: `rm -f {} && aicx index --dry-run=false`",
+                "delete and rebuild: `rm -f {} && aicx index`",
                 path.display()
             ),
         });
@@ -270,7 +291,7 @@ fn try_semantic_search_native(
                     header.dimension, header.model_id, embedder_dim, info.model_id
                 ),
                 recommendation: format!(
-                    "rebuild the index with the current embedder: `rm -f {} && aicx index --dry-run=false`",
+                    "rebuild the index with the current embedder: `rm -f {} && aicx index`",
                     path.display()
                 ),
             });
@@ -283,7 +304,7 @@ fn try_semantic_search_native(
                     path.display()
                 ),
                 recommendation: "run `aicx extract --all` to populate the canonical corpus, \
-                     then rebuild: `aicx index --dry-run=false`"
+                     then rebuild: `aicx index`"
                     .to_string(),
             });
         }
@@ -314,7 +335,7 @@ fn try_semantic_search_native(
                 path: path.clone(),
                 reason: format!("index query failed: {err}"),
                 recommendation: format!(
-                    "delete and rebuild: `rm -f {} && aicx index --dry-run=false`",
+                    "delete and rebuild: `rm -f {} && aicx index`",
                     path.display()
                 ),
             });
@@ -329,10 +350,9 @@ fn try_semantic_search_native(
                 "index at {} produced 0 ranked hits for this query",
                 path.display()
             ),
-            recommendation:
-                "either the index is empty (rebuild with `aicx index --dry-run=false`) \
+            recommendation: "either the index is empty (rebuild with `aicx index`) \
                  or your query has no semantic neighbours in the corpus — try broader phrasing"
-                    .to_string(),
+                .to_string(),
         });
     }
 
@@ -427,7 +447,7 @@ mod tests {
             Path::new("/tmp/aicx-search-engine-test"),
             "any query",
             10,
-            None,
+            &[None],
             None,
         );
 

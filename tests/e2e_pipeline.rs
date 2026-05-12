@@ -96,7 +96,7 @@ fn e2e_index_and_query_roundtrip() {
         &store_root,
         "operator decision and architecture",
         5,
-        None,
+        &[None],
         None,
     )
     .unwrap_or_else(|err| {
