@@ -201,8 +201,12 @@ struct SemanticSearchParams {
     q: String,
     #[serde(default = "default_search_limit")]
     limit: usize,
-    /// Optional project filter (case-insensitive substring match)
+    /// Optional project filter (case-insensitive substring match). Prefer
+    /// `projects` for cross-project search.
     project: Option<String>,
+    /// Optional project filters for cross-project search.
+    #[serde(default)]
+    projects: Vec<String>,
     /// Optional minimum score threshold (0-100)
     score: Option<u8>,
     /// Optional frame/channel filter
@@ -224,6 +228,12 @@ struct CrossSearchParams {
     limit: usize,
     #[serde(default = "default_search_mode")]
     mode: String,
+    /// Optional project filter (case-insensitive substring match). Prefer
+    /// `projects` for cross-project search.
+    project: Option<String>,
+    /// Optional project filters for cross-project search.
+    #[serde(default)]
+    projects: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -741,19 +751,45 @@ fn parse_relative_time(s: &str) -> Option<i64> {
     Some(now - num * unit)
 }
 
-fn merge_project_scope(scope: Option<&str>, request: Option<&str>) -> Option<String> {
-    match (scope, request) {
-        (Some(scope), Some(request))
-            if request
-                .to_ascii_lowercase()
-                .contains(&scope.to_ascii_lowercase()) =>
-        {
-            Some(request.to_string())
+fn merge_project_scopes(
+    scope: Option<&str>,
+    request: Option<String>,
+    requests: Vec<String>,
+) -> Vec<String> {
+    let mut merged = if requests.is_empty() {
+        request.into_iter().collect::<Vec<_>>()
+    } else {
+        requests
+    };
+
+    if let Some(scope) = scope {
+        if merged.is_empty() {
+            merged.push(scope.to_string());
+        } else {
+            let scope_lower = scope.to_ascii_lowercase();
+            merged.retain(|request| request.to_ascii_lowercase().contains(&scope_lower));
+            if merged.is_empty() {
+                merged.push(scope.to_string());
+            }
         }
-        (Some(scope), _) => Some(scope.to_string()),
-        (None, Some(request)) => Some(request.to_string()),
-        (None, None) => None,
     }
+
+    merged
+}
+
+fn search_project_scopes(projects: &[String]) -> Vec<Option<&str>> {
+    if projects.is_empty() {
+        vec![None]
+    } else {
+        projects.iter().map(String::as_str).map(Some).collect()
+    }
+}
+
+fn project_matches_any_filter(project: &str, filters: &[String]) -> bool {
+    filters.is_empty()
+        || filters
+            .iter()
+            .any(|filter| project_matches_filter(project, Some(filter.as_str())))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1160,9 +1196,11 @@ async fn semantic_search(
     let limit = params.limit.min(100);
     let store_root = state.config.store_root.clone();
     let scope = state.config.scope.normalized();
-    let request_project = params.project.clone();
-    let merged_project_filter =
-        merge_project_scope(scope.project.as_deref(), request_project.as_deref());
+    let request_projects = merge_project_scopes(
+        scope.project.as_deref(),
+        params.project.clone(),
+        params.projects.clone(),
+    );
     let frame_kind = params.frame_kind;
     let score_filter = match validate_score_filter(params.score) {
         Ok(score) => score,
@@ -1175,14 +1213,15 @@ async fn semantic_search(
         }
     };
     let query_clone = query.clone();
-    let project_owned = merged_project_filter.clone();
+    let project_owned = request_projects.clone();
 
     let result = tokio::task::spawn_blocking(move || {
+        let project_scopes = search_project_scopes(&project_owned);
         crate::search_engine::try_semantic_search(
             &store_root,
             &query_clone,
             limit,
-            &[project_owned.as_deref()],
+            &project_scopes,
             frame_kind,
         )
     })
@@ -1193,10 +1232,7 @@ async fn semantic_search(
             let mut results: Vec<_> = outcome
                 .results
                 .into_iter()
-                .filter(|r| {
-                    project_matches_filter(&r.project, request_project.as_deref())
-                        && project_matches_filter(&r.project, scope.project.as_deref())
-                })
+                .filter(|r| project_matches_any_filter(&r.project, &request_projects))
                 .filter(|r| score_filter.is_none_or(|min| r.score >= min))
                 .map(|result| {
                     let excerpt = result.matched_lines.join(" ... ");
@@ -1319,9 +1355,16 @@ async fn cross_search(params: Result<Query<CrossSearchParams>, QueryRejection>) 
 
     let limit = params.limit;
     let mode = params.mode;
+    let projects = if params.projects.is_empty() {
+        params.project.into_iter().collect::<Vec<_>>()
+    } else {
+        params.projects
+    };
 
-    let result =
-        tokio::task::spawn_blocking(move || run_memex_cross_search(&query, limit, &mode)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        run_memex_cross_search(&query, limit, &mode, &projects)
+    })
+    .await;
 
     match result {
         Ok(Ok(response)) => (StatusCode::OK, Json(response)).into_response(),
@@ -1344,17 +1387,27 @@ async fn cross_search(params: Result<Query<CrossSearchParams>, QueryRejection>) 
     }
 }
 
-fn run_memex_cross_search(query: &str, limit: usize, mode: &str) -> Result<MemexSearchResponse> {
-    let args = [
-        "cross-search",
-        query,
-        "--limit",
-        &limit.to_string(),
-        "--mode",
-        mode,
-        "--json",
+fn run_memex_cross_search(
+    query: &str,
+    limit: usize,
+    mode: &str,
+    projects: &[String],
+) -> Result<MemexSearchResponse> {
+    let mut args = vec![
+        "cross-search".to_string(),
+        query.to_string(),
+        "--limit".to_string(),
+        limit.to_string(),
+        "--mode".to_string(),
+        mode.to_string(),
+        "--json".to_string(),
     ];
-    let (binary, output) = run_memex_cli(&args, "cross-search")?;
+    for project in projects {
+        args.push("--project".to_string());
+        args.push(project.clone());
+    }
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let (binary, output) = run_memex_cli(&arg_refs, "cross-search")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

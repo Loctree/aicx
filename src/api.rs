@@ -109,11 +109,18 @@ impl Aicx {
         query: impl AsRef<str>,
         opts: SearchOptions,
     ) -> Result<SearchResults> {
+        let owned_projects = if opts.projects.is_empty() {
+            opts.project.into_iter().collect::<Vec<_>>()
+        } else {
+            opts.projects
+        };
+        let project_scopes = search_project_scopes(&owned_projects);
+
         let outcome = crate::search_engine::try_semantic_search(
             &self.config.store_root,
             query.as_ref(),
             opts.limit,
-            &[opts.project.as_deref()],
+            &project_scopes,
             opts.frame_kind,
         )
         .map_err(anyhow::Error::from)
@@ -150,6 +157,7 @@ pub struct StoreOptions {
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
     pub limit: usize,
+    pub projects: Vec<String>,
     pub project: Option<String>,
     pub frame_kind: Option<FrameKind>,
 }
@@ -158,9 +166,18 @@ impl Default for SearchOptions {
     fn default() -> Self {
         Self {
             limit: 10,
+            projects: Vec::new(),
             project: None,
             frame_kind: None,
         }
+    }
+}
+
+fn search_project_scopes(projects: &[String]) -> Vec<Option<&str>> {
+    if projects.is_empty() {
+        vec![None]
+    } else {
+        projects.iter().map(String::as_str).map(Some).collect()
     }
 }
 

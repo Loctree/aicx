@@ -39,8 +39,11 @@ pub struct SearchParams {
     /// Max results to return (default: 10)
     #[serde(default = "default_limit")]
     pub limit: usize,
-    /// Optional project filter (case-insensitive substring)
+    /// Optional project filter (case-insensitive substring). Prefer
+    /// `projects` for cross-project search.
     pub project: Option<String>,
+    /// Optional project filters for cross-project search.
+    pub projects: Option<Vec<String>>,
     /// Minimum score threshold (0-100)
     pub score: Option<u8>,
     /// Hours to look back (0 = all time)
@@ -79,6 +82,14 @@ fn default_limit() -> usize {
 
 fn default_true() -> bool {
     true
+}
+
+fn search_project_scopes(projects: &[String]) -> Vec<Option<&str>> {
+    if projects.is_empty() {
+        vec![None]
+    } else {
+        projects.iter().map(String::as_str).map(Some).collect()
+    }
 }
 
 const MAX_SCORE_FILTER: u8 = 100;
@@ -297,6 +308,12 @@ impl AicxMcpServer {
         let query = params.query;
         let limit = params.limit.min(50);
         let project = params.project;
+        let owned_projects = params
+            .projects
+            .clone()
+            .filter(|projects| !projects.is_empty())
+            .unwrap_or_else(|| project.clone().into_iter().collect());
+        let project_scopes = search_project_scopes(&owned_projects);
         let score = validate_score_filter(params.score)?;
         let hours = params.hours.unwrap_or(0);
         let date = params.date;
@@ -319,7 +336,7 @@ impl AicxMcpServer {
             &store_root,
             &query,
             fetch_limit,
-            &[project.as_deref()],
+            &project_scopes,
             frame_kind,
         ) {
             Ok(outcome) => outcome,

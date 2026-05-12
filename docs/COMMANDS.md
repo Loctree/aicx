@@ -256,11 +256,13 @@ aicx corpus repair --root "$HOME/.aicx/store/Loctree/aicx/2026_0502" --apply --b
 
 ## `aicx search`
 
-Fuzzy search across the canonical corpus (layer 1, filesystem-only).
+Semantic search across the canonical corpus.
 
-Searches chunk content and frontmatter directly in `~/.aicx/` — works
-immediately, no semantic index needed. JSON output includes `oracle_status`
-and is explicitly marked as filesystem fuzzy, not a semantic/content oracle.
+Search uses the materialized semantic index by default. When the embedder or
+index is unavailable, it fails fast with `kind`, `reason`, and
+`recommendation`; it does not silently pretend fuzzy results are semantic
+oracle truth. Use `--no-semantic` only when you intentionally want the explicit
+filesystem-fuzzy escape hatch.
 
 ```bash
 aicx search [OPTIONS] <QUERY>
@@ -268,24 +270,25 @@ aicx search [OPTIONS] <QUERY>
 
 Options:
 - `<QUERY>` search query string
-- `-p, --project <PROJECT>` repo or store-bucket filter (case-insensitive substring)
+- `-p, --project <PROJECT>...` repo or store-bucket filter(s); omit to search all projects
 - `-H, --hours <HOURS>` lookback window (`0` = all time)
 - `-d, --date <DATE>` filter by date (single day, range, or open-ended)
 - `-l, --limit <N>` max results (default: `10`)
 - `-s, --score <SCORE>` minimum quality threshold (`0..=100`)
+- `--no-semantic` run explicit filesystem-fuzzy search instead of semantic search
 - `-j, --json` emit compact JSON instead of plain text
 
 Examples:
 
 ```bash
-# Fuzzy content search across canonical chunks (no memex needed)
+# Semantic content search across the materialized index
 aicx search "auth middleware regression"
 
-# Scoped to a repo or store bucket and date range
-aicx search "refactor" -p ai-contexters --date 2026-03-20..2026-03-28
+# Scoped to several repo/store buckets and date range
+aicx search "refactor" -p ai-contexters loctree-suite --date 2026-03-20..2026-03-28
 
-# Compact JSON for agents or scripts
-aicx search "dashboard" -p ai-contexters --score 60 --json
+# Explicit fuzzy escape hatch, clearly marked as not semantic oracle truth
+aicx search "dashboard" -p ai-contexters --score 60 --no-semantic --json
 
 # Search for a specific day mentioned in query
 aicx search "decisions march 2026"
@@ -396,9 +399,29 @@ aicx migrate-intent-schema
 aicx migrate-intent-schema --project ai-contexters
 ```
 
+## `aicx index`
+
+Build the semantic index used by `aicx search`.
+
+By default, `aicx index` materializes the index for all projects. Use `--dry-run`
+only for preview/probe mode. Project filters can be repeated, comma-separated,
+or supplied as a space list.
+
+```bash
+aicx index
+aicx index --dry-run
+aicx index -p loctree-suite aicx -p vc-operator
+```
+
+Options:
+- `-p, --project <PROJECT>...` repo/store-bucket filter(s); omit to index all projects
+- `--sample <N>` cap indexed chunks for tests/probes (`0` = all discovered chunks)
+- `--dry-run` preview only; omit to materialize
+- `-j, --json` emit JSON stats
+
 ## Native Embeddings
 
-Native embeddings are a library/runtime surface, not a CLI indexing command.
+Native embeddings back semantic indexing/search.
 
 Use `install.sh --pick-embedder` or edit `~/.aicx/embedder.toml`:
 
