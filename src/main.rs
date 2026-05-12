@@ -1238,9 +1238,20 @@ enum Commands {
         #[arg(long)]
         fix: bool,
 
-        /// Move suspicious top-level corpus buckets to $HOME/.aicx/quarantine/
+        /// Move suspicious top-level corpus buckets to $HOME/.aicx/quarantine/.
+        /// Buckets that are merely CamelCase (legitimate GitHub orgs like
+        /// `LibraxisAI`, `VetCoders`, `Loctree`, `Szowesgad`) are
+        /// canonicalized in place to lowercase instead of quarantined,
+        /// merging into existing lowercase buckets if present.
         #[arg(long)]
         fix_buckets: bool,
+
+        /// With --fix-buckets, preview the planned canonicalize/quarantine
+        /// actions without modifying the filesystem. Output entries are
+        /// prefixed with `[dry-run]`. Use this before running `--fix-buckets`
+        /// against a large store to verify the classification before commit.
+        #[arg(long)]
+        dry_run: bool,
 
         /// Emit a reviewable bash script for missing sidecar backfill
         #[arg(long)]
@@ -1759,6 +1770,7 @@ fn main() -> Result<()> {
         Some(Commands::Doctor {
             fix,
             fix_buckets,
+            dry_run,
             rebuild_sidecars,
             prune_empty_bodies,
             check_dedup,
@@ -1769,6 +1781,7 @@ fn main() -> Result<()> {
             let opts = aicx::doctor::DoctorOptions {
                 fix,
                 fix_buckets,
+                dry_run,
                 rebuild_sidecars,
                 prune_empty_bodies,
                 check_dedup,
@@ -1813,6 +1826,7 @@ fn main() -> Result<()> {
             let opts = aicx::doctor::DoctorOptions {
                 fix: false,
                 fix_buckets: false,
+                dry_run: false,
                 rebuild_sidecars: false,
                 prune_empty_bodies: false,
                 check_dedup: false,

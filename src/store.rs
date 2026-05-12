@@ -181,7 +181,7 @@ const MIGRATION_DIRNAME: &str = "migration";
 const MIGRATION_MANIFEST_FILENAME: &str = "manifest.json";
 const MIGRATION_REPORT_FILENAME: &str = "report.md";
 
-fn canonical_project_slug(project: &str) -> String {
+pub(crate) fn canonical_project_slug(project: &str) -> String {
     project
         .split('/')
         .map(canonical_bucket_segment)
@@ -189,36 +189,16 @@ fn canonical_project_slug(project: &str) -> String {
         .join("/")
 }
 
-/// Lowercase + sanitize the *leading character only* of a bucket segment so
-/// dotfile/underscore-prefixed paths (`.scripts`, `_internal`, `-tmp`) become
-/// valid `[a-z0-9]`-prefixed segments via a typed `x*-` escape (`.scripts`
-/// → `xdot-scripts`). Mid-segment garbage (newlines, shell metacharacters,
-/// non-ASCII) is intentionally left untouched so the strict
-/// `is_valid_repo_bucket_name` validator can still reject it as
-/// extractor-bug evidence rather than silently normalizing it into a
+/// Trim whitespace from a bucket segment. Case is preserved; dot-prefix and
+/// underscore-prefix bucket names (`.aicx`, `.codescribe`, `.github`,
+/// `_internal`, `.scripts`) are accepted as-is by `is_valid_repo_bucket_name`
+/// (relaxed 2026-05-12 from prior lowercase-only + leading-char-restricted
+/// schema). Mid-segment garbage from extractor bugs (newlines, shell
+/// metacharacters, leading `$`/`{`/`<`) is intentionally NOT sanitized so the
+/// validator surfaces it instead of silently normalizing junk into a
 /// filesystem path.
 fn canonical_bucket_segment(segment: &str) -> String {
-    let lower = segment.trim().to_ascii_lowercase();
-    let mut chars = lower.chars();
-    let Some(first) = chars.next() else {
-        return lower;
-    };
-    if first.is_ascii_lowercase() || first.is_ascii_digit() {
-        return lower;
-    }
-    let prefix = match first {
-        '.' => "xdot-",
-        '_' => "xunder-",
-        '-' => "xdash-",
-        // Unknown leading char (e.g. `${RELEASE_REPO}`, `<owner>`,
-        // shell metacharacter): preserve so the validator surfaces the
-        // upstream extractor bug instead of silently masking it.
-        _ => return lower,
-    };
-    let mut out = String::with_capacity(lower.len() + prefix.len());
-    out.push_str(prefix);
-    out.extend(chars);
-    out
+    segment.trim().to_string()
 }
 
 fn canonical_path_segment(value: &str, label: &str) -> Result<String> {
@@ -3185,9 +3165,11 @@ mod tests {
 
     #[test]
     fn test_get_context_path_new_layout() {
+        // Case-preserving canonical (relaxed 2026-05-12): `CodeScribe`
+        // stays `CodeScribe` instead of being lowered to `codescribe`.
         if let Ok(path) = get_context_path("CodeScribe", "claude", "2026-01-22", "143005") {
             let s = path.to_string_lossy();
-            assert!(s.contains("codescribe"));
+            assert!(s.contains("CodeScribe"));
             assert!(s.contains("2026-01-22"));
             assert!(s.ends_with("143005_claude-context.md"));
         }
@@ -3197,54 +3179,60 @@ mod tests {
     fn test_get_context_json_path_new_layout() {
         if let Ok(path) = get_context_json_path("CodeScribe", "claude", "2026-01-22", "143005") {
             let s = path.to_string_lossy();
-            assert!(s.contains("codescribe"));
+            assert!(s.contains("CodeScribe"));
             assert!(s.contains("2026-01-22"));
             assert!(s.ends_with("143005_claude-context.json"));
         }
     }
 
     #[test]
-    fn canonical_project_slug_sanitizes_dotfile_prefix_segments() {
+    fn canonical_project_slug_preserves_legit_shapes_and_lets_validator_reject_junk() {
         use crate::validation::is_valid_repo_project_slug;
 
-        // Leading dot/underscore/dash get a typed escape so the result
-        // satisfies the strict bucket validator. This is the actual P0
-        // unblock: `local/.scripts` (dotdir from a session cwd that had a
-        // `.git` but no remote) used to fail-fast the whole `aicx all`
-        // pipeline at chunk phase.
+        // Case is preserved — CamelCase GitHub orgs and dot/underscore-prefix
+        // bucket names pass through `canonical_project_slug` unchanged, and
+        // the validator accepts them directly (relaxed 2026-05-12 from prior
+        // lowercase-only schema).
+        assert_eq!(canonical_project_slug("local/.scripts"), "local/.scripts");
+        assert_eq!(canonical_project_slug("local/.aicx"), "local/.aicx");
+        assert_eq!(canonical_project_slug("local/_priv"), "local/_priv");
+        assert_eq!(canonical_project_slug("VetCoders/Vista"), "VetCoders/Vista");
         assert_eq!(
-            canonical_project_slug("local/.scripts"),
-            "local/xdot-scripts"
+            canonical_project_slug("LibraxisAI/lbrxAgents"),
+            "LibraxisAI/lbrxAgents"
         );
-        assert_eq!(canonical_project_slug("local/_priv"), "local/xunder-priv");
-        assert_eq!(canonical_project_slug("local/-tmp"), "local/xdash-tmp");
-        assert_eq!(canonical_project_slug("LOCAL/.Foo"), "local/xdot-foo");
         assert_eq!(canonical_project_slug("a/b"), "a/b");
-        assert!(is_valid_repo_project_slug(&canonical_project_slug(
-            "local/.scripts"
-        )));
-        assert!(is_valid_repo_project_slug(&canonical_project_slug(
-            "local/_priv"
-        )));
-        assert!(is_valid_repo_project_slug(&canonical_project_slug(
-            "local/-tmp"
-        )));
+        // Trailing whitespace is trimmed:
+        assert_eq!(
+            canonical_project_slug("  vetcoders / aicx  "),
+            "vetcoders/aicx"
+        );
 
-        // Mid-segment garbage (newlines, shell metacharacters, etc.) is
-        // intentionally NOT sanitized — the validator must still reject it
-        // so an extractor bug surfaces instead of silently writing
-        // mangled-but-passable filesystem paths. See
-        // `validated_store_project_dir_rejects_junk_bucket_segments` below.
+        for s in [
+            "local/.scripts",
+            "local/.aicx",
+            "local/_priv",
+            "VetCoders/Vista",
+            "LibraxisAI/lbrxAgents",
+            ".github",
+            ".aicx",
+        ] {
+            assert!(
+                is_valid_repo_project_slug(&canonical_project_slug(s)),
+                "{s} should round-trip through canonical_project_slug + validator"
+            );
+        }
+
+        // Mid-segment garbage (newlines, shell metacharacters, leading `$`/
+        // `{`/`<`) is intentionally NOT sanitized — the validator must
+        // still reject it so an extractor bug surfaces instead of silently
+        // writing mangled-but-passable filesystem paths.
         assert!(!is_valid_repo_project_slug(&canonical_project_slug(
             "VetCoders/vibecrafted.git`"
         )));
         assert!(!is_valid_repo_project_slug(&canonical_project_slug(
             "VetCoders/loctree\n\n**AICX"
         )));
-
-        // Unknown leading chars (`$`, `{`, `<`) are preserved so the
-        // validator catches template-placeholder leaks rather than the
-        // sanitizer masking them.
         assert!(!is_valid_repo_project_slug(&canonical_project_slug(
             "${RELEASE_REPO}/releases"
         )));
@@ -3383,11 +3371,13 @@ mod tests {
         let json = serde_json::to_string_pretty(&index).unwrap();
         let restored: StoreIndex = serde_json::from_str(&json).unwrap();
 
+        // Case-preserving canonical (relaxed 2026-05-12): `CodeScribe`
+        // stays `CodeScribe` instead of being lowered to `codescribe`.
         assert_eq!(restored.projects.len(), 2);
-        assert!(restored.projects.contains_key("codescribe"));
+        assert!(restored.projects.contains_key("CodeScribe"));
         assert!(restored.projects.contains_key("vista"));
 
-        let cs = &restored.projects["codescribe"];
+        let cs = &restored.projects["CodeScribe"];
         assert_eq!(cs.agents["claude"].total_entries, 42);
         assert_eq!(cs.agents["claude"].dates, vec!["2026-01-22"]);
         assert_eq!(cs.agents["gemini"].total_entries, 10);
@@ -3863,11 +3853,13 @@ mod tests {
                 .iter()
                 .any(|path| { path.starts_with(root.join("non-repository-contexts")) })
         );
+        // Case-preserving canonical (relaxed 2026-05-12): `VetCoders` from
+        // git remote stays `VetCoders`, not lowered to `vetcoders`.
         assert!(summary.written_paths.iter().any(|path| {
-            path.starts_with(root.join("store").join("vetcoders").join("ai-contexters"))
+            path.starts_with(root.join("store").join("VetCoders").join("ai-contexters"))
         }));
         assert!(summary.written_paths.iter().any(|path| {
-            path.starts_with(root.join("store").join("vetcoders").join("loctree"))
+            path.starts_with(root.join("store").join("VetCoders").join("loctree"))
         }));
 
         let scanned = scan_context_files_at(&root).expect("scan stored files");
@@ -3879,12 +3871,12 @@ mod tests {
         assert!(
             scanned
                 .iter()
-                .any(|file| file.project == "vetcoders/ai-contexters")
+                .any(|file| file.project == "VetCoders/ai-contexters")
         );
         assert!(
             scanned
                 .iter()
-                .any(|file| file.project == "vetcoders/loctree")
+                .any(|file| file.project == "VetCoders/loctree")
         );
 
         let _ = fs::remove_dir_all(&root);
@@ -4390,15 +4382,17 @@ mod tests {
         assert_eq!(manifest.totals.rebuild_items, 1);
         assert_eq!(manifest.totals.rebuilt_items, 1);
         assert_eq!(manifest.totals.salvaged_items, 0);
+        // Case-preserving canonical (relaxed 2026-05-12): `VetCoders` from
+        // git remote stays `VetCoders`, not lowered to `vetcoders`.
         assert!(manifest.items.iter().any(|item| {
             item.canonical_paths.iter().any(|path| {
-                path.contains("/store/vetcoders/ai-contexters/2025_0321/conversations/codex/")
+                path.contains("/store/VetCoders/ai-contexters/2025_0321/conversations/codex/")
             })
         }));
         assert!(
             store_root
                 .join("store")
-                .join("vetcoders")
+                .join("VetCoders")
                 .join("ai-contexters")
                 .join("2025_0321")
                 .join("conversations")

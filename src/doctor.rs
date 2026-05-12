@@ -31,6 +31,12 @@ use crate::validation::{is_valid_repo_bucket_name, is_valid_repo_project_slug};
 pub struct DoctorOptions {
     pub fix: bool,
     pub fix_buckets: bool,
+    /// When `fix_buckets` is true and `dry_run` is also true, the doctor
+    /// emits the planned canonicalize/quarantine actions as `fixes_applied`
+    /// entries prefixed with `[dry-run]` but performs **no filesystem
+    /// changes**. Lets operators preview a `--fix-buckets` run before
+    /// committing to it.
+    pub dry_run: bool,
     pub rebuild_sidecars: bool,
     pub prune_empty_bodies: bool,
     pub check_dedup: bool,
@@ -163,18 +169,26 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
 
     if opts.fix_buckets {
         let store_root = base.join("store");
-        match suspicious_corpus_buckets(&store_root) {
+        let dry = opts.dry_run;
+        let prefix = if dry { "[dry-run] " } else { "" };
+        match scan_corpus_buckets(&store_root) {
             Ok(suspicious) if suspicious.is_empty() => {
                 fixes_applied.push("no suspicious corpus buckets to quarantine".to_string());
             }
             Ok(suspicious) => {
                 let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
                 let single_bucket = suspicious.len() == 1;
-                for bucket_name in suspicious {
+                for bucket_name in &suspicious {
+                    if dry {
+                        fixes_applied.push(format!(
+                            "{prefix}would quarantine corpus bucket `{bucket_name}`"
+                        ));
+                        continue;
+                    }
                     let result = if single_bucket {
-                        quarantine_bucket(&store_root, &bucket_name)
+                        quarantine_bucket(&store_root, bucket_name)
                     } else {
-                        quarantine_bucket_with_timestamp(&store_root, &bucket_name, &timestamp)
+                        quarantine_bucket_with_timestamp(&store_root, bucket_name, &timestamp)
                     };
                     match result {
                         Ok(dst) => fixes_applied.push(format!(
@@ -187,7 +201,7 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
                     }
                 }
             }
-            Err(e) => fixes_applied.push(format!("bucket quarantine skipped: {e}")),
+            Err(e) => fixes_applied.push(format!("{prefix}bucket scan skipped: {e}")),
         }
     }
 
@@ -409,14 +423,13 @@ fn check_semantic_health() -> CheckResult {
                     name: "semantic_health".to_string(),
                     severity: Severity::Warning,
                     detail: format!(
-                        "native model not found: {}/{}",
+                        "native semantic model not found (optional capability): {}/{}",
                         resolved.repo, resolved.filename
                     ),
                     recommendation: Some(
-                        "Hydrate the model cache or switch [embedder].backend = \"cloud\""
+                        "Hydrate the model cache or switch [embedder].backend = \"cloud\". Semantic features will be skipped until available."
                             .to_string(),
-                    ),
-                }
+                    ),                }
             }
         }
         crate::embedder::BackendPreference::Candle => CheckResult {
@@ -1310,7 +1323,7 @@ fn check_corpus_buckets(base: &Path) -> CheckResult {
         }
     };
 
-    match suspicious_corpus_buckets(&store_root) {
+    match scan_corpus_buckets(&store_root) {
         Ok(suspicious) if suspicious.is_empty() => CheckResult {
             name: "corpus_buckets".to_string(),
             severity: Severity::Green,
@@ -1323,10 +1336,17 @@ fn check_corpus_buckets(base: &Path) -> CheckResult {
             detail: format!(
                 "{} suspicious bucket(s): {}",
                 suspicious.len(),
-                suspicious.join(", ")
+                suspicious
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             recommendation: Some(
-                "Run `aicx doctor --fix-buckets` to move them to $HOME/.aicx/quarantine/"
+                "Run `aicx doctor --fix-buckets --dry-run` to preview the quarantine plan, \
+                 then `aicx doctor --fix-buckets` to move text-extracted-junk and template \
+                 placeholder buckets to $HOME/.aicx/quarantine/<timestamp>/"
                     .to_string(),
             ),
         },
@@ -1355,12 +1375,28 @@ fn count_corpus_buckets(store_root: &Path) -> Result<usize> {
     Ok(count)
 }
 
-fn suspicious_corpus_buckets(store_root: &Path) -> Result<Vec<String>> {
+/// Scan top-level corpus buckets and return only the **suspicious** ones —
+/// folder names that fail [`is_valid_repo_bucket_name`] / [`is_valid_repo_project_slug`].
+///
+/// The validator is intentionally permissive (case-preserving CamelCase,
+/// dot-prefix `.aicx`/`.github`/`.scripts`, underscore-prefix `_internal`)
+/// after the 2026-05-12 relax. What remains "suspicious" is real
+/// extractor-bug evidence: template-placeholder leaks (`${RELEASE_REPO}`,
+/// `<owner>`, `{target_owner}`), and mid-segment shell-metacharacter /
+/// newline / quote garbage (`loctree.git\ncd`,
+/// `vc-skills.git\"><span`).
+///
+/// Pre-2026-05-12 the validator also rejected CamelCase orgs and
+/// dot-prefixed names, which on 2026-05-09 mass-quarantined ~89k
+/// legitimate chunks across `LibraxisAI/`, `VetCoders/`, `Loctree/`,
+/// `Szowesgad/`. Relaxing the validator (not adding canonicalization
+/// magic) was the correct response.
+pub(crate) fn scan_corpus_buckets(store_root: &Path) -> Result<Vec<String>> {
+    let mut suspicious = Vec::new();
     if !store_root.exists() {
-        return Ok(Vec::new());
+        return Ok(suspicious);
     }
 
-    let mut suspicious = Vec::new();
     for org_entry in
         crate::sanitize::read_dir_validated(store_root).context("read corpus store root")?
     {
@@ -1371,11 +1407,13 @@ fn suspicious_corpus_buckets(store_root: &Path) -> Result<Vec<String>> {
         let Ok(org) = org_entry.file_name().into_string() else {
             continue;
         };
+
         if !is_valid_repo_bucket_name(&org) {
             suspicious.push(org);
             continue;
         }
 
+        // Org folder is valid → check each repo subfolder.
         for repo_entry in crate::sanitize::read_dir_validated(&org_entry.path())
             .with_context(|| format!("read corpus org bucket `{org}`"))?
         {
@@ -1396,6 +1434,7 @@ fn suspicious_corpus_buckets(store_root: &Path) -> Result<Vec<String>> {
             }
         }
     }
+
     suspicious.sort();
     Ok(suspicious)
 }
@@ -1792,15 +1831,25 @@ mod tests {
         let tmp = unique_test_dir("bad-buckets");
         let store = tmp.join("store");
         std::fs::create_dir_all(store.join("vetcoders")).unwrap();
+        // Mid-segment garbage: backtick, newlines, asterisks. Validator
+        // rejects mid-segment non-`[A-Za-z0-9._-]` chars regardless of
+        // case (relaxed 2026-05-12 only loosened case + leading-char
+        // rules; mid-segment garbage stays junk).
         std::fs::create_dir_all(store.join("vetcoders").join("vibecrafted.git`")).unwrap();
         std::fs::create_dir_all(store.join("vetcoders").join("loctree\n\n**AICX")).unwrap();
+        // Template-placeholder leaks (leading `{`, `<`, `$`):
         std::fs::create_dir_all(store.join("{target_owner}")).unwrap();
-        std::fs::create_dir_all(store.join("...")).unwrap();
+        std::fs::create_dir_all(store.join("<owner>")).unwrap();
+        std::fs::create_dir_all(store.join("$RELEASE_REPO")).unwrap();
+        // (Note: pure dot-string `"..."` was previously asserted as junk,
+        // but `.` is now an allowed leading-and-mid char, so dotfile-only
+        // names pass — semantically weird but not validator-relevant.)
 
         let result = check_corpus_buckets(&tmp);
         assert_eq!(result.severity, Severity::Warning);
         assert!(result.detail.contains("{target_owner}"));
-        assert!(result.detail.contains("..."));
+        assert!(result.detail.contains("<owner>"));
+        assert!(result.detail.contains("$RELEASE_REPO"));
         assert!(result.detail.contains("vetcoders/vibecrafted.git`"));
         assert!(result.detail.contains("vetcoders/loctree"));
 
@@ -1846,8 +1895,69 @@ mod tests {
         std::fs::create_dir_all(store.join("vetcoders").join("aicx")).unwrap();
         std::fs::create_dir_all(store.join("local")).unwrap();
 
-        let suspicious = suspicious_corpus_buckets(&store).unwrap();
+        let suspicious = scan_corpus_buckets(&store).unwrap();
         assert!(suspicious.is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn scan_passes_camelcase_dotfile_underscore_buckets_through() {
+        let tmp = unique_test_dir("scan-passthrough");
+        let store = tmp.join("store");
+
+        // Legitimate CamelCase GitHub orgs — case-preserving canonical form.
+        // Pre-2026-05-12 these would have been mass-quarantined by the
+        // lowercase-only validator (the `20260509_023025` incident).
+        // Post-relax they pass the validator unchanged.
+        std::fs::create_dir_all(store.join("LibraxisAI").join("vista")).unwrap();
+        std::fs::create_dir_all(store.join("VetCoders").join("Vista")).unwrap();
+        std::fs::create_dir_all(store.join("Loctree").join("aicx")).unwrap();
+        std::fs::create_dir_all(store.join("Szowesgad").join("family-onko-portal")).unwrap();
+
+        // Already-lowercase legacy buckets:
+        std::fs::create_dir_all(store.join("vetcoders").join("aicx")).unwrap();
+        std::fs::create_dir_all(store.join("local")).unwrap();
+
+        // Dot-prefix buckets — UNIX hidden-dir + GitHub `.github`-style
+        // convention. Validator accepts directly (relaxed 2026-05-12).
+        std::fs::create_dir_all(store.join(".scripts")).unwrap();
+        std::fs::create_dir_all(store.join(".aicx")).unwrap();
+        std::fs::create_dir_all(store.join(".github")).unwrap();
+
+        // Underscore-prefix buckets — code-convention naming.
+        std::fs::create_dir_all(store.join("_internal")).unwrap();
+
+        // Truly invalid (template placeholders, leading non-alphanumeric):
+        std::fs::create_dir_all(store.join("{target_owner}").join("repo")).unwrap();
+        std::fs::create_dir_all(store.join("<owner>")).unwrap();
+        std::fs::create_dir_all(store.join("$RELEASE_REPO")).unwrap();
+
+        let suspicious = scan_corpus_buckets(&store).unwrap();
+
+        // Legit names of every relaxed shape are NOT suspicious:
+        for legit in [
+            "LibraxisAI",
+            "VetCoders",
+            "Loctree",
+            "Szowesgad",
+            "vetcoders",
+            "local",
+            ".scripts",
+            ".aicx",
+            ".github",
+            "_internal",
+        ] {
+            assert!(
+                suspicious.iter().all(|n| n != legit),
+                "{legit} should not be in suspicious"
+            );
+        }
+
+        // Real text-extracted junk and placeholder leaks ARE suspicious:
+        assert!(suspicious.iter().any(|n| n == "{target_owner}"));
+        assert!(suspicious.iter().any(|n| n == "<owner>"));
+        assert!(suspicious.iter().any(|n| n == "$RELEASE_REPO"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
