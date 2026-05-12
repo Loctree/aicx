@@ -184,9 +184,41 @@ const MIGRATION_REPORT_FILENAME: &str = "report.md";
 fn canonical_project_slug(project: &str) -> String {
     project
         .split('/')
-        .map(|segment| segment.trim().to_ascii_lowercase())
+        .map(canonical_bucket_segment)
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Lowercase + sanitize the *leading character only* of a bucket segment so
+/// dotfile/underscore-prefixed paths (`.scripts`, `_internal`, `-tmp`) become
+/// valid `[a-z0-9]`-prefixed segments via a typed `x*-` escape (`.scripts`
+/// → `xdot-scripts`). Mid-segment garbage (newlines, shell metacharacters,
+/// non-ASCII) is intentionally left untouched so the strict
+/// `is_valid_repo_bucket_name` validator can still reject it as
+/// extractor-bug evidence rather than silently normalizing it into a
+/// filesystem path.
+fn canonical_bucket_segment(segment: &str) -> String {
+    let lower = segment.trim().to_ascii_lowercase();
+    let mut chars = lower.chars();
+    let Some(first) = chars.next() else {
+        return lower;
+    };
+    if first.is_ascii_lowercase() || first.is_ascii_digit() {
+        return lower;
+    }
+    let prefix = match first {
+        '.' => "xdot-",
+        '_' => "xunder-",
+        '-' => "xdash-",
+        // Unknown leading char (e.g. `${RELEASE_REPO}`, `<owner>`,
+        // shell metacharacter): preserve so the validator surfaces the
+        // upstream extractor bug instead of silently masking it.
+        _ => return lower,
+    };
+    let mut out = String::with_capacity(lower.len() + prefix.len());
+    out.push_str(prefix);
+    out.extend(chars);
+    out
 }
 
 fn canonical_path_segment(value: &str, label: &str) -> Result<String> {
@@ -3169,6 +3201,53 @@ mod tests {
             assert!(s.contains("2026-01-22"));
             assert!(s.ends_with("143005_claude-context.json"));
         }
+    }
+
+    #[test]
+    fn canonical_project_slug_sanitizes_dotfile_prefix_segments() {
+        use crate::validation::is_valid_repo_project_slug;
+
+        // Leading dot/underscore/dash get a typed escape so the result
+        // satisfies the strict bucket validator. This is the actual P0
+        // unblock: `local/.scripts` (dotdir from a session cwd that had a
+        // `.git` but no remote) used to fail-fast the whole `aicx all`
+        // pipeline at chunk phase.
+        assert_eq!(
+            canonical_project_slug("local/.scripts"),
+            "local/xdot-scripts"
+        );
+        assert_eq!(canonical_project_slug("local/_priv"), "local/xunder-priv");
+        assert_eq!(canonical_project_slug("local/-tmp"), "local/xdash-tmp");
+        assert_eq!(canonical_project_slug("LOCAL/.Foo"), "local/xdot-foo");
+        assert_eq!(canonical_project_slug("a/b"), "a/b");
+        assert!(is_valid_repo_project_slug(&canonical_project_slug(
+            "local/.scripts"
+        )));
+        assert!(is_valid_repo_project_slug(&canonical_project_slug(
+            "local/_priv"
+        )));
+        assert!(is_valid_repo_project_slug(&canonical_project_slug(
+            "local/-tmp"
+        )));
+
+        // Mid-segment garbage (newlines, shell metacharacters, etc.) is
+        // intentionally NOT sanitized — the validator must still reject it
+        // so an extractor bug surfaces instead of silently writing
+        // mangled-but-passable filesystem paths. See
+        // `validated_store_project_dir_rejects_junk_bucket_segments` below.
+        assert!(!is_valid_repo_project_slug(&canonical_project_slug(
+            "VetCoders/vibecrafted.git`"
+        )));
+        assert!(!is_valid_repo_project_slug(&canonical_project_slug(
+            "VetCoders/loctree\n\n**AICX"
+        )));
+
+        // Unknown leading chars (`$`, `{`, `<`) are preserved so the
+        // validator catches template-placeholder leaks rather than the
+        // sanitizer masking them.
+        assert!(!is_valid_repo_project_slug(&canonical_project_slug(
+            "${RELEASE_REPO}/releases"
+        )));
     }
 
     #[test]
