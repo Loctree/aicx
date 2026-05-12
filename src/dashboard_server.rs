@@ -282,6 +282,9 @@ struct SteerSearchParams {
     frame_kind: Option<crate::timeline::FrameKind>,
     /// Filter by project (case-insensitive substring)
     project: Option<String>,
+    /// Filter by multiple project substrings
+    #[serde(default)]
+    projects: Vec<String>,
     /// Filter by date (YYYY-MM-DD or range)
     date: Option<String>,
     #[serde(default = "default_search_limit")]
@@ -1497,17 +1500,24 @@ fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSear
         (None, None)
     };
 
-    let filter = crate::steer_index::SteerFilter {
-        run_id: params.run_id.as_deref(),
-        prompt_id: params.prompt_id.as_deref(),
-        agent: params.agent.as_deref(),
-        kind: params.kind.as_deref(),
-        frame_kind: params.frame_kind,
-        project: params.project.as_deref(),
-        date_lo: date_lo.as_deref(),
-        date_hi: date_hi.as_deref(),
-    };
-    let metadatas = rt.block_on(crate::steer_index::search_steer_index(&filter, limit))?;
+    let project_filters = merge_project_scopes(None, params.project.clone(), params.projects);
+    let mut metadatas = Vec::new();
+    for project in search_project_scopes(&project_filters) {
+        let filter = crate::steer_index::SteerFilter {
+            run_id: params.run_id.as_deref(),
+            prompt_id: params.prompt_id.as_deref(),
+            agent: params.agent.as_deref(),
+            kind: params.kind.as_deref(),
+            frame_kind: params.frame_kind,
+            project,
+            date_lo: date_lo.as_deref(),
+            date_hi: date_hi.as_deref(),
+        };
+        let mut batch = rt.block_on(crate::steer_index::search_steer_index(&filter, limit))?;
+        metadatas.append(&mut batch);
+    }
+    dedup_steer_metadata(&mut metadatas);
+    metadatas.truncate(limit);
 
     let mut items = Vec::new();
 
@@ -1596,6 +1606,19 @@ fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSear
         matched: items.len(),
         items,
     })
+}
+
+fn dedup_steer_metadata(metadatas: &mut Vec<serde_json::Value>) {
+    let mut seen = std::collections::BTreeSet::new();
+    metadatas.retain(|meta| {
+        let key = meta
+            .get("path")
+            .or_else(|| meta.get("source_chunk"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| meta.to_string());
+        seen.insert(key)
+    });
 }
 
 fn rebuild_dashboard(config: &DashboardServerConfig) -> Result<BuildOutput> {

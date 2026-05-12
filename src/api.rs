@@ -140,6 +140,19 @@ impl Aicx {
         )
     }
 
+    pub fn extract_intents_for_projects(
+        &self,
+        config: &IntentsConfig,
+        projects: &[String],
+    ) -> Result<IntentExtraction> {
+        crate::intents::extract_intents_from_root_at_for_projects_with_stats(
+            config,
+            projects,
+            &self.config.store_root,
+            chrono::Utc::now(),
+        )
+    }
+
     pub async fn doctor(&self, opts: &DoctorOptions) -> Result<DoctorReport> {
         crate::doctor::run_at(&self.config.store_root, opts).await
     }

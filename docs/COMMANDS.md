@@ -321,7 +321,8 @@ aicx read store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.
 
 ## `aicx steer`
 
-Retrieve chunks by steering metadata (frontmatter sidecar fields). Filters by `run_id`, `prompt_id`, agent, kind, repo/store bucket, and/or date range using sidecar metadata — no filesystem grep needed. JSON output includes `oracle_status` for the rebuildable metadata index.
+Retrieve chunks by steering metadata. JSON output includes `oracle_status` for
+the rebuildable metadata index.
 
 ```bash
 aicx steer [OPTIONS]
@@ -332,7 +333,7 @@ Options:
 - `--prompt-id <PROMPT_ID>` filter by prompt_id (exact match)
 - `-a, --agent <AGENT>` filter by agent: claude, codex, gemini
 - `-k, --kind <KIND>` filter by kind: conversations, plans, reports, other
-- `-p, --project <PROJECT>` filter by repo or store bucket (case-insensitive substring)
+- `-p, --project <PROJECT>...` repo or store-bucket filter(s); omit to search all projects
 - `-d, --date <DATE>` filter by date: single day, range, or open-ended
 - `-l, --limit <N>` max results (default: `20`)
 - `-j, --json` emit JSON with `oracle_status`
@@ -343,8 +344,8 @@ Examples:
 # All chunks from a specific run
 aicx steer --run-id mrbl-001
 
-# Reports for a repo or store bucket on a specific date
-aicx steer --project ai-contexters --kind reports --date 2026-03-28
+# Reports across several repo/store buckets on a specific date
+aicx steer -p ai-contexters loctree-suite --kind reports --date 2026-03-28
 
 # All claude chunks in a date range
 aicx steer --agent claude --date 2026-03-20..2026-03-28
@@ -480,16 +481,16 @@ rank surface is intentionally reintroduced.
 
 ## `aicx intents`
 
-Extract structured intents and decisions from the canonical store (layer 1).
+Extract structured intents and decisions from the canonical store.
 JSON output includes `oracle_status` and is canonical corpus evidence, not
 semantic oracle output.
 
 ```bash
-aicx intents [OPTIONS] --project <PROJECT>
+aicx intents [OPTIONS]
 ```
 
 Options:
-- `-p, --project <PROJECT>` project filter (required)
+- `-p, --project <PROJECT>...` repo or store-bucket filter(s); omit to scan all projects
 - `-H, --hours <HOURS>` lookback window (default: `720`)
 - `--emit <markdown|json>` output format (default: `markdown`; `json` includes `oracle_status`)
 - `--strict` only show high-confidence intents
@@ -498,7 +499,7 @@ Options:
 Example:
 
 ```bash
-aicx intents -p CodeScribe --strict --kind decision
+aicx intents -p CodeScribe loctree-suite --strict --kind decision
 ```
 
 ## `aicx dashboard`
@@ -595,10 +596,10 @@ aicx state --info
 
 Run `aicx` as an MCP server (stdio or streamable HTTP transport).
 
-Exposes search, read, steer, and rank tools over MCP for agent retrieval.
-`aicx_steer` and `aicx_rank` query the canonical corpus on disk.
-`aicx_search` uses canonical-store fuzzy search today and returns
-`oracle_status` so callers cannot mistake it for semantic retrieval.
+Exposes search, read, steer, intents, and rank tools over MCP for agent retrieval.
+`aicx_search` is semantic and fails fast when the index is not ready.
+`aicx_steer`, `aicx_intents`, and `aicx_rank` query the canonical corpus on disk
+and return grounded source paths or chunk references.
 `aicx_read` pulls the actual chunk content by path, file name, or compact
 reference after a discover step.
 

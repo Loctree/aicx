@@ -908,13 +908,11 @@ enum Commands {
     #[command(name = "dashboard-serve", hide = true)]
     DashboardServeLegacy(#[command(flatten)] DashboardServeLegacyArgs),
 
-    /// Extract structured intents and decisions from canonical store (layer 1).
-    /// `--emit json` includes oracle_status and is canonical corpus evidence,
-    /// not semantic oracle output.
+    /// Extract structured intents from the canonical corpus.
     Intents {
-        /// Project filter (required)
-        #[arg(short, long)]
-        project: String,
+        /// Repo or store-bucket filters. Omit to scan all projects.
+        #[arg(short, long, num_args = 1.., value_delimiter = ',')]
+        project: Vec<String>,
 
         /// Hours to look back (default: 720 = 30 days)
         #[arg(short = 'H', long, default_value = "720")]
@@ -946,9 +944,9 @@ enum Commands {
 
     /// Stream newly-arriving intents/chunks in a follow-like mode.
     Tail {
-        /// Project filter (required)
-        #[arg(short, long)]
-        project: String,
+        /// Repo or store-bucket filters. Omit to scan all projects.
+        #[arg(short, long, num_args = 1.., value_delimiter = ',')]
+        project: Vec<String>,
 
         /// Hours to look back (default: 48)
         #[arg(short = 'H', long, default_value = "48")]
@@ -966,13 +964,7 @@ enum Commands {
         filters: RetrievalFilters,
     },
 
-    /// Run aicx as an MCP server (stdio or streamable HTTP).
-    ///
-    /// Exposes search, steer, and rank tools over MCP for agent retrieval.
-    /// `aicx_steer` and `aicx_rank` query the canonical corpus on disk.
-    /// `aicx_search` is canonical-store fuzzy search and returns
-    /// `oracle_status` so callers cannot mistake it for semantic retrieval.
-    #[command(verbatim_doc_comment)]
+    /// Run aicx as an MCP server.
     Serve {
         /// Transport: stdio (default) or http. Legacy alias: sse.
         #[arg(long, value_enum, default_value_t = McpTransport::Stdio)]
@@ -1042,15 +1034,8 @@ enum Commands {
         no_gitignore: bool,
     },
 
-    /// Search the canonical corpus. Semantic-first when the embedder is
-    /// available, with explicit filesystem-fuzzy fallback otherwise.
-    ///
-    /// `aicx` aims to be semantic by default: queries are encoded through
-    /// the in-process embedder ([`aicx_embeddings`] GGUF stack) and matched
-    /// against a materialized vector index. When the embedder cannot load
-    /// or no index has been built yet, the command fails fast with a typed
-    /// reason. Pass `--no-semantic` to intentionally run filesystem-fuzzy
-    /// search instead.
+    /// Search the canonical corpus. Semantic by default; `--no-semantic`
+    /// runs the explicit filesystem-fuzzy fallback.
     #[command(display_order = 12)]
     Search {
         /// Search query string
@@ -1084,18 +1069,8 @@ enum Commands {
         json: bool,
     },
 
-    /// Build (or preview) the vector index used by semantic `aicx search`.
-    ///
-    /// By default this writes the persistent NDJSON-backed semantic index
-    /// queried by `aicx search`. Pass `--dry-run` to probe the embedder,
-    /// sample chunks, and report stats without writing the index.
-    ///
-    /// Why dry-run exists: it is the smallest unit of evidence that the
-    /// model loads, the corpus reads, and the embedder produces vectors
-    /// of the expected dimension. Operators get an honest ETA before
-    /// they commit to a full re-index that may take 10–30 minutes on CPU
-    /// for a 10 k chunk corpus.
-    #[command(display_order = 13, verbatim_doc_comment)]
+    /// Build the semantic index. Use `--dry-run` to preview without writing.
+    #[command(display_order = 13)]
     Index {
         #[command(subcommand)]
         action: Option<IndexAction>,
@@ -1127,19 +1102,8 @@ enum Commands {
         dry_run: bool,
     },
 
-    /// Manage the canonical AICX configuration at `~/.aicx/config.toml`.
-    ///
-    /// Subcommands:
-    ///   - `init` — write a default `config.toml` with cloud-embedder
-    ///     pre-selected (recommended) plus a fully-commented native GGUF
-    ///     section. Bails if the file already exists unless `--force`.
-    ///   - `show` — display the currently resolved [`EmbeddingConfig`]
-    ///     after merging env, embedder.toml, config.toml, and defaults.
-    ///
-    /// The config file holds endpoint URL, model name, and the env-var
-    /// name for the API key — never the key itself, so the file is
-    /// safe to commit, sync, or share.
-    #[command(display_order = 4, verbatim_doc_comment)]
+    /// Manage `$HOME/.aicx/config.toml` for embedders and endpoints.
+    #[command(display_order = 4)]
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -1163,15 +1127,7 @@ enum Commands {
         json: bool,
     },
 
-    /// Retrieve chunks by steering metadata (layer 1, frontmatter fields).
-    ///
-    /// Filters the canonical store by run_id, prompt_id, agent, kind, project,
-    /// and/or date range using frontmatter metadata — no grep needed.
-    ///
-    /// Example:
-    ///   aicx steer --run-id mrbl-001
-    ///   aicx steer --project ai-contexters --kind reports --date 2026-03-28
-    #[command(verbatim_doc_comment)]
+    /// Retrieve chunks by steering metadata.
     Steer {
         /// Filter by run_id (exact match)
         #[arg(long)]
@@ -1185,9 +1141,9 @@ enum Commands {
         #[arg(short, long)]
         kind: Option<String>,
 
-        /// Filter by repo or store bucket (case-insensitive substring)
-        #[arg(short, long)]
-        project: Option<String>,
+        /// Repo or store-bucket filters. Omit to search all projects.
+        #[arg(short, long, num_args = 1.., value_delimiter = ',')]
+        project: Vec<String>,
 
         /// Filter by date: single day (2026-03-28), range (2026-03-20..2026-03-28),
         /// or open-ended (2026-03-20.. or ..2026-03-28)
@@ -1742,7 +1698,7 @@ fn main() -> Result<()> {
                 run_id.as_deref(),
                 prompt_id.as_deref(),
                 kind.as_deref(),
-                project.as_deref(),
+                &project,
                 date.as_deref(),
                 json,
                 filters,
@@ -2026,7 +1982,7 @@ struct IntentsDisplayOptions<'a> {
 }
 
 fn run_intents(
-    project: &str,
+    projects: &[String],
     hours: u64,
     filters: RetrievalFilters,
     display: IntentsDisplayOptions<'_>,
@@ -2047,14 +2003,14 @@ fn run_intents(
     });
 
     let config = intents::IntentsConfig {
-        project: project.to_string(),
+        project: projects.first().cloned().unwrap_or_default(),
         hours,
         strict,
         kind_filter,
         frame_kind: filters.frame_kind.map(Into::into),
     };
 
-    let extraction = intents::extract_intents_with_stats(&config)?;
+    let extraction = intents::extract_intents_with_stats_for_projects(&config, projects)?;
     let records = extraction.records;
 
     let (date_lo, date_hi) = if let Some(ref d) = filters.since {
@@ -2083,8 +2039,9 @@ fn run_intents(
 
     if records.is_empty() && emit != "json" {
         eprintln!(
-            "No intents found for project '{}' in last {} hours.",
-            project, hours
+            "No intents found for {} in last {} hours.",
+            project_scope_label(projects),
+            hours
         );
         return Ok(());
     }
@@ -2111,7 +2068,7 @@ fn run_intents(
 }
 
 fn run_tail(
-    project: &str,
+    projects: &[String],
     hours: u64,
     follow: bool,
     kind: Option<&str>,
@@ -2124,7 +2081,7 @@ fn run_tail(
         }
         filters.sort = Some(SortOrder::Newest);
         return run_intents(
-            project,
+            projects,
             hours,
             filters,
             IntentsDisplayOptions {
@@ -2146,7 +2103,7 @@ fn run_tail(
     });
 
     let mut config = intents::IntentsConfig {
-        project: project.to_string(),
+        project: projects.first().cloned().unwrap_or_default(),
         hours,
         strict: false,
         kind_filter,
@@ -2154,10 +2111,15 @@ fn run_tail(
     };
 
     let mut last_seen = std::collections::HashSet::new();
-    eprintln!("Watching for new intents in project '{}'...", project);
+    eprintln!(
+        "Watching for new intents in {}...",
+        project_scope_label(projects)
+    );
 
     loop {
-        if let Ok(mut records) = intents::extract_intents(&config) {
+        if let Ok(extraction) = intents::extract_intents_with_stats_for_projects(&config, projects)
+        {
+            let mut records = extraction.records;
             // Apply filtering identical to run_intents
             if let Some(agent_filter) = &filters.agent {
                 records.retain(|r| r.agent == *agent_filter);
@@ -3570,9 +3532,24 @@ fn parse_date_filter(s: &str) -> Result<(Option<String>, Option<String>)> {
     }
 }
 
-/// Semantic-only retrieval across the aicx canonical store. Fails fast
-/// (exit code 2) with `kind` + `reason` + `recommendation` when any
-/// precondition is missing — see [`aicx::search_engine::SemanticError`].
+fn project_scopes(projects: &[String]) -> Vec<Option<&str>> {
+    if projects.is_empty() {
+        vec![None]
+    } else {
+        projects.iter().map(String::as_str).map(Some).collect()
+    }
+}
+
+fn project_scope_label(projects: &[String]) -> String {
+    if projects.is_empty() {
+        "all projects".to_string()
+    } else {
+        projects.join(", ")
+    }
+}
+
+/// Semantic-first retrieval across the canonical store. Fails fast when
+/// semantic preconditions are missing unless `--no-semantic` is explicit.
 fn run_search(
     query: &str,
     projects: &[String],
@@ -3611,11 +3588,7 @@ fn run_search(
         filters.limit
     };
 
-    let scopes: Vec<Option<&str>> = if projects.is_empty() {
-        vec![None]
-    } else {
-        projects.iter().map(String::as_str).map(Some).collect()
-    };
+    let scopes = project_scopes(projects);
 
     let (mut results, scanned, semantic_status) = if no_semantic {
         let (results, scanned) = rank::fuzzy_search_store(
@@ -4148,7 +4121,7 @@ fn run_steer(
     run_id: Option<&str>,
     prompt_id: Option<&str>,
     kind: Option<&str>,
-    project: Option<&str>,
+    projects: &[String],
     date: Option<&str>,
     json: bool,
     filters: RetrievalFilters,
@@ -4163,20 +4136,27 @@ fn run_steer(
         (filters.since.clone(), filters.until.clone())
     };
 
-    let filter = aicx::steer_index::SteerFilter {
-        run_id,
-        prompt_id,
-        agent: filters.agent.as_deref(),
-        kind,
-        frame_kind: filters.frame_kind.map(Into::into),
-        project,
-        date_lo: date_lo.as_deref(),
-        date_hi: date_hi.as_deref(),
-    };
-    let mut metadatas = rt.block_on(aicx::steer_index::search_steer_index(
-        &filter,
-        filters.limit,
-    ))?;
+    let frame_kind = filters.frame_kind.map(Into::into);
+    let scopes = project_scopes(projects);
+    let mut metadatas = Vec::new();
+    for project in scopes {
+        let filter = aicx::steer_index::SteerFilter {
+            run_id,
+            prompt_id,
+            agent: filters.agent.as_deref(),
+            kind,
+            frame_kind,
+            project,
+            date_lo: date_lo.as_deref(),
+            date_hi: date_hi.as_deref(),
+        };
+        let mut batch = rt.block_on(aicx::steer_index::search_steer_index(
+            &filter,
+            filters.limit,
+        ))?;
+        metadatas.append(&mut batch);
+    }
+    dedup_steer_metadata(&mut metadatas);
 
     if let Some(sort_order) = filters.sort {
         metadatas.sort_by(|a, b| {
@@ -4197,6 +4177,7 @@ fn run_steer(
             }
         });
     }
+    metadatas.truncate(filters.limit);
 
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
@@ -4273,6 +4254,19 @@ fn run_steer(
     }
 
     Ok(())
+}
+
+fn dedup_steer_metadata(metadatas: &mut Vec<serde_json::Value>) {
+    let mut seen = BTreeSet::new();
+    metadatas.retain(|meta| {
+        let key = meta
+            .get("path")
+            .or_else(|| meta.get("source_chunk"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| meta.to_string());
+        seen.insert(key)
+    });
 }
 
 /// List chunks in the canonical store, filtered by recency.
@@ -5189,6 +5183,48 @@ mod tests {
     }
 
     #[test]
+    fn intents_accepts_multiple_project_filters() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "intents",
+            "-p",
+            "vc-operator",
+            "vibecrafted",
+            "-p",
+            "loctree",
+        ])
+        .expect("intents should accept repeated and space-list project filters");
+
+        match cli.command {
+            Some(Commands::Intents { project, .. }) => {
+                assert_eq!(project, vec!["vc-operator", "vibecrafted", "loctree"]);
+            }
+            _ => panic!("expected intents command"),
+        }
+    }
+
+    #[test]
+    fn steer_accepts_multiple_project_filters() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "steer",
+            "-p",
+            "vc-operator",
+            "vibecrafted",
+            "-p",
+            "loctree",
+        ])
+        .expect("steer should accept repeated and space-list project filters");
+
+        match cli.command {
+            Some(Commands::Steer { project, .. }) => {
+                assert_eq!(project, vec!["vc-operator", "vibecrafted", "loctree"]);
+            }
+            _ => panic!("expected steer command"),
+        }
+    }
+
+    #[test]
     fn steer_accepts_frame_kind_filter() {
         let cli = Cli::try_parse_from(["aicx", "steer", "--frame-kind", "user_msg"])
             .expect("steer command with frame-kind should parse");
@@ -5203,15 +5239,8 @@ mod tests {
 
     #[test]
     fn intents_accepts_frame_kind_filter() {
-        let cli = Cli::try_parse_from([
-            "aicx",
-            "intents",
-            "--project",
-            "ai-contexters",
-            "--frame-kind",
-            "tool_call",
-        ])
-        .expect("intents command with frame-kind should parse");
+        let cli = Cli::try_parse_from(["aicx", "intents", "--frame-kind", "tool_call"])
+            .expect("intents command with frame-kind should parse");
 
         match cli.command {
             Some(Commands::Intents { filters, .. }) => {
@@ -5298,7 +5327,7 @@ mod tests {
     }
 
     #[test]
-    fn serve_help_prefers_http_name_and_explains_search_fallback() {
+    fn serve_help_prefers_http_name_and_stays_compact() {
         let mut cmd = Cli::command();
         let serve = cmd
             .find_subcommand_mut("serve")
@@ -5307,8 +5336,11 @@ mod tests {
 
         assert!(rendered.contains("Transport: stdio (default) or http."));
         assert!(!rendered.contains("Transport: stdio (default) or sse"));
-        assert!(rendered.contains("cannot mistake it for semantic retrieval"));
         assert!(!rendered.contains("embedding mode"));
+        assert!(
+            rendered.lines().count() < 20,
+            "serve help should stay compact"
+        );
     }
 
     #[test]
@@ -5377,21 +5409,22 @@ mod tests {
     }
 
     #[test]
-    fn steer_help_keeps_examples_split() {
+    fn steer_help_stays_short_and_scope_oriented() {
         let mut cmd = Cli::command();
         let steer = cmd
             .find_subcommand_mut("steer")
             .expect("steer subcommand should exist");
-        let rendered = steer.render_long_help().to_string();
+        let rendered = steer.render_help().to_string();
 
-        assert!(rendered.contains("aicx steer --run-id mrbl-001"));
-        assert!(
-            rendered
-                .contains("aicx steer --project ai-contexters --kind reports --date 2026-03-28")
-        );
-        assert!(!rendered.contains("mrbl-001 aicx steer"));
+        assert!(rendered.contains("Retrieve chunks by steering metadata"));
+        assert!(rendered.contains("--project <PROJECT>..."));
+        assert!(!rendered.contains("aicx steer --run-id mrbl-001"));
         assert!(!rendered.contains("--no-redact-secrets"));
         assert!(!rendered.contains("--hours <HOURS>"));
+        assert!(
+            rendered.lines().count() < 45,
+            "steer help should stay compact"
+        );
     }
 
     #[test]
