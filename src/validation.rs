@@ -106,6 +106,9 @@ mod tests {
         assert!(!is_valid_repo_bucket_name("vc-skills.git\"><span"));
         assert!(!is_valid_repo_bucket_name("ai-contexters;"));
         assert!(!is_valid_repo_bucket_name("rmcp-memex\"\\necho"));
+        assert!(!is_valid_repo_bucket_name(
+            "loctxc_O)outcomqqqqqqq]]qqqqqqqqqqqqqqqqqqqqqqqqqqq;;'["
+        ));
     }
 
     #[test]
@@ -124,6 +127,9 @@ mod tests {
         // Mid-segment garbage still rejected (extractor-bug evidence):
         assert!(!is_valid_repo_project_slug("VetCoders/vibecrafted.git`"));
         assert!(!is_valid_repo_project_slug("VetCoders/loctree\n\n**AICX"));
+        assert!(!is_valid_repo_project_slug(
+            "VetCoders/loctxc_O)outcomqqqqqqq]]qqqqqqqqqqqqqqqqqqqqqqqqqqq;;'["
+        ));
 
         // Structural rejects:
         assert!(!is_valid_repo_project_slug("VetCoders/aicx/extra"));

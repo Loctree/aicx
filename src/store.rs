@@ -3256,6 +3256,15 @@ mod tests {
         assert!(validated_store_project_dir(&root, bad).is_err());
         assert!(!root.join("VetCoders").join("loctree\n\n**AICX").exists());
 
+        let bad = "VetCoders/loctxc_O)outcomqqqqqqq]]qqqqqqqqqqqqqqqqqqqqqqqqqqq;;'[";
+        assert!(validated_store_project_dir(&root, bad).is_err());
+        assert!(
+            !root
+                .join("VetCoders")
+                .join("loctxc_O)outcomqqqqqqq]]qqqqqqqqqqqqqqqqqqqqqqqqqqq;;'[")
+                .exists()
+        );
+
         let _ = fs::remove_dir_all(&root);
     }
 
