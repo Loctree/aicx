@@ -192,7 +192,8 @@ fn run_native_pass(
     let mut engine = match crate::embedder::EmbeddingEngine::new() {
         Ok(engine) => engine,
         Err(err) => {
-            stats.fallback_reason = Some(format!("embedder init failed: {err}"));
+            stats.fallback_reason =
+                Some(format!("semantic embedder unavailable (optional): {err}"));
             return;
         }
     };
@@ -331,7 +332,8 @@ pub fn write_index(project: Option<&str>, sample: usize) -> Result<IndexStats> {
     let mut engine = match crate::embedder::EmbeddingEngine::new() {
         Ok(engine) => engine,
         Err(err) => {
-            stats.fallback_reason = Some(format!("embedder init failed: {err}"));
+            stats.fallback_reason =
+                Some(format!("semantic embedder unavailable (optional): {err}"));
             stats.elapsed_ms = started.elapsed().as_millis();
             return Ok(stats);
         }
@@ -536,7 +538,7 @@ pub fn query_index(project: Option<&str>, query: &str, limit: usize) -> Result<V
     let _lock = crate::locks::acquire_shared(crate::locks::lance_lock_path()?)?;
 
     let mut engine = crate::embedder::EmbeddingEngine::new()
-        .with_context(|| "embedder init failed for query")?;
+        .with_context(|| "semantic embedder unavailable (optional) for query")?;
     let query_embedding = engine.embed(query).with_context(|| "embed query")?;
 
     // `open_file_validated` validates the path against canonical roots

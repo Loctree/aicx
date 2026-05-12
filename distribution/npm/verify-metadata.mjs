@@ -21,11 +21,16 @@ const PLATFORMS = [
     key: "darwin-arm64",
     packageName: "@loctree/aicx-darwin-arm64",
     assetTriple: "aarch64-apple-darwin",
+    os: "darwin",
+    cpu: "arm64",
   },
   {
     key: "linux-x64-gnu",
     packageName: "@loctree/aicx-linux-x64-gnu",
     assetTriple: "x86_64-unknown-linux-gnu",
+    os: "linux",
+    cpu: "x64",
+    libc: "glibc",
   },
 ];
 
@@ -83,6 +88,12 @@ for (const platform of PLATFORMS) {
 
   assertEqual(`${platform.key} package name`, pkg.name, platform.packageName);
   assertEqual(`${platform.key} package version`, pkg.version, version);
+  assertIncludes(`${platform.key} package os`, JSON.stringify(pkg.os || []), platform.os);
+  assertIncludes(`${platform.key} package cpu`, JSON.stringify(pkg.cpu || []), platform.cpu);
+  if (platform.libc) {
+    assertIncludes(`${platform.key} package libc`, JSON.stringify(pkg.libc || []), platform.libc);
+    assertNotIncludes(`${platform.key} package libc`, JSON.stringify(pkg.libc || []), "musl");
+  }
   assertIncludes(`${platform.key} postinstall`, postinstall, platform.packageName);
   assertIncludes(
     `${platform.key} postinstall`,

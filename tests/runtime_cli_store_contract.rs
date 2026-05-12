@@ -499,19 +499,19 @@ fn store_cli_codex_emits_repo_and_non_repo_canonical_roots() {
     assert!(payload["requested_source_filters"].is_null());
     assert_eq!(
         resolved_repositories,
-        vec!["vetcoders/ai-contexters".to_string()]
+        vec!["VetCoders/ai-contexters".to_string()]
     );
     assert_eq!(
         payload["includes_non_repository_contexts"].as_bool(),
         Some(true)
     );
-    assert!(payload["resolved_store_buckets"]["vetcoders/ai-contexters"].is_object());
+    assert!(payload["resolved_store_buckets"]["VetCoders/ai-contexters"].is_object());
     assert!(payload["resolved_store_buckets"]["non-repository-contexts"].is_object());
     assert!(store_paths.iter().any(|path| {
         path.starts_with(
             home.join(".aicx")
                 .join("store")
-                .join("vetcoders")
+                .join("VetCoders")
                 .join("ai-contexters"),
         )
     }));
@@ -596,14 +596,14 @@ fn store_cli_store_command_emits_repo_and_non_repo_canonical_roots() {
         "expected at least 2 chunks"
     );
     assert!(payload["requested_source_filters"].is_null());
-    assert_eq!(resolved_repositories, vec!["vetcoders/loctree".to_string()]);
+    assert_eq!(resolved_repositories, vec!["VetCoders/loctree".to_string()]);
     assert_eq!(
         payload["includes_non_repository_contexts"].as_bool(),
         Some(true)
     );
-    assert!(payload["resolved_store_buckets"]["vetcoders/loctree"].is_object());
+    assert!(payload["resolved_store_buckets"]["VetCoders/loctree"].is_object());
     assert!(payload["resolved_store_buckets"]["non-repository-contexts"].is_object());
-    assert!(payload["repos"]["vetcoders/loctree"].is_object());
+    assert!(payload["repos"]["VetCoders/loctree"].is_object());
     assert!(payload["repos"].get("non-repository-contexts").is_none());
     assert!(
         store_paths.len() >= 2,
@@ -614,7 +614,7 @@ fn store_cli_store_command_emits_repo_and_non_repo_canonical_roots() {
         path.starts_with(
             home.join(".aicx")
                 .join("store")
-                .join("vetcoders")
+                .join("VetCoders")
                 .join("loctree"),
         )
     }));
@@ -723,7 +723,7 @@ fn migration_cli_rebuilds_and_salvages_realistic_bundle() {
         canonical_paths[0].starts_with(
             store_root
                 .join("store")
-                .join("vetcoders")
+                .join("VetCoders")
                 .join("ai-contexters")
         )
     );

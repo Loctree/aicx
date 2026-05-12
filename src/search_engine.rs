@@ -211,7 +211,7 @@ fn try_semantic_search_native(
                     .to_string()
             };
             return Err(SemanticError::EmbedderUnavailable {
-                reason: format!("embedder init failed: {msg}"),
+                reason: format!("semantic embedder unavailable (optional): {msg}"),
                 recommendation,
             });
         }

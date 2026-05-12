@@ -137,6 +137,12 @@ def make_text_surfaces(version: str) -> tuple[TextSurface, ...]:
                     0,
                     "distribution/npm/README sync-version check example",
                 ),
+                (
+                    r"(node distribution/npm/verify-metadata\.mjs )\d+\.\d+\.\d+",
+                    rf"\g<1>{version}",
+                    0,
+                    "distribution/npm/README verify-metadata example",
+                ),
             ),
         ),
         TextSurface(
@@ -155,6 +161,12 @@ def make_text_surfaces(version: str) -> tuple[TextSurface, ...]:
                     "distribution/npm/PUBLISHING sync-version check example",
                 ),
                 (
+                    r"(node distribution/npm/verify-metadata\.mjs )\d+\.\d+\.\d+",
+                    rf"\g<1>{version}",
+                    0,
+                    "distribution/npm/PUBLISHING verify-metadata example",
+                ),
+                (
                     r"https://github\.com/Loctree/aicx/releases/download/v\d+\.\d+\.\d+/aicx-v\d+\.\d+\.\d+-aarch64-apple-darwin-slim-unsigned\.tar\.gz",
                     f"https://github.com/Loctree/aicx/releases/download/v{version}/aicx-v{version}-aarch64-apple-darwin-slim-unsigned.tar.gz",
                     0,
@@ -165,6 +177,18 @@ def make_text_surfaces(version: str) -> tuple[TextSurface, ...]:
                     f"https://github.com/Loctree/aicx/releases/download/v{version}/aicx-v{version}-aarch64-apple-darwin-slim-unsigned.tar.gz.sha256",
                     0,
                     "distribution/npm/PUBLISHING checksum URL example",
+                ),
+                (
+                    r"https://github\.com/Loctree/aicx/releases/download/v\d+\.\d+\.\d+/aicx-v\d+\.\d+\.\d+-x86_64-unknown-linux-gnu-slim-unsigned\.tar\.gz",
+                    f"https://github.com/Loctree/aicx/releases/download/v{version}/aicx-v{version}-x86_64-unknown-linux-gnu-slim-unsigned.tar.gz",
+                    0,
+                    "distribution/npm/PUBLISHING linux release archive URL example",
+                ),
+                (
+                    r"https://github\.com/Loctree/aicx/releases/download/v\d+\.\d+\.\d+/aicx-v\d+\.\d+\.\d+-x86_64-unknown-linux-gnu-slim-unsigned\.tar\.gz\.sha256",
+                    f"https://github.com/Loctree/aicx/releases/download/v{version}/aicx-v{version}-x86_64-unknown-linux-gnu-slim-unsigned.tar.gz.sha256",
+                    0,
+                    "distribution/npm/PUBLISHING linux checksum URL example",
                 ),
             ),
         ),

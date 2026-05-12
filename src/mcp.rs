@@ -755,8 +755,13 @@ impl rmcp::handler::server::ServerHandler for AicxMcpServer {
         // `list_tools`, and `get_tool` methods; rust 1.95 dead_code analysis
         // doesn't traverse macro expansions, so anchor the read here.
         let _ = &self.tool_router;
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("aicx-mcp", env!("CARGO_PKG_VERSION")))
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
+        .with_server_info(Implementation::new("aicx-mcp", env!("CARGO_PKG_VERSION")))
     }
 }
 
