@@ -165,11 +165,18 @@ pub fn try_semantic_search(
     query: &str,
     limit: usize,
     project_filters: &[Option<&str>],
-    _frame_kind_filter: Option<FrameKind>,
+    frame_kind_filter: Option<FrameKind>,
+    kind_filter: Option<&str>,
 ) -> std::result::Result<SemanticOutcome, SemanticError> {
     #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
     {
-        let _ = (query, limit, project_filters);
+        let _ = (
+            query,
+            limit,
+            project_filters,
+            frame_kind_filter,
+            kind_filter,
+        );
         Err(SemanticError::EmbedderFeatureMissing {
             reason: "this aicx binary was compiled without any embedder feature".to_string(),
             recommendation:
@@ -192,7 +199,13 @@ pub fn try_semantic_search(
         let mut scanned = 0usize;
         let mut model_id = None;
         for scope in scopes {
-            let mut outcome = try_semantic_search_native(query, per_scope_limit, scope)?;
+            let mut outcome = try_semantic_search_native(
+                query,
+                per_scope_limit,
+                scope,
+                frame_kind_filter,
+                kind_filter,
+            )?;
             scanned += outcome.scanned;
             model_id.get_or_insert(outcome.model_id.clone());
             merged_results.append(&mut outcome.results);
@@ -213,6 +226,8 @@ fn try_semantic_search_native(
     query: &str,
     limit: usize,
     project_filter: Option<&str>,
+    frame_kind_filter: Option<FrameKind>,
+    kind_filter: Option<&str>,
 ) -> std::result::Result<SemanticOutcome, SemanticError> {
     // Probe the embedder first.
     let engine = match crate::embedder::EmbeddingEngine::new() {
@@ -328,7 +343,13 @@ fn try_semantic_search_native(
     // shared so concurrent reads are fine).
     drop(engine);
 
-    let hits = match crate::vector_index::query_index(project_filter, query, limit) {
+    let hits = match crate::vector_index::query_index(
+        project_filter,
+        query,
+        limit,
+        kind_filter,
+        frame_kind_filter.map(FrameKind::as_str),
+    ) {
         Ok(hits) => hits,
         Err(err) => {
             return Err(SemanticError::IndexCorrupt {
@@ -359,27 +380,29 @@ fn try_semantic_search_native(
     let scanned = hits.len();
     let results: Vec<FuzzyResult> = hits
         .into_iter()
+        .take(limit)
         .map(|h| {
             // Map cosine [-1, 1] → unsigned 0..=100 score for FuzzyResult
             // (downstream renderers share the shape with the lexical
             // path). Negative scores clamp to 0; lexical never emits
             // negatives either.
             let score_pct = ((h.score.max(0.0) * 100.0).round() as u8).min(100);
+            let matched_lines = semantic_preview_lines(&h.path);
             FuzzyResult {
                 file: h.path.to_string_lossy().to_string(),
                 path: h.path.to_string_lossy().to_string(),
                 project: h.project,
-                kind: String::new(),
-                frame_kind: None,
+                kind: h.kind,
+                frame_kind: h.frame_kind,
                 agent: h.agent,
                 date: h.date,
                 timestamp: None,
                 score: score_pct,
                 label: format!("semantic:{}", h.id),
                 density: h.score,
-                matched_lines: Vec::new(),
-                session_id: None,
-                cwd: None,
+                matched_lines,
+                session_id: Some(h.session_id),
+                cwd: h.cwd,
             }
         })
         .collect();
@@ -417,6 +440,24 @@ fn index_appears_empty(path: &std::path::Path) -> bool {
         .is_none()
 }
 
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn semantic_preview_lines(path: &std::path::Path) -> Vec<String> {
+    const MAX_LINES: usize = 6;
+    let Ok(content) = crate::sanitize::read_to_string_validated(path) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with("[project:"))
+        .filter(|line| *line != "[signals]" && *line != "[/signals]")
+        .filter(|line| !line.starts_with("id: "))
+        .take(MAX_LINES)
+        .map(|line| line.strip_prefix("content: ").unwrap_or(line).to_string())
+        .collect()
+}
+
 /// Compose the canonical `oracle_status` line emitted to stderr after a
 /// successful semantic search call.
 pub fn render_semantic_status_line(
@@ -448,6 +489,7 @@ mod tests {
             "any query",
             10,
             &[None],
+            None,
             None,
         );
 

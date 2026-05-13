@@ -262,11 +262,13 @@ struct CompactSearchItem {
     score: u8,
     label: String,
     project: String,
+    kind: String,
     agent: String,
     date: String,
     timestamp: Option<String>,
     frame_kind: Option<String>,
     session: String,
+    session_id: String,
     cwd: String,
     matches: Vec<String>,
     path: String,
@@ -315,11 +317,13 @@ pub fn render_search_json_with_oracle(
             score: result.score,
             label: result.label.clone(),
             project: result.project.clone(),
+            kind: result.kind.clone(),
             agent: result.agent.clone(),
             date: result.date.clone(),
             timestamp: result.timestamp.clone(),
             frame_kind: result.frame_kind.clone(),
             session: result.session_id.clone().unwrap_or_else(|| "-".to_string()),
+            session_id: result.session_id.clone().unwrap_or_else(|| "-".to_string()),
             cwd: result.cwd.clone().unwrap_or_else(|| "-".to_string()),
             matches: display_search_matches(result),
             path: result.path.clone(),
@@ -1448,9 +1452,11 @@ Some boilerplate text.
         assert_eq!(payload["items"][0]["score"], 88);
         assert_eq!(payload["items"][0]["label"], "HIGH");
         assert_eq!(payload["items"][0]["project"], "VetCoders/ai-contexters");
+        assert_eq!(payload["items"][0]["kind"], "reports");
         assert_eq!(payload["items"][0]["agent"], "codex");
         assert_eq!(payload["items"][0]["date"], "2026-03-31");
         assert_eq!(payload["items"][0]["session"], "sess-123");
+        assert_eq!(payload["items"][0]["session_id"], "sess-123");
         assert_eq!(payload["items"][0]["cwd"], "/repo");
         assert_eq!(payload["items"][0]["path"], "/tmp/chunk.md");
         assert_eq!(payload["items"][0]["matches"].as_array().unwrap().len(), 2);

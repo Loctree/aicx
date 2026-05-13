@@ -116,12 +116,21 @@ impl Aicx {
         };
         let project_scopes = search_project_scopes(&owned_projects);
 
+        let kind_filter = match opts.kind.as_deref() {
+            Some(kind) => Some(
+                crate::timeline::Kind::parse(kind)
+                    .ok_or_else(|| anyhow::anyhow!("unknown corpus kind `{kind}`"))?,
+            ),
+            None => None,
+        };
+
         let outcome = crate::search_engine::try_semantic_search(
             &self.config.store_root,
             query.as_ref(),
             opts.limit,
             &project_scopes,
             opts.frame_kind,
+            kind_filter.map(|kind| kind.dir_name()),
         )
         .map_err(anyhow::Error::from)
         .context("semantic search unavailable")?;
@@ -173,6 +182,7 @@ pub struct SearchOptions {
     pub projects: Vec<String>,
     pub project: Option<String>,
     pub frame_kind: Option<FrameKind>,
+    pub kind: Option<String>,
 }
 
 impl Default for SearchOptions {
@@ -182,6 +192,7 @@ impl Default for SearchOptions {
             projects: Vec::new(),
             project: None,
             frame_kind: None,
+            kind: None,
         }
     }
 }

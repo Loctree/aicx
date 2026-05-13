@@ -88,6 +88,18 @@ pub struct IndexEntry {
     pub date: String,
     /// Absolute path to the chunk markdown file.
     pub path: PathBuf,
+    /// Canonical corpus kind (`conversations`, `plans`, `reports`, `other`).
+    #[serde(default)]
+    pub kind: String,
+    /// Source session id when known.
+    #[serde(default)]
+    pub session_id: String,
+    /// Timeline frame kind (`user_msg`, `agent_reply`, `internal_thought`, `tool_call`).
+    #[serde(default)]
+    pub frame_kind: Option<String>,
+    /// Working directory when captured by the extractor.
+    #[serde(default)]
+    pub cwd: Option<String>,
     /// Embedding vector. Dimension is implied by the resolved model
     /// (recorded in the per-file header — see [`IndexHeader`]).
     pub embedding: Vec<f32>,
@@ -114,6 +126,10 @@ pub struct QueryHit {
     pub agent: String,
     pub date: String,
     pub path: PathBuf,
+    pub kind: String,
+    pub session_id: String,
+    pub frame_kind: Option<String>,
+    pub cwd: Option<String>,
     /// Cosine similarity in `[-1.0, 1.0]`. Higher = more similar.
     pub score: f32,
 }
@@ -404,6 +420,10 @@ pub fn write_index(project: Option<&str>, sample: usize) -> Result<IndexStats> {
             agent: stored.agent.clone(),
             date: stored.date_iso.clone(),
             path: stored.path.clone(),
+            kind: stored.kind.dir_name().to_string(),
+            session_id: stored.session_id.clone(),
+            frame_kind: chunk_frame_kind(&stored.path),
+            cwd: chunk_cwd(&stored.path),
             embedding,
         };
         writeln!(writer, "{}", serde_json::to_string(&entry)?)?;
@@ -452,6 +472,10 @@ pub fn write_index(project: Option<&str>, sample: usize) -> Result<IndexStats> {
                 agent: stored.sidecar.agent.clone(),
                 date: stored.sidecar.date.clone(),
                 path: stored.raw_path.clone(),
+                kind: "context-corpus".to_string(),
+                session_id: stored.sidecar.id.clone(),
+                frame_kind: None,
+                cwd: None,
                 embedding,
             };
             writeln!(context_writer, "{}", serde_json::to_string(&entry)?)?;
@@ -519,6 +543,77 @@ fn chunk_id_from_path(path: &std::path::Path) -> String {
         })
 }
 
+struct IndexEntryMetadata {
+    kind: String,
+    session_id: String,
+    frame_kind: Option<String>,
+    cwd: Option<String>,
+}
+
+fn indexed_metadata(entry: &IndexEntry) -> IndexEntryMetadata {
+    IndexEntryMetadata {
+        kind: if entry.kind.is_empty() {
+            infer_kind_from_path(&entry.path)
+        } else {
+            entry.kind.clone()
+        },
+        session_id: if entry.session_id.is_empty() {
+            infer_session_id_from_path(&entry.path)
+        } else {
+            entry.session_id.clone()
+        },
+        frame_kind: entry
+            .frame_kind
+            .clone()
+            .or_else(|| chunk_frame_kind(&entry.path)),
+        cwd: entry.cwd.clone().or_else(|| chunk_cwd(&entry.path)),
+    }
+}
+
+fn infer_kind_from_path(path: &std::path::Path) -> String {
+    path.components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .find_map(|part| crate::timeline::Kind::parse(part).map(|kind| kind.dir_name().to_string()))
+        .unwrap_or_else(|| "other".to_string())
+}
+
+fn infer_session_id_from_path(path: &std::path::Path) -> String {
+    let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+        return "-".to_string();
+    };
+    let parts = stem.split('_').collect::<Vec<_>>();
+    if parts.len() >= 5 {
+        parts[3..parts.len() - 1].join("_")
+    } else {
+        "-".to_string()
+    }
+}
+
+fn chunk_frame_kind(path: &std::path::Path) -> Option<String> {
+    first_metadata_field(path, "frame_kind")
+}
+
+fn chunk_cwd(path: &std::path::Path) -> Option<String> {
+    first_metadata_field(path, "cwd")
+}
+
+fn first_metadata_field(path: &std::path::Path, key: &str) -> Option<String> {
+    let content = crate::sanitize::read_to_string_validated(path).ok()?;
+    let first = content.lines().next()?.trim();
+    if !(first.starts_with('[') && first.ends_with(']')) {
+        return None;
+    }
+    first
+        .trim_matches(|ch| ch == '[' || ch == ']')
+        .split('|')
+        .filter_map(|part| part.trim().split_once(':'))
+        .find_map(|(field, value)| {
+            (field.trim() == key)
+                .then(|| value.trim().to_string())
+                .filter(|value| !value.is_empty() && value != "-")
+        })
+}
+
 /// Query the persistent index for the top `limit` chunks most similar to
 /// `query`. Returns an empty `Vec` if the index does not exist yet or
 /// the embedder cannot load.
@@ -528,7 +623,13 @@ fn chunk_id_from_path(path: &std::path::Path) -> String {
 /// ~100k chunks per bucket, the storage migrates to Lance + ANN search
 /// behind the same `query_index` signature.
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-pub fn query_index(project: Option<&str>, query: &str, _limit: usize) -> Result<Vec<QueryHit>> {
+pub fn query_index(
+    project: Option<&str>,
+    query: &str,
+    _limit: usize,
+    kind_filter: Option<&str>,
+    frame_kind_filter: Option<&str>,
+) -> Result<Vec<QueryHit>> {
     use std::io::{BufRead, BufReader};
 
     let path = index_path(project)?;
@@ -577,6 +678,17 @@ pub fn query_index(project: Option<&str>, query: &str, _limit: usize) -> Result<
             Ok(e) => e,
             Err(_) => continue, // tolerate corrupt lines without bailing
         };
+        let metadata = indexed_metadata(&entry);
+        if let Some(kind) = kind_filter
+            && metadata.kind != kind
+        {
+            continue;
+        }
+        if let Some(frame_kind) = frame_kind_filter
+            && metadata.frame_kind.as_deref() != Some(frame_kind)
+        {
+            continue;
+        }
         let score = cosine_similarity(&query_embedding, &entry.embedding);
         hits.push(QueryHit {
             id: entry.id,
@@ -584,6 +696,10 @@ pub fn query_index(project: Option<&str>, query: &str, _limit: usize) -> Result<
             agent: entry.agent,
             date: entry.date,
             path: entry.path,
+            kind: metadata.kind,
+            session_id: metadata.session_id,
+            frame_kind: metadata.frame_kind,
+            cwd: metadata.cwd,
             score,
         });
     }
@@ -598,7 +714,13 @@ pub fn query_index(project: Option<&str>, query: &str, _limit: usize) -> Result<
 
 /// Query stub for builds without an embedder feature.
 #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
-pub fn query_index(_project: Option<&str>, _query: &str, _limit: usize) -> Result<Vec<QueryHit>> {
+pub fn query_index(
+    _project: Option<&str>,
+    _query: &str,
+    _limit: usize,
+    _kind_filter: Option<&str>,
+    _frame_kind_filter: Option<&str>,
+) -> Result<Vec<QueryHit>> {
     Ok(Vec::new())
 }
 

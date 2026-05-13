@@ -19,7 +19,7 @@ use crate::intents::{self, IntentKind, IntentsConfig};
 use crate::oracle::OracleStatus;
 use crate::rank;
 use crate::store;
-use crate::timeline::FrameKind;
+use crate::timeline::{FrameKind, Kind};
 
 // ============================================================================
 // Tool parameter & result types
@@ -60,6 +60,8 @@ pub struct SearchParams {
     pub sort: Option<String>,
     /// Optional frame/channel filter: user_msg, agent_reply, internal_thought, tool_call
     pub frame_kind: Option<FrameKind>,
+    /// Optional canonical corpus kind filter: conversations, plans, reports, other
+    pub kind: Option<String>,
     /// Return only metadata without full snippet content
     #[serde(default = "default_true")]
     pub slim: bool,
@@ -335,6 +337,26 @@ impl AicxMcpServer {
         let hours = params.hours.unwrap_or(0);
         let date = params.date;
         let frame_kind = params.frame_kind;
+        let kind_filter = match params.kind.as_deref() {
+            Some(kind) => match Kind::parse(kind) {
+                Some(kind) => Some(kind),
+                None => {
+                    let payload = serde_json::json!({
+                        "ok": false,
+                        "error": "invalid_kind_filter",
+                        "kind": kind,
+                        "expected": ["conversations", "plans", "reports", "other"],
+                    });
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "invalid kind filter `{kind}`; expected conversations, plans, reports, or other"
+                        ),
+                        Some(payload),
+                    ));
+                }
+            },
+            None => None,
+        };
         let fetch_limit = if score.is_some() || date.is_some() || hours > 0 {
             limit.saturating_mul(5).max(50)
         } else {
@@ -355,6 +377,7 @@ impl AicxMcpServer {
             fetch_limit,
             &project_scopes,
             frame_kind,
+            kind_filter.map(|kind| kind.dir_name()),
         ) {
             Ok(outcome) => outcome,
             Err(err) => {

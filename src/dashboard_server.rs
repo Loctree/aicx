@@ -211,6 +211,8 @@ struct SemanticSearchParams {
     score: Option<u8>,
     /// Optional frame/channel filter
     frame_kind: Option<crate::timeline::FrameKind>,
+    /// Optional canonical corpus kind filter
+    kind: Option<String>,
 }
 
 // default_namespace / default_search_mode removed 2026-05-10: the
@@ -1205,6 +1207,24 @@ async fn semantic_search(
         params.projects.clone(),
     );
     let frame_kind = params.frame_kind;
+    let kind_filter = match params.kind.as_deref() {
+        Some(kind) => match crate::timeline::Kind::parse(kind) {
+            Some(kind) => Some(kind),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        ok: false,
+                        error: format!(
+                            "Invalid kind '{kind}'. Expected conversations, plans, reports, or other"
+                        ),
+                    }),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
     let score_filter = match validate_score_filter(params.score) {
         Ok(score) => score,
         Err(error) => {
@@ -1217,6 +1237,7 @@ async fn semantic_search(
     };
     let query_clone = query.clone();
     let project_owned = request_projects.clone();
+    let kind_filter_owned = kind_filter;
 
     let result = tokio::task::spawn_blocking(move || {
         let project_scopes = search_project_scopes(&project_owned);
@@ -1226,6 +1247,7 @@ async fn semantic_search(
             limit,
             &project_scopes,
             frame_kind,
+            kind_filter_owned.map(|kind| kind.dir_name()),
         )
     })
     .await;

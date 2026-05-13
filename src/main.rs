@@ -1060,6 +1060,10 @@ enum Commands {
         #[command(flatten)]
         filters: RetrievalFilters,
 
+        /// Filter by canonical corpus kind: conversations, plans, reports, other.
+        #[arg(long, value_parser = ["conversations", "conversation", "plans", "plan", "reports", "report", "other"])]
+        kind: Option<String>,
+
         /// Bypass semantic vector search and run filesystem-fuzzy search.
         #[arg(long)]
         no_semantic: bool,
@@ -1650,6 +1654,7 @@ fn main() -> Result<()> {
             hours,
             date,
             filters,
+            kind,
             no_semantic,
             json,
         }) => {
@@ -1660,6 +1665,7 @@ fn main() -> Result<()> {
                 date.as_deref(),
                 json,
                 filters,
+                kind.as_deref(),
                 no_semantic,
             )?;
         }
@@ -3557,8 +3563,10 @@ fn run_search(
     date: Option<&str>,
     json: bool,
     filters: RetrievalFilters,
+    kind: Option<&str>,
     no_semantic: bool,
 ) -> Result<()> {
+    let kind_filter = kind.and_then(aicx::timeline::Kind::parse);
     // Extract inline date hints from query if no explicit --date given
     let (effective_query, inline_date) = if date.is_none() {
         extract_date_from_query(query)
@@ -3606,6 +3614,7 @@ fn run_search(
             fetch_limit,
             &scopes,
             filters.frame_kind.map(Into::into),
+            kind_filter.map(|kind| kind.dir_name()),
         ) {
             Ok(outcome) => {
                 let status = (
@@ -3641,6 +3650,9 @@ fn run_search(
         }
     };
 
+    if let Some(kind_filter) = kind_filter {
+        results.retain(|r| r.kind == kind_filter.dir_name());
+    }
     if let Some(min_score) = filters.score {
         results.retain(|r| r.score >= min_score);
     }
@@ -5108,6 +5120,19 @@ mod tests {
         match cli.command {
             Some(Commands::Search { filters, .. }) => {
                 assert_eq!(filters.frame_kind, Some(FrameKindArg::InternalThought));
+            }
+            _ => panic!("expected search command"),
+        }
+    }
+
+    #[test]
+    fn search_accepts_corpus_kind_filter() {
+        let cli = Cli::try_parse_from(["aicx", "search", "dashboard", "--kind", "conversations"])
+            .expect("search command with corpus kind should parse");
+
+        match cli.command {
+            Some(Commands::Search { kind, .. }) => {
+                assert_eq!(kind.as_deref(), Some("conversations"));
             }
             _ => panic!("expected search command"),
         }
