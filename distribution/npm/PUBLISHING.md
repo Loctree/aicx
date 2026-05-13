@@ -1,11 +1,15 @@
 # Publishing Guide - aicx npm packages
 
+> Status: aligned to the current `*-slim-unsigned.tar.gz` GitHub Release asset
+> shape for macOS arm64 and Linux x64 GNU. Publish only after the matching
+> release assets and `.sha256` sidecars exist for the target version.
+
 This guide describes the publish flow for the single wrapper package and its
 platform sub-packages under the `@loctree` npm scope.
 
 ## Architecture
 
-One wrapper, four platform packages.
+One wrapper, two active platform packages.
 
 The wrapper publishes two commands:
 
@@ -22,14 +26,7 @@ Platform packages install the matching release asset from
 Platform matrix:
 
 - `darwin-arm64`
-- `darwin-x64`
 - `linux-x64-gnu`
-- `linux-x64-musl`
-
-The Linux `gnu` and `musl` platform packages both consume the same
-`x86_64-unknown-linux-musl` release asset because the release binary is
-statically linked and intended to be portable across the two common x64 Linux
-surfaces.
 
 Each platform package downloads:
 
@@ -45,10 +42,10 @@ Then it:
 ## Prerequisites
 
 1. `@loctree` npm org exists and you have publish rights.
-2. GitHub releases exist for the target version with the expected asset names:
-   - `aicx-v{V}-aarch64-apple-darwin.zip`
-   - `aicx-v{V}-x86_64-apple-darwin.zip`
-   - `aicx-v{V}-x86_64-unknown-linux-musl.tar.gz`
+2. GitHub releases exist for the target version with the asset names expected
+   by the platform packages:
+   - `aicx-v{V}-aarch64-apple-darwin-slim-unsigned.tar.gz`
+   - `aicx-v{V}-x86_64-unknown-linux-gnu-slim-unsigned.tar.gz`
 3. Each asset has an adjacent `.sha256`.
 4. Node.js 14+.
 
@@ -57,14 +54,15 @@ Then it:
 ### Step 1 - Sync versions
 
 ```bash
-node distribution/npm/sync-version.mjs 0.6.5
-node distribution/npm/sync-version.mjs --check 0.6.5
+node distribution/npm/sync-version.mjs 0.7.3
+node distribution/npm/sync-version.mjs --check 0.7.3
+node distribution/npm/verify-metadata.mjs 0.7.3
 ```
 
 ### Step 2 - Publish platform packages first
 
 ```bash
-for plat in darwin-arm64 darwin-x64 linux-x64-gnu linux-x64-musl; do
+for plat in darwin-arm64 linux-x64-gnu; do
   (cd distribution/npm/aicx/platform-packages/$plat && npm publish --access public)
 done
 ```
@@ -115,9 +113,13 @@ then publishes the wrapper.
 - Verify the release assets and `.sha256` files exist.
 - Test download manually:
 
+Real asset shape:
+
 ```bash
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.6.5/aicx-v0.6.5-aarch64-apple-darwin.zip
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.6.5/aicx-v0.6.5-aarch64-apple-darwin.zip.sha256
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.7.3/aicx-v0.7.3-aarch64-apple-darwin-slim-unsigned.tar.gz
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.7.3/aicx-v0.7.3-aarch64-apple-darwin-slim-unsigned.tar.gz.sha256
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.7.3/aicx-v0.7.3-x86_64-unknown-linux-gnu-slim-unsigned.tar.gz
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.7.3/aicx-v0.7.3-x86_64-unknown-linux-gnu-slim-unsigned.tar.gz.sha256
 ```
 
 ### optionalDependencies disabled

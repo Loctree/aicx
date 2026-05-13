@@ -112,10 +112,52 @@ pub struct ChunkMetadataSidecar {
     pub framework_version: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intent_entries: Vec<crate::types::IntentEntry>,
+    /// Weak repo/content mentions preserved for query/tag surfaces. This is
+    /// append-only so pre-tag sidecars deserialize with an empty vector.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truth_status: Option<TruthStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learning_use: Option<LearningUse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keywords: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
     /// Number of noise lines dropped during chunk construction. Defaults to
     /// `0` when the field is absent in older sidecars.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub noise_lines_dropped: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TruthStatus {
+    pub role: TruthRole,
+    #[serde(default)]
+    pub runtime_authoritative: bool,
+    #[serde(default)]
+    pub stale_against_current_head: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_head_when_ingested: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TruthRole {
+    Live,
+    Example,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LearningUse {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forbidden: Vec<String>,
 }
 
 fn is_zero_usize(value: &usize) -> bool {
@@ -146,6 +188,13 @@ impl From<&Chunk> for ChunkMetadataSidecar {
             skill_code: chunk.skill_code.clone(),
             framework_version: chunk.framework_version.clone(),
             intent_entries: Vec::new(),
+            tags: Vec::new(),
+            artifact_family: None,
+            schema_version: None,
+            truth_status: None,
+            learning_use: None,
+            keywords: None,
+            content_sha256: None,
             noise_lines_dropped: chunk.noise_lines_dropped,
         }
     }
@@ -381,6 +430,7 @@ pub fn chunk_entries(
         return vec![];
     }
 
+    let project = canonical_project_label(project);
     let (frontmatter, prepared_entries) = prepare_entries_for_chunking(entries);
     let prepared_entries = prepared_entries.as_ref();
 
@@ -398,7 +448,7 @@ pub fn chunk_entries(
         let mut next_seq = 1usize;
         for frame_group in split_day_entries_by_frame_kind(day_entries) {
             let (mut group_chunks, updated_seq) =
-                chunk_day_entries(frame_group, project, agent, date, config, next_seq);
+                chunk_day_entries(frame_group, &project, agent, date, config, next_seq);
             next_seq = updated_seq;
             day_chunks.append(&mut group_chunks);
         }
@@ -548,15 +598,24 @@ pub fn format_chunk_text(
     let entries: Vec<&TimelineEntry> = sanitized_owned.iter().collect();
     let highlights = extract_highlights(&entries);
     let signals = extract_signals(&entries);
+    let project = canonical_project_label(project);
     format_chunk_text_inner(
         &entries,
-        project,
+        &project,
         agent,
         date,
         frame_kind_for_window(&entries),
         &signals,
         &highlights,
     )
+}
+
+fn canonical_project_label(project: &str) -> String {
+    project
+        .split('/')
+        .map(|segment| segment.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Clone a window's entries with their messages run through
@@ -1372,7 +1431,7 @@ mod tests {
 
         let text = format_chunk_text(&refs, "TestProj", "claude", "2026-01-22");
 
-        assert!(text.starts_with("[project: TestProj | agent: claude | date: 2026-01-22]"));
+        assert!(text.starts_with("[project: testproj | agent: claude | date: 2026-01-22]"));
         assert!(text.contains("[14:30:00] user: hello"));
         assert!(text.contains("[14:31:00] assistant: hi there"));
     }
@@ -1539,8 +1598,56 @@ mod tests {
         assert_eq!(legacy.mode, None);
         assert_eq!(legacy.skill_code, None);
         assert_eq!(legacy.framework_version, None);
+        assert_eq!(legacy.artifact_family, None);
+        assert_eq!(legacy.schema_version, None);
+        assert_eq!(legacy.truth_status, None);
+        assert_eq!(legacy.learning_use, None);
+        assert_eq!(legacy.keywords, None);
+        assert_eq!(legacy.content_sha256, None);
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sidecar_deserializes_context_corpus_contract_fields() {
+        let sidecar: ChunkMetadataSidecar = serde_json::from_value(serde_json::json!({
+            "id": "ctx-001",
+            "project": "vetcoders/aicx",
+            "agent": "loct-context-pack",
+            "date": "2026-05-08",
+            "session_id": "batch-001",
+            "kind": "reports",
+            "artifact_family": "loct-context-pack",
+            "schema_version": "context_corpus.v1",
+            "truth_status": {
+                "role": "example",
+                "runtime_authoritative": false,
+                "stale_against_current_head": true,
+                "current_head_when_ingested": "269d13c"
+            },
+            "learning_use": {
+                "allowed": ["retrieval-test"],
+                "forbidden": ["live-truth"]
+            },
+            "keywords": ["prism", "context"],
+            "content_sha256": "abc123"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            sidecar.artifact_family.as_deref(),
+            Some("loct-context-pack")
+        );
+        assert_eq!(sidecar.schema_version.as_deref(), Some("context_corpus.v1"));
+        assert_eq!(
+            sidecar.truth_status.as_ref().map(|status| status.role),
+            Some(TruthRole::Example)
+        );
+        assert_eq!(
+            sidecar.keywords.as_deref(),
+            Some(&["prism".to_string(), "context".to_string()][..])
+        );
+        assert_eq!(sidecar.content_sha256.as_deref(), Some("abc123"));
     }
 
     #[test]
@@ -1581,7 +1688,7 @@ mod tests {
         let config = ChunkerConfig::default();
         let chunks = chunk_entries(&entries, "MyProject", "gemini", &config);
 
-        assert_eq!(chunks[0].id, "MyProject_gemini_2026-01-22_001");
+        assert_eq!(chunks[0].id, "myproject_gemini_2026-01-22_001");
     }
 
     #[test]

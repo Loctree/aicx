@@ -18,9 +18,10 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2024-2026 VetCoders
 
+use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub enum PhaseOutcome {
@@ -215,37 +216,53 @@ impl Reporter for NoopReporter {
     fn phase_finish(&self, _phase: &Phase, _outcome: &PhaseOutcome) {}
 }
 
-/// Compact terminal reporter using the existing `\r`-rewrite pattern
-/// already employed by `run_store` — so the visual UX stays consistent
-/// across stages.
+/// Compact terminal reporter with a fixed three-line status surface:
+/// phase spinner, progress bar, and one stable detail line. This keeps
+/// long corpus runs readable while still leaving the final summary as
+/// normal append-only log text.
 pub struct TerminalReporter {
-    width: Mutex<usize>,
+    state: Mutex<TerminalState>,
+}
+
+#[derive(Default)]
+struct TerminalState {
+    lines: usize,
+    frame: usize,
 }
 
 impl TerminalReporter {
     pub fn new() -> Self {
         Self {
-            width: Mutex::new(0),
+            state: Mutex::new(TerminalState::default()),
         }
     }
 
-    fn paint(&self, line: &str) {
+    fn paint(&self, phase: &Phase, current: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let lines = terminal_status_lines(phase, current, state.frame);
+        state.frame = state.frame.wrapping_add(1);
+
         let mut err = io::stderr().lock();
-        let mut guard = self.width.lock().unwrap_or_else(|e| e.into_inner());
-        let width = (*guard).max(line.len());
-        *guard = width;
-        let _ = write!(err, "\r{line:<width$}");
+        if state.lines > 0 {
+            let _ = write!(err, "\x1b[{}A", state.lines);
+        }
+        for line in &lines {
+            let _ = writeln!(err, "\r\x1b[2K{line}");
+        }
+        state.lines = lines.len();
         let _ = err.flush();
     }
 
     fn clear(&self) {
         let mut err = io::stderr().lock();
-        let mut guard = self.width.lock().unwrap_or_else(|e| e.into_inner());
-        if *guard > 0 {
-            let blanks = " ".repeat(*guard);
-            let _ = write!(err, "\r{blanks}\r");
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.lines > 0 {
+            let _ = write!(err, "\x1b[{}A", state.lines);
+            for _ in 0..state.lines {
+                let _ = writeln!(err, "\r\x1b[2K");
+            }
             let _ = err.flush();
-            *guard = 0;
+            state.lines = 0;
         }
     }
 }
@@ -258,15 +275,11 @@ impl Default for TerminalReporter {
 
 impl Reporter for TerminalReporter {
     fn phase_start(&self, phase: &Phase) {
-        self.paint(&format!("  [{}] starting…", phase.name));
+        self.paint(phase, 0);
     }
 
     fn phase_tick(&self, phase: &Phase, current: u64) {
-        let line = match phase.total {
-            Some(total) => format!("  [{}] {current}/{total}", phase.name),
-            None => format!("  [{}] {current}", phase.name),
-        };
-        self.paint(&line);
+        self.paint(phase, current);
     }
 
     fn phase_finish(&self, phase: &Phase, outcome: &PhaseOutcome) {
@@ -295,14 +308,110 @@ impl Reporter for TerminalReporter {
     }
 }
 
+fn terminal_status_lines(phase: &Phase, current: u64, frame: usize) -> [String; 3] {
+    let spinner = ["|", "/", "-", "\\"][frame % 4];
+    let elapsed = phase.started_at.elapsed().as_secs_f64();
+    let title = format!("  aicx {spinner} {}", phase_label(phase.name));
+
+    let progress = match phase.total {
+        Some(total) if total > 0 => {
+            let ratio = (current as f64 / total as f64).clamp(0.0, 1.0);
+            let pct = (ratio * 100.0).round() as u64;
+            let filled = (ratio * 32.0).round() as usize;
+            let bar = format!("{}{}", "#".repeat(filled), "-".repeat(32 - filled));
+            let eta = if current > 0 && current < total {
+                let per_unit = elapsed / current as f64;
+                format!(" | ETA {:.0}s", per_unit * (total - current) as f64)
+            } else {
+                String::new()
+            };
+            format!(
+                "  [{bar}] {current}/{total} {pct:>3}% | {:.1}s{eta}",
+                elapsed
+            )
+        }
+        _ => format!("  processed {current} | {:.1}s", elapsed),
+    };
+
+    let detail = format!("  log: {}", phase_detail(phase.name));
+    [title, progress, detail]
+}
+
+fn phase_label(phase: &str) -> &'static str {
+    match phase {
+        "extract" => "extracting sources",
+        "chunk" => "chunking canonical corpus",
+        "steer_sync" => "syncing steer index",
+        "bm25_sync" => "syncing BM25 index",
+        _ => "working",
+    }
+}
+
+fn phase_detail(phase: &str) -> &'static str {
+    match phase {
+        "extract" => "reading agent stores; source counts print after scan",
+        "chunk" => "writing canonical markdown chunks; final buckets print below",
+        "steer_sync" => "refreshing metadata retrieval index",
+        "bm25_sync" => "refreshing lexical candidate index",
+        _ => "progress is live; final summary prints below",
+    }
+}
+
 /// One-line marker per event. Stable enough for downstream parsers (the
 /// wizard TUI will consume this surface unchanged) and free of `\r`
-/// rewrites that confuse non-TTY consumers.
-pub struct StructuredReporter;
+/// rewrites that confuse non-TTY consumers. Dense ticks are throttled so
+/// captured logs stay readable during large corpus runs.
+pub struct StructuredReporter {
+    tick_state: Mutex<HashMap<&'static str, StructuredTickState>>,
+}
+
+#[derive(Clone, Copy)]
+struct StructuredTickState {
+    last_emit: Instant,
+    last_bucket: u64,
+}
 
 impl StructuredReporter {
     pub fn new() -> Self {
-        Self
+        Self {
+            tick_state: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn should_emit_tick(&self, phase: &Phase, current: u64) -> bool {
+        const MIN_INTERVAL: Duration = Duration::from_secs(2);
+        const PERCENT_BUCKET: u64 = 10;
+
+        let now = Instant::now();
+        let bucket = phase
+            .total
+            .filter(|total| *total > 0)
+            .map(|total| ((current.saturating_mul(100)) / total) / PERCENT_BUCKET)
+            .unwrap_or(current / 100);
+        let is_terminal_tick = phase.total.is_some_and(|total| current >= total);
+
+        let mut guard = self.tick_state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(state) = guard.get_mut(phase.name) else {
+            guard.insert(
+                phase.name,
+                StructuredTickState {
+                    last_emit: now,
+                    last_bucket: bucket,
+                },
+            );
+            return true;
+        };
+
+        if is_terminal_tick
+            || bucket > state.last_bucket
+            || now.duration_since(state.last_emit) >= MIN_INTERVAL
+        {
+            state.last_emit = now;
+            state.last_bucket = bucket;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -314,6 +423,9 @@ impl Default for StructuredReporter {
 
 impl Reporter for StructuredReporter {
     fn phase_start(&self, phase: &Phase) {
+        if let Ok(mut guard) = self.tick_state.lock() {
+            guard.remove(phase.name);
+        }
         let total = phase
             .total
             .map(|t| format!(" total={t}"))
@@ -324,6 +436,9 @@ impl Reporter for StructuredReporter {
     }
 
     fn phase_tick(&self, phase: &Phase, current: u64) {
+        if !self.should_emit_tick(phase, current) {
+            return;
+        }
         let elapsed_ms = phase.started_at.elapsed().as_millis() as u64;
         let total = phase
             .total
@@ -339,6 +454,9 @@ impl Reporter for StructuredReporter {
     }
 
     fn phase_finish(&self, phase: &Phase, outcome: &PhaseOutcome) {
+        if let Ok(mut guard) = self.tick_state.lock() {
+            guard.remove(phase.name);
+        }
         let mut err = io::stderr().lock();
         match outcome {
             PhaseOutcome::Ok {
@@ -499,6 +617,41 @@ mod tests {
         for h in handles {
             h.join().expect("thread panic");
         }
+    }
+
+    #[test]
+    fn terminal_status_lines_are_fixed_three_line_surface() {
+        let phase = Phase {
+            name: "chunk",
+            started_at: Instant::now(),
+            total: Some(100),
+            reporter: Arc::new(NoopReporter),
+        };
+
+        let lines = terminal_status_lines(&phase, 25, 0);
+
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("chunking canonical corpus"));
+        assert!(lines[1].contains("25/100"));
+        assert!(lines[1].contains("25%"));
+        assert!(lines[2].contains("writing canonical markdown chunks"));
+    }
+
+    #[test]
+    fn structured_reporter_throttles_dense_ticks_but_keeps_percent_buckets() {
+        let reporter = StructuredReporter::new();
+        let phase = Phase {
+            name: "chunk",
+            started_at: Instant::now(),
+            total: Some(100),
+            reporter: Arc::new(NoopReporter),
+        };
+
+        assert!(reporter.should_emit_tick(&phase, 1));
+        assert!(!reporter.should_emit_tick(&phase, 2));
+        assert!(reporter.should_emit_tick(&phase, 10));
+        assert!(!reporter.should_emit_tick(&phase, 11));
+        assert!(reporter.should_emit_tick(&phase, 100));
     }
 
     #[test]

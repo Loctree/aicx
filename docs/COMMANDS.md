@@ -6,6 +6,7 @@ operator-driven: nothing mutates your corpus unless you run a command.
 | Layer | What | Command surface |
 |-------|------|-----------------|
 | **1 — Canonical corpus** | Extract, deduplicate, chunk agent logs into steerable markdown at `~/.aicx/`. This is ground truth. | `claude`, `codex`, `all`, `store`, `extract` |
+| **1b — Context corpus** | Append-only retention for `loct-context-pack` prism artifacts at `~/.aicx/context-corpus/`. Excluded from live-truth retrieval and `aicx intents`; materializes into a separate `context-corpus.embeddings.ndjson` namespace. See [`CONTEXT_CORPUS.md`](./CONTEXT_CORPUS.md). | `ingest --source loct-context-pack <PACK_DIR>`, `doctor --check-dedup` |
 | **2 — Retrieval surfaces** | Query the corpus through filesystem search, steering metadata, MCP tools, and the reusable native embedding library. | `search`, `steer`, `serve`, `aicx-embeddings` |
 
 `aicx` owns the canonical corpus and portable local embedding foundation.
@@ -255,11 +256,13 @@ aicx corpus repair --root "$HOME/.aicx/store/Loctree/aicx/2026_0502" --apply --b
 
 ## `aicx search`
 
-Fuzzy search across the canonical corpus (layer 1, filesystem-only).
+Semantic search across the canonical corpus.
 
-Searches chunk content and frontmatter directly in `~/.aicx/` — works
-immediately, no semantic index needed. JSON output includes `oracle_status`
-and is explicitly marked as filesystem fuzzy, not a semantic/content oracle.
+Search uses the materialized semantic index by default. When the embedder or
+index is unavailable, it fails fast with `kind`, `reason`, and
+`recommendation`; it does not silently pretend fuzzy results are semantic
+oracle truth. Use `--no-semantic` only when you intentionally want the explicit
+filesystem-fuzzy escape hatch.
 
 ```bash
 aicx search [OPTIONS] <QUERY>
@@ -267,24 +270,25 @@ aicx search [OPTIONS] <QUERY>
 
 Options:
 - `<QUERY>` search query string
-- `-p, --project <PROJECT>` repo or store-bucket filter (case-insensitive substring)
+- `-p, --project <PROJECT>...` repo or store-bucket filter(s); omit to search all projects
 - `-H, --hours <HOURS>` lookback window (`0` = all time)
 - `-d, --date <DATE>` filter by date (single day, range, or open-ended)
 - `-l, --limit <N>` max results (default: `10`)
 - `-s, --score <SCORE>` minimum quality threshold (`0..=100`)
+- `--no-semantic` run explicit filesystem-fuzzy search instead of semantic search
 - `-j, --json` emit compact JSON instead of plain text
 
 Examples:
 
 ```bash
-# Fuzzy content search across canonical chunks (no memex needed)
+# Semantic content search across the materialized index
 aicx search "auth middleware regression"
 
-# Scoped to a repo or store bucket and date range
-aicx search "refactor" -p ai-contexters --date 2026-03-20..2026-03-28
+# Scoped to several repo/store buckets and date range
+aicx search "refactor" -p ai-contexters loctree-suite --date 2026-03-20..2026-03-28
 
-# Compact JSON for agents or scripts
-aicx search "dashboard" -p ai-contexters --score 60 --json
+# Explicit fuzzy escape hatch, clearly marked as not semantic oracle truth
+aicx search "dashboard" -p ai-contexters --score 60 --no-semantic --json
 
 # Search for a specific day mentioned in query
 aicx search "decisions march 2026"
@@ -317,7 +321,8 @@ aicx read store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.
 
 ## `aicx steer`
 
-Retrieve chunks by steering metadata (frontmatter sidecar fields). Filters by `run_id`, `prompt_id`, agent, kind, repo/store bucket, and/or date range using sidecar metadata — no filesystem grep needed. JSON output includes `oracle_status` for the rebuildable metadata index.
+Retrieve chunks by steering metadata. JSON output includes `oracle_status` for
+the rebuildable metadata index.
 
 ```bash
 aicx steer [OPTIONS]
@@ -328,7 +333,7 @@ Options:
 - `--prompt-id <PROMPT_ID>` filter by prompt_id (exact match)
 - `-a, --agent <AGENT>` filter by agent: claude, codex, gemini
 - `-k, --kind <KIND>` filter by kind: conversations, plans, reports, other
-- `-p, --project <PROJECT>` filter by repo or store bucket (case-insensitive substring)
+- `-p, --project <PROJECT>...` repo or store-bucket filter(s); omit to search all projects
 - `-d, --date <DATE>` filter by date: single day, range, or open-ended
 - `-l, --limit <N>` max results (default: `20`)
 - `-j, --json` emit JSON with `oracle_status`
@@ -339,8 +344,8 @@ Examples:
 # All chunks from a specific run
 aicx steer --run-id mrbl-001
 
-# Reports for a repo or store bucket on a specific date
-aicx steer --project ai-contexters --kind reports --date 2026-03-28
+# Reports across several repo/store buckets on a specific date
+aicx steer -p ai-contexters loctree-suite --kind reports --date 2026-03-28
 
 # All claude chunks in a date range
 aicx steer --agent claude --date 2026-03-20..2026-03-28
@@ -395,9 +400,29 @@ aicx migrate-intent-schema
 aicx migrate-intent-schema --project ai-contexters
 ```
 
+## `aicx index`
+
+Build the semantic index used by `aicx search`.
+
+By default, `aicx index` materializes the index for all projects. Use `--dry-run`
+only for preview/probe mode. Project filters can be repeated, comma-separated,
+or supplied as a space list.
+
+```bash
+aicx index
+aicx index --dry-run
+aicx index -p loctree-suite aicx -p vc-operator
+```
+
+Options:
+- `-p, --project <PROJECT>...` repo/store-bucket filter(s); omit to index all projects
+- `--sample <N>` cap indexed chunks for tests/probes (`0` = all discovered chunks)
+- `--dry-run` preview only; omit to materialize
+- `-j, --json` emit JSON stats
+
 ## Native Embeddings
 
-Native embeddings are a library/runtime surface, not a CLI indexing command.
+Native embeddings back semantic indexing/search.
 
 Use `install.sh --pick-embedder` or edit `~/.aicx/embedder.toml`:
 
@@ -456,16 +481,16 @@ rank surface is intentionally reintroduced.
 
 ## `aicx intents`
 
-Extract structured intents and decisions from the canonical store (layer 1).
+Extract structured intents and decisions from the canonical store.
 JSON output includes `oracle_status` and is canonical corpus evidence, not
 semantic oracle output.
 
 ```bash
-aicx intents [OPTIONS] --project <PROJECT>
+aicx intents [OPTIONS]
 ```
 
 Options:
-- `-p, --project <PROJECT>` project filter (required)
+- `-p, --project <PROJECT>...` repo or store-bucket filter(s); omit to scan all projects
 - `-H, --hours <HOURS>` lookback window (default: `720`)
 - `--emit <markdown|json>` output format (default: `markdown`; `json` includes `oracle_status`)
 - `--strict` only show high-confidence intents
@@ -474,7 +499,7 @@ Options:
 Example:
 
 ```bash
-aicx intents -p CodeScribe --strict --kind decision
+aicx intents -p CodeScribe loctree-suite --strict --kind decision
 ```
 
 ## `aicx dashboard`
@@ -571,10 +596,10 @@ aicx state --info
 
 Run `aicx` as an MCP server (stdio or streamable HTTP transport).
 
-Exposes search, read, steer, and rank tools over MCP for agent retrieval.
-`aicx_steer` and `aicx_rank` query the canonical corpus on disk.
-`aicx_search` uses canonical-store fuzzy search today and returns
-`oracle_status` so callers cannot mistake it for semantic retrieval.
+Exposes search, read, steer, intents, and rank tools over MCP for agent retrieval.
+`aicx_search` is semantic and fails fast when the index is not ready.
+`aicx_steer`, `aicx_intents`, and `aicx_rank` query the canonical corpus on disk
+and return grounded source paths or chunk references.
 `aicx_read` pulls the actual chunk content by path, file name, or compact
 reference after a discover step.
 

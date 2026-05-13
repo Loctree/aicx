@@ -2109,7 +2109,7 @@ const DASHBOARD_SERVER_SCRIPT: &str = r#"
     const params = new URLSearchParams({ q: q, limit: '100' });
     if (state.project) params.set('project', state.project);
     if (state.scoreMin > 0) params.set('score', String(state.scoreMin));
-    fetch('/api/search/fuzzy?' + params.toString(), { signal: searchAbort.signal })
+    fetch('/api/search/semantic?' + params.toString(), { signal: searchAbort.signal })
       .then(function(r) { return r.json(); })
       .then(function(data) {
         if (!data.ok) { ui.summary.textContent = 'Search error: ' + (data.error || 'unknown'); return; }

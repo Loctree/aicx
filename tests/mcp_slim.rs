@@ -14,14 +14,30 @@ fn test_mcp_slim_defaults() {
 
     let params: SteerParams = serde_json::from_str(r#"{}"#).unwrap();
     assert_eq!(params.limit, 20);
+    assert!(params.project.is_none());
+    assert!(params.projects.is_none());
     assert!(params.slim);
     assert!(!params.verbose);
 
     let params: IntentsParams = serde_json::from_str(r#"{}"#).unwrap();
     assert_eq!(params.limit, 20);
     assert_eq!(params.emit, "markdown");
+    assert!(params.project.is_none());
+    assert!(params.projects.is_none());
     assert!(params.slim);
     assert!(!params.verbose);
+
+    let params: SteerParams = serde_json::from_str(r#"{"projects":["aicx","loctree"]}"#).unwrap();
+    assert_eq!(
+        params.projects.as_deref(),
+        Some(&["aicx".to_string(), "loctree".to_string()][..])
+    );
+
+    let params: IntentsParams = serde_json::from_str(r#"{"projects":["aicx","loctree"]}"#).unwrap();
+    assert_eq!(
+        params.projects.as_deref(),
+        Some(&["aicx".to_string(), "loctree".to_string()][..])
+    );
 
     let params: ReadParams =
         serde_json::from_str(r#"{"reference":"store/VetCoders/aicx/chunk.md"}"#).unwrap();

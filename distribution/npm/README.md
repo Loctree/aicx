@@ -1,10 +1,14 @@
 # distribution/npm - aicx npm release surface
 
-This directory is the canonical npm distribution surface for `aicx`.
+This directory is the planned npm distribution surface for `aicx`.
 The source of truth for the product lives in
 [Loctree/aicx](https://github.com/Loctree/aicx); this folder contains only the
 thin JS wrapper and platform-package manifests that ship to the `@loctree` npm
 scope.
+
+> Status: aligned to the current `*-slim-unsigned.tar.gz` GitHub Release asset
+> shape for macOS arm64 and Linux x64 GNU. Do not publish npm packages until the
+> matching release assets and `.sha256` sidecars exist for the target version.
 
 ## Wrapper package
 
@@ -12,17 +16,15 @@ scope.
 | --- | --- | --- | --- |
 | `@loctree/aicx` | `aicx`, `aicx-mcp` | CLI + MCP server | `Loctree/aicx` |
 
-The wrapper declares 4 platform sub-packages as `optionalDependencies`
+The wrapper declares active platform sub-packages as `optionalDependencies`
 (esbuild/swc pattern).
 
 Current platform matrix:
 
 - `darwin-arm64`
-- `darwin-x64`
 - `linux-x64-gnu`
-- `linux-x64-musl`
 
-Total: **1 wrapper + 4 platform packages = 5 npm packages.**
+Total: **1 wrapper + 2 active platform packages = 3 npm packages.**
 
 ## Install
 
@@ -36,10 +38,6 @@ Then:
 aicx --help
 aicx-mcp --version
 ```
-
-The wrapper's install flow validates that the matching platform package is
-present. The platform package then downloads the matching GitHub Release asset,
-verifies the adjacent `.sha256`, and extracts both binaries in place.
 
 That install surface is intentionally binary-only:
 
@@ -66,16 +64,15 @@ distribution/npm/
     │   └── aicx-mcp
     └── platform-packages/
         ├── darwin-arm64/
-        ├── darwin-x64/
-        ├── linux-x64-gnu/
-        └── linux-x64-musl/
+        └── linux-x64-gnu/
 ```
 
 ## Repo maintenance workflow
 
 ```bash
-node distribution/npm/sync-version.mjs 0.6.5
-node distribution/npm/sync-version.mjs --check 0.6.5
+node distribution/npm/sync-version.mjs 0.7.3
+node distribution/npm/sync-version.mjs --check 0.7.3
+node distribution/npm/verify-metadata.mjs 0.7.3
 ```
 
 See [PUBLISHING.md](./PUBLISHING.md) for the publish flow.

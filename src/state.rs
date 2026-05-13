@@ -7,15 +7,83 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
+pub mod migration;
+
 /// Default maximum number of stored hashes before pruning.
 const DEFAULT_MAX_HASHES: usize = 50_000;
+
+/// Per-project dedup hashes with insertion/LRU order preserved.
+#[derive(Debug, Clone, Default)]
+pub struct SeenHashSet {
+    order: VecDeque<u64>,
+    set: HashSet<u64>,
+}
+
+impl SeenHashSet {
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    pub fn contains(&self, hash: &u64) -> bool {
+        self.set.contains(hash)
+    }
+
+    pub fn insert(&mut self, hash: u64) {
+        if self.set.remove(&hash) {
+            self.order.retain(|existing| *existing != hash);
+        }
+        self.set.insert(hash);
+        self.order.push_back(hash);
+    }
+
+    pub(crate) fn extend_from(&mut self, other: SeenHashSet) {
+        for hash in other.order {
+            self.insert(hash);
+        }
+    }
+
+    pub fn prune_oldest(&mut self, limit: usize) {
+        while self.set.len() > limit {
+            let Some(hash) = self.order.pop_front() else {
+                break;
+            };
+            self.set.remove(&hash);
+        }
+    }
+}
+
+impl Serialize for SeenHashSet {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.order.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SeenHashSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let hashes = Vec::<u64>::deserialize(deserializer)?;
+        let mut out = SeenHashSet::default();
+        for hash in hashes {
+            out.insert(hash);
+        }
+        Ok(out)
+    }
+}
 
 /// Record of a single extraction run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,7 +97,7 @@ pub struct RunRecord {
 }
 
 /// Persistent state for incremental processing and deduplication.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateManager {
     /// Per-source watermark: only process entries newer than this timestamp.
     pub last_processed: HashMap<String, DateTime<Utc>>,
@@ -38,9 +106,26 @@ pub struct StateManager {
     /// Key is project name, value is the set of hashes seen for that project.
     /// This prevents cross-project dedup pollution: entries extracted for
     /// project A won't be skipped when extracting project B.
-    pub seen_hashes: HashMap<String, HashSet<u64>>,
+    pub seen_hashes: HashMap<String, SeenHashSet>,
     /// History of extraction runs.
     pub runs: Vec<RunRecord>,
+    /// Stable algorithm used for persistent `seen_hashes` values.
+    ///
+    /// Missing or different values mean the old `u64` hashes cannot be trusted
+    /// across toolchain changes and must be rebuilt by the next extraction run.
+    #[serde(default)]
+    pub hash_algorithm: String,
+}
+
+impl Default for StateManager {
+    fn default() -> Self {
+        Self {
+            last_processed: HashMap::new(),
+            seen_hashes: HashMap::new(),
+            runs: Vec::new(),
+            hash_algorithm: migration::SIPHASH13_ALGORITHM.to_string(),
+        }
+    }
 }
 
 impl StateManager {
@@ -67,18 +152,36 @@ impl StateManager {
             return Self::default();
         }
 
+        let lock_path = match crate::locks::state_lock_path() {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::warn!("failed to resolve state lock path: {err}");
+                return Self::default();
+            }
+        };
+        let _lock = match crate::locks::acquire_shared(lock_path) {
+            Ok(lock) => lock,
+            Err(err) => {
+                tracing::warn!("failed to acquire shared state lock: {err}");
+                return Self::default();
+            }
+        };
+
         let contents = match fs::read_to_string(&path) {
             Ok(c) => c,
             Err(_) => return Self::default(),
         };
 
         // Try new format first; fall back to default (migration: old flat hashes discarded)
-        serde_json::from_str(&contents).unwrap_or_default()
+        let mut state: Self = serde_json::from_str(&contents).unwrap_or_default();
+        state.apply_load_migrations();
+        state
     }
 
     /// Persist current state to disk. Creates parent directories if needed.
     pub fn save(&self) -> Result<()> {
         let path = Self::state_path()?;
+        let lock = crate::locks::acquire_exclusive(crate::locks::state_lock_path()?)?;
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -90,6 +193,7 @@ impl StateManager {
         fs::write(&path, json)
             .with_context(|| format!("Failed to write state file: {}", path.display()))?;
 
+        crate::locks::release(lock);
         Ok(())
     }
 
@@ -99,15 +203,13 @@ impl StateManager {
 
     /// Compute a stable content hash from entry fields (exact dedup).
     ///
-    /// Uses `DefaultHasher` (SipHash) for fast, collision-resistant hashing.
-    /// The hash is deterministic within a single binary build (which is
-    /// sufficient for dedup across runs of the same version).
+    /// Uses explicitly pinned SipHash-1-3 for fast, stable hashing.
     ///
     /// The (agent, timestamp, message) triple is sufficient for unique
     /// identification. Session ID is excluded because Claude Code stores
     /// the same user message in multiple session JSONL files.
     pub fn content_hash(agent: &str, timestamp: i64, message: &str) -> u64 {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = migration::stable_siphasher13();
         agent.hash(&mut hasher);
         timestamp.hash(&mut hasher);
         message.hash(&mut hasher);
@@ -125,7 +227,7 @@ impl StateManager {
     /// windows, so identical messages arriving within the same minute from
     /// different agents collapse into one.
     pub fn overlap_hash(timestamp: i64, message: &str) -> u64 {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = migration::stable_siphasher13();
         let bucket = timestamp / 60; // 60-second window
         bucket.hash(&mut hasher);
         message.hash(&mut hasher);
@@ -134,17 +236,16 @@ impl StateManager {
 
     /// Returns `true` if this hash has NOT been seen before for the given project.
     pub fn is_new(&self, project: &str, hash: u64) -> bool {
+        let project = migration::canonical_state_bucket(project);
         self.seen_hashes
-            .get(project)
+            .get(&project)
             .is_none_or(|set| !set.contains(&hash))
     }
 
     /// Mark a hash as seen for the given project.
     pub fn mark_seen(&mut self, project: &str, hash: u64) {
-        self.seen_hashes
-            .entry(project.to_string())
-            .or_default()
-            .insert(hash);
+        let project = migration::canonical_state_bucket(project);
+        self.seen_hashes.entry(project).or_default().insert(hash);
     }
 
     // ========================================================================
@@ -156,6 +257,26 @@ impl StateManager {
     /// Returns `None` if this source has never been processed.
     pub fn get_watermark(&self, source: &str) -> Option<DateTime<Utc>> {
         self.last_processed.get(source).copied()
+    }
+
+    /// Carry a watermark forward from legacy source-key generations into the
+    /// canonical key so adding/removing extractor agents does not reset ingest.
+    pub fn migrate_watermark_aliases(&mut self, canonical: &str, aliases: &[String]) -> bool {
+        if self.last_processed.contains_key(canonical) {
+            return false;
+        }
+
+        let migrated = aliases
+            .iter()
+            .filter_map(|alias| self.last_processed.get(alias).copied())
+            .max();
+
+        if let Some(ts) = migrated {
+            self.last_processed.insert(canonical.to_string(), ts);
+            true
+        } else {
+            false
+        }
     }
 
     /// Update the watermark for a source, but only if the new timestamp
@@ -196,20 +317,14 @@ impl StateManager {
         };
 
         for set in self.seen_hashes.values_mut() {
-            if set.len() <= limit {
-                continue;
-            }
-            let excess = set.len() - limit;
-            let to_remove: Vec<u64> = set.iter().take(excess).copied().collect();
-            for hash in to_remove {
-                set.remove(&hash);
-            }
+            set.prune_oldest(limit);
         }
     }
 
     /// Reset hashes for a specific project.
     pub fn reset_project(&mut self, project: &str) {
-        self.seen_hashes.remove(project);
+        self.seen_hashes
+            .remove(&migration::canonical_state_bucket(project));
     }
 
     /// Reset all dedup state.
@@ -220,6 +335,10 @@ impl StateManager {
     /// Total number of hashes across all projects.
     pub fn total_hashes(&self) -> usize {
         self.seen_hashes.values().map(|s| s.len()).sum()
+    }
+
+    fn apply_load_migrations(&mut self) -> migration::StateMigrationReport {
+        migration::migrate_loaded_state(self)
     }
 }
 
@@ -313,6 +432,7 @@ mod tests {
         // Mark seen only in projA
         state.mark_seen("projA", hash);
         assert!(!state.is_new("projA", hash));
+        assert!(!state.is_new("proja", hash));
         assert!(state.is_new("projB", hash)); // still new for projB
 
         // Mark seen in projB
@@ -384,6 +504,47 @@ mod tests {
     }
 
     #[test]
+    fn lru_evicts_oldest_first() {
+        let mut state = StateManager::default();
+        for i in 0..10u64 {
+            state.mark_seen("proj", i);
+        }
+
+        state.prune_old_hashes(5);
+
+        for old in 0..5u64 {
+            assert!(
+                state.is_new("proj", old),
+                "old hash {old} should be evicted"
+            );
+        }
+        for fresh in 5..10u64 {
+            assert!(
+                !state.is_new("proj", fresh),
+                "fresh hash {fresh} should remain"
+            );
+        }
+    }
+
+    #[test]
+    fn watermark_migration_carries_timestamp_forward() {
+        let mut state = StateManager::default();
+        let ts = Utc.with_ymd_and_hms(2026, 5, 6, 11, 0, 0).unwrap();
+        state.update_watermark("claude+codex+gemini:all", ts);
+
+        let migrated = state.migrate_watermark_aliases(
+            "claude+codex+gemini+junie:all",
+            &["claude+codex+gemini:all".to_string()],
+        );
+
+        assert!(migrated);
+        assert_eq!(
+            state.get_watermark("claude+codex+gemini+junie:all"),
+            Some(ts)
+        );
+    }
+
+    #[test]
     fn test_prune_old_hashes_default_limit() {
         let mut state = StateManager::default();
         state.prune_old_hashes(0);
@@ -434,6 +595,69 @@ mod tests {
         assert!(restored.is_new("other", 123456789)); // different project
         assert_eq!(restored.runs.len(), 1);
         assert_eq!(restored.runs[0].entries_added, 5);
+    }
+
+    #[test]
+    fn pre_siphash_state_clears_seen_hashes_once() {
+        let mut state = StateManager::default();
+        state.hash_algorithm.clear();
+        state
+            .seen_hashes
+            .entry("Vista".to_string())
+            .or_default()
+            .insert(42);
+
+        let report = migration::migrate_loaded_state(&mut state);
+
+        assert!(report.hash_algorithm_changed);
+        assert_eq!(report.cleared_seen_hashes, 1);
+        assert_eq!(state.hash_algorithm, migration::SIPHASH13_ALGORITHM);
+        assert_eq!(state.total_hashes(), 0);
+    }
+
+    #[test]
+    fn current_state_lowercases_and_merges_seen_hash_buckets() {
+        let mut state = StateManager::default();
+        state
+            .seen_hashes
+            .entry("Vista".to_string())
+            .or_default()
+            .insert(1);
+        state
+            .seen_hashes
+            .entry("vista".to_string())
+            .or_default()
+            .insert(2);
+
+        let report = migration::migrate_loaded_state(&mut state);
+
+        assert!(!report.hash_algorithm_changed);
+        assert_eq!(report.lowercased_seen_hash_buckets, 1);
+        assert_eq!(report.merged_seen_hash_buckets, 1);
+        assert_eq!(state.seen_hashes.len(), 1);
+        assert!(!state.is_new("vista", 1));
+        assert!(!state.is_new("Vista", 2));
+    }
+
+    #[test]
+    fn case_bucket_merge_script_is_reviewable_and_lowercase_targeted() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-case-bucket-script-{}",
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("VetCoders").join("Vista")).unwrap();
+        std::fs::create_dir_all(root.join("vetcoders").join("vista")).unwrap();
+
+        let plan = migration::generate_case_bucket_merge_script(&root).unwrap();
+
+        assert_eq!(plan.merges.len(), 2);
+        assert!(plan.script.contains("Review before running"));
+        assert!(plan.script.contains("vetcoders"));
+        assert!(plan.script.contains("VetCoders"));
+        assert!(root.join("VetCoders").join("Vista").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

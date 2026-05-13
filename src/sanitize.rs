@@ -12,7 +12,7 @@ use anyhow::{Result, anyhow};
 use std::path::{Component, Path, PathBuf};
 
 /// Known safe agent binary names.
-const ALLOWED_AGENTS: &[&str] = &["claude", "codex"];
+pub use aicx_parser::sanitize::ALLOWED_AGENTS;
 
 // ============================================================================
 // Core helpers (mirroring rmcp-memex pattern)
@@ -418,6 +418,10 @@ mod tests {
     fn test_safe_agent_name_valid() {
         assert_eq!(safe_agent_name("claude").unwrap(), "claude");
         assert_eq!(safe_agent_name("codex").unwrap(), "codex");
+        assert_eq!(safe_agent_name("gemini").unwrap(), "gemini");
+        assert_eq!(safe_agent_name("junie").unwrap(), "junie");
+        assert_eq!(safe_agent_name("codescribe").unwrap(), "codescribe");
+        assert_eq!(safe_agent_name("operator-md").unwrap(), "operator-md");
     }
 
     #[test]
@@ -475,7 +479,6 @@ const SELF_ECHO_PATTERNS: &[&str] = &[
     "aicx_refs",
     "aicx_store",
     // Dashboard API calls
-    "/api/search/fuzzy",
     "/api/search/semantic",
     "/api/search/cross",
     "/api/health",
@@ -576,7 +579,7 @@ mod echo_tests {
     #[test]
     fn test_api_call_is_echo() {
         assert!(is_self_echo(
-            r#"curl -s "http://127.0.0.1:8033/api/search/fuzzy?q=deploy+vistacare&limit=3""#
+            r#"curl -s "http://127.0.0.1:8033/api/search/semantic?q=deploy+vistacare&limit=3""#
         ));
     }
 

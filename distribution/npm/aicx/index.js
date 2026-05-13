@@ -9,17 +9,9 @@ const PLATFORM_PACKAGES = Object.freeze({
     name: "@loctree/aicx-darwin-arm64",
     root: `${__dirname}/node_modules/@loctree/aicx-darwin-arm64`,
   }),
-  "darwin-x64": Object.freeze({
-    name: "@loctree/aicx-darwin-x64",
-    root: `${__dirname}/node_modules/@loctree/aicx-darwin-x64`,
-  }),
   "linux-x64-gnu": Object.freeze({
     name: "@loctree/aicx-linux-x64-gnu",
     root: `${__dirname}/node_modules/@loctree/aicx-linux-x64-gnu`,
-  }),
-  "linux-x64-musl": Object.freeze({
-    name: "@loctree/aicx-linux-x64-musl",
-    root: `${__dirname}/node_modules/@loctree/aicx-linux-x64-musl`,
   }),
 });
 
@@ -51,7 +43,10 @@ function getPlatformKey() {
   const normalizedArch = archMap[arch] || arch;
 
   if (platform === "linux") {
-    const libc = isMuslLibc() ? "musl" : "gnu";
+    if (isMuslLibc()) {
+      throw new Error("AICX npm binaries are not published for Linux musl yet.");
+    }
+    const libc = "gnu";
     return `${platform}-${normalizedArch}-${libc}`;
   }
 
@@ -69,12 +64,19 @@ function getPlatformPackageName() {
 function getPlatformPackage() {
   const platformKey = getPlatformKey();
   if (!platformKey) {
-    throw new Error(`Unsupported platform: ${process.platform}-${process.arch}`);
+    throw new Error(
+      `Unsupported platform: ${process.platform}-${process.arch}.\n` +
+      `AICX currently supports macOS (arm64) and Linux (x64 gnu).\n` +
+      `Please build from source or download manually from: https://github.com/Loctree/aicx/releases`
+    );
   }
 
   const platformPackage = PLATFORM_PACKAGES[platformKey];
   if (!platformPackage) {
-    throw new Error(`No package available for platform: ${platformKey}`);
+    throw new Error(
+      `No package available for platform: ${platformKey}.\n` +
+      `Please build from source or download manually from: https://github.com/Loctree/aicx/releases`
+    );
   }
 
   return platformPackage;
@@ -103,9 +105,10 @@ function getBinaryPath(binaryName) {
 
   if (!existsSync(binaryPath)) {
     throw new Error(
-      `${binaryName} binary not found at ${binaryPath}. ` +
-      `This may happen if optionalDependencies are disabled. ` +
-      `Please ensure "${packageName}" is installed.`
+      `${binaryName} binary not found at ${binaryPath}.\n` +
+      `This typically happens if npm optionalDependencies failed to install or were skipped.\n` +
+      `Please ensure "${packageName}" is installed, or download the binary manually from:\n` +
+      `https://github.com/Loctree/aicx/releases`
     );
   }
 

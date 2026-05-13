@@ -1,6 +1,6 @@
 {
   "name": "@loctree/aicx-linux-x64-gnu",
-  "version": "0.6.5",
+  "version": "0.7.3",
   "description": "aicx + aicx-mcp binaries for Linux x64 (glibc)",
   "keywords": [
     "aicx",
@@ -15,6 +15,9 @@
   ],
   "cpu": [
     "x64"
+  ],
+  "libc": [
+    "glibc"
   ],
   "repository": {
     "type": "git",

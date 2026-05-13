@@ -23,16 +23,41 @@ Supported sources:
 - Codex: `~/.codex/history.jsonl`
 - Gemini CLI: `~/.gemini/tmp/<hash>/chats/session-*.json`
 - Gemini Antigravity direct extract: `~/.gemini/antigravity/conversations/<uuid>.pb` or `~/.gemini/antigravity/brain/<uuid>/`
+- `loct-context-pack` (immutable structural-evidence packs from Loctree prism / polarize): `aicx ingest --source loct-context-pack <PACK_DIR>` writes into the parallel **Context Corpus** at `~/.aicx/context-corpus/`. See [`docs/CONTEXT_CORPUS.md`](./docs/CONTEXT_CORPUS.md).
+
+## Context Corpus
+
+Alongside the canonical session-log store, `aicx` maintains an **immutable
+context corpus** at `~/.aicx/context-corpus/` that retains `loct-context-pack`
+prism artifacts (structural evidence consumed by `vc-polarize` gating and
+doctrine drafting). The corpus is governed by a different contract:
+append-only, operator-driven (only `aicx ingest --source loct-context-pack`
+writes to it), excluded from `aicx intents` and live-truth retrieval, and
+materialized into a separate `context-corpus.embeddings.ndjson` namespace so
+example evidence never poisons live-session truth.
+
+```bash
+aicx ingest --source loct-context-pack /path/to/prism-pack
+aicx doctor --check-dedup   # cross-namespace duplicate report
+```
+
+Sidecars carry `artifact_family=loct-context-pack`,
+`schema_version=context_corpus.v1`, `truth_status.role=Example`, and
+`content_sha256`. Every ingest batch produces an `index.jsonl` manifest. Full
+contract, retention path layout, and immutability filter behavior in
+[`docs/CONTEXT_CORPUS.md`](./docs/CONTEXT_CORPUS.md).
 
 ## Install
 
-Public install from npm:
+Public install from GitHub Releases:
 
 ```bash
-npm install -g @loctree/aicx
+curl -fsSLO https://raw.githubusercontent.com/Loctree/aicx/main/install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.7.3 bash install.sh
 ```
 
-This installs both shipped commands:
+The installer downloads the matching release archive, verifies its adjacent
+`.sha256` sidecar, and installs both shipped commands:
 
 ```bash
 aicx --help
@@ -56,15 +81,19 @@ bash install.sh
 Bundle install copies prebuilt `aicx` + `aicx-mcp` into `~/.local/bin`, removes stale user-local / cargo-installed copies, then refreshes MCP configuration.
 No Rust toolchain and no local memex compilation are required on the target machine.
 
-Directly from GitHub Releases with SHA-256 verification before unpacking:
+From an existing checkout, you can force the same release path:
 
 ```bash
 AICX_INSTALL_MODE=release bash install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.6.5 bash install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.6.6 bash install.sh
 ```
 
-On macOS this consumes the signed/notarized release zip published by CI on the
-`dragon-macos` self-hosted runner. On Linux it consumes the release tarball.
+Current release assets are slim unsigned `.tar.gz` bundles for macOS arm64,
+Linux x64 GNU, and Linux arm64 GNU. The `.sha256` sidecar is mandatory.
+
+The npm wrapper track exists under `distribution/npm/`, but it is not the
+supported v0.6.5 install path until its platform packages are aligned with the
+current GitHub Release asset shape.
 
 From an accessible GitHub repo when you want unreleased source:
 
@@ -87,7 +116,7 @@ cargo install --path . --locked --bin aicx --bin aicx-mcp
 
 `install.sh` prefers a colocated release bundle first, then a local checkout, and otherwise falls back to the published install path.
 
-Maintainer release bundle path on macOS:
+Maintainer-local signed bundle path on macOS:
 
 ```bash
 make release-bundle KEYS=~/.keys
@@ -115,6 +144,29 @@ Config truth:
 `aicx wizard` opens the interactive entrypoint for browsing the corpus,
 running doctor, watching store progress, and viewing the intents timeline.
 Press `?` inside the wizard for the keymap.
+
+### Library API
+
+`aicx` is also a Rust library. The supported facade is `aicx::Aicx`;
+callers do not need to import command-line internals from `main.rs`.
+
+```rust
+use aicx::prelude::*;
+
+let client = Aicx::from_env()?;
+let status = client.index_status(None)?;
+let chunks = client.list_chunks()?;
+```
+
+For embedding AICX into another service, construct a handle with an explicit
+store root and write timeline entries directly:
+
+```rust
+use aicx::prelude::*;
+
+let client = Aicx::with_store_root("/tmp/aicx");
+let summary = client.store_entries(&entries, &StoreOptions::default())?;
+```
 
 ### Layer 1 — build the canonical corpus
 

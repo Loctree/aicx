@@ -23,6 +23,25 @@ pub struct TieredIdentity {
     pub tier: SourceTier,
 }
 
+/// Explicit source used when assigning an entry/session to a bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BucketingSource {
+    OperatorOverride,
+    CwdGitRemote,
+    CwdGitRoot,
+    KnownLayout,
+    Frontmatter,
+    ContentMention,
+    Unclassified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketResolution {
+    pub bucket: String,
+    pub source: BucketingSource,
+    pub identity: Option<RepoIdentity>,
+}
+
 // ============================================================================
 // Gemini projectHash registry
 // ============================================================================
@@ -158,25 +177,60 @@ pub fn infer_repo_identity_from_entry(entry: &TimelineEntry) -> Option<RepoIdent
     infer_tiered_identity_from_entry(entry, &ProjectHashRegistry::default()).map(|t| t.identity)
 }
 
+pub fn resolve_bucket(entry: &TimelineEntry, registry: &ProjectHashRegistry) -> BucketResolution {
+    if let Some(tiered) = infer_tiered_identity_from_cwd(entry.cwd.as_deref()) {
+        let source = match tiered.tier {
+            SourceTier::Primary => BucketingSource::CwdGitRemote,
+            SourceTier::Secondary => BucketingSource::CwdGitRoot,
+            SourceTier::Fallback => BucketingSource::KnownLayout,
+            SourceTier::Opaque => BucketingSource::Unclassified,
+        };
+        return BucketResolution {
+            bucket: tiered.identity.slug(),
+            source,
+            identity: Some(tiered.identity),
+        };
+    }
+
+    if let Some(cwd) = entry.cwd.as_deref()
+        && looks_like_weak_source_identifier(cwd)
+        && let Some(tiered) = registry.resolve(cwd)
+    {
+        return BucketResolution {
+            bucket: tiered.identity.slug(),
+            source: BucketingSource::KnownLayout,
+            identity: Some(tiered.identity),
+        };
+    }
+
+    if let Some(tiered) = infer_tiered_identity_from_text(&entry.message) {
+        return BucketResolution {
+            bucket: tiered.identity.slug(),
+            source: BucketingSource::ContentMention,
+            identity: Some(tiered.identity),
+        };
+    }
+
+    BucketResolution {
+        bucket: "unclassified".to_string(),
+        source: BucketingSource::Unclassified,
+        identity: None,
+    }
+}
+
 /// Infer repo identity with explicit trust tier from all available signals.
 ///
 /// Signal precedence (highest to lowest):
-/// 1. Remote-like URL in message text -> Primary
-/// 2. Path in message text that resolves via git remote -> Primary
-/// 3. Path in message text via known layout -> Fallback
-/// 4. CWD that resolves via local git + remote -> Primary
-/// 5. CWD that resolves via local git + known layout -> Secondary
-/// 6. CWD via known layout (no .git) -> Fallback
-/// 7. ProjectHash resolved through registry -> Secondary
-/// 8. Pure hex hash CWD / opaque -> Opaque (returns None)
+/// 1. CWD that resolves via local git + remote -> Primary
+/// 2. CWD that resolves via local git + known layout/basename -> Secondary
+/// 3. CWD via known layout (no .git) -> Fallback
+/// 4. ProjectHash resolved through registry -> Secondary
+/// 5. Content mentions -> Fallback tags-only signal
+/// 6. Pure hex hash CWD / opaque -> Opaque (returns None)
 pub fn infer_tiered_identity_from_entry(
     entry: &TimelineEntry,
     registry: &ProjectHashRegistry,
 ) -> Option<TieredIdentity> {
-    if let Some(tiered) = infer_tiered_identity_from_text(&entry.message) {
-        return Some(tiered);
-    }
-
     if let Some(tiered) = infer_tiered_identity_from_cwd(entry.cwd.as_deref()) {
         return Some(tiered);
     }
@@ -189,7 +243,7 @@ pub fn infer_tiered_identity_from_entry(
         return registry.resolve(cwd);
     }
 
-    None
+    infer_tiered_identity_from_text(&entry.message)
 }
 
 /// Classify a raw CWD string into a source tier without resolving identity.
@@ -293,11 +347,12 @@ fn infer_repo_identity_from_path(path: &Path) -> Option<RepoIdentity> {
 // ── Tiered inference helpers ──────────────────────────────────────────────
 
 fn infer_tiered_identity_from_text(text: &str) -> Option<TieredIdentity> {
-    // Remote-like URL → Primary (strongest text signal)
+    // Content mentions remain queryable hints, but they must not assert
+    // canonical store ownership over cwd/git truth.
     if let Some(identity) = infer_repo_identity_from_remote_like(text) {
         return Some(TieredIdentity {
             identity,
-            tier: SourceTier::Primary,
+            tier: SourceTier::Fallback,
         });
     }
 
@@ -720,9 +775,36 @@ mod tests {
         );
         let tiered = infer_tiered_identity_from_entry(&e, &ProjectHashRegistry::default())
             .expect("should resolve");
-        assert_eq!(tiered.tier, SourceTier::Primary);
+        assert_eq!(tiered.tier, SourceTier::Fallback);
         assert_eq!(tiered.identity.slug(), "VetCoders/ai-contexters");
-        assert!(tiered.tier.is_assertable());
+        assert!(!tiered.tier.is_assertable());
+    }
+
+    #[test]
+    fn cwd_git_identity_wins_over_content_mentions() {
+        let root = mk_tmp_dir("cwd-wins");
+        let repo = root.join("Git").join("vista");
+        fs::create_dir_all(&repo).unwrap();
+
+        Command::new("git")
+            .arg("init")
+            .arg(&repo)
+            .output()
+            .expect("git init");
+
+        let e = entry(
+            (2026, 5, 6, 10, 0, 0),
+            "sess-cwd-wins",
+            "user",
+            "We need to inspect https://github.com/RustCrypto/RSA while working locally.",
+            Some(repo.to_string_lossy().as_ref()),
+        );
+
+        let resolution = resolve_bucket(&e, &ProjectHashRegistry::default());
+        assert_eq!(resolution.bucket, "local/vista");
+        assert_eq!(resolution.source, BucketingSource::CwdGitRoot);
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -777,7 +859,7 @@ mod tests {
         let tiered = infer_tiered_identity_from_entry(&e, &ProjectHashRegistry::default())
             .expect("malformed remote should resolve to local fallback");
         assert_eq!(tiered.identity.slug(), "local/vibecrafted");
-        assert!(tiered.tier.is_assertable());
+        assert!(!tiered.tier.is_assertable());
 
         let segments = semantic_segments(&[e]);
         assert_eq!(segments.len(), 1);
@@ -966,8 +1048,8 @@ mod tests {
 
         let segments = semantic_segments(&entries);
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].source_tier, Some(SourceTier::Primary));
-        assert!(segments[0].has_assertable_identity());
+        assert_eq!(segments[0].source_tier, Some(SourceTier::Fallback));
+        assert!(!segments[0].has_assertable_identity());
     }
 
     #[test]

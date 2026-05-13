@@ -39,8 +39,11 @@ pub struct SearchParams {
     /// Max results to return (default: 10)
     #[serde(default = "default_limit")]
     pub limit: usize,
-    /// Optional project filter (case-insensitive substring)
+    /// Optional project filter (case-insensitive substring). Prefer
+    /// `projects` for cross-project search.
     pub project: Option<String>,
+    /// Optional project filters for cross-project search.
+    pub projects: Option<Vec<String>>,
     /// Minimum score threshold (0-100)
     pub score: Option<u8>,
     /// Hours to look back (0 = all time)
@@ -79,6 +82,27 @@ fn default_limit() -> usize {
 
 fn default_true() -> bool {
     true
+}
+
+fn search_project_scopes(projects: &[String]) -> Vec<Option<&str>> {
+    if projects.is_empty() {
+        vec![None]
+    } else {
+        projects.iter().map(String::as_str).map(Some).collect()
+    }
+}
+
+fn dedup_metadata_by_path(items: &mut Vec<serde_json::Value>) {
+    let mut seen = std::collections::BTreeSet::new();
+    items.retain(|item| {
+        let key = item
+            .get("path")
+            .or_else(|| item.get("source_chunk"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| item.to_string());
+        seen.insert(key)
+    });
 }
 
 const MAX_SCORE_FILTER: u8 = 100;
@@ -132,6 +156,8 @@ pub struct SteerParams {
     pub frame_kind: Option<FrameKind>,
     /// Filter by project (case-insensitive substring)
     pub project: Option<String>,
+    /// Optional project filters for cross-project steering.
+    pub projects: Option<Vec<String>>,
     /// Filter by date (YYYY-MM-DD, or range like 2026-03-20..2026-03-28)
     pub date: Option<String>,
     /// Max results (default: 20)
@@ -162,6 +188,8 @@ pub struct IntentsParams {
     /// Optional project filter (case-insensitive substring; empty/None = all projects)
     #[serde(default)]
     pub project: Option<String>,
+    /// Optional project filters for cross-project intent extraction.
+    pub projects: Option<Vec<String>>,
     /// Hours to look back (default: 720 = 30 days, 0 = all time). Matches CLI default.
     #[serde(default = "default_intents_hours")]
     pub hours: u64,
@@ -288,7 +316,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_search",
-        description = "Search stored AI session chunks with fast metadata narrowing plus canonical-store fuzzy scoring. Returns oracle_status so callers can see that this is filesystem fuzzy, not semantic retrieval."
+        description = "Semantic search over the canonical corpus. Fails fast with kind/reason/recommendation when the index or embedder is not ready."
     )]
     async fn search(
         &self,
@@ -297,6 +325,12 @@ impl AicxMcpServer {
         let query = params.query;
         let limit = params.limit.min(50);
         let project = params.project;
+        let owned_projects = params
+            .projects
+            .clone()
+            .filter(|projects| !projects.is_empty())
+            .unwrap_or_else(|| project.clone().into_iter().collect());
+        let project_scopes = search_project_scopes(&owned_projects);
         let score = validate_score_filter(params.score)?;
         let hours = params.hours.unwrap_or(0);
         let date = params.date;
@@ -309,14 +343,41 @@ impl AicxMcpServer {
 
         let store_root = store::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
-        let (results, scanned) = rank::fuzzy_search_store(
+
+        // Semantic-only dispatch. No fuzzy fallback. When a precondition
+        // is missing (embedder unhydrated, index not built, ...) return
+        // a structured McpError carrying the same `kind` + `reason` +
+        // `recommendation` triple the CLI fail-fast surface emits, so an
+        // MCP caller has the same diagnostic to act on.
+        let outcome = match crate::search_engine::try_semantic_search(
             &store_root,
             &query,
             fetch_limit,
-            project.as_deref(),
+            &project_scopes,
             frame_kind,
-        )
-        .map_err(|e| McpError::internal_error(format!("Read store: {e}"), None))?;
+        ) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                let payload = serde_json::json!({
+                    "ok": false,
+                    "error": "semantic_search_unavailable",
+                    "kind": err.kind(),
+                    "reason": err.reason(),
+                    "recommendation": err.recommendation(),
+                });
+                return Err(McpError::invalid_params(
+                    format!(
+                        "semantic search unavailable [{}]: {} — recommendation: {}",
+                        err.kind(),
+                        err.reason(),
+                        err.recommendation()
+                    ),
+                    Some(payload),
+                ));
+            }
+        };
+        let scanned = outcome.scanned;
+        let results = outcome.results;
 
         let mut results = results;
 
@@ -526,7 +587,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_steer",
-        description = "Retrieve stored chunks by steering metadata (frontmatter fields). Filters by run_id, prompt_id, agent, kind, project, and/or date range using sidecar metadata — no filesystem grep needed. Returns oracle_status for the rebuildable metadata index and chunk paths for canonical re-entry."
+        description = "Retrieve chunks by steering metadata. Supports project/projects, run_id, prompt_id, agent, kind, frame_kind, and date filters."
     )]
     async fn steer(
         &self,
@@ -541,19 +602,31 @@ impl AicxMcpServer {
             (None, params.until.clone())
         };
 
-        let filter = crate::steer_index::SteerFilter {
-            run_id: params.run_id.as_deref(),
-            prompt_id: params.prompt_id.as_deref(),
-            agent: params.agent.as_deref(),
-            kind: params.kind.as_deref(),
-            frame_kind: params.frame_kind,
-            project: params.project.as_deref(),
-            date_lo: date_lo.as_deref(),
-            date_hi: date_hi.as_deref(),
-        };
-        let mut metadatas = crate::steer_index::search_steer_index(&filter, limit)
-            .await
-            .map_err(|e| McpError::internal_error(format!("Index error: {e}"), None))?;
+        let owned_projects = params
+            .projects
+            .clone()
+            .filter(|projects| !projects.is_empty())
+            .unwrap_or_else(|| params.project.clone().into_iter().collect());
+        let project_scopes = search_project_scopes(&owned_projects);
+        let mut metadatas = Vec::new();
+
+        for project in project_scopes {
+            let filter = crate::steer_index::SteerFilter {
+                run_id: params.run_id.as_deref(),
+                prompt_id: params.prompt_id.as_deref(),
+                agent: params.agent.as_deref(),
+                kind: params.kind.as_deref(),
+                frame_kind: params.frame_kind,
+                project,
+                date_lo: date_lo.as_deref(),
+                date_hi: date_hi.as_deref(),
+            };
+            let mut batch = crate::steer_index::search_steer_index(&filter, limit)
+                .await
+                .map_err(|e| McpError::internal_error(format!("Index error: {e}"), None))?;
+            metadatas.append(&mut batch);
+        }
+        dedup_metadata_by_path(&mut metadatas);
 
         if let Some(min_score) = params.score {
             metadatas.retain(|m| {
@@ -586,6 +659,7 @@ impl AicxMcpServer {
                 }
             });
         }
+        metadatas.truncate(limit);
 
         let store_root = store::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
@@ -632,7 +706,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_intents",
-        description = "Retrieve structured intentions, decisions, outcomes, and tasks extracted from the canonical store. Returns oracle_status marking this as canonical corpus evidence, not semantic oracle output, with source_chunk back-references for grounded follow-up. Mirrors the `aicx intents` CLI: filter by project, hours window (default 720 = 30 days), kind (decision/intent/outcome/task), frame_kind, agent, date range, plus unresolved (intents without matching outcome) and collapse_session (group by session with count). Default: 50 records, last 30 days, all projects, JSON. Cap: 500."
+        description = "Retrieve structured intents, decisions, outcomes, and tasks from the canonical corpus. Supports project/projects and source_chunk back-references."
     )]
     async fn intents(
         &self,
@@ -670,15 +744,21 @@ impl AicxMcpServer {
             },
         };
 
+        let owned_projects = params
+            .projects
+            .clone()
+            .filter(|projects| !projects.is_empty())
+            .unwrap_or_else(|| params.project.clone().into_iter().collect());
+
         let config = IntentsConfig {
-            project: params.project.unwrap_or_default(),
+            project: owned_projects.first().cloned().unwrap_or_default(),
             hours: params.hours,
             strict: params.strict,
             kind_filter,
             frame_kind: params.frame_kind,
         };
 
-        let extraction = intents::extract_intents_with_stats(&config)
+        let extraction = intents::extract_intents_with_stats_for_projects(&config, &owned_projects)
             .map_err(|e| McpError::internal_error(format!("Extract intents: {e}"), None))?;
         let records = extraction.records;
 
@@ -728,8 +808,13 @@ impl rmcp::handler::server::ServerHandler for AicxMcpServer {
         // `list_tools`, and `get_tool` methods; rust 1.95 dead_code analysis
         // doesn't traverse macro expansions, so anchor the read here.
         let _ = &self.tool_router;
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("aicx-mcp", env!("CARGO_PKG_VERSION")))
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
+        .with_server_info(Implementation::new("aicx-mcp", env!("CARGO_PKG_VERSION")))
     }
 }
 

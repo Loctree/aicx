@@ -3,10 +3,42 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-
 ## [Unreleased]
 
+## [0.7.3] - 2026-05-13
+
 ### Added
+- Unified multi-project scope handling across search, intents, semantic index,
+  MCP, dashboard, and doctor surfaces so operators can narrow to one or more
+  projects with the same contract everywhere.
+
+### Changed
+- `aicx store` progress output is now bounded and human-readable: structured
+  progress ticks remain machine-parseable while interactive terminals keep a
+  stable three-line status view instead of flooding logs.
+
+### Fixed
+- Gemini JSONL extraction now treats `.jsonl` files as session transcripts,
+  preserving `sessionId` metadata and allowing `aicx all` to ingest Gemini
+  sources alongside Claude, Codex, Junie, and CodeScribe.
+- Junk corpus bucket slugs are covered so malformed or placeholder project
+  names no longer leak into canonical project grouping.
+
+## [0.7.1] - 2026-05-12
+
+### Changed
+- improve failure UX and make lance optionality clear
+
+### Fixed
+- install python before release version check
+
+## [0.7.0] - 2026-05-08
+
+### Added
+- **Context Corpus Contract** for immutable `loct-context-pack` prism packs: sidecars now carry `artifact_family`, `schema_version`, `truth_status`, `learning_use`, `keywords`, and `content_sha256`; `aicx ingest --source loct-context-pack <PACK_DIR>` retains packs under `$HOME/.aicx/context-corpus/...` with `index.jsonl`.
+- `aicx store` writes content hashes into sidecars and skips duplicate chunk bodies in the target bucket; `aicx doctor --check-dedup` reports duplicate content hashes across the live store and context corpus.
+- `aicx doctor` surfaces the context-corpus state as a first-class check (`context_corpus` field on `DoctorReport`): reports `empty (will be created on first ingest)` when the directory is absent, `empty (no batches yet)` when the tree exists but holds no chunks, or a `N chunks across M batch(es) / R repo(s)` summary when populated. Operators no longer need to `ls ~/.aicx/context-corpus/` to confirm corpus existence.
+- New operator documentation `docs/CONTEXT_CORPUS.md` covering the immutable-corpus contract: ingest source semantics, `~/.aicx/context-corpus/<org>/<repo>/<date>/loct-context-pack/<batch>/{raw,sidecars,index.jsonl}` retention layout, sidecar schema fields (`artifact_family`, `schema_version`, `truth_status`, `content_sha256`, `keywords`), immutability filter behavior (`aicx intents` and live-truth semantic indexes exclude `Example`-role chunks), and the parallel `context-corpus.embeddings.ndjson` materialization namespace. Cross-linked from `STORE_LAYOUT.md`, `COMMANDS.md`, and `README.md`.
 - **9-type intent taxonomy** (`EntryType` enum): Intent, Why, Argue, Decision, Assumption, Outcome, Result, Question, Insight — replaces the flat 4-kind `IntentKind`.
 - **Intent entry state machine** (`EntryState` enum): Proposed → Active → Done/Superseded/Contradicted with explicit lifecycle transitions.
 - **Typed link graph** (`LinkType` + `Link`): DerivedFrom, Supersedes, Verifies, Contradicts, Supports, ResultsIn, Answers, LinksTo — first-class relations between intent entries.
@@ -18,6 +50,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - 25 new unit tests: 20 classifier tests (per-type + abstain + all-9 chunk + deterministic IDs + tag inference), 5 session-level tests (supersedes, contradicted, insight linking, unresolved threshold, recent not tagged).
 
 ### Changed
+- `aicx intents` and semantic index writes exclude immutable `loct-context-pack` examples from the live-truth namespace; context-corpus embeddings materialize to a separate `context-corpus.embeddings.ndjson` namespace.
 - Operator surface wording: "push" → "materialize" in CLI help text, progress messages, and doc comments to reinforce the two-layer mental model (canonical corpus first, semantic materialization second).
 - Semantic compatibility validation now detects stale metadata even when no documents exist yet in the memex index; reports diverged fields explicitly.
 - Compatibility validation runs before file scanning in `memex-sync`, failing fast on config mismatches.
@@ -27,6 +60,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 - Test isolation: source extraction tests use unique temp directories per test to prevent cross-test interference on parallel runs.
+
+## [0.6.5] - 2026-05-06
+
+### Added
+- Public GitHub Release binaries for `aicx` and `aicx-mcp` on macOS arm64,
+  Linux x64 GNU, and Linux arm64 GNU.
+- Slim unsigned release archives with adjacent `.sha256` sidecars for each
+  published target.
+- Release-bundle install path that copies prebuilt `aicx` and `aicx-mcp`
+  without requiring a Rust toolchain on the target machine.
+
+### Changed
+- GitHub Releases are the supported public binary install lane for this
+  release. The npm wrapper lane remains present in-tree, but is not the active
+  v0.6.5 install path until its platform packages match the release asset
+  matrix.
 
 ## [0.5.5] - 2026-03-31
 
