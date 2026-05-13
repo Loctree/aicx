@@ -52,8 +52,7 @@ contract, retention path layout, and immutability filter behavior in
 Public install from GitHub Releases:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Loctree/aicx/main/install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.7.3 bash install.sh
+curl -fsSL https://raw.githubusercontent.com/Loctree/aicx/main/install.sh | AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.7.4 bash
 ```
 
 The installer downloads the matching release archive, verifies its adjacent
@@ -62,6 +61,28 @@ The installer downloads the matching release archive, verifies its adjacent
 ```bash
 aicx --help
 aicx-mcp --version
+```
+
+Direct release download with checksum and GPG verification:
+
+```bash
+version=0.7.4
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64) target=aarch64-apple-darwin ;;
+  Linux-x86_64) target=x86_64-unknown-linux-gnu ;;
+  *) echo "unsupported platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+esac
+
+asset="aicx-v${version}-${target}-slim-unsigned.tar.gz"
+base="https://github.com/Loctree/aicx/releases/download/v${version}"
+
+curl -fLO "${base}/${asset}"
+curl -fLO "${base}/${asset}.sha256"
+curl -fLO "${base}/${asset}.sig"
+
+shasum -a 256 -c "${asset}.sha256"
+gpg --verify "${asset}.sig" "${asset}"
+tar -xzf "${asset}"
 ```
 
 From a local checkout:
@@ -121,6 +142,19 @@ Maintainer-local signed bundle path on macOS:
 ```bash
 make release-bundle KEYS=~/.keys
 make release-bundle KEYS=~/.keys NOTARY_PROFILE=vc-notary
+```
+
+Store a local Apple notary profile from operator-owned credentials:
+
+```bash
+set -a
+source "$HOME/.keys/.notary.env"
+set +a
+
+xcrun notarytool store-credentials "${NOTARY_PROFILE:-vc-notary}" \
+  --apple-id "$NOTARY_APPLE_ID" \
+  --team-id "$NOTARY_TEAM_ID" \
+  --password "$NOTARY_PASSWORD"
 ```
 
 That release path cleans `target/<triple>` after the bundle is safely written so

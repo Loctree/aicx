@@ -457,8 +457,21 @@ impl AicxMcpServer {
 
         let results: Vec<_> = results.into_iter().take(limit).collect();
 
-        let json = rank::render_search_json(&store_root, &results, scanned)
-            .map_err(|e| McpError::internal_error(format!("Serialize search JSON: {e}"), None))?;
+        let oracle_status = OracleStatus::content_semantic(
+            &store_root,
+            scanned,
+            results.len(),
+            crate::oracle::verify_paths(
+                results
+                    .iter()
+                    .map(|result| std::path::Path::new(&result.path).to_path_buf()),
+            ),
+        );
+        let json =
+            rank::render_search_json_with_oracle(&store_root, &results, scanned, oracle_status)
+                .map_err(|e| {
+                    McpError::internal_error(format!("Serialize search JSON: {e}"), None)
+                })?;
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }

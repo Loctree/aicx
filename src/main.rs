@@ -1658,16 +1658,16 @@ fn main() -> Result<()> {
             no_semantic,
             json,
         }) => {
-            run_search(
-                &query,
-                &project,
+            run_search(SearchRunArgs {
+                query: &query,
+                projects: &project,
                 hours,
-                date.as_deref(),
+                date: date.as_deref(),
                 json,
                 filters,
-                kind.as_deref(),
+                kind: kind.as_deref(),
                 no_semantic,
-            )?;
+            })?;
         }
         Some(Commands::Index {
             action,
@@ -3556,16 +3556,28 @@ fn project_scope_label(projects: &[String]) -> String {
 
 /// Semantic-first retrieval across the canonical store. Fails fast when
 /// semantic preconditions are missing unless `--no-semantic` is explicit.
-fn run_search(
-    query: &str,
-    projects: &[String],
+struct SearchRunArgs<'a> {
+    query: &'a str,
+    projects: &'a [String],
     hours: u64,
-    date: Option<&str>,
+    date: Option<&'a str>,
     json: bool,
     filters: RetrievalFilters,
-    kind: Option<&str>,
+    kind: Option<&'a str>,
     no_semantic: bool,
-) -> Result<()> {
+}
+
+fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
+    let SearchRunArgs {
+        query,
+        projects,
+        hours,
+        date,
+        json,
+        filters,
+        kind,
+        no_semantic,
+    } = args;
     let kind_filter = kind.and_then(aicx::timeline::Kind::parse);
     // Extract inline date hints from query if no explicit --date given
     let (effective_query, inline_date) = if date.is_none() {
