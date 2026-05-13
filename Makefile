@@ -1,10 +1,10 @@
 # AICX Build System
 # Local developer flow + release/readiness helpers
 
-.PHONY: all build build-native install install-bin install-config install-cargo git-hooks
+.PHONY: all build build-native release-binaries install install-bin install-config install-cargo git-hooks
 .PHONY: precheck precheck-native test test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
 .PHONY: embeddings-check embeddings-test embeddings-clippy embeddings-hydrate embeddings-info
-.PHONY: version version-show version-check version-bump version-patch bump-patch changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle release-bundle-only-binaries
+.PHONY: version version-show version-check version-bump version-patch bump-patch changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle release-bundle-only-binaries test-e2e
 
 all: build
 
@@ -17,12 +17,48 @@ CLEAN ?= 1
 EMBEDDER_PROFILE ?= base
 NATIVE ?= 0
 FEATURES ?=
+TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
+CODESIGN ?= auto
+CARGO_BUILD ?= cargo build
+DIST_DIR ?= $(CURDIR)/dist
+DRY_RUN ?= 0
+RELEASE_BINARIES := aicx aicx-mcp
 
 build:
 	cargo build --locked --release --bin aicx --bin aicx-mcp
 
 build-native:
 	cargo build --locked --release --features native-embedder --bin aicx --bin aicx-mcp
+
+release-binaries:
+	@if [ -z "$(STAGING_DIR)" ]; then \
+		echo "STAGING_DIR is required. Usage: make release-binaries STAGING_DIR=/tmp/stage TARGET=$(TARGET)" >&2; \
+		exit 1; \
+	fi
+	$(CARGO_BUILD) --locked --release --target "$(TARGET)" --bin aicx --bin aicx-mcp
+	@mkdir -p "$(STAGING_DIR)/bin" "$(STAGING_DIR)/components"
+	@for bin in $(RELEASE_BINARIES); do \
+		install -m 0755 "target/$(TARGET)/release/$$bin" "$(STAGING_DIR)/bin/$$bin"; \
+		printf '  %s -> %s\n' "$$bin" "$(STAGING_DIR)/bin/$$bin"; \
+	done
+	@case "$(TARGET)" in \
+		*apple-darwin) \
+			if [ "$(CODESIGN)" = "0" ]; then \
+				echo "  codesign skipped (CODESIGN=0)"; \
+			elif [ -n "$${MACOS_DEVELOPER_ID_APPLICATION:-}" ]; then \
+				for bin in $(RELEASE_BINARIES); do \
+					codesign --force --timestamp --options runtime --sign "$$MACOS_DEVELOPER_ID_APPLICATION" "$(STAGING_DIR)/bin/$$bin"; \
+					codesign --verify --verbose=2 "$(STAGING_DIR)/bin/$$bin" >/dev/null; \
+					printf '  codesigned %s\n' "$$bin"; \
+				done; \
+			elif [ "$(CODESIGN)" = "1" ]; then \
+				echo "MACOS_DEVELOPER_ID_APPLICATION is required for CODESIGN=1" >&2; \
+				exit 1; \
+			else \
+				echo "  codesign skipped (set CODESIGN=1 and MACOS_DEVELOPER_ID_APPLICATION for release)"; \
+			fi ;; \
+	esac
+	@python3 -c 'import json, pathlib, sys; staging=pathlib.Path(sys.argv[1]); version=sys.argv[2]; commit=sys.argv[3]; data={"source":"loctree-aicx","commit":commit,"components":[{"name":"aicx","version":version,"source":"loctree-aicx"},{"name":"aicx-mcp","version":version,"source":"loctree-aicx"}]}; path=staging/"components"/"loctree-aicx.json"; path.write_text(json.dumps(data, indent=2)+"\n", encoding="utf-8"); print(f"  metadata -> {path}")' "$(STAGING_DIR)" "$(VERSION)" "$$(git rev-parse --short=12 HEAD)"
 
 install:
 	./install.sh
@@ -63,6 +99,14 @@ test:
 test-native:
 	cargo test --locked -p aicx-embeddings --features gguf
 	cargo test --locked -p aicx --features native-embedder --test native_embedder
+
+# End-to-end pipeline test against operator's canonical ~/.aicx/config.toml.
+# Fail-fast when preconditions missing (no config, empty corpus, embedder
+# unreachable) per operator doctrine — distinct from a CI test that
+# silently skips on missing infra.
+test-e2e:
+	cargo test --locked -p aicx --features e2e-aicx --test e2e_pipeline -- --nocapture
+	cargo test --locked -p aicx --features e2e-aicx --test e2e_context_pack_ingest -- --nocapture
 
 check:
 	@echo "=== AICX Quality Gate ==="
@@ -260,6 +304,9 @@ package-check:
 release-bundle:
 	@KEYS="$(KEYS)" \
 	NOTARY_PROFILE="$(NOTARY_PROFILE)" \
+	TARGET="$(TARGET)" \
+	DIST_DIR="$(DIST_DIR)" \
+	DRY_RUN="$(DRY_RUN)" \
 	AICX_CLEAN_AFTER_BUILD="$(CLEAN)" \
 	NATIVE="$(NATIVE)" \
 	FEATURES="$(FEATURES)" \
@@ -268,6 +315,9 @@ release-bundle:
 
 release-bundle-only-binaries:
 	@AICX_RELEASE_BUNDLE_ONLY_BINARIES=1 \
+	TARGET="$(TARGET)" \
+	DIST_DIR="$(DIST_DIR)" \
+	DRY_RUN="$(DRY_RUN)" \
 	AICX_CLEAN_AFTER_BUILD="$(CLEAN)" \
 	NATIVE="$(NATIVE)" \
 	FEATURES="$(FEATURES)" \

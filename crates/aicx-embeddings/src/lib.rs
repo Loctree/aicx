@@ -12,12 +12,16 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
+pub mod cloud;
 mod config;
 mod hf_cache;
 
 #[cfg(feature = "gguf")]
 mod gguf;
 
+#[cfg(feature = "cloud")]
+pub use cloud::CloudEmbeddingProvider;
+pub use cloud::{CloudEmbeddingConfig, DEFAULT_CLOUD_DIMENSION, DEFAULT_TIMEOUT_SECS};
 pub use config::{
     DEFAULT_BASE_FILENAME, DEFAULT_BASE_REPO, DEFAULT_DEV_FILENAME, DEFAULT_DEV_REPO,
     DEFAULT_PREMIUM_FILENAME, DEFAULT_PREMIUM_REPO, config_search_paths, find_cached_model_file,
@@ -29,7 +33,12 @@ pub use config::{
 pub enum BackendPreference {
     /// Let the crate choose the strongest compiled local backend.
     Auto,
-    /// GGUF through llama.cpp. This is the production first choice.
+    /// Cloud HTTP embedder (OpenAI-compatible `/v1/embeddings`). The
+    /// VetCoders default for zero-install operator workflows; the actual
+    /// `[embedder.cloud]` section in config supplies URL + model + key.
+    Cloud,
+    /// GGUF through llama.cpp. The first-choice local backend for
+    /// offline / dev workstations.
     #[default]
     Gguf,
     /// Legacy Candle/BERT selector retained only for clear diagnostics.
@@ -41,6 +50,7 @@ impl BackendPreference {
         match raw.trim().to_ascii_lowercase().as_str() {
             "" => None,
             "auto" => Some(Self::Auto),
+            "cloud" | "http" | "openai" | "openai-compat" => Some(Self::Cloud),
             "gguf" | "llama" | "llama.cpp" | "llamacpp" => Some(Self::Gguf),
             "candle" | "bert" | "safetensors" => Some(Self::Candle),
             _ => None,
@@ -50,6 +60,7 @@ impl BackendPreference {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
+            Self::Cloud => "cloud",
             Self::Gguf => "gguf",
             Self::Candle => "candle",
         }
@@ -133,6 +144,10 @@ pub struct EmbeddingConfig {
     pub gpu_layers: Option<u32>,
     /// Compatibility knob for older configs; GGUF builds do not embed by default.
     pub prefer_embedded: bool,
+    /// Cloud HTTP embedder configuration. Populated from
+    /// `[embedder.cloud]` in `~/.aicx/config.toml`. Only consulted when
+    /// `backend == Cloud` (or `Auto` without a hydrated GGUF model).
+    pub cloud: Option<CloudEmbeddingConfig>,
 }
 
 impl Default for EmbeddingConfig {
@@ -147,6 +162,7 @@ impl Default for EmbeddingConfig {
             threads: None,
             gpu_layers: None,
             prefer_embedded: false,
+            cloud: None,
         }
     }
 }
@@ -198,6 +214,8 @@ pub enum NativeEmbeddingSource {
     },
     /// Explicit operator-specified model file.
     ExplicitPath(PathBuf),
+    /// Remote or local HTTP endpoint for cloud-compatible embeddings.
+    CloudEndpoint(String),
 }
 
 impl NativeEmbeddingSource {
@@ -205,6 +223,7 @@ impl NativeEmbeddingSource {
         match self {
             Self::HfCache { repo, .. } => repo,
             Self::ExplicitPath(_) => "<explicit-path>",
+            Self::CloudEndpoint(_) => "<cloud-endpoint>",
         }
     }
 
@@ -212,6 +231,7 @@ impl NativeEmbeddingSource {
         match self {
             Self::HfCache { path, .. } => path,
             Self::ExplicitPath(path) => path,
+            Self::CloudEndpoint(_) => std::path::Path::new(""),
         }
     }
 }
@@ -251,13 +271,35 @@ impl EmbeddingEngine {
 
     pub fn with_config(config: EmbeddingConfig) -> Result<Self> {
         match config.backend {
+            BackendPreference::Cloud => Self::with_cloud(config),
             BackendPreference::Auto | BackendPreference::Gguf => Self::with_gguf(config),
             BackendPreference::Candle => Err(anyhow!(
                 "Candle/BERT native embedding is no longer the first-choice AICX backend. \
-                 Set backend=\"gguf\" and hydrate an F2LLM GGUF model, or use an older build \
-                 that explicitly enabled the legacy Candle path."
+                 Set backend=\"gguf\" or backend=\"cloud\", or use an older build that \
+                 explicitly enabled the legacy Candle path."
             )),
         }
+    }
+
+    #[cfg(feature = "cloud")]
+    fn with_cloud(config: EmbeddingConfig) -> Result<Self> {
+        let cloud_cfg = config.cloud.clone().ok_or_else(|| {
+            anyhow!(
+                "backend=\"cloud\" but no [embedder.cloud] section in config; \
+                 add url + model + api_key_env to ~/.aicx/config.toml"
+            )
+        })?;
+        Ok(Self {
+            inner: Box::new(cloud::CloudEmbeddingProvider::new(cloud_cfg)?),
+        })
+    }
+
+    #[cfg(not(feature = "cloud"))]
+    fn with_cloud(_config: EmbeddingConfig) -> Result<Self> {
+        Err(anyhow!(
+            "AICX cloud embedder is not compiled in. Rebuild with feature `cloud` \
+             (or AICX feature `cloud-embedder`)."
+        ))
     }
 
     #[cfg(feature = "gguf")]
@@ -358,6 +400,10 @@ struct NativeEmbedderConfigSection {
     threads: Option<i32>,
     #[serde(default)]
     gpu_layers: Option<u32>,
+    /// Nested `[embedder.cloud]` (or `[native_embedder.cloud]`) section.
+    /// Populated when the operator selects the cloud backend.
+    #[serde(default)]
+    cloud: Option<CloudEmbeddingConfig>,
 }
 
 impl NativeEmbedderConfigSection {
@@ -391,6 +437,9 @@ impl NativeEmbedderConfigSection {
         }
         if other.gpu_layers.is_some() {
             self.gpu_layers = other.gpu_layers;
+        }
+        if other.cloud.is_some() {
+            self.cloud = other.cloud;
         }
     }
 }

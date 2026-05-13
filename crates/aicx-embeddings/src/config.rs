@@ -128,13 +128,17 @@ pub fn resolve_model(cfg: &EmbeddingConfig) -> ResolvedEmbeddingModel {
 }
 
 pub fn config_search_paths() -> Vec<PathBuf> {
+    // Order = priority. The first existing file is loaded; later paths
+    // are fallbacks. Canonical `config.toml` outranks legacy
+    // `embedder.toml` so operators migrating to the new schema see their
+    // changes immediately.
     let mut out = Vec::new();
     if let Some(path) = env_string("AICX_EMBEDDER_CONFIG") {
         out.push(PathBuf::from(path));
     }
     if let Some(home) = dirs::home_dir() {
-        out.push(home.join(".aicx").join("embedder.toml"));
-        out.push(home.join(".aicx").join("config.toml"));
+        out.push(home.join(".aicx").join("config.toml")); // canonical, highest priority
+        out.push(home.join(".aicx").join("embedder.toml")); // legacy fallback
     }
     out
 }
@@ -211,6 +215,9 @@ fn apply_section(cfg: &mut EmbeddingConfig, section: crate::NativeEmbedderConfig
     }
     if section.gpu_layers.is_some() {
         cfg.gpu_layers = section.gpu_layers;
+    }
+    if section.cloud.is_some() {
+        cfg.cloud = section.cloud;
     }
 }
 

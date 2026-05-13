@@ -73,5 +73,8 @@ fn source_describes_runtime_provenance() {
             );
         }
         NativeEmbeddingSource::ExplicitPath(p) => assert!(p.exists()),
+        NativeEmbeddingSource::CloudEndpoint(_) => {
+            panic!("native embedder source check should not use a cloud endpoint")
+        }
     }
 }

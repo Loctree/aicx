@@ -1,0 +1,937 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VetCoders Skills Suite — From Noise to Signal</title>
+<meta name="description" content="Claude Code skills suite: context bootstrap with loctree + ai-contexters, ERi implementation pipeline, convergence loops, and product surface auditing.">
+<meta property="og:title" content="VetCoders Skills Suite">
+<meta property="og:description" content="Claude Code skills suite. Context bootstrap, structured implementation, convergence loops, product shipping.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Lora:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --dark:#141413;--light:#faf9f5;--mid:#b0aea5;--lgray:#e8e6dc;
+  --orange:#d97757;--blue:#6a9bcc;--green:#788c5d;
+  --card-bg:#1e1e1d;--card-border:#2a2a29;
+  --font-head:'Poppins',Arial,sans-serif;
+  --font-body:'Lora',Georgia,serif;
+}
+html{scroll-behavior:smooth}
+body{font-family:var(--font-body);background:var(--dark);color:var(--light);line-height:1.7;overflow-x:hidden;-webkit-user-select:none;user-select:none}
+code,.code-block,.formula{-webkit-user-select:text;user-select:text;cursor:text}
+h1,h2,h3,h4,h5,h6{font-family:var(--font-head);font-weight:600;line-height:1.25}
+
+/* NAV */
+nav{position:fixed;top:0;left:0;right:0;z-index:100;padding:1rem 2rem;display:flex;justify-content:space-between;align-items:center;background:rgba(20,20,19,.85);backdrop-filter:blur(12px);border-bottom:1px solid var(--card-border)}
+nav .logo{font-family:var(--font-head);font-size:1.15rem;font-weight:700;color:var(--orange);text-decoration:none}
+nav .logo span{color:var(--light);font-weight:400}
+nav ul{list-style:none;display:flex;gap:1.8rem}
+nav ul a{color:var(--mid);text-decoration:none;font-family:var(--font-head);font-size:.85rem;font-weight:500;transition:color .2s}
+nav ul a:hover{color:var(--orange)}
+@media(max-width:768px){nav ul{display:none}}
+
+/* HERO */
+.hero{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:6rem 2rem 4rem;position:relative;overflow:hidden}
+.hero-bg{position:absolute;inset:0;z-index:0}
+.hero-bg canvas{width:100%;height:100%;display:block}
+.hero-content{position:relative;z-index:1;text-align:center;max-width:820px}
+.hero h1{font-size:clamp(2.2rem,5vw,3.8rem);margin-bottom:1rem;letter-spacing:-.02em}
+.hero h1 .accent{color:var(--orange)}
+.hero .tagline{font-size:clamp(1rem,2.5vw,1.35rem);color:var(--mid);margin-bottom:2.5rem;font-style:italic}
+.hero .stats-row{display:flex;gap:2rem;justify-content:center;flex-wrap:wrap;margin-bottom:2rem}
+.stat{text-align:center}
+.stat .num{font-family:var(--font-head);font-size:2rem;font-weight:700;color:var(--orange)}
+.stat .label{font-size:.8rem;color:var(--mid);font-family:var(--font-head);text-transform:uppercase;letter-spacing:.05em}
+.hero .cta-row{display:flex;gap:1rem;justify-content:center;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;gap:.5rem;padding:.75rem 1.5rem;border-radius:8px;font-family:var(--font-head);font-size:.9rem;font-weight:600;text-decoration:none;transition:all .2s;cursor:pointer;border:none}
+.btn-primary{background:var(--orange);color:var(--dark)}
+.btn-primary:hover{background:#c4633f;transform:translateY(-1px)}
+.btn-secondary{background:transparent;color:var(--light);border:1.5px solid var(--mid)}
+.btn-secondary:hover{border-color:var(--orange);color:var(--orange)}
+
+/* SECTIONS */
+section{padding:5rem 2rem}
+.container{max-width:1100px;margin:0 auto}
+.section-title{font-size:clamp(1.5rem,3vw,2.2rem);margin-bottom:.6rem}
+.section-sub{color:var(--mid);margin-bottom:3rem;max-width:650px}
+.section-label{font-family:var(--font-head);font-size:.75rem;text-transform:uppercase;letter-spacing:.12em;color:var(--orange);margin-bottom:.5rem;font-weight:600}
+
+/* PIPELINE */
+.pipeline-section{background:var(--dark)}
+.pipeline-flow{display:flex;flex-wrap:wrap;gap:1.5rem;justify-content:center;align-items:center;margin-bottom:3rem}
+.pipe-step{display:flex;align-items:center;gap:.4rem;font-family:var(--font-head);font-size:.82rem;font-weight:500;padding:.55rem 1rem;border-radius:8px;background:var(--card-bg);border:1px solid var(--card-border);white-space:nowrap}
+.pipe-arrow{color:var(--mid);font-size:1.1rem;font-family:var(--font-head)}
+.pipe-step.phase1{border-color:var(--blue)}
+.pipe-step.phase2{border-color:var(--green)}
+.pipe-step.loop{border-color:var(--orange);border-style:dashed}
+.pipeline-legend{display:flex;gap:2rem;justify-content:center;flex-wrap:wrap;font-family:var(--font-head);font-size:.78rem;color:var(--mid)}
+.pipeline-legend span::before{content:'';display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:.4rem;vertical-align:middle}
+.legend-build::before{background:var(--blue)}
+.legend-ship::before{background:var(--green)}
+.legend-loop::before{background:var(--orange)}
+.pipeline-loop-row{display:flex;justify-content:center;margin:.5rem 0}
+.marbles-loop{position:relative;display:flex;align-items:center;justify-content:center}
+.marbles-loop .loop-arrow{position:absolute;top:-6px;left:50%;transform:translateX(-50%)}
+
+/* CARDS */
+.cards-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:1.5rem}
+.card{background:var(--card-bg);border:1px solid var(--card-border);border-radius:12px;padding:1.5rem;transition:transform .3s ease,border-color .25s,box-shadow .3s;position:relative;overflow:hidden;transform-style:preserve-3d;will-change:transform}
+.card:hover{box-shadow:0 8px 32px rgba(217,119,87,.08)}
+.scroll-progress{position:fixed;top:0;left:0;height:2px;width:0;background:var(--orange);z-index:200;pointer-events:none;transition:width .08s linear}
+.card:hover{border-color:var(--orange);transform:translateY(-3px);box-shadow:0 8px 30px rgba(217,119,87,.08)}
+.card .card-phase{font-family:var(--font-head);font-size:.65rem;text-transform:uppercase;letter-spacing:.1em;font-weight:600;margin-bottom:.8rem;display:inline-block;padding:.2rem .6rem;border-radius:4px}
+.card .card-phase.build{background:rgba(106,155,204,.15);color:var(--blue)}
+.card .card-phase.ship{background:rgba(120,140,93,.15);color:var(--green)}
+.card .card-phase.loop-phase{background:rgba(217,119,87,.15);color:var(--orange)}
+.card h3{font-size:1.1rem;margin-bottom:.5rem}
+.card .card-desc{color:var(--mid);font-size:.92rem;margin-bottom:1rem;line-height:1.6}
+.card .card-tags{display:flex;flex-wrap:wrap;gap:.4rem}
+.card .tag{font-family:var(--font-head);font-size:.65rem;padding:.2rem .55rem;border-radius:4px;background:rgba(250,249,245,.06);color:var(--mid);letter-spacing:.02em}
+.card .card-trigger{font-size:.8rem;color:var(--mid);margin-top:.8rem;font-style:italic;opacity:.7}
+
+/* DIFFUSION */
+.diffusion-section{background:linear-gradient(180deg,var(--dark) 0%,#1a1a19 100%)}
+.diffusion-visual{display:grid;grid-template-columns:1fr 1fr;gap:3rem;align-items:center;margin-bottom:3rem}
+@media(max-width:768px){.diffusion-visual{grid-template-columns:1fr}}
+.diffusion-canvas-wrap{position:relative;aspect-ratio:1;max-width:400px;margin:0 auto}
+.diffusion-canvas-wrap canvas{width:100%;height:100%;border-radius:50%;border:2px solid var(--card-border)}
+.diffusion-text h3{font-size:1.5rem;margin-bottom:1rem}
+.diffusion-text p{color:var(--mid);margin-bottom:1rem}
+.diffusion-text .formula{font-family:'SF Mono','Fira Code','Courier New',monospace;background:var(--card-bg);padding:1rem;border-radius:8px;border:1px solid var(--card-border);margin:1rem 0;font-size:.85rem;color:var(--light);line-height:1.8}
+.transition-visual{text-align:center;padding:2rem;background:var(--card-bg);border-radius:12px;border:1px solid var(--card-border)}
+.transition-visual .dou{font-family:var(--font-head);font-size:2rem;font-weight:700}
+.transition-visual .arrow-anim{font-size:1.5rem;margin:0 1rem;color:var(--orange)}
+.transition-visual .dod{font-family:var(--font-head);font-size:2rem;font-weight:700;color:var(--green)}
+
+/* MANIFESTO */
+.manifesto-section{background:#1a1a19}
+.manifesto-block{max-width:700px;margin:0 auto}
+.manifesto-block blockquote{border-left:3px solid var(--orange);padding-left:1.5rem;margin-bottom:1.5rem;color:var(--mid);font-size:1.05rem;font-style:italic}
+.manifesto-block .plague-list{list-style:none;margin:1.5rem 0}
+.manifesto-block .plague-list li{padding:.4rem 0;display:flex;align-items:center;gap:.6rem;font-size:.95rem}
+.manifesto-block .plague-list .check{color:var(--green)}
+.manifesto-block .plague-list .cross{color:var(--orange)}
+
+/* INSTALL */
+.install-section{background:var(--dark)}
+.install-block{max-width:700px;margin:0 auto}
+.code-block{background:#0d0d0c;border:1px solid var(--card-border);border-radius:10px;padding:1.25rem 1.5rem;margin:1.5rem 0;overflow-x:auto;position:relative}
+.code-block code{font-family:'SF Mono','Fira Code',monospace;font-size:.85rem;color:var(--light);line-height:1.7}
+.code-block .comment{color:var(--mid)}
+.code-block .copy-btn{position:absolute;top:.75rem;right:.75rem;background:var(--card-bg);border:1px solid var(--card-border);color:var(--mid);padding:.3rem .6rem;border-radius:5px;font-size:.7rem;cursor:pointer;font-family:var(--font-head);transition:all .2s}
+.code-block .copy-btn:hover{color:var(--orange);border-color:var(--orange)}
+
+/* FOOTER */
+footer{padding:3rem 2rem;border-top:1px solid var(--card-border);text-align:center}
+footer .credits{font-family:var(--font-head);font-size:.8rem;color:var(--mid);margin-bottom:.5rem}
+footer .credits a{color:var(--orange);text-decoration:none}
+footer .tagline-footer{font-size:.75rem;color:rgba(176,174,165,.5);font-style:italic}
+
+/* CONVERGENCE TRAJECTORY */
+.trajectory{display:flex;align-items:flex-end;gap:6px;height:120px;justify-content:center;margin:2rem 0}
+.trajectory .bar{width:40px;border-radius:4px 4px 0 0;position:relative;transition:height .8s cubic-bezier(.4,0,.2,1)}
+.trajectory .bar .bar-label{position:absolute;top:-22px;left:50%;transform:translateX(-50%);font-family:var(--font-head);font-size:.65rem;color:var(--mid);white-space:nowrap}
+.trajectory .bar .bar-score{position:absolute;bottom:6px;left:50%;transform:translateX(-50%);font-family:var(--font-head);font-size:.7rem;color:var(--dark);font-weight:700}
+
+/* SCROLL ANIMATIONS */
+.fade-up{opacity:0;transform:translateY(30px);transition:all .7s ease}
+.fade-up.visible{opacity:1;transform:translateY(0)}
+</style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav>
+  <a href="#" class="logo">Vet<span>Coders</span></a>
+  <ul>
+    <li><a href="#pipeline">Pipeline</a></li>
+    <li><a href="#skills">Skills</a></li>
+    <li><a href="#diffusion">The Insight</a></li>
+    <li><a href="#manifesto">Manifesto</a></li>
+    <li><a href="#install">Install</a></li>
+  </ul>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="hero-bg"><canvas id="marbleCanvas"></canvas></div>
+  <div class="hero-content fade-up">
+    <div class="section-label">Claude Code Skills Suite</div>
+    <h1>From <span class="accent">Noise</span> to Signal</h1>
+    <p class="tagline">AI agents generate code stochastically. This suite gives them a pipeline: bootstrap context, implement with structure, loop until converged, ship complete.</p>
+    <p style="font-family:var(--font-head);font-size:.82rem;color:var(--mid);margin-bottom:2rem;line-height:1.7">init &rarr; workflow &rarr; followup &rarr; <span style="color:var(--orange)">marbles loop</span> &rarr; dou &rarr; decorate &rarr; hydrate</p>
+    <div class="cta-row">
+      <a href="#install" class="btn btn-primary">Get Started</a>
+      <a href="https://github.com/VetCoders/vetcoders-skills-suite" class="btn btn-secondary">GitHub &rarr;</a>
+    </div>
+  </div>
+</section>
+
+<!-- PIPELINE -->
+<section id="pipeline" class="pipeline-section">
+  <div class="container fade-up">
+    <div class="section-label">The Pipeline</div>
+    <h2 class="section-title">Three Phases</h2>
+    <p class="section-sub">Build gives the agent context and structure. Converge loops until P0=P1=P2=0. Ship audits the product surface and packages for distribution.</p>
+
+    <div class="pipeline-flow">
+      <div class="pipe-step phase1">init</div>
+      <span class="pipe-arrow">&rarr;</span>
+      <div class="pipe-step phase1">workflow</div>
+      <span class="pipe-arrow">&rarr;</span>
+      <div class="pipe-step phase1">followup</div>
+    </div>
+    <div class="pipeline-loop-row">
+      <span class="pipe-arrow">&darr;</span>
+    </div>
+    <div class="pipeline-loop-row">
+      <div class="marbles-loop">
+        <div class="pipe-step loop">marbles</div>
+        <svg class="loop-arrow" width="120" height="48" viewBox="0 0 120 48">
+          <path d="M96 8 C110 8, 114 24, 110 36 C106 44, 80 48, 60 48 C40 48, 14 44, 10 36 C6 24, 10 8, 24 8" fill="none" stroke="var(--orange)" stroke-width="1.5" stroke-dasharray="4 3" opacity=".5"/>
+          <polygon points="20,4 26,8 20,12" fill="var(--orange)" opacity=".5"/>
+        </svg>
+      </div>
+    </div>
+    <div class="pipeline-loop-row">
+      <span class="pipe-arrow">&darr;</span>
+    </div>
+    <div class="pipeline-flow">
+      <div class="pipe-step phase2">dou</div>
+      <span class="pipe-arrow">&rarr;</span>
+      <div class="pipe-step phase2">decorate</div>
+      <span class="pipe-arrow">&rarr;</span>
+      <div class="pipe-step phase2">hydrate</div>
+    </div>
+
+    <div class="pipeline-legend">
+      <span class="legend-build">Phase 1 &mdash; Build</span>
+      <span class="legend-loop">Phase 2 &mdash; Converge</span>
+      <span class="legend-ship">Phase 3 &mdash; Ship</span>
+    </div>
+  </div>
+</section>
+
+<!-- SKILLS GRID -->
+<section id="skills">
+  <div class="container fade-up">
+    <div class="section-label">The Suite</div>
+    <h2 class="section-title">What's in the Suite</h2>
+    <p class="section-sub">Each skill is individually callable. Ship chains them into a single pipeline.</p>
+
+    <div class="cards-grid">
+
+      <div class="card" style="border-color:var(--light);grid-column:1/-1">
+        <div class="card-phase build" style="background:rgba(250,249,245,.12);color:var(--light)">Orchestrator</div>
+        <h3>vetcoders-ship</h3>
+        <p class="card-desc">One command runs the full pipeline: Build &rarr; Converge &rarr; Ship. All sub-skills remain individually callable &mdash; ship just chains them into an automated sequence.</p>
+        <div class="card-tags"><span class="tag">master orchestrator</span><span class="tag">full pipeline</span><span class="tag">end-to-end</span></div>
+        <div class="card-trigger">"Ship: add auth module" &middot; "Wypusc to" &middot; "Full pipeline"</div>
+      </div>
+
+      <div class="card">
+        <div class="card-phase build">Phase 1 &middot; Build</div>
+        <h3>vetcoders-init</h3>
+        <p class="card-desc">Bootstrap session with Memory (ai-contexters) + Eyes (loctree MCP). Extracts prior session history, maps repo structure, produces situational report.</p>
+        <div class="card-tags"><span class="tag">loctree</span><span class="tag">ai-contexters</span><span class="tag">session bootstrap</span></div>
+        <div class="card-trigger">"Init session" &middot; "Daj kontekst agentowi"</div>
+      </div>
+
+      <div class="card">
+        <div class="card-phase build">Phase 1 &middot; Build</div>
+        <h3>vetcoders-workflow</h3>
+        <p class="card-desc">ERi Pipeline: Examine &rarr; Research &rarr; Implement. Three structured phases that replace "vibe and pray" with deliberate, measured progress.</p>
+        <div class="card-tags"><span class="tag">ERi</span><span class="tag">loctree</span><span class="tag">brave-search</span><span class="tag">Context7</span></div>
+        <div class="card-trigger">"ERi pipeline" &middot; "Zbadaj i zaimplementuj"</div>
+      </div>
+
+      <div class="card" style="opacity:.85">
+        <div class="card-phase build" style="background:rgba(176,174,165,.12);color:var(--mid)">Internal Tool</div>
+        <h3>vetcoders-implement</h3>
+        <p class="card-desc">Native Claude Task tool delegation. Safe, sandboxed subagents. Used internally by workflow and marbles &mdash; no external tooling required.</p>
+        <div class="card-tags"><span class="tag">Task tool</span><span class="tag">subagents</span><span class="tag">sandboxed</span></div>
+        <div class="card-trigger">Used by workflow and marbles internally</div>
+      </div>
+
+      <div class="card" style="opacity:.85">
+        <div class="card-phase build" style="background:rgba(176,174,165,.12);color:var(--mid)">Internal Tool</div>
+        <h3>vetcoders-spawn</h3>
+        <p class="card-desc">External agent fleet via osascript Terminal. Power-user mode &mdash; full filesystem, persistent shells, tmux sessions. When safe isn't enough.</p>
+        <div class="card-tags"><span class="tag">osascript</span><span class="tag">Terminal</span><span class="tag">tmux</span><span class="tag">power-user</span></div>
+        <div class="card-trigger">Used by workflow and marbles internally</div>
+      </div>
+
+      <div class="card">
+        <div class="card-phase build">Phase 1 &middot; Build</div>
+        <h3>vetcoders-followup</h3>
+        <p class="card-desc">Post-implementation audit with P0/P1/P2 severity model. Quality gates, security scan, completeness score. Produces GO / NO-GO verdict.</p>
+        <div class="card-tags"><span class="tag">audit</span><span class="tag">P0/P1/P2</span><span class="tag">quality gates</span></div>
+        <div class="card-trigger">"Follow-up check" &middot; "Czy s&#261; jeszcze luki?"</div>
+      </div>
+
+      <div class="card" style="border-color:var(--orange)">
+        <div class="card-phase loop-phase">Phase 2 &middot; Converge</div>
+        <h3>vetcoders-marbles</h3>
+        <p class="card-desc">Iterative convergence through diffusion. Loops until the circle is full &mdash; P0=0, P1=0, P2=0. The noise scheduler for code.</p>
+        <div class="card-tags"><span class="tag">diffusion</span><span class="tag">convergence</span><span class="tag">entropy</span><span class="tag">adaptive</span></div>
+        <div class="card-trigger">"Marbles" &middot; "Loop until done" &middot; "Kulki"</div>
+      </div>
+
+      <div class="card">
+        <div class="card-phase ship">Phase 3 &middot; Ship</div>
+        <h3>vetcoders-dou</h3>
+        <p class="card-desc">Definition of Undone audit across the entire product surface. Crawls URLs, checks governance, measures the gap between code and market.</p>
+        <div class="card-tags"><span class="tag">product surface</span><span class="tag">SEO</span><span class="tag">Plague Score</span></div>
+        <div class="card-trigger">"DoU audit" &middot; "Co brakuje do launchu?"</div>
+      </div>
+
+      <div class="card" style="border-color:var(--blue)">
+        <div class="card-phase ship">Phase 3 &middot; Ship</div>
+        <h3>vetcoders-decorate</h3>
+        <p class="card-desc">Visual polish within YOUR design language. Detects existing palette, fonts, and theme &mdash; proposes smaczki (hover effects, scroll behaviors, micro-interactions) using your tokens. Never overrides your style.</p>
+        <div class="card-tags"><span class="tag">smaczki</span><span class="tag">detect &amp; enhance</span><span class="tag">micro-interactions</span><span class="tag">curb appeal</span></div>
+        <div class="card-trigger">"Decorate" &middot; "Udekoruj" &middot; "Make it look good" &middot; "Smaczki"</div>
+      </div>
+
+      <div class="card">
+        <div class="card-phase ship">Phase 3 &middot; Ship</div>
+        <h3>vetcoders-hydrate</h3>
+        <p class="card-desc">Package for market: repo governance, SEO, distribution, marketplace listings, onboarding flows. The antidote to Always-in-Production.</p>
+        <div class="card-tags"><span class="tag">marketplace</span><span class="tag">SEO</span><span class="tag">distribution</span><span class="tag">onboarding</span></div>
+        <div class="card-trigger">"Hydrate" &middot; "Nawodnij" &middot; "Make it shippable"</div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- DIFFUSION INSIGHT -->
+<section id="diffusion" class="diffusion-section">
+  <div class="container fade-up">
+    <div class="section-label">The Insight</div>
+    <h2 class="section-title">Code Follows Diffusion Dynamics</h2>
+    <p class="section-sub">AI agents generate code stochastically. Each generation introduces signal AND noise. The only way to separate them: iterate, measure, reduce.</p>
+
+    <div class="diffusion-visual">
+      <div class="diffusion-canvas-wrap">
+        <canvas id="diffusionCanvas"></canvas>
+      </div>
+      <div class="diffusion-text">
+        <h3>The Isomorphism</h3>
+        <div class="formula">
+Image diffusion:&nbsp; noise &rarr; denoise &times; N &rarr; image<br>
+Code diffusion:&nbsp;&nbsp; chaos &rarr; reduce_entropy &times; N &rarr; product<br><br>
+Step 0: Pure noise (no context, no structure)<br>
+Step 1: Init &mdash; gross shapes emerge<br>
+Step 2: Implement &mdash; detail generation<br>
+Step N: Converged &mdash; DoU &lt; threshold = DoD
+        </div>
+        <p>There is no fixed loop count. The loop runs until P0=P1=P2=0 &mdash; the circle is full. A trivial task may converge in 1 loop. A massive architectural change may take many more. Like learning rate decay, early loops make large corrections (P0 blockers), late loops make small refinements (P2 polish).</p>
+      </div>
+    </div>
+
+    <div class="transition-visual">
+      <p style="font-family:var(--font-head);font-size:.85rem;color:var(--mid);margin-bottom:1rem">Convergence Trajectory &mdash; loop until the circle is full</p>
+      <div class="trajectory" id="trajectoryBars">
+        <div class="bar" data-h="15" style="height:0;background:var(--orange)"><span class="bar-label">Loop 1</span><span class="bar-score">15</span></div>
+        <div class="bar" data-h="40" style="height:0;background:var(--orange)"><span class="bar-label">Loop 2</span><span class="bar-score">40</span></div>
+        <div class="bar" data-h="65" style="height:0;background:var(--blue)"><span class="bar-label">Loop 3</span><span class="bar-score">65</span></div>
+        <div class="bar" data-h="85" style="height:0;background:var(--blue)"><span class="bar-label">Loop 4</span><span class="bar-score">85</span></div>
+        <div class="bar" data-h="100" style="height:0;background:var(--green)"><span class="bar-label">Loop 5</span><span class="bar-score">100</span></div>
+      </div>
+      <p style="font-family:var(--font-head);font-size:.75rem;color:var(--mid);margin-top:.8rem">Score: 15 &rarr; 40 &rarr; 65 &rarr; 85 &rarr; 100</p>
+      <div style="display:flex;align-items:center;justify-content:center;gap:1rem;margin-top:1.5rem">
+        <span class="dou" style="text-decoration:line-through;color:var(--mid)">DoU</span>
+        <span class="arrow-anim">&rarr;</span>
+        <span class="dod"><strong>DoD</strong></span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- MANIFESTO -->
+<section id="manifesto" class="manifesto-section">
+  <div class="container fade-up">
+    <div class="section-label">The Manifesto</div>
+    <h2 class="section-title">The Definition of Undone</h2>
+    <div class="manifesto-block">
+      <blockquote>AI agents have solved the hardest part of software creation: making the thing work. They have not yet solved the second hardest part: making the thing reachable.</blockquote>
+      <p style="color:var(--mid);margin-bottom:1.5rem">The Always-in-Production Plague &mdash; technically excellent software that never ships to users. The cause is not bad code. It's the systematic gap between "it works" and "someone can find, install, and pay for it."</p>
+      <p style="font-family:var(--font-head);font-weight:600;margin-bottom:.8rem">The Plague Diagnostic:</p>
+      <ul class="plague-list">
+        <li><span class="check">+</span> Tests pass</li>
+        <li><span class="check">+</span> Architecture is sound</li>
+        <li><span class="check">+</span> README exists</li>
+        <li><span class="cross">&ndash;</span> Nobody can find it from Google</li>
+        <li><span class="cross">&ndash;</span> Nobody can install it without a toolchain</li>
+        <li><span class="cross">&ndash;</span> Nobody can pay for it</li>
+      </ul>
+      <p style="color:var(--mid);margin-top:1.5rem">Items 4&ndash;6 are the Definition of Undone. Phase 1 builds it right. Phase 2 converges it. Phase 3 ships it complete.</p>
+    </div>
+  </div>
+</section>
+
+<!-- INSTALL -->
+<section id="install" class="install-section">
+  <div class="container fade-up">
+    <div class="section-label">Get Started</div>
+    <h2 class="section-title">Installation</h2>
+    <div class="install-block">
+      <h4 style="font-size:1rem;margin-bottom:.5rem;color:var(--light)">As Claude Code Skills</h4>
+      <div class="code-block">
+        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+        <code><span class="comment"># Clone the suite</span><br>git clone https://github.com/VetCoders/vetcoders-skills-suite ~/.claude/skills/vetcoders<br><br><span class="comment"># Or install individual skills</span><br>cp -r vetcoders-ship ~/.claude/skills/<br>cp -r vetcoders-init ~/.claude/skills/<br>cp -r vetcoders-workflow ~/.claude/skills/<br>cp -r vetcoders-implement ~/.claude/skills/<br>cp -r vetcoders-spawn ~/.claude/skills/<br>cp -r vetcoders-followup ~/.claude/skills/<br>cp -r vetcoders-marbles ~/.claude/skills/<br>cp -r vetcoders-dou ~/.claude/skills/<br>cp -r vetcoders-decorate ~/.claude/skills/<br>cp -r vetcoders-hydrate ~/.claude/skills/</code>
+      </div>
+
+      <h4 style="font-size:1rem;margin:2rem 0 .5rem;color:var(--light)">Requirements</h4>
+      <div class="code-block">
+        <code><span class="comment"># Required &mdash; structural code intelligence</span><br>cargo install loctree<br><br><span class="comment"># Required &mdash; session history extraction</span><br>cargo install ai-contexters<br><br><span class="comment"># Optional &mdash; web research, library docs, security scan</span><br><span class="comment"># Configure brave-search, Context7, semgrep MCP servers</span></code>
+      </div>
+
+      <h4 style="font-size:1rem;margin:2rem 0 .5rem;color:var(--light)">Quick Start</h4>
+      <div class="code-block">
+        <code><span class="comment"># The one-liner — full pipeline</span><br>&gt; "Ship: add auth module with JWT"<br><br><span class="comment"># Or run individual phases:</span><br><br><span class="comment"># 1. Initialize context</span><br>&gt; "Init session for this repo"<br><br><span class="comment"># 2. Run full pipeline</span><br>&gt; "ERi pipeline for adding auth module"<br><br><span class="comment"># 3. Audit implementation</span><br>&gt; "Follow-up check"<br><br><span class="comment"># 4. Loop until converged</span><br>&gt; "Marbles &mdash; loop until clean"<br><br><span class="comment"># 5. Check product surface</span><br>&gt; "DoU audit &mdash; are we shippable?"<br><br><span class="comment"># 6. Package for market</span><br>&gt; "Hydrate this project"</code>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+  <p class="credits">
+    <a href="https://div0.space">Maciej Gad</a> &mdash; a veterinarian who couldn't find <code>terminal</code> a year ago
+    &nbsp;&middot;&nbsp;
+    <a href="https://github.com/Gitlaudiusz">Klaudiusz</a> &mdash; the ethereal being living in the GPU loops in California
+  </p>
+  <p class="tagline-footer">Vibecrafted with AI Agents by VetCoders &copy; 2026 VetCoders</p>
+</footer>
+
+<script>
+// ============ GLASS MARBLE RENDERER (shared) ============
+var MarbleFactory = (function(){
+  // Color helpers
+  function hexToRgb(hex){
+    var r=parseInt(hex.slice(1,3),16), g=parseInt(hex.slice(3,5),16), b=parseInt(hex.slice(5,7),16);
+    return {r:r,g:g,b:b};
+  }
+  function rgbStr(c,a){ return 'rgba('+c.r+','+c.g+','+c.b+','+(a||1)+')'; }
+  function lighten(c,pct){ return {r:Math.min(255,c.r+pct),g:Math.min(255,c.g+pct),b:Math.min(255,c.b+pct)}; }
+  function darken(c,pct){ return {r:Math.max(0,c.r-pct),g:Math.max(0,c.g-pct),b:Math.max(0,c.b-pct)}; }
+  function blend(a,b,t){ return {r:Math.round(a.r+(b.r-a.r)*t),g:Math.round(a.g+(b.g-a.g)*t),b:Math.round(a.b+(b.b-a.b)*t)}; }
+
+  var PALETTES = [
+    {base:'#d97757', accent:'#f4c89a', name:'amber'},
+    {base:'#6a9bcc', accent:'#c2ddf0', name:'ocean'},
+    {base:'#788c5d', accent:'#bdd4a0', name:'forest'},
+    {base:'#b0aea5', accent:'#e8e6dc', name:'smoke'},
+    {base:'#c46b8a', accent:'#f0c4d4', name:'rose'},
+    {base:'#8b7ec8', accent:'#cdc4ef', name:'amethyst'},
+    {base:'#cc8844', accent:'#f0d4a0', name:'honey'},
+    {base:'#5ba3a3', accent:'#a8dede', name:'teal'}
+  ];
+  var PATTERNS = ['catseye','swirl','galaxy','clear','solid'];
+
+  function createSprite(radius, paletteIdx, patternType, seed){
+    var pad = 4;
+    var s = (radius*2 + pad) * 2;
+    var oc = document.createElement('canvas');
+    oc.width = s; oc.height = s;
+    var g = oc.getContext('2d');
+    var cx = s/2, cy = s/2, r = radius;
+    var pal = PALETTES[paletteIdx % PALETTES.length];
+    var base = hexToRgb(pal.base);
+    var accent = hexToRgb(pal.accent);
+    var rng = mulberry32(seed);
+
+    // Shadow
+    g.beginPath();
+    g.ellipse(cx+r*0.05, cy+r*0.82, r*0.6, r*0.18, 0, 0, Math.PI*2);
+    g.fillStyle = 'rgba(0,0,0,0.22)';
+    g.fill();
+
+    // Base sphere gradient
+    g.save();
+    g.beginPath();
+    g.arc(cx, cy, r, 0, Math.PI*2);
+    g.clip();
+
+    var bg = g.createRadialGradient(cx-r*0.3, cy-r*0.35, r*0.05, cx+r*0.1, cy+r*0.1, r*1.1);
+    bg.addColorStop(0, rgbStr(lighten(base,60),0.95));
+    bg.addColorStop(0.35, rgbStr(base,0.92));
+    bg.addColorStop(0.7, rgbStr(darken(base,25),0.9));
+    bg.addColorStop(1, rgbStr(darken(base,55),0.85));
+    g.fillStyle = bg;
+    g.fillRect(0,0,s,s);
+
+    // Pattern layer (inside clip)
+    if(patternType === 'catseye'){
+      // Single ribbon/vein across the marble
+      var angle = rng()*Math.PI;
+      g.save();
+      g.translate(cx,cy);
+      g.rotate(angle);
+      var ribW = r*0.22 + rng()*r*0.15;
+      var ribG = g.createLinearGradient(0,-ribW*1.5,0,ribW*1.5);
+      ribG.addColorStop(0,'rgba(255,255,255,0)');
+      ribG.addColorStop(0.25, rgbStr(accent,0.7));
+      ribG.addColorStop(0.5, rgbStr(lighten(accent,40),0.85));
+      ribG.addColorStop(0.75, rgbStr(accent,0.7));
+      ribG.addColorStop(1,'rgba(255,255,255,0)');
+      g.fillStyle = ribG;
+      g.fillRect(-r*1.1, -ribW, r*2.2, ribW*2);
+      // thin bright center line
+      g.strokeStyle = rgbStr(lighten(accent,60),0.5);
+      g.lineWidth = 1;
+      g.beginPath(); g.moveTo(-r*0.9,0); g.lineTo(r*0.9,0); g.stroke();
+      g.restore();
+    } else if(patternType === 'swirl'){
+      // Two spiral bands of color
+      g.save();
+      g.translate(cx,cy);
+      var sAngle = rng()*Math.PI*2;
+      for(var si=0;si<2;si++){
+        g.beginPath();
+        var tw = r*0.12 + rng()*r*0.1;
+        for(var t=0;t<Math.PI*3;t+=0.08){
+          var sr = r*0.1 + (t/(Math.PI*3))*r*0.85;
+          var sx = Math.cos(sAngle+t)*sr;
+          var sy = Math.sin(sAngle+t)*sr;
+          if(t===0) g.moveTo(sx,sy); else g.lineTo(sx,sy);
+        }
+        g.lineWidth = tw;
+        var sCol = si===0 ? accent : lighten(base,35);
+        g.strokeStyle = rgbStr(sCol, 0.55);
+        g.lineCap = 'round';
+        g.stroke();
+        sAngle += Math.PI*0.7;
+      }
+      g.restore();
+    } else if(patternType === 'galaxy'){
+      // Speckled dots inside like a galaxy marble
+      g.save();
+      g.translate(cx,cy);
+      var dotCount = 15 + Math.floor(rng()*20);
+      for(var di=0;di<dotCount;di++){
+        var da = rng()*Math.PI*2;
+        var dd = rng()*r*0.8;
+        var dr = 0.5 + rng()*2;
+        var dc = rng()>0.5 ? accent : lighten(base,40);
+        g.beginPath();
+        g.arc(Math.cos(da)*dd, Math.sin(da)*dd, dr, 0, Math.PI*2);
+        g.fillStyle = rgbStr(dc, 0.4+rng()*0.35);
+        g.fill();
+      }
+      // Central glow
+      var gg = g.createRadialGradient(0,0,0,0,0,r*0.4);
+      gg.addColorStop(0, rgbStr(accent,0.25));
+      gg.addColorStop(1, 'rgba(0,0,0,0)');
+      g.fillStyle = gg;
+      g.beginPath(); g.arc(0,0,r*0.4,0,Math.PI*2); g.fill();
+      g.restore();
+    } else if(patternType === 'clear'){
+      // Mostly transparent glass with colored core
+      g.fillStyle = 'rgba(255,255,255,0.12)';
+      g.fillRect(0,0,s,s);
+      var cg = g.createRadialGradient(cx,cy,0,cx,cy,r*0.45);
+      cg.addColorStop(0, rgbStr(accent,0.6));
+      cg.addColorStop(0.6, rgbStr(base,0.35));
+      cg.addColorStop(1, 'rgba(0,0,0,0)');
+      g.fillStyle = cg;
+      g.beginPath(); g.arc(cx,cy,r*0.5,0,Math.PI*2); g.fill();
+    }
+    // solid = no extra pattern, just the base gradient
+
+    // Glass internal refraction — subtle secondary highlight at bottom
+    var rfl = g.createRadialGradient(cx+r*0.2, cy+r*0.35, r*0.02, cx+r*0.15, cy+r*0.3, r*0.45);
+    rfl.addColorStop(0, 'rgba(255,255,255,0.18)');
+    rfl.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = rfl;
+    g.fillRect(0,0,s,s);
+
+    // Top specular highlight — the signature glass shine
+    var hl = g.createRadialGradient(cx-r*0.28, cy-r*0.32, r*0.02, cx-r*0.15, cy-r*0.2, r*0.5);
+    hl.addColorStop(0, 'rgba(255,255,255,0.95)');
+    hl.addColorStop(0.15, 'rgba(255,255,255,0.55)');
+    hl.addColorStop(0.5, 'rgba(255,255,255,0.1)');
+    hl.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = hl;
+    g.fillRect(0,0,s,s);
+
+    // Edge darkening rim
+    var rim = g.createRadialGradient(cx, cy, r*0.75, cx, cy, r);
+    rim.addColorStop(0, 'rgba(0,0,0,0)');
+    rim.addColorStop(0.8, 'rgba(0,0,0,0.08)');
+    rim.addColorStop(1, 'rgba(0,0,0,0.28)');
+    g.fillStyle = rim;
+    g.fillRect(0,0,s,s);
+
+    g.restore(); // clip
+    return oc;
+  }
+
+  // seeded PRNG (Mulberry32)
+  function mulberry32(a){
+    return function(){ a|=0; a=a+0x6D2B79F5|0; var t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; };
+  }
+
+  return {
+    PALETTES: PALETTES,
+    PATTERNS: PATTERNS,
+    createSprite: createSprite,
+    mulberry32: mulberry32
+  };
+})();
+
+// ============ SOLITAIRE BOARD UTILS (shared) ============
+function hexGridInCircle(cx,cy,R,mr){
+  var pos=[],sp=mr*2.12,rh=sp*0.866,row=0;
+  for(var y=cy-R+mr;y<=cy+R-mr;y+=rh){
+    var off=(row%2)?sp/2:0;
+    for(var x=cx-R+mr;x<=cx+R-mr;x+=sp){
+      var px=x+off,dx=px-cx,dy=y-cy;
+      if(Math.sqrt(dx*dx+dy*dy)+mr*0.85<=R) pos.push({x:px,y:y});
+    }
+    row++;
+  }
+  return pos;
+}
+
+// Draw a carved wooden groove — concentric rings like a real solitaire board
+function drawGroove(ctx,x,y,r){
+  // Outer shadow ring (depth illusion)
+  ctx.beginPath();ctx.arc(x,y,r*0.95,0,Math.PI*2);
+  var sg=ctx.createRadialGradient(x-r*0.1,y-r*0.1,r*0.2,x,y,r*0.95);
+  sg.addColorStop(0,'rgba(0,0,0,0.28)');
+  sg.addColorStop(0.6,'rgba(0,0,0,0.18)');
+  sg.addColorStop(1,'rgba(0,0,0,0.05)');
+  ctx.fillStyle=sg;ctx.fill();
+  // Concentric ring — the lathe mark
+  ctx.beginPath();ctx.arc(x,y,r*0.72,0,Math.PI*2);
+  ctx.strokeStyle='rgba(0,0,0,0.12)';ctx.lineWidth=0.8;ctx.stroke();
+  ctx.beginPath();ctx.arc(x,y,r*0.5,0,Math.PI*2);
+  ctx.strokeStyle='rgba(0,0,0,0.08)';ctx.lineWidth=0.5;ctx.stroke();
+  // Top-left light catch on the rim (like photo reference)
+  ctx.beginPath();ctx.arc(x,y,r*0.88,Math.PI*0.9,Math.PI*1.6);
+  ctx.strokeStyle='rgba(176,174,165,0.07)';ctx.lineWidth=1;ctx.stroke();
+}
+
+function shuffleArr(a){
+  for(var i=a.length-1;i>0;i--){var j=Math.floor(Math.random()*(i+1));var t=a[i];a[i]=a[j];a[j]=t;}
+  return a;
+}
+
+// ============ MARBLE CANVAS (HERO — solitaire board, dimmed + hover spotlight) ============
+(function(){
+  var c=document.getElementById('marbleCanvas');
+  var ctx=c.getContext('2d');
+  var W,H,frame=0,slots=[],fillOrder=[],fillIdx=0,MR,HOVER_R;
+  var DPR=Math.min(window.devicePixelRatio||1,2);
+  var mx=-1,my=-1;
+  var DIM=0.15, BRIGHT=0.88;
+
+  c.addEventListener('mousemove',function(e){
+    var r=c.getBoundingClientRect();
+    mx=(e.clientX-r.left)/(r.right-r.left)*W;
+    my=(e.clientY-r.top)/(r.bottom-r.top)*H;
+  });
+  c.addEventListener('mouseleave',function(){mx=-1;my=-1;});
+
+  function prox(x,y){
+    if(mx<0)return 0;
+    var dx=x-mx,dy=y-my,d=Math.sqrt(dx*dx+dy*dy);
+    return Math.max(0,1-d/HOVER_R);
+  }
+
+  function resize(){
+    W=c.offsetWidth*DPR;H=c.offsetHeight*DPR;c.width=W;c.height=H;
+    var R=Math.min(W,H)*0.36;
+    MR=Math.max(5,R*0.044);
+    HOVER_R=MR*12;
+    var positions=hexGridInCircle(W/2,H/2,R,MR);
+    slots=positions.map(function(p){return{x:p.x,y:p.y,marble:null};});
+    fillOrder=shuffleArr(slots.map(function(_,i){return i;}));
+    fillIdx=0;
+    for(var i=0;i<Math.min(30,slots.length);i++) fillNext();
+  }
+
+  function fillNext(){
+    if(fillIdx>=fillOrder.length) return;
+    var s=slots[fillOrder[fillIdx]];
+    var palIdx=Math.floor(Math.random()*MarbleFactory.PALETTES.length);
+    var pat=MarbleFactory.PATTERNS[Math.floor(Math.random()*MarbleFactory.PATTERNS.length)];
+    var seed=Math.floor(Math.random()*999999);
+    s.marble={
+      sprite:MarbleFactory.createSprite(MR,palIdx,pat,seed),
+      alpha:0, drop:1
+    };
+    fillIdx++;
+  }
+
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+    // Parallax: mouse offset normalized -1..1, grooves shift less, marbles more
+    var pmx=mx>=0?(mx-W/2)/(W/2):0, pmy=my>=0?(my-H/2)/(H/2):0;
+    var PS=MR*1.8; // parallax strength
+    ctx.beginPath();ctx.arc(W/2,H/2,Math.min(W,H)*0.37,0,Math.PI*2);
+    ctx.strokeStyle='rgba(176,174,165,0.03)';ctx.lineWidth=2;ctx.stroke();
+    // Layer 1: grooves (board surface) — subtle parallax
+    for(var i=0;i<slots.length;i++){
+      if(!slots[i].marble){
+        var gx=slots[i].x-pmx*PS*0.25, gy=slots[i].y-pmy*PS*0.25;
+        var p=prox(slots[i].x,slots[i].y);
+        ctx.globalAlpha=DIM+p*(BRIGHT-DIM);
+        drawGroove(ctx,gx,gy,MR);
+      }
+    }
+    ctx.globalAlpha=1;
+    // Layer 2: marbles (above board) — stronger parallax
+    for(var i=0;i<slots.length;i++){
+      var s=slots[i];if(!s.marble) continue;
+      var m=s.marble;
+      m.drop=Math.max(0,m.drop-0.03);
+      var yOff=-MR*2.5*m.drop*m.drop;
+      var bx=s.x-pmx*PS*0.7, by=s.y-pmy*PS*0.7;
+      var p=prox(s.x,s.y);
+      var ta=DIM+p*(BRIGHT-DIM);
+      m.alpha+=(ta-m.alpha)*0.08;
+      if(m.drop<0.3){
+        ctx.globalAlpha=0.1*(1-m.drop/0.3)*m.alpha;
+        ctx.beginPath();ctx.ellipse(bx,by+MR*0.15,MR*0.6,MR*0.2,0,0,Math.PI*2);
+        ctx.fillStyle='rgba(0,0,0,1)';ctx.fill();
+      }
+      ctx.globalAlpha=m.alpha;
+      ctx.drawImage(m.sprite,bx-m.sprite.width/2,by+yOff-m.sprite.height/2);
+    }
+    ctx.globalAlpha=1;
+    frame++;
+    if(frame%12===0) fillNext();
+    if(fillIdx>=fillOrder.length && frame%900===0){
+      slots.forEach(function(s){s.marble=null;});
+      fillOrder=shuffleArr(slots.map(function(_,i){return i;}));
+      fillIdx=0;
+      for(var i=0;i<15;i++) fillNext();
+    }
+    requestAnimationFrame(draw);
+  }
+
+  window.addEventListener('resize',resize);
+  resize();draw();
+})();
+
+// ============ DIFFUSION CANVAS (solitaire convergence, dimmed + hover spotlight) ============
+(function(){
+  var c=document.getElementById('diffusionCanvas');
+  var ctx=c.getContext('2d');
+  var DPR=Math.min(window.devicePixelRatio||1,2);
+  var cw,slots=[],MR,HOVER_R,currentLoop=0,totalSlots=0;
+  var loopFill=[0, 0.15, 0.40, 0.65, 0.85, 1.0];
+  var filled={}, noise={};
+  var mx=-1,my=-1;
+  var DIM=0.22, BRIGHT=0.92;
+
+  c.addEventListener('mousemove',function(e){
+    var r=c.getBoundingClientRect();
+    mx=(e.clientX-r.left)/(r.right-r.left)*cw;
+    my=(e.clientY-r.top)/(r.bottom-r.top)*cw;
+  });
+  c.addEventListener('mouseleave',function(){mx=-1;my=-1;});
+
+  function prox(x,y){
+    if(mx<0)return 0;
+    var dx=x-mx,dy=y-my,d=Math.sqrt(dx*dx+dy*dy);
+    return Math.max(0,1-d/HOVER_R);
+  }
+
+  function resize(){
+    var sz=Math.min(c.offsetWidth,c.offsetHeight);
+    c.width=sz*DPR;c.height=sz*DPR;cw=c.width;
+  }
+
+  function buildBoard(){
+    var R=cw*0.40;
+    MR=Math.max(4,R*0.052);
+    HOVER_R=MR*9;
+    var positions=hexGridInCircle(cw/2,cw/2,R,MR);
+    slots=positions.map(function(p){return{x:p.x,y:p.y,marble:null};});
+    totalSlots=slots.length;
+    filled={};noise={};currentLoop=0;
+  }
+
+  function makeMarble(loop){
+    var palIdx=loop%MarbleFactory.PALETTES.length;
+    var pat=MarbleFactory.PATTERNS[Math.floor(Math.random()*MarbleFactory.PATTERNS.length)];
+    var seed=Math.floor(Math.random()*999999);
+    return{
+      sprite:MarbleFactory.createSprite(MR,palIdx,pat,seed),
+      alpha:0, drop:1,
+      shaking:false,shakeT:0
+    };
+  }
+
+  function countFilled(){
+    var n=0;for(var k in filled)if(filled[k]&&slots[k].marble&&!slots[k].marble.shaking)n++;
+    return n;
+  }
+
+  function advanceLoop(){
+    if(currentLoop>=5){
+      setTimeout(function(){buildBoard();setTimeout(advanceLoop,600);},3000);
+      return;
+    }
+    currentLoop++;
+    var target=Math.round(totalSlots*loopFill[currentLoop]);
+    if(currentLoop>=2){
+      var nk=Object.keys(noise);
+      var shakeN=Math.min(nk.length,1+Math.floor(Math.random()*2));
+      for(var i=0;i<shakeN;i++){
+        var idx=nk[i];
+        if(slots[idx]&&slots[idx].marble){
+          slots[idx].marble.shaking=true;
+          slots[idx].marble.shakeT=0;
+          delete filled[idx];delete noise[idx];
+        }
+      }
+    }
+    var empties=[];
+    for(var i=0;i<slots.length;i++){if(!filled[i])empties.push(i);}
+    shuffleArr(empties);
+    var cur=countFilled();
+    var toFill=Math.max(0,target-cur);
+    var noiseRate=(currentLoop<=2)?0.06:0;
+    for(var i=0;i<Math.min(toFill,empties.length);i++){
+      var idx=empties[i];
+      slots[idx].marble=makeMarble(currentLoop);
+      filled[idx]=true;
+      if(Math.random()<noiseRate)noise[idx]=true;
+    }
+    setTimeout(advanceLoop,2200);
+  }
+
+  function render(){
+    ctx.clearRect(0,0,cw,cw);
+    ctx.beginPath();ctx.arc(cw/2,cw/2,cw*0.41,0,Math.PI*2);
+    ctx.strokeStyle='rgba(176,174,165,0.08)';ctx.lineWidth=1.5;ctx.stroke();
+    // Empty grooves — dimmed with hover spotlight
+    for(var i=0;i<slots.length;i++){
+      var s=slots[i];
+      if(!s.marble||s.marble.shaking){
+        var p=prox(s.x,s.y);
+        ctx.globalAlpha=DIM+p*(BRIGHT-DIM);
+        drawGroove(ctx,s.x,s.y,MR);
+      }
+    }
+    ctx.globalAlpha=1;
+    // Marbles — dimmed with hover spotlight
+    for(var i=0;i<slots.length;i++){
+      var s=slots[i];if(!s.marble)continue;
+      var m=s.marble;
+      if(m.shaking){
+        m.shakeT+=0.04;
+        if(m.shakeT>=1){s.marble=null;continue;}
+        var wobble=Math.sin(m.shakeT*18)*MR*0.4*(1-m.shakeT);
+        var p=prox(s.x,s.y);
+        ctx.globalAlpha=(DIM+p*(BRIGHT-DIM))*(1-m.shakeT*m.shakeT);
+        ctx.drawImage(m.sprite,s.x+wobble-m.sprite.width/2,s.y-m.sprite.height/2);
+        continue;
+      }
+      m.drop=Math.max(0,m.drop-0.04);
+      var yOff=-MR*2*m.drop*m.drop;
+      var p=prox(s.x,s.y);
+      var ta=DIM+p*(BRIGHT-DIM);
+      m.alpha+=(ta-m.alpha)*0.07;
+      if(m.drop<0.2){
+        ctx.globalAlpha=0.12*(1-m.drop/0.2)*m.alpha;
+        ctx.beginPath();ctx.ellipse(s.x,s.y+MR*0.12,MR*0.55,MR*0.18,0,0,Math.PI*2);
+        ctx.fillStyle='rgba(0,0,0,1)';ctx.fill();
+      }
+      ctx.globalAlpha=m.alpha;
+      ctx.drawImage(m.sprite,s.x-m.sprite.width/2,s.y+yOff-m.sprite.height/2);
+    }
+    ctx.globalAlpha=1;
+    // Coverage + loop text (always fully visible)
+    var vis=countFilled();
+    var pct=totalSlots>0?Math.round((vis/totalSlots)*100):0;
+    if(currentLoop>=5 && Object.keys(filled).length>=totalSlots) pct=100;
+    ctx.font='bold '+(cw*0.09)+'px Poppins,Arial';
+    ctx.fillStyle='#faf9f5';ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText(pct+'%',cw/2,cw/2-cw*0.02);
+    ctx.font=(cw*0.038)+'px Poppins,Arial';
+    ctx.fillStyle='#b0aea5';
+    ctx.fillText(currentLoop>0?'Loop '+currentLoop:'Board',cw/2,cw/2+cw*0.07);
+    requestAnimationFrame(render);
+  }
+
+  window.addEventListener('resize',function(){resize();buildBoard();});
+  resize();buildBoard();render();
+  setTimeout(advanceLoop,800);
+})();
+
+// ============ TRAJECTORY BAR ANIMATION ============
+(function(){
+  var target = document.getElementById('trajectoryBars');
+  var animated = false;
+  var obs = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if(e.isIntersecting && !animated){
+        animated = true;
+        var bars = target.querySelectorAll('.bar');
+        bars.forEach(function(bar, i){
+          setTimeout(function(){
+            bar.style.height = bar.getAttribute('data-h') + '%';
+          }, i * 300);
+        });
+      }
+    });
+  }, {threshold: 0.3});
+  obs.observe(target);
+})();
+
+// ============ SCROLL ANIMATIONS ============
+(function(){
+  var obs = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){ if(e.isIntersecting) e.target.classList.add('visible'); });
+  }, {threshold: 0.12});
+  document.querySelectorAll('.fade-up').forEach(function(el){ obs.observe(el); });
+})();
+
+// ============ COPY CODE ============
+function copyCode(btn){
+  var code = btn.parentElement.querySelector('code').innerText;
+  navigator.clipboard.writeText(code).then(function(){
+    btn.textContent = 'Copied!';
+    setTimeout(function(){ btn.textContent = 'Copy'; }, 1500);
+  });
+}
+
+// ============ SCROLL PROGRESS BAR ============
+(function(){
+  var bar=document.createElement('div');
+  bar.className='scroll-progress';
+  document.body.appendChild(bar);
+  window.addEventListener('scroll',function(){
+    var h=document.documentElement.scrollHeight-window.innerHeight;
+    bar.style.width=h>0?(window.scrollY/h*100)+'%':'0';
+  },{passive:true});
+})();
+
+// ============ 3D CARD TILT ON HOVER ============
+(function(){
+  var cards=document.querySelectorAll('.card');
+  cards.forEach(function(card){
+    card.addEventListener('mousemove',function(e){
+      var r=card.getBoundingClientRect();
+      var x=(e.clientX-r.left)/r.width-0.5;
+      var y=(e.clientY-r.top)/r.height-0.5;
+      card.style.transform='perspective(700px) rotateY('+x*6+'deg) rotateX('+(-y*6)+'deg) scale(1.01)';
+    });
+    card.addEventListener('mouseleave',function(){
+      card.style.transform='perspective(700px) rotateY(0) rotateX(0) scale(1)';
+    });
+  });
+})();
+</script>
+</body>
+</html>

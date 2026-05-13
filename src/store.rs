@@ -14,8 +14,10 @@ use chrono::{DateTime, TimeZone, Utc};
 use globset::{Glob, GlobMatcher};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -25,6 +27,7 @@ use crate::segmentation::semantic_segments;
 use crate::sources::{self, ExtractionConfig};
 pub use crate::timeline::Kind;
 use crate::timeline::{RepoIdentity, SemanticSegment, TimelineEntry};
+use crate::validation::is_valid_repo_project_slug;
 
 // ============================================================================
 // Kind classification
@@ -169,11 +172,49 @@ fn truncate_session_id(session_id: &str) -> String {
 
 pub const NON_REPOSITORY_CONTEXTS: &str = "non-repository-contexts";
 pub const CANONICAL_STORE_DIRNAME: &str = "store";
+pub const CONTEXT_CORPUS_DIRNAME: &str = "context-corpus";
+pub const LOCT_CONTEXT_PACK_FAMILY: &str = "loct-context-pack";
+pub const CONTEXT_CORPUS_SCHEMA_VERSION: &str = "context_corpus.v1";
 pub const LEGACY_SALVAGE_DIRNAME: &str = "legacy-store";
 pub const AICX_IGNORE_FILENAME: &str = ".aicxignore";
 const MIGRATION_DIRNAME: &str = "migration";
 const MIGRATION_MANIFEST_FILENAME: &str = "manifest.json";
 const MIGRATION_REPORT_FILENAME: &str = "report.md";
+
+pub(crate) fn canonical_project_slug(project: &str) -> String {
+    project
+        .split('/')
+        .map(canonical_bucket_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Trim whitespace from a bucket segment. Case is preserved; dot-prefix and
+/// underscore-prefix bucket names (`.aicx`, `.codescribe`, `.github`,
+/// `_internal`, `.scripts`) are accepted as-is by `is_valid_repo_bucket_name`
+/// (relaxed 2026-05-12 from prior lowercase-only + leading-char-restricted
+/// schema). Mid-segment garbage from extractor bugs (newlines, shell
+/// metacharacters, leading `$`/`{`/`<`) is intentionally NOT sanitized so the
+/// validator surfaces it instead of silently normalizing junk into a
+/// filesystem path.
+fn canonical_bucket_segment(segment: &str) -> String {
+    segment.trim().to_string()
+}
+
+fn canonical_path_segment(value: &str, label: &str) -> Result<String> {
+    let cleaned = value.trim().to_ascii_lowercase();
+    if cleaned.is_empty()
+        || cleaned.contains('/')
+        || cleaned.contains('\\')
+        || cleaned.contains("..")
+        || !cleaned
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+    {
+        anyhow::bail!("invalid context corpus {label} segment: {value:?}");
+    }
+    Ok(cleaned)
+}
 
 #[derive(Debug, Clone)]
 struct IgnoreRule {
@@ -201,6 +242,29 @@ pub fn store_base_dir() -> Result<PathBuf> {
 pub fn canonical_store_dir() -> Result<PathBuf> {
     let dir = store_base_dir()?.join(CANONICAL_STORE_DIRNAME);
     fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Returns the immutable context-corpus root: `~/.aicx/context-corpus/`.
+pub fn context_corpus_root_dir() -> Result<PathBuf> {
+    let dir = store_base_dir()?.join(CONTEXT_CORPUS_DIRNAME);
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+pub fn aicx_context_corpus_dir(org: &str, repo: &str, date: &str, batch: &str) -> Result<PathBuf> {
+    let org = canonical_path_segment(org, "org")?;
+    let repo = canonical_path_segment(repo, "repo")?;
+    let date = compact_date(date);
+    let batch = canonical_path_segment(batch, "batch")?;
+    let dir = context_corpus_root_dir()?
+        .join(org)
+        .join(repo)
+        .join(date)
+        .join(LOCT_CONTEXT_PACK_FAMILY)
+        .join(batch);
+    fs::create_dir_all(dir.join("raw"))?;
+    fs::create_dir_all(dir.join("sidecars"))?;
     Ok(dir)
 }
 
@@ -365,7 +429,7 @@ where
 
 /// Returns the project directory: `~/.aicx/store/<project>/`
 pub fn project_dir(project: &str) -> Result<PathBuf> {
-    let dir = canonical_store_dir()?.join(project);
+    let dir = validated_store_project_dir(&canonical_store_dir()?, project)?;
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -381,7 +445,7 @@ pub fn chunks_dir() -> Result<PathBuf> {
 ///
 /// Layout: `~/.aicx/store/<project>/<date>/<time>_<agent>-context.md`
 pub fn get_context_path(project: &str, agent: &str, date: &str, time: &str) -> Result<PathBuf> {
-    let dir = canonical_store_dir()?.join(project).join(date);
+    let dir = validated_store_project_dir(&canonical_store_dir()?, project)?.join(date);
     fs::create_dir_all(&dir)?;
     Ok(dir.join(format!("{}_{}-context.md", time, agent)))
 }
@@ -395,9 +459,20 @@ pub fn get_context_json_path(
     date: &str,
     time: &str,
 ) -> Result<PathBuf> {
-    let dir = canonical_store_dir()?.join(project).join(date);
+    let dir = validated_store_project_dir(&canonical_store_dir()?, project)?.join(date);
     fs::create_dir_all(&dir)?;
     Ok(dir.join(format!("{}_{}-context.json", time, agent)))
+}
+
+fn validated_store_project_dir(root: &Path, project: &str) -> Result<PathBuf> {
+    let canonical = canonical_project_slug(project);
+    if !is_valid_repo_project_slug(&canonical) {
+        anyhow::bail!(
+            "invalid canonical store project bucket {:?}; expected lowercase <bucket> or <org>/<repo> with [a-z0-9][a-z0-9._-]{{0,99}} segments",
+            project
+        );
+    }
+    Ok(root.join(canonical))
 }
 
 // ============================================================================
@@ -437,6 +512,20 @@ pub fn load_index() -> StoreIndex {
         Ok(dir) => dir,
         Err(_) => return StoreIndex::default(),
     };
+    let lock_path = match crate::locks::index_lock_path() {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::warn!("failed to resolve index lock path: {err}");
+            return StoreIndex::default();
+        }
+    };
+    let _lock = match crate::locks::acquire_shared(lock_path) {
+        Ok(lock) => lock,
+        Err(err) => {
+            tracing::warn!("failed to acquire shared index lock: {err}");
+            return StoreIndex::default();
+        }
+    };
     load_index_at(&base)
 }
 
@@ -456,7 +545,11 @@ fn load_index_at(base: &Path) -> StoreIndex {
 
 /// Persist the store index to disk.
 pub fn save_index(index: &StoreIndex) -> Result<()> {
-    save_index_at(&store_base_dir()?, index)
+    let base = store_base_dir()?;
+    let lock = crate::locks::acquire_exclusive(crate::locks::index_lock_path()?)?;
+    let result = save_index_at(&base, index);
+    crate::locks::release(lock);
+    result
 }
 
 fn save_index_at(base: &Path, index: &StoreIndex) -> Result<()> {
@@ -477,7 +570,10 @@ pub fn update_index(
     let now = Utc::now();
     index.last_updated = now;
 
-    let project_idx = index.projects.entry(project.to_string()).or_default();
+    let project_idx = index
+        .projects
+        .entry(canonical_project_slug(project))
+        .or_default();
 
     let agent_idx = project_idx.agents.entry(agent.to_string()).or_default();
 
@@ -529,7 +625,16 @@ pub struct ReadContextChunk {
 pub struct StoreWriteSummary {
     pub total_entries: usize,
     pub written_paths: Vec<PathBuf>,
+    pub skipped_empty_body: usize,
+    pub deduped_chunks: usize,
     pub project_summary: BTreeMap<String, BTreeMap<String, usize>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SessionWriteOutcome {
+    written_paths: Vec<PathBuf>,
+    skipped_empty_body: usize,
+    deduped_chunks: usize,
 }
 
 struct SessionWriteSpec<'a> {
@@ -558,10 +663,11 @@ pub fn write_context(
     time: &str,
     entries: &[TimelineEntry],
 ) -> Result<Vec<PathBuf>> {
+    let project = canonical_project_slug(project);
     let mut written = Vec::new();
 
     // Markdown
-    let md_path = get_context_path(project, agent, date, time)?;
+    let md_path = get_context_path(&project, agent, date, time)?;
     let mut md_content = String::new();
     md_content.push_str(&format!("# {} | {} | {}\n\n", project, agent, date));
 
@@ -579,7 +685,7 @@ pub fn write_context(
     written.push(md_path);
 
     // JSON
-    let json_path = get_context_json_path(project, agent, date, time)?;
+    let json_path = get_context_json_path(&project, agent, date, time)?;
     let json_content = serde_json::to_string_pretty(entries)?;
     let write_path = sanitize::validate_write_path(&json_path)?;
     fs::write(&write_path, &json_content)?;
@@ -608,8 +714,9 @@ pub fn write_context_chunked(
         return Ok(vec![]);
     }
 
-    let chunks = chunker::chunk_entries(entries, project, agent, chunker_config);
-    let dir = canonical_store_dir()?.join(project).join(date);
+    let project = canonical_project_slug(project);
+    let chunks = chunker::chunk_entries(entries, &project, agent, chunker_config);
+    let dir = validated_store_project_dir(&canonical_store_dir()?, &project)?.join(date);
     fs::create_dir_all(&dir)?;
 
     let mut written = Vec::new();
@@ -646,7 +753,7 @@ pub fn write_context_session_first(
     chunker_config: &ChunkerConfig,
     kind: Option<Kind>,
 ) -> Result<Vec<PathBuf>> {
-    write_context_session_first_at(
+    Ok(write_context_session_first_outcome_at(
         &canonical_store_dir()?,
         SessionWriteSpec {
             project: Some(project),
@@ -657,32 +764,49 @@ pub fn write_context_session_first(
         },
         entries,
         chunker_config,
-    )
+    )?
+    .written_paths)
 }
 
+#[cfg(test)]
 fn write_context_session_first_at(
     root: &Path,
     spec: SessionWriteSpec<'_>,
     entries: &[TimelineEntry],
     chunker_config: &ChunkerConfig,
 ) -> Result<Vec<PathBuf>> {
+    Ok(write_context_session_first_outcome_at(root, spec, entries, chunker_config)?.written_paths)
+}
+
+fn write_context_session_first_outcome_at(
+    root: &Path,
+    spec: SessionWriteSpec<'_>,
+    entries: &[TimelineEntry],
+    chunker_config: &ChunkerConfig,
+) -> Result<SessionWriteOutcome> {
     if entries.is_empty() {
-        return Ok(vec![]);
+        return Ok(SessionWriteOutcome::default());
     }
 
     let kind = spec.kind.unwrap_or_else(|| classify_kind(entries));
-    let project_label = spec.project.unwrap_or(NON_REPOSITORY_CONTEXTS);
-    let chunks = chunker::chunk_entries(entries, project_label, spec.agent, chunker_config);
+    let project_label = spec
+        .project
+        .map(canonical_project_slug)
+        .unwrap_or_else(|| NON_REPOSITORY_CONTEXTS.to_string());
+    let chunks = chunker::chunk_entries(entries, &project_label, spec.agent, chunker_config);
     let date_dir = compact_date(spec.date);
 
-    let mut written = Vec::new();
+    let mut outcome = SessionWriteOutcome::default();
 
     for (idx, chunk) in chunks.iter().enumerate() {
+        if chunk_body_is_empty(&chunk.text) {
+            outcome.skipped_empty_body += 1;
+            continue;
+        }
         let chunk_num = (idx as u32) + 1;
         let mut dir = root.join(&date_dir).join(kind.dir_name()).join(spec.agent);
-        if let Some(project) = spec.project {
-            dir = root
-                .join(project)
+        if spec.project.is_some() {
+            dir = validated_store_project_dir(root, &project_label)?
                 .join(&date_dir)
                 .join(kind.dir_name())
                 .join(spec.agent);
@@ -691,20 +815,91 @@ fn write_context_session_first_at(
 
         let filename = session_basename(spec.date, spec.agent, spec.session_id, chunk_num);
         let path = dir.join(&filename);
+        let content_sha256 = content_sha256(&chunk.text);
+        if content_sha256_exists_in_dir(&dir, &content_sha256)? {
+            outcome.deduped_chunks += 1;
+            continue;
+        }
 
         let write_path = sanitize::validate_write_path(&path)?;
         fs::write(&write_path, &chunk.text)?;
-        write_chunk_sidecar(&path, chunk)?;
-        written.push(path);
+        write_chunk_sidecar(&path, chunk, Some(content_sha256))?;
+        outcome.written_paths.push(path);
     }
 
-    Ok(written)
+    Ok(outcome)
 }
 
-fn write_chunk_sidecar(path: &Path, chunk: &chunker::Chunk) -> Result<()> {
+fn chunk_body_after_header(content: &str) -> &str {
+    let Some(rest) = content.strip_prefix("[project:") else {
+        return content;
+    };
+    let Some((_, body)) = rest.split_once('\n') else {
+        return "";
+    };
+    body.trim_start_matches(['\r', '\n'])
+}
+
+fn chunk_body_is_empty(content: &str) -> bool {
+    !chunk_body_after_header(content)
+        .lines()
+        .any(chunk_line_has_signal)
+}
+
+fn chunk_line_has_signal(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() {
+        return false;
+    }
+    if let Some((_, rest)) = line.split_once("] ")
+        && let Some((_, message)) = rest.split_once(':')
+    {
+        return !message.trim().is_empty();
+    }
+    true
+}
+
+fn content_sha256(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn content_sha256_exists_in_dir(dir: &Path, content_sha256: &str) -> Result<bool> {
+    if !dir.exists() {
+        return Ok(false);
+    }
+    for entry in read_store_dir(dir)?.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_none_or(|name| !name.ends_with(".meta.json"))
+        {
+            continue;
+        }
+        let Some(sidecar) = load_sidecar_from_path(&path) else {
+            continue;
+        };
+        if sidecar.content_sha256.as_deref() == Some(content_sha256) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn write_chunk_sidecar(
+    path: &Path,
+    chunk: &chunker::Chunk,
+    content_sha256: Option<String>,
+) -> Result<()> {
     let sidecar_path = path.with_extension("meta.json");
     let write_path = sanitize::validate_write_path(&sidecar_path)?;
-    let sidecar = chunker::ChunkMetadataSidecar::from(chunk);
+    let mut sidecar = chunker::ChunkMetadataSidecar::from(chunk);
+    sidecar.content_sha256 = content_sha256;
     fs::write(&write_path, serde_json::to_vec_pretty(&sidecar)?)?;
     Ok(())
 }
@@ -727,7 +922,7 @@ where
     store_semantic_segments_at(&store_base_dir()?, entries, chunker_config, progress)
 }
 
-fn store_semantic_segments_at<F>(
+pub fn store_semantic_segments_at<F>(
     base: &Path,
     entries: &[TimelineEntry],
     chunker_config: &ChunkerConfig,
@@ -741,6 +936,7 @@ where
         return Ok(summary);
     }
 
+    let _lock = crate::locks::acquire_exclusive(base.join("locks").join("index.lock"))?;
     let segments = semantic_segments(entries);
     let total_segments = segments.len();
     let mut index = load_index_at(base);
@@ -751,9 +947,11 @@ where
             .first()
             .map(|entry| entry.timestamp.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
-        let project = segment.project_label();
+        let project = canonical_project_slug(&segment.project_label());
 
-        let paths = write_semantic_segment_at(base, &segment, &date, chunker_config)?;
+        let outcome = write_semantic_segment_at(base, &segment, &date, chunker_config)?;
+        summary.skipped_empty_body += outcome.skipped_empty_body;
+        summary.deduped_chunks += outcome.deduped_chunks;
         update_index(
             &mut index,
             &project,
@@ -768,7 +966,7 @@ where
             .entry(segment.agent.clone())
             .or_insert(0) += segment.entries.len();
         summary.total_entries += segment.entries.len();
-        summary.written_paths.extend(paths);
+        summary.written_paths.extend(outcome.written_paths);
         progress(segment_idx + 1, total_segments);
     }
 
@@ -781,7 +979,7 @@ fn write_semantic_segment_at(
     segment: &SemanticSegment,
     date: &str,
     chunker_config: &ChunkerConfig,
-) -> Result<Vec<PathBuf>> {
+) -> Result<SessionWriteOutcome> {
     // Only assertable identities (Primary/Secondary) earn canonical store placement.
     // Fallback/Opaque/None route to non-repository-contexts.
     let project = if segment.has_assertable_identity() {
@@ -795,7 +993,7 @@ fn write_semantic_segment_at(
         base.join(NON_REPOSITORY_CONTEXTS)
     };
 
-    write_context_session_first_at(
+    write_context_session_first_outcome_at(
         &root,
         SessionWriteSpec {
             project: project.as_deref(),
@@ -1034,10 +1232,285 @@ fn context_files_since_at(
 
 /// Load the metadata sidecar for a context file, if it exists.
 pub fn load_sidecar(chunk_path: &Path) -> Option<chunker::ChunkMetadataSidecar> {
-    let sidecar_path = chunk_path.with_extension("meta.json");
-    let sidecar_path = sanitize::validate_read_path(&sidecar_path).ok()?;
+    let sidecar_path = sidecar_path_for_chunk(chunk_path);
+    load_sidecar_from_path(&sidecar_path)
+}
+
+pub fn sidecar_path_for_chunk(chunk_path: &Path) -> PathBuf {
+    let adjacent = chunk_path.with_extension("meta.json");
+    if adjacent.exists() {
+        return adjacent;
+    }
+    if let (Some(parent), Some(stem)) = (chunk_path.parent(), chunk_path.file_stem()) {
+        if parent.file_name().and_then(|name| name.to_str()) == Some("raw")
+            && let Some(pack_dir) = parent.parent()
+        {
+            let sidecar = pack_dir
+                .join("sidecars")
+                .join(format!("{}.json", stem.to_string_lossy()));
+            if sidecar.exists() {
+                return sidecar;
+            }
+        }
+
+        let sidecar = parent
+            .join("sidecars")
+            .join(format!("{}.json", stem.to_string_lossy()));
+        if sidecar.exists() {
+            return sidecar;
+        }
+    }
+    adjacent
+}
+
+fn load_sidecar_from_path(sidecar_path: &Path) -> Option<chunker::ChunkMetadataSidecar> {
+    let sidecar_path = sanitize::validate_read_path(sidecar_path).ok()?;
     let content = fs::read_to_string(&sidecar_path).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+pub fn is_context_corpus_sidecar(sidecar: &chunker::ChunkMetadataSidecar) -> bool {
+    sidecar.artifact_family.as_deref() == Some(LOCT_CONTEXT_PACK_FAMILY)
+        || sidecar
+            .truth_status
+            .as_ref()
+            .is_some_and(|status| status.role == chunker::TruthRole::Example)
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextCorpusFile {
+    pub raw_path: PathBuf,
+    pub sidecar_path: PathBuf,
+    pub sidecar: chunker::ChunkMetadataSidecar,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ContextCorpusIngestSummary {
+    pub target_dir: PathBuf,
+    pub raw_written: usize,
+    pub sidecars_written: usize,
+    pub deduped_chunks: usize,
+    pub index_path: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextCorpusIndexRow {
+    id: String,
+    path: String,
+    artifact_family: Option<String>,
+    schema_version: Option<String>,
+    truth_status_role: Option<String>,
+    keywords: Option<Vec<String>>,
+    band: Option<String>,
+    content_sha256: Option<String>,
+}
+
+pub fn ingest_loct_context_pack(pack_dir: &Path) -> Result<ContextCorpusIngestSummary> {
+    let pack_dir = sanitize::validate_dir_path(pack_dir)?;
+    let raw_dir = pack_dir.join("raw");
+    let sidecars_dir = pack_dir.join("sidecars");
+    let raw_dir = sanitize::validate_dir_path(&raw_dir)
+        .with_context(|| format!("loct context pack missing raw/: {}", raw_dir.display()))?;
+    let sidecars_dir = sanitize::validate_dir_path(&sidecars_dir).with_context(|| {
+        format!(
+            "loct context pack missing sidecars/: {}",
+            sidecars_dir.display()
+        )
+    })?;
+
+    let mut items = Vec::new();
+    for entry in read_store_dir(&raw_dir)?.filter_map(|entry| entry.ok()) {
+        let raw_path = entry.path();
+        if raw_path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = raw_path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let sidecar_path = sidecars_dir.join(format!("{stem}.json"));
+        let mut sidecar = load_sidecar_from_path(&sidecar_path)
+            .with_context(|| format!("missing or invalid sidecar: {}", sidecar_path.display()))?;
+        sidecar.artifact_family = Some(LOCT_CONTEXT_PACK_FAMILY.to_string());
+        sidecar.schema_version = Some(CONTEXT_CORPUS_SCHEMA_VERSION.to_string());
+        if sidecar.truth_status.is_none() {
+            sidecar.truth_status = Some(chunker::TruthStatus {
+                role: chunker::TruthRole::Example,
+                runtime_authoritative: false,
+                stale_against_current_head: false,
+                current_head_when_ingested: None,
+            });
+        }
+        let raw = sanitize::read_to_string_validated(&raw_path)?;
+        let hash = content_sha256(&raw);
+        sidecar.content_sha256 = Some(hash);
+        items.push((raw_path, sidecar_path, sidecar));
+    }
+
+    if items.is_empty() {
+        anyhow::bail!("loct context pack contains no raw/*.md chunks");
+    }
+
+    let (org, repo) = context_corpus_repo_from_sidecar(&items[0].2)?;
+    let date = items[0].2.date.clone();
+    let batch = pack_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("batch");
+    let target = aicx_context_corpus_dir(&org, &repo, &date, batch)?;
+    let target_raw = target.join("raw");
+    let target_sidecars = target.join("sidecars");
+    let index_path = target.join("index.jsonl");
+
+    let mut seen_hashes = context_corpus_hashes_in_dir(&target_sidecars)?;
+    let mut index_rows = Vec::new();
+    let mut summary = ContextCorpusIngestSummary {
+        target_dir: target.clone(),
+        index_path: index_path.clone(),
+        ..ContextCorpusIngestSummary::default()
+    };
+
+    for (raw_path, _source_sidecar_path, sidecar) in items {
+        let hash = sidecar.content_sha256.clone().unwrap_or_default();
+        if !hash.is_empty() && seen_hashes.contains_key(&hash) {
+            summary.deduped_chunks += 1;
+            continue;
+        }
+        if !hash.is_empty() {
+            seen_hashes.insert(hash.clone(), sidecar.id.clone());
+        }
+
+        let file_name = raw_path
+            .file_name()
+            .ok_or_else(|| anyhow!("raw chunk missing filename: {}", raw_path.display()))?;
+        let raw_target = target_raw.join(file_name);
+        let sidecar_target = target_sidecars.join(format!(
+            "{}.json",
+            raw_target
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or(&sidecar.id)
+        ));
+
+        fs::copy(&raw_path, sanitize::validate_write_path(&raw_target)?)?;
+        let mut file = sanitize::create_file_validated(&sidecar_target)?;
+        file.write_all(serde_json::to_vec_pretty(&sidecar)?.as_slice())?;
+        summary.raw_written += 1;
+        summary.sidecars_written += 1;
+
+        index_rows.push(ContextCorpusIndexRow {
+            id: sidecar.id.clone(),
+            path: raw_target.display().to_string(),
+            artifact_family: sidecar.artifact_family.clone(),
+            schema_version: sidecar.schema_version.clone(),
+            truth_status_role: sidecar
+                .truth_status
+                .as_ref()
+                .map(|status| match status.role {
+                    chunker::TruthRole::Live => "live".to_string(),
+                    chunker::TruthRole::Example => "example".to_string(),
+                }),
+            keywords: sidecar.keywords.clone(),
+            band: sidecar.frame_kind.map(|kind| kind.as_str().to_string()),
+            content_sha256: sidecar.content_sha256.clone(),
+        });
+    }
+
+    write_context_corpus_index(&index_path, &index_rows)?;
+    Ok(summary)
+}
+
+pub fn scan_context_corpus_files_at(base: &Path) -> Result<Vec<ContextCorpusFile>> {
+    let base = sanitize::validate_dir_path(base)?;
+    let root = base.join(CONTEXT_CORPUS_DIRNAME);
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    scan_context_corpus_files_recursive(&root, &mut out)?;
+    out.sort_by(|left, right| left.raw_path.cmp(&right.raw_path));
+    Ok(out)
+}
+
+fn scan_context_corpus_files_recursive(dir: &Path, out: &mut Vec<ContextCorpusFile>) -> Result<()> {
+    for entry in read_store_dir(dir)?.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().and_then(|name| name.to_str()) == Some("raw") {
+                collect_context_corpus_raw_dir(&path, out)?;
+            } else {
+                scan_context_corpus_files_recursive(&path, out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_context_corpus_raw_dir(raw_dir: &Path, out: &mut Vec<ContextCorpusFile>) -> Result<()> {
+    let Some(pack_dir) = raw_dir.parent() else {
+        return Ok(());
+    };
+    let sidecars_dir = pack_dir.join("sidecars");
+    if !sidecars_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in read_store_dir(raw_dir)?.filter_map(|entry| entry.ok()) {
+        let raw_path = entry.path();
+        if raw_path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = raw_path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let sidecar_path = sidecars_dir.join(format!("{stem}.json"));
+        let Some(sidecar) = load_sidecar_from_path(&sidecar_path) else {
+            continue;
+        };
+        out.push(ContextCorpusFile {
+            raw_path,
+            sidecar_path,
+            sidecar,
+        });
+    }
+    Ok(())
+}
+
+fn context_corpus_repo_from_sidecar(
+    sidecar: &chunker::ChunkMetadataSidecar,
+) -> Result<(String, String)> {
+    let project = sidecar.project.trim();
+    if let Some((org, repo)) = project.split_once('/') {
+        return Ok((org.to_string(), repo.to_string()));
+    }
+    Ok(("unknown".to_string(), project.to_string()))
+}
+
+fn context_corpus_hashes_in_dir(sidecars_dir: &Path) -> Result<HashMap<String, String>> {
+    let mut hashes = HashMap::new();
+    if !sidecars_dir.exists() {
+        return Ok(hashes);
+    }
+    for entry in read_store_dir(sidecars_dir)?.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(sidecar) = load_sidecar_from_path(&path) else {
+            continue;
+        };
+        if let Some(hash) = sidecar.content_sha256 {
+            hashes.insert(hash, sidecar.id);
+        }
+    }
+    Ok(hashes)
+}
+
+fn write_context_corpus_index(path: &Path, rows: &[ContextCorpusIndexRow]) -> Result<()> {
+    let mut writer = sanitize::create_file_validated(path)?;
+    for row in rows {
+        writeln!(writer, "{}", serde_json::to_string(row)?)?;
+    }
+    Ok(())
 }
 
 /// Find stored chunks whose sidecar metadata matches a run ID.
@@ -2692,6 +3165,8 @@ mod tests {
 
     #[test]
     fn test_get_context_path_new_layout() {
+        // Case-preserving canonical (relaxed 2026-05-12): `CodeScribe`
+        // stays `CodeScribe` instead of being lowered to `codescribe`.
         if let Ok(path) = get_context_path("CodeScribe", "claude", "2026-01-22", "143005") {
             let s = path.to_string_lossy();
             assert!(s.contains("CodeScribe"));
@@ -2708,6 +3183,131 @@ mod tests {
             assert!(s.contains("2026-01-22"));
             assert!(s.ends_with("143005_claude-context.json"));
         }
+    }
+
+    #[test]
+    fn canonical_project_slug_preserves_legit_shapes_and_lets_validator_reject_junk() {
+        use crate::validation::is_valid_repo_project_slug;
+
+        // Case is preserved — CamelCase GitHub orgs and dot/underscore-prefix
+        // bucket names pass through `canonical_project_slug` unchanged, and
+        // the validator accepts them directly (relaxed 2026-05-12 from prior
+        // lowercase-only schema).
+        assert_eq!(canonical_project_slug("local/.scripts"), "local/.scripts");
+        assert_eq!(canonical_project_slug("local/.aicx"), "local/.aicx");
+        assert_eq!(canonical_project_slug("local/_priv"), "local/_priv");
+        assert_eq!(canonical_project_slug("VetCoders/Vista"), "VetCoders/Vista");
+        assert_eq!(
+            canonical_project_slug("LibraxisAI/lbrxAgents"),
+            "LibraxisAI/lbrxAgents"
+        );
+        assert_eq!(canonical_project_slug("a/b"), "a/b");
+        // Trailing whitespace is trimmed:
+        assert_eq!(
+            canonical_project_slug("  vetcoders / aicx  "),
+            "vetcoders/aicx"
+        );
+
+        for s in [
+            "local/.scripts",
+            "local/.aicx",
+            "local/_priv",
+            "VetCoders/Vista",
+            "LibraxisAI/lbrxAgents",
+            ".github",
+            ".aicx",
+        ] {
+            assert!(
+                is_valid_repo_project_slug(&canonical_project_slug(s)),
+                "{s} should round-trip through canonical_project_slug + validator"
+            );
+        }
+
+        // Mid-segment garbage (newlines, shell metacharacters, leading `$`/
+        // `{`/`<`) is intentionally NOT sanitized — the validator must
+        // still reject it so an extractor bug surfaces instead of silently
+        // writing mangled-but-passable filesystem paths.
+        assert!(!is_valid_repo_project_slug(&canonical_project_slug(
+            "VetCoders/vibecrafted.git`"
+        )));
+        assert!(!is_valid_repo_project_slug(&canonical_project_slug(
+            "VetCoders/loctree\n\n**AICX"
+        )));
+        assert!(!is_valid_repo_project_slug(&canonical_project_slug(
+            "${RELEASE_REPO}/releases"
+        )));
+    }
+
+    #[test]
+    fn validated_store_project_dir_rejects_junk_bucket_segments() {
+        let root = retrieval_test_root("invalid-bucket-segments");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let bad = "VetCoders/vibecrafted.git`";
+        let err = validated_store_project_dir(&root, bad).expect_err("invalid repo bucket");
+        assert!(
+            err.to_string()
+                .contains("invalid canonical store project bucket")
+        );
+        assert!(!root.join("VetCoders").join("vibecrafted.git`").exists());
+
+        let bad = "VetCoders/loctree\n\n**AICX";
+        assert!(validated_store_project_dir(&root, bad).is_err());
+        assert!(!root.join("VetCoders").join("loctree\n\n**AICX").exists());
+
+        let bad = "VetCoders/loctxc_O)outcomqqqqqqq]]qqqqqqqqqqqqqqqqqqqqqqqqqqq;;'[";
+        assert!(validated_store_project_dir(&root, bad).is_err());
+        assert!(
+            !root
+                .join("VetCoders")
+                .join("loctxc_O)outcomqqqqqqq]]qqqqqqqqqqqqqqqqqqqqqqqqqqq;;'[")
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_first_write_blocks_invalid_project_before_mkdir() {
+        let root = retrieval_test_root("invalid-session-write");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let entries = vec![semantic_entry(
+            (2026, 5, 6, 11, 0, 0),
+            "sess-invalid-bucket",
+            "user",
+            "This must not create a junk corpus bucket.",
+            None,
+        )];
+
+        let err = write_context_session_first_at(
+            &root,
+            SessionWriteSpec {
+                project: Some("VetCoders/vc-skills.git\"><span"),
+                agent: "codex",
+                date: "2026-05-06",
+                session_id: "sess-invalid-bucket",
+                kind: Some(Kind::Conversations),
+            },
+            &entries,
+            &ChunkerConfig::default(),
+        )
+        .expect_err("invalid repo segment should fail before mkdir");
+
+        assert!(
+            err.to_string()
+                .contains("invalid canonical store project bucket")
+        );
+        assert!(
+            !root
+                .join("VetCoders")
+                .join("vc-skills.git\"><span")
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2780,6 +3380,8 @@ mod tests {
         let json = serde_json::to_string_pretty(&index).unwrap();
         let restored: StoreIndex = serde_json::from_str(&json).unwrap();
 
+        // Case-preserving canonical (relaxed 2026-05-12): `CodeScribe`
+        // stays `CodeScribe` instead of being lowered to `codescribe`.
         assert_eq!(restored.projects.len(), 2);
         assert!(restored.projects.contains_key("CodeScribe"));
         assert!(restored.projects.contains_key("vista"));
@@ -3155,6 +3757,42 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn session_first_write_skips_empty_body_chunks() {
+        let root = retrieval_test_root("empty-body-guard");
+        let _ = fs::remove_dir_all(&root);
+
+        let entries = vec![TimelineEntry {
+            timestamp: Utc.with_ymd_and_hms(2026, 5, 6, 12, 0, 0).unwrap(),
+            agent: "claude".to_string(),
+            session_id: "sess-empty-body".to_string(),
+            role: "assistant".to_string(),
+            message: "   \n\t".to_string(),
+            branch: None,
+            cwd: None,
+            frame_kind: Some(crate::timeline::FrameKind::InternalThought),
+        }];
+
+        let written = write_context_session_first_at(
+            &root.join("store"),
+            SessionWriteSpec {
+                project: Some("VetCoders/aicx"),
+                agent: "claude",
+                date: "2026-05-06",
+                session_id: "sess-empty-body",
+                kind: Some(Kind::Conversations),
+            },
+            &entries,
+            &ChunkerConfig::default(),
+        )
+        .expect("write should succeed");
+
+        assert!(written.is_empty());
+        assert!(!root.join("store").join("vetcoders").join("aicx").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn semantic_entry(
         ts: (i32, u32, u32, u32, u32, u32),
         session_id: &str,
@@ -3202,14 +3840,14 @@ mod tests {
                 "sess-a",
                 "user",
                 "Switch to https://github.com/VetCoders/ai-contexters now.",
-                None,
+                Some("https://github.com/VetCoders/ai-contexters"),
             ),
             semantic_entry(
                 (2026, 3, 21, 9, 3, 0),
                 "sess-a",
                 "user",
                 "Then inspect https://github.com/VetCoders/loctree as well.",
-                None,
+                Some("https://github.com/VetCoders/loctree"),
             ),
         ];
 
@@ -3224,6 +3862,8 @@ mod tests {
                 .iter()
                 .any(|path| { path.starts_with(root.join("non-repository-contexts")) })
         );
+        // Case-preserving canonical (relaxed 2026-05-12): `VetCoders` from
+        // git remote stays `VetCoders`, not lowered to `vetcoders`.
         assert!(summary.written_paths.iter().any(|path| {
             path.starts_with(root.join("store").join("VetCoders").join("ai-contexters"))
         }));
@@ -3361,6 +4001,107 @@ mod tests {
             file.repo.as_ref().unwrap().slug(),
             "VetCoders/ai-contexters"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_sidecar_accepts_context_corpus_raw_sibling_sidecars_layout() {
+        let root = retrieval_test_root("context-corpus-sidecar-sibling");
+        let _ = fs::remove_dir_all(&root);
+
+        let pack_dir = root
+            .join("context-corpus")
+            .join("vetcoders")
+            .join("aicx")
+            .join("2026_0508")
+            .join("loct-context-pack")
+            .join("batch-alpha");
+        let raw_path = pack_dir.join("raw").join("ctx-example.md");
+        let sidecar_path = pack_dir.join("sidecars").join("ctx-example.json");
+
+        write_text(&raw_path, "Decision: corpus examples are retrieval-only");
+        write_text(
+            &sidecar_path,
+            &serde_json::json!({
+                "id": "ctx-example",
+                "project": "vetcoders/aicx",
+                "agent": "loct-context-pack",
+                "date": "2026-05-08",
+                "session_id": "batch-alpha",
+                "kind": "reports",
+                "artifact_family": "loct-context-pack",
+                "schema_version": "context_corpus.v1",
+                "truth_status": {
+                    "role": "example",
+                    "runtime_authoritative": false,
+                    "stale_against_current_head": true
+                }
+            })
+            .to_string(),
+        );
+
+        assert_eq!(sidecar_path_for_chunk(&raw_path), sidecar_path);
+        let sidecar = load_sidecar(&raw_path).expect("load context-corpus sidecar");
+        assert_eq!(sidecar.id, "ctx-example");
+        assert!(is_context_corpus_sidecar(&sidecar));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_sidecar_keeps_adjacent_meta_json_priority_for_legacy_chunks() {
+        let root = retrieval_test_root("sidecar-adjacent-priority");
+        let _ = fs::remove_dir_all(&root);
+
+        let chunk_dir = root
+            .join("store")
+            .join("VetCoders")
+            .join("aicx")
+            .join("2026_0508")
+            .join("reports")
+            .join("codex");
+        let chunk_path = chunk_dir.join("2026_0508_codex_live-sess_001.md");
+        let adjacent = chunk_path.with_extension("meta.json");
+        let sidecars = chunk_dir
+            .join("sidecars")
+            .join("2026_0508_codex_live-sess_001.json");
+
+        write_text(&chunk_path, "Decision: live adjacent metadata wins");
+        write_text(
+            &adjacent,
+            &serde_json::json!({
+                "id": "legacy-live",
+                "project": "VetCoders/aicx",
+                "agent": "codex",
+                "date": "2026-05-08",
+                "session_id": "live-sess",
+                "kind": "reports"
+            })
+            .to_string(),
+        );
+        write_text(
+            &sidecars,
+            &serde_json::json!({
+                "id": "sidecars-example",
+                "project": "VetCoders/aicx",
+                "agent": "codex",
+                "date": "2026-05-08",
+                "session_id": "live-sess",
+                "kind": "reports",
+                "artifact_family": "loct-context-pack",
+                "truth_status": {
+                    "role": "example",
+                    "runtime_authoritative": false
+                }
+            })
+            .to_string(),
+        );
+
+        assert_eq!(sidecar_path_for_chunk(&chunk_path), adjacent);
+        let sidecar = load_sidecar(&chunk_path).expect("load adjacent sidecar");
+        assert_eq!(sidecar.id, "legacy-live");
+        assert!(!is_context_corpus_sidecar(&sidecar));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -3650,6 +4391,8 @@ mod tests {
         assert_eq!(manifest.totals.rebuild_items, 1);
         assert_eq!(manifest.totals.rebuilt_items, 1);
         assert_eq!(manifest.totals.salvaged_items, 0);
+        // Case-preserving canonical (relaxed 2026-05-12): `VetCoders` from
+        // git remote stays `VetCoders`, not lowered to `vetcoders`.
         assert!(manifest.items.iter().any(|item| {
             item.canonical_paths.iter().any(|path| {
                 path.contains("/store/VetCoders/ai-contexters/2025_0321/conversations/codex/")

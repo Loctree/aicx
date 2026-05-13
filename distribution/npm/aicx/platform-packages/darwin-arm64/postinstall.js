@@ -24,23 +24,13 @@ const VERSION = require("./package.json").version;
 
 const BINARY_MAPPINGS = {
   "@loctree/aicx-darwin-arm64": {
-    file: `aicx-v${VERSION}-aarch64-apple-darwin.zip`,
-    bundleDir: `aicx-v${VERSION}-aarch64-apple-darwin`,
-    archiveType: "zip",
-  },
-  "@loctree/aicx-darwin-x64": {
-    file: `aicx-v${VERSION}-x86_64-apple-darwin.zip`,
-    bundleDir: `aicx-v${VERSION}-x86_64-apple-darwin`,
-    archiveType: "zip",
-  },
-  "@loctree/aicx-linux-x64-gnu": {
-    file: `aicx-v${VERSION}-x86_64-unknown-linux-musl.tar.gz`,
-    bundleDir: `aicx-v${VERSION}-x86_64-unknown-linux-musl`,
+    file: `aicx-v${VERSION}-aarch64-apple-darwin-slim-unsigned.tar.gz`,
+    bundleDir: `aicx-v${VERSION}-aarch64-apple-darwin-slim-unsigned`,
     archiveType: "tar.gz",
   },
-  "@loctree/aicx-linux-x64-musl": {
-    file: `aicx-v${VERSION}-x86_64-unknown-linux-musl.tar.gz`,
-    bundleDir: `aicx-v${VERSION}-x86_64-unknown-linux-musl`,
+  "@loctree/aicx-linux-x64-gnu": {
+    file: `aicx-v${VERSION}-x86_64-unknown-linux-gnu-slim-unsigned.tar.gz`,
+    bundleDir: `aicx-v${VERSION}-x86_64-unknown-linux-gnu-slim-unsigned`,
     archiveType: "tar.gz",
   },
 };
@@ -153,9 +143,15 @@ async function install() {
     console.log(`Successfully installed aicx binaries to ${__dirname}`);
   } catch (error) {
     rmSync(tempDir, { recursive: true, force: true });
+    console.error(`
+======================================================`);
     console.error(`Failed to install aicx binaries: ${error.message}`);
-    console.error(`Archive URL: ${archiveUrl}`);
-    console.error(`Checksum URL: ${checksumUrl}`);
+    console.error(`Target platform: ${process.platform}-${process.arch}`);
+    console.error(`Asset expected: ${mapping.file}`);
+    console.error(`Please download and install manually from:`);
+    console.error(`https://github.com/${GITHUB_REPO}/releases/tag/v${VERSION}`);
+    console.error(`======================================================
+`);
     process.exit(1);
   }
 }

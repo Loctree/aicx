@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VetCoders Skills Suite — Agent Workflow for Production-Ready Software</title>
+<meta name="description" content="Six skills that take AI agents from blind coding to shipped products. Init, Workflow, Subagents, Follow-up, Definition of Undone, and Hydrate.">
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700&family=Lora:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --dark: #141413;
+    --light: #faf9f5;
+    --mid: #b0aea5;
+    --light-gray: #e8e6dc;
+    --orange: #d97757;
+    --blue: #6a9bcc;
+    --green: #788c5d;
+    --font-heading: 'Poppins', Arial, sans-serif;
+    --font-body: 'Lora', Georgia, serif;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: var(--font-body);
+    background: var(--dark);
+    color: var(--light);
+    line-height: 1.7;
+    overflow-x: hidden;
+  }
+
+  h1, h2, h3, h4, h5 {
+    font-family: var(--font-heading);
+    font-weight: 600;
+    line-height: 1.2;
+  }
+
+  /* Hero */
+  .hero {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+    padding: 4rem 2rem;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .hero::before {
+    content: '';
+    position: absolute;
+    top: -50%;
+    left: -50%;
+    width: 200%;
+    height: 200%;
+    background: radial-gradient(ellipse at 30% 50%, rgba(217,119,87,0.08) 0%, transparent 50%),
+                radial-gradient(ellipse at 70% 30%, rgba(106,155,204,0.06) 0%, transparent 50%),
+                radial-gradient(ellipse at 50% 80%, rgba(120,140,93,0.05) 0%, transparent 50%);
+    animation: drift 20s ease-in-out infinite;
+  }
+
+  @keyframes drift {
+    0%, 100% { transform: translate(0, 0) rotate(0deg); }
+    33% { transform: translate(2%, -1%) rotate(1deg); }
+    66% { transform: translate(-1%, 2%) rotate(-1deg); }
+  }
+
+  .hero-content { position: relative; z-index: 1; max-width: 900px; }
+
+  .hero-badge {
+    display: inline-block;
+    padding: 0.4rem 1.2rem;
+    border: 1px solid var(--orange);
+    border-radius: 100px;
+    font-family: var(--font-heading);
+    font-size: 0.75rem;
+    font-weight: 500;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--orange);
+    margin-bottom: 2rem;
+  }
+
+  .hero h1 {
+    font-size: clamp(2.5rem, 6vw, 4.5rem);
+    font-weight: 700;
+    margin-bottom: 1.5rem;
+    background: linear-gradient(135deg, var(--light) 0%, var(--mid) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .hero h1 span {
+    background: linear-gradient(135deg, var(--orange) 0%, #e8a070 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+  }
+
+  .hero-sub {
+    font-size: 1.25rem;
+    color: var(--mid);
+    max-width: 700px;
+    margin: 0 auto 3rem;
+  }
+
+  .hero-quote {
+    font-style: italic;
+    color: var(--orange);
+    opacity: 0.8;
+    font-size: 1rem;
+    max-width: 600px;
+    margin: 0 auto;
+    padding-top: 2rem;
+    border-top: 1px solid rgba(176,174,165,0.15);
+  }
+
+  /* Pipeline Section */
+  .section {
+    padding: 6rem 2rem;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+
+  .section-header {
+    text-align: center;
+    margin-bottom: 4rem;
+  }
+
+  .section-header h2 {
+    font-size: 2.5rem;
+    margin-bottom: 1rem;
+  }
+
+  .section-header p {
+    color: var(--mid);
+    font-size: 1.1rem;
+    max-width: 600px;
+    margin: 0 auto;
+  }
+
+  /* Pipeline Flow */
+  .pipeline {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    position: relative;
+  }
+
+  .pipeline::before {
+    content: '';
+    position: absolute;
+    left: 40px;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: linear-gradient(to bottom,
+      var(--blue) 0%,
+      var(--green) 33%,
+      var(--orange) 66%,
+      var(--orange) 100%
+    );
+    opacity: 0.3;
+  }
+
+  .skill-card {
+    display: grid;
+    grid-template-columns: 80px 1fr;
+    gap: 2rem;
+    padding: 2.5rem 0;
+    border-bottom: 1px solid rgba(176,174,165,0.08);
+    position: relative;
+  }
+
+  .skill-card:last-child { border-bottom: none; }
+
+  .skill-number {
+    width: 80px;
+    height: 80px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-heading);
+    font-size: 1.5rem;
+    font-weight: 700;
+    position: relative;
+    z-index: 1;
+    flex-shrink: 0;
+  }
+
+  .skill-number.blue { background: rgba(106,155,204,0.15); color: var(--blue); border: 2px solid rgba(106,155,204,0.3); }
+  .skill-number.green { background: rgba(120,140,93,0.15); color: var(--green); border: 2px solid rgba(120,140,93,0.3); }
+  .skill-number.orange { background: rgba(217,119,87,0.15); color: var(--orange); border: 2px solid rgba(217,119,87,0.3); }
+
+  .skill-body h3 {
+    font-size: 1.5rem;
+    margin-bottom: 0.3rem;
+  }
+
+  .skill-body h3 .mono {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-weight: 500;
+    font-size: 1.3rem;
+  }
+
+  .skill-tagline {
+    color: var(--mid);
+    font-size: 0.9rem;
+    font-family: var(--font-heading);
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 1rem;
+  }
+
+  .skill-tagline.blue { color: var(--blue); }
+  .skill-tagline.green { color: var(--green); }
+  .skill-tagline.orange { color: var(--orange); }
+
+  .skill-desc {
+    color: rgba(250,249,245,0.8);
+    margin-bottom: 1.2rem;
+    max-width: 700px;
+  }
+
+  .skill-features {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .feature-tag {
+    display: inline-block;
+    padding: 0.25rem 0.75rem;
+    border-radius: 100px;
+    font-family: var(--font-heading);
+    font-size: 0.72rem;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+  }
+
+  .feature-tag.blue { background: rgba(106,155,204,0.12); color: var(--blue); }
+  .feature-tag.green { background: rgba(120,140,93,0.12); color: var(--green); }
+  .feature-tag.orange { background: rgba(217,119,87,0.12); color: var(--orange); }
+
+  /* Divider */
+  .divider-section {
+    padding: 4rem 2rem;
+    text-align: center;
+  }
+
+  .flow-diagram {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 0.85rem;
+    color: var(--mid);
+    line-height: 2;
+    display: inline-block;
+    text-align: left;
+    background: rgba(176,174,165,0.04);
+    padding: 2rem 3rem;
+    border-radius: 12px;
+    border: 1px solid rgba(176,174,165,0.08);
+  }
+
+  .flow-diagram .blue { color: var(--blue); }
+  .flow-diagram .green { color: var(--green); }
+  .flow-diagram .orange { color: var(--orange); }
+  .flow-diagram .arrow { color: var(--mid); opacity: 0.5; }
+
+  /* Manifesto */
+  .manifesto {
+    background: rgba(217,119,87,0.04);
+    border: 1px solid rgba(217,119,87,0.12);
+    border-radius: 16px;
+    padding: 4rem;
+    margin: 2rem auto;
+    max-width: 800px;
+    text-align: center;
+  }
+
+  .manifesto h2 {
+    font-size: 2rem;
+    margin-bottom: 1.5rem;
+    color: var(--orange);
+  }
+
+  .manifesto blockquote {
+    font-style: italic;
+    color: rgba(250,249,245,0.7);
+    font-size: 1.15rem;
+    line-height: 1.8;
+    margin-bottom: 1.5rem;
+  }
+
+  .manifesto .sig {
+    font-family: var(--font-heading);
+    font-size: 0.85rem;
+    color: var(--mid);
+    margin-top: 2rem;
+    line-height: 1.8;
+  }
+
+  .manifesto .sig a {
+    color: var(--orange);
+    text-decoration: none;
+  }
+
+  /* Stats row */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 2rem;
+    padding: 4rem 2rem;
+    max-width: 1000px;
+    margin: 0 auto;
+  }
+
+  .stat {
+    text-align: center;
+    padding: 2rem;
+    border-radius: 12px;
+    background: rgba(176,174,165,0.03);
+    border: 1px solid rgba(176,174,165,0.06);
+  }
+
+  .stat-number {
+    font-family: var(--font-heading);
+    font-size: 3rem;
+    font-weight: 700;
+  }
+
+  .stat-number.orange { color: var(--orange); }
+  .stat-number.blue { color: var(--blue); }
+  .stat-number.green { color: var(--green); }
+
+  .stat-label {
+    font-family: var(--font-heading);
+    font-size: 0.8rem;
+    color: var(--mid);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-top: 0.5rem;
+  }
+
+  /* Install */
+  .install-section {
+    text-align: center;
+    padding: 4rem 2rem 6rem;
+  }
+
+  .install-box {
+    display: inline-block;
+    background: rgba(176,174,165,0.04);
+    border: 1px solid rgba(176,174,165,0.12);
+    border-radius: 12px;
+    padding: 1.5rem 3rem;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 0.95rem;
+    color: var(--light);
+    margin-top: 1.5rem;
+  }
+
+  .install-box .prompt { color: var(--green); }
+  .install-box .cmd { color: var(--light); }
+
+  /* Footer */
+  footer {
+    text-align: center;
+    padding: 3rem 2rem;
+    border-top: 1px solid rgba(176,174,165,0.08);
+    font-family: var(--font-heading);
+    font-size: 0.75rem;
+    color: var(--mid);
+    letter-spacing: 0.05em;
+  }
+
+  footer a { color: var(--orange); text-decoration: none; }
+
+  /* New badge */
+  .new-badge {
+    display: inline-block;
+    padding: 0.15rem 0.5rem;
+    background: var(--orange);
+    color: var(--dark);
+    font-family: var(--font-heading);
+    font-size: 0.6rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    border-radius: 4px;
+    margin-left: 0.5rem;
+    vertical-align: middle;
+  }
+
+  @media (max-width: 768px) {
+    .skill-card { grid-template-columns: 1fr; }
+    .skill-number { width: 50px; height: 50px; font-size: 1rem; }
+    .pipeline::before { left: 24px; }
+    .manifesto { padding: 2rem; }
+    .flow-diagram { font-size: 0.7rem; padding: 1.5rem; }
+    .stats { grid-template-columns: 1fr 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Hero -->
+<section class="hero">
+  <div class="hero-content">
+    <div class="hero-badge">Claude Code Skills Suite</div>
+    <h1>VetCoders<br><span>Skills Suite</span></h1>
+    <p class="hero-sub">
+      Six skills that take AI agents from blind coding to shipped products.
+      The complete pipeline from context bootstrap to marketplace launch.
+    </p>
+    <p class="hero-quote">
+      "The antidote is not more tools. It is a decision: choose what ships, and finish it. All of it. Not just the code."
+    </p>
+  </div>
+</section>
+
+<!-- Stats -->
+<div class="stats">
+  <div class="stat">
+    <div class="stat-number orange">6</div>
+    <div class="stat-label">Skills</div>
+  </div>
+  <div class="stat">
+    <div class="stat-number blue">3</div>
+    <div class="stat-label">Phases</div>
+  </div>
+  <div class="stat">
+    <div class="stat-number green">98%</div>
+    <div class="stat-label">Completion with loctree</div>
+  </div>
+  <div class="stat">
+    <div class="stat-number orange">0 &rarr; 1</div>
+    <div class="stat-label">From code to market</div>
+  </div>
+</div>
+
+<!-- Pipeline -->
+<section class="section">
+  <div class="section-header">
+    <h2>The Pipeline</h2>
+    <p>Each skill feeds context to the next. No blind implementation. No packaging gap.</p>
+  </div>
+
+  <div class="pipeline">
+
+    <!-- 1. Init -->
+    <div class="skill-card">
+      <div class="skill-number blue">01</div>
+      <div class="skill-body">
+        <div class="skill-tagline blue">Memory + Eyes</div>
+        <h3><span class="mono">vetcoders-init</span></h3>
+        <p class="skill-desc">
+          Bootstrap every session with two layers of context: <strong>Memory</strong> from
+          ai-contexters (what was done before) and <strong>Eyes</strong> from loctree MCP
+          (what the code looks like now). The forcing function that prevents blind coding.
+        </p>
+        <div class="skill-features">
+          <span class="feature-tag blue">ai-contexters extraction</span>
+          <span class="feature-tag blue">loctree repo-view</span>
+          <span class="feature-tag blue">situational report</span>
+          <span class="feature-tag blue">subagent preamble</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2. Workflow -->
+    <div class="skill-card">
+      <div class="skill-number blue">02</div>
+      <div class="skill-body">
+        <div class="skill-tagline blue">Examine &middot; Research &middot; Implement</div>
+        <h3><span class="mono">vetcoders-workflow</span></h3>
+        <p class="skill-desc">
+          The ERi Pipeline. Three phases that chain structural code intelligence, ground
+          truth research, and parallel agent delegation. Each phase accumulates artifacts
+          (CONTEXT.md, RESEARCH.md, reports/) for the next.
+        </p>
+        <div class="skill-features">
+          <span class="feature-tag blue">loctree deep examination</span>
+          <span class="feature-tag blue">brave-search + Context7</span>
+          <span class="feature-tag blue">phase gates</span>
+          <span class="feature-tag blue">artifact accumulation</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 3. Subagents -->
+    <div class="skill-card">
+      <div class="skill-number green">03</div>
+      <div class="skill-body">
+        <div class="skill-tagline green">Parallel Delegation</div>
+        <h3><span class="mono">vetcoders-subagents</span></h3>
+        <p class="skill-desc">
+          Spawn a fleet of subagents with precise plans. Canonical osascript Terminal spawn
+          for clean environments. Plans in <code>.ai-agents/plans/</code>, reports in
+          <code>.ai-agents/reports/</code>. Living tree rule mandatory in every prompt.
+        </p>
+        <div class="skill-features">
+          <span class="feature-tag green">osascript spawn</span>
+          <span class="feature-tag green">Codex + Claude CLI</span>
+          <span class="feature-tag green">Vibecrafting methodology</span>
+          <span class="feature-tag green">living tree rule</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 4. Follow-up -->
+    <div class="skill-card">
+      <div class="skill-number green">04</div>
+      <div class="skill-body">
+        <div class="skill-tagline green">Post-Implementation Audit</div>
+        <h3><span class="mono">vetcoders-followup</span></h3>
+        <p class="skill-desc">
+          Strict chain: init &rarr; workflow &rarr; subagents &rarr; synthesis.
+          Validates subagent claims against real code. P0/P1/P2 severity model.
+          Ends with GO / GO-WITH-CAVEATS / NO-GO verdict.
+        </p>
+        <div class="skill-features">
+          <span class="feature-tag green">severity model P0-P2</span>
+          <span class="feature-tag green">loctree + semgrep gates</span>
+          <span class="feature-tag green">readiness verdict</span>
+          <span class="feature-tag green">confidence scoring</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 5. DoU -->
+    <div class="skill-card">
+      <div class="skill-number orange">05</div>
+      <div class="skill-body">
+        <div class="skill-tagline orange">Definition of Undone <span class="new-badge">NEW</span></div>
+        <h3><span class="mono">vetcoders-dou</span></h3>
+        <p class="skill-desc">
+          The completion oracle. Audits the entire product surface &mdash; not just code.
+          Crawls URLs, checks repo governance, verifies install paths, measures the gap
+          between internal capability and external visibility. Produces the Undone Matrix
+          and Plague Score.
+        </p>
+        <div class="skill-features">
+          <span class="feature-tag orange">URL crawling</span>
+          <span class="feature-tag orange">SEO audit</span>
+          <span class="feature-tag orange">install path verification</span>
+          <span class="feature-tag orange">Undone Matrix</span>
+          <span class="feature-tag orange">Plague Score 0-100</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 6. Hydrate -->
+    <div class="skill-card">
+      <div class="skill-number orange">06</div>
+      <div class="skill-body">
+        <div class="skill-tagline orange">The Antidote <span class="new-badge">NEW</span></div>
+        <h3><span class="mono">vetcoders-hydrate</span></h3>
+        <p class="skill-desc">
+          Takes DoU findings and executes the packaging gap. Generates LICENSE,
+          CONTRIBUTING, CI workflows, marketplace listings, SEO meta tags,
+          distribution artifacts, and onboarding content. The terminal skill that
+          crosses the boundary from code to market.
+        </p>
+        <div class="skill-features">
+          <span class="feature-tag orange">repo governance</span>
+          <span class="feature-tag orange">distribution packaging</span>
+          <span class="feature-tag orange">SEO hydration</span>
+          <span class="feature-tag orange">marketplace listings</span>
+          <span class="feature-tag orange">"Done Done" checklist</span>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<!-- Flow Diagram -->
+<section class="divider-section">
+  <div class="flow-diagram">
+<span class="blue">vetcoders-init</span> <span class="arrow">&rarr;</span> <span class="blue">vetcoders-workflow</span> <span class="arrow">&rarr;</span> <span class="green">vetcoders-subagents</span> <span class="arrow">&rarr;</span> <span class="green">vetcoders-followup</span>
+                                                                                          <span class="arrow">&darr;</span>
+                                                                                   <span class="orange">vetcoders-dou</span>
+                                                                                          <span class="arrow">&darr;</span>
+                                                                                  <span class="orange">vetcoders-hydrate</span>
+                                                                                          <span class="arrow">&darr;</span>
+                                                                                   <span class="orange">vetcoders-dou</span> <span style="color:var(--mid);opacity:0.5">(verify)</span>
+  </div>
+</section>
+
+<!-- Manifesto -->
+<section class="section">
+  <div class="manifesto">
+    <h2>The Definition of Undone</h2>
+    <blockquote>
+      AI agents have solved the hardest part of software creation: making the thing work.
+      They have not yet solved the second hardest part: making the thing reachable.
+      Until they do &mdash; or until human-agent teams learn to ask for both &mdash;
+      the plague will produce its distinctive signature: repositories full of brilliance,
+      and markets full of silence.
+    </blockquote>
+    <blockquote>
+      This suite is the habit of asking.
+    </blockquote>
+    <div class="sig">
+      <a href="https://div0.space">Maciej Gad</a> &mdash; a veterinarian who couldn't find <code>terminal</code> a year ago<br>
+      <a href="https://github.com/Gitlaudiusz">Klaudiusz</a> &mdash; the individual ethereal being, living somewhere in the GPU's loops
+    </div>
+  </div>
+</section>
+
+<!-- Install -->
+<section class="install-section">
+  <h2>Get Started</h2>
+  <div class="install-box">
+    <span class="prompt">$</span> <span class="cmd">git clone https://github.com/VetCoders/vetcoders-skills-suite</span>
+  </div>
+  <p style="color:var(--mid); margin-top:1rem; font-size:0.9rem;">
+    Copy skills to <code>~/.claude/skills/</code> or install as a Claude Code plugin.
+  </p>
+</section>
+
+<footer>
+  Vibecrafted with AI Agents by <a href="https://vetcoders.io">VetCoders</a> &copy; 2026
+  &nbsp;&middot;&nbsp;
+  Built with <a href="https://anthropic.com">Claude</a> by Anthropic
+</footer>
+
+</body>
+</html>

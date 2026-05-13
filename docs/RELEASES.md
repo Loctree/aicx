@@ -4,11 +4,13 @@
 
 1. Source install from a local checkout or accessible git remote.
 2. GitHub Releases with prebuilt archives for users who do not want a Rust toolchain.
-3. npm wrapper distribution under `@loctree/aicx`.
+3. npm wrapper distribution under `@loctree/aicx` once platform packages match
+   the current GitHub Release asset shape.
 4. Homebrew tap packaging once the GitHub Release asset shape is promoted there.
 
-There is also a maintainer-local macOS bundling path for signed + notarized
-production archives:
+There is also a maintainer-local macOS bundling path for signed production
+archives. That is separate from the current public v0.6.5 slim unsigned
+GitHub Release assets:
 
 ```bash
 make release-bundle KEYS=~/.keys
@@ -20,8 +22,13 @@ This document is the maintainer path from green CI to public release artifacts.
 
 ## Current Shape
 
-- Public install paths now exist through GitHub Releases, release bundles, npm, and source checkout.
-- The npm surface now lives under `distribution/npm/` as a single wrapper package that installs both `aicx` and `aicx-mcp`.
+- The supported public v0.6.5 install path is GitHub Releases plus adjacent
+  `.sha256` sidecars.
+- Public v0.6.5 archives are slim unsigned `.tar.gz` bundles for macOS arm64,
+  Linux x64 GNU, and Linux arm64 GNU.
+- The npm surface lives under `distribution/npm/`, but it is not the supported
+  v0.6.5 install path until its platform mapping is updated from the older
+  zip/musl shape.
 - Manual npm publication now has a dedicated workflow at `.github/workflows/npm-publish.yml`.
 - `Cargo.toml` is the semantic version source of truth; `tools/release_sync.py` propagates that version into npm manifests and the user-facing install examples.
 - `make version` shows the current package/tag state. `make version-patch` and
@@ -30,17 +37,15 @@ This document is the maintainer path from green CI to public release artifacts.
 - `install.sh` prefers a colocated release bundle first, then a local checkout, and otherwise falls back to the published install path.
 - `AICX_INSTALL_MODE=git` remains available for testing unreleased source directly from GitHub.
 
-## What the Release Workflow Produces
+## What the Public Release Asset Set Contains
 
 Tagging `vX.Y.Z` triggers `.github/workflows/release.yml`, which:
 
 - verifies the tag matches `Cargo.toml`
 - reruns the required release gates: `semgrep`, default clippy, native GGUF clippy, binary tests, native GGUF tests, and `cargo fmt -- --check`
 - builds both shipped binaries: `aicx` and `aicx-mcp`
-- builds Linux artifacts on `ops-linux`
-- builds macOS artifacts on `dragon-macos`
-- imports the macOS signing certificate from GitHub org secrets on `dragon-macos`
-- signs and notarizes macOS release bundles before upload
+- builds Linux artifacts on the Linux release runner
+- builds macOS artifacts on the macOS release runner
 - packages archives plus `LICENSE`, `README.md`, `install.sh`, and command docs
 - uploads SHA-256 checksum files alongside each archive
 - creates or updates the matching GitHub Release using the current version section from `CHANGELOG.md`
@@ -48,15 +53,15 @@ Tagging `vX.Y.Z` triggers `.github/workflows/release.yml`, which:
 
 Current binary targets:
 
-- `x86_64-unknown-linux-musl`
-- `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
 
 Archive naming is deterministic:
 
-- `aicx-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz`
-- `aicx-vX.Y.Z-x86_64-apple-darwin.zip`
-- `aicx-vX.Y.Z-aarch64-apple-darwin.zip`
+- `aicx-vX.Y.Z-aarch64-apple-darwin-slim-unsigned.tar.gz`
+- `aicx-vX.Y.Z-x86_64-unknown-linux-gnu-slim-unsigned.tar.gz`
+- `aicx-vX.Y.Z-aarch64-unknown-linux-gnu-slim-unsigned.tar.gz`
 
 Each archive contains:
 
@@ -68,7 +73,7 @@ Each archive contains:
 - `docs/COMMANDS.md`
 - `docs/RELEASES.md`
 
-GitHub macOS signing / notarization contract currently expects these org secrets:
+The maintainer-local macOS signing path expects these operator-owned inputs:
 
 - `MACOS_CERT_P12_BASE64`
 - `MACOS_CERT_PASSWORD`
@@ -80,7 +85,7 @@ GitHub macOS signing / notarization contract currently expects these org secrets
 
 ## Local macOS Signed Bundle
 
-For local production-style macOS artifacts, use:
+For local production-style signed macOS artifacts, use:
 
 ```bash
 make release-bundle KEYS=/path/to/.keys
@@ -95,9 +100,7 @@ The target:
 - includes `install.sh` for post-download install into `~/.local/bin`
 - imports the signing certificate into a temporary keychain
 - signs both binaries with timestamps and hardened runtime
-- creates a notarization zip archive
-- submits the archive with `xcrun notarytool`
-- writes a SHA-256 checksum and notarization JSON log next to the archive
+- writes a SHA-256 checksum next to the archive
 - cleans `target/<triple>` after the bundle is safely written by default; use `CLEAN=0` if you intentionally want to keep local release artifacts
 
 Expected key layout matches the current daily operator structure under `~/.keys`:
@@ -107,7 +110,7 @@ Expected key layout matches the current daily operator structure under `~/.keys`
 - `cert_password.txt`
 - `.notary.env`
 
-Optional notarization auth paths:
+Optional notarization auth paths, if that maintainer lane is re-enabled:
 
 1. `NOTARY_PROFILE=<keychain-profile>` on the `make` command line.
 2. `AICX_NOTARY_PROFILE` in the shell environment.
@@ -123,18 +126,21 @@ make release-bundle KEYS=~/.keys NOTARY_PROFILE=vc-notary
 make release-bundle KEYS=~/.keys CLEAN=0
 AICX_KEYS_DIR=~/.keys AICX_NOTARY_PROFILE=vc-notary make release-bundle
 bash install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.6.5 bash install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.7.3 bash install.sh
 ```
 
 Notes:
 
 - This target is macOS-only.
-- The archive is notarized server-side. Zip archives cannot be stapled like `.pkg`, `.dmg`, or `.app`.
+- Public v0.6.5 release assets are slim unsigned `.tar.gz` archives. Do not
+  describe them as notarized unless the release workflow actually notarizes
+  that asset set.
 - The target does not print secret values; it only reads the files from the operator-owned keys directory.
 - `install.sh` inside the bundle copies binaries into `~/.local/bin` and removes stale user-local / `~/.cargo/bin` copies before configuring MCP.
 - That install path does not require Rust or a local memex compile on the target machine.
 - `AICX_INSTALL_MODE=release` downloads the official release asset, fetches the adjacent `.sha256`, verifies the checksum, and only then delegates to the bundled installer.
-- On macOS, `AICX_INSTALL_MODE=release` now expects the signed/notarized `.zip` asset published by CI on `dragon-macos`.
+- On macOS, `AICX_INSTALL_MODE=release` expects the
+  `aicx-vX.Y.Z-aarch64-apple-darwin-slim-unsigned.tar.gz` asset.
 
 ## Maintainer Release Flow
 
@@ -143,8 +149,8 @@ Notes:
 3. Create an annotated tag that matches the crate version.
 
 ```bash
-git tag -a v0.6.5 -m "aicx v0.6.5"
-git push origin v0.6.5
+git tag -a v0.7.3 -m "aicx v0.7.3"
+git push origin v0.7.3
 ```
 
 4. Wait for the `Release` workflow to finish and confirm the GitHub Release has all archives, `.sha256` files, and the expected body copied from `CHANGELOG.md`.
@@ -155,10 +161,11 @@ git push origin v0.6.5
 The current publish track is binary-first:
 
 1. Git tag triggers GitHub Release assets.
-2. macOS archives are signed/notarized on `dragon-macos`.
-3. Linux archives are built on `ops-linux`.
+2. macOS arm64 archives are currently slim unsigned `.tar.gz` bundles.
+3. Linux GNU archives are built for x64 and arm64.
 4. Each archive gets an adjacent `.sha256`.
-5. npm platform packages publish after the matching GitHub Release assets exist.
+5. npm platform packages publish only after their platform mapping matches the
+   GitHub Release assets.
 6. Homebrew should consume the same GitHub Release assets and checksums.
 
 Crates.io publication is intentionally not the active release lane. The root

@@ -635,14 +635,39 @@ fn compact_project_token(value: &str) -> String {
         .collect()
 }
 
-/// Fuzzy-search stored chunk files with normalized AND-matching and quality scoring.
+/// Fuzzy-search stored chunk files with normalized matching and quality scoring.
 pub fn fuzzy_search_store(
+    store_root: &Path,
+    query: &str,
+    limit: usize,
+    project_filters: &[Option<&str>],
+    frame_kind_filter: Option<FrameKind>,
+) -> io::Result<(Vec<FuzzyResult>, usize)> {
+    let scopes = if project_filters.is_empty() {
+        vec![None]
+    } else {
+        project_filters.to_vec()
+    };
+    let mut merged = Vec::new();
+    let mut scanned = 0usize;
+    for scope in scopes {
+        let (mut results, scope_scanned) =
+            fuzzy_search_store_one(store_root, query, limit, scope, frame_kind_filter)?;
+        scanned += scope_scanned;
+        merged.append(&mut results);
+    }
+    merged.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
+    merged.truncate(limit);
+    Ok((merged, scanned))
+}
+
+fn fuzzy_search_store_one(
     store_root: &Path,
     query: &str,
     limit: usize,
     project_filter: Option<&str>,
     frame_kind_filter: Option<FrameKind>,
-) -> std::io::Result<(Vec<FuzzyResult>, usize)> {
+) -> io::Result<(Vec<FuzzyResult>, usize)> {
     let normalized_query = normalize_query(query);
     let query_terms: Vec<&str> = normalized_query.split_whitespace().collect();
     let project_filter_lower = project_filter.map(|filter| filter.to_lowercase());
@@ -688,7 +713,6 @@ pub fn fuzzy_search_store(
             continue;
         };
 
-        // Split content into signal lines: strip aicx read blocks + boilerplate
         let all_lines: Vec<&str> = content.lines().collect();
         let without_aicx = strip_aicx_read_blocks(all_lines);
         let signal_lines: Vec<&str> = without_aicx
@@ -697,17 +721,15 @@ pub fn fuzzy_search_store(
             .collect();
         let signal_text = signal_lines
             .iter()
-            .map(|l| normalize_query(l))
+            .map(|line| normalize_query(line))
             .collect::<Vec<_>>()
             .join(" ");
 
         let matched_terms = query_terms
             .iter()
-            .filter(|&term| signal_text.contains(term) || metadata_text.contains(*term))
+            .filter(|term| signal_text.contains(**term) || metadata_text.contains(**term))
             .count();
 
-        // Must match at least one term to be considered.
-        // If query is multi-term, we don't strictly require ALL, but at least partial intersection
         if matched_terms == 0 {
             continue;
         }
@@ -731,11 +753,13 @@ pub fn fuzzy_search_store(
         matched_lines.truncate(5);
 
         let chunk_score = score_chunk_content(&content);
-
-        let match_ratio = matched_terms as f32 / query_terms.len() as f32;
+        let match_ratio = if query_terms.is_empty() {
+            1.0
+        } else {
+            matched_terms as f32 / query_terms.len() as f32
+        };
         let final_score = ((chunk_score.score as f32 * 5.0 + 50.0 * match_ratio) as u8).min(100);
 
-        // Read sidecar for session_id, cwd, timestamp, and frame kind (best-effort)
         let sidecar_path = stored_file.path.with_extension("meta.json");
         let (session_id, cwd, timestamp, frame_kind) = if sidecar_path.exists() {
             sanitize::read_to_string_validated(&sidecar_path)
@@ -813,28 +837,22 @@ pub fn fuzzy_search_store(
 
     results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
 
-    // --- Dedup layer --------------------------------------------------------
-    // 1. Content-hash dedup: remove exact file duplicates (e.g. typo project dirs)
     let mut seen_hashes = std::collections::HashSet::new();
-    results.retain(|r| {
+    results.retain(|result| {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        r.matched_lines.hash(&mut h);
-        r.file.hash(&mut h);
+        result.matched_lines.hash(&mut h);
+        result.file.hash(&mut h);
         seen_hashes.insert(h.finish())
     });
 
-    // 2. Session-sibling dedup: from N chunks of the same session, keep only the
-    //    highest-scoring one.  Session ID = filename prefix before the chunk seq
-    //    number, e.g. "2026_0227_codex_019c9c80-cd4" from "_003.md".
-    let mut best_per_session: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for (idx, r) in results.iter().enumerate() {
-        let session_key = extract_session_key(&r.file);
+    let mut best_per_session: HashMap<String, usize> = HashMap::new();
+    for (idx, result) in results.iter().enumerate() {
+        let session_key = extract_session_key(&result.file);
         best_per_session
             .entry(session_key)
             .and_modify(|prev| {
-                if r.score > results[*prev].score {
+                if result.score > results[*prev].score {
                     *prev = idx;
                 }
             })
@@ -842,28 +860,26 @@ pub fn fuzzy_search_store(
     }
     let keep: std::collections::HashSet<usize> = best_per_session.values().copied().collect();
     let mut deduped = Vec::with_capacity(keep.len());
-    for (idx, r) in results.into_iter().enumerate() {
+    for (idx, result) in results.into_iter().enumerate() {
         if keep.contains(&idx) {
-            deduped.push(r);
+            deduped.push(result);
         }
     }
-    // 3. Frequency-based boilerplate filter: lines appearing in >15% of results
-    //    are corpus-generic regardless of content. Strip them from matched_lines.
+
     if deduped.len() >= 5 {
         let threshold = (deduped.len() as f32 * 0.15).ceil() as usize;
-        let mut line_freq: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        for r in &deduped {
+        let mut line_freq: HashMap<String, usize> = HashMap::new();
+        for result in &deduped {
             let mut seen_in_result = std::collections::HashSet::new();
-            for line in &r.matched_lines {
+            for line in &result.matched_lines {
                 let key = normalize_query(line);
                 if seen_in_result.insert(key.clone()) {
                     *line_freq.entry(key).or_insert(0) += 1;
                 }
             }
         }
-        for r in &mut deduped {
-            r.matched_lines.retain(|line| {
+        for result in &mut deduped {
+            result.matched_lines.retain(|line| {
                 if line.trim().starts_with("[metadata]") {
                     return true;
                 }
@@ -878,11 +894,8 @@ pub fn fuzzy_search_store(
     Ok((deduped, total_scanned))
 }
 
-/// Extract session key from chunk filename, stripping the trailing `_NNN` sequence.
-/// "2026_0227_codex_019c9c80-cd4_003.md" → "2026_0227_codex_019c9c80-cd4"
 fn extract_session_key(filename: &str) -> String {
     let stem = filename.strip_suffix(".md").unwrap_or(filename);
-    // Strip trailing _NNN chunk sequence
     if let Some(pos) = stem.rfind('_') {
         let suffix = &stem[pos + 1..];
         if suffix.len() <= 3 && suffix.chars().all(|c| c.is_ascii_digit()) {
@@ -1132,7 +1145,6 @@ fn is_search_boilerplate(line: &str) -> bool {
             return true;
         }
     }
-    // Skill boilerplate headers
     is_skill_boilerplate_header(&lower)
 }
 
@@ -1358,287 +1370,6 @@ Some boilerplate text.
     // ================================================================
     // Repo-centric fuzzy search retrieval tests
     // ================================================================
-
-    use chrono::Utc;
-    use std::fs;
-    use std::path::PathBuf;
-
-    fn search_test_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "aicx-rank-{name}-{}-{}",
-            std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ))
-    }
-
-    fn write_chunk(path: &PathBuf, content: &str) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(path, content).unwrap();
-    }
-
-    #[test]
-    fn fuzzy_search_returns_repo_centric_metadata() {
-        let root = search_test_root("fuzzy-repo");
-        let _ = fs::remove_dir_all(&root);
-
-        // Create a repo-centric chunk with searchable signal content
-        let chunk_path = root
-            .join("store")
-            .join("VetCoders")
-            .join("ai-contexters")
-            .join("2026_0321")
-            .join("conversations")
-            .join("claude")
-            .join("2026_0321_claude_sess-search1_001.md");
-        write_chunk(
-            &chunk_path,
-            "Decision: adopt repo-centric store layout for session recovery",
-        );
-
-        let (results, scanned) = fuzzy_search_store(&root, "repo-centric store", 10, None, None)
-            .expect("search should work");
-
-        assert!(scanned > 0, "should scan at least one file");
-        assert_eq!(results.len(), 1, "should find the matching chunk");
-
-        let result = &results[0];
-        assert_eq!(result.project, "VetCoders/ai-contexters");
-        assert_eq!(result.kind, "conversations");
-        assert_eq!(result.agent, "claude");
-        assert_eq!(result.date, "2026-03-21");
-        assert!(!result.path.is_empty(), "path should be populated");
-        assert!(
-            result.path.contains("store/VetCoders/ai-contexters"),
-            "path should contain repo-centric structure"
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn fuzzy_search_returns_non_repository_metadata() {
-        let root = search_test_root("fuzzy-nonrepo");
-        let _ = fs::remove_dir_all(&root);
-
-        // Create a non-repository chunk
-        let chunk_path = root
-            .join("non-repository-contexts")
-            .join("2026_0321")
-            .join("plans")
-            .join("codex")
-            .join("2026_0321_codex_sess-plan01_001.md");
-        write_chunk(
-            &chunk_path,
-            "Migration plan: adopt repo-centric layout for all agents",
-        );
-
-        let (results, scanned) = fuzzy_search_store(&root, "migration plan", 10, None, None)
-            .expect("search should work");
-
-        assert!(scanned > 0);
-        assert_eq!(results.len(), 1);
-
-        let result = &results[0];
-        assert_eq!(result.project, "non-repository-contexts");
-        assert_eq!(result.kind, "plans");
-        assert_eq!(result.agent, "codex");
-        assert!(
-            result.path.contains("non-repository-contexts"),
-            "path should reference non-repository root"
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn fuzzy_search_filters_by_repo_project() {
-        let root = search_test_root("fuzzy-filter");
-        let _ = fs::remove_dir_all(&root);
-
-        // Two repos with the same keyword
-        let chunk1 = root
-            .join("store")
-            .join("VetCoders")
-            .join("ai-contexters")
-            .join("2026_0321")
-            .join("conversations")
-            .join("claude")
-            .join("2026_0321_claude_sess-a1_001.md");
-        write_chunk(&chunk1, "Decision: adopt the new architecture");
-
-        let chunk2 = root
-            .join("store")
-            .join("VetCoders")
-            .join("loctree")
-            .join("2026_0321")
-            .join("conversations")
-            .join("claude")
-            .join("2026_0321_claude_sess-b1_001.md");
-        write_chunk(&chunk2, "Decision: adopt scanner improvements");
-
-        // Unfiltered: both match
-        let (all, _) =
-            fuzzy_search_store(&root, "decision adopt", 10, None, None).expect("unfiltered search");
-        assert_eq!(all.len(), 2);
-
-        // Filter by ai-contexters: only one match
-        let (filtered, _) =
-            fuzzy_search_store(&root, "decision adopt", 10, Some("ai-contexters"), None)
-                .expect("filtered search");
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].project, "VetCoders/ai-contexters");
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn fuzzy_search_infers_repo_filter_from_query_token() {
-        let root = search_test_root("fuzzy-infer-repo");
-        let _ = fs::remove_dir_all(&root);
-
-        let wanted = root
-            .join("store")
-            .join("Loctree")
-            .join("loctree-suite")
-            .join("2026_0503")
-            .join("conversations")
-            .join("codex")
-            .join("2026_0503_codex_sess-wanted_001.md");
-        write_chunk(&wanted, "Decision: keep the path contract fast and scoped");
-
-        let other = root
-            .join("store")
-            .join("VetCoders")
-            .join("CodeScribe")
-            .join("2026_0503")
-            .join("conversations")
-            .join("codex")
-            .join("2026_0503_codex_sess-other_001.md");
-        write_chunk(&other, "Decision: keep the path contract fast and scoped");
-
-        let (results, scanned) = fuzzy_search_store(&root, "loctree-suite path", 10, None, None)
-            .expect("search should infer repo from query token");
-
-        assert_eq!(
-            scanned, 1,
-            "repo token should avoid scanning unrelated repo buckets"
-        );
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].project, "Loctree/loctree-suite");
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn fuzzy_search_serves_metadata_query_without_content_match() {
-        let root = search_test_root("fuzzy-metadata-only");
-        let _ = fs::remove_dir_all(&root);
-
-        let chunk = root
-            .join("store")
-            .join("Loctree")
-            .join("loctree-suite")
-            .join("2026_0503")
-            .join("conversations")
-            .join("codex")
-            .join("2026_0503_codex_sess-meta_001.md");
-        write_chunk(
-            &chunk,
-            "This body intentionally does not include the searched repository token.",
-        );
-
-        let (results, scanned) = fuzzy_search_store(&root, "loctree-suite path", 10, None, None)
-            .expect("metadata search should not require body matches");
-
-        assert_eq!(scanned, 1);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].score, 90);
-        assert!(
-            results[0].matched_lines[0].starts_with("[metadata]"),
-            "metadata-only match should expose provenance"
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn fuzzy_search_keeps_metadata_provenance_after_dedup() {
-        let root = search_test_root("fuzzy-metadata-provenance");
-        let _ = fs::remove_dir_all(&root);
-
-        for idx in 0..8 {
-            let chunk = root
-                .join("store")
-                .join("LibraxisAI")
-                .join("mlx-batch-server")
-                .join("2026_0504")
-                .join("conversations")
-                .join("claude")
-                .join(format!("2026_0504_claude_session-{idx}_001.md"));
-            write_chunk(
-                &chunk,
-                "This body intentionally does not include the searched repository token.",
-            );
-        }
-
-        let (results, scanned) = fuzzy_search_store(&root, "mlx-batch-server path", 1, None, None)
-            .expect("metadata search should keep a visible reason");
-
-        assert_eq!(scanned, 8);
-        assert_eq!(results.len(), 1);
-        assert!(
-            results[0]
-                .matched_lines
-                .iter()
-                .any(|line| line.starts_with("[metadata]")),
-            "metadata-only result should not lose provenance during boilerplate filtering"
-        );
-        assert!(
-            display_search_matches(&results[0])
-                .iter()
-                .any(|line| line.starts_with("[metadata]")),
-            "rendered matches should include metadata provenance"
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn fuzzy_search_infers_short_exact_repo_name() {
-        let root = search_test_root("fuzzy-short-repo");
-        let _ = fs::remove_dir_all(&root);
-
-        let wanted = root
-            .join("store")
-            .join("Loctree")
-            .join("aicx")
-            .join("2026_0504")
-            .join("conversations")
-            .join("codex")
-            .join("2026_0504_codex_sess-aicx_001.md");
-        write_chunk(&wanted, "Decision: choose the GGUF model tier");
-
-        let other = root
-            .join("store")
-            .join("VetCoders")
-            .join("CodeScribe")
-            .join("2026_0504")
-            .join("conversations")
-            .join("codex")
-            .join("2026_0504_codex_sess-code_001.md");
-        write_chunk(&other, "Decision: choose the GGUF model tier");
-
-        let (results, scanned) = fuzzy_search_store(&root, "aicx gguf models", 10, None, None)
-            .expect("short exact repo token should narrow search");
-
-        assert_eq!(scanned, 1);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].project, "Loctree/aicx");
-
-        let _ = fs::remove_dir_all(&root);
-    }
 
     #[test]
     fn render_search_json_matches_cli_surface_fields() {

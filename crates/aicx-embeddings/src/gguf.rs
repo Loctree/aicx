@@ -48,6 +48,7 @@ impl GgufEmbeddingProvider {
                 format!("{repo}/{filename}")
             }
             NativeEmbeddingSource::ExplicitPath(path) => path.display().to_string(),
+            NativeEmbeddingSource::CloudEndpoint(url) => url.clone(),
         };
 
         if resolved.from_legacy_repo {

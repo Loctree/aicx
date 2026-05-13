@@ -154,6 +154,14 @@ pub fn extract_intents_with_stats(config: &IntentsConfig) -> Result<IntentExtrac
     extract_intents_from_root_at_with_stats(config, &store_root, Utc::now())
 }
 
+pub fn extract_intents_with_stats_for_projects(
+    config: &IntentsConfig,
+    projects: &[String],
+) -> Result<IntentExtraction> {
+    let store_root = store::store_base_dir()?;
+    extract_intents_from_root_at_for_projects_with_stats(config, projects, &store_root, Utc::now())
+}
+
 /// Sort order for `apply_display_filters`. Mirrors the CLI's `SortOrder`
 /// without importing main.rs types into the library.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,7 +334,7 @@ fn extract_intents_from_root_at(
     Ok(extract_intents_from_root_at_with_stats(config, store_root, now)?.records)
 }
 
-fn extract_intents_from_root_at_with_stats(
+pub(crate) fn extract_intents_from_root_at_with_stats(
     config: &IntentsConfig,
     store_root: &Path,
     now: DateTime<Utc>,
@@ -369,14 +377,7 @@ fn extract_intents_from_root_at_with_stats(
 
     reconcile_session_id_with_path(&mut records);
 
-    records.sort_by(|left, right| {
-        right
-            .date
-            .cmp(&left.date)
-            .then_with(|| left.kind.sort_rank().cmp(&right.kind.sort_rank()))
-            .then_with(|| right.source_chunk.cmp(&left.source_chunk))
-            .then_with(|| left.summary.cmp(&right.summary))
-    });
+    sort_intent_records(&mut records);
 
     let stats = IntentExtractionStats {
         scanned_count,
@@ -385,6 +386,64 @@ fn extract_intents_from_root_at_with_stats(
     };
 
     Ok(IntentExtraction { records, stats })
+}
+
+pub(crate) fn extract_intents_from_root_at_for_projects_with_stats(
+    config: &IntentsConfig,
+    projects: &[String],
+    store_root: &Path,
+    now: DateTime<Utc>,
+) -> Result<IntentExtraction> {
+    if projects.is_empty() {
+        return extract_intents_from_root_at_with_stats(config, store_root, now);
+    }
+
+    let mut records = Vec::new();
+    let mut scanned_count = 0usize;
+    let mut source_paths_verified = true;
+
+    for project in projects {
+        let mut scoped = config.clone();
+        scoped.project = project.clone();
+        let extraction = extract_intents_from_root_at_with_stats(&scoped, store_root, now)?;
+        scanned_count += extraction.stats.scanned_count;
+        source_paths_verified &= extraction.stats.source_paths_verified;
+        records.extend(extraction.records);
+    }
+
+    dedup_intent_records(&mut records);
+    sort_intent_records(&mut records);
+
+    let stats = IntentExtractionStats {
+        scanned_count,
+        candidate_count: records.len(),
+        source_paths_verified,
+    };
+
+    Ok(IntentExtraction { records, stats })
+}
+
+fn sort_intent_records(records: &mut [IntentRecord]) {
+    records.sort_by(|left, right| {
+        right
+            .date
+            .cmp(&left.date)
+            .then_with(|| left.kind.sort_rank().cmp(&right.kind.sort_rank()))
+            .then_with(|| right.source_chunk.cmp(&left.source_chunk))
+            .then_with(|| left.summary.cmp(&right.summary))
+    });
+}
+
+fn dedup_intent_records(records: &mut Vec<IntentRecord>) {
+    let mut seen = HashSet::new();
+    records.retain(|record| {
+        seen.insert((
+            record.kind,
+            record.summary.clone(),
+            record.session_id.clone(),
+            record.source_chunk.clone(),
+        ))
+    });
 }
 
 fn verify_stored_chunk_paths(files: &[StoredChunkFile]) -> bool {
@@ -409,6 +468,15 @@ fn collect_chunk_files(
             .to_ascii_lowercase()
             .contains(&project.to_ascii_lowercase())
         {
+            continue;
+        }
+        if store::load_sidecar(&file.path).is_some_and(|sidecar| {
+            sidecar.artifact_family.as_deref() == Some(store::LOCT_CONTEXT_PACK_FAMILY)
+                || sidecar
+                    .truth_status
+                    .as_ref()
+                    .is_some_and(|status| status.role == crate::chunker::TruthRole::Example)
+        }) {
             continue;
         }
         if let Some(expected) = frame_kind {
@@ -2205,6 +2273,13 @@ mod tests {
             skill_code: None,
             framework_version: None,
             intent_entries: Vec::new(),
+            tags: Vec::new(),
+            artifact_family: None,
+            schema_version: None,
+            truth_status: None,
+            learning_use: None,
+            keywords: None,
+            content_sha256: None,
             noise_lines_dropped: 0,
         };
         fs::write(

@@ -771,6 +771,7 @@ pub async fn sync_steer_index(new_files: &[&PathBuf]) -> Result<()> {
     }
 
     let base = crate::store::store_base_dir()?;
+    let _lock = crate::locks::acquire_exclusive(crate::locks::steer_lock_path()?)?;
     ensure_steer_index_compatible_at(&base).await?;
     sync_steer_index_at(&base, new_files).await
 }
@@ -791,18 +792,21 @@ pub async fn sync_steer_index_with_progress(
     }
 
     let base = crate::store::store_base_dir()?;
+    let _lock = crate::locks::acquire_exclusive(crate::locks::steer_lock_path()?)?;
     ensure_steer_index_compatible_at(&base).await?;
     sync_steer_index_at_with_reporter(&base, new_files, reporter, failures).await
 }
 
-pub async fn query_steer_index() -> Result<Vec<ChromaDocument>> {
+pub async fn query_steer_index_count() -> Result<usize> {
     let base = crate::store::store_base_dir()?;
     ensure_steer_index_compatible_at(&base).await?;
-    query_steer_index_at(&base).await
+    let docs = query_steer_index_at(&base).await?;
+    Ok(docs.len())
 }
 
 pub async fn rebuild_steer_index_if_needed() -> Result<()> {
     let base = crate::store::store_base_dir()?;
+    let _lock = crate::locks::acquire_exclusive(crate::locks::steer_lock_path()?)?;
     rebuild_steer_index_if_needed_at(&base).await
 }
 
@@ -875,6 +879,13 @@ mod tests {
                 skill_code: None,
                 framework_version: Some("2026-04".to_string()),
                 intent_entries: Vec::new(),
+                tags: Vec::new(),
+                artifact_family: None,
+                schema_version: None,
+                truth_status: None,
+                learning_use: None,
+                keywords: None,
+                content_sha256: None,
                 noise_lines_dropped: 0,
             })
             .expect("serialize sidecar"),
@@ -923,6 +934,13 @@ mod tests {
             skill_code: Some("vc-marbles".to_string()),
             framework_version: Some("2026-03".to_string()),
             intent_entries: Vec::new(),
+            tags: Vec::new(),
+            artifact_family: None,
+            schema_version: None,
+            truth_status: None,
+            learning_use: None,
+            keywords: None,
+            content_sha256: None,
             noise_lines_dropped: 0,
         };
 

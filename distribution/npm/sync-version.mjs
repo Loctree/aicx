@@ -6,7 +6,7 @@
  * distribution/npm:
  *
  *   distribution/npm/aicx/package.json
- *   distribution/npm/aicx/platform-packages/{platform}/package.json
+ *   distribution/npm/aicx/platform-packages/{active-platform}/package.json
  *
  * Usage:
  *   node distribution/npm/sync-version.mjs <version>
@@ -23,7 +23,7 @@ const __dirname = path.dirname(__filename);
 const ROOT = __dirname;
 
 const WRAPPERS = ["aicx"];
-const PLATFORMS = ["darwin-arm64", "darwin-x64", "linux-x64-gnu", "linux-x64-musl"];
+const PLATFORMS = ["darwin-arm64", "linux-x64-gnu"];
 
 function allPackageJsonPaths() {
   const paths = [];

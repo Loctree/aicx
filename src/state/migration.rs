@@ -1,0 +1,178 @@
+use super::{SeenHashSet, StateManager};
+use anyhow::{Context, Result};
+use siphasher::sip::SipHasher13;
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+
+pub const SIPHASH13_ALGORITHM: &str = "siphash13-v1";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StateMigrationReport {
+    pub hash_algorithm_changed: bool,
+    pub cleared_seen_hashes: usize,
+    pub lowercased_seen_hash_buckets: usize,
+    pub merged_seen_hash_buckets: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketCaseMerge {
+    pub canonical_bucket: String,
+    pub source_buckets: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketCaseMergeScript {
+    pub merges: Vec<BucketCaseMerge>,
+    pub script: String,
+}
+
+pub fn stable_siphasher13() -> SipHasher13 {
+    SipHasher13::new()
+}
+
+pub fn canonical_state_bucket(project: &str) -> String {
+    project
+        .split('/')
+        .map(|part| part.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+pub fn migrate_loaded_state(state: &mut StateManager) -> StateMigrationReport {
+    let mut report = StateMigrationReport::default();
+
+    if state.hash_algorithm.trim() != SIPHASH13_ALGORITHM {
+        report.hash_algorithm_changed = true;
+        report.cleared_seen_hashes = state.total_hashes();
+        state.seen_hashes.clear();
+        state.hash_algorithm = SIPHASH13_ALGORITHM.to_string();
+        return report;
+    }
+
+    let mut canonicalized: HashMap<String, SeenHashSet> = HashMap::new();
+    for (bucket, hashes) in std::mem::take(&mut state.seen_hashes) {
+        let canonical = canonical_state_bucket(&bucket);
+        if canonical != bucket {
+            report.lowercased_seen_hash_buckets += 1;
+        }
+        let existed = canonicalized.contains_key(&canonical);
+        canonicalized
+            .entry(canonical)
+            .or_default()
+            .extend_from(hashes);
+        if existed {
+            report.merged_seen_hash_buckets += 1;
+        }
+    }
+    state.seen_hashes = canonicalized;
+    report
+}
+
+pub fn generate_case_bucket_merge_script(store_root: &Path) -> Result<BucketCaseMergeScript> {
+    let merges = plan_case_bucket_merges(store_root)?;
+    let mut script = String::from(
+        "#!/usr/bin/env bash\nset -euo pipefail\n\n# Review before running. This script only merges case variants into lowercase buckets.\n",
+    );
+    script.push_str(&format!(
+        "STORE_ROOT={:?}\n",
+        store_root.display().to_string()
+    ));
+    script.push_str("shopt -s dotglob nullglob\n\n");
+
+    for merge in &merges {
+        script.push_str(&format!(
+            "mkdir -p \"$STORE_ROOT/{}\"\n",
+            shell_escape_double_quoted(&merge.canonical_bucket)
+        ));
+        for source in &merge.source_buckets {
+            if source == &merge.canonical_bucket {
+                continue;
+            }
+            script.push_str(&format!(
+                "if [[ -d \"$STORE_ROOT/{}\" ]]; then\n",
+                shell_escape_double_quoted(source)
+            ));
+            script.push_str(&format!(
+                "  mv -n \"$STORE_ROOT/{}\"/* \"$STORE_ROOT/{}/\"\n",
+                shell_escape_double_quoted(source),
+                shell_escape_double_quoted(&merge.canonical_bucket)
+            ));
+            script.push_str(&format!(
+                "  rmdir \"$STORE_ROOT/{}\" 2>/dev/null || true\n",
+                shell_escape_double_quoted(source)
+            ));
+            script.push_str("fi\n");
+        }
+        script.push('\n');
+    }
+
+    Ok(BucketCaseMergeScript { merges, script })
+}
+
+fn plan_case_bucket_merges(store_root: &Path) -> Result<Vec<BucketCaseMerge>> {
+    if !store_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for bucket in discover_store_buckets(store_root)? {
+        let canonical = canonical_state_bucket(&bucket);
+        if canonical != bucket {
+            grouped.entry(canonical).or_default().push(bucket);
+        }
+    }
+
+    Ok(grouped
+        .into_iter()
+        .map(|(canonical_bucket, mut source_buckets)| {
+            source_buckets.sort();
+            source_buckets.dedup();
+            BucketCaseMerge {
+                canonical_bucket,
+                source_buckets,
+            }
+        })
+        .collect())
+}
+
+fn discover_store_buckets(store_root: &Path) -> Result<Vec<String>> {
+    let mut buckets = Vec::new();
+    for org_entry in crate::sanitize::read_dir_validated(store_root)
+        .with_context(|| format!("read {}", store_root.display()))?
+    {
+        let org_entry = org_entry?;
+        let org_path = org_entry.path();
+        if !org_path.is_dir() {
+            continue;
+        }
+        let org = org_entry.file_name().to_string_lossy().to_string();
+        buckets.push(org.clone());
+
+        let Ok(repo_entries) = crate::sanitize::read_dir_validated(&org_path) else {
+            continue;
+        };
+        for repo_entry in repo_entries.filter_map(|entry| entry.ok()) {
+            let repo_path = repo_entry.path();
+            if !repo_path.is_dir() || looks_like_date_dir(&repo_path) {
+                continue;
+            }
+            let repo = repo_entry.file_name().to_string_lossy().to_string();
+            buckets.push(format!("{org}/{repo}"));
+        }
+    }
+    Ok(buckets)
+}
+
+fn looks_like_date_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.len() == 9
+                && name.as_bytes().get(4) == Some(&b'_')
+                && name.chars().filter(|ch| ch.is_ascii_digit()).count() == 8
+        })
+}
+
+fn shell_escape_double_quoted(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}

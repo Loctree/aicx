@@ -15,30 +15,44 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use crate::oracle::OracleReadiness;
 use crate::steer_index;
 use crate::store;
-use crate::validation::is_valid_repo_bucket_name;
+use crate::validation::{is_valid_repo_bucket_name, is_valid_repo_project_slug};
 
 #[derive(Debug, Clone)]
 pub struct DoctorOptions {
     pub fix: bool,
     pub fix_buckets: bool,
+    /// When `fix_buckets` is true and `dry_run` is also true, the doctor
+    /// emits the planned canonicalize/quarantine actions as `fixes_applied`
+    /// entries prefixed with `[dry-run]` but performs **no filesystem
+    /// changes**. Lets operators preview a `--fix-buckets` run before
+    /// committing to it.
+    pub dry_run: bool,
+    pub rebuild_sidecars: bool,
+    pub prune_empty_bodies: bool,
+    pub check_dedup: bool,
     pub verbose: bool,
 }
 
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Green,
+    #[default]
     Warning,
     Critical,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CheckResult {
     pub name: String,
     pub severity: Severity,
@@ -46,7 +60,18 @@ pub struct CheckResult {
     pub recommendation: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+impl Default for CheckResult {
+    fn default() -> Self {
+        Self {
+            name: "unknown".to_string(),
+            severity: Severity::Warning,
+            detail: "not checked".to_string(),
+            recommendation: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DoctorReport {
     pub canonical_store: CheckResult,
     pub steer_lance: CheckResult,
@@ -55,6 +80,26 @@ pub struct DoctorReport {
     pub sidecars: CheckResult,
     pub corpus_buckets: CheckResult,
     pub noise_health: CheckResult,
+    #[serde(default)]
+    pub semantic_health: CheckResult,
+    #[serde(default)]
+    pub index_freshness: CheckResult,
+    #[serde(default)]
+    pub index_consistency: CheckResult,
+    #[serde(default)]
+    pub sidecar_coverage: CheckResult,
+    #[serde(default)]
+    pub embedder_warmth: CheckResult,
+    #[serde(default)]
+    pub empty_body_chunks: CheckResult,
+    #[serde(default)]
+    pub content_dedup: CheckResult,
+    #[serde(default)]
+    pub context_corpus: CheckResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rebuild_sidecars_script: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prune_empty_bodies_script: Option<String>,
     pub fixes_applied: Vec<String>,
     pub overall: Severity,
 }
@@ -73,21 +118,50 @@ pub struct OracleReadinessReport {
 
 pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
     let base = store::store_base_dir().context("Failed to resolve aicx store base directory")?;
+    run_at(&base, opts).await
+}
 
-    let mut canonical_store = check_canonical_store(&base);
-    let mut steer_lance = check_steer_lance(&base).await;
-    let mut steer_bm25 = check_steer_bm25(&base);
-    let mut state = check_state(&base);
-    let mut sidecars = check_sidecar_coverage(&base);
-    let mut corpus_buckets = check_corpus_buckets(&base);
-    let mut noise_health = check_noise_health(&base);
+pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
+    let mut canonical_store = check_canonical_store(base);
+    let mut steer_lance = check_steer_lance(base).await;
+    let mut steer_bm25 = check_steer_bm25(base);
+    let mut state = check_state(base);
+    let mut sidecars = check_sidecar_coverage(base);
+    let mut corpus_buckets = check_corpus_buckets(base);
+    let mut noise_health = check_noise_health(base);
+    let mut semantic_health = check_semantic_health();
+    let mut index_freshness = check_index_freshness(base);
+    let mut index_consistency = check_index_consistency(base);
+    let mut embedder_warmth = check_embedder_warmth();
+    let mut empty_body_chunks = check_empty_body_chunks(base);
+    let mut content_dedup = if opts.check_dedup {
+        check_content_dedup(base)
+    } else {
+        CheckResult {
+            name: "content_dedup".to_string(),
+            severity: Severity::Green,
+            detail: "not requested".to_string(),
+            recommendation: None,
+        }
+    };
+    let mut context_corpus = check_context_corpus(base);
 
     let mut fixes_applied = Vec::new();
+    let rebuild_sidecars_script = if opts.rebuild_sidecars {
+        Some(render_rebuild_sidecars_script(base)?)
+    } else {
+        None
+    };
+    let prune_empty_bodies_script = if opts.prune_empty_bodies {
+        Some(render_prune_empty_bodies_script(base)?)
+    } else {
+        None
+    };
 
     if opts.fix
         && (steer_lance.severity == Severity::Critical || steer_bm25.severity == Severity::Critical)
     {
-        match attempt_steer_rebuild(&base).await {
+        match attempt_steer_rebuild(base).await {
             Ok(msg) => fixes_applied.push(msg),
             Err(e) => fixes_applied.push(format!("rebuild attempted but failed: {e}")),
         }
@@ -95,18 +169,26 @@ pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
 
     if opts.fix_buckets {
         let store_root = base.join("store");
-        match suspicious_corpus_buckets(&store_root) {
+        let dry = opts.dry_run;
+        let prefix = if dry { "[dry-run] " } else { "" };
+        match scan_corpus_buckets(&store_root) {
             Ok(suspicious) if suspicious.is_empty() => {
                 fixes_applied.push("no suspicious corpus buckets to quarantine".to_string());
             }
             Ok(suspicious) => {
                 let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
                 let single_bucket = suspicious.len() == 1;
-                for bucket_name in suspicious {
+                for bucket_name in &suspicious {
+                    if dry {
+                        fixes_applied.push(format!(
+                            "{prefix}would quarantine corpus bucket `{bucket_name}`"
+                        ));
+                        continue;
+                    }
                     let result = if single_bucket {
-                        quarantine_bucket(&store_root, &bucket_name)
+                        quarantine_bucket(&store_root, bucket_name)
                     } else {
-                        quarantine_bucket_with_timestamp(&store_root, &bucket_name, &timestamp)
+                        quarantine_bucket_with_timestamp(&store_root, bucket_name, &timestamp)
                     };
                     match result {
                         Ok(dst) => fixes_applied.push(format!(
@@ -119,18 +201,29 @@ pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
                     }
                 }
             }
-            Err(e) => fixes_applied.push(format!("bucket quarantine skipped: {e}")),
+            Err(e) => fixes_applied.push(format!("{prefix}bucket scan skipped: {e}")),
         }
     }
 
     if opts.fix || opts.fix_buckets {
-        canonical_store = check_canonical_store(&base);
-        steer_lance = check_steer_lance(&base).await;
-        steer_bm25 = check_steer_bm25(&base);
-        state = check_state(&base);
-        sidecars = check_sidecar_coverage(&base);
-        corpus_buckets = check_corpus_buckets(&base);
-        noise_health = check_noise_health(&base);
+        canonical_store = check_canonical_store(base);
+        steer_lance = check_steer_lance(base).await;
+        steer_bm25 = check_steer_bm25(base);
+        state = check_state(base);
+        sidecars = check_sidecar_coverage(base);
+        corpus_buckets = check_corpus_buckets(base);
+        noise_health = check_noise_health(base);
+        semantic_health = check_semantic_health();
+        index_freshness = check_index_freshness(base);
+        index_consistency = check_index_consistency(base);
+        embedder_warmth = check_embedder_warmth();
+        empty_body_chunks = check_empty_body_chunks(base);
+        content_dedup = if opts.check_dedup {
+            check_content_dedup(base)
+        } else {
+            content_dedup
+        };
+        context_corpus = check_context_corpus(base);
     }
 
     let overall = max_severity(&[
@@ -141,6 +234,13 @@ pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
         sidecars.severity,
         corpus_buckets.severity,
         noise_health.severity,
+        semantic_health.severity,
+        index_freshness.severity,
+        index_consistency.severity,
+        embedder_warmth.severity,
+        empty_body_chunks.severity,
+        content_dedup.severity,
+        context_corpus.severity,
     ]);
 
     Ok(DoctorReport {
@@ -151,9 +251,546 @@ pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
         sidecars,
         corpus_buckets,
         noise_health,
+        semantic_health,
+        index_freshness,
+        index_consistency,
+        sidecar_coverage: check_sidecar_coverage(base),
+        embedder_warmth,
+        empty_body_chunks,
+        content_dedup,
+        context_corpus,
+        rebuild_sidecars_script,
+        prune_empty_bodies_script,
         fixes_applied,
         overall,
     })
+}
+
+fn check_context_corpus(base: &Path) -> CheckResult {
+    let corpus_root = base.join(store::CONTEXT_CORPUS_DIRNAME);
+    if !corpus_root.exists() {
+        return CheckResult {
+            name: "context_corpus".to_string(),
+            severity: Severity::Green,
+            detail: format!(
+                "context-corpus: empty (will be created on first `aicx ingest --source loct-context-pack`) at {}",
+                corpus_root.display()
+            ),
+            recommendation: None,
+        };
+    }
+    let files = match store::scan_context_corpus_files_at(base) {
+        Ok(files) => files,
+        Err(err) => {
+            return CheckResult {
+                name: "context_corpus".to_string(),
+                severity: Severity::Warning,
+                detail: format!(
+                    "context-corpus: scan failed at {}: {err}",
+                    corpus_root.display()
+                ),
+                recommendation: Some(
+                    "Inspect ~/.aicx/context-corpus/ for permission or filesystem issues"
+                        .to_string(),
+                ),
+            };
+        }
+    };
+    if files.is_empty() {
+        return CheckResult {
+            name: "context_corpus".to_string(),
+            severity: Severity::Green,
+            detail: format!(
+                "context-corpus: empty (no batches yet; tree exists at {})",
+                corpus_root.display()
+            ),
+            recommendation: None,
+        };
+    }
+    let mut batches: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut repos: BTreeSet<PathBuf> = BTreeSet::new();
+    for file in &files {
+        if let Some(batch_dir) = file.raw_path.parent().and_then(|p| p.parent()) {
+            batches.insert(batch_dir.to_path_buf());
+            // batch_dir layout: <repo>/<date>/loct-context-pack/<batch>
+            // strip <date>/loct-context-pack/<batch> to find <org>/<repo>
+            if let Some(repo_dir) = batch_dir.ancestors().nth(3).map(|p| p.to_path_buf())
+                && repo_dir != corpus_root
+                && repo_dir.starts_with(&corpus_root)
+            {
+                repos.insert(repo_dir);
+            }
+        }
+    }
+    CheckResult {
+        name: "context_corpus".to_string(),
+        severity: Severity::Green,
+        detail: format!(
+            "context-corpus: {} chunks across {} batch(es) / {} repo(s) at {}",
+            files.len(),
+            batches.len(),
+            repos.len(),
+            corpus_root.display()
+        ),
+        recommendation: None,
+    }
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn check_semantic_health() -> CheckResult {
+    let cfg = crate::embedder::EmbeddingConfig::from_env();
+    match cfg.backend {
+        crate::embedder::BackendPreference::Cloud => {
+            let Some(cloud) = cfg.cloud.as_ref() else {
+                return CheckResult {
+                    name: "semantic_health".to_string(),
+                    severity: Severity::Warning,
+                    detail: "cloud backend selected but [embedder.cloud] is not configured"
+                        .to_string(),
+                    recommendation: Some(
+                        "Run `aicx config init` and set provider details".to_string(),
+                    ),
+                };
+            };
+            if let Some(env_name) = cloud.api_key_env.as_deref()
+                && std::env::var(env_name).is_err()
+            {
+                return CheckResult {
+                    name: "semantic_health".to_string(),
+                    severity: Severity::Warning,
+                    detail: format!(
+                        "cloud backend configured for {}, but ${env_name} is unset",
+                        cloud.url
+                    ),
+                    recommendation: Some(format!("export {env_name}=<provider-api-key>")),
+                };
+            }
+            match probe_cloud_embedder_url(&cloud.url) {
+                Ok(detail) => CheckResult {
+                    name: "semantic_health".to_string(),
+                    severity: Severity::Green,
+                    detail: format!(
+                        "cloud backend reachable: {} ({}) - {detail}",
+                        cloud.url, cloud.model
+                    ),
+                    recommendation: None,
+                },
+                Err(failure) => CheckResult {
+                    name: "semantic_health".to_string(),
+                    severity: failure.severity,
+                    detail: format!(
+                        "cloud backend URL probe failed for {}: {}",
+                        cloud.url, failure.detail
+                    ),
+                    recommendation: Some(
+                        "Start the embedder service or correct [embedder.cloud].url".to_string(),
+                    ),
+                },
+            }
+        }
+        crate::embedder::BackendPreference::Gguf | crate::embedder::BackendPreference::Auto => {
+            let resolved = cfg.resolved_model();
+            let found = cfg
+                .model_path
+                .as_ref()
+                .filter(|path| path.exists())
+                .cloned()
+                .or_else(|| {
+                    crate::embedder::find_cached_model_file(&resolved.repo, &resolved.filename)
+                });
+            if let Some(path) = found {
+                match native_embedder_ping() {
+                    Ok(detail) => CheckResult {
+                        name: "semantic_health".to_string(),
+                        severity: Severity::Green,
+                        detail: format!("native model available at {}; {detail}", path.display()),
+                        recommendation: None,
+                    },
+                    Err(err) => CheckResult {
+                        name: "semantic_health".to_string(),
+                        severity: Severity::Warning,
+                        detail: format!(
+                            "native model available at {}, but embedder info probe failed: {err}",
+                            path.display()
+                        ),
+                        recommendation: Some(
+                            "Run `aicx warmup` for a full embedder probe".to_string(),
+                        ),
+                    },
+                }
+            } else {
+                CheckResult {
+                    name: "semantic_health".to_string(),
+                    severity: Severity::Warning,
+                    detail: format!(
+                        "native semantic model not found (optional capability): {}/{}",
+                        resolved.repo, resolved.filename
+                    ),
+                    recommendation: Some(
+                        "Hydrate the model cache or switch [embedder].backend = \"cloud\". Semantic features will be skipped until available."
+                            .to_string(),
+                    ),                }
+            }
+        }
+        crate::embedder::BackendPreference::Candle => CheckResult {
+            name: "semantic_health".to_string(),
+            severity: Severity::Critical,
+            detail: "legacy candle backend is not supported by this build".to_string(),
+            recommendation: Some("Use backend = \"cloud\" or backend = \"gguf\"".to_string()),
+        },
+    }
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+struct CloudProbeFailure {
+    severity: Severity,
+    detail: String,
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn probe_cloud_embedder_url(url: &str) -> std::result::Result<String, CloudProbeFailure> {
+    let (host, port, path, http_head) = split_http_url(url).ok_or_else(|| CloudProbeFailure {
+        severity: Severity::Critical,
+        detail: "URL is not an http(s) URL".to_string(),
+    })?;
+    let addrs = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|err| CloudProbeFailure {
+            severity: classify_cloud_probe_error(&err.to_string()),
+            detail: format!("DNS lookup failed: {err}"),
+        })?;
+    let mut last_err = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+            Ok(mut stream) => {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                if http_head {
+                    let req = format!(
+                        "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+                    );
+                    stream
+                        .write_all(req.as_bytes())
+                        .map_err(|err| CloudProbeFailure {
+                            severity: Severity::Warning,
+                            detail: format!("URL unreachable: {err}"),
+                        })?;
+                    let mut buf = [0_u8; 12];
+                    stream.read(&mut buf).map_err(|err| CloudProbeFailure {
+                        severity: Severity::Warning,
+                        detail: format!("URL unreachable: {err}"),
+                    })?;
+                    return Ok("HTTP HEAD probe responded".to_string());
+                }
+                return Ok(
+                    "TCP probe connected; HTTPS HEAD requires reqwest in the main crate"
+                        .to_string(),
+                );
+            }
+            Err(err) => last_err = Some(err),
+        }
+    }
+    let detail = last_err
+        .map(|err| err.to_string())
+        .unwrap_or_else(|| "no resolved addresses".to_string());
+    Err(CloudProbeFailure {
+        severity: classify_cloud_probe_error(&detail),
+        detail: format!("URL unreachable: {detail}"),
+    })
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn split_http_url(url: &str) -> Option<(String, u16, String, bool)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let http_head = scheme.eq_ignore_ascii_case("http");
+    if !http_head && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let (host, port) = authority
+        .rsplit_once(':')
+        .and_then(|(host, port)| Some((host, port.parse().ok()?)))
+        .unwrap_or((authority, if http_head { 80 } else { 443 }));
+    Some((
+        host.trim_matches(['[', ']']).to_string(),
+        port,
+        format!("/{path}"),
+        http_head,
+    ))
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn classify_cloud_probe_error(detail: &str) -> Severity {
+    let detail = detail.to_ascii_lowercase();
+    if detail.contains("dns")
+        || detail.contains("lookup")
+        || detail.contains("name or service")
+        || detail.contains("nodename")
+        || detail.contains("no address")
+    {
+        Severity::Critical
+    } else {
+        Severity::Warning
+    }
+}
+
+#[cfg(feature = "native-embedder")]
+fn native_embedder_ping() -> std::result::Result<String, String> {
+    crate::embedder::EmbeddingEngine::new()
+        .map(|engine| format!("native engine info responded: {}", engine.info().model_id))
+        .map_err(|err| err.to_string())
+}
+
+#[cfg(not(feature = "native-embedder"))]
+fn native_embedder_ping() -> std::result::Result<String, String> {
+    Ok("native engine info probe skipped; native-embedder feature is disabled".to_string())
+}
+
+#[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+fn check_semantic_health() -> CheckResult {
+    CheckResult {
+        name: "semantic_health".to_string(),
+        severity: Severity::Critical,
+        detail: "binary built without embedder features".to_string(),
+        recommendation: Some("Rebuild with cloud-embedder or native-embedder".to_string()),
+    }
+}
+
+fn check_index_freshness(base: &Path) -> CheckResult {
+    let newest_chunk = newest_mtime(&base.join("store"))
+        .into_iter()
+        .chain(newest_mtime(&base.join("non-repository-contexts")))
+        .max();
+    let index_mtime = newest_mtime(&base.join("steer_db"))
+        .into_iter()
+        .chain(newest_mtime(&base.join("steer_bm25")))
+        .max();
+
+    match (newest_chunk, index_mtime) {
+        (None, _) => CheckResult {
+            name: "index_freshness".to_string(),
+            severity: Severity::Green,
+            detail: "no canonical chunks found; no index lag".to_string(),
+            recommendation: None,
+        },
+        (Some(_), None) => CheckResult {
+            name: "index_freshness".to_string(),
+            severity: Severity::Critical,
+            detail: "canonical chunks exist but no semantic/steer index mtime was found"
+                .to_string(),
+            recommendation: Some(
+                "Run `aicx index --dry-run` to probe, then rebuild steer metadata".to_string(),
+            ),
+        },
+        (Some(chunk), Some(index)) => {
+            let lag = chunk.duration_since(index).unwrap_or(Duration::ZERO);
+            let severity = if lag > Duration::from_secs(72 * 3600) {
+                Severity::Critical
+            } else if lag > Duration::from_secs(24 * 3600) {
+                Severity::Warning
+            } else {
+                Severity::Green
+            };
+            CheckResult {
+                name: "index_freshness".to_string(),
+                severity,
+                detail: format!("semantic lag: {} seconds", lag.as_secs()),
+                recommendation: if severity == Severity::Green {
+                    None
+                } else {
+                    Some(
+                        "Run `aicx index --dry-run` and refresh the materialized index".to_string(),
+                    )
+                },
+            }
+        }
+    }
+}
+
+fn check_index_consistency(base: &Path) -> CheckResult {
+    let files = store::scan_context_files_at(base).unwrap_or_default();
+    let chunk_keys = files
+        .iter()
+        .map(|file| {
+            (
+                file.project.clone(),
+                file.agent.clone(),
+                file.date_compact.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let index_path = base.join("index.json");
+    if !index_path.exists() {
+        return CheckResult {
+            name: "index_consistency".to_string(),
+            severity: if chunk_keys.is_empty() {
+                Severity::Green
+            } else {
+                Severity::Warning
+            },
+            detail: format!(
+                "index.json missing; {} store project/agent/date tuple(s) discovered",
+                chunk_keys.len()
+            ),
+            recommendation: if chunk_keys.is_empty() {
+                None
+            } else {
+                Some("Run `aicx store --full-rescan` to rebuild ~/.aicx/index.json".to_string())
+            },
+        };
+    }
+    let raw = match std::fs::read_to_string(&index_path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            return CheckResult {
+                name: "index_consistency".to_string(),
+                severity: Severity::Critical,
+                detail: format!("Failed to read index.json: {err}"),
+                recommendation: Some(
+                    "Check filesystem permissions on ~/.aicx/index.json".to_string(),
+                ),
+            };
+        }
+    };
+    let index = match serde_json::from_str::<store::StoreIndex>(&raw) {
+        Ok(index) => index,
+        Err(err) => {
+            return CheckResult {
+                name: "index_consistency".to_string(),
+                severity: Severity::Critical,
+                detail: format!("index.json is malformed JSON: {err}"),
+                recommendation: Some(
+                    "Backup and rebuild ~/.aicx/index.json via `aicx store --full-rescan`"
+                        .to_string(),
+                ),
+            };
+        }
+    };
+    let mut index_keys = BTreeSet::new();
+    for (project, project_index) in index.projects {
+        for (agent, agent_index) in project_index.agents {
+            for date in agent_index.dates {
+                index_keys.insert((project.clone(), agent.clone(), date));
+            }
+        }
+    }
+    let orphaned = index_keys
+        .difference(&chunk_keys)
+        .cloned()
+        .collect::<Vec<_>>();
+    let missing = chunk_keys
+        .difference(&index_keys)
+        .cloned()
+        .collect::<Vec<_>>();
+    let sample = |items: &[(String, String, String)]| {
+        items
+            .iter()
+            .take(3)
+            .map(|(project, agent, date)| format!("{project}/{agent}/{date}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    CheckResult {
+        name: "index_consistency".to_string(),
+        severity: if orphaned.is_empty() && missing.is_empty() {
+            Severity::Green
+        } else {
+            Severity::Warning
+        },
+        detail: if orphaned.is_empty() && missing.is_empty() {
+            format!(
+                "index.json matches {} store project/agent/date tuple(s)",
+                chunk_keys.len()
+            )
+        } else {
+            format!(
+                "{} orphaned index tuple(s), {} missing index tuple(s); orphaned sample: {}; missing sample: {}",
+                orphaned.len(),
+                missing.len(),
+                if orphaned.is_empty() {
+                    "none".to_string()
+                } else {
+                    sample(&orphaned)
+                },
+                if missing.is_empty() {
+                    "none".to_string()
+                } else {
+                    sample(&missing)
+                }
+            )
+        },
+        recommendation: if orphaned.is_empty() && missing.is_empty() {
+            None
+        } else {
+            Some("Run `aicx store --full-rescan` to reconcile ~/.aicx/index.json with the canonical store".to_string())
+        },
+    }
+}
+
+fn newest_mtime(root: &Path) -> Option<SystemTime> {
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut newest = root.metadata().ok().and_then(|meta| meta.modified().ok());
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let candidate = if path.is_dir() {
+            newest_mtime(&path)
+        } else {
+            entry.metadata().ok().and_then(|meta| meta.modified().ok())
+        };
+        newest = newest.into_iter().chain(candidate).max();
+    }
+    newest
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn check_embedder_warmth() -> CheckResult {
+    let cfg = crate::embedder::EmbeddingConfig::from_env();
+    if cfg.backend == crate::embedder::BackendPreference::Cloud {
+        let local = cfg
+            .cloud
+            .as_ref()
+            .is_some_and(|cloud| is_local_embedder_url(&cloud.url));
+        if !local {
+            return CheckResult {
+                name: "embedder_warmth".to_string(),
+                severity: Severity::Green,
+                detail: "remote cloud backend: warmth probe skipped to avoid paid/noisy calls"
+                    .to_string(),
+                recommendation: None,
+            };
+        }
+    }
+
+    CheckResult {
+        name: "embedder_warmth".to_string(),
+        severity: Severity::Warning,
+        detail: "local embedder warmth probe available via `aicx warmup`".to_string(),
+        recommendation: Some(
+            "Run `aicx warmup` before one-shot semantic search after idle".to_string(),
+        ),
+    }
+}
+
+#[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+fn check_embedder_warmth() -> CheckResult {
+    CheckResult {
+        name: "embedder_warmth".to_string(),
+        severity: Severity::Critical,
+        detail: "binary built without embedder features".to_string(),
+        recommendation: None,
+    }
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn is_local_embedder_url(url: &str) -> bool {
+    url.contains("localhost:")
+        || url.contains("127.0.0.1:")
+        || url.contains("0.0.0.0:")
+        || url.contains("[::1]:")
 }
 
 fn check_canonical_store(base: &Path) -> CheckResult {
@@ -175,6 +812,17 @@ fn check_canonical_store(base: &Path) -> CheckResult {
     }
 }
 
+#[cfg(not(feature = "lance"))]
+async fn check_steer_lance(_base: &Path) -> CheckResult {
+    CheckResult {
+        name: "steer_lance".to_string(),
+        severity: Severity::Green,
+        detail: "steer_index (Lance/BM25) feature is disabled".to_string(),
+        recommendation: None,
+    }
+}
+
+#[cfg(feature = "lance")]
 async fn check_steer_lance(base: &Path) -> CheckResult {
     let lance_dir = base.join("steer_db").join("mcp_documents.lance");
     if !lance_dir.exists() {
@@ -185,11 +833,11 @@ async fn check_steer_lance(base: &Path) -> CheckResult {
             recommendation: None,
         };
     }
-    match steer_index::query_steer_index().await {
-        Ok(docs) => CheckResult {
+    match steer_index::query_steer_index_count().await {
+        Ok(count) => CheckResult {
             name: "steer_lance".to_string(),
             severity: Severity::Green,
-            detail: format!("Lance steer table healthy, {} documents", docs.len()),
+            detail: format!("Lance steer table healthy, {} documents", count),
             recommendation: None,
         },
         Err(e) => {
@@ -217,6 +865,17 @@ async fn check_steer_lance(base: &Path) -> CheckResult {
     }
 }
 
+#[cfg(not(feature = "lance"))]
+fn check_steer_bm25(_base: &Path) -> CheckResult {
+    CheckResult {
+        name: "steer_bm25".to_string(),
+        severity: Severity::Green,
+        detail: "steer_index (Lance/BM25) feature is disabled".to_string(),
+        recommendation: None,
+    }
+}
+
+#[cfg(feature = "lance")]
 fn check_steer_bm25(base: &Path) -> CheckResult {
     let bm25_dir = base.join("steer_bm25");
     if !bm25_dir.exists() {
@@ -289,7 +948,8 @@ fn check_state(base: &Path) -> CheckResult {
 
 fn check_sidecar_coverage(base: &Path) -> CheckResult {
     let files = store::scan_context_files_at(base).unwrap_or_default();
-    let total = files.len();
+    let context_corpus_files = store::scan_context_corpus_files_at(base).unwrap_or_default();
+    let total = files.len() + context_corpus_files.len();
     if total == 0 {
         return CheckResult {
             name: "sidecars".to_string(),
@@ -300,8 +960,13 @@ fn check_sidecar_coverage(base: &Path) -> CheckResult {
     }
     let mut missing = 0usize;
     for f in &files {
-        let sidecar = f.path.with_extension("meta.json");
+        let sidecar = store::sidecar_path_for_chunk(&f.path);
         if !sidecar.exists() {
+            missing += 1;
+        }
+    }
+    for f in &context_corpus_files {
+        if !f.sidecar_path.exists() {
             missing += 1;
         }
     }
@@ -331,6 +996,218 @@ fn check_sidecar_coverage(base: &Path) -> CheckResult {
             None
         },
     }
+}
+
+fn check_content_dedup(base: &Path) -> CheckResult {
+    let mut seen: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for file in store::scan_context_files_at(base).unwrap_or_default() {
+        if let Some(sidecar) = store::load_sidecar(&file.path)
+            && let Some(hash) = sidecar.content_sha256
+        {
+            seen.entry(hash)
+                .or_default()
+                .push(file.path.display().to_string());
+        }
+    }
+    for file in store::scan_context_corpus_files_at(base).unwrap_or_default() {
+        if let Some(hash) = file.sidecar.content_sha256 {
+            seen.entry(hash)
+                .or_default()
+                .push(file.raw_path.display().to_string());
+        }
+    }
+    let duplicates: Vec<_> = seen.values().filter(|paths| paths.len() > 1).collect();
+    let duplicate_chunks: usize = duplicates.iter().map(|paths| paths.len()).sum();
+    let duplicate_groups = duplicates.len();
+    CheckResult {
+        name: "content_dedup".to_string(),
+        severity: if duplicate_groups == 0 {
+            Severity::Green
+        } else {
+            Severity::Warning
+        },
+        detail: format!("{duplicate_groups} duplicate hash group(s), {duplicate_chunks} chunk(s)"),
+        recommendation: if duplicate_groups > 0 {
+            Some("Run `aicx store --full-rescan` only after pruning duplicate chunks or let content-hash dedup skip future writes".to_string())
+        } else {
+            None
+        },
+    }
+}
+
+fn check_empty_body_chunks(base: &Path) -> CheckResult {
+    let report = empty_body_report(base);
+    let total = report.total;
+    if total == 0 {
+        return CheckResult {
+            name: "empty_body_chunks".to_string(),
+            severity: Severity::Green,
+            detail: "no chunks to inspect".to_string(),
+            recommendation: None,
+        };
+    }
+
+    let pct = (report.empty as f64 / total as f64) * 100.0;
+    let severity = if pct > 5.0 {
+        Severity::Critical
+    } else if pct >= 0.5 {
+        Severity::Warning
+    } else {
+        Severity::Green
+    };
+    let top_frames = report
+        .by_frame_kind
+        .iter()
+        .take(5)
+        .map(|(kind, count)| format!("{kind}:{count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sample = report
+        .sample_paths
+        .iter()
+        .take(3)
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    CheckResult {
+        name: "empty_body_chunks".to_string(),
+        severity,
+        detail: format!(
+            "{} empty-body candidate(s) / {} chunks ({pct:.2}%); frame_kind: {}; sample: {}",
+            report.empty,
+            total,
+            if top_frames.is_empty() {
+                "none"
+            } else {
+                &top_frames
+            },
+            if sample.is_empty() { "none" } else { &sample }
+        ),
+        recommendation: if report.empty > 0 {
+            Some(
+                "Run `aicx doctor --prune-empty-bodies` to emit a reviewable cleanup script"
+                    .to_string(),
+            )
+        } else {
+            None
+        },
+    }
+}
+
+#[derive(Debug, Default)]
+struct EmptyBodyReport {
+    total: usize,
+    empty: usize,
+    empty_paths: Vec<PathBuf>,
+    sample_paths: Vec<PathBuf>,
+    by_frame_kind: BTreeMap<String, usize>,
+}
+
+fn empty_body_report(base: &Path) -> EmptyBodyReport {
+    let files = store::scan_context_files_at(base).unwrap_or_default();
+    let mut report = EmptyBodyReport {
+        total: files.len(),
+        ..Default::default()
+    };
+
+    for file in files {
+        if file.path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&file.path) else {
+            continue;
+        };
+        if !chunk_body_is_empty(&content) && chunk_body_after_header(&content).trim().len() >= 50 {
+            continue;
+        }
+
+        report.empty += 1;
+        report.empty_paths.push(file.path.clone());
+        if report.sample_paths.len() < 20 {
+            report.sample_paths.push(file.path.clone());
+        }
+        let frame_kind = store::load_sidecar(&file.path)
+            .and_then(|sidecar| sidecar.frame_kind.map(|kind| kind.as_str().to_string()))
+            .unwrap_or_else(|| "unknown".to_string());
+        *report.by_frame_kind.entry(frame_kind).or_insert(0) += 1;
+    }
+
+    report
+}
+
+fn chunk_body_after_header(content: &str) -> &str {
+    let Some(rest) = content.strip_prefix("[project:") else {
+        return content;
+    };
+    let Some((_, body)) = rest.split_once('\n') else {
+        return "";
+    };
+    body.trim_start_matches(['\r', '\n'])
+}
+
+fn chunk_body_is_empty(content: &str) -> bool {
+    !chunk_body_after_header(content)
+        .lines()
+        .any(chunk_line_has_signal)
+}
+
+fn chunk_line_has_signal(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() {
+        return false;
+    }
+    if let Some((_, rest)) = line.split_once("] ")
+        && let Some((_, message)) = rest.split_once(':')
+    {
+        return !message.trim().is_empty();
+    }
+    true
+}
+
+pub fn render_prune_empty_bodies_script(base: &Path) -> Result<String> {
+    let report = empty_body_report(base);
+    let mut out = String::from("#!/usr/bin/env bash\nset -euo pipefail\n\n");
+    out.push_str("# Review before running. Generated by `aicx doctor --prune-empty-bodies`.\n");
+    for path in report.empty_paths {
+        out.push_str("rm -f -- ");
+        out.push_str(&shell_quote_path(&path));
+        out.push(' ');
+        out.push_str(&shell_quote_path(&path.with_extension("meta.json")));
+        out.push('\n');
+    }
+    if !out.contains("rm -f --") {
+        out.push_str("# No empty-body chunks detected.\n");
+    }
+    Ok(out)
+}
+
+pub fn render_rebuild_sidecars_script(base: &Path) -> Result<String> {
+    let files = store::scan_context_files_at(base).unwrap_or_default();
+    let mut out = String::from("#!/usr/bin/env bash\nset -euo pipefail\n\n");
+    out.push_str(
+        "# Review before running. Rebuilds missing sidecars by forcing a corpus rescan.\n",
+    );
+    let missing = files
+        .iter()
+        .filter(|file| !file.path.with_extension("meta.json").exists())
+        .take(20)
+        .map(|file| file.path.display().to_string())
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        out.push_str("# No missing sidecars detected.\n");
+    } else {
+        for path in missing {
+            out.push_str(&format!("# missing: {path}\n"));
+        }
+        out.push_str("aicx store --full-rescan\n");
+    }
+    Ok(out)
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    let value = path.display().to_string();
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Aggregate noise filter activity across all sidecars in the canonical
@@ -446,7 +1323,7 @@ fn check_corpus_buckets(base: &Path) -> CheckResult {
         }
     };
 
-    match suspicious_corpus_buckets(&store_root) {
+    match scan_corpus_buckets(&store_root) {
         Ok(suspicious) if suspicious.is_empty() => CheckResult {
             name: "corpus_buckets".to_string(),
             severity: Severity::Green,
@@ -459,10 +1336,17 @@ fn check_corpus_buckets(base: &Path) -> CheckResult {
             detail: format!(
                 "{} suspicious bucket(s): {}",
                 suspicious.len(),
-                suspicious.join(", ")
+                suspicious
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             recommendation: Some(
-                "Run `aicx doctor --fix-buckets` to move them to $HOME/.aicx/quarantine/"
+                "Run `aicx doctor --fix-buckets --dry-run` to preview the quarantine plan, \
+                 then `aicx doctor --fix-buckets` to move text-extracted-junk and template \
+                 placeholder buckets to $HOME/.aicx/quarantine/<timestamp>/"
                     .to_string(),
             ),
         },
@@ -491,26 +1375,66 @@ fn count_corpus_buckets(store_root: &Path) -> Result<usize> {
     Ok(count)
 }
 
-fn suspicious_corpus_buckets(store_root: &Path) -> Result<Vec<String>> {
+/// Scan top-level corpus buckets and return only the **suspicious** ones —
+/// folder names that fail [`is_valid_repo_bucket_name`] / [`is_valid_repo_project_slug`].
+///
+/// The validator is intentionally permissive (case-preserving CamelCase,
+/// dot-prefix `.aicx`/`.github`/`.scripts`, underscore-prefix `_internal`)
+/// after the 2026-05-12 relax. What remains "suspicious" is real
+/// extractor-bug evidence: template-placeholder leaks (`${RELEASE_REPO}`,
+/// `<owner>`, `{target_owner}`), and mid-segment shell-metacharacter /
+/// newline / quote garbage (`loctree.git\ncd`,
+/// `vc-skills.git\"><span`).
+///
+/// Pre-2026-05-12 the validator also rejected CamelCase orgs and
+/// dot-prefixed names, which on 2026-05-09 mass-quarantined ~89k
+/// legitimate chunks across `LibraxisAI/`, `VetCoders/`, `Loctree/`,
+/// `Szowesgad/`. Relaxing the validator (not adding canonicalization
+/// magic) was the correct response.
+pub(crate) fn scan_corpus_buckets(store_root: &Path) -> Result<Vec<String>> {
+    let mut suspicious = Vec::new();
     if !store_root.exists() {
-        return Ok(Vec::new());
+        return Ok(suspicious);
     }
 
-    let mut suspicious = Vec::new();
-    for entry in
+    for org_entry in
         crate::sanitize::read_dir_validated(store_root).context("read corpus store root")?
     {
-        let entry = entry.context("read corpus store entry")?;
-        if !entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false) {
+        let org_entry = org_entry.context("read corpus store entry")?;
+        if !org_entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false) {
             continue;
         }
-        let Ok(name) = entry.file_name().into_string() else {
+        let Ok(org) = org_entry.file_name().into_string() else {
             continue;
         };
-        if !is_valid_repo_bucket_name(&name) {
-            suspicious.push(name);
+
+        if !is_valid_repo_bucket_name(&org) {
+            suspicious.push(org);
+            continue;
+        }
+
+        // Org folder is valid → check each repo subfolder.
+        for repo_entry in crate::sanitize::read_dir_validated(&org_entry.path())
+            .with_context(|| format!("read corpus org bucket `{org}`"))?
+        {
+            let repo_entry = repo_entry.context("read corpus repo entry")?;
+            if !repo_entry
+                .file_type()
+                .map(|ty| ty.is_dir())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Ok(repo) = repo_entry.file_name().into_string() else {
+                continue;
+            };
+            let slug = format!("{org}/{repo}");
+            if !is_valid_repo_project_slug(&slug) {
+                suspicious.push(slug);
+            }
         }
     }
+
     suspicious.sort();
     Ok(suspicious)
 }
@@ -533,6 +1457,9 @@ fn quarantine_bucket_with_timestamp(
     std::fs::create_dir_all(&quarantine_root).context("create quarantine root")?;
     let src = store_root.join(bucket_name);
     let dst = quarantine_root.join(bucket_name);
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).context("create nested quarantine parent")?;
+    }
     std::fs::rename(&src, &dst).with_context(|| {
         format!(
             "rename corpus bucket {} to {}",
@@ -600,6 +1527,13 @@ pub fn format_report_text(report: &DoctorReport, verbose: bool) -> String {
         &report.sidecars,
         &report.corpus_buckets,
         &report.noise_health,
+        &report.semantic_health,
+        &report.index_freshness,
+        &report.index_consistency,
+        &report.sidecar_coverage,
+        &report.embedder_warmth,
+        &report.empty_body_chunks,
+        &report.content_dedup,
     ];
     for check in checks {
         out.push_str(&format!(
@@ -618,21 +1552,32 @@ pub fn format_report_text(report: &DoctorReport, verbose: bool) -> String {
             out.push_str(&format!("  + {}\n", fix));
         }
     }
+    if let Some(script) = &report.rebuild_sidecars_script {
+        out.push_str("\nRebuild sidecars script:\n");
+        out.push_str(script);
+    }
+    if let Some(script) = &report.prune_empty_bodies_script {
+        out.push_str("\nPrune empty bodies script:\n");
+        out.push_str(script);
+    }
     out
 }
 
 pub fn oracle_readiness(report: &DoctorReport) -> OracleReadinessReport {
     let canonical = report.canonical_store.severity;
     let metadata = max_severity(&[report.steer_lance.severity, report.steer_bm25.severity]);
-    let content = Severity::Critical;
-    let dashboard = Severity::Warning;
+    let content = content_semantic_severity(report);
+    let dashboard = Severity::Green;
 
     let readiness = if canonical == Severity::Critical
         || report.sidecars.severity == Severity::Critical
         || content == Severity::Critical
     {
         OracleReadiness::UnsafeForLoctreeScope
-    } else if metadata != Severity::Green || dashboard != Severity::Green {
+    } else if metadata != Severity::Green
+        || content != Severity::Green
+        || dashboard != Severity::Green
+    {
         OracleReadiness::Degraded
     } else {
         OracleReadiness::Ready
@@ -657,6 +1602,17 @@ pub fn oracle_readiness(report: &DoctorReport) -> OracleReadinessReport {
         dashboard_semantic_route_health: dashboard,
         loctree_oracle_readiness: readiness,
         reason,
+    }
+}
+
+fn content_semantic_severity(report: &DoctorReport) -> Severity {
+    match (
+        report.semantic_health.severity,
+        report.index_freshness.severity,
+    ) {
+        (Severity::Critical, Severity::Critical) => Severity::Critical,
+        (Severity::Green, Severity::Green) => Severity::Green,
+        _ => Severity::Warning,
     }
 }
 
@@ -690,7 +1646,7 @@ mod tests {
     }
 
     #[test]
-    fn oracle_readiness_is_unsafe_without_content_index() {
+    fn oracle_readiness_is_ready_when_semantic_and_freshness_are_green() {
         let report = DoctorReport {
             canonical_store: CheckResult {
                 name: "canonical".to_string(),
@@ -734,13 +1690,117 @@ mod tests {
                 detail: "ok".to_string(),
                 recommendation: None,
             },
+            semantic_health: CheckResult {
+                name: "semantic".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            index_freshness: CheckResult {
+                name: "freshness".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            index_consistency: CheckResult {
+                name: "index_consistency".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            sidecar_coverage: CheckResult {
+                name: "sidecar_coverage".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            embedder_warmth: CheckResult {
+                name: "warmth".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            empty_body_chunks: CheckResult {
+                name: "empty_body_chunks".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            content_dedup: CheckResult {
+                name: "content_dedup".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            context_corpus: CheckResult {
+                name: "context_corpus".to_string(),
+                severity: Severity::Green,
+                detail: "ok".to_string(),
+                recommendation: None,
+            },
+            rebuild_sidecars_script: None,
+            prune_empty_bodies_script: None,
             fixes_applied: Vec::new(),
             overall: Severity::Green,
         };
 
         let readiness = oracle_readiness(&report);
-        assert_eq!(readiness.readiness_label, "unsafe_for_loctree_scope");
-        assert_eq!(readiness.content_semantic_index_health, Severity::Critical);
+        assert_eq!(readiness.readiness_label, "ready");
+        assert_eq!(readiness.content_semantic_index_health, Severity::Green);
+        assert_eq!(readiness.dashboard_semantic_route_health, Severity::Green);
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn cloud_probe_dns_failures_are_red() {
+        assert_eq!(
+            classify_cloud_probe_error("failed to lookup address information"),
+            Severity::Critical
+        );
+        assert_eq!(
+            classify_cloud_probe_error("connection refused"),
+            Severity::Warning
+        );
+    }
+
+    #[test]
+    fn index_consistency_flags_orphaned_and_missing_tuples() {
+        let tmp = unique_test_dir("index-consistency");
+        let dir = tmp
+            .join("store")
+            .join("VetCoders")
+            .join("aicx")
+            .join("2026_0506")
+            .join("conversations")
+            .join("codex");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("2026_0506_codex_sess-a_001.md"), "real chunk").unwrap();
+        std::fs::write(
+            tmp.join("index.json"),
+            serde_json::json!({
+                "projects": {
+                    "VetCoders/aicx": {
+                        "agents": {
+                            "codex": {
+                                "dates": ["2026_0505"],
+                                "total_entries": 1,
+                                "last_updated": "2026-05-06T00:00:00Z"
+                            }
+                        }
+                    }
+                },
+                "last_updated": "2026-05-06T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let check = check_index_consistency(&tmp);
+        assert_eq!(check.severity, Severity::Warning);
+        assert!(check.detail.contains("1 orphaned index tuple"));
+        assert!(check.detail.contains("1 missing index tuple"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -756,8 +1816,8 @@ mod tests {
     fn check_corpus_buckets_green_when_only_valid_names() {
         let tmp = unique_test_dir("valid-buckets");
         let store = tmp.join("store");
-        std::fs::create_dir_all(store.join("VetCoders")).unwrap();
-        std::fs::create_dir_all(store.join("LibraxisAI")).unwrap();
+        std::fs::create_dir_all(store.join("vetcoders").join("aicx")).unwrap();
+        std::fs::create_dir_all(store.join("libraxisai").join("vista")).unwrap();
         std::fs::create_dir_all(store.join("local")).unwrap();
 
         let result = check_corpus_buckets(&tmp);
@@ -770,14 +1830,28 @@ mod tests {
     fn check_corpus_buckets_flags_template_literals() {
         let tmp = unique_test_dir("bad-buckets");
         let store = tmp.join("store");
-        std::fs::create_dir_all(store.join("VetCoders")).unwrap();
+        std::fs::create_dir_all(store.join("vetcoders")).unwrap();
+        // Mid-segment garbage: backtick, newlines, asterisks. Validator
+        // rejects mid-segment non-`[A-Za-z0-9._-]` chars regardless of
+        // case (relaxed 2026-05-12 only loosened case + leading-char
+        // rules; mid-segment garbage stays junk).
+        std::fs::create_dir_all(store.join("vetcoders").join("vibecrafted.git`")).unwrap();
+        std::fs::create_dir_all(store.join("vetcoders").join("loctree\n\n**AICX")).unwrap();
+        // Template-placeholder leaks (leading `{`, `<`, `$`):
         std::fs::create_dir_all(store.join("{target_owner}")).unwrap();
-        std::fs::create_dir_all(store.join("...")).unwrap();
+        std::fs::create_dir_all(store.join("<owner>")).unwrap();
+        std::fs::create_dir_all(store.join("$RELEASE_REPO")).unwrap();
+        // (Note: pure dot-string `"..."` was previously asserted as junk,
+        // but `.` is now an allowed leading-and-mid char, so dotfile-only
+        // names pass — semantically weird but not validator-relevant.)
 
         let result = check_corpus_buckets(&tmp);
         assert_eq!(result.severity, Severity::Warning);
         assert!(result.detail.contains("{target_owner}"));
-        assert!(result.detail.contains("..."));
+        assert!(result.detail.contains("<owner>"));
+        assert!(result.detail.contains("$RELEASE_REPO"));
+        assert!(result.detail.contains("vetcoders/vibecrafted.git`"));
+        assert!(result.detail.contains("vetcoders/loctree"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -799,14 +1873,129 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_moves_nested_repo_bucket_atomically() {
+        let tmp = unique_test_dir("quarantine-nested-move");
+        let store = tmp.join("store");
+        let bad = store.join("vetcoders").join("vc-skills.git\"><span");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("test.md"), "content").unwrap();
+
+        let dest = quarantine_bucket(&store, "vetcoders/vc-skills.git\"><span").unwrap();
+        assert!(dest.exists());
+        assert!(!bad.exists());
+        assert!(dest.join("test.md").exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn quarantine_skips_when_no_buckets_match() {
         let tmp = unique_test_dir("quarantine-noop");
         let store = tmp.join("store");
-        std::fs::create_dir_all(store.join("VetCoders")).unwrap();
+        std::fs::create_dir_all(store.join("vetcoders").join("aicx")).unwrap();
         std::fs::create_dir_all(store.join("local")).unwrap();
 
-        let suspicious = suspicious_corpus_buckets(&store).unwrap();
+        let suspicious = scan_corpus_buckets(&store).unwrap();
         assert!(suspicious.is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn scan_passes_camelcase_dotfile_underscore_buckets_through() {
+        let tmp = unique_test_dir("scan-passthrough");
+        let store = tmp.join("store");
+
+        // Legitimate CamelCase GitHub orgs — case-preserving canonical form.
+        // Pre-2026-05-12 these would have been mass-quarantined by the
+        // lowercase-only validator (the `20260509_023025` incident).
+        // Post-relax they pass the validator unchanged.
+        std::fs::create_dir_all(store.join("LibraxisAI").join("vista")).unwrap();
+        std::fs::create_dir_all(store.join("VetCoders").join("Vista")).unwrap();
+        std::fs::create_dir_all(store.join("Loctree").join("aicx")).unwrap();
+        std::fs::create_dir_all(store.join("Szowesgad").join("family-onko-portal")).unwrap();
+
+        // Already-lowercase legacy buckets:
+        std::fs::create_dir_all(store.join("vetcoders").join("aicx")).unwrap();
+        std::fs::create_dir_all(store.join("local")).unwrap();
+
+        // Dot-prefix buckets — UNIX hidden-dir + GitHub `.github`-style
+        // convention. Validator accepts directly (relaxed 2026-05-12).
+        std::fs::create_dir_all(store.join(".scripts")).unwrap();
+        std::fs::create_dir_all(store.join(".aicx")).unwrap();
+        std::fs::create_dir_all(store.join(".github")).unwrap();
+
+        // Underscore-prefix buckets — code-convention naming.
+        std::fs::create_dir_all(store.join("_internal")).unwrap();
+
+        // Truly invalid (template placeholders, leading non-alphanumeric):
+        std::fs::create_dir_all(store.join("{target_owner}").join("repo")).unwrap();
+        std::fs::create_dir_all(store.join("<owner>")).unwrap();
+        std::fs::create_dir_all(store.join("$RELEASE_REPO")).unwrap();
+
+        let suspicious = scan_corpus_buckets(&store).unwrap();
+
+        // Legit names of every relaxed shape are NOT suspicious:
+        for legit in [
+            "LibraxisAI",
+            "VetCoders",
+            "Loctree",
+            "Szowesgad",
+            "vetcoders",
+            "local",
+            ".scripts",
+            ".aicx",
+            ".github",
+            "_internal",
+        ] {
+            assert!(
+                suspicious.iter().all(|n| n != legit),
+                "{legit} should not be in suspicious"
+            );
+        }
+
+        // Real text-extracted junk and placeholder leaks ARE suspicious:
+        assert!(suspicious.iter().any(|n| n == "{target_owner}"));
+        assert!(suspicious.iter().any(|n| n == "<owner>"));
+        assert!(suspicious.iter().any(|n| n == "$RELEASE_REPO"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn empty_body_chunks_red_when_over_threshold_and_script_is_reviewable() {
+        let tmp = unique_test_dir("empty-bodies");
+        let dir = tmp
+            .join("store")
+            .join("VetCoders")
+            .join("aicx")
+            .join("2026_0506")
+            .join("conversations")
+            .join("claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("2026_0506_claude_sess-empty_001.md");
+        let full = dir.join("2026_0506_claude_sess-full_001.md");
+        std::fs::write(
+            &empty,
+            "[project: VetCoders/aicx | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &full,
+            "[project: VetCoders/aicx | agent: claude | date: 2026-05-06]\n\nThis chunk carries enough real body content to avoid the empty-body threshold.",
+        )
+        .unwrap();
+
+        let check = check_empty_body_chunks(&tmp);
+        assert_eq!(check.severity, Severity::Critical);
+        assert!(check.detail.contains("1 empty-body"));
+
+        let script = render_prune_empty_bodies_script(&tmp).unwrap();
+        assert!(script.starts_with("#!/usr/bin/env bash"));
+        assert!(script.contains("rm -f --"));
+        assert!(script.contains("sess-empty"));
+        assert!(!script.contains("sess-full"));
+        assert!(empty.exists(), "script generation must not delete files");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

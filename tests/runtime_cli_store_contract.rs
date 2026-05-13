@@ -198,7 +198,7 @@ fn read_cli_returns_chunk_metadata_and_content() {
     let chunk = home
         .join(".aicx")
         .join("store")
-        .join("VetCoders")
+        .join("vetcoders")
         .join("aicx")
         .join("2026_0502")
         .join("reports")
@@ -210,14 +210,14 @@ fn read_cli_returns_chunk_metadata_and_content() {
         &home,
         &[
             "read",
-            "store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess-read01_001.md",
+            "store/vetcoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess-read01_001.md",
             "--max-chars",
             "13",
             "--json",
         ],
     ));
 
-    assert_eq!(output["project"].as_str(), Some("VetCoders/aicx"));
+    assert_eq!(output["project"].as_str(), Some("vetcoders/aicx"));
     assert_eq!(output["kind"].as_str(), Some("reports"));
     assert_eq!(output["agent"].as_str(), Some("codex"));
     assert_eq!(output["session_id"].as_str(), Some("sess-read01"));
