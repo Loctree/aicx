@@ -100,7 +100,11 @@ struct CodexEntry {
     cwd: Option<String>,
 }
 
-/// Gemini CLI session file (~/.gemini/tmp/<hash>/chats/session-*.json).
+/// Gemini CLI session file (`~/.gemini/tmp/<project>/chats/session-*.json[l]`).
+///
+/// Gemini has used both a single JSON object with a `messages` array and a
+/// JSONL stream where the first line carries session metadata and later lines
+/// carry messages / state updates.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GeminiSession {
@@ -1183,10 +1187,10 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
     ))
 }
 
-/// Extract timeline entries from a single Gemini CLI session JSON file by path.
+/// Extract timeline entries from a single Gemini CLI session file by path.
 ///
-/// Gemini sessions are JSON (not JSONL) and live under:
-/// `~/.gemini/tmp/<hash>/chats/session-*.json`
+/// Gemini sessions live under:
+/// `~/.gemini/tmp/<project>/chats/session-*.json[l]`
 pub fn extract_gemini_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     let mut entries = parse_gemini_session(path, config)?;
     entries.sort_by_key(|a| a.timestamp);
@@ -2480,7 +2484,7 @@ fn walk_files(dir: &Path) -> Vec<PathBuf> {
 
 /// Extract timeline entries from Gemini CLI sessions.
 ///
-/// Reads `~/.gemini/tmp/<projectHash>/chats/session-*.json` files.
+/// Reads `~/.gemini/tmp/<projectHash>/chats/session-*.json[l]` files.
 /// Returns Ok(vec![]) silently if the directory doesn't exist.
 pub fn extract_gemini(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     let home = dirs::home_dir().context("No home dir")?;
@@ -2510,7 +2514,7 @@ pub fn extract_gemini(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
             let file_entry = file_entry?;
             let path = file_entry.path();
 
-            if path.extension().is_none_or(|e| e != "json") {
+            if !is_gemini_session_file(&path) {
                 continue;
             }
 
@@ -2525,13 +2529,13 @@ pub fn extract_gemini(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     Ok(entries)
 }
 
-/// Parse a single Gemini CLI session JSON file.
+/// Parse a single Gemini CLI session file.
 fn parse_gemini_session(
     path: &std::path::Path,
     config: &ExtractionConfig,
 ) -> Result<Vec<TimelineEntry>> {
     let content = sanitize::read_to_string_validated(path)?;
-    let session: GeminiSession = serde_json::from_str(&content)?;
+    let session = parse_gemini_session_content(path, &content)?;
 
     let session_id = session
         .session_id
@@ -2674,6 +2678,62 @@ fn parse_gemini_session(
     }
 
     Ok(entries)
+}
+
+fn is_gemini_session_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "json" | "jsonl"))
+}
+
+fn parse_gemini_session_content(path: &Path, content: &str) -> Result<GeminiSession> {
+    if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+        parse_gemini_jsonl_session(content)
+            .with_context(|| format!("Failed to parse Gemini JSONL session {}", path.display()))
+    } else {
+        serde_json::from_str(content)
+            .with_context(|| format!("Failed to parse Gemini JSON session {}", path.display()))
+    }
+}
+
+fn parse_gemini_jsonl_session(content: &str) -> Result<GeminiSession> {
+    let mut session_id = None;
+    let mut messages = Vec::new();
+
+    for (idx, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let value: serde_json::Value = serde_json::from_str(line)
+            .with_context(|| format!("invalid JSONL record at line {}", idx + 1))?;
+
+        if session_id.is_none() {
+            session_id = value
+                .get("sessionId")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+        }
+
+        let looks_like_message = value.get("timestamp").is_some()
+            && (value.get("type").is_some()
+                || value.get("role").is_some()
+                || value.get("content").is_some()
+                || value.get("displayContent").is_some()
+                || value.get("thoughts").is_some());
+
+        if looks_like_message {
+            let message: GeminiMessage = serde_json::from_value(value)
+                .with_context(|| format!("invalid Gemini message at line {}", idx + 1))?;
+            messages.push(message);
+        }
+    }
+
+    Ok(GeminiSession {
+        session_id,
+        messages,
+    })
 }
 
 /// Extract timeline entries from a single Junie session event log.
@@ -4104,7 +4164,7 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
         }
     }
 
-    // Gemini CLI: ~/.gemini/tmp/<projectHash>/chats/session-*.json
+    // Gemini CLI: ~/.gemini/tmp/<projectHash>/chats/session-*.json[l]
     let gemini_tmp = home.join(".gemini").join("tmp");
     if gemini_tmp.exists() && gemini_tmp.is_dir() {
         for project_entry in fs::read_dir(&gemini_tmp)? {
@@ -4126,7 +4186,7 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
             for file_entry in fs::read_dir(&chats_dir)? {
                 let file_entry = file_entry?;
                 let fp = file_entry.path();
-                if fp.extension().is_some_and(|e| e == "json") {
+                if is_gemini_session_file(&fp) {
                     session_count += 1;
                     if let Ok(meta) = fs::metadata(&fp) {
                         total_size += meta.len();

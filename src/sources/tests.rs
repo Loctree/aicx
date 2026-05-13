@@ -494,6 +494,41 @@ fn test_extract_gemini_file_session_json() {
 }
 
 #[test]
+fn test_extract_gemini_file_session_jsonl_uses_metadata_session_id() {
+    let root = unique_test_dir("gemini-jsonl-direct");
+    let tmp = root.join("session-2026-05-13T02-16-c6c4ada0.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r##"{"sessionId":"c6c4ada0-5d27-4e74-8194-be01b46bf865","projectHash":"hash-1","startTime":"2026-05-13T02:16:02.852Z","lastUpdated":"2026-05-13T02:16:02.852Z","kind":"main"}
+{"id":"u1","timestamp":"2026-05-13T02:16:04.460Z","type":"user","content":[{"text":"# Research Task"},{"text":"\nMap the lanes"}]}
+{"$set":{"lastUpdated":"2026-05-13T02:16:04.460Z"}}
+{"id":"a1","timestamp":"2026-05-13T02:16:13.173Z","type":"gemini","content":"Report written","thoughts":[{"subject":"Planning","description":"Reading files","timestamp":"2026-05-13T02:16:14.000Z"}]}"##;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_gemini_file(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 3);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.session_id == "c6c4ada0-5d27-4e74-8194-be01b46bf865")
+    );
+    assert_eq!(entries[0].role, "user");
+    assert_eq!(entries[0].message, "# Research Task\nMap the lanes");
+    assert_eq!(entries[1].role, "assistant");
+    assert_eq!(entries[1].message, "Report written");
+    assert_eq!(entries[2].role, "reasoning");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn test_extract_gemini_file_classifies_frame_kinds_from_fixture() {
     let root = unique_test_dir("gemini-frame-kind");
     let tmp = root.join("session.json");
