@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+## [0.7.3] - 2026-05-13
+
+### Added
+- Unified multi-project scope handling across search, intents, semantic index,
+  MCP, dashboard, and doctor surfaces so operators can narrow to one or more
+  projects with the same contract everywhere.
+
+### Changed
+- `aicx store` progress output is now bounded and human-readable: structured
+  progress ticks remain machine-parseable while interactive terminals keep a
+  stable three-line status view instead of flooding logs.
+
+### Fixed
+- Gemini JSONL extraction now treats `.jsonl` files as session transcripts,
+  preserving `sessionId` metadata and allowing `aicx all` to ingest Gemini
+  sources alongside Claude, Codex, Junie, and CodeScribe.
+- Junk corpus bucket slugs are covered so malformed or placeholder project
+  names no longer leak into canonical project grouping.
+
 ## [0.7.1] - 2026-05-12
 
 ### Changed
