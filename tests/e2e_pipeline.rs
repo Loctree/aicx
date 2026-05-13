@@ -9,7 +9,7 @@
 //!   1. canonical store has at least one chunk (extract was previously run)
 //!   2. embedder loads via the configured backend (cloud or native GGUF)
 //!   3. `vector_index::write_index` materializes an NDJSON file under
-//!      `~/.aicx/index/<bucket>/embeddings.ndjson`
+//!      `~/.aicx/indexed/<bucket>/embeddings.ndjson`
 //!   4. `vector_index::query_index` returns at least one hit for a
 //!      well-formed query, dimension-matched against the index header
 //!   5. cosine score is in `[0.0, 1.0]` for the top hit (sanity)

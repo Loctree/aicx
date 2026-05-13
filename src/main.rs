@@ -3694,7 +3694,25 @@ fn run_search(
     let results: Vec<_> = results.into_iter().take(filters.limit).collect();
 
     if json {
-        println!("{}", rank::render_search_json(&root, &results, scanned)?);
+        let oracle_status = match semantic_status {
+            Some((_semantic_backend, _semantic_model_id, semantic_scanned)) => {
+                aicx::oracle::OracleStatus::content_semantic(
+                    &root,
+                    semantic_scanned,
+                    results.len(),
+                    aicx::oracle::verify_paths(
+                        results
+                            .iter()
+                            .map(|result| std::path::Path::new(&result.path).to_path_buf()),
+                    ),
+                )
+            }
+            None => rank::search_oracle_status(&root, &results, scanned),
+        };
+        println!(
+            "{}",
+            rank::render_search_json_with_oracle(&root, &results, scanned, oracle_status)?
+        );
         return Ok(());
     }
 

@@ -295,6 +295,20 @@ pub fn render_search_json(
     results: &[FuzzyResult],
     scanned: usize,
 ) -> serde_json::Result<String> {
+    render_search_json_with_oracle(
+        root,
+        results,
+        scanned,
+        search_oracle_status(root, results, scanned),
+    )
+}
+
+pub fn render_search_json_with_oracle(
+    _root: &Path,
+    results: &[FuzzyResult],
+    scanned: usize,
+    oracle_status: OracleStatus,
+) -> serde_json::Result<String> {
     let items = results
         .iter()
         .map(|result| CompactSearchItem {
@@ -313,7 +327,7 @@ pub fn render_search_json(
         .collect();
 
     serde_json::to_string(&CompactSearchResponse {
-        oracle_status: search_oracle_status(root, results, scanned),
+        oracle_status,
         results: results.len(),
         scanned,
         items,

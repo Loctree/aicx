@@ -11,7 +11,7 @@
 //! - [`dry_run_index`]: probe the embedder, sample N chunks, embed them,
 //!   return stats. Used for ETA estimation before a full rebuild.
 //! - [`write_index`] / [`query_index`] (Iter 3): persistent NDJSON-backed
-//!   index per project at `~/.aicx/index/<bucket>/embeddings.ndjson`,
+//!   index per project at `~/.aicx/indexed/<bucket>/embeddings.ndjson`,
 //!   queryable via in-process cosine similarity.
 //!
 //! NDJSON over Lance for the MVP: each chunk is one JSON line
@@ -237,7 +237,7 @@ fn run_native_pass(
 const INDEX_SCHEMA_VERSION: &str = "1.0";
 const INDEX_FILE_NAME: &str = "embeddings.ndjson";
 const CONTEXT_CORPUS_INDEX_FILE_NAME: &str = "context-corpus.embeddings.ndjson";
-const INDEX_DIR_NAME: &str = "index";
+const INDEX_DIR_NAME: &str = "indexed";
 const ALL_BUCKET_NAME: &str = "_all";
 
 /// Resolve the on-disk path of the persistent vector index for a given
@@ -245,9 +245,10 @@ const ALL_BUCKET_NAME: &str = "_all";
 /// `_all` bucket path so an operator can index every chunk in one file.
 pub fn index_path(project: Option<&str>) -> Result<PathBuf> {
     let base = crate::store::store_base_dir()?;
-    // The store base is usually `~/.aicx/store`; the index lives next
-    // to it as `~/.aicx/index/<bucket>/embeddings.ndjson`.
-    let index_root = base.parent().unwrap_or(&base).join(INDEX_DIR_NAME);
+    // `store_base_dir()` resolves to the AICX home (`~/.aicx`), not the
+    // corpus store (`~/.aicx/store`). Keep the vector index inside the
+    // operator-owned AICX home so build, status, and search all agree.
+    let index_root = base.join(INDEX_DIR_NAME);
     let bucket = project.unwrap_or(ALL_BUCKET_NAME);
     // Sanitize project bucket for filesystem (canonical lowercase per
     // canonical_project_slug invariant + replace path separators).
@@ -527,7 +528,7 @@ fn chunk_id_from_path(path: &std::path::Path) -> String {
 /// ~100k chunks per bucket, the storage migrates to Lance + ANN search
 /// behind the same `query_index` signature.
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-pub fn query_index(project: Option<&str>, query: &str, limit: usize) -> Result<Vec<QueryHit>> {
+pub fn query_index(project: Option<&str>, query: &str, _limit: usize) -> Result<Vec<QueryHit>> {
     use std::io::{BufRead, BufReader};
 
     let path = index_path(project)?;
@@ -544,7 +545,7 @@ pub fn query_index(project: Option<&str>, query: &str, limit: usize) -> Result<V
     // `open_file_validated` validates the path against canonical roots
     // BEFORE opening — blocks any path-traversal attempt that an
     // operator-controlled `project` could inject into the lookup. Index
-    // files must always live under the canonical `~/.aicx/index` tree.
+    // files must always live under the canonical `~/.aicx/indexed` tree.
     let file = crate::sanitize::open_file_validated(&path)
         .with_context(|| format!("open index: {}", path.display()))?;
     let reader = BufReader::new(file);
@@ -592,7 +593,6 @@ pub fn query_index(project: Option<&str>, query: &str, limit: usize) -> Result<V
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    hits.truncate(limit);
     Ok(hits)
 }
 
@@ -677,6 +677,7 @@ mod iter3_tests {
             "expected _all bucket in {}",
             path.display()
         );
+        assert_eq!(path, dir.join("indexed").join("_all").join(INDEX_FILE_NAME));
         unsafe {
             std::env::remove_var("AICX_HOME");
         }

@@ -218,6 +218,7 @@ pub fn index_status_at(base: &Path, project: Option<&str>) -> Result<IndexStatus
         .max();
 
     let index_roots = [
+        base.join("indexed"),
         base.join("semantic_index"),
         base.join("vector_index"),
         base.join("index"),

@@ -228,11 +228,14 @@ pub struct StoreIgnoreMatcher {
     rules: Vec<IgnoreRule>,
 }
 
-/// Returns the AICX base directory: `~/.aicx/`
+/// Returns the AICX base directory: `$AICX_HOME` or `~/.aicx/`
 ///
 /// Creates the directory if it doesn't exist.
 pub fn store_base_dir() -> Result<PathBuf> {
-    let dir = dirs::home_dir().context("No home directory")?.join(".aicx");
+    let dir = match std::env::var_os("AICX_HOME") {
+        Some(value) if !value.is_empty() => PathBuf::from(value),
+        _ => dirs::home_dir().context("No home directory")?.join(".aicx"),
+    };
     fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create store dir: {}", dir.display()))?;
     Ok(dir)

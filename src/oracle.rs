@@ -113,6 +113,34 @@ impl OracleStatus {
         }
     }
 
+    pub fn content_semantic(
+        store_root: &Path,
+        indexed_count: usize,
+        candidate_count: usize,
+        source_paths_verified: bool,
+    ) -> Self {
+        Self {
+            source_layer: canonical_layer(),
+            backend: OracleBackend::ContentSemantic,
+            index_kind: OracleIndexKind::ContentChunks,
+            fallback_reason: None,
+            derived_view: "materialized_vector_index_from_canonical_chunks".to_string(),
+            store_root: display_path(store_root),
+            indexed_count,
+            scanned_count: indexed_count,
+            candidate_count,
+            source_paths_verified,
+            stale_or_unknown: !source_paths_verified,
+            loctree_scope_safe: source_paths_verified,
+            loctree_scope_note: if source_paths_verified {
+                "safe_for_semantic_scope_when_followed_by_canonical_chunk_read".to_string()
+            } else {
+                "unsafe_for_scope_narrowing; semantic index returned paths that are not all readable"
+                    .to_string()
+            },
+        }
+    }
+
     pub fn metadata_steer(
         store_root: &Path,
         indexed_count: usize,
