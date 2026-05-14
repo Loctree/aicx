@@ -209,6 +209,91 @@ fn test_conversation_exact_short_duplicate_assistant_within_2s_is_kept() {
 }
 
 #[test]
+fn test_conversation_message_kind_defaults_to_conversation() {
+    let entries = vec![conversation_entry("sess1", "user", "Hello agent", 0)];
+
+    let conv = to_conversation(&entries, &[]);
+    assert_eq!(conv[0].message_kind, MessageKind::Conversation);
+    assert_eq!(conv[0].collapse_stub_kind, None);
+}
+
+#[test]
+fn test_conversation_message_kind_serializes_to_json_metadata() {
+    let entries = vec![conversation_entry("sess1", "user", "Hello agent", 0)];
+
+    let conv = to_conversation(&entries, &[]);
+    let value = serde_json::to_value(&conv[0]).unwrap();
+    assert_eq!(value["message_kind"], "conversation");
+    assert!(value.get("collapse_stub_kind").is_none());
+}
+
+#[test]
+fn test_conversation_message_kind_detects_workflow_prompt() {
+    let message = "run_id: run-1\nprompt_id: prompt-1\nstatus: prompt\nPerform the vc-review task\nReport path: /tmp/report.md";
+    let entries = vec![conversation_entry("sess1", "user", message, 0)];
+
+    let conv = to_conversation(&entries, &[]);
+    assert_eq!(conv[0].message_kind, MessageKind::WorkflowPrompt);
+    assert_eq!(conv[0].collapse_stub_kind, None);
+}
+
+#[test]
+fn test_conversation_message_kind_detects_continuation_summary() {
+    let entries = vec![conversation_entry(
+        "sess1",
+        "user",
+        "This session is being continued from an earlier conversation.",
+        0,
+    )];
+
+    let conv = to_conversation(&entries, &[]);
+    assert_eq!(conv[0].message_kind, MessageKind::ContinuationSummary);
+    assert_eq!(conv[0].collapse_stub_kind, None);
+}
+
+#[test]
+fn test_conversation_message_kind_detects_skill_ref_stub() {
+    let entries = vec![conversation_entry(
+        "sess1",
+        "user",
+        "  <skill-ref: repeated content>",
+        0,
+    )];
+
+    let conv = to_conversation(&entries, &[]);
+    assert_eq!(conv[0].message_kind, MessageKind::CollapseStub);
+    assert_eq!(conv[0].collapse_stub_kind, Some(CollapseStubKind::SkillRef));
+}
+
+#[test]
+fn test_conversation_message_kind_detects_dedup_ref_stub() {
+    let entries = vec![conversation_entry(
+        "sess1",
+        "assistant",
+        "<dedup-ref: repeated content>",
+        0,
+    )];
+
+    let conv = to_conversation(&entries, &[]);
+    assert_eq!(conv[0].message_kind, MessageKind::CollapseStub);
+    assert_eq!(conv[0].collapse_stub_kind, Some(CollapseStubKind::DedupRef));
+}
+
+#[test]
+fn test_conversation_message_kind_does_not_mark_inline_dedup_ref_as_stub() {
+    let entries = vec![conversation_entry(
+        "sess1",
+        "user",
+        "Normal text mentioning <dedup-ref: but not as a stub.",
+        0,
+    )];
+
+    let conv = to_conversation(&entries, &[]);
+    assert_eq!(conv[0].message_kind, MessageKind::Conversation);
+    assert_eq!(conv[0].collapse_stub_kind, None);
+}
+
+#[test]
 fn test_extract_claude_excludes_tool_blocks_then_conversation_clean() {
     use std::fs;
     let tmp = std::env::temp_dir().join(format!(

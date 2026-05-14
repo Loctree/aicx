@@ -23,7 +23,9 @@ use std::process::Command;
 
 use crate::sanitize;
 use crate::timeline::FrameKind;
-pub use crate::timeline::{ConversationMessage, ExtractionConfig, SourceInfo, TimelineEntry};
+pub use crate::timeline::{
+    CollapseStubKind, ConversationMessage, ExtractionConfig, MessageKind, SourceInfo, TimelineEntry,
+};
 
 const CODESCRIBE_AGENT: &str = "codescribe";
 const CODESCRIBE_TRANSCRIPT_KIND: &str = "transcript";
@@ -55,15 +57,21 @@ pub fn to_conversation(
                 Some(FrameKind::UserMsg | FrameKind::AgentReply)
             ) || (entry.frame_kind.is_none() && (entry.role == "user" || entry.role == "assistant"))
         })
-        .map(|e| ConversationMessage {
-            timestamp: e.timestamp,
-            agent: e.agent.clone(),
-            session_id: e.session_id.clone(),
-            role: e.role.clone(),
-            message: e.message.clone(),
-            repo_project: repo_name_from_cwd(e.cwd.as_deref(), project_filter),
-            source_path: e.cwd.clone(),
-            branch: e.branch.clone(),
+        .map(|e| {
+            let (message_kind, collapse_stub_kind) = classify_conversation_message(&e.message);
+
+            ConversationMessage {
+                timestamp: e.timestamp,
+                agent: e.agent.clone(),
+                session_id: e.session_id.clone(),
+                role: e.role.clone(),
+                message: e.message.clone(),
+                repo_project: repo_name_from_cwd(e.cwd.as_deref(), project_filter),
+                source_path: e.cwd.clone(),
+                branch: e.branch.clone(),
+                message_kind,
+                collapse_stub_kind,
+            }
         })
         .collect();
 
@@ -101,6 +109,42 @@ fn drop_exact_short_user_duplicates(
     }
 
     deduped
+}
+
+fn classify_conversation_message(message: &str) -> (MessageKind, Option<CollapseStubKind>) {
+    let trimmed_start = message.trim_start();
+
+    if trimmed_start.starts_with("<skill-ref:") {
+        return (MessageKind::CollapseStub, Some(CollapseStubKind::SkillRef));
+    }
+    if trimmed_start.starts_with("<dedup-ref:") {
+        return (MessageKind::CollapseStub, Some(CollapseStubKind::DedupRef));
+    }
+
+    if message.contains("This session is being continued")
+        || message.contains("<local-command-caveat>")
+        || message.contains("<command-name>/compact</command-name>")
+    {
+        return (MessageKind::ContinuationSummary, None);
+    }
+
+    let workflow_signals = [
+        "run_id:",
+        "prompt_id:",
+        "status: prompt",
+        "Perform the vc-",
+        "VC Agents Worker Charter",
+        "Report path:",
+    ];
+    let workflow_signal_count = workflow_signals
+        .iter()
+        .filter(|signal| message.contains(**signal))
+        .count();
+    if workflow_signal_count >= 2 {
+        return (MessageKind::WorkflowPrompt, None);
+    }
+
+    (MessageKind::Conversation, None)
 }
 
 // ============================================================================
