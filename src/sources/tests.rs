@@ -603,11 +603,29 @@ fn test_codex_session_diagnostics_aggregates_counts() {
                 .to_string(),
         },
     ]);
+    diagnostics.observe(&[CodexSessionWarning::UnparsableTimestamp {
+        count: 3,
+        samples: vec![
+            "2026-02-01T00:00:01".to_string(),
+            "garbage".to_string(),
+            "x".to_string(),
+        ],
+    }]);
+    diagnostics.observe(&[CodexSessionWarning::UnknownMsgType {
+        count: 4,
+        samples: vec![
+            "task_started".to_string(),
+            "task_complete".to_string(),
+            "error".to_string(),
+        ],
+    }]);
 
     assert!(!diagnostics.is_empty());
     assert_eq!(diagnostics.missing, 1);
     assert_eq!(diagnostics.duplicate, 1);
     assert_eq!(diagnostics.mismatch, 1);
+    assert_eq!(diagnostics.unparsable_ts, 3);
+    assert_eq!(diagnostics.unknown_msg_type, 4);
 }
 
 #[test]
@@ -650,6 +668,126 @@ fn test_parse_codex_session_duplicate_and_mismatch_warn_together() {
             },
         ]
     );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_codex_session_unparsable_timestamps_warn_and_drop() {
+    let root = unique_test_dir("codex-unparsable-ts");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"sess","cwd":"/tmp"}}
+{"timestamp":"2026-02-01T00:00:01","type":"event_msg","payload":{"type":"user_message","message":"naive ts dropped"}}
+{"timestamp":"not-a-timestamp","type":"event_msg","payload":{"type":"user_message","message":"garbage ts dropped"}}
+{"timestamp":"2026/02/01T00:00:03Z","type":"event_msg","payload":{"type":"user_message","message":"slash separator dropped"}}
+{"timestamp":"not-a-timestamp","type":"event_msg","payload":{"type":"user_message","message":"duplicate sample dropped"}}
+{"timestamp":"2026-02-01T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"good ts kept"}}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].message, "good ts kept");
+
+    assert_eq!(warnings.len(), 1);
+    match &warnings[0] {
+        CodexSessionWarning::UnparsableTimestamp { count, samples } => {
+            assert_eq!(*count, 4);
+            assert_eq!(
+                samples,
+                &vec![
+                    "2026-02-01T00:00:01".to_string(),
+                    "not-a-timestamp".to_string(),
+                    "2026/02/01T00:00:03Z".to_string(),
+                ]
+            );
+        }
+        other => panic!("expected UnparsableTimestamp, got {other:?}"),
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_codex_session_mcp_tool_call_is_kept_in_timeline() {
+    let root = unique_test_dir("codex-mcp-tool-call");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"sess","cwd":"/tmp"}}
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"mcp_tool_call","server":"memex","tool":"memory_search"}}
+{"timestamp":"2026-02-01T00:00:02Z","type":"event_msg","payload":{"type":"mcp_tool_call_response","server":"memex","result":"ok"}}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|e| e.role == "tool"));
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.frame_kind == Some(FrameKind::ToolCall))
+    );
+    assert!(
+        warnings.is_empty(),
+        "expected no warnings, got {warnings:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_codex_session_unknown_msg_type_warns_and_counts() {
+    let root = unique_test_dir("codex-unknown-msg-type");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"sess","cwd":"/tmp"}}
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"good user"}}
+{"timestamp":"2026-02-01T00:00:02Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-02-01T00:00:03Z","type":"event_msg","payload":{"type":"web_search","query":"x"}}
+{"timestamp":"2026-02-01T00:00:04Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-02-01T00:00:05Z","type":"event_msg","payload":{}}
+{"timestamp":"2026-02-01T00:00:06Z","type":"event_msg","payload":{"type":""}}
+{"timestamp":"2026-02-01T00:00:07Z","type":"event_msg","payload":{"type":"agent_message","message":"good assistant"}}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].role, "user");
+    assert_eq!(entries[1].role, "assistant");
+
+    assert_eq!(warnings.len(), 1);
+    match &warnings[0] {
+        CodexSessionWarning::UnknownMsgType { count, samples } => {
+            assert_eq!(*count, 3);
+            assert_eq!(samples.len(), 2);
+            assert!(samples.iter().any(|s| s == "task_started"));
+            assert!(samples.iter().any(|s| s == "web_search"));
+        }
+        other => panic!("expected UnknownMsgType, got {other:?}"),
+    }
 
     let _ = fs::remove_dir_all(&root);
 }

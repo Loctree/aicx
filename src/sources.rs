@@ -2365,6 +2365,14 @@ pub(crate) enum CodexSessionWarning {
         meta_id: String,
         filename_stem: String,
     },
+    UnparsableTimestamp {
+        count: usize,
+        samples: Vec<String>,
+    },
+    UnknownMsgType {
+        count: usize,
+        samples: Vec<String>,
+    },
 }
 
 impl CodexSessionWarning {
@@ -2390,6 +2398,18 @@ impl CodexSessionWarning {
                 meta_id,
                 filename_stem
             ),
+            CodexSessionWarning::UnparsableTimestamp { count, samples } => format!(
+                "Codex session warning: {} has {} unparsable event_msg timestamp(s); frames dropped. Sample(s): {}",
+                path.display(),
+                count,
+                samples.join(", ")
+            ),
+            CodexSessionWarning::UnknownMsgType { count, samples } => format!(
+                "Codex session warning: {} encountered {} event_msg(s) with unrecognized payload.type; frames dropped. Sample type(s): {}",
+                path.display(),
+                count,
+                samples.join(", ")
+            ),
         }
     }
 }
@@ -2405,6 +2425,8 @@ struct CodexSessionDiagnostics {
     missing: usize,
     duplicate: usize,
     mismatch: usize,
+    unparsable_ts: usize,
+    unknown_msg_type: usize,
 }
 
 impl CodexSessionDiagnostics {
@@ -2414,19 +2436,33 @@ impl CodexSessionDiagnostics {
                 CodexSessionWarning::MissingSessionMeta { .. } => self.missing += 1,
                 CodexSessionWarning::DuplicateSessionMeta { .. } => self.duplicate += 1,
                 CodexSessionWarning::FilenameMismatch { .. } => self.mismatch += 1,
+                CodexSessionWarning::UnparsableTimestamp { count, .. } => {
+                    self.unparsable_ts += count;
+                }
+                CodexSessionWarning::UnknownMsgType { count, .. } => {
+                    self.unknown_msg_type += count;
+                }
             }
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.missing == 0 && self.duplicate == 0 && self.mismatch == 0
+        self.missing == 0
+            && self.duplicate == 0
+            && self.mismatch == 0
+            && self.unparsable_ts == 0
+            && self.unknown_msg_type == 0
     }
 
     fn emit_summary(&self) {
         if !self.is_empty() {
             eprintln!(
-                "Codex sessions diagnostics: missing={} duplicate={} mismatch={}",
-                self.missing, self.duplicate, self.mismatch
+                "Codex sessions diagnostics: missing={} duplicate={} mismatch={} unparsable_ts={} unknown_msg_type={}",
+                self.missing,
+                self.duplicate,
+                self.mismatch,
+                self.unparsable_ts,
+                self.unknown_msg_type
             );
         }
     }
@@ -2571,6 +2607,10 @@ fn parse_codex_session_file_with_diagnostics(
     // Collect event_msg entries (user_message + agent_message)
     let mut entries = Vec::new();
     let mut current_cwd = initial_cwd;
+    let mut unparsable_ts_count: usize = 0;
+    let mut unparsable_ts_samples: Vec<String> = Vec::new();
+    let mut unknown_msg_type_count: usize = 0;
+    let mut unknown_msg_type_samples: Vec<String> = Vec::new();
 
     for ev in &events {
         // Update current context per-turn
@@ -2639,7 +2679,11 @@ fn parse_codex_session_file_with_diagnostics(
                     .to_string(),
                 Some(FrameKind::InternalThought),
             ),
-            "function_call" | "tool_call" | "tool_result" => (
+            "function_call"
+            | "tool_call"
+            | "tool_result"
+            | "mcp_tool_call"
+            | "mcp_tool_call_response" => (
                 "tool",
                 ev.payload
                     .get("message")
@@ -2648,7 +2692,17 @@ fn parse_codex_session_file_with_diagnostics(
                     .unwrap_or_else(|| render_json_inline(&ev.payload)),
                 Some(FrameKind::ToolCall),
             ),
-            _ => continue,
+            other => {
+                if !other.is_empty() {
+                    unknown_msg_type_count += 1;
+                    if unknown_msg_type_samples.len() < 5
+                        && !unknown_msg_type_samples.iter().any(|s| s == other)
+                    {
+                        unknown_msg_type_samples.push(other.to_string());
+                    }
+                }
+                continue;
+            }
         };
 
         if !should_keep_entry(frame_kind, config) {
@@ -2661,7 +2715,15 @@ fn parse_codex_session_file_with_diagnostics(
 
         let timestamp = match DateTime::parse_from_rfc3339(&ev.timestamp) {
             Ok(dt) => dt.with_timezone(&Utc),
-            Err(_) => continue,
+            Err(_) => {
+                unparsable_ts_count += 1;
+                if unparsable_ts_samples.len() < 3
+                    && !unparsable_ts_samples.iter().any(|s| s == &ev.timestamp)
+                {
+                    unparsable_ts_samples.push(ev.timestamp.clone());
+                }
+                continue;
+            }
         };
 
         if timestamp < config.cutoff {
@@ -2683,6 +2745,19 @@ fn parse_codex_session_file_with_diagnostics(
                 frame_kind,
             },
         ));
+    }
+
+    if unparsable_ts_count > 0 {
+        warnings.push(CodexSessionWarning::UnparsableTimestamp {
+            count: unparsable_ts_count,
+            samples: unparsable_ts_samples,
+        });
+    }
+    if unknown_msg_type_count > 0 {
+        warnings.push(CodexSessionWarning::UnknownMsgType {
+            count: unknown_msg_type_count,
+            samples: unknown_msg_type_samples,
+        });
     }
 
     Ok((entries, warnings))
