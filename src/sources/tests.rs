@@ -513,7 +513,7 @@ fn test_parse_codex_session_duplicate_meta_warns_first_wins() {
         warnings,
         vec![CodexSessionWarning::DuplicateSessionMeta {
             first: "session-a".to_string(),
-            also: vec!["session-b".to_string()],
+            ignored: vec!["session-b".to_string()],
         }]
     );
 
@@ -580,6 +580,50 @@ fn test_parse_codex_session_non_rollout_filename_does_not_mismatch_warn() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].session_id, meta_id);
     assert!(warnings.is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_codex_session_duplicate_and_mismatch_warn_together() {
+    let root = unique_test_dir("codex-duplicate-and-mismatch");
+    let filename_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let meta_id = "019e2574-8a7f-7d33-a318-b365aa0ab970";
+    let ignored_id = "119e2574-8a7f-7d33-a318-b365aa0ab970";
+    let stem = format!("rollout-2026-05-14T00-47-35-{filename_id}");
+    let tmp = root.join(format!("{stem}.jsonl"));
+    let _ = fs::remove_dir_all(&root);
+
+    let content = format!(
+        r#"{{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{{"id":"{meta_id}","cwd":"/tmp/a"}}}}
+{{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{{"id":"{ignored_id}","cwd":"/tmp/b"}}}}
+{{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{{"type":"user_message","message":"hello compound"}}}}"#
+    );
+    write_file(&tmp, &content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].session_id, meta_id);
+    assert_eq!(
+        warnings,
+        vec![
+            CodexSessionWarning::DuplicateSessionMeta {
+                first: meta_id.to_string(),
+                ignored: vec![ignored_id.to_string()],
+            },
+            CodexSessionWarning::FilenameMismatch {
+                meta_id: meta_id.to_string(),
+                filename_stem: stem,
+            },
+        ]
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

@@ -2261,7 +2261,7 @@ pub(crate) enum CodexSessionWarning {
     },
     DuplicateSessionMeta {
         first: String,
-        also: Vec<String>,
+        ignored: Vec<String>,
     },
     FilenameMismatch {
         meta_id: String,
@@ -2277,11 +2277,11 @@ impl CodexSessionWarning {
                 path.display(),
                 fallback
             ),
-            CodexSessionWarning::DuplicateSessionMeta { first, also } => format!(
+            CodexSessionWarning::DuplicateSessionMeta { first, ignored } => format!(
                 "Codex session warning: {} has multiple session_meta.payload.id values; using `{}` and ignoring {}",
                 path.display(),
                 first,
-                also.join(", ")
+                ignored.join(", ")
             ),
             CodexSessionWarning::FilenameMismatch {
                 meta_id,
@@ -2299,6 +2299,38 @@ impl CodexSessionWarning {
 fn emit_codex_session_warnings(path: &Path, warnings: &[CodexSessionWarning]) {
     for warning in warnings {
         eprintln!("{}", warning.describe(path));
+    }
+}
+
+#[derive(Default)]
+struct CodexSessionDiagnostics {
+    missing: usize,
+    duplicate: usize,
+    mismatch: usize,
+}
+
+impl CodexSessionDiagnostics {
+    fn observe(&mut self, warnings: &[CodexSessionWarning]) {
+        for warning in warnings {
+            match warning {
+                CodexSessionWarning::MissingSessionMeta { .. } => self.missing += 1,
+                CodexSessionWarning::DuplicateSessionMeta { .. } => self.duplicate += 1,
+                CodexSessionWarning::FilenameMismatch { .. } => self.mismatch += 1,
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.missing == 0 && self.duplicate == 0 && self.mismatch == 0
+    }
+
+    fn emit_summary(&self) {
+        if !self.is_empty() {
+            eprintln!(
+                "Codex sessions diagnostics: missing={} duplicate={} mismatch={}",
+                self.missing, self.duplicate, self.mismatch
+            );
+        }
     }
 }
 
@@ -2321,6 +2353,8 @@ fn is_uuid_like(value: &str) -> bool {
 }
 
 fn uuid_suffix_from_stem(stem: &str) -> Option<&str> {
+    // Codex rollout filenames currently end in strict UUIDv4/v7-style hex IDs.
+    // Non-UUID session ids skip filename-mismatch diagnostics.
     let start = stem.len().checked_sub(36)?;
     let suffix = &stem[start..];
     is_uuid_like(suffix).then_some(suffix)
@@ -2341,22 +2375,21 @@ pub fn extract_codex_sessions(config: &ExtractionConfig) -> Result<Vec<TimelineE
     }
 
     let mut entries = Vec::new();
+    let mut diagnostics = CodexSessionDiagnostics::default();
     let files = walk_jsonl_files(&sessions_dir);
 
     for path in &files {
-        match parse_codex_session_file(path, config) {
-            Ok(se) => entries.extend(se),
+        match parse_codex_session_file_with_diagnostics(path, config) {
+            Ok((se, warnings)) => {
+                diagnostics.observe(&warnings);
+                entries.extend(se);
+            }
             Err(_) => continue,
         }
     }
 
+    diagnostics.emit_summary();
     entries.sort_by_key(|a| a.timestamp);
-    Ok(entries)
-}
-
-/// Parse a single Codex session JSONL file.
-fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let (entries, _warnings) = parse_codex_session_file_with_diagnostics(path, config)?;
     Ok(entries)
 }
 
@@ -2416,7 +2449,7 @@ fn parse_codex_session_file_with_diagnostics(
         if !duplicate_meta_ids.is_empty() {
             warnings.push(CodexSessionWarning::DuplicateSessionMeta {
                 first: first.clone(),
-                also: duplicate_meta_ids,
+                ignored: duplicate_meta_ids,
             });
         }
         if let Some(filename_uuid) = uuid_suffix_from_stem(&filename_stem)
