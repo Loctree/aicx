@@ -66,6 +66,12 @@ pub enum SemanticError {
         reason: String,
         recommendation: String,
     },
+    /// Index exists but is currently locked by an active writer.
+    IndexBusy {
+        path: std::path::PathBuf,
+        reason: String,
+        recommendation: String,
+    },
     /// Index file exists but cannot be read or parsed.
     IndexCorrupt {
         path: std::path::PathBuf,
@@ -107,6 +113,7 @@ impl SemanticError {
             Self::EmbedderFeatureMissing { reason, .. }
             | Self::EmbedderUnavailable { reason, .. }
             | Self::IndexNotBuilt { reason, .. }
+            | Self::IndexBusy { reason, .. }
             | Self::IndexCorrupt { reason, .. }
             | Self::DimensionMismatch { reason, .. }
             | Self::EmptyIndex { reason, .. }
@@ -120,6 +127,7 @@ impl SemanticError {
             Self::EmbedderFeatureMissing { recommendation, .. }
             | Self::EmbedderUnavailable { recommendation, .. }
             | Self::IndexNotBuilt { recommendation, .. }
+            | Self::IndexBusy { recommendation, .. }
             | Self::IndexCorrupt { recommendation, .. }
             | Self::DimensionMismatch { recommendation, .. }
             | Self::EmptyIndex { recommendation, .. }
@@ -133,6 +141,7 @@ impl SemanticError {
             Self::EmbedderFeatureMissing { .. } => "embedder_feature_missing",
             Self::EmbedderUnavailable { .. } => "embedder_unavailable",
             Self::IndexNotBuilt { .. } => "index_not_built",
+            Self::IndexBusy { .. } => "index_busy",
             Self::IndexCorrupt { .. } => "index_corrupt",
             Self::DimensionMismatch { .. } => "dimension_mismatch",
             Self::EmptyIndex { .. } => "empty_index",
@@ -153,6 +162,32 @@ impl std::fmt::Display for SemanticError {
 }
 
 impl std::error::Error for SemanticError {}
+
+fn index_query_error(path: &std::path::Path, err: anyhow::Error) -> SemanticError {
+    let reason = format!("index query failed: {err}");
+    if reason.contains("timed out acquiring shared lock") {
+        return SemanticError::IndexBusy {
+            path: path.to_path_buf(),
+            reason,
+            recommendation: format!(
+                "index is being written; wait for the active `aicx index` process to finish, \
+                 then retry. Check the writer with `ps -p $(awk -F= '/^pid=/ {{print $2}}' {}) -o pid,etime,command`",
+                crate::locks::lance_lock_path()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("~/.aicx/locks/lance.lock"))
+                    .display()
+            ),
+        };
+    }
+
+    SemanticError::IndexCorrupt {
+        path: path.to_path_buf(),
+        reason,
+        recommendation: format!(
+            "delete and rebuild: `rm -f {} && aicx index`",
+            path.display()
+        ),
+    }
+}
 
 /// Run a semantic search against the persistent vector index. Fails fast
 /// with a typed [`SemanticError`] when any precondition is missing — no
@@ -351,16 +386,7 @@ fn try_semantic_search_native(
         frame_kind_filter.map(FrameKind::as_str),
     ) {
         Ok(hits) => hits,
-        Err(err) => {
-            return Err(SemanticError::IndexCorrupt {
-                path: path.clone(),
-                reason: format!("index query failed: {err}"),
-                recommendation: format!(
-                    "delete and rebuild: `rm -f {} && aicx index`",
-                    path.display()
-                ),
-            });
-        }
+        Err(err) => return Err(index_query_error(&path, err)),
     };
 
     if hits.is_empty() {
@@ -520,6 +546,19 @@ mod tests {
                 // the success branch is also a valid contract.
             }
         }
+    }
+
+    #[test]
+    fn lock_timeout_is_index_busy_not_corrupt() {
+        let err = index_query_error(
+            Path::new("/tmp/aicx/indexed/_all/embeddings.ndjson"),
+            anyhow::anyhow!("timed out acquiring shared lock: /tmp/aicx/locks/lance.lock"),
+        );
+
+        assert_eq!(err.kind(), "index_busy");
+        assert!(err.reason().contains("timed out acquiring shared lock"));
+        assert!(!err.recommendation().contains("rm -f"));
+        assert!(err.recommendation().contains("aicx index"));
     }
 
     #[test]
