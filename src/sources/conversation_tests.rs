@@ -164,6 +164,30 @@ fn test_conversation_exact_short_duplicate_user_within_2s_is_dropped() {
 }
 
 #[test]
+fn test_conversation_extract_stats_counts_exact_short_duplicate_drop() {
+    let entries = vec![
+        conversation_entry("sess1", "user", "Hello agent", 0),
+        conversation_entry("sess1", "user", "Hello agent", 1),
+    ];
+
+    let projection = to_conversation_with_stats(&entries, &[]);
+    assert_eq!(projection.messages.len(), 1);
+    assert_eq!(projection.exact_short_duplicates_dropped, 1);
+}
+
+#[test]
+fn test_conversation_extract_stats_zero_without_duplicate() {
+    let entries = vec![
+        conversation_entry("sess1", "user", "Hello agent", 0),
+        conversation_entry("sess1", "assistant", "Hello user", 1),
+    ];
+
+    let projection = to_conversation_with_stats(&entries, &[]);
+    assert_eq!(projection.messages.len(), 2);
+    assert_eq!(projection.exact_short_duplicates_dropped, 0);
+}
+
+#[test]
 fn test_conversation_exact_short_duplicate_user_after_2s_is_kept() {
     let entries = vec![
         conversation_entry("sess1", "user", "Hello agent", 0),

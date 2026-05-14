@@ -2487,16 +2487,29 @@ fn run_extract_session(
     };
 
     if conversation {
-        let conv_msgs = sources::to_conversation(&entries, &[project_identity]);
+        let projection = sources::to_conversation_with_stats(&entries, &[project_identity]);
+        let extract_stats = output::ConversationExtractStats {
+            aicx_version: env!("CARGO_PKG_VERSION"),
+            redaction_enabled: redact_secrets,
+            raw_entries: entries.len(),
+            conversation_messages: projection.messages.len(),
+            conversation_projection: "user_assistant_only",
+            exact_short_duplicates_dropped: projection.exact_short_duplicates_dropped,
+        };
         let ext = output_path
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("md")
             .to_lowercase();
         if ext == "json" {
-            output::write_conversation_json(&output_path, &conv_msgs, &metadata)?;
+            output::write_conversation_json(
+                &output_path,
+                &projection.messages,
+                &metadata,
+                &extract_stats,
+            )?;
         } else {
-            output::write_conversation_markdown(&output_path, &conv_msgs, &metadata)?;
+            output::write_conversation_markdown(&output_path, &projection.messages, &metadata)?;
         }
     } else {
         let ext = output_path
@@ -2623,7 +2636,15 @@ fn run_extract_file(
             .as_ref()
             .map(|p| vec![p.clone()])
             .unwrap_or_default();
-        let conv_msgs = sources::to_conversation(&output_entries, &project_filter);
+        let projection = sources::to_conversation_with_stats(&output_entries, &project_filter);
+        let extract_stats = output::ConversationExtractStats {
+            aicx_version: env!("CARGO_PKG_VERSION"),
+            redaction_enabled: redact_secrets,
+            raw_entries: output_entries.len(),
+            conversation_messages: projection.messages.len(),
+            conversation_projection: "user_assistant_only",
+            exact_short_duplicates_dropped: projection.exact_short_duplicates_dropped,
+        };
 
         let ext = output_path
             .extension()
@@ -2632,9 +2653,14 @@ fn run_extract_file(
             .to_lowercase();
 
         if ext == "json" {
-            output::write_conversation_json(&output_path, &conv_msgs, &metadata)?;
+            output::write_conversation_json(
+                &output_path,
+                &projection.messages,
+                &metadata,
+                &extract_stats,
+            )?;
         } else {
-            output::write_conversation_markdown(&output_path, &conv_msgs, &metadata)?;
+            output::write_conversation_markdown(&output_path, &projection.messages, &metadata)?;
         }
     } else {
         let ext = output_path
@@ -3167,7 +3193,15 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     if let Some(local_dir) = output_dir {
         if conversation {
             // Conversation-first mode: denoised transcript output
-            let conv_msgs = sources::to_conversation(&output_entries, &project);
+            let projection = sources::to_conversation_with_stats(&output_entries, &project);
+            let extract_stats = output::ConversationExtractStats {
+                aicx_version: env!("CARGO_PKG_VERSION"),
+                redaction_enabled: redact_secrets,
+                raw_entries: output_entries.len(),
+                conversation_messages: projection.messages.len(),
+                conversation_projection: "user_assistant_only",
+                exact_short_duplicates_dropped: projection.exact_short_duplicates_dropped,
+            };
             let date_str = metadata.generated_at.format("%Y%m%d_%H%M%S");
             let prefix = metadata.project_filter.as_deref().unwrap_or("all");
 
@@ -3181,12 +3215,17 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
 
             if out_format == OutputFormat::Markdown || out_format == OutputFormat::Both {
                 let md_path = local_dir.join(format!("{}_conversation_{}.md", prefix, date_str));
-                output::write_conversation_markdown(&md_path, &conv_msgs, &metadata)?;
+                output::write_conversation_markdown(&md_path, &projection.messages, &metadata)?;
             }
             if out_format == OutputFormat::Json || out_format == OutputFormat::Both {
                 let json_path =
                     local_dir.join(format!("{}_conversation_{}.json", prefix, date_str));
-                output::write_conversation_json(&json_path, &conv_msgs, &metadata)?;
+                output::write_conversation_json(
+                    &json_path,
+                    &projection.messages,
+                    &metadata,
+                    &extract_stats,
+                )?;
             }
         } else {
             let out_format = match format {

@@ -41,6 +41,12 @@ const UNPROTECTED_SOURCE_WARNING: &str = "unprotected source material; run `aicx
 const EXACT_SHORT_DUP_MAX_CHARS: usize = 1000;
 const EXACT_SHORT_DUP_WINDOW_MS: i64 = 2_000;
 
+#[derive(Debug, Clone)]
+pub struct ConversationProjection {
+    pub messages: Vec<ConversationMessage>,
+    pub exact_short_duplicates_dropped: usize,
+}
+
 /// Project timeline entries into a denoised conversation stream.
 ///
 /// Filters to only `user` and `assistant` roles, resolves repo/project identity
@@ -49,6 +55,13 @@ pub fn to_conversation(
     entries: &[TimelineEntry],
     project_filter: &[String],
 ) -> Vec<ConversationMessage> {
+    to_conversation_with_stats(entries, project_filter).messages
+}
+
+pub fn to_conversation_with_stats(
+    entries: &[TimelineEntry],
+    project_filter: &[String],
+) -> ConversationProjection {
     let messages: Vec<ConversationMessage> = entries
         .iter()
         .filter(|entry| {
@@ -78,11 +91,10 @@ pub fn to_conversation(
     drop_exact_short_user_duplicates(messages)
 }
 
-fn drop_exact_short_user_duplicates(
-    messages: Vec<ConversationMessage>,
-) -> Vec<ConversationMessage> {
+fn drop_exact_short_user_duplicates(messages: Vec<ConversationMessage>) -> ConversationProjection {
     let mut deduped: Vec<ConversationMessage> = Vec::with_capacity(messages.len());
     let mut last_seen_user: HashMap<(String, String), DateTime<Utc>> = HashMap::new();
+    let mut exact_short_duplicates_dropped = 0;
 
     for msg in messages {
         let trimmed = msg.message.trim();
@@ -105,10 +117,15 @@ fn drop_exact_short_user_duplicates(
 
         if !is_exact_short_duplicate {
             deduped.push(msg);
+        } else {
+            exact_short_duplicates_dropped += 1;
         }
     }
 
-    deduped
+    ConversationProjection {
+        messages: deduped,
+        exact_short_duplicates_dropped,
+    }
 }
 
 fn classify_conversation_message(message: &str) -> (MessageKind, Option<CollapseStubKind>) {
