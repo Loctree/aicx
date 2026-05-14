@@ -26,7 +26,7 @@ use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
@@ -42,6 +42,12 @@ use aicx::sources::{self, ExtractionConfig};
 use aicx::state::StateManager;
 use aicx::store;
 use aicx::timeline;
+
+#[derive(Debug, Clone)]
+struct SessionResolution {
+    canonical_id: String,
+    note: Option<String>,
+}
 
 fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
     eprintln!("=== Intent Schema Migration (dry run) ===");
@@ -2222,6 +2228,163 @@ fn default_session_extract_path(agent_label: &str, session_id: &str) -> Result<P
         .join(format!("{safe_session}.md")))
 }
 
+fn uuid_suffix_from_stem(stem: &str) -> Option<&str> {
+    let start = stem.len().checked_sub(36)?;
+    let suffix = &stem[start..];
+    let bytes = suffix.as_bytes();
+    let is_uuid_like = bytes.iter().enumerate().all(|(idx, byte)| {
+        if matches!(idx, 8 | 13 | 18 | 23) {
+            *byte == b'-'
+        } else {
+            byte.is_ascii_hexdigit()
+        }
+    });
+    is_uuid_like.then_some(suffix)
+}
+
+fn read_codex_session_meta_id(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().map_while(std::result::Result::ok) {
+        if !line.contains("\"session_meta\"") {
+            continue;
+        }
+        let data: serde_json::Value = serde_json::from_str(&line).ok()?;
+        if data.get("type").and_then(|value| value.as_str()) != Some("session_meta") {
+            continue;
+        }
+        return data
+            .get("payload")
+            .and_then(|payload| payload.get("id"))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_string());
+    }
+    None
+}
+
+fn collect_codex_session_alias_matches(requested: &str) -> Result<BTreeSet<String>> {
+    let mut matches = BTreeSet::new();
+    let sessions_dir = dirs::home_dir()
+        .context("No home dir")?
+        .join(".codex")
+        .join("sessions");
+    if !sessions_dir.is_dir() {
+        return Ok(matches);
+    }
+
+    let mut stack = vec![sessions_dir];
+    while let Some(dir) = stack.pop() {
+        let Ok(read_dir) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+
+            let stem = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            let file_name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            let suffix = uuid_suffix_from_stem(stem);
+            let canonical = read_codex_session_meta_id(&path)
+                .or_else(|| suffix.map(str::to_string))
+                .unwrap_or_else(|| stem.to_string());
+
+            let alias_matches = requested == stem
+                || requested == file_name
+                || canonical.starts_with(requested)
+                || canonical.ends_with(requested)
+                || suffix.is_some_and(|value| {
+                    value.starts_with(requested) || value.ends_with(requested)
+                });
+            if alias_matches {
+                matches.insert(canonical);
+            }
+        }
+    }
+
+    Ok(matches)
+}
+
+fn resolve_session_reference_from_candidates(
+    requested: &str,
+    session_ids: &BTreeSet<String>,
+    alias_matches: BTreeSet<String>,
+    agent_label: &str,
+) -> Result<SessionResolution> {
+    if session_ids.contains(requested) {
+        return Ok(SessionResolution {
+            canonical_id: requested.to_string(),
+            note: None,
+        });
+    }
+
+    let mut candidates: BTreeSet<String> = session_ids
+        .iter()
+        .filter(|session_id| session_id.starts_with(requested) || session_id.ends_with(requested))
+        .cloned()
+        .collect();
+    candidates.extend(alias_matches);
+
+    match candidates.len() {
+        0 => anyhow::bail!(
+            "No session matched `{}` in agent `{}`. Scanned {} extracted session id(s).\n\
+             Try: use the full session id, increase --hours, or run `aicx extract --agent {} --help`.",
+            requested,
+            agent_label,
+            session_ids.len(),
+            agent_label,
+        ),
+        1 => {
+            let canonical_id = candidates.into_iter().next().unwrap_or_default();
+            Ok(SessionResolution {
+                note: Some(format!("resolved `{requested}` to `{canonical_id}`")),
+                canonical_id,
+            })
+        }
+        _ => {
+            let shown = candidates.iter().take(8).cloned().collect::<Vec<_>>();
+            anyhow::bail!(
+                "Ambiguous session reference `{}` in agent `{}`; matched {} sessions:\n  {}\n\
+                 Use the full session id.",
+                requested,
+                agent_label,
+                candidates.len(),
+                shown.join("\n  "),
+            )
+        }
+    }
+}
+
+fn resolve_session_reference(
+    requested: &str,
+    agent: ExtractInputFormat,
+    agent_label: &str,
+    entries: &[timeline::TimelineEntry],
+) -> Result<SessionResolution> {
+    let session_ids = entries
+        .iter()
+        .map(|entry| entry.session_id.clone())
+        .collect::<BTreeSet<_>>();
+    let alias_matches = if matches!(agent, ExtractInputFormat::Codex) {
+        collect_codex_session_alias_matches(requested)?
+    } else {
+        BTreeSet::new()
+    };
+    resolve_session_reference_from_candidates(requested, &session_ids, alias_matches, agent_label)
+}
+
 /// Run extraction filtered by `session_id` for a single agent and write a
 /// denoised conversation Markdown transcript. Default output path is
 /// `~/.aicx/extracts/<agent>/<session_id>.md`; override via `output`.
@@ -2261,14 +2424,19 @@ fn run_extract_session(
         ExtractInputFormat::Junie => sources::extract_junie(&config)?,
     };
 
-    // Filter by session_id (exact match).
-    entries.retain(|e| e.session_id == session_id);
+    let resolution = resolve_session_reference(session_id, agent, agent_label, &entries)?;
+    if let Some(note) = &resolution.note {
+        eprintln!("{note}");
+    }
+
+    entries.retain(|e| e.session_id == resolution.canonical_id);
 
     if entries.is_empty() {
         anyhow::bail!(
-            "No entries found for session `{}` in agent `{}` within last {} hours.\n\
-             Try: increase --hours, verify the session id, or check that the source store is populated.",
+            "Resolved session `{}` to `{}`, but no entries were extractable for agent `{}` within last {} hours.\n\
+             Try: increase --hours or check the project filter.",
             session_id,
+            resolution.canonical_id,
             agent_label,
             hours,
         );
@@ -2293,13 +2461,13 @@ fn run_extract_session(
 
     let output_path = match output {
         Some(p) => p,
-        None => default_session_extract_path(agent_label, session_id)?,
+        None => default_session_extract_path(agent_label, &resolution.canonical_id)?,
     };
 
     let inferred_repos = sources::repo_labels_from_entries(&entries, &[]);
     let project_identity = explicit_project.unwrap_or_else(|| {
         if inferred_repos.is_empty() {
-            format!("{agent_label}/{session_id}")
+            format!("{agent_label}/{}", resolution.canonical_id)
         } else {
             inferred_repos.join("+")
         }
@@ -2315,7 +2483,7 @@ fn run_extract_session(
         project_filter: Some(project_identity.clone()),
         hours_back,
         total_entries: entries.len(),
-        sessions: vec![session_id.to_string()],
+        sessions: vec![resolution.canonical_id.clone()],
     };
 
     if conversation {
@@ -2352,7 +2520,7 @@ fn run_extract_session(
     eprintln!(
         "Extracted {} entries from session `{}` ({}) -> {}",
         entries.len(),
-        session_id,
+        resolution.canonical_id,
         agent_label,
         output_path.display()
     );
@@ -4926,6 +5094,98 @@ mod tests {
 
     fn set_mtime(path: &Path, unix_seconds: i64) {
         set_file_mtime(path, FileTime::from_unix_time(unix_seconds, 0)).unwrap();
+    }
+
+    #[test]
+    fn uuid_suffix_from_stem_extracts_rollout_uuid() {
+        assert_eq!(
+            uuid_suffix_from_stem(
+                "rollout-2026-05-14T00-47-35-019e2574-8a7f-7d33-a318-b365aa0ab970"
+            ),
+            Some("019e2574-8a7f-7d33-a318-b365aa0ab970")
+        );
+        assert_eq!(uuid_suffix_from_stem("rollout-2026-05-14"), None);
+    }
+
+    #[test]
+    fn session_reference_resolver_accepts_unique_prefix() {
+        let session_ids = BTreeSet::from([
+            "019e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
+            "119e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
+        ]);
+
+        let resolved = resolve_session_reference_from_candidates(
+            "019e2574",
+            &session_ids,
+            BTreeSet::new(),
+            "codex",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.canonical_id,
+            "019e2574-8a7f-7d33-a318-b365aa0ab970"
+        );
+        assert!(resolved.note.is_some());
+    }
+
+    #[test]
+    fn session_reference_resolver_rejects_ambiguous_prefix() {
+        let session_ids = BTreeSet::from([
+            "019e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
+            "019e2574-9999-7d33-a318-b365aa0ab970".to_string(),
+        ]);
+
+        let err = resolve_session_reference_from_candidates(
+            "019e2574",
+            &session_ids,
+            BTreeSet::new(),
+            "codex",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("Ambiguous session reference"));
+    }
+
+    #[test]
+    fn session_reference_resolver_accepts_unique_suffix() {
+        let session_ids = BTreeSet::from([
+            "019e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
+            "119e2574-8a7f-7d33-a318-000000000000".to_string(),
+        ]);
+
+        let resolved = resolve_session_reference_from_candidates(
+            "b365aa0ab970",
+            &session_ids,
+            BTreeSet::new(),
+            "codex",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.canonical_id,
+            "019e2574-8a7f-7d33-a318-b365aa0ab970"
+        );
+    }
+
+    #[test]
+    fn session_reference_resolver_accepts_codex_alias_match() {
+        let session_ids = BTreeSet::from(["019e2574-8a7f-7d33-a318-b365aa0ab970".to_string()]);
+        let aliases = BTreeSet::from(["019e2574-8a7f-7d33-a318-b365aa0ab970".to_string()]);
+
+        let resolved = resolve_session_reference_from_candidates(
+            "rollout-2026-05-14T00-47-35-019e2574-8a7f-7d33-a318-b365aa0ab970",
+            &session_ids,
+            aliases,
+            "codex",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.canonical_id,
+            "019e2574-8a7f-7d33-a318-b365aa0ab970"
+        );
     }
 
     #[test]
