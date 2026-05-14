@@ -585,6 +585,32 @@ fn test_parse_codex_session_non_rollout_filename_does_not_mismatch_warn() {
 }
 
 #[test]
+fn test_codex_session_diagnostics_aggregates_counts() {
+    let mut diagnostics = CodexSessionDiagnostics::default();
+    assert!(diagnostics.is_empty());
+
+    diagnostics.observe(&[CodexSessionWarning::MissingSessionMeta {
+        fallback: "rollout-without-meta".to_string(),
+    }]);
+    diagnostics.observe(&[
+        CodexSessionWarning::DuplicateSessionMeta {
+            first: "session-a".to_string(),
+            ignored: vec!["session-b".to_string()],
+        },
+        CodexSessionWarning::FilenameMismatch {
+            meta_id: "019e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
+            filename_stem: "rollout-2026-05-14T00-47-35-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                .to_string(),
+        },
+    ]);
+
+    assert!(!diagnostics.is_empty());
+    assert_eq!(diagnostics.missing, 1);
+    assert_eq!(diagnostics.duplicate, 1);
+    assert_eq!(diagnostics.mismatch, 1);
+}
+
+#[test]
 fn test_parse_codex_session_duplicate_and_mismatch_warn_together() {
     let root = unique_test_dir("codex-duplicate-and-mismatch");
     let filename_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
