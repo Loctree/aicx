@@ -460,6 +460,131 @@ fn test_extract_codex_file_classifies_frame_kinds_from_fixture() {
 }
 
 #[test]
+fn test_parse_codex_session_missing_meta_warns_and_falls_back_to_stem() {
+    let root = unique_test_dir("codex-missing-session-meta");
+    let tmp = root.join("rollout-without-meta.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello without meta"}}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].session_id, "rollout-without-meta");
+    assert_eq!(
+        warnings,
+        vec![CodexSessionWarning::MissingSessionMeta {
+            fallback: "rollout-without-meta".to_string()
+        }]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_codex_session_duplicate_meta_warns_first_wins() {
+    let root = unique_test_dir("codex-duplicate-session-meta");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"session-a","cwd":"/tmp/a"}}
+{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"session-b","cwd":"/tmp/b"}}
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello duplicate meta"}}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].session_id, "session-a");
+    assert_eq!(
+        warnings,
+        vec![CodexSessionWarning::DuplicateSessionMeta {
+            first: "session-a".to_string(),
+            also: vec!["session-b".to_string()],
+        }]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_codex_session_filename_mismatch_warns() {
+    let root = unique_test_dir("codex-filename-mismatch");
+    let filename_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let meta_id = "019e2574-8a7f-7d33-a318-b365aa0ab970";
+    let stem = format!("rollout-2026-05-14T00-47-35-{filename_id}");
+    let tmp = root.join(format!("{stem}.jsonl"));
+    let _ = fs::remove_dir_all(&root);
+
+    let content = format!(
+        r#"{{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{{"id":"{meta_id}","cwd":"/tmp/a"}}}}
+{{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{{"type":"user_message","message":"hello mismatch"}}}}"#
+    );
+    write_file(&tmp, &content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].session_id, meta_id);
+    assert_eq!(
+        warnings,
+        vec![CodexSessionWarning::FilenameMismatch {
+            meta_id: meta_id.to_string(),
+            filename_stem: stem,
+        }]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_codex_session_non_rollout_filename_does_not_mismatch_warn() {
+    let root = unique_test_dir("codex-non-rollout-no-mismatch");
+    let meta_id = "019e2574-8a7f-7d33-a318-b365aa0ab970";
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = format!(
+        r#"{{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{{"id":"{meta_id}","cwd":"/tmp/a"}}}}
+{{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{{"type":"user_message","message":"hello direct file"}}}}"#
+    );
+    write_file(&tmp, &content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].session_id, meta_id);
+    assert!(warnings.is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn test_extract_gemini_file_session_json() {
     let root = unique_test_dir("gemini-direct");
     let tmp = root.join("session.json");

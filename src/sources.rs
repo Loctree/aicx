@@ -1163,7 +1163,8 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
 
     // Session file: parse as CodexSessionEvent (delegate to existing parser).
     if serde_json::from_str::<CodexSessionEvent>(&first_line).is_ok() {
-        let mut entries = parse_codex_session_file(path, config)?;
+        let (mut entries, warnings) = parse_codex_session_file_with_diagnostics(path, config)?;
+        emit_codex_session_warnings(path, &warnings);
         entries.sort_by_key(|a| a.timestamp);
         return Ok(entries);
     }
@@ -2253,6 +2254,78 @@ struct CodexSessionEvent {
     payload: serde_json::Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CodexSessionWarning {
+    MissingSessionMeta {
+        fallback: String,
+    },
+    DuplicateSessionMeta {
+        first: String,
+        also: Vec<String>,
+    },
+    FilenameMismatch {
+        meta_id: String,
+        filename_stem: String,
+    },
+}
+
+impl CodexSessionWarning {
+    fn describe(&self, path: &Path) -> String {
+        match self {
+            CodexSessionWarning::MissingSessionMeta { fallback } => format!(
+                "Codex session warning: {} has no session_meta.payload.id; using `{}` from filename",
+                path.display(),
+                fallback
+            ),
+            CodexSessionWarning::DuplicateSessionMeta { first, also } => format!(
+                "Codex session warning: {} has multiple session_meta.payload.id values; using `{}` and ignoring {}",
+                path.display(),
+                first,
+                also.join(", ")
+            ),
+            CodexSessionWarning::FilenameMismatch {
+                meta_id,
+                filename_stem,
+            } => format!(
+                "Codex session warning: {} session_meta.payload.id `{}` does not match filename UUID suffix in `{}`",
+                path.display(),
+                meta_id,
+                filename_stem
+            ),
+        }
+    }
+}
+
+fn emit_codex_session_warnings(path: &Path, warnings: &[CodexSessionWarning]) {
+    for warning in warnings {
+        eprintln!("{}", warning.describe(path));
+    }
+}
+
+fn file_stem_string(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+fn is_uuid_like(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(idx, byte)| {
+            if matches!(idx, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn uuid_suffix_from_stem(stem: &str) -> Option<&str> {
+    let start = stem.len().checked_sub(36)?;
+    let suffix = &stem[start..];
+    is_uuid_like(suffix).then_some(suffix)
+}
+
 /// Extract timeline entries from Codex session files (`~/.codex/sessions/`).
 ///
 /// Walks `~/.codex/sessions/` recursively for `*.jsonl` files.
@@ -2283,6 +2356,14 @@ pub fn extract_codex_sessions(config: &ExtractionConfig) -> Result<Vec<TimelineE
 
 /// Parse a single Codex session JSONL file.
 fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
+    let (entries, _warnings) = parse_codex_session_file_with_diagnostics(path, config)?;
+    Ok(entries)
+}
+
+fn parse_codex_session_file_with_diagnostics(
+    path: &Path,
+    config: &ExtractionConfig,
+) -> Result<(Vec<TimelineEntry>, Vec<CodexSessionWarning>)> {
     let file = sanitize::open_file_validated(path)?;
     let reader = BufReader::new(file);
 
@@ -2300,15 +2381,24 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
     // Extract global session metadata (like session_id) and the initial cwd
     let mut session_id: Option<String> = None;
     let mut initial_cwd: Option<String> = None;
+    let mut duplicate_meta_ids: Vec<String> = Vec::new();
 
     for ev in &events {
         if ev.event_type == "session_meta" {
-            if session_id.is_none() {
-                session_id = ev
-                    .payload
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
+            if let Some(meta_id) = ev
+                .payload
+                .get("id")
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.trim().is_empty())
+                .map(|id| id.trim().to_string())
+            {
+                if let Some(first) = &session_id {
+                    if first != &meta_id && !duplicate_meta_ids.contains(&meta_id) {
+                        duplicate_meta_ids.push(meta_id);
+                    }
+                } else {
+                    session_id = Some(meta_id);
+                }
             }
             if initial_cwd.is_none() {
                 initial_cwd = ev
@@ -2320,11 +2410,31 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
         }
     }
 
+    let filename_stem = file_stem_string(path);
+    let mut warnings: Vec<CodexSessionWarning> = Vec::new();
+    if let Some(first) = &session_id {
+        if !duplicate_meta_ids.is_empty() {
+            warnings.push(CodexSessionWarning::DuplicateSessionMeta {
+                first: first.clone(),
+                also: duplicate_meta_ids,
+            });
+        }
+        if let Some(filename_uuid) = uuid_suffix_from_stem(&filename_stem)
+            && first != filename_uuid
+        {
+            warnings.push(CodexSessionWarning::FilenameMismatch {
+                meta_id: first.clone(),
+                filename_stem: filename_stem.clone(),
+            });
+        }
+    }
+
     // Fallback session_id from filename stem
     let session_id = session_id.unwrap_or_else(|| {
-        path.file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default()
+        warnings.push(CodexSessionWarning::MissingSessionMeta {
+            fallback: filename_stem.clone(),
+        });
+        filename_stem
     });
 
     // Collect event_msg entries (user_message + agent_message)
@@ -2444,7 +2554,7 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
         ));
     }
 
-    Ok(entries)
+    Ok((entries, warnings))
 }
 
 /// Recursively walk a directory for `*.jsonl` files.
