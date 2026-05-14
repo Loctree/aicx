@@ -138,6 +138,76 @@ fn test_conversation_first_preserves_provenance() {
     );
 }
 
+fn conversation_entry(session_id: &str, role: &str, message: &str, second: u32) -> TimelineEntry {
+    TimelineEntry {
+        timestamp: Utc.with_ymd_and_hms(2026, 3, 21, 10, 0, second).unwrap(),
+        agent: "claude".to_string(),
+        session_id: session_id.to_string(),
+        role: role.to_string(),
+        message: message.to_string(),
+        branch: None,
+        cwd: None,
+        frame_kind: None,
+    }
+}
+
+#[test]
+fn test_conversation_exact_short_duplicate_user_within_2s_is_dropped() {
+    let entries = vec![
+        conversation_entry("sess1", "user", "Hello agent", 0),
+        conversation_entry("sess1", "user", "  Hello agent  ", 1),
+    ];
+
+    let conv = to_conversation(&entries, &[]);
+    assert_eq!(conv.len(), 1);
+    assert_eq!(conv[0].message, "Hello agent");
+}
+
+#[test]
+fn test_conversation_exact_short_duplicate_user_after_2s_is_kept() {
+    let entries = vec![
+        conversation_entry("sess1", "user", "Hello agent", 0),
+        conversation_entry("sess1", "user", "Hello agent", 3),
+    ];
+
+    let conv = to_conversation(&entries, &[]);
+    assert_eq!(conv.len(), 2);
+}
+
+#[test]
+fn test_conversation_different_short_user_within_2s_is_kept() {
+    let entries = vec![
+        conversation_entry("sess1", "user", "Hello agent", 0),
+        conversation_entry("sess1", "user", "Hello other agent", 1),
+    ];
+
+    let conv = to_conversation(&entries, &[]);
+    assert_eq!(conv.len(), 2);
+}
+
+#[test]
+fn test_conversation_long_exact_duplicate_user_within_2s_is_kept() {
+    let long = "A".repeat(1001);
+    let entries = vec![
+        conversation_entry("sess1", "user", &long, 0),
+        conversation_entry("sess1", "user", &long, 1),
+    ];
+
+    let conv = to_conversation(&entries, &[]);
+    assert_eq!(conv.len(), 2);
+}
+
+#[test]
+fn test_conversation_exact_short_duplicate_assistant_within_2s_is_kept() {
+    let entries = vec![
+        conversation_entry("sess1", "assistant", "Sure.", 0),
+        conversation_entry("sess1", "assistant", "Sure.", 1),
+    ];
+
+    let conv = to_conversation(&entries, &[]);
+    assert_eq!(conv.len(), 2);
+}
+
 #[test]
 fn test_extract_claude_excludes_tool_blocks_then_conversation_clean() {
     use std::fs;

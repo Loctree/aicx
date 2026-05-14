@@ -36,6 +36,8 @@ const OPERATOR_MD_AGENT: &str = "operator";
 const OPERATOR_MD_KIND: &str = "operator-md";
 const OPERATOR_MD_RECENT_DAYS: i64 = 30;
 const UNPROTECTED_SOURCE_WARNING: &str = "unprotected source material; run `aicx sources protect --root <path> --backend git-local --apply` to opt in";
+const EXACT_SHORT_DUP_MAX_CHARS: usize = 1000;
+const EXACT_SHORT_DUP_WINDOW_MS: i64 = 2_000;
 
 /// Project timeline entries into a denoised conversation stream.
 ///
@@ -45,7 +47,7 @@ pub fn to_conversation(
     entries: &[TimelineEntry],
     project_filter: &[String],
 ) -> Vec<ConversationMessage> {
-    entries
+    let messages: Vec<ConversationMessage> = entries
         .iter()
         .filter(|entry| {
             matches!(
@@ -63,7 +65,42 @@ pub fn to_conversation(
             source_path: e.cwd.clone(),
             branch: e.branch.clone(),
         })
-        .collect()
+        .collect();
+
+    drop_exact_short_user_duplicates(messages)
+}
+
+fn drop_exact_short_user_duplicates(
+    messages: Vec<ConversationMessage>,
+) -> Vec<ConversationMessage> {
+    let mut deduped: Vec<ConversationMessage> = Vec::with_capacity(messages.len());
+    let mut last_seen_user: HashMap<(String, String), DateTime<Utc>> = HashMap::new();
+
+    for msg in messages {
+        let trimmed = msg.message.trim();
+        let is_short_user = msg.role == "user" && trimmed.len() <= EXACT_SHORT_DUP_MAX_CHARS;
+        let is_exact_short_duplicate = if is_short_user {
+            let key = (msg.session_id.clone(), trimmed.to_string());
+            let is_duplicate = last_seen_user.get(&key).is_some_and(|previous_timestamp| {
+                msg.timestamp
+                    .signed_duration_since(*previous_timestamp)
+                    .num_milliseconds()
+                    .abs()
+                    <= EXACT_SHORT_DUP_WINDOW_MS
+            });
+
+            last_seen_user.insert(key, msg.timestamp);
+            is_duplicate
+        } else {
+            false
+        };
+
+        if !is_exact_short_duplicate {
+            deduped.push(msg);
+        }
+    }
+
+    deduped
 }
 
 // ============================================================================
