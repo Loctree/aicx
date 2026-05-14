@@ -113,7 +113,7 @@ const MAX_SCORE_FILTER: u8 = 100;
 pub struct RankParams {
     /// Project name (required)
     pub project: String,
-    /// Hours to look back (default: 72)
+    /// Hours to look back (default: 72, 0 = all time)
     #[serde(default = "default_rank_hours")]
     pub hours: u64,
     /// Only show chunks scoring >= 5
@@ -505,8 +505,12 @@ impl AicxMcpServer {
         let strict = params.strict;
         let top = params.top;
 
-        let cutoff = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(hours.saturating_mul(3600).min(365 * 24 * 3600));
+        let cutoff = if hours == 0 {
+            std::time::UNIX_EPOCH
+        } else {
+            std::time::SystemTime::now()
+                - std::time::Duration::from_secs(hours.saturating_mul(3600).min(365 * 24 * 3600))
+        };
         let mut scored = Vec::new();
 
         let (lo, hi) = if let Some(ref d) = params.since {

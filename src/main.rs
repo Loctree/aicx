@@ -475,7 +475,7 @@ enum Commands {
         #[arg(short, long, num_args = 1..)]
         project: Vec<String>,
 
-        /// Hours to look back (default: 48)
+        /// Hours to look back (default: 48, 0 = all time)
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
@@ -545,7 +545,7 @@ enum Commands {
         #[arg(short, long, num_args = 1..)]
         project: Vec<String>,
 
-        /// Hours to look back (default: 48)
+        /// Hours to look back (default: 48, 0 = all time)
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
@@ -617,7 +617,7 @@ enum Commands {
         #[arg(short, long, num_args = 1..)]
         project: Vec<String>,
 
-        /// Hours to look back
+        /// Hours to look back (default: 48, 0 = all time)
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
@@ -702,7 +702,7 @@ enum Commands {
         #[arg(long, value_enum, conflicts_with = "input")]
         agent: Option<ExtractInputFormat>,
 
-        /// Hours to look back when scanning sources in session mode (default: 1 year).
+        /// Hours to look back when scanning sources in session mode (default: 1 year, 0 = all time).
         #[arg(short = 'H', long, default_value = "8760")]
         hours: u64,
 
@@ -752,7 +752,7 @@ enum Commands {
         #[arg(short, long, value_parser = ["claude", "codex", "gemini", "junie", "codescribe", "operator-md"])]
         agent: Option<String>,
 
-        /// Hours to look back (default: 48)
+        /// Hours to look back (default: 48, 0 = all time)
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
@@ -802,7 +802,7 @@ enum Commands {
         #[arg(short, long, num_args = 1..)]
         project: Vec<String>,
 
-        /// Hours to look back when --since is omitted (default: 720 = 30 days)
+        /// Hours to look back when --since is omitted (default: 720 = 30 days, 0 = all time)
         #[arg(short = 'H', long, default_value = "720")]
         hours: u64,
 
@@ -2247,7 +2247,7 @@ fn run_extract_session(
     } = options;
 
     let agent_label = extract_input_format_label(agent);
-    let cutoff = Utc::now() - chrono::Duration::hours(hours.max(1) as i64);
+    let cutoff = lookback_cutoff(hours);
     let config = ExtractionConfig {
         project_filter: explicit_project
             .as_ref()
@@ -2272,11 +2272,11 @@ fn run_extract_session(
 
     if entries.is_empty() {
         anyhow::bail!(
-            "No entries found for session `{}` in agent `{}` within last {} hours.\n\
+            "No entries found for session `{}` in agent `{}` within {}.\n\
              Try: increase --hours, verify the session id, or check that the source store is populated.",
             session_id,
             agent_label,
-            hours,
+            lookback_label(hours),
         );
     }
 
@@ -2723,6 +2723,27 @@ fn parse_ingest_since(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
     Ok(Some(Utc.from_utc_datetime(&datetime)))
 }
 
+fn all_time_cutoff() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(0, 0).expect("Unix epoch timestamp is valid")
+}
+
+fn lookback_cutoff(hours: u64) -> DateTime<Utc> {
+    if hours == 0 {
+        all_time_cutoff()
+    } else {
+        let bounded_hours = hours.min(i64::MAX as u64) as i64;
+        Utc::now() - chrono::Duration::hours(bounded_hours)
+    }
+}
+
+fn lookback_label(hours: u64) -> String {
+    if hours == 0 {
+        "all time".to_string()
+    } else {
+        format!("last {hours} hours")
+    }
+}
+
 fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     let ExtractionParams {
         agents,
@@ -2750,7 +2771,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         project.join("+")
     };
 
-    let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
+    let cutoff = lookback_cutoff(hours);
 
     // Default behavior is incremental. --full-rescan and the legacy --force
     // escape hatch both mean "scan the full lookback window".
@@ -3124,7 +3145,7 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         eprintln!("  [warn] --respect-artifact-family=false: legacy routing mode active");
     }
 
-    let cutoff = cutoff.unwrap_or_else(|| Utc::now() - chrono::Duration::hours(hours as i64));
+    let cutoff = cutoff.unwrap_or_else(|| lookback_cutoff(hours));
 
     let agents = resolve_store_agents(agent.as_deref())?;
 
@@ -5894,5 +5915,20 @@ mod tests {
         assert!(!output.contains("| Filter | file:"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn extractor_help_states_hours_zero_is_all_time() {
+        let mut cmd = Cli::command();
+        for subcommand in ["all", "claude", "codex", "store"] {
+            let command = cmd
+                .find_subcommand_mut(subcommand)
+                .expect("extractor subcommand should exist");
+            let rendered = command.render_long_help().to_string();
+            assert!(
+                rendered.contains("0 = all time"),
+                "{subcommand} --help must state the zero-hours contract"
+            );
+        }
     }
 }

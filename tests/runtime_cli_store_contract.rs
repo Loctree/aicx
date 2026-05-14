@@ -866,6 +866,45 @@ fn all_cli_defaults_to_incremental_and_full_rescan_recovers_backfill() {
 }
 
 #[test]
+fn all_cli_hours_zero_means_all_time() {
+    let root = unique_test_dir("all-hours-zero");
+    let home = root.join("home");
+    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let history = home.join(".codex").join("history.jsonl");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs() as i64;
+
+    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
+    write_codex_history(
+        &history,
+        "all-time-sess",
+        Some(&repo_root),
+        &[(
+            "user",
+            now - (90 * 24 * 3600),
+            "ancient context should still land with hours zero",
+        )],
+    );
+
+    let windowed = parse_stdout_json(&run_aicx(&home, &["all", "-H", "48", "--emit", "json"]));
+    assert_eq!(windowed["total_entries"].as_u64(), Some(0));
+
+    let all_time = parse_stdout_json(&run_aicx(
+        &home,
+        &["all", "-H", "0", "--full-rescan", "--emit", "json"],
+    ));
+    assert_eq!(all_time["total_entries"].as_u64(), Some(1));
+    assert_eq!(
+        all_time["entries"][0]["message"].as_str(),
+        Some("ancient context should still land with hours zero")
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn all_cli_force_ignores_watermark_like_full_rescan() {
     let root = unique_test_dir("all-force-watermark");
     let home = root.join("home");
@@ -1007,6 +1046,61 @@ fn store_cli_defaults_to_incremental_and_full_rescan_recovers_backfill() {
         state["last_processed"]["codex:all"].as_str(),
         Some(expected_watermark.as_str())
     );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn store_cli_hours_zero_means_all_time() {
+    let root = unique_test_dir("store-hours-zero");
+    let home = root.join("home");
+    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let history = home.join(".codex").join("history.jsonl");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs() as i64;
+
+    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
+    write_codex_history(
+        &history,
+        "store-all-time-sess",
+        Some(&repo_root),
+        &[(
+            "user",
+            now - (90 * 24 * 3600),
+            "store ancient context should still land with hours zero",
+        )],
+    );
+
+    let windowed = parse_stdout_json(&run_aicx(
+        &home,
+        &["store", "--agent", "codex", "-H", "48", "--emit", "json"],
+    ));
+    assert_eq!(windowed["total_entries"].as_u64(), Some(0));
+
+    let all_time = parse_stdout_json(&run_aicx(
+        &home,
+        &[
+            "store",
+            "--agent",
+            "codex",
+            "-H",
+            "0",
+            "--full-rescan",
+            "--emit",
+            "json",
+        ],
+    ));
+    assert_eq!(all_time["total_entries"].as_u64(), Some(1));
+
+    let store_paths = json_paths(&all_time, "store_paths");
+    let combined_store = store_paths
+        .iter()
+        .map(|path| fs::read_to_string(path).expect("read store chunk"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(combined_store.contains("store ancient context should still land with hours zero"));
 
     let _ = fs::remove_dir_all(&root);
 }

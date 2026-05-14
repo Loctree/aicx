@@ -339,8 +339,12 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
     store_root: &Path,
     now: DateTime<Utc>,
 ) -> Result<IntentExtraction> {
-    let cutoff_hours = config.hours.min(i64::MAX as u64) as i64;
-    let cutoff = now - Duration::hours(cutoff_hours);
+    let cutoff = if config.hours == 0 {
+        DateTime::<Utc>::from_timestamp(0, 0).expect("Unix epoch timestamp is valid")
+    } else {
+        let cutoff_hours = config.hours.min(i64::MAX as u64) as i64;
+        now - Duration::hours(cutoff_hours)
+    };
     let files = collect_chunk_files(store_root, &config.project, cutoff, config.frame_kind)?;
     let scanned_count = files.len();
     let source_paths_verified = verify_stored_chunk_paths(&files);

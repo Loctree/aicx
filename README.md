@@ -208,6 +208,7 @@ Extract the last 4 hours into `~/.aicx/`. Extractors are quiet on stdout by defa
 
 ```bash
 aicx all -H 4                      # daily driver: watermark-tracked, skips already-processed entries
+aicx all -H 0                      # all time: no lookback cutoff
 aicx store -p MyProject -H 720     # store-first: watermark-tracked refresh into the canonical corpus
 aicx store -p MyProject -H 720 --full-rescan  # explicit backfill / recovery pass
 ```
