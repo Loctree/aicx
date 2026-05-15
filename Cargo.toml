@@ -18,7 +18,12 @@ autobins = false
 default-run = "aicx"
 
 [workspace]
-members = [".", "crates/aicx-embeddings", "crates/aicx-parser"]
+members = [
+    ".",
+    "crates/aicx-embeddings",
+    "crates/aicx-parser",
+    "crates/aicx-retrieve",
+]
 resolver = "3"
 
 [features]
@@ -78,6 +83,7 @@ filetime = "0.2"
 [patch.crates-io]
 aicx-parser = { path = "crates/aicx-parser" }
 aicx-embeddings = { path = "crates/aicx-embeddings" }
+aicx-retrieve = { path = "crates/aicx-retrieve" }
 
 [[bin]]
 name = "aicx"
