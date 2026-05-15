@@ -1609,3 +1609,112 @@ fn test_extract_gemini_file_keeps_inline_data_as_explicit_placeholder() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn test_project_filter_matches_path_word_boundary() {
+    // Empty filter => match all.
+    assert!(project_filter_matches_path("/anything", &[]));
+
+    // Exact segment match — the key fix vs old substring behavior.
+    assert!(project_filter_matches_path(
+        "/tmp/test/foo",
+        &["test".to_string()]
+    ));
+    // Substring used to false-positive here; now correctly rejected.
+    assert!(!project_filter_matches_path(
+        "/tmp/fastest-project",
+        &["test".to_string()]
+    ));
+
+    // Word-boundary inside a segment (split by `-`, `_`, `.`).
+    assert!(project_filter_matches_path(
+        "/Users/silver/Git/vista-portal-pr15-hotfix",
+        &["portal".to_string()]
+    ));
+    // Multi-word filter — all words must appear.
+    assert!(project_filter_matches_path(
+        "/Users/silver/Git/vista-portal-pr15-hotfix",
+        &["vista-portal".to_string()]
+    ));
+    // Multi-word filter missing a word — rejected.
+    assert!(!project_filter_matches_path(
+        "/tmp/abc",
+        &["abc-def".to_string()]
+    ));
+
+    // Case-insensitive both directions.
+    assert!(project_filter_matches_path(
+        "/TMP/Test/foo",
+        &["test".to_string()]
+    ));
+    assert!(project_filter_matches_path(
+        "/tmp/test",
+        &["TEST".to_string()]
+    ));
+
+    // ANY filter mode (multiple filters).
+    assert!(project_filter_matches_path(
+        "/tmp/abc",
+        &["xyz".to_string(), "abc".to_string()]
+    ));
+
+    // Windows-style backslash separator.
+    assert!(project_filter_matches_path(
+        "C:\\Users\\test\\foo",
+        &["test".to_string()]
+    ));
+
+    // Empty cwd never matches a non-empty filter.
+    assert!(!project_filter_matches_path("", &["x".to_string()]));
+}
+
+#[test]
+fn test_extract_codex_file_project_filter_rejects_substring_false_positive() {
+    // `--project test` must NOT match a session whose cwd is `/tmp/fastest-project`.
+    let root = unique_test_dir("codex-pf-substring-fp");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"sess","cwd":"/tmp/fastest-project"}}
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec!["test".to_string()],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_codex_file(&tmp, &config).unwrap();
+    assert!(
+        entries.is_empty(),
+        "session in /tmp/fastest-project must not match --project test, got {} entries",
+        entries.len()
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_extract_codex_file_project_filter_accepts_path_segment() {
+    let root = unique_test_dir("codex-pf-accept");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"sess","cwd":"/Users/x/Git/vista-portal-pr15"}}
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec!["vista-portal".to_string()],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_codex_file(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 1, "vista-portal filter must match path");
+
+    let _ = fs::remove_dir_all(&root);
+}

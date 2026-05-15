@@ -808,18 +808,46 @@ fn infer_project_hint_from_gemini_message(message: &GeminiMessage) -> Option<Str
         })
 }
 
-fn gemini_message_matches_filter(message: &GeminiMessage, filters_lower: &[String]) -> bool {
-    let content = render_gemini_message_content(message);
-    let project_hint = infer_project_hint_from_gemini_message(message);
-
-    filters_lower.iter().any(|filter| {
-        content
-            .as_ref()
-            .is_some_and(|text| text.to_lowercase().contains(filter))
-            || project_hint
-                .as_ref()
-                .is_some_and(|cwd| cwd.to_lowercase().contains(filter))
+/// Check if any project filter matches the given path by **word-boundary** equality.
+///
+/// Path is split into "words" by `/`, `\`, `-`, `_`, `.`.
+/// Filter is split into words by `-`, `_`, `.`.
+/// A filter matches when ALL its words appear in the path words (case-insensitive).
+/// Multiple filters compose with ANY semantics.
+///
+/// This replaces the previous lowercase-substring match which produced false
+/// positives like `--project test` matching `/tmp/fastest-project`.
+fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    let cwd_lower = cwd.to_lowercase();
+    let path_words: Vec<&str> = cwd_lower
+        .split(|c: char| matches!(c, '/' | '\\' | '-' | '_' | '.'))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if path_words.is_empty() {
+        return false;
+    }
+    filters.iter().any(|filter| {
+        let filter_lower = filter.to_lowercase();
+        filter_lower
+            .split(|c: char| matches!(c, '-' | '_' | '.'))
+            .filter(|s| !s.is_empty())
+            .all(|fw| path_words.iter().any(|pw| *pw == fw))
     })
+}
+
+fn gemini_message_matches_filter(message: &GeminiMessage, filters: &[String]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    // Project ownership = cwd path components, not text mentions.
+    // A transcript that *mentions* a project name does not belong to that project.
+    let project_hint = infer_project_hint_from_gemini_message(message);
+    project_hint
+        .as_deref()
+        .is_some_and(|cwd| project_filter_matches_path(cwd, filters))
 }
 
 fn normalize_gemini_role(raw: &str) -> Option<&'static str> {
@@ -1014,27 +1042,13 @@ pub fn extract_claude(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
 
                 // If directory name matched, keep all entries.
                 // Otherwise, check if ANY entry in this session matches the project filter.
-                let keep_session = dir_matches || {
-                    if config.project_filter.is_empty() {
-                        true
-                    } else {
-                        let filters_lower: Vec<String> = config
-                            .project_filter
-                            .iter()
-                            .map(|f| f.to_lowercase())
-                            .collect();
-
-                        session_entries.iter().any(|entry| {
-                            filters_lower.iter().any(|fl| {
-                                entry.message.to_lowercase().contains(fl)
-                                    || entry
-                                        .cwd
-                                        .as_ref()
-                                        .is_some_and(|c| c.to_lowercase().contains(fl))
+                let keep_session = dir_matches
+                    || (!config.project_filter.is_empty()
+                        && session_entries.iter().any(|entry| {
+                            entry.cwd.as_deref().is_some_and(|c| {
+                                project_filter_matches_path(c, &config.project_filter)
                             })
-                        })
-                    }
-                };
+                        }));
 
                 if keep_session {
                     entries.extend(session_entries);
@@ -1182,21 +1196,13 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
 
         // Second pass: determine matching sessions (if filter provided).
         let matching_sessions: HashSet<String> = if !config.project_filter.is_empty() {
-            let filters_lower: Vec<String> = config
-                .project_filter
-                .iter()
-                .map(|f| f.to_lowercase())
-                .collect();
             sessions
                 .iter()
                 .filter(|(_id, msgs)| {
-                    filters_lower.iter().any(|fl| {
-                        msgs.iter().any(|m| {
-                            m.text.to_lowercase().contains(fl)
-                                || m.cwd
-                                    .as_ref()
-                                    .is_some_and(|c| c.to_lowercase().contains(fl))
-                        })
+                    msgs.iter().any(|m| {
+                        m.cwd
+                            .as_deref()
+                            .is_some_and(|c| project_filter_matches_path(c, &config.project_filter))
                     })
                 })
                 .map(|(id, _)| id.clone())
@@ -2166,13 +2172,10 @@ pub fn extract_claude_history(config: &ExtractionConfig) -> Result<Vec<TimelineE
 
         // Project filter
         if !config.project_filter.is_empty() {
-            let matches = entry.project.as_ref().is_some_and(|p| {
-                let pl = p.to_lowercase();
-                config
-                    .project_filter
-                    .iter()
-                    .any(|f| pl.contains(&f.to_lowercase()))
-            });
+            let matches = entry
+                .project
+                .as_deref()
+                .is_some_and(|p| project_filter_matches_path(p, &config.project_filter));
             if !matches {
                 continue;
             }
@@ -2255,21 +2258,13 @@ pub fn extract_codex(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
 
     // Second pass: determine which sessions match the filter
     let matching_sessions: HashSet<String> = if !config.project_filter.is_empty() {
-        let filters_lower: Vec<String> = config
-            .project_filter
-            .iter()
-            .map(|f| f.to_lowercase())
-            .collect();
         sessions
             .iter()
             .filter(|(_id, msgs)| {
-                filters_lower.iter().any(|fl| {
-                    msgs.iter().any(|m| {
-                        m.text.to_lowercase().contains(fl)
-                            || m.cwd
-                                .as_ref()
-                                .is_some_and(|c| c.to_lowercase().contains(fl))
-                    })
+                msgs.iter().any(|m| {
+                    m.cwd
+                        .as_deref()
+                        .is_some_and(|c| project_filter_matches_path(c, &config.project_filter))
                 })
             })
             .map(|(id, _)| id.clone())
@@ -2632,13 +2627,9 @@ fn parse_codex_session_file_with_diagnostics(
 
         // Project filter: check if the current turn's cwd matches
         if !config.project_filter.is_empty() {
-            let matches = current_cwd.as_ref().is_some_and(|cwd| {
-                let cwd_lower = cwd.to_lowercase();
-                config
-                    .project_filter
-                    .iter()
-                    .any(|f| cwd_lower.contains(&f.to_lowercase()))
-            });
+            let matches = current_cwd
+                .as_deref()
+                .is_some_and(|cwd| project_filter_matches_path(cwd, &config.project_filter));
             if !matches {
                 continue;
             }
@@ -2865,15 +2856,10 @@ fn parse_gemini_session(
 
     // Check project filter against message content
     let session_matches_filter = if !config.project_filter.is_empty() {
-        let filters_lower: Vec<String> = config
-            .project_filter
-            .iter()
-            .map(|f| f.to_lowercase())
-            .collect();
         session
             .messages
             .iter()
-            .any(|message| gemini_message_matches_filter(message, &filters_lower))
+            .any(|message| gemini_message_matches_filter(message, &config.project_filter))
     } else {
         true
     };
