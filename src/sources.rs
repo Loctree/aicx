@@ -823,7 +823,7 @@ fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool {
     }
     let cwd_lower = cwd.to_lowercase();
     let path_words: Vec<&str> = cwd_lower
-        .split(|c: char| matches!(c, '/' | '\\' | '-' | '_' | '.'))
+        .split(['/', '\\', '-', '_', '.'])
         .filter(|s| !s.is_empty())
         .collect();
     if path_words.is_empty() {
@@ -832,9 +832,9 @@ fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool {
     filters.iter().any(|filter| {
         let filter_lower = filter.to_lowercase();
         filter_lower
-            .split(|c: char| matches!(c, '-' | '_' | '.'))
+            .split(['-', '_', '.'])
             .filter(|s| !s.is_empty())
-            .all(|fw| path_words.iter().any(|pw| *pw == fw))
+            .all(|fw| path_words.contains(&fw))
     })
 }
 
