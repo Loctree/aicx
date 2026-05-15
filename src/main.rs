@@ -2625,9 +2625,8 @@ fn collect_codex_session_alias_matches(requested: &str) -> Result<BTreeSet<Strin
                 suffix_owned.clone().unwrap_or_default()
             };
 
-            let alias_matches = cheap_match
-                || canonical.starts_with(requested)
-                || canonical.ends_with(requested);
+            let alias_matches =
+                cheap_match || canonical.starts_with(requested) || canonical.ends_with(requested);
             if alias_matches {
                 matches.insert(canonical);
             }
@@ -5444,7 +5443,10 @@ mod tests {
         // With clamp to 1h, cutoff must sit ~1h before now (allow ±5s slack).
         let lower = before - chrono::Duration::hours(1) - chrono::Duration::seconds(5);
         let upper = after - chrono::Duration::hours(1) + chrono::Duration::seconds(5);
-        assert!(cutoff >= lower && cutoff <= upper, "cutoff out of range: {cutoff}");
+        assert!(
+            cutoff >= lower && cutoff <= upper,
+            "cutoff out of range: {cutoff}"
+        );
     }
 
     #[test]
@@ -5454,7 +5456,10 @@ mod tests {
         let after = Utc::now();
         let lower = before - chrono::Duration::hours(8) - chrono::Duration::seconds(5);
         let upper = after - chrono::Duration::hours(8) + chrono::Duration::seconds(5);
-        assert!(cutoff >= lower && cutoff <= upper, "cutoff out of range: {cutoff}");
+        assert!(
+            cutoff >= lower && cutoff <= upper,
+            "cutoff out of range: {cutoff}"
+        );
     }
 
     #[test]
@@ -5464,7 +5469,10 @@ mod tests {
         // strictly in the past.
         let now = Utc::now();
         let cutoff = cutoff_for_hours(u64::MAX);
-        assert!(cutoff < now, "cutoff must not be in the future: {cutoff} vs now {now}");
+        assert!(
+            cutoff < now,
+            "cutoff must not be in the future: {cutoff} vs now {now}"
+        );
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {
