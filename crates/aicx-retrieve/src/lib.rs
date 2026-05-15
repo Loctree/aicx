@@ -2,11 +2,10 @@
 //! Retrieval trait facade for aicx hybrid indexes.
 //!
 //! This crate defines the public contracts shared by lexical, dense, and
-//! fusion retrieval adapters. It intentionally contains no index
-//! implementations; Tantivy, sqlite-vec, and brute-force adapters live in
-//! downstream crates or follow-up tracks.
+//! fusion retrieval adapters plus default-on retrieval implementations.
 
 pub mod adapter_brute_force;
+pub mod adapter_tantivy;
 pub mod error;
 pub mod manifest;
 pub mod trait_dense;
@@ -30,3 +29,5 @@ pub use adapter_brute_force::{
     BRUTE_FORCE_KIND, BruteForceAdapter, DEFAULT_NDJSON_FILE_NAME, LoadStats, default_ndjson_path,
     load_from_ndjson,
 };
+
+pub use adapter_tantivy::*;
