@@ -6547,11 +6547,17 @@ mod tests {
 
     #[test]
     fn conversations_sanitizes_session_filename() {
-        assert_eq!(
-            conversation_batch_safe_session_filename("abc/def:ghi 123"),
-            "abc_def_ghi_123"
+        // Sanitized filenames append a SipHash suffix so distinct ids that
+        // collapse to the same base do not collide on disk. Assert the
+        // sanitized prefix is correct; the suffix is intentionally opaque.
+        let sanitized = conversation_batch_safe_session_filename("abc/def:ghi 123");
+        assert!(
+            sanitized.starts_with("abc_def_ghi_123-"),
+            "expected sanitized base prefix, got {sanitized}"
         );
-        assert_eq!(conversation_batch_safe_session_filename(""), "session");
+        let empty_id = conversation_batch_safe_session_filename("");
+        // Empty input has no chars to sanitize → no suffix needed.
+        assert_eq!(empty_id, "session");
     }
 
     #[test]
@@ -6561,11 +6567,22 @@ mod tests {
             "claude",
             "abc/def",
         );
-
-        assert_eq!(
-            path,
-            PathBuf::from("/tmp/aicx-conversations/claude/abc_def.json")
+        // Path contains the sanitized base + SipHash suffix; assert the
+        // shape, not a fixed hash literal.
+        let path_str = path.to_string_lossy().to_string();
+        assert!(
+            path_str.starts_with("/tmp/aicx-conversations/claude/abc_def-"),
+            "unexpected path: {path_str}"
         );
+        assert!(path_str.ends_with(".json"), "unexpected path: {path_str}");
+
+        // Determinism: same input must yield the same path.
+        let path2 = conversation_batch_output_path(
+            Path::new("/tmp/aicx-conversations"),
+            "claude",
+            "abc/def",
+        );
+        assert_eq!(path, path2, "sanitized path must be deterministic");
     }
 
     #[test]
@@ -6611,8 +6628,23 @@ mod tests {
         assert_eq!(summary.sessions_written, 2);
         assert_eq!(summary.failed_sessions, 0);
         assert_eq!(summary.messages_total, 2);
+        // session-one needed no sanitization — bare filename.
         assert!(out_dir.join("claude/session-one.json").exists());
-        assert!(out_dir.join("claude/session-two_unsafe.json").exists());
+        // session-two/unsafe contains an unsafe `/` → sanitized base is
+        // `session-two_unsafe`, with a SipHash suffix appended. Locate the
+        // file by walking the directory rather than hardcoding the hash.
+        let claude_dir = out_dir.join("claude");
+        let entries: Vec<String> = fs::read_dir(&claude_dir)
+            .expect("claude output dir must exist")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            entries
+                .iter()
+                .any(|name| name.starts_with("session-two_unsafe-") && name.ends_with(".json")),
+            "expected a session-two_unsafe-<hash>.json file, got {entries:?}"
+        );
         assert!(!out_dir.starts_with(aicx::store::store_base_dir().unwrap()));
 
         let _ = fs::remove_dir_all(&root);
