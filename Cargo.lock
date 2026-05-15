@@ -127,9 +127,13 @@ name = "aicx-retrieve"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "chrono",
+ "hex",
+ "rand 0.8.6",
  "serde",
  "serde_json",
+ "sha2",
  "tantivy 0.26.1",
  "tantivy-stemmers",
  "tempfile",

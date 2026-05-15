@@ -1,5 +1,12 @@
 // Vibecrafted with AI Agents by VetCoders (c)2024-2026 LibraxisAI
+use std::fs;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::{Component, Path};
+
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::ManifestError;
@@ -27,6 +34,58 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    pub fn write_to_path(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create manifest parent {}", parent.display()))?;
+        }
+        let mut tmp_path = path.to_path_buf();
+        let tmp_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| format!("{name}.tmp"))
+            .unwrap_or_else(|| "manifest.json.tmp".to_string());
+        tmp_path.set_file_name(tmp_name);
+
+        let mut file = create_validated(&tmp_path)
+            .with_context(|| format!("create tmp manifest {}", tmp_path.display()))?;
+        serde_json::to_writer_pretty(&mut file, self).context("serialize retrieval manifest")?;
+        file.write_all(b"\n")
+            .with_context(|| format!("finish tmp manifest {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync tmp manifest {}", tmp_path.display()))?;
+        drop(file);
+
+        fs::rename(&tmp_path, path).with_context(|| {
+            format!(
+                "commit retrieval manifest: {} -> {}",
+                tmp_path.display(),
+                path.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn read_from_path(path: &Path) -> Result<Manifest> {
+        let bytes =
+            read_validated(path).with_context(|| format!("read manifest {}", path.display()))?;
+        serde_json::from_slice(&bytes).with_context(|| format!("parse manifest {}", path.display()))
+    }
+
+    pub fn fresh_generation_id() -> String {
+        let mut bytes = [0u8; 4];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        format!(
+            "g-{}-{}",
+            Self::now_utc().format("%Y-%m-%dT%H:%M:%SZ"),
+            hex::encode(bytes)
+        )
+    }
+
+    pub fn now_utc() -> DateTime<Utc> {
+        Utc::now()
+    }
+
     /// Validate that two retrieval artifacts belong to the same generation.
     pub fn validate_against(&self, other: &Manifest) -> Result<(), ManifestError> {
         const SUPPORTED_SCHEMA_VERSION: &str = "2.0";
@@ -73,4 +132,37 @@ impl Manifest {
 
         Ok(())
     }
+}
+
+fn validate_manifest_path(path: &Path) -> Result<&Path> {
+    let path_str = path.to_string_lossy();
+    if path_str.contains('\0') || path_str.contains('\n') || path_str.contains('\r') {
+        anyhow::bail!("invalid retrieval manifest path: {}", path.display());
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        anyhow::bail!(
+            "retrieval manifest path must not contain traversal components: {}",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+fn create_validated(path: &Path) -> Result<File> {
+    let path = validate_manifest_path(path)?;
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    File::create(path).with_context(|| format!("create {}", path.display()))
+}
+
+fn read_validated(path: &Path) -> Result<Vec<u8>> {
+    let path = validate_manifest_path(path)?;
+    let mut bytes = Vec::new();
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    Ok(bytes)
 }

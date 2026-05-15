@@ -7,7 +7,9 @@
 pub mod adapter_brute_force;
 pub mod adapter_tantivy;
 pub mod error;
+pub mod fusion_rrf;
 pub mod manifest;
+pub mod orchestrator;
 pub mod trait_dense;
 pub mod trait_fusion;
 pub mod trait_lexical;
@@ -24,6 +26,10 @@ pub use manifest::*;
 pub use error::*;
 
 pub use types::*;
+
+pub use fusion_rrf::*;
+
+pub use orchestrator::*;
 
 pub use adapter_brute_force::{
     BRUTE_FORCE_KIND, BruteForceAdapter, DEFAULT_NDJSON_FILE_NAME, LoadStats, default_ndjson_path,

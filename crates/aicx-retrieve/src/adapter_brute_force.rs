@@ -14,8 +14,9 @@
 //! lets the brute-force adapter compose into other write protocols later.
 
 use std::fs;
+use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -104,7 +105,7 @@ impl BruteForceAdapter {
         };
         tmp_path.set_file_name(tmp_name);
 
-        let file = fs::File::create(&tmp_path)
+        let file = create_validated(&tmp_path)
             .with_context(|| format!("create tmp {}", tmp_path.display()))?;
         let mut writer = BufWriter::new(file);
 
@@ -143,7 +144,7 @@ impl BruteForceAdapter {
     /// in tests; the production path will route through the manifest
     /// (track D) and may relax this to warn-only.
     pub fn load_ndjson(&mut self, path: &Path) -> Result<LoadStats> {
-        let file = fs::File::open(path)
+        let file = open_validated(path)
             .with_context(|| format!("open brute-force index: {}", path.display()))?;
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
@@ -375,6 +376,38 @@ pub const DEFAULT_NDJSON_FILE_NAME: &str = "dense_brute_force.ndjson";
 /// manifest-managed bucket directory.
 pub fn default_ndjson_path(base_dir: &Path) -> PathBuf {
     base_dir.join(DEFAULT_NDJSON_FILE_NAME)
+}
+
+fn validate_index_path(path: &Path) -> Result<&Path> {
+    let path_str = path.to_string_lossy();
+    if path_str.contains('\0') || path_str.contains('\n') || path_str.contains('\r') {
+        return Err(anyhow!(
+            "invalid brute-force index path: {}",
+            path.display()
+        ));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(anyhow!(
+            "brute-force index path must not contain traversal components: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn create_validated(path: &Path) -> Result<File> {
+    let path = validate_index_path(path)?;
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    File::create(path).with_context(|| format!("create {}", path.display()))
+}
+
+fn open_validated(path: &Path) -> Result<File> {
+    let path = validate_index_path(path)?;
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    File::open(path).with_context(|| format!("open {}", path.display()))
 }
 
 #[cfg(test)]
