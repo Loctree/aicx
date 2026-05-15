@@ -60,6 +60,15 @@ release-binaries:
 	esac
 	@python3 -c 'import json, pathlib, sys; staging=pathlib.Path(sys.argv[1]); version=sys.argv[2]; commit=sys.argv[3]; data={"source":"loctree-aicx","commit":commit,"components":[{"name":"aicx","version":version,"source":"loctree-aicx"},{"name":"aicx-mcp","version":version,"source":"loctree-aicx"}]}; path=staging/"components"/"loctree-aicx.json"; path.write_text(json.dumps(data, indent=2)+"\n", encoding="utf-8"); print(f"  metadata -> {path}")' "$(STAGING_DIR)" "$(VERSION)" "$$(git rev-parse --short=12 HEAD)"
 
+release-binaries-linux:
+	@for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-musl; do \
+		echo "==> Building $$target"; \
+		cross build --release --target $$target --bin aicx --bin aicx-mcp || exit 1; \
+		mkdir -p dist/aicx-v$(VERSION)-$$target-slim-unsigned; \
+		cp target/$$target/release/aicx target/$$target/release/aicx-mcp dist/aicx-v$(VERSION)-$$target-slim-unsigned/; \
+		(cd dist && tar -czf aicx-v$(VERSION)-$$target-slim-unsigned.tar.gz aicx-v$(VERSION)-$$target-slim-unsigned/); \
+	done
+
 install:
 	./install.sh
 	@$(MAKE) git-hooks
