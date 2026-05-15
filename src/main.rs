@@ -2330,15 +2330,37 @@ struct ConversationBatchSummary {
 }
 
 fn conversation_batch_safe_session_filename(session_id: &str) -> String {
+    // Empty input has no original characters to disambiguate against, so
+    // skip the hash suffix and use the fixed fallback. Realistically this
+    // signals an upstream bug; we keep the existing observable contract.
+    if session_id.is_empty() {
+        return "session".to_string();
+    }
+    // Already-safe ids (alphanumeric plus `- _ .`) round-trip verbatim.
+    // Previously this function collapsed runs of underscores and trimmed
+    // leading/trailing ones for *every* input, which meant safe ids like
+    // "a__b" and "a_b" — both valid on disk — would map to the same
+    // filename and silently overwrite each other (no hash suffix was
+    // added because no character was actually replaced).
+    let is_already_safe = session_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if is_already_safe {
+        return session_id.to_string();
+    }
+
+    // Otherwise the id contains characters we cannot put on disk. Replace
+    // them with `_`, collapse resulting runs of underscores, trim leading
+    // and trailing ones, and append a 64-bit SipHash fingerprint of the
+    // original id so distinct unsafe ids that collapse to the same base
+    // (e.g. "a/b" vs "a:b" both become "a_b") cannot overwrite each other.
     let mut safe = String::new();
     let mut previous_was_separator = false;
-    let mut sanitized = false;
 
     for ch in session_id.chars() {
         let mapped = if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
             ch
         } else {
-            sanitized = true;
             '_'
         };
 
@@ -2356,20 +2378,12 @@ fn conversation_batch_safe_session_filename(session_id: &str) -> String {
     let safe = safe.trim_matches('_');
     let base = if safe.is_empty() { "session" } else { safe };
 
-    if sanitized {
-        // Two distinct session ids can collapse to the same sanitized base
-        // (e.g. "a/b" and "a:b" both become "a_b"). Append a 64-bit SipHash
-        // fingerprint of the original id so the resulting filename stays
-        // unique even when characters had to be replaced.
-        use siphasher::sip::SipHasher13;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = SipHasher13::new();
-        session_id.hash(&mut hasher);
-        let suffix = hasher.finish();
-        format!("{base}-{suffix:016x}")
-    } else {
-        base.to_string()
-    }
+    use siphasher::sip::SipHasher13;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = SipHasher13::new();
+    session_id.hash(&mut hasher);
+    let suffix = hasher.finish();
+    format!("{base}-{suffix:016x}")
 }
 
 fn conversation_batch_output_path(out_dir: &Path, agent_label: &str, session_id: &str) -> PathBuf {
@@ -2570,7 +2584,14 @@ fn read_codex_session_meta_id(path: &Path) -> Option<String> {
         if !line.contains("\"session_meta\"") {
             continue;
         }
-        let data: serde_json::Value = serde_json::from_str(&line).ok()?;
+        // Skip malformed lines instead of bailing out of the whole scan —
+        // a partially-written rollout file can have a truncated tail, and
+        // the session_meta record we want is usually one of the first
+        // entries. Treat a parse error on a single candidate line as a
+        // miss for that line, not as "this file has no session_meta".
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
         if data.get("type").and_then(|value| value.as_str()) != Some("session_meta") {
             continue;
         }
@@ -5614,6 +5635,39 @@ mod tests {
     }
 
     #[test]
+    fn read_codex_session_meta_id_skips_malformed_lines() {
+        use std::io::Write;
+        let tmp_dir = unique_test_dir("read-meta-malformed");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let path = tmp_dir.join("partial.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        // First candidate line contains the `"session_meta"` substring
+        // but is truncated mid-record (typical of a partially-flushed
+        // rollout). Before the fix this caused `read_codex_session_meta_id`
+        // to bail out and miss the valid record on the next line.
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-15T00:00:00Z","type":"session_meta","payload":{{"id":"truncated"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-15T00:00:01Z","type":"session_meta","payload":{{"id":"019e0000-0000-0000-0000-000000000000","cwd":"/tmp"}}}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        let id = read_codex_session_meta_id(&path);
+        assert_eq!(
+            id.as_deref(),
+            Some("019e0000-0000-0000-0000-000000000000"),
+            "malformed first line must not stop the scan"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
     fn session_reference_resolver_ignores_out_of_window_alias() {
         // Only one id is in the current `--hours`/`--project` window.
         let session_ids = BTreeSet::from(["019e27c0-e492-7790-9c33-52b3dddd1067".to_string()]);
@@ -5641,6 +5695,16 @@ mod tests {
     fn conversation_batch_safe_session_filename_passes_through_safe_ids() {
         let id = "019e27c0-e492-7790-9c33-52b3dddd1067";
         assert_eq!(conversation_batch_safe_session_filename(id), id);
+    }
+
+    #[test]
+    fn conversation_batch_safe_session_filename_preserves_safe_underscore_runs() {
+        // Both ids only use safe characters. Earlier behavior collapsed
+        // `__` to `_` for every input, so "a__b" and "a_b" mapped to the
+        // same filename without a hash suffix and silently overwrote each
+        // other. Safe inputs must round-trip verbatim.
+        assert_eq!(conversation_batch_safe_session_filename("a__b"), "a__b");
+        assert_eq!(conversation_batch_safe_session_filename("a_b"), "a_b");
     }
 
     #[test]

@@ -139,9 +139,19 @@ fn test_conversation_first_preserves_provenance() {
 }
 
 fn conversation_entry(session_id: &str, role: &str, message: &str, second: u32) -> TimelineEntry {
+    conversation_entry_agent("claude", session_id, role, message, second)
+}
+
+fn conversation_entry_agent(
+    agent: &str,
+    session_id: &str,
+    role: &str,
+    message: &str,
+    second: u32,
+) -> TimelineEntry {
     TimelineEntry {
         timestamp: Utc.with_ymd_and_hms(2026, 3, 21, 10, 0, second).unwrap(),
-        agent: "claude".to_string(),
+        agent: agent.to_string(),
         session_id: session_id.to_string(),
         role: role.to_string(),
         message: message.to_string(),
@@ -376,4 +386,20 @@ fn test_extract_claude_excludes_tool_blocks_then_conversation_clean() {
     assert_eq!(conv[0].message, "Hello agent");
 
     let _ = fs::remove_file(&tmp);
+}
+
+#[test]
+fn test_conversation_exact_short_duplicate_key_includes_agent() {
+    // Two extractors can emit the same fallback session id (for example
+    // claude history and codex history both fall back to "history" when
+    // no `sessionId` is present). Without the agent in the dedup key,
+    // identical short prompts within 2 s from unrelated agent streams
+    // would be merged. Verify both messages survive.
+    let entries = vec![
+        conversation_entry_agent("claude", "history", "user", "ping", 0),
+        conversation_entry_agent("codex", "history", "user", "ping", 1),
+    ];
+
+    let conv = to_conversation(&entries, &[]);
+    assert_eq!(conv.len(), 2, "agent must be part of the dedup key");
 }

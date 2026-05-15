@@ -91,14 +91,22 @@ pub fn to_conversation_with_stats(
     drop_exact_short_user_duplicates(messages)
 }
 
-/// Compute a stable 64-bit key for `(session_id, trimmed message)` without
-/// allocating new `String`s on the hot dedup path. Uses SipHash-1-3 with a
-/// null-byte delimiter between the two fields to avoid prefix collisions
-/// between e.g. `("abc", "def")` and `("ab", "cdef")`.
-fn exact_short_dup_key(session_id: &str, trimmed: &str) -> u64 {
+/// Compute a stable 64-bit key for `(agent, session_id, trimmed message)`
+/// without allocating new `String`s on the hot dedup path. Uses SipHash-1-3
+/// with null-byte delimiters between the fields to avoid prefix collisions
+/// between e.g. `("a", "bc", "d")` and `("ab", "c", "d")`.
+///
+/// `agent` is part of the key because extractors can emit a shared fallback
+/// session id (for example `extract_claude_history` uses `"history"` when
+/// `sessionId` is absent). Without the agent in the key, identical short
+/// prompts from two unrelated agent streams within a 2 s window would be
+/// silently merged.
+fn exact_short_dup_key(agent: &str, session_id: &str, trimmed: &str) -> u64 {
     use siphasher::sip::SipHasher13;
     use std::hash::{Hash, Hasher};
     let mut hasher = SipHasher13::new();
+    agent.hash(&mut hasher);
+    0u8.hash(&mut hasher);
     session_id.hash(&mut hasher);
     0u8.hash(&mut hasher);
     trimmed.hash(&mut hasher);
@@ -114,7 +122,7 @@ fn drop_exact_short_user_duplicates(messages: Vec<ConversationMessage>) -> Conve
         let trimmed = msg.message.trim();
         let is_short_user = msg.role == "user" && trimmed.len() <= EXACT_SHORT_DUP_MAX_CHARS;
         let is_exact_short_duplicate = if is_short_user {
-            let key = exact_short_dup_key(&msg.session_id, trimmed);
+            let key = exact_short_dup_key(&msg.agent, &msg.session_id, trimmed);
             let is_duplicate = last_seen_user.get(&key).is_some_and(|previous_timestamp| {
                 msg.timestamp
                     .signed_duration_since(*previous_timestamp)
