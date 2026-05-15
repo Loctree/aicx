@@ -68,6 +68,17 @@ fn test_repo_name_from_cwd() {
         ),
         "lbrx-services"
     );
+
+    // Multi-filter selection must use word-boundary path matching, NOT
+    // raw substring. `--project test` against `/tmp/fastest-project`
+    // would previously pick "test" as the label even though the project
+    // filter step (correctly) rejects that path; the helper must agree.
+    let filters = vec!["test".to_string(), "other".to_string()];
+    assert_ne!(
+        repo_name_from_cwd(Some("/tmp/fastest-project"), &filters),
+        "test",
+        "multi-filter label must not be picked via substring match"
+    );
 }
 
 #[test]

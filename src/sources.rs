@@ -4596,7 +4596,11 @@ pub fn repo_name_from_cwd(cwd: Option<&str>, project_filter: &[String]) -> Strin
             return canonical_repo_label(&project_filter[0]);
         } else if let Some(c) = cwd {
             for p in project_filter {
-                if c.contains(p) {
+                // Use the same word-boundary path match as the project
+                // filter itself, so a label cannot be picked via a raw
+                // substring (`--project test` against `/tmp/fastest-project`)
+                // even though the filter step rejects that match.
+                if project_filter_matches_path(c, std::slice::from_ref(p)) {
                     return canonical_repo_label(p);
                 }
             }

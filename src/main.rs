@@ -759,7 +759,11 @@ enum Commands {
         #[arg(short = 'H', long, default_value = "8760")]
         hours: u64,
 
-        /// Output directory. Files are written as <out-dir>/<agent>/<session_id>.json.
+        /// Output directory. Files are written as
+        /// `<out-dir>/<agent>/<sanitized-session-id>.json`. Session ids
+        /// that contain characters other than `[A-Za-z0-9._-]` are
+        /// sanitized; a SipHash suffix is appended to keep distinct ids
+        /// from colliding after sanitization.
         #[arg(long)]
         out_dir: PathBuf,
 
@@ -2328,11 +2332,13 @@ struct ConversationBatchSummary {
 fn conversation_batch_safe_session_filename(session_id: &str) -> String {
     let mut safe = String::new();
     let mut previous_was_separator = false;
+    let mut sanitized = false;
 
     for ch in session_id.chars() {
         let mapped = if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
             ch
         } else {
+            sanitized = true;
             '_'
         };
 
@@ -2348,10 +2354,21 @@ fn conversation_batch_safe_session_filename(session_id: &str) -> String {
     }
 
     let safe = safe.trim_matches('_');
-    if safe.is_empty() {
-        "session".to_string()
+    let base = if safe.is_empty() { "session" } else { safe };
+
+    if sanitized {
+        // Two distinct session ids can collapse to the same sanitized base
+        // (e.g. "a/b" and "a:b" both become "a_b"). Append a 64-bit SipHash
+        // fingerprint of the original id so the resulting filename stays
+        // unique even when characters had to be replaced.
+        use siphasher::sip::SipHasher13;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = SipHasher13::new();
+        session_id.hash(&mut hasher);
+        let suffix = hasher.finish();
+        format!("{base}-{suffix:016x}")
     } else {
-        safe.to_string()
+        base.to_string()
     }
 }
 
@@ -2654,7 +2671,17 @@ fn resolve_session_reference_from_candidates(
         .filter(|session_id| session_id.starts_with(requested) || session_id.ends_with(requested))
         .cloned()
         .collect();
-    candidates.extend(alias_matches);
+    // Restrict alias matches (gathered by walking `~/.codex/sessions/` for
+    // filename UUID anchors) to ids that were actually extracted in the
+    // current `--hours` / `--project` window. Without this guard, older
+    // out-of-window sessions inflate the candidate set: a previously unique
+    // in-window prefix can flip to "ambiguous", or the resolver can pick an
+    // out-of-window id that then yields zero entries downstream.
+    let in_window_aliases: BTreeSet<String> = alias_matches
+        .into_iter()
+        .filter(|alias| session_ids.contains(alias))
+        .collect();
+    candidates.extend(in_window_aliases);
 
     match candidates.len() {
         0 => anyhow::bail!(
@@ -5583,6 +5610,65 @@ mod tests {
         assert_eq!(
             resolved.canonical_id,
             "019e2574-8a7f-7d33-a318-b365aa0ab970"
+        );
+    }
+
+    #[test]
+    fn session_reference_resolver_ignores_out_of_window_alias() {
+        // Only one id is in the current `--hours`/`--project` window.
+        let session_ids = BTreeSet::from(["019e27c0-e492-7790-9c33-52b3dddd1067".to_string()]);
+        // The full sessions/ tree walk surfaced two aliases sharing the
+        // `019e2` prefix: one in-window, one historical/out-of-window.
+        let aliases = BTreeSet::from([
+            "019e27c0-e492-7790-9c33-52b3dddd1067".to_string(),
+            "019e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
+        ]);
+
+        let resolved =
+            resolve_session_reference_from_candidates("019e2", &session_ids, aliases, "codex")
+                .unwrap();
+
+        // Without the in-window filter the resolver would see two
+        // candidates and bail "ambiguous". After the fix it resolves
+        // uniquely to the in-window id.
+        assert_eq!(
+            resolved.canonical_id,
+            "019e27c0-e492-7790-9c33-52b3dddd1067"
+        );
+    }
+
+    #[test]
+    fn conversation_batch_safe_session_filename_passes_through_safe_ids() {
+        let id = "019e27c0-e492-7790-9c33-52b3dddd1067";
+        assert_eq!(conversation_batch_safe_session_filename(id), id);
+    }
+
+    #[test]
+    fn conversation_batch_safe_session_filename_disambiguates_collisions() {
+        // Two distinct ids that collapse to the same sanitized base must
+        // produce different filenames so one export cannot overwrite the
+        // other.
+        let a = conversation_batch_safe_session_filename("a/b");
+        let b = conversation_batch_safe_session_filename("a:b");
+        assert_ne!(a, b, "distinct ids must not collide after sanitization");
+        assert!(
+            a.starts_with("a_b-"),
+            "expected sanitized base prefix, got {a}"
+        );
+        assert!(
+            b.starts_with("a_b-"),
+            "expected sanitized base prefix, got {b}"
+        );
+    }
+
+    #[test]
+    fn conversation_batch_safe_session_filename_falls_back_to_session() {
+        // All chars sanitized away — base becomes "session" plus a hash
+        // (still unique because the sanitization touched the id).
+        let safe = conversation_batch_safe_session_filename("///");
+        assert!(
+            safe.starts_with("session-"),
+            "expected session-prefixed name, got {safe}"
         );
     }
 

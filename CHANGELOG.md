@@ -8,8 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 - `aicx extract` batch conversation export command for emitting multiple
   session transcripts in a single pass without writing to the canonical store.
-- `extract --conversation` output now carries `frame_kind` metadata per
-  message and surfaces extract statistics in the JSON projection.
+- `extract --conversation` output now carries `message_kind` and
+  `collapse_stub_kind` metadata per message and surfaces extract
+  statistics in the JSON projection.
 
 ### Changed
 - **Project filter is now word-boundary path match, not substring.**
