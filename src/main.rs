@@ -2545,7 +2545,9 @@ fn uuid_suffix_from_stem(stem: &str) -> Option<&str> {
 }
 
 fn read_codex_session_meta_id(path: &Path) -> Option<String> {
-    let file = fs::File::open(path).ok()?;
+    // Route through the project-wide validated opener so symlink/path-safety
+    // guarantees apply uniformly to every place that ingests Codex rollouts.
+    let file = aicx::sanitize::open_file_validated(path).ok()?;
     let reader = BufReader::new(file);
     for line in reader.lines().map_while(std::result::Result::ok) {
         if !line.contains("\"session_meta\"") {
@@ -2599,17 +2601,33 @@ fn collect_codex_session_alias_matches(requested: &str) -> Result<BTreeSet<Strin
                 .and_then(|value| value.to_str())
                 .unwrap_or_default();
             let suffix = uuid_suffix_from_stem(stem);
-            let canonical = read_codex_session_meta_id(&path)
-                .or_else(|| suffix.map(str::to_string))
-                .unwrap_or_else(|| stem.to_string());
+            let suffix_owned: Option<String> = suffix.map(str::to_string);
 
-            let alias_matches = requested == stem
+            // Avoid reading session_meta from every JSONL in the tree.
+            // Cheap path: try matching against the filename stem / UUID
+            // suffix first. Only open the rollout when (a) the cheap
+            // check matched and we need the canonical id for the output,
+            // or (b) the filename carries no UUID suffix (non-rollout
+            // layout) and we have nothing else to anchor on.
+            let cheap_anchor: &str = suffix_owned.as_deref().unwrap_or(stem);
+            let cheap_match = requested == stem
                 || requested == file_name
+                || cheap_anchor.starts_with(requested)
+                || cheap_anchor.ends_with(requested);
+
+            let canonical = if cheap_match || suffix.is_none() {
+                read_codex_session_meta_id(&path)
+                    .or_else(|| suffix_owned.clone())
+                    .unwrap_or_else(|| stem.to_string())
+            } else {
+                // Have a UUID suffix and no cheap hit — trust the suffix
+                // as the canonical id rather than opening the file.
+                suffix_owned.clone().unwrap_or_default()
+            };
+
+            let alias_matches = cheap_match
                 || canonical.starts_with(requested)
-                || canonical.ends_with(requested)
-                || suffix.is_some_and(|value| {
-                    value.starts_with(requested) || value.ends_with(requested)
-                });
+                || canonical.ends_with(requested);
             if alias_matches {
                 matches.insert(canonical);
             }
