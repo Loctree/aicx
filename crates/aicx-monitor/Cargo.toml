@@ -1,0 +1,21 @@
+[package]
+name = "aicx-monitor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91.1"
+license = "BUSL-1.1"
+description = "Live system monitor for aicx pipelines: CPU, RAM, GPU, and embedder process metrics."
+authors = ["Maciej Gad <void@div0.space>", "Monika Szymanska <hello@vetcoders.io>"]
+repository = "https://github.com/Loctree/aicx"
+homepage = "https://github.com/Loctree/aicx"
+documentation = "https://docs.rs/aicx-monitor"
+readme = "../../README.md"
+keywords = ["ai", "monitor", "telemetry", "cpu", "gpu"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+sysinfo = "0.32"
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "rt", "macros", "time", "rt-multi-thread"] }

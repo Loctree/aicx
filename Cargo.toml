@@ -21,7 +21,9 @@ default-run = "aicx"
 members = [
     ".",
     "crates/aicx-embeddings",
+    "crates/aicx-monitor",
     "crates/aicx-parser",
+    "crates/aicx-progress-contracts",
     "crates/aicx-retrieve",
 ]
 resolver = "3"
@@ -54,7 +56,9 @@ e2e-aicx = ["native-embedder", "cloud-embedder"]
 
 [dependencies]
 aicx-embeddings = { version = "0.7.0", optional = true, default-features = false }
+aicx-monitor = { version = "0.1.0", path = "crates/aicx-monitor" }
 aicx-parser = { version = "0.7.0", features = ["json-schema"] }
+aicx-progress-contracts = { version = "0.1.0", path = "crates/aicx-progress-contracts" }
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
@@ -67,6 +71,7 @@ sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1"
+indicatif = "0.18"
 globset = "0.4"
 ratatui = "0.29"
 crossterm = "0.29"
@@ -85,6 +90,8 @@ filetime = "0.2"
 aicx-parser = { path = "crates/aicx-parser" }
 aicx-embeddings = { path = "crates/aicx-embeddings" }
 aicx-retrieve = { path = "crates/aicx-retrieve" }
+aicx-monitor = { path = "crates/aicx-monitor" }
+aicx-progress-contracts = { path = "crates/aicx-progress-contracts" }
 
 [[bin]]
 name = "aicx"

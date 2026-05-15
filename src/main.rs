@@ -3988,6 +3988,83 @@ fn run_config_show(_json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Build the `IndexEvent` -> sink fanout used by `aicx index`. Always
+/// includes a tracing adapter (for log capture / non-TTY runs); adds an
+/// `IndicatifSink` with live ETA + rate when stderr is an interactive
+/// terminal. Translates `IndexEvent` variants into `ProgressUpdate`s that
+/// drive the progress bar position, length, message, and final-state.
+fn build_index_event_fanout(
+    interactive: bool,
+) -> std::sync::Arc<aicx::progress::FanOut<aicx_progress_contracts::IndexEvent>> {
+    use aicx::progress::{FanOut, IndicatifSink, ProgressUpdate, TracingSink};
+    use aicx_progress_contracts::IndexEvent;
+
+    let render = |event: &IndexEvent| -> Option<ProgressUpdate> {
+        match event {
+            IndexEvent::RunStarted { total_items, .. } => Some(ProgressUpdate {
+                position: 0,
+                length: Some(*total_items as u64),
+                message: Some("embedding chunks".to_string()),
+                finished: false,
+            }),
+            IndexEvent::StatsTick {
+                processed,
+                total,
+                items_per_sec,
+                eta_secs,
+                failed,
+                ..
+            } => {
+                let eta_label = match eta_secs {
+                    Some(secs) if *secs >= 60.0 => {
+                        let mins = (secs / 60.0).floor();
+                        let rem = secs - mins * 60.0;
+                        format!("ETA {mins:.0}m{rem:02.0}s")
+                    }
+                    Some(secs) => format!("ETA {secs:.0}s"),
+                    None => "ETA …".to_string(),
+                };
+                let err_suffix = if *failed > 0 {
+                    format!(" · {failed} failed")
+                } else {
+                    String::new()
+                };
+                Some(ProgressUpdate {
+                    position: *processed as u64,
+                    length: Some(*total as u64),
+                    message: Some(format!("{items_per_sec:.1}/s · {eta_label}{err_suffix}")),
+                    finished: false,
+                })
+            }
+            IndexEvent::RunCompleted {
+                processed,
+                indexed,
+                failed,
+                elapsed,
+                ..
+            } => Some(ProgressUpdate {
+                position: *processed as u64,
+                length: Some(*processed as u64),
+                message: Some(format!(
+                    "done · {indexed} indexed · {failed} failed · {:.1}s",
+                    elapsed.as_secs_f64()
+                )),
+                finished: true,
+            }),
+            _ => None,
+        }
+    };
+
+    let mut fan = FanOut::<IndexEvent>::new();
+    fan.push(std::sync::Arc::new(IndicatifSink::new(
+        0,
+        interactive,
+        render,
+    )));
+    fan.push(std::sync::Arc::new(TracingSink));
+    std::sync::Arc::new(fan)
+}
+
 /// Build (or preview) the vector index. `dry_run=true` probes the
 /// embedder + samples chunks for ETA. `dry_run=false` writes a
 /// persistent NDJSON-backed index (Iter 3) that subsequent `aicx search`
@@ -4003,13 +4080,21 @@ fn run_index(projects: &[String], sample: usize, json: bool, dry_run: bool) -> R
             .collect::<Vec<_>>()
     };
 
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr()) && !json;
+
     let mut reports = Vec::with_capacity(scopes.len());
     for scope in scopes {
         let stats = if dry_run {
             let _lock = aicx::locks::acquire_exclusive(aicx::locks::lance_lock_path()?)?;
             aicx::vector_index::dry_run_index(scope, sample)?
         } else {
-            aicx::vector_index::write_index(scope, sample)?
+            let fan = build_index_event_fanout(interactive);
+            let fan_for_closure = std::sync::Arc::clone(&fan);
+            let on_event = move |event: &aicx_progress_contracts::IndexEvent| {
+                use aicx::progress::EventSink;
+                fan_for_closure.on_event(event);
+            };
+            aicx::vector_index::write_index_with_progress(scope, sample, &on_event)?
         };
         reports.push((scope.map(ToString::to_string), stats));
     }

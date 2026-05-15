@@ -24,8 +24,9 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use aicx_progress_contracts::{IndexEvent, RollingRate};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -335,7 +336,58 @@ fn live_index_files(
 /// acquired for the duration of the write so concurrent CLI / MCP
 /// processes serialize their rebuilds.
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[allow(clippy::too_many_arguments)]
+fn maybe_emit_stats_tick(
+    on_event: &dyn Fn(&IndexEvent),
+    rolling: &RollingRate,
+    last_tick: &mut Instant,
+    interval: Duration,
+    processed: usize,
+    indexed: usize,
+    skipped: usize,
+    failed: usize,
+    total: usize,
+) {
+    if last_tick.elapsed() < interval {
+        return;
+    }
+    let rate = rolling.rate_per_sec();
+    let remaining = total.saturating_sub(processed);
+    let eta = rolling.eta_secs(remaining);
+    on_event(&IndexEvent::StatsTick {
+        processed,
+        indexed,
+        skipped,
+        failed,
+        total,
+        items_per_sec: rate,
+        eta_secs: eta,
+        total_chunks: indexed,
+        in_flight: 1,
+    });
+    *last_tick = Instant::now();
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub fn write_index(project: Option<&str>, sample: usize) -> Result<IndexStats> {
+    write_index_with_progress(project, sample, &|_| {})
+}
+
+/// Same as [`write_index`] but emits [`IndexEvent`]s into the supplied sink
+/// for every embedded chunk plus a rate-limited [`IndexEvent::StatsTick`].
+///
+/// `aicx index` builds a `FanOut<IndexEvent>` over an `IndicatifSink` (live
+/// TTY bar) plus a tracing adapter and passes the resulting closure here so
+/// the operator can see the embedding pipeline breathe instead of staring
+/// at a 75-minute blank stdout. Internal rebuild paths (`aicx all`, library
+/// callers) still call the thin [`write_index`] wrapper above and pay zero
+/// observability cost.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub fn write_index_with_progress(
+    project: Option<&str>,
+    sample: usize,
+    on_event: &dyn Fn(&IndexEvent),
+) -> Result<IndexStats> {
     use std::collections::HashSet;
     use std::fs::{self, OpenOptions};
     use std::io::{BufWriter, Write};
@@ -446,29 +498,84 @@ pub fn write_index(project: Option<&str>, sample: usize) -> Result<IndexStats> {
         writer
     };
 
-    for stored in files.iter().take(cap) {
+    let run_started = Instant::now();
+    let total_items = cap;
+    on_event(&IndexEvent::RunStarted {
+        total_items,
+        namespace: "semantic_index".to_string(),
+        source_label: target_path.to_string_lossy().to_string(),
+        parallelism: 1,
+        started_at: chrono::Utc::now(),
+    });
+
+    let mut rolling = RollingRate::new(Duration::from_secs(10));
+    let mut last_tick = Instant::now();
+    let mut processed = 0usize;
+    let mut indexed = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    let tick_interval = Duration::from_secs(1);
+
+    for (item_index, stored) in files.iter().take(cap).enumerate() {
         let entry_id = chunk_id_from_path(&stored.path);
         if resumed_ids.contains(&entry_id) {
+            skipped += 1;
+            processed += 1;
+            on_event(&IndexEvent::ItemSkipped {
+                item_index,
+                label: entry_id,
+                reason: "resumed from checkpoint".to_string(),
+                content_hash: None,
+            });
+            maybe_emit_stats_tick(
+                on_event,
+                &rolling,
+                &mut last_tick,
+                tick_interval,
+                processed,
+                indexed,
+                skipped,
+                failed,
+                total_items,
+            );
             continue;
         }
         stats.chunks_sampled += 1;
+        let item_started = Instant::now();
         let content = match crate::sanitize::read_to_string_validated(&stored.path) {
             Ok(text) => text,
-            Err(_) => {
+            Err(err) => {
                 stats.embed_errors += 1;
+                failed += 1;
+                processed += 1;
+                on_event(&IndexEvent::ItemFailed {
+                    item_index,
+                    label: entry_id,
+                    error: format!("read failed: {err}"),
+                });
                 continue;
             }
         };
         let prefix = take_prefix_bytes(&content, DEFAULT_EMBED_PREFIX_BYTES);
+        let embedder_started = Instant::now();
         let embedding = match engine.embed(&prefix) {
             Ok(vec) => vec,
-            Err(_) => {
+            Err(err) => {
                 stats.embed_errors += 1;
+                failed += 1;
+                processed += 1;
+                on_event(&IndexEvent::ItemFailed {
+                    item_index,
+                    label: entry_id,
+                    error: format!("embed failed: {err}"),
+                });
                 continue;
             }
         };
+        let embedder_ms = embedder_started.elapsed().as_millis() as u64;
+        let duration_ms = item_started.elapsed().as_millis() as u64;
         let entry = IndexEntry {
-            id: entry_id,
+            id: entry_id.clone(),
             project: stored.project.clone(),
             agent: stored.agent.clone(),
             date: stored.date_iso.clone(),
@@ -481,7 +588,40 @@ pub fn write_index(project: Option<&str>, sample: usize) -> Result<IndexStats> {
         };
         writeln!(writer, "{}", serde_json::to_string(&entry)?)?;
         stats.embeddings_computed += 1;
+        indexed += 1;
+        processed += 1;
+        rolling.record(1);
+        on_event(&IndexEvent::ItemIndexed {
+            item_index,
+            label: entry_id,
+            chunks_indexed: 1,
+            duration_ms,
+            embedder_ms: Some(embedder_ms),
+            tokens_estimated: None,
+            content_hash: None,
+        });
+        maybe_emit_stats_tick(
+            on_event,
+            &rolling,
+            &mut last_tick,
+            tick_interval,
+            processed,
+            indexed,
+            skipped,
+            failed,
+            total_items,
+        );
     }
+
+    on_event(&IndexEvent::RunCompleted {
+        processed,
+        indexed,
+        skipped,
+        failed,
+        total_chunks: indexed,
+        elapsed: run_started.elapsed(),
+        stopped_early: false,
+    });
 
     let context_files = crate::store::scan_context_corpus_files_at(&root)?;
     if !context_files.is_empty() {
