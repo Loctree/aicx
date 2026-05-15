@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-15
+
+### Added
+- **Hybrid retrieval stack**: pure-Rust `BruteForceAdapter` for DenseIndex
+  (zero C deps), Tantivy `LexicalIndex` adapter with Polish stemming and
+  FilterCollector, retrieval evaluation harness with 50-query gold set and
+  `make retrieval-eval` gate, fusion via Reciprocal Rank Fusion in the
+  `aicx-retrieve` trait crate.
+- **Live `aicx index` progress feedback**: per-chunk `IndexEvent` stream
+  (RunStarted / ItemIndexed / ItemSkipped / ItemFailed / StatsTick /
+  RunCompleted) with rolling rate and ETA. TTY-aware `IndicatifSink`
+  shows a live progress bar with rate and ETA; piped runs fall through
+  to structured `tracing` events. Previously the 75-minute embed loop
+  emitted nothing on stdout until completion.
+- **New workspace crates**: `aicx-progress-contracts` (typed event
+  contracts, sink trait, rolling-rate helper) and `aicx-monitor` (live
+  CPU/RAM/GPU and embedder process metrics via sysinfo, Apple Silicon
+  GPU detection through ioreg).
+- **Linux cross-compilation release matrix**: GitHub Actions workflow
+  `release-linux.yml` plus `Cross.toml` config for x86_64/aarch64 musl
+  and gnu targets.
+
+### Changed
+- **BREAKING**: NDJSON semantic index corruption now fails fast above the
+  5% threshold instead of silent-swallowing corrupt lines. Operators
+  running checkpoints from older builds may need `aicx index --sample 0`
+  to rebuild cleanly.
+- Zero-hour lookback (`--hours 0`) now aligns with the all-time contract
+  across `aicx intents`, `aicx search`, and `aicx steer`.
+- Active semantic index writer is reported as `busy` in `aicx doctor`
+  output instead of falsely appearing idle.
+
+### Fixed
+- Partial semantic index builds resume from `.ndjson.tmp` checkpoint on
+  subsequent runs instead of restarting from zero.
+- Hybrid retrieve gate stabilized: fusion RRF orchestrator returns
+  consistent ranks under mixed-adapter contention.
+
+## [0.7.4] - 2026-05-15
+
 ## [0.7.3] - 2026-05-13
 
 ### Added

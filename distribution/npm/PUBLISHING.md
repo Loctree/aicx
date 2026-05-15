@@ -54,9 +54,9 @@ Then it:
 ### Step 1 - Sync versions
 
 ```bash
-node distribution/npm/sync-version.mjs 0.7.4
-node distribution/npm/sync-version.mjs --check 0.7.4
-node distribution/npm/verify-metadata.mjs 0.7.4
+node distribution/npm/sync-version.mjs 0.8.0
+node distribution/npm/sync-version.mjs --check 0.8.0
+node distribution/npm/verify-metadata.mjs 0.8.0
 ```
 
 ### Step 2 - Publish platform packages first
@@ -116,10 +116,10 @@ then publishes the wrapper.
 Real asset shape:
 
 ```bash
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.7.4/aicx-v0.7.4-aarch64-apple-darwin-slim-unsigned.tar.gz
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.7.4/aicx-v0.7.4-aarch64-apple-darwin-slim-unsigned.tar.gz.sha256
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.7.4/aicx-v0.7.4-x86_64-unknown-linux-gnu-slim-unsigned.tar.gz
-curl -LI https://github.com/Loctree/aicx/releases/download/v0.7.4/aicx-v0.7.4-x86_64-unknown-linux-gnu-slim-unsigned.tar.gz.sha256
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.8.0/aicx-v0.8.0-aarch64-apple-darwin-slim-unsigned.tar.gz
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.8.0/aicx-v0.8.0-aarch64-apple-darwin-slim-unsigned.tar.gz.sha256
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.8.0/aicx-v0.8.0-x86_64-unknown-linux-gnu-slim-unsigned.tar.gz
+curl -LI https://github.com/Loctree/aicx/releases/download/v0.8.0/aicx-v0.8.0-x86_64-unknown-linux-gnu-slim-unsigned.tar.gz.sha256
 ```
 
 ### optionalDependencies disabled

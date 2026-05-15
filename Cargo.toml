@@ -1,7 +1,7 @@
 [package]
 name = "aicx"
 
-version = "0.7.4"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.91.1"
 description = "Operator CLI + MCP server: canonical corpus first, optional semantic index second (Claude Code, Codex, Gemini)"
@@ -55,9 +55,9 @@ cloud-embedder = ["dep:aicx-embeddings", "aicx-embeddings/cloud"]
 e2e-aicx = ["native-embedder", "cloud-embedder"]
 
 [dependencies]
-aicx-embeddings = { version = "0.7.0", optional = true, default-features = false }
+aicx-embeddings = { version = "0.8.0", optional = true, default-features = false }
 aicx-monitor = { version = "0.1.0", path = "crates/aicx-monitor" }
-aicx-parser = { version = "0.7.0", features = ["json-schema"] }
+aicx-parser = { version = "0.8.0", features = ["json-schema"] }
 aicx-progress-contracts = { version = "0.1.0", path = "crates/aicx-progress-contracts" }
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
