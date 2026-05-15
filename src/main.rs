@@ -1087,7 +1087,7 @@ enum Commands {
         project: Vec<String>,
 
         /// Stop after sampling this many chunks (0 = scan all)
-        #[arg(long, default_value = "16")]
+        #[arg(long, default_value = "0")]
         sample: usize,
 
         /// Emit JSON stats instead of plain text
@@ -4065,6 +4065,11 @@ fn run_index_status(project: Option<&str>, json: bool) -> Result<()> {
             status.semantic_index_present
         );
         eprintln!(
+            "  semantic_index_path:    {}",
+            status.semantic_index_path.as_deref().unwrap_or("<none>")
+        );
+        eprintln!("  semantic_index_rows:    {}", status.semantic_index_rows);
+        eprintln!(
             "  newest_chunk_mtime:     {}",
             status.newest_chunk_mtime.as_deref().unwrap_or("<none>")
         );
@@ -4080,6 +4085,23 @@ fn run_index_status(project: Option<&str>, json: bool) -> Result<()> {
                 .unwrap_or_else(|| "<unknown>".to_string())
         );
         eprintln!("  pending_chunks:         {}", status.pending_chunks);
+        eprintln!("  temp_index_present:     {}", status.temp_index_present);
+        eprintln!(
+            "  temp_index_path:        {}",
+            status.temp_index_path.as_deref().unwrap_or("<none>")
+        );
+        eprintln!("  temp_index_rows:        {}", status.temp_index_rows);
+        eprintln!(
+            "  temp_index_mtime:       {}",
+            status.temp_index_mtime.as_deref().unwrap_or("<none>")
+        );
+        eprintln!(
+            "  temp_index_bytes:       {}",
+            status
+                .temp_index_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<none>".to_string())
+        );
     }
     Ok(())
 }
@@ -5200,10 +5222,14 @@ mod tests {
 
         match cli.command {
             Some(Commands::Index {
-                dry_run, project, ..
+                dry_run,
+                project,
+                sample,
+                ..
             }) => {
                 assert!(!dry_run);
                 assert!(project.is_empty());
+                assert_eq!(sample, 0, "default materialization should index all chunks");
             }
             _ => panic!("expected index command"),
         }

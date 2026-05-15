@@ -72,6 +72,12 @@ pub struct IndexStats {
     /// produced one. `None` for `dry_run_index`. Public so callers can
     /// echo it back to the operator after a build.
     pub index_path: Option<PathBuf>,
+    /// Number of already-materialized embeddings reused from a surviving
+    /// `<index>.tmp` checkpoint during a resumed full build.
+    pub resumed_embeddings: usize,
+    /// Checkpoint path used for resume, when a full build continued from
+    /// an existing temporary index instead of truncating it.
+    pub resume_tmp_path: Option<PathBuf>,
 }
 
 /// One row of the persistent NDJSON-backed index.
@@ -167,6 +173,8 @@ pub fn dry_run_index(project: Option<&str>, sample: usize) -> Result<IndexStats>
         elapsed_ms: 0,
         dry_run: true,
         index_path: None,
+        resumed_embeddings: 0,
+        resume_tmp_path: None,
     };
 
     let root = crate::store::store_base_dir()?;
@@ -328,7 +336,8 @@ fn live_index_files(
 /// processes serialize their rebuilds.
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub fn write_index(project: Option<&str>, sample: usize) -> Result<IndexStats> {
-    use std::fs;
+    use std::collections::HashSet;
+    use std::fs::{self, OpenOptions};
     use std::io::{BufWriter, Write};
 
     let started = Instant::now();
@@ -344,7 +353,18 @@ pub fn write_index(project: Option<&str>, sample: usize) -> Result<IndexStats> {
         elapsed_ms: 0,
         dry_run: false,
         index_path: None,
+        resumed_embeddings: 0,
+        resume_tmp_path: None,
     };
+
+    let target_path = index_path(project)?;
+    let tmp_path = target_path.with_extension("ndjson.tmp");
+    if sample != 0 && tmp_path.exists() {
+        return Err(anyhow::anyhow!(
+            "refusing to overwrite existing semantic index checkpoint: {}. Run `aicx index --sample 0` to resume the full build, or move the checkpoint aside deliberately.",
+            tmp_path.display()
+        ));
+    }
 
     let _lock = crate::locks::acquire_exclusive(crate::locks::lance_lock_path()?)?;
 
@@ -373,43 +393,64 @@ pub fn write_index(project: Option<&str>, sample: usize) -> Result<IndexStats> {
     stats.model_id = Some(info.model_id.clone());
     stats.model_profile = Some(info.profile.to_string());
 
-    let target_path = index_path(project)?;
     if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create index dir: {}", parent.display()))?;
     }
-
-    // Atomic-ish: write to `.tmp` then rename so a partial build cannot
-    // poison subsequent queries. `create_file_validated` validates the
-    // path against canonical roots BEFORE opening the file — important
-    // because `project` flows from operator input into the index path
-    // components, and a malicious `../` segment must not escape the
-    // index tree.
-    let tmp_path = target_path.with_extension("ndjson.tmp");
-    let mut writer = BufWriter::new(
-        crate::sanitize::create_file_validated(&tmp_path)
-            .with_context(|| format!("open tmp index: {}", tmp_path.display()))?,
-    );
 
     let cap = if sample == 0 {
         files.len()
     } else {
         sample.min(files.len())
     };
-
-    let header = IndexHeader {
-        schema_version: INDEX_SCHEMA_VERSION.to_string(),
-        model_id: info.model_id.clone(),
-        model_profile: info.profile.to_string(),
-        dimension: info.dimension,
-        generated_at: chrono::Utc::now().to_rfc3339(),
-        entry_count: 0, // patched by the caller after the entry pass; for
-                        // NDJSON streaming consumers a 0 just means "scan
-                        // until EOF".
+    let resume = if sample == 0 {
+        load_resume_tmp_index(&tmp_path, &info)?
+    } else {
+        None
     };
-    writeln!(writer, "{}", serde_json::to_string(&header)?)?;
+    let resumed_ids: HashSet<String> = resume
+        .as_ref()
+        .map(|state| state.ids.clone())
+        .unwrap_or_default();
+
+    // Atomic-ish: write to `.tmp` then rename so a partial build cannot
+    // poison subsequent queries. Full builds resume an existing compatible
+    // `.tmp` checkpoint; sample builds intentionally start clean so the
+    // operator gets exactly the requested sample size.
+    let mut writer = if let Some(state) = &resume {
+        stats.resumed_embeddings = state.rows;
+        stats.resume_tmp_path = Some(tmp_path.clone());
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&tmp_path)
+            .with_context(|| format!("open tmp index for resume: {}", tmp_path.display()))?;
+        if state.needs_newline {
+            file.write_all(b"\n")
+                .with_context(|| format!("repair tmp trailing newline: {}", tmp_path.display()))?;
+        }
+        BufWriter::new(file)
+    } else {
+        let mut writer = BufWriter::new(
+            crate::sanitize::create_file_validated(&tmp_path)
+                .with_context(|| format!("open tmp index: {}", tmp_path.display()))?,
+        );
+        let header = IndexHeader {
+            schema_version: INDEX_SCHEMA_VERSION.to_string(),
+            model_id: info.model_id.clone(),
+            model_profile: info.profile.to_string(),
+            dimension: info.dimension,
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            entry_count: 0, // NDJSON streaming consumers scan until EOF.
+        };
+        writeln!(writer, "{}", serde_json::to_string(&header)?)?;
+        writer
+    };
 
     for stored in files.iter().take(cap) {
+        let entry_id = chunk_id_from_path(&stored.path);
+        if resumed_ids.contains(&entry_id) {
+            continue;
+        }
         stats.chunks_sampled += 1;
         let content = match crate::sanitize::read_to_string_validated(&stored.path) {
             Ok(text) => text,
@@ -427,7 +468,7 @@ pub fn write_index(project: Option<&str>, sample: usize) -> Result<IndexStats> {
             }
         };
         let entry = IndexEntry {
-            id: chunk_id_from_path(&stored.path),
+            id: entry_id,
             project: stored.project.clone(),
             agent: stored.agent.clone(),
             date: stored.date_iso.clone(),
@@ -541,8 +582,104 @@ pub fn write_index(project: Option<&str>, _sample: usize) -> Result<IndexStats> 
         elapsed_ms: 0,
         dry_run: false,
         index_path: None,
+        resumed_embeddings: 0,
+        resume_tmp_path: None,
     };
     Ok(stats)
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[derive(Debug, Clone)]
+struct ResumeTmpIndex {
+    ids: std::collections::HashSet<String>,
+    rows: usize,
+    needs_newline: bool,
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn load_resume_tmp_index(
+    path: &std::path::Path,
+    info: &crate::embedder::EmbeddingModelInfo,
+) -> Result<Option<ResumeTmpIndex>> {
+    use std::collections::HashSet;
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let file = crate::sanitize::open_file_validated(path)
+        .with_context(|| format!("open tmp index checkpoint: {}", path.display()))?;
+    let mut lines = BufReader::new(file).lines();
+    let header_line = match lines.next() {
+        Some(line) => line.with_context(|| format!("read tmp header: {}", path.display()))?,
+        None => return Ok(None),
+    };
+    let header: IndexHeader = serde_json::from_str(&header_line)
+        .with_context(|| format!("parse tmp header: {}", path.display()))?;
+    let profile = info.profile.to_string();
+    if header.schema_version != INDEX_SCHEMA_VERSION
+        || header.model_id != info.model_id
+        || header.model_profile != profile
+        || header.dimension != info.dimension
+    {
+        return Err(anyhow::anyhow!(
+            "tmp index checkpoint is incompatible with the active embedder: {}. Move it aside or rebuild with matching embedder config.",
+            path.display()
+        ));
+    }
+
+    #[derive(Deserialize)]
+    struct ResumeEntry {
+        id: String,
+    }
+
+    let mut ids = HashSet::new();
+    let mut rows = 0usize;
+    for (line_no, line) in lines.enumerate() {
+        let line = line.with_context(|| {
+            format!(
+                "read tmp index checkpoint line {}: {}",
+                line_no + 2,
+                path.display()
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: ResumeEntry = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "parse tmp index checkpoint line {}: {}",
+                line_no + 2,
+                path.display()
+            )
+        })?;
+        ids.insert(entry.id);
+        rows += 1;
+    }
+
+    let mut tail = crate::sanitize::open_file_validated(path)
+        .with_context(|| format!("open tmp index tail: {}", path.display()))?;
+    let len = tail
+        .metadata()
+        .with_context(|| format!("stat tmp index: {}", path.display()))?
+        .len();
+    let needs_newline = if len == 0 {
+        false
+    } else {
+        tail.seek(SeekFrom::End(-1))
+            .with_context(|| format!("seek tmp index tail: {}", path.display()))?;
+        let mut byte = [0u8; 1];
+        tail.read_exact(&mut byte)
+            .with_context(|| format!("read tmp index tail: {}", path.display()))?;
+        byte[0] != b'\n'
+    };
+
+    Ok(Some(ResumeTmpIndex {
+        ids,
+        rows,
+        needs_newline,
+    }))
 }
 
 fn chunk_id_from_path(path: &std::path::Path) -> String {
@@ -1089,6 +1226,12 @@ pub fn render_stats_text(stats: &IndexStats) -> String {
         "  embeddings_computed: {}\n",
         stats.embeddings_computed
     ));
+    if stats.resumed_embeddings > 0 {
+        out.push_str(&format!(
+            "  resumed_embeddings:  {}\n",
+            stats.resumed_embeddings
+        ));
+    }
     out.push_str(&format!("  embed_errors:        {}\n", stats.embed_errors));
     if let Some(dim) = stats.dimension {
         out.push_str(&format!("  dimension:           {}\n", dim));
@@ -1105,6 +1248,9 @@ pub fn render_stats_text(stats: &IndexStats) -> String {
     }
     if let Some(reason) = stats.fallback_reason.as_deref() {
         out.push_str(&format!("  fallback_reason:     {}\n", reason));
+    }
+    if let Some(path) = stats.resume_tmp_path.as_deref() {
+        out.push_str(&format!("  resume_tmp_path:     {}\n", path.display()));
     }
     if stats.dry_run {
         out.push_str("  note: dry-run only; omit `--dry-run` to materialize the semantic index.\n");
@@ -1135,6 +1281,8 @@ mod tests {
             elapsed_ms: 100,
             dry_run: true,
             index_path: None,
+            resumed_embeddings: 0,
+            resume_tmp_path: None,
         };
         assert!(stats.full_index_eta_secs().is_none());
     }
@@ -1154,6 +1302,8 @@ mod tests {
             elapsed_ms: 1000,
             dry_run: true,
             index_path: None,
+            resumed_embeddings: 0,
+            resume_tmp_path: None,
         };
         // 10000 * 100 ms = 1_000_000 ms = 1000 s.
         assert_eq!(stats.full_index_eta_secs(), Some(1000));
@@ -1173,6 +1323,8 @@ mod tests {
             elapsed_ms: 5,
             dry_run: true,
             index_path: None,
+            resumed_embeddings: 0,
+            resume_tmp_path: None,
         };
         let text = render_stats_text(&stats);
         assert!(text.contains("fallback_reason:"));
@@ -1194,6 +1346,8 @@ mod tests {
             elapsed_ms: 5_000,
             dry_run: true,
             index_path: None,
+            resumed_embeddings: 0,
+            resume_tmp_path: None,
         };
         let text = render_stats_text(&stats);
         assert!(text.contains("full_index_eta_secs:"));
@@ -1215,6 +1369,8 @@ mod tests {
             elapsed_ms: 800,
             dry_run: true,
             index_path: None,
+            resumed_embeddings: 0,
+            resume_tmp_path: None,
         };
         let json = render_stats_json(&stats).expect("serialize");
         assert!(json.contains("\"chunks_total\":42"));
