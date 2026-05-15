@@ -2251,6 +2251,21 @@ struct ExtractFileOptions {
     conversation: bool,
 }
 
+/// Convert a lookback period (in hours) to a UTC cutoff timestamp.
+///
+/// Clamps the input to `[1, i32::MAX]` hours (~245k years — astronomical
+/// upper bound that comfortably fits chrono's internal `TimeDelta` range
+/// and stays well below the `i64`/`u64` overflow boundary). Without these
+/// guards, casting a very large `u64` with `as i64` would silently wrap
+/// to a negative value and place the cutoff in the future.
+fn cutoff_for_hours(hours: u64) -> DateTime<Utc> {
+    const MAX_SAFE_HOURS: i64 = i32::MAX as i64;
+    let hours_i64 = i64::try_from(hours)
+        .unwrap_or(MAX_SAFE_HOURS)
+        .clamp(1, MAX_SAFE_HOURS);
+    Utc::now() - chrono::Duration::hours(hours_i64)
+}
+
 fn extract_input_format_label(format: ExtractInputFormat) -> &'static str {
     match format {
         ExtractInputFormat::Claude => "claude",
@@ -2352,7 +2367,7 @@ fn run_conversations_batch(options: ConversationsBatchOptions) -> Result<()> {
         anyhow::bail!("conversations v1 supports --agent claude only");
     }
 
-    let cutoff = Utc::now() - chrono::Duration::hours(options.hours.max(1) as i64);
+    let cutoff = cutoff_for_hours(options.hours);
     let config = ExtractionConfig {
         project_filter: options.project_filter.clone(),
         cutoff,
@@ -2691,7 +2706,7 @@ fn run_extract_session(
     } = options;
 
     let agent_label = extract_input_format_label(agent);
-    let cutoff = Utc::now() - chrono::Duration::hours(hours.max(1) as i64);
+    let cutoff = cutoff_for_hours(hours);
     let config = ExtractionConfig {
         project_filter: explicit_project
             .as_ref()
@@ -3225,7 +3240,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         project.join("+")
     };
 
-    let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
+    let cutoff = cutoff_for_hours(hours);
 
     // Default behavior is incremental. --full-rescan and the legacy --force
     // escape hatch both mean "scan the full lookback window".
@@ -3612,7 +3627,7 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         eprintln!("  [warn] --respect-artifact-family=false: legacy routing mode active");
     }
 
-    let cutoff = cutoff.unwrap_or_else(|| Utc::now() - chrono::Duration::hours(hours as i64));
+    let cutoff = cutoff.unwrap_or_else(|| cutoff_for_hours(hours));
 
     let agents = resolve_store_agents(agent.as_deref())?;
 
@@ -4159,7 +4174,7 @@ fn run_search(
             })
             .collect()
     } else if hours > 0 {
-        let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
+        let cutoff = cutoff_for_hours(hours);
         let cutoff_date = cutoff.format("%Y-%m-%d").to_string();
         results
             .into_iter()
@@ -5402,6 +5417,37 @@ mod tests {
     use super::*;
     use filetime::{FileTime, set_file_mtime};
     use std::fs;
+
+    #[test]
+    fn cutoff_for_hours_clamps_zero_to_at_least_one_hour() {
+        let before = Utc::now();
+        let cutoff = cutoff_for_hours(0);
+        let after = Utc::now();
+        // With clamp to 1h, cutoff must sit ~1h before now (allow ±5s slack).
+        let lower = before - chrono::Duration::hours(1) - chrono::Duration::seconds(5);
+        let upper = after - chrono::Duration::hours(1) + chrono::Duration::seconds(5);
+        assert!(cutoff >= lower && cutoff <= upper, "cutoff out of range: {cutoff}");
+    }
+
+    #[test]
+    fn cutoff_for_hours_handles_normal_range() {
+        let before = Utc::now();
+        let cutoff = cutoff_for_hours(8);
+        let after = Utc::now();
+        let lower = before - chrono::Duration::hours(8) - chrono::Duration::seconds(5);
+        let upper = after - chrono::Duration::hours(8) + chrono::Duration::seconds(5);
+        assert!(cutoff >= lower && cutoff <= upper, "cutoff out of range: {cutoff}");
+    }
+
+    #[test]
+    fn cutoff_for_hours_avoids_u64_to_i64_overflow() {
+        // Without `i64::try_from`, casting `u64::MAX as i64` wraps to -1 and
+        // places the cutoff one hour in the future. Verify the clamp keeps it
+        // strictly in the past.
+        let now = Utc::now();
+        let cutoff = cutoff_for_hours(u64::MAX);
+        assert!(cutoff < now, "cutoff must not be in the future: {cutoff} vs now {now}");
+    }
 
     fn unique_test_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
