@@ -91,16 +91,30 @@ pub fn to_conversation_with_stats(
     drop_exact_short_user_duplicates(messages)
 }
 
+/// Compute a stable 64-bit key for `(session_id, trimmed message)` without
+/// allocating new `String`s on the hot dedup path. Uses SipHash-1-3 with a
+/// null-byte delimiter between the two fields to avoid prefix collisions
+/// between e.g. `("abc", "def")` and `("ab", "cdef")`.
+fn exact_short_dup_key(session_id: &str, trimmed: &str) -> u64 {
+    use siphasher::sip::SipHasher13;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = SipHasher13::new();
+    session_id.hash(&mut hasher);
+    0u8.hash(&mut hasher);
+    trimmed.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn drop_exact_short_user_duplicates(messages: Vec<ConversationMessage>) -> ConversationProjection {
     let mut deduped: Vec<ConversationMessage> = Vec::with_capacity(messages.len());
-    let mut last_seen_user: HashMap<(String, String), DateTime<Utc>> = HashMap::new();
+    let mut last_seen_user: HashMap<u64, DateTime<Utc>> = HashMap::new();
     let mut exact_short_duplicates_dropped = 0;
 
     for msg in messages {
         let trimmed = msg.message.trim();
         let is_short_user = msg.role == "user" && trimmed.len() <= EXACT_SHORT_DUP_MAX_CHARS;
         let is_exact_short_duplicate = if is_short_user {
-            let key = (msg.session_id.clone(), trimmed.to_string());
+            let key = exact_short_dup_key(&msg.session_id, trimmed);
             let is_duplicate = last_seen_user.get(&key).is_some_and(|previous_timestamp| {
                 msg.timestamp
                     .signed_duration_since(*previous_timestamp)
