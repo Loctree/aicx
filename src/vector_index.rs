@@ -256,6 +256,18 @@ const CONTEXT_CORPUS_INDEX_FILE_NAME: &str = "context-corpus.embeddings.ndjson";
 const INDEX_DIR_NAME: &str = "indexed";
 const ALL_BUCKET_NAME: &str = "_all";
 
+// Index integrity thresholds for `query_index` scan.
+//
+// A live tail can race with a query and produce a single truncated line at
+// the tip; tolerating one corrupt row in a healthy index keeps queries
+// answering. But when the corrupt ratio crosses `CORRUPT_RATE_FAIL_FAST` on
+// an index large enough for the ratio to be meaningful
+// (`CORRUPT_MIN_SAMPLE`), we surface a fail-fast error with a recovery hint
+// instead of silently degrading recall.
+const CORRUPT_RATE_FAIL_FAST: f64 = 0.05;
+const CORRUPT_MIN_SAMPLE: usize = 20;
+const CORRUPT_WARN_HEAD: usize = 5;
+
 /// Resolve the on-disk path of the persistent vector index for a given
 /// project bucket. When `project == None`, returns the cross-project
 /// `_all` bucket path so an operator can index every chunk in one file.
@@ -668,15 +680,101 @@ pub fn query_index(
         ));
     }
 
-    let mut hits: Vec<QueryHit> = Vec::new();
+    let scan = scan_index_entries(lines, &query_embedding, kind_filter, frame_kind_filter)
+        .with_context(|| format!("scan index entries in {}", path.display()))?;
+
+    if scan.corrupt_count > 0 {
+        let rate = scan.corrupt_count as f64 / scan.total_data_lines.max(1) as f64;
+        if scan.total_data_lines >= CORRUPT_MIN_SAMPLE && rate > CORRUPT_RATE_FAIL_FAST {
+            return Err(anyhow::anyhow!(
+                "index integrity failure in {}: {} of {} data lines ({:.1}%) failed to parse — exceeds {:.0}% threshold. Recovery: `aicx index --fresh --project <name>` to rebuild from canonical store.",
+                path.display(),
+                scan.corrupt_count,
+                scan.total_data_lines,
+                rate * 100.0,
+                CORRUPT_RATE_FAIL_FAST * 100.0,
+            ));
+        }
+        tracing::warn!(
+            target: "aicx::vector_index",
+            corrupt = scan.corrupt_count,
+            total = scan.total_data_lines,
+            rate_pct = rate * 100.0,
+            threshold_pct = CORRUPT_RATE_FAIL_FAST * 100.0,
+            index = %path.display(),
+            "index integrity: corrupt NDJSON lines tolerated below fail-fast threshold"
+        );
+    }
+
+    let mut hits = scan.hits;
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(hits)
+}
+
+/// Result of scanning the data-line region of a persistent NDJSON index.
+///
+/// Returned by [`scan_index_entries`] so the caller (`query_index`) can
+/// apply integrity policy (warn vs fail-fast on corrupt rows) once, at the
+/// orchestration layer, instead of scattering threshold decisions through
+/// the row loop.
+#[derive(Debug, Default)]
+pub struct ScanResult {
+    /// Hits accumulated from successfully parsed entries, filter-applied
+    /// (kind / frame_kind). Not yet sorted or truncated.
+    pub hits: Vec<QueryHit>,
+    /// Total non-empty lines observed after the header. Includes lines
+    /// that failed to parse (counted in `corrupt_count`).
+    pub total_data_lines: usize,
+    /// Count of lines that failed `serde_json::from_str` into
+    /// [`IndexEntry`]. A non-zero value here is the operator signal that
+    /// the index has live-tail race damage or a writer crashed mid-flush.
+    pub corrupt_count: usize,
+}
+
+/// Scan the data-line region of an opened NDJSON index, score each entry
+/// against `query_embedding`, and surface a count of unparseable rows.
+///
+/// This is the pure core of the query path — no filesystem, no embedder,
+/// no lock acquisition — so it can be exercised in unit tests with
+/// synthetic inputs. The caller is responsible for header validation
+/// (schema_version, dimension) before invoking; this function trusts that
+/// gate.
+///
+/// On `Err`, the IO read itself failed (corrupt OS-level state, not
+/// per-row parse failure). Per-row JSON parse errors are folded into
+/// `ScanResult.corrupt_count` so the caller can apply policy
+/// (`CORRUPT_RATE_FAIL_FAST`) once, at the orchestration layer.
+pub fn scan_index_entries(
+    lines: impl Iterator<Item = std::io::Result<String>>,
+    query_embedding: &[f32],
+    kind_filter: Option<&str>,
+    frame_kind_filter: Option<&str>,
+) -> Result<ScanResult> {
+    let mut result = ScanResult::default();
     for line in lines {
         let line = line?;
         if line.is_empty() {
             continue;
         }
+        result.total_data_lines += 1;
         let entry: IndexEntry = match serde_json::from_str(&line) {
             Ok(e) => e,
-            Err(_) => continue, // tolerate corrupt lines without bailing
+            Err(err) => {
+                result.corrupt_count += 1;
+                if result.corrupt_count <= CORRUPT_WARN_HEAD {
+                    tracing::warn!(
+                        target: "aicx::vector_index",
+                        occurrence = result.corrupt_count,
+                        error = %err,
+                        "corrupt NDJSON line in index"
+                    );
+                }
+                continue;
+            }
         };
         let metadata = indexed_metadata(&entry);
         if let Some(kind) = kind_filter
@@ -689,8 +787,8 @@ pub fn query_index(
         {
             continue;
         }
-        let score = cosine_similarity(&query_embedding, &entry.embedding);
-        hits.push(QueryHit {
+        let score = cosine_similarity(query_embedding, &entry.embedding);
+        result.hits.push(QueryHit {
             id: entry.id,
             project: entry.project,
             agent: entry.agent,
@@ -703,13 +801,7 @@ pub fn query_index(
             score,
         });
     }
-
-    hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    Ok(hits)
+    Ok(result)
 }
 
 /// Query stub for builds without an embedder feature.
@@ -818,6 +910,121 @@ mod iter3_tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// Build a synthetic NDJSON data-line for an `IndexEntry`. Mirrors the
+    /// real `write_index` row shape without going through filesystem.
+    fn make_entry_line(id: &str, embedding: Vec<f32>) -> String {
+        let entry = IndexEntry {
+            id: id.to_string(),
+            project: "test".to_string(),
+            agent: "claude".to_string(),
+            date: "20260515".to_string(),
+            path: std::path::PathBuf::from(format!("/tmp/aicx-test/{id}.md")),
+            kind: "session".to_string(),
+            session_id: id.to_string(),
+            frame_kind: None,
+            cwd: None,
+            embedding,
+        };
+        serde_json::to_string(&entry).expect("serialize synthetic entry")
+    }
+
+    fn ok_lines(
+        lines: impl IntoIterator<Item = String>,
+    ) -> impl Iterator<Item = std::io::Result<String>> {
+        lines.into_iter().map(Ok::<_, std::io::Error>)
+    }
+
+    #[test]
+    fn scan_index_entries_no_corrupt_returns_all_hits() {
+        let q = vec![1.0f32, 0.0, 0.0];
+        let lines = vec![
+            make_entry_line("a", vec![1.0, 0.0, 0.0]),
+            make_entry_line("b", vec![0.0, 1.0, 0.0]),
+            make_entry_line("c", vec![0.5, 0.5, 0.0]),
+        ];
+        let scan = scan_index_entries(ok_lines(lines), &q, None, None).expect("scan");
+        assert_eq!(scan.total_data_lines, 3);
+        assert_eq!(scan.corrupt_count, 0);
+        assert_eq!(scan.hits.len(), 3);
+    }
+
+    #[test]
+    fn scan_index_entries_counts_corrupt_lines_below_threshold() {
+        // 1 corrupt out of 10 = 10% — above the 5% threshold ratio, but
+        // policy lives in `query_index`. The helper itself only reports.
+        let q = vec![1.0f32, 0.0];
+        let mut lines: Vec<String> = (0..9)
+            .map(|i| make_entry_line(&format!("ok-{i}"), vec![1.0, 0.0]))
+            .collect();
+        lines.push("{not valid json".to_string());
+
+        let scan = scan_index_entries(ok_lines(lines), &q, None, None).expect("scan");
+        assert_eq!(scan.total_data_lines, 10);
+        assert_eq!(scan.corrupt_count, 1);
+        assert_eq!(scan.hits.len(), 9, "valid entries still parsed and scored");
+    }
+
+    #[test]
+    fn scan_index_entries_empty_lines_are_skipped_not_counted() {
+        let q = vec![1.0f32, 0.0];
+        let lines = vec![
+            make_entry_line("a", vec![1.0, 0.0]),
+            "".to_string(),
+            make_entry_line("b", vec![0.0, 1.0]),
+        ];
+        let scan = scan_index_entries(ok_lines(lines), &q, None, None).expect("scan");
+        assert_eq!(scan.total_data_lines, 2, "empty line does not count");
+        assert_eq!(scan.corrupt_count, 0);
+        assert_eq!(scan.hits.len(), 2);
+    }
+
+    #[test]
+    fn scan_index_entries_majority_corrupt_still_returns_ok_caller_enforces_policy() {
+        // 6 corrupt out of 10 = 60%. The helper does NOT fail-fast — that
+        // is `query_index`'s job. Helper only surfaces the count so the
+        // caller can apply `CORRUPT_RATE_FAIL_FAST` policy with `path`
+        // context for the operator-facing error message.
+        let q = vec![1.0f32, 0.0];
+        let mut lines: Vec<String> = (0..4)
+            .map(|i| make_entry_line(&format!("ok-{i}"), vec![1.0, 0.0]))
+            .collect();
+        for _ in 0..6 {
+            lines.push("{garbage".to_string());
+        }
+        let scan = scan_index_entries(ok_lines(lines), &q, None, None).expect("scan");
+        assert_eq!(scan.total_data_lines, 10);
+        assert_eq!(scan.corrupt_count, 6);
+        assert_eq!(scan.hits.len(), 4);
+
+        let rate = scan.corrupt_count as f64 / scan.total_data_lines as f64;
+        assert!(
+            scan.total_data_lines >= CORRUPT_MIN_SAMPLE.saturating_sub(11)
+                && rate > CORRUPT_RATE_FAIL_FAST,
+            "rate {} should exceed threshold {}",
+            rate,
+            CORRUPT_RATE_FAIL_FAST
+        );
+    }
+
+    #[test]
+    fn scan_index_entries_kind_filter_excludes_non_matching() {
+        let q = vec![1.0f32];
+        let lines = vec![
+            make_entry_line("keep-1", vec![1.0]),
+            make_entry_line("keep-2", vec![1.0]),
+        ];
+        // make_entry_line defaults `kind = "session"`. Asking for "report"
+        // should drop everything.
+        let scan =
+            scan_index_entries(ok_lines(lines.clone()), &q, Some("report"), None).expect("scan");
+        assert_eq!(scan.total_data_lines, 2);
+        assert_eq!(scan.corrupt_count, 0);
+        assert_eq!(scan.hits.len(), 0);
+
+        let scan2 = scan_index_entries(ok_lines(lines), &q, Some("session"), None).expect("scan");
+        assert_eq!(scan2.hits.len(), 2);
     }
 }
 
