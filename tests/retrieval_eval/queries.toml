@@ -1,0 +1,600 @@
+[[queries]]
+id = "po-000"
+category = "polish"
+query = "gdzie jest naprawiony corrupt-line bug w vector_index"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/tauri-apps/window-vibrancy/2026_0220/conversations/codex/2026_0220_codex_019c7860-dda_1073.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vetcoders-io/2026_0415/conversations/claude/2026_0415_claude_c98f54af-1e9_107.md",
+    "/Users/polyversai/.aicx/store/vitejs/vite-plugin-react/2025_1116/conversations/codex/2025_1116_codex_019a8b5d-1c4_255.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated polish query"
+
+[[queries]]
+id = "po-001"
+category = "polish"
+query = "wczorajsze problemy z mesh embedderem"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/vista-portal/2026_0410/conversations/claude/2026_0410_claude_f476f4be-6d7_007.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vista/2026_0427/conversations/claude/2026_0427_claude_1609302b-8f2_062.md",
+    "/Users/polyversai/.aicx/store/Loctree/loct-codex/2025_1204/conversations/codex/2025_1204_codex_019abab7-26b_007.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated polish query"
+
+[[queries]]
+id = "po-002"
+category = "polish"
+query = "kto pisał o Lance removal"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/Loctree/Loctree/2026_0315/conversations/claude/2026_0315_claude_4db577f7-823_060.md",
+    "/Users/polyversai/.aicx/store/tauri-apps/window-vibrancy/2026_0220/conversations/codex/2026_0220_codex_019c7860-dda_821.md",
+    "/Users/polyversai/.aicx/store/LibraxisAI/vista/2025_1206/conversations/claude/2025_1206_claude_37fcb92b-1b8_012.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated polish query"
+
+[[queries]]
+id = "po-003"
+category = "polish"
+query = "ostatnia decyzja architektoniczna o sqlite-vec"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/LibraxisAI/lbrx-services/2026_0427/conversations/claude/2026_0427_claude_e55b8a33-2e1_042.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0328/conversations/claude/2026_0328_claude_9f5195fe-89d_003.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vista-portal/2026_0416/conversations/claude/2026_0416_claude_c021cb1b-f09_011.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated polish query"
+
+[[queries]]
+id = "po-004"
+category = "polish"
+query = "co Codex zaproponował w rsch-091120"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/codescribe/2026_0416/plans/gemini/2026_0416_gemini_e3102f2d-804_012.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vc-operator/2026_0513/conversations/claude/2026_0513_claude_6507833e-e60_074.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0424/plans/claude/2026_0424_claude_c72b49be-80c_022.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated polish query"
+
+[[queries]]
+id = "po-005"
+category = "polish"
+query = "fix dla NDJSON corrupt-line"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/Loctree/loctree-suite/2026_0427/conversations/claude/2026_0427_claude_68431802-229_044.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vista/2026_0428/conversations/claude/2026_0428_claude_de3b638a-312_041.md",
+    "/Users/polyversai/.aicx/store/Loctree/loct-codex/2025_1210/conversations/claude/2025_1210_claude_06fb8119-9bc_003.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated polish query"
+
+[[queries]]
+id = "po-006"
+category = "polish"
+query = "jak zaimplementować chunking w aicx"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/vista-portal/2026_0418/plans/claude/2026_0418_claude_9e332f05-60a_169.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0408/conversations/claude/2026_0408_claude_0428f902-b0a_016.md",
+    "/Users/polyversai/.aicx/store/Loctree/Loctree/2026_0413/conversations/claude/2026_0413_claude_d871ffcb-068_222.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated polish query"
+
+[[queries]]
+id = "po-007"
+category = "polish"
+query = "gdzie logujemy błędy wektoryzacji"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/rmcp-memex/2026_0405/plans/claude/2026_0405_claude_780b6a70-e46_024.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vista/2025_1124/conversations/gemini/2025_1124_gemini_79b9571d-273_015.md",
+    "/Users/polyversai/.aicx/store/Homebrew/brew/2025_1114/conversations/codex/2025_1114_codex_019a717e-fc2_069.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated polish query"
+
+[[queries]]
+id = "po-008"
+category = "polish"
+query = "kiedy usunęliśmy stare adaptery bazy"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/LibraxisAI/lbrx-services/2026_0314/conversations/claude/2026_0314_claude_2e303e26-0c5_096.md",
+    "/Users/polyversai/.aicx/store/VetCoders/unicode-puzzles-portal/2026_0429/conversations/claude/2026_0429_claude_b941c18a-d49_007.md",
+    "/Users/polyversai/.aicx/store/Szowesgad/maciej-almanach/2025_1103/conversations/codex/2025_1103_codex_019a4a50-ee0_037.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated polish query"
+
+[[queries]]
+id = "po-009"
+category = "polish"
+query = "problem z generowaniem manifest schema"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/Szowesgad/family-onko-portal/2026_0301/conversations/claude/2026_0301_claude_8c6851d2-8b4_169.md",
+    "/Users/polyversai/.aicx/store/local/BratPrezent/2025_1226/conversations/claude/2025_1226_claude_faae82be-38b_066.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vista-portal/2026_0411/conversations/claude/2026_0411_claude_5cff2603-1ec_100.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated polish query"
+
+[[queries]]
+id = "po-010"
+category = "polish"
+query = "gdzie jest kod do parsowania markdowna"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/Loctree/loctree-suite/2026_0428/conversations/claude/2026_0428_claude_e25341f7-045_069.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0411/plans/codex/2026_0411_codex_019d7c48-4c8_091.md",
+    "/Users/polyversai/.aicx/store/m-szymanska/loctree/2025_1211/conversations/claude/2025_1211_claude_edc6fd4a-d6f_003.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated polish query"
+
+[[queries]]
+id = "po-011"
+category = "polish"
+query = "wątek o migracji na lokalne gguf"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/codescribe/2026_0405/conversations/codex/2026_0405_codex_019d5ca3-094_002.md",
+    "/Users/polyversai/.aicx/store/VetCoders/codescribe/2026_0416/plans/claude/2026_0416_claude_f9d68621-683_497.md",
+    "/Users/polyversai/.aicx/store/Szowesgad/family-onko-portal/2026_0410/conversations/claude/2026_0410_claude_ced8a7ae-669_028.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated polish query"
+
+[[queries]]
+id = "po-012"
+category = "polish"
+query = "dyskusja o wydajności cosine similarity"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/LibraxisAI/mikserka/2026_0410/conversations/claude/2026_0410_claude_576e88b3-e23_069.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0416/conversations/codex/2026_0416_codex_019d8b22-57a_005.md",
+    "/Users/polyversai/.aicx/store/Homebrew/brew/2026_0207/conversations/codex/2026_0207_codex_019c3807-bfd_281.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated polish query"
+
+[[queries]]
+id = "po-013"
+category = "polish"
+query = "jak działają fallback modele"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/codescribe/2026_0416/conversations/claude/2026_0416_claude_9f932999-d86_015.md",
+    "/Users/polyversai/.aicx/store/Homebrew/brew/2026_0208/conversations/codex/2026_0208_codex_019c3b47-473_523.md",
+    "/Users/polyversai/.aicx/store/LibraxisAI/lbrx-services/2025_1105/conversations/codex/2025_1105_codex_019a05e6-b2c_163.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated polish query"
+
+[[queries]]
+id = "po-014"
+category = "polish"
+query = "nowe filtry do usuwania noise'u"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/vista-portal/2026_0418/plans/claude/2026_0418_claude_9e332f05-60a_163.md",
+    "/Users/polyversai/.aicx/store/Homebrew/brew/2026_0315/conversations/claude/2026_0315_claude_0b5f1e7e-d1f_036.md",
+    "/Users/polyversai/.aicx/store/Loctree/aicx/2026_0424/conversations/claude/2026_0424_claude_6d72d9af-8f5_006.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated polish query"
+
+[[queries]]
+id = "en-015"
+category = "english"
+query = "where is StreamingRecorder defined"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0405/plans/claude/2026_0405_claude_721509bd-597_007.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0323/plans/claude/2026_0323_claude_9e7b228a-efb_013.md",
+    "/Users/polyversai/.aicx/store/Szowesgad/quantum-replit/2026_0428/conversations/claude/2026_0428_claude_ce00b431-dac_045.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated english query"
+
+[[queries]]
+id = "en-016"
+category = "english"
+query = "embedder unavailable fallback path"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/local/.ai-memories/2026_0414/conversations/claude/2026_0414_claude_576d993f-42e_001.md",
+    "/Users/polyversai/.aicx/store/LibraxisAI/lbrx-services/2026_0411/conversations/claude/2026_0411_claude_f2037268-48e_021.md",
+    "/Users/polyversai/.aicx/store/Loctree/Loctree/2026_0313/conversations/claude/2026_0313_claude_bec6f1fb-873_104.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated english query"
+
+[[queries]]
+id = "en-017"
+category = "english"
+query = "Tantivy adapter scaffolding"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/Loctree/Loctree/2026_0313/plans/claude/2026_0313_claude_4a23db72-d2b_011.md",
+    "/Users/polyversai/.aicx/store/tauri-apps/window-vibrancy/2026_0215/conversations/codex/2026_0215_codex_019c61f0-bcc_1233.md",
+    "/Users/polyversai/.aicx/store/VetCoders/unicode-puzzles-portal/2026_0401/conversations/claude/2026_0401_claude_ed687f46-f7c_007.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated english query"
+
+[[queries]]
+id = "en-018"
+category = "english"
+query = "RRF fusion implementation"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/Loctree/Loctree/2025_1216/conversations/claude/2025_1216_claude_6d310b9d-ff5_002.md",
+    "/Users/polyversai/.aicx/store/local/mcp-cli/2025_1121/conversations/codex/2025_1121_codex_019aa85c-03a_026.md",
+    "/Users/polyversai/.aicx/store/Homebrew/brew/2026_0204/conversations/codex/2026_0204_codex_019c2667-6f3_593.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated english query"
+
+[[queries]]
+id = "en-019"
+category = "english"
+query = "manifest schema generation_id"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0410/conversations/claude/2026_0410_claude_9a0e4a56-9c8_097.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vista/2026_0428/conversations/claude/2026_0428_claude_de3b638a-312_085.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vista-portal/2026_0429/conversations/claude/2026_0429_claude_de3b638a-312_270.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated english query"
+
+[[queries]]
+id = "en-020"
+category = "english"
+query = "how to handle NDJSON decoding errors"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0407/conversations/claude/2026_0407_claude_d10c14dc-4a4_067.md",
+    "/Users/polyversai/.aicx/store/Homebrew/brew/2025_1205/conversations/claude/2025_1205_claude_edc6fd4a-d6f_004.md",
+    "/Users/polyversai/.aicx/store/LibraxisAI/loctree/2025_1130/conversations/claude/2025_1130_claude_c9dde48b-09b_027.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated english query"
+
+[[queries]]
+id = "en-021"
+category = "english"
+query = "what is the max length of a chunk"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/local/.scripts/2026_0411/conversations/claude/2026_0411_claude_efeef355-cc1_240.md",
+    "/Users/polyversai/.aicx/store/Szowesgad/maciej-almanach/2025_1113/conversations/codex/2025_1113_codex_019a7adc-6dd_079.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vista-portal/2026_0417/plans/claude/2026_0417_claude_9e332f05-60a_011.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated english query"
+
+[[queries]]
+id = "en-022"
+category = "english"
+query = "fallback to local gguf models"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/Loctree/aicx/2026_0512/conversations/claude/2026_0512_claude_311bc9b4-16c_062.md",
+    "/Users/polyversai/.aicx/store/Loctree/rust-memex/2026_0508/conversations/claude/2026_0508_claude_f5a1e104-e33_017.md",
+    "/Users/polyversai/.aicx/store/local/lbrx-services/2026_0311/conversations/codex/2026_0311_codex_019cdebe-39c_050.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated english query"
+
+[[queries]]
+id = "en-023"
+category = "english"
+query = "calculating cosine similarity over vectors"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/Homebrew/brew/2026_0303/plans/claude/2026_0303_claude_729718c8-83e_047.md",
+    "/Users/polyversai/.aicx/store/tauri-apps/window-vibrancy/2026_0215/conversations/codex/2026_0215_codex_019c61f0-bcc_1110.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0410/plans/claude/2026_0410_claude_c874fe8e-e80_007.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated english query"
+
+[[queries]]
+id = "en-024"
+category = "english"
+query = "storing metadata in index header"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/local/unknown/2026_0427/reports/claude/2026_0427_claude_a8fb06a3-9a5_001.md",
+    "/Users/polyversai/.aicx/store/Loctree/aicx/2026_0513/conversations/claude/2026_0513_claude_92d4382e-d76_039.md",
+    "/Users/polyversai/.aicx/store/local/projects/2026_0315/conversations/claude/2026_0315_claude_5f855ccb-d16_004.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated english query"
+
+[[queries]]
+id = "en-025"
+category = "english"
+query = "how semantic search ranks results"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/Homebrew/brew/2026_0411/conversations/claude/2026_0411_claude_efeef355-cc1_011.md",
+    "/Users/polyversai/.aicx/store/Homebrew/brew/2026_0219/conversations/codex/2026_0219_codex_019c765b-e18_209.md",
+    "/Users/polyversai/.aicx/store/LibraxisAI/vista-refactor/2025_1109/conversations/codex/2025_1109_codex_019a5895-908_196.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated english query"
+
+[[queries]]
+id = "en-026"
+category = "english"
+query = "removing html tags from corpus"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/Homebrew/brew/2026_0405/conversations/claude/2026_0405_claude_1c3b75cf-aa9_004.md",
+    "/Users/polyversai/.aicx/store/Szowesgad/family-onko-portal/2026_0309/plans/codex/2026_0309_codex_019cd36b-8b2_099.md",
+    "/Users/polyversai/.aicx/store/Homebrew/brew/2026_0211/conversations/codex/2026_0211_codex_019c4a10-695_119.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated english query"
+
+[[queries]]
+id = "en-027"
+category = "english"
+query = "when is aicx config created"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/local/projects/2026_0207/conversations/codex/2026_0207_codex_019c357f-739_004.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vista-portal/2026_0411/conversations/claude/2026_0411_claude_cc18645d-71c_226.md",
+    "/Users/polyversai/.aicx/store/local/lbrx-services/2026_0211/conversations/codex/2026_0211_codex_019c3b47-473_004.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated english query"
+
+[[queries]]
+id = "en-028"
+category = "english"
+query = "where is the embedding cache logic"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0331/conversations/codex/2026_0331_codex_019d443d-551_001.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0410/conversations/claude/2026_0410_claude_9a0e4a56-9c8_104.md",
+    "/Users/polyversai/.aicx/store/LibraxisAI/vista/2025_1116/conversations/codex/2025_1116_codex_019a7ae2-f77_120.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated english query"
+
+[[queries]]
+id = "en-029"
+category = "english"
+query = "how does pagination work for queries"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/Loctree/aicx/2026_0420/conversations/claude/2026_0420_claude_4d0fd17b-765_107.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0414/plans/codex/2026_0414_codex_019d8b22-57a_111.md",
+    "/Users/polyversai/.aicx/store/LibraxisAI/lbrx-services/2026_0314/conversations/claude/2026_0314_claude_a534d3fa-f84_002.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated english query"
+
+[[queries]]
+id = "co-030"
+category = "code_id"
+query = "try_semantic_search"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/Homebrew/brew/2026_0303/plans/claude/2026_0303_claude_729718c8-83e_126.md",
+    "/Users/polyversai/.aicx/store/Homebrew/brew/2025_1206/conversations/claude/2025_1206_claude_37fcb92b-1b8_177.md",
+    "/Users/polyversai/.aicx/store/Loctree/loctree-suite/2026_0504/conversations/claude/2026_0504_claude_21238107-35f_623.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated code_id query"
+
+[[queries]]
+id = "co-031"
+category = "code_id"
+query = "EmbedderUnavailable"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/Homebrew/brew/2026_0204/conversations/codex/2026_0204_codex_019c2667-6f3_583.md",
+    "/Users/polyversai/.aicx/store/Loctree/rust-memex/2026_0427/conversations/claude/2026_0427_claude_a70ad508-c7c_053.md",
+    "/Users/polyversai/.aicx/store/VetCoders/ai-contexters/2026_0408/conversations/claude/2026_0408_claude_8289ee5b-633_003.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated code_id query"
+
+[[queries]]
+id = "co-032"
+category = "code_id"
+query = "aicx_intents"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/LibraxisAI/vista/2025_1109/conversations/codex/2025_1109_codex_019a5bf6-a5e_034.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vista-portal/2026_0421/plans/claude/2026_0421_claude_f84f791d-ba8_032.md",
+    "/Users/polyversai/.aicx/store/Homebrew/brew/2026_0208/conversations/codex/2026_0208_codex_019c3af8-21b_365.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated code_id query"
+
+[[queries]]
+id = "co-033"
+category = "code_id"
+query = "IndexEntry"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0508/conversations/claude/2026_0508_claude_99ecc671-ab1_021.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vista/2026_0315/conversations/codex/2026_0315_codex_019cf262-43e_003.md",
+    "/Users/polyversai/.aicx/store/tauri-apps/window-vibrancy/2026_0220/conversations/codex/2026_0220_codex_019c7860-dda_1312.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated code_id query"
+
+[[queries]]
+id = "co-034"
+category = "code_id"
+query = "cosine_similarity"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/Loctree/loctree-suite/2026_0414/conversations/claude/2026_0414_claude_291ef005-7a6_050.md",
+    "/Users/polyversai/.aicx/store/abiosoft/colima/2026_0213/conversations/codex/2026_0213_codex_019c578c-98a_162.md",
+    "/Users/polyversai/.aicx/store/tauri-apps/window-vibrancy/2026_0215/conversations/codex/2026_0215_codex_019c61f0-bcc_902.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated code_id query"
+
+[[queries]]
+id = "co-035"
+category = "code_id"
+query = "query_index"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/Szowesgad/family-onko-portal/2026_0421/plans/claude/2026_0421_claude_4d6e3cf1-549_042.md",
+    "/Users/polyversai/.aicx/store/LibraxisAI/rust-mcp-sdk/2025_1121/conversations/codex/2025_1121_codex_019aa85c-03a_085.md",
+    "/Users/polyversai/.aicx/store/VetCoders/codescribe/2026_0417/plans/claude/2026_0417_claude_f9d68621-683_018.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated code_id query"
+
+[[queries]]
+id = "co-036"
+category = "code_id"
+query = "embed_prefix_bytes"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/rmcp-memex/2026_0405/plans/claude/2026_0405_claude_943b1196-8d9_135.md",
+    "/Users/polyversai/.aicx/store/Szowesgad/quantum-replit/2026_0427/conversations/claude/2026_0427_claude_f0694a2e-c09_174.md",
+    "/Users/polyversai/.aicx/store/Szowesgad/quantum-replit/2026_0428/conversations/claude/2026_0428_claude_f0694a2e-c09_010.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated code_id query"
+
+[[queries]]
+id = "co-037"
+category = "code_id"
+query = "StoredContextFile"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/abiosoft/colima/2026_0206/conversations/codex/2026_0206_codex_019c2667-6f3_010.md",
+    "/Users/polyversai/.aicx/store/tauri-apps/window-vibrancy/2026_0214/conversations/codex/2026_0214_codex_019c5821-5c4_169.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted-io/2026_0409/conversations/claude/2026_0409_claude_20206392-387_084.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated code_id query"
+
+[[queries]]
+id = "co-038"
+category = "code_id"
+query = "FrameKind"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/Loctree/loctree-suite/2025_1214/conversations/claude/2025_1214_claude_edc6fd4a-d6f_015.md",
+    "/Users/polyversai/.aicx/store/Homebrew/brew/2026_0408/conversations/claude/2026_0408_claude_ae459016-146_043.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0501/conversations/claude/2026_0501_claude_629285c3-0ec_133.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated code_id query"
+
+[[queries]]
+id = "co-039"
+category = "code_id"
+query = "LanceConfig"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/vista/2026_0310/conversations/codex/2026_0310_codex_019cd570-6df_012.md",
+    "/Users/polyversai/.aicx/store/Loctree/loctree-suite/2026_0506/plans/claude/2026_0506_claude_6dec4750-d22_067.md",
+    "/Users/polyversai/.aicx/store/vitejs/vite-plugin-react/2025_1121/conversations/codex/2025_1121_codex_019aa85c-03a_289.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated code_id query"
+
+[[queries]]
+id = "mi-040"
+category = "mixed"
+query = "gdzie używamy try_semantic_search w kodzie"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0416/conversations/codex/2026_0416_codex_019d8b22-57a_149.md",
+    "/Users/polyversai/.aicx/store/local/lbrx-services/2026_0204/conversations/codex/2026_0204_codex_019c2667-6f3_015.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vc-operator/2026_0430/conversations/claude/2026_0430_claude_c3f6c9a9-504_010.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated mixed query"
+
+[[queries]]
+id = "mi-041"
+category = "mixed"
+query = "fix dla EmbedderUnavailable z ostatniego tygodnia"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0416/conversations/codex/2026_0416_codex_019d972c-32d_015.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0502/other/claude/2026_0502_claude_629285c3-0ec_002.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted-io/2026_0513/conversations/claude/2026_0513_claude_bddecbbb-fdb_033.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated mixed query"
+
+[[queries]]
+id = "mi-042"
+category = "mixed"
+query = "co aicx_intents zwraca dla project=lbrx"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0331/conversations/codex/2026_0331_codex_019d425a-81c_004.md",
+    "/Users/polyversai/.aicx/store/VetCoders/codescribe/2026_0220/plans/codex/2026_0220_codex_019c79bd-32c_007.md",
+    "/Users/polyversai/.aicx/store/Loctree/loctree-suite/2026_0428/conversations/claude/2026_0428_claude_0e91df35-e6b_039.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated mixed query"
+
+[[queries]]
+id = "mi-043"
+category = "mixed"
+query = "rejestracja IndexEntry w manifest schema"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/LibraxisAI/lbrx-services/2026_0410/conversations/claude/2026_0410_claude_d98d6053-53d_009.md",
+    "/Users/polyversai/.aicx/store/Loctree/aicx/2026_0508/conversations/claude/2026_0508_claude_556a52ae-72d_023.md",
+    "/Users/polyversai/.aicx/store/local/projects/2025_1218/conversations/claude/2025_1218_claude_67c12298-687_263.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated mixed query"
+
+[[queries]]
+id = "mi-044"
+category = "mixed"
+query = "obliczanie cosine_similarity na wektorach"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/Homebrew/brew/2026_0213/conversations/codex/2026_0213_codex_019c578c-98a_154.md",
+    "/Users/polyversai/.aicx/store/Loctree/Loctree/2026_0315/conversations/claude/2026_0315_claude_4db577f7-823_007.md",
+    "/Users/polyversai/.aicx/store/VetCoders/unicode-puzzles-portal/2026_0418/conversations/claude/2026_0418_claude_d86b74c8-153_061.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated mixed query"
+
+[[queries]]
+id = "mi-045"
+category = "mixed"
+query = "czy query_index wspiera limit wyników"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0402/plans/claude/2026_0402_claude_ee4de9c8-625_470.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted-io/2026_0409/conversations/claude/2026_0409_claude_b0a10bab-f3c_018.md",
+    "/Users/polyversai/.aicx/store/local/lbrx-services/2026_0210/conversations/codex/2026_0210_codex_019c3b47-473_109.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated mixed query"
+
+[[queries]]
+id = "mi-046"
+category = "mixed"
+query = "nowa implementacja embed_prefix_bytes"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/LibraxisAI/lbrx-services/2026_0316/conversations/claude/2026_0316_claude_e9fe11dc-16c_080.md",
+    "/Users/polyversai/.aicx/store/VetCoders/codescribe/2026_0416/conversations/claude/2026_0416_claude_f9d68621-683_047.md",
+    "/Users/polyversai/.aicx/store/LibraxisAI/loctree/2025_1121/conversations/codex/2025_1121_codex_019aa777-1c7_090.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated mixed query"
+
+[[queries]]
+id = "mi-047"
+category = "mixed"
+query = "jak serializować StoredContextFile"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/vibecrafted/2026_0505/conversations/claude/2026_0505_claude_f8f0728c-778_036.md",
+    "/Users/polyversai/.aicx/store/Loctree/loctree-suite/2026_0428/plans/claude/2026_0428_claude_0e91df35-e6b_263.md",
+    "/Users/polyversai/.aicx/store/local/projects/2026_0314/conversations/claude/2026_0314_claude_b24c7f8a-b96_041.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated mixed query"
+
+[[queries]]
+id = "mi-048"
+category = "mixed"
+query = "wszystkie wartości enum FrameKind"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/local/aicx-store-logs/2026_0423/conversations/claude/2026_0423_claude_fcd70800-5e4_008.md",
+    "/Users/polyversai/.aicx/store/Homebrew/brew/2026_0408/conversations/claude/2026_0408_claude_c9ec5bc3-80e_010.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vetcoders-tools/2026_0420/conversations/claude/2026_0420_claude_c40b5984-2f1_001.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated mixed query"
+
+[[queries]]
+id = "mi-049"
+category = "mixed"
+query = "ustawienia dla LanceConfig"
+expected_top_3_paths = [
+    "/Users/polyversai/.aicx/store/VetCoders/codescribe/2026_0416/plans/gemini/2026_0416_gemini_e3102f2d-804_129.md",
+    "/Users/polyversai/.aicx/store/Szowesgad/family-onko-portal/2026_0421/plans/claude/2026_0421_claude_4d6e3cf1-549_021.md",
+    "/Users/polyversai/.aicx/store/VetCoders/vista/2025_1124/conversations/gemini/2025_1124_gemini_79b9571d-273_008.md"
+]
+expected_minimum_recall_at_5 = 0.5
+notes = "Auto-generated mixed query"
+

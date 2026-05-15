@@ -108,6 +108,9 @@ test-e2e:
 	cargo test --locked -p aicx --features e2e-aicx --test e2e_pipeline -- --nocapture
 	cargo test --locked -p aicx --features e2e-aicx --test e2e_context_pack_ingest -- --nocapture
 
+test-retrieval-eval:
+	cargo test --test retrieval_eval_harness --features e2e-aicx -- --nocapture
+
 check:
 	@echo "=== AICX Quality Gate ==="
 	@echo "[1/10] Checking manifest portability..."

@@ -78,6 +78,7 @@ rmcp-memex = { package = "rust-memex", version = "0.6.5", default-features = fal
 schemars = "1.2.1"
 
 [dev-dependencies]
+toml = "0.8"
 filetime = "0.2"
 
 [patch.crates-io]
