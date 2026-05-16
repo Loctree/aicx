@@ -56,9 +56,9 @@ e2e-aicx = ["native-embedder", "cloud-embedder"]
 
 [dependencies]
 aicx-embeddings = { version = "0.8.0", optional = true, default-features = false }
-aicx-monitor = { version = "0.1.0", path = "crates/aicx-monitor" }
+aicx-monitor = { version = "0.1.0" }
 aicx-parser = { version = "0.8.0", features = ["json-schema"] }
-aicx-progress-contracts = { version = "0.1.0", path = "crates/aicx-progress-contracts" }
+aicx-progress-contracts = { version = "0.1.0" }
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
