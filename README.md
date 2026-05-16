@@ -52,7 +52,7 @@ contract, retention path layout, and immutability filter behavior in
 Public install from GitHub Releases:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Loctree/aicx/main/install.sh | AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.8.0 bash
+curl -fsSL https://raw.githubusercontent.com/Loctree/aicx/main/install.sh | AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.8.1 bash
 ```
 
 The installer downloads the matching release archive, verifies its adjacent
