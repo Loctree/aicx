@@ -26,7 +26,7 @@ use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
@@ -42,6 +42,12 @@ use aicx::sources::{self, ExtractionConfig};
 use aicx::state::StateManager;
 use aicx::store;
 use aicx::timeline;
+
+#[derive(Debug, Clone)]
+struct SessionResolution {
+    canonical_id: String,
+    note: Option<String>,
+}
 
 fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
     eprintln!("=== Intent Schema Migration (dry run) ===");
@@ -730,6 +736,44 @@ enum Commands {
         /// Conversation-first mode: emit denoised user/assistant transcript only
         #[arg(long)]
         conversation: bool,
+    },
+
+    /// Batch-export conversation JSON files without writing to the canonical store.
+    ///
+    /// Thin wrapper around `aicx extract --conversation` semantics: scans source
+    /// sessions, groups by session_id, and writes one JSON file per session.
+    #[command(display_order = 6)]
+    Conversations {
+        #[command(flatten)]
+        redaction: RedactionArgs,
+
+        /// Source agent for batch conversation export (v1: claude only).
+        #[arg(long, value_parser = ["claude"], default_value = "claude")]
+        agent: String,
+
+        /// Source cwd/project filter(s): narrows session discovery before export.
+        #[arg(short, long, num_args = 1..)]
+        project: Vec<String>,
+
+        /// Hours to look back when scanning source sessions (default: 1 year).
+        #[arg(short = 'H', long, default_value = "8760")]
+        hours: u64,
+
+        /// Output directory. Files are written as
+        /// `<out-dir>/<agent>/<sanitized-session-id>.json`. Session ids
+        /// that contain characters other than `[A-Za-z0-9._-]` are
+        /// sanitized; a SipHash suffix is appended to keep distinct ids
+        /// from colliding after sanitization.
+        #[arg(long)]
+        out_dir: PathBuf,
+
+        /// Maximum number of sessions to write, after deterministic session sorting.
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Preview discovery/projection without writing JSON files.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Build the canonical corpus in ~/.aicx/ from agent logs (layer 1).
@@ -1438,6 +1482,25 @@ fn main() -> Result<()> {
                     },
                 )?;
             }
+        }
+        Some(Commands::Conversations {
+            redaction,
+            agent,
+            project,
+            hours,
+            out_dir,
+            limit,
+            dry_run,
+        }) => {
+            run_conversations_batch(ConversationsBatchOptions {
+                agent,
+                project_filter: project,
+                hours,
+                out_dir,
+                limit,
+                dry_run,
+                redact_secrets: redaction.redact_secrets,
+            })?;
         }
         Some(Commands::Store {
             redaction,
@@ -2192,6 +2255,21 @@ struct ExtractFileOptions {
     conversation: bool,
 }
 
+/// Convert a lookback period (in hours) to a UTC cutoff timestamp.
+///
+/// Clamps the input to `[1, i32::MAX]` hours (~245k years — astronomical
+/// upper bound that comfortably fits chrono's internal `TimeDelta` range
+/// and stays well below the `i64`/`u64` overflow boundary). Without these
+/// guards, casting a very large `u64` with `as i64` would silently wrap
+/// to a negative value and place the cutoff in the future.
+fn cutoff_for_hours(hours: u64) -> DateTime<Utc> {
+    const MAX_SAFE_HOURS: i64 = i32::MAX as i64;
+    let hours_i64 = i64::try_from(hours)
+        .unwrap_or(MAX_SAFE_HOURS)
+        .clamp(1, MAX_SAFE_HOURS);
+    Utc::now() - chrono::Duration::hours(hours_i64)
+}
+
 fn extract_input_format_label(format: ExtractInputFormat) -> &'static str {
     match format {
         ExtractInputFormat::Claude => "claude",
@@ -2222,6 +2300,458 @@ fn default_session_extract_path(agent_label: &str, session_id: &str) -> Result<P
         .join(format!("{safe_session}.md")))
 }
 
+struct ConversationsBatchOptions {
+    agent: String,
+    project_filter: Vec<String>,
+    hours: u64,
+    out_dir: PathBuf,
+    limit: Option<usize>,
+    dry_run: bool,
+    redact_secrets: bool,
+}
+
+struct ConversationBatchWriteOptions<'a> {
+    agent_label: &'a str,
+    entries: Vec<timeline::TimelineEntry>,
+    project_filter: Vec<String>,
+    out_dir: PathBuf,
+    limit: Option<usize>,
+    dry_run: bool,
+    redaction_enabled: bool,
+}
+
+#[derive(Debug)]
+struct ConversationBatchSummary {
+    sessions_discovered: usize,
+    sessions_written: usize,
+    messages_total: usize,
+    output_dir: PathBuf,
+    failed_sessions: usize,
+}
+
+fn conversation_batch_safe_session_filename(session_id: &str) -> String {
+    // Empty input has no original characters to disambiguate against, so
+    // skip the hash suffix and use the fixed fallback. Realistically this
+    // signals an upstream bug; we keep the existing observable contract.
+    if session_id.is_empty() {
+        return "session".to_string();
+    }
+    // Already-safe ids (alphanumeric plus `- _ .`) round-trip verbatim.
+    // Previously this function collapsed runs of underscores and trimmed
+    // leading/trailing ones for *every* input, which meant safe ids like
+    // "a__b" and "a_b" — both valid on disk — would map to the same
+    // filename and silently overwrite each other (no hash suffix was
+    // added because no character was actually replaced).
+    let is_already_safe = session_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if is_already_safe {
+        return session_id.to_string();
+    }
+
+    // Otherwise the id contains characters we cannot put on disk. Replace
+    // them with `_`, collapse resulting runs of underscores, trim leading
+    // and trailing ones, and append a 64-bit SipHash fingerprint of the
+    // original id so distinct unsafe ids that collapse to the same base
+    // (e.g. "a/b" vs "a:b" both become "a_b") cannot overwrite each other.
+    let mut safe = String::new();
+    let mut previous_was_separator = false;
+
+    for ch in session_id.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            ch
+        } else {
+            '_'
+        };
+
+        if mapped == '_' {
+            if !previous_was_separator {
+                safe.push(mapped);
+            }
+            previous_was_separator = true;
+        } else {
+            safe.push(mapped);
+            previous_was_separator = false;
+        }
+    }
+
+    let safe = safe.trim_matches('_');
+    let base = if safe.is_empty() { "session" } else { safe };
+
+    use siphasher::sip::SipHasher13;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = SipHasher13::new();
+    session_id.hash(&mut hasher);
+    let suffix = hasher.finish();
+    format!("{base}-{suffix:016x}")
+}
+
+fn conversation_batch_output_path(out_dir: &Path, agent_label: &str, session_id: &str) -> PathBuf {
+    out_dir.join(agent_label).join(format!(
+        "{}.json",
+        conversation_batch_safe_session_filename(session_id)
+    ))
+}
+
+fn run_conversations_batch(options: ConversationsBatchOptions) -> Result<()> {
+    if options.agent != "claude" {
+        anyhow::bail!("conversations v1 supports --agent claude only");
+    }
+
+    let cutoff = cutoff_for_hours(options.hours);
+    let config = ExtractionConfig {
+        project_filter: options.project_filter.clone(),
+        cutoff,
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = sources::extract_claude(&config)?;
+    let summary = write_conversation_batch_outputs(ConversationBatchWriteOptions {
+        agent_label: &options.agent,
+        entries,
+        project_filter: options.project_filter,
+        out_dir: options.out_dir,
+        limit: options.limit,
+        dry_run: options.dry_run,
+        redaction_enabled: options.redact_secrets,
+    })?;
+
+    eprintln!("sessions_discovered={}", summary.sessions_discovered);
+    eprintln!("sessions_written={}", summary.sessions_written);
+    eprintln!("messages_total={}", summary.messages_total);
+    eprintln!("output_dir={}", summary.output_dir.display());
+    eprintln!("failed_sessions={}", summary.failed_sessions);
+
+    Ok(())
+}
+
+fn write_conversation_batch_outputs(
+    options: ConversationBatchWriteOptions<'_>,
+) -> Result<ConversationBatchSummary> {
+    let ConversationBatchWriteOptions {
+        agent_label,
+        entries,
+        project_filter,
+        out_dir,
+        limit,
+        dry_run,
+        redaction_enabled,
+    } = options;
+
+    let mut grouped: BTreeMap<String, Vec<timeline::TimelineEntry>> = BTreeMap::new();
+    for entry in entries {
+        grouped
+            .entry(entry.session_id.clone())
+            .or_default()
+            .push(entry);
+    }
+
+    let sessions_discovered = grouped.len();
+    if !dry_run {
+        fs::create_dir_all(out_dir.join(agent_label)).with_context(|| {
+            format!(
+                "Failed to create conversation output dir: {}",
+                out_dir.join(agent_label).display()
+            )
+        })?;
+    }
+
+    let mut sessions_written = 0;
+    let mut messages_total = 0;
+    let mut failed_sessions = 0;
+    let max_sessions = limit.unwrap_or(usize::MAX);
+
+    for (session_id, mut session_entries) in grouped.into_iter().take(max_sessions) {
+        let result = write_conversation_batch_session(
+            agent_label,
+            &project_filter,
+            &out_dir,
+            &session_id,
+            &mut session_entries,
+            dry_run,
+            redaction_enabled,
+        );
+
+        match result {
+            Ok(messages_written) => {
+                if !dry_run {
+                    sessions_written += 1;
+                }
+                messages_total += messages_written;
+            }
+            Err(error) => {
+                failed_sessions += 1;
+                eprintln!("failed_session={} error={error:#}", session_id);
+            }
+        }
+    }
+
+    Ok(ConversationBatchSummary {
+        sessions_discovered,
+        sessions_written,
+        messages_total,
+        output_dir: out_dir,
+        failed_sessions,
+    })
+}
+
+fn write_conversation_batch_session(
+    agent_label: &str,
+    project_filter: &[String],
+    out_dir: &Path,
+    session_id: &str,
+    entries: &mut Vec<timeline::TimelineEntry>,
+    dry_run: bool,
+    redaction_enabled: bool,
+) -> Result<usize> {
+    entries.sort_by_key(|entry| entry.timestamp);
+    let (mut entries, _) = aicx_parser::collapse_repeats(
+        std::mem::take(entries),
+        aicx_parser::DEFAULT_THRESHOLD_LINES,
+    );
+
+    if redaction_enabled {
+        for entry in &mut entries {
+            entry.message = aicx::redact::redact_secrets(&entry.message);
+        }
+    }
+
+    let inferred_repos = sources::repo_labels_from_entries(&entries, &[]);
+    let project_identity = if !project_filter.is_empty() {
+        project_filter.join("+")
+    } else if inferred_repos.is_empty() {
+        format!("{agent_label}/{session_id}")
+    } else {
+        inferred_repos.join("+")
+    };
+
+    let hours_back = entries
+        .first()
+        .map(|entry| (Utc::now() - entry.timestamp).num_hours().max(0) as u64)
+        .unwrap_or(0);
+
+    let metadata = ReportMetadata {
+        generated_at: Utc::now(),
+        project_filter: Some(project_identity.clone()),
+        hours_back,
+        total_entries: entries.len(),
+        sessions: vec![session_id.to_string()],
+    };
+    let projection = sources::to_conversation_with_stats(&entries, &[project_identity]);
+    let extract_stats = output::ConversationExtractStats {
+        aicx_version: env!("CARGO_PKG_VERSION"),
+        redaction_enabled,
+        raw_entries: entries.len(),
+        conversation_messages: projection.messages.len(),
+        conversation_projection: "user_assistant_only",
+        exact_short_duplicates_dropped: projection.exact_short_duplicates_dropped,
+    };
+
+    if !dry_run {
+        let output_path = conversation_batch_output_path(out_dir, agent_label, session_id);
+        output::write_conversation_json(
+            &output_path,
+            &projection.messages,
+            &metadata,
+            &extract_stats,
+        )?;
+    }
+
+    Ok(projection.messages.len())
+}
+
+fn uuid_suffix_from_stem(stem: &str) -> Option<&str> {
+    let start = stem.len().checked_sub(36)?;
+    let suffix = &stem[start..];
+    let bytes = suffix.as_bytes();
+    let is_uuid_like = bytes.iter().enumerate().all(|(idx, byte)| {
+        if matches!(idx, 8 | 13 | 18 | 23) {
+            *byte == b'-'
+        } else {
+            byte.is_ascii_hexdigit()
+        }
+    });
+    is_uuid_like.then_some(suffix)
+}
+
+fn read_codex_session_meta_id(path: &Path) -> Option<String> {
+    // Route through the project-wide validated opener so symlink/path-safety
+    // guarantees apply uniformly to every place that ingests Codex rollouts.
+    let file = aicx::sanitize::open_file_validated(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().map_while(std::result::Result::ok) {
+        if !line.contains("\"session_meta\"") {
+            continue;
+        }
+        // Skip malformed lines instead of bailing out of the whole scan —
+        // a partially-written rollout file can have a truncated tail, and
+        // the session_meta record we want is usually one of the first
+        // entries. Treat a parse error on a single candidate line as a
+        // miss for that line, not as "this file has no session_meta".
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if data.get("type").and_then(|value| value.as_str()) != Some("session_meta") {
+            continue;
+        }
+        return data
+            .get("payload")
+            .and_then(|payload| payload.get("id"))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_string());
+    }
+    None
+}
+
+fn collect_codex_session_alias_matches(requested: &str) -> Result<BTreeSet<String>> {
+    let mut matches = BTreeSet::new();
+    let sessions_dir = dirs::home_dir()
+        .context("No home dir")?
+        .join(".codex")
+        .join("sessions");
+    if !sessions_dir.is_dir() {
+        return Ok(matches);
+    }
+
+    let mut stack = vec![sessions_dir];
+    while let Some(dir) = stack.pop() {
+        let Ok(read_dir) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+
+            let stem = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            let file_name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            let suffix = uuid_suffix_from_stem(stem);
+            let suffix_owned: Option<String> = suffix.map(str::to_string);
+
+            // Avoid reading session_meta from every JSONL in the tree.
+            // Cheap path: try matching against the filename stem / UUID
+            // suffix first. Only open the rollout when (a) the cheap
+            // check matched and we need the canonical id for the output,
+            // or (b) the filename carries no UUID suffix (non-rollout
+            // layout) and we have nothing else to anchor on.
+            let cheap_anchor: &str = suffix_owned.as_deref().unwrap_or(stem);
+            let cheap_match = requested == stem
+                || requested == file_name
+                || cheap_anchor.starts_with(requested)
+                || cheap_anchor.ends_with(requested);
+
+            let canonical = if cheap_match || suffix.is_none() {
+                read_codex_session_meta_id(&path)
+                    .or_else(|| suffix_owned.clone())
+                    .unwrap_or_else(|| stem.to_string())
+            } else {
+                // Have a UUID suffix and no cheap hit — trust the suffix
+                // as the canonical id rather than opening the file.
+                suffix_owned.clone().unwrap_or_default()
+            };
+
+            let alias_matches =
+                cheap_match || canonical.starts_with(requested) || canonical.ends_with(requested);
+            if alias_matches {
+                matches.insert(canonical);
+            }
+        }
+    }
+
+    Ok(matches)
+}
+
+fn resolve_session_reference_from_candidates(
+    requested: &str,
+    session_ids: &BTreeSet<String>,
+    alias_matches: BTreeSet<String>,
+    agent_label: &str,
+) -> Result<SessionResolution> {
+    if session_ids.contains(requested) {
+        return Ok(SessionResolution {
+            canonical_id: requested.to_string(),
+            note: None,
+        });
+    }
+
+    let mut candidates: BTreeSet<String> = session_ids
+        .iter()
+        .filter(|session_id| session_id.starts_with(requested) || session_id.ends_with(requested))
+        .cloned()
+        .collect();
+    // Restrict alias matches (gathered by walking `~/.codex/sessions/` for
+    // filename UUID anchors) to ids that were actually extracted in the
+    // current `--hours` / `--project` window. Without this guard, older
+    // out-of-window sessions inflate the candidate set: a previously unique
+    // in-window prefix can flip to "ambiguous", or the resolver can pick an
+    // out-of-window id that then yields zero entries downstream.
+    let in_window_aliases: BTreeSet<String> = alias_matches
+        .into_iter()
+        .filter(|alias| session_ids.contains(alias))
+        .collect();
+    candidates.extend(in_window_aliases);
+
+    match candidates.len() {
+        0 => anyhow::bail!(
+            "No session matched `{}` in agent `{}`. Scanned {} extracted session id(s).\n\
+             Try: use the full session id, increase --hours, or run `aicx extract --agent {} --help`.",
+            requested,
+            agent_label,
+            session_ids.len(),
+            agent_label,
+        ),
+        1 => {
+            let canonical_id = candidates.into_iter().next().unwrap_or_default();
+            Ok(SessionResolution {
+                note: Some(format!("resolved `{requested}` to `{canonical_id}`")),
+                canonical_id,
+            })
+        }
+        _ => {
+            let shown = candidates.iter().take(8).cloned().collect::<Vec<_>>();
+            anyhow::bail!(
+                "Ambiguous session reference `{}` in agent `{}`; matched {} sessions:\n  {}\n\
+                 Use the full session id.",
+                requested,
+                agent_label,
+                candidates.len(),
+                shown.join("\n  "),
+            )
+        }
+    }
+}
+
+fn resolve_session_reference(
+    requested: &str,
+    agent: ExtractInputFormat,
+    agent_label: &str,
+    entries: &[timeline::TimelineEntry],
+) -> Result<SessionResolution> {
+    let session_ids = entries
+        .iter()
+        .map(|entry| entry.session_id.clone())
+        .collect::<BTreeSet<_>>();
+    let alias_matches = if matches!(agent, ExtractInputFormat::Codex) {
+        collect_codex_session_alias_matches(requested)?
+    } else {
+        BTreeSet::new()
+    };
+    resolve_session_reference_from_candidates(requested, &session_ids, alias_matches, agent_label)
+}
+
 /// Run extraction filtered by `session_id` for a single agent and write a
 /// denoised conversation Markdown transcript. Default output path is
 /// `~/.aicx/extracts/<agent>/<session_id>.md`; override via `output`.
@@ -2241,7 +2771,7 @@ fn run_extract_session(
     } = options;
 
     let agent_label = extract_input_format_label(agent);
-    let cutoff = Utc::now() - chrono::Duration::hours(hours.max(1) as i64);
+    let cutoff = cutoff_for_hours(hours);
     let config = ExtractionConfig {
         project_filter: explicit_project
             .as_ref()
@@ -2261,14 +2791,19 @@ fn run_extract_session(
         ExtractInputFormat::Junie => sources::extract_junie(&config)?,
     };
 
-    // Filter by session_id (exact match).
-    entries.retain(|e| e.session_id == session_id);
+    let resolution = resolve_session_reference(session_id, agent, agent_label, &entries)?;
+    if let Some(note) = &resolution.note {
+        eprintln!("{note}");
+    }
+
+    entries.retain(|e| e.session_id == resolution.canonical_id);
 
     if entries.is_empty() {
         anyhow::bail!(
-            "No entries found for session `{}` in agent `{}` within last {} hours.\n\
-             Try: increase --hours, verify the session id, or check that the source store is populated.",
+            "Resolved session `{}` to `{}`, but no entries were extractable for agent `{}` within last {} hours.\n\
+             Try: increase --hours or check the project filter.",
             session_id,
+            resolution.canonical_id,
             agent_label,
             hours,
         );
@@ -2293,13 +2828,13 @@ fn run_extract_session(
 
     let output_path = match output {
         Some(p) => p,
-        None => default_session_extract_path(agent_label, session_id)?,
+        None => default_session_extract_path(agent_label, &resolution.canonical_id)?,
     };
 
     let inferred_repos = sources::repo_labels_from_entries(&entries, &[]);
     let project_identity = explicit_project.unwrap_or_else(|| {
         if inferred_repos.is_empty() {
-            format!("{agent_label}/{session_id}")
+            format!("{agent_label}/{}", resolution.canonical_id)
         } else {
             inferred_repos.join("+")
         }
@@ -2315,20 +2850,33 @@ fn run_extract_session(
         project_filter: Some(project_identity.clone()),
         hours_back,
         total_entries: entries.len(),
-        sessions: vec![session_id.to_string()],
+        sessions: vec![resolution.canonical_id.clone()],
     };
 
     if conversation {
-        let conv_msgs = sources::to_conversation(&entries, &[project_identity]);
+        let projection = sources::to_conversation_with_stats(&entries, &[project_identity]);
+        let extract_stats = output::ConversationExtractStats {
+            aicx_version: env!("CARGO_PKG_VERSION"),
+            redaction_enabled: redact_secrets,
+            raw_entries: entries.len(),
+            conversation_messages: projection.messages.len(),
+            conversation_projection: "user_assistant_only",
+            exact_short_duplicates_dropped: projection.exact_short_duplicates_dropped,
+        };
         let ext = output_path
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("md")
             .to_lowercase();
         if ext == "json" {
-            output::write_conversation_json(&output_path, &conv_msgs, &metadata)?;
+            output::write_conversation_json(
+                &output_path,
+                &projection.messages,
+                &metadata,
+                &extract_stats,
+            )?;
         } else {
-            output::write_conversation_markdown(&output_path, &conv_msgs, &metadata)?;
+            output::write_conversation_markdown(&output_path, &projection.messages, &metadata)?;
         }
     } else {
         let ext = output_path
@@ -2352,7 +2900,7 @@ fn run_extract_session(
     eprintln!(
         "Extracted {} entries from session `{}` ({}) -> {}",
         entries.len(),
-        session_id,
+        resolution.canonical_id,
         agent_label,
         output_path.display()
     );
@@ -2455,7 +3003,15 @@ fn run_extract_file(
             .as_ref()
             .map(|p| vec![p.clone()])
             .unwrap_or_default();
-        let conv_msgs = sources::to_conversation(&output_entries, &project_filter);
+        let projection = sources::to_conversation_with_stats(&output_entries, &project_filter);
+        let extract_stats = output::ConversationExtractStats {
+            aicx_version: env!("CARGO_PKG_VERSION"),
+            redaction_enabled: redact_secrets,
+            raw_entries: output_entries.len(),
+            conversation_messages: projection.messages.len(),
+            conversation_projection: "user_assistant_only",
+            exact_short_duplicates_dropped: projection.exact_short_duplicates_dropped,
+        };
 
         let ext = output_path
             .extension()
@@ -2464,9 +3020,14 @@ fn run_extract_file(
             .to_lowercase();
 
         if ext == "json" {
-            output::write_conversation_json(&output_path, &conv_msgs, &metadata)?;
+            output::write_conversation_json(
+                &output_path,
+                &projection.messages,
+                &metadata,
+                &extract_stats,
+            )?;
         } else {
-            output::write_conversation_markdown(&output_path, &conv_msgs, &metadata)?;
+            output::write_conversation_markdown(&output_path, &projection.messages, &metadata)?;
         }
     } else {
         let ext = output_path
@@ -2744,7 +3305,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         project.join("+")
     };
 
-    let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
+    let cutoff = cutoff_for_hours(hours);
 
     // Default behavior is incremental. --full-rescan and the legacy --force
     // escape hatch both mean "scan the full lookback window".
@@ -2999,7 +3560,15 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     if let Some(local_dir) = output_dir {
         if conversation {
             // Conversation-first mode: denoised transcript output
-            let conv_msgs = sources::to_conversation(&output_entries, &project);
+            let projection = sources::to_conversation_with_stats(&output_entries, &project);
+            let extract_stats = output::ConversationExtractStats {
+                aicx_version: env!("CARGO_PKG_VERSION"),
+                redaction_enabled: redact_secrets,
+                raw_entries: output_entries.len(),
+                conversation_messages: projection.messages.len(),
+                conversation_projection: "user_assistant_only",
+                exact_short_duplicates_dropped: projection.exact_short_duplicates_dropped,
+            };
             let date_str = metadata.generated_at.format("%Y%m%d_%H%M%S");
             let prefix = metadata.project_filter.as_deref().unwrap_or("all");
 
@@ -3013,12 +3582,17 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
 
             if out_format == OutputFormat::Markdown || out_format == OutputFormat::Both {
                 let md_path = local_dir.join(format!("{}_conversation_{}.md", prefix, date_str));
-                output::write_conversation_markdown(&md_path, &conv_msgs, &metadata)?;
+                output::write_conversation_markdown(&md_path, &projection.messages, &metadata)?;
             }
             if out_format == OutputFormat::Json || out_format == OutputFormat::Both {
                 let json_path =
                     local_dir.join(format!("{}_conversation_{}.json", prefix, date_str));
-                output::write_conversation_json(&json_path, &conv_msgs, &metadata)?;
+                output::write_conversation_json(
+                    &json_path,
+                    &projection.messages,
+                    &metadata,
+                    &extract_stats,
+                )?;
             }
         } else {
             let out_format = match format {
@@ -3118,7 +3692,7 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         eprintln!("  [warn] --respect-artifact-family=false: legacy routing mode active");
     }
 
-    let cutoff = cutoff.unwrap_or_else(|| Utc::now() - chrono::Duration::hours(hours as i64));
+    let cutoff = cutoff.unwrap_or_else(|| cutoff_for_hours(hours));
 
     let agents = resolve_store_agents(agent.as_deref())?;
 
@@ -3665,7 +4239,7 @@ fn run_search(
             })
             .collect()
     } else if hours > 0 {
-        let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
+        let cutoff = cutoff_for_hours(hours);
         let cutoff_date = cutoff.format("%Y-%m-%d").to_string();
         results
             .into_iter()
@@ -4909,6 +5483,46 @@ mod tests {
     use filetime::{FileTime, set_file_mtime};
     use std::fs;
 
+    #[test]
+    fn cutoff_for_hours_clamps_zero_to_at_least_one_hour() {
+        let before = Utc::now();
+        let cutoff = cutoff_for_hours(0);
+        let after = Utc::now();
+        // With clamp to 1h, cutoff must sit ~1h before now (allow ±5s slack).
+        let lower = before - chrono::Duration::hours(1) - chrono::Duration::seconds(5);
+        let upper = after - chrono::Duration::hours(1) + chrono::Duration::seconds(5);
+        assert!(
+            cutoff >= lower && cutoff <= upper,
+            "cutoff out of range: {cutoff}"
+        );
+    }
+
+    #[test]
+    fn cutoff_for_hours_handles_normal_range() {
+        let before = Utc::now();
+        let cutoff = cutoff_for_hours(8);
+        let after = Utc::now();
+        let lower = before - chrono::Duration::hours(8) - chrono::Duration::seconds(5);
+        let upper = after - chrono::Duration::hours(8) + chrono::Duration::seconds(5);
+        assert!(
+            cutoff >= lower && cutoff <= upper,
+            "cutoff out of range: {cutoff}"
+        );
+    }
+
+    #[test]
+    fn cutoff_for_hours_avoids_u64_to_i64_overflow() {
+        // Without `i64::try_from`, casting `u64::MAX as i64` wraps to -1 and
+        // places the cutoff one hour in the future. Verify the clamp keeps it
+        // strictly in the past.
+        let now = Utc::now();
+        let cutoff = cutoff_for_hours(u64::MAX);
+        assert!(
+            cutoff < now,
+            "cutoff must not be in the future: {cutoff} vs now {now}"
+        );
+    }
+
     fn unique_test_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "aicx-main-{name}-{}-{}",
@@ -4926,6 +5540,200 @@ mod tests {
 
     fn set_mtime(path: &Path, unix_seconds: i64) {
         set_file_mtime(path, FileTime::from_unix_time(unix_seconds, 0)).unwrap();
+    }
+
+    #[test]
+    fn uuid_suffix_from_stem_extracts_rollout_uuid() {
+        assert_eq!(
+            uuid_suffix_from_stem(
+                "rollout-2026-05-14T00-47-35-019e2574-8a7f-7d33-a318-b365aa0ab970"
+            ),
+            Some("019e2574-8a7f-7d33-a318-b365aa0ab970")
+        );
+        assert_eq!(uuid_suffix_from_stem("rollout-2026-05-14"), None);
+    }
+
+    #[test]
+    fn session_reference_resolver_accepts_unique_prefix() {
+        let session_ids = BTreeSet::from([
+            "019e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
+            "119e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
+        ]);
+
+        let resolved = resolve_session_reference_from_candidates(
+            "019e2574",
+            &session_ids,
+            BTreeSet::new(),
+            "codex",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.canonical_id,
+            "019e2574-8a7f-7d33-a318-b365aa0ab970"
+        );
+        assert!(resolved.note.is_some());
+    }
+
+    #[test]
+    fn session_reference_resolver_rejects_ambiguous_prefix() {
+        let session_ids = BTreeSet::from([
+            "019e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
+            "019e2574-9999-7d33-a318-b365aa0ab970".to_string(),
+        ]);
+
+        let err = resolve_session_reference_from_candidates(
+            "019e2574",
+            &session_ids,
+            BTreeSet::new(),
+            "codex",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("Ambiguous session reference"));
+    }
+
+    #[test]
+    fn session_reference_resolver_accepts_unique_suffix() {
+        let session_ids = BTreeSet::from([
+            "019e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
+            "119e2574-8a7f-7d33-a318-000000000000".to_string(),
+        ]);
+
+        let resolved = resolve_session_reference_from_candidates(
+            "b365aa0ab970",
+            &session_ids,
+            BTreeSet::new(),
+            "codex",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.canonical_id,
+            "019e2574-8a7f-7d33-a318-b365aa0ab970"
+        );
+    }
+
+    #[test]
+    fn session_reference_resolver_accepts_codex_alias_match() {
+        let session_ids = BTreeSet::from(["019e2574-8a7f-7d33-a318-b365aa0ab970".to_string()]);
+        let aliases = BTreeSet::from(["019e2574-8a7f-7d33-a318-b365aa0ab970".to_string()]);
+
+        let resolved = resolve_session_reference_from_candidates(
+            "rollout-2026-05-14T00-47-35-019e2574-8a7f-7d33-a318-b365aa0ab970",
+            &session_ids,
+            aliases,
+            "codex",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.canonical_id,
+            "019e2574-8a7f-7d33-a318-b365aa0ab970"
+        );
+    }
+
+    #[test]
+    fn read_codex_session_meta_id_skips_malformed_lines() {
+        use std::io::Write;
+        let tmp_dir = unique_test_dir("read-meta-malformed");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let path = tmp_dir.join("partial.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        // First candidate line contains the `"session_meta"` substring
+        // but is truncated mid-record (typical of a partially-flushed
+        // rollout). Before the fix this caused `read_codex_session_meta_id`
+        // to bail out and miss the valid record on the next line.
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-15T00:00:00Z","type":"session_meta","payload":{{"id":"truncated"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"timestamp":"2026-05-15T00:00:01Z","type":"session_meta","payload":{{"id":"019e0000-0000-0000-0000-000000000000","cwd":"/tmp"}}}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        let id = read_codex_session_meta_id(&path);
+        assert_eq!(
+            id.as_deref(),
+            Some("019e0000-0000-0000-0000-000000000000"),
+            "malformed first line must not stop the scan"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn session_reference_resolver_ignores_out_of_window_alias() {
+        // Only one id is in the current `--hours`/`--project` window.
+        let session_ids = BTreeSet::from(["019e27c0-e492-7790-9c33-52b3dddd1067".to_string()]);
+        // The full sessions/ tree walk surfaced two aliases sharing the
+        // `019e2` prefix: one in-window, one historical/out-of-window.
+        let aliases = BTreeSet::from([
+            "019e27c0-e492-7790-9c33-52b3dddd1067".to_string(),
+            "019e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
+        ]);
+
+        let resolved =
+            resolve_session_reference_from_candidates("019e2", &session_ids, aliases, "codex")
+                .unwrap();
+
+        // Without the in-window filter the resolver would see two
+        // candidates and bail "ambiguous". After the fix it resolves
+        // uniquely to the in-window id.
+        assert_eq!(
+            resolved.canonical_id,
+            "019e27c0-e492-7790-9c33-52b3dddd1067"
+        );
+    }
+
+    #[test]
+    fn conversation_batch_safe_session_filename_passes_through_safe_ids() {
+        let id = "019e27c0-e492-7790-9c33-52b3dddd1067";
+        assert_eq!(conversation_batch_safe_session_filename(id), id);
+    }
+
+    #[test]
+    fn conversation_batch_safe_session_filename_preserves_safe_underscore_runs() {
+        // Both ids only use safe characters. Earlier behavior collapsed
+        // `__` to `_` for every input, so "a__b" and "a_b" mapped to the
+        // same filename without a hash suffix and silently overwrote each
+        // other. Safe inputs must round-trip verbatim.
+        assert_eq!(conversation_batch_safe_session_filename("a__b"), "a__b");
+        assert_eq!(conversation_batch_safe_session_filename("a_b"), "a_b");
+    }
+
+    #[test]
+    fn conversation_batch_safe_session_filename_disambiguates_collisions() {
+        // Two distinct ids that collapse to the same sanitized base must
+        // produce different filenames so one export cannot overwrite the
+        // other.
+        let a = conversation_batch_safe_session_filename("a/b");
+        let b = conversation_batch_safe_session_filename("a:b");
+        assert_ne!(a, b, "distinct ids must not collide after sanitization");
+        assert!(
+            a.starts_with("a_b-"),
+            "expected sanitized base prefix, got {a}"
+        );
+        assert!(
+            b.starts_with("a_b-"),
+            "expected sanitized base prefix, got {b}"
+        );
+    }
+
+    #[test]
+    fn conversation_batch_safe_session_filename_falls_back_to_session() {
+        // All chars sanitized away — base becomes "session" plus a hash
+        // (still unique because the sanitization touched the id).
+        let safe = conversation_batch_safe_session_filename("///");
+        assert!(
+            safe.starts_with("session-"),
+            "expected session-prefixed name, got {safe}"
+        );
     }
 
     #[test]
@@ -5751,6 +6559,159 @@ mod tests {
             res.is_err(),
             "--session must conflict with positional INPUT path"
         );
+    }
+
+    #[test]
+    fn conversations_accepts_claude_agent_and_out_dir() {
+        let cli = Cli::try_parse_from([
+            "aicx",
+            "conversations",
+            "--agent",
+            "claude",
+            "--hours",
+            "24",
+            "--limit",
+            "5",
+            "--out-dir",
+            "/tmp/aicx-conversations",
+        ])
+        .expect("conversations command should parse");
+
+        match cli.command {
+            Some(Commands::Conversations {
+                agent,
+                hours,
+                limit,
+                out_dir,
+                ..
+            }) => {
+                assert_eq!(agent, "claude");
+                assert_eq!(hours, 24);
+                assert_eq!(limit, Some(5));
+                assert_eq!(out_dir, PathBuf::from("/tmp/aicx-conversations"));
+            }
+            _ => panic!("expected conversations command"),
+        }
+    }
+
+    #[test]
+    fn conversations_rejects_non_claude_agent_for_v1() {
+        let err = Cli::try_parse_from([
+            "aicx",
+            "conversations",
+            "--agent",
+            "codex",
+            "--out-dir",
+            "/tmp/aicx-conversations",
+        ])
+        .expect_err("conversations v1 should reject non-claude agents");
+
+        assert!(err.to_string().contains("possible values"));
+    }
+
+    #[test]
+    fn conversations_sanitizes_session_filename() {
+        // Sanitized filenames append a SipHash suffix so distinct ids that
+        // collapse to the same base do not collide on disk. Assert the
+        // sanitized prefix is correct; the suffix is intentionally opaque.
+        let sanitized = conversation_batch_safe_session_filename("abc/def:ghi 123");
+        assert!(
+            sanitized.starts_with("abc_def_ghi_123-"),
+            "expected sanitized base prefix, got {sanitized}"
+        );
+        let empty_id = conversation_batch_safe_session_filename("");
+        // Empty input has no chars to sanitize → no suffix needed.
+        assert_eq!(empty_id, "session");
+    }
+
+    #[test]
+    fn conversations_output_path_is_deterministic() {
+        let path = conversation_batch_output_path(
+            Path::new("/tmp/aicx-conversations"),
+            "claude",
+            "abc/def",
+        );
+        // Path contains the sanitized base + SipHash suffix; assert the
+        // shape, not a fixed hash literal.
+        let path_str = path.to_string_lossy().to_string();
+        assert!(
+            path_str.starts_with("/tmp/aicx-conversations/claude/abc_def-"),
+            "unexpected path: {path_str}"
+        );
+        assert!(path_str.ends_with(".json"), "unexpected path: {path_str}");
+
+        // Determinism: same input must yield the same path.
+        let path2 = conversation_batch_output_path(
+            Path::new("/tmp/aicx-conversations"),
+            "claude",
+            "abc/def",
+        );
+        assert_eq!(path, path2, "sanitized path must be deterministic");
+    }
+
+    #[test]
+    fn conversations_batch_writes_synthetic_sessions_without_store_path() {
+        let root = unique_test_dir("conversations-batch");
+        let out_dir = root.join("out");
+        let ts = Utc.with_ymd_and_hms(2026, 5, 14, 12, 0, 0).unwrap();
+        let entries = vec![
+            timeline::TimelineEntry {
+                timestamp: ts,
+                agent: "claude".to_string(),
+                session_id: "session-one".to_string(),
+                role: "user".to_string(),
+                message: "hello one".to_string(),
+                frame_kind: None,
+                branch: Some("main".to_string()),
+                cwd: Some("/tmp/project-one".to_string()),
+            },
+            timeline::TimelineEntry {
+                timestamp: ts + chrono::Duration::seconds(1),
+                agent: "claude".to_string(),
+                session_id: "session-two/unsafe".to_string(),
+                role: "assistant".to_string(),
+                message: "hello two".to_string(),
+                frame_kind: None,
+                branch: None,
+                cwd: Some("/tmp/project-two".to_string()),
+            },
+        ];
+
+        let summary = write_conversation_batch_outputs(ConversationBatchWriteOptions {
+            agent_label: "claude",
+            entries,
+            project_filter: vec![],
+            out_dir: out_dir.clone(),
+            limit: None,
+            dry_run: false,
+            redaction_enabled: false,
+        })
+        .expect("synthetic batch should write conversation JSON files");
+
+        assert_eq!(summary.sessions_discovered, 2);
+        assert_eq!(summary.sessions_written, 2);
+        assert_eq!(summary.failed_sessions, 0);
+        assert_eq!(summary.messages_total, 2);
+        // session-one needed no sanitization — bare filename.
+        assert!(out_dir.join("claude/session-one.json").exists());
+        // session-two/unsafe contains an unsafe `/` → sanitized base is
+        // `session-two_unsafe`, with a SipHash suffix appended. Locate the
+        // file by walking the directory rather than hardcoding the hash.
+        let claude_dir = out_dir.join("claude");
+        let entries: Vec<String> = fs::read_dir(&claude_dir)
+            .expect("claude output dir must exist")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            entries
+                .iter()
+                .any(|name| name.starts_with("session-two_unsafe-") && name.ends_with(".json")),
+            "expected a session-two_unsafe-<hash>.json file, got {entries:?}"
+        );
+        assert!(!out_dir.starts_with(aicx::store::store_base_dir().unwrap()));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
