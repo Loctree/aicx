@@ -1,5 +1,5 @@
 {
-  "metadata": "Baseline measured: NDJSON brute-force retrieval",
+  "metadata": "Historical baseline floor measured before live hybrid_rrf gating; default CI validates this file, live operator eval compares production hybrid_rrf against it.",
   "aggregate": {
     "recall_at_5": 0.0,
     "ndcg_at_10": 0.0,

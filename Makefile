@@ -118,7 +118,13 @@ test-e2e:
 	cargo test --locked -p aicx --features e2e-aicx --test e2e_context_pack_ingest -- --nocapture
 
 test-retrieval-eval:
+	cargo test --test retrieval_eval_harness
+
+test-retrieval-eval-live:
 	cargo test --test retrieval_eval_harness --features e2e-aicx -- --nocapture
+
+test-retrieval-eval-rebaseline:
+	AICX_RETRIEVAL_EVAL_WRITE_BASELINE=1 cargo test --test retrieval_eval_harness --features e2e-aicx -- --nocapture
 
 check:
 	@echo "=== AICX Quality Gate ==="

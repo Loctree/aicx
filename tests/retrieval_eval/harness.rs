@@ -115,6 +115,7 @@ fn eval_harness() {
     } else {
         None
     };
+    let write_baseline = std::env::var_os("AICX_RETRIEVAL_EVAL_WRITE_BASELINE").is_some();
 
     let mut current_data = BaselineData {
         metadata: "Baseline measured: production hybrid_rrf retrieval".to_string(),
@@ -215,9 +216,15 @@ fn eval_harness() {
             p95_latency
         );
     } else {
+        assert!(
+            write_baseline,
+            "No previous baseline exists. Re-run with AICX_RETRIEVAL_EVAL_WRITE_BASELINE=1 to establish one."
+        );
         println!("No previous baseline. Establishing new baseline.");
     }
 
-    let json = serde_json::to_string_pretty(&current_data).unwrap();
-    fs::write(baseline_path, json).unwrap();
+    if write_baseline {
+        let json = serde_json::to_string_pretty(&current_data).unwrap();
+        fs::write(baseline_path, json).unwrap();
+    }
 }
