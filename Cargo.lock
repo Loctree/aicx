@@ -59,6 +59,7 @@ dependencies = [
  "aicx-monitor",
  "aicx-parser 0.8.0",
  "aicx-progress-contracts",
+ "aicx-retrieve",
  "anyhow",
  "axum",
  "chrono",

@@ -36,10 +36,10 @@ struct BaselineData {
     queries: HashMap<String, BaselineMetric>,
 }
 
-fn calculate_ndcg(results: &[aicx::vector_index::QueryHit], expected: &[String], k: usize) -> f64 {
+fn calculate_ndcg(results: &[aicx::rank::FuzzyResult], expected: &[String], k: usize) -> f64 {
     let mut dcg = 0.0;
     for (i, hit) in results.iter().take(k).enumerate() {
-        let path_str = hit.path.to_string_lossy().to_string();
+        let path_str = hit.path.clone();
         if expected
             .iter()
             .any(|e| path_str.contains(e) || e.contains(&path_str))
@@ -79,7 +79,7 @@ fn eval_harness() {
     };
 
     let mut current_data = BaselineData {
-        metadata: "Baseline measured: NDJSON brute-force retrieval".to_string(),
+        metadata: "Baseline measured: production hybrid_rrf retrieval".to_string(),
         aggregate: BaselineMetric::default(),
         queries: HashMap::new(),
     };
@@ -90,14 +90,39 @@ fn eval_harness() {
 
     for q in &config.queries {
         let start = Instant::now();
-        let results = aicx::vector_index::query_index(None, &q.query, 10, None, None)
-            .unwrap_or_else(|_| Vec::new());
+        let results = aicx::search_engine::try_semantic_search(
+            std::path::Path::new(""),
+            &q.query,
+            10,
+            &[None],
+            None,
+            None,
+        )
+        .map(|outcome| {
+            assert_eq!(
+                outcome.backend_label, "hybrid_rrf",
+                "retrieval eval must exercise the production hybrid path"
+            );
+            assert!(
+                outcome.retrieval_status.is_some(),
+                "retrieval eval must observe a committed hybrid manifest"
+            );
+            outcome.results
+        })
+        .unwrap_or_else(|err| {
+            panic!(
+                "retrieval eval requires a live hybrid index: kind={} reason={}; recommendation={}",
+                err.kind(),
+                err.reason(),
+                err.recommendation()
+            )
+        });
         let latency = start.elapsed().as_millis();
 
         let mut hits = 0;
         for expected in &q.expected_top_3_paths {
             let found = results.iter().take(5).any(|hit| {
-                let p = hit.path.to_string_lossy().to_string();
+                let p = hit.path.clone();
                 p.contains(expected) || expected.contains(&p)
             });
             if found {

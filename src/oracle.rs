@@ -11,6 +11,8 @@ pub enum OracleBackend {
     SteerMetadata,
     ContentSemantic,
     Hybrid,
+    #[serde(rename = "hybrid_rrf")]
+    HybridRrf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -46,6 +48,16 @@ pub struct OracleStatus {
     pub stale_or_unknown: bool,
     pub loctree_scope_safe: bool,
     pub loctree_scope_note: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_generation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_source_chunk_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dense_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lexical_doc_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fusion_algorithm: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,6 +95,11 @@ impl OracleStatus {
             } else {
                 "unsafe_for_scope_narrowing; source chunks must be readable before Loctree trusts this surface".to_string()
             },
+            manifest_generation_id: None,
+            manifest_source_chunk_count: None,
+            dense_count: None,
+            lexical_doc_count: None,
+            fusion_algorithm: None,
         }
     }
 
@@ -110,6 +127,11 @@ impl OracleStatus {
             loctree_scope_note:
                 "unsafe_for_scope_narrowing; use as routing evidence, then read canonical chunks"
                     .to_string(),
+            manifest_generation_id: None,
+            manifest_source_chunk_count: None,
+            dense_count: None,
+            lexical_doc_count: None,
+            fusion_algorithm: None,
         }
     }
 
@@ -138,6 +160,44 @@ impl OracleStatus {
                 "unsafe_for_scope_narrowing; semantic index returned paths that are not all readable"
                     .to_string()
             },
+            manifest_generation_id: None,
+            manifest_source_chunk_count: None,
+            dense_count: None,
+            lexical_doc_count: None,
+            fusion_algorithm: None,
+        }
+    }
+
+    pub fn hybrid_rrf(
+        store_root: &Path,
+        status: &crate::search_engine::HybridRetrievalStatus,
+        candidate_count: usize,
+        source_paths_verified: bool,
+    ) -> Self {
+        Self {
+            source_layer: canonical_layer(),
+            backend: OracleBackend::HybridRrf,
+            index_kind: OracleIndexKind::OnionContent,
+            fallback_reason: None,
+            derived_view: "hybrid_rrf_manifest_bound_lexical_dense_index".to_string(),
+            store_root: display_path(store_root),
+            indexed_count: status.source_chunk_count,
+            scanned_count: status.source_chunk_count,
+            candidate_count,
+            source_paths_verified,
+            stale_or_unknown: !source_paths_verified,
+            loctree_scope_safe: source_paths_verified,
+            loctree_scope_note: if source_paths_verified {
+                "safe_for_hybrid_scope_when_followed_by_canonical_chunk_read".to_string()
+            } else {
+                "unsafe_for_scope_narrowing; hybrid index returned paths that are not all readable"
+                    .to_string()
+            },
+            manifest_generation_id: Some(status.generation_id.clone()),
+            manifest_source_chunk_count: Some(status.source_chunk_count),
+            dense_count: Some(status.dense_count),
+            lexical_doc_count: Some(status.lexical_doc_count),
+            fusion_algorithm: Some(status.fusion_algorithm.clone()),
         }
     }
 
@@ -167,6 +227,11 @@ impl OracleStatus {
                 "unsafe_for_scope_narrowing; metadata index returned paths that are not all readable"
                     .to_string()
             },
+            manifest_generation_id: None,
+            manifest_source_chunk_count: None,
+            dense_count: None,
+            lexical_doc_count: None,
+            fusion_algorithm: None,
         }
     }
 }

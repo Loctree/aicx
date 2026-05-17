@@ -8,11 +8,11 @@
 //! Pipeline asserted, end to end:
 //!   1. canonical store has at least one chunk (extract was previously run)
 //!   2. embedder loads via the configured backend (cloud or native GGUF)
-//!   3. `vector_index::write_index` materializes an NDJSON file under
-//!      `~/.aicx/indexed/<bucket>/embeddings.ndjson`
-//!   4. `vector_index::query_index` returns at least one hit for a
-//!      well-formed query, dimension-matched against the index header
-//!   5. cosine score is in `[0.0, 1.0]` for the top hit (sanity)
+//!   3. `vector_index::write_index` materializes NDJSON + committed hybrid
+//!      artifacts under `~/.aicx/indexed/<bucket>/`
+//!   4. `search_engine::try_semantic_search` returns at least one hybrid RRF
+//!      hit for a well-formed query, dimension-matched against the manifest
+//!   5. normalized score is in `[0, 100]` for the top hit (sanity)
 //!
 //! Fail-fast philosophy: when any precondition is missing the test panics
 //! with the same `SemanticError` shape the production CLI emits, so the
@@ -127,7 +127,11 @@ fn e2e_index_and_query_roundtrip() {
         "top hit score {} exceeds [0, 100] range — cosine clamp regression",
         top.score
     );
-    assert_eq!(outcome.backend_label, "embedded_semantic");
+    assert_eq!(outcome.backend_label, "hybrid_rrf");
+    assert!(
+        outcome.retrieval_status.is_some(),
+        "hybrid search must surface committed manifest status"
+    );
     assert!(
         !outcome.model_id.is_empty(),
         "outcome must record the embedder model_id for operator diagnostics"
@@ -136,4 +140,7 @@ fn e2e_index_and_query_roundtrip() {
     // Cleanup: remove the test-built index so re-runs start clean.
     // Don't fail the test if removal fails — the index file is small.
     let _ = std::fs::remove_file(&index_path);
+    if let Some(parent) = index_path.parent() {
+        let _ = std::fs::remove_dir_all(parent.join("hybrid"));
+    }
 }

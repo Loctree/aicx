@@ -37,10 +37,22 @@ pub struct SemanticSearchOutcome {
     /// Embedder model identifier surfaced for operator diagnostics
     /// (e.g. `"F2LLM-v2-0.6B.Q4_K_M.gguf"`).
     pub model_id: String,
+    /// Manifest-backed hybrid retrieval status, when the live path is the
+    /// committed hybrid stack rather than a legacy vector scan.
+    pub retrieval_status: Option<HybridRetrievalStatus>,
 }
 
 /// Result of a semantic search call.
 pub type SemanticOutcome = SemanticSearchOutcome;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HybridRetrievalStatus {
+    pub generation_id: String,
+    pub source_chunk_count: usize,
+    pub dense_count: usize,
+    pub lexical_doc_count: usize,
+    pub fusion_algorithm: String,
+}
 
 /// Fail-fast typed error for semantic-search preconditions. Each variant
 /// captures the diagnostic the operator needs to fix the problem and
@@ -74,6 +86,20 @@ pub enum SemanticError {
     },
     /// Index file exists but cannot be read or parsed.
     IndexCorrupt {
+        path: std::path::PathBuf,
+        reason: String,
+        recommendation: String,
+    },
+    /// The committed vector artifact exists, but the hybrid manifest that
+    /// binds lexical+dense generations is missing.
+    RetrievalManifestMissing {
+        path: std::path::PathBuf,
+        reason: String,
+        recommendation: String,
+    },
+    /// The hybrid manifest exists but no longer matches the dense/lexical
+    /// artifacts, embedder fingerprint, or committed source hash.
+    RetrievalManifestStale {
         path: std::path::PathBuf,
         reason: String,
         recommendation: String,
@@ -115,6 +141,8 @@ impl SemanticError {
             | Self::IndexNotBuilt { reason, .. }
             | Self::IndexBusy { reason, .. }
             | Self::IndexCorrupt { reason, .. }
+            | Self::RetrievalManifestMissing { reason, .. }
+            | Self::RetrievalManifestStale { reason, .. }
             | Self::DimensionMismatch { reason, .. }
             | Self::EmptyIndex { reason, .. }
             | Self::NoResults { reason, .. } => reason,
@@ -129,6 +157,8 @@ impl SemanticError {
             | Self::IndexNotBuilt { recommendation, .. }
             | Self::IndexBusy { recommendation, .. }
             | Self::IndexCorrupt { recommendation, .. }
+            | Self::RetrievalManifestMissing { recommendation, .. }
+            | Self::RetrievalManifestStale { recommendation, .. }
             | Self::DimensionMismatch { recommendation, .. }
             | Self::EmptyIndex { recommendation, .. }
             | Self::NoResults { recommendation, .. } => recommendation,
@@ -143,6 +173,8 @@ impl SemanticError {
             Self::IndexNotBuilt { .. } => "index_not_built",
             Self::IndexBusy { .. } => "index_busy",
             Self::IndexCorrupt { .. } => "index_corrupt",
+            Self::RetrievalManifestMissing { .. } => "retrieval_manifest_missing",
+            Self::RetrievalManifestStale { .. } => "retrieval_manifest_stale",
             Self::DimensionMismatch { .. } => "dimension_mismatch",
             Self::EmptyIndex { .. } => "empty_index",
             Self::NoResults { .. } => "no_results",
@@ -233,6 +265,7 @@ pub fn try_semantic_search(
         let mut merged_results = Vec::new();
         let mut scanned = 0usize;
         let mut model_id = None;
+        let mut hybrid_statuses = Vec::new();
         for scope in scopes {
             let mut outcome = try_semantic_search_native(
                 query,
@@ -243,6 +276,9 @@ pub fn try_semantic_search(
             )?;
             scanned += outcome.scanned;
             model_id.get_or_insert(outcome.model_id.clone());
+            if let Some(status) = outcome.retrieval_status.clone() {
+                hybrid_statuses.push(status);
+            }
             merged_results.append(&mut outcome.results);
         }
         merged_results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
@@ -250,8 +286,9 @@ pub fn try_semantic_search(
         Ok(SemanticOutcome {
             results: merged_results,
             scanned,
-            backend_label: "embedded_semantic",
+            backend_label: "hybrid_rrf",
             model_id: model_id.unwrap_or_else(|| "unknown".to_string()),
+            retrieval_status: merge_hybrid_statuses(&hybrid_statuses),
         })
     }
 }
@@ -265,7 +302,7 @@ fn try_semantic_search_native(
     kind_filter: Option<&str>,
 ) -> std::result::Result<SemanticOutcome, SemanticError> {
     // Probe the embedder first.
-    let engine = match crate::embedder::EmbeddingEngine::new() {
+    let mut engine = match crate::embedder::EmbeddingEngine::new() {
         Ok(engine) => engine,
         Err(err) => {
             let msg = err.to_string();
@@ -374,28 +411,69 @@ fn try_semantic_search_native(
         });
     }
 
-    // Drop the engine handle before query_index opens its own (locks are
-    // shared so concurrent reads are fine).
-    drop(engine);
+    let manifest_path =
+        crate::vector_index::hybrid_manifest_path(project_filter).map_err(|err| {
+            SemanticError::IndexCorrupt {
+                path: path.clone(),
+                reason: format!("could not resolve hybrid manifest path: {err}"),
+                recommendation: "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index`"
+                    .to_string(),
+            }
+        })?;
+    if !manifest_path.exists() {
+        let cmd = match project_filter {
+            Some(p) => format!("aicx index --project {p}"),
+            None => "aicx index".to_string(),
+        };
+        return Err(SemanticError::RetrievalManifestMissing {
+            path: manifest_path.clone(),
+            reason: format!(
+                "hybrid retrieval manifest is missing at {}",
+                manifest_path.display()
+            ),
+            recommendation: format!(
+                "run `{cmd}` with the current binary so lexical+dense hybrid artifacts are committed"
+            ),
+        });
+    }
 
-    let hits = match crate::vector_index::query_index(
-        project_filter,
-        query,
+    let query_embedding = match engine.embed(query) {
+        Ok(embedding) => embedding,
+        Err(err) => {
+            return Err(SemanticError::EmbedderUnavailable {
+                reason: format!("semantic embedder could not encode query: {err}"),
+                recommendation:
+                    "check `aicx config show` for resolved backend; if unhealthy run `aicx doctor` \
+                     then retry"
+                        .to_string(),
+            });
+        }
+    };
+
+    let hybrid = load_hybrid_index(project_filter, &path, &info, &manifest_path)?;
+    let manifest = hybrid.manifest().cloned();
+    let filters = hybrid_filters(kind_filter, frame_kind_filter);
+    let hits = match hybrid.query_hybrid(aicx_retrieve::HybridQueryInput {
+        query_text: query,
+        query_embedding: &query_embedding,
+        filters,
         limit,
-        kind_filter,
-        frame_kind_filter.map(FrameKind::as_str),
-    ) {
+    }) {
         Ok(hits) => hits,
         Err(err) => return Err(index_query_error(&path, err)),
     };
 
     if hits.is_empty() {
+        let scanned = manifest
+            .as_ref()
+            .map(|manifest| manifest.source_chunk_count)
+            .unwrap_or(0);
         return Err(SemanticError::NoResults {
             path: path.clone(),
-            scanned: 0,
+            scanned,
             reason: format!(
-                "index at {} produced 0 ranked hits for this query",
-                path.display()
+                "hybrid index at {} produced 0 ranked hits for this query",
+                manifest_path.display()
             ),
             recommendation: "either the index is empty (rebuild with `aicx index`) \
                  or your query has no semantic neighbours in the corpus — try broader phrasing"
@@ -403,32 +481,33 @@ fn try_semantic_search_native(
         });
     }
 
-    let scanned = hits.len();
+    let retrieval_status = manifest.as_ref().map(HybridRetrievalStatus::from);
+    let scanned = retrieval_status
+        .as_ref()
+        .map(|status| status.source_chunk_count)
+        .unwrap_or(hits.len());
     let results: Vec<FuzzyResult> = hits
         .into_iter()
         .take(limit)
         .map(|h| {
-            // Map cosine [-1, 1] → unsigned 0..=100 score for FuzzyResult
-            // (downstream renderers share the shape with the lexical
-            // path). Negative scores clamp to 0; lexical never emits
-            // negatives either.
-            let score_pct = ((h.score.max(0.0) * 100.0).round() as u8).min(100);
-            let matched_lines = semantic_preview_lines(&h.path);
+            let path = hit_path(&h);
+            let score_pct = hybrid_score_pct(h.score);
+            let matched_lines = semantic_preview_lines(&path);
             FuzzyResult {
-                file: h.path.to_string_lossy().to_string(),
-                path: h.path.to_string_lossy().to_string(),
-                project: h.project,
-                kind: h.kind,
-                frame_kind: h.frame_kind,
-                agent: h.agent,
-                date: h.date,
+                file: path.to_string_lossy().to_string(),
+                path: path.to_string_lossy().to_string(),
+                project: hit_metadata_string(&h, "project"),
+                kind: hit_metadata_string(&h, "kind"),
+                frame_kind: hit_metadata_optional_string(&h, "frame_kind"),
+                agent: hit_metadata_string(&h, "agent"),
+                date: hit_metadata_string(&h, "date"),
                 timestamp: None,
                 score: score_pct,
-                label: format!("semantic:{}", h.id),
+                label: format!("hybrid_rrf:{}", h.chunk_id),
                 density: h.score,
                 matched_lines,
-                session_id: Some(h.session_id),
-                cwd: h.cwd,
+                session_id: hit_metadata_optional_string(&h, "session_id"),
+                cwd: hit_metadata_optional_string(&h, "cwd"),
             }
         })
         .collect();
@@ -436,9 +515,171 @@ fn try_semantic_search_native(
     Ok(SemanticOutcome {
         results,
         scanned,
-        backend_label: "embedded_semantic",
+        backend_label: "hybrid_rrf",
         model_id: info.model_id,
+        retrieval_status,
     })
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn load_hybrid_index(
+    project_filter: Option<&str>,
+    source_index_path: &std::path::Path,
+    info: &crate::embedder::EmbeddingModelInfo,
+    manifest_path: &std::path::Path,
+) -> std::result::Result<aicx_retrieve::HybridIndex, SemanticError> {
+    let manifest_dir = crate::vector_index::hybrid_index_dir(project_filter).map_err(|err| {
+        SemanticError::RetrievalManifestStale {
+            path: manifest_path.to_path_buf(),
+            reason: format!("could not resolve hybrid index dir: {err}"),
+            recommendation: "run `aicx index` to rebuild the hybrid retrieval bucket".to_string(),
+        }
+    })?;
+    let dense_path = crate::vector_index::hybrid_dense_path(project_filter).map_err(|err| {
+        SemanticError::RetrievalManifestStale {
+            path: manifest_path.to_path_buf(),
+            reason: format!("could not resolve hybrid dense path: {err}"),
+            recommendation: "run `aicx index` to rebuild the hybrid retrieval bucket".to_string(),
+        }
+    })?;
+    if !dense_path.exists() {
+        return Err(SemanticError::RetrievalManifestStale {
+            path: manifest_path.to_path_buf(),
+            reason: format!(
+                "hybrid dense artifact is missing at {}",
+                dense_path.display()
+            ),
+            recommendation: "run `aicx index` to rebuild the committed hybrid artifacts"
+                .to_string(),
+        });
+    }
+    let source_hash = crate::vector_index::observed_source_hash_for_index_path(source_index_path)
+        .map_err(|err| SemanticError::RetrievalManifestStale {
+        path: manifest_path.to_path_buf(),
+        reason: format!("could not hash committed source index: {err}"),
+        recommendation: "run `aicx index` to rebuild the committed hybrid artifacts".to_string(),
+    })?;
+    let lexical = Box::new(
+        aicx_retrieve::TantivyAdapter::new(manifest_dir.clone()).map_err(|err| {
+            SemanticError::RetrievalManifestStale {
+                path: manifest_path.to_path_buf(),
+                reason: format!("could not open hybrid lexical artifact: {err:#}"),
+                recommendation: "run `aicx index` to rebuild the committed hybrid artifacts"
+                    .to_string(),
+            }
+        })?,
+    );
+    let dense = Box::new(
+        aicx_retrieve::load_from_ndjson(
+            &dense_path,
+            info.dimension,
+            aicx_retrieve::Distance::Cosine,
+        )
+        .map_err(|err| SemanticError::RetrievalManifestStale {
+            path: manifest_path.to_path_buf(),
+            reason: format!("could not open hybrid dense artifact: {err:#}"),
+            recommendation: "run `aicx index` to rebuild the committed hybrid artifacts"
+                .to_string(),
+        })?,
+    );
+    let fusion = Box::new(aicx_retrieve::ReciprocalRankFusion::default());
+    let fingerprint = crate::vector_index::hybrid_embedder_fingerprint(info);
+    aicx_retrieve::HybridIndex::load_from_manifest(
+        lexical,
+        dense,
+        fusion,
+        manifest_dir,
+        fingerprint,
+        &source_hash,
+    )
+    .map_err(|err| SemanticError::RetrievalManifestStale {
+        path: manifest_path.to_path_buf(),
+        reason: format!("hybrid retrieval manifest does not match live artifacts: {err:#}"),
+        recommendation:
+            "run `aicx index` to rebuild lexical+dense artifacts from the canonical corpus"
+                .to_string(),
+    })
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn hybrid_filters(
+    kind_filter: Option<&str>,
+    frame_kind_filter: Option<FrameKind>,
+) -> aicx_retrieve::FilterSet {
+    let mut filters = aicx_retrieve::FilterSet::default();
+    if let Some(kind) = kind_filter {
+        filters.values.insert(
+            "kind".to_string(),
+            serde_json::Value::String(kind.to_string()),
+        );
+    }
+    if let Some(frame_kind) = frame_kind_filter {
+        filters.values.insert(
+            "frame_kind".to_string(),
+            serde_json::Value::String(frame_kind.as_str().to_string()),
+        );
+    }
+    filters
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn hit_path(hit: &aicx_retrieve::Hit) -> std::path::PathBuf {
+    hit.metadata
+        .get("source_path")
+        .and_then(serde_json::Value::as_str)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(&hit.chunk_id))
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn hit_metadata_string(hit: &aicx_retrieve::Hit, key: &str) -> String {
+    hit_metadata_optional_string(hit, key).unwrap_or_else(|| "-".to_string())
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn hit_metadata_optional_string(hit: &aicx_retrieve::Hit, key: &str) -> Option<String> {
+    match hit.metadata.get(key)? {
+        serde_json::Value::String(value) if !value.is_empty() => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn hybrid_score_pct(score: f32) -> u8 {
+    let max_rrf = 2.0 / (aicx_retrieve::RRF_K_DEFAULT as f32 + 1.0);
+    ((score.max(0.0) / max_rrf * 100.0).round() as u8).min(100)
+}
+
+impl From<&aicx_retrieve::Manifest> for HybridRetrievalStatus {
+    fn from(manifest: &aicx_retrieve::Manifest) -> Self {
+        Self {
+            generation_id: manifest.generation_id.clone(),
+            source_chunk_count: manifest.source_chunk_count,
+            dense_count: manifest.dense_count,
+            lexical_doc_count: manifest.lexical_doc_count,
+            fusion_algorithm: manifest.fusion_algorithm.clone(),
+        }
+    }
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn merge_hybrid_statuses(statuses: &[HybridRetrievalStatus]) -> Option<HybridRetrievalStatus> {
+    match statuses {
+        [] => None,
+        [status] => Some(status.clone()),
+        many => Some(HybridRetrievalStatus {
+            generation_id: "multiple".to_string(),
+            source_chunk_count: many.iter().map(|status| status.source_chunk_count).sum(),
+            dense_count: many.iter().map(|status| status.dense_count).sum(),
+            lexical_doc_count: many.iter().map(|status| status.lexical_doc_count).sum(),
+            fusion_algorithm: many
+                .first()
+                .map(|status| status.fusion_algorithm.clone())
+                .unwrap_or_else(|| "rrf".to_string()),
+        }),
+    }
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -491,10 +732,23 @@ pub fn render_semantic_status_line(
     model_id: &str,
     result_count: usize,
     scanned: usize,
+    retrieval_status: Option<&HybridRetrievalStatus>,
 ) -> String {
+    let manifest = retrieval_status
+        .map(|status| {
+            format!(
+                " manifest_generation={} source_chunks={} dense_count={} lexical_doc_count={} fusion={}",
+                status.generation_id,
+                status.source_chunk_count,
+                status.dense_count,
+                status.lexical_doc_count,
+                status.fusion_algorithm
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "{} result(s) from {} candidate chunks. oracle_status: backend={} index=lance fallback=none model={} loctree_scope_safe=true",
-        result_count, scanned, backend_label, model_id
+        "{} result(s) from {} candidate chunks. oracle_status: backend={} index=hybrid fallback=none model={} loctree_scope_safe=true{}",
+        result_count, scanned, backend_label, model_id, manifest
     )
 }
 
@@ -568,10 +822,28 @@ mod tests {
             "F2LLM-v2-0.6B.Q4_K_M.gguf",
             0,
             11_237,
+            None,
         );
         assert!(line.contains("backend=embedded_semantic"));
-        assert!(line.contains("index=lance"));
+        assert!(line.contains("index=hybrid"));
         assert!(line.contains("model=F2LLM-v2-0.6B.Q4_K_M.gguf"));
         assert!(line.contains("loctree_scope_safe=true"));
+    }
+
+    #[test]
+    fn semantic_status_line_surfaces_hybrid_manifest_counts() {
+        let status = HybridRetrievalStatus {
+            generation_id: "g-test".to_string(),
+            source_chunk_count: 123,
+            dense_count: 123,
+            lexical_doc_count: 122,
+            fusion_algorithm: "rrf".to_string(),
+        };
+        let line = render_semantic_status_line("hybrid_rrf", "model", 3, 123, Some(&status));
+        assert!(line.contains("backend=hybrid_rrf"));
+        assert!(line.contains("manifest_generation=g-test"));
+        assert!(line.contains("source_chunks=123"));
+        assert!(line.contains("dense_count=123"));
+        assert!(line.contains("lexical_doc_count=122"));
     }
 }
