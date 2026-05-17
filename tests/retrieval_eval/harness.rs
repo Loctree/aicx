@@ -1,9 +1,9 @@
-#![cfg(feature = "e2e-aicx")]
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+
+#[cfg(feature = "e2e-aicx")]
 use std::time::Instant;
 
 #[derive(Deserialize)]
@@ -36,6 +36,7 @@ struct BaselineData {
     queries: HashMap<String, BaselineMetric>,
 }
 
+#[cfg(feature = "e2e-aicx")]
 fn calculate_ndcg(results: &[aicx::rank::FuzzyResult], expected: &[String], k: usize) -> f64 {
     let mut dcg = 0.0;
     for (i, hit) in results.iter().take(k).enumerate() {
@@ -62,6 +63,43 @@ fn calculate_ndcg(results: &[aicx::rank::FuzzyResult], expected: &[String], k: u
     dcg / idcg
 }
 
+#[cfg(not(feature = "e2e-aicx"))]
+#[test]
+fn eval_harness_contract_is_not_empty_without_live_index() {
+    let queries_path = PathBuf::from("tests/retrieval_eval/queries.toml");
+    let content = fs::read_to_string(&queries_path).expect("failed to read queries.toml");
+    let config: QueriesConfig = toml::from_str(&content).expect("failed to parse TOML");
+
+    assert_eq!(config.queries.len(), 50, "Expected exactly 50 queries");
+    assert!(
+        config
+            .queries
+            .iter()
+            .all(|query| !query.id.trim().is_empty()
+                && !query.category.trim().is_empty()
+                && !query.query.trim().is_empty()
+                && !query.expected_top_3_paths.is_empty()
+                && !query.notes.trim().is_empty()
+                && (0.0..=1.0).contains(&query.expected_minimum_recall_at_5)),
+        "each retrieval eval query must carry id/category/query/expected paths/notes/threshold"
+    );
+
+    let baseline_path = PathBuf::from("tests/retrieval_eval/baseline.json");
+    let baseline = fs::read_to_string(&baseline_path).expect("failed to read baseline.json");
+    let baseline: BaselineData =
+        serde_json::from_str(&baseline).expect("failed to parse baseline.json");
+    assert_eq!(
+        baseline.queries.len(),
+        50,
+        "baseline must cover every gold query"
+    );
+    assert!(
+        !baseline.metadata.trim().is_empty(),
+        "baseline metadata must describe the measured retrieval backend"
+    );
+}
+
+#[cfg(feature = "e2e-aicx")]
 #[test]
 fn eval_harness() {
     let queries_path = PathBuf::from("tests/retrieval_eval/queries.toml");
