@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+### Added
+- `aicx extract` batch conversation export command for emitting multiple
+  session transcripts in a single pass without writing to the canonical store.
+- `extract --conversation` output now carries `message_kind` and
+  `collapse_stub_kind` metadata per message and surfaces extract
+  statistics in the JSON projection.
+
+### Changed
+- **Project filter is now word-boundary path match, not substring.**
+  `--project test` no longer matches `cwd: /tmp/fastest-project`; multi-word
+  filters compose with AND semantics across path words, and multiple filters
+  with ANY. Path is split on `/`, `\`, `-`, `_`, `.`; filter on `-`, `_`, `.`.
+  Message-text matching is dropped entirely — a transcript that *mentions*
+  a project name does not belong to that project.
+- `aicx extract --conversation` deduplicates exact-equal short user messages
+  within the same session (≤ 1000 chars, ≤ 2 s delta). Assistant messages and
+  long bodies are untouched.
+
+### Fixed
+- Codex `extract --session <id>` now accepts a UUID prefix, suffix, or
+  unique substring instead of requiring the full `session_meta.payload.id`.
+  Ambiguous prefixes return a candidate list with an actionable error.
+- Codex session parser surfaces aggregated diagnostics for missing
+  `session_meta`, duplicate `session_meta.payload.id` values, filename ↔
+  meta UUID mismatch, unparsable event_msg timestamps, and unrecognized
+  event_msg `payload.type` values. Broad scans emit one summary line per
+  run; direct file extracts emit per-file warning details.
+- Codex `mcp_tool_call` and `mcp_tool_call_response` event types are now
+  classified as `FrameKind::ToolCall` instead of being silently dropped.
+- `infer_repo_identity_from_known_layout` (parser) now tries all five
+  layout markers (`hosted`, `repos`, `repositories`, `github`, `git`).
+  Previously a `?` inside the loop returned from the whole function on
+  the first marker miss, so four of the five markers were dead code and
+  paths like `~/repos/Org/Repo` fell back to the opaque bucket.
+- Secret redaction now catches inline assignments such as
+  `BRAVE_API_KEY="…"` or `api_key = "…"` embedded in prose and code
+  spans, not only line-start environment declarations.
+
 ## [0.8.0] - 2026-05-15
 
 ### Added

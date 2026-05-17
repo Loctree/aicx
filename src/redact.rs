@@ -63,12 +63,25 @@ static RE_ENV_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
     .expect("regex")
 });
 
+static RE_INLINE_SENSITIVE_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+    // Redact sensitive assignments that appear inside prose/code spans, not only
+    // line-start env declarations. This catches agent reports such as
+    // `BRAVE_API_KEY="..."` and code snippets like `api_key = "..."`.
+    Regex::new(
+        r#"(?P<prefix>\b(?P<key>[A-Za-z_][A-Za-z0-9_-]*)\b\s*[:=]\s*)(?P<quote>["']?)(?P<val>[A-Za-z0-9_./+=:@-]{8,})(?P<suffix>["']?)"#,
+    )
+    .expect("regex")
+});
+
 static RE_HEADER_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(X-API-KEY|X-Auth-Token|Api-Key|Token)\s*:\s*([^\s]+)").expect("regex")
 });
 
 pub fn redact_secrets(text: &str) -> String {
-    if !SECRET_LOOKUP_SET.is_match(text) && !RE_ENV_ASSIGNMENT.is_match(text) {
+    if !SECRET_LOOKUP_SET.is_match(text)
+        && !RE_ENV_ASSIGNMENT.is_match(text)
+        && !RE_INLINE_SENSITIVE_ASSIGNMENT.is_match(text)
+    {
         return text.to_string();
     }
 
@@ -109,6 +122,22 @@ pub fn redact_secrets(text: &str) -> String {
         out = s;
     }
 
+    let inline_replaced = RE_INLINE_SENSITIVE_ASSIGNMENT.replace_all(&out, |caps: &Captures| {
+        let prefix = caps.name("prefix").map(|m| m.as_str()).unwrap_or("");
+        let key = caps.name("key").map(|m| m.as_str()).unwrap_or("");
+        let full = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+        if !is_sensitive_assignment_key(key) {
+            return full.to_string();
+        }
+        let quote = caps.name("quote").map(|m| m.as_str()).unwrap_or("");
+        let suffix = caps.name("suffix").map(|m| m.as_str()).unwrap_or(quote);
+        format!("{prefix}{quote}[REDACTED]{suffix}")
+    });
+
+    if let Cow::Owned(s) = inline_replaced {
+        out = s;
+    }
+
     if let Cow::Owned(s) =
         RE_HEADER_TOKEN.replace_all(&out, |caps: &Captures| format!("{}: [REDACTED]", &caps[1]))
     {
@@ -137,6 +166,22 @@ pub fn redact_secrets(text: &str) -> String {
     out
 }
 
+fn is_sensitive_assignment_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    let normalized = lower.replace('-', "_");
+    normalized == "token"
+        || normalized == "secret"
+        || normalized == "password"
+        || normalized == "pat"
+        || normalized.contains("api_key")
+        || normalized.ends_with("_token")
+        || normalized.ends_with("_secret")
+        || normalized.ends_with("_password")
+        || normalized.starts_with("pat_")
+        || normalized.contains("_pat_")
+        || normalized.ends_with("_pat")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +206,36 @@ mod tests {
         assert!(!r.contains("abc123"));
         assert!(!r.contains("xyz"));
         assert!(!r.contains("pass"));
+    }
+
+    #[test]
+    fn redacts_inline_sensitive_assignment_in_agent_report() {
+        // Build the secret-like value at runtime so semgrep does not flag the
+        // test fixture as a real leaked key (no literal long alphanumeric
+        // string in source code).
+        let value = "a".repeat(32);
+        let s = format!(r#"- `BRAVE_API_KEY="{value}"` **exposed in plaintext**"#);
+        let r = redact_secrets(&s);
+        assert!(r.contains(r#"BRAVE_API_KEY="[REDACTED]""#));
+        assert!(!r.contains(&value));
+    }
+
+    #[test]
+    fn redacts_lowercase_code_style_api_key_assignment() {
+        // Same runtime-built dummy value strategy — semgrep cannot fingerprint
+        // the literal once it is constructed at runtime.
+        let value = "b".repeat(32);
+        let s = format!(r#"client = SearchClient(api_key = "{value}")"#);
+        let r = redact_secrets(&s);
+        assert!(r.contains(r#"api_key = "[REDACTED]""#));
+        assert!(!r.contains(&value));
+    }
+
+    #[test]
+    fn does_not_redact_token_usage_metadata() {
+        let s = "token_usage: 12345678";
+        let r = redact_secrets(s);
+        assert_eq!(r, s);
     }
 
     #[test]

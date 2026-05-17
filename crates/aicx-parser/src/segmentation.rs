@@ -473,9 +473,9 @@ fn infer_repo_identity_from_known_layout(path: &Path) -> Option<RepoIdentity> {
         .collect();
 
     for marker in ["hosted", "repos", "repositories", "github", "git"] {
-        let marker_index = components
-            .iter()
-            .position(|component| component == marker)?;
+        let Some(marker_index) = components.iter().position(|component| component == marker) else {
+            continue;
+        };
         if components.len() > marker_index + 2 {
             let organization = components[marker_index + 1].clone();
             let repository = components[marker_index + 2].clone();
@@ -1175,5 +1175,61 @@ mod tests {
         assert!(SourceTier::Secondary.is_assertable());
         assert!(!SourceTier::Fallback.is_assertable());
         assert!(!SourceTier::Opaque.is_assertable());
+    }
+
+    #[test]
+    fn infer_repo_identity_from_known_layout_matches_hosted() {
+        let path = Path::new("/Users/x/hosted/MyOrg/my-repo/src/lib.rs");
+        let id = infer_repo_identity_from_known_layout(path).expect("hosted match");
+        assert_eq!(id.organization, "MyOrg");
+        assert_eq!(id.repository, "my-repo");
+    }
+
+    #[test]
+    fn infer_repo_identity_from_known_layout_matches_repos() {
+        // Previously dead code: `?` inside the loop returned from the function
+        // on the first missing marker, so only "hosted" was ever tried.
+        let path = Path::new("/Users/x/repos/MyOrg/my-repo/src/lib.rs");
+        let id = infer_repo_identity_from_known_layout(path).expect("repos match");
+        assert_eq!(id.organization, "MyOrg");
+        assert_eq!(id.repository, "my-repo");
+    }
+
+    #[test]
+    fn infer_repo_identity_from_known_layout_matches_repositories() {
+        let path = Path::new("/Users/x/repositories/MyOrg/my-repo/file.txt");
+        let id = infer_repo_identity_from_known_layout(path).expect("repositories match");
+        assert_eq!(id.organization, "MyOrg");
+        assert_eq!(id.repository, "my-repo");
+    }
+
+    #[test]
+    fn infer_repo_identity_from_known_layout_matches_github() {
+        let path = Path::new("/home/user/github/MyOrg/my-repo/src");
+        let id = infer_repo_identity_from_known_layout(path).expect("github match");
+        assert_eq!(id.organization, "MyOrg");
+        assert_eq!(id.repository, "my-repo");
+    }
+
+    #[test]
+    fn infer_repo_identity_from_known_layout_matches_git() {
+        let path = Path::new("/home/user/git/MyOrg/my-repo");
+        let id = infer_repo_identity_from_known_layout(path).expect("git match");
+        assert_eq!(id.organization, "MyOrg");
+        assert_eq!(id.repository, "my-repo");
+    }
+
+    #[test]
+    fn infer_repo_identity_from_known_layout_returns_none_when_no_marker() {
+        let path = Path::new("/tmp/scratch/work/file.txt");
+        assert!(infer_repo_identity_from_known_layout(path).is_none());
+    }
+
+    #[test]
+    fn infer_repo_identity_from_known_layout_rejects_non_repo_name_segments() {
+        // The `is_probably_repo_name` guard still applies after the loop fix.
+        // Org/repo segments must be alphanumeric + `.-_` only.
+        let path = Path::new("/Users/x/repos/My Org With Spaces/my-repo");
+        assert!(infer_repo_identity_from_known_layout(path).is_none());
     }
 }

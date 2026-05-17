@@ -97,6 +97,29 @@ impl fmt::Display for FrameKind {
     }
 }
 
+/// Neutral metadata for conversation JSON consumers.
+///
+/// This is descriptive only: it does not decide indexing policy, filtering, or
+/// chunking behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum MessageKind {
+    #[default]
+    Conversation,
+    WorkflowPrompt,
+    ContinuationSummary,
+    CollapseStub,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CollapseStubKind {
+    SkillRef,
+    DedupRef,
+}
+
 /// Unified timeline entry from any AI agent source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineEntry {
@@ -136,6 +159,12 @@ pub struct ConversationMessage {
     /// Git branch at time of message (when available).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Neutral descriptive metadata for JSON consumers.
+    #[serde(default)]
+    pub message_kind: MessageKind,
+    /// Present only when `message_kind` is `collapse_stub`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collapse_stub_kind: Option<CollapseStubKind>,
 }
 
 /// Configuration for extraction.

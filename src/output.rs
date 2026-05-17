@@ -85,6 +85,16 @@ pub struct ReportMetadata {
     pub sessions: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationExtractStats {
+    pub aicx_version: &'static str,
+    pub redaction_enabled: bool,
+    pub raw_entries: usize,
+    pub conversation_messages: usize,
+    pub conversation_projection: &'static str,
+    pub exact_short_duplicates_dropped: usize,
+}
+
 // ============================================================================
 // Decision markers
 // ============================================================================
@@ -787,6 +797,7 @@ pub fn write_conversation_json(
     path: &Path,
     messages: &[ConversationMessage],
     metadata: &ReportMetadata,
+    extract_stats: &ConversationExtractStats,
 ) -> Result<PathBuf> {
     let validated = sanitize::validate_write_path(path)?;
     if let Some(parent) = validated.parent() {
@@ -801,6 +812,7 @@ pub fn write_conversation_json(
         hours_back: u64,
         total_messages: usize,
         sessions: &'a [String],
+        extract_stats: &'a ConversationExtractStats,
         messages: &'a [ConversationMessage],
     }
 
@@ -810,6 +822,7 @@ pub fn write_conversation_json(
         hours_back: metadata.hours_back,
         total_messages: messages.len(),
         sessions: &metadata.sessions,
+        extract_stats,
         messages,
     };
 
@@ -1365,6 +1378,109 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["total_entries"], 3);
         assert_eq!(parsed["entries"].as_array().unwrap().len(), 3);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_conversation_json_extract_stats_are_additive() {
+        let dir = unique_test_dir("conversation_extract_stats");
+        let path = dir.join("conversation.json");
+        let messages = vec![ConversationMessage {
+            timestamp: Utc.with_ymd_and_hms(2026, 1, 23, 12, 0, 0).unwrap(),
+            agent: "claude".to_string(),
+            session_id: "sess-stats".to_string(),
+            role: "user".to_string(),
+            message: "Hello".to_string(),
+            repo_project: "test".to_string(),
+            source_path: None,
+            branch: None,
+            message_kind: crate::timeline::MessageKind::Conversation,
+            collapse_stub_kind: None,
+        }];
+        let metadata = ReportMetadata {
+            generated_at: Utc.with_ymd_and_hms(2026, 1, 23, 13, 0, 0).unwrap(),
+            project_filter: Some("test".to_string()),
+            hours_back: 24,
+            total_entries: 2,
+            sessions: vec!["sess-stats".to_string()],
+        };
+        let stats = ConversationExtractStats {
+            aicx_version: env!("CARGO_PKG_VERSION"),
+            redaction_enabled: true,
+            raw_entries: 2,
+            conversation_messages: messages.len(),
+            conversation_projection: "user_assistant_only",
+            exact_short_duplicates_dropped: 1,
+        };
+
+        write_conversation_json(&path, &messages, &metadata, &stats).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            parsed["extract_stats"]["aicx_version"],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(parsed["extract_stats"]["redaction_enabled"], true);
+        assert_eq!(parsed["extract_stats"]["raw_entries"], 2);
+        assert_eq!(parsed["extract_stats"]["conversation_messages"], 1);
+        assert_eq!(
+            parsed["extract_stats"]["conversation_projection"],
+            "user_assistant_only"
+        );
+        assert_eq!(parsed["extract_stats"]["exact_short_duplicates_dropped"], 1);
+        assert_eq!(
+            parsed["extract_stats"]["conversation_messages"],
+            parsed["messages"].as_array().unwrap().len()
+        );
+        assert!(
+            parsed["extract_stats"]["raw_entries"].as_u64().unwrap()
+                >= parsed["extract_stats"]["conversation_messages"]
+                    .as_u64()
+                    .unwrap()
+        );
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_conversation_json_extract_stats_can_report_redaction_disabled() {
+        let dir = unique_test_dir("conversation_extract_stats_redaction_disabled");
+        let path = dir.join("conversation.json");
+        let messages = vec![ConversationMessage {
+            timestamp: Utc.with_ymd_and_hms(2026, 1, 23, 12, 0, 0).unwrap(),
+            agent: "claude".to_string(),
+            session_id: "sess-stats".to_string(),
+            role: "user".to_string(),
+            message: "Hello".to_string(),
+            repo_project: "test".to_string(),
+            source_path: None,
+            branch: None,
+            message_kind: crate::timeline::MessageKind::Conversation,
+            collapse_stub_kind: None,
+        }];
+        let metadata = ReportMetadata {
+            generated_at: Utc.with_ymd_and_hms(2026, 1, 23, 13, 0, 0).unwrap(),
+            project_filter: Some("test".to_string()),
+            hours_back: 24,
+            total_entries: 1,
+            sessions: vec!["sess-stats".to_string()],
+        };
+        let stats = ConversationExtractStats {
+            aicx_version: env!("CARGO_PKG_VERSION"),
+            redaction_enabled: false,
+            raw_entries: 1,
+            conversation_messages: messages.len(),
+            conversation_projection: "user_assistant_only",
+            exact_short_duplicates_dropped: 0,
+        };
+
+        write_conversation_json(&path, &messages, &metadata, &stats).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["extract_stats"]["redaction_enabled"], false);
 
         cleanup(&dir);
     }

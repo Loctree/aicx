@@ -23,7 +23,9 @@ use std::process::Command;
 
 use crate::sanitize;
 use crate::timeline::FrameKind;
-pub use crate::timeline::{ConversationMessage, ExtractionConfig, SourceInfo, TimelineEntry};
+pub use crate::timeline::{
+    CollapseStubKind, ConversationMessage, ExtractionConfig, MessageKind, SourceInfo, TimelineEntry,
+};
 
 const CODESCRIBE_AGENT: &str = "codescribe";
 const CODESCRIBE_TRANSCRIPT_KIND: &str = "transcript";
@@ -36,6 +38,14 @@ const OPERATOR_MD_AGENT: &str = "operator";
 const OPERATOR_MD_KIND: &str = "operator-md";
 const OPERATOR_MD_RECENT_DAYS: i64 = 30;
 const UNPROTECTED_SOURCE_WARNING: &str = "unprotected source material; run `aicx sources protect --root <path> --backend git-local --apply` to opt in";
+const EXACT_SHORT_DUP_MAX_CHARS: usize = 1000;
+const EXACT_SHORT_DUP_WINDOW_MS: i64 = 2_000;
+
+#[derive(Debug, Clone)]
+pub struct ConversationProjection {
+    pub messages: Vec<ConversationMessage>,
+    pub exact_short_duplicates_dropped: usize,
+}
 
 /// Project timeline entries into a denoised conversation stream.
 ///
@@ -45,7 +55,14 @@ pub fn to_conversation(
     entries: &[TimelineEntry],
     project_filter: &[String],
 ) -> Vec<ConversationMessage> {
-    entries
+    to_conversation_with_stats(entries, project_filter).messages
+}
+
+pub fn to_conversation_with_stats(
+    entries: &[TimelineEntry],
+    project_filter: &[String],
+) -> ConversationProjection {
+    let messages: Vec<ConversationMessage> = entries
         .iter()
         .filter(|entry| {
             matches!(
@@ -53,17 +70,120 @@ pub fn to_conversation(
                 Some(FrameKind::UserMsg | FrameKind::AgentReply)
             ) || (entry.frame_kind.is_none() && (entry.role == "user" || entry.role == "assistant"))
         })
-        .map(|e| ConversationMessage {
-            timestamp: e.timestamp,
-            agent: e.agent.clone(),
-            session_id: e.session_id.clone(),
-            role: e.role.clone(),
-            message: e.message.clone(),
-            repo_project: repo_name_from_cwd(e.cwd.as_deref(), project_filter),
-            source_path: e.cwd.clone(),
-            branch: e.branch.clone(),
+        .map(|e| {
+            let (message_kind, collapse_stub_kind) = classify_conversation_message(&e.message);
+
+            ConversationMessage {
+                timestamp: e.timestamp,
+                agent: e.agent.clone(),
+                session_id: e.session_id.clone(),
+                role: e.role.clone(),
+                message: e.message.clone(),
+                repo_project: repo_name_from_cwd(e.cwd.as_deref(), project_filter),
+                source_path: e.cwd.clone(),
+                branch: e.branch.clone(),
+                message_kind,
+                collapse_stub_kind,
+            }
         })
-        .collect()
+        .collect();
+
+    drop_exact_short_user_duplicates(messages)
+}
+
+/// Compute a stable 64-bit key for `(agent, session_id, trimmed message)`
+/// without allocating new `String`s on the hot dedup path. Uses SipHash-1-3
+/// with null-byte delimiters between the fields to avoid prefix collisions
+/// between e.g. `("a", "bc", "d")` and `("ab", "c", "d")`.
+///
+/// `agent` is part of the key because extractors can emit a shared fallback
+/// session id (for example `extract_claude_history` uses `"history"` when
+/// `sessionId` is absent). Without the agent in the key, identical short
+/// prompts from two unrelated agent streams within a 2 s window would be
+/// silently merged.
+fn exact_short_dup_key(agent: &str, session_id: &str, trimmed: &str) -> u64 {
+    use siphasher::sip::SipHasher13;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = SipHasher13::new();
+    agent.hash(&mut hasher);
+    0u8.hash(&mut hasher);
+    session_id.hash(&mut hasher);
+    0u8.hash(&mut hasher);
+    trimmed.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn drop_exact_short_user_duplicates(messages: Vec<ConversationMessage>) -> ConversationProjection {
+    let mut deduped: Vec<ConversationMessage> = Vec::with_capacity(messages.len());
+    let mut last_seen_user: HashMap<u64, DateTime<Utc>> = HashMap::new();
+    let mut exact_short_duplicates_dropped = 0;
+
+    for msg in messages {
+        let trimmed = msg.message.trim();
+        let is_short_user = msg.role == "user" && trimmed.len() <= EXACT_SHORT_DUP_MAX_CHARS;
+        let is_exact_short_duplicate = if is_short_user {
+            let key = exact_short_dup_key(&msg.agent, &msg.session_id, trimmed);
+            let is_duplicate = last_seen_user.get(&key).is_some_and(|previous_timestamp| {
+                msg.timestamp
+                    .signed_duration_since(*previous_timestamp)
+                    .num_milliseconds()
+                    .abs()
+                    <= EXACT_SHORT_DUP_WINDOW_MS
+            });
+
+            last_seen_user.insert(key, msg.timestamp);
+            is_duplicate
+        } else {
+            false
+        };
+
+        if !is_exact_short_duplicate {
+            deduped.push(msg);
+        } else {
+            exact_short_duplicates_dropped += 1;
+        }
+    }
+
+    ConversationProjection {
+        messages: deduped,
+        exact_short_duplicates_dropped,
+    }
+}
+
+fn classify_conversation_message(message: &str) -> (MessageKind, Option<CollapseStubKind>) {
+    let trimmed_start = message.trim_start();
+
+    if trimmed_start.starts_with("<skill-ref:") {
+        return (MessageKind::CollapseStub, Some(CollapseStubKind::SkillRef));
+    }
+    if trimmed_start.starts_with("<dedup-ref:") {
+        return (MessageKind::CollapseStub, Some(CollapseStubKind::DedupRef));
+    }
+
+    if message.contains("This session is being continued")
+        || message.contains("<local-command-caveat>")
+        || message.contains("<command-name>/compact</command-name>")
+    {
+        return (MessageKind::ContinuationSummary, None);
+    }
+
+    let workflow_signals = [
+        "run_id:",
+        "prompt_id:",
+        "status: prompt",
+        "Perform the vc-",
+        "VC Agents Worker Charter",
+        "Report path:",
+    ];
+    let workflow_signal_count = workflow_signals
+        .iter()
+        .filter(|signal| message.contains(**signal))
+        .count();
+    if workflow_signal_count >= 2 {
+        return (MessageKind::WorkflowPrompt, None);
+    }
+
+    (MessageKind::Conversation, None)
 }
 
 // ============================================================================
@@ -710,18 +830,46 @@ fn infer_project_hint_from_gemini_message(message: &GeminiMessage) -> Option<Str
         })
 }
 
-fn gemini_message_matches_filter(message: &GeminiMessage, filters_lower: &[String]) -> bool {
-    let content = render_gemini_message_content(message);
-    let project_hint = infer_project_hint_from_gemini_message(message);
-
-    filters_lower.iter().any(|filter| {
-        content
-            .as_ref()
-            .is_some_and(|text| text.to_lowercase().contains(filter))
-            || project_hint
-                .as_ref()
-                .is_some_and(|cwd| cwd.to_lowercase().contains(filter))
+/// Check if any project filter matches the given path by **word-boundary** equality.
+///
+/// Path is split into "words" by `/`, `\`, `-`, `_`, `.`.
+/// Filter is split into words by `-`, `_`, `.`.
+/// A filter matches when ALL its words appear in the path words (case-insensitive).
+/// Multiple filters compose with ANY semantics.
+///
+/// This replaces the previous lowercase-substring match which produced false
+/// positives like `--project test` matching `/tmp/fastest-project`.
+fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    let cwd_lower = cwd.to_lowercase();
+    let path_words: Vec<&str> = cwd_lower
+        .split(['/', '\\', '-', '_', '.'])
+        .filter(|s| !s.is_empty())
+        .collect();
+    if path_words.is_empty() {
+        return false;
+    }
+    filters.iter().any(|filter| {
+        let filter_lower = filter.to_lowercase();
+        filter_lower
+            .split(['-', '_', '.'])
+            .filter(|s| !s.is_empty())
+            .all(|fw| path_words.contains(&fw))
     })
+}
+
+fn gemini_message_matches_filter(message: &GeminiMessage, filters: &[String]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    // Project ownership = cwd path components, not text mentions.
+    // A transcript that *mentions* a project name does not belong to that project.
+    let project_hint = infer_project_hint_from_gemini_message(message);
+    project_hint
+        .as_deref()
+        .is_some_and(|cwd| project_filter_matches_path(cwd, filters))
 }
 
 fn normalize_gemini_role(raw: &str) -> Option<&'static str> {
@@ -916,27 +1064,13 @@ pub fn extract_claude(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
 
                 // If directory name matched, keep all entries.
                 // Otherwise, check if ANY entry in this session matches the project filter.
-                let keep_session = dir_matches || {
-                    if config.project_filter.is_empty() {
-                        true
-                    } else {
-                        let filters_lower: Vec<String> = config
-                            .project_filter
-                            .iter()
-                            .map(|f| f.to_lowercase())
-                            .collect();
-
-                        session_entries.iter().any(|entry| {
-                            filters_lower.iter().any(|fl| {
-                                entry.message.to_lowercase().contains(fl)
-                                    || entry
-                                        .cwd
-                                        .as_ref()
-                                        .is_some_and(|c| c.to_lowercase().contains(fl))
+                let keep_session = dir_matches
+                    || (!config.project_filter.is_empty()
+                        && session_entries.iter().any(|entry| {
+                            entry.cwd.as_deref().is_some_and(|c| {
+                                project_filter_matches_path(c, &config.project_filter)
                             })
-                        })
-                    }
-                };
+                        }));
 
                 if keep_session {
                     entries.extend(session_entries);
@@ -1084,21 +1218,13 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
 
         // Second pass: determine matching sessions (if filter provided).
         let matching_sessions: HashSet<String> = if !config.project_filter.is_empty() {
-            let filters_lower: Vec<String> = config
-                .project_filter
-                .iter()
-                .map(|f| f.to_lowercase())
-                .collect();
             sessions
                 .iter()
                 .filter(|(_id, msgs)| {
-                    filters_lower.iter().any(|fl| {
-                        msgs.iter().any(|m| {
-                            m.text.to_lowercase().contains(fl)
-                                || m.cwd
-                                    .as_ref()
-                                    .is_some_and(|c| c.to_lowercase().contains(fl))
-                        })
+                    msgs.iter().any(|m| {
+                        m.cwd
+                            .as_deref()
+                            .is_some_and(|c| project_filter_matches_path(c, &config.project_filter))
                     })
                 })
                 .map(|(id, _)| id.clone())
@@ -1163,7 +1289,8 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
 
     // Session file: parse as CodexSessionEvent (delegate to existing parser).
     if serde_json::from_str::<CodexSessionEvent>(&first_line).is_ok() {
-        let mut entries = parse_codex_session_file(path, config)?;
+        let (mut entries, warnings) = parse_codex_session_file_with_diagnostics(path, config)?;
+        emit_codex_session_warnings(path, &warnings);
         entries.sort_by_key(|a| a.timestamp);
         return Ok(entries);
     }
@@ -2067,13 +2194,10 @@ pub fn extract_claude_history(config: &ExtractionConfig) -> Result<Vec<TimelineE
 
         // Project filter
         if !config.project_filter.is_empty() {
-            let matches = entry.project.as_ref().is_some_and(|p| {
-                let pl = p.to_lowercase();
-                config
-                    .project_filter
-                    .iter()
-                    .any(|f| pl.contains(&f.to_lowercase()))
-            });
+            let matches = entry
+                .project
+                .as_deref()
+                .is_some_and(|p| project_filter_matches_path(p, &config.project_filter));
             if !matches {
                 continue;
             }
@@ -2156,21 +2280,13 @@ pub fn extract_codex(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
 
     // Second pass: determine which sessions match the filter
     let matching_sessions: HashSet<String> = if !config.project_filter.is_empty() {
-        let filters_lower: Vec<String> = config
-            .project_filter
-            .iter()
-            .map(|f| f.to_lowercase())
-            .collect();
         sessions
             .iter()
             .filter(|(_id, msgs)| {
-                filters_lower.iter().any(|fl| {
-                    msgs.iter().any(|m| {
-                        m.text.to_lowercase().contains(fl)
-                            || m.cwd
-                                .as_ref()
-                                .is_some_and(|c| c.to_lowercase().contains(fl))
-                    })
+                msgs.iter().any(|m| {
+                    m.cwd
+                        .as_deref()
+                        .is_some_and(|c| project_filter_matches_path(c, &config.project_filter))
                 })
             })
             .map(|(id, _)| id.clone())
@@ -2253,6 +2369,148 @@ struct CodexSessionEvent {
     payload: serde_json::Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CodexSessionWarning {
+    MissingSessionMeta {
+        fallback: String,
+    },
+    DuplicateSessionMeta {
+        first: String,
+        ignored: Vec<String>,
+    },
+    FilenameMismatch {
+        meta_id: String,
+        filename_stem: String,
+    },
+    UnparsableTimestamp {
+        count: usize,
+        samples: Vec<String>,
+    },
+    UnknownMsgType {
+        count: usize,
+        samples: Vec<String>,
+    },
+}
+
+impl CodexSessionWarning {
+    fn describe(&self, path: &Path) -> String {
+        match self {
+            CodexSessionWarning::MissingSessionMeta { fallback } => format!(
+                "Codex session warning: {} has no session_meta.payload.id; using `{}` from filename",
+                path.display(),
+                fallback
+            ),
+            CodexSessionWarning::DuplicateSessionMeta { first, ignored } => format!(
+                "Codex session warning: {} has multiple session_meta.payload.id values; using `{}` and ignoring {}",
+                path.display(),
+                first,
+                ignored.join(", ")
+            ),
+            CodexSessionWarning::FilenameMismatch {
+                meta_id,
+                filename_stem,
+            } => format!(
+                "Codex session warning: {} session_meta.payload.id `{}` does not match filename UUID suffix in `{}`",
+                path.display(),
+                meta_id,
+                filename_stem
+            ),
+            CodexSessionWarning::UnparsableTimestamp { count, samples } => format!(
+                "Codex session warning: {} has {} unparsable event_msg timestamp(s); frames dropped. Sample(s): {}",
+                path.display(),
+                count,
+                samples.join(", ")
+            ),
+            CodexSessionWarning::UnknownMsgType { count, samples } => format!(
+                "Codex session warning: {} encountered {} event_msg(s) with unrecognized payload.type; frames dropped. Sample type(s): {}",
+                path.display(),
+                count,
+                samples.join(", ")
+            ),
+        }
+    }
+}
+
+fn emit_codex_session_warnings(path: &Path, warnings: &[CodexSessionWarning]) {
+    for warning in warnings {
+        eprintln!("{}", warning.describe(path));
+    }
+}
+
+#[derive(Default)]
+struct CodexSessionDiagnostics {
+    missing: usize,
+    duplicate: usize,
+    mismatch: usize,
+    unparsable_ts: usize,
+    unknown_msg_type: usize,
+}
+
+impl CodexSessionDiagnostics {
+    fn observe(&mut self, warnings: &[CodexSessionWarning]) {
+        for warning in warnings {
+            match warning {
+                CodexSessionWarning::MissingSessionMeta { .. } => self.missing += 1,
+                CodexSessionWarning::DuplicateSessionMeta { .. } => self.duplicate += 1,
+                CodexSessionWarning::FilenameMismatch { .. } => self.mismatch += 1,
+                CodexSessionWarning::UnparsableTimestamp { count, .. } => {
+                    self.unparsable_ts += count;
+                }
+                CodexSessionWarning::UnknownMsgType { count, .. } => {
+                    self.unknown_msg_type += count;
+                }
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.missing == 0
+            && self.duplicate == 0
+            && self.mismatch == 0
+            && self.unparsable_ts == 0
+            && self.unknown_msg_type == 0
+    }
+
+    fn emit_summary(&self) {
+        if !self.is_empty() {
+            eprintln!(
+                "Codex sessions diagnostics: missing={} duplicate={} mismatch={} unparsable_ts={} unknown_msg_type={}",
+                self.missing,
+                self.duplicate,
+                self.mismatch,
+                self.unparsable_ts,
+                self.unknown_msg_type
+            );
+        }
+    }
+}
+
+fn file_stem_string(path: &Path) -> String {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+fn is_uuid_like(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(idx, byte)| {
+            if matches!(idx, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn uuid_suffix_from_stem(stem: &str) -> Option<&str> {
+    // Codex rollout filenames currently end in strict UUIDv4/v7-style hex IDs.
+    // Non-UUID session ids skip filename-mismatch diagnostics.
+    let start = stem.len().checked_sub(36)?;
+    let suffix = &stem[start..];
+    is_uuid_like(suffix).then_some(suffix)
+}
+
 /// Extract timeline entries from Codex session files (`~/.codex/sessions/`).
 ///
 /// Walks `~/.codex/sessions/` recursively for `*.jsonl` files.
@@ -2268,21 +2526,28 @@ pub fn extract_codex_sessions(config: &ExtractionConfig) -> Result<Vec<TimelineE
     }
 
     let mut entries = Vec::new();
+    let mut diagnostics = CodexSessionDiagnostics::default();
     let files = walk_jsonl_files(&sessions_dir);
 
     for path in &files {
-        match parse_codex_session_file(path, config) {
-            Ok(se) => entries.extend(se),
+        match parse_codex_session_file_with_diagnostics(path, config) {
+            Ok((se, warnings)) => {
+                diagnostics.observe(&warnings);
+                entries.extend(se);
+            }
             Err(_) => continue,
         }
     }
 
+    diagnostics.emit_summary();
     entries.sort_by_key(|a| a.timestamp);
     Ok(entries)
 }
 
-/// Parse a single Codex session JSONL file.
-fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
+fn parse_codex_session_file_with_diagnostics(
+    path: &Path,
+    config: &ExtractionConfig,
+) -> Result<(Vec<TimelineEntry>, Vec<CodexSessionWarning>)> {
     let file = sanitize::open_file_validated(path)?;
     let reader = BufReader::new(file);
 
@@ -2300,15 +2565,24 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
     // Extract global session metadata (like session_id) and the initial cwd
     let mut session_id: Option<String> = None;
     let mut initial_cwd: Option<String> = None;
+    let mut duplicate_meta_ids: Vec<String> = Vec::new();
 
     for ev in &events {
         if ev.event_type == "session_meta" {
-            if session_id.is_none() {
-                session_id = ev
-                    .payload
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
+            if let Some(meta_id) = ev
+                .payload
+                .get("id")
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.trim().is_empty())
+                .map(|id| id.trim().to_string())
+            {
+                if let Some(first) = &session_id {
+                    if first != &meta_id && !duplicate_meta_ids.contains(&meta_id) {
+                        duplicate_meta_ids.push(meta_id);
+                    }
+                } else {
+                    session_id = Some(meta_id);
+                }
             }
             if initial_cwd.is_none() {
                 initial_cwd = ev
@@ -2320,16 +2594,40 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
         }
     }
 
+    let filename_stem = file_stem_string(path);
+    let mut warnings: Vec<CodexSessionWarning> = Vec::new();
+    if let Some(first) = &session_id {
+        if !duplicate_meta_ids.is_empty() {
+            warnings.push(CodexSessionWarning::DuplicateSessionMeta {
+                first: first.clone(),
+                ignored: duplicate_meta_ids,
+            });
+        }
+        if let Some(filename_uuid) = uuid_suffix_from_stem(&filename_stem)
+            && first != filename_uuid
+        {
+            warnings.push(CodexSessionWarning::FilenameMismatch {
+                meta_id: first.clone(),
+                filename_stem: filename_stem.clone(),
+            });
+        }
+    }
+
     // Fallback session_id from filename stem
     let session_id = session_id.unwrap_or_else(|| {
-        path.file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default()
+        warnings.push(CodexSessionWarning::MissingSessionMeta {
+            fallback: filename_stem.clone(),
+        });
+        filename_stem
     });
 
     // Collect event_msg entries (user_message + agent_message)
     let mut entries = Vec::new();
     let mut current_cwd = initial_cwd;
+    let mut unparsable_ts_count: usize = 0;
+    let mut unparsable_ts_samples: Vec<String> = Vec::new();
+    let mut unknown_msg_type_count: usize = 0;
+    let mut unknown_msg_type_samples: Vec<String> = Vec::new();
 
     for ev in &events {
         // Update current context per-turn
@@ -2351,13 +2649,9 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
 
         // Project filter: check if the current turn's cwd matches
         if !config.project_filter.is_empty() {
-            let matches = current_cwd.as_ref().is_some_and(|cwd| {
-                let cwd_lower = cwd.to_lowercase();
-                config
-                    .project_filter
-                    .iter()
-                    .any(|f| cwd_lower.contains(&f.to_lowercase()))
-            });
+            let matches = current_cwd
+                .as_deref()
+                .is_some_and(|cwd| project_filter_matches_path(cwd, &config.project_filter));
             if !matches {
                 continue;
             }
@@ -2398,7 +2692,11 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
                     .to_string(),
                 Some(FrameKind::InternalThought),
             ),
-            "function_call" | "tool_call" | "tool_result" => (
+            "function_call"
+            | "tool_call"
+            | "tool_result"
+            | "mcp_tool_call"
+            | "mcp_tool_call_response" => (
                 "tool",
                 ev.payload
                     .get("message")
@@ -2407,7 +2705,17 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
                     .unwrap_or_else(|| render_json_inline(&ev.payload)),
                 Some(FrameKind::ToolCall),
             ),
-            _ => continue,
+            other => {
+                if !other.is_empty() {
+                    unknown_msg_type_count += 1;
+                    if unknown_msg_type_samples.len() < 5
+                        && !unknown_msg_type_samples.iter().any(|s| s == other)
+                    {
+                        unknown_msg_type_samples.push(other.to_string());
+                    }
+                }
+                continue;
+            }
         };
 
         if !should_keep_entry(frame_kind, config) {
@@ -2420,7 +2728,15 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
 
         let timestamp = match DateTime::parse_from_rfc3339(&ev.timestamp) {
             Ok(dt) => dt.with_timezone(&Utc),
-            Err(_) => continue,
+            Err(_) => {
+                unparsable_ts_count += 1;
+                if unparsable_ts_samples.len() < 3
+                    && !unparsable_ts_samples.iter().any(|s| s == &ev.timestamp)
+                {
+                    unparsable_ts_samples.push(ev.timestamp.clone());
+                }
+                continue;
+            }
         };
 
         if timestamp < config.cutoff {
@@ -2444,7 +2760,20 @@ fn parse_codex_session_file(path: &Path, config: &ExtractionConfig) -> Result<Ve
         ));
     }
 
-    Ok(entries)
+    if unparsable_ts_count > 0 {
+        warnings.push(CodexSessionWarning::UnparsableTimestamp {
+            count: unparsable_ts_count,
+            samples: unparsable_ts_samples,
+        });
+    }
+    if unknown_msg_type_count > 0 {
+        warnings.push(CodexSessionWarning::UnknownMsgType {
+            count: unknown_msg_type_count,
+            samples: unknown_msg_type_samples,
+        });
+    }
+
+    Ok((entries, warnings))
 }
 
 /// Recursively walk a directory for `*.jsonl` files.
@@ -2549,15 +2878,10 @@ fn parse_gemini_session(
 
     // Check project filter against message content
     let session_matches_filter = if !config.project_filter.is_empty() {
-        let filters_lower: Vec<String> = config
-            .project_filter
-            .iter()
-            .map(|f| f.to_lowercase())
-            .collect();
         session
             .messages
             .iter()
-            .any(|message| gemini_message_matches_filter(message, &filters_lower))
+            .any(|message| gemini_message_matches_filter(message, &config.project_filter))
     } else {
         true
     };
@@ -4280,7 +4604,11 @@ pub fn repo_name_from_cwd(cwd: Option<&str>, project_filter: &[String]) -> Strin
             return canonical_repo_label(&project_filter[0]);
         } else if let Some(c) = cwd {
             for p in project_filter {
-                if c.contains(p) {
+                // Use the same word-boundary path match as the project
+                // filter itself, so a label cannot be picked via a raw
+                // substring (`--project test` against `/tmp/fastest-project`)
+                // even though the filter step rejects that match.
+                if project_filter_matches_path(c, std::slice::from_ref(p)) {
                     return canonical_repo_label(p);
                 }
             }
