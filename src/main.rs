@@ -3654,6 +3654,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                     outcome.backend_label,
                     outcome.model_id.clone(),
                     outcome.scanned,
+                    outcome.retrieval_status.clone(),
                 );
                 (outcome.results, outcome.scanned, Some(status))
             }
@@ -3740,7 +3741,22 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
 
     if json {
         let oracle_status = match semantic_status {
-            Some((_semantic_backend, _semantic_model_id, semantic_scanned)) => {
+            Some((
+                _semantic_backend,
+                _semantic_model_id,
+                _semantic_scanned,
+                Some(ref retrieval_status),
+            )) => aicx::oracle::OracleStatus::hybrid_rrf(
+                &root,
+                retrieval_status,
+                results.len(),
+                aicx::oracle::verify_paths(
+                    results
+                        .iter()
+                        .map(|result| std::path::Path::new(&result.path).to_path_buf()),
+                ),
+            ),
+            Some((_semantic_backend, _semantic_model_id, semantic_scanned, None)) => {
                 aicx::oracle::OracleStatus::content_semantic(
                     &root,
                     semantic_scanned,
@@ -3776,12 +3792,13 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         eprintln!(
             "\n{}",
             match semantic_status {
-                Some((semantic_backend, semantic_model_id, semantic_scanned)) => {
+                Some((semantic_backend, semantic_model_id, semantic_scanned, retrieval_status)) => {
                     aicx::search_engine::render_semantic_status_line(
                         semantic_backend,
                         &semantic_model_id,
                         results.len(),
                         semantic_scanned,
+                        retrieval_status.as_ref(),
                     )
                 }
                 None => format!(
@@ -4144,6 +4161,16 @@ fn run_index_status(project: Option<&str>, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
         eprintln!("aicx index status");
+        eprintln!(
+            "  readiness:              {}",
+            match status.readiness {
+                aicx::IndexReadiness::Ready => "ready",
+                aicx::IndexReadiness::Pending => "pending (only temp checkpoint)",
+                aicx::IndexReadiness::Missing => "missing",
+            }
+        );
+        eprintln!("  backend:                {}", status.backend);
+        eprintln!("  project_bucket:         {}", status.project_bucket);
         eprintln!("  canonical_chunks:       {}", status.canonical_chunks);
         eprintln!(
             "  semantic_index_present: {}",
@@ -4154,6 +4181,10 @@ fn run_index_status(project: Option<&str>, json: bool) -> Result<()> {
             status.semantic_index_path.as_deref().unwrap_or("<none>")
         );
         eprintln!("  semantic_index_rows:    {}", status.semantic_index_rows);
+        eprintln!(
+            "  committed_at:           {}",
+            status.committed_at.as_deref().unwrap_or("<none>")
+        );
         eprintln!(
             "  newest_chunk_mtime:     {}",
             status.newest_chunk_mtime.as_deref().unwrap_or("<none>")

@@ -38,7 +38,9 @@ pub mod wizard;
 
 pub use aicx_parser as parser;
 pub use aicx_parser::{chunker, frontmatter, sanitize, segmentation, timeline, types};
-pub use api::{Aicx, AicxConfig, IndexStatus, SearchOptions, SearchResults, StoreOptions};
+pub use api::{
+    Aicx, AicxConfig, IndexReadiness, IndexStatus, SearchOptions, SearchResults, StoreOptions,
+};
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub use aicx_embeddings as embeddings;

@@ -15,6 +15,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::api;
 use crate::intents::{self, IntentKind, IntentsConfig};
 use crate::oracle::OracleStatus;
 use crate::rank;
@@ -242,6 +243,15 @@ fn default_intents_emit() -> String {
     "markdown".to_string()
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct IndexStatusParams {
+    /// Optional project bucket filter. Omit (or pass null) to query the
+    /// cross-project `_all` bucket. Matches the same canonical lowercase
+    /// slug rules the index writer uses on disk.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct RankResponse {
     project: String,
@@ -400,6 +410,7 @@ impl AicxMcpServer {
             }
         };
         let scanned = outcome.scanned;
+        let retrieval_status = outcome.retrieval_status.clone();
         let results = outcome.results;
 
         let mut results = results;
@@ -457,16 +468,26 @@ impl AicxMcpServer {
 
         let results: Vec<_> = results.into_iter().take(limit).collect();
 
-        let oracle_status = OracleStatus::content_semantic(
-            &store_root,
-            scanned,
-            results.len(),
-            crate::oracle::verify_paths(
-                results
-                    .iter()
-                    .map(|result| std::path::Path::new(&result.path).to_path_buf()),
-            ),
+        let source_paths_verified = crate::oracle::verify_paths(
+            results
+                .iter()
+                .map(|result| std::path::Path::new(&result.path).to_path_buf()),
         );
+        let oracle_status = if let Some(ref retrieval_status) = retrieval_status {
+            OracleStatus::hybrid_rrf(
+                &store_root,
+                retrieval_status,
+                results.len(),
+                source_paths_verified,
+            )
+        } else {
+            OracleStatus::content_semantic(
+                &store_root,
+                scanned,
+                results.len(),
+                source_paths_verified,
+            )
+        };
         let json =
             rank::render_search_json_with_oracle(&store_root, &results, scanned, oracle_status)
                 .map_err(|e| {
@@ -834,6 +855,24 @@ impl AicxMcpServer {
         };
 
         Ok(CallToolResult::success(vec![Content::text(body)]))
+    }
+
+    #[tool(
+        name = "aicx_index_status",
+        description = "Report the truthful state of the AICX semantic vector index for a project bucket. Returns `readiness` (ready/pending/missing), backend, project_bucket, committed_at, pending_chunks, and the final + temp checkpoint paths. `ready` is set only when the atomically committed `embeddings.ndjson` is present; a lone `.ndjson.tmp` checkpoint surfaces as `pending` so Loctree and other oracles can refuse to trust semantic retrieval before commit."
+    )]
+    async fn index_status(
+        &self,
+        Parameters(params): Parameters<IndexStatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let store_root = store::store_base_dir()
+            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+        let status = api::index_status_at(&store_root, params.project.as_deref())
+            .map_err(|e| McpError::internal_error(format!("index status: {e}"), None))?;
+        let json = serde_json::to_string(&status).map_err(|e| {
+            McpError::internal_error(format!("Serialize index status JSON: {e}"), None)
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 }
 

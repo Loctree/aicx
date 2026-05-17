@@ -23,12 +23,13 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use aicx_progress_contracts::{IndexEvent, RollingRate};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Default cap on how much of a chunk's content the embedder sees.
 ///
@@ -286,21 +287,77 @@ pub fn index_path(project: Option<&str>) -> Result<PathBuf> {
     // corpus store (`~/.aicx/store`). Keep the vector index inside the
     // operator-owned AICX home so build, status, and search all agree.
     let index_root = base.join(INDEX_DIR_NAME);
+    Ok(index_root
+        .join(index_bucket_name(project))
+        .join(INDEX_FILE_NAME))
+}
+
+pub fn context_corpus_index_path(project: Option<&str>) -> Result<PathBuf> {
+    Ok(index_path(project)?.with_file_name(CONTEXT_CORPUS_INDEX_FILE_NAME))
+}
+
+pub fn index_bucket_name(project: Option<&str>) -> String {
     let bucket = project.unwrap_or(ALL_BUCKET_NAME);
     // Sanitize project bucket for filesystem (canonical lowercase per
     // canonical_project_slug invariant + replace path separators).
-    let safe_bucket = bucket
+    bucket
         .chars()
         .map(|c| match c {
             '/' | '\\' => '_',
             c => c.to_ascii_lowercase(),
         })
-        .collect::<String>();
-    Ok(index_root.join(safe_bucket).join(INDEX_FILE_NAME))
+        .collect()
 }
 
-pub fn context_corpus_index_path(project: Option<&str>) -> Result<PathBuf> {
-    Ok(index_path(project)?.with_file_name(CONTEXT_CORPUS_INDEX_FILE_NAME))
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub fn hybrid_index_dir(project: Option<&str>) -> Result<PathBuf> {
+    let path = index_path(project)?;
+    path.parent()
+        .map(|parent| parent.join("hybrid"))
+        .ok_or_else(|| anyhow::anyhow!("index path has no parent: {}", path.display()))
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub fn hybrid_manifest_path(project: Option<&str>) -> Result<PathBuf> {
+    Ok(hybrid_index_dir(project)?.join("manifest.json"))
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub fn hybrid_dense_path(project: Option<&str>) -> Result<PathBuf> {
+    Ok(aicx_retrieve::default_ndjson_path(&hybrid_index_dir(
+        project,
+    )?))
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub fn observed_source_hash_for_index_path(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub fn hybrid_embedder_fingerprint(
+    info: &crate::embedder::EmbeddingModelInfo,
+) -> aicx_retrieve::EmbedderFingerprint {
+    let source = match &info.source {
+        crate::embedder::NativeEmbeddingSource::HfCache {
+            repo,
+            filename,
+            path,
+        } => format!("hf-cache:{repo}:{filename}:{}", path.display()),
+        crate::embedder::NativeEmbeddingSource::ExplicitPath(path) => {
+            format!("explicit-path:{}", path.display())
+        }
+        crate::embedder::NativeEmbeddingSource::CloudEndpoint(url) => {
+            format!("cloud-endpoint:{url}")
+        }
+    };
+    aicx_retrieve::EmbedderFingerprint::new(
+        info.model_id.clone(),
+        &source,
+        info.dimension,
+        "cosine",
+    )
 }
 
 fn live_index_files(
@@ -613,15 +670,9 @@ pub fn write_index_with_progress(
         );
     }
 
-    on_event(&IndexEvent::RunCompleted {
-        processed,
-        indexed,
-        skipped,
-        failed,
-        total_chunks: indexed,
-        elapsed: run_started.elapsed(),
-        stopped_early: false,
-    });
+    // Emit completion only after the final atomic commit lands on disk so the
+    // event truthfully reflects "semantic index ready to query". The embed
+    // loop is done at this point; the rest is filesystem commit.
 
     let context_files = crate::store::scan_context_corpus_files_at(&root)?;
     if !context_files.is_empty() {
@@ -673,35 +724,181 @@ pub fn write_index_with_progress(
             };
             writeln!(context_writer, "{}", serde_json::to_string(&entry)?)?;
         }
-        context_writer.flush().with_context(|| {
-            format!("flush context-corpus tmp index: {}", context_tmp.display())
-        })?;
+        if let Err(err) = context_writer
+            .flush()
+            .with_context(|| format!("flush context-corpus tmp index: {}", context_tmp.display()))
+        {
+            on_event(&IndexEvent::RunFailed {
+                error: format!("{err:#}"),
+                processed_before_failure: processed,
+            });
+            return Err(err);
+        }
         drop(context_writer);
-        fs::rename(&context_tmp, &context_target).with_context(|| {
+        if let Err(err) = fs::rename(&context_tmp, &context_target).with_context(|| {
             format!(
                 "commit context-corpus index: {} → {}",
                 context_tmp.display(),
                 context_target.display()
             )
-        })?;
+        }) {
+            on_event(&IndexEvent::RunFailed {
+                error: format!("{err:#}"),
+                processed_before_failure: processed,
+            });
+            return Err(err);
+        }
     }
 
-    writer
+    if let Err(err) = writer
         .flush()
-        .with_context(|| format!("flush tmp index: {}", tmp_path.display()))?;
+        .with_context(|| format!("flush tmp index: {}", tmp_path.display()))
+    {
+        on_event(&IndexEvent::RunFailed {
+            error: format!("{err:#}"),
+            processed_before_failure: processed,
+        });
+        return Err(err);
+    }
     drop(writer);
 
-    fs::rename(&tmp_path, &target_path).with_context(|| {
+    if let Err(err) = fs::rename(&tmp_path, &target_path).with_context(|| {
         format!(
             "commit index: {} → {}",
             tmp_path.display(),
             target_path.display()
         )
-    })?;
+    }) {
+        on_event(&IndexEvent::RunFailed {
+            error: format!("{err:#}"),
+            processed_before_failure: processed,
+        });
+        return Err(err);
+    }
+
+    if let Err(err) = materialize_hybrid_index(&target_path, project, &info) {
+        on_event(&IndexEvent::RunFailed {
+            error: format!("{err:#}"),
+            processed_before_failure: processed,
+        });
+        return Err(err.context("materialize hybrid retrieval index"));
+    }
+
+    // Final atomic commit succeeded. Only now is the semantic index queryable
+    // at its canonical final path — emit RunCompleted so downstream consumers
+    // (Loctree bridge, MCP `aicx_index_status`) can trust the readiness claim.
+    on_event(&IndexEvent::RunCompleted {
+        processed,
+        indexed,
+        skipped,
+        failed,
+        total_chunks: indexed,
+        elapsed: run_started.elapsed(),
+        stopped_early: false,
+    });
 
     stats.index_path = Some(target_path);
     stats.elapsed_ms = started.elapsed().as_millis();
     Ok(stats)
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn materialize_hybrid_index(
+    index_path: &Path,
+    project: Option<&str>,
+    info: &crate::embedder::EmbeddingModelInfo,
+) -> Result<aicx_retrieve::Manifest> {
+    use aicx_retrieve::{
+        BruteForceAdapter, ChunkRef, DenseChunkRef, Distance, HybridIndex, ReciprocalRankFusion,
+        TantivyAdapter,
+    };
+
+    let (header, entries) = read_committed_index_entries(index_path)?;
+    if header.dimension != info.dimension {
+        anyhow::bail!(
+            "hybrid build dim mismatch: committed index has {}, embedder has {}",
+            header.dimension,
+            info.dimension
+        );
+    }
+
+    let manifest_dir = hybrid_index_dir(project)?;
+    let source_hash = observed_source_hash_for_index_path(index_path)?;
+    let mut lexical_chunks = Vec::with_capacity(entries.len());
+    let mut dense_chunks = Vec::with_capacity(entries.len());
+
+    for entry in entries {
+        let text = crate::sanitize::read_to_string_validated(&entry.path)
+            .with_context(|| format!("read chunk for hybrid index: {}", entry.path.display()))?;
+        let metadata = index_entry_metadata_json(&entry);
+        let chunk = ChunkRef {
+            id: entry.id.clone(),
+            source_path: entry.path.to_string_lossy().to_string(),
+            text,
+            metadata,
+        };
+        lexical_chunks.push(chunk.clone());
+        dense_chunks.push(DenseChunkRef {
+            chunk,
+            embedding: entry.embedding,
+        });
+    }
+
+    let lexical = Box::new(TantivyAdapter::new(manifest_dir.clone())?);
+    let dense = Box::new(BruteForceAdapter::new(header.dimension).with_distance(Distance::Cosine));
+    let fusion = Box::new(ReciprocalRankFusion::default());
+    let fingerprint = hybrid_embedder_fingerprint(info);
+    let mut hybrid = HybridIndex::new(lexical, dense, fusion, manifest_dir, fingerprint);
+    hybrid.build_hybrid(&lexical_chunks, &dense_chunks, &source_hash)?;
+    let manifest = hybrid.commit()?.clone();
+
+    let mut dense_persist =
+        BruteForceAdapter::new(header.dimension).with_distance(Distance::Cosine);
+    aicx_retrieve::DenseIndex::build(&mut dense_persist, &dense_chunks)?;
+    dense_persist.persist_ndjson(&hybrid_dense_path(project)?)?;
+
+    Ok(manifest)
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn read_committed_index_entries(path: &Path) -> Result<(IndexHeader, Vec<IndexEntry>)> {
+    use std::io::{BufRead, BufReader};
+
+    let file = crate::sanitize::open_file_validated(path)
+        .with_context(|| format!("open committed semantic index: {}", path.display()))?;
+    let mut lines = BufReader::new(file).lines();
+    let header_line = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty committed semantic index: {}", path.display()))?
+        .with_context(|| format!("read header in {}", path.display()))?;
+    let header = serde_json::from_str::<IndexHeader>(&header_line)
+        .with_context(|| format!("parse header in {}", path.display()))?;
+    let mut entries = Vec::new();
+    for (line_no, line) in lines.enumerate() {
+        let line =
+            line.with_context(|| format!("read line {} in {}", line_no + 2, path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry = serde_json::from_str::<IndexEntry>(&line)
+            .with_context(|| format!("parse line {} in {}", line_no + 2, path.display()))?;
+        entries.push(entry);
+    }
+    Ok((header, entries))
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn index_entry_metadata_json(entry: &IndexEntry) -> serde_json::Value {
+    serde_json::json!({
+        "source_path": entry.path.to_string_lossy(),
+        "project": entry.project,
+        "agent": entry.agent,
+        "date": entry.date,
+        "kind": entry.kind,
+        "session_id": entry.session_id,
+        "frame_kind": entry.frame_kind,
+        "cwd": entry.cwd,
+    })
 }
 
 /// Build-disabled stub for binaries compiled without any embedder feature.
