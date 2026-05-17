@@ -4584,6 +4584,7 @@ fn run_config_show(_json: bool) -> Result<()> {
 /// `IndicatifSink` with live ETA + rate when stderr is an interactive
 /// terminal. Translates `IndexEvent` variants into `ProgressUpdate`s that
 /// drive the progress bar position, length, message, and final-state.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn build_index_event_fanout(
     interactive: bool,
 ) -> std::sync::Arc<aicx::progress::FanOut<aicx_progress_contracts::IndexEvent>> {
@@ -4656,6 +4657,33 @@ fn build_index_event_fanout(
     std::sync::Arc::new(fan)
 }
 
+fn write_index_for_current_build(
+    scope: Option<&str>,
+    sample: usize,
+    interactive: bool,
+) -> Result<aicx::vector_index::IndexStats> {
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    {
+        let fan = build_index_event_fanout(interactive);
+        let fan_for_closure = std::sync::Arc::clone(&fan);
+        let on_event = move |event: &aicx_progress_contracts::IndexEvent| {
+            use aicx::progress::EventSink;
+            fan_for_closure.on_event(event);
+        };
+        aicx::vector_index::write_index_with_progress(scope, sample, &on_event)
+    }
+
+    #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+    {
+        let _ = (scope, sample, interactive);
+        anyhow::bail!(
+            "aicx index requires a semantic embedder backend; rebuild with \
+             --features native-embedder or --features cloud-embedder, or use \
+             `aicx index --dry-run` to inspect corpus/index readiness without embedding"
+        );
+    }
+}
+
 /// Build (or preview) the vector index. `dry_run=true` probes the
 /// embedder + samples chunks for ETA. `dry_run=false` writes a
 /// persistent NDJSON-backed index (Iter 3) that subsequent `aicx search`
@@ -4679,13 +4707,7 @@ fn run_index(projects: &[String], sample: usize, json: bool, dry_run: bool) -> R
             let _lock = aicx::locks::acquire_exclusive(aicx::locks::lance_lock_path()?)?;
             aicx::vector_index::dry_run_index(scope, sample)?
         } else {
-            let fan = build_index_event_fanout(interactive);
-            let fan_for_closure = std::sync::Arc::clone(&fan);
-            let on_event = move |event: &aicx_progress_contracts::IndexEvent| {
-                use aicx::progress::EventSink;
-                fan_for_closure.on_event(event);
-            };
-            aicx::vector_index::write_index_with_progress(scope, sample, &on_event)?
+            write_index_for_current_build(scope, sample, interactive)?
         };
         reports.push((scope.map(ToString::to_string), stats));
     }

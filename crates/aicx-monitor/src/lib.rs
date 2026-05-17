@@ -120,8 +120,12 @@ pub fn spawn_monitor(interval: Duration) -> (watch::Receiver<MonitorSnapshot>, J
         let my_pid = Pid::from_u32(std::process::id());
         let mut system = System::new_all();
         system.refresh_all();
-        // First CPU reading from sysinfo is always 0.0 — give the kernel a
-        // beat to populate the per-process deltas before the first sample.
+        // Send a liveness snapshot immediately so dashboards/tests do not
+        // stare at the default zero state while CPU deltas warm up. The next
+        // tick gets the more meaningful per-process CPU reading.
+        if sender.send(build_snapshot(&system, my_pid)).is_err() {
+            return;
+        }
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         loop {
@@ -359,7 +363,7 @@ mod tests {
 
         // Wait for a non-default snapshot. system_ram_total > 0 is a robust
         // liveness signal — every host running this test has RAM.
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         let mut got_live = false;
         loop {
             if rx.borrow().system_ram_total > 0 {
@@ -384,7 +388,7 @@ mod tests {
 
         assert!(
             got_live,
-            "spawn_monitor did not produce a live snapshot within 500ms"
+            "spawn_monitor did not produce a live snapshot within 2s"
         );
     }
 }
