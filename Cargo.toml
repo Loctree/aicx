@@ -29,6 +29,7 @@ members = [
 resolver = "3"
 
 [features]
+loctree-consumer = []
 # aicx is semantic-by-default with two compiled-in backends: cloud HTTP
 # embedder (the recommended VetCoders production default — zero-install,
 # config-driven) and native GGUF (offline / dev workstations). Filesystem
