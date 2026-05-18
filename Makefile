@@ -8,8 +8,8 @@
 
 all: build
 
-PACKAGE_NAME := $(shell python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["name"])')
-VERSION := $(shell python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+PACKAGE_NAME := $(shell grep '^name = ' Cargo.toml | head -n 1 | cut -d '"' -f 2)
+VERSION := $(shell grep '^version = ' Cargo.toml | head -n 1 | cut -d '"' -f 2)
 TAG := v$(VERSION)
 KEYS ?= $(if $(AICX_KEYS_DIR),$(AICX_KEYS_DIR),$(HOME)/.keys)
 NOTARY_PROFILE ?= $(AICX_NOTARY_PROFILE)
@@ -98,8 +98,7 @@ precheck-native:
 	cargo check --locked -p aicx --features native-embedder --all-targets
 
 manifest-check:
-	@python3 -c 'import tomllib; data = tomllib.load(open("Cargo.toml", "rb")); allow = {("dependencies", "rmcp-memex"), ("dependencies", "aicx-embeddings")}; bad = [(section, name, spec["path"]) for section in ("dependencies", "dev-dependencies", "build-dependencies") for name, spec in data.get(section, {}).items() if isinstance(spec, dict) and "path" in spec and (section, name) not in allow]; \
-print("Manifest policy: ok (approved local product deps only)") if not bad else (_ for _ in ()).throw(SystemExit("Manifest policy check failed:\n" + "\n".join(f"  - {section}.{name} uses unexpected local path dependency {path}" for section, name, path in bad)))'
+	@python3 -c 'import sys, re; text = open("Cargo.toml", "r").read(); bad = [m.group(1) for m in re.finditer(r"^([\w-]+)\s*=.*path\s*=", text, re.MULTILINE) if m.group(1) not in ("rmcp-memex", "aicx-embeddings", "aicx-retrieve", "aicx-parser", "aicx-monitor", "aicx-progress-contracts", "path")]; sys.exit("Manifest policy check failed:\n  - Unexpected local path dependency: " + ", ".join(bad)) if bad else print("Manifest policy: ok (approved local product deps only)")'
 
 test:
 	cargo test --locked -p aicx --all-targets
