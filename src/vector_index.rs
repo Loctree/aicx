@@ -23,6 +23,7 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -331,7 +332,11 @@ pub fn hybrid_dense_path(project: Option<&str>) -> Result<PathBuf> {
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub fn observed_source_hash_for_index_path(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let mut file = crate::sanitize::open_file_validated(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
     Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 

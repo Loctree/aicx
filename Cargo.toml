@@ -82,7 +82,7 @@ rmcp = { version = "1.2", features = ["server", "schemars", "transport-io", "tra
 libc = "0.2.183"
 rmcp-memex = { package = "rust-memex", version = "0.6.5", default-features = false, optional = true }
 schemars = "1.2.1"
-aicx-retrieve = { version = "0.2.0", path = "crates/aicx-retrieve" }
+aicx-retrieve = { version = "0.2.0" }
 
 [dev-dependencies]
 toml = "0.8"
