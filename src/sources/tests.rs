@@ -873,6 +873,54 @@ fn test_extract_gemini_file_session_jsonl_uses_metadata_session_id() {
 }
 
 #[test]
+fn test_extract_gemini_file_prefers_session_path_project_over_content_hints() {
+    let root = unique_test_dir("gemini-session-path-project");
+    let tmp = root
+        .join(".gemini")
+        .join("tmp")
+        .join("vista-portal")
+        .join("chats")
+        .join("session-2026-05-17T11-29-6d5b2959.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r##"{"sessionId":"6d5b2959-c56b-4c90-b198-41eb2ce399da","projectHash":"atomic-orbitals-b716c2b71310439897d3f81602f6c799","startTime":"2026-05-17T11:29:00.000Z","kind":"main"}
+{"id":"u1","timestamp":"2026-05-17T11:29:01.000Z","type":"user","content":[{"cwd":"/Users/silver/Desktop/screenshot/Screenshot","text":"Review this screenshot for Vista Portal."}]}
+{"id":"a1","timestamp":"2026-05-17T11:29:02.000Z","type":"gemini","content":"The screenshot review belongs to the Vista Portal session."}"##;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_gemini_file(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.cwd.as_deref() == Some("vista-portal"))
+    );
+    assert_eq!(
+        repo_labels_from_entries(&entries, &[]),
+        vec!["vista-portal"]
+    );
+
+    let screenshot_filter = ExtractionConfig {
+        project_filter: vec!["screenshot".to_string()],
+        ..config
+    };
+    let filtered_entries = extract_gemini_file(&tmp, &screenshot_filter).unwrap();
+    assert!(
+        filtered_entries.is_empty(),
+        "session path ownership must not match screenshot-only content hints"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn test_extract_gemini_file_classifies_frame_kinds_from_fixture() {
     let root = unique_test_dir("gemini-frame-kind");
     let tmp = root.join("session.json");

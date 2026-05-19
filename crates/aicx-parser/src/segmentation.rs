@@ -6,7 +6,6 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use crate::timeline::{Kind, RepoIdentity, SemanticSegment, SourceTier, TimelineEntry};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -347,26 +346,15 @@ fn infer_repo_identity_from_path(path: &Path) -> Option<RepoIdentity> {
 // ── Tiered inference helpers ──────────────────────────────────────────────
 
 fn infer_tiered_identity_from_text(text: &str) -> Option<TieredIdentity> {
-    // Content mentions remain queryable hints, but they must not assert
-    // canonical store ownership over cwd/git truth.
-    if let Some(identity) = infer_repo_identity_from_remote_like(text) {
-        return Some(TieredIdentity {
-            identity,
-            tier: SourceTier::Fallback,
-        });
-    }
-
-    // Path in text → tier depends on how it resolves
-    let path_re = Regex::new(r"(/[A-Za-z0-9._~\-]+(?:/[A-Za-z0-9._~\-]+)+)").ok()?;
-    for capture in path_re.captures_iter(text) {
-        let raw = capture.get(1)?.as_str();
-        let path = PathBuf::from(raw);
-        if let Some(tiered) = infer_tiered_identity_from_path(&path) {
-            return Some(tiered);
-        }
-    }
-
-    None
+    // Content mentions are tag-only signals — never assertable. URL mentions
+    // map to Fallback identity for search hinting. FS-resolved path mentions
+    // were removed: chunks can quote any path on disk, and walking the FS to
+    // validate them leaks ownership from unrelated local repos through
+    // `git remote get-url origin` (see fix/segmentation-identity-leak).
+    infer_repo_identity_from_remote_like(text).map(|identity| TieredIdentity {
+        identity,
+        tier: SourceTier::Fallback,
+    })
 }
 
 fn infer_tiered_identity_from_cwd(cwd: Option<&str>) -> Option<TieredIdentity> {
@@ -473,7 +461,10 @@ fn infer_repo_identity_from_known_layout(path: &Path) -> Option<RepoIdentity> {
         .collect();
 
     for marker in ["hosted", "repos", "repositories", "github", "git"] {
-        let Some(marker_index) = components.iter().position(|component| component == marker) else {
+        let Some(marker_index) = components
+            .iter()
+            .position(|component| component.eq_ignore_ascii_case(marker))
+        else {
             continue;
         };
         if components.len() > marker_index + 2 {
@@ -1231,5 +1222,135 @@ mod tests {
         // Org/repo segments must be alphanumeric + `.-_` only.
         let path = Path::new("/Users/x/repos/My Org With Spaces/my-repo");
         assert!(infer_repo_identity_from_known_layout(path).is_none());
+    }
+
+    // ================================================================
+    // Identity-leak regression: text mentions must not assert ownership
+    // ================================================================
+
+    #[test]
+    fn known_layout_marker_matches_case_insensitive() {
+        // Mac convention `/Users/<u>/Git/...` (capital G) must match the
+        // lowercase `git` marker. Previously case-sensitive comparison rejected
+        // it, sending identity inference into the now-removed text fallback.
+        let path = Path::new("/Users/silver/Git/VetCoders/ai-contexters/src/lib.rs");
+        let id = infer_repo_identity_from_known_layout(path).expect("Git (capital) matches");
+        assert_eq!(id.organization, "VetCoders");
+        assert_eq!(id.repository, "ai-contexters");
+
+        // Mixed-case markers also accepted (defensive).
+        let mixed = Path::new("/srv/Hosted/OrgA/repo-x");
+        let id_mixed = infer_repo_identity_from_known_layout(mixed).expect("Hosted match");
+        assert_eq!(id_mixed.organization, "OrgA");
+        assert_eq!(id_mixed.repository, "repo-x");
+    }
+
+    #[test]
+    fn text_mention_with_disk_path_no_longer_resolves_to_assertable_tier() {
+        // Regression: previously, a text mention containing any absolute path
+        // that walked to a real `.git` on disk produced a Primary/Secondary
+        // tier via `git remote get-url origin`. That leaked ownership from
+        // local-clone-folder-name → remote-URL repo (e.g. cwd `vista-codex`
+        // with chunk mentioning `/Users/.../ai-collaborators/.git/...` and that
+        // repo's remote pointing to `Szowesgad/maciej-almanach.git`).
+        //
+        // After fix: `infer_tiered_identity_from_text` only reads `https://github.com/X/Y`
+        // URL mentions and clamps the tier to Fallback. Path mentions are ignored.
+        let root = mk_tmp_dir("text-path-no-leak");
+        let real_git_repo = root.join("hosted").join("EvilOrg").join("evil-repo");
+        fs::create_dir_all(&real_git_repo).unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg(&real_git_repo)
+            .output()
+            .expect("git init");
+        Command::new("git")
+            .arg("-C")
+            .arg(&real_git_repo)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:EvilOrg/evil-repo.git",
+            ])
+            .output()
+            .expect("git remote add");
+
+        let chunk_text = format!(
+            "Scanning empty directories. Found: {} (this is just a mention)",
+            real_git_repo.display()
+        );
+        let e = entry(
+            (2026, 5, 19, 10, 0, 0),
+            "sess-leak",
+            "user",
+            &chunk_text,
+            None,
+        );
+
+        // No identity at all — text path mentions are no longer FS-validated.
+        assert!(infer_tiered_identity_from_entry(&e, &ProjectHashRegistry::default()).is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn text_url_mention_returns_fallback_tier_only() {
+        // URL mentions stay as a Fallback tag (search hint) but are NOT
+        // assertable, so they never route a segment into canonical store.
+        let e = entry(
+            (2026, 5, 19, 10, 0, 0),
+            "sess-url",
+            "user",
+            "See https://github.com/VetCoders/aicx for context.",
+            None,
+        );
+        let tiered = infer_tiered_identity_from_entry(&e, &ProjectHashRegistry::default())
+            .expect("URL mention yields Fallback identity");
+        assert_eq!(tiered.tier, SourceTier::Fallback);
+        assert!(!tiered.tier.is_assertable());
+        assert_eq!(tiered.identity.slug(), "VetCoders/aicx");
+    }
+
+    #[test]
+    fn semantic_segment_text_only_path_stays_non_assertable() {
+        // End-to-end: a session with no cwd but with chunks mentioning real
+        // on-disk paths must NOT produce an assertable segment. Such segments
+        // route to non-repository-contexts in store, not the canonical bucket.
+        let root = mk_tmp_dir("segment-text-only");
+        let real_git_repo = root.join("Git").join("OrgX").join("repo-y");
+        fs::create_dir_all(&real_git_repo).unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg(&real_git_repo)
+            .output()
+            .expect("git init");
+
+        let chunk_text = format!("Inspecting {}", real_git_repo.display());
+        let entries = vec![
+            entry(
+                (2026, 5, 19, 10, 0, 0),
+                "sess-e2e",
+                "user",
+                &chunk_text,
+                None,
+            ),
+            entry(
+                (2026, 5, 19, 10, 1, 0),
+                "sess-e2e",
+                "assistant",
+                "Found some files.",
+                None,
+            ),
+        ];
+
+        let segments = semantic_segments(&entries);
+        assert_eq!(segments.len(), 1);
+        assert!(
+            !segments[0].has_assertable_identity(),
+            "text-only path mention must never produce assertable identity"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

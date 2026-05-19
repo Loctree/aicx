@@ -966,8 +966,22 @@ fn load_resume_tmp_index(
         || header.dimension != info.dimension
     {
         return Err(anyhow::anyhow!(
-            "tmp index checkpoint is incompatible with the active embedder: {}. Move it aside or rebuild with matching embedder config.",
-            path.display()
+            "tmp index checkpoint at {path} is incompatible with the active embedder.\n  \
+             checkpoint: schema={cks} model={ckm} profile={ckp} dim={ckd}\n  \
+             current   : schema={cur_s} model={cur_m} profile={cur_p} dim={cur_d}\n  \
+             they cannot resume each other. fix one of:\n    \
+             - rebuild the partial index with the original embedder, or\n    \
+             - remove the stale checkpoint and start fresh:\n        \
+                 rm {path}",
+            path = path.display(),
+            cks = header.schema_version,
+            ckm = header.model_id,
+            ckp = header.model_profile,
+            ckd = header.dimension,
+            cur_s = INDEX_SCHEMA_VERSION,
+            cur_m = info.model_id,
+            cur_p = profile,
+            cur_d = info.dimension,
         ));
     }
 

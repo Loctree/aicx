@@ -830,6 +830,17 @@ fn infer_project_hint_from_gemini_message(message: &GeminiMessage) -> Option<Str
         })
 }
 
+fn infer_gemini_project_hint_from_session_path(path: &Path) -> Option<String> {
+    let chats_dir = path.parent()?;
+    if chats_dir.file_name().and_then(|name| name.to_str()) != Some("chats") {
+        return None;
+    }
+
+    let project_dir = chats_dir.parent()?;
+    let project = project_dir.file_name()?.to_string_lossy();
+    normalize_project_hint(&project)
+}
+
 /// Check if any project filter matches the given path by **word-boundary** equality.
 ///
 /// Path is split into "words" by `/`, `\`, `-`, `_`, `.`.
@@ -858,18 +869,6 @@ fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool {
             .filter(|s| !s.is_empty())
             .all(|fw| path_words.contains(&fw))
     })
-}
-
-fn gemini_message_matches_filter(message: &GeminiMessage, filters: &[String]) -> bool {
-    if filters.is_empty() {
-        return true;
-    }
-    // Project ownership = cwd path components, not text mentions.
-    // A transcript that *mentions* a project name does not belong to that project.
-    let project_hint = infer_project_hint_from_gemini_message(message);
-    project_hint
-        .as_deref()
-        .is_some_and(|cwd| project_filter_matches_path(cwd, filters))
 }
 
 fn normalize_gemini_role(raw: &str) -> Option<&'static str> {
@@ -2871,17 +2870,27 @@ fn parse_gemini_session(
         .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()))
         .unwrap_or_default();
 
-    let session_default_cwd = session
+    let path_default_cwd = infer_gemini_project_hint_from_session_path(path);
+    let session_default_cwd = path_default_cwd.clone().or_else(|| {
+        session
+            .messages
+            .iter()
+            .find_map(infer_project_hint_from_gemini_message)
+    });
+
+    let content_default_cwd = session
         .messages
         .iter()
         .find_map(infer_project_hint_from_gemini_message);
 
-    // Check project filter against message content
+    // Gemini CLI stores sessions under ~/.gemini/tmp/<project>/chats/.
+    // That path is the session ownership signal; message content may contain
+    // referenced files/screenshots from unrelated projects.
     let session_matches_filter = if !config.project_filter.is_empty() {
-        session
-            .messages
-            .iter()
-            .any(|message| gemini_message_matches_filter(message, &config.project_filter))
+        path_default_cwd
+            .as_deref()
+            .or(content_default_cwd.as_deref())
+            .is_some_and(|cwd| project_filter_matches_path(cwd, &config.project_filter))
     } else {
         true
     };
@@ -2919,8 +2928,9 @@ fn parse_gemini_session(
             continue;
         }
 
-        let inferred_cwd =
-            infer_project_hint_from_gemini_message(msg).or_else(|| session_default_cwd.clone());
+        let inferred_cwd = session_default_cwd
+            .clone()
+            .or_else(|| infer_project_hint_from_gemini_message(msg));
         let mut classified = msg
             .content
             .as_ref()

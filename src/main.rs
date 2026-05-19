@@ -1085,11 +1085,19 @@ enum Commands {
         /// Search query string
         query: String,
 
-        /// Repo or store-bucket filters. Omit to search all projects.
+        /// Project filter. Omit to search every project.
         ///
-        /// Accepts repeated flags (`-p repo-a -p repo-b`), comma-separated
-        /// values (`-p repo-a,repo-b`), or a space list (`-p repo-a repo-b`).
-        #[arg(short, long, num_args = 1.., value_delimiter = ',')]
+        /// Accepted forms (case-insensitive, repeatable):
+        ///   `-p owner/repo`   strict `<owner>/<repo>` slug match
+        ///   `-p owner/`       all repos under that owner (org wildcard)
+        ///   `-p /repo`        same repo name across every owner
+        ///   `-p name`         name matches an owner OR a repo (cross-org)
+        ///
+        /// Multiple `-p` flags or a comma list (`-p a,b`) form a union.
+        /// Substring matching is intentionally not supported — `-p vista`
+        /// no longer matches `vista-portal` / `vista-docs`. Use `-p vetcoders/Vista`
+        /// or `-p /Vista` if you want exactness.
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
         /// Hours to look back (0 = all time)
@@ -1123,11 +1131,18 @@ enum Commands {
         #[command(subcommand)]
         action: Option<IndexAction>,
 
-        /// Repo or store-bucket filters. Omit to index all projects.
+        /// Project filter. Omit to index every project.
         ///
-        /// Accepts repeated flags (`-p repo-a -p repo-b`), comma-separated
-        /// values (`-p repo-a,repo-b`), or a space list (`-p repo-a repo-b`).
-        #[arg(short, long, num_args = 1.., value_delimiter = ',')]
+        /// Accepted forms (case-insensitive, repeatable):
+        ///   `-p owner/repo`   strict `<owner>/<repo>` slug match
+        ///   `-p owner/`       all repos under that owner (org wildcard)
+        ///   `-p /repo`        same repo name across every owner
+        ///   `-p name`         name matches an owner OR a repo (cross-org)
+        ///
+        /// Multiple `-p` flags or a comma list (`-p a,b`) form a union.
+        /// Substring matching is intentionally not supported — `-p vista`
+        /// no longer matches `vista-portal` / `vista-docs`.
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
         /// Stop after sampling this many chunks (0 = scan all)
@@ -4137,6 +4152,31 @@ fn project_scopes(projects: &[String]) -> Vec<Option<&str>> {
     }
 }
 
+/// Resolve user `-p` filters into canonical `<owner>/<repo>` slugs by
+/// enumerating the on-disk store. Empty input → empty output (caller treats
+/// it as "all projects"). Non-empty input that matches zero projects returns
+/// an error with the user-visible filter list, so search/index never silently
+/// resolve to `_all` after a typo.
+fn resolve_project_filters_or_error(projects: &[String]) -> Result<Vec<String>> {
+    if projects.is_empty() {
+        return Ok(Vec::new());
+    }
+    let resolved = aicx::store::resolve_filters_to_slugs(projects)?;
+    if resolved.is_empty() {
+        anyhow::bail!(
+            "no project matches filter(s): {}\n  \
+             accepted forms (case-insensitive): -p owner/repo (strict), \
+             -p owner/ (org wildcard), -p /repo (cross-org repo), -p name (cross-org)",
+            projects
+                .iter()
+                .map(|p| format!("{p:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(resolved)
+}
+
 fn project_scope_label(projects: &[String]) -> String {
     if projects.is_empty() {
         "all projects".to_string()
@@ -4199,7 +4239,8 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         filters.limit
     };
 
-    let scopes = project_scopes(projects);
+    let resolved_projects = resolve_project_filters_or_error(projects)?;
+    let scopes = project_scopes(&resolved_projects);
 
     let (mut results, scanned, semantic_status) = if no_semantic {
         let (results, scanned) = rank::fuzzy_search_store(
@@ -4685,10 +4726,11 @@ fn write_index_for_current_build(
 /// persistent NDJSON-backed index (Iter 3) that subsequent `aicx search`
 /// queries against via cosine similarity.
 fn run_index(projects: &[String], sample: usize, json: bool, dry_run: bool) -> Result<()> {
-    let scopes: Vec<Option<&str>> = if projects.is_empty() {
+    let resolved_projects = resolve_project_filters_or_error(projects)?;
+    let scopes: Vec<Option<&str>> = if resolved_projects.is_empty() {
         vec![None]
     } else {
-        projects
+        resolved_projects
             .iter()
             .map(String::as_str)
             .map(Some)

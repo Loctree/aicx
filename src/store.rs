@@ -1617,6 +1617,108 @@ fn scan_repo_store(
     Ok(())
 }
 
+/// Decide whether `<organization>/<repository>` matches a single `-p` filter.
+///
+/// Semantics (case-insensitive throughout):
+/// - `-p owner/repo` → strict `<owner>/<repo>` slug equality.
+/// - `-p owner/` → every repo under this owner (org wildcard).
+/// - `-p /repo` → every `*/repo` across all owners (repo wildcard).
+/// - `-p name` → match `name` as organization OR repository (cross-org).
+///
+/// Substring matching (old behavior) is intentionally removed: `-p vista`
+/// no longer matched `vista-portal`, `VistaBrain`, `vista-datasets`, etc.
+/// Operators get the same effect with `-p vetcoders/Vista -p vetcoders/vista-portal …`
+/// when they really mean a list.
+pub(crate) fn project_filter_matches(organization: &str, repository: &str, filter: &str) -> bool {
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return false;
+    }
+
+    // `-p /repo` → cross-org exact repo-name match
+    if let Some(repo_only) = filter.strip_prefix('/') {
+        if repo_only.is_empty() || repo_only.contains('/') {
+            return false;
+        }
+        return repository.eq_ignore_ascii_case(repo_only);
+    }
+
+    // `-p owner/` → org wildcard (all repos under this owner)
+    if let Some(org_only) = filter.strip_suffix('/') {
+        if org_only.is_empty() || org_only.contains('/') {
+            return false;
+        }
+        return organization.eq_ignore_ascii_case(org_only);
+    }
+
+    // `-p owner/repo` → strict slug equality
+    if filter.contains('/') {
+        let slug = format!("{organization}/{repository}");
+        return slug.eq_ignore_ascii_case(filter);
+    }
+
+    // `-p name` → cross-org match on organization OR repository
+    organization.eq_ignore_ascii_case(filter) || repository.eq_ignore_ascii_case(filter)
+}
+
+/// Resolve user-supplied `-p` filters into canonical `<owner>/<repo>` slugs
+/// by enumerating the on-disk canonical store. Used by `aicx search` and
+/// `aicx index` so a single short name like `-p spotlight-convo-pipeline-v2`
+/// expands to `m-szymanska/spotlight-convo-pipeline-v2` before downstream
+/// index path / search engine lookup.
+///
+/// Returns:
+/// - empty input → empty output (treat as "search all projects")
+/// - non-empty input → union of canonical slugs that match any filter
+/// - matched zero projects → empty vec (caller decides: error or all)
+pub fn resolve_filters_to_slugs(filters: &[String]) -> Result<Vec<String>> {
+    let base = store_base_dir()?;
+    let canonical_root = base.join(CANONICAL_STORE_DIRNAME);
+    resolve_filters_to_slugs_at(&canonical_root, filters)
+}
+
+pub fn resolve_filters_to_slugs_at(
+    canonical_root: &Path,
+    filters: &[String],
+) -> Result<Vec<String>> {
+    if filters.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !canonical_root.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut slugs: Vec<String> = Vec::new();
+    for organization_entry in read_store_dir(canonical_root)?.filter_map(|entry| entry.ok()) {
+        let organization_path = organization_entry.path();
+        if !organization_path.is_dir() {
+            continue;
+        }
+        let organization = organization_entry.file_name().to_string_lossy().to_string();
+
+        for repository_entry in read_store_dir(&organization_path)?.filter_map(|entry| entry.ok()) {
+            let repository_path = repository_entry.path();
+            if !repository_path.is_dir() {
+                continue;
+            }
+            let repository = repository_entry.file_name().to_string_lossy().to_string();
+
+            if filters
+                .iter()
+                .any(|filter| project_filter_matches(&organization, &repository, filter))
+            {
+                let slug = format!("{organization}/{repository}");
+                if !slugs.iter().any(|existing| existing == &slug) {
+                    slugs.push(slug);
+                }
+            }
+        }
+    }
+
+    slugs.sort();
+    Ok(slugs)
+}
+
 fn scan_repo_store_filtered(
     root: &Path,
     ignore: &StoreIgnoreMatcher,
@@ -1636,18 +1738,14 @@ fn scan_repo_store_filtered(
                 continue;
             }
             let repository = repository_entry.file_name().to_string_lossy().to_string();
+            if !project_filter_matches(&organization, &repository, project_filter) {
+                continue;
+            }
             let repo = RepoIdentity {
                 organization: organization.clone(),
                 repository: repository.clone(),
             };
             let repo_slug = repo.slug();
-            if !repo_slug.to_lowercase().contains(project_filter)
-                && !repository.to_lowercase().contains(project_filter)
-                && !organization.to_lowercase().contains(project_filter)
-            {
-                continue;
-            }
-
             scan_single_repo_store(&repository_path, ignore, &repo, &repo_slug, files)?;
         }
     }
@@ -4552,5 +4650,207 @@ mod tests {
         }
 
         write_text(path, &lines.join("\n"));
+    }
+
+    // ================================================================
+    // project_filter_matches — semantic filter for `aicx … -p <filter>`
+    // ================================================================
+
+    #[test]
+    fn project_filter_strict_owner_repo_match() {
+        assert!(project_filter_matches(
+            "VetCoders",
+            "CodeScribe",
+            "VetCoders/CodeScribe"
+        ));
+        // Case-insensitive both sides.
+        assert!(project_filter_matches(
+            "VetCoders",
+            "CodeScribe",
+            "vetcoders/codescribe"
+        ));
+        assert!(!project_filter_matches(
+            "VetCoders",
+            "CodeScribe",
+            "VetCoders/Vista"
+        ));
+        assert!(!project_filter_matches(
+            "VetCoders",
+            "CodeScribe",
+            "OtherOrg/CodeScribe"
+        ));
+    }
+
+    #[test]
+    fn project_filter_org_wildcard_with_trailing_slash() {
+        // `-p owner/` matches every repo under that owner.
+        assert!(project_filter_matches("m-szymanska", "lab", "m-szymanska/"));
+        assert!(project_filter_matches(
+            "m-szymanska",
+            "spotlight-convo-pipeline-v2",
+            "m-szymanska/"
+        ));
+        assert!(project_filter_matches("M-SZYMANSKA", "lab", "m-szymanska/"));
+        assert!(!project_filter_matches("vetcoders", "lab", "m-szymanska/"));
+    }
+
+    #[test]
+    fn project_filter_repo_wildcard_with_leading_slash() {
+        // `-p /repo` matches the same repo name across every owner.
+        assert!(project_filter_matches(
+            "VetCoders",
+            "CodeScribe",
+            "/CodeScribe"
+        ));
+        assert!(project_filter_matches(
+            "OtherOrg",
+            "codescribe",
+            "/CodeScribe"
+        ));
+        assert!(!project_filter_matches("VetCoders", "Vista", "/CodeScribe"));
+        // Exact name only — no substring leakage.
+        assert!(!project_filter_matches(
+            "VetCoders",
+            "CodeScribe-extra",
+            "/CodeScribe"
+        ));
+    }
+
+    #[test]
+    fn project_filter_bare_name_matches_org_or_repo() {
+        // Cross-org repo match.
+        assert!(project_filter_matches(
+            "VetCoders",
+            "CodeScribe",
+            "codescribe"
+        ));
+        assert!(project_filter_matches(
+            "OtherOrg",
+            "codescribe",
+            "codescribe"
+        ));
+        // Org match (regression for `-p m-szymanska` use case).
+        assert!(project_filter_matches(
+            "m-szymanska",
+            "spotlight-convo-pipeline-v2",
+            "m-szymanska"
+        ));
+        // No match — different name.
+        assert!(!project_filter_matches("vetcoders", "Vista", "codescribe"));
+        // ---- Bug A-CLI regression ----
+        // `-p vista` must NOT match `vista-portal`, `VistaBrain`, etc.
+        // Substring matching is gone.
+        assert!(!project_filter_matches(
+            "vetcoders",
+            "vista-portal",
+            "vista"
+        ));
+        assert!(!project_filter_matches("vetcoders", "VistaBrain", "vista"));
+        assert!(!project_filter_matches(
+            "LibraxisAI",
+            "vista-datasets",
+            "vista"
+        ));
+        assert!(!project_filter_matches(
+            "local",
+            "nextra-docs-vista",
+            "vista"
+        ));
+        // Exact "vista" still matches `vetcoders/Vista` (case-insensitive).
+        assert!(project_filter_matches("vetcoders", "Vista", "vista"));
+    }
+
+    #[test]
+    fn resolve_filters_to_slugs_expands_short_name_to_canonical() {
+        let root = migration_test_root("resolve-short");
+        let canonical = root.join(CANONICAL_STORE_DIRNAME);
+        fs::create_dir_all(
+            canonical
+                .join("m-szymanska")
+                .join("spotlight-convo-pipeline-v2"),
+        )
+        .unwrap();
+        fs::create_dir_all(canonical.join("m-szymanska").join("lab")).unwrap();
+        fs::create_dir_all(canonical.join("vetcoders").join("CodeScribe")).unwrap();
+
+        let resolved =
+            resolve_filters_to_slugs_at(&canonical, &["spotlight-convo-pipeline-v2".to_string()])
+                .unwrap();
+        assert_eq!(resolved, vec!["m-szymanska/spotlight-convo-pipeline-v2"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_filters_to_slugs_supports_explicit_syntax() {
+        let root = migration_test_root("resolve-explicit");
+        let canonical = root.join(CANONICAL_STORE_DIRNAME);
+        fs::create_dir_all(canonical.join("m-szymanska").join("lab")).unwrap();
+        fs::create_dir_all(canonical.join("m-szymanska").join("badi")).unwrap();
+        fs::create_dir_all(canonical.join("vetcoders").join("CodeScribe")).unwrap();
+        fs::create_dir_all(canonical.join("OtherOrg").join("CodeScribe")).unwrap();
+
+        // owner/ → all repos under owner
+        let mut got =
+            resolve_filters_to_slugs_at(&canonical, &["m-szymanska/".to_string()]).unwrap();
+        got.sort();
+        assert_eq!(got, vec!["m-szymanska/badi", "m-szymanska/lab"]);
+
+        // /repo → cross-org repo match
+        let mut got =
+            resolve_filters_to_slugs_at(&canonical, &["/CodeScribe".to_string()]).unwrap();
+        got.sort();
+        assert_eq!(got, vec!["OtherOrg/CodeScribe", "vetcoders/CodeScribe"]);
+
+        // strict slug match
+        let got =
+            resolve_filters_to_slugs_at(&canonical, &["vetcoders/CodeScribe".to_string()]).unwrap();
+        assert_eq!(got, vec!["vetcoders/CodeScribe"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_filters_to_slugs_no_match_returns_empty_vec() {
+        let root = migration_test_root("resolve-empty");
+        let canonical = root.join(CANONICAL_STORE_DIRNAME);
+        fs::create_dir_all(canonical.join("foo").join("bar")).unwrap();
+
+        let got = resolve_filters_to_slugs_at(&canonical, &["nonexistent".to_string()]).unwrap();
+        assert!(got.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_filters_to_slugs_empty_input_returns_empty() {
+        // Empty filters list means "all projects" by caller convention.
+        let root = migration_test_root("resolve-no-filter");
+        let canonical = root.join(CANONICAL_STORE_DIRNAME);
+        fs::create_dir_all(canonical.join("foo").join("bar")).unwrap();
+
+        let got = resolve_filters_to_slugs_at(&canonical, &[]).unwrap();
+        assert!(got.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_filter_edge_cases() {
+        // Empty / whitespace filter rejects all.
+        assert!(!project_filter_matches("vetcoders", "Vista", ""));
+        assert!(!project_filter_matches("vetcoders", "Vista", "   "));
+        // Lone or malformed separators reject all.
+        assert!(!project_filter_matches("vetcoders", "Vista", "/"));
+        assert!(!project_filter_matches("vetcoders", "Vista", "//"));
+        // `/owner/repo` strips one leading slash — the remainder still has `/`
+        // and a repo name never contains `/`, so reject.
+        assert!(!project_filter_matches(
+            "vetcoders",
+            "Vista",
+            "/vetcoders/Vista"
+        ));
+        // `owner/repo/extra` is not a valid slug — reject.
+        assert!(!project_filter_matches("vetcoders", "Vista", "foo/bar/baz"));
     }
 }

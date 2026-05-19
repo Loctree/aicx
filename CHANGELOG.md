@@ -11,6 +11,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `extract --conversation` output now carries `message_kind` and
   `collapse_stub_kind` metadata per message and surfaces extract
   statistics in the JSON projection.
+- Explicit `-p` filter syntax for `aicx index` and `aicx search`:
+  `-p owner/repo` (strict slug), `-p owner/` (org wildcard),
+  `-p /repo` (cross-org repo wildcard), `-p name` (cross-org match on
+  organization or repository). Multiple `-p` flags or a comma list form a
+  union. Filters resolve to canonical `<owner>/<repo>` slugs before
+  downstream index lookup so a short repo name like
+  `-p spotlight-convo-pipeline-v2` expands to its full
+  `m-szymanska/spotlight-convo-pipeline-v2` index path.
 
 ### Changed
 - **Project filter is now word-boundary path match, not substring.**
@@ -19,11 +27,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with ANY. Path is split on `/`, `\`, `-`, `_`, `.`; filter on `-`, `_`, `.`.
   Message-text matching is dropped entirely — a transcript that *mentions*
   a project name does not belong to that project.
+- **Canonical store project filter (`aicx index/search -p`) no longer
+  substring-matches.** `-p vista` previously matched `vista-portal`,
+  `VistaBrain`, `vista-datasets`, `nextra-docs-vista` etc., ballooning a
+  single-project request into seven projects (~32k chunks). Now `-p vista`
+  matches the exact repo or organization name `vista` (case-insensitive).
+  For multi-project intent, repeat the flag or use the explicit wildcards.
 - `aicx extract --conversation` deduplicates exact-equal short user messages
   within the same session (≤ 1000 chars, ≤ 2 s delta). Assistant messages and
   long bodies are untouched.
 
 ### Fixed
+- **Segmentation identity leak: text mentions could be promoted to
+  assertable ownership.** `infer_tiered_identity_from_text` walked any
+  absolute path it found in chunk text into the filesystem and called
+  `git remote get-url origin` to resolve identity — so a chunk that
+  merely *mentioned* `/Users/foo/Downloads/ai-collaborators/...` could
+  hijack a session into whatever GitHub repo that local clone's remote
+  pointed to (e.g. `Szowesgad/maciej-almanach`). Text path inference is
+  removed; only `https://github.com/X/Y` URL mentions remain, clamped to
+  the non-assertable `Fallback` tier.
+- `infer_repo_identity_from_known_layout` matches markers
+  (`hosted`/`repos`/`repositories`/`github`/`git`) case-insensitively, so
+  macOS conventions like `/Users/u/Git/Org/Repo` resolve through cwd
+  instead of falling back to text inference.
+- `aicx index -p` / `aicx search -p` reject filters with no matching
+  project (instead of silently resolving to the `_all` bucket after a
+  typo) and print accepted syntax in the error.
+- Stale `embeddings.ndjson.tmp` checkpoint mismatch error now reports the
+  checkpoint's recorded `schema/model/profile/dim` vs the active
+  embedder's values, and suggests an exact `rm <path>` command.
 - Codex `extract --session <id>` now accepts a UUID prefix, suffix, or
   unique substring instead of requiring the full `session_meta.payload.id`.
   Ambiguous prefixes return a candidate list with an actionable error.
