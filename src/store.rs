@@ -1719,6 +1719,47 @@ pub fn resolve_filters_to_slugs_at(
     Ok(slugs)
 }
 
+/// Detect the "bare-name" ambiguity case described in the `-p name` filter
+/// semantics: a single token like `codex` matches both as an *organization*
+/// (e.g. `codex/foo`) and as a *repository* (e.g. `openai/codex`). The CLI
+/// still resolves the union — this helper just lets the caller warn the
+/// operator so they can disambiguate with `-p name/` or `-p /name` if the
+/// match was unintended.
+///
+/// Returns:
+/// - `None` if the filter is not a bare name, or if it matches in only one
+///   role (org-only or repo-only), or in neither.
+/// - `Some((orgs, repos))` when the filter matches in BOTH roles. `orgs`
+///   are slugs whose owner component equals `filter` (case-insensitive),
+///   `repos` are slugs whose repository component equals `filter`.
+///   Both vecs are non-empty when this returns `Some`.
+pub fn detect_ambiguous_bare_filter(
+    filter: &str,
+    slugs: &[String],
+) -> Option<(Vec<String>, Vec<String>)> {
+    let trimmed = filter.trim();
+    if trimmed.is_empty() || trimmed.contains('/') {
+        return None;
+    }
+    let mut as_org: Vec<String> = Vec::new();
+    let mut as_repo: Vec<String> = Vec::new();
+    for slug in slugs {
+        let Some((org, repo)) = slug.split_once('/') else {
+            continue;
+        };
+        if org.eq_ignore_ascii_case(trimmed) {
+            as_org.push(slug.clone());
+        }
+        if repo.eq_ignore_ascii_case(trimmed) {
+            as_repo.push(slug.clone());
+        }
+    }
+    if as_org.is_empty() || as_repo.is_empty() {
+        return None;
+    }
+    Some((as_org, as_repo))
+}
+
 fn scan_repo_store_filtered(
     root: &Path,
     ignore: &StoreIgnoreMatcher,
@@ -3998,6 +4039,23 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
 
+        // Round-2: identity now comes from cwd, not text URL mentions, so we
+        // build two on-disk repos and switch cwd between them mid-session.
+        // Result: one "plans" segment (no cwd) followed by two cwd-owned
+        // segments → three progress ticks, same as before.
+        let repo_a = root.join("hosted").join("VetCoders").join("ai-contexters");
+        let repo_b = root.join("hosted").join("VetCoders").join("loctree");
+        for r in [&repo_a, &repo_b] {
+            fs::create_dir_all(r).unwrap();
+            std::process::Command::new("git")
+                .arg("init")
+                .arg(r)
+                .output()
+                .unwrap();
+        }
+        let cwd_a = repo_a.to_string_lossy().to_string();
+        let cwd_b = repo_b.to_string_lossy().to_string();
+
         let entries = vec![
             semantic_entry(
                 (2026, 3, 21, 9, 0, 0),
@@ -4017,15 +4075,15 @@ mod tests {
                 (2026, 3, 21, 9, 2, 0),
                 "sess-a",
                 "user",
-                "Switch to https://github.com/VetCoders/ai-contexters now.",
-                None,
+                "Switch to the ai-contexters repo on disk now.",
+                Some(&cwd_a),
             ),
             semantic_entry(
                 (2026, 3, 21, 9, 3, 0),
                 "sess-a",
                 "user",
-                "Then inspect https://github.com/VetCoders/loctree as well.",
-                None,
+                "Then move into loctree on disk as well.",
+                Some(&cwd_b),
             ),
         ];
 
@@ -4833,6 +4891,60 @@ mod tests {
         assert!(got.is_empty());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_ambiguous_bare_filter_flags_org_and_repo_collision() {
+        // `-p codex` resolves to both `codex/foo` (org match) AND
+        // `openai/codex` (repo match) — operator should be warned.
+        let root = migration_test_root("ambiguous-codex");
+        let canonical = root.join(CANONICAL_STORE_DIRNAME);
+        fs::create_dir_all(canonical.join("codex").join("some-repo")).unwrap();
+        fs::create_dir_all(canonical.join("openai").join("codex")).unwrap();
+        fs::create_dir_all(canonical.join("unrelated").join("lab")).unwrap();
+
+        let resolved = resolve_filters_to_slugs_at(&canonical, &["codex".to_string()]).unwrap();
+        // Filter still returns union (no behavior change).
+        assert_eq!(resolved, vec!["codex/some-repo", "openai/codex"]);
+
+        // Helper flags the ambiguity.
+        let detected =
+            detect_ambiguous_bare_filter("codex", &resolved).expect("ambiguity must be detected");
+        assert_eq!(detected.0, vec!["codex/some-repo"]);
+        assert_eq!(detected.1, vec!["openai/codex"]);
+
+        // Case-insensitive on the filter side too.
+        let detected_upper = detect_ambiguous_bare_filter("CODEX", &resolved)
+            .expect("ambiguity must be detected case-insensitively");
+        assert_eq!(detected_upper.0, vec!["codex/some-repo"]);
+        assert_eq!(detected_upper.1, vec!["openai/codex"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_ambiguous_bare_filter_skips_unambiguous_and_qualified_filters() {
+        // Org-only match → no ambiguity.
+        let slugs_org_only = vec![
+            "codex/some-repo".to_string(),
+            "codex/other-repo".to_string(),
+        ];
+        assert!(detect_ambiguous_bare_filter("codex", &slugs_org_only).is_none());
+
+        // Repo-only match → no ambiguity.
+        let slugs_repo_only = vec!["openai/codex".to_string(), "anthropic/codex".to_string()];
+        assert!(detect_ambiguous_bare_filter("codex", &slugs_repo_only).is_none());
+
+        // Qualified filter forms (owner/, /repo, owner/repo) are never
+        // "ambiguous" — they expressed intent, so the helper short-circuits.
+        let slugs_mixed = vec!["codex/some-repo".to_string(), "openai/codex".to_string()];
+        assert!(detect_ambiguous_bare_filter("codex/", &slugs_mixed).is_none());
+        assert!(detect_ambiguous_bare_filter("/codex", &slugs_mixed).is_none());
+        assert!(detect_ambiguous_bare_filter("openai/codex", &slugs_mixed).is_none());
+
+        // Empty / whitespace filter → None.
+        assert!(detect_ambiguous_bare_filter("", &slugs_mixed).is_none());
+        assert!(detect_ambiguous_bare_filter("   ", &slugs_mixed).is_none());
     }
 
     #[test]

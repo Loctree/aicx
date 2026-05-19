@@ -4174,6 +4174,24 @@ fn resolve_project_filters_or_error(projects: &[String]) -> Result<Vec<String>> 
                 .join(", ")
         );
     }
+    // Warn (don't fail) when a bare-name filter matched both as an
+    // organization AND as a repository — operator likely wanted one or the
+    // other. Filter still resolves to the union; this is just a heads-up.
+    for filter in projects {
+        if let Some((as_org, as_repo)) =
+            aicx::store::detect_ambiguous_bare_filter(filter, &resolved)
+        {
+            let trimmed = filter.trim();
+            let org_example = as_org.first().cloned().unwrap_or_default();
+            let repo_example = as_repo.first().cloned().unwrap_or_default();
+            eprintln!(
+                "warning: filter '{trimmed}' matched as both an organization AND a repository name.\n  \
+                 as org    -> {trimmed}/* (e.g. {org_example})\n  \
+                 as repo   -> {repo_example}\n  \
+                 use -p {trimmed}/ for org-only or -p /{trimmed} for repo-only."
+            );
+        }
+    }
     Ok(resolved)
 }
 

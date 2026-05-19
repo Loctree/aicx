@@ -217,15 +217,21 @@ pub fn resolve_bucket(entry: &TimelineEntry, registry: &ProjectHashRegistry) -> 
     }
 }
 
-/// Infer repo identity with explicit trust tier from all available signals.
+/// Infer repo identity with explicit trust tier from source-side signals.
 ///
 /// Signal precedence (highest to lowest):
 /// 1. CWD that resolves via local git + remote -> Primary
 /// 2. CWD that resolves via local git + known layout/basename -> Secondary
 /// 3. CWD via known layout (no .git) -> Fallback
-/// 4. ProjectHash resolved through registry -> Secondary
-/// 5. Content mentions -> Fallback tags-only signal
-/// 6. Pure hex hash CWD / opaque -> Opaque (returns None)
+/// 4. ProjectHash resolved through registry (Gemini) -> Secondary
+///
+/// Text mentions are deliberately NOT a fallback here. A chunk may legitimately
+/// quote URLs or paths from other repos as discussion material — promoting any
+/// of them to entry identity would (a) split a single-owner session across
+/// `current_repo != explicit_repo` segments and (b) smear `segment.repo` with
+/// non-ownership signals downstream consumers (search, dashboard) may grow to
+/// trust. Standalone callers that want "what does this entry mention?" can use
+/// [`resolve_bucket`] with `BucketingSource::ContentMention`.
 pub fn infer_tiered_identity_from_entry(
     entry: &TimelineEntry,
     registry: &ProjectHashRegistry,
@@ -242,7 +248,7 @@ pub fn infer_tiered_identity_from_entry(
         return registry.resolve(cwd);
     }
 
-    infer_tiered_identity_from_text(&entry.message)
+    None
 }
 
 /// Classify a raw CWD string into a source tier without resolving identity.
@@ -588,7 +594,42 @@ fn is_probably_repo_name(value: &str) -> bool {
         return false;
     }
 
+    // Date-shaped strings (`2026-01-22`, `2026_01_22`, `2026_0122`) sneak past
+    // the alphanumeric+`.-_` filter and have landed in the canonical store as
+    // pseudo-repos before. Treat them as not-a-repo so layout inference and
+    // segmentation never accept a folder dated like a session-bucket.
+    if looks_like_date_pattern(value) {
+        return false;
+    }
+
     true
+}
+
+/// Returns true if `value` is shaped like a calendar date (no other content).
+///
+/// Recognized: `YYYY-MM-DD`, `YYYY_MM_DD`, `YYYY_MMDD`. The check is
+/// shape-only (digits + separator placement); we do not validate that the
+/// month/day fall within a real calendar — `2026-99-99` is still rejected as
+/// "repo-like" because the *intent* is clearly a date bucket, not a repo.
+fn looks_like_date_pattern(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    match bytes.len() {
+        // YYYY-MM-DD or YYYY_MM_DD
+        10 => {
+            bytes[..4].iter().all(u8::is_ascii_digit)
+                && matches!(bytes[4], b'-' | b'_')
+                && bytes[5..7].iter().all(u8::is_ascii_digit)
+                && bytes[7] == bytes[4]
+                && bytes[8..10].iter().all(u8::is_ascii_digit)
+        }
+        // YYYY_MMDD (compact form used by the canonical store layout)
+        9 => {
+            bytes[..4].iter().all(u8::is_ascii_digit)
+                && bytes[4] == b'_'
+                && bytes[5..9].iter().all(u8::is_ascii_digit)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -628,34 +669,49 @@ mod tests {
 
     #[test]
     fn repo_signal_segmentation_splits_one_session_across_multiple_repositories() {
+        // Multi-repo split must come from a source-of-truth signal (cwd
+        // switch between two real git repos), NOT from text URL mentions
+        // in chunks. Pre-round-2 a session that merely *mentioned* repo B
+        // mid-conversation would split into a second non-assertable
+        // segment with B's URL as identity; that smear is gone.
+        let root = mk_tmp_dir("multi-repo-cwd-switch");
+        let repo_a = root.join("hosted").join("VetCoders").join("ai-contexters");
+        let repo_b = root.join("hosted").join("VetCoders").join("loctree");
+        for r in [&repo_a, &repo_b] {
+            fs::create_dir_all(r).unwrap();
+            Command::new("git").arg("init").arg(r).output().unwrap();
+        }
+
+        let cwd_a = repo_a.to_string_lossy().to_string();
+        let cwd_b = repo_b.to_string_lossy().to_string();
         let entries = vec![
             entry(
                 (2026, 3, 21, 9, 0, 0),
                 "sess-1",
                 "user",
-                "Please inspect https://github.com/VetCoders/ai-contexters before editing.",
-                None,
+                "Please inspect ai-contexters before editing.",
+                Some(&cwd_a),
             ),
             entry(
                 (2026, 3, 21, 9, 1, 0),
                 "sess-1",
                 "assistant",
-                "I found the store seam in ai-contexters.",
-                None,
+                "I found the store seam.",
+                Some(&cwd_a),
             ),
             entry(
                 (2026, 3, 21, 9, 2, 0),
                 "sess-1",
                 "user",
-                "Switch now to https://github.com/VetCoders/loctree and review the scanner.",
-                None,
+                "Switch to loctree now.",
+                Some(&cwd_b),
             ),
             entry(
                 (2026, 3, 21, 9, 3, 0),
                 "sess-1",
                 "assistant",
-                "I am reviewing loctree next.",
-                None,
+                "Reviewing loctree next.",
+                Some(&cwd_b),
             ),
         ];
 
@@ -663,10 +719,23 @@ mod tests {
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].project_label(), "VetCoders/ai-contexters");
         assert_eq!(segments[1].project_label(), "VetCoders/loctree");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn repo_signal_segmentation_keeps_unknown_prefix_honest() {
+        // First half of the session has no cwd (no identity); the user then
+        // starts working in a real on-disk repo. Segmentation must split:
+        // a no-identity prefix (preserved as plan/setup talk) followed by
+        // a properly-owned segment once cwd lands. Previously this was
+        // exercised by a text URL mention; that path is no longer a signal.
+        let root = mk_tmp_dir("unknown-prefix-then-cwd");
+        let repo = root.join("hosted").join("VetCoders").join("ai-contexters");
+        fs::create_dir_all(&repo).unwrap();
+        Command::new("git").arg("init").arg(&repo).output().unwrap();
+
+        let cwd = repo.to_string_lossy().to_string();
         let entries = vec![
             entry(
                 (2026, 3, 21, 9, 0, 0),
@@ -686,8 +755,8 @@ mod tests {
                 (2026, 3, 21, 9, 2, 0),
                 "sess-2",
                 "user",
-                "The actual repo is https://github.com/VetCoders/ai-contexters.",
-                None,
+                "Now working in the repo on disk.",
+                Some(&cwd),
             ),
         ];
 
@@ -696,6 +765,8 @@ mod tests {
         assert!(segments[0].repo.is_none());
         assert_eq!(segments[0].kind, Kind::Plans);
         assert_eq!(segments[1].project_label(), "VetCoders/ai-contexters");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -755,21 +826,9 @@ mod tests {
     // Source tier tests
     // ================================================================
 
-    #[test]
-    fn source_tier_github_url_is_primary() {
-        let e = entry(
-            (2026, 3, 22, 10, 0, 0),
-            "sess-tier",
-            "user",
-            "Check https://github.com/VetCoders/ai-contexters for updates.",
-            None,
-        );
-        let tiered = infer_tiered_identity_from_entry(&e, &ProjectHashRegistry::default())
-            .expect("should resolve");
-        assert_eq!(tiered.tier, SourceTier::Fallback);
-        assert_eq!(tiered.identity.slug(), "VetCoders/ai-contexters");
-        assert!(!tiered.tier.is_assertable());
-    }
+    // (Removed `source_tier_github_url_is_primary` — superseded by
+    //  `entry_identity_ignores_text_url_mentions` /
+    //  `resolve_bucket_still_surfaces_text_url_mentions` below.)
 
     #[test]
     fn cwd_git_identity_wins_over_content_mentions() {
@@ -839,6 +898,11 @@ mod tests {
 
     #[test]
     fn fallback_routes_invalid_remote_owner_to_local_bucket() {
+        // After round-2, text URLs no longer feed segment identity, so this
+        // test exercises the lower-level `resolve_bucket` API instead. The
+        // malformed-owner → `local/<repo>` rule still belongs to the parser
+        // (anything routing through `infer_repo_identity_from_remote_like`
+        // must not silently materialize a `{placeholder}/...` org).
         let e = entry(
             (2026, 3, 22, 10, 0, 0),
             "sess-local-fallback",
@@ -846,16 +910,16 @@ mod tests {
             "Clone https://github.com/{target_owner}/vibecrafted.git before release.",
             None,
         );
+        let resolution = resolve_bucket(&e, &ProjectHashRegistry::default());
+        assert_eq!(resolution.source, BucketingSource::ContentMention);
+        assert_eq!(resolution.bucket, "local/vibecrafted");
+        assert_ne!(resolution.bucket, "{target_owner}/vibecrafted");
 
-        let tiered = infer_tiered_identity_from_entry(&e, &ProjectHashRegistry::default())
-            .expect("malformed remote should resolve to local fallback");
-        assert_eq!(tiered.identity.slug(), "local/vibecrafted");
-        assert!(!tiered.tier.is_assertable());
-
+        // Segment pipeline ignores text mentions entirely → non-assertable.
         let segments = semantic_segments(&[e]);
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].project_label(), "local/vibecrafted");
-        assert_ne!(segments[0].project_label(), "{target_owner}/vibecrafted");
+        assert!(segments[0].repo.is_none());
+        assert!(!segments[0].has_assertable_identity());
     }
 
     #[test]
@@ -1020,27 +1084,38 @@ mod tests {
 
     #[test]
     fn segments_carry_source_tier() {
+        // Source-tier propagation is now demonstrated through cwd-derived
+        // identity (the only entry-level identity path). Text URL mentions
+        // no longer produce a Fallback-tier segment.
+        let root = mk_tmp_dir("segments-carry-tier");
+        let repo = root.join("hosted").join("VetCoders").join("ai-contexters");
+        fs::create_dir_all(&repo).unwrap();
+        Command::new("git").arg("init").arg(&repo).output().unwrap();
+
+        let cwd = repo.to_string_lossy().to_string();
         let entries = vec![
             entry(
                 (2026, 3, 22, 10, 0, 0),
                 "sess-st",
                 "user",
-                "Check https://github.com/VetCoders/ai-contexters",
-                None,
+                "Working on ai-contexters.",
+                Some(&cwd),
             ),
             entry(
                 (2026, 3, 22, 10, 1, 0),
                 "sess-st",
                 "assistant",
                 "Reviewing now.",
-                None,
+                Some(&cwd),
             ),
         ];
 
         let segments = semantic_segments(&entries);
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].source_tier, Some(SourceTier::Fallback));
-        assert!(!segments[0].has_assertable_identity());
+        assert_eq!(segments[0].source_tier, Some(SourceTier::Secondary));
+        assert!(segments[0].has_assertable_identity());
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1295,9 +1370,10 @@ mod tests {
     }
 
     #[test]
-    fn text_url_mention_returns_fallback_tier_only() {
-        // URL mentions stay as a Fallback tag (search hint) but are NOT
-        // assertable, so they never route a segment into canonical store.
+    fn entry_identity_ignores_text_url_mentions() {
+        // Round 2: even URL mentions are no longer entry identity. Promoting
+        // them produced segment.repo smear and split sessions on context_switch
+        // when current cwd-derived identity differed from a chunk's mention.
         let e = entry(
             (2026, 5, 19, 10, 0, 0),
             "sess-url",
@@ -1305,11 +1381,118 @@ mod tests {
             "See https://github.com/VetCoders/aicx for context.",
             None,
         );
-        let tiered = infer_tiered_identity_from_entry(&e, &ProjectHashRegistry::default())
-            .expect("URL mention yields Fallback identity");
-        assert_eq!(tiered.tier, SourceTier::Fallback);
-        assert!(!tiered.tier.is_assertable());
-        assert_eq!(tiered.identity.slug(), "VetCoders/aicx");
+        assert!(
+            infer_tiered_identity_from_entry(&e, &ProjectHashRegistry::default()).is_none(),
+            "entry-level identity must come from cwd/registry only"
+        );
+    }
+
+    #[test]
+    fn resolve_bucket_still_surfaces_text_url_mentions() {
+        // resolve_bucket is a standalone bucket-resolver (separate from segment
+        // pipeline). Text URL mentions remain a ContentMention signal so future
+        // search-hint use cases can read them — but they do NOT feed segment
+        // identity. This test guards that contract.
+        let e = entry(
+            (2026, 5, 19, 10, 0, 0),
+            "sess-bucket",
+            "user",
+            "Read https://github.com/VetCoders/aicx and tell me what you see.",
+            None,
+        );
+        let resolution = resolve_bucket(&e, &ProjectHashRegistry::default());
+        assert_eq!(resolution.source, BucketingSource::ContentMention);
+        assert_eq!(resolution.bucket, "VetCoders/aicx");
+    }
+
+    #[test]
+    fn semantic_segment_does_not_split_on_text_url_mention() {
+        // Round-2 regression: a session whose cwd points at VetCoders/Vista
+        // (Primary identity, real .git on disk) and whose middle chunk simply
+        // mentions a different repo URL must stay as ONE segment with the
+        // owner-correct identity. Pre-fix this split into two segments
+        // (vetcoders/Vista → VetCoders/aicx Fallback) and the second chunk
+        // routed away from its real owner.
+        let root = mk_tmp_dir("segment-no-split-on-url");
+        let repo = root.join("Git").join("VetCoders").join("vista");
+        fs::create_dir_all(&repo).unwrap();
+        Command::new("git").arg("init").arg(&repo).output().unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:VetCoders/vista.git",
+            ])
+            .output()
+            .unwrap();
+
+        let cwd = repo.to_string_lossy().to_string();
+        let entries = vec![
+            entry(
+                (2026, 5, 19, 10, 0, 0),
+                "sess-no-split",
+                "user",
+                "Start working on Vista.",
+                Some(&cwd),
+            ),
+            entry(
+                (2026, 5, 19, 10, 1, 0),
+                "sess-no-split",
+                "assistant",
+                "See https://github.com/VetCoders/aicx for the shared parser.",
+                None,
+            ),
+            entry(
+                (2026, 5, 19, 10, 2, 0),
+                "sess-no-split",
+                "user",
+                "Back to Vista.",
+                Some(&cwd),
+            ),
+        ];
+
+        let segments = semantic_segments(&entries);
+        assert_eq!(
+            segments.len(),
+            1,
+            "single-owner session must not split on a text URL mention"
+        );
+        assert_eq!(segments[0].project_label(), "VetCoders/vista");
+        assert!(segments[0].has_assertable_identity());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_probably_repo_name_rejects_date_patterns() {
+        // Live bug: pseudo-projects like `CodeScribe/2026-01-22` made it into
+        // ~/.aicx/store/. Block all three date shapes used by known layouts.
+        assert!(!is_probably_repo_name("2026-01-22"));
+        assert!(!is_probably_repo_name("2026_01_22"));
+        assert!(!is_probably_repo_name("2026_0122"));
+        // Sanity: real-shaped repo names with a date suffix still pass.
+        assert!(is_probably_repo_name("release-2026"));
+        assert!(is_probably_repo_name("v2026.01"));
+        assert!(is_probably_repo_name("aicx"));
+        assert!(is_probably_repo_name("ai-contexters"));
+    }
+
+    #[test]
+    fn looks_like_date_pattern_recognizes_three_shapes() {
+        assert!(looks_like_date_pattern("2026-01-22"));
+        assert!(looks_like_date_pattern("2026_01_22"));
+        assert!(looks_like_date_pattern("2026_0122"));
+        // Out-of-range digits are still date-shaped — intent is what matters.
+        assert!(looks_like_date_pattern("9999-99-99"));
+        // Negative cases: wrong length, wrong separators, mixed separators.
+        assert!(!looks_like_date_pattern("2026-0122")); // 9 chars but wrong sep at idx 4
+        assert!(!looks_like_date_pattern("2026-01_22")); // mixed - and _
+        assert!(!looks_like_date_pattern("202601-22")); // missing sep at idx 4
+        assert!(!looks_like_date_pattern("v2026-01-22")); // extra prefix
+        assert!(!looks_like_date_pattern("aicx"));
     }
 
     #[test]
