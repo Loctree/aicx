@@ -1023,3 +1023,5 @@ wpisie (`41aac1a`). E.7 negation guard świadomie konserwatywny: tylko
 phrase-pair "negator + keyword w bliskim sąsiedztwie", nie pełna
 sentence-level analiza, żeby nie zjeść pozytywnych intentów typu
 `"Don't worry, let's ship"`.
+
+- [Area F] Dashboard Security Hardening: Mitigated stored-XSS in markdown linkifier, added CSP meta tags and X-Headers, restricted CORS wildcard, required CSRF tokens for `/api/regenerate`, secured `run_memex_cli` execution path, and added parameter length caps for MCP tools.

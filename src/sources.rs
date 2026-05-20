@@ -465,7 +465,56 @@ struct TimelineEntryMeta {
     frame_kind: Option<FrameKind>,
 }
 
+trait PushContentSanitizationWarning {
+    fn push_content_sanitization_warning(&mut self, warning: sanitize::ContentSanitizationWarning);
+}
+
 fn build_timeline_entry(
+    timestamp: DateTime<Utc>,
+    agent: &str,
+    session_id: &str,
+    role: &str,
+    message: String,
+    meta: TimelineEntryMeta,
+) -> TimelineEntry {
+    let sanitized = sanitize::sanitize_chunk_content(&message);
+    build_timeline_entry_from_message(
+        timestamp,
+        agent,
+        session_id,
+        role,
+        sanitized.text.into_owned(),
+        meta,
+    )
+}
+
+fn build_timeline_entry_with_content_warnings<W>(
+    timestamp: DateTime<Utc>,
+    agent: &str,
+    session_id: &str,
+    role: &str,
+    message: String,
+    meta: TimelineEntryMeta,
+    warnings: &mut W,
+) -> TimelineEntry
+where
+    W: PushContentSanitizationWarning,
+{
+    let sanitized = sanitize::sanitize_chunk_content(&message);
+    for warning in sanitized.warnings {
+        warnings.push_content_sanitization_warning(warning);
+    }
+    build_timeline_entry_from_message(
+        timestamp,
+        agent,
+        session_id,
+        role,
+        sanitized.text.into_owned(),
+        meta,
+    )
+}
+
+fn build_timeline_entry_from_message(
     timestamp: DateTime<Utc>,
     agent: &str,
     session_id: &str,
@@ -695,6 +744,7 @@ fn extract_claude_line_entries(
     entry: ClaudeEntry,
     session_id: &str,
     config: &ExtractionConfig,
+    warnings: &mut Vec<ClaudeSessionWarning>,
 ) -> Vec<TimelineEntry> {
     let timestamp = match entry.timestamp.as_deref() {
         Some(ts) => match parse_rfc3339_or_naive_utc(ts) {
@@ -721,7 +771,7 @@ fn extract_claude_line_entries(
             if !should_keep_entry(Some(block.frame_kind), config) {
                 continue;
             }
-            entries.push(build_timeline_entry(
+            entries.push(build_timeline_entry_with_content_warnings(
                 timestamp,
                 "claude",
                 session_id,
@@ -732,6 +782,7 @@ fn extract_claude_line_entries(
                     cwd: entry.cwd.clone(),
                     frame_kind: Some(block.frame_kind),
                 },
+                warnings,
             ));
         }
         return entries;
@@ -748,7 +799,7 @@ fn extract_claude_line_entries(
         return Vec::new();
     }
 
-    entries.push(build_timeline_entry(
+    entries.push(build_timeline_entry_with_content_warnings(
         timestamp,
         "claude",
         session_id,
@@ -759,6 +810,7 @@ fn extract_claude_line_entries(
             cwd: entry.cwd,
             frame_kind,
         },
+        warnings,
     ));
     entries
 }
@@ -1179,13 +1231,46 @@ struct GeminiAntigravityRecovery {
     mode: GeminiAntigravityRecoveryMode,
 }
 
+fn describe_content_sanitization_warning(warning: &sanitize::ContentSanitizationWarning) -> String {
+    match warning {
+        sanitize::ContentSanitizationWarning::NullByteStripped(offset) => {
+            format!("stripped NUL byte at byte offset {offset}")
+        }
+        sanitize::ContentSanitizationWarning::BidiOverride(ch, offset) => format!(
+            "preserved bidi override U+{:04X} at byte offset {}",
+            *ch as u32, offset
+        ),
+        sanitize::ContentSanitizationWarning::ZeroWidth(ch, offset) => format!(
+            "preserved zero-width character U+{:04X} at byte offset {}",
+            *ch as u32, offset
+        ),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ClaudeSessionWarning {
-    MissingSessionId { fallback: String },
-    SessionIdDrift { first: String, ignored: Vec<String> },
-    UnparsableTimestamp { count: usize, samples: Vec<String> },
-    InvalidEpochMillis { count: usize, samples: Vec<String> },
-    OversizedLine { count: usize, samples: Vec<String> },
+    MissingSessionId {
+        fallback: String,
+    },
+    SessionIdDrift {
+        first: String,
+        ignored: Vec<String>,
+    },
+    UnparsableTimestamp {
+        count: usize,
+        samples: Vec<String>,
+    },
+    InvalidEpochMillis {
+        count: usize,
+        samples: Vec<String>,
+    },
+    OversizedLine {
+        count: usize,
+        samples: Vec<String>,
+    },
+    ContentSanitization {
+        warning: sanitize::ContentSanitizationWarning,
+    },
 }
 
 impl ClaudeSessionWarning {
@@ -1221,6 +1306,11 @@ impl ClaudeSessionWarning {
                 MAX_LINE_BYTES,
                 samples.join(", ")
             ),
+            ClaudeSessionWarning::ContentSanitization { warning } => format!(
+                "Claude content warning: {} {}",
+                path.display(),
+                describe_content_sanitization_warning(warning)
+            ),
         }
     }
 }
@@ -1233,10 +1323,24 @@ fn emit_claude_session_warnings(path: &Path, warnings: &[ClaudeSessionWarning]) 
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GeminiSessionWarning {
-    MissingSessionId { fallback: String },
-    SessionIdDrift { first: String, ignored: Vec<String> },
-    UnparsableTimestamp { count: usize, samples: Vec<String> },
-    UnknownMsgType { count: usize, samples: Vec<String> },
+    MissingSessionId {
+        fallback: String,
+    },
+    SessionIdDrift {
+        first: String,
+        ignored: Vec<String>,
+    },
+    UnparsableTimestamp {
+        count: usize,
+        samples: Vec<String>,
+    },
+    UnknownMsgType {
+        count: usize,
+        samples: Vec<String>,
+    },
+    ContentSanitization {
+        warning: sanitize::ContentSanitizationWarning,
+    },
 }
 
 impl GeminiSessionWarning {
@@ -1265,6 +1369,11 @@ impl GeminiSessionWarning {
                 count,
                 samples.join(", ")
             ),
+            GeminiSessionWarning::ContentSanitization { warning } => format!(
+                "Gemini content warning: {} {}",
+                path.display(),
+                describe_content_sanitization_warning(warning)
+            ),
         }
     }
 }
@@ -1277,8 +1386,16 @@ fn emit_gemini_session_warnings(path: &Path, warnings: &[GeminiSessionWarning]) 
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JunieSessionWarning {
-    JunieFallbackId { fallback: String },
-    OversizedLine { count: usize, samples: Vec<String> },
+    JunieFallbackId {
+        fallback: String,
+    },
+    OversizedLine {
+        count: usize,
+        samples: Vec<String>,
+    },
+    ContentSanitization {
+        warning: sanitize::ContentSanitizationWarning,
+    },
 }
 
 impl JunieSessionWarning {
@@ -1295,6 +1412,11 @@ impl JunieSessionWarning {
                 count,
                 MAX_LINE_BYTES,
                 samples.join(", ")
+            ),
+            JunieSessionWarning::ContentSanitization { warning } => format!(
+                "Junie content warning: {} {}",
+                path.display(),
+                describe_content_sanitization_warning(warning)
             ),
         }
     }
@@ -1464,6 +1586,7 @@ fn parse_claude_jsonl_with_diagnostics(
             entry,
             &effective_session_id,
             config,
+            &mut warnings,
         ));
     }
 
@@ -2505,7 +2628,7 @@ pub fn extract_claude_history(config: &ExtractionConfig) -> Result<Vec<TimelineE
             continue;
         }
 
-        entries.push(build_timeline_entry(
+        entries.push(build_timeline_entry_with_content_warnings(
             timestamp,
             "claude",
             entry.session_id.as_deref().unwrap_or("history"),
@@ -2516,6 +2639,7 @@ pub fn extract_claude_history(config: &ExtractionConfig) -> Result<Vec<TimelineE
                 cwd: entry.project,
                 frame_kind: Some(FrameKind::UserMsg),
             },
+            &mut warnings,
         ));
     }
 
@@ -2646,6 +2770,9 @@ pub(crate) enum CodexSessionWarning {
         count: usize,
         samples: Vec<String>,
     },
+    ContentSanitization {
+        warning: sanitize::ContentSanitizationWarning,
+    },
 }
 
 impl CodexSessionWarning {
@@ -2696,7 +2823,36 @@ impl CodexSessionWarning {
                 MAX_LINE_BYTES,
                 samples.join(", ")
             ),
+            CodexSessionWarning::ContentSanitization { warning } => format!(
+                "Codex content warning: {} {}",
+                path.display(),
+                describe_content_sanitization_warning(warning)
+            ),
         }
+    }
+}
+
+impl PushContentSanitizationWarning for Vec<ClaudeSessionWarning> {
+    fn push_content_sanitization_warning(&mut self, warning: sanitize::ContentSanitizationWarning) {
+        self.push(ClaudeSessionWarning::ContentSanitization { warning });
+    }
+}
+
+impl PushContentSanitizationWarning for Vec<GeminiSessionWarning> {
+    fn push_content_sanitization_warning(&mut self, warning: sanitize::ContentSanitizationWarning) {
+        self.push(GeminiSessionWarning::ContentSanitization { warning });
+    }
+}
+
+impl PushContentSanitizationWarning for Vec<JunieSessionWarning> {
+    fn push_content_sanitization_warning(&mut self, warning: sanitize::ContentSanitizationWarning) {
+        self.push(JunieSessionWarning::ContentSanitization { warning });
+    }
+}
+
+impl PushContentSanitizationWarning for Vec<CodexSessionWarning> {
+    fn push_content_sanitization_warning(&mut self, warning: sanitize::ContentSanitizationWarning) {
+        self.push(CodexSessionWarning::ContentSanitization { warning });
     }
 }
 
@@ -2715,6 +2871,7 @@ struct CodexSessionDiagnostics {
     unknown_msg_type: usize,
     mixed_format: usize,
     oversized_line: usize,
+    content_sanitization: usize,
 }
 
 impl CodexSessionDiagnostics {
@@ -2736,6 +2893,9 @@ impl CodexSessionDiagnostics {
                 CodexSessionWarning::OversizedLine { count, .. } => {
                     self.oversized_line += count;
                 }
+                CodexSessionWarning::ContentSanitization { .. } => {
+                    self.content_sanitization += 1;
+                }
             }
         }
     }
@@ -2748,19 +2908,21 @@ impl CodexSessionDiagnostics {
             && self.unknown_msg_type == 0
             && self.mixed_format == 0
             && self.oversized_line == 0
+            && self.content_sanitization == 0
     }
 
     fn emit_summary(&self) {
         if !self.is_empty() {
             eprintln!(
-                "Codex sessions diagnostics: missing={} duplicate={} mismatch={} unparsable_ts={} unknown_msg_type={} mixed_format={} oversized_line={}",
+                "Codex sessions diagnostics: missing={} duplicate={} mismatch={} unparsable_ts={} unknown_msg_type={} mixed_format={} oversized_line={} content_sanitization={}",
                 self.missing,
                 self.duplicate,
                 self.mismatch,
                 self.unparsable_ts,
                 self.unknown_msg_type,
                 self.mixed_format,
-                self.oversized_line
+                self.oversized_line,
+                self.content_sanitization
             );
         }
     }
@@ -2886,7 +3048,7 @@ fn build_codex_history_entries(
                 continue;
             }
 
-            entries.push(build_timeline_entry(
+            entries.push(build_timeline_entry_with_content_warnings(
                 timestamp,
                 "codex",
                 session_id,
@@ -2897,6 +3059,7 @@ fn build_codex_history_entries(
                     cwd: msg.cwd.clone(),
                     frame_kind,
                 },
+                warnings,
             ));
         }
     }
@@ -3193,7 +3356,7 @@ fn parse_codex_session_events_with_diagnostics(
             continue;
         }
 
-        entries.push(build_timeline_entry(
+        entries.push(build_timeline_entry_with_content_warnings(
             timestamp,
             "codex",
             &session_id,
@@ -3204,6 +3367,7 @@ fn parse_codex_session_events_with_diagnostics(
                 cwd: current_cwd.clone(),
                 frame_kind,
             },
+            &mut warnings,
         ));
     }
 
@@ -3453,7 +3617,7 @@ fn parse_gemini_session_with_diagnostics(
             if !should_keep_entry(Some(block.frame_kind), config) {
                 continue;
             }
-            entries.push(build_timeline_entry(
+            entries.push(build_timeline_entry_with_content_warnings(
                 timestamp,
                 "gemini",
                 &session_id,
@@ -3464,6 +3628,7 @@ fn parse_gemini_session_with_diagnostics(
                     cwd: inferred_cwd.clone(),
                     frame_kind: Some(block.frame_kind),
                 },
+                &mut warnings,
             ));
         }
 
@@ -3500,7 +3665,7 @@ fn parse_gemini_session_with_diagnostics(
                     format!("**{}**: {}", subj, desc)
                 };
 
-                entries.push(build_timeline_entry(
+                entries.push(build_timeline_entry_with_content_warnings(
                     thought_ts,
                     "gemini",
                     &session_id,
@@ -3511,6 +3676,7 @@ fn parse_gemini_session_with_diagnostics(
                         cwd: inferred_cwd.clone(),
                         frame_kind: Some(FrameKind::InternalThought),
                     },
+                    &mut warnings,
                 ));
             }
         }
@@ -3702,7 +3868,7 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                     .and_then(parse_junie_request_timestamp);
                 let timestamp = next_junie_timestamp(&mut cursor, candidate);
                 if junie_timestamp_in_window(timestamp, config) {
-                    entries.push(build_timeline_entry(
+                    entries.push(build_timeline_entry_with_content_warnings(
                         timestamp,
                         "junie",
                         &session_id,
@@ -3713,6 +3879,7 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                             cwd: current_cwd.clone(),
                             frame_kind: Some(FrameKind::UserMsg),
                         },
+                        &mut warnings,
                     ));
                 }
             }
@@ -3729,7 +3896,7 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
 
                 let timestamp = next_junie_timestamp(&mut cursor, None);
                 if junie_timestamp_in_window(timestamp, config) {
-                    entries.push(build_timeline_entry(
+                    entries.push(build_timeline_entry_with_content_warnings(
                         timestamp,
                         "junie",
                         &session_id,
@@ -3740,6 +3907,7 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                             cwd: current_cwd.clone(),
                             frame_kind: Some(FrameKind::UserMsg),
                         },
+                        &mut warnings,
                     ));
                 }
             }
@@ -3820,7 +3988,7 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
 
                 let timestamp = next_junie_timestamp(&mut cursor, None);
                 if junie_timestamp_in_window(timestamp, config) {
-                    entries.push(build_timeline_entry(
+                    entries.push(build_timeline_entry_with_content_warnings(
                         timestamp,
                         "junie",
                         &session_id,
@@ -3831,6 +3999,7 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                             cwd: current_cwd.clone(),
                             frame_kind: Some(frame_kind),
                         },
+                        &mut warnings,
                     ));
                 }
             }

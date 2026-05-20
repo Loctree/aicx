@@ -9,6 +9,7 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Result, anyhow};
+use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
 
 /// Known safe extractor agent names.
@@ -20,6 +21,19 @@ pub const ALLOWED_AGENTS: &[&str] = &[
     "codescribe",
     "operator-md",
 ];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentSanitizationWarning {
+    NullByteStripped(usize),
+    BidiOverride(char, usize),
+    ZeroWidth(char, usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SanitizedContent<'a> {
+    pub text: Cow<'a, str>,
+    pub warnings: Vec<ContentSanitizationWarning>,
+}
 
 // ============================================================================
 // Core helpers (mirroring rmcp-memex pattern)
@@ -252,6 +266,80 @@ pub fn safe_project_name(name: &str) -> Result<&str> {
 }
 
 // ============================================================================
+// Public API: message content sanitization
+// ============================================================================
+
+pub fn sanitize_chunk_content(text: &str) -> SanitizedContent<'_> {
+    let (text, warnings) = sanitize_message_content(text);
+    SanitizedContent { text, warnings }
+}
+
+fn sanitize_message_content(input: &str) -> (Cow<'_, str>, Vec<ContentSanitizationWarning>) {
+    let mut output: Option<String> = None;
+    let mut warnings = Vec::new();
+    let mut chars = input.char_indices().peekable();
+
+    while let Some((offset, ch)) = chars.next() {
+        match ch {
+            '\0' => {
+                warnings.push(ContentSanitizationWarning::NullByteStripped(offset));
+                ensure_output(&mut output, input, offset);
+            }
+            '\r' => {
+                ensure_output(&mut output, input, offset);
+                output.as_mut().expect("output initialized").push('\n');
+                if chars.peek().is_some_and(|(_, next)| *next == '\n') {
+                    chars.next();
+                }
+            }
+            _ => {
+                if is_bidi_override(ch) {
+                    warnings.push(ContentSanitizationWarning::BidiOverride(ch, offset));
+                } else if is_zero_width(ch) {
+                    warnings.push(ContentSanitizationWarning::ZeroWidth(ch, offset));
+                }
+
+                if let Some(out) = output.as_mut() {
+                    out.push(ch);
+                }
+            }
+        }
+    }
+
+    match output {
+        Some(output) => (Cow::Owned(output), warnings),
+        None => (Cow::Borrowed(input), warnings),
+    }
+}
+
+fn ensure_output(output: &mut Option<String>, input: &str, offset: usize) {
+    if output.is_none() {
+        let mut owned = String::with_capacity(input.len());
+        owned.push_str(&input[..offset]);
+        *output = Some(owned);
+    }
+}
+
+fn is_bidi_override(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{202A}'
+            | '\u{202B}'
+            | '\u{202C}'
+            | '\u{202D}'
+            | '\u{202E}'
+            | '\u{2066}'
+            | '\u{2067}'
+            | '\u{2068}'
+            | '\u{2069}'
+    )
+}
+
+fn is_zero_width(ch: char) -> bool {
+    matches!(ch, '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}')
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -419,6 +507,63 @@ mod tests {
         assert_eq!(entries, 1);
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_sanitize_strips_nul_byte_and_warns() {
+        let sanitized = sanitize_chunk_content("abc\0def\0");
+        assert_eq!(sanitized.text, "abcdef");
+        assert_eq!(
+            sanitized.warnings,
+            vec![
+                ContentSanitizationWarning::NullByteStripped(3),
+                ContentSanitizationWarning::NullByteStripped(7),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sanitize_normalizes_crlf_to_lf() {
+        let sanitized = sanitize_chunk_content("one\r\ntwo\rthree\nfour");
+        assert_eq!(sanitized.text, "one\ntwo\nthree\nfour");
+        assert!(sanitized.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_sanitize_preserves_unicode_emoji() {
+        let sanitized = sanitize_chunk_content("ship it 🚀");
+        assert_eq!(sanitized.text, "ship it 🚀");
+        assert!(sanitized.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_sanitize_preserves_polish_diacritics_nfc() {
+        let input = "Zażółć gęślą jaźń";
+        let sanitized = sanitize_chunk_content(input);
+        assert_eq!(sanitized.text, input);
+        assert!(sanitized.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_sanitize_bidi_override_warns_but_does_not_strip() {
+        let input = "safe \u{202E}txt";
+        let sanitized = sanitize_chunk_content(input);
+        assert_eq!(sanitized.text, input);
+        assert_eq!(
+            sanitized.warnings,
+            vec![ContentSanitizationWarning::BidiOverride('\u{202E}', 5)]
+        );
+    }
+
+    #[test]
+    fn test_sanitize_zero_width_warns_but_does_not_strip() {
+        let input = "zero\u{200B}width";
+        let sanitized = sanitize_chunk_content(input);
+        assert_eq!(sanitized.text, input);
+        assert_eq!(
+            sanitized.warnings,
+            vec![ContentSanitizationWarning::ZeroWidth('\u{200B}', 4)]
+        );
     }
 
     #[test]
