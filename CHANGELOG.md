@@ -38,6 +38,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   long bodies are untouched.
 
 ### Fixed
+
 - **Segmentation identity leak: text mentions could be promoted to
   assertable ownership.** `infer_tiered_identity_from_text` walked any
   absolute path it found in chunk text into the filesystem and called
@@ -74,6 +75,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Stale `embeddings.ndjson.tmp` checkpoint mismatch error now reports the
   checkpoint's recorded `schema/model/profile/dim` vs the active
   embedder's values, and suggests an exact `rm <path>` command.
+- Junie extractor (`extract_junie_file`) now captures the full agent work
+  trail — internal thoughts (`AgentThoughtBlockUpdatedEvent`), terminal
+  commands (`TerminalBlockUpdatedEvent`), MCP calls (`McpBlockUpdatedEvent`),
+  tool blocks (`ToolBlockUpdatedEvent`), file views
+  (`ViewFilesBlockUpdatedEvent`), and file changes
+  (`FileChangesBlockUpdatedEvent`) — in addition to the previously-only
+  conversational user/assistant pairs. Sessions whose `ResultBlockUpdatedEvent`
+  payloads are empty (most non-conversational steps) no longer index as
+  bare prompts with zero context. Streaming snapshots are dedup'd per
+  `(stepId, kind)` and pre-COMPLETED states are skipped for the streaming
+  block kinds.
 - Codex `extract --session <id>` now accepts a UUID prefix, suffix, or
   unique substring instead of requiring the full `session_meta.payload.id`.
   Ambiguous prefixes return a candidate list with an actionable error.

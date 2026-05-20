@@ -965,7 +965,7 @@ fn test_extract_junie_file_keeps_conversation_truth_and_dedups_results() {
 {"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"step-1","cancelled":false,"result":"Initial plan","changes":[],"errorCode":"Submit"}}}
 {"kind":"UserResponseEvent","prompt":"jedziemy","isChoice":true}
 {"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"step-1","cancelled":false,"result":"Refined plan","changes":[],"errorCode":"Submit"}}}
-{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"TerminalBlockUpdatedEvent","command":"rg foo","output":"this should stay ignored"}}}"#;
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"TerminalBlockUpdatedEvent","stepId":"step-term-1","status":"COMPLETED","command":"rg foo","output":"matched line"}}}"#;
     write_file(&tmp, content);
 
     let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
@@ -977,7 +977,7 @@ fn test_extract_junie_file_keeps_conversation_truth_and_dedups_results() {
     };
 
     let entries = extract_junie_file(&tmp, &config).unwrap();
-    assert_eq!(entries.len(), 4);
+    assert_eq!(entries.len(), 5);
     assert_eq!(entries[0].agent, "junie");
     assert_eq!(entries[0].session_id, "260408-214715-abcd");
     assert_eq!(entries[0].role, "user");
@@ -988,6 +988,9 @@ fn test_extract_junie_file_keeps_conversation_truth_and_dedups_results() {
     assert_eq!(entries[2].message, "jedziemy");
     assert_eq!(entries[3].role, "assistant");
     assert_eq!(entries[3].message, "Refined plan");
+    assert_eq!(entries[4].role, "tool");
+    assert_eq!(entries[4].frame_kind, Some(FrameKind::ToolCall));
+    assert_eq!(entries[4].message, "$ rg foo\nmatched line");
     assert!(
         entries
             .windows(2)
@@ -998,6 +1001,89 @@ fn test_extract_junie_file_keeps_conversation_truth_and_dedups_results() {
             .iter()
             .all(|entry| entry.cwd.as_deref() == Some("/tmp/repo"))
     );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_extract_junie_file_captures_thoughts_and_tool_chain() {
+    let root = unique_test_dir("junie-rich");
+    let session_dir = root.join("session-260519-164145-rich");
+    let tmp = session_dir.join("events.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    // Stream snapshots in IN_PROGRESS -> COMPLETED order; dedup must collapse
+    // the two identical COMPLETED frames for the same stepId.
+    let content = r#"{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"CurrentDirectoryUpdatedEvent","currentDirectory":"/work/repo"}}}
+{"kind":"UserPromptEvent","requestId":"prompt-260519-164200-aaaa","prompt":"map the repo","presentablePrompt":"map the repo"}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"AgentThoughtBlockUpdatedEvent","stepId":"th-1","text":"I should run loctree context first."}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"McpBlockUpdatedEvent","stepId":"mcp-1","toolName":"loctree-mcp/context","input":"{\"project\":\"/work/repo\"}","status":"IN_PROGRESS","details":""}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"McpBlockUpdatedEvent","stepId":"mcp-1","toolName":"loctree-mcp/context","input":"{\"project\":\"/work/repo\"}","status":"COMPLETED","details":"atlas v1"}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ToolBlockUpdatedEvent","stepId":"tool-1","status":"COMPLETED","text":"Found \"docs/plans/**\"","details":"docs/plans/PLAN_22.md\n"}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ViewFilesBlockUpdatedEvent","stepId":"view-1","status":"COMPLETED","files":[{"relativePath":"docs/plans/PLAN_22.md","lineFrom":1,"lineTo":50}]}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"FileChangesBlockUpdatedEvent","stepId":"chg-1","status":"COMPLETED","changes":[{"relativePath":"src/lib.rs"}]}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"TerminalBlockUpdatedEvent","stepId":"term-1","status":"IN_PROGRESS","command":"cargo build","output":""}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"TerminalBlockUpdatedEvent","stepId":"term-1","status":"COMPLETED","command":"cargo build","output":"Compiling aicx"}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"TerminalBlockUpdatedEvent","stepId":"term-1","status":"COMPLETED","command":"cargo build","output":"Compiling aicx"}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"res-1","cancelled":false,"result":"Mapped.","errorCode":"Submit"}}}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_junie_file(&tmp, &config).unwrap();
+    let kinds: Vec<_> = entries
+        .iter()
+        .map(|e| (e.role.as_str(), e.frame_kind))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("user", Some(FrameKind::UserMsg)),
+            ("reasoning", Some(FrameKind::InternalThought)),
+            ("tool", Some(FrameKind::ToolCall)),
+            ("tool", Some(FrameKind::ToolCall)),
+            ("tool", Some(FrameKind::ToolCall)),
+            ("tool", Some(FrameKind::ToolCall)),
+            ("tool", Some(FrameKind::ToolCall)),
+            ("assistant", Some(FrameKind::AgentReply)),
+        ]
+    );
+    assert_eq!(entries[0].message, "map the repo");
+    assert_eq!(entries[1].message, "I should run loctree context first.");
+    assert!(entries[2].message.starts_with("loctree-mcp/context: "));
+    assert!(entries[2].message.contains("atlas v1"));
+    assert!(entries[3].message.starts_with("Found"));
+    assert!(entries[3].message.contains("PLAN_22.md"));
+    assert_eq!(entries[4].message, "viewed: docs/plans/PLAN_22.md:1-50");
+    assert_eq!(entries[5].message, "edited: src/lib.rs");
+    assert_eq!(entries[6].message, "$ cargo build\nCompiling aicx");
+    assert_eq!(entries[7].message, "Mapped.");
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.cwd.as_deref() == Some("/work/repo"))
+    );
+    assert!(
+        entries
+            .windows(2)
+            .all(|pair| pair[0].timestamp < pair[1].timestamp)
+    );
+
+    // user-only mode strips everything but UserMsg
+    let user_only = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: false,
+        watermark: None,
+    };
+    let user_entries = extract_junie_file(&tmp, &user_only).unwrap();
+    assert_eq!(user_entries.len(), 1);
+    assert_eq!(user_entries[0].role, "user");
 
     let _ = fs::remove_dir_all(&root);
 }

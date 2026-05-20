@@ -3075,13 +3075,26 @@ fn parse_gemini_jsonl_session(content: &str) -> Result<GeminiSession> {
 /// Junie stores very noisy UI/runtime session traces under:
 /// `~/.junie/sessions/session-<YYMMDD>-<HHMMSS>-<id>/events.jsonl`
 ///
-/// This extractor intentionally keeps only the conversational truth:
-/// - `UserPromptEvent.prompt`          -> `user`
-/// - `UserResponseEvent.prompt`        -> `user`
-/// - `ResultBlockUpdatedEvent.result`  -> `assistant`
+/// This extractor keeps the full conversation truth: user prompts, agent
+/// replies, the agent's internal thoughts, and the tool / terminal / MCP /
+/// file-change actions the agent took. Status churn (`AgentCurrentStatusUpdatedEvent`,
+/// env updates, plan ticks) and intermediate streaming snapshots are dropped
+/// via per-`stepId` content dedup so we keep the final state of each block.
 ///
-/// The rest of the block/update noise (terminal snapshots, tool blocks, file
-/// views, status churn, env updates) is ignored.
+/// Mapping:
+/// - `UserPromptEvent.prompt`              -> `user` / `UserMsg`
+/// - `UserResponseEvent.prompt`            -> `user` / `UserMsg`
+/// - `ResultBlockUpdatedEvent.result`      -> `assistant` / `AgentReply`
+/// - `AgentThoughtBlockUpdatedEvent.text`  -> `reasoning` / `InternalThought`
+/// - `TerminalBlockUpdatedEvent`           -> `tool` / `ToolCall` (`$ {cmd}\n{output}`)
+/// - `McpBlockUpdatedEvent`                -> `tool` / `ToolCall` (`{toolName}: {input}` + details)
+/// - `ToolBlockUpdatedEvent`               -> `tool` / `ToolCall` (text + details)
+/// - `FileChangesBlockUpdatedEvent`        -> `tool` / `ToolCall` (paths changed)
+/// - `ViewFilesBlockUpdatedEvent`          -> `tool` / `ToolCall` (paths viewed)
+///
+/// Pre-COMPLETED block snapshots are dropped automatically because rendered
+/// text dedups by `stepId`. Status churn (`AgentCurrentStatusUpdatedEvent`,
+/// `EnvironmentVariablesUpdatedEvent`, plan updates) is ignored.
 pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     let path = sanitize::validate_read_path(path)?;
     let file = sanitize::open_file_validated(&path)?;
@@ -3094,7 +3107,10 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
     let mut entries = Vec::new();
     let mut current_cwd: Option<String> = None;
     let mut cursor = session_anchor;
-    let mut last_result_by_step: HashMap<String, String> = HashMap::new();
+    // Streaming dedup: each Junie block kind emits multiple updates per stepId
+    // (IN_PROGRESS -> COMPLETED, sometimes COMPLETED twice). Track the last
+    // rendered text per (stepId, kind) to drop snapshots that didn't change.
+    let mut last_block_render: HashMap<(String, &'static str), String> = HashMap::new();
     let mut line = String::new();
 
     loop {
@@ -3193,38 +3209,75 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                     .filter(|text| !text.is_empty())
                     .map(ToOwned::to_owned);
             }
-            Some("ResultBlockUpdatedEvent") => {
+            Some(
+                block_kind @ ("ResultBlockUpdatedEvent"
+                | "AgentThoughtBlockUpdatedEvent"
+                | "TerminalBlockUpdatedEvent"
+                | "McpBlockUpdatedEvent"
+                | "ToolBlockUpdatedEvent"
+                | "FileChangesBlockUpdatedEvent"
+                | "ViewFilesBlockUpdatedEvent"),
+            ) => {
                 if !config.include_assistant {
                     reset_stream_buffer(&mut line);
                     continue;
                 }
 
                 let agent_event = raw.get("event").and_then(|value| value.get("agentEvent"));
-                let step_id = agent_event
-                    .and_then(|value| value.get("stepId"))
-                    .and_then(|value| value.as_str())
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| format!("{session_id}:result"));
-                let message = agent_event
-                    .and_then(|value| value.get("result"))
-                    .and_then(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|text| !text.is_empty())
-                    .map(ToOwned::to_owned);
-
-                let Some(message) = message else {
+                let Some(agent_event) = agent_event else {
                     reset_stream_buffer(&mut line);
                     continue;
                 };
 
-                if last_result_by_step
-                    .get(&step_id)
+                // Streaming block events (terminal/tool/mcp/view/changes) emit
+                // a noisy IN_PROGRESS snapshot before COMPLETED. Skip pre-final
+                // states so the corpus only sees the settled rendering.
+                // `ResultBlockUpdatedEvent` and `AgentThoughtBlockUpdatedEvent`
+                // do not carry a `status` field — let them through unconditionally.
+                let has_streaming_status = matches!(
+                    block_kind,
+                    "TerminalBlockUpdatedEvent"
+                        | "McpBlockUpdatedEvent"
+                        | "ToolBlockUpdatedEvent"
+                        | "FileChangesBlockUpdatedEvent"
+                        | "ViewFilesBlockUpdatedEvent"
+                );
+                if has_streaming_status {
+                    let status = agent_event
+                        .get("status")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default();
+                    if !status.eq_ignore_ascii_case("COMPLETED") {
+                        reset_stream_buffer(&mut line);
+                        continue;
+                    }
+                }
+
+                let step_id = agent_event
+                    .get("stepId")
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| format!("{session_id}:{block_kind}"));
+
+                let Some(BlockProjection {
+                    message,
+                    role,
+                    frame_kind,
+                }) = project_junie_block(block_kind, agent_event)
+                else {
+                    reset_stream_buffer(&mut line);
+                    continue;
+                };
+
+                let dedup_key = (step_id, block_kind);
+                if last_block_render
+                    .get(&dedup_key)
                     .is_some_and(|previous| previous == &message)
                 {
                     reset_stream_buffer(&mut line);
                     continue;
                 }
-                last_result_by_step.insert(step_id, message.clone());
+                last_block_render.insert(dedup_key, message.clone());
 
                 let timestamp = next_junie_timestamp(&mut cursor, None);
                 if junie_timestamp_in_window(timestamp, config) {
@@ -3232,12 +3285,12 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                         timestamp,
                         "junie",
                         &session_id,
-                        "assistant",
+                        role,
                         message,
                         TimelineEntryMeta {
                             branch: None,
                             cwd: current_cwd.clone(),
-                            frame_kind: Some(FrameKind::AgentReply),
+                            frame_kind: Some(frame_kind),
                         },
                     ));
                 }
@@ -3250,6 +3303,195 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
 
     entries.sort_by_key(|a| a.timestamp);
     Ok(entries)
+}
+
+struct BlockProjection {
+    message: String,
+    role: &'static str,
+    frame_kind: FrameKind,
+}
+
+/// Render a Junie `agentEvent` payload into a timeline-shaped (role, frame, text) triple.
+///
+/// Returns `None` when the block has no extractable content yet (empty streaming
+/// snapshot, missing required field) or when the block kind isn't supported.
+fn project_junie_block(kind: &str, agent_event: &serde_json::Value) -> Option<BlockProjection> {
+    match kind {
+        "ResultBlockUpdatedEvent" => agent_event
+            .get("result")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| BlockProjection {
+                message: text.to_string(),
+                role: "assistant",
+                frame_kind: FrameKind::AgentReply,
+            }),
+        "AgentThoughtBlockUpdatedEvent" => agent_event
+            .get("text")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| BlockProjection {
+                message: text.to_string(),
+                role: "reasoning",
+                frame_kind: FrameKind::InternalThought,
+            }),
+        "TerminalBlockUpdatedEvent" => {
+            let command = agent_event
+                .get("command")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .unwrap_or_default();
+            if command.is_empty() {
+                return None;
+            }
+            let output = agent_event
+                .get("presentableOutput")
+                .or_else(|| agent_event.get("output"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .unwrap_or_default();
+            let message = if output.is_empty() {
+                format!("$ {command}")
+            } else {
+                format!("$ {command}\n{output}")
+            };
+            Some(BlockProjection {
+                message,
+                role: "tool",
+                frame_kind: FrameKind::ToolCall,
+            })
+        }
+        "McpBlockUpdatedEvent" => {
+            let tool_name = agent_event
+                .get("toolName")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("mcp");
+            let input = agent_event
+                .get("input")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .unwrap_or_default();
+            let details = agent_event
+                .get("details")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .unwrap_or_default();
+            // Skip pure status churn (no input, no details).
+            if input.is_empty() && details.is_empty() {
+                return None;
+            }
+            let mut message = format!("{tool_name}: {input}");
+            if !details.is_empty() && details != input {
+                message.push_str("\n→ ");
+                message.push_str(details);
+            }
+            Some(BlockProjection {
+                message,
+                role: "tool",
+                frame_kind: FrameKind::ToolCall,
+            })
+        }
+        "ToolBlockUpdatedEvent" => {
+            let text = agent_event
+                .get("text")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .unwrap_or_default();
+            let details = agent_event
+                .get("details")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .unwrap_or_default();
+            let output = agent_event
+                .get("output")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .unwrap_or_default();
+            if text.is_empty() && details.is_empty() && output.is_empty() {
+                return None;
+            }
+            let mut message = text.to_string();
+            for extra in [details, output] {
+                if extra.is_empty() || extra == text {
+                    continue;
+                }
+                if !message.is_empty() {
+                    message.push('\n');
+                }
+                message.push_str(extra);
+            }
+            if message.is_empty() {
+                return None;
+            }
+            Some(BlockProjection {
+                message,
+                role: "tool",
+                frame_kind: FrameKind::ToolCall,
+            })
+        }
+        "ViewFilesBlockUpdatedEvent" => {
+            let files = agent_event
+                .get("files")
+                .and_then(|value| value.as_array())?;
+            let mut paths = Vec::new();
+            for file in files {
+                let Some(rel) = file
+                    .get("relativePath")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                else {
+                    continue;
+                };
+                let from = file.get("lineFrom").and_then(serde_json::Value::as_i64);
+                let to = file.get("lineTo").and_then(serde_json::Value::as_i64);
+                let span = match (from, to) {
+                    (Some(start), Some(end)) => format!("{rel}:{start}-{end}"),
+                    (Some(start), None) => format!("{rel}:{start}"),
+                    _ => rel.to_string(),
+                };
+                paths.push(span);
+            }
+            if paths.is_empty() {
+                return None;
+            }
+            Some(BlockProjection {
+                message: format!("viewed: {}", paths.join(", ")),
+                role: "tool",
+                frame_kind: FrameKind::ToolCall,
+            })
+        }
+        "FileChangesBlockUpdatedEvent" => {
+            let changes = agent_event
+                .get("changes")
+                .and_then(|value| value.as_array())?;
+            let mut paths = Vec::new();
+            for change in changes {
+                if let Some(rel) = change
+                    .get("relativePath")
+                    .or_else(|| change.get("path"))
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                {
+                    paths.push(rel.to_string());
+                }
+            }
+            if paths.is_empty() {
+                return None;
+            }
+            Some(BlockProjection {
+                message: format!("edited: {}", paths.join(", ")),
+                role: "tool",
+                frame_kind: FrameKind::ToolCall,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Extract timeline entries from all Junie session logs under `~/.junie/sessions/`.
@@ -3289,17 +3531,33 @@ pub fn extract_junie(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
 }
 
 fn detect_junie_interesting_kind(line: &str) -> Option<&'static str> {
-    if line.contains("\"UserPromptEvent\"") {
-        Some("UserPromptEvent")
-    } else if line.contains("\"UserResponseEvent\"") {
-        Some("UserResponseEvent")
-    } else if line.contains("\"CurrentDirectoryUpdatedEvent\"") {
-        Some("CurrentDirectoryUpdatedEvent")
-    } else if line.contains("\"ResultBlockUpdatedEvent\"") {
-        Some("ResultBlockUpdatedEvent")
-    } else {
-        None
+    // Order matters only for ambiguity: each kind is a unique JSON literal
+    // (`"kind":"X"` substring). We bail on the first match.
+    const KINDS: &[&str] = &[
+        "UserPromptEvent",
+        "UserResponseEvent",
+        "CurrentDirectoryUpdatedEvent",
+        "ResultBlockUpdatedEvent",
+        "AgentThoughtBlockUpdatedEvent",
+        "TerminalBlockUpdatedEvent",
+        "McpBlockUpdatedEvent",
+        "ToolBlockUpdatedEvent",
+        "FileChangesBlockUpdatedEvent",
+        "ViewFilesBlockUpdatedEvent",
+    ];
+    for kind in KINDS {
+        // Match the JSON literal form to avoid false positives from prose
+        // ("...mentioned UserPromptEvent in docs..." -> would never match
+        // because we require the surrounding quotes).
+        let mut needle = String::with_capacity(kind.len() + 2);
+        needle.push('"');
+        needle.push_str(kind);
+        needle.push('"');
+        if line.contains(&needle) {
+            return Some(*kind);
+        }
     }
+    None
 }
 
 fn reset_stream_buffer(buffer: &mut String) {
