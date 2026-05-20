@@ -87,7 +87,7 @@ fn parse_frontmatter_fields(yaml_str: &str) -> Option<ReportFrontmatter> {
 
         let value = value.trim();
         if looks_like_unsupported_yaml_value(value) {
-            return None;
+            continue;
         }
         let value = normalize_scalar(value);
         saw_field = true;
@@ -174,10 +174,54 @@ mod tests {
 
     #[test]
     fn handles_malformed_yaml_gracefully() {
-        let input = "---\n: this is not valid yaml [\n---\nBody";
+        let input = "---\nagent: codex\nrun_id: mrbl-001\nunsupported: [not, scalar]\nstatus: completed\n---\nBody";
+        let (frontmatter, body) = parse(input);
+        let frontmatter = frontmatter.unwrap();
+
+        assert_eq!(frontmatter.telemetry.agent.as_deref(), Some("codex"));
+        assert_eq!(frontmatter.telemetry.run_id.as_deref(), Some("mrbl-001"));
+        assert_eq!(frontmatter.telemetry.status.as_deref(), Some("completed"));
+        assert_eq!(body, "Body");
+    }
+
+    #[test]
+    fn preserves_scalars_when_value_is_unsupported_yaml_list() {
+        let input = "---\nrun_id: abc123\nmode: [research, audit]\nstatus: completed\nmodel: claude-opus-4-7\nstarted_at: 2026-05-20T11:51:55Z\n---\nBody";
+        let (frontmatter, body) = parse(input);
+        let frontmatter = frontmatter.unwrap();
+
+        assert_eq!(frontmatter.telemetry.run_id.as_deref(), Some("abc123"));
+        assert_eq!(frontmatter.telemetry.status.as_deref(), Some("completed"));
+        assert_eq!(
+            frontmatter.telemetry.model.as_deref(),
+            Some("claude-opus-4-7")
+        );
+        assert_eq!(
+            frontmatter.telemetry.started_at.as_deref(),
+            Some("2026-05-20T11:51:55Z")
+        );
+        assert_eq!(frontmatter.steering.mode, None);
+        assert_eq!(body, "Body");
+    }
+
+    #[test]
+    fn preserves_scalars_when_value_is_unsupported_yaml_map() {
+        let input = "---\nrun_id: abc123\nagent_model: {provider}/claude-opus-4-7\nstatus: completed\nmodel: codex\n---\nBody";
+        let (frontmatter, body) = parse(input);
+        let frontmatter = frontmatter.unwrap();
+
+        assert_eq!(frontmatter.telemetry.run_id.as_deref(), Some("abc123"));
+        assert_eq!(frontmatter.telemetry.status.as_deref(), Some("completed"));
+        assert_eq!(frontmatter.telemetry.model.as_deref(), Some("codex"));
+        assert_eq!(body, "Body");
+    }
+
+    #[test]
+    fn still_returns_none_when_no_delimiters() {
+        let input = "run_id: abc123\nstatus: completed\nBody";
         let (frontmatter, body) = parse(input);
 
         assert!(frontmatter.is_none());
-        assert_eq!(body, "Body");
+        assert_eq!(body, input);
     }
 }

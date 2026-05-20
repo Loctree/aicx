@@ -1480,7 +1480,7 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_entries_strip_malformed_frontmatter_without_metadata() {
+    fn test_chunk_entries_skips_unsupported_frontmatter_values_without_dropping_metadata() {
         let entries = vec![make_entry(
             14,
             30,
@@ -1493,7 +1493,7 @@ mod tests {
 
         let chunk = &chunks[0];
         assert_eq!(chunk.run_id, None);
-        assert_eq!(chunk.mode, None);
+        assert_eq!(chunk.mode.as_deref(), Some("session-first"));
         assert!(chunk.text.contains("## Report"));
         assert!(chunk.text.contains("Body survives"));
         assert!(!chunk.text.contains("mode: session-first"));
