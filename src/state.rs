@@ -5,13 +5,15 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use crate::store::atomic_write::atomic_write;
 
 pub mod migration;
 
@@ -135,54 +137,65 @@ impl StateManager {
         Ok(base.join("state.json"))
     }
 
-    /// Load state from disk. Creates a fresh default state if the file
-    /// does not exist or cannot be parsed.
+    /// Load state from disk. Creates a fresh default state only when the file
+    /// does not exist.
     ///
-    /// **Migration:** If the file contains the old flat `HashSet<u64>` format
-    /// for `seen_hashes`, deserialization will fail and we fall back to
-    /// `Default` (empty state). Old hashes are discarded — they have no
-    /// project context and would cause cross-project dedup pollution.
-    pub fn load() -> Self {
-        let path = match Self::state_path() {
-            Ok(p) => p,
-            Err(_) => return Self::default(),
-        };
+    /// Malformed JSON is never silently reset to default. We recover from a
+    /// valid rolling backup when available; otherwise the caller gets an error.
+    pub fn load() -> Result<Self> {
+        Self::load_from_path(&Self::state_path()?)
+    }
 
+    fn load_from_path(path: &Path) -> Result<Self> {
         if !path.exists() {
-            return Self::default();
+            return Ok(Self::default());
         }
 
-        let lock_path = match crate::locks::state_lock_path() {
-            Ok(path) => path,
+        let backup_path = Self::backup_path(path);
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read state file: {}", path.display()))?;
+
+        let mut state: Self = match serde_json::from_str(&contents) {
+            Ok(state) => state,
             Err(err) => {
-                tracing::warn!("failed to resolve state lock path: {err}");
-                return Self::default();
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "state.json parse failed"
+                );
+                if backup_path.exists() {
+                    let backup = fs::read_to_string(&backup_path).with_context(|| {
+                        format!("Failed to read state backup: {}", backup_path.display())
+                    })?;
+                    serde_json::from_str(&backup).map_err(|backup_err| {
+                        anyhow!("state.json malformed AND backup unreadable: {err} / {backup_err}")
+                    })?
+                } else {
+                    return Err(anyhow!(
+                        "state.json corrupted, no backup; manual recovery needed: {}",
+                        path.display()
+                    ));
+                }
             }
         };
-        let _lock = match crate::locks::acquire_shared(lock_path) {
-            Ok(lock) => lock,
-            Err(err) => {
-                tracing::warn!("failed to acquire shared state lock: {err}");
-                return Self::default();
-            }
-        };
-
-        let contents = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => return Self::default(),
-        };
-
-        // Try new format first; fall back to default (migration: old flat hashes discarded)
-        let mut state: Self = serde_json::from_str(&contents).unwrap_or_default();
         state.apply_load_migrations();
-        state
+        Ok(state)
     }
 
     /// Persist current state to disk. Creates parent directories if needed.
     pub fn save(&self) -> Result<()> {
         let path = Self::state_path()?;
-        let lock = crate::locks::acquire_exclusive(crate::locks::state_lock_path()?)?;
+        self.save_to_path(&path)
+    }
 
+    fn save_to_path(&self, path: &Path) -> Result<()> {
+        self.save_to_path_with_writer(path, atomic_write)
+    }
+
+    fn save_to_path_with_writer<W>(&self, path: &Path, write_atomic: W) -> Result<()>
+    where
+        W: Fn(&Path, &[u8]) -> std::io::Result<()>,
+    {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create config dir: {}", parent.display()))?;
@@ -190,11 +203,22 @@ impl StateManager {
 
         let json = serde_json::to_string_pretty(self).context("Failed to serialize state")?;
 
-        fs::write(&path, json)
-            .with_context(|| format!("Failed to write state file: {}", path.display()))?;
+        if path.exists() {
+            let previous = fs::read(path)
+                .with_context(|| format!("Failed to read state file: {}", path.display()))?;
+            let backup_path = Self::backup_path(path);
+            write_atomic(&backup_path, &previous).with_context(|| {
+                format!("Failed to write state backup: {}", backup_path.display())
+            })?;
+        }
 
-        crate::locks::release(lock);
+        write_atomic(path, json.as_bytes())
+            .with_context(|| format!("Failed to write state file: {}", path.display()))?;
         Ok(())
+    }
+
+    fn backup_path(path: &Path) -> PathBuf {
+        path.with_file_name("state.json.bak")
     }
 
     // ========================================================================
@@ -350,6 +374,36 @@ impl StateManager {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_state_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("aicx-state-{label}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("state.json")
+    }
+
+    fn cleanup_state_path(path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    fn ts(seconds: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(seconds, 0).single().unwrap()
+    }
+
+    fn state_with_marker(source: &str, watermark_seconds: i64, project_hash: u64) -> StateManager {
+        let mut state = StateManager::default();
+        state.update_watermark(source, ts(watermark_seconds));
+        state.mark_seen("project", project_hash);
+        state
+    }
 
     #[test]
     fn test_default_state_is_empty() {
@@ -479,6 +533,82 @@ mod tests {
         assert_eq!(state.runs.len(), 1);
         assert_eq!(state.runs[0].entries_added, 42);
         assert_eq!(state.runs[0].sources, vec!["claude:Proj", "codex:global"]);
+    }
+
+    #[test]
+    fn test_save_uses_atomic_write() {
+        let path = unique_state_path("atomic-write");
+        let old = state_with_marker("claude:test", 10, 101);
+        old.save_to_path(&path).unwrap();
+        let old_contents = fs::read(&path).unwrap();
+
+        let new = state_with_marker("claude:test", 20, 202);
+        let target_path = path.clone();
+        let err = new
+            .save_to_path_with_writer(&path, move |target, content| {
+                if target == target_path.as_path() {
+                    return Err(std::io::Error::other("mock atomic_write failure"));
+                }
+                crate::store::atomic_write::atomic_write(target, content)
+            })
+            .expect_err("mocked final atomic write should fail");
+
+        assert!(err.to_string().contains("Failed to write state file"));
+        assert_eq!(fs::read(&path).unwrap(), old_contents);
+        let loaded = StateManager::load_from_path(&path).unwrap();
+        assert_eq!(loaded.get_watermark("claude:test"), Some(ts(10)));
+        assert!(!loaded.is_new("project", 101));
+
+        cleanup_state_path(&path);
+    }
+
+    #[test]
+    fn test_load_malformed_returns_error_not_default() {
+        let path = unique_state_path("malformed");
+        fs::write(&path, b"{ this is not json").unwrap();
+
+        let err = StateManager::load_from_path(&path)
+            .expect_err("malformed state without backup must not default");
+
+        assert!(err.to_string().contains("state.json corrupted"));
+        cleanup_state_path(&path);
+    }
+
+    #[test]
+    fn test_load_recovers_from_backup_when_main_corrupt() {
+        let path = unique_state_path("backup-recovery");
+        let backup_path = StateManager::backup_path(&path);
+        let backup_state = state_with_marker("claude:test", 20, 202);
+        fs::write(&path, b"{ this is not json").unwrap();
+        fs::write(
+            &backup_path,
+            serde_json::to_string_pretty(&backup_state).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = StateManager::load_from_path(&path).unwrap();
+
+        assert_eq!(loaded.get_watermark("claude:test"), Some(ts(20)));
+        assert!(!loaded.is_new("project", 202));
+        cleanup_state_path(&path);
+    }
+
+    #[test]
+    fn test_save_creates_backup_before_overwrite() {
+        let path = unique_state_path("backup-overwrite");
+        let backup_path = StateManager::backup_path(&path);
+        let old = state_with_marker("claude:test", 10, 101);
+        old.save_to_path(&path).unwrap();
+        let old_contents = fs::read_to_string(&path).unwrap();
+
+        let new = state_with_marker("claude:test", 20, 202);
+        new.save_to_path(&path).unwrap();
+
+        assert_eq!(fs::read_to_string(&backup_path).unwrap(), old_contents);
+        let loaded = StateManager::load_from_path(&path).unwrap();
+        assert_eq!(loaded.get_watermark("claude:test"), Some(ts(20)));
+        assert!(!loaded.is_new("project", 202));
+        cleanup_state_path(&path);
     }
 
     #[test]

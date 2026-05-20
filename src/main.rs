@@ -3338,8 +3338,12 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         emit,
     } = params;
 
+    // Hold the state lock across the full read-modify-write cycle so two
+    // concurrent runs cannot clobber each other's watermarks or seen hashes.
+    let _state_guard = aicx::locks::acquire_exclusive(aicx::locks::state_lock_path()?)?;
+
     // Load state for incremental/dedup
-    let mut state = StateManager::load();
+    let mut state = StateManager::load()?;
     let project_name = if project.is_empty() {
         "_global".to_string()
     } else {
@@ -3737,7 +3741,11 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
 
     let agents = resolve_store_agents(agent.as_deref())?;
 
-    let mut state = StateManager::load();
+    // Hold the state lock across the full read-modify-write cycle so two
+    // concurrent store runs cannot clobber each other's state.
+    let _state_guard = aicx::locks::acquire_exclusive(aicx::locks::state_lock_path()?)?;
+
+    let mut state = StateManager::load()?;
     let source_key = extraction_source_key(&agents, &project);
     let source_aliases = extraction_source_key_aliases(&agents, &project);
     state.migrate_watermark_aliases(&source_key, &source_aliases);
@@ -5267,7 +5275,8 @@ fn print_refs_summary(files: &[store::StoredContextFile]) -> Result<()> {
 
 /// Manage dedup state.
 fn run_state(reset: bool, project: Option<String>, info: bool) -> Result<()> {
-    let mut state = StateManager::load();
+    let _state_guard = aicx::locks::acquire_exclusive(aicx::locks::state_lock_path()?)?;
+    let mut state = StateManager::load()?;
 
     if info {
         eprintln!("=== State Info ===");

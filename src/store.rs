@@ -21,7 +21,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-mod atomic_write;
+pub(crate) mod atomic_write;
 use atomic_write::atomic_write;
 
 use crate::chunker::{self, ChunkerConfig};
