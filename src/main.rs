@@ -2261,21 +2261,6 @@ struct ExtractFileOptions {
     conversation: bool,
 }
 
-/// Convert a lookback period (in hours) to a UTC cutoff timestamp.
-///
-/// Clamps the input to `[1, i32::MAX]` hours (~245k years — astronomical
-/// upper bound that comfortably fits chrono's internal `TimeDelta` range
-/// and stays well below the `i64`/`u64` overflow boundary). Without these
-/// guards, casting a very large `u64` with `as i64` would silently wrap
-/// to a negative value and place the cutoff in the future.
-fn cutoff_for_hours(hours: u64) -> DateTime<Utc> {
-    const MAX_SAFE_HOURS: i64 = i32::MAX as i64;
-    let hours_i64 = i64::try_from(hours)
-        .unwrap_or(MAX_SAFE_HOURS)
-        .clamp(1, MAX_SAFE_HOURS);
-    Utc::now() - chrono::Duration::hours(hours_i64)
-}
-
 fn extract_input_format_label(format: ExtractInputFormat) -> &'static str {
     match format {
         ExtractInputFormat::Claude => "claude",
@@ -2404,7 +2389,7 @@ fn run_conversations_batch(options: ConversationsBatchOptions) -> Result<()> {
         anyhow::bail!("conversations v1 supports --agent claude only");
     }
 
-    let cutoff = cutoff_for_hours(options.hours);
+    let cutoff = lookback_cutoff(options.hours);
     let config = ExtractionConfig {
         project_filter: options.project_filter.clone(),
         cutoff,
@@ -3288,13 +3273,24 @@ fn all_time_cutoff() -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(0, 0).expect("Unix epoch timestamp is valid")
 }
 
+/// Convert a lookback window (in hours) to a UTC cutoff timestamp.
+///
+/// Canonical time-window helper for every CLI/MCP path that asks "what is the
+/// cutoff for `--hours N`?". One function, one set of semantics.
+///
+/// - `hours == 0` → [`all_time_cutoff`] (operator convention: 0 means all time).
+/// - `hours > 0`  → `Utc::now() - hours`, with the hour count clamped to
+///   `[1, i32::MAX]` (~245k years) so a wildly large `u64` cannot silently wrap
+///   `as i64` to a negative value and place the cutoff in the future.
 fn lookback_cutoff(hours: u64) -> DateTime<Utc> {
     if hours == 0 {
-        all_time_cutoff()
-    } else {
-        let bounded_hours = hours.min(i64::MAX as u64) as i64;
-        Utc::now() - chrono::Duration::hours(bounded_hours)
+        return all_time_cutoff();
     }
+    const MAX_SAFE_HOURS: i64 = i32::MAX as i64;
+    let hours_i64 = i64::try_from(hours)
+        .unwrap_or(MAX_SAFE_HOURS)
+        .clamp(1, MAX_SAFE_HOURS);
+    Utc::now() - chrono::Duration::hours(hours_i64)
 }
 
 fn lookback_label(hours: u64) -> String {
@@ -4285,7 +4281,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
             })
             .collect()
     } else if hours > 0 {
-        let cutoff = cutoff_for_hours(hours);
+        let cutoff = lookback_cutoff(hours);
         let cutoff_date = cutoff.format("%Y-%m-%d").to_string();
         results
             .into_iter()
@@ -5707,23 +5703,19 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn cutoff_for_hours_clamps_zero_to_at_least_one_hour() {
-        let before = Utc::now();
-        let cutoff = cutoff_for_hours(0);
-        let after = Utc::now();
-        // With clamp to 1h, cutoff must sit ~1h before now (allow ±5s slack).
-        let lower = before - chrono::Duration::hours(1) - chrono::Duration::seconds(5);
-        let upper = after - chrono::Duration::hours(1) + chrono::Duration::seconds(5);
-        assert!(
-            cutoff >= lower && cutoff <= upper,
-            "cutoff out of range: {cutoff}"
+    fn lookback_cutoff_zero_returns_all_time() {
+        let cutoff = lookback_cutoff(0);
+        assert_eq!(
+            cutoff,
+            all_time_cutoff(),
+            "hours=0 must collapse to the Unix-epoch all-time sentinel"
         );
     }
 
     #[test]
-    fn cutoff_for_hours_handles_normal_range() {
+    fn lookback_cutoff_handles_normal_range() {
         let before = Utc::now();
-        let cutoff = cutoff_for_hours(8);
+        let cutoff = lookback_cutoff(8);
         let after = Utc::now();
         let lower = before - chrono::Duration::hours(8) - chrono::Duration::seconds(5);
         let upper = after - chrono::Duration::hours(8) + chrono::Duration::seconds(5);
@@ -5734,12 +5726,12 @@ mod tests {
     }
 
     #[test]
-    fn cutoff_for_hours_avoids_u64_to_i64_overflow() {
-        // Without `i64::try_from`, casting `u64::MAX as i64` wraps to -1 and
+    fn lookback_cutoff_avoids_u64_to_i64_overflow() {
+        // Without the `i32::MAX` clamp, casting `u64::MAX as i64` wraps to -1 and
         // places the cutoff one hour in the future. Verify the clamp keeps it
-        // strictly in the past.
+        // strictly in the past for the entire `u64` domain.
         let now = Utc::now();
-        let cutoff = cutoff_for_hours(u64::MAX);
+        let cutoff = lookback_cutoff(u64::MAX);
         assert!(
             cutoff < now,
             "cutoff must not be in the future: {cutoff} vs now {now}"

@@ -479,8 +479,9 @@ pub fn normalize_query(text: &str) -> String {
 /// These create feedback loops: search → log → extract → search matches own query.
 /// Retired MCP tool names stay here so historical traces remain filterable.
 const SELF_ECHO_PATTERNS: &[&str] = &[
-    // MCP tool calls
+    // MCP tool calls (current + retired names so historical traces remain filterable)
     "aicx_search",
+    "aicx_read",
     "aicx_rank",
     "aicx_refs",
     "aicx_store",
