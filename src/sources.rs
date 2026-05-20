@@ -13,11 +13,11 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -40,6 +40,13 @@ const OPERATOR_MD_RECENT_DAYS: i64 = 30;
 const UNPROTECTED_SOURCE_WARNING: &str = "unprotected source material; run `aicx sources protect --root <path> --backend git-local --apply` to opt in";
 const EXACT_SHORT_DUP_MAX_CHARS: usize = 1000;
 const EXACT_SHORT_DUP_WINDOW_MS: i64 = 2_000;
+const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug)]
+struct LimitedLine {
+    line: String,
+    exceeded: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct ConversationProjection {
@@ -148,6 +155,77 @@ fn drop_exact_short_user_duplicates(messages: Vec<ConversationMessage>) -> Conve
         messages: deduped,
         exact_short_duplicates_dropped,
     }
+}
+
+fn read_line_limited<R: BufRead>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> io::Result<Option<LimitedLine>> {
+    let mut buf = Vec::new();
+    let read = {
+        let mut limited = reader.take(max_bytes.saturating_add(1) as u64);
+        limited.read_until(b'\n', &mut buf)?
+    };
+    if read == 0 {
+        return Ok(None);
+    }
+
+    let exceeded = buf.len() > max_bytes;
+    if exceeded {
+        let ended_at_newline = buf.last().copied() == Some(b'\n');
+        buf.truncate(max_bytes);
+        if !ended_at_newline {
+            drain_until_newline(reader)?;
+        }
+    }
+
+    let line =
+        String::from_utf8(buf).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    Ok(Some(LimitedLine { line, exceeded }))
+}
+
+fn drain_until_newline<R: BufRead>(reader: &mut R) -> io::Result<()> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        let consume = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |idx| idx + 1);
+        let ended_at_newline = available.get(consume.saturating_sub(1)) == Some(&b'\n');
+        reader.consume(consume);
+        if ended_at_newline {
+            return Ok(());
+        }
+    }
+}
+
+fn observe_oversized_line(count: &mut usize, samples: &mut Vec<String>, line_number: usize) {
+    *count += 1;
+    if samples.len() < 5 {
+        samples.push(format!("line {line_number}"));
+    }
+}
+
+fn parse_rfc3339_or_naive_utc(raw: &str) -> Result<DateTime<Utc>, chrono::ParseError> {
+    if let Ok(timestamp) = DateTime::parse_from_rfc3339(raw) {
+        return Ok(timestamp.with_timezone(&Utc));
+    }
+
+    NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f"))
+        .map(|timestamp| DateTime::<Utc>::from_naive_utc_and_offset(timestamp, Utc))
+}
+
+fn short_path_hash(path: &Path) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}").chars().take(12).collect::<String>()
 }
 
 fn classify_conversation_message(message: &str) -> (MessageKind, Option<CollapseStubKind>) {
@@ -440,6 +518,7 @@ fn frame_kind_from_role(role: &str) -> Option<FrameKind> {
         "assistant" | "agent" => Some(FrameKind::AgentReply),
         "reasoning" | "thinking" => Some(FrameKind::InternalThought),
         "tool" | "tool_call" | "tool_result" | "function_call" => Some(FrameKind::ToolCall),
+        "system" | "info" | "error" | "notification" | "system_note" => Some(FrameKind::SystemNote),
         _ => None,
     }
 }
@@ -460,6 +539,7 @@ fn role_for_frame_kind(frame_kind: FrameKind) -> &'static str {
         FrameKind::AgentReply => "assistant",
         FrameKind::InternalThought => "reasoning",
         FrameKind::ToolCall => "tool",
+        FrameKind::SystemNote => "system",
     }
 }
 
@@ -613,11 +693,11 @@ fn extract_claude_classified_blocks(
 
 fn extract_claude_line_entries(
     entry: ClaudeEntry,
-    default_session_id: &str,
+    session_id: &str,
     config: &ExtractionConfig,
 ) -> Vec<TimelineEntry> {
     let timestamp = match entry.timestamp.as_deref() {
-        Some(ts) => match DateTime::parse_from_rfc3339(ts) {
+        Some(ts) => match parse_rfc3339_or_naive_utc(ts) {
             Ok(dt) => dt.with_timezone(&Utc),
             Err(_) => return Vec::new(),
         },
@@ -628,9 +708,6 @@ fn extract_claude_line_entries(
         return Vec::new();
     }
 
-    let session_id = entry
-        .session_id
-        .unwrap_or_else(|| default_session_id.to_string());
     let mut entries = Vec::new();
     let fallback_role = if entry.entry_type == "tool_use" || entry.entry_type == "tool_result" {
         role_for_frame_kind(FrameKind::ToolCall)
@@ -647,7 +724,7 @@ fn extract_claude_line_entries(
             entries.push(build_timeline_entry(
                 timestamp,
                 "claude",
-                &session_id,
+                session_id,
                 &block.role,
                 block.message,
                 TimelineEntryMeta {
@@ -674,7 +751,7 @@ fn extract_claude_line_entries(
     entries.push(build_timeline_entry(
         timestamp,
         "claude",
-        &session_id,
+        session_id,
         fallback_role,
         message,
         TimelineEntryMeta {
@@ -684,6 +761,47 @@ fn extract_claude_line_entries(
         },
     ));
     entries
+}
+
+fn select_claude_session_id(
+    entries: &[ClaudeEntry],
+    fallback: &str,
+    warnings: &mut Vec<ClaudeSessionWarning>,
+) -> String {
+    let mut first: Option<String> = None;
+    let mut ignored = Vec::new();
+    for id in entries
+        .iter()
+        .filter_map(|entry| entry.session_id.as_deref())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        if let Some(existing) = &first {
+            if existing != id && !ignored.iter().any(|seen| seen == id) {
+                ignored.push(id.to_string());
+            }
+        } else {
+            first = Some(id.to_string());
+        }
+    }
+
+    match first {
+        Some(first) => {
+            if !ignored.is_empty() {
+                warnings.push(ClaudeSessionWarning::SessionIdDrift {
+                    first: first.clone(),
+                    ignored,
+                });
+            }
+            first
+        }
+        None => {
+            warnings.push(ClaudeSessionWarning::MissingSessionId {
+                fallback: fallback.to_string(),
+            });
+            fallback.to_string()
+        }
+    }
 }
 
 fn render_gemini_message_content(message: &GeminiMessage) -> Option<String> {
@@ -841,33 +959,87 @@ fn infer_gemini_project_hint_from_session_path(path: &Path) -> Option<String> {
     normalize_project_hint(&project)
 }
 
-/// Check if any project filter matches the given path by **word-boundary** equality.
+/// Check if any project filter matches the given path by strict path segment.
 ///
-/// Path is split into "words" by `/`, `\`, `-`, `_`, `.`.
-/// Filter is split into words by `-`, `_`, `.`.
-/// A filter matches when ALL its words appear in the path words (case-insensitive).
-/// Multiple filters compose with ANY semantics.
-///
-/// This replaces the previous lowercase-substring match which produced false
-/// positives like `--project test` matching `/tmp/fastest-project`.
+/// Mirrors store filter forms without substring matching:
+/// - `owner/repo` => adjacent path segments.
+/// - `owner/` => exact owner segment.
+/// - `/repo` => exact repo segment.
+/// - `name` => exact path segment.
 fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool {
     if filters.is_empty() {
         return true;
     }
-    let cwd_lower = cwd.to_lowercase();
-    let path_words: Vec<&str> = cwd_lower
-        .split(['/', '\\', '-', '_', '.'])
-        .filter(|s| !s.is_empty())
+    let path_segments: Vec<String> = cwd
+        .split(['/', '\\'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.to_ascii_lowercase())
         .collect();
-    if path_words.is_empty() {
+    if path_segments.is_empty() {
         return false;
     }
     filters.iter().any(|filter| {
-        let filter_lower = filter.to_lowercase();
-        filter_lower
-            .split(['-', '_', '.'])
-            .filter(|s| !s.is_empty())
-            .all(|fw| path_words.contains(&fw))
+        let filter = filter.trim().to_ascii_lowercase();
+        if filter.is_empty() {
+            return false;
+        }
+
+        if let Some(repo_only) = filter.strip_prefix('/') {
+            return !repo_only.is_empty()
+                && !repo_only.contains('/')
+                && path_segments.iter().any(|segment| segment == repo_only);
+        }
+
+        if let Some(owner_only) = filter.strip_suffix('/') {
+            return !owner_only.is_empty()
+                && !owner_only.contains('/')
+                && path_segments.iter().any(|segment| segment == owner_only);
+        }
+
+        if filter.contains('/') {
+            let mut parts = filter.split('/');
+            let Some(owner) = parts.next().filter(|part| !part.is_empty()) else {
+                return false;
+            };
+            let Some(repo) = parts.next().filter(|part| !part.is_empty()) else {
+                return false;
+            };
+            if parts.next().is_some() {
+                return false;
+            }
+            return path_segments
+                .windows(2)
+                .any(|pair| pair[0] == owner && pair[1] == repo);
+        }
+
+        path_segments.iter().any(|segment| segment == &filter)
+    })
+}
+
+fn claude_project_dir_matches_filter(dir_name: &str, filters: &[String]) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    let decoded = decode_claude_project_path(dir_name);
+    let dir_lower = dir_name.to_ascii_lowercase();
+
+    filters.iter().any(|filter| {
+        let filter = filter.trim();
+        if filter.is_empty() {
+            return false;
+        }
+        let filter_lower = filter.to_ascii_lowercase();
+        if filter.contains('/') {
+            project_filter_matches_path(&decoded, &[filter.to_string()])
+        } else {
+            decoded
+                .rsplit('/')
+                .next()
+                .is_some_and(|segment| segment.eq_ignore_ascii_case(filter))
+                || dir_lower == filter_lower
+                || dir_lower.ends_with(&format!("-{filter_lower}"))
+        }
     })
 }
 
@@ -1007,6 +1179,133 @@ struct GeminiAntigravityRecovery {
     mode: GeminiAntigravityRecoveryMode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaudeSessionWarning {
+    MissingSessionId { fallback: String },
+    SessionIdDrift { first: String, ignored: Vec<String> },
+    UnparsableTimestamp { count: usize, samples: Vec<String> },
+    InvalidEpochMillis { count: usize, samples: Vec<String> },
+    OversizedLine { count: usize, samples: Vec<String> },
+}
+
+impl ClaudeSessionWarning {
+    fn describe(&self, path: &Path) -> String {
+        match self {
+            ClaudeSessionWarning::MissingSessionId { fallback } => format!(
+                "Claude session warning: {} has no non-empty sessionId; using `{}` fallback",
+                path.display(),
+                fallback
+            ),
+            ClaudeSessionWarning::SessionIdDrift { first, ignored } => format!(
+                "Claude session warning: {} has multiple sessionId values; using `{}` and ignoring {}",
+                path.display(),
+                first,
+                ignored.join(", ")
+            ),
+            ClaudeSessionWarning::UnparsableTimestamp { count, samples } => format!(
+                "Claude session warning: {} has {} unparsable timestamp(s); frames dropped. Sample(s): {}",
+                path.display(),
+                count,
+                samples.join(", ")
+            ),
+            ClaudeSessionWarning::InvalidEpochMillis { count, samples } => format!(
+                "Claude history warning: {} has {} invalid epoch millisecond timestamp(s); frames dropped. Sample(s): {}",
+                path.display(),
+                count,
+                samples.join(", ")
+            ),
+            ClaudeSessionWarning::OversizedLine { count, samples } => format!(
+                "Claude session warning: {} skipped {} oversized JSONL line(s) over {} bytes. Sample(s): {}",
+                path.display(),
+                count,
+                MAX_LINE_BYTES,
+                samples.join(", ")
+            ),
+        }
+    }
+}
+
+fn emit_claude_session_warnings(path: &Path, warnings: &[ClaudeSessionWarning]) {
+    for warning in warnings {
+        eprintln!("{}", warning.describe(path));
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GeminiSessionWarning {
+    MissingSessionId { fallback: String },
+    SessionIdDrift { first: String, ignored: Vec<String> },
+    UnparsableTimestamp { count: usize, samples: Vec<String> },
+    UnknownMsgType { count: usize, samples: Vec<String> },
+}
+
+impl GeminiSessionWarning {
+    fn describe(&self, path: &Path) -> String {
+        match self {
+            GeminiSessionWarning::MissingSessionId { fallback } => format!(
+                "Gemini session warning: {} has no non-empty sessionId; using `{}` fallback",
+                path.display(),
+                fallback
+            ),
+            GeminiSessionWarning::SessionIdDrift { first, ignored } => format!(
+                "Gemini session warning: {} has multiple sessionId values; using `{}` and ignoring {}",
+                path.display(),
+                first,
+                ignored.join(", ")
+            ),
+            GeminiSessionWarning::UnparsableTimestamp { count, samples } => format!(
+                "Gemini session warning: {} has {} unparsable timestamp(s); frames dropped or fell back to parent timestamp. Sample(s): {}",
+                path.display(),
+                count,
+                samples.join(", ")
+            ),
+            GeminiSessionWarning::UnknownMsgType { count, samples } => format!(
+                "Gemini session warning: {} encountered {} message(s) with unrecognized type/role; preserved as system_note. Sample(s): {}",
+                path.display(),
+                count,
+                samples.join(", ")
+            ),
+        }
+    }
+}
+
+fn emit_gemini_session_warnings(path: &Path, warnings: &[GeminiSessionWarning]) {
+    for warning in warnings {
+        eprintln!("{}", warning.describe(path));
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JunieSessionWarning {
+    JunieFallbackId { fallback: String },
+    OversizedLine { count: usize, samples: Vec<String> },
+}
+
+impl JunieSessionWarning {
+    fn describe(&self, path: &Path) -> String {
+        match self {
+            JunieSessionWarning::JunieFallbackId { fallback } => format!(
+                "Junie session warning: {} has no session-* ancestor; using `{}` fallback",
+                path.display(),
+                fallback
+            ),
+            JunieSessionWarning::OversizedLine { count, samples } => format!(
+                "Junie session warning: {} skipped {} oversized JSONL line(s) over {} bytes. Sample(s): {}",
+                path.display(),
+                count,
+                MAX_LINE_BYTES,
+                samples.join(", ")
+            ),
+        }
+    }
+}
+
+fn emit_junie_session_warnings(path: &Path, warnings: &[JunieSessionWarning]) {
+    for warning in warnings {
+        eprintln!("{}", warning.describe(path));
+    }
+}
+
 // ============================================================================
 // Claude Code extractor
 // ============================================================================
@@ -1037,17 +1336,7 @@ pub fn extract_claude(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
         }
 
         // Determine if directory name inherently matches the filter
-        let dir_matches = if config.project_filter.is_empty() {
-            true
-        } else {
-            let decoded = decode_claude_project_path(&dir_name);
-            let decoded_lower = decoded.to_lowercase();
-            let dir_lower = dir_name.to_lowercase();
-            config.project_filter.iter().any(|f| {
-                let fl = f.to_lowercase();
-                decoded_lower.contains(&fl) || dir_lower.contains(&fl)
-            })
-        };
+        let dir_matches = claude_project_dir_matches_filter(&dir_name, &config.project_filter);
 
         for file_entry in fs::read_dir(&project_dir)? {
             let file_entry = file_entry?;
@@ -1094,12 +1383,33 @@ fn parse_claude_jsonl(
     session_id: &str,
     config: &ExtractionConfig,
 ) -> Result<Vec<TimelineEntry>> {
-    let file = sanitize::open_file_validated(path)?;
-    let reader = BufReader::new(file);
-    let mut entries = Vec::new();
+    let (entries, warnings) = parse_claude_jsonl_with_diagnostics(path, session_id, config)?;
+    emit_claude_session_warnings(path, &warnings);
+    Ok(entries)
+}
 
-    for line in reader.lines() {
-        let line = line?;
+fn parse_claude_jsonl_with_diagnostics(
+    path: &std::path::Path,
+    default_session_id: &str,
+    config: &ExtractionConfig,
+) -> Result<(Vec<TimelineEntry>, Vec<ClaudeSessionWarning>)> {
+    let file = sanitize::open_file_validated(path)?;
+    let mut reader = BufReader::new(file);
+    let mut raw_entries = Vec::new();
+    let mut warnings = Vec::new();
+    let mut oversized_count = 0usize;
+    let mut oversized_samples = Vec::new();
+    let mut unparsable_ts_count = 0usize;
+    let mut unparsable_ts_samples = Vec::new();
+    let mut line_number = 0usize;
+
+    while let Some(limited) = read_line_limited(&mut reader, MAX_LINE_BYTES)? {
+        line_number += 1;
+        if limited.exceeded {
+            observe_oversized_line(&mut oversized_count, &mut oversized_samples, line_number);
+            continue;
+        }
+        let line = limited.line;
         if line.trim().is_empty() {
             continue;
         }
@@ -1108,6 +1418,21 @@ fn parse_claude_jsonl(
             Ok(e) => e,
             Err(_) => continue,
         };
+        if entry
+            .timestamp
+            .as_deref()
+            .is_none_or(|ts| parse_rfc3339_or_naive_utc(ts).is_err())
+        {
+            unparsable_ts_count += 1;
+            if unparsable_ts_samples.len() < 5 {
+                unparsable_ts_samples.push(
+                    entry
+                        .timestamp
+                        .clone()
+                        .unwrap_or_else(|| format!("line {line_number}: <missing>")),
+                );
+            }
+        }
 
         if !matches!(
             entry.entry_type.as_str(),
@@ -1115,10 +1440,34 @@ fn parse_claude_jsonl(
         ) {
             continue;
         }
-        entries.extend(extract_claude_line_entries(entry, session_id, config));
+        raw_entries.push(entry);
     }
 
-    Ok(entries)
+    if oversized_count > 0 {
+        warnings.push(ClaudeSessionWarning::OversizedLine {
+            count: oversized_count,
+            samples: oversized_samples,
+        });
+    }
+    if unparsable_ts_count > 0 {
+        warnings.push(ClaudeSessionWarning::UnparsableTimestamp {
+            count: unparsable_ts_count,
+            samples: unparsable_ts_samples,
+        });
+    }
+
+    let effective_session_id =
+        select_claude_session_id(&raw_entries, default_session_id, &mut warnings);
+    let mut entries = Vec::new();
+    for entry in raw_entries {
+        entries.extend(extract_claude_line_entries(
+            entry,
+            &effective_session_id,
+            config,
+        ));
+    }
+
+    Ok((entries, warnings))
 }
 
 /// Extract timeline entries from a single Claude JSONL-like file by path.
@@ -1130,38 +1479,14 @@ fn parse_claude_jsonl(
 /// `~/.claude/projects/**` nor to have a `.jsonl` extension (Claude task outputs
 /// often end with `.output` but are still JSONL).
 pub fn extract_claude_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let file = sanitize::open_file_validated(path)?;
-    let reader = BufReader::new(file);
-    let mut entries = Vec::new();
-
     let default_session_id = path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let entry: ClaudeEntry = match serde_json::from_str(&line) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        if !matches!(
-            entry.entry_type.as_str(),
-            "user" | "assistant" | "tool_use" | "tool_result"
-        ) {
-            continue;
-        }
-        entries.extend(extract_claude_line_entries(
-            entry,
-            &default_session_id,
-            config,
-        ));
-    }
+    let (mut entries, warnings) =
+        parse_claude_jsonl_with_diagnostics(path, &default_session_id, config)?;
+    emit_claude_session_warnings(path, &warnings);
 
     entries.sort_by_key(|a| a.timestamp);
     Ok(entries)
@@ -1174,121 +1499,74 @@ pub fn extract_claude_file(path: &Path, config: &ExtractionConfig) -> Result<Vec
 /// - Codex session format (`~/.codex/sessions/**/**/*.jsonl`) — `CodexSessionEvent` per line.
 pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     let file = sanitize::open_file_validated(path)?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
+    let mut history_records = Vec::new();
+    let mut session_events = Vec::new();
+    let mut warnings = Vec::new();
+    let mut first_non_empty: Option<String> = None;
+    let mut oversized_count = 0usize;
+    let mut oversized_samples = Vec::new();
+    let mut line_number = 0usize;
 
-    // Detect file format from the first non-empty line.
-    let mut first_line: Option<String> = None;
-    for line in reader.lines() {
-        let line = line?;
-        if !line.trim().is_empty() {
-            first_line = Some(line);
-            break;
+    while let Some(limited) = read_line_limited(&mut reader, MAX_LINE_BYTES)? {
+        line_number += 1;
+        if limited.exceeded {
+            observe_oversized_line(&mut oversized_count, &mut oversized_samples, line_number);
+            continue;
+        }
+        let line = limited.line;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if first_non_empty.is_none() {
+            first_non_empty = Some(line.clone());
+        }
+        if let Ok(entry) = serde_json::from_str::<CodexEntry>(&line) {
+            history_records.push(entry);
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<CodexSessionEvent>(&line) {
+            session_events.push(event);
         }
     }
 
-    let Some(first_line) = first_line else {
+    if oversized_count > 0 {
+        warnings.push(CodexSessionWarning::OversizedLine {
+            count: oversized_count,
+            samples: oversized_samples,
+        });
+    }
+
+    let Some(first_line) = first_non_empty else {
+        emit_codex_session_warnings(path, &warnings);
         return Ok(vec![]);
     };
 
-    // History file: parse as CodexEntry (per line).
-    if serde_json::from_str::<CodexEntry>(&first_line).is_ok() {
-        let file = sanitize::open_file_validated(path)?;
-        let reader = BufReader::new(file);
-
-        // First pass: group by session_id (same behavior as extract_codex()).
-        let mut sessions: HashMap<String, Vec<CodexEntry>> = HashMap::new();
-
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            let entry: CodexEntry = match serde_json::from_str(&line) {
-                Ok(e) => e,
-                Err(_) => continue,
+    if !history_records.is_empty() || !session_events.is_empty() {
+        if !history_records.is_empty() && !session_events.is_empty() {
+            let history_first = serde_json::from_str::<CodexEntry>(&first_line).is_ok();
+            let minority_count = if history_first {
+                session_events.len()
+            } else {
+                history_records.len()
             };
-
-            sessions
-                .entry(entry.session_id.clone())
-                .or_default()
-                .push(entry);
+            warnings.push(CodexSessionWarning::MixedFormat {
+                count: minority_count,
+                samples: vec![if history_first {
+                    "session records after history first line".to_string()
+                } else {
+                    "history records after session first line".to_string()
+                }],
+            });
         }
 
-        // Second pass: determine matching sessions (if filter provided).
-        let matching_sessions: HashSet<String> = if !config.project_filter.is_empty() {
-            sessions
-                .iter()
-                .filter(|(_id, msgs)| {
-                    msgs.iter().any(|m| {
-                        m.cwd
-                            .as_deref()
-                            .is_some_and(|c| project_filter_matches_path(c, &config.project_filter))
-                    })
-                })
-                .map(|(id, _)| id.clone())
-                .collect()
-        } else {
-            sessions.keys().cloned().collect()
-        };
-
-        // Third pass: build timeline entries from matching sessions.
-        let mut entries: Vec<TimelineEntry> = Vec::new();
-
-        for (session_id, msgs) in &sessions {
-            if !matching_sessions.contains(session_id) {
-                continue;
-            }
-
-            for msg in msgs {
-                let timestamp = match Utc.timestamp_opt(msg.ts, 0).single() {
-                    Some(ts) => ts,
-                    None => continue,
-                };
-
-                // Respect cutoff
-                if timestamp < config.cutoff {
-                    continue;
-                }
-
-                // Respect watermark
-                if config.watermark.is_some_and(|wm| timestamp <= wm) {
-                    continue;
-                }
-
-                let role = msg.role.as_deref().unwrap_or("user").to_string();
-                let frame_kind = frame_kind_from_role(&role);
-
-                if !should_keep_entry(frame_kind, config) {
-                    continue;
-                }
-
-                if msg.text.is_empty() {
-                    continue;
-                }
-
-                entries.push(build_timeline_entry(
-                    timestamp,
-                    "codex",
-                    session_id,
-                    &role,
-                    msg.text.clone(),
-                    TimelineEntryMeta {
-                        branch: None,
-                        cwd: msg.cwd.clone(),
-                        frame_kind,
-                    },
-                ));
-            }
+        let mut entries = build_codex_history_entries(&history_records, config, &mut warnings);
+        if !session_events.is_empty() {
+            let (mut session_entries, session_warnings) =
+                parse_codex_session_events_with_diagnostics(path, &session_events, config);
+            warnings.extend(session_warnings);
+            entries.append(&mut session_entries);
         }
-
-        entries.sort_by_key(|a| a.timestamp);
-        return Ok(entries);
-    }
-
-    // Session file: parse as CodexSessionEvent (delegate to existing parser).
-    if serde_json::from_str::<CodexSessionEvent>(&first_line).is_ok() {
-        let (mut entries, warnings) = parse_codex_session_file_with_diagnostics(path, config)?;
         emit_codex_session_warnings(path, &warnings);
         entries.sort_by_key(|a| a.timestamp);
         return Ok(entries);
@@ -1850,9 +2128,7 @@ fn extract_text_from_json_value(value: &serde_json::Value) -> Option<String> {
 
 fn parse_json_timestamp(value: &serde_json::Value) -> Option<DateTime<Utc>> {
     match value {
-        serde_json::Value::String(raw) => DateTime::parse_from_rfc3339(raw)
-            .ok()
-            .map(|timestamp| timestamp.with_timezone(&Utc)),
+        serde_json::Value::String(raw) => parse_rfc3339_or_naive_utc(raw).ok(),
         serde_json::Value::Number(number) => {
             let raw = number.as_i64()?;
             if raw > 10_000_000_000 {
@@ -2149,11 +2425,22 @@ pub fn extract_claude_history(config: &ExtractionConfig) -> Result<Vec<TimelineE
     }
 
     let file = sanitize::open_file_validated(&history_path)?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut entries = Vec::new();
+    let mut warnings = Vec::new();
+    let mut oversized_count = 0usize;
+    let mut oversized_samples = Vec::new();
+    let mut invalid_epoch_count = 0usize;
+    let mut invalid_epoch_samples = Vec::new();
+    let mut line_number = 0usize;
 
-    for line in reader.lines() {
-        let line = line?;
+    while let Some(limited) = read_line_limited(&mut reader, MAX_LINE_BYTES)? {
+        line_number += 1;
+        if limited.exceeded {
+            observe_oversized_line(&mut oversized_count, &mut oversized_samples, line_number);
+            continue;
+        }
+        let line = limited.line;
         if line.trim().is_empty() {
             continue;
         }
@@ -2202,12 +2489,13 @@ pub fn extract_claude_history(config: &ExtractionConfig) -> Result<Vec<TimelineE
             }
         }
 
-        // timestamp is ms epoch
-        let ts_secs = entry.timestamp / 1000;
-        let ts_nanos = ((entry.timestamp % 1000) * 1_000_000) as u32;
-        let timestamp = match Utc.timestamp_opt(ts_secs, ts_nanos).single() {
+        let timestamp = match DateTime::<Utc>::from_timestamp_millis(entry.timestamp) {
             Some(ts) => ts,
-            None => continue,
+            None => {
+                invalid_epoch_count += 1;
+                push_unique_sample(&mut invalid_epoch_samples, entry.timestamp.to_string(), 5);
+                continue;
+            }
         };
 
         if timestamp < config.cutoff {
@@ -2230,6 +2518,20 @@ pub fn extract_claude_history(config: &ExtractionConfig) -> Result<Vec<TimelineE
             },
         ));
     }
+
+    if oversized_count > 0 {
+        warnings.push(ClaudeSessionWarning::OversizedLine {
+            count: oversized_count,
+            samples: oversized_samples,
+        });
+    }
+    if invalid_epoch_count > 0 {
+        warnings.push(ClaudeSessionWarning::InvalidEpochMillis {
+            count: invalid_epoch_count,
+            samples: invalid_epoch_samples,
+        });
+    }
+    emit_claude_session_warnings(&history_path, &warnings);
 
     entries.sort_by_key(|a| a.timestamp);
     Ok(entries)
@@ -2255,13 +2557,21 @@ pub fn extract_codex(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     }
 
     let file = sanitize::open_file_validated(&codex_path)?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
 
-    // First pass: read all entries, group by session
-    let mut sessions: HashMap<String, Vec<CodexEntry>> = HashMap::new();
+    let mut records = Vec::new();
+    let mut warnings = Vec::new();
+    let mut oversized_count = 0usize;
+    let mut oversized_samples = Vec::new();
+    let mut line_number = 0usize;
 
-    for line in reader.lines() {
-        let line = line?;
+    while let Some(limited) = read_line_limited(&mut reader, MAX_LINE_BYTES)? {
+        line_number += 1;
+        if limited.exceeded {
+            observe_oversized_line(&mut oversized_count, &mut oversized_samples, line_number);
+            continue;
+        }
+        let line = limited.line;
         if line.trim().is_empty() {
             continue;
         }
@@ -2271,78 +2581,17 @@ pub fn extract_codex(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
             Err(_) => continue,
         };
 
-        sessions
-            .entry(entry.session_id.clone())
-            .or_default()
-            .push(entry);
+        records.push(entry);
     }
 
-    // Second pass: determine which sessions match the filter
-    let matching_sessions: HashSet<String> = if !config.project_filter.is_empty() {
-        sessions
-            .iter()
-            .filter(|(_id, msgs)| {
-                msgs.iter().any(|m| {
-                    m.cwd
-                        .as_deref()
-                        .is_some_and(|c| project_filter_matches_path(c, &config.project_filter))
-                })
-            })
-            .map(|(id, _)| id.clone())
-            .collect()
-    } else {
-        sessions.keys().cloned().collect()
-    };
-
-    // Third pass: build timeline entries from matching sessions
-    let mut entries: Vec<TimelineEntry> = Vec::new();
-
-    for (session_id, msgs) in &sessions {
-        if !matching_sessions.contains(session_id) {
-            continue;
-        }
-
-        for msg in msgs {
-            let timestamp = match Utc.timestamp_opt(msg.ts, 0).single() {
-                Some(ts) => ts,
-                None => continue,
-            };
-
-            // Respect cutoff
-            if timestamp < config.cutoff {
-                continue;
-            }
-
-            // Respect watermark
-            if config.watermark.is_some_and(|wm| timestamp <= wm) {
-                continue;
-            }
-
-            let role = msg.role.as_deref().unwrap_or("user").to_string();
-
-            // Skip assistant messages if not requested
-            if !config.include_assistant && role == "assistant" {
-                continue;
-            }
-
-            if msg.text.is_empty() {
-                continue;
-            }
-
-            entries.push(build_timeline_entry(
-                timestamp,
-                "codex",
-                session_id,
-                &role,
-                msg.text.clone(),
-                TimelineEntryMeta {
-                    branch: None,
-                    cwd: msg.cwd.clone(),
-                    frame_kind: frame_kind_from_role(&role),
-                },
-            ));
-        }
+    if oversized_count > 0 {
+        warnings.push(CodexSessionWarning::OversizedLine {
+            count: oversized_count,
+            samples: oversized_samples,
+        });
     }
+    let mut entries = build_codex_history_entries(&records, config, &mut warnings);
+    emit_codex_session_warnings(&codex_path, &warnings);
 
     // Merge codex sessions entries
     match extract_codex_sessions(config) {
@@ -2389,6 +2638,14 @@ pub(crate) enum CodexSessionWarning {
         count: usize,
         samples: Vec<String>,
     },
+    MixedFormat {
+        count: usize,
+        samples: Vec<String>,
+    },
+    OversizedLine {
+        count: usize,
+        samples: Vec<String>,
+    },
 }
 
 impl CodexSessionWarning {
@@ -2415,15 +2672,28 @@ impl CodexSessionWarning {
                 filename_stem
             ),
             CodexSessionWarning::UnparsableTimestamp { count, samples } => format!(
-                "Codex session warning: {} has {} unparsable event_msg timestamp(s); frames dropped. Sample(s): {}",
+                "Codex warning: {} has {} unparsable timestamp(s); frames dropped. Sample(s): {}",
                 path.display(),
                 count,
                 samples.join(", ")
             ),
             CodexSessionWarning::UnknownMsgType { count, samples } => format!(
-                "Codex session warning: {} encountered {} event_msg(s) with unrecognized payload.type; frames dropped. Sample type(s): {}",
+                "Codex session warning: {} encountered {} event_msg(s) with unrecognized payload.type; content preserved via fallback. Sample type(s): {}",
                 path.display(),
                 count,
+                samples.join(", ")
+            ),
+            CodexSessionWarning::MixedFormat { count, samples } => format!(
+                "Codex file warning: {} contains mixed history/session JSONL records ({} minority record(s)); content was parsed by both parsers where possible. Sample(s): {}",
+                path.display(),
+                count,
+                samples.join(", ")
+            ),
+            CodexSessionWarning::OversizedLine { count, samples } => format!(
+                "Codex warning: {} skipped {} oversized JSONL line(s) over {} bytes. Sample(s): {}",
+                path.display(),
+                count,
+                MAX_LINE_BYTES,
                 samples.join(", ")
             ),
         }
@@ -2443,6 +2713,8 @@ struct CodexSessionDiagnostics {
     mismatch: usize,
     unparsable_ts: usize,
     unknown_msg_type: usize,
+    mixed_format: usize,
+    oversized_line: usize,
 }
 
 impl CodexSessionDiagnostics {
@@ -2458,6 +2730,12 @@ impl CodexSessionDiagnostics {
                 CodexSessionWarning::UnknownMsgType { count, .. } => {
                     self.unknown_msg_type += count;
                 }
+                CodexSessionWarning::MixedFormat { count, .. } => {
+                    self.mixed_format += count;
+                }
+                CodexSessionWarning::OversizedLine { count, .. } => {
+                    self.oversized_line += count;
+                }
             }
         }
     }
@@ -2468,17 +2746,21 @@ impl CodexSessionDiagnostics {
             && self.mismatch == 0
             && self.unparsable_ts == 0
             && self.unknown_msg_type == 0
+            && self.mixed_format == 0
+            && self.oversized_line == 0
     }
 
     fn emit_summary(&self) {
         if !self.is_empty() {
             eprintln!(
-                "Codex sessions diagnostics: missing={} duplicate={} mismatch={} unparsable_ts={} unknown_msg_type={}",
+                "Codex sessions diagnostics: missing={} duplicate={} mismatch={} unparsable_ts={} unknown_msg_type={} mixed_format={} oversized_line={}",
                 self.missing,
                 self.duplicate,
                 self.mismatch,
                 self.unparsable_ts,
-                self.unknown_msg_type
+                self.unknown_msg_type,
+                self.mixed_format,
+                self.oversized_line
             );
         }
     }
@@ -2508,6 +2790,125 @@ fn uuid_suffix_from_stem(stem: &str) -> Option<&str> {
     let start = stem.len().checked_sub(36)?;
     let suffix = &stem[start..];
     is_uuid_like(suffix).then_some(suffix)
+}
+
+fn push_unique_sample(samples: &mut Vec<String>, sample: String, max: usize) {
+    if samples.len() < max && !samples.iter().any(|existing| existing == &sample) {
+        samples.push(sample);
+    }
+}
+
+fn codex_payload_message(payload: &serde_json::Value) -> String {
+    for key in ["message", "text", "content", "error", "query", "result"] {
+        if let Some(value) = payload.get(key) {
+            if let Some(text) = value.as_str() {
+                if !text.trim().is_empty() {
+                    return text.to_string();
+                }
+            } else if !value.is_null() {
+                return render_json_inline(value);
+            }
+        }
+    }
+    render_json_inline(payload)
+}
+
+fn codex_timestamp_from_epoch_seconds(raw: i64) -> Option<DateTime<Utc>> {
+    Utc.timestamp_opt(raw, 0).single()
+}
+
+fn build_codex_history_entries(
+    records: &[CodexEntry],
+    config: &ExtractionConfig,
+    warnings: &mut Vec<CodexSessionWarning>,
+) -> Vec<TimelineEntry> {
+    let mut sessions: HashMap<String, Vec<&CodexEntry>> = HashMap::new();
+    for entry in records {
+        sessions
+            .entry(entry.session_id.clone())
+            .or_default()
+            .push(entry);
+    }
+
+    let matching_sessions: HashSet<String> = if !config.project_filter.is_empty() {
+        sessions
+            .iter()
+            .filter(|(_id, msgs)| {
+                msgs.iter().any(|m| {
+                    m.cwd
+                        .as_deref()
+                        .is_some_and(|c| project_filter_matches_path(c, &config.project_filter))
+                })
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    } else {
+        sessions.keys().cloned().collect()
+    };
+
+    let mut entries = Vec::new();
+    let mut unparsable_ts_count = 0usize;
+    let mut unparsable_ts_samples = Vec::new();
+
+    for (session_id, msgs) in &sessions {
+        if !matching_sessions.contains(session_id) {
+            continue;
+        }
+
+        for msg in msgs {
+            let timestamp = match codex_timestamp_from_epoch_seconds(msg.ts) {
+                Some(ts) => ts,
+                None => {
+                    unparsable_ts_count += 1;
+                    push_unique_sample(
+                        &mut unparsable_ts_samples,
+                        format!("{}:{}", msg.session_id, msg.ts),
+                        5,
+                    );
+                    continue;
+                }
+            };
+
+            if timestamp < config.cutoff {
+                continue;
+            }
+            if config.watermark.is_some_and(|wm| timestamp <= wm) {
+                continue;
+            }
+
+            let role = msg.role.as_deref().unwrap_or("user").to_string();
+            let frame_kind = frame_kind_from_role(&role);
+            if !should_keep_entry(frame_kind, config) {
+                continue;
+            }
+
+            if msg.text.is_empty() {
+                continue;
+            }
+
+            entries.push(build_timeline_entry(
+                timestamp,
+                "codex",
+                session_id,
+                &role,
+                msg.text.clone(),
+                TimelineEntryMeta {
+                    branch: None,
+                    cwd: msg.cwd.clone(),
+                    frame_kind,
+                },
+            ));
+        }
+    }
+
+    if unparsable_ts_count > 0 {
+        warnings.push(CodexSessionWarning::UnparsableTimestamp {
+            count: unparsable_ts_count,
+            samples: unparsable_ts_samples,
+        });
+    }
+
+    entries
 }
 
 /// Extract timeline entries from Codex session files (`~/.codex/sessions/`).
@@ -2548,11 +2949,20 @@ fn parse_codex_session_file_with_diagnostics(
     config: &ExtractionConfig,
 ) -> Result<(Vec<TimelineEntry>, Vec<CodexSessionWarning>)> {
     let file = sanitize::open_file_validated(path)?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
 
     let mut events: Vec<CodexSessionEvent> = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
+    let mut warnings = Vec::new();
+    let mut oversized_count = 0usize;
+    let mut oversized_samples = Vec::new();
+    let mut line_number = 0usize;
+    while let Some(limited) = read_line_limited(&mut reader, MAX_LINE_BYTES)? {
+        line_number += 1;
+        if limited.exceeded {
+            observe_oversized_line(&mut oversized_count, &mut oversized_samples, line_number);
+            continue;
+        }
+        let line = limited.line;
         if line.trim().is_empty() {
             continue;
         }
@@ -2561,12 +2971,30 @@ fn parse_codex_session_file_with_diagnostics(
         }
     }
 
+    if oversized_count > 0 {
+        warnings.push(CodexSessionWarning::OversizedLine {
+            count: oversized_count,
+            samples: oversized_samples,
+        });
+    }
+
+    let (entries, event_warnings) =
+        parse_codex_session_events_with_diagnostics(path, &events, config);
+    warnings.extend(event_warnings);
+    Ok((entries, warnings))
+}
+
+fn parse_codex_session_events_with_diagnostics(
+    path: &Path,
+    events: &[CodexSessionEvent],
+    config: &ExtractionConfig,
+) -> (Vec<TimelineEntry>, Vec<CodexSessionWarning>) {
     // Extract global session metadata (like session_id) and the initial cwd
     let mut session_id: Option<String> = None;
     let mut initial_cwd: Option<String> = None;
     let mut duplicate_meta_ids: Vec<String> = Vec::new();
 
-    for ev in &events {
+    for ev in events {
         if ev.event_type == "session_meta" {
             if let Some(meta_id) = ev
                 .payload
@@ -2628,7 +3056,7 @@ fn parse_codex_session_file_with_diagnostics(
     let mut unknown_msg_type_count: usize = 0;
     let mut unknown_msg_type_samples: Vec<String> = Vec::new();
 
-    for ev in &events {
+    for ev in events {
         // Update current context per-turn
         if ev.event_type == "turn_context" {
             if let Some(cwd) = ev
@@ -2704,16 +3132,36 @@ fn parse_codex_session_file_with_diagnostics(
                     .unwrap_or_else(|| render_json_inline(&ev.payload)),
                 Some(FrameKind::ToolCall),
             ),
+            "task_started"
+            | "task_complete"
+            | "error"
+            | "notification"
+            | "web_search"
+            | "web_search_complete" => (
+                "system",
+                codex_payload_message(&ev.payload),
+                Some(FrameKind::SystemNote),
+            ),
             other => {
-                if !other.is_empty() {
-                    unknown_msg_type_count += 1;
-                    if unknown_msg_type_samples.len() < 5
-                        && !unknown_msg_type_samples.iter().any(|s| s == other)
-                    {
-                        unknown_msg_type_samples.push(other.to_string());
-                    }
-                }
-                continue;
+                let sample = if other.is_empty() {
+                    "<missing>".to_string()
+                } else {
+                    other.to_string()
+                };
+                unknown_msg_type_count += 1;
+                push_unique_sample(&mut unknown_msg_type_samples, sample, 5);
+
+                let role = ev
+                    .payload
+                    .get("role")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("system");
+                let frame_kind = frame_kind_from_role(role).unwrap_or(FrameKind::SystemNote);
+                (
+                    role_for_frame_kind(frame_kind),
+                    codex_payload_message(&ev.payload),
+                    Some(frame_kind),
+                )
             }
         };
 
@@ -2725,8 +3173,8 @@ fn parse_codex_session_file_with_diagnostics(
             continue;
         }
 
-        let timestamp = match DateTime::parse_from_rfc3339(&ev.timestamp) {
-            Ok(dt) => dt.with_timezone(&Utc),
+        let timestamp = match parse_rfc3339_or_naive_utc(&ev.timestamp) {
+            Ok(dt) => dt,
             Err(_) => {
                 unparsable_ts_count += 1;
                 if unparsable_ts_samples.len() < 3
@@ -2772,7 +3220,7 @@ fn parse_codex_session_file_with_diagnostics(
         });
     }
 
-    Ok((entries, warnings))
+    (entries, warnings)
 }
 
 /// Recursively walk a directory for `*.jsonl` files.
@@ -2862,13 +3310,31 @@ fn parse_gemini_session(
     path: &std::path::Path,
     config: &ExtractionConfig,
 ) -> Result<Vec<TimelineEntry>> {
-    let content = sanitize::read_to_string_validated(path)?;
-    let session = parse_gemini_session_content(path, &content)?;
+    let (entries, warnings) = parse_gemini_session_with_diagnostics(path, config)?;
+    emit_gemini_session_warnings(path, &warnings);
+    Ok(entries)
+}
 
-    let session_id = session
-        .session_id
-        .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()))
-        .unwrap_or_default();
+fn parse_gemini_session_with_diagnostics(
+    path: &std::path::Path,
+    config: &ExtractionConfig,
+) -> Result<(Vec<TimelineEntry>, Vec<GeminiSessionWarning>)> {
+    let content = sanitize::read_to_string_validated(path)?;
+    let (mut session, mut warnings) = parse_gemini_session_content(path, &content)?;
+
+    let session_id = match session.session_id.take() {
+        Some(id) if !id.trim().is_empty() => id,
+        _ => {
+            let fallback = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            warnings.push(GeminiSessionWarning::MissingSessionId {
+                fallback: fallback.clone(),
+            });
+            fallback
+        }
+    };
 
     let path_default_cwd = infer_gemini_project_hint_from_session_path(path);
     let session_default_cwd = path_default_cwd.clone().or_else(|| {
@@ -2896,26 +3362,56 @@ fn parse_gemini_session(
     };
 
     if !session_matches_filter {
-        return Ok(vec![]);
+        return Ok((vec![], vec![]));
     }
 
     let mut entries = Vec::new();
+    let mut unparsable_ts_count: usize = 0;
+    let mut unparsable_ts_samples: Vec<String> = Vec::new();
+    let mut unknown_msg_type_count: usize = 0;
+    let mut unknown_msg_type_samples: Vec<String> = Vec::new();
 
-    for msg in &session.messages {
-        let Some(base_role) = gemini_base_role(msg) else {
-            continue;
+    for (idx, msg) in session.messages.iter().enumerate() {
+        let base_role = match gemini_base_role(msg) {
+            Some(role) => role,
+            None => {
+                unknown_msg_type_count += 1;
+                push_unique_sample(
+                    &mut unknown_msg_type_samples,
+                    msg.msg_type
+                        .as_deref()
+                        .or(msg.role.as_deref())
+                        .unwrap_or("<missing>")
+                        .to_string(),
+                    5,
+                );
+                "system"
+            }
         };
 
         // Parse timestamp (always RFC3339 in Gemini CLI)
-        let timestamp = msg.timestamp.as_ref().and_then(|ts| {
-            DateTime::parse_from_rfc3339(ts)
-                .ok()
-                .map(|dt| dt.with_timezone(&Utc))
-        });
-
-        let timestamp = match timestamp {
-            Some(ts) => ts,
-            None => continue,
+        let timestamp = match msg.timestamp.as_deref() {
+            Some(ts) => match parse_rfc3339_or_naive_utc(ts) {
+                Ok(timestamp) => timestamp,
+                Err(_) => {
+                    unparsable_ts_count += 1;
+                    push_unique_sample(
+                        &mut unparsable_ts_samples,
+                        format!("message {}: {}", idx + 1, ts),
+                        5,
+                    );
+                    continue;
+                }
+            },
+            None => {
+                unparsable_ts_count += 1;
+                push_unique_sample(
+                    &mut unparsable_ts_samples,
+                    format!("message {}: <missing>", idx + 1),
+                    5,
+                );
+                continue;
+            }
         };
 
         // Respect cutoff
@@ -2974,12 +3470,21 @@ fn parse_gemini_session(
         // Extract thoughts as reasoning entries (only when include_assistant)
         if config.include_assistant && !msg.thoughts.is_empty() {
             for thought in &msg.thoughts {
-                let thought_ts = thought
-                    .timestamp
-                    .as_ref()
-                    .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or(timestamp);
+                let thought_ts = match thought.timestamp.as_deref() {
+                    Some(ts) => match parse_rfc3339_or_naive_utc(ts) {
+                        Ok(timestamp) => timestamp,
+                        Err(_) => {
+                            unparsable_ts_count += 1;
+                            push_unique_sample(
+                                &mut unparsable_ts_samples,
+                                format!("thought {}: {}", idx + 1, ts),
+                                5,
+                            );
+                            timestamp
+                        }
+                    },
+                    None => timestamp,
+                };
 
                 let desc = thought.description.as_deref().unwrap_or("");
                 let subj = thought.subject.as_deref().unwrap_or("");
@@ -3011,7 +3516,20 @@ fn parse_gemini_session(
         }
     }
 
-    Ok(entries)
+    if unparsable_ts_count > 0 {
+        warnings.push(GeminiSessionWarning::UnparsableTimestamp {
+            count: unparsable_ts_count,
+            samples: unparsable_ts_samples,
+        });
+    }
+    if unknown_msg_type_count > 0 {
+        warnings.push(GeminiSessionWarning::UnknownMsgType {
+            count: unknown_msg_type_count,
+            samples: unknown_msg_type_samples,
+        });
+    }
+
+    Ok((entries, warnings))
 }
 
 fn is_gemini_session_file(path: &Path) -> bool {
@@ -3020,19 +3538,24 @@ fn is_gemini_session_file(path: &Path) -> bool {
         .is_some_and(|ext| matches!(ext, "json" | "jsonl"))
 }
 
-fn parse_gemini_session_content(path: &Path, content: &str) -> Result<GeminiSession> {
+fn parse_gemini_session_content(
+    path: &Path,
+    content: &str,
+) -> Result<(GeminiSession, Vec<GeminiSessionWarning>)> {
     if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
         parse_gemini_jsonl_session(content)
             .with_context(|| format!("Failed to parse Gemini JSONL session {}", path.display()))
     } else {
         serde_json::from_str(content)
+            .map(|session| (session, Vec::new()))
             .with_context(|| format!("Failed to parse Gemini JSON session {}", path.display()))
     }
 }
 
-fn parse_gemini_jsonl_session(content: &str) -> Result<GeminiSession> {
+fn parse_gemini_jsonl_session(content: &str) -> Result<(GeminiSession, Vec<GeminiSessionWarning>)> {
     let mut session_id = None;
     let mut messages = Vec::new();
+    let mut distinct_session_ids = Vec::new();
 
     for (idx, line) in content.lines().enumerate() {
         let line = line.trim();
@@ -3043,11 +3566,18 @@ fn parse_gemini_jsonl_session(content: &str) -> Result<GeminiSession> {
         let value: serde_json::Value = serde_json::from_str(line)
             .with_context(|| format!("invalid JSONL record at line {}", idx + 1))?;
 
-        if session_id.is_none() {
-            session_id = value
-                .get("sessionId")
-                .and_then(|value| value.as_str())
-                .map(str::to_string);
+        if let Some(candidate) = value
+            .get("sessionId")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            if session_id.is_none() {
+                session_id = Some(candidate.to_string());
+            }
+            if !distinct_session_ids.iter().any(|id| id == candidate) {
+                distinct_session_ids.push(candidate.to_string());
+            }
         }
 
         let looks_like_message = value.get("timestamp").is_some()
@@ -3064,10 +3594,23 @@ fn parse_gemini_jsonl_session(content: &str) -> Result<GeminiSession> {
         }
     }
 
-    Ok(GeminiSession {
-        session_id,
-        messages,
-    })
+    let mut warnings = Vec::new();
+    if let Some(first) = distinct_session_ids.first()
+        && distinct_session_ids.len() > 1
+    {
+        warnings.push(GeminiSessionWarning::SessionIdDrift {
+            first: first.clone(),
+            ignored: distinct_session_ids[1..].to_vec(),
+        });
+    }
+
+    Ok((
+        GeminiSession {
+            session_id,
+            messages,
+        },
+        warnings,
+    ))
 }
 
 /// Extract timeline entries from a single Junie session event log.
@@ -3099,7 +3642,11 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
     let path = sanitize::validate_read_path(path)?;
     let file = sanitize::open_file_validated(&path)?;
     let mut reader = BufReader::new(file);
-    let session_id = junie_session_id_from_path(&path);
+    let (session_id, fallback_warning) = junie_session_id_from_path_with_warning(&path);
+    let mut warnings = Vec::new();
+    if let Some(warning) = fallback_warning {
+        warnings.push(warning);
+    }
     let session_anchor = infer_junie_session_anchor(&path)
         .or_else(|| infer_junie_file_anchor(&path))
         .unwrap_or_else(Utc::now);
@@ -3111,31 +3658,30 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
     // (IN_PROGRESS -> COMPLETED, sometimes COMPLETED twice). Track the last
     // rendered text per (stepId, kind) to drop snapshots that didn't change.
     let mut last_block_render: HashMap<(String, &'static str), String> = HashMap::new();
-    let mut line = String::new();
+    let mut oversized_count = 0usize;
+    let mut oversized_samples = Vec::new();
+    let mut line_number = 0usize;
 
-    loop {
-        let bytes = reader.read_line(&mut line)?;
-        if bytes == 0 {
-            break;
+    while let Some(limited) = read_line_limited(&mut reader, MAX_LINE_BYTES)? {
+        line_number += 1;
+        if limited.exceeded {
+            observe_oversized_line(&mut oversized_count, &mut oversized_samples, line_number);
+            continue;
         }
+        let line = limited.line;
 
         if line.trim().is_empty() {
-            reset_stream_buffer(&mut line);
             continue;
         }
 
         let interesting_kind = detect_junie_interesting_kind(&line);
         if interesting_kind.is_none() {
-            reset_stream_buffer(&mut line);
             continue;
         }
 
         let raw: serde_json::Value = match serde_json::from_str(&line) {
             Ok(value) => value,
-            Err(_) => {
-                reset_stream_buffer(&mut line);
-                continue;
-            }
+            Err(_) => continue,
         };
 
         match interesting_kind {
@@ -3147,7 +3693,6 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                     .filter(|text| !text.is_empty())
                     .map(ToOwned::to_owned);
                 let Some(message) = message else {
-                    reset_stream_buffer(&mut line);
                     continue;
                 };
 
@@ -3179,7 +3724,6 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                     .filter(|text| !text.is_empty())
                     .map(ToOwned::to_owned);
                 let Some(message) = message else {
-                    reset_stream_buffer(&mut line);
                     continue;
                 };
 
@@ -3219,13 +3763,11 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                 | "ViewFilesBlockUpdatedEvent"),
             ) => {
                 if !config.include_assistant {
-                    reset_stream_buffer(&mut line);
                     continue;
                 }
 
                 let agent_event = raw.get("event").and_then(|value| value.get("agentEvent"));
                 let Some(agent_event) = agent_event else {
-                    reset_stream_buffer(&mut line);
                     continue;
                 };
 
@@ -3248,7 +3790,6 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                         .and_then(|value| value.as_str())
                         .unwrap_or_default();
                     if !status.eq_ignore_ascii_case("COMPLETED") {
-                        reset_stream_buffer(&mut line);
                         continue;
                     }
                 }
@@ -3265,7 +3806,6 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                     frame_kind,
                 }) = project_junie_block(block_kind, agent_event)
                 else {
-                    reset_stream_buffer(&mut line);
                     continue;
                 };
 
@@ -3274,7 +3814,6 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                     .get(&dedup_key)
                     .is_some_and(|previous| previous == &message)
                 {
-                    reset_stream_buffer(&mut line);
                     continue;
                 }
                 last_block_render.insert(dedup_key, message.clone());
@@ -3297,9 +3836,15 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
             }
             _ => {}
         }
-
-        reset_stream_buffer(&mut line);
     }
+
+    if oversized_count > 0 {
+        warnings.push(JunieSessionWarning::OversizedLine {
+            count: oversized_count,
+            samples: oversized_samples,
+        });
+    }
+    emit_junie_session_warnings(&path, &warnings);
 
     entries.sort_by_key(|a| a.timestamp);
     Ok(entries)
@@ -3560,25 +4105,23 @@ fn detect_junie_interesting_kind(line: &str) -> Option<&'static str> {
     None
 }
 
-fn reset_stream_buffer(buffer: &mut String) {
-    if buffer.capacity() > 16 * 1024 * 1024 {
-        *buffer = String::new();
-    } else {
-        buffer.clear();
+fn junie_session_id_from_path_with_warning(path: &Path) -> (String, Option<JunieSessionWarning>) {
+    for ancestor in path.ancestors() {
+        if let Some(raw) = ancestor.file_name().and_then(|segment| segment.to_str())
+            && let Some(id) = raw
+                .strip_prefix(JUNIE_SESSION_DIR_PREFIX)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+        {
+            return (id.to_string(), None);
+        }
     }
-}
 
-fn junie_session_id_from_path(path: &Path) -> String {
-    path.parent()
-        .and_then(|parent| parent.file_name())
-        .or_else(|| path.file_stem())
-        .map(|segment| {
-            let raw = segment.to_string_lossy();
-            raw.strip_prefix(JUNIE_SESSION_DIR_PREFIX)
-                .unwrap_or(raw.as_ref())
-                .to_string()
-        })
-        .unwrap_or_else(|| "unknown".to_string())
+    let fallback = format!("unknown-{}", short_path_hash(path));
+    (
+        fallback.clone(),
+        Some(JunieSessionWarning::JunieFallbackId { fallback }),
+    )
 }
 
 fn infer_junie_session_anchor(path: &Path) -> Option<DateTime<Utc>> {
@@ -4960,17 +5503,35 @@ pub fn detect_project_name() -> String {
 /// Count unique sessions in the Codex history file.
 fn count_codex_sessions(path: &std::path::Path) -> Result<usize> {
     let file = sanitize::open_file_validated(path)?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut sessions: HashSet<String> = HashSet::new();
+    let mut oversized_count = 0usize;
+    let mut oversized_samples = Vec::new();
+    let mut line_number = 0usize;
 
-    for line in reader.lines() {
-        let line = line?;
+    while let Some(limited) = read_line_limited(&mut reader, MAX_LINE_BYTES)? {
+        line_number += 1;
+        if limited.exceeded {
+            observe_oversized_line(&mut oversized_count, &mut oversized_samples, line_number);
+            continue;
+        }
+        let line = limited.line;
         if line.trim().is_empty() {
             continue;
         }
         if let Ok(entry) = serde_json::from_str::<CodexEntry>(&line) {
             sessions.insert(entry.session_id);
         }
+    }
+
+    if oversized_count > 0 {
+        emit_codex_session_warnings(
+            path,
+            &[CodexSessionWarning::OversizedLine {
+                count: oversized_count,
+                samples: oversized_samples,
+            }],
+        );
     }
 
     Ok(sessions.len())

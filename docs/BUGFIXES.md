@@ -655,3 +655,73 @@ aicx --lib output::` (30/30), `make precheck`, `make test`, `make clippy`,
 **Related.** Area C Priority-2 (2.1–2.5) z
 `/Users/silver/Downloads/bug-tracker-aicx.md` linie 1278–1333 oraz
 `/Users/silver/AI_notes/projects/aicx/reports/subagents/SUBAGENT_03_audit-area-C--20-05-2026.md`.
+
+---
+
+## 2026-05-20 — sources.rs diagnostics bundle + BufReader caps (Area A + C P3) · `{commit-sha}`
+
+**Symptom.** Ekstraktory w `src/sources.rs` miały kilka cichych ścieżek
+utraty prawdy: dropowały wpisy przy nieznanym `msg_type`, gubiły content gdy
+dało się go odzyskać z `payload.role`, ignorowały drift `sessionId`, nie
+raportowały części błędnych timestampów, mieszały formaty Codex history/session
+bez diagnostyki, brały Junie session id z najbliższego katalogu zamiast
+ancestor `session-*`, oraz czytały JSONL przez nieograniczone `BufReader`
+linie.
+
+**Root cause.** Każdy extractor rozwijał własne "best effort" zachowanie bez
+wspólnego kontraktu diagnostycznego. Codex miał już `CodexSessionWarning`,
+ale Claude/Gemini/Junie nie miały równoważnej powierzchni warningów, a część
+parserów w razie nieznanego shape robiła `continue` zamiast zachować payload
+jako jawny systemowy artefakt.
+
+**Fix.**
+- Dodano per-extractor warning enums:
+  `ClaudeSessionWarning`, `GeminiSessionWarning`, `JunieSessionWarning` oraz
+  rozszerzono `CodexSessionWarning` o mixed format / oversized line.
+- Ujednolicono timestamp parsing przez `parse_rfc3339_or_naive_utc`: RFC3339
+  (`Z`, offset, fractional) plus naive ISO traktowany jako UTC; błędne wartości
+  idą do diagnostyki zamiast znikać po cichu.
+- Claude/Gemini wybierają pierwszy niepusty `sessionId`, raportują drift i
+  missing id. Claude history używa bezpiecznego
+  `DateTime::<Utc>::from_timestamp_millis`.
+- Codex/Gemini/Junie zachowują nieznane albo systemowe eventy jako
+  `FrameKind::SystemNote`; `payload.role` może uratować tool/tool_result
+  content zanim event trafi do fallbacku.
+- Codex mixed history/session JSONL wykrywa oba formaty per line i emituje
+  `MixedFormat`, zamiast wybierać jeden format i tracić resztę.
+- Junie session id chodzi po ancestorach szukając `session-*`; brak takiego
+  katalogu dostaje deterministyczne `unknown-<path-hash>` i warning.
+- Project filter w `sources.rs` przeszedł na strict path-segment matching
+  zgodny z `store.rs`, bez substring false positive typu `vista` vs
+  `vista-portal`.
+- JSONL readers dostały `MAX_LINE_BYTES = 8 MiB` i `read_line_limited`, z
+  `OversizedLine` warningiem i drainem do kolejnej linii.
+
+**Touched.**
+- `src/sources.rs` — extractor diagnostics, timestamp fallback, content
+  preservation, mixed-format handling, strict project filter, Junie ancestor
+  session id, bounded line reads.
+- `src/sources/tests.rs` — 33 nowe testy wokół Area A i Area C P3.
+- `crates/aicx-parser/src/timeline.rs` — nowy `FrameKind::SystemNote`.
+
+**Tests.** Zielone:
+`cargo test --package aicx --lib sources::` (111/111),
+`make precheck`, `make clippy`, `cargo fmt --all -- --check`.
+Repo-wide `make test` / `make check` zatrzymały się na out-of-scope W3-F
+regresji w `src/main.rs::tests::serve_help_prefers_http_name_and_stays_compact`;
+`src/lib.rs` część testów przeszła 456/456.
+
+**Lessons.**
+- Parser nie powinien traktować nieznanego shape jako zgody na utratę contentu;
+  najbezpieczniejszym fallbackiem jest zachowany `SystemNote` plus warning.
+- Bounded line read musi drainować oversized line przed kolejnym `read_line`,
+  inaczej limit zmienia parser w generator sztucznych fragmentów.
+- Path filters w source extraction muszą być segmentowe, bo substring matching
+  wygląda wygodnie tylko do pierwszego repo typu `vista-portal`.
+
+**Related.** Area A (A-1..A-25) z
+`/Users/silver/Downloads/bug-tracker-aicx.md` linie 15-643 oraz Area C P3
+linie 1335-1396; audyty
+`/Users/silver/AI_notes/projects/aicx/reports/subagents/SUBAGENT_01_audit-area-A--20-05-2026.md`
+i
+`/Users/silver/AI_notes/projects/aicx/reports/subagents/SUBAGENT_03_audit-area-C--20-05-2026.md`.
