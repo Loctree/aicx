@@ -468,3 +468,46 @@ test piszący conversation `.md` + `.json` przez `aicx::output`.
 **Related.** Area C P1 1.1-1.10 z `/Users/silver/Downloads/bug-tracker-aicx.md`.
 
 ---
+
+## 2026-05-20 — frontmatter parser skip-unsupported-value (A-10) · `202d5d1`
+
+**Symptom.** Frontmatter parser wyrzucał cały blok metadanych, jeśli pojedyncza
+wartość wyglądała jak unsupported YAML shape (`[...]` albo `{...}`). W ingest
+to oznaczało utratę sąsiednich scalarów typu `run_id`, `prompt_id`, `status`,
+`model` i `started_at`.
+
+**Root cause.** `parse_frontmatter_fields` robił `return None` wewnątrz pętli
+po liniach, gdy `looks_like_unsupported_yaml_value(value)` zwracało true.
+Jedną nieskalarną wartość traktował więc jak błąd całego frontmattera zamiast
+pominąć tylko ten klucz.
+
+**Fix.**
+- `parse_frontmatter_fields`: unsupported value branch robi teraz `continue`,
+  więc parser pomija tylko bieżący key/value i zachowuje pozostałe scalars.
+- Test `handles_malformed_yaml_gracefully` przepisany z oczekiwania
+  `frontmatter.is_none()` na zachowanie sąsiednich scalarów.
+- Dodano regresje dla unsupported list, map-shaped value i tekstu bez
+  delimiterów frontmatter.
+- Downstream chunker test zaktualizowany do nowego kontraktu: unsupported
+  `run_id` nie blokuje zachowania scalar `mode`.
+
+**Touched.**
+- `crates/aicx-parser/src/frontmatter.rs` — `parse_frontmatter_fields`, tests.
+- `crates/aicx-parser/src/chunker.rs` — test alignment dla frontmatter ingest.
+
+**Tests.** `cargo test --package aicx-parser --lib` — 118/118 pass. Root
+`make precheck`, `make test`, `make check`, `make clippy` były odpalone, ale
+blokuje je równoległy out-of-scope diff w `crates/aicx-embeddings/src/cloud.rs`
+(`CloudEmbeddingProvider` zdefiniowany/importowany dwa razy). `make fmt` pass.
+
+**Lessons.**
+- Parser frontmatter powinien fail-soft na pojedynczych unsupported value
+  shapes; telemetry scalars są cenniejsze niż perfekcyjna obsługa każdego
+  sąsiedniego YAML idiomu.
+- Testy downstream mogą utrwalać stary bug nawet wtedy, gdy unit test parsera
+  został już poprawiony — po zmianie kontraktu sprawdź consumer tests w tej
+  samej paczce.
+
+**Related.** A-10 z `/Users/silver/Downloads/bug-tracker-aicx.md`, Area A.
+
+---
