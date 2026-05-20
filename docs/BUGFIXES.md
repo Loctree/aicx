@@ -917,3 +917,109 @@ stashing other agents' WIP").
 C P3.3 z `docs/bug-tracker-aicx`. Wzorzec atomic_write pochodzi z W1
 (`src/store/atomic_write.rs`, commit `bc67728`). Parallel wave hazard
 udokumentowany powyżej — nie blokuje mojego commitu.
+
+---
+
+## 2026-05-20 — intents indexed dedup + word-boundary keyword classifier · `0d1eeed`
+
+**Symptom.** Dwie powiązane wady w intent extraction:
+
+1. Sesje z dużą liczbą rekordów (10k+) wisiały sekundami — czasem minutami —
+   bo `drop_truncated_duplicate_records` w `src/intents.rs` był O(N²)
+   (`records.iter().enumerate().map(...records.iter().enumerate().any(...))`).
+2. Klasyfikator intentów łapał false positives jak `"Let's not refactor"`
+   (negacja jako intent), `"nie mam pomysłu"` (sufiks fleksyjny pomylony ze
+   słowem kluczowym `"pomysł"`), `` `let's encrypt` `` (nazwa narzędzia w
+   inline code spanie), oraz dowolne `let's …` w środku trzy-backtickowego
+   bloku kodu. Operator widział te wpisy w `aicx intents` jako "ja chcę
+   refaktor!" gdy w transkrypcie wprost padło "let's NOT refactor".
+
+**Root cause.**
+* (1) Pełne quadratic skanowanie: zewnętrzny `iter().enumerate().map` ×
+  wewnętrzny `iter().enumerate().any` = 100M porównań przy 10k rekordach.
+  Brak bucketowania mimo że klucz dedupowania (`kind` + `session_id` +
+  `source_chunk`) jest oczywisty.
+* (2) `looks_like_intent_line` i `classify_line_entry_type` używały
+  `lower.contains(kw)` — czysty substring match. Polskie `pomysłu` zawiera
+  `pomysł`; `let's` w `let's not refactor` jest na czystym word boundary;
+  backtick code spany i fenced code blocki nie były rozpoznawane wcale.
+  `parse_chunk_document` ślepo wrzucał każdą linię (transkryptową) do
+  klasyfikacji niezależnie od czy znajduje się w bloku ``` ``` ```.
+
+**Fix.**
+- `drop_truncated_duplicate_records` przepisany na dwupass indexed shape:
+  pass 1 buduje `HashMap<(kind, session_id, source_chunk), Vec<usize>>` z
+  indexami nietruncated rekordów; pass 2 robi O(1) lookup per truncated
+  rekord i skanuje tylko małą listę siblingów. Grupy w realnych danych są
+  drobne — efektywnie stały koszt na lookup.
+- Nowe helpery w `src/intents.rs`:
+  - `code_span_ranges(line)` — zakresy bajtowe inline `` `...` `` spans.
+  - `is_word_char(c)` — `c.is_alphanumeric() || c == '_'` (Unicode-aware,
+    polskie diakrytyki traktowane jako word char).
+  - `is_negated_keyword(lower_line, kw_pos, kw_len)` — pre-window (~24
+    znaków) sprawdza prefiksy negatorów (`don't `, `do not `, `won't `,
+    `nie `, `bez `, `shouldn't `, …); post-window (~16 znaków) sprawdza
+    `" not "`, `" nie "` — łapie symetrycznie `"don't let's"` i
+    `"let's not"`.
+  - `matches_keyword_word_boundary(line, kw)` — case-insensitive find z
+    twardym word boundary po obu stronach, odrzuca match w code spanie i
+    odrzuca match z negacją w pobliżu.
+- `looks_like_intent_line` (src/intents.rs:820) i `classify_line_entry_type`
+  (src/intents.rs:1636) używają teraz `matches_keyword_word_boundary` zamiast
+  `lower.contains(kw)`.
+- `parse_chunk_document` (src/intents.rs:554) trackuje stan triple-backtick
+  fence dla sekcji transkryptu; linie wewnątrz fence (i same markery
+  ``` ``` ```) są w ogóle wyłączone z pipeline'u klasyfikacyjnego.
+
+**Touched.**
+- `src/intents.rs` — `drop_truncated_duplicate_records` rewrite,
+  `parse_chunk_document` fence tracking, 4 nowe helpery, repointed callers,
+  8 nowych testów.
+
+**Tests.** 8 nowych (5 classifier + 1 chunk-level fence + 2 dedup):
+`test_intent_let_us_not_refactor_is_not_intent`,
+`test_intent_polish_nie_mam_pomyslu_is_not_intent`,
+`test_intent_inline_code_let_us_encrypt_is_not_intent`,
+`test_intent_in_fenced_code_block_is_not_intent`,
+`test_intent_real_let_us_refactor_still_classifies`,
+`test_intent_polish_chce_zrobic_still_classifies`,
+`test_drop_truncated_duplicate_is_linear` (10k rekordów w < 200 ms),
+`test_drop_truncated_dedup_keeps_fullest`. Stare 47 testów `intents::tests::*`
+nadal zielone. Gates (w izolacji mojego scope'u — sibling Wave-4 WIP-y
+chwilowo zestashowane, bo W4-F zostawił niekompletne ślady CSRF
+breakujące lib build): `cargo build --lib` ok, `cargo test --lib` ok
+(469 passed / 0 failed), `cargo clippy --lib --all-targets -D warnings`
+ok, `cargo fmt -- --check` ok. Po commit-cie sibling WIP-y popnięte z
+powrotem — operator widzi je jako modified i decyduje o ich integracji.
+
+**Lessons.**
+- `lower.contains(kw)` to nigdy klasyfikator intentu — to listonosz co
+  dostarcza listy z odwróconym adresem. Polish suffixy fleksyjne
+  (`pomysł` → `pomysłu`/`pomysłem`) muszą polegać na word-boundary z
+  Unicode `is_alphanumeric`, bo właśnie diakrytyk jest word char.
+- Negacja symetryczna: `"don't let's"` i `"let's not"` to ten sam case
+  ("operator NIE chce robić X"), więc guard musi patrzeć z obu stron
+  keyword position. Pre-only window wpadałby na drugi przypadek.
+- Code spans (`` `…` ``) i code fences (``` ``` ```) to dwa różne
+  poziomy ignore — inline span trzeba widzieć w obrębie linii podczas
+  matchowania, fence trzeba widzieć na poziomie dokumentu jeszcze przed
+  klasyfikacją. Nie da się jednego załatwić drugim.
+- Indexed dedup z `(kind, session, source_chunk)` jako bucket key
+  wystarcza — nie ma potrzeby pakować prefiksu do klucza, bo grupy w
+  realnych danych są małe. Pakowanie prefiksu (jak początkowo
+  spróbowałem) wpadało w pułapkę "truncated krótszy niż N znaków → inny
+  klucz niż jego non-truncated parent" i nie dropowało nic.
+- Living tree z 5 paralelnymi Wave-4 workerami: sibling files mogą być
+  w mid-write state (W4-F zostawił niekompletne CSRF + struct field).
+  Worker charter chroni przed commitem nie-swojej pracy, ale build
+  może być chwilowo broken — wtedy stash sibling files, validate
+  w izolacji, commit swój scope, popnij stashe z powrotem.
+
+**Related.** Closes E.3 i E.7 z Area E w `docs/bug-tracker-aicx`. Audit
+report: `~/AI_notes/projects/aicx/reports/subagents/SUBAGENT_05_audit-area-E--20-05-2026.md`.
+Sibling Wave-4 tasks (W3-C, W4-A, W4-D, W4-F) leciały równolegle na
+tym samym branchu — wave-4 plage hazard udokumentowany w poprzednim
+wpisie (`41aac1a`). E.7 negation guard świadomie konserwatywny: tylko
+phrase-pair "negator + keyword w bliskim sąsiedztwie", nie pełna
+sentence-level analiza, żeby nie zjeść pozytywnych intentów typu
+`"Don't worry, let's ship"`.
