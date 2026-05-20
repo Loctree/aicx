@@ -307,6 +307,18 @@ fn background_refresh_args(hours: u64, project: Option<&str>) -> Vec<String> {
 // MCP Server
 // ============================================================================
 
+fn validate_string_len(val: Option<&str>, max: usize, field: &str) -> Result<(), McpError> {
+    if let Some(v) = val
+        && v.len() > max
+    {
+        return Err(McpError::invalid_params(
+            format!("Field '{}' exceeds max length {} bytes", field, max),
+            None,
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct AicxMcpServer {
     #[allow(dead_code)]
@@ -335,6 +347,19 @@ impl AicxMcpServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
+        validate_string_len(Some(params.query.as_str()), 4096, "query")?;
+        validate_string_len(params.project.as_deref(), 4096, "project")?;
+        validate_string_len(params.agent.as_deref(), 4096, "agent")?;
+        validate_string_len(params.date.as_deref(), 4096, "date")?;
+        validate_string_len(params.since.as_deref(), 4096, "since")?;
+        validate_string_len(params.until.as_deref(), 4096, "until")?;
+        validate_string_len(params.sort.as_deref(), 4096, "sort")?;
+        if let Some(projects) = &params.projects {
+            for (i, p) in projects.iter().enumerate() {
+                validate_string_len(Some(p), 4096, &format!("projects[{}]", i))?;
+            }
+        }
+
         let query = params.query;
         let limit = params.limit.min(50);
         let project = params.project;
@@ -434,11 +459,8 @@ impl AicxMcpServer {
             results
                 .into_iter()
                 .filter(|result| {
-                    lo.as_ref()
-                        .is_none_or(|lo| result.date.as_str() >= lo.as_str())
-                        && hi
-                            .as_ref()
-                            .is_none_or(|hi| result.date.as_str() <= hi.as_str())
+                    lo.as_deref().is_none_or(|lo| result.date.as_str() >= lo)
+                        && hi.as_deref().is_none_or(|hi| result.date.as_str() <= hi)
                 })
                 .collect()
         } else if hours > 0 {
@@ -522,10 +544,17 @@ impl AicxMcpServer {
         &self,
         Parameters(params): Parameters<RankParams>,
     ) -> Result<CallToolResult, McpError> {
+        validate_string_len(Some(params.project.as_str()), 4096, "project")?;
+        validate_string_len(params.agent.as_deref(), 4096, "agent")?;
+        validate_string_len(params.since.as_deref(), 4096, "since")?;
+        validate_string_len(params.until.as_deref(), 4096, "until")?;
+        validate_string_len(params.sort.as_deref(), 4096, "sort")?;
+
         let project = params.project;
         let hours = params.hours;
         let strict = params.strict;
-        let top = params.top;
+        const MAX_TOP: usize = 1000;
+        let top = params.top.map(|t| t.min(MAX_TOP));
 
         let cutoff = if hours == 0 {
             std::time::UNIX_EPOCH
@@ -553,12 +582,8 @@ impl AicxMcpServer {
             {
                 continue;
             }
-            if lo
-                .as_ref()
-                .is_some_and(|lo| file.date_iso.as_str() < lo.as_str())
-                || hi
-                    .as_ref()
-                    .is_some_and(|hi| file.date_iso.as_str() > hi.as_str())
+            if lo.as_deref().is_some_and(|lo| file.date_iso.as_str() < lo)
+                || hi.as_deref().is_some_and(|hi| file.date_iso.as_str() > hi)
             {
                 continue;
             }
@@ -655,6 +680,20 @@ impl AicxMcpServer {
         &self,
         Parameters(params): Parameters<SteerParams>,
     ) -> Result<CallToolResult, McpError> {
+        validate_string_len(params.run_id.as_deref(), 4096, "run_id")?;
+        validate_string_len(params.prompt_id.as_deref(), 4096, "prompt_id")?;
+        validate_string_len(params.agent.as_deref(), 4096, "agent")?;
+        validate_string_len(params.kind.as_deref(), 4096, "kind")?;
+        validate_string_len(params.project.as_deref(), 4096, "project")?;
+        validate_string_len(params.date.as_deref(), 4096, "date")?;
+        validate_string_len(params.since.as_deref(), 4096, "since")?;
+        validate_string_len(params.until.as_deref(), 4096, "until")?;
+        if let Some(projects) = &params.projects {
+            for (i, p) in projects.iter().enumerate() {
+                validate_string_len(Some(p), 4096, &format!("projects[{}]", i))?;
+            }
+        }
+
         let limit = params.limit.min(100);
 
         let date_effective = params.date.or(params.since.clone());

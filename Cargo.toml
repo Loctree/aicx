@@ -77,13 +77,14 @@ globset = "0.4"
 ratatui = "0.29"
 crossterm = "0.29"
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "signal", "process"] }
 rmcp = { version = "1.2", features = ["server", "schemars", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 libc = "0.2.183"
 rmcp-memex = { package = "rust-memex", version = "0.6.5", default-features = false, optional = true }
 schemars = "1.2.1"
 aicx-retrieve = { version = "0.2.0" }
 blake3 = "1.8.5"
+which = "8.0.2"
 
 [dev-dependencies]
 toml = "0.8"

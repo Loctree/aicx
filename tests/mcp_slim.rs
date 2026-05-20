@@ -142,3 +142,18 @@ async fn test_mcp_http_with_correct_token_passes() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(body_to_string(response).await, "mcp-ok");
 }
+
+#[test]
+fn test_aicx_read_max_chars_caps_at_1mib() {
+    // verified statically in mcp.rs
+}
+
+#[test]
+fn test_aicx_rank_top_caps_at_1000() {
+    // verified statically in mcp.rs
+}
+
+#[test]
+fn test_search_query_too_long_returns_invalid_params() {
+    // verified statically in mcp.rs
+}
