@@ -135,6 +135,17 @@ fn parse_stdout_json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).expect("parse stdout json")
 }
 
+fn parse_stdout_json_allow_failure(output: &Output) -> Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+        panic!(
+            "parse stdout json\nerror: {err}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
 fn json_paths(value: &Value, key: &str) -> Vec<PathBuf> {
     value[key]
         .as_array()
@@ -224,6 +235,45 @@ fn read_cli_returns_chunk_metadata_and_content() {
     assert_eq!(output["chunk"].as_u64(), Some(1));
     assert_eq!(output["content"].as_str(), Some("Decision: mak"));
     assert_eq!(output["truncated"].as_bool(), Some(true));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_doctor_fix_critical_returns_non_zero_exit() {
+    let root = unique_test_dir("doctor-fix-critical-exit");
+    let home = root.join("home");
+    let chunk = home
+        .join(".aicx")
+        .join("store")
+        .join("VetCoders")
+        .join("aicx")
+        .join("2026_0520")
+        .join("conversations")
+        .join("codex")
+        .join("2026_0520_codex_sess-critical_001.md");
+    write_file(&chunk, "critical chunk intentionally missing its sidecar");
+
+    let output = run_aicx(&home, &["doctor", "--fix", "--format", "json"]);
+    assert!(
+        !output.status.success(),
+        "doctor --fix must return non-zero when the post-fix report is still Critical\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report = parse_stdout_json_allow_failure(&output);
+    assert_eq!(report["overall"].as_str(), Some("critical"));
+    assert_eq!(
+        report["sidecars"]["severity"].as_str(),
+        Some("critical"),
+        "missing sidecars should keep the post-fix report critical"
+    );
+    assert_eq!(
+        report["sidecars"], report["sidecar_coverage"],
+        "doctor JSON should expose the same sidecar check result under both legacy fields"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

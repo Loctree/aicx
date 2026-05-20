@@ -68,6 +68,7 @@ dependencies = [
  "crossterm 0.29.0",
  "dirs",
  "filetime",
+ "futures",
  "globset",
  "http-body-util",
  "indicatif",

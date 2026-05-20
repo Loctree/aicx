@@ -54,7 +54,7 @@ pub enum Severity {
     Critical,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct CheckResult {
     pub name: String,
     pub severity: Severity,
@@ -234,6 +234,8 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
         context_corpus = check_context_corpus(base);
     }
 
+    let sidecar_coverage = sidecars.clone();
+
     let overall = max_severity(&[
         canonical_store.severity,
         steer_lance.severity,
@@ -263,7 +265,7 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
         semantic_health,
         index_freshness,
         index_consistency,
-        sidecar_coverage: check_sidecar_coverage(base),
+        sidecar_coverage,
         embedder_warmth,
         empty_body_chunks,
         content_dedup,
@@ -2050,6 +2052,43 @@ mod tests {
         assert!(script.contains("sess-empty"));
         assert!(!script.contains("sess-full"));
         assert!(empty.exists(), "script generation must not delete files");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_doctor_sidecars_and_coverage_share_check_result() {
+        let tmp = unique_test_dir("sidecars-shared-result");
+        let dir = tmp
+            .join("store")
+            .join("VetCoders")
+            .join("aicx")
+            .join("2026_0506")
+            .join("conversations")
+            .join("codex");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("2026_0506_codex_sess-sidecars_001.md"),
+            "chunk without a sidecar",
+        )
+        .unwrap();
+
+        let opts = DoctorOptions {
+            fix: false,
+            fix_buckets: false,
+            dry_run: false,
+            rebuild_sidecars: false,
+            prune_empty_bodies: false,
+            check_dedup: false,
+            verbose: false,
+            smoke: false,
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let report = rt.block_on(run_at(&tmp, &opts)).unwrap();
+
+        assert_eq!(report.sidecars, report.sidecar_coverage);
+        assert_eq!(report.sidecars.name, "sidecars");
+        assert_eq!(report.sidecars.severity, Severity::Critical);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

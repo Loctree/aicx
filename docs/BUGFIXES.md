@@ -1117,3 +1117,65 @@ ale content path nigdy nie zgłaszał warningu, bo nigdy nie patrzył.
 normalization) z Area A w `docs/bug-tracker-aicx`. Recovery dispatch
 dla failed `bugtracker-W4-A-unicode-20260520`. Report:
 `/Users/silver/AI_notes/projects/aicx/reports/subagents/SUBAGENT_W4A_unicode-recovery-20-05-2026.md`.
+---
+
+## 2026-05-20 — doctor exit-code truth + sidecar coverage de-dupe + MCP session guard (Area F F-P2-12/F-P3-15/F-P1-P2-3) · `{commit-sha}`
+
+**Symptom.**
+- `aicx doctor --fix` mógł zwrócić exit `0`, nawet gdy raport po fixie
+  nadal miał `overall = Critical`.
+- `DoctorReport.sidecars` i `DoctorReport.sidecar_coverage` liczyły ten
+  sam kosztowny check osobno, więc JSON miał dwa pola o tej samej semantyce
+  bez jednego źródła prawdy.
+- MCP streamable HTTP używał gołego `LocalSessionManager::default()`, bez
+  projektu-level limitu liczby sesji.
+
+**Root cause.**
+- CLI exit code był warunkowany `!fix && !fix_buckets`, zamiast zawsze
+  ufać post-fix `report.overall`.
+- `run_at` trzymał wynik `check_sidecar_coverage(base)` w `sidecars`, ale
+  przy budowie raportu odpalał `check_sidecar_coverage(base)` drugi raz dla
+  pola `sidecar_coverage`.
+- `rmcp` daje natywny idle timeout jako `SessionConfig::keep_alive`, ale
+  nie daje max-session knob; lokalny server nie dokładał własnej warstwy
+  limitującej.
+
+**Fix.**
+- `src/main.rs` — Doctor arm wylicza exit code wyłącznie z post-fix
+  `report.overall`: `Critical => 1`, reszta `0`.
+- `src/doctor.rs` — `CheckResult` dostał `Clone + PartialEq + Eq`, a
+  `sidecar_coverage` jest klonem już policzonego `sidecars`.
+- `src/mcp.rs` — `AicxSessionManager` wrapper nad `LocalSessionManager`:
+  `SessionConfig.keep_alive = 30 min`, max `1000` aktywnych sesji,
+  `last_seen` + okresowy sweeper co 60s. Wybór udokumentowany w kodzie:
+  `rmcp` expose'uje idle TTL, ale nie expose'uje max-session knob.
+- `Cargo.toml`/`Cargo.lock` — direct `futures = "0.3"` dla jawnego użycia
+  `futures::Stream` w implementacji `SessionManager`.
+
+**Tests.**
+- Nowe testy: `test_doctor_fix_critical_returns_non_zero_exit`,
+  `test_doctor_sidecars_and_coverage_share_check_result`,
+  `test_mcp_session_manager_configures_idle_ttl_and_cap`,
+  `test_mcp_session_count_capped`,
+  `test_mcp_session_idle_ttl_cleans_up`,
+  `test_mcp_session_cleanup_task_can_be_spawned`.
+- Zielone w tym runie: `cargo check -q --lib`;
+  `cargo test -q test_mcp_session --lib` (4/4, przed późniejszym dirty
+  update `src/intents.rs`); `cargo test -q --test runtime_cli_store_contract
+  test_doctor_fix_critical_returns_non_zero_exit` przeszedł raz, potem
+  został zablokowany przez równoległą zmianę `ReportsExtractorConfig`
+  wymagającą pola `deterministic` w `src/main.rs`.
+- Aktualne pełne `cargo test --lib` jest zablokowane przez równoległe dirty
+  testy w `src/intents.rs` konstruujące stary kształt
+  `aicx_parser::IntentEntry`.
+
+**Lessons.**
+- `--fix` nie może być exit-code amnestią. Jeśli post-fix raport nadal
+  mówi `Critical`, proces musi zwrócić `1`.
+- Backward-compatible alias pola (`sidecars` + `sidecar_coverage`) może
+  istnieć, ale oba pola muszą pochodzić z tego samego wyniku.
+- Przy `rmcp::LocalSessionManager` TTL jest natywny (`keep_alive`), cap nie;
+  wrapper jest mniejszym ryzykiem niż forkowanie transportu.
+
+**Related.** Closes F-P2-12, F-P3-15, F-P1/P2-3 from Area F. Report:
+`/Users/silver/.vibecrafted/artifacts/Loctree/aicx/2026_0520/reports/20260520_135025_20260520_1350_perform-the-vc-justdo-skill-on-this-repository_codex.md`.

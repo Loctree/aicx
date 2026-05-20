@@ -1912,7 +1912,7 @@ fn main() -> Result<()> {
             }
 
             let exit_code = match report.overall {
-                aicx::doctor::Severity::Critical if !fix && !fix_buckets => 1,
+                aicx::doctor::Severity::Critical => 1,
                 _ => 0,
             };
             std::process::exit(exit_code);

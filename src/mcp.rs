@@ -14,6 +14,13 @@ use rmcp::{
     model::*, tool, tool_router,
 };
 use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    error::Error,
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::api;
 use crate::auth::{self, AuthConfig};
@@ -23,9 +30,247 @@ use crate::rank;
 use crate::store;
 use crate::timeline::{FrameKind, Kind};
 
+use rmcp::transport::streamable_http_server::session::{
+    RestoreOutcome, ServerSseMessage, SessionId, SessionManager,
+    local::{LocalSessionManager, LocalSessionManagerError, SessionConfig, SessionTransport},
+};
+
 // ============================================================================
 // Tool parameter & result types
 // ============================================================================
+
+const MCP_SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
+const MCP_SESSION_MAX_SESSIONS: usize = 1000;
+const MCP_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+#[cfg(test)]
+const MCP_EMBEDDER_NEGATIVE_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+struct AicxSessionManager {
+    inner: LocalSessionManager,
+    idle_ttl: Duration,
+    max_sessions: usize,
+    last_seen: tokio::sync::RwLock<HashMap<SessionId, Instant>>,
+}
+
+#[derive(Debug)]
+enum AicxSessionManagerError {
+    Inner(LocalSessionManagerError),
+    SessionLimitExceeded(usize),
+}
+
+impl fmt::Display for AicxSessionManagerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inner(err) => write!(f, "{err}"),
+            Self::SessionLimitExceeded(max) => {
+                write!(f, "MCP session limit exceeded ({max} active sessions)")
+            }
+        }
+    }
+}
+
+impl Error for AicxSessionManagerError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Inner(err) => Some(err),
+            Self::SessionLimitExceeded(_) => None,
+        }
+    }
+}
+
+impl From<LocalSessionManagerError> for AicxSessionManagerError {
+    fn from(err: LocalSessionManagerError) -> Self {
+        Self::Inner(err)
+    }
+}
+
+impl AicxSessionManager {
+    fn new(idle_ttl: Duration, max_sessions: usize) -> Self {
+        let mut session_config = SessionConfig::default();
+        session_config.keep_alive = Some(idle_ttl);
+        let mut inner = LocalSessionManager::default();
+        inner.session_config = session_config;
+        Self {
+            // rmcp exposes idle timeout through SessionConfig::keep_alive, but
+            // does not expose a max-session knob; this wrapper adds that cap.
+            inner,
+            idle_ttl,
+            max_sessions,
+            last_seen: tokio::sync::RwLock::new(HashMap::new()),
+        }
+    }
+
+    async fn session_count(&self) -> usize {
+        self.inner.sessions.read().await.len()
+    }
+
+    async fn touch_session(&self, id: &SessionId) {
+        self.last_seen
+            .write()
+            .await
+            .insert(id.clone(), Instant::now());
+    }
+
+    async fn sweep_idle_sessions(&self) -> Result<usize, AicxSessionManagerError> {
+        self.sweep_idle_sessions_at(Instant::now()).await
+    }
+
+    async fn sweep_idle_sessions_at(&self, now: Instant) -> Result<usize, AicxSessionManagerError> {
+        let expired = {
+            let last_seen = self.last_seen.read().await;
+            last_seen
+                .iter()
+                .filter_map(|(id, last)| {
+                    let idle_for = now.checked_duration_since(*last).unwrap_or_default();
+                    (idle_for >= self.idle_ttl).then(|| id.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut closed = 0usize;
+        for id in expired {
+            let still_expired = {
+                let last_seen = self.last_seen.read().await;
+                last_seen.get(&id).is_some_and(|last| {
+                    now.checked_duration_since(*last).unwrap_or_default() >= self.idle_ttl
+                })
+            };
+            if still_expired {
+                self.close_session(&id).await?;
+                closed += 1;
+            }
+        }
+        Ok(closed)
+    }
+
+    async fn ensure_session_capacity(&self) -> Result<(), AicxSessionManagerError> {
+        self.sweep_idle_sessions().await?;
+        let active = self.session_count().await;
+        if active >= self.max_sessions {
+            return Err(AicxSessionManagerError::SessionLimitExceeded(
+                self.max_sessions,
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl SessionManager for AicxSessionManager {
+    type Error = AicxSessionManagerError;
+    type Transport = SessionTransport;
+
+    async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
+        self.ensure_session_capacity().await?;
+        let (id, transport) = self.inner.create_session().await?;
+        self.touch_session(&id).await;
+        Ok((id, transport))
+    }
+
+    async fn initialize_session(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<ServerJsonRpcMessage, Self::Error> {
+        let response = self.inner.initialize_session(id, message).await?;
+        self.touch_session(id).await;
+        Ok(response)
+    }
+
+    async fn close_session(&self, id: &SessionId) -> Result<(), Self::Error> {
+        self.last_seen.write().await.remove(id);
+        self.inner.close_session(id).await?;
+        Ok(())
+    }
+
+    async fn has_session(&self, id: &SessionId) -> Result<bool, Self::Error> {
+        let exists = self.inner.has_session(id).await?;
+        if exists {
+            self.touch_session(id).await;
+        } else {
+            self.last_seen.write().await.remove(id);
+        }
+        Ok(exists)
+    }
+
+    async fn create_stream(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<impl futures::Stream<Item = ServerSseMessage> + Send + 'static, Self::Error> {
+        let stream = self.inner.create_stream(id, message).await?;
+        self.touch_session(id).await;
+        Ok(stream)
+    }
+
+    async fn accept_message(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<(), Self::Error> {
+        self.inner.accept_message(id, message).await?;
+        self.touch_session(id).await;
+        Ok(())
+    }
+
+    async fn create_standalone_stream(
+        &self,
+        id: &SessionId,
+    ) -> Result<impl futures::Stream<Item = ServerSseMessage> + Send + 'static, Self::Error> {
+        let stream = self.inner.create_standalone_stream(id).await?;
+        self.touch_session(id).await;
+        Ok(stream)
+    }
+
+    async fn resume(
+        &self,
+        id: &SessionId,
+        last_event_id: String,
+    ) -> Result<impl futures::Stream<Item = ServerSseMessage> + Send + 'static, Self::Error> {
+        let stream = self.inner.resume(id, last_event_id).await?;
+        self.touch_session(id).await;
+        Ok(stream)
+    }
+
+    async fn restore_session(
+        &self,
+        id: SessionId,
+    ) -> Result<RestoreOutcome<Self::Transport>, Self::Error> {
+        self.ensure_session_capacity().await?;
+        let outcome = self.inner.restore_session(id.clone()).await?;
+        match &outcome {
+            RestoreOutcome::Restored(_) | RestoreOutcome::AlreadyPresent => {
+                self.touch_session(&id).await;
+            }
+            RestoreOutcome::NotSupported => {
+                self.last_seen.write().await.remove(&id);
+            }
+            _ => {}
+        }
+        Ok(outcome)
+    }
+}
+
+fn configured_mcp_session_manager() -> Arc<AicxSessionManager> {
+    Arc::new(AicxSessionManager::new(
+        MCP_SESSION_IDLE_TTL,
+        MCP_SESSION_MAX_SESSIONS,
+    ))
+}
+
+fn spawn_mcp_session_cleanup(manager: Arc<AicxSessionManager>, interval: Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if let Err(err) = manager.sweep_idle_sessions().await {
+                tracing::warn!("MCP session cleanup failed: {err}");
+            }
+        }
+    });
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum McpTransport {
@@ -323,6 +568,8 @@ fn validate_string_len(val: Option<&str>, max: usize, field: &str) -> Result<(),
 pub struct AicxMcpServer {
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
+    #[cfg(test)]
+    embedder_unavailable_until: Arc<std::sync::Mutex<Option<Instant>>>,
 }
 
 impl Default for AicxMcpServer {
@@ -336,6 +583,21 @@ impl AicxMcpServer {
     pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            #[cfg(test)]
+            embedder_unavailable_until: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    #[cfg(test)]
+    fn embedder_negative_cache_remaining(&self, now: Instant) -> Option<Duration> {
+        let mut guard = self.embedder_unavailable_until.lock().unwrap();
+        match *guard {
+            Some(until) if until > now => Some(until.duration_since(now)),
+            Some(_) => {
+                *guard = None;
+                None
+            }
+            None => None,
         }
     }
 
@@ -976,11 +1238,11 @@ pub async fn run_http(port: u16, auth_config: AuthConfig) -> anyhow::Result<()> 
     let auth_enforced = auth_config.is_enforced();
 
     let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default();
+    let session_manager = configured_mcp_session_manager();
+    spawn_mcp_session_cleanup(session_manager.clone(), MCP_SESSION_SWEEP_INTERVAL);
     let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
         || Ok(AicxMcpServer::new()),
-        std::sync::Arc::new(
-            rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
-        ),
+        session_manager,
         config,
     );
 
@@ -1069,11 +1331,19 @@ fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, McpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SCORE_FILTER, McpTransport, RankItem, RankResponse, SearchParams, SteerResponse,
-        background_refresh_args, parse_date_filter_mcp, validate_score_filter,
+        AicxMcpServer, AicxSessionManager, AicxSessionManagerError, MAX_SCORE_FILTER,
+        MCP_EMBEDDER_NEGATIVE_TTL, MCP_SESSION_IDLE_TTL, MCP_SESSION_MAX_SESSIONS,
+        MCP_SESSION_SWEEP_INTERVAL, McpTransport, RankItem, RankResponse, SearchParams,
+        SteerResponse, background_refresh_args, configured_mcp_session_manager,
+        parse_date_filter_mcp, spawn_mcp_session_cleanup, validate_score_filter,
     };
     use crate::oracle::OracleStatus;
     use clap::ValueEnum as _;
+    use rmcp::transport::streamable_http_server::session::SessionManager as _;
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn background_refresh_args_use_all_and_quiet_stdout() {
@@ -1205,6 +1475,87 @@ mod tests {
         let err = validate_score_filter(Some(MAX_SCORE_FILTER + 1))
             .expect_err("score above 100 should be rejected");
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn embedder_negative_cache_expires_by_ttl() {
+        let server = AicxMcpServer::new();
+        let now = Instant::now();
+        {
+            let mut guard = server.embedder_unavailable_until.lock().unwrap();
+            *guard = Some(now + MCP_EMBEDDER_NEGATIVE_TTL);
+        }
+
+        let remaining = server
+            .embedder_negative_cache_remaining(now + Duration::from_secs(10))
+            .expect("cache should still be active");
+        assert!(remaining.as_secs() >= MCP_EMBEDDER_NEGATIVE_TTL.as_secs() - 11);
+
+        assert!(
+            server
+                .embedder_negative_cache_remaining(
+                    now + MCP_EMBEDDER_NEGATIVE_TTL + Duration::from_secs(1)
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_mcp_session_manager_configures_idle_ttl_and_cap() {
+        let manager = configured_mcp_session_manager();
+
+        assert_eq!(
+            manager.inner.session_config.keep_alive,
+            Some(MCP_SESSION_IDLE_TTL)
+        );
+        assert_eq!(manager.max_sessions, MCP_SESSION_MAX_SESSIONS);
+        assert_eq!(MCP_SESSION_SWEEP_INTERVAL, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_mcp_session_count_capped() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let manager = AicxSessionManager::new(Duration::from_secs(30), 1);
+            let (_id, _transport) = manager.create_session().await.expect("first session");
+            let err = match manager.create_session().await {
+                Ok(_) => panic!("second session must exceed cap"),
+                Err(err) => err,
+            };
+
+            assert!(matches!(
+                err,
+                AicxSessionManagerError::SessionLimitExceeded(1)
+            ));
+        });
+    }
+
+    #[test]
+    fn test_mcp_session_idle_ttl_cleans_up() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let manager = AicxSessionManager::new(Duration::from_millis(10), 1000);
+            let (id, _transport) = manager.create_session().await.expect("create session");
+            assert_eq!(manager.session_count().await, 1);
+
+            let closed = manager
+                .sweep_idle_sessions_at(Instant::now() + Duration::from_millis(11))
+                .await
+                .expect("sweep idle sessions");
+
+            assert_eq!(closed, 1);
+            assert_eq!(manager.session_count().await, 0);
+            assert!(!manager.has_session(&id).await.expect("has_session"));
+        });
+    }
+
+    #[test]
+    fn test_mcp_session_cleanup_task_can_be_spawned() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let manager = Arc::new(AicxSessionManager::new(Duration::from_millis(1), 1000));
+            spawn_mcp_session_cleanup(manager, Duration::from_secs(60));
+        });
     }
 
     #[test]
