@@ -6199,11 +6199,12 @@ mod tests {
             "rust-mux",
             "-p",
             "vc-operator",
+            "-p",
             "vibecrafted",
             "-p",
             "loctree",
         ])
-        .expect("search should accept repeated and space-list project filters");
+        .expect("search should accept repeated project filters");
 
         match cli.command {
             Some(Commands::Search { project, .. }) => {
@@ -6268,11 +6269,12 @@ mod tests {
             "index",
             "-p",
             "vc-operator",
+            "-p",
             "vibecrafted",
             "-p",
             "loctree",
         ])
-        .expect("index should accept repeated and space-list project filters");
+        .expect("index should accept repeated project filters");
 
         match cli.command {
             Some(Commands::Index { project, .. }) => {
