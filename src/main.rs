@@ -478,7 +478,7 @@ enum Commands {
         redaction: RedactionArgs,
 
         /// Source cwd/project filter(s): narrows session discovery before repo segmentation
-        #[arg(short, long, num_args = 1..)]
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
         /// Hours to look back (default: 48, 0 = all time)
@@ -548,7 +548,7 @@ enum Commands {
         redaction: RedactionArgs,
 
         /// Source cwd/project filter(s): narrows session discovery before repo segmentation
-        #[arg(short, long, num_args = 1..)]
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
         /// Hours to look back (default: 48, 0 = all time)
@@ -620,7 +620,7 @@ enum Commands {
         redaction: RedactionArgs,
 
         /// Source cwd/project filter(s): narrows session discovery before repo segmentation
-        #[arg(short, long, num_args = 1..)]
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
         /// Hours to look back (default: 48, 0 = all time)
@@ -752,7 +752,7 @@ enum Commands {
         agent: String,
 
         /// Source cwd/project filter(s): narrows session discovery before export.
-        #[arg(short, long, num_args = 1..)]
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
         /// Hours to look back when scanning source sessions (default: 1 year).
@@ -789,7 +789,7 @@ enum Commands {
         redaction: RedactionArgs,
 
         /// Source cwd/project filter(s): narrows session discovery before repo segmentation
-        #[arg(short, long, num_args = 1..)]
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
         /// Agent filter: claude, codex, gemini, junie, codescribe, operator-md (default: all agents)
@@ -843,7 +843,7 @@ enum Commands {
         source: IngestSource,
 
         /// Source cwd/project filter(s): narrows source discovery before repo segmentation
-        #[arg(short, long, num_args = 1..)]
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
         /// Hours to look back when --since is omitted (default: 720 = 30 days, 0 = all time)
@@ -990,7 +990,8 @@ enum Commands {
     /// Stream newly-arriving intents/chunks in a follow-like mode.
     Tail {
         /// Repo or store-bucket filters. Omit to scan all projects.
-        #[arg(short, long, num_args = 1.., value_delimiter = ',')]
+        /// Repeated `-p` flags or comma list (`-p a,b`) form a union.
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
         /// Hours to look back (default: 48)
