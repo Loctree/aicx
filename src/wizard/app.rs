@@ -79,6 +79,21 @@ impl App {
         self.store.poll();
     }
 
+    pub fn handle_paste(&mut self, content: String) {
+        if !self.search_mode {
+            return;
+        }
+
+        let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+        let sanitized: String = normalized
+            .chars()
+            .filter(|&c| c >= ' ' || c == '\n' || c == '\t')
+            .map(|c| if c == '\n' { ' ' } else { c })
+            .collect();
+
+        self.search_input.push_str(&sanitized);
+    }
+
     pub fn handle_key_event(&mut self, key: crossterm::event::KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             if self.store.cancel() {
