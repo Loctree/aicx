@@ -562,3 +562,22 @@ i `make check` blokuje równoległy out-of-scope doctor diff (`unused imports`,
 `/Users/silver/AI_notes/projects/aicx/reports/subagents/SUBAGENT_02_audit-area-B--20-05-2026.md`.
 
 ---
+
+## 2026-05-20 — doctor truth: real embedder smoke + Skipped/NotConfigured severity (Area F P1+P2) · {commit-sha}
+
+**Symptom.** `aicx doctor` was lying. It reported `Severity::Green` for embedder health just because a TCP connection could be opened, even if the embedder endpoint was actually broken or required auth. Also, it inflated warnings by defaulting `CheckResult::default()` to `Warning`, and showed Green for steer databases when the feature was compiled out.
+
+**Fix.**
+- Expanded `Severity` enum with `Unknown`, `Skipped`, and `NotConfigured` variants, changing the default to `Unknown` to prevent inflation of warnings.
+- Upgraded the embedder probe from a TCP `HEAD` check to a real `POST /v1/embeddings` using a new `probe` helper in `aicx_embeddings::cloud`, validating the response shape and dimension.
+- Hid the HTTP probe behind a new `--smoke` flag on `aicx doctor`. Without `--smoke`, `check_embedder_warmth` correctly reports `Severity::Skipped` and `check_semantic_health` stays cheap.
+- Updated `check_steer_lance` and `check_steer_bm25` to return `Severity::NotConfigured` if the `lance` feature is disabled, rather than defaulting to Green. If the feature is enabled but no actual query is run, it returns `Severity::Skipped`.
+- Bumped `DoctorReport` schema version to 2 via `#[serde(default)]` migrations.
+
+**Touched.**
+- `src/doctor.rs` — Severity enum, all checking logic, parsing legacy defaults.
+- `src/main.rs` — Wires the `--smoke` flag into `DoctorOptions`.
+- `src/embedder/mod.rs` & `crates/aicx-embeddings/src/cloud.rs` — Extracted and exposed the HTTP JSON probe logic.
+
+**Related.** Area F Priority-4 truth-restoring fixes (F-P1-10, F-P1-11, F-P2-13, F-P2-14) from `docs/bug-tracker-aicx`.
+

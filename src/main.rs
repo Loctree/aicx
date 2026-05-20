@@ -1305,6 +1305,11 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
 
+        /// Run actual real HTTP POST / embedder tests instead of skipping them.
+        /// Doctor stays fast and cheap by default; this flag exercises the AI provider.
+        #[arg(long)]
+        smoke: bool,
+
         /// Output format: text (default), json
         #[arg(long, default_value = "text")]
         format: String,
@@ -1834,6 +1839,7 @@ fn main() -> Result<()> {
             prune_empty_bodies,
             check_dedup,
             verbose,
+            smoke,
             format,
             oracle,
         }) => {
@@ -1845,6 +1851,7 @@ fn main() -> Result<()> {
                 prune_empty_bodies,
                 check_dedup,
                 verbose,
+                smoke,
             };
             let rt = tokio::runtime::Runtime::new()
                 .context("Failed to start tokio runtime for doctor")?;
@@ -1890,6 +1897,7 @@ fn main() -> Result<()> {
                 prune_empty_bodies: false,
                 check_dedup: false,
                 verbose: true,
+                smoke: false,
             };
             let rt = tokio::runtime::Runtime::new()
                 .context("Failed to start tokio runtime for health")?;

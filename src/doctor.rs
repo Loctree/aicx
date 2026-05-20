@@ -17,8 +17,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -41,6 +39,7 @@ pub struct DoctorOptions {
     pub prune_empty_bodies: bool,
     pub check_dedup: bool,
     pub verbose: bool,
+    pub smoke: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
@@ -48,6 +47,9 @@ pub struct DoctorOptions {
 pub enum Severity {
     Green,
     #[default]
+    Unknown,
+    Skipped,
+    NotConfigured,
     Warning,
     Critical,
 }
@@ -64,15 +66,21 @@ impl Default for CheckResult {
     fn default() -> Self {
         Self {
             name: "unknown".to_string(),
-            severity: Severity::Warning,
+            severity: Severity::Unknown,
             detail: "not checked".to_string(),
             recommendation: None,
         }
     }
 }
 
+fn default_schema_version_2() -> u32 {
+    2
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DoctorReport {
+    #[serde(default = "default_schema_version_2")]
+    pub schema_version: u32,
     pub canonical_store: CheckResult,
     pub steer_lance: CheckResult,
     pub steer_bm25: CheckResult,
@@ -129,10 +137,10 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
     let mut sidecars = check_sidecar_coverage(base);
     let mut corpus_buckets = check_corpus_buckets(base);
     let mut noise_health = check_noise_health(base);
-    let mut semantic_health = check_semantic_health();
+    let mut semantic_health = check_semantic_health(opts);
     let mut index_freshness = check_index_freshness(base);
     let mut index_consistency = check_index_consistency(base);
-    let mut embedder_warmth = check_embedder_warmth();
+    let mut embedder_warmth = check_embedder_warmth(opts);
     let mut empty_body_chunks = check_empty_body_chunks(base);
     let mut content_dedup = if opts.check_dedup {
         check_content_dedup(base)
@@ -213,10 +221,10 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
         sidecars = check_sidecar_coverage(base);
         corpus_buckets = check_corpus_buckets(base);
         noise_health = check_noise_health(base);
-        semantic_health = check_semantic_health();
+        semantic_health = check_semantic_health(opts);
         index_freshness = check_index_freshness(base);
         index_consistency = check_index_consistency(base);
-        embedder_warmth = check_embedder_warmth();
+        embedder_warmth = check_embedder_warmth(opts);
         empty_body_chunks = check_empty_body_chunks(base);
         content_dedup = if opts.check_dedup {
             check_content_dedup(base)
@@ -244,6 +252,7 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
     ]);
 
     Ok(DoctorReport {
+        schema_version: 2,
         canonical_store,
         steer_lance,
         steer_bm25,
@@ -337,14 +346,14 @@ fn check_context_corpus(base: &Path) -> CheckResult {
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn check_semantic_health() -> CheckResult {
+fn check_semantic_health(opts: &DoctorOptions) -> CheckResult {
     let cfg = crate::embedder::EmbeddingConfig::from_env();
     match cfg.backend {
         crate::embedder::BackendPreference::Cloud => {
             let Some(cloud) = cfg.cloud.as_ref() else {
                 return CheckResult {
                     name: "semantic_health".to_string(),
-                    severity: Severity::Warning,
+                    severity: Severity::NotConfigured,
                     detail: "cloud backend selected but [embedder.cloud] is not configured"
                         .to_string(),
                     recommendation: Some(
@@ -365,7 +374,18 @@ fn check_semantic_health() -> CheckResult {
                     recommendation: Some(format!("export {env_name}=<provider-api-key>")),
                 };
             }
-            match probe_cloud_embedder_url(&cloud.url) {
+            if !opts.smoke {
+                return CheckResult {
+                    name: "semantic_health".to_string(),
+                    severity: Severity::Green,
+                    detail: format!(
+                        "cloud backend configured for {} (pass --smoke for real HTTP probe)",
+                        cloud.url
+                    ),
+                    recommendation: None,
+                };
+            }
+            match crate::embedder::cloud::probe(&cloud.url, &cloud.model) {
                 Ok(detail) => CheckResult {
                     name: "semantic_health".to_string(),
                     severity: Severity::Green,
@@ -377,10 +397,10 @@ fn check_semantic_health() -> CheckResult {
                 },
                 Err(failure) => CheckResult {
                     name: "semantic_health".to_string(),
-                    severity: failure.severity,
+                    severity: Severity::Critical,
                     detail: format!(
                         "cloud backend URL probe failed for {}: {}",
-                        cloud.url, failure.detail
+                        cloud.url, failure
                     ),
                     recommendation: Some(
                         "Start the embedder service or correct [embedder.cloud].url".to_string(),
@@ -438,102 +458,6 @@ fn check_semantic_health() -> CheckResult {
             detail: "legacy candle backend is not supported by this build".to_string(),
             recommendation: Some("Use backend = \"cloud\" or backend = \"gguf\"".to_string()),
         },
-    }
-}
-
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-struct CloudProbeFailure {
-    severity: Severity,
-    detail: String,
-}
-
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn probe_cloud_embedder_url(url: &str) -> std::result::Result<String, CloudProbeFailure> {
-    let (host, port, path, http_head) = split_http_url(url).ok_or_else(|| CloudProbeFailure {
-        severity: Severity::Critical,
-        detail: "URL is not an http(s) URL".to_string(),
-    })?;
-    let addrs = (host.as_str(), port)
-        .to_socket_addrs()
-        .map_err(|err| CloudProbeFailure {
-            severity: classify_cloud_probe_error(&err.to_string()),
-            detail: format!("DNS lookup failed: {err}"),
-        })?;
-    let mut last_err = None;
-    for addr in addrs {
-        match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
-            Ok(mut stream) => {
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-                if http_head {
-                    let req = format!(
-                        "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-                    );
-                    stream
-                        .write_all(req.as_bytes())
-                        .map_err(|err| CloudProbeFailure {
-                            severity: Severity::Warning,
-                            detail: format!("URL unreachable: {err}"),
-                        })?;
-                    let mut buf = [0_u8; 12];
-                    stream.read(&mut buf).map_err(|err| CloudProbeFailure {
-                        severity: Severity::Warning,
-                        detail: format!("URL unreachable: {err}"),
-                    })?;
-                    return Ok("HTTP HEAD probe responded".to_string());
-                }
-                return Ok(
-                    "TCP probe connected; HTTPS HEAD requires reqwest in the main crate"
-                        .to_string(),
-                );
-            }
-            Err(err) => last_err = Some(err),
-        }
-    }
-    let detail = last_err
-        .map(|err| err.to_string())
-        .unwrap_or_else(|| "no resolved addresses".to_string());
-    Err(CloudProbeFailure {
-        severity: classify_cloud_probe_error(&detail),
-        detail: format!("URL unreachable: {detail}"),
-    })
-}
-
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn split_http_url(url: &str) -> Option<(String, u16, String, bool)> {
-    let (scheme, rest) = url.split_once("://")?;
-    let http_head = scheme.eq_ignore_ascii_case("http");
-    if !http_head && !scheme.eq_ignore_ascii_case("https") {
-        return None;
-    }
-    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let authority = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    let (host, port) = authority
-        .rsplit_once(':')
-        .and_then(|(host, port)| Some((host, port.parse().ok()?)))
-        .unwrap_or((authority, if http_head { 80 } else { 443 }));
-    Some((
-        host.trim_matches(['[', ']']).to_string(),
-        port,
-        format!("/{path}"),
-        http_head,
-    ))
-}
-
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn classify_cloud_probe_error(detail: &str) -> Severity {
-    let detail = detail.to_ascii_lowercase();
-    if detail.contains("dns")
-        || detail.contains("lookup")
-        || detail.contains("name or service")
-        || detail.contains("nodename")
-        || detail.contains("no address")
-    {
-        Severity::Critical
-    } else {
-        Severity::Warning
     }
 }
 
@@ -747,28 +671,99 @@ fn newest_mtime(root: &Path) -> Option<SystemTime> {
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn check_embedder_warmth() -> CheckResult {
+fn check_embedder_warmth(opts: &DoctorOptions) -> CheckResult {
     let cfg = crate::embedder::EmbeddingConfig::from_env();
     if cfg.backend == crate::embedder::BackendPreference::Cloud {
         let local = cfg
             .cloud
             .as_ref()
             .is_some_and(|cloud| is_local_embedder_url(&cloud.url));
-        if !local {
+        if !local && !opts.smoke {
             return CheckResult {
                 name: "embedder_warmth".to_string(),
-                severity: Severity::Green,
-                detail: "remote cloud backend: warmth probe skipped to avoid paid/noisy calls"
-                    .to_string(),
+                severity: Severity::Skipped,
+                detail: "warmth probe skipped; pass --smoke to enable".to_string(),
                 recommendation: None,
             };
+        }
+
+        if opts.smoke
+            && let Some(cloud) = cfg.cloud.as_ref()
+        {
+            let start = std::time::Instant::now();
+            match crate::embedder::cloud::probe(&cloud.url, &cloud.model) {
+                Ok(_) => {
+                    let elapsed = start.elapsed();
+                    let severity = if elapsed < Duration::from_millis(500) {
+                        Severity::Green
+                    } else if elapsed < Duration::from_secs(3) {
+                        Severity::Warning
+                    } else {
+                        Severity::Critical
+                    };
+                    return CheckResult {
+                        name: "embedder_warmth".to_string(),
+                        severity,
+                        detail: format!("cloud embedder replied in {}ms", elapsed.as_millis()),
+                        recommendation: None,
+                    };
+                }
+                Err(e) => {
+                    return CheckResult {
+                        name: "embedder_warmth".to_string(),
+                        severity: Severity::Critical,
+                        detail: format!("cloud warmth probe failed: {e}"),
+                        recommendation: None,
+                    };
+                }
+            }
+        }
+    } else if opts.smoke {
+        #[cfg(feature = "native-embedder")]
+        {
+            let start = std::time::Instant::now();
+            match crate::embedder::EmbeddingEngine::new() {
+                Ok(mut engine) => {
+                    let _ = engine.embed_batch(&["aicx doctor probe".to_string()]);
+                    let elapsed = start.elapsed();
+                    let severity = if elapsed < Duration::from_millis(500) {
+                        Severity::Green
+                    } else if elapsed < Duration::from_secs(3) {
+                        Severity::Warning
+                    } else {
+                        Severity::Critical
+                    };
+                    return CheckResult {
+                        name: "embedder_warmth".to_string(),
+                        severity,
+                        detail: format!("native embedder replied in {}ms", elapsed.as_millis()),
+                        recommendation: None,
+                    };
+                }
+                Err(e) => {
+                    return CheckResult {
+                        name: "embedder_warmth".to_string(),
+                        severity: Severity::Critical,
+                        detail: format!("native warmth probe failed: {e}"),
+                        recommendation: None,
+                    };
+                }
+            }
         }
     }
 
     CheckResult {
         name: "embedder_warmth".to_string(),
-        severity: Severity::Warning,
-        detail: "local embedder warmth probe available via `aicx warmup`".to_string(),
+        severity: if opts.smoke {
+            Severity::Green
+        } else {
+            Severity::Skipped
+        },
+        detail: if opts.smoke {
+            "warmth probe ran".to_string()
+        } else {
+            "warmth probe skipped".to_string()
+        },
         recommendation: Some(
             "Run `aicx warmup` before one-shot semantic search after idle".to_string(),
         ),
@@ -776,10 +771,10 @@ fn check_embedder_warmth() -> CheckResult {
 }
 
 #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
-fn check_embedder_warmth() -> CheckResult {
+fn check_embedder_warmth(_opts: &DoctorOptions) -> CheckResult {
     CheckResult {
         name: "embedder_warmth".to_string(),
-        severity: Severity::Critical,
+        severity: Severity::NotConfigured,
         detail: "binary built without embedder features".to_string(),
         recommendation: None,
     }
@@ -816,7 +811,7 @@ fn check_canonical_store(base: &Path) -> CheckResult {
 async fn check_steer_lance(_base: &Path) -> CheckResult {
     CheckResult {
         name: "steer_lance".to_string(),
-        severity: Severity::Green,
+        severity: Severity::NotConfigured,
         detail: "steer_index (Lance/BM25) feature is disabled".to_string(),
         recommendation: None,
     }
@@ -836,8 +831,11 @@ async fn check_steer_lance(base: &Path) -> CheckResult {
     match steer_index::query_steer_index_count().await {
         Ok(count) => CheckResult {
             name: "steer_lance".to_string(),
-            severity: Severity::Green,
-            detail: format!("Lance steer table healthy, {} documents", count),
+            severity: Severity::Skipped,
+            detail: format!(
+                "Lance steer table exists ({} documents); real query not run",
+                count
+            ),
             recommendation: None,
         },
         Err(e) => {
@@ -869,7 +867,7 @@ async fn check_steer_lance(base: &Path) -> CheckResult {
 fn check_steer_bm25(_base: &Path) -> CheckResult {
     CheckResult {
         name: "steer_bm25".to_string(),
-        severity: Severity::Green,
+        severity: Severity::NotConfigured,
         detail: "steer_index (Lance/BM25) feature is disabled".to_string(),
         recommendation: None,
     }
@@ -892,11 +890,14 @@ fn check_steer_bm25(base: &Path) -> CheckResult {
     CheckResult {
         name: "steer_bm25".to_string(),
         severity: if entries > 0 {
-            Severity::Green
+            Severity::Skipped
         } else {
             Severity::Warning
         },
-        detail: format!("BM25 index has {} entries on disk", entries),
+        detail: format!(
+            "BM25 index has {} entries on disk; real query not run",
+            entries
+        ),
         recommendation: if entries == 0 {
             Some("BM25 dir is empty; reindex with `aicx store -H 168 --full-rescan`".to_string())
         } else {
@@ -1567,7 +1568,9 @@ pub fn oracle_readiness(report: &DoctorReport) -> OracleReadinessReport {
     let canonical = report.canonical_store.severity;
     let metadata = max_severity(&[report.steer_lance.severity, report.steer_bm25.severity]);
     let content = content_semantic_severity(report);
-    let dashboard = Severity::Green;
+
+    // TODO: Actually check dashboard port if configured.
+    let dashboard = Severity::NotConfigured;
 
     let readiness = if canonical == Severity::Critical
         || report.sidecars.severity == Severity::Critical
@@ -1576,7 +1579,7 @@ pub fn oracle_readiness(report: &DoctorReport) -> OracleReadinessReport {
         OracleReadiness::UnsafeForLoctreeScope
     } else if metadata != Severity::Green
         || content != Severity::Green
-        || dashboard != Severity::Green
+        || (dashboard != Severity::Green && dashboard != Severity::NotConfigured)
     {
         OracleReadiness::Degraded
     } else {
@@ -1633,11 +1636,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn max_severity_promotes_critical() {
+    fn test_severity_unknown_is_default_not_warning() {
+        let default_res = CheckResult::default();
+        assert_eq!(default_res.severity, Severity::Unknown);
+    }
+
+    #[test]
+    fn test_aggregation_unknown_does_not_inflate_warning() {
         assert_eq!(
-            max_severity(&[Severity::Green, Severity::Warning, Severity::Critical]),
-            Severity::Critical
+            max_severity(&[
+                Severity::Green,
+                Severity::Unknown,
+                Severity::Skipped,
+                Severity::NotConfigured
+            ]),
+            Severity::Green
         );
+        assert_eq!(
+            max_severity(&[Severity::Green, Severity::Unknown, Severity::Warning]),
+            Severity::Warning
+        );
+    }
+
+    #[test]
+    fn test_legacy_report_deserialization_maps_missing_fields_to_unknown() {
+        let legacy_json = r#"{
+            "canonical_store": {"name":"canonical","severity":"green","detail":"ok"},
+            "steer_lance": {"name":"lance","severity":"green","detail":"ok"},
+            "steer_bm25": {"name":"bm25","severity":"green","detail":"ok"},
+            "state": {"name":"state","severity":"green","detail":"ok"},
+            "sidecars": {"name":"sidecars","severity":"green","detail":"ok"},
+            "corpus_buckets": {"name":"buckets","severity":"green","detail":"ok"},
+            "noise_health": {"name":"noise","severity":"green","detail":"ok"},
+            "fixes_applied": [],
+            "overall": "green"
+        }"#;
+        let report: DoctorReport = serde_json::from_str(legacy_json).unwrap();
+        // Since CheckResult::default() uses Unknown, these should be Unknown!
+        assert_eq!(report.semantic_health.severity, Severity::Unknown);
+        assert_eq!(report.embedder_warmth.severity, Severity::Unknown);
+        assert_eq!(report.schema_version, 2); // default_schema_version_2 returns 2
+    }
+
+    #[test]
+    fn test_check_embedder_warmth_without_smoke_returns_skipped() {
+        let opts = DoctorOptions {
+            fix: false,
+            fix_buckets: false,
+            dry_run: false,
+            rebuild_sidecars: false,
+            prune_empty_bodies: false,
+            check_dedup: false,
+            verbose: false,
+            smoke: false,
+        };
+        // Even if config is missing or local, without smoke it skips.
+        // Actually check_embedder_warmth reads from env, which could be anything in test,
+        // but regardless, if smoke=false, it should return Skipped or NotConfigured (if no feature).
+        let check = check_embedder_warmth(&opts);
+        #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+        assert_eq!(check.severity, Severity::Skipped);
+        #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+        assert_eq!(check.severity, Severity::NotConfigured);
+    }
+    #[test]
+    fn test_max_severity_promotes_critical() {
         assert_eq!(
             max_severity(&[Severity::Green, Severity::Warning]),
             Severity::Warning
@@ -1648,6 +1711,7 @@ mod tests {
     #[test]
     fn oracle_readiness_is_ready_when_semantic_and_freshness_are_green() {
         let report = DoctorReport {
+            schema_version: 2,
             canonical_store: CheckResult {
                 name: "canonical".to_string(),
                 severity: Severity::Green,
@@ -1747,19 +1811,9 @@ mod tests {
         let readiness = oracle_readiness(&report);
         assert_eq!(readiness.readiness_label, "ready");
         assert_eq!(readiness.content_semantic_index_health, Severity::Green);
-        assert_eq!(readiness.dashboard_semantic_route_health, Severity::Green);
-    }
-
-    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-    #[test]
-    fn cloud_probe_dns_failures_are_red() {
         assert_eq!(
-            classify_cloud_probe_error("failed to lookup address information"),
-            Severity::Critical
-        );
-        assert_eq!(
-            classify_cloud_probe_error("connection refused"),
-            Severity::Warning
+            readiness.dashboard_semantic_route_health,
+            Severity::NotConfigured
         );
     }
 

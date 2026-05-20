@@ -12,6 +12,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
@@ -646,22 +647,26 @@ fn apply_truncation(message: &str, max_chars: usize) -> String {
 }
 
 fn write_formatted_message(w: &mut impl Write, message: &str) -> Result<()> {
-    let has_code_blocks = message.contains("```");
-    let is_multiline = message.contains('\n');
+    // CRLF/CR normalized before any downstream decision so writers see one newline form.
+    let normalized = normalize_newlines(message);
+    let body = normalized.as_ref();
+    let has_code_blocks = body.contains("```");
+    let is_multiline = body.contains('\n');
 
-    if !is_multiline {
-        // Single line: simple blockquote
-        writeln!(w, "> {}", message)?;
-    } else if has_code_blocks {
-        // Message with code blocks: use HTML blockquote to preserve code fences
-        write_blockquote_with_code(w, message)?;
+    if has_code_blocks {
+        // Code-bearing messages: HTML blockquote + dynamic outer fence so inner
+        // backticks (and any HTML/markdown they contain) cannot break out.
+        write_blockquote_with_code(w, body)?;
+    } else if !is_multiline {
+        // Single line: markdown `>` blockquote with HTML escape.
+        writeln!(w, "> {}", html_escape(body))?;
     } else {
-        // Multi-line without code blocks: blockquote each line properly
-        for line in message.lines() {
+        // Multi-line plain text: markdown `>` blockquote per line, HTML-escaped.
+        for line in body.lines() {
             if line.is_empty() {
                 writeln!(w, ">")?;
             } else {
-                writeln!(w, "> {}", line)?;
+                writeln!(w, "> {}", html_escape(line))?;
             }
         }
         writeln!(w)?;
@@ -670,24 +675,62 @@ fn write_formatted_message(w: &mut impl Write, message: &str) -> Result<()> {
     Ok(())
 }
 
+/// Wrap a code-bearing message inside `<blockquote>` with an outer code fence
+/// of dynamic length, guaranteeing the inner content cannot terminate the fence.
+///
+/// Caller is expected to pass CRLF-normalized input (see `normalize_newlines`).
 fn write_blockquote_with_code(w: &mut impl Write, message: &str) -> Result<()> {
-    // Use HTML <blockquote> when code fences are present
-    // This avoids breaking code blocks with `>` prefixes
+    let fence = dynamic_fence_for(message);
     writeln!(w, "<blockquote>")?;
     writeln!(w)?;
-
-    let mut in_code_block = false;
+    writeln!(w, "{}", fence)?;
     for line in message.lines() {
-        if line.starts_with("```") {
-            in_code_block = !in_code_block;
-        }
         writeln!(w, "{}", line)?;
     }
-
+    writeln!(w, "{}", fence)?;
     writeln!(w)?;
     writeln!(w, "</blockquote>")?;
     writeln!(w)?;
     Ok(())
+}
+
+/// HTML-escape the five characters that can break out of markdown blockquote
+/// rendering when the downstream renderer treats raw HTML as live markup.
+fn html_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Pick a code fence one backtick longer than the longest run inside `content`
+/// (minimum 3). Guarantees the fence cannot be closed early by inner backticks.
+fn dynamic_fence_for(content: &str) -> String {
+    let mut max_run = 0usize;
+    let mut current = 0usize;
+    for ch in content.chars() {
+        if ch == '`' {
+            current += 1;
+            if current > max_run {
+                max_run = current;
+            }
+        } else {
+            current = 0;
+        }
+    }
+    let fence_len = std::cmp::max(3, max_run + 1);
+    "`".repeat(fence_len)
+}
+
+/// Normalize `\r\n` and lone `\r` to `\n`. Borrows when nothing to change.
+fn normalize_newlines(s: &str) -> Cow<'_, str> {
+    if s.contains('\r') {
+        Cow::Owned(s.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        Cow::Borrowed(s)
+    }
 }
 
 fn write_markdown_footer(w: &mut impl Write) -> Result<()> {
@@ -1546,5 +1589,158 @@ mod tests {
         assert!(!content.contains("<blockquote>"));
 
         cleanup(&dir);
+    }
+
+    // --- Markdown safety policy (Area C P2) ---
+
+    fn render_message_markdown(msg: &str) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        write_formatted_message(&mut buf, msg).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn test_html_escape_neutralizes_script_payload() {
+        let out = render_message_markdown("<script>alert(1)</script>");
+        // Script payload becomes inert text — no live `<script>` tag survives.
+        assert!(out.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!out.contains("<script>"));
+        assert!(!out.contains("</script>"));
+
+        // Same protection holds for multi-line plain text.
+        let multi = render_message_markdown("line a\n<img src=x onerror=alert(1)>\nline b");
+        assert!(multi.contains("&lt;img src=x onerror=alert(1)&gt;"));
+        assert!(!multi.contains("<img"));
+    }
+
+    #[test]
+    fn test_stray_triple_backtick_does_not_break_out() {
+        // Message with a stray triple-backtick inside a code-bearing body must stay
+        // contained — the outer fence must be longer than any inner backtick run.
+        let msg = "intro\n```\nstray fence content\n```\ntrailing";
+        let out = render_message_markdown(msg);
+        assert!(out.contains("<blockquote>"));
+        assert!(out.contains("</blockquote>"));
+        // Outer fence must be strictly longer than the longest inner run (3 → 4).
+        assert!(out.contains("````\n"));
+        // The literal inner backticks still appear as text inside the wrapping fence.
+        assert!(out.contains("stray fence content"));
+        // Trailing context survives in the same artifact (proves no runaway block).
+        assert!(out.contains("trailing"));
+    }
+
+    #[test]
+    fn test_link_injection_does_not_become_active_link() {
+        // Markdown link-injection payload must surface as literal text in the artifact;
+        // we never synthesize an `<a>` tag, and structural delimiters do not survive.
+        let payload = "before ]([http://attacker.example/](http://attacker.example/)) after";
+        let out = render_message_markdown(payload);
+        // No HTML anchor tag was generated by the writer.
+        assert!(!out.contains("<a "));
+        assert!(!out.contains("</a>"));
+        // The literal URL is present as text (proves we did not strip or fetch).
+        assert!(out.contains("http://attacker.example/"));
+        // The line still starts with a markdown blockquote prefix — structure intact.
+        assert!(out.contains("> before "));
+    }
+
+    #[test]
+    fn test_crlf_normalized_to_lf() {
+        let out = render_message_markdown("first\r\nsecond\rthird");
+        // Output never carries CR back through.
+        assert!(!out.contains('\r'));
+        // All three lines surface as ordinary blockquote lines.
+        assert!(out.contains("> first"));
+        assert!(out.contains("> second"));
+        assert!(out.contains("> third"));
+    }
+
+    #[test]
+    fn test_dynamic_fence_avoids_collision() {
+        // Helper-level invariants first: fence must exceed the longest internal run.
+        assert_eq!(dynamic_fence_for("no backticks here"), "```");
+        assert_eq!(dynamic_fence_for("```"), "````");
+        assert_eq!(dynamic_fence_for("````"), "`````");
+        assert_eq!(dynamic_fence_for("``a```b``"), "````");
+
+        // End-to-end: a body containing 4 backticks must be wrapped with 5+.
+        let msg = "before\n````\nfour-tick fence\n````\nafter";
+        let out = render_message_markdown(msg);
+        assert!(out.contains("`````\n"));
+        assert!(!out.contains("``````\n")); // exactly one more than the inner run
+    }
+
+    // --- JSON regression (Area C P2 — confirm serde_json is RFC-compliant) ---
+
+    fn json_roundtrip_entry(msg: &str) -> serde_json::Value {
+        let dir = unique_test_dir("json_regression");
+        let config = OutputConfig {
+            dir: dir.clone(),
+            format: OutputFormat::Json,
+            mode: OutputMode::NewFile,
+            ..Default::default()
+        };
+        let entries = vec![TimelineEntry {
+            timestamp: Utc.with_ymd_and_hms(2026, 5, 20, 12, 0, 0).unwrap(),
+            agent: "claude".to_string(),
+            session_id: "json-regr".to_string(),
+            role: "user".to_string(),
+            message: msg.to_string(),
+            branch: None,
+            cwd: None,
+            frame_kind: None,
+        }];
+        let metadata = ReportMetadata {
+            generated_at: Utc.with_ymd_and_hms(2026, 5, 20, 13, 0, 0).unwrap(),
+            project_filter: Some("regr".to_string()),
+            hours_back: 1,
+            total_entries: 1,
+            sessions: vec!["json-regr".to_string()],
+        };
+        let paths = write_report(&config, &entries, &metadata).unwrap();
+        let content = fs::read_to_string(&paths[0]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        cleanup(&dir);
+        parsed
+    }
+
+    #[test]
+    fn test_json_escapes_control_chars() {
+        // \u{0001} (SOH), \u{0008} (backspace), \u{000c} (form feed), \t, \n, \r
+        let msg = "ctrl\u{0001}\u{0008}\u{000c}\t\n\rend";
+        let parsed = json_roundtrip_entry(msg);
+        let recovered = parsed["entries"][0]["message"].as_str().unwrap();
+        assert_eq!(recovered, msg, "control chars must round-trip losslessly");
+    }
+
+    #[test]
+    fn test_json_handles_bom_in_message() {
+        let msg = "\u{feff}body after BOM";
+        let parsed = json_roundtrip_entry(msg);
+        let recovered = parsed["entries"][0]["message"].as_str().unwrap();
+        assert_eq!(recovered, msg, "U+FEFF must survive JSON round-trip");
+        // Top-level JSON must be parseable (already proven by from_str success above).
+        assert!(parsed.is_object());
+    }
+
+    #[test]
+    fn test_json_invalid_input_rejected_upstream() {
+        // Unpaired surrogates cannot exist in a Rust `String` — the type system
+        // already enforces well-formed UTF-8 / UTF-16-safe scalars. Confirm both
+        // sides of the contract: (1) raw bytes containing an unpaired surrogate
+        // fail at parse time, (2) any `String` we hand to serde_json round-trips.
+        // Build at runtime so the compile-time `invalid_from_utf8` lint stays quiet.
+        let bad_bytes: Vec<u8> = vec![0xEDu8, 0xA0u8, 0x80u8]; // UTF-8 of U+D800
+        assert!(
+            std::str::from_utf8(&bad_bytes).is_err(),
+            "unpaired surrogate must fail UTF-8 parse before reaching the writer"
+        );
+
+        // Sanity: every valid scalar (including high BMP and supplementary planes)
+        // survives the writer, proving the rejection is purely upstream.
+        let msg = "supp \u{1f4cc} bmp \u{2603} done";
+        let parsed = json_roundtrip_entry(msg);
+        let recovered = parsed["entries"][0]["message"].as_str().unwrap();
+        assert_eq!(recovered, msg);
     }
 }
