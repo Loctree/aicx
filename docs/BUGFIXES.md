@@ -545,9 +545,10 @@ w `run_store` i `run_extraction` działał bez outer locka. Sam save używał
 
 **Tests.** Dodano 4 state unit tests i 1 integration contention test. Zielone:
 `cargo test --package aicx --lib state::` (26/26), `cargo test --test
-locks_contention` (2/2), `make precheck`, `make test`, `make fmt`. `make clippy`
-i `make check` blokuje równoległy out-of-scope doctor diff (`unused imports`,
-`unused mut`, `collapsible_if`, plus formatting drift w `src/doctor.rs`).
+locks_contention` (2/2), `make precheck`, `make test`, `make fmt`,
+`make clippy`, `make check`. `make check` wymagał wąskich inline `nosemgrep`
+dla Semgrep false positives na wewnętrznych pathach `state.json`, `index.json`
+i atomic tempfile; follow-up commit: `ec4f74e`.
 
 **Lessons.**
 - Lock na pojedynczy `load` i pojedynczy `save` nie chroni transakcji. Jeśli
@@ -654,4 +655,3 @@ aicx --lib output::` (30/30), `make precheck`, `make test`, `make clippy`,
 **Related.** Area C Priority-2 (2.1–2.5) z
 `/Users/silver/Downloads/bug-tracker-aicx.md` linie 1278–1333 oraz
 `/Users/silver/AI_notes/projects/aicx/reports/subagents/SUBAGENT_03_audit-area-C--20-05-2026.md`.
-
