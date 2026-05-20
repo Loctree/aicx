@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn chars(ch: char, len: usize) -> String {
-    std::iter::repeat(ch).take(len).collect()
+    std::iter::repeat_n(ch, len).collect()
 }
 
 fn unique_test_dir(name: &str) -> PathBuf {

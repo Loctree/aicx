@@ -273,7 +273,7 @@ mod tests {
     use super::*;
 
     fn chars(ch: char, len: usize) -> String {
-        std::iter::repeat(ch).take(len).collect()
+        std::iter::repeat_n(ch, len).collect()
     }
 
     fn assert_redacted(raw: &str, label: &str) {
