@@ -511,3 +511,54 @@ blokuje je równoległy out-of-scope diff w `crates/aicx-embeddings/src/cloud.rs
 **Related.** A-10 z `/Users/silver/Downloads/bug-tracker-aicx.md`, Area A.
 
 ---
+
+## 2026-05-20 — transactional state.json + outer state lock (B-2+B-3) · `31186db`
+
+**Symptom.** Dwa równoległe `aicx store` / `aicx all` mogły załadować ten sam
+stary `state.json`, a potem drugi zapis nadpisywał watermarki, `seen_hashes`
+i `runs` pierwszego. Dodatkowo crash podczas `StateManager::save` mógł zostawić
+ucięty `state.json`, a parse failure cicho resetował state do defaultu.
+
+**Root cause.** `StateManager::load` i `save` brały `state.lock` tylko na
+krótkie fragmenty pojedynczego odczytu/zapisu. Cały cykl read → mutate → save
+w `run_store` i `run_extraction` działał bez outer locka. Sam save używał
+`fs::write`, a load robił `serde_json::from_str(...).unwrap_or_default()`.
+
+**Fix.**
+- `StateManager::load` zwraca teraz `Result<Self>`; brak pliku nadal daje
+  default, ale malformed JSON próbuje `state.json.bak`, a bez backupu zwraca
+  jawny błąd zamiast silent default.
+- `StateManager::save` używa Wave-1 `atomic_write` i zapisuje rolling
+  `state.json.bak` z poprzedniej wersji przed atomową podmianą main file.
+- Wewnętrzne `state.lock` reacquire w `load/save` zostało usunięte, żeby
+  outer lock nie deadlockował na tym samym zasobie.
+- `run_extraction`, `run_store` i `run_state` trzymają teraz exclusive
+  `state.lock` przez pełny state read-modify-write cykl.
+
+**Touched.**
+- `src/state.rs` — transactional load/save, backup recovery, state unit tests.
+- `src/main.rs` — outer `state.lock` w `run_extraction`, `run_store`,
+  `run_state`.
+- `src/store.rs` — `atomic_write` module visibility only; store write paths
+  nietknięte.
+- `tests/locks_contention.rs` — simplified concurrent state update regression.
+
+**Tests.** Dodano 4 state unit tests i 1 integration contention test. Zielone:
+`cargo test --package aicx --lib state::` (26/26), `cargo test --test
+locks_contention` (2/2), `make precheck`, `make test`, `make fmt`. `make clippy`
+i `make check` blokuje równoległy out-of-scope doctor diff (`unused imports`,
+`unused mut`, `collapsible_if`, plus formatting drift w `src/doctor.rs`).
+
+**Lessons.**
+- Lock na pojedynczy `load` i pojedynczy `save` nie chroni transakcji. Jeśli
+  decyzja dedup/watermark zapada między nimi, lock musi objąć całą sekcję.
+- JSON state nie może mieć `unwrap_or_default()` na parse failure; default jest
+  poprawny tylko dla missing file, nie dla corruption.
+- Po zdjęciu locków wewnętrznych trzeba od razu sprawdzić poboczne CLI surface
+  (`aicx state`), bo inaczej reset/info zostałyby poza nowym kontraktem.
+
+**Related.** Area B Wave-B (B-2 + B-3) z
+`/Users/silver/Downloads/bug-tracker-aicx.md` linie 645-1058 oraz
+`/Users/silver/AI_notes/projects/aicx/reports/subagents/SUBAGENT_02_audit-area-B--20-05-2026.md`.
+
+---
