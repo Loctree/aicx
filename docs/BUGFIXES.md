@@ -136,7 +136,7 @@ oraz pełnego sweepa `-p` semantics (wpis 2026-05-20).
 
 ---
 
-## 2026-05-20 — atomic store writes + UUIDv7 basename collision precheck · `5310ba4`
+## 2026-05-20 — atomic store writes + UUIDv7 basename collision precheck · `bc67728`
 
 **Symptom.** Trzy niezależne ścieżki w canonical store mogły po cichu
 tracić dane:
