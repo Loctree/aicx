@@ -581,3 +581,77 @@ i `make check` blokuje równoległy out-of-scope doctor diff (`unused imports`,
 
 **Related.** Area F Priority-4 truth-restoring fixes (F-P1-10, F-P1-11, F-P2-13, F-P2-14) from `docs/bug-tracker-aicx`.
 
+---
+
+## 2026-05-20 — markdown HTML escape + dynamic fence + CRLF normalization (Area C P2) · `fff5cc5`
+
+**Symptom.** `write_formatted_message` w `src/output.rs` emitował user / agent
+message body jako raw markdown / HTML. Single-line szło do `>` blockquote bez
+HTML escape, multi-line z triple backtickami trafiało do literalnego
+`<blockquote>` którego inner linie też nie były escapowane. Payloady typu
+`<script>alert(1)</script>`, stray triple backticks, markdown link injection
+i CRLF mogły zmieniać strukturę artefaktu albo wykonywać się w permissive
+rendererach (GitHub, browser otwierający `.md` jako HTML).
+
+**Root cause.** Markdown writer traktował message body jako safe markup.
+`write_blockquote_with_code` echował linie verbatim a sam `<blockquote>`
+zakładał że inner content jest trusted. Brak dynamicznego dobierania fence,
+brak escape pass i brak normalizacji newline — dowolne wewnętrzne backticki
+długości >= 3 mogły zamknąć otaczający markdown, dowolny raw `<script>`
+przeżywał nietknięty, a `\r\n` przeżywał z powrotem do artefaktu.
+
+**Fix.**
+- Dodano trzy private helpery w `src/output.rs`:
+  - `html_escape` (output.rs:699) — escapuje `& < > " '`, lustruje istniejące
+    private kopie w `src/dashboard.rs:1020` i `src/reports_extractor.rs:1282`
+    (brak wspólnego aicx helpera; zostawione spójnie z konwencją zamiast
+    wprowadzać nowy util module mid-wave).
+  - `dynamic_fence_for` (output.rs:710) — skanuje content szukając najdłuższego
+    runu backticków, zwraca `max(3, longest+1)` backticków żeby wrapping fence
+    nie mógł zostać zamknięty przedwcześnie przez inner content.
+  - `normalize_newlines` (output.rs:728) — kolapsuje `\r\n` / lone `\r` do
+    `\n`, zwraca `Cow` żeby unchanged input unikał alokacji.
+- Przepisano `write_formatted_message` (output.rs:648): najpierw normalize
+  newlines, potem routing — code-bearing → `write_blockquote_with_code`,
+  single-line → markdown `>` blockquote z `html_escape`, multi-line plain →
+  per-line `>` blockquote z `html_escape`.
+- Przepisano `write_blockquote_with_code` (output.rs:684): wraps body inside
+  `<blockquote>` + outer dynamic fence żeby inner backticki nie mogły się
+  wydostać i żeby dowolny inner HTML / markdown renderował się jako inert
+  code text.
+- JSON writery (output.rs:346, output.rs:373, output.rs:831) nietknięte —
+  audit Area C potwierdził że `serde_json` jest RFC-compliant; ten fix tylko
+  dodaje regresyjne testy wokół tego kontraktu.
+
+**Touched.**
+- `src/output.rs` — helpery, markdown write paths, 8 nowych testów.
+
+**Tests.** 8 nowych testów w `src/output.rs::tests` (30/30 total w module):
+`test_html_escape_neutralizes_script_payload`,
+`test_stray_triple_backtick_does_not_break_out`,
+`test_link_injection_does_not_become_active_link`,
+`test_crlf_normalized_to_lf`, `test_dynamic_fence_avoids_collision`,
+`test_json_escapes_control_chars`, `test_json_handles_bom_in_message`,
+`test_json_invalid_input_rejected_upstream`. Zielone: `cargo test --package
+aicx --lib output::` (30/30), `make precheck`, `make test`, `make clippy`,
+`make fmt`.
+
+**Lessons.**
+- Trust boundary dla `output.rs` to message body, nie renderer. Defensive
+  escape at write time jest tańszy niż audytowanie każdego downstream
+  renderera pod kątem raw-HTML permissywności.
+- Outer fence length musi być dłuższy od **najdłuższego runu** inner
+  backticków, nie po prostu count occurrences — trzy osobne 3-tick runy
+  i jeden 4-tick run oba wymagają takiego samego 5-tick outer fence.
+- `Cow` dla `normalize_newlines` trzyma zero-CR case alokacja-free; większość
+  transkryptów Claude / Codex / Gemini już używa LF, więc borrow path to hot
+  path.
+- Parallel-wave Living Tree etiquette: W2-C output.rs cut był autorski na
+  swoim branchu ale wylądował wewnątrz sibling commit `fff5cc5` bo tamta fala
+  stage'owała szersze working tree niż jej scope. Substrate boundary notowane
+  poniżej w sekcji Living Tree; kod w drzewie jest poprawny i gaty zielone.
+
+**Related.** Area C Priority-2 (2.1–2.5) z
+`/Users/silver/Downloads/bug-tracker-aicx.md` linie 1278–1333 oraz
+`/Users/silver/AI_notes/projects/aicx/reports/subagents/SUBAGENT_03_audit-area-C--20-05-2026.md`.
+
