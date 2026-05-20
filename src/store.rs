@@ -21,6 +21,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+mod atomic_write;
+use atomic_write::atomic_write;
+
 use crate::chunker::{self, ChunkerConfig};
 use crate::sanitize;
 use crate::segmentation::semantic_segments;
@@ -154,16 +157,32 @@ pub(crate) fn compact_date(date: &str) -> String {
 
 /// Truncate session ID to a reasonable length for filenames.
 ///
-/// Session IDs can be UUIDs (36 chars) or other formats.
-/// We take the first 12 chars which provides sufficient uniqueness
-/// (~2^48 for hex IDs) while keeping basenames readable.
+/// UUIDv7 IDs share a time-dominated prefix; truncating to 12 hex chars
+/// makes basename collisions between near-in-time sessions plausible. We
+/// keep up to 20 cleaned chars, and append a 6-hex SipHash-1-3 suffix of
+/// the original ID when truncation actually drops information so the
+/// basename remains collision-resistant.
 fn truncate_session_id(session_id: &str) -> String {
     let cleaned: String = session_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
         .collect();
-    let limit = 12.min(cleaned.len());
-    cleaned[..limit].to_string()
+    const LIMIT: usize = 20;
+    if cleaned.len() <= LIMIT {
+        return cleaned;
+    }
+    format!("{}-h{}", &cleaned[..LIMIT], siphash13_hex6(session_id))
+}
+
+/// Stable 6-char hex of `input` via SipHash-1-3 with default (zero) key.
+/// 24 bits of disambiguation — collision probability ~2^-24 for unrelated
+/// inputs, sufficient for basename suffix disambiguation.
+fn siphash13_hex6(input: &str) -> String {
+    use siphasher::sip::SipHasher13;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = SipHasher13::new();
+    input.hash(&mut hasher);
+    format!("{:06x}", (hasher.finish() & 0x00FF_FFFF) as u32)
 }
 
 // ============================================================================
@@ -509,7 +528,11 @@ pub struct AgentIndex {
 
 /// Load the store index from `~/.aicx/index.json`.
 ///
-/// Returns a default empty index if the file doesn't exist or can't be parsed.
+/// Returns a default empty index if the file doesn't exist. If the file
+/// exists but cannot be read or parsed (and no `.bak` sibling rescues it),
+/// emits a `tracing::warn!` and still returns default to preserve the
+/// public `StoreIndex` API; callers that need fail-fast semantics on a
+/// corrupt index should call `load_index_at` directly.
 pub fn load_index() -> StoreIndex {
     let base = match store_base_dir() {
         Ok(dir) => dir,
@@ -529,21 +552,55 @@ pub fn load_index() -> StoreIndex {
             return StoreIndex::default();
         }
     };
-    load_index_at(&base)
+    match load_index_at(&base) {
+        Ok(idx) => idx,
+        Err(err) => {
+            tracing::warn!("failed to load store index (returning empty default): {err:#}");
+            StoreIndex::default()
+        }
+    }
 }
 
-fn load_index_at(base: &Path) -> StoreIndex {
+fn load_index_at(base: &Path) -> Result<StoreIndex> {
     let path = base.join("index.json");
     if !path.exists() {
-        return StoreIndex::default();
+        return Ok(StoreIndex::default());
     }
 
-    let contents = match fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return StoreIndex::default(),
-    };
+    match read_and_parse_index(&path) {
+        Ok(idx) => Ok(idx),
+        Err(primary_err) => {
+            let bak_path = path.with_extension("json.bak");
+            tracing::warn!(
+                path = %path.display(),
+                bak = %bak_path.display(),
+                "store index corrupt or unreadable ({primary_err:#}); attempting .bak recovery"
+            );
+            if bak_path.exists() {
+                match read_and_parse_index(&bak_path) {
+                    Ok(idx) => {
+                        tracing::warn!("recovered store index from {}", bak_path.display());
+                        return Ok(idx);
+                    }
+                    Err(bak_err) => {
+                        return Err(anyhow!(
+                            "store index unreadable and .bak fallback also failed (primary: {primary_err:#}; bak: {bak_err:#})"
+                        ));
+                    }
+                }
+            }
+            Err(primary_err.context(format!(
+                "store index unreadable and no .bak sibling at {}",
+                bak_path.display()
+            )))
+        }
+    }
+}
 
-    serde_json::from_str(&contents).unwrap_or_default()
+fn read_and_parse_index(path: &Path) -> Result<StoreIndex> {
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("read failed: {}", path.display()))?;
+    serde_json::from_str(&contents).with_context(|| format!("parse failed: {}", path.display()))
 }
 
 /// Persist the store index to disk.
@@ -558,7 +615,23 @@ pub fn save_index(index: &StoreIndex) -> Result<()> {
 fn save_index_at(base: &Path, index: &StoreIndex) -> Result<()> {
     let path = base.join("index.json");
     let json = serde_json::to_string_pretty(index).context("Failed to serialize index")?;
-    fs::write(&path, json).with_context(|| format!("Failed to write index: {}", path.display()))?;
+
+    // Best-effort: snapshot the previous index to `.bak` BEFORE the swap so a
+    // crash mid-write still leaves a recoverable copy. Errors here are logged
+    // but never block the save itself.
+    if path.exists() {
+        let bak = path.with_extension("json.bak");
+        if let Err(err) = fs::copy(&path, &bak) {
+            tracing::warn!(
+                src = %path.display(),
+                dst = %bak.display(),
+                "failed to snapshot index to .bak before save: {err}"
+            );
+        }
+    }
+
+    atomic_write(&path, json.as_bytes())
+        .with_context(|| format!("Failed to write index: {}", path.display()))?;
     Ok(())
 }
 
@@ -684,14 +757,14 @@ pub fn write_context(
     }
 
     let write_path = sanitize::validate_write_path(&md_path)?;
-    fs::write(&write_path, &md_content)?;
+    atomic_write(&write_path, md_content.as_bytes())?;
     written.push(md_path);
 
     // JSON
     let json_path = get_context_json_path(&project, agent, date, time)?;
     let json_content = serde_json::to_string_pretty(entries)?;
     let write_path = sanitize::validate_write_path(&json_path)?;
-    fs::write(&write_path, &json_content)?;
+    atomic_write(&write_path, json_content.as_bytes())?;
     written.push(json_path);
 
     Ok(written)
@@ -732,7 +805,7 @@ pub fn write_context_chunked(
         let path = dir.join(&filename);
 
         let write_path = sanitize::validate_write_path(&path)?;
-        fs::write(&write_path, &chunk.text)?;
+        atomic_write(&write_path, chunk.text.as_bytes())?;
         written.push(path);
     }
 
@@ -824,10 +897,64 @@ fn write_context_session_first_outcome_at(
             continue;
         }
 
-        let write_path = sanitize::validate_write_path(&path)?;
-        fs::write(&write_path, &chunk.text)?;
-        write_chunk_sidecar(&path, chunk, Some(content_sha256))?;
-        outcome.written_paths.push(path);
+        // Basename collision precheck. UUIDv7 prefix sessions can land on the
+        // same `session_basename` even after siphash suffix in pathological
+        // cases (different inputs, same suffix). If the target already exists
+        // with a different `content_sha256`, disambiguate via a `-c{hex}`
+        // suffix derived from the new content hash so the existing chunk is
+        // never silently overwritten.
+        let target_path = if path.exists() {
+            let existing_sidecar = path.with_extension("meta.json");
+            let existing_sha =
+                load_sidecar_from_path(&existing_sidecar).and_then(|s| s.content_sha256);
+            if existing_sha.as_deref() == Some(content_sha256.as_str()) {
+                outcome.deduped_chunks += 1;
+                continue;
+            }
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("chunk");
+            let disambig = dir.join(format!("{}-c{}.md", stem, siphash13_hex6(&content_sha256)));
+            tracing::warn!(
+                target: "aicx::store",
+                existing = %path.display(),
+                disambiguated = %disambig.display(),
+                existing_sha = ?existing_sha,
+                "session-first chunk basename collision; writing under disambiguated path"
+            );
+            disambig
+        } else {
+            path
+        };
+
+        let write_path = sanitize::validate_write_path(&target_path)?;
+        let sidecar_path = target_path.with_extension("meta.json");
+        let sidecar_write_path = sanitize::validate_write_path(&sidecar_path)?;
+
+        let mut sidecar = chunker::ChunkMetadataSidecar::from(chunk);
+        sidecar.content_sha256 = Some(content_sha256);
+        let sidecar_bytes = serde_json::to_vec_pretty(&sidecar)?;
+
+        // Two-phase commit: stage both tempfiles, then rename in order
+        // (.md first, .meta.json second). A crash between renames leaves an
+        // orphan .md without sidecar — detectable and recoverable — instead
+        // of an orphan .md with a stale or absent sidecar.
+        let chunk_tmp = atomic_write::stage_tempfile(&write_path, chunk.text.as_bytes())?;
+        let sidecar_tmp = match atomic_write::stage_tempfile(&sidecar_write_path, &sidecar_bytes) {
+            Ok(tmp) => tmp,
+            Err(err) => {
+                atomic_write::discard_tempfile(&chunk_tmp);
+                return Err(err.into());
+            }
+        };
+        if let Err(err) = atomic_write::commit_tempfile(&chunk_tmp, &write_path) {
+            atomic_write::discard_tempfile(&chunk_tmp);
+            atomic_write::discard_tempfile(&sidecar_tmp);
+            return Err(err.into());
+        }
+        if let Err(err) = atomic_write::commit_tempfile(&sidecar_tmp, &sidecar_write_path) {
+            atomic_write::discard_tempfile(&sidecar_tmp);
+            return Err(err.into());
+        }
+        outcome.written_paths.push(target_path);
     }
 
     Ok(outcome)
@@ -894,19 +1021,6 @@ fn content_sha256_exists_in_dir(dir: &Path, content_sha256: &str) -> Result<bool
     Ok(false)
 }
 
-fn write_chunk_sidecar(
-    path: &Path,
-    chunk: &chunker::Chunk,
-    content_sha256: Option<String>,
-) -> Result<()> {
-    let sidecar_path = path.with_extension("meta.json");
-    let write_path = sanitize::validate_write_path(&sidecar_path)?;
-    let mut sidecar = chunker::ChunkMetadataSidecar::from(chunk);
-    sidecar.content_sha256 = content_sha256;
-    fs::write(&write_path, serde_json::to_vec_pretty(&sidecar)?)?;
-    Ok(())
-}
-
 pub fn store_semantic_segments(
     entries: &[TimelineEntry],
     chunker_config: &ChunkerConfig,
@@ -942,7 +1056,7 @@ where
     let _lock = crate::locks::acquire_exclusive(base.join("locks").join("index.lock"))?;
     let segments = semantic_segments(entries);
     let total_segments = segments.len();
-    let mut index = load_index_at(base);
+    let mut index = load_index_at(base)?;
 
     for (segment_idx, segment) in segments.into_iter().enumerate() {
         let date = segment
@@ -2299,7 +2413,7 @@ fn write_migration_artifacts(manifest: &MigrationManifest) -> Result<()> {
     }
     let manifest_json = serde_json::to_string_pretty(manifest)?;
     let manifest_path = sanitize::validate_write_path(&manifest_path)?;
-    fs::write(&manifest_path, manifest_json)?;
+    atomic_write(&manifest_path, manifest_json.as_bytes())?;
 
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let report_path = PathBuf::from(&manifest.report_path);
@@ -2308,7 +2422,7 @@ fn write_migration_artifacts(manifest: &MigrationManifest) -> Result<()> {
     }
     let report = render_migration_report(manifest);
     let report_path = sanitize::validate_write_path(&report_path)?;
-    fs::write(&report_path, report)?;
+    atomic_write(&report_path, report.as_bytes())?;
 
     Ok(())
 }
@@ -3075,7 +3189,10 @@ fn preserve_legacy_item(
         "ambiguous_sources": item.ambiguous_sources.clone(),
         "errors": item.errors.clone(),
     });
-    fs::write(&provenance_path, serde_json::to_string_pretty(&provenance)?)?;
+    atomic_write(
+        &provenance_path,
+        serde_json::to_string_pretty(&provenance)?.as_bytes(),
+    )?;
     preserved.push(provenance_path);
 
     Ok(preserved)
@@ -4964,5 +5081,350 @@ mod tests {
         ));
         // `owner/repo/extra` is not a valid slug — reject.
         assert!(!project_filter_matches("vetcoders", "Vista", "foo/bar/baz"));
+    }
+
+    // ================================================================
+    // Atomic-write / basename-collision regression (Area B Wave-A)
+    // ================================================================
+
+    fn session_first_entry(
+        ts: DateTime<Utc>,
+        agent: &str,
+        session_id: &str,
+        message: &str,
+    ) -> TimelineEntry {
+        TimelineEntry {
+            timestamp: ts,
+            agent: agent.to_string(),
+            session_id: session_id.to_string(),
+            role: "assistant".to_string(),
+            message: message.to_string(),
+            branch: None,
+            cwd: None,
+            frame_kind: None,
+        }
+    }
+
+    #[test]
+    fn test_uuidv7_prefix_collision_does_not_overwrite_silently() {
+        // Two synthetic UUIDv7-like IDs that share the first 20 cleaned chars
+        // (well past the legacy 12-char prefix). Without the SipHash suffix
+        // both would collapse onto the same basename. With it, basenames MUST
+        // diverge so the second write cannot silently clobber the first.
+        let common = "01902e3a9d4d7f8c1234"; // 20 chars
+        let sid_a = format!("{}-aaaaaaaa-1111-222222222222", common);
+        let sid_b = format!("{}-bbbbbbbb-3333-444444444444", common);
+
+        let basename_a = session_basename("2026-05-20", "claude", &sid_a, 1);
+        let basename_b = session_basename("2026-05-20", "claude", &sid_b, 1);
+        assert_ne!(
+            basename_a, basename_b,
+            "UUIDv7 20-char prefix twins must NOT yield identical basenames"
+        );
+        assert!(
+            basename_a.contains("-h"),
+            "truncated id must carry SipHash suffix"
+        );
+        assert!(
+            basename_b.contains("-h"),
+            "truncated id must carry SipHash suffix"
+        );
+
+        // End-to-end: writing both sessions into the same dir produces two
+        // distinct chunk files, not one silently overwritten.
+        let root = retrieval_test_root("uuidv7-collision");
+        let _ = fs::remove_dir_all(&root);
+
+        let ts = Utc.with_ymd_and_hms(2026, 5, 20, 11, 0, 0).unwrap();
+        for sid in [&sid_a, &sid_b] {
+            let entries = vec![session_first_entry(
+                ts,
+                "claude",
+                sid,
+                &format!("Distinct chunk body for session {sid}.\n## Findings\nUnique content.\n"),
+            )];
+            write_context_session_first_at(
+                &root.join("store"),
+                SessionWriteSpec {
+                    project: Some("VetCoders/aicx"),
+                    agent: "claude",
+                    date: "2026-05-20",
+                    session_id: sid,
+                    kind: Some(Kind::Reports),
+                },
+                &entries,
+                &ChunkerConfig::default(),
+            )
+            .expect("write session-first chunk");
+        }
+
+        let dir = root
+            .join("store")
+            .join("VetCoders")
+            .join("aicx")
+            .join("2026_0520")
+            .join(Kind::Reports.dir_name())
+            .join("claude");
+        let md_files: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().ends_with(".md"))
+            .collect();
+        assert_eq!(
+            md_files.len(),
+            2,
+            "expected two distinct chunk files, got {md_files:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_existing_target_with_different_content_disambiguates() {
+        let root = retrieval_test_root("collision-disambiguate");
+        let _ = fs::remove_dir_all(&root);
+
+        let sid = "sess-collide";
+        let ts = Utc.with_ymd_and_hms(2026, 5, 20, 12, 0, 0).unwrap();
+        let entries = vec![session_first_entry(
+            ts,
+            "claude",
+            sid,
+            "## Findings\nBrand new body that should land on disk.\n",
+        )];
+
+        // Pre-create the would-be target with DIFFERENT content + a sidecar
+        // carrying a non-matching content_sha256 so the dedup short-circuit
+        // does not fire and we exercise the collision precheck.
+        let date_dir = compact_date("2026-05-20");
+        let dir = root
+            .join("store")
+            .join("VetCoders")
+            .join("aicx")
+            .join(&date_dir)
+            .join(Kind::Reports.dir_name())
+            .join("claude");
+        fs::create_dir_all(&dir).unwrap();
+        let original_filename = session_basename("2026-05-20", "claude", sid, 1);
+        let original_path = dir.join(&original_filename);
+        fs::write(
+            &original_path,
+            "stale pre-existing body — must NOT be overwritten",
+        )
+        .unwrap();
+        fs::write(
+            original_path.with_extension("meta.json"),
+            r#"{"content_sha256":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
+        )
+        .unwrap();
+
+        let written = write_context_session_first_at(
+            &root.join("store"),
+            SessionWriteSpec {
+                project: Some("VetCoders/aicx"),
+                agent: "claude",
+                date: "2026-05-20",
+                session_id: sid,
+                kind: Some(Kind::Reports),
+            },
+            &entries,
+            &ChunkerConfig::default(),
+        )
+        .expect("write session-first chunk");
+
+        assert_eq!(written.len(), 1);
+        let landed = &written[0];
+        assert_ne!(
+            landed, &original_path,
+            "new chunk must land on a disambiguated path, not on the pre-existing target"
+        );
+        let landed_name = landed.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            landed_name.contains("-c"),
+            "disambiguated basename must contain -c{{hex}} suffix, got {landed_name}"
+        );
+
+        let original_body = fs::read_to_string(&original_path).unwrap();
+        assert!(
+            original_body.starts_with("stale pre-existing body"),
+            "pre-existing chunk must not be touched"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_existing_target_with_identical_content_dedupes() {
+        let root = retrieval_test_root("collision-dedupe");
+        let _ = fs::remove_dir_all(&root);
+
+        let sid = "sess-dedupe";
+        let ts = Utc.with_ymd_and_hms(2026, 5, 20, 13, 0, 0).unwrap();
+        let entries = vec![session_first_entry(
+            ts,
+            "claude",
+            sid,
+            "## Findings\nIdempotent body — second call must not double-write.\n",
+        )];
+
+        let spec = SessionWriteSpec {
+            project: Some("VetCoders/aicx"),
+            agent: "claude",
+            date: "2026-05-20",
+            session_id: sid,
+            kind: Some(Kind::Reports),
+        };
+
+        let first = write_context_session_first_at(
+            &root.join("store"),
+            spec,
+            &entries,
+            &ChunkerConfig::default(),
+        )
+        .expect("first write");
+        let second = write_context_session_first_at(
+            &root.join("store"),
+            SessionWriteSpec {
+                project: Some("VetCoders/aicx"),
+                agent: "claude",
+                date: "2026-05-20",
+                session_id: sid,
+                kind: Some(Kind::Reports),
+            },
+            &entries,
+            &ChunkerConfig::default(),
+        )
+        .expect("second write");
+
+        assert_eq!(first.len(), 1);
+        assert!(
+            second.is_empty(),
+            "second write of identical content must be deduped (no new paths), got {second:?}"
+        );
+
+        let dir = first[0].parent().unwrap();
+        let md_files: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().ends_with(".md"))
+            .collect();
+        assert_eq!(md_files.len(), 1, "only one .md chunk should exist");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_atomic_write_crash_simulation() {
+        // Atomic writes must leave no `.tmp.*` siblings on the happy path, and
+        // a pre-existing stale tempfile (e.g. from a crashed earlier run) must
+        // not poison the next write.
+        let root = retrieval_test_root("atomic-crash-sim");
+        let _ = fs::remove_dir_all(&root);
+
+        let sid = "sess-atomic";
+        let ts = Utc.with_ymd_and_hms(2026, 5, 20, 14, 0, 0).unwrap();
+        let entries = vec![session_first_entry(
+            ts,
+            "claude",
+            sid,
+            "## Findings\nPost-crash recovery probe.\n",
+        )];
+
+        let written = write_context_session_first_at(
+            &root.join("store"),
+            SessionWriteSpec {
+                project: Some("VetCoders/aicx"),
+                agent: "claude",
+                date: "2026-05-20",
+                session_id: sid,
+                kind: Some(Kind::Reports),
+            },
+            &entries,
+            &ChunkerConfig::default(),
+        )
+        .expect("write");
+        assert_eq!(written.len(), 1);
+        let dir = written[0].parent().unwrap().to_path_buf();
+
+        // Drop a stale tempfile matching the atomic_write naming convention
+        // to simulate a crashed prior run, then verify a second write still
+        // succeeds with a fresh body and leaves no stray tempfiles.
+        let stale = dir.join(".2026_0520_claude_sess-atomic_001.md.tmp.99999.123");
+        fs::write(&stale, "leftover from crash").unwrap();
+
+        let next_entries = vec![session_first_entry(
+            ts,
+            "claude",
+            sid,
+            "## Findings\nNew body after a simulated crash; must land cleanly.\n",
+        )];
+        let _ = write_context_session_first_at(
+            &root.join("store"),
+            SessionWriteSpec {
+                project: Some("VetCoders/aicx"),
+                agent: "claude",
+                date: "2026-05-20",
+                session_id: sid,
+                kind: Some(Kind::Reports),
+            },
+            &next_entries,
+            &ChunkerConfig::default(),
+        )
+        .expect("post-crash write");
+
+        // Stale tempfile is intentionally left alone (we do not garbage
+        // collect; recovery is via `--full-rescan`). What MUST be true is
+        // that no NEW `.tmp.<pid>.<nanos>` siblings were left behind by the
+        // successful write.
+        let stray: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.starts_with('.') && n.contains(".tmp.") && !n.contains(".tmp.99999."))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "atomic_write left stray tempfiles: {stray:?}"
+        );
+
+        let _ = fs::remove_file(&stale);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_malformed_index_json_returns_error_not_default() {
+        let root = retrieval_test_root("malformed-index");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let index_path = root.join("index.json");
+
+        // Primary alone is malformed and no .bak exists → Err.
+        fs::write(&index_path, b"{ this is not valid json").unwrap();
+        let err = load_index_at(&root).expect_err("malformed index must surface an error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("parse failed") || msg.contains(".bak"),
+            "error message should mention parse failure / bak fallback: {msg}"
+        );
+
+        // Add a valid .bak sibling → recovery returns it.
+        let bak_path = index_path.with_extension("json.bak");
+        let mut good = StoreIndex::default();
+        update_index(&mut good, "VetCoders/aicx", "claude", "2026_0520", 7);
+        fs::write(
+            &bak_path,
+            serde_json::to_string_pretty(&good).unwrap().as_bytes(),
+        )
+        .unwrap();
+        let recovered = load_index_at(&root).expect("recovery via .bak must succeed");
+        assert!(
+            recovered
+                .projects
+                .get("VetCoders/aicx")
+                .and_then(|p| p.agents.get("claude"))
+                .is_some(),
+            "recovered index must contain the .bak payload"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

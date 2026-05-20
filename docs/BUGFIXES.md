@@ -136,6 +136,82 @@ oraz pełnego sweepa `-p` semantics (wpis 2026-05-20).
 
 ---
 
+## 2026-05-20 — atomic store writes + UUIDv7 basename collision precheck · `5310ba4`
+
+**Symptom.** Trzy niezależne ścieżki w canonical store mogły po cichu
+tracić dane:
+- `truncate_session_id` brał pierwsze 12 znaków session ID; dwa UUIDv7
+  z bliskich timestampów dzielą ten prefix → drugi chunk po cichu
+  nadpisywał pierwszy (`fs::write` bez `path.exists()` precheck).
+- `fs::write` na chunk `.md`, sidecar `.meta.json`, `index.json`
+  i migration manifestach nie był atomowy; crash mid-write zostawiał
+  truncated plik lub orphan `.md` bez sidecara.
+- `load_index_at` robiło `serde_json::from_str(...).unwrap_or_default()`
+  — uszkodzony `index.json` cicho resetował cały index do pustki,
+  bez warna, bez fallbacka.
+
+**Fix.**
+- Nowy moduł `src/store/atomic_write.rs`: `atomic_write` (tempfile +
+  fsync + rename + best-effort parent fsync) oraz dwufazowy
+  `stage_tempfile` / `commit_tempfile` / `discard_tempfile` dla
+  uporządkowanych renamów wielu plików.
+- `truncate_session_id`: limit 12 → 20 znaków cleaned + sufix
+  `-h{6-char-siphash13-hex(session_id)}` gdy nastąpiło truncation;
+  prefix-collision UUIDv7 niemożliwy.
+- `write_context_session_first_outcome_at`: `target.exists()` precheck;
+  jeśli istniejący sidecar ma **inny** `content_sha256`, zapisujemy
+  pod `<stem>-c{6-char-siphash13-hex(content_sha256)}.md` i emitujemy
+  `tracing::warn!`. Identyczny `content_sha256` → dedup (poprzednia
+  ścieżka się nie zmieniła).
+- Sidecar commit order: stage chunk-tempfile → stage sidecar-tempfile
+  → commit `.md` → commit `.meta.json`. Crash między renamami daje
+  detectable orphan `.md` (bez sidecara), nigdy orphan + zły sidecar.
+- `load_index_at` zwraca teraz `Result<StoreIndex>`: `tracing::warn!`
+  + próba `.bak` sibling → `Err` jeśli oba się nie udadzą. `save_index_at`
+  używa `atomic_write` i robi best-effort `fs::copy(...index.json.bak)`
+  PRZED swapem. Publiczne `load_index()` zachowuje API (`StoreIndex`)
+  mapując `Err` na `default()` z warnem.
+- Pozostałe `fs::write` w produkcyjnych ścieżkach (`write_context`,
+  `write_context_chunked`, `write_migration_artifacts`, provenance
+  JSON) → `atomic_write`.
+
+**Touched.**
+- `src/store/atomic_write.rs` — nowy moduł, 4 testy.
+- `src/store.rs` — `mod atomic_write`, `truncate_session_id` rewrite,
+  `siphash13_hex6`, `load_index{,_at}`, `save_index_at`,
+  `write_context_session_first_outcome_at` (collision precheck +
+  two-phase commit), sweep wszystkich `fs::write` w produkcyjnych
+  ścieżkach, usunięty redundantny `write_chunk_sidecar`. 5 nowych
+  testów regresyjnych.
+
+**Tests.** 9 nowych: 4 w `atomic_write::tests` (create / overwrite /
+tempfile-cleanup-on-error / unicode paths), 5 w `store::tests`
+(UUIDv7-prefix collision end-to-end, existing target z innym contentem
+→ disambiguation, identyczny content → dedup, crash simulation, malformed
+`index.json` → `Err` + `.bak` recovery). Wszystkie wcześniejsze testy
+w `store.rs` przechodzą; `cargo test --lib -p aicx` = 398 passed.
+
+**Lessons.**
+- Prefix UUIDv7 to time-domain leak: 12 hex chars to ~6 godzin entropii,
+  nie 2^48 jak komentarz sugerował. Truncation musi nieść hash sufiks
+  pełnego ID.
+- `unwrap_or_default()` na parse JSON-a indexa = silent thief klasy
+  „1714 orphan / 282 missing" (BACKLOG 2026-05-12). Każdy korupcjogenny
+  fallback powinien iść przez `tracing::warn!` + `.bak` recovery,
+  nigdy cicho do default.
+- Dwufazowy commit (`stage` + `commit`) jest jedynym sposobem na
+  uporządkowane renamy dwóch plików; sekwencyjne `atomic_write × 2`
+  daje orphan przy crashu między nimi.
+
+**Related.** Area B Wave-A (B-1 P0 + B-4 P1 + B-5 P1) z
+`/Users/silver/Downloads/bug-tracker-aicx.md` linie 645-1058.
+SUBAGENT_02 audit:
+`/Users/silver/AI_notes/projects/aicx/reports/subagents/SUBAGENT_02_audit-area-B--20-05-2026.md`.
+Wave-2 (`state.rs` atomic save + outer state lock w `run_store`)
+zużyje ten sam `atomic_write` helper.
+
+---
+
 ## 2026-05-19 — date-shaped names accepted as repo · `49520a8`
 
 **Symptom.** Pseudo-projekty typu `CodeScribe/2026-01-22`, `CodeScribe/2026_01_22`,
