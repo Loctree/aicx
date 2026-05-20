@@ -35,6 +35,10 @@ pub struct ReportsExtractorConfig {
     pub title: String,
     /// Max characters in record previews (0 = no truncation).
     pub preview_chars: usize,
+    /// If true, derive `generated_at` from the latest record timestamp instead
+    /// of wall-clock `Utc::now()`. Bit-for-bit reproducible runs on a frozen
+    /// artifact tree.
+    pub deterministic: bool,
 }
 
 /// Generation output for the standalone reports explorer.
@@ -309,9 +313,24 @@ fn scan_reports(
         },
     };
 
+    let generated_at = if config.deterministic {
+        // Pick the latest record sort timestamp so the same artifact tree
+        // produces the same `generated_at` across runs. Empty tree falls back
+        // to the Unix epoch sentinel rather than `Utc::now()`.
+        records
+            .iter()
+            .map(|record| record.sort_ts)
+            .max()
+            .and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0))
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_else(|| "1970-01-01T00:00:00+00:00".to_string())
+    } else {
+        Utc::now().to_rfc3339()
+    };
+
     Ok(ReportsExplorerPayload {
         schema_version: 1,
-        generated_at: Utc::now().to_rfc3339(),
+        generated_at,
         artifacts_root: artifacts_root.display().to_string(),
         resolved_org: config.org.clone(),
         resolved_repo: config.repo.clone(),
@@ -646,10 +665,19 @@ fn build_record_key(
     relative_path: &str,
     meta_path: Option<&str>,
 ) -> String {
-    run_id
-        .map(|value| format!("run:{value}"))
-        .or_else(|| meta_path.map(|value| format!("meta:{value}")))
-        .unwrap_or_else(|| format!("path:{absolute_path}:{relative_path}"))
+    // Composite identity: relative_path is ALWAYS part of the key so that two
+    // artifacts that happen to share a `run_id` (or even a `meta_path` from a
+    // sibling tree) do not collide in the explorer payload or in the JS
+    // mergePayload Map. Format: `run:{run_id}@path:{relative_path}`,
+    // `meta:{meta_path}@path:{relative_path}`, or
+    // `path:{absolute_path}:{relative_path}` as a last resort.
+    if let Some(value) = run_id {
+        format!("run:{value}@path:{relative_path}")
+    } else if let Some(value) = meta_path {
+        format!("meta:{value}@path:{relative_path}")
+    } else {
+        format!("path:{absolute_path}:{relative_path}")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1710,10 +1738,38 @@ const REPORTS_EXTRACTOR_SCRIPT: &str = r#"
     selectOptions(ui.day, payload.days || [], 'All days');
   };
 
+  const MERGE_MAX_RECORDS = 100000;
+  const MERGE_MAX_FIELD_CHARS = 16384;
+  const MERGE_REQUIRED_FIELDS = ['key', 'workflow', 'status', 'agent', 'date_iso', 'title', 'relative_path'];
+
+  const validateImportedRecord = (record, index) => {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) {
+      throw new Error('Imported record ' + index + ' is not an object.');
+    }
+    for (let i = 0; i < MERGE_REQUIRED_FIELDS.length; i += 1) {
+      const field = MERGE_REQUIRED_FIELDS[i];
+      const value = record[field];
+      if (typeof value !== 'string') {
+        throw new Error('Imported record ' + index + ' is missing required string field "' + field + '".');
+      }
+      if (value.length > MERGE_MAX_FIELD_CHARS) {
+        throw new Error('Imported record ' + index + ' field "' + field + '" exceeds ' + MERGE_MAX_FIELD_CHARS + ' chars.');
+      }
+    }
+    return record;
+  };
+
   const mergePayload = (incoming) => {
-    if (!incoming || !Array.isArray(incoming.records)) {
+    if (!incoming || typeof incoming !== 'object' || !Array.isArray(incoming.records)) {
       throw new Error('Imported file does not look like an AICX reports bundle.');
     }
+    if (incoming.schema_version !== undefined && incoming.schema_version !== 1) {
+      throw new Error('Imported bundle schema_version ' + incoming.schema_version + ' is not supported (expected 1).');
+    }
+    if (incoming.records.length > MERGE_MAX_RECORDS) {
+      throw new Error('Imported bundle has ' + incoming.records.length + ' records, exceeding limit of ' + MERGE_MAX_RECORDS + '.');
+    }
+    incoming.records.forEach(validateImportedRecord);
     const merged = new Map();
     [...(state.payload.records || []), ...incoming.records].forEach((record) => {
       merged.set(record.key || record.absolute_path || record.relative_path, record);
@@ -2079,6 +2135,7 @@ mod tests {
             workflow: None,
             title: "AICX Reports Explorer".to_string(),
             preview_chars: 120,
+            deterministic: false,
         };
 
         let artifact = build_reports_explorer(&config).expect("build reports explorer");
@@ -2148,6 +2205,7 @@ mod tests {
             workflow: None,
             title: "AICX Reports Explorer".to_string(),
             preview_chars: 120,
+            deterministic: false,
         };
 
         let artifact = build_reports_explorer(&config).expect("build reports explorer");

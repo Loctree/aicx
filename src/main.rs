@@ -337,6 +337,16 @@ struct ReportsArgs {
     #[arg(long)]
     bundle_output: Option<PathBuf>,
 
+    /// Overwrite existing HTML/bundle outputs. Without this flag, the command
+    /// refuses to clobber a pre-existing file at either output path.
+    #[arg(long, default_value_t = false)]
+    force: bool,
+
+    /// Derive `generated_at` from the latest record timestamp instead of
+    /// `Utc::now()`. Also enabled via `AICX_REPORTS_DETERMINISTIC=1` env var.
+    #[arg(long, default_value_t = false)]
+    deterministic: bool,
+
     /// Document title
     #[arg(long, default_value = DEFAULT_REPORTS_TITLE)]
     title: String,
@@ -5652,6 +5662,8 @@ struct ReportsExtractorRunArgs {
     bundle_output: Option<PathBuf>,
     title: String,
     preview_chars: usize,
+    force: bool,
+    deterministic: bool,
 }
 
 fn default_reports_output_path() -> Result<PathBuf> {
@@ -5659,6 +5671,15 @@ fn default_reports_output_path() -> Result<PathBuf> {
 }
 
 fn run_reports_command(args: ReportsArgs) -> Result<()> {
+    // Env var hook keeps CI/scripts reproducible without rewiring CLI flags.
+    let deterministic = args.deterministic
+        || matches!(
+            std::env::var("AICX_REPORTS_DETERMINISTIC")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+        );
     run_reports_extractor(ReportsExtractorRunArgs {
         artifacts_root: args.artifacts_root,
         org: args.org,
@@ -5670,6 +5691,8 @@ fn run_reports_command(args: ReportsArgs) -> Result<()> {
         bundle_output: args.bundle_output,
         title: args.title,
         preview_chars: args.preview_chars,
+        force: args.force,
+        deterministic,
     })
 }
 
@@ -5730,14 +5753,21 @@ fn run_reports_extractor(args: ReportsExtractorRunArgs) -> Result<()> {
         workflow: args.workflow,
         title: args.title,
         preview_chars: args.preview_chars,
+        deterministic: args.deterministic,
     };
 
     let artifact = reports_extractor::build_reports_explorer(&config)?;
-    write_text_output(&args.output, &artifact.html, "report explorer HTML")?;
+    write_text_output(
+        &args.output,
+        &artifact.html,
+        "report explorer HTML",
+        args.force,
+    )?;
     write_text_output(
         &bundle_output,
         &artifact.bundle_json,
         "report explorer JSON bundle",
+        args.force,
     )?;
 
     eprintln!("✓ Vibecrafted reports extracted");
@@ -5814,13 +5844,19 @@ fn parse_cli_date(value: Option<&str>, flag_name: &str) -> Result<Option<NaiveDa
     ))
 }
 
-fn write_text_output(path: &Path, content: &str, label: &str) -> Result<()> {
+fn write_text_output(path: &Path, content: &str, label: &str, force: bool) -> Result<()> {
     let mut validated = aicx::sanitize::validate_write_path(path)?;
     if let Some(parent) = validated.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create output directory: {}", parent.display()))?;
     }
     validated = aicx::sanitize::validate_write_path(&validated)?;
+    if !force && validated.exists() {
+        return Err(anyhow::anyhow!(
+            "Refusing to overwrite existing {label} at {}: pass --force to replace it.",
+            validated.display()
+        ));
+    }
     fs::write(&validated, content)
         .with_context(|| format!("Failed to write {}: {}", label, validated.display()))
 }
