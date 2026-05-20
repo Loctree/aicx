@@ -1025,3 +1025,95 @@ sentence-level analiza, żeby nie zjeść pozytywnych intentów typu
 `"Don't worry, let's ship"`.
 
 - [Area F] Dashboard Security Hardening: Mitigated stored-XSS in markdown linkifier, added CSP meta tags and X-Headers, restricted CORS wildcard, required CSRF tokens for `/api/regenerate`, secured `run_memex_cli` execution path, and added parameter length caps for MCP tools.
+
+---
+
+## 2026-05-20 — chunk content sanitization layer (Area A A-7 + A-25, recovery) · `{commit-sha}`
+
+**Symptom.** NUL bytes, bare CR / CRLF, Trojan Source bidi/RLO overrides
+i zero-width controls przepływały surowo z transcript files (Claude /
+Codex / Gemini / Junie JSONL) do `TimelineEntry.message`. Parser sam nie
+crashował, ale chunks zawierały:
+- `\0` bajty psujące diff / display / dowolne narzędzia traktujące NUL
+  jako terminator,
+- CRLF, który downstream renderery interpretowały jako podwójne
+  separatory linii,
+- niewidoczne bidi overrides (`U+202E`, `U+2066`..`U+2069`,
+  `U+202A`..`U+202D`) — klasyczny Trojan Source vector, niewidzialny
+  reverse w UI / diff,
+- zero-width chars (`U+200B`..`U+200D`, `U+FEFF`), używane do dedup
+  evasion i UI spoofingu.
+
+**Root cause.** Każdy extractor w `src/sources.rs` budował
+`TimelineEntry` wprost z `extract_message_text(...)` bez normalizacji.
+Brak była wspólnej warstwy sanitize na seam chunk-emission. Per-extractor
+warning enums (Claude/Gemini/Junie/Codex) istniały od audytu Area A,
+ale content path nigdy nie zgłaszał warningu, bo nigdy nie patrzył.
+
+**Fix.**
+- `crates/aicx-parser/src/sanitize.rs`:
+  - Nowy `ContentSanitizationWarning` enum (`NullByteStripped(usize)`,
+    `BidiOverride(char, usize)`, `ZeroWidth(char, usize)`) z byte-offset
+    pozycją dla diagnostyki.
+  - `SanitizedContent<'a> { text: Cow<'a, str>, warnings: Vec<…> }` —
+    zero-copy Cow w fast path (bez modyfikacji = Borrowed).
+  - `sanitize_chunk_content(&str) -> SanitizedContent<'_>` — single-pass
+    iterator po `char_indices`: stripuje NUL (warning), normalizuje
+    `\r\n` i bare `\r` do `\n`, preserve'uje bidi/zero-width z
+    warningiem.
+  - `is_bidi_override` / `is_zero_width` — twardy zestaw codepointów
+    wymienionych w bug trackerze A-25 (LRE/RLE/PDF/LRO/RLO/LRI/RLI/FSI/
+    PDI + ZWSP/ZWNJ/ZWJ/BOM).
+- `src/sources.rs`:
+  - `build_timeline_entry_with_content_warnings<W>(...)` — generic
+    wrapper który puszcza `sanitize_chunk_content` na message body
+    i kanalizuje warningi przez `PushContentSanitizationWarning` trait.
+  - `impl PushContentSanitizationWarning for Vec<{Claude,Codex,Gemini,
+    Junie}SessionWarning>` — wszystkie cztery extractor warning enums
+    dostały wariant `ContentSanitization { warning }`.
+  - `CodexSessionDiagnostics` policzony nowy bucket `content_sanitization`
+    w summary.
+  - Wszystkie extractor seamy (Claude line/history, Codex history/session,
+    Gemini session, Junie file/history) repointed na nowy wrapper.
+
+**Touched.**
+- `crates/aicx-parser/src/sanitize.rs` — `ContentSanitizationWarning`,
+  `SanitizedContent`, `sanitize_chunk_content`, helpers + 6 unit tests.
+- `src/sources.rs` — wrapper builder, warning enum extensions,
+  diagnostic summary bucket, repointed callers.
+- `tests/content_sanitization_e2e.rs` — 2 nowe integration testy
+  (NUL crash safety + bidi RLO preserved with CRLF normalized) na
+  poziomie `extract_claude_file(...)`.
+
+**Tests.** Zielone:
+- `cargo test --package aicx-parser --lib sanitize::` (32/32, w tym
+  6 nowych content-sanitization unit tests).
+- `cargo test --test content_sanitization_e2e` (2/2, integration na
+  publicznym extractor seamie).
+- Gates W IZOLACJI mojego scope'u: stash sibling Wave-4/Wave-5 WIP-y
+  (intents.rs, chunker.rs, mcp.rs, vector_index.rs, doctor.rs,
+  reports_extractor.rs, search_engine.rs, embeddings/*, Cargo.{toml,lock})
+  — sibling agents pisali do tree w trakcie. Po commit-cie operator
+  widzi je jako modified i decyduje o ich integracji.
+
+**Lessons.**
+- Sanitize na chunk-emission seam, nie na finalnym output. NUL w środku
+  TimelineEntry.message zatruwa dowolny downstream consumer (diff, JSON
+  serialize, MD render), więc trzeba czyścić w punkcie emisji, nie tuż
+  przed rendering.
+- Bidi/zero-width zachowujemy z warningiem zamiast stripować — bo arabski
+  / hebrajski tekst LEGITIMATELY używa bidi controls. Strip-by-default
+  zjadłby treść. Warning + render policy w outputach (np. visible marker
+  albo escape) to właściwa decyzja.
+- `Cow<'a, str>` w sanitize fast path: jeżeli input nie ma żadnego NUL/
+  CR/bidi/ZWS, zwracamy `Cow::Borrowed(input)` bez alokacji. Owned String
+  tworzymy dopiero gdy pierwszy znak wymaga modyfikacji.
+- W2-A original (codex) dispatch padł na substrate-cascade; recovery
+  prawidłowo wylądował silently jako część `8564b98` ("Update
+  docs/BUGFIXES.md") razem z W4-D-steer-locks. Brakowały tylko 2
+  integration testy i ten docs entry.
+
+**Related.** Closes A-7 (NUL/CRLF/RLO policy) + A-25 (zero-width/bidi
+normalization) z Area A w `docs/bug-tracker-aicx`. Recovery dispatch
+dla failed `bugtracker-W4-A-unicode-20260520`. Report:
+`/Users/silver/AI_notes/projects/aicx/reports/subagents/SUBAGENT_W4A_unicode-recovery-20-05-2026.md`.
