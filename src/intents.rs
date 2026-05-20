@@ -553,6 +553,7 @@ fn combine_date_time(date: NaiveDate, time: &str) -> Option<DateTime<Utc>> {
 
 fn parse_chunk_document(content: &str) -> (Vec<String>, Vec<TranscriptEntry>) {
     let mut in_signals = false;
+    let mut fenced = false;
     let mut signal_lines = Vec::new();
     let mut transcript_lines = Vec::new();
 
@@ -571,6 +572,18 @@ fn parse_chunk_document(content: &str) -> (Vec<String>, Vec<TranscriptEntry>) {
             continue;
         }
         if trimmed.starts_with("[project:") {
+            continue;
+        }
+        // Track triple-backtick fence in the transcript section. Lines inside a
+        // fenced block (e.g. pasted code, shell output, JSON dumps) are quoted
+        // material — classifying them as user intents or assistant decisions is
+        // a category error (`let's encrypt` inside a code block is a tool name,
+        // not an intent).
+        if trimmed.starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
             continue;
         }
         transcript_lines.push(line.to_string());
@@ -817,12 +830,150 @@ fn is_outcome_line(line: &str) -> bool {
         || lower.contains("p2=0")
 }
 
+/// Inline backtick code-span ranges within a single line, as byte offsets
+/// `(start, end_exclusive)`. Used so keyword classifiers ignore matches that
+/// fall inside `` `inline code` `` (e.g. `` `let's encrypt` `` is a tool name,
+/// not an intent).
+fn code_span_ranges(line: &str) -> Vec<(usize, usize)> {
+    let bytes = line.as_bytes();
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            if let Some(rel) = bytes[i + 1..].iter().position(|&b| b == b'`') {
+                let close = i + 1 + rel;
+                ranges.push((i, close + 1));
+                i = close + 1;
+            } else {
+                break;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    ranges
+}
+
+/// Word boundaries treat alphanumerics (Unicode) and `_` as "word" chars.
+/// Diacritics are alphanumeric in Rust so `pomysłu` does NOT word-match
+/// keyword `pomysł` — exactly the behavior we want for Polish suffixes.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// `true` if a negator sits immediately around the keyword position — close
+/// enough that it inverts the keyword's polarity. Checked on the lower-cased
+/// line. Two windows:
+/// * pre (~24 chars before): English/Polish negator prefixes that flip the
+///   following clause (`don't `, `nie `, `bez `, ...).
+/// * post (~16 chars after): post-keyword negators that flip the keyword
+///   itself (`let's not`, `chcę nie`, ...).
+fn is_negated_keyword(lower_line: &str, kw_pos: usize, kw_len: usize) -> bool {
+    const PRE_NEGATORS: &[&str] = &[
+        // Polish
+        "nie ",
+        "bez ",
+        // English
+        "don't ",
+        "do not ",
+        "won't ",
+        "will not ",
+        "shouldn't ",
+        "should not ",
+        "wouldn't ",
+        "would not ",
+        "isn't ",
+        "aren't ",
+        "doesn't ",
+        "didn't ",
+    ];
+    const POST_NEGATORS: &[&str] = &[" not ", " not,", " not.", " nie ", " nie,", " nie."];
+
+    let pre_window_start = lower_line[..kw_pos]
+        .char_indices()
+        .rev()
+        .take(24)
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let pre = &lower_line[pre_window_start..kw_pos];
+    if PRE_NEGATORS.iter().any(|n| pre.ends_with(n)) {
+        return true;
+    }
+
+    let post_start = kw_pos + kw_len;
+    if post_start < lower_line.len() {
+        let post_end = lower_line[post_start..]
+            .char_indices()
+            .take(16)
+            .map(|(i, c)| post_start + i + c.len_utf8())
+            .last()
+            .unwrap_or(lower_line.len())
+            .min(lower_line.len());
+        let post = &lower_line[post_start..post_end];
+        if POST_NEGATORS.iter().any(|n| post.starts_with(n)) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Substring match for `keyword` in `line` that:
+/// * is case-insensitive,
+/// * requires a word boundary on both sides (so `pomysł` does not match
+///   `pomysłu`, `let's` does not match `let'salutations`),
+/// * rejects matches that fall inside an inline `` ` `` code span,
+/// * rejects matches that are immediately negated (`let's not`, `nie chcę`).
+fn matches_keyword_word_boundary(line: &str, keyword: &str) -> bool {
+    let lower_line = line.to_lowercase();
+    let lower_kw = keyword.to_lowercase();
+    if lower_kw.is_empty() || lower_line.len() < lower_kw.len() {
+        return false;
+    }
+    let spans = code_span_ranges(&lower_line);
+
+    let mut start = 0;
+    while let Some(rel) = lower_line[start..].find(&lower_kw) {
+        let abs = start + rel;
+        let end = abs + lower_kw.len();
+
+        let prev_ok = if abs == 0 {
+            true
+        } else {
+            let prev = lower_line[..abs].chars().next_back().unwrap();
+            !is_word_char(prev) && prev != '-'
+        };
+        let next_ok = if end >= lower_line.len() {
+            true
+        } else {
+            let next = lower_line[end..].chars().next().unwrap();
+            !is_word_char(next)
+        };
+
+        if prev_ok && next_ok {
+            let in_span = spans.iter().any(|&(s, e)| abs >= s && abs < e);
+            if !in_span && !is_negated_keyword(&lower_line, abs, lower_kw.len()) {
+                return true;
+            }
+        }
+
+        start = abs + 1;
+    }
+    false
+}
+
 fn looks_like_intent_line(line: &str) -> bool {
     let lower = line.to_lowercase();
-    lower.starts_with("intent:")
-        || lower.starts_with("[intent]")
-        || severity_marker(line).is_some()
-        || INTENT_KEYWORDS.iter().any(|kw| lower.contains(kw))
+    if lower.starts_with("intent:") || lower.starts_with("[intent]") {
+        return true;
+    }
+    if severity_marker(line).is_some() {
+        return true;
+    }
+    INTENT_KEYWORDS
+        .iter()
+        .any(|kw| matches_keyword_word_boundary(line, kw))
 }
 
 fn severity_marker(line: &str) -> Option<&'static str> {
@@ -1217,28 +1368,71 @@ fn reconcile_session_id_with_path(records: &mut [IntentRecord]) {
     }
 }
 
+/// Drop truncated-prefix duplicates: records whose summary ends in
+/// `...[truncated]` AND whose pre-truncation prefix is also the literal prefix
+/// of a longer non-truncated sibling in the same `(kind, session_id,
+/// source_chunk)` group.
+///
+/// Indexed: O(N) build of a per-group index of non-truncated record indices,
+/// then O(N) decision pass that only scans the small same-group set. The
+/// previous shape was O(N²) — a 10k record session ran 100M comparisons.
+/// Real groups stay small (one chunk holds at most a handful of records of a
+/// single kind), so the inner scan is effectively constant.
 fn drop_truncated_duplicate_records(records: &mut Vec<IntentRecord>) {
+    const TRUNC_MARKER: &str = "...[truncated]";
+
+    type GroupKey = (IntentKind, String, String);
+
+    // Pass 1: bucket non-truncated record indices by (kind, session, chunk).
+    // Truncated records cannot be "the fuller version" of another, so they
+    // never need to live in the index.
+    let mut groups: HashMap<GroupKey, Vec<usize>> = HashMap::new();
+    for (idx, record) in records.iter().enumerate() {
+        if record.summary.contains(TRUNC_MARKER) {
+            continue;
+        }
+        groups
+            .entry((
+                record.kind,
+                record.session_id.clone(),
+                record.source_chunk.clone(),
+            ))
+            .or_default()
+            .push(idx);
+    }
+
+    // Pass 2: each truncated record looks up its (kind, session, chunk)
+    // bucket once and scans the small list of non-truncated siblings.
     let keep: Vec<bool> = records
         .iter()
         .enumerate()
         .map(|(idx, record)| {
-            let Some(prefix) = record.summary.split("...[truncated]").next() else {
+            if !record.summary.contains(TRUNC_MARKER) {
+                return true;
+            }
+            let Some(raw_prefix) = record.summary.split(TRUNC_MARKER).next() else {
                 return true;
             };
-            let prefix = prefix.trim_end();
+            let prefix = raw_prefix.trim_end();
             if prefix.is_empty() {
                 return true;
             }
-
-            !records.iter().enumerate().any(|(other_idx, other)| {
-                idx != other_idx
-                    && other.kind == record.kind
-                    && other.session_id == record.session_id
-                    && other.source_chunk == record.source_chunk
-                    && !other.summary.contains("...[truncated]")
-                    && other.summary.len() > record.summary.len()
-                    && other.summary.starts_with(prefix)
-            })
+            let key = (
+                record.kind,
+                record.session_id.clone(),
+                record.source_chunk.clone(),
+            );
+            let Some(siblings) = groups.get(&key) else {
+                return true;
+            };
+            let has_fuller = siblings.iter().any(|&other_idx| {
+                if other_idx == idx {
+                    return false;
+                }
+                let other = &records[other_idx];
+                other.summary.len() > record.summary.len() && other.summary.starts_with(prefix)
+            });
+            !has_fuller
         })
         .collect();
 
@@ -1633,7 +1827,11 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
         return Some((EntryType::Why, 0.7));
     }
 
-    if is_user && INTENT_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+    if is_user
+        && INTENT_KEYWORDS
+            .iter()
+            .any(|kw| matches_keyword_word_boundary(line, kw))
+    {
         return Some((EntryType::Intent, 0.7));
     }
     if is_decision_tag(line) {
@@ -2866,6 +3064,85 @@ Outcome:
             assert_eq!(initial_state(EntryType::Why), EntryState::Active);
             assert_eq!(initial_state(EntryType::Argue), EntryState::Active);
         }
+
+        // Area E.7: keyword classifier must respect word boundaries, negation,
+        // inline code spans, and fenced code blocks.
+
+        #[test]
+        fn test_intent_let_us_not_refactor_is_not_intent() {
+            let result = classify_line_entry_type("Let's not refactor the parser today", true);
+            assert!(
+                result.map(|r| r.0) != Some(EntryType::Intent),
+                "negation `let's not` must invert the keyword polarity"
+            );
+            assert!(!looks_like_intent_line(
+                "Let's not refactor the parser today"
+            ));
+        }
+
+        #[test]
+        fn test_intent_polish_nie_mam_pomyslu_is_not_intent() {
+            // Diacritic-aware word boundary: `pomysłu` should not match keyword
+            // `pomysł` because the following `u` is alphanumeric.
+            assert!(!looks_like_intent_line("nie mam pomysłu na ten task"));
+            let classified = classify_line_entry_type("nie mam pomysłu na ten task", true);
+            assert!(
+                classified.map(|r| r.0) != Some(EntryType::Intent),
+                "Polish negation `nie mam` + suffixed `pomysłu` must not classify as intent"
+            );
+        }
+
+        #[test]
+        fn test_intent_inline_code_let_us_encrypt_is_not_intent() {
+            let line = "We rotated certs via `let's encrypt` last Tuesday";
+            assert!(
+                !looks_like_intent_line(line),
+                "keyword inside backtick inline code must not classify"
+            );
+        }
+
+        #[test]
+        fn test_intent_in_fenced_code_block_is_not_intent() {
+            let chunk = "[project: demo | agent: codex | date: 2026-05-20]\n\n\
+                [12:00:00] user: see the snippet below\n\
+                ```\n\
+                let's encrypt --domain example.com\n\
+                ```\n\
+                [12:01:00] user: that's all\n";
+            let entries = classify_chunk_entries(
+                chunk,
+                "fake.md",
+                Some("demo"),
+                Some("codex"),
+                None,
+                "2026-05-20",
+            );
+            assert!(
+                entries.iter().all(|e| e.entry_type != EntryType::Intent),
+                "lines inside ``` fence must be excluded from classification, got: {entries:?}"
+            );
+        }
+
+        #[test]
+        fn test_intent_real_let_us_refactor_still_classifies() {
+            let result = classify_line_entry_type("Let's refactor the parser today", true);
+            assert_eq!(
+                result.map(|r| r.0),
+                Some(EntryType::Intent),
+                "positive `let's refactor` must still classify as intent"
+            );
+            assert!(looks_like_intent_line("Let's refactor the parser today"));
+        }
+
+        #[test]
+        fn test_intent_polish_chce_zrobic_still_classifies() {
+            assert!(
+                looks_like_intent_line("chcę zrobić nowy parser"),
+                "positive Polish intent should still match keyword `chcę`"
+            );
+            let result = classify_line_entry_type("chcę zrobić nowy parser", true);
+            assert_eq!(result.map(|r| r.0), Some(EntryType::Intent));
+        }
     }
 
     mod session_level {
@@ -3397,6 +3674,109 @@ Outcome:
 
             assert_eq!(records.len(), 1);
             assert!(!records[0].summary.contains("...[truncated]"));
+        }
+
+        // Area E.3: dedup must scale linearly. The quadratic shape blew up on
+        // 10k-record sessions (100M comparisons); the indexed version stays
+        // O(N).
+
+        fn make_record(
+            kind: IntentKind,
+            summary: &str,
+            session_id: &str,
+            source_chunk: &str,
+        ) -> IntentRecord {
+            IntentRecord {
+                kind,
+                summary: summary.to_string(),
+                evidence: Vec::new(),
+                project: "demo".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-05-04".to_string(),
+                session_id: session_id.to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: source_chunk.to_string(),
+                timestamp: None,
+                context: None,
+            }
+        }
+
+        #[test]
+        fn test_drop_truncated_duplicate_is_linear() {
+            // Build 10k records: 5k full + 5k truncated prefix duplicates,
+            // distributed across many (session, chunk) buckets so the bucket
+            // index keeps each lookup O(1). The previous O(N²) shape on this
+            // input ran ~100M comparisons.
+            let mut records = Vec::with_capacity(10_000);
+            for i in 0..5_000 {
+                let session = format!("s{:04}", i % 250);
+                let chunk = format!("/tmp/s{:04}_c{:03}.md", i % 250, i % 50);
+                let full = format!(
+                    "Decision number {i}: keep canonical store at ~/.aicx/store and rebuild semantic index nightly"
+                );
+                let truncated = format!(
+                    "Decision number {i}: keep canonical store at ~/.aicx/store...[truncated]"
+                );
+                records.push(make_record(IntentKind::Decision, &full, &session, &chunk));
+                records.push(make_record(
+                    IntentKind::Decision,
+                    &truncated,
+                    &session,
+                    &chunk,
+                ));
+            }
+            assert_eq!(records.len(), 10_000);
+
+            let start = std::time::Instant::now();
+            drop_truncated_duplicate_records(&mut records);
+            let elapsed = start.elapsed();
+
+            assert!(
+                elapsed.as_millis() < 200,
+                "dedup must run in < 200ms on 10k records (got {elapsed:?}) — quadratic regression suspected"
+            );
+            assert_eq!(records.len(), 5_000);
+            assert!(
+                records
+                    .iter()
+                    .all(|r| !r.summary.contains("...[truncated]"))
+            );
+        }
+
+        #[test]
+        fn test_drop_truncated_dedup_keeps_fullest() {
+            // Two truncated and one full; the full survives even when ordered
+            // last in the input.
+            let session = "sess-fullest";
+            let chunk = "/tmp/fullest.md";
+            let mut records = vec![
+                make_record(
+                    IntentKind::Decision,
+                    "keep canonical store at ~/.aicx/store and...[truncated]",
+                    session,
+                    chunk,
+                ),
+                make_record(
+                    IntentKind::Decision,
+                    "keep canonical store at ~/.aicx/store and rebuild...[truncated]",
+                    session,
+                    chunk,
+                ),
+                make_record(
+                    IntentKind::Decision,
+                    "keep canonical store at ~/.aicx/store and rebuild semantic index nightly",
+                    session,
+                    chunk,
+                ),
+            ];
+
+            drop_truncated_duplicate_records(&mut records);
+
+            assert_eq!(records.len(), 1);
+            assert!(!records[0].summary.contains("...[truncated]"));
+            assert!(records[0].summary.ends_with("nightly"));
         }
     }
 }
