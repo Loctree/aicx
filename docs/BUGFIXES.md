@@ -727,3 +727,102 @@ i
 `/Users/silver/AI_notes/projects/aicx/reports/subagents/SUBAGENT_03_audit-area-C--20-05-2026.md`.
 - B-6: Switched deduplication to BLAKE3-128 collision-resistant algorithm.
 - B-7: Bumped default state lock timeout to 60s and plumbed --lock-timeout flag.
+
+---
+
+## 2026-05-20 — shared HTTP auth middleware for MCP + dashboard (Area F P0/P1)
+
+**Symptom.** MCP HTTP transport (`/mcp` at `127.0.0.1:8044`) i dashboard
+`/api/*` (`127.0.0.1:9478`) ufały samej znajomości portu. Każdy proces lokalny
+albo każdy klient, który dosięgnął portu, mógł inwokować MCP tools albo czytać
+cały kanoniczny korpus. Nie było żadnej warstwy authn ani autoryzacji.
+
+**Root cause.** `src/mcp.rs::run_http` (≈L926) montował `/mcp` przez
+`axum::Router::new().route(...)` bez middleware. `src/dashboard_server.rs`
+(≈L351) montował `/api/*` tylko za CORS middleware. `validate_dashboard_host_policy`
+(≈L403) wymagało jedynie explicit non-Local CORS dla non-loopback, ale w
+ogóle nie sprawdzało authn — bind na `0.0.0.0` z `--allow-cors-origins all`
+był legalny bez żadnego tokena.
+
+**Fix.**
+- Nowy moduł `src/auth.rs` — `AuthConfig`, `AuthSource`, `load_auth_config`,
+  `require_auth_layer<S>(router, config) -> Router<S>`, `constant_time_eq`,
+  middleware który zwraca identyczne `{"error":"unauthorized"}` 401 dla
+  missing / invalid tokena (defeats oracle channel).
+- Resolution: `--auth-token` → `AICX_HTTP_AUTH_TOKEN` env → `~/.aicx/auth-token`
+  (mode 0600) → generated 32-byte hex z `/dev/urandom` + persist 0600.
+- `src/mcp.rs::run_http` wrappuje `/mcp` przez `auth::require_auth_layer`.
+  `run_transport` / `run_sse` rozszerzone o `AuthConfig`. Startup log podaje
+  `source: cli|env|file:...|generated:...|disabled` — nigdy samego tokena.
+- `src/dashboard_server.rs` dzieli router na public (`/`, `/health`,
+  `/api/health`, `/manifest.webmanifest`, `/service-worker.js`) i protected
+  (`/api/status`, `/api/browse`, `/api/detail`, `/api/chunk`, `/api/context`,
+  `/api/regenerate`, `/api/search/*`). Tylko protected ma `require_auth_layer`.
+- `validate_dashboard_host_policy` przyjmuje teraz `&AuthConfig` i odmawia
+  bindowania na non-loopback gdy `auth.is_enforced() == false`.
+- CLI: `aicx serve --auth-token <TOKEN> [--require-auth=true|false]`,
+  `aicx-mcp --auth-token ... --require-auth ...`,
+  `aicx dashboard --serve --auth-token ... --require-auth ...`.
+  `--no-require-auth` emituje stderr warning na HTTP path.
+- `spawn_dashboard_server_background` zrefaktorowany w
+  `DashboardServerBackgroundArgs<'_>` żeby clippy `too_many_arguments` nie
+  fail-ował na -D warnings przy nowych flagach auth.
+
+**Touched.**
+- `src/auth.rs` (new) — module + 6 unit tests.
+- `src/lib.rs` — `pub mod auth;`.
+- `src/mcp.rs::run_http,run_sse,run_transport` — `AuthConfig` przekazywany.
+- `src/dashboard_server.rs` — split router + `validate_dashboard_host_policy`
+  rozszerzony o `&AuthConfig`, `DashboardServerConfig.auth` dodane.
+- `src/main.rs` — `DashboardArgs.auth_token/require_auth`, `Commands::Serve`
+  rozszerzony, `DashboardServerRunArgs.auth_token/require_auth`,
+  `run_dashboard_server` ładuje `AuthConfig`, `spawn_dashboard_server_background`
+  zrefaktorowany.
+- `src/bin/aicx_mcp.rs` — `--auth-token`, `--require-auth` flagi + load.
+- `Cargo.toml` — dodane direct `blake3 = "1.8.5"` (substrate fix: B-6 commit
+  używał `blake3::hash` w `src/state/migration.rs` bez direct dep — make check
+  failował na E0433 przed naprawą).
+- `src/main.rs::dedup_entries_for_state` — 2× `.clone()` + 2× `&` na
+  `is_new` / insert callerach po B-6 zmianie typu hash z `u64` → `String`
+  (substrate fix; sibling B-6 commit nie zaktualizował tych call-sites).
+
+**Tests.** 15 nowych testów (plan wymagał 10):
+- `src/auth.rs::tests` (6): `test_load_auth_token_from_env`,
+  `test_load_auth_token_from_file_with_mode_0600`,
+  `test_load_auth_token_generates_when_missing`,
+  `test_constant_time_compare_rejects_short_mismatch`,
+  `test_cli_override_wins`, `test_disabled_config_passes_through_in_middleware`.
+- `tests/mcp_slim.rs` (3): `test_mcp_http_without_auth_returns_401`,
+  `test_mcp_http_with_wrong_token_returns_401_same_shape`,
+  `test_mcp_http_with_correct_token_passes`.
+- `tests/dashboard_auth.rs` (5): `test_dashboard_api_browse_without_token_401`,
+  `test_dashboard_api_browse_with_wrong_token_returns_401_same_shape`,
+  `test_dashboard_correct_token_passes`, `test_disabled_auth_does_not_gate_requests`,
+  `test_dashboard_non_loopback_without_token_refuses_bind`.
+- `src/dashboard_server.rs::tests::validate_dashboard_host_policy_*`
+  rozszerzony o `AuthConfig` arg + 2 nowe asercje (non-loopback bez
+  tokena → Err).
+
+Gates: `make precheck` ok, `make test` ok (456 lib + 71 main.rs + 15 nowych +
+existing wszystkie green), `make clippy` ok (`-D warnings`), `make fmt-check`
+ok, `make manifest-check` ok, `make check` ok (`=== All checks passed ===`).
+
+**Lessons.**
+- Constant-time compare zerwany short-circuit na length jest standardową
+  konwencją (subtle::ConstantTimeEq robi to samo). Length to public channel
+  dla tokenów stałej długości, więc OK.
+- Auth middleware na `axum::middleware::from_fn_with_state` z
+  `Arc<AuthConfig>` jest tańszy niż custom `tower::Layer` impl i nie
+  wymaga dodatkowej `tower` direct dep w produkcji (tylko w dev-deps na
+  `tower::ServiceExt::oneshot` w testach).
+- 401 body MUSI być identyczne dla missing vs invalid — różny body daje
+  napastnikowi oracle channel ("czy mam jakiś token czy w ogóle żaden").
+- W living-tree multi-wave środowisku jeden wave (B-6) potrafi dodać
+  `use blake3::hash` w state/migration.rs ale zapomnieć o Cargo.toml +
+  zostawić call-sites w main.rs z surowym `u64`. Następna fala musi
+  patrzeć na `cargo build` HEAD-as-merged, nie tylko na własny carve-out.
+
+**Related.** F-P0/P1-1 (MCP), F-P0/P1-2 (dashboard) z
+`docs/bug-tracker-aicx` Area F. F-P1/P2-3 (MCP session TTL) odłożone
+do Wave-5 zgodnie z planem. Substrate fix dla B-6: `blake3` dep +
+2 call-site updates w `src/main.rs::dedup_entries_for_state`.

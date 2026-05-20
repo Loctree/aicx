@@ -10,6 +10,7 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
+use aicx::auth;
 use aicx::mcp::{self, McpTransport};
 use std::io::Write as _;
 use std::panic;
@@ -30,6 +31,14 @@ struct Args {
     /// Port for streamable HTTP transport
     #[arg(long, default_value = "8044")]
     port: u16,
+
+    /// Optional explicit auth token (overrides env / file / generated). HTTP transport only.
+    #[arg(long, value_name = "TOKEN")]
+    auth_token: Option<String>,
+
+    /// Require Bearer auth on HTTP transport (default: true). Pass `--no-require-auth` to opt out.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    require_auth: bool,
 }
 
 // Safe stderr logging — never panics, even if stderr is closed.
@@ -87,7 +96,19 @@ fn main() -> ExitCode {
         }
     };
 
-    match rt.block_on(async { mcp::run_transport(args.transport, args.port).await }) {
+    let auth_config = match auth::load_auth_config(args.auth_token.as_deref(), args.require_auth) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            safe_stderr_log(&format!("[aicx-mcp] Failed to load auth config: {e:#}"));
+            return ExitCode::FAILURE;
+        }
+    };
+    if matches!(args.transport, McpTransport::Http) && !args.require_auth {
+        safe_stderr_log(
+            "[aicx-mcp] WARNING: HTTP transport bound without auth (--no-require-auth)",
+        );
+    }
+    match rt.block_on(async { mcp::run_transport(args.transport, args.port, auth_config).await }) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let err_str = format!("{e:?}");

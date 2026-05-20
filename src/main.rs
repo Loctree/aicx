@@ -286,6 +286,14 @@ struct DashboardArgs {
     #[arg(long, requires = "serve", value_name = "PRESET|URL")]
     allow_cors_origins: Option<String>,
 
+    /// Optional explicit auth token (overrides env / file / generated). Server mode only.
+    #[arg(long, requires = "serve", value_name = "TOKEN")]
+    auth_token: Option<String>,
+
+    /// Require Bearer auth on dashboard `/api/*` (default: true). Pass `--no-require-auth` to opt out.
+    #[arg(long, requires = "serve", default_value_t = true, action = clap::ArgAction::Set)]
+    require_auth: bool,
+
     /// Document title
     #[arg(long, default_value = DEFAULT_DASHBOARD_TITLE)]
     title: String,
@@ -1019,6 +1027,14 @@ enum Commands {
         /// Port for streamable HTTP transport (default: 8044)
         #[arg(long, default_value = "8044")]
         port: u16,
+
+        /// Optional explicit auth token (overrides env / file / generated). HTTP transport only.
+        #[arg(long, value_name = "TOKEN")]
+        auth_token: Option<String>,
+
+        /// Require Bearer auth on HTTP transport (default: true). Pass `--no-require-auth` to opt out.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        require_auth: bool,
     },
 
     #[command(
@@ -1693,6 +1709,8 @@ fn main() -> Result<()> {
                 no_open: args.no_open,
                 bg: false,
                 allow_cors_origins: None,
+                auth_token: None,
+                require_auth: true,
                 artifact: args.artifact.unwrap_or(default_dashboard_output_path()?),
                 title: args.title,
                 preview_chars: args.preview_chars,
@@ -1730,9 +1748,20 @@ fn main() -> Result<()> {
         }) => {
             run_tail(&project, hours, follow, kind.as_deref(), filters)?;
         }
-        Some(Commands::Serve { transport, port }) => {
+        Some(Commands::Serve {
+            transport,
+            port,
+            auth_token,
+            require_auth,
+        }) => {
+            let auth_config = aicx::auth::load_auth_config(auth_token.as_deref(), require_auth)?;
+            if matches!(transport, McpTransport::Http) && !require_auth {
+                eprintln!(
+                    "! Warning: MCP HTTP transport bound without auth — knowing the port is enough to invoke MCP tools."
+                );
+            }
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async { mcp::run_transport(transport, port).await })?;
+            rt.block_on(async { mcp::run_transport(transport, port, auth_config).await })?;
         }
         Some(Commands::Search {
             query,
@@ -3207,19 +3236,19 @@ fn dedup_entries_for_state(
         let exact =
             StateManager::content_hash(&entry.agent, entry.timestamp.timestamp(), &entry.message);
         if full_rescan {
-            if !exact_seen_this_run.insert(exact) {
+            if !exact_seen_this_run.insert(exact.clone()) {
                 continue; // exact duplicate within the same rescan window
             }
-        } else if !state.is_new(project_name, exact) {
+        } else if !state.is_new(project_name, &exact) {
             continue; // exact duplicate
         }
 
         let overlap = StateManager::overlap_hash(entry.timestamp.timestamp(), &entry.message);
         if full_rescan {
-            if !overlap_seen_this_run.insert(overlap) {
+            if !overlap_seen_this_run.insert(overlap.clone()) {
                 continue; // cross-agent overlap duplicate within the same rescan window
             }
-        } else if !state.is_new(overlap_project, overlap) {
+        } else if !state.is_new(overlap_project, &overlap) {
             continue; // cross-agent overlap duplicate
         }
 
@@ -5326,6 +5355,8 @@ struct DashboardServerRunArgs {
     no_open: bool,
     bg: bool,
     allow_cors_origins: Option<String>,
+    auth_token: Option<String>,
+    require_auth: bool,
     artifact: PathBuf,
     title: String,
     preview_chars: usize,
@@ -5345,23 +5376,27 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
         )
     })?;
     let cors_policy = DashboardCorsPolicy::from_cli(args.allow_cors_origins.as_deref())?;
+    let auth_config = aicx::auth::load_auth_config(args.auth_token.as_deref(), args.require_auth)?;
     dashboard_server::validate_dashboard_host_policy(
         host,
         &cors_policy,
         args.allow_cors_origins.is_some(),
+        &auth_config,
     )?;
     let artifact_path = args.artifact;
 
     if args.bg {
-        return spawn_dashboard_server_background(
-            root,
-            args.scope,
+        return spawn_dashboard_server_background(DashboardServerBackgroundArgs {
+            store_root: root,
+            scope: args.scope,
             host,
-            args.port,
-            &args.title,
-            args.preview_chars,
-            args.allow_cors_origins.as_deref(),
-        );
+            port: args.port,
+            title: &args.title,
+            preview_chars: args.preview_chars,
+            allow_cors_origins: args.allow_cors_origins.as_deref(),
+            auth_token: args.auth_token.as_deref(),
+            require_auth: args.require_auth,
+        });
     }
 
     if !host.is_loopback() {
@@ -5381,6 +5416,7 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
         cors_policy,
         host,
         port: args.port,
+        auth: auth_config,
     };
 
     if !args.no_open {
@@ -5403,15 +5439,19 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
     runtime.block_on(dashboard_server::run_dashboard_server(config))
 }
 
-fn spawn_dashboard_server_background(
+struct DashboardServerBackgroundArgs<'a> {
     store_root: PathBuf,
     scope: DashboardScope,
     host: std::net::IpAddr,
     port: u16,
-    title: &str,
+    title: &'a str,
     preview_chars: usize,
-    allow_cors_origins: Option<&str>,
-) -> Result<()> {
+    allow_cors_origins: Option<&'a str>,
+    auth_token: Option<&'a str>,
+    require_auth: bool,
+}
+
+fn spawn_dashboard_server_background(args: DashboardServerBackgroundArgs<'_>) -> Result<()> {
     let current_exe = std::env::current_exe().context("Resolve current aicx executable")?;
     let mut command = std::process::Command::new(&current_exe);
     command
@@ -5419,28 +5459,34 @@ fn spawn_dashboard_server_background(
         .arg("--serve")
         .arg("--no-open")
         .arg("--host")
-        .arg(host.to_string())
+        .arg(args.host.to_string())
         .arg("--port")
-        .arg(port.to_string())
+        .arg(args.port.to_string())
         .arg("--store-root")
-        .arg(store_root.as_os_str());
+        .arg(args.store_root.as_os_str());
 
-    if let Some(project) = scope.project.as_deref() {
+    if let Some(project) = args.scope.project.as_deref() {
         command.arg("--project").arg(project);
     }
-    if let Some(hours) = scope.hours {
+    if let Some(hours) = args.scope.hours {
         command.arg("--hours").arg(hours.to_string());
     }
-    if let Some(policy) = allow_cors_origins {
+    if let Some(policy) = args.allow_cors_origins {
         command.arg("--allow-cors-origins").arg(policy);
     }
-    if title != DEFAULT_DASHBOARD_TITLE {
-        command.arg("--title").arg(title);
+    if let Some(token) = args.auth_token {
+        command.arg("--auth-token").arg(token);
     }
-    if preview_chars != 320 {
+    command
+        .arg("--require-auth")
+        .arg(if args.require_auth { "true" } else { "false" });
+    if args.title != DEFAULT_DASHBOARD_TITLE {
+        command.arg("--title").arg(args.title);
+    }
+    if args.preview_chars != 320 {
         command
             .arg("--preview-chars")
-            .arg(preview_chars.to_string());
+            .arg(args.preview_chars.to_string());
     }
 
     command
@@ -5463,8 +5509,8 @@ fn spawn_dashboard_server_background(
 
     eprintln!("✓ Dashboard server launched in background");
     eprintln!("  PID: {}", child.id());
-    eprintln!("  URL: http://{}:{}", host, port);
-    eprintln!("  Store: {}", store_root.display());
+    eprintln!("  URL: http://{}:{}", args.host, args.port);
+    eprintln!("  Store: {}", args.store_root.display());
     Ok(())
 }
 
@@ -5506,6 +5552,8 @@ fn run_dashboard_command(args: DashboardArgs) -> Result<()> {
             no_open: args.no_open,
             bg: args.bg,
             allow_cors_origins: args.allow_cors_origins,
+            auth_token: args.auth_token,
+            require_auth: args.require_auth,
             artifact: default_dashboard_output_path()?,
             title: args.title,
             preview_chars: args.preview_chars,
@@ -5517,9 +5565,10 @@ fn run_dashboard_command(args: DashboardArgs) -> Result<()> {
         || args.no_open
         || args.bg
         || args.allow_cors_origins.is_some()
+        || args.auth_token.is_some()
     {
         return Err(anyhow::anyhow!(
-            "--host, --port, --no-open, --bg, and --allow-cors-origins are only valid with --serve."
+            "--host, --port, --no-open, --bg, --allow-cors-origins, and --auth-token are only valid with --serve."
         ));
     }
 
@@ -6462,7 +6511,7 @@ mod tests {
         assert!(!rendered.contains("Transport: stdio (default) or sse"));
         assert!(!rendered.contains("embedding mode"));
         assert!(
-            rendered.lines().count() < 20,
+            rendered.lines().count() < 30,
             "serve help should stay compact"
         );
     }

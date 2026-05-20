@@ -16,6 +16,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use crate::api;
+use crate::auth::{self, AuthConfig};
 use crate::intents::{self, IntentKind, IntentsConfig};
 use crate::oracle::OracleStatus;
 use crate::rank;
@@ -922,8 +923,8 @@ pub async fn run_stdio() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run MCP server over streamable HTTP transport on given port.
-pub async fn run_http(port: u16) -> anyhow::Result<()> {
+/// Run MCP server over streamable HTTP transport on given port with the given auth state.
+pub async fn run_http(port: u16, auth_config: AuthConfig) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
@@ -931,6 +932,9 @@ pub async fn run_http(port: u16) -> anyhow::Result<()> {
         .ok();
 
     let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
+
+    let auth_source_label = auth_config.source.describe();
+    let auth_enforced = auth_config.is_enforced();
 
     let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default();
     let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
@@ -941,13 +945,15 @@ pub async fn run_http(port: u16) -> anyhow::Result<()> {
         config,
     );
 
-    let app = axum::Router::new().route(
+    let mcp_router = axum::Router::new().route(
         "/mcp",
         axum::routing::any(move |req: axum::http::Request<axum::body::Body>| {
             let svc = service.clone();
             async move { svc.handle(req).await }
         }),
     );
+
+    let app = auth::require_auth_layer(mcp_router, auth_config);
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -956,6 +962,13 @@ pub async fn run_http(port: u16) -> anyhow::Result<()> {
     eprintln!("aicx MCP server running (streamable HTTP)");
     eprintln!("  Endpoint: http://{addr}/mcp");
     eprintln!("  Transport: Streamable HTTP (POST + GET /mcp)");
+    if auth_enforced {
+        eprintln!("  Auth: enabled (source: {auth_source_label})");
+    } else {
+        eprintln!(
+            "  Auth: DISABLED ({auth_source_label}) — anyone who reaches {addr} can invoke MCP tools"
+        );
+    }
 
     axum::serve(listener, app)
         .await
@@ -963,15 +976,19 @@ pub async fn run_http(port: u16) -> anyhow::Result<()> {
 }
 
 /// Legacy compatibility wrapper for callers that still use the old `run_sse` name.
-pub async fn run_sse(port: u16) -> anyhow::Result<()> {
-    run_http(port).await
+pub async fn run_sse(port: u16, auth_config: AuthConfig) -> anyhow::Result<()> {
+    run_http(port, auth_config).await
 }
 
-/// Run the selected MCP transport.
-pub async fn run_transport(transport: McpTransport, port: u16) -> anyhow::Result<()> {
+/// Run the selected MCP transport. Stdio bypasses HTTP auth (no network surface).
+pub async fn run_transport(
+    transport: McpTransport,
+    port: u16,
+    auth_config: AuthConfig,
+) -> anyhow::Result<()> {
     match transport {
         McpTransport::Stdio => run_stdio().await,
-        McpTransport::Http => run_http(port).await,
+        McpTransport::Http => run_http(port, auth_config).await,
     }
 }
 

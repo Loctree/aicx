@@ -28,6 +28,7 @@ use tokio::sync::RwLock;
 #[cfg(test)]
 use std::{fs, io::Write};
 
+use crate::auth::{self, AuthConfig};
 use crate::dashboard::{
     self, DashboardPayload, DashboardRecord, DashboardScope, DashboardStats, project_matches_filter,
 };
@@ -109,6 +110,7 @@ pub struct DashboardServerConfig {
     pub cors_policy: DashboardCorsPolicy,
     pub host: IpAddr,
     pub port: u16,
+    pub auth: AuthConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -337,7 +339,7 @@ impl Drop for RebuildFlagGuard<'_> {
 
 /// Run dashboard server and block until process is terminated.
 pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
-    validate_dashboard_host_policy(config.host, &config.cors_policy, true)?;
+    validate_dashboard_host_policy(config.host, &config.cors_policy, true, &config.auth)?;
 
     let initial = rebuild_dashboard(&config).context("Initial dashboard build failed")?;
     let shell_html = dashboard::render_server_shell_html(&config.title);
@@ -348,10 +350,21 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         rebuilding: AtomicBool::new(false),
     });
 
-    let app = Router::new()
+    let auth_source_label = config.auth.source.describe();
+    let auth_enforced = config.auth.is_enforced();
+
+    // Public (no Bearer) routes: HTML shell + manifest + service worker + liveness.
+    // The browser fetches these as a raw GET to render the UI; the corpus-data
+    // surface (`/api/browse`, `/api/detail`, `/api/chunk`, `/api/context`,
+    // `/api/search/*`, `/api/regenerate`, `/api/status`) is gated below.
+    let public_router: Router<Arc<DashboardServerState>> = Router::new()
         .route("/", get(get_dashboard_html))
-        .route("/api/health", get(get_health))
         .route("/health", get(get_health))
+        .route("/api/health", get(get_health))
+        .route("/manifest.webmanifest", get(get_manifest))
+        .route("/service-worker.js", get(get_service_worker));
+
+    let api_router: Router<Arc<DashboardServerState>> = Router::new()
         .route("/api/status", get(get_status))
         .route("/api/browse", get(get_browse))
         .route("/api/detail", get(get_detail))
@@ -360,9 +373,12 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         .route("/api/regenerate", post(regenerate_dashboard))
         .route("/api/search/semantic", get(semantic_search))
         .route("/api/search/cross", get(cross_search))
-        .route("/api/search/steer", get(steer_search))
-        .route("/manifest.webmanifest", get(get_manifest))
-        .route("/service-worker.js", get(get_service_worker))
+        .route("/api/search/steer", get(steer_search));
+
+    let api_router = auth::require_auth_layer(api_router, config.auth.clone());
+
+    let app = public_router
+        .merge(api_router)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             dashboard_cors_middleware,
@@ -394,6 +410,13 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
     );
     eprintln!("  Store: {}", config.store_root.display());
     eprintln!("  CORS: {}", config.cors_policy.describe());
+    if auth_enforced {
+        eprintln!("  Auth: enabled on /api/* (source: {auth_source_label})");
+    } else {
+        eprintln!(
+            "  Auth: DISABLED ({auth_source_label}) — /api/* surface is reachable by anyone who can hit {addr}"
+        );
+    }
 
     axum::serve(listener, app)
         .await
@@ -404,6 +427,7 @@ pub fn validate_dashboard_host_policy(
     host: IpAddr,
     cors_policy: &DashboardCorsPolicy,
     cors_policy_was_explicit: bool,
+    auth: &AuthConfig,
 ) -> Result<()> {
     if host.is_loopback() {
         return Ok(());
@@ -412,6 +436,13 @@ pub fn validate_dashboard_host_policy(
     if !cors_policy_was_explicit || matches!(cors_policy, DashboardCorsPolicy::Local) {
         return Err(anyhow!(
             "Binding dashboard server to non-loopback address '{}' requires an explicit non-local CORS policy. Re-run with `--allow-cors-origins tailscale`, `--allow-cors-origins all`, or an explicit URL.",
+            host
+        ));
+    }
+
+    if !auth.is_enforced() {
+        return Err(anyhow!(
+            "Binding dashboard server to non-loopback address '{}' requires HTTP Bearer auth. Re-run without `--no-require-auth` or provide `--auth-token <TOKEN>`.",
             host
         ));
     }
@@ -1770,6 +1801,7 @@ mod tests {
                 cors_policy: DashboardCorsPolicy::Local,
                 host: "127.0.0.1".parse().expect("host"),
                 port: 8033,
+                auth: AuthConfig::disabled(),
             },
             shell_html: "<html>shell</html>".to_string(),
             snapshot: RwLock::new(DashboardSnapshot {
@@ -1799,22 +1831,55 @@ mod tests {
         let all = DashboardCorsPolicy::All;
         let exact =
             DashboardCorsPolicy::from_cli(Some("https://dashboard.example.com")).expect("exact");
+        let auth_on = AuthConfig {
+            token: Some("test-token".to_string()),
+            source: crate::auth::AuthSource::Cli,
+        };
+        let auth_off = AuthConfig::disabled();
 
         assert!(
-            validate_dashboard_host_policy("127.0.0.1".parse().expect("ipv4"), &local, false)
+            validate_dashboard_host_policy(
+                "127.0.0.1".parse().expect("ipv4"),
+                &local,
+                false,
+                &auth_off
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_dashboard_host_policy(
+                "0.0.0.0".parse().expect("any"),
+                &local,
+                false,
+                &auth_on
+            )
+            .is_err()
+        );
+        assert!(
+            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &local, true, &auth_on)
+                .is_err()
+        );
+        assert!(
+            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &all, true, &auth_on)
                 .is_ok()
         );
         assert!(
-            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &local, false).is_err()
+            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &exact, true, &auth_on)
+                .is_ok()
+        );
+        // F-P0-2: non-loopback bind without auth must refuse, regardless of CORS.
+        assert!(
+            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &all, true, &auth_off)
+                .is_err()
         );
         assert!(
-            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &local, true).is_err()
-        );
-        assert!(
-            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &all, true).is_ok()
-        );
-        assert!(
-            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &exact, true).is_ok()
+            validate_dashboard_host_policy(
+                "0.0.0.0".parse().expect("any"),
+                &exact,
+                true,
+                &auth_off
+            )
+            .is_err()
         );
     }
 
