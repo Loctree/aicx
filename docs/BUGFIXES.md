@@ -725,3 +725,5 @@ linie 1335-1396; audyty
 `/Users/silver/AI_notes/projects/aicx/reports/subagents/SUBAGENT_01_audit-area-A--20-05-2026.md`
 i
 `/Users/silver/AI_notes/projects/aicx/reports/subagents/SUBAGENT_03_audit-area-C--20-05-2026.md`.
+- B-6: Switched deduplication to BLAKE3-128 collision-resistant algorithm.
+- B-7: Bumped default state lock timeout to 60s and plumbed --lock-timeout flag.
