@@ -955,7 +955,8 @@ enum Commands {
     /// Extract structured intents from the canonical corpus.
     Intents {
         /// Repo or store-bucket filters. Omit to scan all projects.
-        #[arg(short, long, num_args = 1.., value_delimiter = ',')]
+        /// Repeated `-p` flags or comma list (`-p a,b`) form a union.
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
         /// Hours to look back (default: 720 = 30 days)
@@ -1205,7 +1206,8 @@ enum Commands {
         kind: Option<String>,
 
         /// Repo or store-bucket filters. Omit to search all projects.
-        #[arg(short, long, num_args = 1.., value_delimiter = ',')]
+        /// Repeated `-p` flags or comma list (`-p a,b`) form a union.
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
         /// Filter by date: single day (2026-03-28), range (2026-03-20..2026-03-28),
@@ -6291,11 +6293,12 @@ mod tests {
             "intents",
             "-p",
             "vc-operator",
+            "-p",
             "vibecrafted",
             "-p",
             "loctree",
         ])
-        .expect("intents should accept repeated and space-list project filters");
+        .expect("intents should accept repeated project filters");
 
         match cli.command {
             Some(Commands::Intents { project, .. }) => {
@@ -6312,11 +6315,12 @@ mod tests {
             "steer",
             "-p",
             "vc-operator",
+            "-p",
             "vibecrafted",
             "-p",
             "loctree",
         ])
-        .expect("steer should accept repeated and space-list project filters");
+        .expect("steer should accept repeated project filters");
 
         match cli.command {
             Some(Commands::Steer { project, .. }) => {
@@ -6519,7 +6523,7 @@ mod tests {
         let rendered = steer.render_help().to_string();
 
         assert!(rendered.contains("Retrieve chunks by steering metadata"));
-        assert!(rendered.contains("--project <PROJECT>..."));
+        assert!(rendered.contains("--project <PROJECT>"));
         assert!(!rendered.contains("aicx steer --run-id mrbl-001"));
         assert!(!rendered.contains("--no-redact-secrets"));
         assert!(!rendered.contains("--hours <HOURS>"));
