@@ -143,6 +143,10 @@ fn warn_if_steer_incompatible(err: &anyhow::Error) {
     }
 }
 
+fn is_steer_incompatible(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<SteerIncompatible>().is_some()
+}
+
 fn chunk_id_for_path(file: &Path) -> String {
     file.file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -991,6 +995,9 @@ pub async fn query_steer_index_count() -> Result<usize> {
     call_steer_read_lock_hook();
     if let Err(err) = ensure_steer_index_compatible_at(&base).await {
         warn_if_steer_incompatible(&err);
+        if is_steer_incompatible(&err) {
+            return Ok(0);
+        }
         return Err(err);
     }
     let docs = query_steer_index_at(&base).await?;
@@ -1017,6 +1024,9 @@ pub async fn search_steer_index(
     call_steer_read_lock_hook();
     if let Err(err) = ensure_steer_index_compatible_at(&base).await {
         warn_if_steer_incompatible(&err);
+        if is_steer_incompatible(&err) {
+            return Ok(vec![]);
+        }
         return Err(err);
     }
 
@@ -1024,6 +1034,9 @@ pub async fn search_steer_index(
         Ok(results) => results,
         Err(err) => {
             warn_if_steer_incompatible(&err);
+            if is_steer_incompatible(&err) {
+                return Ok(vec![]);
+            }
             return Err(err);
         }
     };
@@ -1128,16 +1141,6 @@ mod tests {
         let (lock, ready) = &**pair;
         *lock.lock().expect("flag lock") = true;
         ready.notify_all();
-    }
-
-    fn assert_steer_error(err: &anyhow::Error, expected: fn(&SteerIncompatible) -> bool) {
-        let incompatible = err
-            .downcast_ref::<SteerIncompatible>()
-            .expect("typed steer error");
-        assert!(
-            expected(incompatible),
-            "unexpected steer error: {incompatible}"
-        );
     }
 
     fn path_count(path: &Path) -> usize {
@@ -1393,12 +1396,10 @@ mod tests {
         });
         let before_count = path_count(&steer_db_path(&home.dir));
 
-        let err = rt
+        let count = rt
             .block_on(query_steer_index_count())
-            .expect_err("query should return typed rebuild requirement");
-        assert_steer_error(&err, |incompatible| {
-            matches!(incompatible, SteerIncompatible::RebuildRequired { .. })
-        });
+            .expect("query should degrade to an empty count");
+        assert_eq!(count, 0);
         assert_eq!(path_count(&steer_db_path(&home.dir)), before_count);
 
         let docs = rt
@@ -1431,7 +1432,7 @@ mod tests {
                 .expect("insert legacy steer document");
         });
 
-        let err = rt
+        let results = rt
             .block_on(async {
                 let filter = SteerFilter {
                     run_id: Some("impl-055522"),
@@ -1439,10 +1440,8 @@ mod tests {
                 };
                 search_steer_index(&filter, 10).await
             })
-            .expect_err("search should return typed rebuild requirement");
-        assert_steer_error(&err, |incompatible| {
-            matches!(incompatible, SteerIncompatible::RebuildRequired { .. })
-        });
+            .expect("search should degrade to empty results");
+        assert!(results.is_empty());
 
         let docs = rt
             .block_on(query_steer_index_at(&home.dir))
@@ -1475,10 +1474,8 @@ mod tests {
             first.join().expect("first worker"),
             second.join().expect("second worker"),
         ] {
-            let err = result.expect_err("missing index should be a typed diagnostic");
-            assert_steer_error(&err, |incompatible| {
-                matches!(incompatible, SteerIncompatible::NotBootstrapped { .. })
-            });
+            let results = result.expect("missing index should degrade to empty results");
+            assert!(results.is_empty());
         }
 
         assert!(!steer_db_path(&home.dir).exists());

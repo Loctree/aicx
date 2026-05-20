@@ -1179,3 +1179,52 @@ dla failed `bugtracker-W4-A-unicode-20260520`. Report:
 
 **Related.** Closes F-P2-12, F-P3-15, F-P1/P2-3 from Area F. Report:
 `/Users/silver/.vibecrafted/artifacts/Loctree/aicx/2026_0520/reports/20260520_135025_20260520_1350_perform-the-vc-justdo-skill-on-this-repository_codex.md`.
+
+---
+
+## 2026-05-20 — steer read paths degrade on rebuild-required state (Area D D-1 recovery #2) · `{commit-sha}`
+
+**Symptom.** Recovery #2 dispatch wymagał, żeby `search_steer_index` i
+`query_steer_index_count` pod shared `steer.lock` nie mutowały indexu, a przy
+`SteerIncompatible` dawały pusty wynik + warn. Current HEAD miał już shared
+locki, typed error, writer-side rebuild i atomic-ish swap, ale reader entry
+points nadal propagowały typed `Err` do callerów.
+
+**Root cause.** Pierwszy D-1 patch zatrzymał destructive rebuild z read path,
+ale zostawił reader contract w trybie "diagnostic as error". To było lepsze
+niż kasowanie/rebuild bez exclusive locka, ale nie spełniało W6 recovery
+contractu dla read callers: empty result + `tracing::warn!`.
+
+**Fix.**
+- `query_steer_index_count` po `SteerIncompatible` loguje istniejącym
+  warningiem i zwraca `Ok(0)`.
+- `search_steer_index` po `SteerIncompatible` z compatibility check albo BM25
+  bootstrap check loguje warning i zwraca `Ok(vec![])`.
+- Non-steer errors nadal propagują jako `Err`, żeby nie ukrywać realnej
+  korupcji I/O/runtime pod pustym wynikiem.
+- Testy D-1 dostosowane do finalnego read contractu i dalej sprawdzają brak
+  mutacji indexu oraz brak rebuildów z read path.
+
+**Touched.**
+- `src/steer_index.rs` — reader error mapping w `query_steer_index_count`,
+  `search_steer_index`, helper `is_steer_incompatible`, test expectations.
+
+**Tests.**
+- `cargo fmt --all -- --check`
+- `cargo test -p aicx --features lance steer_index` — 10 passed.
+- `cargo check -p aicx --features lance` — passed.
+- `cargo clippy -p aicx --features lance -- -D warnings` — blocked by
+  unrelated `src/intents.rs:920` and `src/intents.rs:925`
+  `manual_pattern_char_comparison` lints outside this D-1 scope.
+
+**Lessons.**
+- Loctree/repo truth pokazały, że większość D-1 była już w HEAD; recovery
+  worker powinien był od razu przerwać na "already landed + small contract
+  delta", zamiast mielić długi recon.
+- Typed diagnostic i graceful read degradation to dwie różne umowy. Dla
+  operator-facing read path pusty wynik z warnem jest stabilniejszy niż
+  bubble-up typed error, jeśli rebuild jest decyzją writer path.
+
+**Related.** Closes D-1 from docs/bug-tracker-aicx Area D; recovery #2 for
+failed `bugtracker-W4-D-steer-locks-*` runs. Report:
+`/Users/silver/.vibecrafted/artifacts/Loctree/aicx/2026_0520/reports/20260520_143717_20260520_1437_perform-the-vc-justdo-skill-on-this-repository_codex.md`.
