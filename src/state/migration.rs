@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 pub const SIPHASH13_ALGORITHM: &str = "siphash13-v1";
+pub const BLAKE3_128_ALGORITHM: &str = "blake3-128-v1";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StateMigrationReport {
@@ -30,6 +31,13 @@ pub fn stable_siphasher13() -> SipHasher13 {
     SipHasher13::new()
 }
 
+pub fn stable_blake3_128(input: &[u8]) -> String {
+    let hash = blake3::hash(input);
+    let hex = hash.to_hex();
+    // take 128-bit prefix (16 bytes = 32 hex chars)
+    hex[..32].to_string()
+}
+
 pub fn canonical_state_bucket(project: &str) -> String {
     project
         .split('/')
@@ -41,11 +49,11 @@ pub fn canonical_state_bucket(project: &str) -> String {
 pub fn migrate_loaded_state(state: &mut StateManager) -> StateMigrationReport {
     let mut report = StateMigrationReport::default();
 
-    if state.hash_algorithm.trim() != SIPHASH13_ALGORITHM {
+    if state.hash_algorithm.trim() != BLAKE3_128_ALGORITHM {
         report.hash_algorithm_changed = true;
         report.cleared_seen_hashes = state.total_hashes();
         state.seen_hashes.clear();
-        state.hash_algorithm = SIPHASH13_ALGORITHM.to_string();
+        state.hash_algorithm = BLAKE3_128_ALGORITHM.to_string();
         return report;
     }
 
@@ -175,4 +183,42 @@ fn looks_like_date_dir(path: &Path) -> bool {
 
 fn shell_escape_double_quoted(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::StateManager;
+
+    #[test]
+    fn test_migration_clears_state_on_algorithm_bump() {
+        let mut state = StateManager {
+            hash_algorithm: SIPHASH13_ALGORITHM.to_string(),
+            ..Default::default()
+        };
+        state
+            .seen_hashes
+            .insert("test".to_string(), crate::state::SeenHashSet::default());
+        state
+            .seen_hashes
+            .get_mut("test")
+            .unwrap()
+            .insert("somehash".to_string());
+
+        let report = migrate_loaded_state(&mut state);
+        assert!(report.hash_algorithm_changed);
+        assert_eq!(report.cleared_seen_hashes, 1);
+        assert!(state.seen_hashes.is_empty());
+        assert_eq!(state.hash_algorithm, BLAKE3_128_ALGORITHM);
+    }
+
+    #[test]
+    fn test_blake3_128_collision_resistance() {
+        let mut hashes = std::collections::HashSet::new();
+        for i in 0..1000 {
+            let input = format!("test input {i}");
+            let hash = stable_blake3_128(input.as_bytes());
+            assert!(hashes.insert(hash));
+        }
+    }
 }

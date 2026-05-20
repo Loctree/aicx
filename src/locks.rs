@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 const STALE_AFTER: Duration = Duration::from_secs(60);
 const RETRY_DELAY: Duration = Duration::from_millis(25);
 
@@ -413,6 +413,29 @@ mod tests {
         let err = acquire_exclusive_with_timeout(&path, Duration::from_millis(75))
             .expect_err("second lock should time out");
         assert!(err.to_string().contains("timed out"));
+        release(first);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_default_timeout_is_60_seconds() {
+        assert_eq!(DEFAULT_TIMEOUT, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_with_timeout_override_respects_arg() {
+        let path = temp_lock("override_timeout");
+        let first = acquire_exclusive(&path).expect("first lock");
+
+        let started = Instant::now();
+        let err = acquire_exclusive_with_timeout(&path, Duration::from_secs(1))
+            .expect_err("should time out");
+
+        let elapsed = started.elapsed();
+        assert!(err.to_string().contains("timed out"));
+        assert!(elapsed >= Duration::from_secs(1));
+        assert!(elapsed < Duration::from_secs(2));
+
         release(first);
         let _ = fs::remove_file(path);
     }

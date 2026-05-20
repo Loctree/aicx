@@ -10,7 +10,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use crate::store::atomic_write::atomic_write;
@@ -23,8 +22,8 @@ const DEFAULT_MAX_HASHES: usize = 50_000;
 /// Per-project dedup hashes with insertion/LRU order preserved.
 #[derive(Debug, Clone, Default)]
 pub struct SeenHashSet {
-    order: VecDeque<u64>,
-    set: HashSet<u64>,
+    order: VecDeque<String>,
+    set: HashSet<String>,
 }
 
 impl SeenHashSet {
@@ -36,15 +35,15 @@ impl SeenHashSet {
         self.set.is_empty()
     }
 
-    pub fn contains(&self, hash: &u64) -> bool {
+    pub fn contains(&self, hash: &str) -> bool {
         self.set.contains(hash)
     }
 
-    pub fn insert(&mut self, hash: u64) {
+    pub fn insert(&mut self, hash: String) {
         if self.set.remove(&hash) {
             self.order.retain(|existing| *existing != hash);
         }
-        self.set.insert(hash);
+        self.set.insert(hash.clone());
         self.order.push_back(hash);
     }
 
@@ -78,7 +77,7 @@ impl<'de> Deserialize<'de> for SeenHashSet {
     where
         D: Deserializer<'de>,
     {
-        let hashes = Vec::<u64>::deserialize(deserializer)?;
+        let hashes = Vec::<String>::deserialize(deserializer)?;
         let mut out = SeenHashSet::default();
         for hash in hashes {
             out.insert(hash);
@@ -125,7 +124,7 @@ impl Default for StateManager {
             last_processed: HashMap::new(),
             seen_hashes: HashMap::new(),
             runs: Vec::new(),
-            hash_algorithm: migration::SIPHASH13_ALGORITHM.to_string(),
+            hash_algorithm: migration::BLAKE3_128_ALGORITHM.to_string(),
         }
     }
 }
@@ -228,17 +227,17 @@ impl StateManager {
 
     /// Compute a stable content hash from entry fields (exact dedup).
     ///
-    /// Uses explicitly pinned SipHash-1-3 for fast, stable hashing.
+    /// Uses explicitly pinned BLAKE3-128 for fast, stable hashing.
     ///
     /// The (agent, timestamp, message) triple is sufficient for unique
     /// identification. Session ID is excluded because Claude Code stores
     /// the same user message in multiple session JSONL files.
-    pub fn content_hash(agent: &str, timestamp: i64, message: &str) -> u64 {
-        let mut hasher = migration::stable_siphasher13();
-        agent.hash(&mut hasher);
-        timestamp.hash(&mut hasher);
-        message.hash(&mut hasher);
-        hasher.finish()
+    pub fn content_hash(agent: &str, timestamp: i64, message: &str) -> String {
+        let mut data = Vec::new();
+        data.extend_from_slice(agent.as_bytes());
+        data.extend_from_slice(&timestamp.to_le_bytes());
+        data.extend_from_slice(message.as_bytes());
+        migration::stable_blake3_128(&data)
     }
 
     /// Compute an overlap hash for cross-agent dedup.
@@ -251,24 +250,24 @@ impl StateManager {
     /// The overlap hash ignores `agent` and buckets timestamps into 60-second
     /// windows, so identical messages arriving within the same minute from
     /// different agents collapse into one.
-    pub fn overlap_hash(timestamp: i64, message: &str) -> u64 {
-        let mut hasher = migration::stable_siphasher13();
+    pub fn overlap_hash(timestamp: i64, message: &str) -> String {
         let bucket = timestamp / 60; // 60-second window
-        bucket.hash(&mut hasher);
-        message.hash(&mut hasher);
-        hasher.finish()
+        let mut data = Vec::new();
+        data.extend_from_slice(&bucket.to_le_bytes());
+        data.extend_from_slice(message.as_bytes());
+        migration::stable_blake3_128(&data)
     }
 
     /// Returns `true` if this hash has NOT been seen before for the given project.
-    pub fn is_new(&self, project: &str, hash: u64) -> bool {
+    pub fn is_new(&self, project: &str, hash: &str) -> bool {
         let project = migration::canonical_state_bucket(project);
         self.seen_hashes
             .get(&project)
-            .is_none_or(|set| !set.contains(&hash))
+            .is_none_or(|set| !set.contains(hash))
     }
 
     /// Mark a hash as seen for the given project.
-    pub fn mark_seen(&mut self, project: &str, hash: u64) {
+    pub fn mark_seen(&mut self, project: &str, hash: String) {
         let project = migration::canonical_state_bucket(project);
         self.seen_hashes.entry(project).or_default().insert(hash);
     }
@@ -402,7 +401,7 @@ mod tests {
     fn state_with_marker(source: &str, watermark_seconds: i64, project_hash: u64) -> StateManager {
         let mut state = StateManager::default();
         state.update_watermark(source, ts(watermark_seconds));
-        state.mark_seen("project", project_hash);
+        state.mark_seen("project", project_hash.to_string());
         state
     }
 
@@ -481,18 +480,18 @@ mod tests {
         let hash = StateManager::content_hash("claude", 100, "msg");
 
         // New for both projects
-        assert!(state.is_new("projA", hash));
-        assert!(state.is_new("projB", hash));
+        assert!(state.is_new("projA", &hash));
+        assert!(state.is_new("projB", &hash));
 
         // Mark seen only in projA
-        state.mark_seen("projA", hash);
-        assert!(!state.is_new("projA", hash));
-        assert!(!state.is_new("proja", hash));
-        assert!(state.is_new("projB", hash)); // still new for projB
+        state.mark_seen("projA", hash.clone());
+        assert!(!state.is_new("projA", &hash));
+        assert!(!state.is_new("proja", &hash));
+        assert!(state.is_new("projB", &hash)); // still new for projB
 
         // Mark seen in projB
-        state.mark_seen("projB", hash);
-        assert!(!state.is_new("projB", hash));
+        state.mark_seen("projB", hash.clone());
+        assert!(!state.is_new("projB", &hash));
     }
 
     #[test]
@@ -558,7 +557,7 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), old_contents);
         let loaded = StateManager::load_from_path(&path).unwrap();
         assert_eq!(loaded.get_watermark("claude:test"), Some(ts(10)));
-        assert!(!loaded.is_new("project", 101));
+        assert!(!loaded.is_new("project", "101"));
 
         cleanup_state_path(&path);
     }
@@ -590,7 +589,7 @@ mod tests {
         let loaded = StateManager::load_from_path(&path).unwrap();
 
         assert_eq!(loaded.get_watermark("claude:test"), Some(ts(20)));
-        assert!(!loaded.is_new("project", 202));
+        assert!(!loaded.is_new("project", "202"));
         cleanup_state_path(&path);
     }
 
@@ -608,7 +607,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&backup_path).unwrap(), old_contents);
         let loaded = StateManager::load_from_path(&path).unwrap();
         assert_eq!(loaded.get_watermark("claude:test"), Some(ts(20)));
-        assert!(!loaded.is_new("project", 202));
+        assert!(!loaded.is_new("project", "202"));
         cleanup_state_path(&path);
     }
 
@@ -616,7 +615,7 @@ mod tests {
     fn test_prune_old_hashes_below_limit() {
         let mut state = StateManager::default();
         for i in 0..10u64 {
-            state.mark_seen("proj", i);
+            state.mark_seen("proj", i.to_string());
         }
 
         state.prune_old_hashes(100);
@@ -627,7 +626,7 @@ mod tests {
     fn test_prune_old_hashes_above_limit() {
         let mut state = StateManager::default();
         for i in 0..100u64 {
-            state.mark_seen("proj", i);
+            state.mark_seen("proj", i.to_string());
         }
 
         state.prune_old_hashes(30);
@@ -638,20 +637,20 @@ mod tests {
     fn lru_evicts_oldest_first() {
         let mut state = StateManager::default();
         for i in 0..10u64 {
-            state.mark_seen("proj", i);
+            state.mark_seen("proj", i.to_string());
         }
 
         state.prune_old_hashes(5);
 
         for old in 0..5u64 {
             assert!(
-                state.is_new("proj", old),
+                state.is_new("proj", &old.to_string()),
                 "old hash {old} should be evicted"
             );
         }
         for fresh in 5..10u64 {
             assert!(
-                !state.is_new("proj", fresh),
+                !state.is_new("proj", &fresh.to_string()),
                 "fresh hash {fresh} should remain"
             );
         }
@@ -685,24 +684,24 @@ mod tests {
     #[test]
     fn test_reset_project() {
         let mut state = StateManager::default();
-        state.mark_seen("projA", 1);
-        state.mark_seen("projA", 2);
-        state.mark_seen("projB", 3);
+        state.mark_seen("projA", "1".to_string());
+        state.mark_seen("projA", "2".to_string());
+        state.mark_seen("projB", "3".to_string());
 
         state.reset_project("projA");
-        assert!(state.is_new("projA", 1));
-        assert!(!state.is_new("projB", 3));
+        assert!(state.is_new("projA", "1"));
+        assert!(!state.is_new("projB", "3"));
     }
 
     #[test]
     fn test_reset_all() {
         let mut state = StateManager::default();
-        state.mark_seen("projA", 1);
-        state.mark_seen("projB", 2);
+        state.mark_seen("projA", "1".to_string());
+        state.mark_seen("projB", "2".to_string());
 
         state.reset_all();
-        assert!(state.is_new("projA", 1));
-        assert!(state.is_new("projB", 2));
+        assert!(state.is_new("projA", "1"));
+        assert!(state.is_new("projB", "2"));
         assert_eq!(state.total_hashes(), 0);
     }
 
@@ -712,18 +711,18 @@ mod tests {
         let t = Utc.with_ymd_and_hms(2026, 1, 20, 15, 30, 0).unwrap();
 
         state.update_watermark("claude:TestProject", t);
-        state.mark_seen("myproj", 123456789);
-        state.mark_seen("myproj", 987654321);
+        state.mark_seen("myproj", "123456789".to_string());
+        state.mark_seen("myproj", "987654321".to_string());
         state.record_run(5, vec!["claude:TestProject".to_string()]);
 
         let json = serde_json::to_string_pretty(&state).unwrap();
         let restored: StateManager = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored.get_watermark("claude:TestProject"), Some(t));
-        assert!(!restored.is_new("myproj", 123456789));
-        assert!(!restored.is_new("myproj", 987654321));
-        assert!(restored.is_new("myproj", 111111111));
-        assert!(restored.is_new("other", 123456789)); // different project
+        assert!(!restored.is_new("myproj", "123456789"));
+        assert!(!restored.is_new("myproj", "987654321"));
+        assert!(restored.is_new("myproj", "111111111"));
+        assert!(restored.is_new("other", "123456789")); // different project
         assert_eq!(restored.runs.len(), 1);
         assert_eq!(restored.runs[0].entries_added, 5);
     }
@@ -736,13 +735,13 @@ mod tests {
             .seen_hashes
             .entry("Vista".to_string())
             .or_default()
-            .insert(42);
+            .insert("42".to_string());
 
         let report = migration::migrate_loaded_state(&mut state);
 
         assert!(report.hash_algorithm_changed);
         assert_eq!(report.cleared_seen_hashes, 1);
-        assert_eq!(state.hash_algorithm, migration::SIPHASH13_ALGORITHM);
+        assert_eq!(state.hash_algorithm, migration::BLAKE3_128_ALGORITHM);
         assert_eq!(state.total_hashes(), 0);
     }
 
@@ -753,12 +752,12 @@ mod tests {
             .seen_hashes
             .entry("Vista".to_string())
             .or_default()
-            .insert(1);
+            .insert("1".to_string());
         state
             .seen_hashes
             .entry("vista".to_string())
             .or_default()
-            .insert(2);
+            .insert("2".to_string());
 
         let report = migration::migrate_loaded_state(&mut state);
 
@@ -766,8 +765,8 @@ mod tests {
         assert_eq!(report.lowercased_seen_hash_buckets, 1);
         assert_eq!(report.merged_seen_hash_buckets, 1);
         assert_eq!(state.seen_hashes.len(), 1);
-        assert!(!state.is_new("vista", 1));
-        assert!(!state.is_new("Vista", 2));
+        assert!(!state.is_new("vista", "1"));
+        assert!(!state.is_new("Vista", "2"));
     }
 
     #[test]

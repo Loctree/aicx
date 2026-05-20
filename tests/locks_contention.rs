@@ -70,7 +70,7 @@ fn ts(seconds: i64) -> chrono::DateTime<Utc> {
     Utc.timestamp_opt(seconds, 0).single().expect("timestamp")
 }
 
-fn locked_state_update(source: &str, project: &str, watermark: i64, hash: u64, hold: Duration) {
+fn locked_state_update(source: &str, project: &str, watermark: i64, hash: String, hold: Duration) {
     let _guard =
         aicx::locks::acquire_exclusive(aicx::locks::state_lock_path().expect("state lock path"))
             .expect("state lock");
@@ -112,11 +112,23 @@ fn test_concurrent_run_store_does_not_lose_state_updates() {
     let project = "VetCoders/Vista";
 
     let first = thread::spawn(move || {
-        locked_state_update(source, project, 10, 101, Duration::from_millis(150));
+        locked_state_update(
+            source,
+            project,
+            10,
+            "101".to_string(),
+            Duration::from_millis(150),
+        );
     });
     thread::sleep(Duration::from_millis(25));
     let second = thread::spawn(move || {
-        locked_state_update(source, project, 20, 202, Duration::from_millis(0));
+        locked_state_update(
+            source,
+            project,
+            20,
+            "202".to_string(),
+            Duration::from_millis(0),
+        );
     });
 
     first.join().expect("first state update");
@@ -124,7 +136,28 @@ fn test_concurrent_run_store_does_not_lose_state_updates() {
 
     let final_state = StateManager::load().expect("final state");
     assert_eq!(final_state.get_watermark(source), Some(ts(20)));
-    assert!(!final_state.is_new(project, 101));
-    assert!(!final_state.is_new(project, 202));
+    assert!(!final_state.is_new(project, "101"));
+    assert!(!final_state.is_new(project, "202"));
     assert_eq!(final_state.runs.len(), 2);
+}
+
+#[test]
+fn test_contention_succeeds_under_60s_timeout() {
+    let path = temp_lock("timeout_success");
+    let first = aicx::locks::acquire_exclusive(&path).expect("first lock");
+    let worker_path = path.clone();
+
+    let started = Instant::now();
+    let worker = thread::spawn(move || {
+        // Will block until first releases it, but won't timeout because default is 60s
+        aicx::locks::acquire_exclusive(&worker_path).expect("second lock shouldn't timeout")
+    });
+
+    // Hold the lock for 6 seconds (longer than old 5s timeout)
+    thread::sleep(Duration::from_secs(6));
+    aicx::locks::release(first);
+
+    let second = worker.join().expect("worker");
+    assert!(started.elapsed() >= Duration::from_secs(6));
+    aicx::locks::release(second);
 }
