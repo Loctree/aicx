@@ -352,3 +352,43 @@ Po sweepie każdy `-p` w CLI obowiązuje jeden kontrakt:
 powierzchni.
 
 ---
+
+## 2026-05-20 — modern secret redaction coverage (Area C P1) · `0b1b7ad`
+
+**Symptom.** `redact_secrets` przepuszczał współczesne credential formats:
+Anthropic `sk-ant-api03-*`, OpenAI `sk-proj-*`, GitHub `ghs_/gho_/ghu_/ghr_`,
+GitLab `glpat-*`, AWS `ASIA*`, Slack `xapp-*`, JWT, Stripe `sk_/rk_` oraz
+GCP service-account JSON z escaped `private_key`.
+
+**Root cause.** Warstwa regexów była prefix-anchored na starsze formaty
+(`sk-*`, `ghp_*`, `xox*`, `AKIA*`, `AIza*`) i raw PEM block. JSON field
+`"private_key": "-----BEGIN...\n..."` oraz service-account side fields
+nie miały osobnej ścieżki redakcji.
+
+**Fix.**
+- Dodano explicit regexy dla nowych rodzin tokenów i wpisy w `SECRET_LOOKUP_SET`.
+- `ghp_*` przeniesiono do wspólnego `RE_GITHUB_TOKENS_EXT`, żeby nie robić
+  podwójnej redakcji.
+- Dodano GCP service-account JSON redaction: `private_key` globalnie,
+  a `private_key_id` i `client_email` tylko w bounded obiekcie
+  `"type": "service_account"`.
+- Zachowano istniejące labelki i patterny legacy.
+
+**Touched.**
+- `src/redact.rs` — regex set, replacement pipeline, GCP SA helper, unit tests.
+- `tests/secret_redaction_e2e.rs` — output-level md/json no-leak regression.
+
+**Tests.** Dodano pozytywne testy dla nowych rodzin, GCP SA JSON i Bearer
+regression, negatywne testy SHA1/SHA256/UUID/base64/patient-like oraz e2e
+test piszący conversation `.md` + `.json` przez `aicx::output`.
+
+**Lessons.**
+- Token regex coverage musi być pinowane pozytywnymi i negatywnymi testami
+  razem; samo poszerzenie patternów bez SHA/UUID/base64 guardów to proszenie
+  się o false positives.
+- JSON-escaped private keys nie są tym samym przypadkiem co raw PEM block;
+  potrzebują field-aware redakcji przed ogólnym PEM replacerem.
+
+**Related.** Area C P1 1.1-1.10 z `/Users/silver/Downloads/bug-tracker-aicx.md`.
+
+---
