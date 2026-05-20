@@ -481,4 +481,25 @@ mod tests {
         assert_eq!(resolved.repo, DEFAULT_DEV_REPO);
         assert_eq!(resolved.filename, DEFAULT_DEV_FILENAME);
     }
+
+    #[cfg(not(any(feature = "gguf", feature = "cloud")))]
+    #[test]
+    fn auto_with_cloud_config_attempts_cloud_fallback_after_gguf() {
+        let cfg = EmbeddingConfig {
+            backend: BackendPreference::Auto,
+            cloud: Some(CloudEmbeddingConfig {
+                url: "http://127.0.0.1:65535/v1/embeddings".to_string(),
+                model: "test-model".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = match EmbeddingEngine::with_config(cfg) {
+            Ok(_) => panic!("auto without compiled backends should not construct an engine"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("failed GGUF"));
+        assert!(err.contains("cloud fallback"));
+    }
 }
