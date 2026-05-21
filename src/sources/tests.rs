@@ -68,6 +68,17 @@ fn test_repo_name_from_cwd() {
         ),
         "lbrx-services"
     );
+
+    // Multi-filter selection must use word-boundary path matching, NOT
+    // raw substring. `--project test` against `/tmp/fastest-project`
+    // would previously pick "test" as the label even though the project
+    // filter step (correctly) rejects that path; the helper must agree.
+    let filters = vec!["test".to_string(), "other".to_string()];
+    assert_ne!(
+        repo_name_from_cwd(Some("/tmp/fastest-project"), &filters),
+        "test",
+        "multi-filter label must not be picked via substring match"
+    );
 }
 
 #[test]
@@ -455,6 +466,339 @@ fn test_extract_codex_file_classifies_frame_kinds_from_fixture() {
     assert_eq!(entries[1].message, "Visible assistant reply");
     assert_eq!(entries[2].message, "Hidden chain of thought");
     assert!(entries[3].message.contains("searchDocs"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_codex_session_missing_meta_warns_and_falls_back_to_stem() {
+    let root = unique_test_dir("codex-missing-session-meta");
+    let tmp = root.join("rollout-without-meta.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello without meta"}}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].session_id, "rollout-without-meta");
+    assert_eq!(
+        warnings,
+        vec![CodexSessionWarning::MissingSessionMeta {
+            fallback: "rollout-without-meta".to_string()
+        }]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_codex_session_duplicate_meta_warns_first_wins() {
+    let root = unique_test_dir("codex-duplicate-session-meta");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"session-a","cwd":"/tmp/a"}}
+{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"session-b","cwd":"/tmp/b"}}
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello duplicate meta"}}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].session_id, "session-a");
+    assert_eq!(
+        warnings,
+        vec![CodexSessionWarning::DuplicateSessionMeta {
+            first: "session-a".to_string(),
+            ignored: vec!["session-b".to_string()],
+        }]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_codex_session_filename_mismatch_warns() {
+    let root = unique_test_dir("codex-filename-mismatch");
+    let filename_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let meta_id = "019e2574-8a7f-7d33-a318-b365aa0ab970";
+    let stem = format!("rollout-2026-05-14T00-47-35-{filename_id}");
+    let tmp = root.join(format!("{stem}.jsonl"));
+    let _ = fs::remove_dir_all(&root);
+
+    let content = format!(
+        r#"{{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{{"id":"{meta_id}","cwd":"/tmp/a"}}}}
+{{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{{"type":"user_message","message":"hello mismatch"}}}}"#
+    );
+    write_file(&tmp, &content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].session_id, meta_id);
+    assert_eq!(
+        warnings,
+        vec![CodexSessionWarning::FilenameMismatch {
+            meta_id: meta_id.to_string(),
+            filename_stem: stem,
+        }]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_codex_session_non_rollout_filename_does_not_mismatch_warn() {
+    let root = unique_test_dir("codex-non-rollout-no-mismatch");
+    let meta_id = "019e2574-8a7f-7d33-a318-b365aa0ab970";
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = format!(
+        r#"{{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{{"id":"{meta_id}","cwd":"/tmp/a"}}}}
+{{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{{"type":"user_message","message":"hello direct file"}}}}"#
+    );
+    write_file(&tmp, &content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].session_id, meta_id);
+    assert!(warnings.is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_codex_session_diagnostics_aggregates_counts() {
+    let mut diagnostics = CodexSessionDiagnostics::default();
+    assert!(diagnostics.is_empty());
+
+    diagnostics.observe(&[CodexSessionWarning::MissingSessionMeta {
+        fallback: "rollout-without-meta".to_string(),
+    }]);
+    diagnostics.observe(&[
+        CodexSessionWarning::DuplicateSessionMeta {
+            first: "session-a".to_string(),
+            ignored: vec!["session-b".to_string()],
+        },
+        CodexSessionWarning::FilenameMismatch {
+            meta_id: "019e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
+            filename_stem: "rollout-2026-05-14T00-47-35-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                .to_string(),
+        },
+    ]);
+    diagnostics.observe(&[CodexSessionWarning::UnparsableTimestamp {
+        count: 3,
+        samples: vec![
+            "2026-02-01T00:00:01".to_string(),
+            "garbage".to_string(),
+            "x".to_string(),
+        ],
+    }]);
+    diagnostics.observe(&[CodexSessionWarning::UnknownMsgType {
+        count: 4,
+        samples: vec![
+            "task_started".to_string(),
+            "task_complete".to_string(),
+            "error".to_string(),
+        ],
+    }]);
+
+    assert!(!diagnostics.is_empty());
+    assert_eq!(diagnostics.missing, 1);
+    assert_eq!(diagnostics.duplicate, 1);
+    assert_eq!(diagnostics.mismatch, 1);
+    assert_eq!(diagnostics.unparsable_ts, 3);
+    assert_eq!(diagnostics.unknown_msg_type, 4);
+}
+
+#[test]
+fn test_parse_codex_session_duplicate_and_mismatch_warn_together() {
+    let root = unique_test_dir("codex-duplicate-and-mismatch");
+    let filename_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let meta_id = "019e2574-8a7f-7d33-a318-b365aa0ab970";
+    let ignored_id = "119e2574-8a7f-7d33-a318-b365aa0ab970";
+    let stem = format!("rollout-2026-05-14T00-47-35-{filename_id}");
+    let tmp = root.join(format!("{stem}.jsonl"));
+    let _ = fs::remove_dir_all(&root);
+
+    let content = format!(
+        r#"{{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{{"id":"{meta_id}","cwd":"/tmp/a"}}}}
+{{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{{"id":"{ignored_id}","cwd":"/tmp/b"}}}}
+{{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{{"type":"user_message","message":"hello compound"}}}}"#
+    );
+    write_file(&tmp, &content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].session_id, meta_id);
+    assert_eq!(
+        warnings,
+        vec![
+            CodexSessionWarning::DuplicateSessionMeta {
+                first: meta_id.to_string(),
+                ignored: vec![ignored_id.to_string()],
+            },
+            CodexSessionWarning::FilenameMismatch {
+                meta_id: meta_id.to_string(),
+                filename_stem: stem,
+            },
+        ]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_codex_session_unparsable_timestamps_warn_and_drop() {
+    let root = unique_test_dir("codex-unparsable-ts");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"sess","cwd":"/tmp"}}
+{"timestamp":"2026-02-01T00:00:01","type":"event_msg","payload":{"type":"user_message","message":"naive ts dropped"}}
+{"timestamp":"not-a-timestamp","type":"event_msg","payload":{"type":"user_message","message":"garbage ts dropped"}}
+{"timestamp":"2026/02/01T00:00:03Z","type":"event_msg","payload":{"type":"user_message","message":"slash separator dropped"}}
+{"timestamp":"not-a-timestamp","type":"event_msg","payload":{"type":"user_message","message":"duplicate sample dropped"}}
+{"timestamp":"2026-02-01T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"good ts kept"}}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].message, "good ts kept");
+
+    assert_eq!(warnings.len(), 1);
+    match &warnings[0] {
+        CodexSessionWarning::UnparsableTimestamp { count, samples } => {
+            assert_eq!(*count, 4);
+            assert_eq!(
+                samples,
+                &vec![
+                    "2026-02-01T00:00:01".to_string(),
+                    "not-a-timestamp".to_string(),
+                    "2026/02/01T00:00:03Z".to_string(),
+                ]
+            );
+        }
+        other => panic!("expected UnparsableTimestamp, got {other:?}"),
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_codex_session_mcp_tool_call_is_kept_in_timeline() {
+    let root = unique_test_dir("codex-mcp-tool-call");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"sess","cwd":"/tmp"}}
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"mcp_tool_call","server":"memex","tool":"memory_search"}}
+{"timestamp":"2026-02-01T00:00:02Z","type":"event_msg","payload":{"type":"mcp_tool_call_response","server":"memex","result":"ok"}}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|e| e.role == "tool"));
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.frame_kind == Some(FrameKind::ToolCall))
+    );
+    assert!(
+        warnings.is_empty(),
+        "expected no warnings, got {warnings:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_codex_session_unknown_msg_type_warns_and_counts() {
+    let root = unique_test_dir("codex-unknown-msg-type");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"sess","cwd":"/tmp"}}
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"good user"}}
+{"timestamp":"2026-02-01T00:00:02Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-02-01T00:00:03Z","type":"event_msg","payload":{"type":"web_search","query":"x"}}
+{"timestamp":"2026-02-01T00:00:04Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-02-01T00:00:05Z","type":"event_msg","payload":{}}
+{"timestamp":"2026-02-01T00:00:06Z","type":"event_msg","payload":{"type":""}}
+{"timestamp":"2026-02-01T00:00:07Z","type":"event_msg","payload":{"type":"agent_message","message":"good assistant"}}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].role, "user");
+    assert_eq!(entries[1].role, "assistant");
+
+    assert_eq!(warnings.len(), 1);
+    match &warnings[0] {
+        CodexSessionWarning::UnknownMsgType { count, samples } => {
+            assert_eq!(*count, 3);
+            assert_eq!(samples.len(), 2);
+            assert!(samples.iter().any(|s| s == "task_started"));
+            assert!(samples.iter().any(|s| s == "web_search"));
+        }
+        other => panic!("expected UnknownMsgType, got {other:?}"),
+    }
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -1273,6 +1617,115 @@ fn test_extract_gemini_file_keeps_inline_data_as_explicit_placeholder() {
             .contains("[inlineData omitted: mimeType=image/png, data_chars=6]")
     );
     assert!(entries[1].message.contains("humanoidalny robot"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_project_filter_matches_path_word_boundary() {
+    // Empty filter => match all.
+    assert!(project_filter_matches_path("/anything", &[]));
+
+    // Exact segment match — the key fix vs old substring behavior.
+    assert!(project_filter_matches_path(
+        "/tmp/test/foo",
+        &["test".to_string()]
+    ));
+    // Substring used to false-positive here; now correctly rejected.
+    assert!(!project_filter_matches_path(
+        "/tmp/fastest-project",
+        &["test".to_string()]
+    ));
+
+    // Word-boundary inside a segment (split by `-`, `_`, `.`).
+    assert!(project_filter_matches_path(
+        "/Users/silver/Git/vista-portal-pr15-hotfix",
+        &["portal".to_string()]
+    ));
+    // Multi-word filter — all words must appear.
+    assert!(project_filter_matches_path(
+        "/Users/silver/Git/vista-portal-pr15-hotfix",
+        &["vista-portal".to_string()]
+    ));
+    // Multi-word filter missing a word — rejected.
+    assert!(!project_filter_matches_path(
+        "/tmp/abc",
+        &["abc-def".to_string()]
+    ));
+
+    // Case-insensitive both directions.
+    assert!(project_filter_matches_path(
+        "/TMP/Test/foo",
+        &["test".to_string()]
+    ));
+    assert!(project_filter_matches_path(
+        "/tmp/test",
+        &["TEST".to_string()]
+    ));
+
+    // ANY filter mode (multiple filters).
+    assert!(project_filter_matches_path(
+        "/tmp/abc",
+        &["xyz".to_string(), "abc".to_string()]
+    ));
+
+    // Windows-style backslash separator.
+    assert!(project_filter_matches_path(
+        "C:\\Users\\test\\foo",
+        &["test".to_string()]
+    ));
+
+    // Empty cwd never matches a non-empty filter.
+    assert!(!project_filter_matches_path("", &["x".to_string()]));
+}
+
+#[test]
+fn test_extract_codex_file_project_filter_rejects_substring_false_positive() {
+    // `--project test` must NOT match a session whose cwd is `/tmp/fastest-project`.
+    let root = unique_test_dir("codex-pf-substring-fp");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"sess","cwd":"/tmp/fastest-project"}}
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec!["test".to_string()],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_codex_file(&tmp, &config).unwrap();
+    assert!(
+        entries.is_empty(),
+        "session in /tmp/fastest-project must not match --project test, got {} entries",
+        entries.len()
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_extract_codex_file_project_filter_accepts_path_segment() {
+    let root = unique_test_dir("codex-pf-accept");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"sess","cwd":"/Users/x/Git/vista-portal-pr15"}}
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec!["vista-portal".to_string()],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_codex_file(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 1, "vista-portal filter must match path");
 
     let _ = fs::remove_dir_all(&root);
 }
