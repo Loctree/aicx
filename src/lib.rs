@@ -11,6 +11,7 @@ pub mod auth;
 pub mod corpus;
 pub mod dashboard;
 pub mod dashboard_server;
+pub mod diagnostics;
 pub mod doctor;
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub mod embedder;

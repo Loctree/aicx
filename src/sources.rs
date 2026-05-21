@@ -1330,9 +1330,53 @@ impl ClaudeSessionWarning {
 }
 
 fn emit_claude_session_warnings(path: &Path, warnings: &[ClaudeSessionWarning]) {
+    use crate::diagnostics::{self, DiagnosticKind};
     for warning in warnings {
-        eprintln!("{}", warning.describe(path));
+        let line = warning.describe(path);
+        diagnostics::log_describe(&line);
+        match warning {
+            ClaudeSessionWarning::FallbackTimestamp { count, .. } => {
+                diagnostics::record("claude", DiagnosticKind::FallbackTimestamp, *count, path);
+            }
+            ClaudeSessionWarning::UnparsableTimestamp { count, .. } => {
+                diagnostics::record("claude", DiagnosticKind::UnparsableTimestamp, *count, path);
+            }
+            ClaudeSessionWarning::InvalidEpochMillis { count, .. } => {
+                diagnostics::record("claude", DiagnosticKind::InvalidEpochMillis, *count, path);
+            }
+            ClaudeSessionWarning::OversizedLine { count, .. } => {
+                diagnostics::record("claude", DiagnosticKind::OversizedLine, *count, path);
+            }
+            ClaudeSessionWarning::MissingSessionId { .. } => {
+                diagnostics::record("claude", DiagnosticKind::MissingSessionId, 1, path);
+            }
+            ClaudeSessionWarning::SessionIdDrift { .. } => {
+                diagnostics::record("claude", DiagnosticKind::SessionIdDrift, 1, path);
+            }
+            ClaudeSessionWarning::ContentSanitization { warning } => {
+                record_content_sanitization("claude", warning, path);
+            }
+        }
+        if diagnostics::is_verbose() {
+            eprintln!("{line}");
+        }
     }
+}
+
+fn record_content_sanitization(
+    extractor: &'static str,
+    warning: &sanitize::ContentSanitizationWarning,
+    path: &Path,
+) {
+    use crate::diagnostics::{self, DiagnosticKind};
+    let kind = match warning {
+        sanitize::ContentSanitizationWarning::BidiOverride(_, _) => DiagnosticKind::BidiOverride,
+        sanitize::ContentSanitizationWarning::ZeroWidth(_, _) => DiagnosticKind::ZeroWidth,
+        sanitize::ContentSanitizationWarning::NullByteStripped(_) => {
+            DiagnosticKind::NullByteStripped
+        }
+    };
+    diagnostics::record(extractor, kind, 1, path);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1393,8 +1437,30 @@ impl GeminiSessionWarning {
 }
 
 fn emit_gemini_session_warnings(path: &Path, warnings: &[GeminiSessionWarning]) {
+    use crate::diagnostics::{self, DiagnosticKind};
     for warning in warnings {
-        eprintln!("{}", warning.describe(path));
+        let line = warning.describe(path);
+        diagnostics::log_describe(&line);
+        match warning {
+            GeminiSessionWarning::UnparsableTimestamp { count, .. } => {
+                diagnostics::record("gemini", DiagnosticKind::UnparsableTimestamp, *count, path);
+            }
+            GeminiSessionWarning::UnknownMsgType { count, .. } => {
+                diagnostics::record("gemini", DiagnosticKind::UnknownMsgType, *count, path);
+            }
+            GeminiSessionWarning::MissingSessionId { .. } => {
+                diagnostics::record("gemini", DiagnosticKind::MissingSessionId, 1, path);
+            }
+            GeminiSessionWarning::SessionIdDrift { .. } => {
+                diagnostics::record("gemini", DiagnosticKind::SessionIdDrift, 1, path);
+            }
+            GeminiSessionWarning::ContentSanitization { warning } => {
+                record_content_sanitization("gemini", warning, path);
+            }
+        }
+        if diagnostics::is_verbose() {
+            eprintln!("{line}");
+        }
     }
 }
 
@@ -1437,8 +1503,24 @@ impl JunieSessionWarning {
 }
 
 fn emit_junie_session_warnings(path: &Path, warnings: &[JunieSessionWarning]) {
+    use crate::diagnostics::{self, DiagnosticKind};
     for warning in warnings {
-        eprintln!("{}", warning.describe(path));
+        let line = warning.describe(path);
+        diagnostics::log_describe(&line);
+        match warning {
+            JunieSessionWarning::JunieFallbackId { .. } => {
+                diagnostics::record("junie", DiagnosticKind::JunieFallbackId, 1, path);
+            }
+            JunieSessionWarning::OversizedLine { count, .. } => {
+                diagnostics::record("junie", DiagnosticKind::OversizedLine, *count, path);
+            }
+            JunieSessionWarning::ContentSanitization { warning } => {
+                record_content_sanitization("junie", warning, path);
+            }
+        }
+        if diagnostics::is_verbose() {
+            eprintln!("{line}");
+        }
     }
 }
 
@@ -2913,25 +2995,62 @@ impl PushContentSanitizationWarning for Vec<CodexSessionWarning> {
 }
 
 fn emit_codex_session_warnings(path: &Path, warnings: &[CodexSessionWarning]) {
+    use crate::diagnostics::{self, DiagnosticKind};
     for warning in warnings {
-        eprintln!("{}", warning.describe(path));
+        let line = warning.describe(path);
+        diagnostics::log_describe(&line);
+        match warning {
+            CodexSessionWarning::MissingSessionMeta { .. } => {
+                diagnostics::record("codex", DiagnosticKind::MissingSessionMeta, 1, path);
+            }
+            CodexSessionWarning::DuplicateSessionMeta { .. } => {
+                diagnostics::record("codex", DiagnosticKind::DuplicateSessionMeta, 1, path);
+            }
+            CodexSessionWarning::FilenameMismatch { .. } => {
+                diagnostics::record("codex", DiagnosticKind::FilenameMismatch, 1, path);
+            }
+            CodexSessionWarning::UnparsableTimestamp { count, .. } => {
+                diagnostics::record("codex", DiagnosticKind::UnparsableTimestamp, *count, path);
+            }
+            CodexSessionWarning::UnknownMsgType { count, .. } => {
+                diagnostics::record("codex", DiagnosticKind::UnknownMsgType, *count, path);
+            }
+            CodexSessionWarning::MixedFormat { count, .. } => {
+                diagnostics::record("codex", DiagnosticKind::MixedFormat, *count, path);
+            }
+            CodexSessionWarning::OversizedLine { count, .. } => {
+                diagnostics::record("codex", DiagnosticKind::OversizedLine, *count, path);
+            }
+            CodexSessionWarning::ContentSanitization { warning } => {
+                record_content_sanitization("codex", warning, path);
+            }
+        }
+        if diagnostics::is_verbose() {
+            eprintln!("{line}");
+        }
     }
 }
 
+// Legacy per-extractor aggregator kept for test coverage only. Production
+// extractors now route per-file warnings through `emit_codex_session_warnings`
+// which records into the shared `crate::diagnostics` aggregator and emits a
+// single per-run SUMMARY (G-4).
+#[cfg(test)]
 #[derive(Default)]
-struct CodexSessionDiagnostics {
-    missing: usize,
-    duplicate: usize,
-    mismatch: usize,
-    unparsable_ts: usize,
-    unknown_msg_type: usize,
-    mixed_format: usize,
-    oversized_line: usize,
-    content_sanitization: usize,
+pub(crate) struct CodexSessionDiagnostics {
+    pub(crate) missing: usize,
+    pub(crate) duplicate: usize,
+    pub(crate) mismatch: usize,
+    pub(crate) unparsable_ts: usize,
+    pub(crate) unknown_msg_type: usize,
+    pub(crate) mixed_format: usize,
+    pub(crate) oversized_line: usize,
+    pub(crate) content_sanitization: usize,
 }
 
+#[cfg(test)]
 impl CodexSessionDiagnostics {
-    fn observe(&mut self, warnings: &[CodexSessionWarning]) {
+    pub(crate) fn observe(&mut self, warnings: &[CodexSessionWarning]) {
         for warning in warnings {
             match warning {
                 CodexSessionWarning::MissingSessionMeta { .. } => self.missing += 1,
@@ -2956,7 +3075,7 @@ impl CodexSessionDiagnostics {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.missing == 0
             && self.duplicate == 0
             && self.mismatch == 0
@@ -2965,22 +3084,6 @@ impl CodexSessionDiagnostics {
             && self.mixed_format == 0
             && self.oversized_line == 0
             && self.content_sanitization == 0
-    }
-
-    fn emit_summary(&self) {
-        if !self.is_empty() {
-            eprintln!(
-                "Codex sessions diagnostics: missing={} duplicate={} mismatch={} unparsable_ts={} unknown_msg_type={} mixed_format={} oversized_line={} content_sanitization={}",
-                self.missing,
-                self.duplicate,
-                self.mismatch,
-                self.unparsable_ts,
-                self.unknown_msg_type,
-                self.mixed_format,
-                self.oversized_line,
-                self.content_sanitization
-            );
-        }
     }
 }
 
@@ -3146,20 +3249,18 @@ pub fn extract_codex_sessions(config: &ExtractionConfig) -> Result<Vec<TimelineE
     }
 
     let mut entries = Vec::new();
-    let mut diagnostics = CodexSessionDiagnostics::default();
     let files = walk_jsonl_files(&sessions_dir);
 
     for path in &files {
         match parse_codex_session_file_with_diagnostics(path, config) {
             Ok((se, warnings)) => {
-                diagnostics.observe(&warnings);
+                emit_codex_session_warnings(path, &warnings);
                 entries.extend(se);
             }
             Err(_) => continue,
         }
     }
 
-    diagnostics.emit_summary();
     entries.sort_by_key(|a| a.timestamp);
     Ok(entries)
 }

@@ -85,6 +85,15 @@ fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
 #[command(version)]
 #[command(verbatim_doc_comment)]
 struct Cli {
+    /// Verbose diagnostics: echo per-file extractor warnings to stderr.
+    ///
+    /// Default behavior aggregates warnings into a per-extractor SUMMARY
+    /// (≤5 lines) at end of run; structured per-run detail is always written
+    /// to `~/.aicx/state/diagnostics-<run-id>.log`. Pass `--verbose` to
+    /// restore the pre-G-4 per-file echo for debugging individual sessions.
+    #[arg(long, short = 'v', global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -1382,7 +1391,16 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.command {
+    let diagnostics_state_dir = aicx::store::store_base_dir().ok().map(|d| d.join("state"));
+    let _ = aicx::diagnostics::init(cli.verbose, diagnostics_state_dir);
+
+    let result = run_command(cli.command);
+    aicx::diagnostics::emit_summary();
+    result
+}
+
+fn run_command(command: Option<Commands>) -> Result<()> {
+    match command {
         Some(Commands::Claude {
             redaction,
             project,
