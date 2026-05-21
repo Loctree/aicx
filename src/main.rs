@@ -1342,9 +1342,13 @@ enum Commands {
         #[arg(long)]
         rebuild_sidecars: bool,
 
-        /// Emit a reviewable bash script for deleting empty-body chunks
+        /// Emit a reviewable bash script for moving empty-body chunks to quarantine
         #[arg(long)]
         prune_empty_bodies: bool,
+
+        /// With --prune-empty-bodies, move empty-body chunks into recoverable quarantine
+        #[arg(long, requires = "prune_empty_bodies")]
+        apply: bool,
 
         /// Report duplicate content_sha256 groups across store and context-corpus
         #[arg(long)]
@@ -1909,6 +1913,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             dry_run,
             rebuild_sidecars,
             prune_empty_bodies,
+            apply,
             check_dedup,
             verbose,
             smoke,
@@ -1921,6 +1926,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 dry_run,
                 rebuild_sidecars,
                 prune_empty_bodies,
+                apply_prune_empty_bodies: apply,
                 check_dedup,
                 verbose,
                 smoke,
@@ -1967,6 +1973,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 dry_run: false,
                 rebuild_sidecars: false,
                 prune_empty_bodies: false,
+                apply_prune_empty_bodies: false,
                 check_dedup: false,
                 verbose: true,
                 smoke: false,
@@ -6899,6 +6906,28 @@ mod tests {
             }
             _ => panic!("expected corpus repair command"),
         }
+    }
+
+    #[test]
+    fn doctor_apply_requires_prune_empty_bodies() {
+        let cli = Cli::try_parse_from(["aicx", "doctor", "--prune-empty-bodies", "--apply"])
+            .expect("doctor prune apply should parse");
+        match cli.command {
+            Some(Commands::Doctor {
+                prune_empty_bodies,
+                apply,
+                ..
+            }) => {
+                assert!(prune_empty_bodies);
+                assert!(apply);
+            }
+            _ => panic!("expected doctor command"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["aicx", "doctor", "--apply"]).is_err(),
+            "--apply is only valid as a --prune-empty-bodies modifier"
+        );
     }
 
     #[test]

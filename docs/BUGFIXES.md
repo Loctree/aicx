@@ -1417,3 +1417,50 @@ Vec::new()`. Diagnostic nie był połączony z żadną ścieżką fallback times
 
 **Related.** Closes G-5 from `docs/bug-tracker-aicx-followup-pass-2`; recovery
 of W-B-1 substrate failure.
+
+## 2026-05-21 — empty-body prune apply moves chunks to quarantine (H-1) · `{commit-sha}`
+
+**Symptom.** `aicx doctor --prune-empty-bodies` tylko emitował skrypt
+czyszczący. Przy tysiącach pustych chunków operator i tak musiałby odpalić
+go blind, a stary skrypt używał `rm -f`, więc ścieżka recovery była słaba.
+
+**Root cause.** `empty_body_report` miało deterministyczną klasyfikację i
+reviewable renderer, ale brakowało opt-in apply path. Doctor nie miał też
+ponownego przeliczenia `empty_body_chunks` po fizycznym przeniesieniu
+kandydatów.
+
+**Fix.**
+- Dodano `aicx doctor --prune-empty-bodies --apply`, które przenosi chunk `.md`
+  i istniejący sidecar `.meta.json` do
+  `~/.aicx/quarantine/empty-bodies-<ISO-timestamp>/`, zachowując ścieżkę
+  względną względem `store/`.
+- Domyślne `--prune-empty-bodies` zostaje dry-run/script mode, ale skrypt
+  przeszedł z `rm -f` na `mv -n` do quarantine.
+- Po apply doctor ponownie liczy checks, więc `empty_body_chunks` spada w tym
+  samym raporcie, jeśli move się udał.
+- CLI `--apply` jest modifierem wymagającym `--prune-empty-bodies`.
+
+**Touched.**
+- `src/doctor.rs` — empty-body quarantine helper, script renderer, recheck,
+  tests.
+- `src/main.rs` — `--apply` flag wiring + parser contract test.
+- `docs/BACKLOG.md` — status H-1.
+
+**Tests.**
+- Nowe: `apply_prune_empty_bodies_moves_chunks_to_quarantine_and_rechecks`.
+- Nowe: `doctor_apply_requires_prune_empty_bodies`.
+- Zmienione: `empty_body_chunks_red_when_over_threshold_and_script_is_reviewable`
+  sprawdza move-not-rm script.
+- Zielone: targeted `cargo test --workspace` dla trzech powyższych testów,
+  `make test`, `cargo test --workspace`, `make clippy`, `make fmt`.
+
+**Lessons.**
+- Quarantine paths muszą liczyć relative path po canonicalized store root;
+  macOS `/var` vs `/private/var` potrafi inaczej złamać `strip_prefix`.
+- Reviewable cleanup script nie powinien zostawiać starszej destructive ścieżki,
+  gdy apply path jest już recoverable.
+
+**Related.** Closes H-1 from
+`docs/bug-tracker-aicx-followup-pass-2.md`; partially addresses
+`docs/BACKLOG.md` 2026-05-12 `[aicx/empty-bodies]` by adding the safe operator
+apply path, but does not mutate the live canonical store by itself.
