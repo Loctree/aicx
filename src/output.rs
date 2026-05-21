@@ -554,6 +554,8 @@ fn find_footer_position(path: &Path, file_size: u64, window: u64) -> Result<Opti
     let tail_len = std::cmp::min(window, file_size);
     let start = file_size - tail_len;
 
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    // Timeline path is resolved from AICX output writers via validate_write_path, not from request input.
     let mut file = File::open(path)
         .with_context(|| format!("strip_footer: open failed: {}", path.display()))?;
     file.seek(SeekFrom::Start(start))?;
@@ -591,7 +593,10 @@ fn truncate_file_atomic(path: &Path, pos: u64) -> Result<()> {
     let tmp_path = parent.join(tmp_name);
 
     let copy_result: io::Result<()> = (|| {
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        // src/tmp_path are derived from already-resolved AICX timeline path + sibling tempfile.
         let mut src = File::open(path)?;
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         let mut dst = File::create(&tmp_path)?;
 
         const CHUNK: usize = 64 * 1024;
@@ -623,6 +628,8 @@ fn truncate_file_atomic(path: &Path, pos: u64) -> Result<()> {
         )
     })?;
 
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    // Parent dir is derived from already-resolved AICX timeline path; best-effort fsync after atomic rename.
     if !parent.as_os_str().is_empty()
         && let Ok(dir) = File::open(parent)
     {
