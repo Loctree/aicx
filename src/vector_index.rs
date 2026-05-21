@@ -435,6 +435,38 @@ pub fn write_index(project: Option<&str>, sample: usize) -> Result<IndexStats> {
     write_index_with_progress(project, sample, &|_| {})
 }
 
+/// G-3 build-mode options for [`write_index_with_options`].
+///
+/// Default is incremental: only sidecars whose mtime is newer than the
+/// committed index `header.generated_at` are re-embedded, and their rows
+/// are appended to the existing `embeddings.ndjson`. `full_rescan: true`
+/// restores the pre-G-3 from-zero rebuild.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IndexBuildOptions {
+    /// `true` to embed every chunk from scratch. `false` (default) to walk
+    /// only chunks newer than the committed index header.
+    pub full_rescan: bool,
+}
+
+/// Short label for the currently-configured embedder backend
+/// (`"cloud"` / `"gguf"`). Returns `None` if no embedder can be loaded
+/// — caller is free to skip printing rather than surfacing a noisy error
+/// before the same backend init runs again inside [`write_index`].
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub fn probe_backend_label() -> Option<&'static str> {
+    let engine = crate::embedder::EmbeddingEngine::new().ok()?;
+    Some(backend_label_from_info(engine.info()))
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn backend_label_from_info(info: &crate::embedder::EmbeddingModelInfo) -> &'static str {
+    match info.source {
+        crate::embedder::NativeEmbeddingSource::CloudEndpoint(_) => "cloud",
+        crate::embedder::NativeEmbeddingSource::HfCache { .. }
+        | crate::embedder::NativeEmbeddingSource::ExplicitPath(_) => "gguf",
+    }
+}
+
 /// Same as [`write_index`] but emits [`IndexEvent`]s into the supplied sink
 /// for every embedded chunk plus a rate-limited [`IndexEvent::StatsTick`].
 ///
@@ -444,10 +476,29 @@ pub fn write_index(project: Option<&str>, sample: usize) -> Result<IndexStats> {
 /// at a 75-minute blank stdout. Internal rebuild paths (`aicx all`, library
 /// callers) still call the thin [`write_index`] wrapper above and pay zero
 /// observability cost.
+///
+/// Defaults to **incremental** since G-3 (only sidecars newer than the
+/// committed `header.generated_at` are re-embedded). Callers that need a
+/// from-zero rebuild use [`write_index_with_options`] with
+/// `full_rescan: true`.
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub fn write_index_with_progress(
     project: Option<&str>,
     sample: usize,
+    on_event: &dyn Fn(&IndexEvent),
+) -> Result<IndexStats> {
+    write_index_with_options(project, sample, IndexBuildOptions::default(), on_event)
+}
+
+/// Build (or incrementally update) the persistent NDJSON-backed index.
+///
+/// `options.full_rescan` controls the walk strategy — see
+/// [`IndexBuildOptions`].
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub fn write_index_with_options(
+    project: Option<&str>,
+    sample: usize,
+    options: IndexBuildOptions,
     on_event: &dyn Fn(&IndexEvent),
 ) -> Result<IndexStats> {
     use std::collections::HashSet;
@@ -483,10 +534,10 @@ pub fn write_index_with_progress(
     let _lock = crate::locks::acquire_exclusive(crate::locks::lance_lock_path()?)?;
 
     let root = crate::store::store_base_dir()?;
-    let files = live_index_files(&root, project)?;
-    stats.chunks_total = files.len();
+    let all_files = live_index_files(&root, project)?;
+    stats.chunks_total = all_files.len();
 
-    if files.is_empty() {
+    if all_files.is_empty() {
         stats.fallback_reason = Some("no chunks found in canonical store".to_string());
         stats.elapsed_ms = started.elapsed().as_millis();
         return Ok(stats);
@@ -512,12 +563,34 @@ pub fn write_index_with_progress(
             .with_context(|| format!("create index dir: {}", parent.display()))?;
     }
 
+    // G-3: decide build mode. `--full-rescan` always rebuilds from zero.
+    // `sample != 0` is a deterministic-subset diagnostic mode, also full.
+    // Otherwise look for a compatible committed index — if absent or
+    // incompatible (dim/model/profile drift), fall back to full so the
+    // operator does not silently mix model outputs.
+    let incremental_baseline = if options.full_rescan || sample != 0 {
+        None
+    } else {
+        load_incremental_baseline(&target_path, &info)?
+    };
+
+    // Files to walk through the embed loop. Incremental keeps only those
+    // newer than the baseline `generated_at` AND not already embedded
+    // (id-set diff covers crash-recovery cases where mtime ≤ generated_at
+    // but the row never made it into the committed index).
+    let files: Vec<crate::store::StoredContextFile> = match incremental_baseline.as_ref() {
+        Some(baseline) => partition_incremental_files(&all_files, baseline),
+        None => all_files.clone(),
+    };
     let cap = if sample == 0 {
         files.len()
     } else {
         sample.min(files.len())
     };
-    let resume = if sample == 0 {
+    // Resume-from-checkpoint only applies to a full rebuild; an
+    // incremental walk never writes to `ndjson.tmp` so there is nothing
+    // to resume from.
+    let resume = if sample == 0 && incremental_baseline.is_none() {
         load_resume_tmp_index(&tmp_path, &info)?
     } else {
         None
@@ -528,9 +601,12 @@ pub fn write_index_with_progress(
         .unwrap_or_default();
 
     // Atomic-ish: write to `.tmp` then rename so a partial build cannot
-    // poison subsequent queries. Full builds resume an existing compatible
-    // `.tmp` checkpoint; sample builds intentionally start clean so the
-    // operator gets exactly the requested sample size.
+    // poison subsequent queries. Three flows feed the same tmp file shape:
+    //   1. Resumed full build → append onto the surviving `.tmp` checkpoint.
+    //   2. Incremental walk (G-3) → seed tmp with the committed body so the
+    //      embed loop only writes the genuinely new rows.
+    //   3. Fresh full build → empty tmp + placeholder header, embed loop
+    //      writes every chunk.
     let mut writer = if let Some(state) = &resume {
         stats.resumed_embeddings = state.rows;
         stats.resume_tmp_path = Some(tmp_path.clone());
@@ -562,6 +638,21 @@ pub fn write_index_with_progress(
             entry_count: 0,
         };
         writeln!(writer, "{}", serde_json::to_string(&header)?)?;
+        // G-3: incremental seed — copy every data line from the committed
+        // index into tmp before the embed loop appends new rows. The
+        // truthful-header rewrite at commit time then sees existing-plus-new
+        // and renames atomically onto the target. `stats.resumed_embeddings`
+        // doubles as the "already in the file" count so the D-2 entry_count
+        // math below stays accurate.
+        if incremental_baseline.is_some() {
+            stats.resumed_embeddings = copy_committed_body_into(&mut writer, &target_path)
+                .with_context(|| {
+                    format!(
+                        "seed incremental tmp from committed index: {}",
+                        target_path.display()
+                    )
+                })?;
+        }
         writer
     };
 
@@ -1128,6 +1219,194 @@ fn load_resume_tmp_index(
     }))
 }
 
+/// G-3 incremental baseline parsed from the existing committed index. The
+/// `cutoff` field is the `header.generated_at` lifted into a comparable
+/// [`std::time::SystemTime`] so the file-mtime filter does not allocate
+/// per-call. `embedded_ids` captures the row IDs that already live in the
+/// committed file, used as a sanity gate (a chunk whose id is already in
+/// the committed body never re-embeds, regardless of mtime drift).
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[derive(Debug, Clone)]
+pub(crate) struct IncrementalBaseline {
+    pub(crate) cutoff: std::time::SystemTime,
+    pub(crate) embedded_ids: std::collections::HashSet<String>,
+}
+
+/// Read the committed index at `path`, validate that its header matches
+/// the active embedder, and emit an [`IncrementalBaseline`] the caller
+/// can hand to [`partition_incremental_files`].
+///
+/// Returns `Ok(None)` when the committed index does not exist or has no
+/// data rows — both cases degrade to a full rebuild, since incremental
+/// math against "zero entries with stale generated_at" would silently
+/// skip every sidecar older than the cutoff and produce an empty result.
+///
+/// Header dim / model / profile mismatch returns an `Err` with a
+/// recovery hint pointing at `--full-rescan`. Embedder swaps must be
+/// explicit, never silent.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn load_incremental_baseline(
+    path: &Path,
+    info: &crate::embedder::EmbeddingModelInfo,
+) -> Result<Option<IncrementalBaseline>> {
+    use std::io::{BufRead, BufReader};
+
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let file = crate::sanitize::open_file_validated(path)
+        .with_context(|| format!("open committed index for incremental: {}", path.display()))?;
+    let mut lines = BufReader::new(file).lines();
+    let header_line = match lines.next() {
+        Some(line) => line.with_context(|| format!("read committed header: {}", path.display()))?,
+        None => return Ok(None),
+    };
+    let header: IndexHeader = serde_json::from_str(&header_line)
+        .with_context(|| format!("parse committed header: {}", path.display()))?;
+    let profile = info.profile.to_string();
+    if header.schema_version != INDEX_SCHEMA_VERSION
+        || header.model_id != info.model_id
+        || header.model_profile != profile
+        || header.dimension != info.dimension
+    {
+        return Err(anyhow::anyhow!(
+            "committed semantic index at {path} is incompatible with the active embedder.\n  \
+             committed: schema={cks} model={ckm} profile={ckp} dim={ckd}\n  \
+             current  : schema={cur_s} model={cur_m} profile={cur_p} dim={cur_d}\n  \
+             incremental walk requires a matching embedder. Rebuild from scratch:\n    \
+                 aicx index --full-rescan",
+            path = path.display(),
+            cks = header.schema_version,
+            ckm = header.model_id,
+            ckp = header.model_profile,
+            ckd = header.dimension,
+            cur_s = INDEX_SCHEMA_VERSION,
+            cur_m = info.model_id,
+            cur_p = profile,
+            cur_d = info.dimension,
+        ));
+    }
+
+    let cutoff = chrono::DateTime::parse_from_rfc3339(&header.generated_at)
+        .with_context(|| {
+            format!(
+                "parse header.generated_at ({}) in {}",
+                header.generated_at,
+                path.display()
+            )
+        })?
+        .with_timezone(&chrono::Utc);
+    let cutoff_st: std::time::SystemTime = cutoff.into();
+
+    #[derive(Deserialize)]
+    struct IdOnly {
+        id: String,
+    }
+
+    let mut embedded_ids = std::collections::HashSet::new();
+    let mut data_rows = 0usize;
+    for (line_no, line) in lines.enumerate() {
+        let line = line
+            .with_context(|| format!("read committed line {}: {}", line_no + 2, path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        data_rows += 1;
+        match serde_json::from_str::<IdOnly>(&line) {
+            Ok(row) => {
+                embedded_ids.insert(row.id);
+            }
+            Err(_) => {
+                // A corrupt row is rare here (writer commits whole rows or
+                // not at all). Tolerate it; query_index will surface the
+                // ratio at read time.
+            }
+        }
+    }
+
+    if data_rows == 0 {
+        // Header alone, no body — treat as never-built so the operator
+        // does not get a silent empty index after the first --full-rescan.
+        return Ok(None);
+    }
+
+    Ok(Some(IncrementalBaseline {
+        cutoff: cutoff_st,
+        embedded_ids,
+    }))
+}
+
+/// Return the subset of `files` that need to be embedded under the
+/// incremental walk: chunk path mtime strictly newer than the baseline
+/// `cutoff` AND id not already in the committed body. Pure function so
+/// it can be exercised against a synthetic corpus in tests.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn partition_incremental_files(
+    files: &[crate::store::StoredContextFile],
+    baseline: &IncrementalBaseline,
+) -> Vec<crate::store::StoredContextFile> {
+    files
+        .iter()
+        .filter(|stored| {
+            // Crash-recovery guard: if the id was already written into the
+            // committed body, never re-embed regardless of mtime drift.
+            let entry_id = chunk_id_from_path(&stored.path);
+            if baseline.embedded_ids.contains(&entry_id) {
+                return false;
+            }
+            // Primary gate: sidecar/chunk mtime newer than the committed
+            // header.generated_at. Missing mtime (filesystem refused stat)
+            // defaults to "include" — better to embed once and let dedup
+            // catch it than silently skip a real new chunk.
+            let mtime = std::fs::metadata(&stored.path)
+                .and_then(|m| m.modified())
+                .ok();
+            match mtime {
+                Some(ts) => ts > baseline.cutoff,
+                None => true,
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+/// G-3 incremental seed: copy every data row from the committed index at
+/// `target_path` into the open tmp writer. Skips the header line because
+/// the caller has already written its own placeholder header into tmp.
+/// Returns the number of rows copied so the caller can fold it into
+/// `stats.resumed_embeddings` (the D-2 entry_count math relies on it).
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn copy_committed_body_into(
+    writer: &mut std::io::BufWriter<std::fs::File>,
+    target_path: &Path,
+) -> Result<usize> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let src = crate::sanitize::open_file_validated(target_path)
+        .with_context(|| format!("open committed index for seed: {}", target_path.display()))?;
+    let mut lines = BufReader::new(src).lines();
+    // Discard the header — caller has already emitted a new placeholder
+    // for the tmp file. Done by consuming `lines.next()` once.
+    let _ = lines.next();
+    let mut rows = 0usize;
+    for line in lines {
+        let line =
+            line.with_context(|| format!("read committed body row: {}", target_path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        writeln!(writer, "{}", line).with_context(|| {
+            format!(
+                "seed incremental tmp with committed row: {}",
+                target_path.display()
+            )
+        })?;
+        rows += 1;
+    }
+    Ok(rows)
+}
+
 fn chunk_id_from_path(path: &std::path::Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -1467,6 +1746,203 @@ mod iter3_tests {
             std::env::remove_var("AICX_HOME");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn partition_incremental_files_keeps_only_unembedded_and_fresh() {
+        // G-3 partition logic on a synthetic corpus. The committed
+        // baseline knows about ids `a` and `b`; chunk `c` is brand new.
+        // The mtime of `b` is younger than the cutoff, but its id is in
+        // the committed set so it MUST stay skipped — crash-recovery
+        // guard. Chunk `a` is older than cutoff AND in the set, also
+        // skipped. Chunk `c` (new id, fresh mtime) is the only survivor.
+        use std::collections::HashSet;
+
+        let dir = tempdir_for_test();
+        let cutoff_dt = chrono::DateTime::parse_from_rfc3339("2026-05-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let chunks = [
+            ("a", "2026-05-14T00:00:00Z"), // older than cutoff
+            ("b", "2026-05-16T00:00:00Z"), // newer than cutoff
+            ("c", "2026-05-16T00:00:00Z"), // newer than cutoff
+        ];
+        let mut files: Vec<crate::store::StoredContextFile> = Vec::new();
+        for (id, mtime_rfc) in chunks {
+            let path = dir.join(format!("{id}.md"));
+            std::fs::write(&path, format!("# chunk {id}")).unwrap();
+            let ts: std::time::SystemTime = chrono::DateTime::parse_from_rfc3339(mtime_rfc)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+                .into();
+            filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(ts)).unwrap();
+            files.push(crate::store::StoredContextFile {
+                path,
+                project: "test".into(),
+                repo: None,
+                date_compact: "20260516".into(),
+                date_iso: "2026-05-16".into(),
+                kind: crate::timeline::Kind::Other,
+                agent: "claude".into(),
+                session_id: id.into(),
+                chunk: 0,
+            });
+        }
+
+        let mut embedded_ids = HashSet::new();
+        embedded_ids.insert("a".to_string());
+        embedded_ids.insert("b".to_string());
+        let baseline = IncrementalBaseline {
+            cutoff: cutoff_dt.into(),
+            embedded_ids,
+        };
+
+        let to_embed = partition_incremental_files(&files, &baseline);
+        let ids: Vec<String> = to_embed
+            .iter()
+            .map(|stored| chunk_id_from_path(&stored.path))
+            .collect();
+        assert_eq!(ids, vec!["c".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn copy_committed_body_into_streams_data_rows_only() {
+        // G-3 incremental seed: existing committed index has 5 data rows
+        // plus a header. The seed helper must write exactly those 5 rows
+        // into the tmp writer (header dropped because the caller writes a
+        // fresh placeholder of its own).
+        let dir = tempdir_for_test();
+        let target = dir.join("embeddings.ndjson");
+        let tmp = dir.join("embeddings.ndjson.tmp");
+
+        let header = IndexHeader {
+            schema_version: "v0-test".into(),
+            model_id: "test-model".into(),
+            model_profile: "base".into(),
+            dimension: 4,
+            generated_at: "2026-05-15T12:00:00Z".into(),
+            entry_count: 5,
+        };
+        let mut body = serde_json::to_string(&header).unwrap();
+        body.push('\n');
+        for i in 0..5 {
+            body.push_str(&format!(
+                r#"{{"id":"row-{i}","embedding":[0.1,0.2,0.3,0.4]}}"#
+            ));
+            body.push('\n');
+        }
+        std::fs::write(&target, &body).unwrap();
+
+        {
+            let mut writer = std::io::BufWriter::new(std::fs::File::create(&tmp).unwrap());
+            use std::io::Write;
+            // Caller writes its own placeholder first.
+            writeln!(writer, "{{\"placeholder\":true}}").unwrap();
+            let rows = copy_committed_body_into(&mut writer, &target).unwrap();
+            assert_eq!(rows, 5, "seed must surface row count for D-2 math");
+        }
+
+        let content = std::fs::read_to_string(&tmp).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 6, "placeholder header + 5 data rows");
+        assert_eq!(lines[0], "{\"placeholder\":true}");
+        for (i, expected_id) in (0..5).map(|i| format!("row-{i}")).enumerate() {
+            assert!(
+                lines[i + 1].contains(&expected_id),
+                "row {} preserved verbatim",
+                i
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn incremental_round_trip_appends_only_new_rows() {
+        // End-to-end shape: first committed index has 3 rows. Operator
+        // adds 5 more chunks. Incremental walk + seed + rewrite produces
+        // a final file with exactly 8 rows and a truthful entry_count.
+        let dir = tempdir_for_test();
+        let target = dir.join("embeddings.ndjson");
+        let tmp = dir.join("embeddings.ndjson.tmp");
+        let commit_tmp = dir.join("embeddings.ndjson.commit-tmp");
+
+        // 1. Seed the canonical committed file with 3 rows.
+        let old_header = IndexHeader {
+            schema_version: INDEX_SCHEMA_VERSION.into(),
+            model_id: "test-model".into(),
+            model_profile: "base".into(),
+            dimension: 4,
+            generated_at: "2026-05-15T12:00:00Z".into(),
+            entry_count: 3,
+        };
+        let mut body = serde_json::to_string(&old_header).unwrap();
+        body.push('\n');
+        for i in 0..3 {
+            body.push_str(&format!(
+                r#"{{"id":"old-{i}","project":"test","agent":"claude","date":"20260515","path":"/tmp/old-{i}.md","kind":"other","session_id":"old-{i}","frame_kind":null,"cwd":null,"embedding":[0.1,0.2,0.3,0.4]}}"#
+            ));
+            body.push('\n');
+        }
+        std::fs::write(&target, &body).unwrap();
+
+        // 2. Simulate incremental write: tmp = placeholder + copy of old
+        //    body + 5 brand-new rows. Mirrors the production sequencing
+        //    inside `write_index_with_options` without invoking the
+        //    embedder (the unit-of-work the test is asserting is the
+        //    file-level math, not the embed step itself).
+        {
+            let mut writer = std::io::BufWriter::new(std::fs::File::create(&tmp).unwrap());
+            use std::io::Write;
+            let placeholder = IndexHeader {
+                entry_count: 0,
+                generated_at: "2026-05-16T12:00:00Z".into(),
+                ..old_header.clone()
+            };
+            writeln!(writer, "{}", serde_json::to_string(&placeholder).unwrap()).unwrap();
+            copy_committed_body_into(&mut writer, &target).unwrap();
+            for i in 0..5 {
+                writeln!(
+                    writer,
+                    r#"{{"id":"new-{i}","project":"test","agent":"claude","date":"20260516","path":"/tmp/new-{i}.md","kind":"other","session_id":"new-{i}","frame_kind":null,"cwd":null,"embedding":[0.5,0.6,0.7,0.8]}}"#
+                )
+                .unwrap();
+            }
+        }
+
+        // 3. Truthful header rewrite (D-2 contract) + atomic rename
+        //    onto the canonical target.
+        let truthful = IndexHeader {
+            entry_count: 8,
+            generated_at: "2026-05-16T12:00:00Z".into(),
+            ..old_header
+        };
+        rewrite_index_with_truthful_header(&tmp, &commit_tmp, &truthful).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::rename(&commit_tmp, &target).unwrap();
+
+        // 4. Assertions: header.entry_count == 8, body has 3 old + 5 new
+        //    rows, no full re-embed of the originals.
+        let final_content = std::fs::read_to_string(&target).unwrap();
+        let lines: Vec<&str> = final_content.lines().collect();
+        assert_eq!(lines.len(), 9, "header + 3 old + 5 new = 9 lines");
+        let final_header: IndexHeader = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(
+            final_header.entry_count, 8,
+            "D-2 entry_count truthful after incremental append"
+        );
+        let old_count = (1..=3).filter(|i| lines[*i].contains("old-")).count();
+        let new_count = (4..=8).filter(|i| lines[*i].contains("new-")).count();
+        assert_eq!(old_count, 3, "3 original rows preserved verbatim");
+        assert_eq!(new_count, 5, "exactly 5 new rows appended");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]

@@ -1154,6 +1154,13 @@ enum Commands {
     },
 
     /// Build the semantic index. Use `--dry-run` to preview without writing.
+    ///
+    /// Default behaviour is INCREMENTAL: only sidecars whose mtime is newer
+    /// than the existing index `header.generated_at` are embedded, and the
+    /// new rows are appended to the committed index file. Pass
+    /// `--full-rescan` to re-embed every chunk from scratch — useful when
+    /// the embedder model changes, the index file is corrupt, or an
+    /// operator wants a deterministic from-zero rebuild.
     #[command(display_order = 13)]
     Index {
         #[command(subcommand)]
@@ -1191,6 +1198,13 @@ enum Commands {
             value_parser = clap::builder::BoolishValueParser::new()
         )]
         dry_run: bool,
+
+        /// Force a full re-embed of every chunk. Default is incremental:
+        /// walk only sidecars newer than the existing index's
+        /// `header.generated_at` and append. Use this flag after embedder
+        /// model changes or when the committed index is suspect.
+        #[arg(long)]
+        full_rescan: bool,
     },
 
     /// Manage `$HOME/.aicx/config.toml` for embedders and endpoints.
@@ -1800,11 +1814,12 @@ fn main() -> Result<()> {
             sample,
             json,
             dry_run,
+            full_rescan,
         }) => match action {
             Some(IndexAction::Status { project, json }) => {
                 run_index_status(project.as_deref(), json)?;
             }
-            None => run_index(&project, sample, json, dry_run)?,
+            None => run_index(&project, sample, json, dry_run, full_rescan)?,
         },
         Some(Commands::Config { action }) => {
             run_config(action)?;
@@ -4774,6 +4789,7 @@ fn write_index_for_current_build(
     scope: Option<&str>,
     sample: usize,
     interactive: bool,
+    full_rescan: bool,
 ) -> Result<aicx::vector_index::IndexStats> {
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     {
@@ -4783,12 +4799,13 @@ fn write_index_for_current_build(
             use aicx::progress::EventSink;
             fan_for_closure.on_event(event);
         };
-        aicx::vector_index::write_index_with_progress(scope, sample, &on_event)
+        let options = aicx::vector_index::IndexBuildOptions { full_rescan };
+        aicx::vector_index::write_index_with_options(scope, sample, options, &on_event)
     }
 
     #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
     {
-        let _ = (scope, sample, interactive);
+        let _ = (scope, sample, interactive, full_rescan);
         anyhow::bail!(
             "aicx index requires a semantic embedder backend; rebuild with \
              --features native-embedder or --features cloud-embedder, or use \
@@ -4801,7 +4818,13 @@ fn write_index_for_current_build(
 /// embedder + samples chunks for ETA. `dry_run=false` writes a
 /// persistent NDJSON-backed index (Iter 3) that subsequent `aicx search`
 /// queries against via cosine similarity.
-fn run_index(projects: &[String], sample: usize, json: bool, dry_run: bool) -> Result<()> {
+fn run_index(
+    projects: &[String],
+    sample: usize,
+    json: bool,
+    dry_run: bool,
+    full_rescan: bool,
+) -> Result<()> {
     let resolved_projects = resolve_project_filters_or_error(projects)?;
     let scopes: Vec<Option<&str>> = if resolved_projects.is_empty() {
         vec![None]
@@ -4815,13 +4838,24 @@ fn run_index(projects: &[String], sample: usize, json: bool, dry_run: bool) -> R
 
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr()) && !json;
 
+    // G-3: announce embedder backend class so the operator can predict perf.
+    // Cloud HTTP (~2.5s/req) vs native GGUF (~50ms/req on M-series) matter
+    // for ETA expectations; suppressed in --json mode so machine readers
+    // get a clean payload.
+    if !json {
+        #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+        if let Some(label) = aicx::vector_index::probe_backend_label() {
+            eprintln!("Backend: {}", label);
+        }
+    }
+
     let mut reports = Vec::with_capacity(scopes.len());
     for scope in scopes {
         let stats = if dry_run {
             let _lock = aicx::locks::acquire_exclusive(aicx::locks::lance_lock_path()?)?;
             aicx::vector_index::dry_run_index(scope, sample)?
         } else {
-            write_index_for_current_build(scope, sample, interactive)?
+            write_index_for_current_build(scope, sample, interactive, full_rescan)?
         };
         reports.push((scope.map(ToString::to_string), stats));
     }
