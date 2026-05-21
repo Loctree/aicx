@@ -405,12 +405,30 @@ mod tests {
 
     #[test]
     fn summary_aggregates_per_extractor() {
-        lock_test_init(false, None);
+        // G-4 stores diagnostics in a process-global `Mutex<DiagnosticsState>`.
+        // Other tests can call production paths (extract_*_file) that record
+        // into this same global. To make this test deterministic under
+        // parallel `cargo test`, hold the lock for the entire test body and
+        // record inline against `&mut state` rather than re-entering the
+        // global `record()` helper (which would acquire+release per call and
+        // leave race windows). Recover from prior-test poison silently — the
+        // next line wipes state anyway.
+        let mut state = STATE
+            .get_or_init(|| Mutex::new(DiagnosticsState::default()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *state = DiagnosticsState::default();
+        state.initialized = true;
+
         for i in 0..10 {
             let p = PathBuf::from(format!("/tmp/claude/sess-{i}.jsonl"));
-            record("claude", DiagnosticKind::FallbackTimestamp, 5, &p);
+            let label = p.display().to_string();
+            state.extractors.entry("claude").or_default().record(
+                DiagnosticKind::FallbackTimestamp,
+                5,
+                &label,
+            );
         }
-        let state = lock_state();
         let line = state
             .extractors
             .get("claude")

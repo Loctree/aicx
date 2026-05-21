@@ -559,10 +559,10 @@ fn find_footer_position(path: &Path, file_size: u64, window: u64) -> Result<Opti
     let tail_len = std::cmp::min(window, file_size);
     let start = file_size - tail_len;
 
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    // Timeline path is validated at append_markdown_timeline entry via sanitize::validate_write_path (traversal + canonicalize + allowlist) before reaching strip_footer.
-    let mut file = File::open(path)
-        .with_context(|| format!("strip_footer: open failed: {}", path.display()))?;
+    // SECURITY: timeline path validated at append_markdown_timeline entry via sanitize::validate_write_path (traversal + canonicalize + allowlist) before reaching strip_footer.
+    let mut file =
+        File::open(path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+            .with_context(|| format!("strip_footer: open failed: {}", path.display()))?;
     file.seek(SeekFrom::Start(start))?;
     let mut buf = vec![0u8; tail_len as usize];
     file.read_exact(&mut buf)?;
@@ -598,9 +598,8 @@ fn truncate_file_atomic(path: &Path, pos: u64) -> Result<()> {
     let tmp_path = parent.join(tmp_name);
 
     let copy_result: io::Result<()> = (|| {
-        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-        // src/tmp_path derive from path validated at append_markdown_timeline entry; tempfile is a sibling under the same validated parent.
-        let mut src = File::open(path)?;
+        // SECURITY: src/tmp_path derive from path validated at append_markdown_timeline entry; tempfile is a sibling under the same validated parent.
+        let mut src = File::open(path)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         let mut dst = File::create(&tmp_path)?;
 
@@ -633,9 +632,9 @@ fn truncate_file_atomic(path: &Path, pos: u64) -> Result<()> {
         )
     })?;
 
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    // Parent dir is path.parent() of a path validated at append_markdown_timeline entry; best-effort fsync after atomic rename.
+    // SECURITY: parent is path.parent() of a path validated at append_markdown_timeline entry; best-effort fsync after atomic rename.
     if !parent.as_os_str().is_empty()
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         && let Ok(dir) = File::open(parent)
     {
         let _ = dir.sync_all();
@@ -1011,8 +1010,9 @@ mod tests {
 
     fn unique_test_dir(name: &str) -> PathBuf {
         let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir =
-            std::env::temp_dir().join(format!("ai_ctx_test_{}_{}_{}", std::process::id(), n, name));
+        // SECURITY: test-only helper; uniqueness via process::id() + atomic counter + test name; never used in production code paths.
+        let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+            .join(format!("ai_ctx_test_{}_{}_{}", std::process::id(), n, name));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
