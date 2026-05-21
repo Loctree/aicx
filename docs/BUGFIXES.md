@@ -1331,7 +1331,7 @@ D-12 already landed via `453f166`. Closes F-P3-18 from Area F. Final dispatch
 in bug-tracker-aicx plan recovery wave. Report:
 `/Users/silver/.vibecrafted/artifacts/Loctree/aicx/2026_0520/reports/20260520_165547_20260520_1655_perform-the-vc-justdo-skill-on-this-repository_claude.md`.
 
-## 2026-05-21 — legacy siphash state load migration · `{commit-sha}`
+## 2026-05-21 — legacy siphash state load migration · `0c9ba5e`
 
 **Symptom.** Pre-BLAKE3 `~/.aicx/state.json` z `hash_algorithm:
 "siphash13-v1"` i u64 hashami padał na strict serde load zanim mogła
@@ -1371,7 +1371,7 @@ algorytm, ale strict deserialize blokowało dojście do tego punktu.
 
 **Related.** Closes G-1 from `docs/bug-tracker-aicx-followup-pass-2`.
 
-## 2026-05-21 — Claude missing timestamp frames preserved with fallback timestamp · `{commit-sha}`
+## 2026-05-21 — Claude missing timestamp frames preserved with fallback timestamp · `0651674`
 
 **Symptom.** W3-A-sources (`1f7490f`) zatrzymał silent drop i zaczął emitować
 diagnostic dla Claude JSONL bez `timestamp`, ale nadal wyrzucał treść tych
@@ -1418,7 +1418,7 @@ Vec::new()`. Diagnostic nie był połączony z żadną ścieżką fallback times
 **Related.** Closes G-5 from `docs/bug-tracker-aicx-followup-pass-2`; recovery
 of W-B-1 substrate failure.
 
-## 2026-05-21 — empty-body prune apply moves chunks to quarantine (H-1) · `{commit-sha}`
+## 2026-05-21 — empty-body prune apply moves chunks to quarantine (H-1) · `dc74331`
 
 **Symptom.** `aicx doctor --prune-empty-bodies` tylko emitował skrypt
 czyszczący. Przy tysiącach pustych chunków operator i tak musiałby odpalić
@@ -1464,3 +1464,172 @@ kandydatów.
 `docs/bug-tracker-aicx-followup-pass-2.md`; partially addresses
 `docs/BACKLOG.md` 2026-05-12 `[aicx/empty-bodies]` by adding the safe operator
 apply path, but does not mutate the live canonical store by itself.
+
+## 2026-05-21 — lance.lock holder sidecar + acquire-timeout liveness check (G-2) · `7ded8cb`
+
+**Symptom.** Stale `aicx index` PID trzymający exclusive `lance.lock` indefinitely (pass-1 zaobserwowane 2026-05-20: 2.5h-old PID 64667). Nowe `aicx index` timeout-ują po 60s (W3-B default) z `Error: timed out acquiring exclusive lock`. POSIX `fcntl` auto-releasuje na crash, ale NIE na idle hang.
+
+**Root cause.** Lock primitive nie miało żadnego sidecar / metadata o trzymaczu. Acquire-timeout flow odrzucał bez informacji kto trzyma i czy ten PID jeszcze żyje. Helper `pid_is_alive` istniał w `src/locks.rs:194-205` ale nie był wpięty w acquire path.
+
+**Fix.**
+- Lock holder zapisuje `<lockname>.holder` sidecar (PID + ISO timestamp + run_kind) atomowo przy acquire.
+- Acquire-with-timeout flow czyta sidecar na timeout, branchuje na `pid_is_alive`:
+  - dead PID → cleanup stale lock + retry z warningiem `recovered stale lock from dead PID N`.
+  - alive idle PID → fail z warningiem `lock held by PID N (run_kind=K) for M minutes; consider killing manually` — NIE auto-killuje (operator decision).
+- Sidecar usuwany przy normal release.
+
+**Touched.**
+- `src/locks.rs` — sidecar write/read, acquire path branching.
+- `src/store.rs` — lance.lock holder sites przekazują run_kind (additive only, no API surface zmiana).
+- Tests dla stale-dead + stale-alive-idle scenariuszy.
+
+**Tests.** Stale-dead-process integration test (symulowany dead PID lock → next acquire succeeds + warning). Stale-alive-idle test (alive holder + idle → operator warning bez auto-kill). Existing `tests/locks_contention.rs` zielone.
+
+**Lessons.** Lock metadata nie powinna kończyć się na sekcji crítical-section samego locka; sidecar PID jest minimalnym kosztem dla diagnostyki. Operator decision zostaje operator decision — never auto-kill alive holder.
+
+**Related.** Closes G-2 z `docs/bug-tracker-aicx-followup-pass-2.md`.
+
+## 2026-05-21 — incremental aicx index walk + --full-rescan (G-3) · `c74deb1`
+
+**Symptom.** `aicx index` po `aicx all -H 24` re-embedował WSZYSTKIE chunki (76k+) przez cloud ~2.5s/req. ETA: 2240+ min (37h) dla rutynowego refresha. Nieużywalne dla daily ops.
+
+**Root cause.** Brak ścieżki incremental — write_index zawsze re-walkował cały canonical store, embedując każdy chunk od zera. D-2 header.entry_count atomic-update pattern z `9069b5e` istniał ale nie był wpięty w incremental decision.
+
+**Fix.**
+- `aicx index` default: incremental walk based on sidecar `created_at > embeddings.ndjson header.generated_at`, embeduje tylko nowe sidecary, appenduje do existing ndjson.
+- `--full-rescan` flag triggeruje pre-G-3 full rebuild (nuclear option dla embedder model change / suspected corruption).
+- Embedder / schema-version / dim / profile mismatch między committed index a active embedder → reject z recovery hint na `--full-rescan` (NIE silent re-embed pod innym modelem).
+- D-2 contract preserved end-to-end (tmp + verbatim copy + freshly embedded + atomic rename).
+- Backend label w startup log: `Backend: cloud` vs `Backend: gguf` (operator wie co dostaje).
+
+**Touched.**
+- `src/vector_index.rs` — write_index_with_options + IndexBuildOptions + probe_backend_label.
+- `src/search_engine.rs` — index freshness detection helper.
+- `src/main.rs` — `--full-rescan` clap arg na `aicx index` subcommand.
+- Small-corpus integration test dla 5-new-chunks scenariusza.
+
+**Tests.** Synthetic fixture: add 5 chunks → assert tylko 5 new embeddings appended (NIE 5 + originals). Existing `--dry-run` zachowane. Doc-tests zielone.
+
+**Lessons.** D-2 header pattern z `9069b5e` był ready-made contract — incremental walk to jego naturalne rozszerzenie. Nuclear option (`--full-rescan`) musi pozostać dostępna dla legitimate model changes — ale nie jako default.
+
+**Related.** Closes G-3 z `docs/bug-tracker-aicx-followup-pass-2.md`. NIE rozwiązuje D2 `index_consistency` 188 orphan / 40 missing tuples — to Layer 1 (`aicx store --full-rescan` territory), nie Layer 2 (embeddings). Patrz W-D-2 follow-up.
+
+## 2026-05-21 — per-extractor SUMMARY + --verbose flag + structured run log (G-4) · `ae30779`
+
+**Symptom.** `aicx all -H N` na normal corpus (Vista folder, ~60 jsonl files) emitował >2000 stderr lines per run — per-file G-5 fallback-timestamp diagnostics + A-25 sanitization warnings spamują każdy invoke. Operator reaction: _"log-spam na milion linii"_. Real signal drowned w noise.
+
+**Root cause.** Per-file emission pattern z W3-A-sources (`1f7490f`) + W4-A-recovery (`4538236`) był operator-debug verbosity, NIE tuned dla daily ops. Warning content sam w sobie był valid, ale brak aggregator + verbosity gate sprawiał że każdy run wyglądał jak incident.
+
+**Fix.**
+- Nowy moduł `src/diagnostics.rs` — process-wide aggregator (`Mutex<DiagnosticsState>`) + per-extractor counters + structured log writer + SUMMARY shaper.
+- `src/sources.rs` `emit_{claude,codex,gemini,junie}_session_warnings` używają aggregator zamiast bezpośredniego `eprintln!`.
+- Stderr default: ≤5 lines (jedna per-extractor SUMMARY line gdy non-zero counts + trailer pointing at structured log).
+- `--verbose` (top-level, global) restore pre-G-4 per-file echo.
+- Full per-file detail zawsze writeowany do `~/.aicx/state/diagnostics-<run-id>.log` regardless of verbosity.
+- Warning content + detection logic unchanged — TYLKO emission shape.
+
+**Touched.**
+- `src/diagnostics.rs` (new, 446 LOC).
+- `src/lib.rs` (+1 — module wire-up).
+- `src/main.rs` (+20/-5 — --verbose flag + init/emit_summary).
+- `src/sources.rs` (+135/-34 — per-extractor warning emit migration).
+- `tests/diagnostics_summary.rs` (new, 227 LOC).
+
+**Tests.** `tests/diagnostics_summary.rs` 2/2, `diagnostics::tests::*` 4/4, full `make test` zielone. Sanity: simulated extract 10 files × 5 unparsable timestamps → default ≤ 5 stderr lines, `--verbose` ≥ 50 lines.
+
+**Lessons.** Diagnostic intent (operator audibility) i UX (signal-to-noise) to dwa cele — pierwszy wave robi detection right, drugi wave robi emission right. Aggregator-as-module to czyste cięcie zamiast multi-file `eprintln!` polowania.
+
+**Related.** Closes G-4 z `docs/bug-tracker-aicx-followup-pass-2.md`. Buduje na G-5 (diagnostic phrasing dostarczone przez parser) + A-25 (sanitize warning counters).
+
+## 2026-05-21 — tracing filter for Lance _deletions diagnostic (H-3) · `38a9245`
+
+**Symptom.** `tests/store_progress_markers.rs` + unittests src/lib.rs streamowały `✗ steer_sync FAILED after 0.0s / cause: Lance index missing _deletions/130-86502-...arrow` jako intentional recovery-test diagnostic. Test result line `ok` — actual test passes. Ale visible "FAILED" tail łamał operator interpretation; ten session: G-2 codex worker, W-B-2 codex worker, C-1 claude worker WSZYSTKIE flagowały to jako blocker w swoich raportach.
+
+**Root cause.** Diagnostic emitter w recovery-test stdout streamował misleading FAILED line bez RUST_LOG gate. Test assertion sama była clean (FailureLog content + recovery_hint check), ale visible tail wyglądał jak bug.
+
+**Fix.**
+- `RUST_LOG` target gate dla syntetycznego Lance `_deletions` recovery diagnostic.
+- Default env: records recovery semantics WITHOUT rendering noisy failure tail.
+- `RUST_LOG=lance=trace` (lub analogous `lancedb::...=trace`): renderuje tail (debug path zachowany).
+- Recovery assertions preserved (`record.phase == "steer_sync"`, `record.recovery_hint == Some("aicx doctor --fix")`, `FailureLog` contains the synthetic miss).
+
+**Touched.**
+- `tests/store_progress_markers.rs` — tracing filter wiring + targeted re-enable test.
+
+**Tests.** Baseline + targeted-trace dwie ścieżki, obie zielone. Default `make test` już NIE pokazuje misleading ✗ FAILED line.
+
+**Lessons.** Recovery-test diagnostic stdout musi być env-gated od początku — operator-readable test output jest też contract. Pass-1 substrate cascade #1 + H-3 self-flagging trzech workerów dało wystarczająco dowodów że confusing test stdout to rzeczywisty koszt.
+
+**Related.** Closes H-3 z `docs/bug-tracker-aicx-followup-pass-2.md`. W-D-3 oryginalny dispatch halted na D-1 mid-flight pollution (substrate failure, work zachowane in-tree); recovery dispatch verify + commit-narrow domknął cleanly.
+
+## 2026-05-21 — is_self_echo strict majority threshold (I-2) · `28cb000`
+
+**Symptom.** `crates/aicx-parser/src/sanitize.rs:686` `is_self_echo` używał `echo_lines * 2 >= lines.len()` (50%-or-more threshold) podczas gdy surrounding comment claimed "strict majority". 50% exactly counted as self-echo wbrew nazwie + intent.
+
+**Root cause.** Comment-vs-code drift na ≥ vs >. Two-character bug żywy od czasu pass-1 audit Area C P4.2.
+
+**Fix.** `echo_lines * 2 >= lines.len()` → `echo_lines * 2 > lines.len()`. Comment + behaviour aligned.
+
+**Touched.** `crates/aicx-parser/src/sanitize.rs` — L686 + 3 boundary tests.
+
+**Tests.** 3 nowe testy: exactly-half (NOT echo), just-above-half (echo), just-below-half (NOT echo). Existing tests zielone.
+
+**Lessons.** Surface area = jedna porównawcza linia, ale debt-cost = nieprawidłowe self-echo decisions w extractor pipeline od pass-1. Audit-driven micro-fixy mają dziwnie wysoki return per LOC.
+
+**Related.** Closes I-2 z `docs/bug-tracker-aicx-followup-pass-2.md`; closes pass-1 Area C P4.2 tail.
+
+## 2026-05-21 — default_session_extract_path edge guards (I-3) · `3663da7`
+
+**Symptom.** Pass-1 audit C P5.1: `default_session_extract_path` (`src/main.rs:2374`) produces unsafe outputs dla edge-case session_id: `""` → `.md`, `"."` → `..md`, `".."` → `...md`, brak length cap. Companion `conversation_batch_safe_session_filename` (`src/main.rs:2341-2396`) już robi hash-suffix na unsafe inputs — drift między dwoma helperami.
+
+**Root cause.** Dwa kuzyni-helpery z podobnym job (safe session filename) ale różnym hardening level. Mirror reference istniała ale nie została wykonana.
+
+**Fix.** `default_session_extract_path` reuse SipHash suffix pattern z mirrora — pusty / dot-only / unsafe / oversized session_id dostaje hashed safe filename. `conversation_batch_safe_session_filename` unchanged (mirror stays).
+
+**Touched.** `src/main.rs:2374` body + 4 unit tests dla edge cases.
+
+**Tests.** `""` / `"."` / `".."` / oversized inputs → safe paths. Existing testy zielone.
+
+**Lessons.** Cousin-helper drift to common bug source — gdy dwa helpery robią podobny job, jeden hardening musi propagować. Pass-1 audit identified the drift; pass-2 closed it.
+
+**Related.** Closes I-3 z `docs/bug-tracker-aicx-followup-pass-2.md`; closes pass-1 Area C P5.1 tail.
+
+## 2026-05-21 — hybrid /tmp allowlist (cfg(test) || AICX_ALLOW_TMP) (I-4) · `7b178b0` (retry) + `2f7a375` (REVERTED via `76d7a32`)
+
+**Symptom.** Pass-1 audit C P5.3: `crates/aicx-parser/src/sanitize.rs:74-81` unconditionally whitelisted `/tmp` i siblings. Operator policy decision: zaostrzyć production posture bez psucia dev/smoke flow.
+
+**Root cause.** Pass-1 path validation security tightening (`a170888`) ustawiło kierunek "validate paths, no silent allow". `/tmp` whitelist branch survived as unconditional default — niespójność z reszta surface.
+
+**Fix attempts.**
+- **Attempt 1 (`2f7a375`, REVERTED):** Strict env opt-in: default off, `AICX_ALLOW_TMP=1` enables. **Zabiło 121 testów** bo tempfile crate używa `$TMPDIR` (macOS `/private/var/folders/...`) co wpada w `/tmp` allowlist category. Strict env gate odrzucał wszystkie tempfile-backed testy bez env setupu.
+- **Revert (`76d7a32`):** Restored green substrate; operator policy revised B → HYBRID.
+- **Attempt 2 (`7b178b0`, LANDED):** Hybrid `cfg!(test) || std::env::var("AICX_ALLOW_TMP").as_deref() == Ok("1")`. Test builds zawsze allow `/tmp` (preserves test surface). Release builds gate behind explicit env. Dev/smoke opt-in via export.
+
+**Touched.** `crates/aicx-parser/src/sanitize.rs` — `/tmp` whitelist branch → hybrid gate + tests dla cfg(test) auto-allow + release+env-unset reject + release+env-set accept.
+
+**Tests.** Targeted `test_tmp_allowlist_hybrid_policy` zielony. Pełne gates (test/clippy/fmt) zielone po hybrid — 121-test regression z attempt-1 nie odrodziło się.
+
+**Lessons.**
+- Sanitize-layer policy zmiana ma fan-out do całego test surface — `cfg(test)` opt-in MUSI być branem pod uwagę gdy `/tmp` jest test fixture territory na danej platformie.
+- Operator policy decision (B/C/hybrid) wymaga test-surface analysis PRZED commitem, nie po. Hybrid był naturalnym kompromisem ale został odkryty empirycznie via 121-test breakage.
+- `git revert` bez `--no-edit` może być safer than `git reset --hard` (które safe-delete hook blokuje) na local-only commits.
+
+**Related.** Closes I-4 z `docs/bug-tracker-aicx-followup-pass-2.md` (pre-decided policy B → revised HYBRID after empirical test); closes pass-1 Area C P5.3 tail.
+
+## 2026-05-21 — BufReader cap inventory + scoped follow-up plan (I-1, audit-only) · `26d8123`
+
+**Symptom.** Pass-1 W3-A-sources (`1f7490f`) dodało BufReader caps na 8 audit-cited sites w `src/sources.rs` via existing `MAX_LINE_BYTES` constant (~8 MiB). Pass-1 BUGFIXES Area C P3.1 acknowledged partial coverage — inne `BufReader::lines()` / `read_to_string` sites w workspace mogą lack the cap.
+
+**Root cause.** Pierwszy wave miał audit-cited focus na sources.rs; szersza workspace coverage to dopiero second pass scope.
+
+**Fix.** **AUDIT-ONLY commit** — worker zinwentaryzował wszystkie BufReader / read_to_string sites w workspace + cap status (capped / uncapped / not-applicable). >5 missing sites wykryte → per brief protocol fix-implementation deferred do pass-3 (operator-agent narrows next dispatch z konkretną listą). Audit artifact wylądował jako docs commit.
+
+**Touched.** Docs-only commit (audit raport + scoped follow-up plan).
+
+**Tests.** Brak — docs commit bez Rust changes. `git diff --check` clean.
+
+**Lessons.**
+- Audit-only closure to valid wave outcome gdy fix-fan-out >> brief envelope. Honesty about scope > rushed wide-stage commit.
+- Pass-3 (or pass-2.5) potrzebuje konkretnej, narrow per-site brief dla każdego cap-missing site — zamiast jednego "wide sweep" brief.
+
+**Related.** Closes I-1 z `docs/bug-tracker-aicx-followup-pass-2.md` AS AUDIT; full BufReader cap implementation zostaje **open** dla pass-3 (referencuje commit `26d8123` audit doc).
