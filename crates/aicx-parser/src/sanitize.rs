@@ -721,8 +721,8 @@ pub fn is_self_echo(message: &str) -> bool {
         }
     }
 
-    // Message is self-echo if majority of lines match
-    echo_lines > 0 && echo_lines * 2 >= lines.len()
+    // Message is self-echo only if a strict majority of lines match.
+    echo_lines > 0 && echo_lines * 2 > lines.len()
 }
 
 /// Filter a vec of timeline entries, removing self-echo messages.
@@ -779,6 +779,35 @@ mod echo_tests {
                    The architecture looks clean.\n\
                    Let's proceed with implementation.\n\
                    Decision: expose 4 tools via rmcp.";
+        assert!(!is_self_echo(msg));
+    }
+
+    #[test]
+    fn test_self_echo_exactly_half_is_not_majority() {
+        let msg = "aicx all -H 24 --emit none\n\
+                   Decision: preserve real operator signal\n\
+                   aicx store -H 24 --full-rescan\n\
+                   Root cause: threshold was too wide";
+        assert!(!is_self_echo(msg));
+    }
+
+    #[test]
+    fn test_self_echo_just_above_half_is_echo() {
+        let msg = "aicx all -H 24 --emit none\n\
+                   Decision: preserve real operator signal\n\
+                   aicx store -H 24 --full-rescan\n\
+                   Root cause: threshold was too wide\n\
+                   aicx refs -H 24";
+        assert!(is_self_echo(msg));
+    }
+
+    #[test]
+    fn test_self_echo_just_below_half_is_not_echo() {
+        let msg = "aicx all -H 24 --emit none\n\
+                   Decision: preserve real operator signal\n\
+                   aicx store -H 24 --full-rescan\n\
+                   Root cause: threshold was too wide\n\
+                   Follow-up: add focused coverage";
         assert!(!is_self_echo(msg));
     }
 }
