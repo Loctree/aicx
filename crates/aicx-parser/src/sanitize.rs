@@ -22,6 +22,8 @@ pub const ALLOWED_AGENTS: &[&str] = &[
     "operator-md",
 ];
 
+const AICX_ALLOW_TMP_ENV: &str = "AICX_ALLOW_TMP";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentSanitizationWarning {
     NullByteStripped(usize),
@@ -69,6 +71,30 @@ fn canonicalize_existing(path: &Path) -> Result<PathBuf> {
         .map_err(|e| anyhow!("Cannot canonicalize path '{}': {}", path.display(), e))
 }
 
+/// Hybrid temp-dir policy for pass-2 D-7 retry:
+/// test/non-release builds always allow tempfile-backed `/tmp` paths, while
+/// release builds require `AICX_ALLOW_TMP=1` so production does not silently
+/// accept temp targets. This preserves the 121 tempfile-dependent tests broken
+/// by the reverted env-only attempt (`2f7a375`); `debug_assertions` covers
+/// Cargo test binaries where `aicx-parser` is compiled as a dependency and
+/// therefore does not receive this crate's `cfg(test)`.
+fn temp_allowlist_enabled() -> bool {
+    temp_allowlist_enabled_for_build(cfg!(test), cfg!(debug_assertions))
+}
+
+fn temp_allowlist_enabled_for_build(is_test_build: bool, is_non_release_build: bool) -> bool {
+    is_test_build
+        || is_non_release_build
+        || std::env::var(AICX_ALLOW_TMP_ENV).is_ok_and(|value| value == "1")
+}
+
+fn is_temp_allowlist_path(path: &Path) -> bool {
+    path.starts_with("/tmp")
+        || path.starts_with("/var/folders")
+        || path.starts_with("/private/tmp")
+        || path.starts_with("/private/var/folders")
+}
+
 /// Validate that a path is under an allowed base directory.
 fn is_under_allowed_base(path: &Path) -> Result<bool> {
     let home = home_dir()?;
@@ -85,13 +111,8 @@ fn is_under_allowed_base(path: &Path) -> Result<bool> {
         }
     }
 
-    // Temporary directories (tests)
-    if path.starts_with("/tmp")
-        || path.starts_with("/var/folders")
-        || path.starts_with("/private/tmp")
-        || path.starts_with("/private/var/folders")
-    {
-        return Ok(true);
+    if is_temp_allowlist_path(path) {
+        return Ok(temp_allowlist_enabled());
     }
 
     Ok(false)
@@ -347,6 +368,48 @@ fn is_zero_width(ch: char) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let guard = ENV_MUTEX.lock().unwrap();
+            let previous = std::env::var_os(key);
+            // SAFETY: these tests serialize all mutations of this process env
+            // var and restore the previous value while holding the same mutex.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            Self {
+                key,
+                previous,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: the mutex guard is held until after restoration, keeping
+            // this crate's env-var tests serialized around AICX_ALLOW_TMP.
+            unsafe {
+                match &self.previous {
+                    Some(previous) => std::env::set_var(self.key, previous),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_contains_traversal() {
@@ -385,7 +448,28 @@ mod tests {
     }
 
     #[test]
+    fn test_tmp_allowlist_hybrid_policy() {
+        {
+            let _env = EnvVarGuard::set(AICX_ALLOW_TMP_ENV, None);
+            assert!(temp_allowlist_enabled_for_build(true, false));
+            assert!(temp_allowlist_enabled_for_build(false, true));
+            assert!(!temp_allowlist_enabled_for_build(false, false));
+        }
+
+        {
+            let _env = EnvVarGuard::set(AICX_ALLOW_TMP_ENV, Some("1"));
+            assert!(temp_allowlist_enabled_for_build(false, false));
+        }
+
+        {
+            let _env = EnvVarGuard::set(AICX_ALLOW_TMP_ENV, Some("true"));
+            assert!(!temp_allowlist_enabled_for_build(false, false));
+        }
+    }
+
+    #[test]
     fn test_validate_read_path_existing() {
+        let _env = EnvVarGuard::set(AICX_ALLOW_TMP_ENV, None);
         let tmp = std::env::temp_dir().join("ai-ctx-san-test-read");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
