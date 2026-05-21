@@ -1228,3 +1228,106 @@ contractu dla read callers: empty result + `tracing::warn!`.
 **Related.** Closes D-1 from docs/bug-tracker-aicx Area D; recovery #2 for
 failed `bugtracker-W4-D-steer-locks-*` runs. Report:
 `/Users/silver/.vibecrafted/artifacts/Loctree/aicx/2026_0520/reports/20260520_143717_20260520_1437_perform-the-vc-justdo-skill-on-this-repository_codex.md`.
+
+## 2026-05-20 — D-bundle tail + F-P3-18 audit log · `pending-commit`
+
+**Symptom.** Po wave-D-recovery zostały otwarte: nieprawdziwe `entry_count: 0` w
+nagłówku semantycznego indeksu, niebezpieczny order commit (context-corpus
+przed primary), trzymanie shared lance-locka przez cały embed-init w legacy
+query path, brak negative cache na zerwanym embedderze, brak cloud fallbacku
+dla `backend = "auto"`, mylące "not hydrated" gdy snapshot HF jest niekompletny,
+brak query length budgetu pre-embedder, brak NFC w normalize_query, brak audit
+logu wejścia do każdego MCP tool handlera.
+
+**Root cause.**
+- D-2 — header zawsze pisany z `entry_count: 0` z komentarzem "NDJSON streaming
+  consumers scan until EOF", co było ucieczką w specyfikację a nie prawdą.
+- D-3 — context-corpus pisał `fs::rename` przed primary, więc crash między tymi
+  dwoma operacjami zostawiał context-corpus ahead-of-primary.
+- D-5 — legacy `query_index` brał `acquire_shared` zanim odpalał
+  `EmbeddingEngine::new()` + `engine.embed(query)`, blokując concurrent
+  rebuilds na czas inicjalizacji cloud/GGUF.
+- D-6 — scaffolding negative cache był `#[cfg(test)]`-only, prod nigdy nie
+  obserwował embedder failure.
+- D-7 — `BackendPreference::Auto` szło prosto do `with_gguf` bez konsultacji
+  z `config.cloud`.
+- D-8 — `is_file()` przyjmował zerobajtowe (truncated) snapshoty jako gotowe,
+  a użytkownik dostawał "model not hydrated" bez ścieżki.
+- D-9 — embedder akceptował dowolnie dużą string, pinning tokenizer / cloud
+  POST body bez limitu.
+- D-11 — `normalize_query` mapował tylko PL diakrytyki; NFD vs NFC formy tego
+  samego słowa nie matchowały.
+- F-P3-18 — żaden MCP tool handler nie logował entry, więc audit trail
+  istniał tylko po stronie HTTP middleware.
+
+**Fix.**
+- D-2: `rewrite_index_with_truthful_header` streamuje primary tmp → commit-tmp
+  z prawdziwym `entry_count` (resumed+indexed+skipped), context-corpus
+  buduje listę in-memory i zna count od pierwszego bajtu zapisu.
+- D-3: primary `fs::rename` jako pierwsze; context-corpus dopiero potem;
+  crash między nimi zostawia primary spójne, context-corpus po prostu
+  nieobecne.
+- D-5: drop embeddera przed `acquire_shared`, zamek wyłącznie na czas
+  czytania pliku indeksu.
+- D-6: `MCP_EMBEDDER_NEGATIVE_TTL = 5min` w produkcji, `mark_embedder_unavailable`
+  wywoływany po `SemanticError::EmbedderUnavailable`, search handler
+  short-circuituje gdy cache aktywny.
+- D-7: `with_config(Auto)` próbuje `with_gguf`, na błędzie i `config.cloud.is_some()`
+  → `with_cloud`; komunikat błędu wymienia obie próby (test
+  `auto_with_cloud_config_attempts_cloud_fallback_after_gguf` unignored).
+- D-8: `find_snapshot_with_file_verbose` zwraca `HfCacheMiss::{NotPresent, Partial{path,reason}}`,
+  `validate_cache_file` odrzuca 0-byte i non-regular; gguf path renderuje
+  precyzyjny error z konkretną ścieżką.
+- D-9: `MAX_EMBED_INPUT_BYTES = 32 KiB` + `enforce_embed_input_budget` w
+  `aicx-embeddings`, wywoływane w `cloud::embed_batch`, `gguf::embed_batch`
+  i `search_engine::try_semantic_search_native` przed embedderem.
+- D-11: NFC pass przed istniejącym mapowaniem diakrytyk; dependency
+  `unicode-normalization = "0.1"` w `aicx-parser`.
+- F-P3-18: `tracing::info!(target = "mcp.audit", tool_name = ...)` jako
+  pierwsza linia każdego z 6 handlerów + startup log z `auth_enabled`,
+  `auth_source`, `tools = MCP_TOOL_SURFACE` na stdio i HTTP transports.
+- Out-of-scope drobiazg: `src/intents.rs:920,925` `manual_pattern_char_comparison`
+  fix wymagany do zielonego `make clippy` (pre-existing failure na HEAD
+  `148f8b0`, 2 jedno-linijowe zmiany z `|c: char| ...` na array pattern).
+
+**Touched.**
+- `src/vector_index.rs` — `rewrite_index_with_truthful_header`, reorder commit
+  primary→context, D-5 lock release.
+- `src/search_engine.rs` — D-9 query length cap.
+- `src/mcp.rs` — D-6 production wiring, F-P3-18 audit log per handler +
+  startup, `MCP_TOOL_SURFACE`.
+- `crates/aicx-embeddings/src/lib.rs` — D-9 const + helper, D-7 auto branch.
+- `crates/aicx-embeddings/src/cloud.rs` — D-9 input check w `embed_batch`.
+- `crates/aicx-embeddings/src/gguf.rs` — D-8 verbose miss, D-9 input check.
+- `crates/aicx-embeddings/src/hf_cache.rs` — `HfCacheMiss`,
+  `find_snapshot_with_file_verbose`, `validate_cache_file`.
+- `src/hf_cache.rs` — completeness check (size > 0) z `tracing::warn!`.
+- `crates/aicx-parser/src/sanitize.rs` — D-11 NFC w `normalize_query`.
+- `crates/aicx-parser/Cargo.toml` — `unicode-normalization` dep.
+- `src/intents.rs` — clippy nit fix (gate dependency).
+
+**Tests.**
+- 13 nowych testów across packages (sanitize NFC, embed budget x3, hf cache
+  validation x3, hf miss x1, mcp tool surface x1, mcp ttl x1, mcp mark x1,
+  rewrite header x1, D-7 unignored x1).
+- `make precheck`, `make test`, `make test-native`, `make clippy`,
+  `make clippy-native`, `make fmt-check` — wszystko zielone.
+
+**Lessons.**
+- Bezpiecznie pisać `entry_count` truthful, nawet jeśli streaming readerzy go
+  ignorują — wartość darmowa dla statyk i diagnostyki.
+- Commit order matters: zawsze primary przed satellite indexes, żeby crash
+  zostawiał system w spójnym state.
+- Negative cache scaffolding pod `#[cfg(test)]` to anti-pattern; bez prod
+  wiring nie służy nikomu.
+- D-7 test był ignored — gdy worker pisze test bez implementacji, oznaczać
+  `#[ignore]` z konkretnym TODO i tracking item, żeby recovery dispatch
+  miał czego się złapać.
+- `is_file()` to mit "file exists and is usable"; tylko z `metadata().len() > 0`
+  faktycznie wykluczamy partial downloads.
+
+**Related.** Closes D-2, D-3, D-5, D-6, D-7 IMPL, D-8, D-9, D-11 from Area D;
+D-12 already landed via `453f166`. Closes F-P3-18 from Area F. Final dispatch
+in bug-tracker-aicx plan recovery wave. Report:
+`/Users/silver/.vibecrafted/artifacts/Loctree/aicx/2026_0520/reports/20260520_165547_20260520_1655_perform-the-vc-justdo-skill-on-this-repository_claude.md`.
+

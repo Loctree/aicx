@@ -595,12 +595,19 @@ mod tests {
 // Query normalization (PL/EN diacritics + case folding)
 // ============================================================================
 
-/// Normalize text for fuzzy matching: lowercase + strip Polish diacritics.
+/// Normalize text for fuzzy matching: NFC + lowercase + strip Polish diacritics.
+///
+/// NFC canonical composition is applied first so NFD-stored variants (e.g.
+/// `o` + combining acute) collapse to the same code points as NFC-stored
+/// composed variants (`ó`) before diacritic mapping. Without this step,
+/// `źródło` typed via NFD on one platform would refuse to match the same
+/// word typed via NFC on another.
 ///
 /// Maps: ą→a, ć→c, ę→e, ł→l, ń→n, ó→o, ś→s, ź→z, ż→z
 /// Enables "wdrozenie" to match "wdrożenie", "zrodlo" to match "źródło", etc.
 pub fn normalize_query(text: &str) -> String {
-    text.chars()
+    use unicode_normalization::UnicodeNormalization;
+    text.nfc()
         .map(|c| match c {
             'Ą' | 'ą' => 'a',
             'Ć' | 'ć' => 'c',
@@ -786,6 +793,26 @@ mod normalize_tests {
         assert_eq!(normalize_query("źródło ŁĄCZNOŚCI"), "zrodlo lacznosci");
         assert_eq!(normalize_query("Deploy Vista"), "deploy vista");
         assert_eq!(normalize_query("ąćęłńóśźż"), "acelnoszz");
+    }
+
+    #[test]
+    fn test_normalize_query_unifies_nfc_and_nfd_inputs() {
+        // D-11: same word stored in NFC ("ó" composed) vs NFD ("o" + combining
+        // acute U+0301) must normalize to the same key. Without NFC pre-pass,
+        // NFD lookups would not survive the diacritic mapping table.
+        use unicode_normalization::UnicodeNormalization;
+        let composed = "źródło";
+        let decomposed: String = composed.nfd().collect();
+        assert_ne!(
+            composed, decomposed,
+            "test pre-condition: NFC and NFD forms must differ at the byte level"
+        );
+        assert_eq!(
+            normalize_query(composed),
+            normalize_query(&decomposed),
+            "NFC pre-pass must collapse pre-composed and decomposed diacritics"
+        );
+        assert_eq!(normalize_query(&decomposed), "zrodlo");
     }
 
     #[test]

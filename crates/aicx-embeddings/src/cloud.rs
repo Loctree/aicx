@@ -162,6 +162,13 @@ mod cloud_impl {
             if texts.is_empty() {
                 return Ok(Vec::new());
             }
+            // D-9: cap each input before serializing the HTTP body so a
+            // pathological caller cannot pin a remote endpoint with a 200 MB
+            // POST. Whitespace-only inputs also fail-fast here.
+            for (idx, text) in texts.iter().enumerate() {
+                crate::enforce_embed_input_budget(text)
+                    .with_context(|| format!("cloud embed input #{idx} rejected"))?;
+            }
             let api_key = self.resolve_api_key()?;
             let body = serde_json::json!({
                 "model": self.config.model,

@@ -311,8 +311,14 @@ fn reports_escapes_xss_payloads_in_embedded_json_and_html() {
     // app-wrapper `<script>...</script>`. Any extra means a payload leaked.
     let raw_open = html.matches("<script").count();
     let raw_close = html.matches("</script>").count();
-    assert_eq!(raw_open, 2, "expected exactly 2 raw <script tags (envelope), got {raw_open}");
-    assert_eq!(raw_close, 2, "expected exactly 2 raw </script> tags (envelope), got {raw_close}");
+    assert_eq!(
+        raw_open, 2,
+        "expected exactly 2 raw <script tags (envelope), got {raw_open}"
+    );
+    assert_eq!(
+        raw_close, 2,
+        "expected exactly 2 raw </script> tags (envelope), got {raw_close}"
+    );
     // The `javascript:` URL in markdown must also survive only inside the
     // escaped JSON payload (as `&` characters or literal escaped form),
     // never as a usable href attribute.
@@ -478,10 +484,17 @@ fn reports_composite_record_key_distinguishes_artifacts_with_same_run_id() {
         serde_json::from_str(&fs::read_to_string(&bundle_output).expect("read bundle"))
             .expect("parse bundle");
     let records = bundle["records"].as_array().expect("records array");
-    assert_eq!(records.len(), 2, "both artifacts must survive into the bundle");
+    assert_eq!(
+        records.len(),
+        2,
+        "both artifacts must survive into the bundle"
+    );
     let key_a = records[0]["key"].as_str().expect("key a").to_string();
     let key_b = records[1]["key"].as_str().expect("key b").to_string();
-    assert_ne!(key_a, key_b, "composite keys must differ when relative_path differs");
+    assert_ne!(
+        key_a, key_b,
+        "composite keys must differ when relative_path differs"
+    );
     assert!(key_a.contains("@path:"), "key should be composite: {key_a}");
     assert!(key_b.contains("@path:"), "key should be composite: {key_b}");
     assert!(key_a.starts_with("run:shared-run-id@path:"));

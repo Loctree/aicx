@@ -43,8 +43,12 @@ const MCP_SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 const MCP_SESSION_MAX_SESSIONS: usize = 1000;
 const MCP_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
-#[cfg(test)]
-const MCP_EMBEDDER_NEGATIVE_TTL: Duration = Duration::from_secs(30);
+/// D-6: once the embedder fails to load (model not hydrated, cloud creds
+/// missing, ...) the MCP server short-circuits subsequent semantic search
+/// requests for this long so a flapping endpoint cannot retry-storm the
+/// embedder. 5 minutes balances "recover quickly when the operator fixes
+/// the config" against "stop hammering the same broken path".
+const MCP_EMBEDDER_NEGATIVE_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug)]
 struct AicxSessionManager {
@@ -568,7 +572,6 @@ fn validate_string_len(val: Option<&str>, max: usize, field: &str) -> Result<(),
 pub struct AicxMcpServer {
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
-    #[cfg(test)]
     embedder_unavailable_until: Arc<std::sync::Mutex<Option<Instant>>>,
 }
 
@@ -583,12 +586,13 @@ impl AicxMcpServer {
     pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
-            #[cfg(test)]
             embedder_unavailable_until: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
-    #[cfg(test)]
+    /// D-6: returns remaining negative-cache TTL when the embedder was
+    /// flagged unavailable. Side effect: lazily clears the entry when it
+    /// has expired so a subsequent retry hits the embedder again.
     fn embedder_negative_cache_remaining(&self, now: Instant) -> Option<Duration> {
         let mut guard = self.embedder_unavailable_until.lock().unwrap();
         match *guard {
@@ -601,6 +605,13 @@ impl AicxMcpServer {
         }
     }
 
+    /// D-6: arm the negative cache for `ttl` from `now`. Called after a
+    /// real embedder failure so subsequent requests fail-fast.
+    fn mark_embedder_unavailable(&self, now: Instant, ttl: Duration) {
+        let mut guard = self.embedder_unavailable_until.lock().unwrap();
+        *guard = Some(now + ttl);
+    }
+
     #[tool(
         name = "aicx_search",
         description = "Semantic search over the canonical corpus. Fails fast with kind/reason/recommendation when the index or embedder is not ready."
@@ -609,6 +620,36 @@ impl AicxMcpServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
+        // F-P3-18: audit log records tool-name entry only. NEVER include
+        // arguments (query/project/agent/...) — they may carry PII or
+        // operator secrets and the audit log is intended to be safe to
+        // archive long-term.
+        tracing::info!(target: "mcp.audit", tool_name = "aicx_search", "mcp tool invoked");
+
+        // D-6: short-circuit while the embedder is in the negative-cache
+        // window. Returns a structured error the MCP caller can act on
+        // without further round-trips to the embedder.
+        let now = Instant::now();
+        if let Some(remaining) = self.embedder_negative_cache_remaining(now) {
+            let payload = serde_json::json!({
+                "ok": false,
+                "error": "semantic_search_unavailable",
+                "kind": "embedder_unavailable",
+                "reason": format!(
+                    "embedder negative cache active for another {}s — last embed attempt failed",
+                    remaining.as_secs()
+                ),
+                "recommendation": "run `aicx doctor` to inspect embedder health; the cache clears automatically after the TTL elapses",
+            });
+            return Err(McpError::invalid_params(
+                format!(
+                    "semantic search unavailable [embedder_unavailable]: negative cache active for {}s",
+                    remaining.as_secs()
+                ),
+                Some(payload),
+            ));
+        }
+
         validate_string_len(Some(params.query.as_str()), 4096, "query")?;
         validate_string_len(params.project.as_deref(), 4096, "project")?;
         validate_string_len(params.agent.as_deref(), 4096, "agent")?;
@@ -679,6 +720,14 @@ impl AicxMcpServer {
         ) {
             Ok(outcome) => outcome,
             Err(err) => {
+                // D-6: arm the negative cache on real embedder failures so
+                // subsequent requests fail-fast for MCP_EMBEDDER_NEGATIVE_TTL
+                // instead of re-running the same broken bootstrap. Other
+                // kinds (index missing, dim mismatch, ...) remain
+                // synchronously retryable.
+                if err.kind() == "embedder_unavailable" {
+                    self.mark_embedder_unavailable(Instant::now(), MCP_EMBEDDER_NEGATIVE_TTL);
+                }
                 let payload = serde_json::json!({
                     "ok": false,
                     "error": "semantic_search_unavailable",
@@ -790,6 +839,7 @@ impl AicxMcpServer {
         &self,
         Parameters(params): Parameters<ReadParams>,
     ) -> Result<CallToolResult, McpError> {
+        tracing::info!(target: "mcp.audit", tool_name = "aicx_read", "mcp tool invoked");
         let chunk = store::read_context_chunk(&params.reference, params.max_chars)
             .map_err(|e| McpError::internal_error(format!("Read chunk: {e}"), None))?;
         let json = serde_json::to_string(&chunk)
@@ -806,6 +856,7 @@ impl AicxMcpServer {
         &self,
         Parameters(params): Parameters<RankParams>,
     ) -> Result<CallToolResult, McpError> {
+        tracing::info!(target: "mcp.audit", tool_name = "aicx_rank", "mcp tool invoked");
         validate_string_len(Some(params.project.as_str()), 4096, "project")?;
         validate_string_len(params.agent.as_deref(), 4096, "agent")?;
         validate_string_len(params.since.as_deref(), 4096, "since")?;
@@ -942,6 +993,7 @@ impl AicxMcpServer {
         &self,
         Parameters(params): Parameters<SteerParams>,
     ) -> Result<CallToolResult, McpError> {
+        tracing::info!(target: "mcp.audit", tool_name = "aicx_steer", "mcp tool invoked");
         validate_string_len(params.run_id.as_deref(), 4096, "run_id")?;
         validate_string_len(params.prompt_id.as_deref(), 4096, "prompt_id")?;
         validate_string_len(params.agent.as_deref(), 4096, "agent")?;
@@ -1075,6 +1127,7 @@ impl AicxMcpServer {
         &self,
         Parameters(params): Parameters<IntentsParams>,
     ) -> Result<CallToolResult, McpError> {
+        tracing::info!(target: "mcp.audit", tool_name = "aicx_intents", "mcp tool invoked");
         let kind_filter = match params.kind.as_deref() {
             None => None,
             Some(s) => match s.to_lowercase().as_str() {
@@ -1167,6 +1220,7 @@ impl AicxMcpServer {
         &self,
         Parameters(params): Parameters<IndexStatusParams>,
     ) -> Result<CallToolResult, McpError> {
+        tracing::info!(target: "mcp.audit", tool_name = "aicx_index_status", "mcp tool invoked");
         let store_root = store::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
         let status = api::index_status_at(&store_root, params.project.as_deref())
@@ -1203,6 +1257,18 @@ impl rmcp::handler::server::ServerHandler for AicxMcpServer {
 // Server runners
 // ============================================================================
 
+/// Names of all tool handlers wired into `AicxMcpServer`. Used at startup
+/// to log the audit surface (F-P3-18) and in tests to confirm the list
+/// stays in sync with the actual `#[tool]` annotations on the impl block.
+pub const MCP_TOOL_SURFACE: &[&str] = &[
+    "aicx_search",
+    "aicx_read",
+    "aicx_rank",
+    "aicx_steer",
+    "aicx_intents",
+    "aicx_index_status",
+];
+
 /// Run MCP server over stdio transport.
 pub async fn run_stdio() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -1210,6 +1276,15 @@ pub async fn run_stdio() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .try_init()
         .ok();
+
+    // F-P3-18: stdio bypasses HTTP auth (no network surface) — log it so
+    // the audit trail captures the security posture explicitly.
+    tracing::info!(
+        target: "mcp.audit",
+        auth = "stdio_no_network",
+        tools = ?MCP_TOOL_SURFACE,
+        "mcp server starting (stdio)"
+    );
 
     let server = AicxMcpServer::new();
     let service = rmcp::ServiceExt::serve(server, rmcp::transport::io::stdio())
@@ -1236,6 +1311,18 @@ pub async fn run_http(port: u16, auth_config: AuthConfig) -> anyhow::Result<()> 
 
     let auth_source_label = auth_config.source.describe();
     let auth_enforced = auth_config.is_enforced();
+
+    // F-P3-18: emit the truthful auth posture + tool surface as a single
+    // tracing event so security review can audit boot configuration
+    // without parsing free-form eprintln! lines.
+    tracing::info!(
+        target: "mcp.audit",
+        auth_enabled = auth_enforced,
+        auth_source = %auth_source_label,
+        tools = ?MCP_TOOL_SURFACE,
+        port = port,
+        "mcp server starting (http)"
+    );
 
     let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default();
     let session_manager = configured_mcp_session_manager();
@@ -1475,6 +1562,60 @@ mod tests {
         let err = validate_score_filter(Some(MAX_SCORE_FILTER + 1))
             .expect_err("score above 100 should be rejected");
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn mcp_tool_surface_lists_all_handlers() {
+        // F-P3-18: any new #[tool] handler MUST add itself to MCP_TOOL_SURFACE
+        // so the startup audit log includes it. This test fails when a new
+        // tool is added without updating the surface list.
+        let expected = [
+            "aicx_search",
+            "aicx_read",
+            "aicx_rank",
+            "aicx_steer",
+            "aicx_intents",
+            "aicx_index_status",
+        ];
+        assert_eq!(
+            super::MCP_TOOL_SURFACE.len(),
+            expected.len(),
+            "MCP_TOOL_SURFACE drifted from expected handler set: {:?} vs {expected:?}",
+            super::MCP_TOOL_SURFACE
+        );
+        for name in expected {
+            assert!(
+                super::MCP_TOOL_SURFACE.contains(&name),
+                "MCP_TOOL_SURFACE missing handler `{name}`"
+            );
+        }
+    }
+
+    #[test]
+    fn embedder_negative_ttl_is_five_minutes() {
+        // D-6: production TTL is five minutes; a regression to the test-only
+        // 30s value would let a flapping endpoint retry-storm an unhealthy
+        // embedder six times faster than intended.
+        assert_eq!(MCP_EMBEDDER_NEGATIVE_TTL, Duration::from_secs(5 * 60));
+    }
+
+    #[test]
+    fn mark_embedder_unavailable_arms_cache() {
+        // D-6: mark + check cycle works end-to-end without external state.
+        let server = AicxMcpServer::new();
+        let now = Instant::now();
+        assert!(server.embedder_negative_cache_remaining(now).is_none());
+        server.mark_embedder_unavailable(now, Duration::from_secs(120));
+        let remaining = server
+            .embedder_negative_cache_remaining(now)
+            .expect("cache should be armed after mark");
+        assert!(remaining.as_secs() >= 119 && remaining.as_secs() <= 120);
+        // After TTL elapsed, cache lazily clears.
+        assert!(
+            server
+                .embedder_negative_cache_remaining(now + Duration::from_secs(121))
+                .is_none()
+        );
     }
 
     #[test]

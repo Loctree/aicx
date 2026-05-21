@@ -411,6 +411,23 @@ fn try_semantic_search_native(
         });
     }
 
+    // D-9: cap query length BEFORE the embedder is touched so a runaway
+    // caller (CLI or MCP) cannot pin the tokenizer or POST a multi-MB
+    // body to a remote endpoint. Mirrors the byte budget enforced inside
+    // every embedder backend; surfaced here for a clean structured error.
+    if query.len() > aicx_embeddings::MAX_EMBED_INPUT_BYTES {
+        return Err(SemanticError::NoResults {
+            path: path.clone(),
+            scanned: 0,
+            reason: format!(
+                "query is {} bytes; semantic embedder rejects inputs over {} bytes",
+                query.len(),
+                aicx_embeddings::MAX_EMBED_INPUT_BYTES
+            ),
+            recommendation: "trim the query to a sentence or two; embeddings only need a short focus phrase to retrieve similar chunks".to_string(),
+        });
+    }
+
     let manifest_path =
         crate::vector_index::hybrid_manifest_path(project_filter).map_err(|err| {
             SemanticError::IndexCorrupt {

@@ -915,14 +915,12 @@ fn is_bare_affirmation(line: &str) -> bool {
         "done",
         "completed",
     ];
-    let trimmed = line
-        .trim()
-        .trim_end_matches(|c: char| c == '.' || c == '!' || c == ',');
+    let trimmed = line.trim().trim_end_matches(['.', '!', ',']);
     if trimmed.is_empty() || trimmed.contains(':') {
         return false;
     }
     let stripped = trimmed
-        .trim_start_matches(|c: char| matches!(c, '-' | '*' | '+' | '>' | ' ' | '\t'))
+        .trim_start_matches(['-', '*', '+', '>', ' ', '\t'])
         .to_lowercase();
     BARE.iter().any(|word| stripped == *word)
 }

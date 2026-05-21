@@ -548,13 +548,18 @@ pub fn write_index_with_progress(
             crate::sanitize::create_file_validated(&tmp_path)
                 .with_context(|| format!("open tmp index: {}", tmp_path.display()))?,
         );
+        // Placeholder count is rewritten with the truthful `indexed` total
+        // once the embed loop ends but before the atomic rename to the final
+        // committed path (see D-2 — `entry_count` is truthful for new builds).
+        // Streaming consumers that scan until EOF still work; readers that
+        // want a constant-time count now have one.
         let header = IndexHeader {
             schema_version: INDEX_SCHEMA_VERSION.to_string(),
             model_id: info.model_id.clone(),
             model_profile: info.profile.to_string(),
             dimension: info.dimension,
             generated_at: chrono::Utc::now().to_rfc3339(),
-            entry_count: 0, // NDJSON streaming consumers scan until EOF.
+            entry_count: 0,
         };
         writeln!(writer, "{}", serde_json::to_string(&header)?)?;
         writer
@@ -679,81 +684,10 @@ pub fn write_index_with_progress(
     // event truthfully reflects "semantic index ready to query". The embed
     // loop is done at this point; the rest is filesystem commit.
 
-    let context_files = crate::store::scan_context_corpus_files_at(&root)?;
-    if !context_files.is_empty() {
-        let context_target = context_corpus_index_path(project)?;
-        if let Some(parent) = context_target.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("create context-corpus index dir: {}", parent.display())
-            })?;
-        }
-        let context_tmp = context_target.with_extension("ndjson.tmp");
-        let mut context_writer = BufWriter::new(
-            crate::sanitize::create_file_validated(&context_tmp).with_context(|| {
-                format!("open context-corpus tmp index: {}", context_tmp.display())
-            })?,
-        );
-        let context_header = IndexHeader {
-            schema_version: INDEX_SCHEMA_VERSION.to_string(),
-            model_id: info.model_id.clone(),
-            model_profile: info.profile.to_string(),
-            dimension: info.dimension,
-            generated_at: chrono::Utc::now().to_rfc3339(),
-            entry_count: 0,
-        };
-        writeln!(
-            context_writer,
-            "{}",
-            serde_json::to_string(&context_header)?
-        )?;
-        for stored in &context_files {
-            let content = match crate::sanitize::read_to_string_validated(&stored.raw_path) {
-                Ok(text) => text,
-                Err(_) => continue,
-            };
-            let prefix = take_prefix_bytes(&content, DEFAULT_EMBED_PREFIX_BYTES);
-            let Ok(embedding) = engine.embed(&prefix) else {
-                continue;
-            };
-            let entry = IndexEntry {
-                id: stored.sidecar.id.clone(),
-                project: stored.sidecar.project.clone(),
-                agent: stored.sidecar.agent.clone(),
-                date: stored.sidecar.date.clone(),
-                path: stored.raw_path.clone(),
-                kind: "context-corpus".to_string(),
-                session_id: stored.sidecar.id.clone(),
-                frame_kind: None,
-                cwd: None,
-                embedding,
-            };
-            writeln!(context_writer, "{}", serde_json::to_string(&entry)?)?;
-        }
-        if let Err(err) = context_writer
-            .flush()
-            .with_context(|| format!("flush context-corpus tmp index: {}", context_tmp.display()))
-        {
-            on_event(&IndexEvent::RunFailed {
-                error: format!("{err:#}"),
-                processed_before_failure: processed,
-            });
-            return Err(err);
-        }
-        drop(context_writer);
-        if let Err(err) = fs::rename(&context_tmp, &context_target).with_context(|| {
-            format!(
-                "commit context-corpus index: {} → {}",
-                context_tmp.display(),
-                context_target.display()
-            )
-        }) {
-            on_event(&IndexEvent::RunFailed {
-                error: format!("{err:#}"),
-                processed_before_failure: processed,
-            });
-            return Err(err);
-        }
-    }
+    // Primary commits FIRST (D-3). If the process crashes between primary
+    // and context-corpus, readers querying the primary index still get
+    // correct semantics; an absent context-corpus is a graceful degrade,
+    // never a stale-ahead-of-primary inconsistency.
 
     if let Err(err) = writer
         .flush()
@@ -767,10 +701,39 @@ pub fn write_index_with_progress(
     }
     drop(writer);
 
-    if let Err(err) = fs::rename(&tmp_path, &target_path).with_context(|| {
+    // D-2: rewrite the placeholder header so `entry_count` reflects the
+    // truthful row total before the atomic rename. Done by streaming the
+    // tmp file into a fresh `commit-tmp` file (header swapped, entries
+    // copied verbatim) so resumed checkpoints with the older placeholder
+    // format are upgraded transparently.
+    let final_tmp_path = target_path.with_extension("ndjson.commit-tmp");
+    let total_indexed = stats
+        .resumed_embeddings
+        .saturating_add(indexed)
+        .saturating_add(skipped);
+    let truthful_header = IndexHeader {
+        schema_version: INDEX_SCHEMA_VERSION.to_string(),
+        model_id: info.model_id.clone(),
+        model_profile: info.profile.to_string(),
+        dimension: info.dimension,
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        entry_count: total_indexed,
+    };
+    if let Err(err) =
+        rewrite_index_with_truthful_header(&tmp_path, &final_tmp_path, &truthful_header)
+    {
+        on_event(&IndexEvent::RunFailed {
+            error: format!("{err:#}"),
+            processed_before_failure: processed,
+        });
+        return Err(err);
+    }
+    let _ = fs::remove_file(&tmp_path);
+
+    if let Err(err) = fs::rename(&final_tmp_path, &target_path).with_context(|| {
         format!(
             "commit index: {} → {}",
-            tmp_path.display(),
+            final_tmp_path.display(),
             target_path.display()
         )
     }) {
@@ -779,6 +742,89 @@ pub fn write_index_with_progress(
             processed_before_failure: processed,
         });
         return Err(err);
+    }
+
+    // Context-corpus commits AFTER primary. Tiny corpus; collect entries
+    // in-memory so the header carries the truthful `entry_count` from the
+    // first byte written (no rewrite needed).
+    let context_files = crate::store::scan_context_corpus_files_at(&root)?;
+    if !context_files.is_empty() {
+        let context_target = context_corpus_index_path(project)?;
+        if let Some(parent) = context_target.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("create context-corpus index dir: {}", parent.display())
+            })?;
+        }
+        let mut context_entries: Vec<IndexEntry> = Vec::with_capacity(context_files.len());
+        for stored in &context_files {
+            let content = match crate::sanitize::read_to_string_validated(&stored.raw_path) {
+                Ok(text) => text,
+                Err(_) => continue,
+            };
+            let prefix = take_prefix_bytes(&content, DEFAULT_EMBED_PREFIX_BYTES);
+            let Ok(embedding) = engine.embed(&prefix) else {
+                continue;
+            };
+            context_entries.push(IndexEntry {
+                id: stored.sidecar.id.clone(),
+                project: stored.sidecar.project.clone(),
+                agent: stored.sidecar.agent.clone(),
+                date: stored.sidecar.date.clone(),
+                path: stored.raw_path.clone(),
+                kind: "context-corpus".to_string(),
+                session_id: stored.sidecar.id.clone(),
+                frame_kind: None,
+                cwd: None,
+                embedding,
+            });
+        }
+
+        let context_tmp = context_target.with_extension("ndjson.tmp");
+        let context_header = IndexHeader {
+            schema_version: INDEX_SCHEMA_VERSION.to_string(),
+            model_id: info.model_id.clone(),
+            model_profile: info.profile.to_string(),
+            dimension: info.dimension,
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            entry_count: context_entries.len(),
+        };
+        {
+            let mut context_writer = BufWriter::new(
+                crate::sanitize::create_file_validated(&context_tmp).with_context(|| {
+                    format!("open context-corpus tmp index: {}", context_tmp.display())
+                })?,
+            );
+            writeln!(
+                context_writer,
+                "{}",
+                serde_json::to_string(&context_header)?
+            )?;
+            for entry in &context_entries {
+                writeln!(context_writer, "{}", serde_json::to_string(entry)?)?;
+            }
+            if let Err(err) = context_writer.flush().with_context(|| {
+                format!("flush context-corpus tmp index: {}", context_tmp.display())
+            }) {
+                on_event(&IndexEvent::RunFailed {
+                    error: format!("{err:#}"),
+                    processed_before_failure: processed,
+                });
+                return Err(err);
+            }
+        }
+        if let Err(err) = fs::rename(&context_tmp, &context_target).with_context(|| {
+            format!(
+                "commit context-corpus index: {} → {}",
+                context_tmp.display(),
+                context_target.display()
+            )
+        }) {
+            on_event(&IndexEvent::RunFailed {
+                error: format!("{err:#}"),
+                processed_before_failure: processed,
+            });
+            return Err(err);
+        }
     }
 
     if let Err(err) = materialize_hybrid_index(&target_path, project, &info) {
@@ -863,6 +909,50 @@ fn materialize_hybrid_index(
     dense_persist.persist_ndjson(&hybrid_dense_path(project)?)?;
 
     Ok(manifest)
+}
+
+/// Rewrite the placeholder header in `tmp_path` with the truthful one and
+/// stream the remaining entries into `final_tmp_path`. Caller renames
+/// `final_tmp_path` onto the committed target after this succeeds.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn rewrite_index_with_truthful_header(
+    tmp_path: &Path,
+    final_tmp_path: &Path,
+    header: &IndexHeader,
+) -> Result<()> {
+    use std::io::{BufRead, BufReader, BufWriter, Write};
+
+    let src = crate::sanitize::open_file_validated(tmp_path)
+        .with_context(|| format!("open tmp index for header rewrite: {}", tmp_path.display()))?;
+    let mut src_reader = BufReader::new(src);
+    let mut placeholder = String::new();
+    src_reader
+        .read_line(&mut placeholder)
+        .with_context(|| format!("read placeholder header: {}", tmp_path.display()))?;
+    if placeholder.is_empty() {
+        anyhow::bail!("tmp index unexpectedly empty: {}", tmp_path.display());
+    }
+
+    let dst = crate::sanitize::create_file_validated(final_tmp_path)
+        .with_context(|| format!("create commit-tmp index: {}", final_tmp_path.display()))?;
+    let mut dst_writer = BufWriter::new(dst);
+    writeln!(dst_writer, "{}", serde_json::to_string(header)?).with_context(|| {
+        format!(
+            "write truthful header to commit-tmp: {}",
+            final_tmp_path.display()
+        )
+    })?;
+    std::io::copy(&mut src_reader, &mut dst_writer).with_context(|| {
+        format!(
+            "copy entries from {} → {}",
+            tmp_path.display(),
+            final_tmp_path.display()
+        )
+    })?;
+    dst_writer
+        .flush()
+        .with_context(|| format!("flush commit-tmp index: {}", final_tmp_path.display()))?;
+    Ok(())
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -1142,11 +1232,18 @@ pub fn query_index(
         return Ok(Vec::new());
     }
 
-    let _lock = crate::locks::acquire_shared(crate::locks::lance_lock_path()?)?;
-
+    // D-5: embedder init + query embed runs OUTSIDE the lance lock. A
+    // cloud-backend embed can take hundreds of ms on a slow link; a GGUF
+    // init can take seconds on cold caches. Holding the shared lance lock
+    // across that window blocks concurrent rebuilds (exclusive) and other
+    // readers for no good reason — query embeddings do not touch any
+    // lance-resource. The lock is re-acquired only for the index file read.
     let mut engine = crate::embedder::EmbeddingEngine::new()
         .with_context(|| "semantic embedder unavailable (optional) for query")?;
     let query_embedding = engine.embed(query).with_context(|| "embed query")?;
+    drop(engine);
+
+    let _lock = crate::locks::acquire_shared(crate::locks::lance_lock_path()?)?;
 
     // `open_file_validated` validates the path against canonical roots
     // BEFORE opening — blocks any path-traversal attempt that an
@@ -1370,6 +1467,60 @@ mod iter3_tests {
             std::env::remove_var("AICX_HOME");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn rewrite_index_with_truthful_header_replaces_placeholder_and_preserves_entries() {
+        // D-2: rewrite swap-and-rename helper produces a file whose first
+        // line carries the truthful entry_count and whose data lines are
+        // byte-for-byte identical to the placeholder tmp.
+        let dir = tempdir_for_test();
+        let tmp_path = dir.join("test.ndjson.tmp");
+        let final_tmp = dir.join("test.ndjson.commit-tmp");
+
+        let placeholder = IndexHeader {
+            schema_version: "v0-test".to_string(),
+            model_id: "test-model".to_string(),
+            model_profile: "base".to_string(),
+            dimension: 4,
+            generated_at: "2026-01-01T00:00:00Z".to_string(),
+            entry_count: 0,
+        };
+        let entries = [
+            r#"{"id":"a","embedding":[0.1,0.2,0.3,0.4]}"#,
+            r#"{"id":"b","embedding":[0.5,0.6,0.7,0.8]}"#,
+            r#"{"id":"c","embedding":[0.9,1.0,1.1,1.2]}"#,
+        ];
+        let mut tmp_bytes = serde_json::to_string(&placeholder).unwrap();
+        tmp_bytes.push('\n');
+        for entry in &entries {
+            tmp_bytes.push_str(entry);
+            tmp_bytes.push('\n');
+        }
+        std::fs::write(&tmp_path, &tmp_bytes).unwrap();
+
+        let truthful = IndexHeader {
+            entry_count: entries.len(),
+            ..placeholder.clone()
+        };
+        rewrite_index_with_truthful_header(&tmp_path, &final_tmp, &truthful)
+            .expect("rewrite must succeed");
+
+        let lines: Vec<String> = std::fs::read_to_string(&final_tmp)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        let header: IndexHeader = serde_json::from_str(&lines[0]).expect("header parses");
+        assert_eq!(
+            header.entry_count,
+            entries.len(),
+            "rewritten header must carry truthful entry_count"
+        );
+        assert_eq!(&lines[1..], entries);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
