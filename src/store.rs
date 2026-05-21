@@ -3586,6 +3586,7 @@ mod tests {
                 message: "hello world".to_string(),
                 branch: None,
                 cwd: None,
+                timestamp_source: None,
                 frame_kind: None,
             },
             TimelineEntry {
@@ -3596,6 +3597,7 @@ mod tests {
                 message: "hi there\nsecond line".to_string(),
                 branch: None,
                 cwd: None,
+                timestamp_source: None,
                 frame_kind: None,
             },
         ];
@@ -3701,6 +3703,7 @@ mod tests {
             message: message.to_string(),
             branch: None,
             cwd: None,
+            timestamp_source: None,
             frame_kind: None,
         }
     }
@@ -3952,6 +3955,7 @@ mod tests {
             message: "---\nrun_id: mrbl-001\nprompt_id: api-redesign_20260327\nmodel: gpt-5.4\nstarted_at: 2026-03-27T10:00:00Z\ncompleted_at: 2026-03-27T10:01:00Z\ntoken_usage: 1234\nfindings_count: 4\nframe_kind: agent_reply\nphase: implement\nmode: session-first\nskill_code: vc-workflow\nframework_version: 2026-03\n---\n## Findings\nTelemetry wiring landed.\n".to_string(),
             branch: None,
             cwd: None,
+            timestamp_source: None,
             frame_kind: None,
         }];
 
@@ -4030,6 +4034,7 @@ mod tests {
             message: "   \n\t".to_string(),
             branch: None,
             cwd: None,
+            timestamp_source: None,
             frame_kind: Some(crate::timeline::FrameKind::InternalThought),
         }];
 
@@ -4070,6 +4075,7 @@ mod tests {
             message: message.to_string(),
             branch: None,
             cwd: cwd.map(ToOwned::to_owned),
+            timestamp_source: None,
             frame_kind: None,
         }
     }
@@ -5102,6 +5108,7 @@ mod tests {
             message: message.to_string(),
             branch: None,
             cwd: None,
+            timestamp_source: None,
             frame_kind: None,
         }
     }

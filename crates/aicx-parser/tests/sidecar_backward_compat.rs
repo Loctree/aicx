@@ -40,6 +40,7 @@ fn old_sidecar_without_noise_lines_dropped_deserializes_with_zero_default() {
     assert_eq!(sidecar.project, "Loctree/aicx");
     assert_eq!(sidecar.agent, "claude");
     assert_eq!(sidecar.session_id, "2921f021-3af4-4d6f-b378-73ad9575268e");
+    assert_eq!(sidecar.timestamp_source, None);
     assert_eq!(sidecar.workflow_phase.as_deref(), Some("implement"));
     assert_eq!(sidecar.skill_code.as_deref(), Some("vc-ownership"));
 }
@@ -56,6 +57,10 @@ fn new_sidecar_with_zero_drops_skips_field_on_serialize() {
     assert!(
         !json.contains("noise_lines_dropped"),
         "zero-valued counter must be skipped on serialization, got: {json}"
+    );
+    assert!(
+        !json.contains("timestamp_source"),
+        "absent timestamp source must be skipped on serialization, got: {json}"
     );
 }
 
@@ -74,6 +79,25 @@ fn new_sidecar_with_nonzero_drops_emits_field_on_serialize() {
     let roundtrip: ChunkMetadataSidecar =
         serde_json::from_str(&json).expect("new-shape round-trip");
     assert_eq!(roundtrip.noise_lines_dropped, 42);
+}
+
+#[test]
+fn sidecar_with_timestamp_source_emits_field_on_serialize() {
+    let mut sidecar: ChunkMetadataSidecar = serde_json::from_str(OLD_SIDECAR_JSON).unwrap();
+    sidecar.timestamp_source = Some("fallback_previous".to_string());
+
+    let json = serde_json::to_string(&sidecar).expect("serialize");
+    assert!(
+        json.contains("\"timestamp_source\":\"fallback_previous\""),
+        "timestamp source must be present when inferred, got: {json}"
+    );
+
+    let roundtrip: ChunkMetadataSidecar =
+        serde_json::from_str(&json).expect("timestamp-source round-trip");
+    assert_eq!(
+        roundtrip.timestamp_source.as_deref(),
+        Some("fallback_previous")
+    );
 }
 
 #[test]

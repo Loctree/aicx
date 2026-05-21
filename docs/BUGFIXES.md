@@ -1370,3 +1370,50 @@ algorytm, ale strict deserialize blokowało dojście do tego punktu.
   rozpoznany po stabilnym tagu formatu, nie po samej porażce parsera.
 
 **Related.** Closes G-1 from `docs/bug-tracker-aicx-followup-pass-2`.
+
+## 2026-05-21 — Claude missing timestamp frames preserved with fallback timestamp · `{commit-sha}`
+
+**Symptom.** W3-A-sources (`1f7490f`) zatrzymał silent drop i zaczął emitować
+diagnostic dla Claude JSONL bez `timestamp`, ale nadal wyrzucał treść tych
+ramek. Operator widział ostrzeżenie `frames dropped`, a canonical store nadal
+tracił message body z eventów bez pola `timestamp`.
+
+**Root cause.** `parse_claude_jsonl_with_diagnostics` liczył brakujące timestampy
+jako warning, ale `extract_claude_line_entries` miało twardy `None => return
+Vec::new()`. Diagnostic nie był połączony z żadną ścieżką fallback timestamp.
+
+**Fix.**
+- Claude parser zachowuje wspierane ramki bez pola `timestamp`, używając
+  poprzedniego poprawnego timestampu z tej samej sesji (`fallback_previous`).
+- Gdy brak poprzedniego timestampu, parser zachowuje ramkę przez fallback do
+  mtime pliku albo bieżącego czasu, z osobnym `timestamp_source`.
+- Diagnostic dla brakującego pola zmieniony na
+  `N frames preserved with fallback timestamp; sample lines: ...`; invalid
+  timestamp stringi nadal są dropowane i raportowane jako `frames dropped`.
+- `timestamp_source` przechodzi przez `TimelineEntry` → `Chunk` →
+  `ChunkMetadataSidecar`, żeby `.meta.json` pokazywał inferred timestampy.
+
+**Touched.**
+- `src/sources.rs` — Claude missing-timestamp fallback + warning variant +
+  `TimelineEntryMeta.timestamp_source`.
+- `crates/aicx-parser/src/timeline.rs` — opcjonalne
+  `TimelineEntry.timestamp_source`.
+- `crates/aicx-parser/src/chunker.rs` — propagacja
+  `timestamp_source` do chunków i sidecarów.
+- Test/literal updates only: `src/sources/tests.rs`,
+  `crates/aicx-parser/tests/sidecar_backward_compat.rs`, plus compile-time
+  literals w testach.
+
+**Tests.**
+- Nowe: `test_parse_claude_jsonl_preserves_missing_timestamp_with_fallback_metadata`.
+- Nowe: `sidecar_with_timestamp_source_emits_field_on_serialize`.
+- Zielone w tym runie przed pełnymi gate’ami: `cargo test --workspace`.
+
+**Lessons.**
+- Diagnostic bez preservation path to połowa fixa: ostrzeżenie musi odpowiadać
+  realnemu zachowaniu danych.
+- Sidecar-observable inferred metadata wymaga pełnego przepływu przez typy
+  parsera, nie tylko lokalnego flagowania w extractorze.
+
+**Related.** Closes G-5 from `docs/bug-tracker-aicx-followup-pass-2`; recovery
+of W-B-1 substrate failure.

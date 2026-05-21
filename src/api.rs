@@ -580,6 +580,7 @@ mod tests {
             frame_kind: Some(FrameKind::UserMsg),
             branch: None,
             cwd: None,
+            timestamp_source: None,
         }];
 
         let summary = client

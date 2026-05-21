@@ -7099,6 +7099,7 @@ mod tests {
                 frame_kind: None,
                 branch: Some("main".to_string()),
                 cwd: Some("/tmp/project-one".to_string()),
+                timestamp_source: None,
             },
             timeline::TimelineEntry {
                 timestamp: ts + chrono::Duration::seconds(1),
@@ -7109,6 +7110,7 @@ mod tests {
                 frame_kind: None,
                 branch: None,
                 cwd: Some("/tmp/project-two".to_string()),
+                timestamp_source: None,
             },
         ];
 

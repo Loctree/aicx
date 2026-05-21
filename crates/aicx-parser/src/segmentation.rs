@@ -655,6 +655,7 @@ mod tests {
             message: message.to_string(),
             branch: None,
             cwd: cwd.map(ToOwned::to_owned),
+            timestamp_source: None,
             frame_kind: None,
         }
     }

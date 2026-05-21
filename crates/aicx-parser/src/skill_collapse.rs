@@ -142,6 +142,7 @@ mod tests {
             frame_kind: None,
             branch: None,
             cwd: None,
+            timestamp_source: None,
         }
     }
 

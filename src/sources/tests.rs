@@ -1,4 +1,5 @@
 use super::*;
+use crate::chunker::{ChunkMetadataSidecar, ChunkerConfig, chunk_entries};
 use filetime::{FileTime, set_file_mtime};
 use std::fs;
 use std::io::Cursor;
@@ -1505,6 +1506,7 @@ fn test_dedup_logic() {
             message: "same message here".to_string(),
             branch: None,
             cwd: None,
+            timestamp_source: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -1515,6 +1517,7 @@ fn test_dedup_logic() {
             message: "same message here".to_string(),
             branch: None,
             cwd: None,
+            timestamp_source: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -1525,6 +1528,7 @@ fn test_dedup_logic() {
             message: "different".to_string(),
             branch: None,
             cwd: None,
+            timestamp_source: None,
             frame_kind: None,
         },
     ];
@@ -1925,6 +1929,61 @@ fn test_parse_claude_jsonl_invalid_timestamp_warns() {
             count: 1,
             samples: vec!["bad-ts".to_string()],
         }]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_claude_jsonl_preserves_missing_timestamp_with_fallback_metadata() {
+    let root = unique_test_dir("claude-missing-ts-fallback");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"type":"user","message":{"role":"user","content":"first with timestamp"},"timestamp":"2026-02-01T00:00:00Z","sessionId":"session-a","cwd":"/tmp/aicx"}
+{"type":"user","message":{"role":"user","content":"missing timestamp preserved"},"sessionId":"session-a","cwd":"/tmp/aicx"}
+{"type":"assistant","message":{"role":"assistant","content":"assistant with timestamp"},"timestamp":"2026-02-01T00:00:01Z","sessionId":"session-a","cwd":"/tmp/aicx"}"#;
+    write_file(&tmp, content);
+
+    let (entries, warnings) =
+        parse_claude_jsonl_with_diagnostics(&tmp, "fallback", &default_config(true)).unwrap();
+
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].message, "first with timestamp");
+    assert_eq!(entries[1].message, "missing timestamp preserved");
+    assert_eq!(entries[2].message, "assistant with timestamp");
+    assert_eq!(entries[1].timestamp, entries[0].timestamp);
+    assert_eq!(
+        entries[1].timestamp_source.as_deref(),
+        Some("fallback_previous")
+    );
+    assert!(entries[0].timestamp_source.is_none());
+    assert!(entries[2].timestamp_source.is_none());
+
+    assert_eq!(warnings.len(), 1);
+    match &warnings[0] {
+        ClaudeSessionWarning::FallbackTimestamp { count, samples } => {
+            assert_eq!(*count, 1);
+            assert_eq!(
+                samples,
+                &vec!["line 2: <missing> -> fallback_previous".to_string()]
+            );
+            let rendered = warnings[0].describe(&tmp);
+            assert!(rendered.contains("1 frames preserved with fallback timestamp"));
+            assert!(rendered.contains("sample lines: line 2: <missing> -> fallback_previous"));
+            assert!(!rendered.contains("frames dropped"));
+        }
+        other => panic!("expected FallbackTimestamp, got {other:?}"),
+    }
+
+    let chunks = chunk_entries(&entries, "aicx", "claude", &ChunkerConfig::default());
+    let fallback_chunk = chunks
+        .iter()
+        .find(|chunk| chunk.text.contains("missing timestamp preserved"))
+        .expect("fallback body should be chunked");
+    let sidecar = ChunkMetadataSidecar::from(fallback_chunk);
+    assert_eq!(
+        sidecar.timestamp_source.as_deref(),
+        Some("fallback_previous")
     );
 
     let _ = fs::remove_dir_all(&root);

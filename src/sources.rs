@@ -285,6 +285,12 @@ struct ClaudeEntry {
     cwd: Option<String>,
 }
 
+#[derive(Debug)]
+struct ClaudeRawEntry {
+    entry: ClaudeEntry,
+    line_number: usize,
+}
+
 /// Codex history JSONL entry structure.
 #[derive(Debug, Deserialize)]
 struct CodexEntry {
@@ -463,6 +469,7 @@ struct TimelineEntryMeta {
     branch: Option<String>,
     cwd: Option<String>,
     frame_kind: Option<FrameKind>,
+    timestamp_source: Option<String>,
 }
 
 trait PushContentSanitizationWarning {
@@ -531,6 +538,7 @@ fn build_timeline_entry_from_message(
         frame_kind: meta.frame_kind,
         branch: meta.branch,
         cwd: meta.cwd,
+        timestamp_source: meta.timestamp_source,
     }
 }
 
@@ -742,18 +750,12 @@ fn extract_claude_classified_blocks(
 
 fn extract_claude_line_entries(
     entry: ClaudeEntry,
+    timestamp: DateTime<Utc>,
+    timestamp_source: Option<&str>,
     session_id: &str,
     config: &ExtractionConfig,
     warnings: &mut Vec<ClaudeSessionWarning>,
 ) -> Vec<TimelineEntry> {
-    let timestamp = match entry.timestamp.as_deref() {
-        Some(ts) => match parse_rfc3339_or_naive_utc(ts) {
-            Ok(dt) => dt.with_timezone(&Utc),
-            Err(_) => return Vec::new(),
-        },
-        None => return Vec::new(),
-    };
-
     if timestamp < config.cutoff || config.watermark.is_some_and(|wm| timestamp <= wm) {
         return Vec::new();
     }
@@ -781,6 +783,7 @@ fn extract_claude_line_entries(
                     branch: entry.git_branch.clone(),
                     cwd: entry.cwd.clone(),
                     frame_kind: Some(block.frame_kind),
+                    timestamp_source: timestamp_source.map(str::to_string),
                 },
                 warnings,
             ));
@@ -809,21 +812,22 @@ fn extract_claude_line_entries(
             branch: entry.git_branch,
             cwd: entry.cwd,
             frame_kind,
+            timestamp_source: timestamp_source.map(str::to_string),
         },
         warnings,
     ));
     entries
 }
 
-fn select_claude_session_id(
-    entries: &[ClaudeEntry],
+fn select_claude_session_id<'a>(
+    entries: impl IntoIterator<Item = &'a ClaudeEntry>,
     fallback: &str,
     warnings: &mut Vec<ClaudeSessionWarning>,
 ) -> String {
     let mut first: Option<String> = None;
     let mut ignored = Vec::new();
     for id in entries
-        .iter()
+        .into_iter()
         .filter_map(|entry| entry.session_id.as_deref())
         .map(str::trim)
         .filter(|id| !id.is_empty())
@@ -1260,6 +1264,10 @@ pub(crate) enum ClaudeSessionWarning {
         count: usize,
         samples: Vec<String>,
     },
+    FallbackTimestamp {
+        count: usize,
+        samples: Vec<String>,
+    },
     InvalidEpochMillis {
         count: usize,
         samples: Vec<String>,
@@ -1289,6 +1297,12 @@ impl ClaudeSessionWarning {
             ),
             ClaudeSessionWarning::UnparsableTimestamp { count, samples } => format!(
                 "Claude session warning: {} has {} unparsable timestamp(s); frames dropped. Sample(s): {}",
+                path.display(),
+                count,
+                samples.join(", ")
+            ),
+            ClaudeSessionWarning::FallbackTimestamp { count, samples } => format!(
+                "Claude session warning: {} has {} frames preserved with fallback timestamp; sample lines: {}",
                 path.display(),
                 count,
                 samples.join(", ")
@@ -1516,6 +1530,11 @@ fn parse_claude_jsonl_with_diagnostics(
     config: &ExtractionConfig,
 ) -> Result<(Vec<TimelineEntry>, Vec<ClaudeSessionWarning>)> {
     let file = sanitize::open_file_validated(path)?;
+    let file_mtime = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .map(DateTime::<Utc>::from);
     let mut reader = BufReader::new(file);
     let mut raw_entries = Vec::new();
     let mut warnings = Vec::new();
@@ -1523,6 +1542,8 @@ fn parse_claude_jsonl_with_diagnostics(
     let mut oversized_samples = Vec::new();
     let mut unparsable_ts_count = 0usize;
     let mut unparsable_ts_samples = Vec::new();
+    let mut fallback_ts_count = 0usize;
+    let mut fallback_ts_samples = Vec::new();
     let mut line_number = 0usize;
 
     while let Some(limited) = read_line_limited(&mut reader, MAX_LINE_BYTES)? {
@@ -1540,29 +1561,66 @@ fn parse_claude_jsonl_with_diagnostics(
             Ok(e) => e,
             Err(_) => continue,
         };
-        if entry
-            .timestamp
-            .as_deref()
-            .is_none_or(|ts| parse_rfc3339_or_naive_utc(ts).is_err())
-        {
-            unparsable_ts_count += 1;
-            if unparsable_ts_samples.len() < 5 {
-                unparsable_ts_samples.push(
-                    entry
-                        .timestamp
-                        .clone()
-                        .unwrap_or_else(|| format!("line {line_number}: <missing>")),
-                );
-            }
-        }
-
         if !matches!(
             entry.entry_type.as_str(),
             "user" | "assistant" | "tool_use" | "tool_result"
         ) {
             continue;
         }
-        raw_entries.push(entry);
+        raw_entries.push(ClaudeRawEntry { entry, line_number });
+    }
+
+    let effective_session_id = select_claude_session_id(
+        raw_entries.iter().map(|raw| &raw.entry),
+        default_session_id,
+        &mut warnings,
+    );
+    let mut entries = Vec::new();
+    let mut previous_timestamp = None;
+    for raw in raw_entries {
+        let (timestamp, timestamp_source) = match raw.entry.timestamp.as_deref() {
+            Some(ts) => match parse_rfc3339_or_naive_utc(ts) {
+                Ok(timestamp) => {
+                    let timestamp = timestamp.with_timezone(&Utc);
+                    previous_timestamp = Some(timestamp);
+                    (timestamp, None)
+                }
+                Err(_) => {
+                    unparsable_ts_count += 1;
+                    push_unique_sample(&mut unparsable_ts_samples, ts.to_string(), 5);
+                    continue;
+                }
+            },
+            None => {
+                let (timestamp, source) = if let Some(timestamp) = previous_timestamp {
+                    (timestamp, "fallback_previous")
+                } else if let Some(timestamp) = file_mtime {
+                    (timestamp, "fallback_file_mtime")
+                } else {
+                    (Utc::now(), "fallback_now")
+                };
+                (timestamp, Some(source))
+            }
+        };
+
+        let line_entries = extract_claude_line_entries(
+            raw.entry,
+            timestamp,
+            timestamp_source,
+            &effective_session_id,
+            config,
+            &mut warnings,
+        );
+        if !line_entries.is_empty()
+            && let Some(source) = timestamp_source
+        {
+            fallback_ts_count += line_entries.len();
+            if fallback_ts_samples.len() < 5 {
+                fallback_ts_samples
+                    .push(format!("line {}: <missing> -> {source}", raw.line_number));
+            }
+        }
+        entries.extend(line_entries);
     }
 
     if oversized_count > 0 {
@@ -1571,23 +1629,17 @@ fn parse_claude_jsonl_with_diagnostics(
             samples: oversized_samples,
         });
     }
+    if fallback_ts_count > 0 {
+        warnings.push(ClaudeSessionWarning::FallbackTimestamp {
+            count: fallback_ts_count,
+            samples: fallback_ts_samples,
+        });
+    }
     if unparsable_ts_count > 0 {
         warnings.push(ClaudeSessionWarning::UnparsableTimestamp {
             count: unparsable_ts_count,
             samples: unparsable_ts_samples,
         });
-    }
-
-    let effective_session_id =
-        select_claude_session_id(&raw_entries, default_session_id, &mut warnings);
-    let mut entries = Vec::new();
-    for entry in raw_entries {
-        entries.extend(extract_claude_line_entries(
-            entry,
-            &effective_session_id,
-            config,
-            &mut warnings,
-        ));
     }
 
     Ok((entries, warnings))
@@ -1943,6 +1995,7 @@ fn extract_gemini_antigravity_step_outputs(
                 cwd: infer_project_hint_from_text(trimmed)
                     .or_else(|| session_default_cwd.clone()),
                 frame_kind: None,
+                timestamp_source: None,
             },
         ));
     }
@@ -2196,6 +2249,7 @@ fn antigravity_json_message_to_entries(
                     branch: None,
                     cwd: cwd.clone(),
                     frame_kind: Some(block.frame_kind),
+                    timestamp_source: None,
                 },
             ));
         }
@@ -2317,6 +2371,7 @@ fn parse_antigravity_transcript_text(
                 branch: None,
                 cwd: default_cwd.clone(),
                 frame_kind: frame_kind_from_role(role),
+                timestamp_source: None,
             },
         ));
     }
@@ -2638,6 +2693,7 @@ pub fn extract_claude_history(config: &ExtractionConfig) -> Result<Vec<TimelineE
                 branch: None,
                 cwd: entry.project,
                 frame_kind: Some(FrameKind::UserMsg),
+                timestamp_source: None,
             },
             &mut warnings,
         ));
@@ -3058,6 +3114,7 @@ fn build_codex_history_entries(
                     branch: None,
                     cwd: msg.cwd.clone(),
                     frame_kind,
+                    timestamp_source: None,
                 },
                 warnings,
             ));
@@ -3366,6 +3423,7 @@ fn parse_codex_session_events_with_diagnostics(
                 branch: None,
                 cwd: current_cwd.clone(),
                 frame_kind,
+                timestamp_source: None,
             },
             &mut warnings,
         ));
@@ -3627,6 +3685,7 @@ fn parse_gemini_session_with_diagnostics(
                     branch: None,
                     cwd: inferred_cwd.clone(),
                     frame_kind: Some(block.frame_kind),
+                    timestamp_source: None,
                 },
                 &mut warnings,
             ));
@@ -3675,6 +3734,7 @@ fn parse_gemini_session_with_diagnostics(
                         branch: None,
                         cwd: inferred_cwd.clone(),
                         frame_kind: Some(FrameKind::InternalThought),
+                        timestamp_source: None,
                     },
                     &mut warnings,
                 ));
@@ -3878,6 +3938,7 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                             branch: None,
                             cwd: current_cwd.clone(),
                             frame_kind: Some(FrameKind::UserMsg),
+                            timestamp_source: None,
                         },
                         &mut warnings,
                     ));
@@ -3906,6 +3967,7 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                             branch: None,
                             cwd: current_cwd.clone(),
                             frame_kind: Some(FrameKind::UserMsg),
+                            timestamp_source: None,
                         },
                         &mut warnings,
                     ));
@@ -3998,6 +4060,7 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                             branch: None,
                             cwd: current_cwd.clone(),
                             frame_kind: Some(frame_kind),
+                            timestamp_source: None,
                         },
                         &mut warnings,
                     ));

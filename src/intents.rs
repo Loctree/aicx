@@ -2609,6 +2609,7 @@ mod tests {
             date: date.to_string(),
             session_id: "intentstest01".to_string(),
             cwd: None,
+            timestamp_source: None,
             kind: crate::store::Kind::Conversations,
             run_id: None,
             prompt_id: None,
