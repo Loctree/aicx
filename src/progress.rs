@@ -23,6 +23,8 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use indicatif::{ProgressBar, ProgressStyle};
+
 #[derive(Clone, Debug)]
 pub enum PhaseOutcome {
     Ok {
@@ -489,6 +491,249 @@ impl Reporter for StructuredReporter {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Event sink layer
+//
+// A parallel observability surface that consumes richer per-step events
+// (the wire-up phase binds `E = aicx_progress_contracts::IndexEvent`)
+// while leaving the legacy `Reporter`/`Phase` API untouched. Sinks are
+// generic over the event type `E` so this module compiles standalone
+// against any future event shape; integration just plugs the concrete
+// event type and a translator closure in at the call site.
+//
+// Three sinks ship here:
+//
+// * [`FanOut`]        — multi-sink dispatch, ordered.
+// * [`IndicatifSink`] — TTY-aware progress bar via `indicatif`, with
+//                        rate-limited stderr fallback for non-TTY runs.
+// * [`TracingSink`]   — pure-`tracing::info!` line per event.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Sink consuming richer pipeline events. Generic over the event type so
+/// the wire-up phase can bind `E = aicx_progress_contracts::IndexEvent`
+/// (or any future shape) without forcing a contracts-crate dependency on
+/// this module today.
+pub trait EventSink<E>: Send + Sync {
+    fn on_event(&self, event: &E);
+}
+
+/// Snapshot of progress derived from an arbitrary event by the closure
+/// passed to [`IndicatifSink::new`]. The closure is the translator: it
+/// tells the sink how to drive the bar without coupling this module to
+/// the concrete event shape.
+#[derive(Clone, Debug, Default)]
+pub struct ProgressUpdate {
+    /// Current position. Pass through unchanged to the bar.
+    pub position: u64,
+    /// Optional new length. When `Some`, the bar resets its denominator
+    /// (useful when total count is learned mid-stream).
+    pub length: Option<u64>,
+    /// Optional inline status. Rendered in the `{msg}` slot.
+    pub message: Option<String>,
+    /// When `true`, the bar finishes with the current message and the
+    /// non-interactive fallback emits a final line regardless of the
+    /// rate-limit guard.
+    pub finished: bool,
+}
+
+/// Multi-sink dispatcher. Registered sinks receive `on_event` in
+/// insertion order. Cheap to clone — the inner `Vec<Arc<...>>` is shared.
+pub struct FanOut<E> {
+    sinks: Vec<Arc<dyn EventSink<E>>>,
+}
+
+impl<E> FanOut<E> {
+    pub fn new() -> Self {
+        Self { sinks: Vec::new() }
+    }
+
+    pub fn push(&mut self, sink: Arc<dyn EventSink<E>>) {
+        self.sinks.push(sink);
+    }
+
+    pub fn builder() -> FanOutBuilder<E> {
+        FanOutBuilder { sinks: Vec::new() }
+    }
+
+    pub fn len(&self) -> usize {
+        self.sinks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sinks.is_empty()
+    }
+}
+
+impl<E> Default for FanOut<E> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<E: Send + Sync> EventSink<E> for FanOut<E> {
+    fn on_event(&self, event: &E) {
+        for sink in &self.sinks {
+            sink.on_event(event);
+        }
+    }
+}
+
+/// Fluent builder for [`FanOut`]. Order of `with` calls is the dispatch
+/// order (first registered = first invoked).
+pub struct FanOutBuilder<E> {
+    sinks: Vec<Arc<dyn EventSink<E>>>,
+}
+
+impl<E> FanOutBuilder<E> {
+    pub fn with(mut self, sink: Arc<dyn EventSink<E>>) -> Self {
+        self.sinks.push(sink);
+        self
+    }
+
+    pub fn build(self) -> FanOut<E> {
+        FanOut { sinks: self.sinks }
+    }
+}
+
+/// Translator closure: maps an event to an optional [`ProgressUpdate`].
+/// Returning `None` means this event does not advance the bar (e.g. a
+/// configuration-change event that other sinks consume but the bar
+/// ignores).
+type RenderFn<E> = Box<dyn Fn(&E) -> Option<ProgressUpdate> + Send + Sync + 'static>;
+
+/// TTY-aware progress sink built on `indicatif::ProgressBar`. In
+/// interactive mode the bar renders inline and updates per event. In
+/// non-interactive mode the sink falls back to rate-limited `eprintln!`
+/// at most once per second, plus a forced final line when an event
+/// signals `finished`. The translator closure is the only event-shape
+/// coupling: callers wire it up to whatever concrete event type the
+/// pipeline emits.
+pub struct IndicatifSink<E> {
+    progress_bar: Option<ProgressBar>,
+    render: RenderFn<E>,
+    last_line_at: Mutex<Instant>,
+}
+
+impl<E> IndicatifSink<E> {
+    /// Construct a new sink. `total` is the initial bar length (it can
+    /// be replaced later via [`ProgressUpdate::length`]). `interactive`
+    /// is typically `io::stderr().is_terminal() && !structured`. The
+    /// translator closure tells the sink how to derive a
+    /// [`ProgressUpdate`] from each event.
+    pub fn new<F>(total: u64, interactive: bool, render: F) -> Self
+    where
+        F: Fn(&E) -> Option<ProgressUpdate> + Send + Sync + 'static,
+    {
+        let progress_bar = if interactive {
+            let pb = ProgressBar::new(total);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template(
+                        "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} | {msg} | ETA {eta_precise}",
+                    )
+                    .expect("invalid indicatif progress template")
+                    .progress_chars("#>-"),
+            );
+            Some(pb)
+        } else {
+            None
+        };
+
+        Self {
+            progress_bar,
+            render: Box::new(render),
+            // Initialise the rate-limit anchor in the past so the first
+            // non-interactive event is allowed to render immediately.
+            last_line_at: Mutex::new(Instant::now() - Duration::from_secs(5)),
+        }
+    }
+
+    /// Interleave an info line without breaking the bar. When the bar is
+    /// present this goes through `progress_bar.println` so the spinner
+    /// stays on the bottom row; otherwise it falls through to `stderr`.
+    pub fn println(&self, line: &str) {
+        if let Some(progress_bar) = &self.progress_bar {
+            progress_bar.println(line);
+        } else {
+            eprintln!("{line}");
+        }
+    }
+
+    /// Whether the sink rendered in interactive (progress-bar) mode.
+    /// Surface for tests and for callers that want to interleave their
+    /// own structured output only when the bar is absent.
+    pub fn is_interactive(&self) -> bool {
+        self.progress_bar.is_some()
+    }
+}
+
+impl<E: Send + Sync> EventSink<E> for IndicatifSink<E> {
+    fn on_event(&self, event: &E) {
+        let Some(update) = (self.render)(event) else {
+            return;
+        };
+
+        if let Some(progress_bar) = &self.progress_bar {
+            if let Some(length) = update.length {
+                progress_bar.set_length(length);
+            }
+            progress_bar.set_position(update.position);
+            if let Some(message) = update.message.clone() {
+                progress_bar.set_message(message);
+            }
+            if update.finished {
+                let final_msg = update.message.unwrap_or_else(|| "complete".to_string());
+                progress_bar.finish_with_message(final_msg);
+            }
+            return;
+        }
+
+        // Non-interactive fallback: rate-limit to one line per second
+        // unless this event signals completion.
+        let now = Instant::now();
+        let mut guard = self.last_line_at.lock().unwrap_or_else(|e| e.into_inner());
+        if !update.finished && now.duration_since(*guard) < Duration::from_secs(1) {
+            return;
+        }
+        *guard = now;
+        drop(guard);
+
+        let msg = update.message.unwrap_or_default();
+        match update.length {
+            Some(length) => {
+                eprintln!("[aicx] {}/{} {}", update.position, length, msg);
+            }
+            None => {
+                eprintln!("[aicx] {} {}", update.position, msg);
+            }
+        }
+    }
+}
+
+/// Thin sink that emits one `tracing::info!` per event. Useful when the
+/// operator wants structured machine-readable output alongside (or
+/// instead of) the progress bar. Requires `E: Debug` so the event can
+/// be rendered as a field.
+pub struct TracingSink;
+
+impl TracingSink {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for TracingSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<E: std::fmt::Debug + Send + Sync> EventSink<E> for TracingSink {
+    fn on_event(&self, event: &E) {
+        tracing::info!(?event, "aicx event");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,5 +906,190 @@ mod tests {
         let r = select_reporter(true);
         let phase = Phase::start(r, "extract", None);
         phase.finish_ok("0 entries");
+    }
+}
+
+#[cfg(test)]
+mod sink_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Capture sink: records the stringified event for ordering checks.
+    struct CaptureSink {
+        label: &'static str,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl EventSink<String> for CaptureSink {
+        fn on_event(&self, event: &String) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:{}", self.label, event));
+        }
+    }
+
+    #[test]
+    fn fan_out_dispatches_to_all_sinks_in_order() {
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut fan = FanOut::<String>::new();
+        fan.push(Arc::new(CaptureSink {
+            label: "a",
+            log: log.clone(),
+        }));
+        fan.push(Arc::new(CaptureSink {
+            label: "b",
+            log: log.clone(),
+        }));
+        fan.push(Arc::new(CaptureSink {
+            label: "c",
+            log: log.clone(),
+        }));
+
+        fan.on_event(&"one".to_string());
+        fan.on_event(&"two".to_string());
+
+        let captured = log.lock().unwrap().clone();
+        assert_eq!(
+            captured,
+            vec![
+                "a:one".to_string(),
+                "b:one".to_string(),
+                "c:one".to_string(),
+                "a:two".to_string(),
+                "b:two".to_string(),
+                "c:two".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn fan_out_builder_preserves_order() {
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let fan = FanOut::<String>::builder()
+            .with(Arc::new(CaptureSink {
+                label: "first",
+                log: log.clone(),
+            }))
+            .with(Arc::new(CaptureSink {
+                label: "second",
+                log: log.clone(),
+            }))
+            .build();
+
+        assert_eq!(fan.len(), 2);
+        fan.on_event(&"x".to_string());
+        let captured = log.lock().unwrap().clone();
+        assert_eq!(
+            captured,
+            vec!["first:x".to_string(), "second:x".to_string()]
+        );
+    }
+
+    #[test]
+    fn indicatif_sink_invokes_translator_for_every_event_non_interactive() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_inner = calls.clone();
+        let sink: IndicatifSink<u64> = IndicatifSink::new(0, false, move |event| {
+            calls_inner.fetch_add(1, Ordering::SeqCst);
+            Some(ProgressUpdate {
+                position: *event,
+                length: Some(10),
+                message: Some(format!("item {event}")),
+                finished: false,
+            })
+        });
+
+        assert!(!sink.is_interactive());
+        for i in 0..5u64 {
+            sink.on_event(&i);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn indicatif_sink_finished_event_completes_without_panic() {
+        // Interactive=true path: ensures finish_with_message is a clean
+        // exit. We can't intercept stderr here, but a panic in the bar
+        // would surface immediately.
+        let sink: IndicatifSink<bool> = IndicatifSink::new(3, true, |finished| {
+            Some(ProgressUpdate {
+                position: 3,
+                length: Some(3),
+                message: Some("done".to_string()),
+                finished: *finished,
+            })
+        });
+        sink.on_event(&true);
+        sink.println("post-finish info line should not panic");
+    }
+
+    #[test]
+    fn indicatif_sink_non_interactive_finished_bypasses_rate_limit() {
+        // Two rapid events: only the second is `finished`. The first
+        // should print (rate-limit anchor starts in the past), and the
+        // second should print despite being <1s later because finished
+        // forces a render. We can't intercept stderr; we assert that
+        // both events reach the translator and the call returns.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_inner = calls.clone();
+        let sink: IndicatifSink<bool> = IndicatifSink::new(0, false, move |finished| {
+            calls_inner.fetch_add(1, Ordering::SeqCst);
+            Some(ProgressUpdate {
+                position: 1,
+                length: None,
+                message: None,
+                finished: *finished,
+            })
+        });
+        sink.on_event(&false);
+        sink.on_event(&true);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn indicatif_sink_translator_returning_none_is_a_noop() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_inner = calls.clone();
+        let sink: IndicatifSink<u64> = IndicatifSink::new(0, false, move |_event| {
+            calls_inner.fetch_add(1, Ordering::SeqCst);
+            None
+        });
+        sink.on_event(&7);
+        sink.on_event(&42);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // No panic, no stderr churn — just translator invocation.
+    }
+
+    #[test]
+    fn tracing_sink_consumes_events_without_panic() {
+        let sink = TracingSink::new();
+        EventSink::<String>::on_event(&sink, &"hello".to_string());
+        EventSink::<u64>::on_event(&sink, &42u64);
+    }
+
+    #[test]
+    fn fan_out_can_mix_indicatif_and_tracing_sinks() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_inner = calls.clone();
+        let indicatif: Arc<dyn EventSink<u64>> = Arc::new(IndicatifSink::new(0, false, move |e| {
+            calls_inner.fetch_add(1, Ordering::SeqCst);
+            Some(ProgressUpdate {
+                position: *e,
+                length: None,
+                message: None,
+                finished: false,
+            })
+        }));
+        let tracing_sink: Arc<dyn EventSink<u64>> = Arc::new(TracingSink::new());
+        let fan = FanOut::<u64>::builder()
+            .with(indicatif)
+            .with(tracing_sink)
+            .build();
+
+        fan.on_event(&1);
+        fan.on_event(&2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fan.len(), 2);
     }
 }

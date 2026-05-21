@@ -19,11 +19,15 @@ logs and the canonical corpus are truth; indexes are derived, rebuildable views
 that must disclose fallback and Loctree scope safety.
 
 Supported sources:
+
 - Claude Code: `~/.claude/projects/*/*.jsonl`
 - Codex: `~/.codex/history.jsonl`
 - Gemini CLI: `~/.gemini/tmp/<hash>/chats/session-*.json`
-- Gemini Antigravity direct extract: `~/.gemini/antigravity/conversations/<uuid>.pb` or `~/.gemini/antigravity/brain/<uuid>/`
-- `loct-context-pack` (immutable structural-evidence packs from Loctree prism / polarize): `aicx ingest --source loct-context-pack <PACK_DIR>` writes into the parallel **Context Corpus** at `~/.aicx/context-corpus/`. See [`docs/CONTEXT_CORPUS.md`](./docs/CONTEXT_CORPUS.md).
+- Gemini Antigravity direct extract: `~/.gemini/antigravity/conversations/<uuid>.pb` or
+  `~/.gemini/antigravity/brain/<uuid>/`
+- `loct-context-pack` (immutable structural-evidence packs from Loctree prism / polarize):
+  `aicx ingest --source loct-context-pack <PACK_DIR>` writes into the parallel **Context Corpus** at
+  `~/.aicx/context-corpus/`. See [`docs/CONTEXT_CORPUS.md`](./docs/CONTEXT_CORPUS.md).
 
 ## Context Corpus
 
@@ -52,8 +56,7 @@ contract, retention path layout, and immutability filter behavior in
 Public install from GitHub Releases:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Loctree/aicx/main/install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.7.3 bash install.sh
+curl -fsSL https://raw.githubusercontent.com/Loctree/aicx/main/install.sh | AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.8.1 bash
 ```
 
 The installer downloads the matching release archive, verifies its adjacent
@@ -64,13 +67,36 @@ aicx --help
 aicx-mcp --version
 ```
 
+Direct release download with checksum and GPG verification:
+
+```bash
+version=0.7.4
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64) target=aarch64-apple-darwin ;;
+  Linux-x86_64) target=x86_64-unknown-linux-gnu ;;
+  *) echo "unsupported platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+esac
+
+asset="aicx-v${version}-${target}-slim-unsigned.tar.gz"
+base="https://github.com/Loctree/aicx/releases/download/v${version}"
+
+curl -fLO "${base}/${asset}"
+curl -fLO "${base}/${asset}.sha256"
+curl -fLO "${base}/${asset}.sig"
+
+shasum -a 256 -c "${asset}.sha256"
+gpg --verify "${asset}.sig" "${asset}"
+tar -xzf "${asset}"
+```
+
 From a local checkout:
 
 ```bash
 ./install.sh
 ```
 
-`install.sh` installs `aicx` + `aicx-mcp` from the current checkout and configures Claude Code, Codex, and Gemini when their MCP settings directories already exist.
+`install.sh` installs `aicx` + `aicx-mcp` from the current checkout and configures Claude Code, Codex, and Gemini when
+their MCP settings directories already exist.
 
 From a release bundle:
 
@@ -78,7 +104,8 @@ From a release bundle:
 bash install.sh
 ```
 
-Bundle install copies prebuilt `aicx` + `aicx-mcp` into `~/.local/bin`, removes stale user-local / cargo-installed copies, then refreshes MCP configuration.
+Bundle install copies prebuilt `aicx` + `aicx-mcp` into `~/.local/bin`, removes stale user-local / cargo-installed
+copies, then refreshes MCP configuration.
 No Rust toolchain and no local memex compilation are required on the target machine.
 
 From an existing checkout, you can force the same release path:
@@ -114,7 +141,8 @@ cargo install --path . --locked --bin aicx --bin aicx-mcp
 ./install.sh --skip-install
 ```
 
-`install.sh` prefers a colocated release bundle first, then a local checkout, and otherwise falls back to the published install path.
+`install.sh` prefers a colocated release bundle first, then a local checkout, and otherwise falls back to the published
+install path.
 
 Maintainer-local signed bundle path on macOS:
 
@@ -123,20 +151,36 @@ make release-bundle KEYS=~/.keys
 make release-bundle KEYS=~/.keys NOTARY_PROFILE=vc-notary
 ```
 
+Store a local Apple notary profile from operator-owned credentials:
+
+```bash
+set -a
+source "$HOME/.keys/.notary.env"
+set +a
+
+xcrun notarytool store-credentials "${NOTARY_PROFILE:-vc-notary}" \
+  --apple-id "$NOTARY_APPLE_ID" \
+  --team-id "$NOTARY_TEAM_ID" \
+  --password "$NOTARY_PASSWORD"
+```
+
 That release path cleans `target/<triple>` after the bundle is safely written so
 the self-hosted box does not keep hauling old release artifacts. Use `CLEAN=0`
 when you explicitly want to keep the local build outputs.
 
 Native embedder profiles:
+
 - `base` — F2LLM-v2 0.6B `Q4_K_M` GGUF, 1024 dims, about 397 MB
 - `dev` — F2LLM-v2 1.7B `Q4_K_M` GGUF, 2048 dims, about 1.1 GB
 - `premium` — F2LLM-v2 1.7B `Q6_K` GGUF, 2048 dims, about 1.4 GB
 - Picker during install: `bash install.sh --pick-embedder`
 
 Config truth:
+
 - AICX native embedder preferences live in `~/.aicx/embedder.toml` or `AICX_EMBEDDER_CONFIG`.
 - The picker writes `backend = "gguf"`, `profile`, `repo`, and exact `filename`; model hydration is explicit.
-- Roost/rust-memex retrieval config remains separate, usually `~/.rmcp-servers/rust-memex/config.toml` or `RUST_MEMEX_CONFIG`.
+- Roost/rust-memex retrieval config remains separate, usually `~/.rmcp-servers/rust-memex/config.toml` or
+  `RUST_MEMEX_CONFIG`.
 - Current public release bundles stay slim; they do not auto-bundle model weights.
 
 ## Quickstart
@@ -153,9 +197,9 @@ callers do not need to import command-line internals from `main.rs`.
 ```rust
 use aicx::prelude::*;
 
-let client = Aicx::from_env()?;
-let status = client.index_status(None)?;
-let chunks = client.list_chunks()?;
+let client = Aicx::from_env() ?;
+let status = client.index_status(None) ?;
+let chunks = client.list_chunks() ?;
 ```
 
 For embedding AICX into another service, construct a handle with an explicit
@@ -165,7 +209,7 @@ store root and write timeline entries directly:
 use aicx::prelude::*;
 
 let client = Aicx::with_store_root("/tmp/aicx");
-let summary = client.store_entries(&entries, &StoreOptions::default())?;
+let summary = client.store_entries( & entries, & StoreOptions::default ()) ?;
 ```
 
 ### Layer 1 — build the canonical corpus
@@ -174,6 +218,7 @@ Extract the last 4 hours into `~/.aicx/`. Extractors are quiet on stdout by defa
 
 ```bash
 aicx all -H 4                      # daily driver: watermark-tracked, skips already-processed entries
+aicx all -H 0                      # all time: no lookback cutoff
 aicx store -p MyProject -H 720     # store-first: watermark-tracked refresh into the canonical corpus
 aicx store -p MyProject -H 720 --full-rescan  # explicit backfill / recovery pass
 ```
@@ -192,6 +237,7 @@ aicx read store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.
 ```
 
 Surface contract:
+
 - `aicx refs` is the active CLI inventory command for canonical chunks.
 - `aicx read` is the direct re-entry command for paths returned by `refs`,
   `search`, dashboard chunk APIs, or MCP retrieval tools.
@@ -231,21 +277,26 @@ aicx all -H 4 --emit json | jq '.resolved_store_buckets'
 ## What Gets Written Where
 
 ### Layer 1 — canonical store (extractors, `store`)
+
 - `~/.aicx/store/<organization>/<repository>/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
 - `~/.aicx/non-repository-contexts/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
 - `~/.aicx/index.json`
 
 ### Native embedder config
+
 - `~/.aicx/embedder.toml` — local GGUF backend/profile/repo/filename/path preference
 - HuggingFace cache snapshots under `~/.cache/huggingface/hub/`
 
 Framework-owned repo-local context artifacts (not written by the `aicx` CLI itself):
+
 - `.ai-context/share/artifacts/SUMMARY.md`
 - `.ai-context/share/artifacts/TIMELINE.md`
 - `.ai-context/share/artifacts/TRIAGE.md`
 
 Store ignore contract:
-- Optional `~/.aicx/.aicxignore` excludes matching canonical chunk paths from steer indexing and downstream retrieval materialization.
+
+- Optional `~/.aicx/.aicxignore` excludes matching canonical chunk paths from steer indexing and downstream retrieval
+  materialization.
 - Patterns are matched relative to `~/.aicx/` using glob syntax, for example:
 
 ```gitignore
@@ -301,9 +352,12 @@ cat ~/.aicx/embedder.toml
 ```
 
 Heavy retrieval lives outside this CLI surface:
+
 - Use Roost/rust-memex for advanced retrieval pipelines, provider routing, and operator-scale indexing.
-- Keep Roost/rust-memex settings in its own config plane (`RUST_MEMEX_CONFIG`, usually `~/.rmcp-servers/rust-memex/config.toml`).
-- Do not put the heavy retrieval provider config into `~/.aicx/embedder.toml`; that file governs only AICX local embeddings.
+- Keep Roost/rust-memex settings in its own config plane (`RUST_MEMEX_CONFIG`, usually
+  `~/.rmcp-servers/rust-memex/config.toml`).
+- Do not put the heavy retrieval provider config into `~/.aicx/embedder.toml`; that file governs only AICX local
+  embeddings.
 
 Example Roost/rust-memex provider config:
 
@@ -361,21 +415,23 @@ The `tailscale` CORS preset accepts both tailnet IP origins and MagicDNS browser
 
 The intent engine classifies stored chunks into 9 semantic types with typed link relations:
 
-| Type | What it captures | Initial state |
-|------|-----------------|---------------|
-| `intent` | User-expressed goal or proposal | proposed |
-| `why` | Motivation behind a decision | active |
-| `argue` | Multi-voice disagreement or trade-off | active |
-| `decision` | Crystallized choice from discussion | active |
-| `assumption` | Hypothesis treated as true until verified | proposed |
-| `outcome` | Broad result of an action | done |
-| `result` | Concrete measurable data point | done |
-| `question` | Open knowledge gap | proposed |
-| `insight` | Reframe backed by research evidence | active |
+| Type         | What it captures                          | Initial state |
+|--------------|-------------------------------------------|---------------|
+| `intent`     | User-expressed goal or proposal           | proposed      |
+| `why`        | Motivation behind a decision              | active        |
+| `argue`      | Multi-voice disagreement or trade-off     | active        |
+| `decision`   | Crystallized choice from discussion       | active        |
+| `assumption` | Hypothesis treated as true until verified | proposed      |
+| `outcome`    | Broad result of an action                 | done          |
+| `result`     | Concrete measurable data point            | done          |
+| `question`   | Open knowledge gap                        | proposed      |
+| `insight`    | Reframe backed by research evidence       | active        |
 
 Link types: `derived_from`, `supersedes`, `verifies`, `contradicts`, `supports`, `results_in`, `answers`, `links_to`.
 
-State transitions: Proposed → Active → Done/Superseded/Contradicted. Session-level post-processing detects unresolved intents (no outcome after 7 days), supersedes chains (newer entry on same topic), contradicted assumptions (result + failure signal), and insight sourcing (DerivedFrom links to research chunks).
+State transitions: Proposed → Active → Done/Superseded/Contradicted. Session-level post-processing detects unresolved
+intents (no outcome after 7 days), supersedes chains (newer entry on same topic), contradicted assumptions (result +
+failure signal), and insight sourcing (DerivedFrom links to research chunks).
 
 ```bash
 aicx migrate
@@ -395,7 +451,8 @@ aicx migrate-intent-schema --project MyProject --dry-run
 
 ## Notes
 
-- Secrets are redacted by default on corpus-building commands (`claude`, `codex`, `all`, `extract`, `store`). Disable only if you know what you’re doing: `--no-redact-secrets`.
+- Secrets are redacted by default on corpus-building commands (`claude`, `codex`, `all`, `extract`, `store`). Disable
+  only if you know what you’re doing: `--no-redact-secrets`.
 - Framework integration expects `aicx` or `aicx-mcp` in `PATH`.
 - Native embedding models are never downloaded silently by package install or MCP startup.
 

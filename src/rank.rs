@@ -213,6 +213,14 @@ enum LineClass {
     Neutral,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpeakerRole {
+    Operator,
+    Assistant,
+    Tool,
+    Unknown,
+}
+
 /// Score result for a single chunk file.
 #[derive(Debug, Clone)]
 pub struct ChunkScore {
@@ -262,11 +270,13 @@ struct CompactSearchItem {
     score: u8,
     label: String,
     project: String,
+    kind: String,
     agent: String,
     date: String,
     timestamp: Option<String>,
     frame_kind: Option<String>,
     session: String,
+    session_id: String,
     cwd: String,
     matches: Vec<String>,
     path: String,
@@ -295,17 +305,33 @@ pub fn render_search_json(
     results: &[FuzzyResult],
     scanned: usize,
 ) -> serde_json::Result<String> {
+    render_search_json_with_oracle(
+        root,
+        results,
+        scanned,
+        search_oracle_status(root, results, scanned),
+    )
+}
+
+pub fn render_search_json_with_oracle(
+    _root: &Path,
+    results: &[FuzzyResult],
+    scanned: usize,
+    oracle_status: OracleStatus,
+) -> serde_json::Result<String> {
     let items = results
         .iter()
         .map(|result| CompactSearchItem {
             score: result.score,
             label: result.label.clone(),
             project: result.project.clone(),
+            kind: result.kind.clone(),
             agent: result.agent.clone(),
             date: result.date.clone(),
             timestamp: result.timestamp.clone(),
             frame_kind: result.frame_kind.clone(),
             session: result.session_id.clone().unwrap_or_else(|| "-".to_string()),
+            session_id: result.session_id.clone().unwrap_or_else(|| "-".to_string()),
             cwd: result.cwd.clone().unwrap_or_else(|| "-".to_string()),
             matches: display_search_matches(result),
             path: result.path.clone(),
@@ -313,7 +339,7 @@ pub fn render_search_json(
         .collect();
 
     serde_json::to_string(&CompactSearchResponse {
-        oracle_status: search_oracle_status(root, results, scanned),
+        oracle_status,
         results: results.len(),
         scanned,
         items,
@@ -752,16 +778,8 @@ fn fuzzy_search_store_one(
         }
         matched_lines.truncate(5);
 
-        let chunk_score = score_chunk_content(&content);
-        let match_ratio = if query_terms.is_empty() {
-            1.0
-        } else {
-            matched_terms as f32 / query_terms.len() as f32
-        };
-        let final_score = ((chunk_score.score as f32 * 5.0 + 50.0 * match_ratio) as u8).min(100);
-
         let sidecar_path = stored_file.path.with_extension("meta.json");
-        let (session_id, cwd, timestamp, frame_kind) = if sidecar_path.exists() {
+        let (session_id, cwd, timestamp, frame_kind, speaker_hint) = if sidecar_path.exists() {
             sanitize::read_to_string_validated(&sidecar_path)
                 .ok()
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -783,12 +801,29 @@ fn fuzzy_search_store_one(
                             .and_then(|s| s.as_str())
                             .and_then(FrameKind::parse)
                             .map(|kind| kind.to_string()),
+                        v.get("speaker_hint")
+                            .or_else(|| v.get("speaker"))
+                            .or_else(|| v.get("role"))
+                            .and_then(|s| s.as_str())
+                            .map(String::from),
                     )
                 })
-                .unwrap_or((None, None, None, None))
+                .unwrap_or((None, None, None, None, None))
         } else {
-            (None, None, None, None)
+            (None, None, None, None, None)
         };
+
+        let chunk_score = score_chunk_content_with_context(
+            &content,
+            frame_kind.as_deref(),
+            speaker_hint.as_deref(),
+        );
+        let match_ratio = if query_terms.is_empty() {
+            1.0
+        } else {
+            matched_terms as f32 / query_terms.len() as f32
+        };
+        let final_score = combine_match_quality_score(match_ratio, chunk_score.score);
 
         if let Some(expected) = frame_kind_filter
             && frame_kind.as_deref() != Some(expected.as_str())
@@ -848,7 +883,7 @@ fn fuzzy_search_store_one(
 
     let mut best_per_session: HashMap<String, usize> = HashMap::new();
     for (idx, result) in results.iter().enumerate() {
-        let session_key = extract_session_key(&result.file);
+        let session_key = session_key_for_result(result);
         best_per_session
             .entry(session_key)
             .and_modify(|prev| {
@@ -896,13 +931,34 @@ fn fuzzy_search_store_one(
 
 fn extract_session_key(filename: &str) -> String {
     let stem = filename.strip_suffix(".md").unwrap_or(filename);
-    if let Some(pos) = stem.rfind('_') {
-        let suffix = &stem[pos + 1..];
-        if suffix.len() <= 3 && suffix.chars().all(|c| c.is_ascii_digit()) {
-            return stem[..pos].to_string();
-        }
+    if let Some(key) = canonical_session_key(stem) {
+        return key;
     }
+    tracing::warn!(
+        target: "aicx::rank",
+        filename = %filename,
+        "legacy_non_canonical_session_filename"
+    );
     stem.to_string()
+}
+
+fn session_key_for_result(result: &FuzzyResult) -> String {
+    let stem = result.file.strip_suffix(".md").unwrap_or(&result.file);
+    if let Some(key) = canonical_session_key(stem) {
+        return key;
+    }
+    let legacy_key = extract_session_key(&result.file);
+    format!("legacy:{}:{legacy_key}", result.path)
+}
+
+fn canonical_session_key(stem: &str) -> Option<String> {
+    let pos = stem.rfind('_')?;
+    let suffix = &stem[pos + 1..];
+    if suffix.len() <= 3 && suffix.chars().all(|c| c.is_ascii_digit()) {
+        Some(stem[..pos].to_string())
+    } else {
+        None
+    }
 }
 
 /// Score a chunk file's content quality.
@@ -912,9 +968,18 @@ fn extract_session_key(filename: &str) -> String {
 /// - Presence of high-value patterns (decisions, bugs, outcomes)
 /// - Penalty for boilerplate-heavy content
 pub fn score_chunk_content(content: &str) -> ChunkScore {
+    score_chunk_content_with_context(content, None, None)
+}
+
+pub fn score_chunk_content_with_context(
+    content: &str,
+    frame_kind: Option<&str>,
+    speaker_hint: Option<&str>,
+) -> ChunkScore {
     let mut signal = 0usize;
     let mut noise = 0usize;
     let mut total = 0usize;
+    let mut weighted_signal = 0.0f32;
     let mut in_skill_boilerplate = false;
     let mut in_code_block = false;
     let mut consecutive_noise = 0usize;
@@ -962,10 +1027,15 @@ pub fn score_chunk_content(content: &str) -> ChunkScore {
 
         match class {
             LineClass::Signal => {
-                signal += 1;
                 consecutive_noise = 0;
+                let role = speaker_role(frame_kind, speaker_hint, trimmed);
+                let weight = signal_weight_for_role(&lower, role);
+                weighted_signal += weight;
+                if weight >= 0.5 {
+                    signal += 1;
+                }
                 // High-value markers get extra weight
-                if is_high_value_signal(&lower) {
+                if is_high_value_signal(&lower) && high_value_bonus_allowed(role) {
                     has_high_value = true;
                 }
             }
@@ -995,7 +1065,7 @@ pub fn score_chunk_content(content: &str) -> ChunkScore {
         };
     }
 
-    let density = signal as f32 / total as f32;
+    let density = weighted_signal / total as f32;
     let noise_ratio = noise as f32 / total as f32;
 
     // Base score from signal density (0–6 points)
@@ -1099,6 +1169,11 @@ fn classify_line(line: &str, in_boilerplate: bool) -> LineClass {
     LineClass::Neutral
 }
 
+fn combine_match_quality_score(match_ratio: f32, quality_score: u8) -> u8 {
+    let quality_weight = if match_ratio >= 0.5 { 4.0 } else { 2.0 };
+    ((60.0 * match_ratio + quality_score as f32 * quality_weight) as u8).min(100)
+}
+
 fn is_noise_line(lower: &str) -> bool {
     for prefix in NOISE_PREFIXES {
         if lower.starts_with(prefix) {
@@ -1115,7 +1190,7 @@ fn is_noise_line(lower: &str) -> bool {
 
 fn is_signal_line(lower: &str) -> bool {
     for substr in SIGNAL_CONTAINS {
-        if lower.contains(substr) {
+        if signal_contains_matches(lower, substr) {
             return true;
         }
     }
@@ -1125,6 +1200,102 @@ fn is_signal_line(lower: &str) -> bool {
         }
     }
     false
+}
+
+fn signal_contains_matches(lower: &str, needle: &str) -> bool {
+    match needle {
+        "deploy" | "release" => contains_word(lower, needle),
+        _ => lower.contains(needle),
+    }
+}
+
+fn speaker_role(frame_kind: Option<&str>, speaker_hint: Option<&str>, line: &str) -> SpeakerRole {
+    if matches!(frame_kind, Some("user_msg")) {
+        return SpeakerRole::Operator;
+    }
+    if matches!(
+        frame_kind,
+        Some("internal_thought" | "tool_call" | "tool_result")
+    ) {
+        return SpeakerRole::Tool;
+    }
+    if matches!(frame_kind, Some("agent_reply")) {
+        return SpeakerRole::Assistant;
+    }
+
+    let hint = speaker_hint.or_else(|| conversation_speaker(line));
+    match hint.map(|hint| hint.trim().to_ascii_lowercase()) {
+        Some(hint) if matches!(hint.as_str(), "user" | "human" | "operator" | "monika") => {
+            SpeakerRole::Operator
+        }
+        Some(hint)
+            if matches!(
+                hint.as_str(),
+                "assistant" | "agent" | "claude" | "codex" | "gemini" | "junie"
+            ) =>
+        {
+            SpeakerRole::Assistant
+        }
+        Some(hint) if matches!(hint.as_str(), "tool" | "system" | "internal_thought") => {
+            SpeakerRole::Tool
+        }
+        _ => SpeakerRole::Unknown,
+    }
+}
+
+fn conversation_speaker(line: &str) -> Option<&str> {
+    let (_, rest) = line.split_once("] ")?;
+    rest.split_once(':').map(|(speaker, _)| speaker.trim())
+}
+
+fn signal_weight_for_role(lower: &str, role: SpeakerRole) -> f32 {
+    match role {
+        SpeakerRole::Operator | SpeakerRole::Unknown => 1.0,
+        SpeakerRole::Tool => 0.0,
+        SpeakerRole::Assistant if is_assistant_scaffolding_signal(lower) => 0.25,
+        SpeakerRole::Assistant => 0.75,
+    }
+}
+
+fn is_assistant_scaffolding_signal(lower: &str) -> bool {
+    lower.contains("todo:")
+        || lower.contains("- [ ]")
+        || lower.contains("- [x]")
+        || lower.contains("decision:")
+        || lower.contains("[decision]")
+        || lower.contains("plan:")
+        || lower.contains("outcome:")
+        || lower.contains("[skill_outcome]")
+        || lower.contains("p0=")
+        || lower.contains("p1=")
+        || lower.contains("p2=")
+        || lower.contains("score:")
+        || lower.contains("/100")
+        || contains_word(lower, "deploy")
+        || contains_word(lower, "release")
+}
+
+fn high_value_bonus_allowed(role: SpeakerRole) -> bool {
+    !matches!(role, SpeakerRole::Assistant | SpeakerRole::Tool)
+}
+
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    let mut start = 0usize;
+    while let Some(offset) = haystack[start..].find(needle) {
+        let pos = start + offset;
+        let end = pos + needle.len();
+        let before = haystack[..pos].chars().next_back();
+        let after = haystack[end..].chars().next();
+        if before.is_none_or(|ch| !is_word_char(ch)) && after.is_none_or(|ch| !is_word_char(ch)) {
+            return true;
+        }
+        start = end;
+    }
+    false
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
 }
 
 /// Lines that are generic preamble/boilerplate — should not contribute to search matching.
@@ -1196,8 +1367,8 @@ fn is_high_value_signal(lower: &str) -> bool {
         || lower.contains("p1=")
         || lower.contains("p2=")
         || lower.contains("/100")
-        || lower.contains("deploy")
-        || lower.contains("release")
+        || contains_word(lower, "deploy")
+        || contains_word(lower, "release")
         || lower.contains("breaking change")
 }
 
@@ -1354,16 +1525,88 @@ Some boilerplate text.
     fn test_high_value_signals_boost() {
         let content = r#"[project: test | agent: claude | date: 2026-03-14]
 
-[14:30:00] assistant: Decision: rewrite auth middleware for compliance
-[14:31:00] assistant: Outcome: P0=0, P1=0, P2=0, Score: 100/100
-[14:32:00] assistant: Deploy to vistacare.ai complete
-[14:33:00] assistant: Release v0.8.16 tagged
+    [14:30:00] user: Decision: rewrite auth middleware for compliance
+    [14:31:00] user: Outcome: P0=0, P1=0, P2=0, Score: 100/100
+    [14:32:00] user: Deploy to vistacare.ai complete
+    [14:33:00] user: Release v0.8.16 tagged
 "#;
         let score = score_chunk_content(content);
         assert!(
             score.score >= 8,
             "High-value signals should score >=8, got {}",
             score.score
+        );
+    }
+
+    #[test]
+    fn assistant_todo_scaffolding_is_discounted() {
+        let assistant = r#"[project: test | agent: codex | date: 2026-05-20]
+
+    [14:30:00] assistant: TODO: add tests
+    [14:31:00] assistant: Decision: run cargo test
+    [14:32:00] assistant: Outcome: P0=0, P1=0, P2=0, Score: 100/100
+"#;
+        let user = r#"[project: test | agent: codex | date: 2026-05-20]
+
+    [14:30:00] user: TODO: fix search ranking
+    [14:31:00] user: Decision: rank user-authored TODO above agent checklist
+    [14:32:00] user: Release is blocked until ranking is fixed
+"#;
+
+        let assistant_score = score_chunk_content(assistant);
+        let user_score = score_chunk_content(user);
+
+        assert!(user_score.score > assistant_score.score);
+        assert!(assistant_score.score <= 4, "got {}", assistant_score.score);
+    }
+
+    #[test]
+    fn deploy_and_release_require_word_boundaries() {
+        assert!(is_high_value_signal("release v0.8.1"));
+        assert!(is_high_value_signal("deploy after tests"));
+        assert!(!is_high_value_signal("predeployment checklist"));
+        assert!(!is_high_value_signal("releasedocs draft"));
+    }
+
+    #[test]
+    fn partial_match_high_signal_does_not_beat_full_lexical_match() {
+        let partial_high_signal = combine_match_quality_score(1.0 / 3.0, 10);
+        let full_low_signal = combine_match_quality_score(1.0, 0);
+        assert!(full_low_signal > partial_high_signal);
+    }
+
+    #[test]
+    fn extract_session_key_strips_canonical_suffix() {
+        assert_eq!(
+            extract_session_key("2026_0405_codex_sess1_001.md"),
+            "2026_0405_codex_sess1"
+        );
+    }
+
+    #[test]
+    fn legacy_session_key_for_result_uses_path_to_avoid_global_collision() {
+        let result_a = FuzzyResult {
+            file: "chunk.md".to_string(),
+            path: "/tmp/a/chunk.md".to_string(),
+            project: "p".to_string(),
+            kind: "conversations".to_string(),
+            frame_kind: None,
+            agent: "codex".to_string(),
+            date: "2026-05-20".to_string(),
+            timestamp: None,
+            score: 1,
+            label: "LOW".to_string(),
+            density: 0.0,
+            matched_lines: Vec::new(),
+            session_id: None,
+            cwd: None,
+        };
+        let mut result_b = result_a.clone();
+        result_b.path = "/tmp/b/chunk.md".to_string();
+
+        assert_ne!(
+            session_key_for_result(&result_a),
+            session_key_for_result(&result_b)
         );
     }
 
@@ -1434,9 +1677,11 @@ Some boilerplate text.
         assert_eq!(payload["items"][0]["score"], 88);
         assert_eq!(payload["items"][0]["label"], "HIGH");
         assert_eq!(payload["items"][0]["project"], "VetCoders/ai-contexters");
+        assert_eq!(payload["items"][0]["kind"], "reports");
         assert_eq!(payload["items"][0]["agent"], "codex");
         assert_eq!(payload["items"][0]["date"], "2026-03-31");
         assert_eq!(payload["items"][0]["session"], "sess-123");
+        assert_eq!(payload["items"][0]["session_id"], "sess-123");
         assert_eq!(payload["items"][0]["cwd"], "/repo");
         assert_eq!(payload["items"][0]["path"], "/tmp/chunk.md");
         assert_eq!(payload["items"][0]["matches"].as_array().unwrap().len(), 2);

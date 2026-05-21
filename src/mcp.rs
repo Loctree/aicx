@@ -14,16 +14,267 @@ use rmcp::{
     model::*, tool, tool_router,
 };
 use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    error::Error,
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
+use crate::api;
+use crate::auth::{self, AuthConfig};
 use crate::intents::{self, IntentKind, IntentsConfig};
 use crate::oracle::OracleStatus;
 use crate::rank;
 use crate::store;
-use crate::timeline::FrameKind;
+use crate::timeline::{FrameKind, Kind};
+
+use rmcp::transport::streamable_http_server::session::{
+    RestoreOutcome, ServerSseMessage, SessionId, SessionManager,
+    local::{LocalSessionManager, LocalSessionManagerError, SessionConfig, SessionTransport},
+};
 
 // ============================================================================
 // Tool parameter & result types
 // ============================================================================
+
+const MCP_SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
+const MCP_SESSION_MAX_SESSIONS: usize = 1000;
+const MCP_SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// D-6: once the embedder fails to load (model not hydrated, cloud creds
+/// missing, ...) the MCP server short-circuits subsequent semantic search
+/// requests for this long so a flapping endpoint cannot retry-storm the
+/// embedder. 5 minutes balances "recover quickly when the operator fixes
+/// the config" against "stop hammering the same broken path".
+const MCP_EMBEDDER_NEGATIVE_TTL: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Debug)]
+struct AicxSessionManager {
+    inner: LocalSessionManager,
+    idle_ttl: Duration,
+    max_sessions: usize,
+    last_seen: tokio::sync::RwLock<HashMap<SessionId, Instant>>,
+}
+
+#[derive(Debug)]
+enum AicxSessionManagerError {
+    Inner(LocalSessionManagerError),
+    SessionLimitExceeded(usize),
+}
+
+impl fmt::Display for AicxSessionManagerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inner(err) => write!(f, "{err}"),
+            Self::SessionLimitExceeded(max) => {
+                write!(f, "MCP session limit exceeded ({max} active sessions)")
+            }
+        }
+    }
+}
+
+impl Error for AicxSessionManagerError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Inner(err) => Some(err),
+            Self::SessionLimitExceeded(_) => None,
+        }
+    }
+}
+
+impl From<LocalSessionManagerError> for AicxSessionManagerError {
+    fn from(err: LocalSessionManagerError) -> Self {
+        Self::Inner(err)
+    }
+}
+
+impl AicxSessionManager {
+    fn new(idle_ttl: Duration, max_sessions: usize) -> Self {
+        let mut session_config = SessionConfig::default();
+        session_config.keep_alive = Some(idle_ttl);
+        let mut inner = LocalSessionManager::default();
+        inner.session_config = session_config;
+        Self {
+            // rmcp exposes idle timeout through SessionConfig::keep_alive, but
+            // does not expose a max-session knob; this wrapper adds that cap.
+            inner,
+            idle_ttl,
+            max_sessions,
+            last_seen: tokio::sync::RwLock::new(HashMap::new()),
+        }
+    }
+
+    async fn session_count(&self) -> usize {
+        self.inner.sessions.read().await.len()
+    }
+
+    async fn touch_session(&self, id: &SessionId) {
+        self.last_seen
+            .write()
+            .await
+            .insert(id.clone(), Instant::now());
+    }
+
+    async fn sweep_idle_sessions(&self) -> Result<usize, AicxSessionManagerError> {
+        self.sweep_idle_sessions_at(Instant::now()).await
+    }
+
+    async fn sweep_idle_sessions_at(&self, now: Instant) -> Result<usize, AicxSessionManagerError> {
+        let expired = {
+            let last_seen = self.last_seen.read().await;
+            last_seen
+                .iter()
+                .filter_map(|(id, last)| {
+                    let idle_for = now.checked_duration_since(*last).unwrap_or_default();
+                    (idle_for >= self.idle_ttl).then(|| id.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut closed = 0usize;
+        for id in expired {
+            let still_expired = {
+                let last_seen = self.last_seen.read().await;
+                last_seen.get(&id).is_some_and(|last| {
+                    now.checked_duration_since(*last).unwrap_or_default() >= self.idle_ttl
+                })
+            };
+            if still_expired {
+                self.close_session(&id).await?;
+                closed += 1;
+            }
+        }
+        Ok(closed)
+    }
+
+    async fn ensure_session_capacity(&self) -> Result<(), AicxSessionManagerError> {
+        self.sweep_idle_sessions().await?;
+        let active = self.session_count().await;
+        if active >= self.max_sessions {
+            return Err(AicxSessionManagerError::SessionLimitExceeded(
+                self.max_sessions,
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl SessionManager for AicxSessionManager {
+    type Error = AicxSessionManagerError;
+    type Transport = SessionTransport;
+
+    async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
+        self.ensure_session_capacity().await?;
+        let (id, transport) = self.inner.create_session().await?;
+        self.touch_session(&id).await;
+        Ok((id, transport))
+    }
+
+    async fn initialize_session(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<ServerJsonRpcMessage, Self::Error> {
+        let response = self.inner.initialize_session(id, message).await?;
+        self.touch_session(id).await;
+        Ok(response)
+    }
+
+    async fn close_session(&self, id: &SessionId) -> Result<(), Self::Error> {
+        self.last_seen.write().await.remove(id);
+        self.inner.close_session(id).await?;
+        Ok(())
+    }
+
+    async fn has_session(&self, id: &SessionId) -> Result<bool, Self::Error> {
+        let exists = self.inner.has_session(id).await?;
+        if exists {
+            self.touch_session(id).await;
+        } else {
+            self.last_seen.write().await.remove(id);
+        }
+        Ok(exists)
+    }
+
+    async fn create_stream(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<impl futures::Stream<Item = ServerSseMessage> + Send + 'static, Self::Error> {
+        let stream = self.inner.create_stream(id, message).await?;
+        self.touch_session(id).await;
+        Ok(stream)
+    }
+
+    async fn accept_message(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<(), Self::Error> {
+        self.inner.accept_message(id, message).await?;
+        self.touch_session(id).await;
+        Ok(())
+    }
+
+    async fn create_standalone_stream(
+        &self,
+        id: &SessionId,
+    ) -> Result<impl futures::Stream<Item = ServerSseMessage> + Send + 'static, Self::Error> {
+        let stream = self.inner.create_standalone_stream(id).await?;
+        self.touch_session(id).await;
+        Ok(stream)
+    }
+
+    async fn resume(
+        &self,
+        id: &SessionId,
+        last_event_id: String,
+    ) -> Result<impl futures::Stream<Item = ServerSseMessage> + Send + 'static, Self::Error> {
+        let stream = self.inner.resume(id, last_event_id).await?;
+        self.touch_session(id).await;
+        Ok(stream)
+    }
+
+    async fn restore_session(
+        &self,
+        id: SessionId,
+    ) -> Result<RestoreOutcome<Self::Transport>, Self::Error> {
+        self.ensure_session_capacity().await?;
+        let outcome = self.inner.restore_session(id.clone()).await?;
+        match &outcome {
+            RestoreOutcome::Restored(_) | RestoreOutcome::AlreadyPresent => {
+                self.touch_session(&id).await;
+            }
+            RestoreOutcome::NotSupported => {
+                self.last_seen.write().await.remove(&id);
+            }
+            _ => {}
+        }
+        Ok(outcome)
+    }
+}
+
+fn configured_mcp_session_manager() -> Arc<AicxSessionManager> {
+    Arc::new(AicxSessionManager::new(
+        MCP_SESSION_IDLE_TTL,
+        MCP_SESSION_MAX_SESSIONS,
+    ))
+}
+
+fn spawn_mcp_session_cleanup(manager: Arc<AicxSessionManager>, interval: Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if let Err(err) = manager.sweep_idle_sessions().await {
+                tracing::warn!("MCP session cleanup failed: {err}");
+            }
+        }
+    });
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum McpTransport {
@@ -60,6 +311,8 @@ pub struct SearchParams {
     pub sort: Option<String>,
     /// Optional frame/channel filter: user_msg, agent_reply, internal_thought, tool_call
     pub frame_kind: Option<FrameKind>,
+    /// Optional canonical corpus kind filter: conversations, plans, reports, other
+    pub kind: Option<String>,
     /// Return only metadata without full snippet content
     #[serde(default = "default_true")]
     pub slim: bool,
@@ -111,7 +364,7 @@ const MAX_SCORE_FILTER: u8 = 100;
 pub struct RankParams {
     /// Project name (required)
     pub project: String,
-    /// Hours to look back (default: 72)
+    /// Hours to look back (default: 72, 0 = all time)
     #[serde(default = "default_rank_hours")]
     pub hours: u64,
     /// Only show chunks scoring >= 5
@@ -240,6 +493,15 @@ fn default_intents_emit() -> String {
     "markdown".to_string()
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct IndexStatusParams {
+    /// Optional project bucket filter. Omit (or pass null) to query the
+    /// cross-project `_all` bucket. Matches the same canonical lowercase
+    /// slug rules the index writer uses on disk.
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct RankResponse {
     project: String,
@@ -294,10 +556,23 @@ fn background_refresh_args(hours: u64, project: Option<&str>) -> Vec<String> {
 // MCP Server
 // ============================================================================
 
+fn validate_string_len(val: Option<&str>, max: usize, field: &str) -> Result<(), McpError> {
+    if let Some(v) = val
+        && v.len() > max
+    {
+        return Err(McpError::invalid_params(
+            format!("Field '{}' exceeds max length {} bytes", field, max),
+            None,
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct AicxMcpServer {
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
+    embedder_unavailable_until: Arc<std::sync::Mutex<Option<Instant>>>,
 }
 
 impl Default for AicxMcpServer {
@@ -311,7 +586,30 @@ impl AicxMcpServer {
     pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            embedder_unavailable_until: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// D-6: returns remaining negative-cache TTL when the embedder was
+    /// flagged unavailable. Side effect: lazily clears the entry when it
+    /// has expired so a subsequent retry hits the embedder again.
+    fn embedder_negative_cache_remaining(&self, now: Instant) -> Option<Duration> {
+        let mut guard = self.embedder_unavailable_until.lock().unwrap();
+        match *guard {
+            Some(until) if until > now => Some(until.duration_since(now)),
+            Some(_) => {
+                *guard = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// D-6: arm the negative cache for `ttl` from `now`. Called after a
+    /// real embedder failure so subsequent requests fail-fast.
+    fn mark_embedder_unavailable(&self, now: Instant, ttl: Duration) {
+        let mut guard = self.embedder_unavailable_until.lock().unwrap();
+        *guard = Some(now + ttl);
     }
 
     #[tool(
@@ -322,6 +620,49 @@ impl AicxMcpServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
+        // F-P3-18: audit log records tool-name entry only. NEVER include
+        // arguments (query/project/agent/...) — they may carry PII or
+        // operator secrets and the audit log is intended to be safe to
+        // archive long-term.
+        tracing::info!(target: "mcp.audit", tool_name = "aicx_search", "mcp tool invoked");
+
+        // D-6: short-circuit while the embedder is in the negative-cache
+        // window. Returns a structured error the MCP caller can act on
+        // without further round-trips to the embedder.
+        let now = Instant::now();
+        if let Some(remaining) = self.embedder_negative_cache_remaining(now) {
+            let payload = serde_json::json!({
+                "ok": false,
+                "error": "semantic_search_unavailable",
+                "kind": "embedder_unavailable",
+                "reason": format!(
+                    "embedder negative cache active for another {}s — last embed attempt failed",
+                    remaining.as_secs()
+                ),
+                "recommendation": "run `aicx doctor` to inspect embedder health; the cache clears automatically after the TTL elapses",
+            });
+            return Err(McpError::invalid_params(
+                format!(
+                    "semantic search unavailable [embedder_unavailable]: negative cache active for {}s",
+                    remaining.as_secs()
+                ),
+                Some(payload),
+            ));
+        }
+
+        validate_string_len(Some(params.query.as_str()), 4096, "query")?;
+        validate_string_len(params.project.as_deref(), 4096, "project")?;
+        validate_string_len(params.agent.as_deref(), 4096, "agent")?;
+        validate_string_len(params.date.as_deref(), 4096, "date")?;
+        validate_string_len(params.since.as_deref(), 4096, "since")?;
+        validate_string_len(params.until.as_deref(), 4096, "until")?;
+        validate_string_len(params.sort.as_deref(), 4096, "sort")?;
+        if let Some(projects) = &params.projects {
+            for (i, p) in projects.iter().enumerate() {
+                validate_string_len(Some(p), 4096, &format!("projects[{}]", i))?;
+            }
+        }
+
         let query = params.query;
         let limit = params.limit.min(50);
         let project = params.project;
@@ -335,6 +676,26 @@ impl AicxMcpServer {
         let hours = params.hours.unwrap_or(0);
         let date = params.date;
         let frame_kind = params.frame_kind;
+        let kind_filter = match params.kind.as_deref() {
+            Some(kind) => match Kind::parse(kind) {
+                Some(kind) => Some(kind),
+                None => {
+                    let payload = serde_json::json!({
+                        "ok": false,
+                        "error": "invalid_kind_filter",
+                        "kind": kind,
+                        "expected": ["conversations", "plans", "reports", "other"],
+                    });
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "invalid kind filter `{kind}`; expected conversations, plans, reports, or other"
+                        ),
+                        Some(payload),
+                    ));
+                }
+            },
+            None => None,
+        };
         let fetch_limit = if score.is_some() || date.is_some() || hours > 0 {
             limit.saturating_mul(5).max(50)
         } else {
@@ -355,9 +716,18 @@ impl AicxMcpServer {
             fetch_limit,
             &project_scopes,
             frame_kind,
+            kind_filter.map(|kind| kind.dir_name()),
         ) {
             Ok(outcome) => outcome,
             Err(err) => {
+                // D-6: arm the negative cache on real embedder failures so
+                // subsequent requests fail-fast for MCP_EMBEDDER_NEGATIVE_TTL
+                // instead of re-running the same broken bootstrap. Other
+                // kinds (index missing, dim mismatch, ...) remain
+                // synchronously retryable.
+                if err.kind() == "embedder_unavailable" {
+                    self.mark_embedder_unavailable(Instant::now(), MCP_EMBEDDER_NEGATIVE_TTL);
+                }
                 let payload = serde_json::json!({
                     "ok": false,
                     "error": "semantic_search_unavailable",
@@ -377,6 +747,7 @@ impl AicxMcpServer {
             }
         };
         let scanned = outcome.scanned;
+        let retrieval_status = outcome.retrieval_status.clone();
         let results = outcome.results;
 
         let mut results = results;
@@ -399,11 +770,8 @@ impl AicxMcpServer {
             results
                 .into_iter()
                 .filter(|result| {
-                    lo.as_ref()
-                        .is_none_or(|lo| result.date.as_str() >= lo.as_str())
-                        && hi
-                            .as_ref()
-                            .is_none_or(|hi| result.date.as_str() <= hi.as_str())
+                    lo.as_deref().is_none_or(|lo| result.date.as_str() >= lo)
+                        && hi.as_deref().is_none_or(|hi| result.date.as_str() <= hi)
                 })
                 .collect()
         } else if hours > 0 {
@@ -434,8 +802,31 @@ impl AicxMcpServer {
 
         let results: Vec<_> = results.into_iter().take(limit).collect();
 
-        let json = rank::render_search_json(&store_root, &results, scanned)
-            .map_err(|e| McpError::internal_error(format!("Serialize search JSON: {e}"), None))?;
+        let source_paths_verified = crate::oracle::verify_paths(
+            results
+                .iter()
+                .map(|result| std::path::Path::new(&result.path).to_path_buf()),
+        );
+        let oracle_status = if let Some(ref retrieval_status) = retrieval_status {
+            OracleStatus::hybrid_rrf(
+                &store_root,
+                retrieval_status,
+                results.len(),
+                source_paths_verified,
+            )
+        } else {
+            OracleStatus::content_semantic(
+                &store_root,
+                scanned,
+                results.len(),
+                source_paths_verified,
+            )
+        };
+        let json =
+            rank::render_search_json_with_oracle(&store_root, &results, scanned, oracle_status)
+                .map_err(|e| {
+                    McpError::internal_error(format!("Serialize search JSON: {e}"), None)
+                })?;
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
@@ -448,6 +839,7 @@ impl AicxMcpServer {
         &self,
         Parameters(params): Parameters<ReadParams>,
     ) -> Result<CallToolResult, McpError> {
+        tracing::info!(target: "mcp.audit", tool_name = "aicx_read", "mcp tool invoked");
         let chunk = store::read_context_chunk(&params.reference, params.max_chars)
             .map_err(|e| McpError::internal_error(format!("Read chunk: {e}"), None))?;
         let json = serde_json::to_string(&chunk)
@@ -464,13 +856,25 @@ impl AicxMcpServer {
         &self,
         Parameters(params): Parameters<RankParams>,
     ) -> Result<CallToolResult, McpError> {
+        tracing::info!(target: "mcp.audit", tool_name = "aicx_rank", "mcp tool invoked");
+        validate_string_len(Some(params.project.as_str()), 4096, "project")?;
+        validate_string_len(params.agent.as_deref(), 4096, "agent")?;
+        validate_string_len(params.since.as_deref(), 4096, "since")?;
+        validate_string_len(params.until.as_deref(), 4096, "until")?;
+        validate_string_len(params.sort.as_deref(), 4096, "sort")?;
+
         let project = params.project;
         let hours = params.hours;
         let strict = params.strict;
-        let top = params.top;
+        const MAX_TOP: usize = 1000;
+        let top = params.top.map(|t| t.min(MAX_TOP));
 
-        let cutoff = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(hours.saturating_mul(3600).min(365 * 24 * 3600));
+        let cutoff = if hours == 0 {
+            std::time::UNIX_EPOCH
+        } else {
+            std::time::SystemTime::now()
+                - std::time::Duration::from_secs(hours.saturating_mul(3600).min(365 * 24 * 3600))
+        };
         let mut scored = Vec::new();
 
         let (lo, hi) = if let Some(ref d) = params.since {
@@ -491,12 +895,8 @@ impl AicxMcpServer {
             {
                 continue;
             }
-            if lo
-                .as_ref()
-                .is_some_and(|lo| file.date_iso.as_str() < lo.as_str())
-                || hi
-                    .as_ref()
-                    .is_some_and(|hi| file.date_iso.as_str() > hi.as_str())
+            if lo.as_deref().is_some_and(|lo| file.date_iso.as_str() < lo)
+                || hi.as_deref().is_some_and(|hi| file.date_iso.as_str() > hi)
             {
                 continue;
             }
@@ -593,6 +993,21 @@ impl AicxMcpServer {
         &self,
         Parameters(params): Parameters<SteerParams>,
     ) -> Result<CallToolResult, McpError> {
+        tracing::info!(target: "mcp.audit", tool_name = "aicx_steer", "mcp tool invoked");
+        validate_string_len(params.run_id.as_deref(), 4096, "run_id")?;
+        validate_string_len(params.prompt_id.as_deref(), 4096, "prompt_id")?;
+        validate_string_len(params.agent.as_deref(), 4096, "agent")?;
+        validate_string_len(params.kind.as_deref(), 4096, "kind")?;
+        validate_string_len(params.project.as_deref(), 4096, "project")?;
+        validate_string_len(params.date.as_deref(), 4096, "date")?;
+        validate_string_len(params.since.as_deref(), 4096, "since")?;
+        validate_string_len(params.until.as_deref(), 4096, "until")?;
+        if let Some(projects) = &params.projects {
+            for (i, p) in projects.iter().enumerate() {
+                validate_string_len(Some(p), 4096, &format!("projects[{}]", i))?;
+            }
+        }
+
         let limit = params.limit.min(100);
 
         let date_effective = params.date.or(params.since.clone());
@@ -712,6 +1127,7 @@ impl AicxMcpServer {
         &self,
         Parameters(params): Parameters<IntentsParams>,
     ) -> Result<CallToolResult, McpError> {
+        tracing::info!(target: "mcp.audit", tool_name = "aicx_intents", "mcp tool invoked");
         let kind_filter = match params.kind.as_deref() {
             None => None,
             Some(s) => match s.to_lowercase().as_str() {
@@ -795,6 +1211,25 @@ impl AicxMcpServer {
 
         Ok(CallToolResult::success(vec![Content::text(body)]))
     }
+
+    #[tool(
+        name = "aicx_index_status",
+        description = "Report the truthful state of the AICX semantic vector index for a project bucket. Returns `readiness` (ready/pending/missing), backend, project_bucket, committed_at, pending_chunks, and the final + temp checkpoint paths. `ready` is set only when the atomically committed `embeddings.ndjson` is present; a lone `.ndjson.tmp` checkpoint surfaces as `pending` so Loctree and other oracles can refuse to trust semantic retrieval before commit."
+    )]
+    async fn index_status(
+        &self,
+        Parameters(params): Parameters<IndexStatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        tracing::info!(target: "mcp.audit", tool_name = "aicx_index_status", "mcp tool invoked");
+        let store_root = store::store_base_dir()
+            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+        let status = api::index_status_at(&store_root, params.project.as_deref())
+            .map_err(|e| McpError::internal_error(format!("index status: {e}"), None))?;
+        let json = serde_json::to_string(&status).map_err(|e| {
+            McpError::internal_error(format!("Serialize index status JSON: {e}"), None)
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
 }
 
 // ============================================================================
@@ -822,6 +1257,18 @@ impl rmcp::handler::server::ServerHandler for AicxMcpServer {
 // Server runners
 // ============================================================================
 
+/// Names of all tool handlers wired into `AicxMcpServer`. Used at startup
+/// to log the audit surface (F-P3-18) and in tests to confirm the list
+/// stays in sync with the actual `#[tool]` annotations on the impl block.
+pub const MCP_TOOL_SURFACE: &[&str] = &[
+    "aicx_search",
+    "aicx_read",
+    "aicx_rank",
+    "aicx_steer",
+    "aicx_intents",
+    "aicx_index_status",
+];
+
 /// Run MCP server over stdio transport.
 pub async fn run_stdio() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -829,6 +1276,15 @@ pub async fn run_stdio() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .try_init()
         .ok();
+
+    // F-P3-18: stdio bypasses HTTP auth (no network surface) — log it so
+    // the audit trail captures the security posture explicitly.
+    tracing::info!(
+        target: "mcp.audit",
+        auth = "stdio_no_network",
+        tools = ?MCP_TOOL_SURFACE,
+        "mcp server starting (stdio)"
+    );
 
     let server = AicxMcpServer::new();
     let service = rmcp::ServiceExt::serve(server, rmcp::transport::io::stdio())
@@ -843,8 +1299,8 @@ pub async fn run_stdio() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run MCP server over streamable HTTP transport on given port.
-pub async fn run_http(port: u16) -> anyhow::Result<()> {
+/// Run MCP server over streamable HTTP transport on given port with the given auth state.
+pub async fn run_http(port: u16, auth_config: AuthConfig) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
@@ -853,22 +1309,39 @@ pub async fn run_http(port: u16) -> anyhow::Result<()> {
 
     let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
 
+    let auth_source_label = auth_config.source.describe();
+    let auth_enforced = auth_config.is_enforced();
+
+    // F-P3-18: emit the truthful auth posture + tool surface as a single
+    // tracing event so security review can audit boot configuration
+    // without parsing free-form eprintln! lines.
+    tracing::info!(
+        target: "mcp.audit",
+        auth_enabled = auth_enforced,
+        auth_source = %auth_source_label,
+        tools = ?MCP_TOOL_SURFACE,
+        port = port,
+        "mcp server starting (http)"
+    );
+
     let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default();
+    let session_manager = configured_mcp_session_manager();
+    spawn_mcp_session_cleanup(session_manager.clone(), MCP_SESSION_SWEEP_INTERVAL);
     let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
         || Ok(AicxMcpServer::new()),
-        std::sync::Arc::new(
-            rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
-        ),
+        session_manager,
         config,
     );
 
-    let app = axum::Router::new().route(
+    let mcp_router = axum::Router::new().route(
         "/mcp",
         axum::routing::any(move |req: axum::http::Request<axum::body::Body>| {
             let svc = service.clone();
             async move { svc.handle(req).await }
         }),
     );
+
+    let app = auth::require_auth_layer(mcp_router, auth_config);
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -877,6 +1350,13 @@ pub async fn run_http(port: u16) -> anyhow::Result<()> {
     eprintln!("aicx MCP server running (streamable HTTP)");
     eprintln!("  Endpoint: http://{addr}/mcp");
     eprintln!("  Transport: Streamable HTTP (POST + GET /mcp)");
+    if auth_enforced {
+        eprintln!("  Auth: enabled (source: {auth_source_label})");
+    } else {
+        eprintln!(
+            "  Auth: DISABLED ({auth_source_label}) — anyone who reaches {addr} can invoke MCP tools"
+        );
+    }
 
     axum::serve(listener, app)
         .await
@@ -884,15 +1364,19 @@ pub async fn run_http(port: u16) -> anyhow::Result<()> {
 }
 
 /// Legacy compatibility wrapper for callers that still use the old `run_sse` name.
-pub async fn run_sse(port: u16) -> anyhow::Result<()> {
-    run_http(port).await
+pub async fn run_sse(port: u16, auth_config: AuthConfig) -> anyhow::Result<()> {
+    run_http(port, auth_config).await
 }
 
-/// Run the selected MCP transport.
-pub async fn run_transport(transport: McpTransport, port: u16) -> anyhow::Result<()> {
+/// Run the selected MCP transport. Stdio bypasses HTTP auth (no network surface).
+pub async fn run_transport(
+    transport: McpTransport,
+    port: u16,
+    auth_config: AuthConfig,
+) -> anyhow::Result<()> {
     match transport {
         McpTransport::Stdio => run_stdio().await,
-        McpTransport::Http => run_http(port).await,
+        McpTransport::Http => run_http(port, auth_config).await,
     }
 }
 
@@ -934,11 +1418,19 @@ fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, McpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SCORE_FILTER, McpTransport, RankItem, RankResponse, SearchParams, SteerResponse,
-        background_refresh_args, parse_date_filter_mcp, validate_score_filter,
+        AicxMcpServer, AicxSessionManager, AicxSessionManagerError, MAX_SCORE_FILTER,
+        MCP_EMBEDDER_NEGATIVE_TTL, MCP_SESSION_IDLE_TTL, MCP_SESSION_MAX_SESSIONS,
+        MCP_SESSION_SWEEP_INTERVAL, McpTransport, RankItem, RankResponse, SearchParams,
+        SteerResponse, background_refresh_args, configured_mcp_session_manager,
+        parse_date_filter_mcp, spawn_mcp_session_cleanup, validate_score_filter,
     };
     use crate::oracle::OracleStatus;
     use clap::ValueEnum as _;
+    use rmcp::transport::streamable_http_server::session::SessionManager as _;
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn background_refresh_args_use_all_and_quiet_stdout() {
@@ -1070,6 +1562,141 @@ mod tests {
         let err = validate_score_filter(Some(MAX_SCORE_FILTER + 1))
             .expect_err("score above 100 should be rejected");
         assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn mcp_tool_surface_lists_all_handlers() {
+        // F-P3-18: any new #[tool] handler MUST add itself to MCP_TOOL_SURFACE
+        // so the startup audit log includes it. This test fails when a new
+        // tool is added without updating the surface list.
+        let expected = [
+            "aicx_search",
+            "aicx_read",
+            "aicx_rank",
+            "aicx_steer",
+            "aicx_intents",
+            "aicx_index_status",
+        ];
+        assert_eq!(
+            super::MCP_TOOL_SURFACE.len(),
+            expected.len(),
+            "MCP_TOOL_SURFACE drifted from expected handler set: {:?} vs {expected:?}",
+            super::MCP_TOOL_SURFACE
+        );
+        for name in expected {
+            assert!(
+                super::MCP_TOOL_SURFACE.contains(&name),
+                "MCP_TOOL_SURFACE missing handler `{name}`"
+            );
+        }
+    }
+
+    #[test]
+    fn embedder_negative_ttl_is_five_minutes() {
+        // D-6: production TTL is five minutes; a regression to the test-only
+        // 30s value would let a flapping endpoint retry-storm an unhealthy
+        // embedder six times faster than intended.
+        assert_eq!(MCP_EMBEDDER_NEGATIVE_TTL, Duration::from_secs(5 * 60));
+    }
+
+    #[test]
+    fn mark_embedder_unavailable_arms_cache() {
+        // D-6: mark + check cycle works end-to-end without external state.
+        let server = AicxMcpServer::new();
+        let now = Instant::now();
+        assert!(server.embedder_negative_cache_remaining(now).is_none());
+        server.mark_embedder_unavailable(now, Duration::from_secs(120));
+        let remaining = server
+            .embedder_negative_cache_remaining(now)
+            .expect("cache should be armed after mark");
+        assert!(remaining.as_secs() >= 119 && remaining.as_secs() <= 120);
+        // After TTL elapsed, cache lazily clears.
+        assert!(
+            server
+                .embedder_negative_cache_remaining(now + Duration::from_secs(121))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn embedder_negative_cache_expires_by_ttl() {
+        let server = AicxMcpServer::new();
+        let now = Instant::now();
+        {
+            let mut guard = server.embedder_unavailable_until.lock().unwrap();
+            *guard = Some(now + MCP_EMBEDDER_NEGATIVE_TTL);
+        }
+
+        let remaining = server
+            .embedder_negative_cache_remaining(now + Duration::from_secs(10))
+            .expect("cache should still be active");
+        assert!(remaining.as_secs() >= MCP_EMBEDDER_NEGATIVE_TTL.as_secs() - 11);
+
+        assert!(
+            server
+                .embedder_negative_cache_remaining(
+                    now + MCP_EMBEDDER_NEGATIVE_TTL + Duration::from_secs(1)
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_mcp_session_manager_configures_idle_ttl_and_cap() {
+        let manager = configured_mcp_session_manager();
+
+        assert_eq!(
+            manager.inner.session_config.keep_alive,
+            Some(MCP_SESSION_IDLE_TTL)
+        );
+        assert_eq!(manager.max_sessions, MCP_SESSION_MAX_SESSIONS);
+        assert_eq!(MCP_SESSION_SWEEP_INTERVAL, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_mcp_session_count_capped() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let manager = AicxSessionManager::new(Duration::from_secs(30), 1);
+            let (_id, _transport) = manager.create_session().await.expect("first session");
+            let err = match manager.create_session().await {
+                Ok(_) => panic!("second session must exceed cap"),
+                Err(err) => err,
+            };
+
+            assert!(matches!(
+                err,
+                AicxSessionManagerError::SessionLimitExceeded(1)
+            ));
+        });
+    }
+
+    #[test]
+    fn test_mcp_session_idle_ttl_cleans_up() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let manager = AicxSessionManager::new(Duration::from_millis(10), 1000);
+            let (id, _transport) = manager.create_session().await.expect("create session");
+            assert_eq!(manager.session_count().await, 1);
+
+            let closed = manager
+                .sweep_idle_sessions_at(Instant::now() + Duration::from_millis(11))
+                .await
+                .expect("sweep idle sessions");
+
+            assert_eq!(closed, 1);
+            assert_eq!(manager.session_count().await, 0);
+            assert!(!manager.has_session(&id).await.expect("has_session"));
+        });
+    }
+
+    #[test]
+    fn test_mcp_session_cleanup_task_can_be_spawned() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let manager = Arc::new(AicxSessionManager::new(Duration::from_millis(1), 1000));
+            spawn_mcp_session_cleanup(manager, Duration::from_secs(60));
+        });
     }
 
     #[test]

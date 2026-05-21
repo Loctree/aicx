@@ -108,6 +108,61 @@ host_target() {
   rustc -vV | sed -n 's/^host: //p'
 }
 
+write_release_manifest() {
+  local output="$1"
+  local version="$2"
+  local target="$3"
+  local flavor="$4"
+  local signed="$5"
+  local notarized="$6"
+  local commit full_commit
+
+  full_commit=$(git -C "$REPO_ROOT" rev-parse HEAD)
+  commit=$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD)
+  python3 - "$output" "$version" "$target" "$flavor" "$signed" "$notarized" "$full_commit" "$commit" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+output = Path(sys.argv[1])
+version = sys.argv[2]
+target = sys.argv[3]
+flavor = sys.argv[4]
+signed = sys.argv[5] == "1"
+notarized = sys.argv[6] == "1"
+full_commit = sys.argv[7]
+short_commit = sys.argv[8]
+
+data = {
+    "source": "Loctree/aicx",
+    "version": version,
+    "target": target,
+    "flavor": flavor,
+    "commit": full_commit,
+    "short_commit": short_commit,
+    "signed": signed,
+    "notarized": notarized,
+    "components": [
+        {
+            "name": "aicx",
+            "version": version,
+            "source": "Loctree/aicx",
+            "commit": full_commit,
+            "short_commit": short_commit,
+        },
+        {
+            "name": "aicx-mcp",
+            "version": version,
+            "source": "Loctree/aicx",
+            "commit": full_commit,
+            "short_commit": short_commit,
+        },
+    ],
+}
+output.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
 cleanup() {
   local status=$?
   if [[ -n "${TEMP_KEYCHAIN_PATH:-}" && -f "${TEMP_KEYCHAIN_PATH}" ]]; then
@@ -215,6 +270,7 @@ EOF
   cp "$REPO_ROOT/install.sh" "$BUNDLE_DIR/install.sh"
   cp "$REPO_ROOT/docs/COMMANDS.md" "$BUNDLE_DIR/docs/COMMANDS.md"
   cp "$REPO_ROOT/docs/RELEASES.md" "$BUNDLE_DIR/docs/RELEASES.md"
+  write_release_manifest "$BUNDLE_DIR/release-manifest.json" "$VERSION" "$TARGET" "$BUILD_FLAVOR" 0 0
   chmod +x "$BUNDLE_DIR/install.sh"
 
   echo "[2/3] Packaging tar.gz archive..."
@@ -373,6 +429,7 @@ cp "$REPO_ROOT/README.md" "$BUNDLE_DIR/README.md"
 cp "$REPO_ROOT/install.sh" "$BUNDLE_DIR/install.sh"
 cp "$REPO_ROOT/docs/COMMANDS.md" "$BUNDLE_DIR/docs/COMMANDS.md"
 cp "$REPO_ROOT/docs/RELEASES.md" "$BUNDLE_DIR/docs/RELEASES.md"
+write_release_manifest "$BUNDLE_DIR/release-manifest.json" "$VERSION" "$TARGET" "$BUILD_FLAVOR" 1 1
 chmod +x "$BUNDLE_DIR/install.sh"
 
 echo "[2/6] Preparing temporary signing keychain..."

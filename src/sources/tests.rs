@@ -1,6 +1,7 @@
 use super::*;
 use filetime::{FileTime, set_file_mtime};
 use std::fs;
+use std::io::Cursor;
 use std::path::PathBuf;
 
 const CLAUDE_FRAME_KIND_FIXTURE: &str =
@@ -25,6 +26,15 @@ fn write_file(path: &Path, content: &str) {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(path, content).unwrap();
+}
+
+fn default_config(include_assistant: bool) -> ExtractionConfig {
+    ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant,
+        watermark: None,
+    }
 }
 
 fn set_mtime(path: &Path, unix_seconds: i64) {
@@ -705,17 +715,21 @@ fn test_parse_codex_session_unparsable_timestamps_warn_and_drop() {
     };
 
     let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].message, "good ts kept");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].message, "naive ts dropped");
+    assert_eq!(
+        entries[0].timestamp,
+        Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 1).unwrap()
+    );
+    assert_eq!(entries[1].message, "good ts kept");
 
     assert_eq!(warnings.len(), 1);
     match &warnings[0] {
         CodexSessionWarning::UnparsableTimestamp { count, samples } => {
-            assert_eq!(*count, 4);
+            assert_eq!(*count, 3);
             assert_eq!(
                 samples,
                 &vec![
-                    "2026-02-01T00:00:01".to_string(),
                     "not-a-timestamp".to_string(),
                     "2026/02/01T00:00:03Z".to_string(),
                 ]
@@ -785,17 +799,19 @@ fn test_parse_codex_session_unknown_msg_type_warns_and_counts() {
     };
 
     let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
-    assert_eq!(entries.len(), 2);
+    assert_eq!(entries.len(), 7);
     assert_eq!(entries[0].role, "user");
-    assert_eq!(entries[1].role, "assistant");
+    assert_eq!(entries[1].role, "system");
+    assert_eq!(entries[1].frame_kind, Some(FrameKind::SystemNote));
+    assert_eq!(entries[2].role, "system");
+    assert_eq!(entries[2].message, "x");
+    assert_eq!(entries[6].role, "assistant");
 
     assert_eq!(warnings.len(), 1);
     match &warnings[0] {
         CodexSessionWarning::UnknownMsgType { count, samples } => {
-            assert_eq!(*count, 3);
-            assert_eq!(samples.len(), 2);
-            assert!(samples.iter().any(|s| s == "task_started"));
-            assert!(samples.iter().any(|s| s == "web_search"));
+            assert_eq!(*count, 2);
+            assert_eq!(samples, &vec!["<missing>".to_string()]);
         }
         other => panic!("expected UnknownMsgType, got {other:?}"),
     }
@@ -829,10 +845,12 @@ fn test_extract_gemini_file_session_json() {
     };
 
     let entries = extract_gemini_file(&tmp, &config).unwrap();
-    assert_eq!(entries.len(), 2);
+    assert_eq!(entries.len(), 3);
     assert_eq!(entries[0].agent, "gemini");
     assert_eq!(entries[0].role, "user");
     assert_eq!(entries[1].role, "assistant");
+    assert_eq!(entries[2].role, "system");
+    assert_eq!(entries[2].frame_kind, Some(FrameKind::SystemNote));
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -868,6 +886,54 @@ fn test_extract_gemini_file_session_jsonl_uses_metadata_session_id() {
     assert_eq!(entries[1].role, "assistant");
     assert_eq!(entries[1].message, "Report written");
     assert_eq!(entries[2].role, "reasoning");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_extract_gemini_file_prefers_session_path_project_over_content_hints() {
+    let root = unique_test_dir("gemini-session-path-project");
+    let tmp = root
+        .join(".gemini")
+        .join("tmp")
+        .join("vista-portal")
+        .join("chats")
+        .join("session-2026-05-17T11-29-6d5b2959.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r##"{"sessionId":"6d5b2959-c56b-4c90-b198-41eb2ce399da","projectHash":"atomic-orbitals-b716c2b71310439897d3f81602f6c799","startTime":"2026-05-17T11:29:00.000Z","kind":"main"}
+{"id":"u1","timestamp":"2026-05-17T11:29:01.000Z","type":"user","content":[{"cwd":"/Users/silver/Desktop/screenshot/Screenshot","text":"Review this screenshot for Vista Portal."}]}
+{"id":"a1","timestamp":"2026-05-17T11:29:02.000Z","type":"gemini","content":"The screenshot review belongs to the Vista Portal session."}"##;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_gemini_file(&tmp, &config).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.cwd.as_deref() == Some("vista-portal"))
+    );
+    assert_eq!(
+        repo_labels_from_entries(&entries, &[]),
+        vec!["vista-portal"]
+    );
+
+    let screenshot_filter = ExtractionConfig {
+        project_filter: vec!["screenshot".to_string()],
+        ..config
+    };
+    let filtered_entries = extract_gemini_file(&tmp, &screenshot_filter).unwrap();
+    assert!(
+        filtered_entries.is_empty(),
+        "session path ownership must not match screenshot-only content hints"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -917,7 +983,7 @@ fn test_extract_junie_file_keeps_conversation_truth_and_dedups_results() {
 {"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"step-1","cancelled":false,"result":"Initial plan","changes":[],"errorCode":"Submit"}}}
 {"kind":"UserResponseEvent","prompt":"jedziemy","isChoice":true}
 {"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"step-1","cancelled":false,"result":"Refined plan","changes":[],"errorCode":"Submit"}}}
-{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"TerminalBlockUpdatedEvent","command":"rg foo","output":"this should stay ignored"}}}"#;
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"TerminalBlockUpdatedEvent","stepId":"step-term-1","status":"COMPLETED","command":"rg foo","output":"matched line"}}}"#;
     write_file(&tmp, content);
 
     let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
@@ -929,7 +995,7 @@ fn test_extract_junie_file_keeps_conversation_truth_and_dedups_results() {
     };
 
     let entries = extract_junie_file(&tmp, &config).unwrap();
-    assert_eq!(entries.len(), 4);
+    assert_eq!(entries.len(), 5);
     assert_eq!(entries[0].agent, "junie");
     assert_eq!(entries[0].session_id, "260408-214715-abcd");
     assert_eq!(entries[0].role, "user");
@@ -940,6 +1006,9 @@ fn test_extract_junie_file_keeps_conversation_truth_and_dedups_results() {
     assert_eq!(entries[2].message, "jedziemy");
     assert_eq!(entries[3].role, "assistant");
     assert_eq!(entries[3].message, "Refined plan");
+    assert_eq!(entries[4].role, "tool");
+    assert_eq!(entries[4].frame_kind, Some(FrameKind::ToolCall));
+    assert_eq!(entries[4].message, "$ rg foo\nmatched line");
     assert!(
         entries
             .windows(2)
@@ -950,6 +1019,89 @@ fn test_extract_junie_file_keeps_conversation_truth_and_dedups_results() {
             .iter()
             .all(|entry| entry.cwd.as_deref() == Some("/tmp/repo"))
     );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_extract_junie_file_captures_thoughts_and_tool_chain() {
+    let root = unique_test_dir("junie-rich");
+    let session_dir = root.join("session-260519-164145-rich");
+    let tmp = session_dir.join("events.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    // Stream snapshots in IN_PROGRESS -> COMPLETED order; dedup must collapse
+    // the two identical COMPLETED frames for the same stepId.
+    let content = r#"{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"CurrentDirectoryUpdatedEvent","currentDirectory":"/work/repo"}}}
+{"kind":"UserPromptEvent","requestId":"prompt-260519-164200-aaaa","prompt":"map the repo","presentablePrompt":"map the repo"}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"AgentThoughtBlockUpdatedEvent","stepId":"th-1","text":"I should run loctree context first."}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"McpBlockUpdatedEvent","stepId":"mcp-1","toolName":"loctree-mcp/context","input":"{\"project\":\"/work/repo\"}","status":"IN_PROGRESS","details":""}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"McpBlockUpdatedEvent","stepId":"mcp-1","toolName":"loctree-mcp/context","input":"{\"project\":\"/work/repo\"}","status":"COMPLETED","details":"atlas v1"}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ToolBlockUpdatedEvent","stepId":"tool-1","status":"COMPLETED","text":"Found \"docs/plans/**\"","details":"docs/plans/PLAN_22.md\n"}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ViewFilesBlockUpdatedEvent","stepId":"view-1","status":"COMPLETED","files":[{"relativePath":"docs/plans/PLAN_22.md","lineFrom":1,"lineTo":50}]}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"FileChangesBlockUpdatedEvent","stepId":"chg-1","status":"COMPLETED","changes":[{"relativePath":"src/lib.rs"}]}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"TerminalBlockUpdatedEvent","stepId":"term-1","status":"IN_PROGRESS","command":"cargo build","output":""}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"TerminalBlockUpdatedEvent","stepId":"term-1","status":"COMPLETED","command":"cargo build","output":"Compiling aicx"}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"TerminalBlockUpdatedEvent","stepId":"term-1","status":"COMPLETED","command":"cargo build","output":"Compiling aicx"}}}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"res-1","cancelled":false,"result":"Mapped.","errorCode":"Submit"}}}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_junie_file(&tmp, &config).unwrap();
+    let kinds: Vec<_> = entries
+        .iter()
+        .map(|e| (e.role.as_str(), e.frame_kind))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("user", Some(FrameKind::UserMsg)),
+            ("reasoning", Some(FrameKind::InternalThought)),
+            ("tool", Some(FrameKind::ToolCall)),
+            ("tool", Some(FrameKind::ToolCall)),
+            ("tool", Some(FrameKind::ToolCall)),
+            ("tool", Some(FrameKind::ToolCall)),
+            ("tool", Some(FrameKind::ToolCall)),
+            ("assistant", Some(FrameKind::AgentReply)),
+        ]
+    );
+    assert_eq!(entries[0].message, "map the repo");
+    assert_eq!(entries[1].message, "I should run loctree context first.");
+    assert!(entries[2].message.starts_with("loctree-mcp/context: "));
+    assert!(entries[2].message.contains("atlas v1"));
+    assert!(entries[3].message.starts_with("Found"));
+    assert!(entries[3].message.contains("PLAN_22.md"));
+    assert_eq!(entries[4].message, "viewed: docs/plans/PLAN_22.md:1-50");
+    assert_eq!(entries[5].message, "edited: src/lib.rs");
+    assert_eq!(entries[6].message, "$ cargo build\nCompiling aicx");
+    assert_eq!(entries[7].message, "Mapped.");
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.cwd.as_deref() == Some("/work/repo"))
+    );
+    assert!(
+        entries
+            .windows(2)
+            .all(|pair| pair[0].timestamp < pair[1].timestamp)
+    );
+
+    // user-only mode strips everything but UserMsg
+    let user_only = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: false,
+        watermark: None,
+    };
+    let user_entries = extract_junie_file(&tmp, &user_only).unwrap();
+    assert_eq!(user_entries.len(), 1);
+    assert_eq!(user_entries[0].role, "user");
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -1428,8 +1580,8 @@ fn test_gemini_message_type_mapping() {
 }
 
 #[test]
-fn test_gemini_message_skip_error_info() {
-    // "error" and "info" types should be skipped
+fn test_gemini_message_error_info_map_to_system_note() {
+    // "error" and "info" types are preserved as system notes.
     for msg_type in &["error", "info"] {
         let msg = GeminiMessage {
             msg_type: Some(msg_type.to_string()),
@@ -1442,9 +1594,14 @@ fn test_gemini_message_skip_error_info() {
         let role = match msg.msg_type.as_deref().unwrap_or("user") {
             "user" => Some("user"),
             "gemini" => Some("assistant"),
-            _ => None, // skip
+            "error" | "info" => Some("system"),
+            _ => None,
         };
-        assert_eq!(role, None);
+        assert_eq!(role, Some("system"));
+        assert_eq!(
+            role.and_then(frame_kind_from_role),
+            Some(FrameKind::SystemNote)
+        );
     }
 }
 
@@ -1622,7 +1779,482 @@ fn test_extract_gemini_file_keeps_inline_data_as_explicit_placeholder() {
 }
 
 #[test]
-fn test_project_filter_matches_path_word_boundary() {
+fn test_parse_rfc3339_or_naive_utc_accepts_z() {
+    let ts = parse_rfc3339_or_naive_utc("2026-01-01T00:00:00Z").unwrap();
+    assert_eq!(ts, Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap());
+}
+
+#[test]
+fn test_parse_rfc3339_or_naive_utc_accepts_offset() {
+    let ts = parse_rfc3339_or_naive_utc("2026-01-01T01:00:00+01:00").unwrap();
+    assert_eq!(ts, Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap());
+}
+
+#[test]
+fn test_parse_rfc3339_or_naive_utc_accepts_fractional_z() {
+    let ts = parse_rfc3339_or_naive_utc("2026-01-01T00:00:00.123Z").unwrap();
+    assert_eq!(ts.timestamp_subsec_millis(), 123);
+}
+
+#[test]
+fn test_parse_rfc3339_or_naive_utc_accepts_naive_as_utc() {
+    let ts = parse_rfc3339_or_naive_utc("2026-01-01T00:00:00").unwrap();
+    assert_eq!(ts, Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap());
+}
+
+#[test]
+fn test_parse_rfc3339_or_naive_utc_rejects_garbage() {
+    assert!(parse_rfc3339_or_naive_utc("not-a-timestamp").is_err());
+}
+
+#[test]
+fn test_read_line_limited_returns_normal_line() {
+    let mut reader = Cursor::new(b"{\"ok\":true}\nnext\n".to_vec());
+    let line = read_line_limited(&mut reader, 32).unwrap().unwrap();
+    assert!(!line.exceeded);
+    assert_eq!(line.line, "{\"ok\":true}\n");
+}
+
+#[test]
+fn test_read_line_limited_skips_to_next_line_after_oversized() {
+    let mut reader = Cursor::new(b"aaaaaaaaa\nok\n".to_vec());
+    let first = read_line_limited(&mut reader, 4).unwrap().unwrap();
+    assert!(first.exceeded);
+    assert_eq!(first.line, "aaaa");
+    let second = read_line_limited(&mut reader, 4).unwrap().unwrap();
+    assert_eq!(second.line, "ok\n");
+}
+
+#[test]
+fn test_parse_claude_jsonl_first_non_empty_session_id_wins() {
+    let root = unique_test_dir("claude-session-first-wins");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"type":"user","message":{"role":"user","content":"first"},"timestamp":"2026-02-01T00:00:00Z","sessionId":""}
+{"type":"user","message":{"role":"user","content":"second"},"timestamp":"2026-02-01T00:00:01Z","sessionId":"session-a"}"#;
+    write_file(&tmp, content);
+
+    let (entries, warnings) =
+        parse_claude_jsonl_with_diagnostics(&tmp, "fallback", &default_config(true)).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|entry| entry.session_id == "session-a"));
+    assert!(warnings.is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_claude_jsonl_session_id_drift_warns() {
+    let root = unique_test_dir("claude-session-drift");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"type":"user","message":{"role":"user","content":"first"},"timestamp":"2026-02-01T00:00:00Z","sessionId":"session-a"}
+{"type":"assistant","message":{"role":"assistant","content":"second"},"timestamp":"2026-02-01T00:00:01Z","sessionId":"session-b"}"#;
+    write_file(&tmp, content);
+
+    let (entries, warnings) =
+        parse_claude_jsonl_with_diagnostics(&tmp, "fallback", &default_config(true)).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|entry| entry.session_id == "session-a"));
+    assert_eq!(
+        warnings,
+        vec![ClaudeSessionWarning::SessionIdDrift {
+            first: "session-a".to_string(),
+            ignored: vec!["session-b".to_string()],
+        }]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_claude_jsonl_missing_session_id_warns_fallback() {
+    let root = unique_test_dir("claude-session-missing");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"type":"user","message":{"role":"user","content":"first"},"timestamp":"2026-02-01T00:00:00Z"}"#;
+    write_file(&tmp, content);
+
+    let (entries, warnings) =
+        parse_claude_jsonl_with_diagnostics(&tmp, "fallback-id", &default_config(true)).unwrap();
+    assert_eq!(entries[0].session_id, "fallback-id");
+    assert_eq!(
+        warnings,
+        vec![ClaudeSessionWarning::MissingSessionId {
+            fallback: "fallback-id".to_string(),
+        }]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_claude_jsonl_naive_timestamp_is_kept() {
+    let root = unique_test_dir("claude-naive-ts");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"type":"user","message":{"role":"user","content":"naive"},"timestamp":"2026-02-01T00:00:00","sessionId":"session-a"}"#;
+    write_file(&tmp, content);
+
+    let (entries, warnings) =
+        parse_claude_jsonl_with_diagnostics(&tmp, "fallback", &default_config(true)).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].timestamp,
+        Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap()
+    );
+    assert!(warnings.is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_claude_jsonl_invalid_timestamp_warns() {
+    let root = unique_test_dir("claude-invalid-ts");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"type":"user","message":{"role":"user","content":"bad"},"timestamp":"bad-ts","sessionId":"session-a"}"#;
+    write_file(&tmp, content);
+
+    let (entries, warnings) =
+        parse_claude_jsonl_with_diagnostics(&tmp, "fallback", &default_config(true)).unwrap();
+    assert!(entries.is_empty());
+    assert_eq!(
+        warnings,
+        vec![ClaudeSessionWarning::UnparsableTimestamp {
+            count: 1,
+            samples: vec!["bad-ts".to_string()],
+        }]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_codex_session_meta_empty_then_valid_wins() {
+    let root = unique_test_dir("codex-empty-valid-meta");
+    let tmp = root.join("rollout.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"","cwd":"/tmp/a"}}
+{"timestamp":"2026-02-01T00:00:01Z","type":"session_meta","payload":{"id":"session-a","cwd":"/tmp/a"}}
+{"timestamp":"2026-02-01T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#;
+    write_file(&tmp, content);
+
+    let (entries, warnings) =
+        parse_codex_session_file_with_diagnostics(&tmp, &default_config(true)).unwrap();
+    assert_eq!(entries[0].session_id, "session-a");
+    assert!(warnings.is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_codex_session_meta_empty_then_valid_duplicate_warns() {
+    let root = unique_test_dir("codex-empty-valid-duplicate");
+    let tmp = root.join("rollout.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"","cwd":"/tmp/a"}}
+{"timestamp":"2026-02-01T00:00:01Z","type":"session_meta","payload":{"id":"session-a","cwd":"/tmp/a"}}
+{"timestamp":"2026-02-01T00:00:02Z","type":"session_meta","payload":{"id":"session-b","cwd":"/tmp/b"}}
+{"timestamp":"2026-02-01T00:00:03Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#;
+    write_file(&tmp, content);
+
+    let (entries, warnings) =
+        parse_codex_session_file_with_diagnostics(&tmp, &default_config(true)).unwrap();
+    assert_eq!(entries[0].session_id, "session-a");
+    assert_eq!(
+        warnings,
+        vec![CodexSessionWarning::DuplicateSessionMeta {
+            first: "session-a".to_string(),
+            ignored: vec!["session-b".to_string()],
+        }]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_codex_session_meta_empty_only_falls_back() {
+    let root = unique_test_dir("codex-empty-only-meta");
+    let tmp = root.join("rollout-empty-only.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"","cwd":"/tmp/a"}}
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#;
+    write_file(&tmp, content);
+
+    let (entries, warnings) =
+        parse_codex_session_file_with_diagnostics(&tmp, &default_config(true)).unwrap();
+    assert_eq!(entries[0].session_id, "rollout-empty-only");
+    assert_eq!(
+        warnings,
+        vec![CodexSessionWarning::MissingSessionMeta {
+            fallback: "rollout-empty-only".to_string(),
+        }]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_codex_session_role_only_tool_frame_is_preserved() {
+    let root = unique_test_dir("codex-role-tool");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"session-a","cwd":"/tmp/a"}}
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"message","role":"tool","message":"tool output"}}"#;
+    write_file(&tmp, content);
+
+    let (entries, warnings) =
+        parse_codex_session_file_with_diagnostics(&tmp, &default_config(true)).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].role, "tool");
+    assert_eq!(entries[0].frame_kind, Some(FrameKind::ToolCall));
+    assert_eq!(entries[0].message, "tool output");
+    assert_eq!(warnings.len(), 1);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_codex_session_unknown_payload_preserved_as_system_note() {
+    let root = unique_test_dir("codex-unknown-preserved");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"session-a","cwd":"/tmp/a"}}
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"surprise","content":{"nested":true}}}"#;
+    write_file(&tmp, content);
+
+    let (entries, warnings) =
+        parse_codex_session_file_with_diagnostics(&tmp, &default_config(true)).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].role, "system");
+    assert_eq!(entries[0].frame_kind, Some(FrameKind::SystemNote));
+    assert!(entries[0].message.contains("\"nested\":true"));
+    assert_eq!(warnings.len(), 1);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_extract_codex_file_mixed_history_first_warns_and_recovers_both() {
+    let root = unique_test_dir("codex-mixed-history-first");
+    let tmp = root.join("mixed.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"session_id":"history-a","text":"history message","ts":1000,"role":"user","cwd":"/tmp/a"}
+{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"session-a","cwd":"/tmp/a"}}
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"session message"}}"#;
+    write_file(&tmp, content);
+
+    let entries = extract_codex_file(&tmp, &default_config(true)).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().any(|entry| entry.session_id == "history-a"));
+    assert!(entries.iter().any(|entry| entry.session_id == "session-a"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_extract_codex_file_mixed_session_first_warns_and_recovers_both() {
+    let root = unique_test_dir("codex-mixed-session-first");
+    let tmp = root.join("mixed.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"session-a","cwd":"/tmp/a"}}
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"session message"}}
+{"session_id":"history-a","text":"history message","ts":1000,"role":"user","cwd":"/tmp/a"}"#;
+    write_file(&tmp, content);
+
+    let entries = extract_codex_file(&tmp, &default_config(true)).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().any(|entry| entry.session_id == "history-a"));
+    assert!(entries.iter().any(|entry| entry.session_id == "session-a"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_gemini_jsonl_session_id_drift_warns() {
+    let content = r#"{"sessionId":"session-a","kind":"main"}
+{"sessionId":"session-b","kind":"main"}
+{"timestamp":"2026-02-01T00:00:00Z","type":"user","content":"hello"}"#;
+
+    let (session, warnings) = parse_gemini_jsonl_session(content).unwrap();
+    assert_eq!(session.session_id.as_deref(), Some("session-a"));
+    assert_eq!(
+        warnings,
+        vec![GeminiSessionWarning::SessionIdDrift {
+            first: "session-a".to_string(),
+            ignored: vec!["session-b".to_string()],
+        }]
+    );
+}
+
+#[test]
+fn test_gemini_jsonl_same_session_id_has_no_drift_warning() {
+    let content = r#"{"sessionId":"session-a","kind":"main"}
+{"sessionId":"session-a","kind":"main"}
+{"timestamp":"2026-02-01T00:00:00Z","type":"user","content":"hello"}"#;
+
+    let (_session, warnings) = parse_gemini_jsonl_session(content).unwrap();
+    assert!(warnings.is_empty());
+}
+
+#[test]
+fn test_gemini_jsonl_missing_session_id_falls_back_to_filename() {
+    let root = unique_test_dir("gemini-missing-session");
+    let tmp = root.join("session-fallback.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    write_file(
+        &tmp,
+        r#"{"timestamp":"2026-02-01T00:00:00Z","type":"user","content":"hello"}"#,
+    );
+
+    let (entries, warnings) =
+        parse_gemini_session_with_diagnostics(&tmp, &default_config(true)).unwrap();
+    assert_eq!(entries[0].session_id, "session-fallback");
+    assert_eq!(
+        warnings,
+        vec![GeminiSessionWarning::MissingSessionId {
+            fallback: "session-fallback".to_string(),
+        }]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_gemini_naive_timestamp_is_kept_as_utc() {
+    let root = unique_test_dir("gemini-naive-ts");
+    let tmp = root.join("session.json");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"sessionId":"session-a","messages":[{"type":"user","content":"hello","timestamp":"2026-02-01T00:00:00"}]}"#;
+    write_file(&tmp, content);
+
+    let (entries, warnings) =
+        parse_gemini_session_with_diagnostics(&tmp, &default_config(true)).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].timestamp,
+        Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap()
+    );
+    assert!(warnings.is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_gemini_invalid_timestamp_warns() {
+    let root = unique_test_dir("gemini-invalid-ts");
+    let tmp = root.join("session.json");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"sessionId":"session-a","messages":[{"type":"user","content":"hello","timestamp":"bad"}]}"#;
+    write_file(&tmp, content);
+
+    let (entries, warnings) =
+        parse_gemini_session_with_diagnostics(&tmp, &default_config(true)).unwrap();
+    assert!(entries.is_empty());
+    assert_eq!(
+        warnings,
+        vec![GeminiSessionWarning::UnparsableTimestamp {
+            count: 1,
+            samples: vec!["message 1: bad".to_string()],
+        }]
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_gemini_unknown_role_preserves_content_as_system_note() {
+    let root = unique_test_dir("gemini-unknown-role");
+    let tmp = root.join("session.json");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"sessionId":"session-a","messages":[{"type":"mystery","content":"keep me","timestamp":"2026-02-01T00:00:00Z"}]}"#;
+    write_file(&tmp, content);
+
+    let (entries, warnings) =
+        parse_gemini_session_with_diagnostics(&tmp, &default_config(true)).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].role, "system");
+    assert_eq!(entries[0].frame_kind, Some(FrameKind::SystemNote));
+    assert_eq!(entries[0].message, "keep me");
+    assert_eq!(warnings.len(), 1);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_junie_session_id_canonical_path() {
+    let path = PathBuf::from("/tmp/session-260408-214715-abcd/events.jsonl");
+    let (session_id, warning) = junie_session_id_from_path_with_warning(&path);
+    assert_eq!(session_id, "260408-214715-abcd");
+    assert!(warning.is_none());
+}
+
+#[test]
+fn test_junie_session_id_parentless_events_hashes() {
+    let path = PathBuf::from("events.jsonl");
+    let (session_id, warning) = junie_session_id_from_path_with_warning(&path);
+    assert!(session_id.starts_with("unknown-"));
+    assert_ne!(session_id, "events");
+    assert_eq!(
+        warning,
+        Some(JunieSessionWarning::JunieFallbackId {
+            fallback: session_id
+        })
+    );
+}
+
+#[test]
+fn test_junie_session_id_nested_path_walks_ancestors() {
+    let path = PathBuf::from("/tmp/session-260408-214715-abcd/subdir/events.jsonl");
+    let (session_id, warning) = junie_session_id_from_path_with_warning(&path);
+    assert_eq!(session_id, "260408-214715-abcd");
+    assert!(warning.is_none());
+}
+
+#[test]
+fn test_junie_session_id_wrapper_uses_ancestor_logic() {
+    let path = PathBuf::from("/tmp/session-260408-214715-abcd/subdir/events.jsonl");
+    assert_eq!(
+        junie_session_id_from_path_with_warning(&path).0,
+        "260408-214715-abcd"
+    );
+}
+
+#[test]
+fn test_project_filter_matches_owner_repo_segments() {
+    assert!(project_filter_matches_path(
+        "/Users/silver/Git/Loctree/aicx/src",
+        &["Loctree/aicx".to_string()]
+    ));
+}
+
+#[test]
+fn test_project_filter_matches_owner_wildcard_segment() {
+    assert!(project_filter_matches_path(
+        "/Users/silver/Git/Loctree/aicx",
+        &["Loctree/".to_string()]
+    ));
+}
+
+#[test]
+fn test_project_filter_matches_repo_wildcard_segment() {
+    assert!(project_filter_matches_path(
+        "/Users/silver/Git/Other/aicx",
+        &["/aicx".to_string()]
+    ));
+}
+
+#[test]
+fn test_project_filter_rejects_vista_for_vista_portal() {
+    assert!(!project_filter_matches_path(
+        "/Users/silver/Git/vista-portal",
+        &["vista".to_string()]
+    ));
+}
+
+#[test]
+fn test_project_filter_matches_path_strict_segments() {
     // Empty filter => match all.
     assert!(project_filter_matches_path("/anything", &[]));
 
@@ -1637,20 +2269,14 @@ fn test_project_filter_matches_path_word_boundary() {
         &["test".to_string()]
     ));
 
-    // Word-boundary inside a segment (split by `-`, `_`, `.`).
-    assert!(project_filter_matches_path(
+    // No word-boundary matching inside a segment.
+    assert!(!project_filter_matches_path(
         "/Users/silver/Git/vista-portal-pr15-hotfix",
         &["portal".to_string()]
     ));
-    // Multi-word filter — all words must appear.
-    assert!(project_filter_matches_path(
+    assert!(!project_filter_matches_path(
         "/Users/silver/Git/vista-portal-pr15-hotfix",
         &["vista-portal".to_string()]
-    ));
-    // Multi-word filter missing a word — rejected.
-    assert!(!project_filter_matches_path(
-        "/tmp/abc",
-        &["abc-def".to_string()]
     ));
 
     // Case-insensitive both directions.
@@ -1713,7 +2339,7 @@ fn test_extract_codex_file_project_filter_accepts_path_segment() {
     let tmp = root.join("session.jsonl");
     let _ = fs::remove_dir_all(&root);
 
-    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"sess","cwd":"/Users/x/Git/vista-portal-pr15"}}
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"sess","cwd":"/Users/x/Git/vista-portal"}}
 {"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#;
     write_file(&tmp, content);
 

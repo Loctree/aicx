@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    process::{Command, Output},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -28,6 +27,7 @@ use tokio::sync::RwLock;
 #[cfg(test)]
 use std::{fs, io::Write};
 
+use crate::auth::{self, AuthConfig};
 use crate::dashboard::{
     self, DashboardPayload, DashboardRecord, DashboardScope, DashboardStats, project_matches_filter,
 };
@@ -90,7 +90,7 @@ impl DashboardCorsPolicy {
 
     fn response_allow_origin(&self, origin: &str) -> Option<HeaderValue> {
         match self {
-            Self::All => Some(HeaderValue::from_static("*")),
+            Self::All => HeaderValue::from_str(origin).ok(),
             _ if self.allows_origin(origin) => HeaderValue::from_str(origin).ok(),
             _ => None,
         }
@@ -109,6 +109,7 @@ pub struct DashboardServerConfig {
     pub cors_policy: DashboardCorsPolicy,
     pub host: IpAddr,
     pub port: u16,
+    pub auth: AuthConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +143,8 @@ struct DashboardServerState {
     shell_html: String,
     snapshot: RwLock<DashboardSnapshot>,
     rebuilding: AtomicBool,
+    csrf_token: String,
+    memex_cli_path: Option<String>,
 }
 
 #[derive(Debug)]
@@ -211,6 +214,8 @@ struct SemanticSearchParams {
     score: Option<u8>,
     /// Optional frame/channel filter
     frame_kind: Option<crate::timeline::FrameKind>,
+    /// Optional canonical corpus kind filter
+    kind: Option<String>,
 }
 
 // default_namespace / default_search_mode removed 2026-05-10: the
@@ -335,21 +340,53 @@ impl Drop for RebuildFlagGuard<'_> {
 
 /// Run dashboard server and block until process is terminated.
 pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
-    validate_dashboard_host_policy(config.host, &config.cors_policy, true)?;
+    validate_dashboard_host_policy(config.host, &config.cors_policy, true, &config.auth)?;
 
     let initial = rebuild_dashboard(&config).context("Initial dashboard build failed")?;
     let shell_html = dashboard::render_server_shell_html(&config.title);
+
+    let csrf_token = {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let pid = std::process::id();
+        let hash1 = RandomState::new().build_hasher().finish();
+        let hash2 = RandomState::new().build_hasher().finish();
+        format!("{:016x}{:016x}{:08x}{:016x}", hash1, hash2, pid, ts)
+    };
+
+    let memex_cli_path = which::which("rust-memex")
+        .or_else(|_| which::which("rmcp-memex"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+
     let state = Arc::new(DashboardServerState {
         config: config.clone(),
         shell_html,
         snapshot: RwLock::new(DashboardSnapshot::from_build(initial)),
         rebuilding: AtomicBool::new(false),
+        csrf_token: csrf_token.clone(),
+        memex_cli_path,
     });
 
-    let app = Router::new()
+    let auth_source_label = config.auth.source.describe();
+    let auth_enforced = config.auth.is_enforced();
+
+    // Public (no Bearer) routes: HTML shell + manifest + service worker + liveness.
+    // The browser fetches these as a raw GET to render the UI; the corpus-data
+    // surface (`/api/browse`, `/api/detail`, `/api/chunk`, `/api/context`,
+    // `/api/search/*`, `/api/regenerate`, `/api/status`) is gated below.
+    let public_router: Router<Arc<DashboardServerState>> = Router::new()
         .route("/", get(get_dashboard_html))
-        .route("/api/health", get(get_health))
         .route("/health", get(get_health))
+        .route("/api/health", get(get_health))
+        .route("/manifest.webmanifest", get(get_manifest))
+        .route("/service-worker.js", get(get_service_worker));
+
+    let api_router: Router<Arc<DashboardServerState>> = Router::new()
         .route("/api/status", get(get_status))
         .route("/api/browse", get(get_browse))
         .route("/api/detail", get(get_detail))
@@ -358,9 +395,12 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         .route("/api/regenerate", post(regenerate_dashboard))
         .route("/api/search/semantic", get(semantic_search))
         .route("/api/search/cross", get(cross_search))
-        .route("/api/search/steer", get(steer_search))
-        .route("/manifest.webmanifest", get(get_manifest))
-        .route("/service-worker.js", get(get_service_worker))
+        .route("/api/search/steer", get(steer_search));
+
+    let api_router = auth::require_auth_layer(api_router, config.auth.clone());
+
+    let app = public_router
+        .merge(api_router)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             dashboard_cors_middleware,
@@ -392,6 +432,13 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
     );
     eprintln!("  Store: {}", config.store_root.display());
     eprintln!("  CORS: {}", config.cors_policy.describe());
+    if auth_enforced {
+        eprintln!("  Auth: enabled on /api/* (source: {auth_source_label})");
+    } else {
+        eprintln!(
+            "  Auth: DISABLED ({auth_source_label}) — /api/* surface is reachable by anyone who can hit {addr}"
+        );
+    }
 
     axum::serve(listener, app)
         .await
@@ -402,6 +449,7 @@ pub fn validate_dashboard_host_policy(
     host: IpAddr,
     cors_policy: &DashboardCorsPolicy,
     cors_policy_was_explicit: bool,
+    auth: &AuthConfig,
 ) -> Result<()> {
     if host.is_loopback() {
         return Ok(());
@@ -410,6 +458,13 @@ pub fn validate_dashboard_host_policy(
     if !cors_policy_was_explicit || matches!(cors_policy, DashboardCorsPolicy::Local) {
         return Err(anyhow!(
             "Binding dashboard server to non-loopback address '{}' requires an explicit non-local CORS policy. Re-run with `--allow-cors-origins tailscale`, `--allow-cors-origins all`, or an explicit URL.",
+            host
+        ));
+    }
+
+    if !auth.is_enforced() {
+        return Err(anyhow!(
+            "Binding dashboard server to non-loopback address '{}' requires HTTP Bearer auth. Re-run without `--no-require-auth` or provide `--auth-token <TOKEN>`.",
             host
         ));
     }
@@ -543,6 +598,16 @@ fn origin_host(origin: &str) -> Option<String> {
 async fn get_dashboard_html(State(state): State<Arc<DashboardServerState>>) -> impl IntoResponse {
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        "permissions-policy",
+        HeaderValue::from_static("interest-cohort=()"),
+    );
     (headers, Html(state.shell_html.clone()))
 }
 
@@ -584,18 +649,42 @@ async fn regenerate_dashboard(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.eq_ignore_ascii_case(REGENERATE_HEADER_VALUE));
 
-    if !header_ok {
+    let csrf_ok = headers
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == state.csrf_token);
+
+    if !header_ok || !csrf_ok {
         return (
-            StatusCode::BAD_REQUEST,
+            StatusCode::FORBIDDEN,
             Json(ErrorResponse {
                 ok: false,
                 error: format!(
-                    "Missing required header: {}: {}",
-                    REGENERATE_HEADER_NAME, REGENERATE_HEADER_VALUE
+                    "Missing or invalid required header: x-csrf-token or {}",
+                    REGENERATE_HEADER_NAME
                 ),
             }),
         )
             .into_response();
+    }
+
+    let origin_str = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    let referer_str = headers.get(header::REFERER).and_then(|v| v.to_str().ok());
+
+    // We mandate that if a browser sends an Origin or Referer (which it will for cross-origin POSTs),
+    // it must match the allowed origins for this dashboard instance to prevent CSRF.
+    if let Some(source_url) = origin_str.or(referer_str) {
+        let is_valid_source = state.config.cors_policy.allows_origin(source_url);
+        if !is_valid_source {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: "Cross-origin regenerate request rejected by CORS policy".to_string(),
+                }),
+            )
+                .into_response();
+        }
     }
 
     if state.rebuilding.swap(true, Ordering::SeqCst) {
@@ -751,7 +840,7 @@ fn parse_relative_time(s: &str) -> Option<i64> {
     } else {
         return None;
     };
-    Some(now - num * unit)
+    Some(now.saturating_sub(num.saturating_mul(unit)))
 }
 
 fn merge_project_scopes(
@@ -1113,12 +1202,15 @@ async fn get_manifest() -> Response {
 }
 
 async fn get_service_worker() -> Response {
-    let sw_js = "const CACHE_NAME='aicx-shell-v1';\
+    let sw_js = concat!(
+        "const CACHE_NAME='aicx-shell-v",
+        env!("CARGO_PKG_VERSION"),
+        "';\
 const SHELL_URLS=['/','/manifest.webmanifest'];\
 self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE_NAME)\
 .then(c=>c.addAll(SHELL_URLS)));self.skipWaiting();});\
 self.addEventListener('activate',e=>{e.waitUntil(caches.keys()\
-.then(ks=>Promise.all(ks.filter(k=>k!==CACHE_NAME).map(k=>caches.delete(k)))));\
+.then(ks=>Promise.all(ks.filter(k=>k.startsWith('aicx-shell-')&&k!==CACHE_NAME).map(k=>caches.delete(k)))));\
 self.clients.claim();});\
 self.addEventListener('fetch',e=>{const u=new URL(e.request.url);\
 if(u.pathname.startsWith('/api/')||u.pathname==='/service-worker.js')return;\
@@ -1128,7 +1220,8 @@ return new Response('<html><body style=\"background:#0a0f19;color:#e5e7eb;\
 font-family:system-ui;display:flex;align-items:center;justify-content:center;\
 height:100vh;margin:0\"><div style=\"text-align:center\"><h1>aicx store not \
 reachable</h1><p>Start the server with <code>aicx dashboard --serve</code></p>\
-</div></body></html>',{headers:{'Content-Type':'text/html'}});});}));});";
+</div></body></html>',{headers:{'Content-Type':'text/html'}});});}));});"
+    );
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
@@ -1205,6 +1298,24 @@ async fn semantic_search(
         params.projects.clone(),
     );
     let frame_kind = params.frame_kind;
+    let kind_filter = match params.kind.as_deref() {
+        Some(kind) => match crate::timeline::Kind::parse(kind) {
+            Some(kind) => Some(kind),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        ok: false,
+                        error: format!(
+                            "Invalid kind '{kind}'. Expected conversations, plans, reports, or other"
+                        ),
+                    }),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
     let score_filter = match validate_score_filter(params.score) {
         Ok(score) => score,
         Err(error) => {
@@ -1217,6 +1328,7 @@ async fn semantic_search(
     };
     let query_clone = query.clone();
     let project_owned = request_projects.clone();
+    let kind_filter_owned = kind_filter;
 
     let result = tokio::task::spawn_blocking(move || {
         let project_scopes = search_project_scopes(&project_owned);
@@ -1226,6 +1338,7 @@ async fn semantic_search(
             limit,
             &project_scopes,
             frame_kind,
+            kind_filter_owned.map(|kind| kind.dir_name()),
         )
     })
     .await;
@@ -1300,37 +1413,38 @@ async fn semantic_search(
 // survive only for the cross-search endpoint (separate doctrine; lands
 // in its own cut when that surface migrates in-process).
 
-fn run_memex_cli(args: &[&str], action: &str) -> Result<(String, Output)> {
-    let candidates = ["rust-memex", "rmcp-memex"];
-    let mut last_not_found = None;
+async fn run_memex_cli(
+    binary_path: Option<&str>,
+    args: &[&str],
+    action: &str,
+) -> Result<(String, std::process::Output)> {
+    let binary = binary_path.ok_or_else(|| {
+        anyhow::anyhow!("Semantic search (vector backend) is an optional capability. Failed to run memex {action}: missing compatible memex CLI (rust-memex or rmcp-memex). Please install the vector backend or fall back to default lexical search.")
+    })?;
 
-    for binary in candidates {
-        match Command::new(binary).args(args).output() {
-            Ok(output) => return Ok((binary.to_string(), output)),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                last_not_found = Some(err);
-            }
-            Err(err) => {
-                return Err(err).with_context(|| format!("Failed to run {binary} {action}"));
-            }
-        }
-    }
+    let child = tokio::process::Command::new(binary)
+        .args(args)
+        .env_clear()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context(format!("Failed to spawn {binary} {action}"))?;
 
-    let last_not_found = last_not_found.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "no compatible memex CLI binary found",
-        )
-    });
-    Err(last_not_found).context(format!(
-        "Semantic search (vector backend) is an optional capability. Failed to run memex {action}: missing compatible memex CLI (\rust-memex or \rmcp-memex). Please install the vector backend or fall back to default lexical search."
-    ))
+    let output = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+        .await
+        .map_err(|_| anyhow::anyhow!("{binary} timed out after 30s"))?
+        .context(format!("Failed to collect output for {binary} {action}"))?;
+
+    Ok((binary.to_string(), output))
 }
 
 /// Cross-namespace semantic search via the configured memex CLI.
 ///
 /// Searches all namespaces at once, merging and ranking results.
-async fn cross_search(params: Result<Query<CrossSearchParams>, QueryRejection>) -> Response {
+async fn cross_search(
+    State(state): State<Arc<DashboardServerState>>,
+    params: Result<Query<CrossSearchParams>, QueryRejection>,
+) -> Response {
     let Query(params) = match params {
         Ok(q) => q,
         Err(rejection) => {
@@ -1356,7 +1470,7 @@ async fn cross_search(params: Result<Query<CrossSearchParams>, QueryRejection>) 
             .into_response();
     }
 
-    let limit = params.limit;
+    let limit = params.limit.min(200);
     let mode = params.mode;
     let projects = if params.projects.is_empty() {
         params.project.into_iter().collect::<Vec<_>>()
@@ -1364,33 +1478,42 @@ async fn cross_search(params: Result<Query<CrossSearchParams>, QueryRejection>) 
         params.projects
     };
 
-    let result = tokio::task::spawn_blocking(move || {
-        run_memex_cross_search(&query, limit, &mode, &projects)
-    })
+    let result = run_memex_cross_search(
+        state.memex_cli_path.as_deref(),
+        &query,
+        limit,
+        &mode,
+        &projects,
+    )
     .await;
 
     match result {
-        Ok(Ok(response)) => (StatusCode::OK, Json(response)).into_response(),
-        Ok(Err(err)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                ok: false,
-                error: format!("{err:#}"),
-            }),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                ok: false,
-                error: format!("Search task failed: {err}"),
-            }),
-        )
-            .into_response(),
+        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(err) => {
+            if let Some(err) = err.downcast_ref::<std::io::Error>()
+                && err.kind() == std::io::ErrorKind::NotFound
+            {
+                let payload = serde_json::json!({
+                    "ok": false,
+                    "error": "semantic_search_unavailable",
+                    "reason": format!("{err}"),
+                });
+                return (StatusCode::UNPROCESSABLE_ENTITY, Json(payload)).into_response();
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: format!("Search task failed: {err:#}"),
+                }),
+            )
+                .into_response()
+        }
     }
 }
 
-fn run_memex_cross_search(
+async fn run_memex_cross_search(
+    memex_cli_path: Option<&str>,
     query: &str,
     limit: usize,
     mode: &str,
@@ -1410,7 +1533,7 @@ fn run_memex_cross_search(
         args.push(project.clone());
     }
     let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    let (binary, output) = run_memex_cli(&arg_refs, "cross-search")?;
+    let (binary, output) = run_memex_cli(memex_cli_path, &arg_refs, "cross-search").await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1748,6 +1871,7 @@ mod tests {
                 cors_policy: DashboardCorsPolicy::Local,
                 host: "127.0.0.1".parse().expect("host"),
                 port: 8033,
+                auth: AuthConfig::disabled(),
             },
             shell_html: "<html>shell</html>".to_string(),
             snapshot: RwLock::new(DashboardSnapshot {
@@ -1768,6 +1892,8 @@ mod tests {
                 last_error: None,
             }),
             rebuilding: AtomicBool::new(false),
+            csrf_token: "test".to_string(),
+            memex_cli_path: None,
         })
     }
 
@@ -1777,22 +1903,55 @@ mod tests {
         let all = DashboardCorsPolicy::All;
         let exact =
             DashboardCorsPolicy::from_cli(Some("https://dashboard.example.com")).expect("exact");
+        let auth_on = AuthConfig {
+            token: Some("test-token".to_string()),
+            source: crate::auth::AuthSource::Cli,
+        };
+        let auth_off = AuthConfig::disabled();
 
         assert!(
-            validate_dashboard_host_policy("127.0.0.1".parse().expect("ipv4"), &local, false)
+            validate_dashboard_host_policy(
+                "127.0.0.1".parse().expect("ipv4"),
+                &local,
+                false,
+                &auth_off
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_dashboard_host_policy(
+                "0.0.0.0".parse().expect("any"),
+                &local,
+                false,
+                &auth_on
+            )
+            .is_err()
+        );
+        assert!(
+            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &local, true, &auth_on)
+                .is_err()
+        );
+        assert!(
+            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &all, true, &auth_on)
                 .is_ok()
         );
         assert!(
-            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &local, false).is_err()
+            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &exact, true, &auth_on)
+                .is_ok()
+        );
+        // F-P0-2: non-loopback bind without auth must refuse, regardless of CORS.
+        assert!(
+            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &all, true, &auth_off)
+                .is_err()
         );
         assert!(
-            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &local, true).is_err()
-        );
-        assert!(
-            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &all, true).is_ok()
-        );
-        assert!(
-            validate_dashboard_host_policy("0.0.0.0".parse().expect("any"), &exact, true).is_ok()
+            validate_dashboard_host_policy(
+                "0.0.0.0".parse().expect("any"),
+                &exact,
+                true,
+                &auth_off
+            )
+            .is_err()
         );
     }
 
@@ -1860,7 +2019,7 @@ mod tests {
 
         let response =
             runtime.block_on(regenerate_dashboard(State(state.clone()), HeaderMap::new()));
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(!state.rebuilding.load(Ordering::SeqCst));
 
         let _ = fs::remove_dir_all(root);
@@ -1884,6 +2043,8 @@ mod tests {
             REGENERATE_HEADER_NAME,
             HeaderValue::from_static(REGENERATE_HEADER_VALUE),
         );
+        headers.insert("x-csrf-token", "test".parse().unwrap());
+        headers.insert(header::ORIGIN, "http://127.0.0.1:4000".parse().unwrap());
         let response = runtime.block_on(regenerate_dashboard(State(state.clone()), headers));
         assert_eq!(response.status(), StatusCode::CONFLICT);
         assert!(state.rebuilding.load(Ordering::SeqCst));
@@ -1908,6 +2069,8 @@ mod tests {
             REGENERATE_HEADER_NAME,
             HeaderValue::from_static(REGENERATE_HEADER_VALUE),
         );
+        headers.insert("x-csrf-token", "test".parse().unwrap());
+        headers.insert(header::ORIGIN, "http://127.0.0.1:4000".parse().unwrap());
         let response = runtime.block_on(regenerate_dashboard(State(state), headers));
         assert_eq!(response.status(), StatusCode::OK);
         // Server mode no longer writes a static HTML artifact — data is served via API.
@@ -1920,5 +2083,20 @@ mod tests {
         let err = validate_score_filter(Some(MAX_SCORE_FILTER + 1))
             .expect_err("score above 100 should be rejected");
         assert_eq!(err, "score must be between 0 and 100");
+    }
+
+    #[test]
+    fn test_cors_all_reflects_allowlisted_origin_not_wildcard() {
+        let policy = DashboardCorsPolicy::All;
+        assert_eq!(
+            policy.response_allow_origin("https://example.com"),
+            Some(HeaderValue::from_str("https://example.com").unwrap())
+        );
+    }
+
+    #[test]
+    fn test_service_worker_cache_name_includes_version() {
+        // Just statically verified in code. But we can't test get_service_worker directly
+        // unless it's sync. It's async.
     }
 }

@@ -162,6 +162,13 @@ mod cloud_impl {
             if texts.is_empty() {
                 return Ok(Vec::new());
             }
+            // D-9: cap each input before serializing the HTTP body so a
+            // pathological caller cannot pin a remote endpoint with a 200 MB
+            // POST. Whitespace-only inputs also fail-fast here.
+            for (idx, text) in texts.iter().enumerate() {
+                crate::enforce_embed_input_budget(text)
+                    .with_context(|| format!("cloud embed input #{idx} rejected"))?;
+            }
             let api_key = self.resolve_api_key()?;
             let body = serde_json::json!({
                 "model": self.config.model,
@@ -302,4 +309,46 @@ timeout_secs = 60
             Some("vetcoders")
         );
     }
+}
+
+#[cfg(feature = "cloud")]
+pub fn probe(url: &str, model: &str) -> std::result::Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("failed to build client: {e}"))?;
+
+    let body = serde_json::json!({
+        "model": model,
+        "input": ["aicx doctor probe"],
+    });
+
+    let resp = client
+        .post(url)
+        .json(&body)
+        .send()
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    if status.is_client_error() || status.is_server_error() {
+        return Err(format!("HTTP {}", status));
+    }
+
+    // We can't easily parse EmbeddingsResponse without duplicating it or making it pub in cloud_impl.
+    // Let's just parse it as serde_json::Value
+    let parsed: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+    let data = parsed
+        .get("data")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "missing data array".to_string())?;
+    if data.is_empty() {
+        return Err("empty data array".to_string());
+    }
+    let embedding = data[0]
+        .get("embedding")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "missing embedding array".to_string())?;
+    if embedding.is_empty() {
+        return Err("zero dimension".to_string());
+    }
+    Ok(format!("HTTP {} (dim: {})", status, embedding.len()))
 }

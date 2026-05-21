@@ -5,13 +5,14 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use crate::store::atomic_write::atomic_write;
 
 pub mod migration;
 
@@ -21,8 +22,8 @@ const DEFAULT_MAX_HASHES: usize = 50_000;
 /// Per-project dedup hashes with insertion/LRU order preserved.
 #[derive(Debug, Clone, Default)]
 pub struct SeenHashSet {
-    order: VecDeque<u64>,
-    set: HashSet<u64>,
+    order: VecDeque<String>,
+    set: HashSet<String>,
 }
 
 impl SeenHashSet {
@@ -34,15 +35,15 @@ impl SeenHashSet {
         self.set.is_empty()
     }
 
-    pub fn contains(&self, hash: &u64) -> bool {
+    pub fn contains(&self, hash: &str) -> bool {
         self.set.contains(hash)
     }
 
-    pub fn insert(&mut self, hash: u64) {
+    pub fn insert(&mut self, hash: String) {
         if self.set.remove(&hash) {
             self.order.retain(|existing| *existing != hash);
         }
-        self.set.insert(hash);
+        self.set.insert(hash.clone());
         self.order.push_back(hash);
     }
 
@@ -76,7 +77,7 @@ impl<'de> Deserialize<'de> for SeenHashSet {
     where
         D: Deserializer<'de>,
     {
-        let hashes = Vec::<u64>::deserialize(deserializer)?;
+        let hashes = Vec::<String>::deserialize(deserializer)?;
         let mut out = SeenHashSet::default();
         for hash in hashes {
             out.insert(hash);
@@ -123,7 +124,7 @@ impl Default for StateManager {
             last_processed: HashMap::new(),
             seen_hashes: HashMap::new(),
             runs: Vec::new(),
-            hash_algorithm: migration::SIPHASH13_ALGORITHM.to_string(),
+            hash_algorithm: migration::BLAKE3_128_ALGORITHM.to_string(),
         }
     }
 }
@@ -135,54 +136,66 @@ impl StateManager {
         Ok(base.join("state.json"))
     }
 
-    /// Load state from disk. Creates a fresh default state if the file
-    /// does not exist or cannot be parsed.
+    /// Load state from disk. Creates a fresh default state only when the file
+    /// does not exist.
     ///
-    /// **Migration:** If the file contains the old flat `HashSet<u64>` format
-    /// for `seen_hashes`, deserialization will fail and we fall back to
-    /// `Default` (empty state). Old hashes are discarded — they have no
-    /// project context and would cause cross-project dedup pollution.
-    pub fn load() -> Self {
-        let path = match Self::state_path() {
-            Ok(p) => p,
-            Err(_) => return Self::default(),
-        };
+    /// Malformed JSON is never silently reset to default. We recover from a
+    /// valid rolling backup when available; otherwise the caller gets an error.
+    pub fn load() -> Result<Self> {
+        Self::load_from_path(&Self::state_path()?)
+    }
 
+    fn load_from_path(path: &Path) -> Result<Self> {
         if !path.exists() {
-            return Self::default();
+            return Ok(Self::default());
         }
 
-        let lock_path = match crate::locks::state_lock_path() {
-            Ok(path) => path,
+        let backup_path = Self::backup_path(path);
+        let contents = fs::read_to_string(path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+            .with_context(|| format!("Failed to read state file: {}", path.display()))?;
+
+        let mut state: Self = match serde_json::from_str(&contents) {
+            Ok(state) => state,
             Err(err) => {
-                tracing::warn!("failed to resolve state lock path: {err}");
-                return Self::default();
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "state.json parse failed"
+                );
+                if backup_path.exists() {
+                    let backup = fs::read_to_string(&backup_path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+                        .with_context(|| {
+                            format!("Failed to read state backup: {}", backup_path.display())
+                        })?;
+                    serde_json::from_str(&backup).map_err(|backup_err| {
+                        anyhow!("state.json malformed AND backup unreadable: {err} / {backup_err}")
+                    })?
+                } else {
+                    return Err(anyhow!(
+                        "state.json corrupted, no backup; manual recovery needed: {}",
+                        path.display()
+                    ));
+                }
             }
         };
-        let _lock = match crate::locks::acquire_shared(lock_path) {
-            Ok(lock) => lock,
-            Err(err) => {
-                tracing::warn!("failed to acquire shared state lock: {err}");
-                return Self::default();
-            }
-        };
-
-        let contents = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => return Self::default(),
-        };
-
-        // Try new format first; fall back to default (migration: old flat hashes discarded)
-        let mut state: Self = serde_json::from_str(&contents).unwrap_or_default();
         state.apply_load_migrations();
-        state
+        Ok(state)
     }
 
     /// Persist current state to disk. Creates parent directories if needed.
     pub fn save(&self) -> Result<()> {
         let path = Self::state_path()?;
-        let lock = crate::locks::acquire_exclusive(crate::locks::state_lock_path()?)?;
+        self.save_to_path(&path)
+    }
 
+    fn save_to_path(&self, path: &Path) -> Result<()> {
+        self.save_to_path_with_writer(path, atomic_write)
+    }
+
+    fn save_to_path_with_writer<W>(&self, path: &Path, write_atomic: W) -> Result<()>
+    where
+        W: Fn(&Path, &[u8]) -> std::io::Result<()>,
+    {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create config dir: {}", parent.display()))?;
@@ -190,11 +203,22 @@ impl StateManager {
 
         let json = serde_json::to_string_pretty(self).context("Failed to serialize state")?;
 
-        fs::write(&path, json)
-            .with_context(|| format!("Failed to write state file: {}", path.display()))?;
+        if path.exists() {
+            let previous = fs::read(path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+                .with_context(|| format!("Failed to read state file: {}", path.display()))?;
+            let backup_path = Self::backup_path(path);
+            write_atomic(&backup_path, &previous).with_context(|| {
+                format!("Failed to write state backup: {}", backup_path.display())
+            })?;
+        }
 
-        crate::locks::release(lock);
+        write_atomic(path, json.as_bytes())
+            .with_context(|| format!("Failed to write state file: {}", path.display()))?;
         Ok(())
+    }
+
+    fn backup_path(path: &Path) -> PathBuf {
+        path.with_file_name("state.json.bak")
     }
 
     // ========================================================================
@@ -203,17 +227,17 @@ impl StateManager {
 
     /// Compute a stable content hash from entry fields (exact dedup).
     ///
-    /// Uses explicitly pinned SipHash-1-3 for fast, stable hashing.
+    /// Uses explicitly pinned BLAKE3-128 for fast, stable hashing.
     ///
     /// The (agent, timestamp, message) triple is sufficient for unique
     /// identification. Session ID is excluded because Claude Code stores
     /// the same user message in multiple session JSONL files.
-    pub fn content_hash(agent: &str, timestamp: i64, message: &str) -> u64 {
-        let mut hasher = migration::stable_siphasher13();
-        agent.hash(&mut hasher);
-        timestamp.hash(&mut hasher);
-        message.hash(&mut hasher);
-        hasher.finish()
+    pub fn content_hash(agent: &str, timestamp: i64, message: &str) -> String {
+        let mut data = Vec::new();
+        data.extend_from_slice(agent.as_bytes());
+        data.extend_from_slice(&timestamp.to_le_bytes());
+        data.extend_from_slice(message.as_bytes());
+        migration::stable_blake3_128(&data)
     }
 
     /// Compute an overlap hash for cross-agent dedup.
@@ -226,24 +250,24 @@ impl StateManager {
     /// The overlap hash ignores `agent` and buckets timestamps into 60-second
     /// windows, so identical messages arriving within the same minute from
     /// different agents collapse into one.
-    pub fn overlap_hash(timestamp: i64, message: &str) -> u64 {
-        let mut hasher = migration::stable_siphasher13();
+    pub fn overlap_hash(timestamp: i64, message: &str) -> String {
         let bucket = timestamp / 60; // 60-second window
-        bucket.hash(&mut hasher);
-        message.hash(&mut hasher);
-        hasher.finish()
+        let mut data = Vec::new();
+        data.extend_from_slice(&bucket.to_le_bytes());
+        data.extend_from_slice(message.as_bytes());
+        migration::stable_blake3_128(&data)
     }
 
     /// Returns `true` if this hash has NOT been seen before for the given project.
-    pub fn is_new(&self, project: &str, hash: u64) -> bool {
+    pub fn is_new(&self, project: &str, hash: &str) -> bool {
         let project = migration::canonical_state_bucket(project);
         self.seen_hashes
             .get(&project)
-            .is_none_or(|set| !set.contains(&hash))
+            .is_none_or(|set| !set.contains(hash))
     }
 
     /// Mark a hash as seen for the given project.
-    pub fn mark_seen(&mut self, project: &str, hash: u64) {
+    pub fn mark_seen(&mut self, project: &str, hash: String) {
         let project = migration::canonical_state_bucket(project);
         self.seen_hashes.entry(project).or_default().insert(hash);
     }
@@ -350,6 +374,36 @@ impl StateManager {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_state_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("aicx-state-{label}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("state.json")
+    }
+
+    fn cleanup_state_path(path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    fn ts(seconds: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(seconds, 0).single().unwrap()
+    }
+
+    fn state_with_marker(source: &str, watermark_seconds: i64, project_hash: u64) -> StateManager {
+        let mut state = StateManager::default();
+        state.update_watermark(source, ts(watermark_seconds));
+        state.mark_seen("project", project_hash.to_string());
+        state
+    }
 
     #[test]
     fn test_default_state_is_empty() {
@@ -426,18 +480,18 @@ mod tests {
         let hash = StateManager::content_hash("claude", 100, "msg");
 
         // New for both projects
-        assert!(state.is_new("projA", hash));
-        assert!(state.is_new("projB", hash));
+        assert!(state.is_new("projA", &hash));
+        assert!(state.is_new("projB", &hash));
 
         // Mark seen only in projA
-        state.mark_seen("projA", hash);
-        assert!(!state.is_new("projA", hash));
-        assert!(!state.is_new("proja", hash));
-        assert!(state.is_new("projB", hash)); // still new for projB
+        state.mark_seen("projA", hash.clone());
+        assert!(!state.is_new("projA", &hash));
+        assert!(!state.is_new("proja", &hash));
+        assert!(state.is_new("projB", &hash)); // still new for projB
 
         // Mark seen in projB
-        state.mark_seen("projB", hash);
-        assert!(!state.is_new("projB", hash));
+        state.mark_seen("projB", hash.clone());
+        assert!(!state.is_new("projB", &hash));
     }
 
     #[test]
@@ -482,10 +536,86 @@ mod tests {
     }
 
     #[test]
+    fn test_save_uses_atomic_write() {
+        let path = unique_state_path("atomic-write");
+        let old = state_with_marker("claude:test", 10, 101);
+        old.save_to_path(&path).unwrap();
+        let old_contents = fs::read(&path).unwrap();
+
+        let new = state_with_marker("claude:test", 20, 202);
+        let target_path = path.clone();
+        let err = new
+            .save_to_path_with_writer(&path, move |target, content| {
+                if target == target_path.as_path() {
+                    return Err(std::io::Error::other("mock atomic_write failure"));
+                }
+                crate::store::atomic_write::atomic_write(target, content)
+            })
+            .expect_err("mocked final atomic write should fail");
+
+        assert!(err.to_string().contains("Failed to write state file"));
+        assert_eq!(fs::read(&path).unwrap(), old_contents);
+        let loaded = StateManager::load_from_path(&path).unwrap();
+        assert_eq!(loaded.get_watermark("claude:test"), Some(ts(10)));
+        assert!(!loaded.is_new("project", "101"));
+
+        cleanup_state_path(&path);
+    }
+
+    #[test]
+    fn test_load_malformed_returns_error_not_default() {
+        let path = unique_state_path("malformed");
+        fs::write(&path, b"{ this is not json").unwrap();
+
+        let err = StateManager::load_from_path(&path)
+            .expect_err("malformed state without backup must not default");
+
+        assert!(err.to_string().contains("state.json corrupted"));
+        cleanup_state_path(&path);
+    }
+
+    #[test]
+    fn test_load_recovers_from_backup_when_main_corrupt() {
+        let path = unique_state_path("backup-recovery");
+        let backup_path = StateManager::backup_path(&path);
+        let backup_state = state_with_marker("claude:test", 20, 202);
+        fs::write(&path, b"{ this is not json").unwrap();
+        fs::write(
+            &backup_path,
+            serde_json::to_string_pretty(&backup_state).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = StateManager::load_from_path(&path).unwrap();
+
+        assert_eq!(loaded.get_watermark("claude:test"), Some(ts(20)));
+        assert!(!loaded.is_new("project", "202"));
+        cleanup_state_path(&path);
+    }
+
+    #[test]
+    fn test_save_creates_backup_before_overwrite() {
+        let path = unique_state_path("backup-overwrite");
+        let backup_path = StateManager::backup_path(&path);
+        let old = state_with_marker("claude:test", 10, 101);
+        old.save_to_path(&path).unwrap();
+        let old_contents = fs::read_to_string(&path).unwrap();
+
+        let new = state_with_marker("claude:test", 20, 202);
+        new.save_to_path(&path).unwrap();
+
+        assert_eq!(fs::read_to_string(&backup_path).unwrap(), old_contents);
+        let loaded = StateManager::load_from_path(&path).unwrap();
+        assert_eq!(loaded.get_watermark("claude:test"), Some(ts(20)));
+        assert!(!loaded.is_new("project", "202"));
+        cleanup_state_path(&path);
+    }
+
+    #[test]
     fn test_prune_old_hashes_below_limit() {
         let mut state = StateManager::default();
         for i in 0..10u64 {
-            state.mark_seen("proj", i);
+            state.mark_seen("proj", i.to_string());
         }
 
         state.prune_old_hashes(100);
@@ -496,7 +626,7 @@ mod tests {
     fn test_prune_old_hashes_above_limit() {
         let mut state = StateManager::default();
         for i in 0..100u64 {
-            state.mark_seen("proj", i);
+            state.mark_seen("proj", i.to_string());
         }
 
         state.prune_old_hashes(30);
@@ -507,20 +637,20 @@ mod tests {
     fn lru_evicts_oldest_first() {
         let mut state = StateManager::default();
         for i in 0..10u64 {
-            state.mark_seen("proj", i);
+            state.mark_seen("proj", i.to_string());
         }
 
         state.prune_old_hashes(5);
 
         for old in 0..5u64 {
             assert!(
-                state.is_new("proj", old),
+                state.is_new("proj", &old.to_string()),
                 "old hash {old} should be evicted"
             );
         }
         for fresh in 5..10u64 {
             assert!(
-                !state.is_new("proj", fresh),
+                !state.is_new("proj", &fresh.to_string()),
                 "fresh hash {fresh} should remain"
             );
         }
@@ -554,24 +684,24 @@ mod tests {
     #[test]
     fn test_reset_project() {
         let mut state = StateManager::default();
-        state.mark_seen("projA", 1);
-        state.mark_seen("projA", 2);
-        state.mark_seen("projB", 3);
+        state.mark_seen("projA", "1".to_string());
+        state.mark_seen("projA", "2".to_string());
+        state.mark_seen("projB", "3".to_string());
 
         state.reset_project("projA");
-        assert!(state.is_new("projA", 1));
-        assert!(!state.is_new("projB", 3));
+        assert!(state.is_new("projA", "1"));
+        assert!(!state.is_new("projB", "3"));
     }
 
     #[test]
     fn test_reset_all() {
         let mut state = StateManager::default();
-        state.mark_seen("projA", 1);
-        state.mark_seen("projB", 2);
+        state.mark_seen("projA", "1".to_string());
+        state.mark_seen("projB", "2".to_string());
 
         state.reset_all();
-        assert!(state.is_new("projA", 1));
-        assert!(state.is_new("projB", 2));
+        assert!(state.is_new("projA", "1"));
+        assert!(state.is_new("projB", "2"));
         assert_eq!(state.total_hashes(), 0);
     }
 
@@ -581,18 +711,18 @@ mod tests {
         let t = Utc.with_ymd_and_hms(2026, 1, 20, 15, 30, 0).unwrap();
 
         state.update_watermark("claude:TestProject", t);
-        state.mark_seen("myproj", 123456789);
-        state.mark_seen("myproj", 987654321);
+        state.mark_seen("myproj", "123456789".to_string());
+        state.mark_seen("myproj", "987654321".to_string());
         state.record_run(5, vec!["claude:TestProject".to_string()]);
 
         let json = serde_json::to_string_pretty(&state).unwrap();
         let restored: StateManager = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored.get_watermark("claude:TestProject"), Some(t));
-        assert!(!restored.is_new("myproj", 123456789));
-        assert!(!restored.is_new("myproj", 987654321));
-        assert!(restored.is_new("myproj", 111111111));
-        assert!(restored.is_new("other", 123456789)); // different project
+        assert!(!restored.is_new("myproj", "123456789"));
+        assert!(!restored.is_new("myproj", "987654321"));
+        assert!(restored.is_new("myproj", "111111111"));
+        assert!(restored.is_new("other", "123456789")); // different project
         assert_eq!(restored.runs.len(), 1);
         assert_eq!(restored.runs[0].entries_added, 5);
     }
@@ -605,13 +735,13 @@ mod tests {
             .seen_hashes
             .entry("Vista".to_string())
             .or_default()
-            .insert(42);
+            .insert("42".to_string());
 
         let report = migration::migrate_loaded_state(&mut state);
 
         assert!(report.hash_algorithm_changed);
         assert_eq!(report.cleared_seen_hashes, 1);
-        assert_eq!(state.hash_algorithm, migration::SIPHASH13_ALGORITHM);
+        assert_eq!(state.hash_algorithm, migration::BLAKE3_128_ALGORITHM);
         assert_eq!(state.total_hashes(), 0);
     }
 
@@ -622,12 +752,12 @@ mod tests {
             .seen_hashes
             .entry("Vista".to_string())
             .or_default()
-            .insert(1);
+            .insert("1".to_string());
         state
             .seen_hashes
             .entry("vista".to_string())
             .or_default()
-            .insert(2);
+            .insert("2".to_string());
 
         let report = migration::migrate_loaded_state(&mut state);
 
@@ -635,8 +765,8 @@ mod tests {
         assert_eq!(report.lowercased_seen_hash_buckets, 1);
         assert_eq!(report.merged_seen_hash_buckets, 1);
         assert_eq!(state.seen_hashes.len(), 1);
-        assert!(!state.is_new("vista", 1));
-        assert!(!state.is_new("Vista", 2));
+        assert!(!state.is_new("vista", "1"));
+        assert!(!state.is_new("Vista", "2"));
     }
 
     #[test]

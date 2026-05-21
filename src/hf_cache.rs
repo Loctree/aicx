@@ -92,10 +92,32 @@ fn find_snapshot_in_base(
         if !path.is_dir() {
             continue;
         }
-        if !required_all.iter().all(|f| path.join(f).exists()) {
+        // D-8: don't trust raw `exists()` — a zero-byte or non-regular file
+        // is a partial / truncated download, not a usable cache hit. Log
+        // the exact path so an operator chasing a broken hydrate has a
+        // clear lead instead of a silent miss.
+        let missing_required = required_all
+            .iter()
+            .find(|name| !is_complete_cache_file(&path.join(name)));
+        if let Some(name) = missing_required {
+            tracing::warn!(
+                target: "aicx::hf_cache",
+                path = %path.join(name).display(),
+                file = %name,
+                "hf cache snapshot is missing or incomplete; ignoring"
+            );
             continue;
         }
-        if !required_any.is_empty() && !required_any.iter().any(|f| path.join(f).exists()) {
+        if !required_any.is_empty()
+            && !required_any
+                .iter()
+                .any(|name| is_complete_cache_file(&path.join(name)))
+        {
+            tracing::warn!(
+                target: "aicx::hf_cache",
+                path = %path.display(),
+                "hf cache snapshot has none of the required-any files in a usable state; ignoring"
+            );
             continue;
         }
         let modified = entry
@@ -109,4 +131,14 @@ fn find_snapshot_in_base(
     }
 
     best.map(|(_, p)| p)
+}
+
+/// Returns `true` when `path` is a regular file with non-zero length. The
+/// `fs::metadata` syscall costs a stat per snapshot but the cache lookup
+/// runs at most once per process bootstrap.
+fn is_complete_cache_file(path: &Path) -> bool {
+    match fs::metadata(path) {
+        Ok(meta) => meta.is_file() && meta.len() > 0,
+        Err(_) => false,
+    }
 }

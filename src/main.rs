@@ -286,6 +286,14 @@ struct DashboardArgs {
     #[arg(long, requires = "serve", value_name = "PRESET|URL")]
     allow_cors_origins: Option<String>,
 
+    /// Optional explicit auth token (overrides env / file / generated). Server mode only.
+    #[arg(long, requires = "serve", value_name = "TOKEN")]
+    auth_token: Option<String>,
+
+    /// Require Bearer auth on dashboard `/api/*` (default: true). Pass `--no-require-auth` to opt out.
+    #[arg(long, requires = "serve", default_value_t = true, action = clap::ArgAction::Set)]
+    require_auth: bool,
+
     /// Document title
     #[arg(long, default_value = DEFAULT_DASHBOARD_TITLE)]
     title: String,
@@ -328,6 +336,16 @@ struct ReportsArgs {
     /// Optional JSON bundle output path for later import/merge
     #[arg(long)]
     bundle_output: Option<PathBuf>,
+
+    /// Overwrite existing HTML/bundle outputs. Without this flag, the command
+    /// refuses to clobber a pre-existing file at either output path.
+    #[arg(long, default_value_t = false)]
+    force: bool,
+
+    /// Derive `generated_at` from the latest record timestamp instead of
+    /// `Utc::now()`. Also enabled via `AICX_REPORTS_DETERMINISTIC=1` env var.
+    #[arg(long, default_value_t = false)]
+    deterministic: bool,
 
     /// Document title
     #[arg(long, default_value = DEFAULT_REPORTS_TITLE)]
@@ -478,10 +496,10 @@ enum Commands {
         redaction: RedactionArgs,
 
         /// Source cwd/project filter(s): narrows session discovery before repo segmentation
-        #[arg(short, long, num_args = 1..)]
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
-        /// Hours to look back (default: 48)
+        /// Hours to look back (default: 48, 0 = all time)
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
@@ -548,10 +566,10 @@ enum Commands {
         redaction: RedactionArgs,
 
         /// Source cwd/project filter(s): narrows session discovery before repo segmentation
-        #[arg(short, long, num_args = 1..)]
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
-        /// Hours to look back (default: 48)
+        /// Hours to look back (default: 48, 0 = all time)
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
@@ -620,10 +638,10 @@ enum Commands {
         redaction: RedactionArgs,
 
         /// Source cwd/project filter(s): narrows session discovery before repo segmentation
-        #[arg(short, long, num_args = 1..)]
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
-        /// Hours to look back
+        /// Hours to look back (default: 48, 0 = all time)
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
@@ -708,7 +726,7 @@ enum Commands {
         #[arg(long, value_enum, conflicts_with = "input")]
         agent: Option<ExtractInputFormat>,
 
-        /// Hours to look back when scanning sources in session mode (default: 1 year).
+        /// Hours to look back when scanning sources in session mode (default: 1 year, 0 = all time).
         #[arg(short = 'H', long, default_value = "8760")]
         hours: u64,
 
@@ -752,7 +770,7 @@ enum Commands {
         agent: String,
 
         /// Source cwd/project filter(s): narrows session discovery before export.
-        #[arg(short, long, num_args = 1..)]
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
         /// Hours to look back when scanning source sessions (default: 1 year).
@@ -789,14 +807,14 @@ enum Commands {
         redaction: RedactionArgs,
 
         /// Source cwd/project filter(s): narrows session discovery before repo segmentation
-        #[arg(short, long, num_args = 1..)]
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
         /// Agent filter: claude, codex, gemini, junie, codescribe, operator-md (default: all agents)
         #[arg(short, long, value_parser = ["claude", "codex", "gemini", "junie", "codescribe", "operator-md"])]
         agent: Option<String>,
 
-        /// Hours to look back (default: 48)
+        /// Hours to look back (default: 48, 0 = all time)
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
@@ -843,10 +861,10 @@ enum Commands {
         source: IngestSource,
 
         /// Source cwd/project filter(s): narrows source discovery before repo segmentation
-        #[arg(short, long, num_args = 1..)]
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
-        /// Hours to look back when --since is omitted (default: 720 = 30 days)
+        /// Hours to look back when --since is omitted (default: 720 = 30 days, 0 = all time)
         #[arg(short = 'H', long, default_value = "720")]
         hours: u64,
 
@@ -955,7 +973,8 @@ enum Commands {
     /// Extract structured intents from the canonical corpus.
     Intents {
         /// Repo or store-bucket filters. Omit to scan all projects.
-        #[arg(short, long, num_args = 1.., value_delimiter = ',')]
+        /// Repeated `-p` flags or comma list (`-p a,b`) form a union.
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
         /// Hours to look back (default: 720 = 30 days)
@@ -989,7 +1008,8 @@ enum Commands {
     /// Stream newly-arriving intents/chunks in a follow-like mode.
     Tail {
         /// Repo or store-bucket filters. Omit to scan all projects.
-        #[arg(short, long, num_args = 1.., value_delimiter = ',')]
+        /// Repeated `-p` flags or comma list (`-p a,b`) form a union.
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
         /// Hours to look back (default: 48)
@@ -1017,6 +1037,14 @@ enum Commands {
         /// Port for streamable HTTP transport (default: 8044)
         #[arg(long, default_value = "8044")]
         port: u16,
+
+        /// Optional explicit auth token (overrides env / file / generated). HTTP transport only.
+        #[arg(long, value_name = "TOKEN")]
+        auth_token: Option<String>,
+
+        /// Require Bearer auth on HTTP transport (default: true). Pass `--no-require-auth` to opt out.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        require_auth: bool,
     },
 
     #[command(
@@ -1085,11 +1113,19 @@ enum Commands {
         /// Search query string
         query: String,
 
-        /// Repo or store-bucket filters. Omit to search all projects.
+        /// Project filter. Omit to search every project.
         ///
-        /// Accepts repeated flags (`-p repo-a -p repo-b`), comma-separated
-        /// values (`-p repo-a,repo-b`), or a space list (`-p repo-a repo-b`).
-        #[arg(short, long, num_args = 1.., value_delimiter = ',')]
+        /// Accepted forms (case-insensitive, repeatable):
+        ///   `-p owner/repo`   strict `<owner>/<repo>` slug match
+        ///   `-p owner/`       all repos under that owner (org wildcard)
+        ///   `-p /repo`        same repo name across every owner
+        ///   `-p name`         name matches an owner OR a repo (cross-org)
+        ///
+        /// Multiple `-p` flags or a comma list (`-p a,b`) form a union.
+        /// Substring matching is intentionally not supported — `-p vista`
+        /// no longer matches `vista-portal` / `vista-docs`. Use `-p vetcoders/Vista`
+        /// or `-p /Vista` if you want exactness.
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
         /// Hours to look back (0 = all time)
@@ -1103,6 +1139,10 @@ enum Commands {
 
         #[command(flatten)]
         filters: RetrievalFilters,
+
+        /// Filter by canonical corpus kind: conversations, plans, reports, other.
+        #[arg(long, value_parser = ["conversations", "conversation", "plans", "plan", "reports", "report", "other"])]
+        kind: Option<String>,
 
         /// Bypass semantic vector search and run filesystem-fuzzy search.
         #[arg(long)]
@@ -1119,15 +1159,22 @@ enum Commands {
         #[command(subcommand)]
         action: Option<IndexAction>,
 
-        /// Repo or store-bucket filters. Omit to index all projects.
+        /// Project filter. Omit to index every project.
         ///
-        /// Accepts repeated flags (`-p repo-a -p repo-b`), comma-separated
-        /// values (`-p repo-a,repo-b`), or a space list (`-p repo-a repo-b`).
-        #[arg(short, long, num_args = 1.., value_delimiter = ',')]
+        /// Accepted forms (case-insensitive, repeatable):
+        ///   `-p owner/repo`   strict `<owner>/<repo>` slug match
+        ///   `-p owner/`       all repos under that owner (org wildcard)
+        ///   `-p /repo`        same repo name across every owner
+        ///   `-p name`         name matches an owner OR a repo (cross-org)
+        ///
+        /// Multiple `-p` flags or a comma list (`-p a,b`) form a union.
+        /// Substring matching is intentionally not supported — `-p vista`
+        /// no longer matches `vista-portal` / `vista-docs`.
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
         /// Stop after sampling this many chunks (0 = scan all)
-        #[arg(long, default_value = "16")]
+        #[arg(long, default_value = "0")]
         sample: usize,
 
         /// Emit JSON stats instead of plain text
@@ -1186,7 +1233,8 @@ enum Commands {
         kind: Option<String>,
 
         /// Repo or store-bucket filters. Omit to search all projects.
-        #[arg(short, long, num_args = 1.., value_delimiter = ',')]
+        /// Repeated `-p` flags or comma list (`-p a,b`) form a union.
+        #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
         /// Filter by date: single day (2026-03-28), range (2026-03-20..2026-03-28),
@@ -1282,6 +1330,11 @@ enum Commands {
         /// Print recommendations for green checks too
         #[arg(short, long)]
         verbose: bool,
+
+        /// Run actual real HTTP POST / embedder tests instead of skipping them.
+        /// Doctor stays fast and cheap by default; this flag exercises the AI provider.
+        #[arg(long)]
+        smoke: bool,
 
         /// Output format: text (default), json
         #[arg(long, default_value = "text")]
@@ -1666,6 +1719,8 @@ fn main() -> Result<()> {
                 no_open: args.no_open,
                 bg: false,
                 allow_cors_origins: None,
+                auth_token: None,
+                require_auth: true,
                 artifact: args.artifact.unwrap_or(default_dashboard_output_path()?),
                 title: args.title,
                 preview_chars: args.preview_chars,
@@ -1703,9 +1758,20 @@ fn main() -> Result<()> {
         }) => {
             run_tail(&project, hours, follow, kind.as_deref(), filters)?;
         }
-        Some(Commands::Serve { transport, port }) => {
+        Some(Commands::Serve {
+            transport,
+            port,
+            auth_token,
+            require_auth,
+        }) => {
+            let auth_config = aicx::auth::load_auth_config(auth_token.as_deref(), require_auth)?;
+            if matches!(transport, McpTransport::Http) && !require_auth {
+                eprintln!(
+                    "! Warning: MCP HTTP transport bound without auth — knowing the port is enough to invoke MCP tools."
+                );
+            }
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async { mcp::run_transport(transport, port).await })?;
+            rt.block_on(async { mcp::run_transport(transport, port, auth_config).await })?;
         }
         Some(Commands::Search {
             query,
@@ -1713,18 +1779,20 @@ fn main() -> Result<()> {
             hours,
             date,
             filters,
+            kind,
             no_semantic,
             json,
         }) => {
-            run_search(
-                &query,
-                &project,
+            run_search(SearchRunArgs {
+                query: &query,
+                projects: &project,
                 hours,
-                date.as_deref(),
+                date: date.as_deref(),
                 json,
                 filters,
+                kind: kind.as_deref(),
                 no_semantic,
-            )?;
+            })?;
         }
         Some(Commands::Index {
             action,
@@ -1810,6 +1878,7 @@ fn main() -> Result<()> {
             prune_empty_bodies,
             check_dedup,
             verbose,
+            smoke,
             format,
             oracle,
         }) => {
@@ -1821,6 +1890,7 @@ fn main() -> Result<()> {
                 prune_empty_bodies,
                 check_dedup,
                 verbose,
+                smoke,
             };
             let rt = tokio::runtime::Runtime::new()
                 .context("Failed to start tokio runtime for doctor")?;
@@ -1852,7 +1922,7 @@ fn main() -> Result<()> {
             }
 
             let exit_code = match report.overall {
-                aicx::doctor::Severity::Critical if !fix && !fix_buckets => 1,
+                aicx::doctor::Severity::Critical => 1,
                 _ => 0,
             };
             std::process::exit(exit_code);
@@ -1866,6 +1936,7 @@ fn main() -> Result<()> {
                 prune_empty_bodies: false,
                 check_dedup: false,
                 verbose: true,
+                smoke: false,
             };
             let rt = tokio::runtime::Runtime::new()
                 .context("Failed to start tokio runtime for health")?;
@@ -2255,21 +2326,6 @@ struct ExtractFileOptions {
     conversation: bool,
 }
 
-/// Convert a lookback period (in hours) to a UTC cutoff timestamp.
-///
-/// Clamps the input to `[1, i32::MAX]` hours (~245k years — astronomical
-/// upper bound that comfortably fits chrono's internal `TimeDelta` range
-/// and stays well below the `i64`/`u64` overflow boundary). Without these
-/// guards, casting a very large `u64` with `as i64` would silently wrap
-/// to a negative value and place the cutoff in the future.
-fn cutoff_for_hours(hours: u64) -> DateTime<Utc> {
-    const MAX_SAFE_HOURS: i64 = i32::MAX as i64;
-    let hours_i64 = i64::try_from(hours)
-        .unwrap_or(MAX_SAFE_HOURS)
-        .clamp(1, MAX_SAFE_HOURS);
-    Utc::now() - chrono::Duration::hours(hours_i64)
-}
-
 fn extract_input_format_label(format: ExtractInputFormat) -> &'static str {
     match format {
         ExtractInputFormat::Claude => "claude",
@@ -2398,7 +2454,7 @@ fn run_conversations_batch(options: ConversationsBatchOptions) -> Result<()> {
         anyhow::bail!("conversations v1 supports --agent claude only");
     }
 
-    let cutoff = cutoff_for_hours(options.hours);
+    let cutoff = lookback_cutoff(options.hours);
     let config = ExtractionConfig {
         project_filter: options.project_filter.clone(),
         cutoff,
@@ -2771,7 +2827,7 @@ fn run_extract_session(
     } = options;
 
     let agent_label = extract_input_format_label(agent);
-    let cutoff = cutoff_for_hours(hours);
+    let cutoff = lookback_cutoff(hours);
     let config = ExtractionConfig {
         project_filter: explicit_project
             .as_ref()
@@ -2800,12 +2856,12 @@ fn run_extract_session(
 
     if entries.is_empty() {
         anyhow::bail!(
-            "Resolved session `{}` to `{}`, but no entries were extractable for agent `{}` within last {} hours.\n\
-             Try: increase --hours or check the project filter.",
+            "Resolved session `{}` to `{}`, but no entries were extractable for agent `{}` within {}.\n\
+             Try: increase --hours, verify the project filter, or check that the source store is populated.",
             session_id,
             resolution.canonical_id,
             agent_label,
-            hours,
+            lookback_label(hours),
         );
     }
 
@@ -3190,19 +3246,19 @@ fn dedup_entries_for_state(
         let exact =
             StateManager::content_hash(&entry.agent, entry.timestamp.timestamp(), &entry.message);
         if full_rescan {
-            if !exact_seen_this_run.insert(exact) {
+            if !exact_seen_this_run.insert(exact.clone()) {
                 continue; // exact duplicate within the same rescan window
             }
-        } else if !state.is_new(project_name, exact) {
+        } else if !state.is_new(project_name, &exact) {
             continue; // exact duplicate
         }
 
         let overlap = StateManager::overlap_hash(entry.timestamp.timestamp(), &entry.message);
         if full_rescan {
-            if !overlap_seen_this_run.insert(overlap) {
+            if !overlap_seen_this_run.insert(overlap.clone()) {
                 continue; // cross-agent overlap duplicate within the same rescan window
             }
-        } else if !state.is_new(overlap_project, overlap) {
+        } else if !state.is_new(overlap_project, &overlap) {
             continue; // cross-agent overlap duplicate
         }
 
@@ -3278,6 +3334,38 @@ fn parse_ingest_since(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
     Ok(Some(Utc.from_utc_datetime(&datetime)))
 }
 
+fn all_time_cutoff() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(0, 0).expect("Unix epoch timestamp is valid")
+}
+
+/// Convert a lookback window (in hours) to a UTC cutoff timestamp.
+///
+/// Canonical time-window helper for every CLI/MCP path that asks "what is the
+/// cutoff for `--hours N`?". One function, one set of semantics.
+///
+/// - `hours == 0` → [`all_time_cutoff`] (operator convention: 0 means all time).
+/// - `hours > 0`  → `Utc::now() - hours`, with the hour count clamped to
+///   `[1, i32::MAX]` (~245k years) so a wildly large `u64` cannot silently wrap
+///   `as i64` to a negative value and place the cutoff in the future.
+fn lookback_cutoff(hours: u64) -> DateTime<Utc> {
+    if hours == 0 {
+        return all_time_cutoff();
+    }
+    const MAX_SAFE_HOURS: i64 = i32::MAX as i64;
+    let hours_i64 = i64::try_from(hours)
+        .unwrap_or(MAX_SAFE_HOURS)
+        .clamp(1, MAX_SAFE_HOURS);
+    Utc::now() - chrono::Duration::hours(hours_i64)
+}
+
+fn lookback_label(hours: u64) -> String {
+    if hours == 0 {
+        "all time".to_string()
+    } else {
+        format!("last {hours} hours")
+    }
+}
+
 fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     let ExtractionParams {
         agents,
@@ -3297,15 +3385,19 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         emit,
     } = params;
 
+    // Hold the state lock across the full read-modify-write cycle so two
+    // concurrent runs cannot clobber each other's watermarks or seen hashes.
+    let _state_guard = aicx::locks::acquire_exclusive(aicx::locks::state_lock_path()?)?;
+
     // Load state for incremental/dedup
-    let mut state = StateManager::load();
+    let mut state = StateManager::load()?;
     let project_name = if project.is_empty() {
         "_global".to_string()
     } else {
         project.join("+")
     };
 
-    let cutoff = cutoff_for_hours(hours);
+    let cutoff = lookback_cutoff(hours);
 
     // Default behavior is incremental. --full-rescan and the legacy --force
     // escape hatch both mean "scan the full lookback window".
@@ -3692,11 +3784,15 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         eprintln!("  [warn] --respect-artifact-family=false: legacy routing mode active");
     }
 
-    let cutoff = cutoff.unwrap_or_else(|| cutoff_for_hours(hours));
+    let cutoff = cutoff.unwrap_or_else(|| lookback_cutoff(hours));
 
     let agents = resolve_store_agents(agent.as_deref())?;
 
-    let mut state = StateManager::load();
+    // Hold the state lock across the full read-modify-write cycle so two
+    // concurrent store runs cannot clobber each other's state.
+    let _state_guard = aicx::locks::acquire_exclusive(aicx::locks::state_lock_path()?)?;
+
+    let mut state = StateManager::load()?;
     let source_key = extraction_source_key(&agents, &project);
     let source_aliases = extraction_source_key_aliases(&agents, &project);
     state.migrate_watermark_aliases(&source_key, &source_aliases);
@@ -4114,6 +4210,49 @@ fn project_scopes(projects: &[String]) -> Vec<Option<&str>> {
     }
 }
 
+/// Resolve user `-p` filters into canonical `<owner>/<repo>` slugs by
+/// enumerating the on-disk store. Empty input → empty output (caller treats
+/// it as "all projects"). Non-empty input that matches zero projects returns
+/// an error with the user-visible filter list, so search/index never silently
+/// resolve to `_all` after a typo.
+fn resolve_project_filters_or_error(projects: &[String]) -> Result<Vec<String>> {
+    if projects.is_empty() {
+        return Ok(Vec::new());
+    }
+    let resolved = aicx::store::resolve_filters_to_slugs(projects)?;
+    if resolved.is_empty() {
+        anyhow::bail!(
+            "no project matches filter(s): {}\n  \
+             accepted forms (case-insensitive): -p owner/repo (strict), \
+             -p owner/ (org wildcard), -p /repo (cross-org repo), -p name (cross-org)",
+            projects
+                .iter()
+                .map(|p| format!("{p:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    // Warn (don't fail) when a bare-name filter matched both as an
+    // organization AND as a repository — operator likely wanted one or the
+    // other. Filter still resolves to the union; this is just a heads-up.
+    for filter in projects {
+        if let Some((as_org, as_repo)) =
+            aicx::store::detect_ambiguous_bare_filter(filter, &resolved)
+        {
+            let trimmed = filter.trim();
+            let org_example = as_org.first().cloned().unwrap_or_default();
+            let repo_example = as_repo.first().cloned().unwrap_or_default();
+            eprintln!(
+                "warning: filter '{trimmed}' matched as both an organization AND a repository name.\n  \
+                 as org    -> {trimmed}/* (e.g. {org_example})\n  \
+                 as repo   -> {repo_example}\n  \
+                 use -p {trimmed}/ for org-only or -p /{trimmed} for repo-only."
+            );
+        }
+    }
+    Ok(resolved)
+}
+
 fn project_scope_label(projects: &[String]) -> String {
     if projects.is_empty() {
         "all projects".to_string()
@@ -4124,15 +4263,29 @@ fn project_scope_label(projects: &[String]) -> String {
 
 /// Semantic-first retrieval across the canonical store. Fails fast when
 /// semantic preconditions are missing unless `--no-semantic` is explicit.
-fn run_search(
-    query: &str,
-    projects: &[String],
+struct SearchRunArgs<'a> {
+    query: &'a str,
+    projects: &'a [String],
     hours: u64,
-    date: Option<&str>,
+    date: Option<&'a str>,
     json: bool,
     filters: RetrievalFilters,
+    kind: Option<&'a str>,
     no_semantic: bool,
-) -> Result<()> {
+}
+
+fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
+    let SearchRunArgs {
+        query,
+        projects,
+        hours,
+        date,
+        json,
+        filters,
+        kind,
+        no_semantic,
+    } = args;
+    let kind_filter = kind.and_then(aicx::timeline::Kind::parse);
     // Extract inline date hints from query if no explicit --date given
     let (effective_query, inline_date) = if date.is_none() {
         extract_date_from_query(query)
@@ -4162,7 +4315,8 @@ fn run_search(
         filters.limit
     };
 
-    let scopes = project_scopes(projects);
+    let resolved_projects = resolve_project_filters_or_error(projects)?;
+    let scopes = project_scopes(&resolved_projects);
 
     let (mut results, scanned, semantic_status) = if no_semantic {
         let (results, scanned) = rank::fuzzy_search_store(
@@ -4180,12 +4334,14 @@ fn run_search(
             fetch_limit,
             &scopes,
             filters.frame_kind.map(Into::into),
+            kind_filter.map(|kind| kind.dir_name()),
         ) {
             Ok(outcome) => {
                 let status = (
                     outcome.backend_label,
                     outcome.model_id.clone(),
                     outcome.scanned,
+                    outcome.retrieval_status.clone(),
                 );
                 (outcome.results, outcome.scanned, Some(status))
             }
@@ -4215,6 +4371,9 @@ fn run_search(
         }
     };
 
+    if let Some(kind_filter) = kind_filter {
+        results.retain(|r| r.kind == kind_filter.dir_name());
+    }
     if let Some(min_score) = filters.score {
         results.retain(|r| r.score >= min_score);
     }
@@ -4239,7 +4398,7 @@ fn run_search(
             })
             .collect()
     } else if hours > 0 {
-        let cutoff = cutoff_for_hours(hours);
+        let cutoff = lookback_cutoff(hours);
         let cutoff_date = cutoff.format("%Y-%m-%d").to_string();
         results
             .into_iter()
@@ -4268,7 +4427,40 @@ fn run_search(
     let results: Vec<_> = results.into_iter().take(filters.limit).collect();
 
     if json {
-        println!("{}", rank::render_search_json(&root, &results, scanned)?);
+        let oracle_status = match semantic_status {
+            Some((
+                _semantic_backend,
+                _semantic_model_id,
+                _semantic_scanned,
+                Some(ref retrieval_status),
+            )) => aicx::oracle::OracleStatus::hybrid_rrf(
+                &root,
+                retrieval_status,
+                results.len(),
+                aicx::oracle::verify_paths(
+                    results
+                        .iter()
+                        .map(|result| std::path::Path::new(&result.path).to_path_buf()),
+                ),
+            ),
+            Some((_semantic_backend, _semantic_model_id, semantic_scanned, None)) => {
+                aicx::oracle::OracleStatus::content_semantic(
+                    &root,
+                    semantic_scanned,
+                    results.len(),
+                    aicx::oracle::verify_paths(
+                        results
+                            .iter()
+                            .map(|result| std::path::Path::new(&result.path).to_path_buf()),
+                    ),
+                )
+            }
+            None => rank::search_oracle_status(&root, &results, scanned),
+        };
+        println!(
+            "{}",
+            rank::render_search_json_with_oracle(&root, &results, scanned, oracle_status)?
+        );
         return Ok(());
     }
 
@@ -4287,12 +4479,13 @@ fn run_search(
         eprintln!(
             "\n{}",
             match semantic_status {
-                Some((semantic_backend, semantic_model_id, semantic_scanned)) => {
+                Some((semantic_backend, semantic_model_id, semantic_scanned, retrieval_status)) => {
                     aicx::search_engine::render_semantic_status_line(
                         semantic_backend,
                         &semantic_model_id,
                         results.len(),
                         semantic_scanned,
+                        retrieval_status.as_ref(),
                     )
                 }
                 None => format!(
@@ -4499,20 +4692,128 @@ fn run_config_show(_json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Build the `IndexEvent` -> sink fanout used by `aicx index`. Always
+/// includes a tracing adapter (for log capture / non-TTY runs); adds an
+/// `IndicatifSink` with live ETA + rate when stderr is an interactive
+/// terminal. Translates `IndexEvent` variants into `ProgressUpdate`s that
+/// drive the progress bar position, length, message, and final-state.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn build_index_event_fanout(
+    interactive: bool,
+) -> std::sync::Arc<aicx::progress::FanOut<aicx_progress_contracts::IndexEvent>> {
+    use aicx::progress::{FanOut, IndicatifSink, ProgressUpdate, TracingSink};
+    use aicx_progress_contracts::IndexEvent;
+
+    let render = |event: &IndexEvent| -> Option<ProgressUpdate> {
+        match event {
+            IndexEvent::RunStarted { total_items, .. } => Some(ProgressUpdate {
+                position: 0,
+                length: Some(*total_items as u64),
+                message: Some("embedding chunks".to_string()),
+                finished: false,
+            }),
+            IndexEvent::StatsTick {
+                processed,
+                total,
+                items_per_sec,
+                eta_secs,
+                failed,
+                ..
+            } => {
+                let eta_label = match eta_secs {
+                    Some(secs) if *secs >= 60.0 => {
+                        let mins = (secs / 60.0).floor();
+                        let rem = secs - mins * 60.0;
+                        format!("ETA {mins:.0}m{rem:02.0}s")
+                    }
+                    Some(secs) => format!("ETA {secs:.0}s"),
+                    None => "ETA …".to_string(),
+                };
+                let err_suffix = if *failed > 0 {
+                    format!(" · {failed} failed")
+                } else {
+                    String::new()
+                };
+                Some(ProgressUpdate {
+                    position: *processed as u64,
+                    length: Some(*total as u64),
+                    message: Some(format!("{items_per_sec:.1}/s · {eta_label}{err_suffix}")),
+                    finished: false,
+                })
+            }
+            IndexEvent::RunCompleted {
+                processed,
+                indexed,
+                failed,
+                elapsed,
+                ..
+            } => Some(ProgressUpdate {
+                position: *processed as u64,
+                length: Some(*processed as u64),
+                message: Some(format!(
+                    "done · {indexed} indexed · {failed} failed · {:.1}s",
+                    elapsed.as_secs_f64()
+                )),
+                finished: true,
+            }),
+            _ => None,
+        }
+    };
+
+    let mut fan = FanOut::<IndexEvent>::new();
+    fan.push(std::sync::Arc::new(IndicatifSink::new(
+        0,
+        interactive,
+        render,
+    )));
+    fan.push(std::sync::Arc::new(TracingSink));
+    std::sync::Arc::new(fan)
+}
+
+fn write_index_for_current_build(
+    scope: Option<&str>,
+    sample: usize,
+    interactive: bool,
+) -> Result<aicx::vector_index::IndexStats> {
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    {
+        let fan = build_index_event_fanout(interactive);
+        let fan_for_closure = std::sync::Arc::clone(&fan);
+        let on_event = move |event: &aicx_progress_contracts::IndexEvent| {
+            use aicx::progress::EventSink;
+            fan_for_closure.on_event(event);
+        };
+        aicx::vector_index::write_index_with_progress(scope, sample, &on_event)
+    }
+
+    #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+    {
+        let _ = (scope, sample, interactive);
+        anyhow::bail!(
+            "aicx index requires a semantic embedder backend; rebuild with \
+             --features native-embedder or --features cloud-embedder, or use \
+             `aicx index --dry-run` to inspect corpus/index readiness without embedding"
+        );
+    }
+}
+
 /// Build (or preview) the vector index. `dry_run=true` probes the
 /// embedder + samples chunks for ETA. `dry_run=false` writes a
 /// persistent NDJSON-backed index (Iter 3) that subsequent `aicx search`
 /// queries against via cosine similarity.
 fn run_index(projects: &[String], sample: usize, json: bool, dry_run: bool) -> Result<()> {
-    let scopes: Vec<Option<&str>> = if projects.is_empty() {
+    let resolved_projects = resolve_project_filters_or_error(projects)?;
+    let scopes: Vec<Option<&str>> = if resolved_projects.is_empty() {
         vec![None]
     } else {
-        projects
+        resolved_projects
             .iter()
             .map(String::as_str)
             .map(Some)
             .collect::<Vec<_>>()
     };
+
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr()) && !json;
 
     let mut reports = Vec::with_capacity(scopes.len());
     for scope in scopes {
@@ -4520,7 +4821,7 @@ fn run_index(projects: &[String], sample: usize, json: bool, dry_run: bool) -> R
             let _lock = aicx::locks::acquire_exclusive(aicx::locks::lance_lock_path()?)?;
             aicx::vector_index::dry_run_index(scope, sample)?
         } else {
-            aicx::vector_index::write_index(scope, sample)?
+            write_index_for_current_build(scope, sample, interactive)?
         };
         reports.push((scope.map(ToString::to_string), stats));
     }
@@ -4570,10 +4871,29 @@ fn run_index_status(project: Option<&str>, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
         eprintln!("aicx index status");
+        eprintln!(
+            "  readiness:              {}",
+            match status.readiness {
+                aicx::IndexReadiness::Ready => "ready",
+                aicx::IndexReadiness::Pending => "pending (only temp checkpoint)",
+                aicx::IndexReadiness::Missing => "missing",
+            }
+        );
+        eprintln!("  backend:                {}", status.backend);
+        eprintln!("  project_bucket:         {}", status.project_bucket);
         eprintln!("  canonical_chunks:       {}", status.canonical_chunks);
         eprintln!(
             "  semantic_index_present: {}",
             status.semantic_index_present
+        );
+        eprintln!(
+            "  semantic_index_path:    {}",
+            status.semantic_index_path.as_deref().unwrap_or("<none>")
+        );
+        eprintln!("  semantic_index_rows:    {}", status.semantic_index_rows);
+        eprintln!(
+            "  committed_at:           {}",
+            status.committed_at.as_deref().unwrap_or("<none>")
         );
         eprintln!(
             "  newest_chunk_mtime:     {}",
@@ -4591,6 +4911,23 @@ fn run_index_status(project: Option<&str>, json: bool) -> Result<()> {
                 .unwrap_or_else(|| "<unknown>".to_string())
         );
         eprintln!("  pending_chunks:         {}", status.pending_chunks);
+        eprintln!("  temp_index_present:     {}", status.temp_index_present);
+        eprintln!(
+            "  temp_index_path:        {}",
+            status.temp_index_path.as_deref().unwrap_or("<none>")
+        );
+        eprintln!("  temp_index_rows:        {}", status.temp_index_rows);
+        eprintln!(
+            "  temp_index_mtime:       {}",
+            status.temp_index_mtime.as_deref().unwrap_or("<none>")
+        );
+        eprintln!(
+            "  temp_index_bytes:       {}",
+            status
+                .temp_index_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<none>".to_string())
+        );
     }
     Ok(())
 }
@@ -4985,7 +5322,8 @@ fn print_refs_summary(files: &[store::StoredContextFile]) -> Result<()> {
 
 /// Manage dedup state.
 fn run_state(reset: bool, project: Option<String>, info: bool) -> Result<()> {
-    let mut state = StateManager::load();
+    let _state_guard = aicx::locks::acquire_exclusive(aicx::locks::state_lock_path()?)?;
+    let mut state = StateManager::load()?;
 
     if info {
         eprintln!("=== State Info ===");
@@ -5027,6 +5365,8 @@ struct DashboardServerRunArgs {
     no_open: bool,
     bg: bool,
     allow_cors_origins: Option<String>,
+    auth_token: Option<String>,
+    require_auth: bool,
     artifact: PathBuf,
     title: String,
     preview_chars: usize,
@@ -5046,23 +5386,27 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
         )
     })?;
     let cors_policy = DashboardCorsPolicy::from_cli(args.allow_cors_origins.as_deref())?;
+    let auth_config = aicx::auth::load_auth_config(args.auth_token.as_deref(), args.require_auth)?;
     dashboard_server::validate_dashboard_host_policy(
         host,
         &cors_policy,
         args.allow_cors_origins.is_some(),
+        &auth_config,
     )?;
     let artifact_path = args.artifact;
 
     if args.bg {
-        return spawn_dashboard_server_background(
-            root,
-            args.scope,
+        return spawn_dashboard_server_background(DashboardServerBackgroundArgs {
+            store_root: root,
+            scope: args.scope,
             host,
-            args.port,
-            &args.title,
-            args.preview_chars,
-            args.allow_cors_origins.as_deref(),
-        );
+            port: args.port,
+            title: &args.title,
+            preview_chars: args.preview_chars,
+            allow_cors_origins: args.allow_cors_origins.as_deref(),
+            auth_token: args.auth_token.as_deref(),
+            require_auth: args.require_auth,
+        });
     }
 
     if !host.is_loopback() {
@@ -5082,6 +5426,7 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
         cors_policy,
         host,
         port: args.port,
+        auth: auth_config,
     };
 
     if !args.no_open {
@@ -5104,15 +5449,19 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
     runtime.block_on(dashboard_server::run_dashboard_server(config))
 }
 
-fn spawn_dashboard_server_background(
+struct DashboardServerBackgroundArgs<'a> {
     store_root: PathBuf,
     scope: DashboardScope,
     host: std::net::IpAddr,
     port: u16,
-    title: &str,
+    title: &'a str,
     preview_chars: usize,
-    allow_cors_origins: Option<&str>,
-) -> Result<()> {
+    allow_cors_origins: Option<&'a str>,
+    auth_token: Option<&'a str>,
+    require_auth: bool,
+}
+
+fn spawn_dashboard_server_background(args: DashboardServerBackgroundArgs<'_>) -> Result<()> {
     let current_exe = std::env::current_exe().context("Resolve current aicx executable")?;
     let mut command = std::process::Command::new(&current_exe);
     command
@@ -5120,28 +5469,34 @@ fn spawn_dashboard_server_background(
         .arg("--serve")
         .arg("--no-open")
         .arg("--host")
-        .arg(host.to_string())
+        .arg(args.host.to_string())
         .arg("--port")
-        .arg(port.to_string())
+        .arg(args.port.to_string())
         .arg("--store-root")
-        .arg(store_root.as_os_str());
+        .arg(args.store_root.as_os_str());
 
-    if let Some(project) = scope.project.as_deref() {
+    if let Some(project) = args.scope.project.as_deref() {
         command.arg("--project").arg(project);
     }
-    if let Some(hours) = scope.hours {
+    if let Some(hours) = args.scope.hours {
         command.arg("--hours").arg(hours.to_string());
     }
-    if let Some(policy) = allow_cors_origins {
+    if let Some(policy) = args.allow_cors_origins {
         command.arg("--allow-cors-origins").arg(policy);
     }
-    if title != DEFAULT_DASHBOARD_TITLE {
-        command.arg("--title").arg(title);
+    if let Some(token) = args.auth_token {
+        command.arg("--auth-token").arg(token);
     }
-    if preview_chars != 320 {
+    command
+        .arg("--require-auth")
+        .arg(if args.require_auth { "true" } else { "false" });
+    if args.title != DEFAULT_DASHBOARD_TITLE {
+        command.arg("--title").arg(args.title);
+    }
+    if args.preview_chars != 320 {
         command
             .arg("--preview-chars")
-            .arg(preview_chars.to_string());
+            .arg(args.preview_chars.to_string());
     }
 
     command
@@ -5164,8 +5519,8 @@ fn spawn_dashboard_server_background(
 
     eprintln!("✓ Dashboard server launched in background");
     eprintln!("  PID: {}", child.id());
-    eprintln!("  URL: http://{}:{}", host, port);
-    eprintln!("  Store: {}", store_root.display());
+    eprintln!("  URL: http://{}:{}", args.host, args.port);
+    eprintln!("  Store: {}", args.store_root.display());
     Ok(())
 }
 
@@ -5207,6 +5562,8 @@ fn run_dashboard_command(args: DashboardArgs) -> Result<()> {
             no_open: args.no_open,
             bg: args.bg,
             allow_cors_origins: args.allow_cors_origins,
+            auth_token: args.auth_token,
+            require_auth: args.require_auth,
             artifact: default_dashboard_output_path()?,
             title: args.title,
             preview_chars: args.preview_chars,
@@ -5218,9 +5575,10 @@ fn run_dashboard_command(args: DashboardArgs) -> Result<()> {
         || args.no_open
         || args.bg
         || args.allow_cors_origins.is_some()
+        || args.auth_token.is_some()
     {
         return Err(anyhow::anyhow!(
-            "--host, --port, --no-open, --bg, and --allow-cors-origins are only valid with --serve."
+            "--host, --port, --no-open, --bg, --allow-cors-origins, and --auth-token are only valid with --serve."
         ));
     }
 
@@ -5304,6 +5662,8 @@ struct ReportsExtractorRunArgs {
     bundle_output: Option<PathBuf>,
     title: String,
     preview_chars: usize,
+    force: bool,
+    deterministic: bool,
 }
 
 fn default_reports_output_path() -> Result<PathBuf> {
@@ -5311,6 +5671,15 @@ fn default_reports_output_path() -> Result<PathBuf> {
 }
 
 fn run_reports_command(args: ReportsArgs) -> Result<()> {
+    // Env var hook keeps CI/scripts reproducible without rewiring CLI flags.
+    let deterministic = args.deterministic
+        || matches!(
+            std::env::var("AICX_REPORTS_DETERMINISTIC")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+        );
     run_reports_extractor(ReportsExtractorRunArgs {
         artifacts_root: args.artifacts_root,
         org: args.org,
@@ -5322,6 +5691,8 @@ fn run_reports_command(args: ReportsArgs) -> Result<()> {
         bundle_output: args.bundle_output,
         title: args.title,
         preview_chars: args.preview_chars,
+        force: args.force,
+        deterministic,
     })
 }
 
@@ -5382,14 +5753,21 @@ fn run_reports_extractor(args: ReportsExtractorRunArgs) -> Result<()> {
         workflow: args.workflow,
         title: args.title,
         preview_chars: args.preview_chars,
+        deterministic: args.deterministic,
     };
 
     let artifact = reports_extractor::build_reports_explorer(&config)?;
-    write_text_output(&args.output, &artifact.html, "report explorer HTML")?;
+    write_text_output(
+        &args.output,
+        &artifact.html,
+        "report explorer HTML",
+        args.force,
+    )?;
     write_text_output(
         &bundle_output,
         &artifact.bundle_json,
         "report explorer JSON bundle",
+        args.force,
     )?;
 
     eprintln!("✓ Vibecrafted reports extracted");
@@ -5466,13 +5844,19 @@ fn parse_cli_date(value: Option<&str>, flag_name: &str) -> Result<Option<NaiveDa
     ))
 }
 
-fn write_text_output(path: &Path, content: &str, label: &str) -> Result<()> {
+fn write_text_output(path: &Path, content: &str, label: &str, force: bool) -> Result<()> {
     let mut validated = aicx::sanitize::validate_write_path(path)?;
     if let Some(parent) = validated.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create output directory: {}", parent.display()))?;
     }
     validated = aicx::sanitize::validate_write_path(&validated)?;
+    if !force && validated.exists() {
+        return Err(anyhow::anyhow!(
+            "Refusing to overwrite existing {label} at {}: pass --force to replace it.",
+            validated.display()
+        ));
+    }
     fs::write(&validated, content)
         .with_context(|| format!("Failed to write {}: {}", label, validated.display()))
 }
@@ -5484,23 +5868,19 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn cutoff_for_hours_clamps_zero_to_at_least_one_hour() {
-        let before = Utc::now();
-        let cutoff = cutoff_for_hours(0);
-        let after = Utc::now();
-        // With clamp to 1h, cutoff must sit ~1h before now (allow ±5s slack).
-        let lower = before - chrono::Duration::hours(1) - chrono::Duration::seconds(5);
-        let upper = after - chrono::Duration::hours(1) + chrono::Duration::seconds(5);
-        assert!(
-            cutoff >= lower && cutoff <= upper,
-            "cutoff out of range: {cutoff}"
+    fn lookback_cutoff_zero_returns_all_time() {
+        let cutoff = lookback_cutoff(0);
+        assert_eq!(
+            cutoff,
+            all_time_cutoff(),
+            "hours=0 must collapse to the Unix-epoch all-time sentinel"
         );
     }
 
     #[test]
-    fn cutoff_for_hours_handles_normal_range() {
+    fn lookback_cutoff_handles_normal_range() {
         let before = Utc::now();
-        let cutoff = cutoff_for_hours(8);
+        let cutoff = lookback_cutoff(8);
         let after = Utc::now();
         let lower = before - chrono::Duration::hours(8) - chrono::Duration::seconds(5);
         let upper = after - chrono::Duration::hours(8) + chrono::Duration::seconds(5);
@@ -5511,12 +5891,12 @@ mod tests {
     }
 
     #[test]
-    fn cutoff_for_hours_avoids_u64_to_i64_overflow() {
-        // Without `i64::try_from`, casting `u64::MAX as i64` wraps to -1 and
+    fn lookback_cutoff_avoids_u64_to_i64_overflow() {
+        // Without the `i32::MAX` clamp, casting `u64::MAX as i64` wraps to -1 and
         // places the cutoff one hour in the future. Verify the clamp keeps it
-        // strictly in the past.
+        // strictly in the past for the entire `u64` domain.
         let now = Utc::now();
-        let cutoff = cutoff_for_hours(u64::MAX);
+        let cutoff = lookback_cutoff(u64::MAX);
         assert!(
             cutoff < now,
             "cutoff must not be in the future: {cutoff} vs now {now}"
@@ -5904,6 +6284,19 @@ mod tests {
     }
 
     #[test]
+    fn search_accepts_corpus_kind_filter() {
+        let cli = Cli::try_parse_from(["aicx", "search", "dashboard", "--kind", "conversations"])
+            .expect("search command with corpus kind should parse");
+
+        match cli.command {
+            Some(Commands::Search { kind, .. }) => {
+                assert_eq!(kind.as_deref(), Some("conversations"));
+            }
+            _ => panic!("expected search command"),
+        }
+    }
+
+    #[test]
     fn search_accepts_multiple_project_filters() {
         let cli = Cli::try_parse_from([
             "aicx",
@@ -5911,11 +6304,12 @@ mod tests {
             "rust-mux",
             "-p",
             "vc-operator",
+            "-p",
             "vibecrafted",
             "-p",
             "loctree",
         ])
-        .expect("search should accept repeated and space-list project filters");
+        .expect("search should accept repeated project filters");
 
         match cli.command {
             Some(Commands::Search { project, .. }) => {
@@ -5932,10 +6326,14 @@ mod tests {
 
         match cli.command {
             Some(Commands::Index {
-                dry_run, project, ..
+                dry_run,
+                project,
+                sample,
+                ..
             }) => {
                 assert!(!dry_run);
                 assert!(project.is_empty());
+                assert_eq!(sample, 0, "default materialization should index all chunks");
             }
             _ => panic!("expected index command"),
         }
@@ -5976,11 +6374,12 @@ mod tests {
             "index",
             "-p",
             "vc-operator",
+            "-p",
             "vibecrafted",
             "-p",
             "loctree",
         ])
-        .expect("index should accept repeated and space-list project filters");
+        .expect("index should accept repeated project filters");
 
         match cli.command {
             Some(Commands::Index { project, .. }) => {
@@ -5997,11 +6396,12 @@ mod tests {
             "intents",
             "-p",
             "vc-operator",
+            "-p",
             "vibecrafted",
             "-p",
             "loctree",
         ])
-        .expect("intents should accept repeated and space-list project filters");
+        .expect("intents should accept repeated project filters");
 
         match cli.command {
             Some(Commands::Intents { project, .. }) => {
@@ -6018,11 +6418,12 @@ mod tests {
             "steer",
             "-p",
             "vc-operator",
+            "-p",
             "vibecrafted",
             "-p",
             "loctree",
         ])
-        .expect("steer should accept repeated and space-list project filters");
+        .expect("steer should accept repeated project filters");
 
         match cli.command {
             Some(Commands::Steer { project, .. }) => {
@@ -6146,7 +6547,7 @@ mod tests {
         assert!(!rendered.contains("Transport: stdio (default) or sse"));
         assert!(!rendered.contains("embedding mode"));
         assert!(
-            rendered.lines().count() < 20,
+            rendered.lines().count() < 30,
             "serve help should stay compact"
         );
     }
@@ -6225,7 +6626,7 @@ mod tests {
         let rendered = steer.render_help().to_string();
 
         assert!(rendered.contains("Retrieve chunks by steering metadata"));
-        assert!(rendered.contains("--project <PROJECT>..."));
+        assert!(rendered.contains("--project <PROJECT>"));
         assert!(!rendered.contains("aicx steer --run-id mrbl-001"));
         assert!(!rendered.contains("--no-redact-secrets"));
         assert!(!rendered.contains("--hours <HOURS>"));
@@ -6800,5 +7201,20 @@ mod tests {
         assert!(!output.contains("| Filter | file:"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn extractor_help_states_hours_zero_is_all_time() {
+        let mut cmd = Cli::command();
+        for subcommand in ["all", "claude", "codex", "store"] {
+            let command = cmd
+                .find_subcommand_mut(subcommand)
+                .expect("extractor subcommand should exist");
+            let rendered = command.render_long_help().to_string();
+            assert!(
+                rendered.contains("0 = all time"),
+                "{subcommand} --help must state the zero-hours contract"
+            );
+        }
     }
 }

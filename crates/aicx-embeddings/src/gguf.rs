@@ -97,6 +97,11 @@ impl LocalEmbeddingProvider for GgufEmbeddingProvider {
         let mut total_tokens = 0usize;
 
         for text in texts {
+            // D-9: enforce the embed input budget before paying the
+            // tokenizer cost. A 100 MB string fed to llama.cpp would
+            // allocate a multi-million token vector before any token
+            // truncation kicks in.
+            crate::enforce_embed_input_budget(text).context("GGUF embed input rejected")?;
             let mut tokens = self
                 .model
                 .str_to_token(text, AddBos::Always)
@@ -192,6 +197,15 @@ fn resolve_model_path(
         ));
     }
 
+    // D-8: when the snapshot dir exists but the model file is missing,
+    // truncated, or not a regular file, surface the exact failing path
+    // instead of the bland "not hydrated" message.
+    if config.model_path.is_none() {
+        match crate::hf_cache::find_snapshot_with_file_verbose(&resolved.repo, &resolved.filename) {
+            Ok(snapshot) => return Ok(snapshot.join(&resolved.filename)),
+            Err(miss) => return Err(miss.into_error(&resolved.repo, &resolved.filename)),
+        }
+    }
     find_cached_model_file(&resolved.repo, &resolved.filename).ok_or_else(|| {
         anyhow!(
             "AICX GGUF embedder model is not hydrated. Expected {file} in HF cache for {repo}. \

@@ -154,6 +154,7 @@ Options are similar to `claude`, with two important details:
 - `all` does not expose `--format` because local report writing is hardcoded to `both`.
 - `all` defaults to `--emit none`, so stdout stays quiet unless you opt in.
 - `all` still supports `--no-redact-secrets` when you intentionally want raw output.
+- `-H 0` means all time, matching the retrieval/MCP contract.
 
 Examples:
 
@@ -210,7 +211,7 @@ aicx store [OPTIONS]
 Options:
 - `-p, --project <PROJECT>...` source cwd/project filter(s)
 - `-a, --agent <AGENT>` `claude`, `codex`, `gemini`, `junie` (default: all)
-- `-H, --hours <HOURS>` lookback window (default: `48`)
+- `-H, --hours <HOURS>` lookback window (default: `48`, `0` = all time)
 - `--full-rescan` ignore the stored watermark and rescan the full lookback window
 - `--no-redact-secrets` disable secret redaction for this corpus build
 - `--user-only` exclude assistant + reasoning messages (default: assistant included)

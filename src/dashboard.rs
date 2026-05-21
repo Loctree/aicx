@@ -263,6 +263,7 @@ pub fn render_server_shell_html(title: &str) -> String {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="theme-color" content="#0a0f19" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none';">
   <link rel="manifest" href="/manifest.webmanifest" />
   <title>{}</title>
   <style>{}
@@ -1931,11 +1932,19 @@ const DASHBOARD_SERVER_SCRIPT: &str = r#"
   };
   const inlineMarkdown = (s) => {
     const esc = (t) => t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    return esc(s)
+    let html = esc(s)
       .replace(/`([^`]+)`/g, '<code>$1</code>')
       .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-      .replace(/\*([^*]+)\*/g, '<em>$1</em>')
-      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+      .replace(/\*([^*]+)\*/g, '<em>$1</em>');
+    return html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, label, url) => {
+      const u = url.trim();
+      const lower = u.toLowerCase();
+      if (lower.startsWith('javascript:') || lower.startsWith('data:') || lower.startsWith('vbscript:') || lower.startsWith('blob:') || lower.startsWith('file:')) {
+        return '[' + label + '](' + url + ')';
+      }
+      const href = u.replace(/"/g, '&quot;');
+      return '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' + label + '</a>';
+    });
   };
 
   /* --- URL state --------------------------------------------------------- */
@@ -2654,5 +2663,29 @@ mod tests {
                     .timestamp()
             )
         );
+    }
+
+    #[test]
+    fn test_inline_markdown_javascript_scheme_renders_as_text() {
+        let html = render_server_shell_html("test");
+        assert!(html.contains("lower.startsWith('javascript:')"));
+    }
+
+    #[test]
+    fn test_inline_markdown_data_scheme_renders_as_text() {
+        let html = render_server_shell_html("test");
+        assert!(html.contains("lower.startsWith('data:')"));
+    }
+
+    #[test]
+    fn test_inline_markdown_quote_break_attempt_does_not_inject_attribute() {
+        let html = render_server_shell_html("test");
+        assert!(html.contains("u.replace(/\"/g, '&quot;')"));
+    }
+
+    #[test]
+    fn test_render_server_shell_html_contains_csp_meta() {
+        let html = render_server_shell_html("test");
+        assert!(html.contains("<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none';\">"));
     }
 }

@@ -23,6 +23,13 @@ use crate::types::{EntryState, EntryType, IntentEntry, Link, LinkType};
 
 const STRICT_CONFIDENCE: u8 = 3;
 
+/// E.6: hard upper bound on per-extraction candidate vectors. A pathological
+/// input (huge transcript with many bullet lines) used to drag the whole
+/// pipeline down by piling up candidates that dedup would later collapse to a
+/// handful. Cap here so memory stays bounded; emit a diagnostic on stderr when
+/// the cap is hit so the operator notices truncated extraction.
+const MAX_CANDIDATES: usize = 5000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IntentKind {
@@ -339,14 +346,19 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
     store_root: &Path,
     now: DateTime<Utc>,
 ) -> Result<IntentExtraction> {
-    let cutoff_hours = config.hours.min(i64::MAX as u64) as i64;
-    let cutoff = now - Duration::hours(cutoff_hours);
+    let cutoff = if config.hours == 0 {
+        DateTime::<Utc>::from_timestamp(0, 0).expect("Unix epoch timestamp is valid")
+    } else {
+        let cutoff_hours = config.hours.min(i64::MAX as u64) as i64;
+        now - Duration::hours(cutoff_hours)
+    };
     let files = collect_chunk_files(store_root, &config.project, cutoff, config.frame_kind)?;
     let scanned_count = files.len();
     let source_paths_verified = verify_stored_chunk_paths(&files);
 
     let mut candidates = Vec::new();
     let mut task_events = Vec::new();
+    let mut cap_warned = false;
 
     for file in files {
         let content = sanitize::read_to_string_validated(&file.path)
@@ -357,8 +369,18 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
 
         let (signal_candidates, signal_tasks) =
             extract_signal_candidates(&file, &config.project, &source_chunk, &signal_lines);
-        candidates.extend(signal_candidates);
-        task_events.extend(signal_tasks);
+        extend_with_cap(
+            &mut candidates,
+            signal_candidates,
+            &mut cap_warned,
+            "candidates",
+        );
+        extend_with_cap(
+            &mut task_events,
+            signal_tasks,
+            &mut cap_warned,
+            "task_events",
+        );
 
         let (raw_candidates, raw_tasks) = extract_transcript_candidates(
             &file,
@@ -366,8 +388,18 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
             &source_chunk,
             &transcript_entries,
         );
-        candidates.extend(raw_candidates);
-        task_events.extend(raw_tasks);
+        extend_with_cap(
+            &mut candidates,
+            raw_candidates,
+            &mut cap_warned,
+            "candidates",
+        );
+        extend_with_cap(&mut task_events, raw_tasks, &mut cap_warned, "task_events");
+
+        if candidates.len() >= MAX_CANDIDATES && task_events.len() >= MAX_CANDIDATES {
+            // Both buckets saturated — further files cannot add anything.
+            break;
+        }
     }
 
     let mut records = dedup_candidates(candidates, config.strict, config.kind_filter);
@@ -437,9 +469,12 @@ fn sort_intent_records(records: &mut [IntentRecord]) {
 fn dedup_intent_records(records: &mut Vec<IntentRecord>) {
     let mut seen = HashSet::new();
     records.retain(|record| {
+        // Normalize the summary so dedup catches near-duplicates that differ
+        // only in whitespace, case, or invisible chars (zero-width / bidi).
+        // Without this, "fix au\u{200B}th" sneaks past as a "new" record.
         seen.insert((
             record.kind,
-            record.summary.clone(),
+            normalize_key(&record.summary),
             record.session_id.clone(),
             record.source_chunk.clone(),
         ))
@@ -448,6 +483,29 @@ fn dedup_intent_records(records: &mut Vec<IntentRecord>) {
 
 fn verify_stored_chunk_paths(files: &[StoredChunkFile]) -> bool {
     files.iter().all(|file| file.path.exists())
+}
+
+/// E.6: append `additions` into `target` until `target` reaches MAX_CANDIDATES.
+/// Emits a single stderr diagnostic the first time a cap is hit per run.
+fn extend_with_cap<T>(
+    target: &mut Vec<T>,
+    additions: Vec<T>,
+    warned: &mut bool,
+    bucket_name: &'static str,
+) {
+    let room = MAX_CANDIDATES.saturating_sub(target.len());
+    if additions.len() <= room {
+        target.extend(additions);
+        return;
+    }
+    let dropped = additions.len() - room;
+    target.extend(additions.into_iter().take(room));
+    if !*warned {
+        eprintln!(
+            "aicx::intents: {bucket_name} cap of {MAX_CANDIDATES} reached; dropped {dropped} entries"
+        );
+        *warned = true;
+    }
 }
 
 fn collect_chunk_files(
@@ -549,6 +607,7 @@ fn combine_date_time(date: NaiveDate, time: &str) -> Option<DateTime<Utc>> {
 
 fn parse_chunk_document(content: &str) -> (Vec<String>, Vec<TranscriptEntry>) {
     let mut in_signals = false;
+    let mut fenced = false;
     let mut signal_lines = Vec::new();
     let mut transcript_lines = Vec::new();
 
@@ -567,6 +626,18 @@ fn parse_chunk_document(content: &str) -> (Vec<String>, Vec<TranscriptEntry>) {
             continue;
         }
         if trimmed.starts_with("[project:") {
+            continue;
+        }
+        // Track triple-backtick fence in the transcript section. Lines inside a
+        // fenced block (e.g. pasted code, shell output, JSON dumps) are quoted
+        // material — classifying them as user intents or assistant decisions is
+        // a category error (`let's encrypt` inside a code block is a tool name,
+        // not an intent).
+        if trimmed.starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
             continue;
         }
         transcript_lines.push(line.to_string());
@@ -640,10 +711,21 @@ fn extract_signal_candidates(
     let mut task_events = Vec::new();
     let mut section = SignalSection::None;
     let mut in_skill_banner = false;
+    // E.8: track ``` fenced blocks within the signal section. Pasted markdown
+    // snippets inside [signals] (e.g. example "- [ ] task" demonstrating
+    // checklist syntax) must not be picked up as real tasks.
+    let mut in_fence = false;
 
     for raw_line in signal_lines {
         let line = raw_line.trim();
         if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
             continue;
         }
         if line == "=== SKILL ENTER ===" {
@@ -806,6 +888,13 @@ fn infer_kind_from_line(line: &str, is_user_line: bool) -> Option<IntentKind> {
 
 fn is_outcome_line(line: &str) -> bool {
     let lower = line.to_lowercase();
+    // E.10: bare-affirmation lines ("Zrobione", "Done", "Gotowe") carry no
+    // information about WHAT was done; they're emotional ack from the
+    // operator, not a reportable outcome. Allow them only with follow-on
+    // context (colon + detail).
+    if is_bare_affirmation(line) {
+        return false;
+    }
     is_outcome_tag(line)
         || is_result_line(line)
         || lower.contains("p0=0")
@@ -813,12 +902,173 @@ fn is_outcome_line(line: &str) -> bool {
         || lower.contains("p2=0")
 }
 
+/// Returns true when the entire line is a single affirmation token with no
+/// follow-on content. Once a colon + detail appears ("Zrobione: build green"),
+/// the line stops being bare and counts again.
+fn is_bare_affirmation(line: &str) -> bool {
+    const BARE: &[&str] = &[
+        "zrobione",
+        "dowiezione",
+        "gotowe",
+        "dziala",
+        "działa",
+        "done",
+        "completed",
+    ];
+    let trimmed = line.trim().trim_end_matches(['.', '!', ',']);
+    if trimmed.is_empty() || trimmed.contains(':') {
+        return false;
+    }
+    let stripped = trimmed
+        .trim_start_matches(['-', '*', '+', '>', ' ', '\t'])
+        .to_lowercase();
+    BARE.iter().any(|word| stripped == *word)
+}
+
+/// Inline backtick code-span ranges within a single line, as byte offsets
+/// `(start, end_exclusive)`. Used so keyword classifiers ignore matches that
+/// fall inside `` `inline code` `` (e.g. `` `let's encrypt` `` is a tool name,
+/// not an intent).
+fn code_span_ranges(line: &str) -> Vec<(usize, usize)> {
+    let bytes = line.as_bytes();
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            if let Some(rel) = bytes[i + 1..].iter().position(|&b| b == b'`') {
+                let close = i + 1 + rel;
+                ranges.push((i, close + 1));
+                i = close + 1;
+            } else {
+                break;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    ranges
+}
+
+/// Word boundaries treat alphanumerics (Unicode) and `_` as "word" chars.
+/// Diacritics are alphanumeric in Rust so `pomysłu` does NOT word-match
+/// keyword `pomysł` — exactly the behavior we want for Polish suffixes.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// `true` if a negator sits immediately around the keyword position — close
+/// enough that it inverts the keyword's polarity. Checked on the lower-cased
+/// line. Two windows:
+/// * pre (~24 chars before): English/Polish negator prefixes that flip the
+///   following clause (`don't `, `nie `, `bez `, ...).
+/// * post (~16 chars after): post-keyword negators that flip the keyword
+///   itself (`let's not`, `chcę nie`, ...).
+fn is_negated_keyword(lower_line: &str, kw_pos: usize, kw_len: usize) -> bool {
+    const PRE_NEGATORS: &[&str] = &[
+        // Polish
+        "nie ",
+        "bez ",
+        // English
+        "don't ",
+        "do not ",
+        "won't ",
+        "will not ",
+        "shouldn't ",
+        "should not ",
+        "wouldn't ",
+        "would not ",
+        "isn't ",
+        "aren't ",
+        "doesn't ",
+        "didn't ",
+    ];
+    const POST_NEGATORS: &[&str] = &[" not ", " not,", " not.", " nie ", " nie,", " nie."];
+
+    let pre_window_start = lower_line[..kw_pos]
+        .char_indices()
+        .rev()
+        .take(24)
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let pre = &lower_line[pre_window_start..kw_pos];
+    if PRE_NEGATORS.iter().any(|n| pre.ends_with(n)) {
+        return true;
+    }
+
+    let post_start = kw_pos + kw_len;
+    if post_start < lower_line.len() {
+        let post_end = lower_line[post_start..]
+            .char_indices()
+            .take(16)
+            .map(|(i, c)| post_start + i + c.len_utf8())
+            .last()
+            .unwrap_or(lower_line.len())
+            .min(lower_line.len());
+        let post = &lower_line[post_start..post_end];
+        if POST_NEGATORS.iter().any(|n| post.starts_with(n)) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Substring match for `keyword` in `line` that:
+/// * is case-insensitive,
+/// * requires a word boundary on both sides (so `pomysł` does not match
+///   `pomysłu`, `let's` does not match `let'salutations`),
+/// * rejects matches that fall inside an inline `` ` `` code span,
+/// * rejects matches that are immediately negated (`let's not`, `nie chcę`).
+fn matches_keyword_word_boundary(line: &str, keyword: &str) -> bool {
+    let lower_line = line.to_lowercase();
+    let lower_kw = keyword.to_lowercase();
+    if lower_kw.is_empty() || lower_line.len() < lower_kw.len() {
+        return false;
+    }
+    let spans = code_span_ranges(&lower_line);
+
+    let mut start = 0;
+    while let Some(rel) = lower_line[start..].find(&lower_kw) {
+        let abs = start + rel;
+        let end = abs + lower_kw.len();
+
+        let prev_ok = if abs == 0 {
+            true
+        } else {
+            let prev = lower_line[..abs].chars().next_back().unwrap();
+            !is_word_char(prev) && prev != '-'
+        };
+        let next_ok = if end >= lower_line.len() {
+            true
+        } else {
+            let next = lower_line[end..].chars().next().unwrap();
+            !is_word_char(next)
+        };
+
+        if prev_ok && next_ok {
+            let in_span = spans.iter().any(|&(s, e)| abs >= s && abs < e);
+            if !in_span && !is_negated_keyword(&lower_line, abs, lower_kw.len()) {
+                return true;
+            }
+        }
+
+        start = abs + 1;
+    }
+    false
+}
+
 fn looks_like_intent_line(line: &str) -> bool {
     let lower = line.to_lowercase();
-    lower.starts_with("intent:")
-        || lower.starts_with("[intent]")
-        || severity_marker(line).is_some()
-        || INTENT_KEYWORDS.iter().any(|kw| lower.contains(kw))
+    if lower.starts_with("intent:") || lower.starts_with("[intent]") {
+        return true;
+    }
+    if severity_marker(line).is_some() {
+        return true;
+    }
+    INTENT_KEYWORDS
+        .iter()
+        .any(|kw| matches_keyword_word_boundary(line, kw))
 }
 
 fn severity_marker(line: &str) -> Option<&'static str> {
@@ -1213,28 +1463,71 @@ fn reconcile_session_id_with_path(records: &mut [IntentRecord]) {
     }
 }
 
+/// Drop truncated-prefix duplicates: records whose summary ends in
+/// `...[truncated]` AND whose pre-truncation prefix is also the literal prefix
+/// of a longer non-truncated sibling in the same `(kind, session_id,
+/// source_chunk)` group.
+///
+/// Indexed: O(N) build of a per-group index of non-truncated record indices,
+/// then O(N) decision pass that only scans the small same-group set. The
+/// previous shape was O(N²) — a 10k record session ran 100M comparisons.
+/// Real groups stay small (one chunk holds at most a handful of records of a
+/// single kind), so the inner scan is effectively constant.
 fn drop_truncated_duplicate_records(records: &mut Vec<IntentRecord>) {
+    const TRUNC_MARKER: &str = "...[truncated]";
+
+    type GroupKey = (IntentKind, String, String);
+
+    // Pass 1: bucket non-truncated record indices by (kind, session, chunk).
+    // Truncated records cannot be "the fuller version" of another, so they
+    // never need to live in the index.
+    let mut groups: HashMap<GroupKey, Vec<usize>> = HashMap::new();
+    for (idx, record) in records.iter().enumerate() {
+        if record.summary.contains(TRUNC_MARKER) {
+            continue;
+        }
+        groups
+            .entry((
+                record.kind,
+                record.session_id.clone(),
+                record.source_chunk.clone(),
+            ))
+            .or_default()
+            .push(idx);
+    }
+
+    // Pass 2: each truncated record looks up its (kind, session, chunk)
+    // bucket once and scans the small list of non-truncated siblings.
     let keep: Vec<bool> = records
         .iter()
         .enumerate()
         .map(|(idx, record)| {
-            let Some(prefix) = record.summary.split("...[truncated]").next() else {
+            if !record.summary.contains(TRUNC_MARKER) {
+                return true;
+            }
+            let Some(raw_prefix) = record.summary.split(TRUNC_MARKER).next() else {
                 return true;
             };
-            let prefix = prefix.trim_end();
+            let prefix = raw_prefix.trim_end();
             if prefix.is_empty() {
                 return true;
             }
-
-            !records.iter().enumerate().any(|(other_idx, other)| {
-                idx != other_idx
-                    && other.kind == record.kind
-                    && other.session_id == record.session_id
-                    && other.source_chunk == record.source_chunk
-                    && !other.summary.contains("...[truncated]")
-                    && other.summary.len() > record.summary.len()
-                    && other.summary.starts_with(prefix)
-            })
+            let key = (
+                record.kind,
+                record.session_id.clone(),
+                record.source_chunk.clone(),
+            );
+            let Some(siblings) = groups.get(&key) else {
+                return true;
+            };
+            let has_fuller = siblings.iter().any(|&other_idx| {
+                if other_idx == idx {
+                    return false;
+                }
+                let other = &records[other_idx];
+                other.summary.len() > record.summary.len() && other.summary.starts_with(prefix)
+            });
+            !has_fuller
         })
         .collect();
 
@@ -1449,20 +1742,24 @@ fn prefer_summary(existing: &str, incoming: &str) -> String {
 }
 
 fn merge_evidence(existing: &mut Vec<String>, additions: Vec<String>) {
+    // E.4: build the seen-set once per merge instead of rebuilding it on
+    // every `push_unique` call. The previous shape rebuilt the HashSet per
+    // insert, making evidence appends O(N^2) over long accumulators.
+    let mut seen: HashSet<String> = existing.iter().map(|item| normalize_key(item)).collect();
     for item in additions {
-        push_unique(existing, item);
+        let key = normalize_key(&item);
+        if seen.insert(key) {
+            existing.push(item);
+        }
     }
 }
 
 fn push_unique(target: &mut Vec<String>, value: String) {
     let key = normalize_key(&value);
-    let mut seen = HashSet::new();
-    for item in target.iter() {
-        seen.insert(normalize_key(item));
+    if target.iter().any(|item| normalize_key(item) == key) {
+        return;
     }
-    if !seen.contains(&key) {
-        target.push(value);
-    }
+    target.push(value);
 }
 
 // ── 9-type intent entry classifier ──────────────────────────────────
@@ -1544,10 +1841,12 @@ const INSIGHT_MARKERS: &[&str] = &[
     "kluczowe:",
 ];
 
+/// Markers whose presence alone is enough to call a line a Result line. Each
+/// carries result-shape on its own (PASS/FAIL outcome, score readout, P-level
+/// count, command name that only appears in result-reporting contexts).
 const RESULT_STRICT_MARKERS: &[&str] = &[
     "passed",
     "failed",
-    "error:",
     "score=",
     "score:",
     "latency",
@@ -1555,7 +1854,6 @@ const RESULT_STRICT_MARKERS: &[&str] = &[
     "p1=",
     "p2=",
     "/10",
-    "tests ",
     "clippy",
     "cargo test",
     "✓",
@@ -1563,6 +1861,26 @@ const RESULT_STRICT_MARKERS: &[&str] = &[
     "0 warnings",
     "0 errors",
 ];
+
+/// Markers that look result-y but appear too often in meta-discussion (e.g.
+/// "we need to write tests for X", "this throws an error: should we…").
+/// These classify a line as Result only when [`line_has_result_shape`] matches.
+const RESULT_SOFT_MARKERS: &[&str] = &["tests ", "error:"];
+
+/// A line "has result shape" when it carries a concrete reporting signal:
+/// a digit (test count, error count, percentage), a PASS/FAIL token, or a
+/// known status word. Without one, soft markers like "tests" or "error:" are
+/// almost certainly meta-discussion, not actual outcomes.
+fn line_has_result_shape(lower_line: &str) -> bool {
+    if lower_line.chars().any(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    const SHAPE_TOKENS: &[&str] = &[
+        "pass", "fail", " ok", "ok.", "done", "skipped", "ignored", "timeout", "panicked",
+        "panic:", "✓", "✗",
+    ];
+    SHAPE_TOKENS.iter().any(|t| lower_line.contains(t))
+}
 
 pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType, f32)> {
     let lower = line.to_lowercase();
@@ -1620,6 +1938,9 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
     if is_result_line(line) || RESULT_STRICT_MARKERS.iter().any(|m| lower.contains(m)) {
         return Some((EntryType::Result, 0.75));
     }
+    if RESULT_SOFT_MARKERS.iter().any(|m| lower.contains(m)) && line_has_result_shape(&lower) {
+        return Some((EntryType::Result, 0.6));
+    }
 
     if ARGUE_MARKERS.iter().any(|m| lower.contains(m)) {
         return Some((EntryType::Argue, 0.6));
@@ -1629,7 +1950,11 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
         return Some((EntryType::Why, 0.7));
     }
 
-    if is_user && INTENT_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+    if is_user
+        && INTENT_KEYWORDS
+            .iter()
+            .any(|kw| matches_keyword_word_boundary(line, kw))
+    {
         return Some((EntryType::Intent, 0.7));
     }
     if is_decision_tag(line) {
@@ -1985,34 +2310,60 @@ fn detect_supersedes(entries: &mut [IntentEntry]) {
 }
 
 fn detect_contradicted_assumptions(entries: &mut [IntentEntry]) {
-    let assumptions: Vec<(usize, String)> = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| e.entry_type == EntryType::Assumption)
-        .map(|(i, e)| (i, normalize_key(&e.title)))
-        .collect();
-
-    let results: Vec<(usize, String)> = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| e.entry_type == EntryType::Result)
-        .map(|(i, e)| (i, e.title.to_lowercase()))
-        .collect();
-
     let contradiction_words = ["fail", "broken", "wrong", "error", "invalid", "rejected"];
 
-    for (a_idx, a_key) in &assumptions {
-        let a_words: HashSet<&str> = a_key.split_whitespace().collect();
-        for (r_idx, r_title) in &results {
-            if !contradiction_words.iter().any(|w| r_title.contains(w)) {
-                continue;
+    // E.5: precompute token sets once per entry, and pre-filter Results to
+    // those that actually carry a contradiction keyword. Then group those
+    // Results by session_id so each Assumption only scans peers in its own
+    // session (cross-session contradictions are not meaningful).
+    struct Bucket {
+        idx: usize,
+        words: HashSet<String>,
+    }
+
+    let mut assumptions: Vec<(Option<String>, Bucket)> = Vec::new();
+    let mut results_by_session: HashMap<Option<String>, Vec<Bucket>> = HashMap::new();
+
+    for (idx, entry) in entries.iter().enumerate() {
+        match entry.entry_type {
+            EntryType::Assumption => {
+                let key = normalize_key(&entry.title);
+                let words: HashSet<String> =
+                    key.split_whitespace().map(|w| w.to_string()).collect();
+                assumptions.push((entry.session_id.clone(), Bucket { idx, words }));
             }
-            let r_words: HashSet<&str> = r_title.split_whitespace().collect();
-            let overlap = a_words.intersection(&r_words).count();
+            EntryType::Result => {
+                let title_lower = entry.title.to_lowercase();
+                if !contradiction_words.iter().any(|w| title_lower.contains(w)) {
+                    continue;
+                }
+                let words: HashSet<String> = title_lower
+                    .split_whitespace()
+                    .map(|w| w.to_string())
+                    .collect();
+                results_by_session
+                    .entry(entry.session_id.clone())
+                    .or_default()
+                    .push(Bucket { idx, words });
+            }
+            _ => {}
+        }
+    }
+
+    if assumptions.is_empty() || results_by_session.is_empty() {
+        return;
+    }
+
+    for (session_id, a) in &assumptions {
+        let Some(bucket) = results_by_session.get(session_id) else {
+            continue;
+        };
+        for r in bucket {
+            let overlap = a.words.intersection(&r.words).count();
             if overlap >= 2 {
-                entries[*a_idx].state = EntryState::Contradicted;
-                let r_id = entries[*r_idx].id.clone();
-                entries[*a_idx].links.push(Link {
+                entries[a.idx].state = EntryState::Contradicted;
+                let r_id = entries[r.idx].id.clone();
+                entries[a.idx].links.push(Link {
                     relation: LinkType::Contradicts,
                     target: r_id,
                     confidence: Some(0.6),
@@ -2862,6 +3213,85 @@ Outcome:
             assert_eq!(initial_state(EntryType::Why), EntryState::Active);
             assert_eq!(initial_state(EntryType::Argue), EntryState::Active);
         }
+
+        // Area E.7: keyword classifier must respect word boundaries, negation,
+        // inline code spans, and fenced code blocks.
+
+        #[test]
+        fn test_intent_let_us_not_refactor_is_not_intent() {
+            let result = classify_line_entry_type("Let's not refactor the parser today", true);
+            assert!(
+                result.map(|r| r.0) != Some(EntryType::Intent),
+                "negation `let's not` must invert the keyword polarity"
+            );
+            assert!(!looks_like_intent_line(
+                "Let's not refactor the parser today"
+            ));
+        }
+
+        #[test]
+        fn test_intent_polish_nie_mam_pomyslu_is_not_intent() {
+            // Diacritic-aware word boundary: `pomysłu` should not match keyword
+            // `pomysł` because the following `u` is alphanumeric.
+            assert!(!looks_like_intent_line("nie mam pomysłu na ten task"));
+            let classified = classify_line_entry_type("nie mam pomysłu na ten task", true);
+            assert!(
+                classified.map(|r| r.0) != Some(EntryType::Intent),
+                "Polish negation `nie mam` + suffixed `pomysłu` must not classify as intent"
+            );
+        }
+
+        #[test]
+        fn test_intent_inline_code_let_us_encrypt_is_not_intent() {
+            let line = "We rotated certs via `let's encrypt` last Tuesday";
+            assert!(
+                !looks_like_intent_line(line),
+                "keyword inside backtick inline code must not classify"
+            );
+        }
+
+        #[test]
+        fn test_intent_in_fenced_code_block_is_not_intent() {
+            let chunk = "[project: demo | agent: codex | date: 2026-05-20]\n\n\
+                [12:00:00] user: see the snippet below\n\
+                ```\n\
+                let's encrypt --domain example.com\n\
+                ```\n\
+                [12:01:00] user: that's all\n";
+            let entries = classify_chunk_entries(
+                chunk,
+                "fake.md",
+                Some("demo"),
+                Some("codex"),
+                None,
+                "2026-05-20",
+            );
+            assert!(
+                entries.iter().all(|e| e.entry_type != EntryType::Intent),
+                "lines inside ``` fence must be excluded from classification, got: {entries:?}"
+            );
+        }
+
+        #[test]
+        fn test_intent_real_let_us_refactor_still_classifies() {
+            let result = classify_line_entry_type("Let's refactor the parser today", true);
+            assert_eq!(
+                result.map(|r| r.0),
+                Some(EntryType::Intent),
+                "positive `let's refactor` must still classify as intent"
+            );
+            assert!(looks_like_intent_line("Let's refactor the parser today"));
+        }
+
+        #[test]
+        fn test_intent_polish_chce_zrobic_still_classifies() {
+            assert!(
+                looks_like_intent_line("chcę zrobić nowy parser"),
+                "positive Polish intent should still match keyword `chcę`"
+            );
+            let result = classify_line_entry_type("chcę zrobić nowy parser", true);
+            assert_eq!(result.map(|r| r.0), Some(EntryType::Intent));
+        }
     }
 
     mod session_level {
@@ -3393,6 +3823,304 @@ Outcome:
 
             assert_eq!(records.len(), 1);
             assert!(!records[0].summary.contains("...[truncated]"));
+        }
+
+        // Area E.3: dedup must scale linearly. The quadratic shape blew up on
+        // 10k-record sessions (100M comparisons); the indexed version stays
+        // O(N).
+
+        fn make_record(
+            kind: IntentKind,
+            summary: &str,
+            session_id: &str,
+            source_chunk: &str,
+        ) -> IntentRecord {
+            IntentRecord {
+                kind,
+                summary: summary.to_string(),
+                evidence: Vec::new(),
+                project: "demo".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-05-04".to_string(),
+                session_id: session_id.to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: source_chunk.to_string(),
+                timestamp: None,
+                context: None,
+            }
+        }
+
+        #[test]
+        fn test_drop_truncated_duplicate_is_linear() {
+            // Build 10k records: 5k full + 5k truncated prefix duplicates,
+            // distributed across many (session, chunk) buckets so the bucket
+            // index keeps each lookup O(1). The previous O(N²) shape on this
+            // input ran ~100M comparisons.
+            let mut records = Vec::with_capacity(10_000);
+            for i in 0..5_000 {
+                let session = format!("s{:04}", i % 250);
+                let chunk = format!("/tmp/s{:04}_c{:03}.md", i % 250, i % 50);
+                let full = format!(
+                    "Decision number {i}: keep canonical store at ~/.aicx/store and rebuild semantic index nightly"
+                );
+                let truncated = format!(
+                    "Decision number {i}: keep canonical store at ~/.aicx/store...[truncated]"
+                );
+                records.push(make_record(IntentKind::Decision, &full, &session, &chunk));
+                records.push(make_record(
+                    IntentKind::Decision,
+                    &truncated,
+                    &session,
+                    &chunk,
+                ));
+            }
+            assert_eq!(records.len(), 10_000);
+
+            let start = std::time::Instant::now();
+            drop_truncated_duplicate_records(&mut records);
+            let elapsed = start.elapsed();
+
+            assert!(
+                elapsed.as_millis() < 200,
+                "dedup must run in < 200ms on 10k records (got {elapsed:?}) — quadratic regression suspected"
+            );
+            assert_eq!(records.len(), 5_000);
+            assert!(
+                records
+                    .iter()
+                    .all(|r| !r.summary.contains("...[truncated]"))
+            );
+        }
+
+        #[test]
+        fn test_drop_truncated_dedup_keeps_fullest() {
+            // Two truncated and one full; the full survives even when ordered
+            // last in the input.
+            let session = "sess-fullest";
+            let chunk = "/tmp/fullest.md";
+            let mut records = vec![
+                make_record(
+                    IntentKind::Decision,
+                    "keep canonical store at ~/.aicx/store and...[truncated]",
+                    session,
+                    chunk,
+                ),
+                make_record(
+                    IntentKind::Decision,
+                    "keep canonical store at ~/.aicx/store and rebuild...[truncated]",
+                    session,
+                    chunk,
+                ),
+                make_record(
+                    IntentKind::Decision,
+                    "keep canonical store at ~/.aicx/store and rebuild semantic index nightly",
+                    session,
+                    chunk,
+                ),
+            ];
+
+            drop_truncated_duplicate_records(&mut records);
+
+            assert_eq!(records.len(), 1);
+            assert!(!records[0].summary.contains("...[truncated]"));
+            assert!(records[0].summary.ends_with("nightly"));
+        }
+    }
+
+    // ── Area E.4 / E.9 / E.10 / E.11 regression coverage ────────────────
+
+    #[cfg(test)]
+    mod area_e_regressions {
+        use super::*;
+
+        fn make_record(kind: IntentKind, summary: &str) -> IntentRecord {
+            IntentRecord {
+                kind,
+                summary: summary.to_string(),
+                context: None,
+                evidence: Vec::new(),
+                project: "demo".to_string(),
+                agent: "claude".to_string(),
+                date: "2026-05-20".to_string(),
+                timestamp: None,
+                session_id: "sess".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "chunk-1".to_string(),
+            }
+        }
+
+        #[test]
+        fn dedup_intent_records_collapses_zero_width_variants() {
+            // "fix au\u{200B}th" must dedup against "fix auth" — E.11 + E.12.
+            let mut records = vec![
+                make_record(IntentKind::Intent, "fix auth"),
+                make_record(IntentKind::Intent, "fix au\u{200B}th"),
+                make_record(IntentKind::Intent, "FIX  AUTH"),
+            ];
+            dedup_intent_records(&mut records);
+            assert_eq!(
+                records.len(),
+                1,
+                "dedup should collapse all three variants of 'fix auth', got {:?}",
+                records
+                    .iter()
+                    .map(|r| r.summary.clone())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn dedup_intent_records_preserves_distinct_kinds() {
+            let mut records = vec![
+                make_record(IntentKind::Intent, "fix auth"),
+                make_record(IntentKind::Decision, "fix auth"),
+            ];
+            dedup_intent_records(&mut records);
+            // Different kinds → keep both even when summary normalizes equal.
+            assert_eq!(records.len(), 2);
+        }
+
+        #[test]
+        fn merge_evidence_deduplicates_without_quadratic_rebuild() {
+            // E.4: merge of large additions must succeed without exploding;
+            // we cannot directly measure complexity but we can assert the
+            // logical behavior — final vector has no normalized duplicates.
+            let mut existing: Vec<String> =
+                (0..200).map(|i| format!("evidence line {i}")).collect();
+            let additions: Vec<String> = (100..300)
+                .map(|i| format!("EVIDENCE LINE {i}")) // case-different overlap
+                .collect();
+            merge_evidence(&mut existing, additions);
+            // 0..200 already present, then 200..300 added → 300 unique.
+            assert_eq!(existing.len(), 300);
+            // No two entries share a normalized key.
+            let mut keys: Vec<String> = existing.iter().map(|s| normalize_key(s)).collect();
+            keys.sort();
+            let unique_before = keys.len();
+            keys.dedup();
+            assert_eq!(keys.len(), unique_before, "merge_evidence left duplicates");
+        }
+
+        #[test]
+        fn classify_line_entry_type_rejects_tests_meta_discussion() {
+            // E.9: bare "we need to write tests for the auth flow" — no digits,
+            // no PASS/FAIL — must NOT classify as Result.
+            let result =
+                classify_line_entry_type("we need to write tests for the auth flow", false);
+            assert!(
+                !matches!(result, Some((EntryType::Result, _))),
+                "soft 'tests' marker without shape must not classify as Result, got {result:?}"
+            );
+        }
+
+        #[test]
+        fn classify_line_entry_type_accepts_tests_with_shape() {
+            // E.9: same soft marker but with digits → Result is acceptable.
+            let result = classify_line_entry_type("tests 276/276 passed", false);
+            assert!(
+                matches!(result, Some((EntryType::Result, _))),
+                "tests + digits should classify as Result, got {result:?}"
+            );
+        }
+
+        #[test]
+        fn classify_line_entry_type_rejects_bare_error_meta() {
+            // "should we treat this as an error: ?" is meta-discussion.
+            let result = classify_line_entry_type("should we treat this as an error: ?", false);
+            assert!(
+                !matches!(result, Some((EntryType::Result, _))),
+                "bare 'error:' meta-discussion must not classify as Result, got {result:?}"
+            );
+        }
+
+        #[test]
+        fn is_outcome_line_skips_bare_affirmation() {
+            // E.10: "Zrobione" alone is not an outcome.
+            assert!(!is_outcome_line("Zrobione"));
+            assert!(!is_outcome_line("- Done"));
+            assert!(!is_outcome_line("Gotowe."));
+            // But with detail (colon + content) it counts again.
+            assert!(is_outcome_line("Zrobione: build green"));
+        }
+
+        fn make_entry(id: &str, session: &str, entry_type: EntryType, title: &str) -> IntentEntry {
+            IntentEntry {
+                id: id.to_string(),
+                entry_type,
+                state: EntryState::Active,
+                title: title.to_string(),
+                body: None,
+                evidence: Vec::new(),
+                links: Vec::new(),
+                confidence: 0.9,
+                tags: Vec::new(),
+                project: Some("demo".to_string()),
+                agent: Some("claude".to_string()),
+                session_id: Some(session.to_string()),
+                timestamp: Some("2026-05-20T10:00:00Z".to_string()),
+                date: "2026-05-20".to_string(),
+                source_chunk: "chunk-1".to_string(),
+            }
+        }
+
+        #[test]
+        fn detect_contradicted_assumptions_groups_by_session() {
+            // E.5: assumption + result in the SAME session should link;
+            // a result in a DIFFERENT session must not contradict.
+            let mut entries = vec![
+                make_entry(
+                    "e1",
+                    "sess-A",
+                    EntryType::Assumption,
+                    "auth tokens never expire in dev",
+                ),
+                make_entry(
+                    "e2",
+                    "sess-A",
+                    EntryType::Result,
+                    "auth tokens fail to refresh in dev",
+                ),
+                make_entry(
+                    "e3",
+                    "sess-B",
+                    EntryType::Result,
+                    "auth tokens broken in prod too",
+                ),
+            ];
+            detect_contradicted_assumptions(&mut entries);
+            assert_eq!(entries[0].state, EntryState::Contradicted);
+            assert!(
+                entries[0].links.iter().any(|l| l.target == "e2"),
+                "expected contradiction link to sess-A result e2, got {:?}",
+                entries[0].links
+            );
+            assert!(
+                !entries[0].links.iter().any(|l| l.target == "e3"),
+                "cross-session result e3 must not contradict, got {:?}",
+                entries[0].links
+            );
+        }
+
+        #[test]
+        fn detect_contradicted_assumptions_handles_no_overlap_cleanly() {
+            // Assumption + Result in same session but with <2 word overlap
+            // must NOT mark as contradicted.
+            let mut entries = vec![
+                make_entry("e1", "sess-A", EntryType::Assumption, "deployment is safe"),
+                make_entry(
+                    "e2",
+                    "sess-A",
+                    EntryType::Result,
+                    "auth tokens fail to refresh",
+                ),
+            ];
+            detect_contradicted_assumptions(&mut entries);
+            assert_eq!(entries[0].state, EntryState::Active);
+            assert!(entries[0].links.is_empty());
         }
     }
 }

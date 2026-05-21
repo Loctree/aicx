@@ -27,6 +27,9 @@ pub use aicx_embeddings::{
 #[cfg(feature = "cloud-embedder")]
 pub use aicx_embeddings::CloudEmbeddingProvider;
 
+#[cfg(feature = "cloud-embedder")]
+pub use aicx_embeddings::cloud;
+
 pub type EmbedderConfig = EmbeddingConfig;
 pub type EmbedderEngine = EmbeddingEngine;
 

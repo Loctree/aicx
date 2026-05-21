@@ -135,6 +135,17 @@ fn parse_stdout_json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).expect("parse stdout json")
 }
 
+fn parse_stdout_json_allow_failure(output: &Output) -> Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+        panic!(
+            "parse stdout json\nerror: {err}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
 fn json_paths(value: &Value, key: &str) -> Vec<PathBuf> {
     value[key]
         .as_array()
@@ -224,6 +235,45 @@ fn read_cli_returns_chunk_metadata_and_content() {
     assert_eq!(output["chunk"].as_u64(), Some(1));
     assert_eq!(output["content"].as_str(), Some("Decision: mak"));
     assert_eq!(output["truncated"].as_bool(), Some(true));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_doctor_fix_critical_returns_non_zero_exit() {
+    let root = unique_test_dir("doctor-fix-critical-exit");
+    let home = root.join("home");
+    let chunk = home
+        .join(".aicx")
+        .join("store")
+        .join("VetCoders")
+        .join("aicx")
+        .join("2026_0520")
+        .join("conversations")
+        .join("codex")
+        .join("2026_0520_codex_sess-critical_001.md");
+    write_file(&chunk, "critical chunk intentionally missing its sidecar");
+
+    let output = run_aicx(&home, &["doctor", "--fix", "--format", "json"]);
+    assert!(
+        !output.status.success(),
+        "doctor --fix must return non-zero when the post-fix report is still Critical\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report = parse_stdout_json_allow_failure(&output);
+    assert_eq!(report["overall"].as_str(), Some("critical"));
+    assert_eq!(
+        report["sidecars"]["severity"].as_str(),
+        Some("critical"),
+        "missing sidecars should keep the post-fix report critical"
+    );
+    assert_eq!(
+        report["sidecars"], report["sidecar_coverage"],
+        "doctor JSON should expose the same sidecar check result under both legacy fields"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -866,6 +916,45 @@ fn all_cli_defaults_to_incremental_and_full_rescan_recovers_backfill() {
 }
 
 #[test]
+fn all_cli_hours_zero_means_all_time() {
+    let root = unique_test_dir("all-hours-zero");
+    let home = root.join("home");
+    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let history = home.join(".codex").join("history.jsonl");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs() as i64;
+
+    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
+    write_codex_history(
+        &history,
+        "all-time-sess",
+        Some(&repo_root),
+        &[(
+            "user",
+            now - (90 * 24 * 3600),
+            "ancient context should still land with hours zero",
+        )],
+    );
+
+    let windowed = parse_stdout_json(&run_aicx(&home, &["all", "-H", "48", "--emit", "json"]));
+    assert_eq!(windowed["total_entries"].as_u64(), Some(0));
+
+    let all_time = parse_stdout_json(&run_aicx(
+        &home,
+        &["all", "-H", "0", "--full-rescan", "--emit", "json"],
+    ));
+    assert_eq!(all_time["total_entries"].as_u64(), Some(1));
+    assert_eq!(
+        all_time["entries"][0]["message"].as_str(),
+        Some("ancient context should still land with hours zero")
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn all_cli_force_ignores_watermark_like_full_rescan() {
     let root = unique_test_dir("all-force-watermark");
     let home = root.join("home");
@@ -1007,6 +1096,61 @@ fn store_cli_defaults_to_incremental_and_full_rescan_recovers_backfill() {
         state["last_processed"]["codex:all"].as_str(),
         Some(expected_watermark.as_str())
     );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn store_cli_hours_zero_means_all_time() {
+    let root = unique_test_dir("store-hours-zero");
+    let home = root.join("home");
+    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let history = home.join(".codex").join("history.jsonl");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs() as i64;
+
+    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
+    write_codex_history(
+        &history,
+        "store-all-time-sess",
+        Some(&repo_root),
+        &[(
+            "user",
+            now - (90 * 24 * 3600),
+            "store ancient context should still land with hours zero",
+        )],
+    );
+
+    let windowed = parse_stdout_json(&run_aicx(
+        &home,
+        &["store", "--agent", "codex", "-H", "48", "--emit", "json"],
+    ));
+    assert_eq!(windowed["total_entries"].as_u64(), Some(0));
+
+    let all_time = parse_stdout_json(&run_aicx(
+        &home,
+        &[
+            "store",
+            "--agent",
+            "codex",
+            "-H",
+            "0",
+            "--full-rescan",
+            "--emit",
+            "json",
+        ],
+    ));
+    assert_eq!(all_time["total_entries"].as_u64(), Some(1));
+
+    let store_paths = json_paths(&all_time, "store_paths");
+    let combined_store = store_paths
+        .iter()
+        .map(|path| fs::read_to_string(path).expect("read store chunk"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(combined_store.contains("store ancient context should still land with hours zero"));
 
     let _ = fs::remove_dir_all(&root);
 }

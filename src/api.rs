@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -116,12 +117,21 @@ impl Aicx {
         };
         let project_scopes = search_project_scopes(&owned_projects);
 
+        let kind_filter = match opts.kind.as_deref() {
+            Some(kind) => Some(
+                crate::timeline::Kind::parse(kind)
+                    .ok_or_else(|| anyhow::anyhow!("unknown corpus kind `{kind}`"))?,
+            ),
+            None => None,
+        };
+
         let outcome = crate::search_engine::try_semantic_search(
             &self.config.store_root,
             query.as_ref(),
             opts.limit,
             &project_scopes,
             opts.frame_kind,
+            kind_filter.map(|kind| kind.dir_name()),
         )
         .map_err(anyhow::Error::from)
         .context("semantic search unavailable")?;
@@ -173,6 +183,7 @@ pub struct SearchOptions {
     pub projects: Vec<String>,
     pub project: Option<String>,
     pub frame_kind: Option<FrameKind>,
+    pub kind: Option<String>,
 }
 
 impl Default for SearchOptions {
@@ -182,6 +193,7 @@ impl Default for SearchOptions {
             projects: Vec::new(),
             project: None,
             frame_kind: None,
+            kind: None,
         }
     }
 }
@@ -200,14 +212,57 @@ pub struct SearchResults {
     pub scanned: usize,
 }
 
+/// Truthful semantic-readiness verdict for a single project bucket.
+///
+/// Loctree (and any other oracle) reads `IndexStatus::readiness` first to
+/// decide whether semantic retrieval is safe. A `Pending` bucket means an
+/// in-flight build crashed or is mid-rebuild — the only artifact on disk is
+/// the `*.tmp` checkpoint, never atomically renamed into place, so it MUST
+/// NOT be queried as if it were a complete corpus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexReadiness {
+    /// No semantic index file present on disk (committed or temp).
+    Missing,
+    /// Only the `.ndjson.tmp` checkpoint exists; no committed final index.
+    /// Treat as semantically unsafe — the embed loop never atomically
+    /// committed, so the checkpoint may be torn or partial.
+    Pending,
+    /// Atomically committed final index exists at the canonical path. Safe
+    /// to query. A temp checkpoint may coexist when a rebuild is in
+    /// flight over a previously committed index.
+    Ready,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct IndexStatus {
     pub canonical_chunks: usize,
     pub semantic_index_present: bool,
+    pub semantic_index_path: Option<String>,
+    pub semantic_index_rows: usize,
     pub newest_chunk_mtime: Option<String>,
     pub semantic_index_mtime: Option<String>,
     pub semantic_lag_secs: Option<u64>,
     pub pending_chunks: usize,
+    pub temp_index_present: bool,
+    pub temp_index_path: Option<String>,
+    pub temp_index_rows: usize,
+    pub temp_index_mtime: Option<String>,
+    pub temp_index_bytes: Option<u64>,
+    /// Truthful readiness verdict consumed by Loctree and other oracles.
+    /// `Ready` only when the canonical final index is atomically present.
+    pub readiness: IndexReadiness,
+    /// Storage backend for the index file (currently always `"ndjson"`;
+    /// changes when the Lance migration lands).
+    pub backend: String,
+    /// On-disk bucket name (the safe-bucketed project slug, or `"_all"`
+    /// when the cross-project bucket is queried).
+    pub project_bucket: String,
+    /// RFC3339 timestamp of the committed final index, when present.
+    /// Mirrors `semantic_index_mtime` under an explicit semantic name so
+    /// MCP callers do not have to know that the mtime equals the commit
+    /// time (true because `write_index` atomic-renames into place).
+    pub committed_at: Option<String>,
 }
 
 pub fn index_status_at(base: &Path, project: Option<&str>) -> Result<IndexStatus> {
@@ -217,17 +272,22 @@ pub fn index_status_at(base: &Path, project: Option<&str>) -> Result<IndexStatus
         .filter_map(|chunk| chunk.path.metadata().ok()?.modified().ok())
         .max();
 
-    let index_roots = [
-        base.join("semantic_index"),
-        base.join("vector_index"),
-        base.join("index"),
-        base.join("steer_db"),
-    ];
-    let semantic_index_mtime = index_roots
-        .iter()
-        .filter_map(|path| newest_mtime(path))
-        .max();
+    let project_bucket = canonical_bucket_name(project);
+    let semantic_index_path = semantic_index_path_for_bucket(base, &project_bucket);
+    let temp_index_path = semantic_index_path.with_extension("ndjson.tmp");
+    let semantic_index_mtime = semantic_index_path
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+    let temp_metadata = temp_index_path.metadata().ok();
+    let temp_index_mtime = temp_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.modified().ok());
+    let temp_index_bytes = temp_metadata.as_ref().map(|metadata| metadata.len());
     let semantic_index_present = semantic_index_mtime.is_some();
+    let temp_index_present = temp_index_mtime.is_some();
+    let semantic_index_rows = count_index_rows(&semantic_index_path)?;
+    let temp_index_rows = count_index_rows(&temp_index_path)?;
     let semantic_lag_secs = match (newest_chunk, semantic_index_mtime) {
         (Some(chunk), Some(index)) => Some(
             chunk
@@ -238,33 +298,72 @@ pub fn index_status_at(base: &Path, project: Option<&str>) -> Result<IndexStatus
         _ => None,
     };
 
-    let pending_chunks = if matches!(semantic_lag_secs, Some(lag) if lag > 0)
-        || (newest_chunk.is_some() && semantic_index_mtime.is_none())
-    {
-        chunks.len()
-    } else {
-        0
+    let pending_chunks = chunks.len().saturating_sub(semantic_index_rows);
+
+    let readiness = match (semantic_index_present, temp_index_present) {
+        (true, _) => IndexReadiness::Ready,
+        (false, true) => IndexReadiness::Pending,
+        (false, false) => IndexReadiness::Missing,
     };
+    let committed_at = semantic_index_mtime.map(system_time_to_rfc3339);
 
     Ok(IndexStatus {
         canonical_chunks: chunks.len(),
         semantic_index_present,
+        semantic_index_path: semantic_index_present.then(|| path_for_json(&semantic_index_path)),
+        semantic_index_rows,
         newest_chunk_mtime: newest_chunk.map(system_time_to_rfc3339),
-        semantic_index_mtime: semantic_index_mtime.map(system_time_to_rfc3339),
+        semantic_index_mtime: committed_at.clone(),
         semantic_lag_secs,
         pending_chunks,
+        temp_index_present,
+        temp_index_path: temp_index_present.then(|| path_for_json(&temp_index_path)),
+        temp_index_rows,
+        temp_index_mtime: temp_index_mtime.map(system_time_to_rfc3339),
+        temp_index_bytes,
+        readiness,
+        backend: "ndjson".to_string(),
+        project_bucket,
+        committed_at,
     })
 }
 
-fn newest_mtime(root: &Path) -> Option<SystemTime> {
-    let metadata = root.metadata().ok()?;
-    let mut newest = metadata.modified().ok();
-    if metadata.is_dir() {
-        for entry in std::fs::read_dir(root).ok()?.flatten() {
-            newest = newest.into_iter().chain(newest_mtime(&entry.path())).max();
+fn canonical_bucket_name(project: Option<&str>) -> String {
+    project
+        .unwrap_or("_all")
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' => '_',
+            c => c.to_ascii_lowercase(),
+        })
+        .collect()
+}
+
+fn semantic_index_path_for_bucket(base: &Path, bucket: &str) -> PathBuf {
+    base.join("indexed").join(bucket).join("embeddings.ndjson")
+}
+
+fn count_index_rows(path: &Path) -> Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let file = crate::sanitize::open_file_validated(path)
+        .with_context(|| format!("open semantic index for status: {}", path.display()))?;
+    let mut lines = BufReader::new(file).lines();
+    if lines.next().transpose()?.is_none() {
+        return Ok(0);
+    }
+    let mut rows = 0usize;
+    for line in lines {
+        if !line?.trim().is_empty() {
+            rows += 1;
         }
     }
-    newest
+    Ok(rows)
+}
+
+fn path_for_json(path: &Path) -> String {
+    path.display().to_string()
 }
 
 fn system_time_to_rfc3339(value: SystemTime) -> String {
@@ -292,6 +391,177 @@ mod tests {
         assert!(!status.semantic_index_present);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn index_status_reports_bucket_final_and_temp_indexes() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-api-index-status-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let all_dir = root.join("indexed").join("_all");
+        let sibling_dir = root.join("indexed").join("vibecrafted");
+        std::fs::create_dir_all(&all_dir).expect("create all index dir");
+        std::fs::create_dir_all(&sibling_dir).expect("create sibling index dir");
+        std::fs::write(
+            all_dir.join("embeddings.ndjson"),
+            "{\"schema_version\":\"1.0\"}\n{\"id\":\"a\"}\n{\"id\":\"b\"}\n",
+        )
+        .expect("write final index");
+        std::fs::write(
+            all_dir.join("embeddings.ndjson.tmp"),
+            "{\"schema_version\":\"1.0\"}\n{\"id\":\"a\"}\n{\"id\":\"b\"}\n{\"id\":\"c\"}",
+        )
+        .expect("write temp index");
+        std::fs::write(
+            sibling_dir.join("embeddings.ndjson"),
+            "{\"schema_version\":\"1.0\"}\n{\"id\":\"sibling\"}\n",
+        )
+        .expect("write sibling index");
+
+        let status = index_status_at(&root, None).expect("index status");
+
+        assert!(status.semantic_index_present);
+        assert_eq!(status.semantic_index_rows, 2);
+        assert!(
+            status
+                .semantic_index_path
+                .as_deref()
+                .is_some_and(|path| path.ends_with("indexed/_all/embeddings.ndjson")),
+            "status must report the _all query bucket, not sibling projects"
+        );
+        assert!(status.temp_index_present);
+        assert_eq!(status.temp_index_rows, 3);
+        assert!(
+            status
+                .temp_index_path
+                .as_deref()
+                .is_some_and(|path| path.ends_with("indexed/_all/embeddings.ndjson.tmp"))
+        );
+        assert_eq!(
+            status.readiness,
+            IndexReadiness::Ready,
+            "committed final index must surface as Ready even with a coexisting rebuild checkpoint"
+        );
+        assert_eq!(status.backend, "ndjson");
+        assert_eq!(status.project_bucket, "_all");
+        assert!(
+            status.committed_at.is_some(),
+            "committed_at must mirror the final index mtime once the atomic commit landed"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn index_status_marks_pending_when_only_temp_checkpoint_exists() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-api-index-status-pending-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let bucket_dir = root.join("indexed").join("_all");
+        std::fs::create_dir_all(&bucket_dir).expect("create bucket dir");
+        // Simulate a crashed embed loop: tmp checkpoint exists, atomic
+        // rename never landed, so embeddings.ndjson is absent.
+        std::fs::write(
+            bucket_dir.join("embeddings.ndjson.tmp"),
+            "{\"schema_version\":\"1.0\"}\n{\"id\":\"a\"}\n",
+        )
+        .expect("write temp index");
+
+        let status = index_status_at(&root, None).expect("index status");
+
+        assert!(!status.semantic_index_present);
+        assert!(status.temp_index_present);
+        assert_eq!(
+            status.readiness,
+            IndexReadiness::Pending,
+            "a lone temp checkpoint must surface as Pending so Loctree refuses semantic retrieval"
+        );
+        assert!(
+            status.committed_at.is_none(),
+            "committed_at must stay None when no atomic commit ever landed"
+        );
+        assert_eq!(status.project_bucket, "_all");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn index_status_marks_missing_when_no_artifact_exists() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-api-index-status-missing-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+
+        let status = index_status_at(&root, None).expect("index status");
+
+        assert!(!status.semantic_index_present);
+        assert!(!status.temp_index_present);
+        assert_eq!(status.readiness, IndexReadiness::Missing);
+        assert_eq!(status.backend, "ndjson");
+        assert_eq!(status.project_bucket, "_all");
+        assert!(status.committed_at.is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn index_status_canonicalizes_project_bucket_slug() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-api-index-status-bucket-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+
+        let status =
+            index_status_at(&root, Some("VetCoders/Loctree")).expect("index status with project");
+
+        // Mirrors the on-disk bucket: lowercase + path separators replaced.
+        assert_eq!(status.project_bucket, "vetcoders_loctree");
+        assert_eq!(status.readiness, IndexReadiness::Missing);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn index_status_serializes_readiness_as_snake_case_string() {
+        let status = IndexStatus {
+            canonical_chunks: 0,
+            semantic_index_present: false,
+            semantic_index_path: None,
+            semantic_index_rows: 0,
+            newest_chunk_mtime: None,
+            semantic_index_mtime: None,
+            semantic_lag_secs: None,
+            pending_chunks: 0,
+            temp_index_present: true,
+            temp_index_path: Some("/tmp/_all/embeddings.ndjson.tmp".to_string()),
+            temp_index_rows: 1,
+            temp_index_mtime: None,
+            temp_index_bytes: Some(64),
+            readiness: IndexReadiness::Pending,
+            backend: "ndjson".to_string(),
+            project_bucket: "_all".to_string(),
+            committed_at: None,
+        };
+
+        let payload: serde_json::Value =
+            serde_json::to_value(&status).expect("status should serialize");
+        assert_eq!(payload["readiness"], "pending");
+        assert_eq!(payload["backend"], "ndjson");
+        assert_eq!(payload["project_bucket"], "_all");
+        assert!(payload["committed_at"].is_null());
+        assert_eq!(payload["temp_index_rows"], 1);
     }
 
     #[test]

@@ -15,6 +15,7 @@ use rmcp_memex::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,10 +26,53 @@ use crate::timeline::FrameKind;
 const STEER_NAMESPACE: &str = "steer";
 const STEER_BM25_DIR: &str = "steer_bm25";
 const STEER_METADATA_FILE: &str = "steer_index_meta.json";
+const STEER_NEXT_DIR: &str = ".steer.next";
+const STEER_PREV_DIR: &str = ".steer.prev";
 const STEER_INDEX_METADATA_VERSION: u32 = 1;
 const STEER_SENTINEL_DIMENSION: usize = 1;
 const MIN_CANDIDATES: usize = 200;
 const CANDIDATE_MULTIPLIER: usize = 20;
+
+#[cfg(test)]
+type TestHook = Arc<dyn Fn() + Send + Sync + 'static>;
+
+#[cfg(test)]
+static STEER_READ_LOCK_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<TestHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static STEER_REBUILD_SWAP_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<TestHook>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn call_steer_read_lock_hook() {
+    let hook = STEER_READ_LOCK_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("steer read hook lock poisoned")
+        .clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn call_steer_read_lock_hook() {}
+
+#[cfg(test)]
+fn call_steer_rebuild_swap_hook() {
+    let hook = STEER_REBUILD_SWAP_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("steer rebuild hook lock poisoned")
+        .clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn call_steer_rebuild_swap_hook() {}
 
 trait Bm25CandidateHit {
     fn into_hit(self) -> (String, f32);
@@ -58,6 +102,51 @@ struct SteerIndexMetadata {
     updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SteerIncompatible {
+    RebuildRequired { reason: String },
+    NotBootstrapped { reason: String },
+}
+
+impl SteerIncompatible {
+    fn rebuild_required(reason: impl Into<String>) -> Self {
+        Self::RebuildRequired {
+            reason: reason.into(),
+        }
+    }
+
+    fn not_bootstrapped(reason: impl Into<String>) -> Self {
+        Self::NotBootstrapped {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl fmt::Display for SteerIncompatible {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RebuildRequired { reason } => {
+                write!(f, "steer index requires rebuild: {reason}")
+            }
+            Self::NotBootstrapped { reason } => {
+                write!(f, "steer index is not bootstrapped: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SteerIncompatible {}
+
+fn warn_if_steer_incompatible(err: &anyhow::Error) {
+    if let Some(incompatible) = err.downcast_ref::<SteerIncompatible>() {
+        tracing::warn!("{incompatible}; run `aicx doctor --fix`");
+    }
+}
+
+fn is_steer_incompatible(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<SteerIncompatible>().is_some()
+}
+
 fn chunk_id_for_path(file: &Path) -> String {
     file.file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -74,6 +163,10 @@ fn steer_bm25_path(base: &Path) -> PathBuf {
 
 fn steer_metadata_path(base: &Path) -> PathBuf {
     base.join(STEER_METADATA_FILE)
+}
+
+fn steer_lock_path_at(base: &Path) -> PathBuf {
+    base.join("locks").join("steer.lock")
 }
 
 fn steer_bm25_config(base: &Path, read_only: bool) -> BM25Config {
@@ -348,11 +441,22 @@ async fn sync_steer_index_at_with_reporter(
     reporter: Arc<dyn Reporter>,
     failures: &FailureLog,
 ) -> Result<()> {
-    let db_path = steer_db_path(base);
+    sync_steer_index_at_with_reporter_and_filter_base(base, base, new_files, reporter, failures)
+        .await
+}
+
+async fn sync_steer_index_at_with_reporter_and_filter_base(
+    index_base: &Path,
+    filter_base: &Path,
+    new_files: &[&PathBuf],
+    reporter: Arc<dyn Reporter>,
+    failures: &FailureLog,
+) -> Result<()> {
+    let db_path = steer_db_path(index_base);
     let storage = StorageManager::new_lance_only(&db_path.to_string_lossy()).await?;
     storage.ensure_collection().await?;
 
-    let (filtered_paths, _) = crate::store::filter_ignored_paths_at(base, new_files)?;
+    let (filtered_paths, _) = crate::store::filter_ignored_paths_at(filter_base, new_files)?;
     let filtered_refs: Vec<&PathBuf> = filtered_paths.iter().collect();
     let docs = build_steer_docs(&filtered_refs);
 
@@ -391,7 +495,7 @@ async fn sync_steer_index_at_with_reporter(
     }
 
     let bm25_phase = Phase::start(reporter.clone(), "bm25_sync", Some(total_docs));
-    match sync_steer_bm25_at(base, &docs).await {
+    match sync_steer_bm25_at(index_base, &docs).await {
         Ok(()) => {
             bm25_phase.finish_ok(format!("{total_docs} docs"));
         }
@@ -402,27 +506,103 @@ async fn sync_steer_index_at_with_reporter(
         }
     }
 
-    write_steer_metadata(base)?;
+    write_steer_metadata(index_base)?;
     Ok(())
+}
+
+fn remove_dir_if_exists(path: &Path) -> Result<()> {
+    if path.exists() {
+        fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn clear_steer_index_artifacts_at(base: &Path) -> Result<()> {
+    remove_dir_if_exists(&steer_db_path(base))?;
+    remove_dir_if_exists(&steer_bm25_path(base))?;
+    remove_file_if_exists(&steer_metadata_path(base))?;
+    remove_dir_if_exists(&base.join(STEER_NEXT_DIR))?;
+    remove_dir_if_exists(&base.join(STEER_PREV_DIR))?;
+    Ok(())
+}
+
+fn rename_if_exists(from: &Path, to: &Path) -> Result<bool> {
+    if !from.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(from, to)?;
+    Ok(true)
+}
+
+fn restore_if_missing(from: &Path, to: &Path) {
+    if from.exists() && !to.exists() {
+        let _ = fs::rename(from, to);
+    }
 }
 
 async fn rebuild_all_steer_index_at(
     base: &Path,
     all_files: &[crate::store::StoredContextFile],
 ) -> Result<()> {
-    let db_path = steer_db_path(base);
-    if db_path.exists() {
-        fs::remove_dir_all(&db_path)?;
-    }
-
-    let bm25_path = steer_bm25_path(base);
-    if bm25_path.exists() {
-        fs::remove_dir_all(&bm25_path)?;
-    }
+    let next_base = base.join(STEER_NEXT_DIR);
+    let prev_base = base.join(STEER_PREV_DIR);
+    remove_dir_if_exists(&next_base)?;
+    remove_dir_if_exists(&prev_base)?;
+    fs::create_dir_all(&next_base)?;
 
     let paths: Vec<PathBuf> = all_files.iter().map(|file| file.path.clone()).collect();
     let path_refs: Vec<&PathBuf> = paths.iter().collect();
-    sync_steer_index_at(base, &path_refs).await
+    let reporter: Arc<dyn Reporter> = Arc::new(NoopReporter);
+    let failures = FailureLog::new();
+    sync_steer_index_at_with_reporter_and_filter_base(
+        &next_base, base, &path_refs, reporter, &failures,
+    )
+    .await?;
+
+    call_steer_rebuild_swap_hook();
+
+    let db_path = steer_db_path(base);
+    let bm25_path = steer_bm25_path(base);
+    let meta_path = steer_metadata_path(base);
+    let prev_db_path = prev_base.join("steer_db");
+    let prev_bm25_path = prev_base.join(STEER_BM25_DIR);
+    let prev_meta_path = prev_base.join(STEER_METADATA_FILE);
+    let next_db_path = steer_db_path(&next_base);
+    let next_bm25_path = steer_bm25_path(&next_base);
+
+    remove_dir_if_exists(&prev_base)?;
+    fs::create_dir_all(&prev_base)?;
+    rename_if_exists(&db_path, &prev_db_path)?;
+    rename_if_exists(&bm25_path, &prev_bm25_path)?;
+    rename_if_exists(&meta_path, &prev_meta_path)?;
+
+    let swap_result: Result<()> = (|| {
+        rename_if_exists(&next_db_path, &db_path)?;
+        rename_if_exists(&next_bm25_path, &bm25_path)?;
+        write_steer_metadata(base)?;
+        Ok(())
+    })();
+
+    if let Err(err) = swap_result {
+        restore_if_missing(&prev_db_path, &db_path);
+        restore_if_missing(&prev_bm25_path, &bm25_path);
+        restore_if_missing(&prev_meta_path, &meta_path);
+        return Err(err);
+    }
+
+    remove_dir_if_exists(&next_base)?;
+    remove_dir_if_exists(&prev_base)?;
+    Ok(())
 }
 
 async fn query_steer_index_at(base: &Path) -> Result<Vec<ChromaDocument>> {
@@ -441,6 +621,15 @@ async fn bootstrap_steer_index_if_missing_at(base: &Path) -> Result<bool> {
     }
 
     let expected_docs = files.len();
+    let bm25_path = steer_bm25_path(base);
+    if !bm25_path.exists() {
+        let incompatible = SteerIncompatible::not_bootstrapped(format!(
+            "BM25 index is missing (store has {expected_docs} files)"
+        ));
+        tracing::warn!("{incompatible}; run `aicx doctor --fix`");
+        return Err(incompatible.into());
+    }
+
     let bm25 = BM25Index::new(&steer_bm25_config(base, true))?;
     let bm25_docs = bm25.doc_count() as usize;
 
@@ -448,20 +637,11 @@ async fn bootstrap_steer_index_if_missing_at(base: &Path) -> Result<bool> {
         return Ok(false);
     }
 
-    let paths: Vec<PathBuf> = files.into_iter().map(|file| file.path).collect();
-    let path_refs: Vec<&PathBuf> = paths.iter().collect();
-    let docs = build_steer_docs(&path_refs);
-
-    tracing::info!(
-        "Bootstrapping steer BM25 from store scan (bm25: {}, store: {})",
-        bm25_docs,
-        expected_docs
-    );
-    let bm25_writer = BM25Index::new(&steer_bm25_config(base, false))?;
-    let _ = bm25_writer.delete_namespace_term(STEER_NAMESPACE).await;
-    sync_steer_bm25_at(base, &docs).await?;
-
-    Ok(true)
+    let incompatible = SteerIncompatible::not_bootstrapped(format!(
+        "BM25 index has {bm25_docs} docs but store has {expected_docs} files"
+    ));
+    tracing::warn!("{incompatible}; run `aicx doctor --fix`");
+    Err(incompatible.into())
 }
 
 async fn ensure_steer_index_compatible_at(base: &Path) -> Result<()> {
@@ -469,39 +649,56 @@ async fn ensure_steer_index_compatible_at(base: &Path) -> Result<()> {
 
     match actual_dimension {
         Some(actual_dimension) if actual_dimension != STEER_SENTINEL_DIMENSION => {
-            let files = crate::store::scan_context_files_at(base)?;
-            if files.is_empty() {
-                let meta_path = steer_metadata_path(base);
-                if meta_path.exists() {
-                    let _ = fs::remove_file(meta_path);
-                }
-                return Ok(());
-            }
-
-            tracing::info!(
-                "Rebuilding steer index because stored vectors use {} dims, expected {}",
-                actual_dimension,
-                STEER_SENTINEL_DIMENSION
-            );
-            rebuild_all_steer_index_at(base, &files).await?;
+            return Err(SteerIncompatible::rebuild_required(format!(
+                "stored vectors use {actual_dimension} dims, expected {STEER_SENTINEL_DIMENSION}"
+            ))
+            .into());
         }
         Some(_) => {
             let metadata_ok = load_steer_metadata(base)
                 .as_ref()
                 .is_some_and(|metadata| steer_metadata_matches_current(base, metadata));
             if !metadata_ok {
-                write_steer_metadata(base)?;
+                return Err(
+                    SteerIncompatible::rebuild_required("metadata is missing or stale").into(),
+                );
             }
         }
         None => {
-            let meta_path = steer_metadata_path(base);
-            if meta_path.exists() {
-                let _ = fs::remove_file(meta_path);
+            let files = crate::store::scan_context_files_at(base)?;
+            if files.is_empty() {
+                return Ok(());
             }
+            return Err(SteerIncompatible::not_bootstrapped(format!(
+                "LanceDB steer index is missing (store has {} files)",
+                files.len()
+            ))
+            .into());
         }
     }
 
     Ok(())
+}
+
+async fn ensure_steer_index_compatible_for_write_at(base: &Path) -> Result<()> {
+    match ensure_steer_index_compatible_at(base).await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let Some(incompatible) = err.downcast_ref::<SteerIncompatible>().cloned() else {
+                return Err(err);
+            };
+
+            let files = crate::store::scan_context_files_at(base)?;
+            if files.is_empty() {
+                tracing::info!("Clearing empty steer index after {incompatible}");
+                clear_steer_index_artifacts_at(base)?;
+                return Ok(());
+            }
+
+            tracing::info!("Rebuilding steer index after {incompatible}");
+            rebuild_all_steer_index_at(base, &files).await
+        }
+    }
 }
 
 /// Steer index filter — all 8 optional filters in one bag so helpers don't
@@ -679,12 +876,14 @@ async fn search_bm25_candidates_at(
         return Ok(vec![]);
     };
 
-    let mut bm25 = BM25Index::new(&steer_bm25_config(base, true))?;
-    if bm25.doc_count() == 0 && bootstrap_steer_index_if_missing_at(base).await? {
-        bm25 = BM25Index::new(&steer_bm25_config(base, true))?;
+    if !steer_bm25_path(base).exists() {
+        bootstrap_steer_index_if_missing_at(base).await?;
+        return Ok(vec![]);
     }
 
+    let bm25 = BM25Index::new(&steer_bm25_config(base, true))?;
     if bm25.doc_count() == 0 {
+        bootstrap_steer_index_if_missing_at(base).await?;
         return Ok(vec![]);
     }
 
@@ -727,10 +926,11 @@ async fn search_bm25_candidates_at(
 }
 
 async fn rebuild_steer_index_if_needed_at(base: &Path) -> Result<()> {
-    ensure_steer_index_compatible_at(base).await?;
+    ensure_steer_index_compatible_for_write_at(base).await?;
 
     let all_files = crate::store::scan_context_files_at(base)?;
     if all_files.is_empty() {
+        clear_steer_index_artifacts_at(base)?;
         return Ok(());
     }
 
@@ -749,15 +949,7 @@ async fn rebuild_steer_index_if_needed_at(base: &Path) -> Result<()> {
             bm25_needs_rebuild
         );
 
-        let db_path = steer_db_path(base);
-        let storage = StorageManager::new_lance_only(&db_path.to_string_lossy()).await?;
-        let _ = storage.delete_namespace_documents(STEER_NAMESPACE).await;
-        let bm25 = BM25Index::new(&steer_bm25_config(base, false))?;
-        let _ = bm25.delete_namespace_term(STEER_NAMESPACE).await;
-
-        let paths: Vec<PathBuf> = all_files.into_iter().map(|f| f.path).collect();
-        let path_refs: Vec<&PathBuf> = paths.iter().collect();
-        sync_steer_index_at(base, &path_refs).await?;
+        rebuild_all_steer_index_at(base, &all_files).await?;
     }
 
     Ok(())
@@ -772,7 +964,7 @@ pub async fn sync_steer_index(new_files: &[&PathBuf]) -> Result<()> {
 
     let base = crate::store::store_base_dir()?;
     let _lock = crate::locks::acquire_exclusive(crate::locks::steer_lock_path()?)?;
-    ensure_steer_index_compatible_at(&base).await?;
+    ensure_steer_index_compatible_for_write_at(&base).await?;
     sync_steer_index_at(&base, new_files).await
 }
 
@@ -793,21 +985,34 @@ pub async fn sync_steer_index_with_progress(
 
     let base = crate::store::store_base_dir()?;
     let _lock = crate::locks::acquire_exclusive(crate::locks::steer_lock_path()?)?;
-    ensure_steer_index_compatible_at(&base).await?;
+    ensure_steer_index_compatible_for_write_at(&base).await?;
     sync_steer_index_at_with_reporter(&base, new_files, reporter, failures).await
 }
 
 pub async fn query_steer_index_count() -> Result<usize> {
     let base = crate::store::store_base_dir()?;
-    ensure_steer_index_compatible_at(&base).await?;
+    let _lock = crate::locks::acquire_shared(crate::locks::steer_lock_path()?)?;
+    call_steer_read_lock_hook();
+    if let Err(err) = ensure_steer_index_compatible_at(&base).await {
+        warn_if_steer_incompatible(&err);
+        if is_steer_incompatible(&err) {
+            return Ok(0);
+        }
+        return Err(err);
+    }
     let docs = query_steer_index_at(&base).await?;
     Ok(docs.len())
 }
 
+pub async fn try_rebuild_steer_index_if_needed_at(base: &Path) -> Result<()> {
+    fs::create_dir_all(base)?;
+    let _lock = crate::locks::acquire_exclusive(steer_lock_path_at(base))?;
+    rebuild_steer_index_if_needed_at(base).await
+}
+
 pub async fn rebuild_steer_index_if_needed() -> Result<()> {
     let base = crate::store::store_base_dir()?;
-    let _lock = crate::locks::acquire_exclusive(crate::locks::steer_lock_path()?)?;
-    rebuild_steer_index_if_needed_at(&base).await
+    try_rebuild_steer_index_if_needed_at(&base).await
 }
 
 pub async fn search_steer_index(
@@ -815,9 +1020,26 @@ pub async fn search_steer_index(
     limit: usize,
 ) -> Result<Vec<serde_json::Value>> {
     let base = crate::store::store_base_dir()?;
-    ensure_steer_index_compatible_at(&base).await?;
+    let _lock = crate::locks::acquire_shared(crate::locks::steer_lock_path()?)?;
+    call_steer_read_lock_hook();
+    if let Err(err) = ensure_steer_index_compatible_at(&base).await {
+        warn_if_steer_incompatible(&err);
+        if is_steer_incompatible(&err) {
+            return Ok(vec![]);
+        }
+        return Err(err);
+    }
 
-    let candidate_results = search_bm25_candidates_at(&base, filter, limit).await?;
+    let candidate_results = match search_bm25_candidates_at(&base, filter, limit).await {
+        Ok(results) => results,
+        Err(err) => {
+            warn_if_steer_incompatible(&err);
+            if is_steer_incompatible(&err) {
+                return Ok(vec![]);
+            }
+            return Err(err);
+        }
+    };
 
     if candidate_results.len() >= limit || !candidate_results.is_empty() {
         return Ok(candidate_results);
@@ -832,8 +1054,107 @@ mod tests {
     use crate::chunker::ChunkMetadataSidecar;
     use crate::store::Kind;
     use serde_json::json;
+    use std::ffi::OsString;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    static AICX_HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct AicxHomeGuard {
+        previous: Option<OsString>,
+        dir: PathBuf,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for AicxHomeGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(previous) => {
+                    // SAFETY: tests that mutate AICX_HOME are serialized by
+                    // AICX_HOME_LOCK and all spawned workers are joined before drop.
+                    unsafe { std::env::set_var("AICX_HOME", previous) };
+                }
+                None => {
+                    // SAFETY: tests that mutate AICX_HOME are serialized by
+                    // AICX_HOME_LOCK and all spawned workers are joined before drop.
+                    unsafe { std::env::remove_var("AICX_HOME") };
+                }
+            }
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn set_temp_aicx_home(label: &str) -> AicxHomeGuard {
+        let guard = AICX_HOME_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("AICX_HOME test lock");
+        let dir = unique_test_dir(label);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp AICX_HOME");
+        let previous = std::env::var_os("AICX_HOME");
+        // SAFETY: guarded by AICX_HOME_LOCK for the full lifetime of this guard.
+        unsafe { std::env::set_var("AICX_HOME", &dir) };
+        AicxHomeGuard {
+            previous,
+            dir,
+            _guard: guard,
+        }
+    }
+
+    struct HookGuard {
+        cell: &'static OnceLock<Mutex<Option<TestHook>>>,
+    }
+
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            *self
+                .cell
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("hook lock poisoned") = None;
+        }
+    }
+
+    fn install_hook(
+        cell: &'static OnceLock<Mutex<Option<TestHook>>>,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) -> HookGuard {
+        *cell
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("hook lock poisoned") = Some(Arc::new(hook));
+        HookGuard { cell }
+    }
+
+    fn wait_flag(pair: &Arc<(Mutex<bool>, Condvar)>) {
+        let (lock, ready) = &**pair;
+        let mut value = lock.lock().expect("flag lock");
+        while !*value {
+            value = ready.wait(value).expect("flag wait");
+        }
+    }
+
+    fn set_flag(pair: &Arc<(Mutex<bool>, Condvar)>) {
+        let (lock, ready) = &**pair;
+        *lock.lock().expect("flag lock") = true;
+        ready.notify_all();
+    }
+
+    fn path_count(path: &Path) -> usize {
+        if !path.exists() {
+            return 0;
+        }
+        let mut count = 1;
+        if path.is_dir() {
+            for entry in fs::read_dir(path).expect("read dir") {
+                count += path_count(&entry.expect("dir entry").path());
+            }
+        }
+        count
+    }
 
     fn unique_test_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -968,7 +1289,7 @@ mod tests {
     }
 
     #[test]
-    fn steer_index_rebuilds_incompatible_vector_dimension() {
+    fn writer_repairs_incompatible_vector_dimension() {
         let base = unique_test_dir("rebuild");
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).expect("create temp root");
@@ -990,7 +1311,7 @@ mod tests {
                 .await
                 .expect("insert legacy steer document");
 
-            ensure_steer_index_compatible_at(&base)
+            ensure_steer_index_compatible_for_write_at(&base)
                 .await
                 .expect("compatibility repair should succeed");
 
@@ -1006,6 +1327,217 @@ mod tests {
         assert!(steer_metadata_matches_current(&base, &metadata));
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_search_steer_index_takes_shared_lock() {
+        let home = set_temp_aicx_home("search-shared-lock");
+        let chunk_path = write_store_chunk(&home.dir);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(sync_steer_index_at(&home.dir, &[&chunk_path]))
+            .expect("build steer index");
+
+        let acquired = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let acquired_for_hook = acquired.clone();
+        let release_for_hook = release.clone();
+        let _hook = install_hook(&STEER_READ_LOCK_HOOK, move || {
+            set_flag(&acquired_for_hook);
+            wait_flag(&release_for_hook);
+        });
+
+        let worker = thread::spawn(|| {
+            let rt = tokio::runtime::Runtime::new().expect("runtime");
+            rt.block_on(async {
+                let filter = SteerFilter {
+                    run_id: Some("impl-055522"),
+                    ..SteerFilter::default()
+                };
+                search_steer_index(&filter, 10).await
+            })
+        });
+
+        wait_flag(&acquired);
+        let err = crate::locks::acquire_exclusive_with_timeout(
+            steer_lock_path_at(&home.dir),
+            Duration::from_millis(75),
+        )
+        .expect_err("exclusive lock should wait while search holds shared lock");
+        assert!(err.to_string().contains("timed out"));
+        set_flag(&release);
+
+        let results = worker
+            .join()
+            .expect("search worker")
+            .expect("search should complete");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_query_steer_index_count_does_not_mutate_under_shared() {
+        let home = set_temp_aicx_home("query-no-mutate");
+        let chunk_path = write_store_chunk(&home.dir);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let storage =
+                StorageManager::new_lance_only(&steer_db_path(&home.dir).to_string_lossy())
+                    .await
+                    .expect("open steer db");
+            storage
+                .add_to_store(vec![ChromaDocument::new_flat(
+                    "legacy-steer".to_string(),
+                    STEER_NAMESPACE.to_string(),
+                    vec![0.0; 8],
+                    json!({"path": chunk_path.display().to_string()}),
+                    "legacy steer".to_string(),
+                )])
+                .await
+                .expect("insert legacy steer document");
+        });
+        let before_count = path_count(&steer_db_path(&home.dir));
+
+        let count = rt
+            .block_on(query_steer_index_count())
+            .expect("query should degrade to an empty count");
+        assert_eq!(count, 0);
+        assert_eq!(path_count(&steer_db_path(&home.dir)), before_count);
+
+        let docs = rt
+            .block_on(query_steer_index_at(&home.dir))
+            .expect("read legacy docs");
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].id, "legacy-steer");
+        assert_eq!(docs[0].embedding.len(), 8);
+    }
+
+    #[test]
+    fn test_incompatible_index_during_search_returns_diagnostic() {
+        let home = set_temp_aicx_home("search-incompatible");
+        let chunk_path = write_store_chunk(&home.dir);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let storage =
+                StorageManager::new_lance_only(&steer_db_path(&home.dir).to_string_lossy())
+                    .await
+                    .expect("open steer db");
+            storage
+                .add_to_store(vec![ChromaDocument::new_flat(
+                    "legacy-steer".to_string(),
+                    STEER_NAMESPACE.to_string(),
+                    vec![0.0; 8],
+                    json!({"path": chunk_path.display().to_string()}),
+                    "legacy steer".to_string(),
+                )])
+                .await
+                .expect("insert legacy steer document");
+        });
+
+        let results = rt
+            .block_on(async {
+                let filter = SteerFilter {
+                    run_id: Some("impl-055522"),
+                    ..SteerFilter::default()
+                };
+                search_steer_index(&filter, 10).await
+            })
+            .expect("search should degrade to empty results");
+        assert!(results.is_empty());
+
+        let docs = rt
+            .block_on(query_steer_index_at(&home.dir))
+            .expect("read legacy docs");
+        assert_eq!(docs[0].id, "legacy-steer");
+        assert_eq!(docs[0].embedding.len(), 8);
+    }
+
+    #[test]
+    fn test_two_parallel_search_calls_on_missing_index_do_not_double_rebuild() {
+        let home = set_temp_aicx_home("parallel-missing");
+        write_store_chunk(&home.dir);
+
+        let worker = || {
+            thread::spawn(|| {
+                let rt = tokio::runtime::Runtime::new().expect("runtime");
+                rt.block_on(async {
+                    let filter = SteerFilter {
+                        run_id: Some("impl-055522"),
+                        ..SteerFilter::default()
+                    };
+                    search_steer_index(&filter, 10).await
+                })
+            })
+        };
+
+        let first = worker();
+        let second = worker();
+        for result in [
+            first.join().expect("first worker"),
+            second.join().expect("second worker"),
+        ] {
+            let results = result.expect("missing index should degrade to empty results");
+            assert!(results.is_empty());
+        }
+
+        assert!(!steer_db_path(&home.dir).exists());
+        assert!(!steer_bm25_path(&home.dir).exists());
+    }
+
+    #[test]
+    fn test_rebuild_atomic_swap_does_not_expose_partial_state() {
+        let home = set_temp_aicx_home("atomic-swap");
+        let first_chunk =
+            write_chunk_with_sidecar(&home.dir, "2026_0331_codex_sess1_001.md", "mrbl-001", "p1");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(sync_steer_index_at(&home.dir, &[&first_chunk]))
+            .expect("build initial steer index");
+
+        let second_chunk =
+            write_chunk_with_sidecar(&home.dir, "2026_0331_codex_sess1_002.md", "mrbl-002", "p2");
+        assert!(second_chunk.exists());
+
+        let staged = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let staged_for_hook = staged.clone();
+        let release_for_hook = release.clone();
+        let _hook = install_hook(&STEER_REBUILD_SWAP_HOOK, move || {
+            set_flag(&staged_for_hook);
+            wait_flag(&release_for_hook);
+        });
+
+        let base = home.dir.clone();
+        let writer = thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("runtime");
+            rt.block_on(try_rebuild_steer_index_if_needed_at(&base))
+        });
+
+        wait_flag(&staged);
+        assert!(steer_db_path(&home.dir).exists());
+        assert!(steer_db_path(&home.dir.join(STEER_NEXT_DIR)).exists());
+        let err = crate::locks::acquire_shared_with_timeout(
+            steer_lock_path_at(&home.dir),
+            Duration::from_millis(75),
+        )
+        .expect_err("reader should not enter while writer is staged");
+        assert!(err.to_string().contains("timed out"));
+        set_flag(&release);
+
+        writer
+            .join()
+            .expect("writer thread")
+            .expect("writer rebuild should finish");
+        assert!(!home.dir.join(STEER_NEXT_DIR).exists());
+        assert!(!home.dir.join(STEER_PREV_DIR).exists());
+
+        let docs = rt
+            .block_on(query_steer_index_at(&home.dir))
+            .expect("query rebuilt steer index");
+        assert_eq!(docs.len(), 2);
+        assert!(
+            docs.iter()
+                .all(|doc| doc.embedding.len() == STEER_SENTINEL_DIMENSION)
+        );
+        let metadata = load_steer_metadata(&home.dir).expect("metadata");
+        assert!(steer_metadata_matches_current(&home.dir, &metadata));
     }
 
     #[test]

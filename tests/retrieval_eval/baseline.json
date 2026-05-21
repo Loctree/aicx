@@ -1,0 +1,260 @@
+{
+  "metadata": "Historical baseline floor measured before live hybrid_rrf gating; default CI validates this file, live operator eval compares production hybrid_rrf against it.",
+  "aggregate": {
+    "recall_at_5": 0.0,
+    "ndcg_at_10": 0.0,
+    "latency_ms": 318
+  },
+  "queries": {
+    "po-007": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 282
+    },
+    "po-002": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 282
+    },
+    "po-004": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 291
+    },
+    "en-018": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 253
+    },
+    "en-019": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 319
+    },
+    "co-032": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 256
+    },
+    "en-028": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 272
+    },
+    "po-012": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 293
+    },
+    "mi-041": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 280
+    },
+    "mi-046": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 271
+    },
+    "mi-048": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 269
+    },
+    "po-008": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 285
+    },
+    "en-020": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 263
+    },
+    "co-033": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 242
+    },
+    "po-001": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 290
+    },
+    "en-026": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 262
+    },
+    "po-003": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 283
+    },
+    "po-010": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 283
+    },
+    "en-027": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 266
+    },
+    "co-039": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 258
+    },
+    "mi-042": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 271
+    },
+    "en-016": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 262
+    },
+    "en-022": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 269
+    },
+    "po-014": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 285
+    },
+    "en-023": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 267
+    },
+    "co-030": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 252
+    },
+    "co-037": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 259
+    },
+    "mi-043": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 296
+    },
+    "po-000": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 1068
+    },
+    "co-036": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 265
+    },
+    "en-017": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 292
+    },
+    "co-038": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 247
+    },
+    "en-024": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 268
+    },
+    "co-034": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 260
+    },
+    "en-025": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 259
+    },
+    "po-013": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 262
+    },
+    "po-009": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 275
+    },
+    "po-011": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 275
+    },
+    "po-006": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 291
+    },
+    "en-015": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 261
+    },
+    "co-031": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 246
+    },
+    "co-035": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 247
+    },
+    "mi-044": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 278
+    },
+    "mi-047": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 318
+    },
+    "mi-049": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 274
+    },
+    "po-005": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 277
+    },
+    "en-029": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 269
+    },
+    "mi-045": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 280
+    },
+    "mi-040": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 283
+    },
+    "en-021": {
+      "recall_at_5": 0.0,
+      "ndcg_at_10": 0.0,
+      "latency_ms": 293
+    }
+  }
+}

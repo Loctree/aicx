@@ -8,8 +8,8 @@
 
 all: build
 
-PACKAGE_NAME := $(shell python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["name"])')
-VERSION := $(shell python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+PACKAGE_NAME := $(shell grep '^name = ' Cargo.toml | head -n 1 | cut -d '"' -f 2)
+VERSION := $(shell grep '^version = ' Cargo.toml | head -n 1 | cut -d '"' -f 2)
 TAG := v$(VERSION)
 KEYS ?= $(if $(AICX_KEYS_DIR),$(AICX_KEYS_DIR),$(HOME)/.keys)
 NOTARY_PROFILE ?= $(AICX_NOTARY_PROFILE)
@@ -60,6 +60,15 @@ release-binaries:
 	esac
 	@python3 -c 'import json, pathlib, sys; staging=pathlib.Path(sys.argv[1]); version=sys.argv[2]; commit=sys.argv[3]; data={"source":"loctree-aicx","commit":commit,"components":[{"name":"aicx","version":version,"source":"loctree-aicx"},{"name":"aicx-mcp","version":version,"source":"loctree-aicx"}]}; path=staging/"components"/"loctree-aicx.json"; path.write_text(json.dumps(data, indent=2)+"\n", encoding="utf-8"); print(f"  metadata -> {path}")' "$(STAGING_DIR)" "$(VERSION)" "$$(git rev-parse --short=12 HEAD)"
 
+release-binaries-linux:
+	@for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-musl; do \
+		echo "==> Building $$target"; \
+		cross build --release --target $$target --bin aicx --bin aicx-mcp || exit 1; \
+		mkdir -p dist/aicx-v$(VERSION)-$$target-slim-unsigned; \
+		cp target/$$target/release/aicx target/$$target/release/aicx-mcp dist/aicx-v$(VERSION)-$$target-slim-unsigned/; \
+		(cd dist && tar -czf aicx-v$(VERSION)-$$target-slim-unsigned.tar.gz aicx-v$(VERSION)-$$target-slim-unsigned/); \
+	done
+
 install:
 	./install.sh
 	@$(MAKE) git-hooks
@@ -89,8 +98,7 @@ precheck-native:
 	cargo check --locked -p aicx --features native-embedder --all-targets
 
 manifest-check:
-	@python3 -c 'import tomllib; data = tomllib.load(open("Cargo.toml", "rb")); allow = {("dependencies", "rmcp-memex"), ("dependencies", "aicx-embeddings")}; bad = [(section, name, spec["path"]) for section in ("dependencies", "dev-dependencies", "build-dependencies") for name, spec in data.get(section, {}).items() if isinstance(spec, dict) and "path" in spec and (section, name) not in allow]; \
-print("Manifest policy: ok (approved local product deps only)") if not bad else (_ for _ in ()).throw(SystemExit("Manifest policy check failed:\n" + "\n".join(f"  - {section}.{name} uses unexpected local path dependency {path}" for section, name, path in bad)))'
+	@python3 -c 'import sys, re; text = open("Cargo.toml", "r").read(); bad = [m.group(1) for m in re.finditer(r"^([\w-]+)\s*=.*path\s*=", text, re.MULTILINE) if m.group(1) not in ("rmcp-memex", "aicx-embeddings", "aicx-retrieve", "aicx-parser", "aicx-monitor", "aicx-progress-contracts", "path")]; sys.exit("Manifest policy check failed:\n  - Unexpected local path dependency: " + ", ".join(bad)) if bad else print("Manifest policy: ok (approved local product deps only)")'
 
 test:
 	cargo test --locked -p aicx --all-targets
@@ -107,6 +115,15 @@ test-native:
 test-e2e:
 	cargo test --locked -p aicx --features e2e-aicx --test e2e_pipeline -- --nocapture
 	cargo test --locked -p aicx --features e2e-aicx --test e2e_context_pack_ingest -- --nocapture
+
+test-retrieval-eval:
+	cargo test --test retrieval_eval_harness
+
+test-retrieval-eval-live:
+	cargo test --test retrieval_eval_harness --features e2e-aicx -- --nocapture
+
+test-retrieval-eval-rebaseline:
+	AICX_RETRIEVAL_EVAL_WRITE_BASELINE=1 cargo test --test retrieval_eval_harness --features e2e-aicx -- --nocapture
 
 check:
 	@echo "=== AICX Quality Gate ==="

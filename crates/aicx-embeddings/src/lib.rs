@@ -22,6 +22,32 @@ mod gguf;
 #[cfg(feature = "cloud")]
 pub use cloud::CloudEmbeddingProvider;
 pub use cloud::{CloudEmbeddingConfig, DEFAULT_CLOUD_DIMENSION, DEFAULT_TIMEOUT_SECS};
+
+/// Maximum input byte length any embedder backend will accept (D-9). Inputs
+/// over this size short-circuit with a structured error before the embedder
+/// touches the tokenizer, HTTP body, or local context. 32 KiB is large
+/// enough for any sane prefix slice yet small enough to keep cloud POSTs
+/// snappy and prevent runaway local tokenization.
+pub const MAX_EMBED_INPUT_BYTES: usize = 32 * 1024;
+
+/// Trim `text` to `MAX_EMBED_INPUT_BYTES` and reject empty / whitespace-only
+/// payloads. Centralized so cloud + gguf backends apply the same budget and
+/// rejection message. Returns the (possibly-truncated) input on success.
+pub fn enforce_embed_input_budget(text: &str) -> Result<&str> {
+    if text.trim().is_empty() {
+        return Err(anyhow!(
+            "embedder input is empty or whitespace-only; supply a non-empty query"
+        ));
+    }
+    if text.len() > MAX_EMBED_INPUT_BYTES {
+        return Err(anyhow!(
+            "embedder input {} bytes exceeds {} byte budget; truncate or rephrase before embedding",
+            text.len(),
+            MAX_EMBED_INPUT_BYTES
+        ));
+    }
+    Ok(text)
+}
 pub use config::{
     DEFAULT_BASE_FILENAME, DEFAULT_BASE_REPO, DEFAULT_DEV_FILENAME, DEFAULT_DEV_REPO,
     DEFAULT_PREMIUM_FILENAME, DEFAULT_PREMIUM_REPO, config_search_paths, find_cached_model_file,
@@ -272,7 +298,28 @@ impl EmbeddingEngine {
     pub fn with_config(config: EmbeddingConfig) -> Result<Self> {
         match config.backend {
             BackendPreference::Cloud => Self::with_cloud(config),
-            BackendPreference::Auto | BackendPreference::Gguf => Self::with_gguf(config),
+            BackendPreference::Gguf => Self::with_gguf(config),
+            // D-7: `backend = "auto"` prefers the local GGUF backend; on
+            // failure (model not hydrated, feature missing, …) falls back
+            // to the cloud backend if a `[embedder.cloud]` section is
+            // configured. Operators get usable retrieval on a fresh machine
+            // before they finish downloading the local weights.
+            BackendPreference::Auto => {
+                let cloud_available = config.cloud.is_some();
+                let cloud_fallback = config.clone();
+                match Self::with_gguf(config) {
+                    Ok(engine) => Ok(engine),
+                    Err(gguf_err) if cloud_available => match Self::with_cloud(cloud_fallback) {
+                        Ok(engine) => Ok(engine),
+                        Err(cloud_err) => Err(anyhow!(
+                            "embedder=auto: failed GGUF ({gguf_err}); cloud fallback also failed: {cloud_err}"
+                        )),
+                    },
+                    Err(gguf_err) => Err(anyhow!(
+                        "embedder=auto: failed GGUF ({gguf_err}); no [embedder.cloud] section configured for cloud fallback"
+                    )),
+                }
+            }
             BackendPreference::Candle => Err(anyhow!(
                 "Candle/BERT native embedding is no longer the first-choice AICX backend. \
                  Set backend=\"gguf\" or backend=\"cloud\", or use an older build that \
@@ -455,6 +502,37 @@ mod tests {
     }
 
     #[test]
+    fn enforce_embed_input_budget_rejects_empty_and_whitespace() {
+        assert!(enforce_embed_input_budget("").is_err());
+        assert!(enforce_embed_input_budget("   \n\t  ").is_err());
+    }
+
+    #[test]
+    fn enforce_embed_input_budget_rejects_inputs_over_32kib() {
+        let big = "x".repeat(MAX_EMBED_INPUT_BYTES + 1);
+        let err = enforce_embed_input_budget(&big)
+            .expect_err("input above the 32 KiB cap must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds"),
+            "error must reference budget breach: {msg}"
+        );
+    }
+
+    #[test]
+    fn enforce_embed_input_budget_accepts_normal_query_and_exact_limit() {
+        assert_eq!(
+            enforce_embed_input_budget("how does the noise filter work").unwrap(),
+            "how does the noise filter work"
+        );
+        let exact = "x".repeat(MAX_EMBED_INPUT_BYTES);
+        assert!(
+            enforce_embed_input_budget(&exact).is_ok(),
+            "input exactly at the cap must be accepted"
+        );
+    }
+
+    #[test]
     fn similarity_length_mismatch_is_zero() {
         assert_eq!(similarity(&[1.0, 0.0], &[1.0, 0.0, 0.0]), 0.0);
     }
@@ -480,5 +558,26 @@ mod tests {
         assert!(resolved.from_legacy_repo);
         assert_eq!(resolved.repo, DEFAULT_DEV_REPO);
         assert_eq!(resolved.filename, DEFAULT_DEV_FILENAME);
+    }
+
+    #[cfg(not(any(feature = "gguf", feature = "cloud")))]
+    #[test]
+    fn auto_with_cloud_config_attempts_cloud_fallback_after_gguf() {
+        let cfg = EmbeddingConfig {
+            backend: BackendPreference::Auto,
+            cloud: Some(CloudEmbeddingConfig {
+                url: "http://127.0.0.1:65535/v1/embeddings".to_string(),
+                model: "test-model".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = match EmbeddingEngine::with_config(cfg) {
+            Ok(_) => panic!("auto without compiled backends should not construct an engine"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("failed GGUF"));
+        assert!(err.contains("cloud fallback"));
     }
 }

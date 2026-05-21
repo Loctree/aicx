@@ -841,7 +841,18 @@ fn extract_checklist_items(entries: &[&TimelineEntry]) -> (Vec<String>, Vec<Stri
     let mut order: Vec<String> = Vec::new();
 
     for entry in entries {
+        // Track fenced code blocks per entry. Checklist-looking lines inside
+        // ``` fences (pasted markdown snippets, code samples documenting
+        // checklist syntax) must not be promoted to actual tasks.
+        let mut in_fence = false;
         for line in entry.message.lines() {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if in_fence {
+                continue;
+            }
             if let Some((is_done, task)) = parse_checklist_task(line) {
                 let key = normalize_key(&task);
                 if !state_by_key.contains_key(&key) {
@@ -1000,10 +1011,38 @@ pub fn is_result_line(line: &str) -> bool {
 }
 
 pub fn normalize_key(s: &str) -> String {
-    s.split_whitespace()
+    // Strip invisible characters that would otherwise let "fix au\u{200B}th"
+    // bypass dedup of "fix auth". Covers zero-width family
+    // (U+200B/200C/200D/FEFF) and bidi controls (U+202A-202E/2066-2069) that
+    // can be pasted from chat clients or copy-paste from PDFs.
+    let cleaned: String = s
+        .chars()
+        .filter(|ch| !is_invisible_normalize_char(*ch))
+        .collect();
+    cleaned
+        .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+fn is_invisible_normalize_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200B}'
+            | '\u{200C}'
+            | '\u{200D}'
+            | '\u{FEFF}'
+            | '\u{202A}'
+            | '\u{202B}'
+            | '\u{202C}'
+            | '\u{202D}'
+            | '\u{202E}'
+            | '\u{2066}'
+            | '\u{2067}'
+            | '\u{2068}'
+            | '\u{2069}'
+    )
 }
 
 pub fn truncate_signal_line(line: &str) -> String {
@@ -1480,7 +1519,7 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_entries_strip_malformed_frontmatter_without_metadata() {
+    fn test_chunk_entries_skips_unsupported_frontmatter_values_without_dropping_metadata() {
         let entries = vec![make_entry(
             14,
             30,
@@ -1493,7 +1532,7 @@ mod tests {
 
         let chunk = &chunks[0];
         assert_eq!(chunk.run_id, None);
-        assert_eq!(chunk.mode, None);
+        assert_eq!(chunk.mode.as_deref(), Some("session-first"));
         assert!(chunk.text.contains("## Report"));
         assert!(chunk.text.contains("Body survives"));
         assert!(!chunk.text.contains("mode: session-first"));
@@ -1801,5 +1840,50 @@ mod tests {
         assert!(text.contains("Intent:"));
         assert!(text.contains("No i tutaj mam taki pomysł, żeby to zrobić"));
         assert!(text.contains("[/signals]"));
+    }
+
+    // ── Area E.8 + E.12 regression coverage ─────────────────────────────
+
+    #[test]
+    fn test_normalize_key_strips_zero_width_chars() {
+        assert_eq!(normalize_key("fix au\u{200B}th"), "fix auth");
+        assert_eq!(normalize_key("fix au\u{200C}th"), "fix auth");
+        assert_eq!(normalize_key("fix au\u{200D}th"), "fix auth");
+        assert_eq!(normalize_key("\u{FEFF}fix auth"), "fix auth");
+    }
+
+    #[test]
+    fn test_normalize_key_strips_bidi_controls() {
+        assert_eq!(normalize_key("fix\u{202A}auth\u{202C}"), "fixauth");
+        assert_eq!(normalize_key("fix \u{2066}auth\u{2069}"), "fix auth");
+    }
+
+    #[test]
+    fn test_normalize_key_preserves_visible_chars() {
+        assert_eq!(normalize_key("  Fix  AUTH  Bug  "), "fix auth bug");
+        assert_eq!(normalize_key("naprawdę"), "naprawdę");
+    }
+
+    #[test]
+    fn test_extract_checklist_skips_lines_inside_code_fence() {
+        let entry = make_entry(
+            12,
+            0,
+            "user",
+            "Here is sample syntax:\n```\n- [ ] sample task A\n- [x] sample task B\n```\nReal work:\n- [ ] real task open\n- [x] real task done",
+        );
+        let entries = vec![&entry];
+        let (open, done) = extract_checklist_items(&entries);
+        assert_eq!(open, vec!["real task open".to_string()]);
+        assert_eq!(done, vec!["real task done".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_checklist_fence_toggle_resets_per_entry() {
+        let entry_a = make_entry(12, 0, "user", "```\n- [ ] fenced leak");
+        let entry_b = make_entry(12, 1, "user", "- [ ] honest task");
+        let entries = vec![&entry_a, &entry_b];
+        let (open, _done) = extract_checklist_items(&entries);
+        assert_eq!(open, vec!["honest task".to_string()]);
     }
 }

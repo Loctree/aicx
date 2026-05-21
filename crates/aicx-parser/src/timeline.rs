@@ -66,6 +66,7 @@ pub enum FrameKind {
     AgentReply,
     InternalThought,
     ToolCall,
+    SystemNote,
 }
 
 impl FrameKind {
@@ -75,6 +76,7 @@ impl FrameKind {
             Self::AgentReply => "agent_reply",
             Self::InternalThought => "internal_thought",
             Self::ToolCall => "tool_call",
+            Self::SystemNote => "system_note",
         }
     }
 
@@ -86,6 +88,7 @@ impl FrameKind {
                 Some(Self::InternalThought)
             }
             "tool_call" | "tool" | "tool_result" | "function_call" => Some(Self::ToolCall),
+            "system_note" | "system" | "note" | "notification" | "error" => Some(Self::SystemNote),
             _ => None,
         }
     }
