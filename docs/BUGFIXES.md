@@ -1331,3 +1331,42 @@ D-12 already landed via `453f166`. Closes F-P3-18 from Area F. Final dispatch
 in bug-tracker-aicx plan recovery wave. Report:
 `/Users/silver/.vibecrafted/artifacts/Loctree/aicx/2026_0520/reports/20260520_165547_20260520_1655_perform-the-vc-justdo-skill-on-this-repository_claude.md`.
 
+## 2026-05-21 — legacy siphash state load migration · `{commit-sha}`
+
+**Symptom.** Pre-BLAKE3 `~/.aicx/state.json` z `hash_algorithm:
+"siphash13-v1"` i u64 hashami padał na strict serde load zanim mogła
+zadziałać migracja. Użytkownik widział `state.json corrupted, no backup;
+manual recovery needed` przy pierwszym `aicx all` / `aicx store` po upgrade.
+
+**Root cause.** `StateManager` oczekiwał już BLAKE3-128 hashy jako stringów,
+więc `seen_hashes: { project: [123_u64] }` nie deserializowało się do
+`SeenHashSet`. `migrate_loaded_state` umiało wyczyścić bucket i podbić
+algorytm, ale strict deserialize blokowało dojście do tego punktu.
+
+**Fix.**
+- `StateManager::load_from_path` próbuje strict serde jako domyślną ścieżkę.
+- Tylko dla JSON-a z tagiem `siphash13-v1` włącza legacy parser
+  `HashMap<String, Vec<u64>>`, buduje tymczasowy stan i oddaje go do
+  istniejącej migracji.
+- Migracja czyści legacy `seen_hashes`, podbija `hash_algorithm` do
+  `blake3-128-v1` i emituje warning o migracji.
+- Non-legacy schema mismatch dalej kończy się `state.json corrupted, no
+  backup; manual recovery needed`.
+
+**Touched.**
+- `src/state.rs` — legacy pre-deserialize branch, warning hook, regression
+  tests.
+- `src/state/migration.rs` — helper rozpoznający `siphash13-v1`.
+
+**Tests.**
+- Nowe: `test_load_migrates_legacy_siphash_u64_state`,
+  `test_load_rejects_non_legacy_schema_mismatch`.
+- Zielone w tym runie: `make test`, `make clippy`, `make fmt`.
+
+**Lessons.**
+- Migracja schematu nie może siedzieć wyłącznie po stronie typed modelu,
+  jeśli zmienia typ pola potrzebnego do zdeserializowania modelu.
+- Strict corrupted-state contract zostaje domyślne; wyjątek musi być
+  rozpoznany po stabilnym tagu formatu, nie po samej porażce parsera.
+
+**Related.** Closes G-1 from `docs/bug-tracker-aicx-followup-pass-2`.

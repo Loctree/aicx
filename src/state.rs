@@ -118,6 +118,40 @@ pub struct StateManager {
     pub hash_algorithm: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct LegacySiphashStateManager {
+    #[serde(default)]
+    last_processed: HashMap<String, DateTime<Utc>>,
+    #[serde(default)]
+    seen_hashes: HashMap<String, Vec<u64>>,
+    #[serde(default)]
+    runs: Vec<RunRecord>,
+    hash_algorithm: String,
+}
+
+impl LegacySiphashStateManager {
+    fn into_current_state(self) -> StateManager {
+        let seen_hashes = self
+            .seen_hashes
+            .into_iter()
+            .map(|(project, hashes)| {
+                let mut set = SeenHashSet::default();
+                for hash in hashes {
+                    set.insert(hash.to_string());
+                }
+                (project, set)
+            })
+            .collect();
+
+        StateManager {
+            last_processed: self.last_processed,
+            seen_hashes,
+            runs: self.runs,
+            hash_algorithm: self.hash_algorithm,
+        }
+    }
+}
+
 impl Default for StateManager {
     fn default() -> Self {
         Self {
@@ -146,6 +180,13 @@ impl StateManager {
     }
 
     fn load_from_path(path: &Path) -> Result<Self> {
+        Self::load_from_path_with_legacy_warning(path, |message| eprintln!("{message}"))
+    }
+
+    fn load_from_path_with_legacy_warning<W>(path: &Path, mut warn_legacy: W) -> Result<Self>
+    where
+        W: FnMut(&str),
+    {
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -154,32 +195,122 @@ impl StateManager {
         let contents = fs::read_to_string(path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
             .with_context(|| format!("Failed to read state file: {}", path.display()))?;
 
-        let mut state: Self = match serde_json::from_str(&contents) {
-            Ok(state) => state,
-            Err(err) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "state.json parse failed"
-                );
-                if backup_path.exists() {
-                    let backup = fs::read_to_string(&backup_path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-                        .with_context(|| {
-                            format!("Failed to read state backup: {}", backup_path.display())
-                        })?;
-                    serde_json::from_str(&backup).map_err(|backup_err| {
-                        anyhow!("state.json malformed AND backup unreadable: {err} / {backup_err}")
-                    })?
-                } else {
-                    return Err(anyhow!(
-                        "state.json corrupted, no backup; manual recovery needed: {}",
-                        path.display()
-                    ));
+        let state: Self =
+            match Self::deserialize_and_migrate_contents(path, &contents, &mut warn_legacy) {
+                Ok(state) => state,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "state.json parse failed"
+                    );
+                    if backup_path.exists() {
+                        let backup = fs::read_to_string(&backup_path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+                            .with_context(|| {
+                                format!("Failed to read state backup: {}", backup_path.display())
+                            })?;
+                        Self::deserialize_and_migrate_contents(
+                            &backup_path,
+                            &backup,
+                            &mut warn_legacy,
+                        )
+                        .map_err(|backup_err| {
+                            anyhow!(
+                                "state.json malformed AND backup unreadable: {err} / {backup_err}"
+                            )
+                        })?
+                    } else {
+                        return Err(anyhow!(
+                            "state.json corrupted, no backup; manual recovery needed: {}",
+                            path.display()
+                        ));
+                    }
                 }
-            }
-        };
-        state.apply_load_migrations();
+            };
         Ok(state)
+    }
+
+    fn deserialize_and_migrate_contents<W>(
+        path: &Path,
+        contents: &str,
+        warn_legacy: &mut W,
+    ) -> std::result::Result<Self, serde_json::Error>
+    where
+        W: FnMut(&str),
+    {
+        let (mut state, loaded_legacy_u64_shape) =
+            Self::deserialize_current_or_legacy_siphash(contents)?;
+        let previous_hash_algorithm = state.hash_algorithm.clone();
+        let report = state.apply_load_migrations();
+        Self::emit_load_migration_warning(
+            path,
+            &previous_hash_algorithm,
+            loaded_legacy_u64_shape,
+            &report,
+            warn_legacy,
+        );
+        Ok(state)
+    }
+
+    fn deserialize_current_or_legacy_siphash(
+        contents: &str,
+    ) -> std::result::Result<(Self, bool), serde_json::Error> {
+        match serde_json::from_str(contents) {
+            Ok(state) => Ok((state, false)),
+            Err(strict_err) => {
+                if !Self::is_legacy_siphash_state_json(contents) {
+                    return Err(strict_err);
+                }
+
+                serde_json::from_str::<LegacySiphashStateManager>(contents)
+                    .map(|legacy| (legacy.into_current_state(), true))
+                    .map_err(|_| strict_err)
+            }
+        }
+    }
+
+    fn is_legacy_siphash_state_json(contents: &str) -> bool {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(contents) else {
+            return false;
+        };
+        value
+            .get("hash_algorithm")
+            .and_then(|algorithm| algorithm.as_str())
+            .is_some_and(migration::is_legacy_siphash13_algorithm)
+    }
+
+    fn emit_load_migration_warning<W>(
+        path: &Path,
+        previous_hash_algorithm: &str,
+        loaded_legacy_u64_shape: bool,
+        report: &migration::StateMigrationReport,
+        warn_legacy: &mut W,
+    ) where
+        W: FnMut(&str),
+    {
+        if !report.hash_algorithm_changed {
+            return;
+        }
+
+        tracing::warn!(
+            path = %path.display(),
+            previous_hash_algorithm = %previous_hash_algorithm,
+            current_hash_algorithm = %migration::BLAKE3_128_ALGORITHM,
+            cleared_seen_hashes = report.cleared_seen_hashes,
+            legacy_u64_shape = loaded_legacy_u64_shape,
+            "state.json migrated from legacy hash algorithm"
+        );
+
+        let previous = if previous_hash_algorithm.trim().is_empty() {
+            "missing"
+        } else {
+            previous_hash_algorithm.trim()
+        };
+        warn_legacy(&format!(
+            "Warning: state.json migrated from legacy hash algorithm {previous} to {}; cleared {} legacy seen_hashes",
+            migration::BLAKE3_128_ALGORITHM,
+            report.cleared_seen_hashes
+        ));
     }
 
     /// Persist current state to disk. Creates parent directories if needed.
@@ -590,6 +721,85 @@ mod tests {
 
         assert_eq!(loaded.get_watermark("claude:test"), Some(ts(20)));
         assert!(!loaded.is_new("project", "202"));
+        cleanup_state_path(&path);
+    }
+
+    #[test]
+    fn test_load_migrates_legacy_siphash_u64_state() {
+        let path = unique_state_path("legacy-siphash-u64");
+        let legacy_state = serde_json::json!({
+            "last_processed": {
+                "claude:test": "2026-05-20T12:00:00Z"
+            },
+            "seen_hashes": {
+                "Vista": [101_u64, 202_u64]
+            },
+            "runs": [
+                {
+                    "timestamp": "2026-05-20T12:30:00Z",
+                    "entries_added": 2,
+                    "sources": ["claude:test"]
+                }
+            ],
+            "hash_algorithm": migration::SIPHASH13_ALGORITHM
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&legacy_state).unwrap()).unwrap();
+
+        let mut warnings = Vec::new();
+        let loaded = StateManager::load_from_path_with_legacy_warning(&path, |message| {
+            warnings.push(message.to_string());
+        })
+        .unwrap();
+
+        assert_eq!(loaded.hash_algorithm, migration::BLAKE3_128_ALGORITHM);
+        assert!(loaded.seen_hashes.is_empty());
+        assert_eq!(loaded.total_hashes(), 0);
+        assert_eq!(loaded.get_watermark("claude:test"), Some(ts(1779278400)));
+        assert_eq!(loaded.runs.len(), 1);
+        assert_eq!(loaded.runs[0].entries_added, 2);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("migrated from legacy hash algorithm"));
+        assert!(warnings[0].contains(migration::SIPHASH13_ALGORITHM));
+        assert!(warnings[0].contains(migration::BLAKE3_128_ALGORITHM));
+        assert!(warnings[0].contains("cleared 2 legacy seen_hashes"));
+
+        loaded.save_to_path(&path).unwrap();
+        let persisted: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            persisted["hash_algorithm"],
+            serde_json::Value::String(migration::BLAKE3_128_ALGORITHM.to_string())
+        );
+        assert_eq!(persisted["seen_hashes"].as_object().unwrap().len(), 0);
+
+        cleanup_state_path(&path);
+    }
+
+    #[test]
+    fn test_load_rejects_non_legacy_schema_mismatch() {
+        let path = unique_state_path("non-legacy-schema-mismatch");
+        let invalid_current_state = serde_json::json!({
+            "last_processed": {},
+            "seen_hashes": {
+                "Vista": [101_u64]
+            },
+            "runs": [],
+            "hash_algorithm": migration::BLAKE3_128_ALGORITHM
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&invalid_current_state).unwrap(),
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let err = StateManager::load_from_path_with_legacy_warning(&path, |message| {
+            warnings.push(message.to_string());
+        })
+        .expect_err("non-legacy u64 hashes must still be rejected");
+
+        assert!(err.to_string().contains("state.json corrupted"));
+        assert!(warnings.is_empty());
         cleanup_state_path(&path);
     }
 

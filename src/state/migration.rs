@@ -38,6 +38,10 @@ pub fn stable_blake3_128(input: &[u8]) -> String {
     hex[..32].to_string()
 }
 
+pub fn is_legacy_siphash13_algorithm(hash_algorithm: &str) -> bool {
+    hash_algorithm.trim() == SIPHASH13_ALGORITHM
+}
+
 pub fn canonical_state_bucket(project: &str) -> String {
     project
         .split('/')
