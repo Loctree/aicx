@@ -2371,18 +2371,58 @@ fn extract_input_format_label(format: ExtractInputFormat) -> &'static str {
 
 /// Resolve the default output path for `aicx extract --session ...`:
 /// `~/.aicx/extracts/<agent>/<session_id>.md`.
+const DEFAULT_SESSION_EXTRACT_FILENAME_STEM_MAX_BYTES: usize = 180;
+
 fn default_session_extract_path(agent_label: &str, session_id: &str) -> Result<PathBuf> {
     let base = aicx::store::store_base_dir()?;
-    let safe_session: String = session_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
+    let is_already_safe = !session_id.is_empty()
+        && session_id.len() <= DEFAULT_SESSION_EXTRACT_FILENAME_STEM_MAX_BYTES
+        && !session_id.chars().all(|c| c == '.')
+        && session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    let safe_session = if is_already_safe {
+        session_id.to_string()
+    } else if session_id.is_empty() {
+        "session".to_string()
+    } else {
+        let mut safe = String::new();
+        let mut previous_was_separator = false;
+
+        for ch in session_id.chars() {
+            let mapped = if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
             } else {
                 '_'
+            };
+
+            if mapped == '_' {
+                if !previous_was_separator {
+                    safe.push(mapped);
+                }
+                previous_was_separator = true;
+            } else {
+                safe.push(mapped);
+                previous_was_separator = false;
             }
-        })
-        .collect();
+        }
+
+        let safe = safe.trim_matches(|ch| ch == '_' || ch == '.');
+        let base = if safe.is_empty() { "session" } else { safe };
+        let base_max_len = DEFAULT_SESSION_EXTRACT_FILENAME_STEM_MAX_BYTES - 17;
+        let capped_base = if base.len() > base_max_len {
+            &base[..base_max_len]
+        } else {
+            base
+        };
+
+        use siphasher::sip::SipHasher13;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = SipHasher13::new();
+        session_id.hash(&mut hasher);
+        let suffix = hasher.finish();
+        format!("{capped_base}-{suffix:016x}")
+    };
     Ok(base
         .join("extracts")
         .join(agent_label)
@@ -6121,6 +6161,59 @@ mod tests {
             resolved.canonical_id,
             "019e27c0-e492-7790-9c33-52b3dddd1067"
         );
+    }
+
+    fn default_session_extract_file_name(session_id: &str) -> String {
+        default_session_extract_path("claude", session_id)
+            .expect("default session extract path should resolve")
+            .file_name()
+            .expect("default session extract path should include a file name")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn default_session_extract_path_empty_session_uses_safe_fallback() {
+        assert_eq!(default_session_extract_file_name(""), "session.md");
+    }
+
+    #[test]
+    fn default_session_extract_path_dot_session_gets_hashed_safe_name() {
+        let file_name = default_session_extract_file_name(".");
+
+        assert_ne!(file_name, "..md");
+        assert!(
+            file_name.starts_with("session-"),
+            "expected session-prefixed fallback, got {file_name}"
+        );
+        assert!(file_name.ends_with(".md"));
+    }
+
+    #[test]
+    fn default_session_extract_path_dotdot_session_gets_hashed_safe_name() {
+        let file_name = default_session_extract_file_name("..");
+
+        assert_ne!(file_name, "...md");
+        assert!(
+            file_name.starts_with("session-"),
+            "expected session-prefixed fallback, got {file_name}"
+        );
+        assert!(file_name.ends_with(".md"));
+    }
+
+    #[test]
+    fn default_session_extract_path_oversized_session_is_length_capped() {
+        let file_name = default_session_extract_file_name(&"a".repeat(500));
+        let stem = file_name
+            .strip_suffix(".md")
+            .expect("default extract filename should use markdown extension");
+        let (_, suffix) = stem
+            .rsplit_once('-')
+            .expect("oversized session id should carry hash suffix");
+
+        assert!(stem.len() <= DEFAULT_SESSION_EXTRACT_FILENAME_STEM_MAX_BYTES);
+        assert_eq!(suffix.len(), 16);
+        assert!(suffix.chars().all(|ch| ch.is_ascii_hexdigit()));
     }
 
     #[test]
