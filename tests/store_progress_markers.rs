@@ -14,6 +14,31 @@ use aicx::progress::{
     recovery_hint_for, render_failure_tail, select_reporter,
 };
 
+fn lance_trace_diagnostics_enabled() -> bool {
+    std::env::var("RUST_LOG")
+        .ok()
+        .is_some_and(|filter| rust_log_enables_lance_trace_filter(&filter))
+}
+
+fn rust_log_enables_lance_trace_filter(filter: &str) -> bool {
+    if tracing_subscriber::EnvFilter::try_new(filter).is_err() {
+        return false;
+    }
+
+    filter.split(',').any(|directive| {
+        let Some((target, level)) = directive.trim().rsplit_once('=') else {
+            return false;
+        };
+        level.trim().eq_ignore_ascii_case("trace") && is_lance_target(target.trim())
+    })
+}
+
+fn is_lance_target(target: &str) -> bool {
+    matches!(target, "lance" | "lancedb")
+        || target.starts_with("lance::")
+        || target.starts_with("lancedb::")
+}
+
 #[derive(Default)]
 struct CapturingReporter {
     events: Mutex<Vec<String>>,
@@ -104,7 +129,20 @@ fn noop_reporter_handles_full_phase_lifecycle() {
 }
 
 #[test]
-fn failed_phase_records_recovery_hint_and_renders_tail() {
+fn lance_diagnostic_filter_requires_targeted_trace() {
+    assert!(!rust_log_enables_lance_trace_filter(""));
+    assert!(!rust_log_enables_lance_trace_filter("trace"));
+    assert!(!rust_log_enables_lance_trace_filter("lance=debug"));
+    assert!(!rust_log_enables_lance_trace_filter("aicx=trace"));
+    assert!(rust_log_enables_lance_trace_filter("lance=trace"));
+    assert!(rust_log_enables_lance_trace_filter(
+        "aicx=debug,lance=trace"
+    ));
+    assert!(rust_log_enables_lance_trace_filter("lancedb::io=trace"));
+}
+
+#[test]
+fn failed_phase_records_recovery_hint_and_gates_lance_tail_rendering() {
     let reporter: Arc<dyn Reporter> = Arc::new(NoopReporter);
     let log = FailureLog::new();
     assert!(!render_failure_tail(&log));
@@ -117,5 +155,15 @@ fn failed_phase_records_recovery_hint_and_renders_tail() {
     assert_eq!(record.phase, "steer_sync");
     assert_eq!(record.recovery_hint.as_deref(), Some("aicx doctor --fix"));
     log.record(record);
-    assert!(render_failure_tail(&log));
+
+    let records = log.snapshot();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].error,
+        "Lance index missing _deletions/130-86502-...arrow"
+    );
+
+    if lance_trace_diagnostics_enabled() {
+        assert!(render_failure_tail(&log));
+    }
 }
