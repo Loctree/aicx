@@ -436,6 +436,11 @@ fn append_markdown_timeline(
     max_chars: usize,
     loctree_snapshot: Option<&str>,
 ) -> Result<()> {
+    // SECURITY: --append-to is a user-controlled CLI path. Validate before
+    // any read/write to prevent path traversal. Downstream strip_footer +
+    // truncate_file_atomic carry nosemgrep annotations that assume this
+    // gate has already run.
+    let path = &sanitize::validate_write_path(path)?;
     if !path.exists() {
         // First time: write full file (includes initial sync marker)
         return write_markdown_full(path, entries, metadata, max_chars, loctree_snapshot);
@@ -555,7 +560,7 @@ fn find_footer_position(path: &Path, file_size: u64, window: u64) -> Result<Opti
     let start = file_size - tail_len;
 
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    // Timeline path is resolved from AICX output writers via validate_write_path, not from request input.
+    // Timeline path is validated at append_markdown_timeline entry via sanitize::validate_write_path (traversal + canonicalize + allowlist) before reaching strip_footer.
     let mut file = File::open(path)
         .with_context(|| format!("strip_footer: open failed: {}", path.display()))?;
     file.seek(SeekFrom::Start(start))?;
@@ -594,7 +599,7 @@ fn truncate_file_atomic(path: &Path, pos: u64) -> Result<()> {
 
     let copy_result: io::Result<()> = (|| {
         // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-        // src/tmp_path are derived from already-resolved AICX timeline path + sibling tempfile.
+        // src/tmp_path derive from path validated at append_markdown_timeline entry; tempfile is a sibling under the same validated parent.
         let mut src = File::open(path)?;
         // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         let mut dst = File::create(&tmp_path)?;
@@ -629,7 +634,7 @@ fn truncate_file_atomic(path: &Path, pos: u64) -> Result<()> {
     })?;
 
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    // Parent dir is derived from already-resolved AICX timeline path; best-effort fsync after atomic rename.
+    // Parent dir is path.parent() of a path validated at append_markdown_timeline entry; best-effort fsync after atomic rename.
     if !parent.as_os_str().is_empty()
         && let Ok(dir) = File::open(parent)
     {
