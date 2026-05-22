@@ -31,8 +31,6 @@ Initial public release of `aicx-parser`, extracted from the `aicx` 0.6.2 workspa
 
 ### Migration from in-tree
 
-Prior to v0.1.0, this code lived inside `aicx` (`src/chunker.rs`,
-`src/sanitize.rs`, `src/segmentation.rs`, `src/frontmatter.rs`,
-`src/timeline.rs`, `src/types.rs`). The extraction preserved file history
-via `git mv` and was verified byte-identical for `aicx --help`/`--version`
-and full-corpus store smoke tests.
+Prior to v0.1.0, these parser modules lived inside the main `aicx` crate.
+The extraction preserved file history via `git mv` and was verified
+byte-identical for `aicx --help`/`--version` and full-corpus store smoke tests.

@@ -70,6 +70,7 @@ dependencies = [
  "filetime",
  "futures",
  "globset",
+ "hex",
  "http-body-util",
  "indicatif",
  "libc",

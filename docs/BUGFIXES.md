@@ -1783,3 +1783,53 @@ apply path, but does not mutate the live canonical store by itself.
 - Self-referential commit SHA nie jest możliwy w tym samym commicie; finalny SHA tego wpisu jest zapisany w raporcie A-3.
 
 **Related.** Closes A-3 / L-1 extractor/UI diagnostic close-out z `docs/bug-tracker-aicx-followup-pass-3.md`; implements remaining split #3 from audit `26d8123` / `docs/scope-overflow.md`; follows A-1 `6482bff` and A-2 `7230ba0`.
+
+---
+
+## 2026-05-21 — Wave E tests/docs hygiene sweep (K-1 + N-1 + N-6 + N-12) · `same-commit`
+
+**Symptom.** Pass-3 Wave E zebrał cztery luźne hygiene bugs: pusty fake test
+`tests/dashboard_security.rs`, current-state docs wskazujące na emerytowane
+root-crate parser paths, brak jawnych `CHANGELOG.md` wpisów dla nowych crate'ów
+oraz działający, ale mniej czytelny hex-prefix truncation pattern dla
+`stable_blake3_128`.
+
+**Root cause.** Po pass-2 część zmian była realnie domknięta w kodzie, ale
+ogon dokumentacyjno-testowy został rozjechany: test udawał asercję, docs nie
+nadążyły za ekstrakcją parser crate, release notes nie wymieniały całego
+workspace expansion, a BLAKE3 truncation ukrywał byte boundary za slicingiem
+hex stringa.
+
+**Fix.**
+- Usunięto pusty `tests/dashboard_security.rs`; gap zapisany w
+  `docs/BACKLOG.md` zamiast utrzymywać compliance theater.
+- `docs/ARCHITECTURE.md` wskazuje current parser crate paths dla chunker/sanitize.
+- `CHANGELOG.md` jawnie wymienia `aicx-monitor` i
+  `aicx-progress-contracts`; istniejący `aicx-retrieve` wpis zostaje bez zmian.
+- `stable_blake3_128` używa byte-truncation (`hash.as_bytes()[..16]`) +
+  `hex::encode`, z direct `hex` dependency i regression testem starego
+  32-znakowego kontraktu.
+
+**Touched.**
+- `tests/dashboard_security.rs` — deleted fake test.
+- `docs/BACKLOG.md` — K-1 gap note.
+- `docs/ARCHITECTURE.md` — parser crate paths.
+- `CHANGELOG.md` — explicit new crate entries.
+- `crates/aicx-parser/CHANGELOG.md` — removed stale in-tree path literals from
+  historical migration note.
+- `Cargo.toml`, `Cargo.lock` — direct `hex` dependency for root crate.
+- `src/state/migration.rs` — BLAKE3-128 truncation pattern + contract test.
+
+**Tests.** `cargo build --workspace`; `cargo test --workspace -- --test-threads=4`;
+`cargo clippy --workspace -- -D warnings`; `cargo fmt --check`; targeted
+`cargo test -p aicx test_blake3_128 --lib`.
+
+**Lessons.**
+- Fake tests should be deleted or made behavioral; a comment-only test is worse
+  than an explicit backlog item.
+- Simple doc regexes can match correct crate paths too; report whether hits are
+  stale root paths or intentional current paths.
+
+**Related.** Closes K-1, N-1, N-6, and N-12 from
+`docs/bug-tracker-aicx-followup-pass-3.md`. Final commit SHA is recorded in the
+worker report because a file cannot stably contain its own commit hash.

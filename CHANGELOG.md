@@ -11,6 +11,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `extract --conversation` output now carries `message_kind` and
   `collapse_stub_kind` metadata per message and surfaces extract
   statistics in the JSON projection.
+- `aicx-monitor` crate for live CPU, RAM, GPU, and embedder process telemetry
+  snapshots during long-running aicx pipelines.
+- `aicx-progress-contracts` crate for shared indexing progress event contracts,
+  telemetry snapshots, and sink traits across producers and UI consumers.
 - Explicit `-p` filter syntax for `aicx index` and `aicx search`:
   `-p owner/repo` (strict slug), `-p owner/` (org wildcard),
   `-p /repo` (cross-org repo wildcard), `-p name` (cross-org match on
