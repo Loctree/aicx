@@ -1719,3 +1719,36 @@ Ruby YAML parse OK. `cargo build --workspace` OK. `cargo fmt --check` OK.
   B-1 zapisuje finalny SHA dla tej pozycji J-1.
 
 **Related.** J-1 z `docs/bug-tracker-aicx-followup-pass-3.md`.
+
+## 2026-05-22 — Cross.toml cross-rs image pin (J-2) · `pending-this-commit`
+
+**Symptom.** `Cross.toml` używał `ghcr.io/cross-rs/...:main` dla obu Linux
+builder images. `:main` jest moving tagiem, więc release artifact build mógł
+po cichu pobrać inny obraz niż poprzedni green run.
+
+**Root cause.** Cross-rs image refs były traktowane jak konfiguracja runtime,
+ale bez supply-chain identity pin. Workflow release-linux czyta `Cross.toml`,
+więc ruchomy GHCR tag siedział bezpośrednio na ścieżce publikacji Linux assetów.
+
+**Fix.**
+- `Cross.toml`: oba obrazy zmienione z `:main` na `0.2.5@sha256:<digest>`.
+- `docs/RELEASES.md`: dodano maintainer note z ręcznym protokołem bumpowania
+  pinów po wybraniu nowego release `cross-rs`.
+
+**Touched.**
+- `Cross.toml` — Linux cross-rs image refs.
+- `docs/RELEASES.md` — release maintainer protocol.
+
+**Tests.** TOML parse OK. `cargo build --workspace` OK. `cargo fmt --check` OK.
+`rg -n ':main' Cross.toml` zero hits.
+
+**Lessons.**
+- Release builder image jest częścią supply chain tak samo jak action pin albo
+  checksum sidecar; moving tag nie powinien siedzieć na release path.
+- `cross-rs` release tag to `v0.2.5`, ale GHCR image tag to `0.2.5`; zapis
+  `0.2.5@sha256:<digest>` zachowuje czytelny version anchor i immutable digest.
+- Finalny commit SHA jest znany dopiero po commicie; raport B-2 zapisuje finalny
+  SHA dla tej pozycji J-2.
+
+**Related.** J-2 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows
+`9d1a9c1` (B-1 release SHA256SUMS).
