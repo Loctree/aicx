@@ -1787,3 +1787,40 @@ zapisuje raport B-3.
 
 **Related.** J-3 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows
 `9d1a9c1` (B-1 release SHA256SUMS) + `643fa4c` (B-2 Cross.toml pin).
+
+## 2026-05-22 — GCP service-account field redaction without object-size gate (J-7) · `pending-this-commit`
+
+**Symptom.** Duży GCP service-account JSON (>2.5 KiB po `"type":
+"service_account"`) redagował `"private_key"` osobnym regexem, ale
+`"private_key_id"` i `"client_email"` mogły zostać w outputach bez redakcji.
+
+**Root cause.** `redact_gcp_service_account_fields` odpalało per-field regexes
+tylko wewnątrz `RE_GCP_SERVICE_ACCOUNT_OBJECT.replace_all(...)`. Wrapper miał
+limit `[^{}]{0,2500}`, więc realny większy service-account object nie matchował
+i pola nie przechodziły przez istniejące standalone regexes.
+
+**Fix.**
+- Usunięto `RE_GCP_SERVICE_ACCOUNT_OBJECT` jako misleading defense-in-depth.
+- `RE_GCP_PRIVATE_KEY_ID_FIELD` i `RE_GCP_CLIENT_EMAIL_FIELD` działają teraz na
+  całym tekście, niezależnie od rozmiaru obiektu JSON.
+- Fast lookup `SECRET_LOOKUP_SET` dostał wzorce dla `"private_key_id"` i
+  `"client_email"`, żeby early-return nie omijał field-only path.
+
+**Touched.**
+- `src/redact.rs` — GCP service-account field pipeline + unit regression.
+- `tests/secret_redaction_e2e.rs` — 4 KiB synthesized GCP service-account
+  fixture.
+
+**Tests.** Dodano e2e regression dla >4 KiB service-account JSON oraz unit test
+dla field-only `private_key_id`/`client_email` triggera. Pełne gates J-7 zapisuje
+raport B-4.
+
+**Lessons.**
+- Regex wrapper z limitem długości nie może być gate'em dla pól, które mają
+  bezpieczne standalone redaction patterns.
+- Fast negative path musi znać te same rodziny sekretów, które redaguje pełny
+  pipeline; inaczej poprawny regex może nigdy nie zostać uruchomiony.
+
+**Related.** J-7 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows
+`9d1a9c1` (B-1 release SHA256SUMS) + `643fa4c` (B-2 Cross.toml pin) +
+`6c7d06d` (B-3 auth getrandom).
