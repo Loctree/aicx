@@ -83,6 +83,16 @@ Note on heavy retrieval:
 - AICX native embeddings are exposed as a reusable library, not as an automatic
   background indexing daemon.
 
+Dashboard cross-search still has one legacy external boundary:
+`/api/search/cross` shells out to the resolved absolute `rust-memex` or
+`rmcp-memex` binary. The spawn environment is intentionally cleared, then only
+`HOME`, `XDG_CONFIG_HOME`, and `XDG_DATA_HOME` are passed through for config-dir
+resolution. `PATH` is never passed; the binary must be resolved before
+`env_clear()` so a user-controlled `PATH` cannot change what gets executed.
+If the memex CLI becomes fully self-contained, these variables may be absent and
+the child process must still fail with a normal command error, not by inheriting
+the parent environment.
+
 Framework note:
 - Repo-local `.ai-context/` artifacts are now owned by higher-level workflow tooling such as `/vc-init`, not by the retired `aicx init` flow.
 

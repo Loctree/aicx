@@ -1828,3 +1828,65 @@ rotacji backupu, jeśli primary jest znanym corrupt wejściem.
 **Related.** Closes M-14, M-15, M-16, M-17, M-18 z
 `docs/bug-tracker-aicx-followup-pass-3.md`; H-3 Wave H batch 3. M-13 pozostaje
 scope-overflow z H-2, bez zmian w tym commicie.
+
+---
+
+## 2026-05-22 — deps/CI/dashboard env polish (M-19..M-22) · `this H-4 commit`
+
+**Symptom.** Ostatni batch Area M P2 zostawił dependency/security-warning drift
+(`lru`, `paste`, RSA Marvin przez optional `rust-memex`), `retrieval-eval.yml`
+bez `cancel-in-progress`, jedyny workflow checkout na `@v4`, oraz dashboard
+cross-search spawnujący memex CLI z pełnym `env_clear()` bez jawnego kontraktu
+`HOME`/`XDG_*`.
+
+**Root cause.** `ratatui 0.29` trzymał stare `lru 0.12.5`, a optional
+`rust-memex 0.6.5` dalej wnosi transitive Lance/Tantivy/DataFusion/paste/RSA
+powierzchnię, której AICX nie używa jako własnego crypto hot path. CI workflow
+drift był zwykłym starzeniem YAML-a, a memex cross-search miał dobry PATH-safe
+model, ale nie miał opisanej minimalnej env allowlisty dla config-dir lookupów.
+
+**Fix.**
+- M-19: `ratatui` podbite do `0.30`, co usuwa stare `lru` z bezpośredniego TUI
+  stacka; `.cargo/audit.toml` i `cargo-audit.toml` dokumentują ignore dla
+  remaining optional `rust-memex` advisories: RSA Marvin, `paste`, oraz stare
+  `lru` przez Tantivy 0.24/Lance do czasu upstream fixa.
+- M-20: `retrieval-eval.yml` dostał top-level `concurrency` z
+  `cancel-in-progress: true`.
+- M-21: `retrieval-eval.yml` wyrównany do `actions/checkout@v6`; wszystkie
+  workflow checkouty są teraz na tym samym majorze.
+- M-22: `run_memex_cli` czyści env, po czym przepuszcza tylko `HOME`,
+  `XDG_CONFIG_HOME`, `XDG_DATA_HOME`; `PATH` nadal nie przechodzi.
+- M-22: `docs/ARCHITECTURE.md` opisuje dashboard cross-search memex CLI env
+  boundary.
+
+**Touched.**
+- `Cargo.toml`, `Cargo.lock` — `ratatui 0.30` + lock refresh.
+- `.cargo/audit.toml`, `cargo-audit.toml` — cargo-audit ignore/rationale.
+- `.github/workflows/retrieval-eval.yml` — concurrency + checkout v6.
+- `src/dashboard_server.rs` — memex CLI env allowlist + regression test.
+- `docs/ARCHITECTURE.md` — spawn/env contract.
+
+**Tests.** Zielone: `cargo build --workspace`;
+`cargo test --workspace -- --test-threads=4`;
+`cargo clippy --workspace -- -D warnings`; `cargo fmt --check`; `cargo audit`;
+`cargo test -p aicx dashboard_server::tests::run_memex_cli_passes_home_xdg_without_path`;
+`actionlint .github/workflows/retrieval-eval.yml`.
+Pełne `actionlint .github/workflows/*.yml` nadal blokuje pre-existing SC2086 w
+`release-linux.yml:83`, poza zakresem M-20/M-21. Lokalny host nie ma
+`rust-memex`/`rmcp-memex` binary ani sibling checkout, więc prawdziwy external
+memex smoke nie był możliwy; test repo weryfikuje sam spawn/env contract przez
+`/usr/bin/env`.
+
+**Lessons.**
+- Cargo audit config dla lokalnego `cargo-audit 0.22.0` musi żyć w
+  `.cargo/audit.toml`; top-level `cargo-audit.toml` jest dokumentacyjnym
+  aliasem pod brief/operatorów, ale nie jest czytany przez tę wersję narzędzia.
+- `env_clear()` nie powinno cicho blokować config-dir lookupów; allowlista
+  `HOME`/`XDG_*` zachowuje izolację bez wracania do parent `PATH`.
+- Optional upstream deps mogą dalej trafiać do `Cargo.lock` i `cargo audit`,
+  nawet jeśli default build ich nie używa. Oddziel "resolved in our direct
+  stack" od "upstream optional surface waiting for replacement".
+
+**Related.** Closes M-19, M-20, M-21, M-22 z
+`docs/bug-tracker-aicx-followup-pass-3.md`; pass-3 N-10 zostaje user-facing
+known-issue follow-upem dla RSA Marvin statusu.

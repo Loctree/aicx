@@ -38,6 +38,7 @@ const CROSS_SEARCH_MAX_LIMIT: usize = 200;
 const CROSS_SEARCH_CLAMPED_LIMIT_HEADER: &str = "x-clamped-limit";
 const MAX_SCORE_FILTER: u8 = 100;
 const LOCALHOST_ORIGINS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+const MEMEX_CLI_ENV_PASSTHROUGH: [&str; 3] = ["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"];
 const TAILSCALE_MAGICDNS_SUFFIX: &str = ".ts.net";
 const TAILSCALE_RANGE_BASE: u32 = u32::from_be_bytes([100, 64, 0, 0]);
 const TAILSCALE_RANGE_END: u32 = u32::from_be_bytes([100, 127, 255, 255]);
@@ -1434,6 +1435,15 @@ async fn semantic_search(
 // survive only for the cross-search endpoint (separate doctrine; lands
 // in its own cut when that surface migrates in-process).
 
+fn apply_memex_cli_env(command: &mut tokio::process::Command) {
+    command.env_clear();
+    for key in MEMEX_CLI_ENV_PASSTHROUGH {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+}
+
 async fn run_memex_cli(
     binary_path: Option<&str>,
     args: &[&str],
@@ -1443,9 +1453,10 @@ async fn run_memex_cli(
         anyhow::anyhow!("Semantic search (vector backend) is an optional capability. Failed to run memex {action}: missing compatible memex CLI (rust-memex or rmcp-memex). Please install the vector backend or fall back to default lexical search.")
     })?;
 
-    let child = tokio::process::Command::new(binary)
+    let mut command = tokio::process::Command::new(binary);
+    apply_memex_cli_env(&mut command);
+    let child = command
         .args(args)
-        .env_clear()
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -2291,6 +2302,37 @@ mod tests {
             response.headers().get(CROSS_SEARCH_CLAMPED_LIMIT_HEADER),
             Some(&HeaderValue::from_static("200"))
         );
+    }
+
+    #[test]
+    fn run_memex_cli_passes_home_xdg_without_path() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let env_binary = "/usr/bin/env";
+        assert!(
+            Path::new(env_binary).exists(),
+            "{env_binary} must exist for env passthrough test"
+        );
+
+        let (_binary, output) = runtime
+            .block_on(run_memex_cli(Some(env_binary), &[], "env probe"))
+            .expect("env probe");
+        assert!(output.status.success(), "env probe should succeed");
+        let stdout = String::from_utf8(output.stdout).expect("utf8 env output");
+        let lines = stdout.lines().collect::<Vec<_>>();
+
+        assert!(
+            !lines.iter().any(|line| line.starts_with("PATH=")),
+            "memex CLI env must not inherit PATH:\n{stdout}"
+        );
+        for key in MEMEX_CLI_ENV_PASSTHROUGH {
+            if std::env::var_os(key).is_some() {
+                let prefix = format!("{key}=");
+                assert!(
+                    lines.iter().any(|line| line.starts_with(&prefix)),
+                    "memex CLI env should pass {key} when parent has it:\n{stdout}"
+                );
+            }
+        }
     }
 
     #[test]

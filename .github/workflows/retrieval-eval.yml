@@ -8,12 +8,16 @@ on:
       - 'crates/aicx-retrieve/**'
       - 'tests/retrieval_eval/**'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Run Retrieval Evaluation Harness
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Run retrieval eval harness

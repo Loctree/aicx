@@ -1,0 +1,19 @@
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071: transitive rsa 0.9.10 via optional
+    # rust-memex -> openidconnect. AICX does not use RSA in its own
+    # cryptographic hot path. Track upstream rust-memex/openidconnect and
+    # remove this when a non-vulnerable release exists; pass-3 N-10 covers the
+    # user-facing known-issue note.
+    "RUSTSEC-2023-0071",
+    # RUSTSEC-2024-0436: paste is transitive through third-party UI/retrieval
+    # deps. H-4 upgrades ratatui to reduce direct TUI exposure; remaining
+    # occurrences are in optional Lance/DataFusion/rust-memex dependency
+    # surfaces until upstream replaces paste.
+    "RUSTSEC-2024-0436",
+    # RUSTSEC-2026-0002: old lru 0.12.5 no longer comes from AICX's direct
+    # ratatui dependency after the H-4 ratatui 0.30 upgrade. The remaining
+    # edge is transitive through optional rust-memex/Lance/Tantivy until
+    # upstream moves to Tantivy >= 0.26 / lru >= 0.16.3.
+    "RUSTSEC-2026-0002",
+]
