@@ -1867,3 +1867,47 @@ oficjalnie wspieranym token-file targetem.
 `6c7d06d` (B-3 auth getrandom) + `81622d9` (B-4 GCP redaction).
 
 ---
+
+## 2026-05-22 — auth token file atomic create mode 0600 (J-5) · `pending-this-commit`
+
+**Symptom.** `src/auth.rs::persist_token_file` tworzył token file przez
+`std::fs::write`, a dopiero potem robił Unix `chmod 0600`. Między `open/create`
+i `chmod` plik mógł chwilowo istnieć z uprawnieniami zależnymi od `umask`
+(np. `0644`), więc lokalny proces mógł odczytać token w oknie TOCTOU.
+
+**Root cause.** Ochrona sekretu była ustawiana po utworzeniu pliku zamiast w
+tym samym syscallu, który tworzy plik. `set_permissions` naprawia stan docelowy,
+ale nie cofa momentu, w którym plik już istniał z domyślnym mode.
+
+**Fix.**
+- `src/auth.rs::persist_token_file` na Unix używa teraz
+  `OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)`,
+  więc mode jest nadawany atomowo podczas `O_CREAT`.
+- Zapis treści tokena idzie przez `write_all` + `flush`; usunięto osobny
+  `set_permissions` po zapisie.
+- Semantyka rotacji: istniejący token file nie jest nadpisywany. Rotacja albo
+  recovery po pustym/starym pliku wymaga unlink-first, potem ponownego
+  wygenerowania/zapisania tokena.
+- Dla platform bez Unix mode i bez Windows ACL policy dodano odmowę zapisu
+  zamiast cichego persistowania pliku bez znanej ochrony.
+
+**Touched.**
+- `src/auth.rs` — `persist_token_file` Unix create path + unit regression.
+
+**Tests.** Dodano `test_persist_token_file_refuses_existing_file`, który
+sprawdza `AlreadyExists` i brak nadpisania istniejącego token file. Istniejący
+`test_load_auth_token_generates_when_missing` nadal asercyjnie sprawdza mode
+`0600` po pierwszym persist.
+
+**Lessons.**
+- Sekret zapisany do pliku musi dostać restrykcyjny mode w momencie utworzenia,
+  nie w osobnym kroku po zapisie.
+- `create_new(true)` jest celowo ostrzejsze od overwrite: bezpieczna rotacja
+  tokena powinna być jawna i unlink-first, nie przypadkowa przez truncate.
+- Finalny commit SHA jest znany dopiero po commicie; raport C-2 zapisuje
+  finalny SHA dla tej pozycji J-5.
+
+**Related.** J-5 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows Wave B
+B-1..B-4 + C-1 `d2d41e1`.
+
+---

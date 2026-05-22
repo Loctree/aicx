@@ -150,27 +150,42 @@ fn persist_token_file(path: &PathBuf, token: &str) -> Result<()> {
         ));
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Create token directory {}", parent.display()))?;
         }
-        std::fs::write(path, format!("{}\n", token))
-            .with_context(|| format!("Write token file {}", path.display()))?;
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(path)
-                .with_context(|| format!("Stat token file {}", path.display()))?
-                .permissions();
-            perms.set_mode(0o600);
-            std::fs::set_permissions(path, perms)
-                .with_context(|| format!("Set mode 0600 on token file {}", path.display()))?;
-        }
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| {
+                format!(
+                    "Create token file {} atomically with mode 0600",
+                    path.display()
+                )
+            })?;
+        file.write_all(format!("{}\n", token).as_bytes())
+            .with_context(|| format!("Write token file {}", path.display()))?;
+        file.flush()
+            .with_context(|| format!("Flush token file {}", path.display()))?;
 
         Ok(())
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = token;
+        Err(anyhow!(
+            "Refusing to persist aicx auth token file {} because this platform does not expose Unix mode 0600 or Windows restricted ACL handling. Pass --auth-token <token> explicitly so the token file is never written.",
+            path.display()
+        ))
     }
 }
 
@@ -343,6 +358,34 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600, "persisted token must be 0600");
         }
+        let _ = std::fs::remove_file(&tmp_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_persist_token_file_refuses_existing_file() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "aicx-auth-existing-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let tmp_path = tmp_dir.join("auth-token");
+        std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
+        std::fs::write(&tmp_path, "existing-token\n").expect("write existing token");
+
+        let err = persist_token_file(&tmp_path, "replacement-token")
+            .expect_err("existing token file must not be overwritten");
+        let io_err = err
+            .root_cause()
+            .downcast_ref::<std::io::Error>()
+            .expect("root cause should be io error");
+        assert_eq!(io_err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&tmp_path).expect("read existing token"),
+            "existing-token\n"
+        );
+
         let _ = std::fs::remove_file(&tmp_path);
         let _ = std::fs::remove_dir(&tmp_dir);
     }
