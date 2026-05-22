@@ -34,6 +34,7 @@ pub enum DiagnosticKind {
     DuplicateSessionMeta,
     FilenameMismatch,
     MixedFormat,
+    LineParseError,
 }
 
 impl DiagnosticKind {
@@ -54,6 +55,7 @@ impl DiagnosticKind {
             Self::DuplicateSessionMeta => "duplicate_session_meta",
             Self::FilenameMismatch => "filename_mismatch",
             Self::MixedFormat => "mixed_format",
+            Self::LineParseError => "line_parse_error",
         }
     }
 }
@@ -167,6 +169,10 @@ impl ExtractorCounters {
             "session_meta/filename UUID mismatch(es)",
         );
         emit_simple(DiagnosticKind::MixedFormat, "mixed-format JSONL line(s)");
+        emit_simple(
+            DiagnosticKind::LineParseError,
+            "malformed JSONL line(s) skipped",
+        );
 
         if parts.is_empty() {
             return None;

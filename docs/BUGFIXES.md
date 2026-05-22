@@ -2442,3 +2442,50 @@ Pelne wyniki bramek zapisane w raporcie Wave C-7.
   wieloprocesowa invalidacja hot dir pozostaje poza tym cieciem.
 
 **Related.** Closes bug #25 z pass-4 Wave C-7.
+
+---
+
+## 2026-05-22 — Codex malformed JSONL lines emit warnings (#2 narrowed) · `this C-1 commit`
+
+**Symptom.** Dwa Codex parser loops w `src/sources.rs` uzywaly kaskady
+`if let Ok(...) = serde_json::from_str(...)` bez `Err` branch. Malformed line w
+Codex history albo session JSONL byla po prostu pominieta, a operator nie widzial
+ani per-file logu, ani summary.
+
+**Root cause.** Codex mial juz kanal `CodexSessionWarning` dla meta/timestamp/
+oversized/mixed-format problemow, ale sam JSON parse failure nie byl modelem
+diagnostycznym. Direct-file parser dodatkowo zwracal tylko `Vec<TimelineEntry>`,
+wiec testy nie mogly asercyjnie sprawdzic warningow dla historii.
+
+**Fix.**
+- Dodany `CodexSessionWarning::LineParseError { line_number, snippet }`, ze
+  snippetem ucietym do 200 znakow.
+- Codex history/session direct-file parser i Codex session-event parser zamienily
+  silent `if let Ok` na jawny `match`, z zachowaniem probowania alternatywnego
+  formatu przed ostrzezeniem.
+- Direct-file Codex path ma prywatna funkcje diagnostyczna zwracajaca
+  `(entries, warnings)`, a publiczne `extract_codex_file` nadal emituje przez
+  `emit_codex_session_warnings`.
+- `diagnostics::DiagnosticKind::LineParseError` trafia do structured logu i
+  per-extractor summary jako malformed JSONL skipped.
+
+**Touched.**
+- `src/sources.rs` — warning variant, parser branches, diagnostic helper.
+- `src/sources/tests.rs` — dwa regression tests dla history i session event path.
+- `src/diagnostics.rs` — summary/diagnostic kind dla parse errors.
+
+**Tests.** Zielone: `cargo build --release --bin aicx`;
+`cargo clippy --bin aicx --all-targets -- -D warnings`;
+`cargo test --lib codex_history_silent`;
+`cargo test --lib codex_session_event_silent`;
+`cargo test --lib sources::tests`. Pelne `cargo test --lib` zostaje na znanym
+baseline: 559 passed, 3 failed (`state::tests::test_state_path_is_under_store`,
+`store::tests::test_chunks_dir`, `store::tests::test_store_base_dir`) przez
+pre-existing `.aicx`/`AICX_HOME` kontrakt.
+
+**Lessons.** JSONL parsers nie powinny traktowac per-line parse failure jak
+neutralnego braku danych. Jesli parser probuje kilku formatow, warning nalezy
+emitowac dopiero po wyczerpaniu alternatyw, z numerem linii i malym snippetem,
+zeby operator mogl znalezc konkretna uszkodzona linie bez zalewania logu.
+
+**Related.** Closes bug #2 narrowed Codex scope z pass-4 Wave C-1.
