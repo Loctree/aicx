@@ -99,6 +99,7 @@ fn run_aicx(home: &Path, args: &[&str]) -> Output {
         .args(args)
         .env("HOME", home)
         .env("AICX_HOME", home.join(".aicx"))
+        .env("AICX_ALLOW_TMP", "1")
         .output()
         .expect("run aicx")
 }

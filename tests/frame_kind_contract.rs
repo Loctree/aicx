@@ -198,6 +198,7 @@ fn run_aicx(home: &Path, args: &[&str]) -> Output {
     Command::new(ensure_aicx_binary_exists())
         .args(args)
         .env("HOME", home)
+        .env("AICX_ALLOW_TMP", "1")
         .output()
         .expect("run aicx")
 }

@@ -13,6 +13,15 @@ pub enum RetrieveError {
         dense_gen: String,
     },
 
+    #[error("dense count mismatch: expected {expected}, got {actual}")]
+    DenseCountMismatch { expected: usize, actual: usize },
+
+    #[error("lexical document count mismatch: expected {expected}, got {actual}")]
+    LexicalDocCountMismatch { expected: usize, actual: usize },
+
+    #[error("lexical commit mismatch: expected {expected}, got {actual}")]
+    LexicalCommitMismatch { expected: String, actual: String },
+
     #[error("embedder model drift: manifest={manifest_model}, query={query_model}")]
     EmbedderModelDrift {
         manifest_model: String,

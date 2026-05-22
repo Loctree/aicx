@@ -19,6 +19,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::redact::redact_secrets;
 use crate::sanitize;
 
 // ============================================================================
@@ -870,11 +871,29 @@ pub fn write_conversation_markdown(
     messages: &[ConversationMessage],
     metadata: &ReportMetadata,
 ) -> Result<PathBuf> {
+    write_conversation_markdown_with_redaction(path, messages, metadata, true)
+}
+
+/// Write a denoised conversation transcript as Markdown with explicit redaction control.
+pub fn write_conversation_markdown_with_redaction(
+    path: &Path,
+    messages: &[ConversationMessage],
+    metadata: &ReportMetadata,
+    redact: bool,
+) -> Result<PathBuf> {
     let validated = sanitize::validate_write_path(path)?;
     if let Some(parent) = validated.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
     }
+
+    let redacted_messages;
+    let messages = if redact {
+        redacted_messages = redact_conversation_messages(messages);
+        redacted_messages.as_slice()
+    } else {
+        messages
+    };
 
     let mut file = File::create(&validated) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         .with_context(|| format!("Failed to create: {}", path.display()))?;
@@ -961,6 +980,17 @@ pub fn write_conversation_json(
     metadata: &ReportMetadata,
     extract_stats: &ConversationExtractStats,
 ) -> Result<PathBuf> {
+    write_conversation_json_with_redaction(path, messages, metadata, extract_stats, true)
+}
+
+/// Write a denoised conversation transcript as JSON with explicit redaction control.
+pub fn write_conversation_json_with_redaction(
+    path: &Path,
+    messages: &[ConversationMessage],
+    metadata: &ReportMetadata,
+    extract_stats: &ConversationExtractStats,
+    redact: bool,
+) -> Result<PathBuf> {
     let validated = sanitize::validate_write_path(path)?;
     if let Some(parent) = validated.parent() {
         fs::create_dir_all(parent)
@@ -978,6 +1008,14 @@ pub fn write_conversation_json(
         messages: &'a [ConversationMessage],
     }
 
+    let redacted_messages;
+    let messages = if redact {
+        redacted_messages = redact_conversation_messages(messages);
+        redacted_messages.as_slice()
+    } else {
+        messages
+    };
+
     let report = ConversationReport {
         generated_at: metadata.generated_at,
         project_filter: &metadata.project_filter,
@@ -993,6 +1031,17 @@ pub fn write_conversation_json(
     serde_json::to_writer_pretty(file, &report)?;
     eprintln!("  -> {}", path.display());
     Ok(validated)
+}
+
+fn redact_conversation_messages(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
+    messages
+        .iter()
+        .cloned()
+        .map(|mut msg| {
+            msg.message = redact_secrets(&msg.message);
+            msg
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -1019,6 +1068,42 @@ mod tests {
 
     fn cleanup(dir: &Path) {
         let _ = fs::remove_dir_all(dir);
+    }
+
+    fn conversation_message(message: &str) -> ConversationMessage {
+        ConversationMessage {
+            timestamp: Utc.with_ymd_and_hms(2026, 1, 23, 12, 0, 0).unwrap(),
+            agent: "claude".to_string(),
+            session_id: "sess-redaction".to_string(),
+            role: "user".to_string(),
+            message: message.to_string(),
+            repo_project: "test".to_string(),
+            source_path: None,
+            branch: None,
+            message_kind: crate::timeline::MessageKind::Conversation,
+            collapse_stub_kind: None,
+        }
+    }
+
+    fn conversation_metadata(total: usize) -> ReportMetadata {
+        ReportMetadata {
+            generated_at: Utc.with_ymd_and_hms(2026, 1, 23, 13, 0, 0).unwrap(),
+            project_filter: Some("test".to_string()),
+            hours_back: 24,
+            total_entries: total,
+            sessions: vec!["sess-redaction".to_string()],
+        }
+    }
+
+    fn conversation_stats(redaction_enabled: bool, messages: usize) -> ConversationExtractStats {
+        ConversationExtractStats {
+            aicx_version: env!("CARGO_PKG_VERSION"),
+            redaction_enabled,
+            raw_entries: messages,
+            conversation_messages: messages,
+            conversation_projection: "user_assistant_only",
+            exact_short_duplicates_dropped: 0,
+        }
     }
 
     fn sample_entries() -> Vec<TimelineEntry> {
@@ -1653,6 +1738,51 @@ mod tests {
         let content = fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["extract_stats"]["redaction_enabled"], false);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn write_conversation_outputs_redact_by_default() {
+        let dir = unique_test_dir("conversation_redact_default");
+        let md_path = dir.join("conversation.md");
+        let json_path = dir.join("conversation.json");
+        let raw = "raw token sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWX should not leak";
+        let messages = vec![conversation_message(raw)];
+        let metadata = conversation_metadata(messages.len());
+        let stats = conversation_stats(true, messages.len());
+
+        write_conversation_markdown(&md_path, &messages, &metadata).unwrap();
+        write_conversation_json(&json_path, &messages, &metadata, &stats).unwrap();
+
+        let md = fs::read_to_string(&md_path).unwrap();
+        let json = fs::read_to_string(&json_path).unwrap();
+        assert!(!md.contains("sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWX"));
+        assert!(!json.contains("sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWX"));
+        assert!(md.contains("[REDACTED_ANTHROPIC_KEY]"));
+        assert!(json.contains("[REDACTED_ANTHROPIC_KEY]"));
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn write_conversation_outputs_can_preserve_raw_with_explicit_flag() {
+        let dir = unique_test_dir("conversation_redact_opt_out");
+        let md_path = dir.join("conversation.md");
+        let json_path = dir.join("conversation.json");
+        let raw = "raw token sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWX preserved";
+        let messages = vec![conversation_message(raw)];
+        let metadata = conversation_metadata(messages.len());
+        let stats = conversation_stats(false, messages.len());
+
+        write_conversation_markdown_with_redaction(&md_path, &messages, &metadata, false).unwrap();
+        write_conversation_json_with_redaction(&json_path, &messages, &metadata, &stats, false)
+            .unwrap();
+
+        let md = fs::read_to_string(&md_path).unwrap();
+        let json = fs::read_to_string(&json_path).unwrap();
+        assert!(md.contains("sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWX"));
+        assert!(json.contains("sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWX"));
 
         cleanup(&dir);
     }

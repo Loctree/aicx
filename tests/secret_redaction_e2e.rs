@@ -2,7 +2,6 @@ use aicx::output::{
     ConversationExtractStats, ConversationMessage, ReportMetadata, write_conversation_json,
     write_conversation_markdown,
 };
-use aicx::redact::redact_secrets;
 use chrono::{TimeZone, Utc};
 use std::fs;
 use std::path::PathBuf;
@@ -95,7 +94,7 @@ fn extract_outputs_do_not_leak_modern_secret_families() {
             agent: "codex".to_string(),
             session_id: "secret-redaction-e2e".to_string(),
             role: if idx % 2 == 0 { "user" } else { "assistant" }.to_string(),
-            message: redact_secrets(payload),
+            message: payload.clone(),
             repo_project: "Loctree/aicx".to_string(),
             source_path: Some("/Users/silver/Git/aicx".to_string()),
             branch: Some("fix/bug-tracker-pass-1".to_string()),

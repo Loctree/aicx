@@ -1708,3 +1708,74 @@ apply path, but does not mutate the live canonical store by itself.
 **Lessons.** `tower_governor` per-IP is not just a layer call: Axum must provide peer `ConnectInfo`, or the limiter turns into 500-before-auth. Security-body opacity should not erase operator observability — log detail is the place for header names and source URLs, not client JSON.
 
 **Related.** Closes M-1, M-2, M-3, M-4, M-5, M-6 z `docs/bug-tracker-aicx-followup-pass-3.md`; H-1 Wave H batch 1.
+
+---
+
+## 2026-05-22 — parser/retrieve/MCP/output quality sweep (M-7..M-13) · `this H-2 commit`
+
+**Symptom.** Pass-3 Area M P2 quality sweep zostawił siedem mniejszych
+footgunów: debug builds automatycznie dopuszczały tempfile-backed `/tmp`;
+retrieve manifest mismatch errors zlewały count/commit/doc-count różnice w
+generyczny `GenerationMismatch`; `HybridIndex::commit()` miał redundantny
+`.expect`; MCP negative-cache mutex używał `.lock().unwrap()`; `aicx_steer`
+slim response serializował przez `.unwrap()`; conversation-first output API
+wymagało ręcznej redakcji sekretów; CSP server shell nadal używał
+`'unsafe-inline'`.
+
+**Root cause.** Część kodu była poprawna logicznie, ale krucha diagnostycznie:
+defense-in-depth błędy trafiały w generyczne varianty, panic-prone helpery
+opierały się na "to się nie wydarzy", a redakcja siedziała w callerach zamiast
+w publicznym output API. M-13 okazało się szersze niż `dashboard.rs`: pełny fix
+nonce wymaga także HTTP `Content-Security-Policy` headera przy serwowaniu HTML.
+
+**Fix.**
+- M-7: temp allowlist wymaga `AICX_ALLOW_TMP=1` także w debug/dev runs; cargo
+  test harness zachowuje tempfile allowance bez powrotu do szerokiego
+  `debug_assertions`.
+- M-8: dodane dedykowane `RetrieveError::{DenseCountMismatch,
+  LexicalDocCountMismatch, LexicalCommitMismatch}` z named fields i call-site
+  tests.
+- M-9: `HybridIndex::commit()` zwraca wcześniej sprawdzony borrow bez
+  `.expect("manifest checked above")`; dodany test błędu commit-before-build.
+- M-10: MCP embedder negative-cache mutex używa descriptively-named `.expect`
+  helpera zamiast `.lock().unwrap()` w hot path.
+- M-11: `aicx_steer` slim serialization propaguje błąd przez structured
+  `McpError` zamiast panikować.
+- M-12: `write_conversation_*` redaktują przez `redact_secrets` domyślnie;
+  dodane explicit `*_with_redaction(..., false)` dla opt-out i podpięte CLI
+  call-site'y żeby `--no-redact-secrets` zachował dotychczasowy kontrakt.
+- M-13: nie zaimplementowane w tym commicie; zapisany scope-overflow artifact
+  z follow-up planem, bo pełny fix wymaga touchnięcia `dashboard_server.rs`
+  (H-1/no-touch w tym briefie).
+
+**Touched.**
+- `crates/aicx-parser/src/sanitize.rs` — M-7 temp allowlist policy.
+- `crates/aicx-retrieve/src/error.rs`, `manifest.rs`, `orchestrator.rs` —
+  M-8/M-9 typed errors + clean commit borrow.
+- `src/mcp.rs` — M-10/M-11 mutex expect helper + steer serialization error path.
+- `src/output.rs`, `src/main.rs`, `tests/secret_redaction_e2e.rs` — M-12
+  redact-by-default API + explicit CLI opt-out preservation.
+- `CONTRIBUTING.md` — M-7 env var note.
+- `~/.vibecrafted/artifacts/Loctree/aicx/2026_0522/bugtracker-aicx-pass-3/reports/H-2_M-7-to-M-13-quality_scope-overflow.md`
+  — M-13 split note.
+
+**Tests.** Targeted green before full gates:
+`cargo test -p aicx-parser sanitize::tests::test_tmp_allowlist_hybrid_policy -- --exact`;
+`cargo test -p aicx-retrieve`; `cargo test --test secret_redaction_e2e`;
+`cargo test -p aicx --lib mcp::tests::steer_response_with_nan_score_serializes_without_panic -- --exact`;
+`cargo test -p aicx --lib write_conversation_outputs`;
+`cargo test -p aicx --lib embedder_negative_cache`.
+
+**Lessons.**
+- `cfg(test)` does not reach dependency crates in integration tests; if policy
+  depends on "cargo test may use temp dirs", verify the actual test harness
+  path instead of smuggling back full debug-build allowance.
+- Public output APIs should be safe by default. Caller-side redaction is too
+  easy to skip, but opt-out still needs to be explicit for deliberate local
+  exports.
+- CSP nonce work is not done until the HTTP response header and rendered inline
+  elements share the same nonce. Meta-only cleanup is a half-fix.
+
+**Related.** Closes M-7, M-8, M-9, M-10, M-11, M-12 z
+`docs/bug-tracker-aicx-followup-pass-3.md`; M-13 scope-overflow documented for
+the next Wave H cut.

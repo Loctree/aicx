@@ -2691,11 +2691,12 @@ fn write_conversation_batch_session(
 
     if !dry_run {
         let output_path = conversation_batch_output_path(out_dir, agent_label, session_id);
-        output::write_conversation_json(
+        output::write_conversation_json_with_redaction(
             &output_path,
             &projection.messages,
             &metadata,
             &extract_stats,
+            false,
         )?;
     }
 
@@ -3010,14 +3011,20 @@ fn run_extract_session(
             .unwrap_or("md")
             .to_lowercase();
         if ext == "json" {
-            output::write_conversation_json(
+            output::write_conversation_json_with_redaction(
                 &output_path,
                 &projection.messages,
                 &metadata,
                 &extract_stats,
+                false,
             )?;
         } else {
-            output::write_conversation_markdown(&output_path, &projection.messages, &metadata)?;
+            output::write_conversation_markdown_with_redaction(
+                &output_path,
+                &projection.messages,
+                &metadata,
+                false,
+            )?;
         }
     } else {
         let ext = output_path
@@ -3161,14 +3168,20 @@ fn run_extract_file(
             .to_lowercase();
 
         if ext == "json" {
-            output::write_conversation_json(
+            output::write_conversation_json_with_redaction(
                 &output_path,
                 &projection.messages,
                 &metadata,
                 &extract_stats,
+                false,
             )?;
         } else {
-            output::write_conversation_markdown(&output_path, &projection.messages, &metadata)?;
+            output::write_conversation_markdown_with_redaction(
+                &output_path,
+                &projection.messages,
+                &metadata,
+                false,
+            )?;
         }
     } else {
         let ext = output_path
@@ -3759,16 +3772,22 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
 
             if out_format == OutputFormat::Markdown || out_format == OutputFormat::Both {
                 let md_path = local_dir.join(format!("{}_conversation_{}.md", prefix, date_str));
-                output::write_conversation_markdown(&md_path, &projection.messages, &metadata)?;
+                output::write_conversation_markdown_with_redaction(
+                    &md_path,
+                    &projection.messages,
+                    &metadata,
+                    false,
+                )?;
             }
             if out_format == OutputFormat::Json || out_format == OutputFormat::Both {
                 let json_path =
                     local_dir.join(format!("{}_conversation_{}.json", prefix, date_str));
-                output::write_conversation_json(
+                output::write_conversation_json_with_redaction(
                     &json_path,
                     &projection.messages,
                     &metadata,
                     &extract_stats,
+                    false,
                 )?;
             }
         } else {
