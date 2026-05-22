@@ -2361,3 +2361,45 @@ secret redaction. Full gate results recorded in the I-1 worker report.
 **Related.** Closes N-2, N-3, N-4, N-5, N-7, N-8, N-9, N-10 z
 `docs/bug-tracker-aicx-followup-pass-3.md`; N-11 tracked in `docs/BACKLOG.md`
 as out-of-scope upstream prview-rs work.
+
+---
+
+## 2026-05-22 — `chunks_by_run_id_at` strict project filter (#18-ogon) · `this B-4 commit`
+
+**Symptom.** `chunks_by_run_id_at` dalej filtrowal projekt przez substring
+`file.project.to_ascii_lowercase().contains(needle)`, chociaz sibling
+`context_files_since_at` byl juz po migracji do strict
+`project_filter_matches`. W praktyce `aicx steer --run-id ... -p vista` moglo
+przyniesc chunki z `vista-portal` albo innych sasiednich repo z tym samym
+`run_id`.
+
+**Root cause.** Migracja z `e55961f` zamknela strict semantics dla
+`context_files_since_at`, ale nie przeniosla tego samego wzorca do ogona
+`chunks_by_run_id_at`.
+
+**Fix.**
+- `chunks_by_run_id_at` trimuje pusty filtr tak jak sibling i rozdziela
+  kanoniczny slug `StoredContextFile.project` przez `split_once('/')`.
+- Projekt jest teraz sprawdzany przez `project_filter_matches(org, repo, f)`,
+  bez substringowego przecieku.
+- Dodany regression test
+  `chunks_by_run_id_does_not_leak_substring_into_neighbor_repos`: dwa chunki
+  z tym samym `run_id` w `VetCoders/vista` i `VetCoders/vista-portal`, filtr
+  `Some("vista")` musi zwrocic tylko literalne `vista`.
+
+**Touched.** `src/store.rs`.
+
+**Tests.** Zielone: `cargo build --release --bin aicx`;
+`cargo clippy --bin aicx --all-targets -- -D warnings`;
+`cargo test --lib chunks_by_run_id`; `cargo test --lib context_files_since`.
+Pelne `cargo test --lib` zostaje na znanym baseline:
+546 passed, 3 failed (`state::tests::test_state_path_is_under_store`,
+`store::tests::test_chunks_dir`, `store::tests::test_store_base_dir`) przez
+pre-existing `.aicx`/`AICX_HOME` kontrakt.
+
+**Lessons.** Przy migracji wspolnego kontraktu filtrowania trzeba domknac
+wszystkie wrappery, nie tylko pierwszy widoczny callsite; testy powinny uzywac
+par sasiednich repo z tym samym identyfikatorem runa, bo dopiero wtedy stary
+substring robi falszywie zielony wynik.
+
+**Related.** Closes #18-ogon z pass-4 Wave B-4.

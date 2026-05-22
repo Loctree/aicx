@@ -1719,14 +1719,21 @@ fn chunks_by_run_id_at(
     project: Option<&str>,
     cutoff: SystemTime,
 ) -> Result<Vec<StoredContextFile>> {
-    let filter = project.map(|value| value.to_ascii_lowercase());
+    let project_filter = project.map(str::trim).filter(|value| !value.is_empty());
     let cutoff_date = DateTime::<Utc>::from(cutoff).format("%Y-%m-%d").to_string();
     let mut matched = Vec::new();
 
     for file in scan_context_files_at(base)? {
-        let matches_project = filter
-            .as_ref()
-            .is_none_or(|needle| file.project.to_ascii_lowercase().contains(needle));
+        let matches_project = match project_filter {
+            None => true,
+            Some(f) => {
+                let (org, repo) = file
+                    .project
+                    .split_once('/')
+                    .unwrap_or(("", file.project.as_str()));
+                project_filter_matches(org, repo, f)
+            }
+        };
         let matches_cutoff = file.date_iso >= cutoff_date;
 
         if !matches_project || !matches_cutoff {
@@ -4786,6 +4793,77 @@ mod tests {
 
         // Exactly one file matches `-p vista` (the literal `vista`
         // repo); `vista-portal` must NOT slip in via substring match.
+        assert_eq!(files.len(), 1, "got {files:?}");
+        assert!(
+            files[0]
+                .path
+                .to_string_lossy()
+                .contains("/vista/2026_0401/"),
+            "expected vista hit, got {:?}",
+            files[0].path
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn chunks_by_run_id_does_not_leak_substring_into_neighbor_repos() {
+        // Regression: `chunks_by_run_id_at` previously matched `-p vista`
+        // against `vista-portal`, `vista-datasets`, etc. via substring.
+        // Keep it aligned with strict `project_filter_matches` semantics.
+        let root = retrieval_test_root("chunks-by-run-id-no-substring-leak");
+        let _ = fs::remove_dir_all(&root);
+
+        let run_id = "just-122007-20901";
+        let vista = root
+            .join("store")
+            .join("VetCoders")
+            .join("vista")
+            .join("2026_0401")
+            .join("reports")
+            .join("claude")
+            .join("2026_0401_claude_sess-vista_001.md");
+        let vista_portal = root
+            .join("store")
+            .join("VetCoders")
+            .join("vista-portal")
+            .join("2026_0401")
+            .join("reports")
+            .join("claude")
+            .join("2026_0401_claude_sess-portal_001.md");
+        write_chunk_file(&vista, "vista run chunk");
+        write_chunk_file(&vista_portal, "vista-portal run chunk");
+        write_text(
+            &vista.with_extension("meta.json"),
+            &serde_json::json!({
+                "id": "vista-run",
+                "project": "VetCoders/vista",
+                "agent": "claude",
+                "date": "2026-04-01",
+                "session_id": "sess-vista",
+                "kind": "reports",
+                "run_id": run_id
+            })
+            .to_string(),
+        );
+        write_text(
+            &vista_portal.with_extension("meta.json"),
+            &serde_json::json!({
+                "id": "vista-portal-run",
+                "project": "VetCoders/vista-portal",
+                "agent": "claude",
+                "date": "2026-04-01",
+                "session_id": "sess-portal",
+                "kind": "reports",
+                "run_id": run_id
+            })
+            .to_string(),
+        );
+
+        let cutoff: SystemTime = Utc.with_ymd_and_hms(2026, 3, 30, 0, 0, 0).unwrap().into();
+        let files = chunks_by_run_id_at(&root, run_id, Some("vista"), cutoff)
+            .expect("strict run-id project filter should succeed");
+
         assert_eq!(files.len(), 1, "got {files:?}");
         assert!(
             files[0]
