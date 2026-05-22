@@ -1091,19 +1091,31 @@ where
         summary.skipped_empty_body += outcome.skipped_empty_body;
         summary.deduped_chunks += outcome.deduped_chunks;
 
-        // Count entries proportionally to chunks actually written to
-        // disk. Previously this added `segment.entries.len()`
-        // unconditionally, which meant a `--full-rescan` over an
-        // already-stored corpus pumped `index.json.total_entries` by
-        // the full entry count on every run even though
-        // `write_context_session_first_outcome_at` had short-circuited
-        // every chunk on content_sha256 dedup. Now: when nothing landed
-        // on disk, the index/summary stay flat; partial-new segments
-        // contribute their proportional share.
+        // Two separate counters with two separate semantics:
+        //
+        // 1. `summary.total_entries` and `summary.project_summary` are
+        //    "this run processed N entries through the pipeline" —
+        //    used by CLI/JSON output that operators (and the
+        //    `runtime_cli_store_contract` test) expect to reflect the
+        //    full pipeline cost, regardless of whether the chunks
+        //    landed on disk or were dedup-skipped.
+        //
+        // 2. `update_index(...)` writes the on-disk-truth counter to
+        //    `index.json`. THAT one is proportional to chunks actually
+        //    written, so a `--full-rescan` over an already-stored
+        //    corpus doesn't pump the index counter on every run when
+        //    `write_context_session_first_outcome_at` short-circuits
+        //    every chunk on content_sha256 dedup. This is the
+        //    bug #1 fix from PR #7 — index reflects what's on disk,
+        //    not what the pipeline touched.
+        //
+        // Earlier in PR #7 these two semantics were collapsed (both
+        // proportional) which broke the contract test
+        // `store_cli_defaults_to_incremental_and_full_rescan_recovers_backfill`.
         let chunks_written = outcome.written_paths.len();
         let chunks_total =
             chunks_written + outcome.deduped_chunks + outcome.skipped_empty_body;
-        let entries_recorded = if chunks_total == 0 || chunks_written == 0 {
+        let entries_committed_to_disk = if chunks_total == 0 || chunks_written == 0 {
             0
         } else {
             // Round-half-up integer division so a one-chunk-written
@@ -1111,21 +1123,26 @@ where
             (segment.entries.len() * chunks_written + chunks_total / 2) / chunks_total
         };
 
-        if entries_recorded > 0 {
+        // Pipeline-processed counter (full segment entry count) —
+        // operator-facing CLI/JSON output + project_summary breakdown.
+        *summary
+            .project_summary
+            .entry(project.clone())
+            .or_default()
+            .entry(segment.agent.clone())
+            .or_insert(0) += segment.entries.len();
+        summary.total_entries += segment.entries.len();
+
+        // On-disk-truth counter (proportional to chunks actually
+        // written) — `index.json` only.
+        if entries_committed_to_disk > 0 {
             update_index(
                 &mut index,
                 &project,
                 &segment.agent,
                 &compact_date(&date),
-                entries_recorded,
+                entries_committed_to_disk,
             );
-            *summary
-                .project_summary
-                .entry(project)
-                .or_default()
-                .entry(segment.agent.clone())
-                .or_insert(0) += entries_recorded;
-            summary.total_entries += entries_recorded;
         }
         summary.written_paths.extend(outcome.written_paths);
         progress(segment_idx + 1, total_segments);
@@ -4287,14 +4304,21 @@ mod tests {
 
     #[test]
     fn store_segments_does_not_pump_index_when_rerun_dedupes_everything() {
-        // Regression guard: previously `store_segments_at` unconditionally
-        // added `segment.entries.len()` to `summary.total_entries` and
-        // bumped `index.json` per segment, even when every chunk was
-        // short-circuited by `content_sha256` dedup inside
-        // `write_context_session_first_outcome_at`. Effect: re-running
-        // `--full-rescan` on an already-stored corpus inflated
-        // `index.json.total_entries` on every run despite zero new files
-        // hitting disk. Lock the new proportional accounting in.
+        // Regression guard for the bug #1 fix: `index.json` previously
+        // pumped on every `--full-rescan` even when content_sha256
+        // dedup short-circuited every chunk. Lock the split semantics:
+        //
+        // - `summary.total_entries` and `summary.project_summary` are
+        //   PIPELINE-PROCESSED counts (full segment.entries.len()) —
+        //   they reflect what the run touched, not what landed on disk.
+        //   This preserves the `runtime_cli_store_contract` test's
+        //   expectation that a `--full-rescan` reports re-processed
+        //   entries even when everything dedups.
+        //
+        // - `index.json` totals are ON-DISK-TRUTH (proportional to
+        //   `outcome.written_paths.len()`) — a dedup-only re-run
+        //   contributes ZERO to the index counter, so the on-disk
+        //   stat doesn't inflate on every rescan.
         let root = retrieval_test_root("store-segments-rerun-dedup");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
@@ -4367,9 +4391,15 @@ mod tests {
             "second run must report dedup hits (got {})",
             second.deduped_chunks
         );
+        // `total_entries` is pipeline-processed (what the run touched),
+        // so a dedup-only re-run still reports the full segment count —
+        // this matches `runtime_cli_store_contract`'s contract that
+        // `--full-rescan` shows re-processed entries even when
+        // everything dedups.
         assert_eq!(
-            second.total_entries, 0,
-            "second run must NOT pump total_entries when nothing was written"
+            second.total_entries,
+            entries.len(),
+            "second run reports full pipeline-processed entry count even when everything dedups"
         );
 
         let index_after_second = load_index_at(&root).expect("load index after second");
