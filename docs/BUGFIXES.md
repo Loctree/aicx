@@ -2403,3 +2403,42 @@ par sasiednich repo z tym samym identyfikatorem runa, bo dopiero wtedy stary
 substring robi falszywie zielony wynik.
 
 **Related.** Closes #18-ogon z pass-4 Wave B-4.
+
+---
+
+## 2026-05-22 — dir-scoped chunk sha cache (#25) · `this C-7 commit`
+
+**Symptom.** `aicx store --full-rescan -H 0` potrafil zatrzymac sie na kilka
+minut na pojedynczym ticku chunk-phase. Operator widzial 237 sekund przerwy
+miedzy dwoma tickami na goracym katalogu z wieloma sidecarami.
+
+**Root cause.** `write_context_session_first_outcome_at` wolal
+`content_sha256_exists_in_dir` dla kazdego nowego chunka. Helper skanowal i
+parsowal wszystkie `*.meta.json` w katalogu, wiec jeden batch w hot dir mial
+koszt `O(N*M)` zamiast `O(N+M)`.
+
+**Fix.**
+- Dodany `DirShaCache` (`HashMap<PathBuf, HashSet<String>>`) z leniwym
+  wczytaniem hashy per katalog.
+- `store_segments_at` trzyma jeden cache przez cale wywolanie i przekazuje go
+  do `write_semantic_segment_at` oraz `write_context_session_first_outcome_at`.
+- Po udanym zapisie `.meta.json` nowy `content_sha256` trafia do cache, wiec
+  duplikaty z tego samego batcha dedupuja bez ponownego skanu katalogu.
+- `content_sha256_exists_in_dir` zostaje jako niecache'owany fallback.
+
+**Touched.**
+- `src/store.rs` — `DirShaCache`, hot-path dedup, testy cache.
+
+**Tests.** Dodane:
+`test_dir_sha_cache_contains_after_insert`,
+`test_dir_sha_cache_lazy_population`,
+`test_dir_sha_cache_does_not_cross_dirs`.
+Pelne wyniki bramek zapisane w raporcie Wave C-7.
+
+**Lessons.**
+- Dedupe po sidecarach musi miec batch-local cache. Inaczej poprawny
+  semantycznie helper staje sie ukrytym mnoznikiem kosztu przy full-rescan.
+- Cache jest per `store_segments_at`, wiec zaklada single-process batch scope;
+  wieloprocesowa invalidacja hot dir pozostaje poza tym cieciem.
+
+**Related.** Closes bug #25 z pass-4 Wave C-7.

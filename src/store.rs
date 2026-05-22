@@ -15,7 +15,7 @@ use globset::{Glob, GlobMatcher};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -830,6 +830,7 @@ pub fn write_context_session_first(
     chunker_config: &ChunkerConfig,
     kind: Option<Kind>,
 ) -> Result<Vec<PathBuf>> {
+    let mut sha_cache = DirShaCache::default();
     Ok(write_context_session_first_outcome_at(
         &canonical_store_dir()?,
         SessionWriteSpec {
@@ -841,6 +842,7 @@ pub fn write_context_session_first(
         },
         entries,
         chunker_config,
+        &mut sha_cache,
     )?
     .written_paths)
 }
@@ -852,7 +854,17 @@ fn write_context_session_first_at(
     entries: &[TimelineEntry],
     chunker_config: &ChunkerConfig,
 ) -> Result<Vec<PathBuf>> {
-    Ok(write_context_session_first_outcome_at(root, spec, entries, chunker_config)?.written_paths)
+    let mut sha_cache = DirShaCache::default();
+    Ok(
+        write_context_session_first_outcome_at(
+            root,
+            spec,
+            entries,
+            chunker_config,
+            &mut sha_cache,
+        )?
+        .written_paths,
+    )
 }
 
 fn write_context_session_first_outcome_at(
@@ -860,6 +872,7 @@ fn write_context_session_first_outcome_at(
     spec: SessionWriteSpec<'_>,
     entries: &[TimelineEntry],
     chunker_config: &ChunkerConfig,
+    sha_cache: &mut DirShaCache,
 ) -> Result<SessionWriteOutcome> {
     if entries.is_empty() {
         return Ok(SessionWriteOutcome::default());
@@ -893,7 +906,7 @@ fn write_context_session_first_outcome_at(
         let filename = session_basename(spec.date, spec.agent, spec.session_id, chunk_num);
         let path = dir.join(&filename);
         let content_sha256 = content_sha256(&chunk.text);
-        if content_sha256_exists_in_dir(&dir, &content_sha256)? {
+        if sha_cache.contains(&dir, &content_sha256)? {
             outcome.deduped_chunks += 1;
             continue;
         }
@@ -931,7 +944,7 @@ fn write_context_session_first_outcome_at(
         let sidecar_write_path = sanitize::validate_write_path(&sidecar_path)?;
 
         let mut sidecar = chunker::ChunkMetadataSidecar::from(chunk);
-        sidecar.content_sha256 = Some(content_sha256);
+        sidecar.content_sha256 = Some(content_sha256.clone());
         let sidecar_bytes = serde_json::to_vec_pretty(&sidecar)?;
 
         // Two-phase commit: stage both tempfiles, then rename in order
@@ -955,6 +968,7 @@ fn write_context_session_first_outcome_at(
             atomic_write::discard_tempfile(&sidecar_tmp);
             return Err(err.into());
         }
+        sha_cache.insert(&dir, content_sha256);
         outcome.written_paths.push(target_path);
     }
 
@@ -996,9 +1010,14 @@ fn content_sha256(content: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn content_sha256_exists_in_dir(dir: &Path, content_sha256: &str) -> Result<bool> {
+pub fn content_sha256_exists_in_dir(dir: &Path, content_sha256: &str) -> Result<bool> {
+    Ok(content_sha256s_in_dir(dir)?.contains(content_sha256))
+}
+
+fn content_sha256s_in_dir(dir: &Path) -> Result<HashSet<String>> {
+    let mut hashes = HashSet::new();
     if !dir.exists() {
-        return Ok(false);
+        return Ok(hashes);
     }
     for entry in read_store_dir(dir)?.filter_map(|entry| entry.ok()) {
         let path = entry.path();
@@ -1015,11 +1034,33 @@ fn content_sha256_exists_in_dir(dir: &Path, content_sha256: &str) -> Result<bool
         let Some(sidecar) = load_sidecar_from_path(&path) else {
             continue;
         };
-        if sidecar.content_sha256.as_deref() == Some(content_sha256) {
-            return Ok(true);
+        if let Some(content_sha256) = sidecar.content_sha256 {
+            hashes.insert(content_sha256);
         }
     }
-    Ok(false)
+    Ok(hashes)
+}
+
+#[derive(Debug, Default)]
+struct DirShaCache {
+    by_dir: HashMap<PathBuf, HashSet<String>>,
+}
+
+impl DirShaCache {
+    fn contains(&mut self, dir: &Path, sha: &str) -> Result<bool> {
+        let hashes = match self.by_dir.entry(dir.to_path_buf()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(content_sha256s_in_dir(dir)?),
+        };
+        Ok(hashes.contains(sha))
+    }
+
+    fn insert(&mut self, dir: &Path, sha: String) {
+        self.by_dir
+            .entry(dir.to_path_buf())
+            .or_default()
+            .insert(sha);
+    }
 }
 
 pub fn store_semantic_segments(
@@ -1078,6 +1119,7 @@ where
     let _lock = crate::locks::acquire_exclusive(base.join("locks").join("index.lock"))?;
     let total_segments = segments.len();
     let mut index = load_index_at(base)?;
+    let mut sha_cache = DirShaCache::default();
 
     for (segment_idx, segment) in segments.iter().enumerate() {
         let date = segment
@@ -1087,7 +1129,8 @@ where
             .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
         let project = canonical_project_slug(&segment.project_label());
 
-        let outcome = write_semantic_segment_at(base, segment, &date, chunker_config)?;
+        let outcome =
+            write_semantic_segment_at(base, segment, &date, chunker_config, &mut sha_cache)?;
         summary.skipped_empty_body += outcome.skipped_empty_body;
         summary.deduped_chunks += outcome.deduped_chunks;
 
@@ -1113,8 +1156,7 @@ where
         // proportional) which broke the contract test
         // `store_cli_defaults_to_incremental_and_full_rescan_recovers_backfill`.
         let chunks_written = outcome.written_paths.len();
-        let chunks_total =
-            chunks_written + outcome.deduped_chunks + outcome.skipped_empty_body;
+        let chunks_total = chunks_written + outcome.deduped_chunks + outcome.skipped_empty_body;
         let entries_committed_to_disk = if chunks_total == 0 || chunks_written == 0 {
             0
         } else {
@@ -1157,6 +1199,7 @@ fn write_semantic_segment_at(
     segment: &SemanticSegment,
     date: &str,
     chunker_config: &ChunkerConfig,
+    sha_cache: &mut DirShaCache,
 ) -> Result<SessionWriteOutcome> {
     // Only assertable identities (Primary/Secondary) earn canonical store placement.
     // Fallback/Opaque/None route to non-repository-contexts.
@@ -1182,6 +1225,7 @@ fn write_semantic_segment_at(
         },
         &segment.entries,
         chunker_config,
+        sha_cache,
     )
 }
 
@@ -4347,13 +4391,9 @@ mod tests {
             ),
         ];
 
-        let first = store_semantic_segments_at(
-            &root,
-            &entries,
-            &ChunkerConfig::default(),
-            |_, _| {},
-        )
-        .expect("first store");
+        let first =
+            store_semantic_segments_at(&root, &entries, &ChunkerConfig::default(), |_, _| {})
+                .expect("first store");
         assert!(
             !first.written_paths.is_empty(),
             "first run must actually write something"
@@ -4382,13 +4422,9 @@ mod tests {
         // Re-run with the same entries. Every chunk's content_sha256
         // is already on disk, so `write_context_session_first_outcome_at`
         // increments `deduped_chunks` instead of producing a new path.
-        let second = store_semantic_segments_at(
-            &root,
-            &entries,
-            &ChunkerConfig::default(),
-            |_, _| {},
-        )
-        .expect("second store");
+        let second =
+            store_semantic_segments_at(&root, &entries, &ChunkerConfig::default(), |_, _| {})
+                .expect("second store");
         assert!(
             second.written_paths.is_empty(),
             "second run must not write any new files when every chunk dedups"
@@ -4420,6 +4456,76 @@ mod tests {
             total_after_second, total_after_first,
             "index.json.total_entries must not grow on a full-rescan that produced zero new chunks"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn write_dir_sha_cache_test_sidecar(dir: &Path, stem: &str, sha: &str) {
+        fs::create_dir_all(dir).unwrap();
+        let path = dir.join(format!("{stem}.meta.json"));
+        let sidecar = serde_json::json!({
+            "id": stem,
+            "project": "VetCoders/aicx",
+            "agent": "claude",
+            "date": "2026-05-22",
+            "session_id": "dir-sha-cache-test",
+            "kind": "reports",
+            "content_sha256": sha,
+        });
+        fs::write(path, serde_json::to_vec_pretty(&sidecar).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn test_dir_sha_cache_contains_after_insert() {
+        let root = retrieval_test_root("dir-sha-cache-insert");
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("store").join("VetCoders").join("aicx");
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut cache = DirShaCache::default();
+        assert!(!cache.contains(&dir, "sha-after-insert").unwrap());
+        cache.insert(&dir, "sha-after-insert".to_string());
+        assert!(cache.contains(&dir, "sha-after-insert").unwrap());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_dir_sha_cache_lazy_population() {
+        let root = retrieval_test_root("dir-sha-cache-lazy");
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("store").join("VetCoders").join("aicx");
+        write_dir_sha_cache_test_sidecar(&dir, "old", "sha-old");
+
+        let mut cache = DirShaCache::default();
+        assert!(cache.contains(&dir, "sha-old").unwrap());
+
+        write_dir_sha_cache_test_sidecar(&dir, "new", "sha-new");
+        assert!(
+            !cache.contains(&dir, "sha-new").unwrap(),
+            "cache must not rescan a dir after first lazy population"
+        );
+
+        cache.insert(&dir, "sha-new".to_string());
+        assert!(cache.contains(&dir, "sha-new").unwrap());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_dir_sha_cache_does_not_cross_dirs() {
+        let root = retrieval_test_root("dir-sha-cache-dir-isolation");
+        let _ = fs::remove_dir_all(&root);
+        let left = root.join("store").join("VetCoders").join("aicx");
+        let right = root.join("store").join("Loctree").join("aicx");
+        write_dir_sha_cache_test_sidecar(&left, "left", "sha-left");
+        write_dir_sha_cache_test_sidecar(&right, "right", "sha-right");
+
+        let mut cache = DirShaCache::default();
+        assert!(cache.contains(&left, "sha-left").unwrap());
+        assert!(!cache.contains(&left, "sha-right").unwrap());
+        assert!(cache.contains(&right, "sha-right").unwrap());
+        assert!(!cache.contains(&right, "sha-left").unwrap());
 
         let _ = fs::remove_dir_all(&root);
     }
