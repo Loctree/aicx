@@ -701,27 +701,40 @@ fn merge_hybrid_statuses(statuses: &[HybridRetrievalStatus]) -> Option<HybridRet
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn read_index_header(path: &std::path::Path) -> Option<crate::vector_index::IndexHeader> {
-    use std::io::{BufRead, BufReader};
+    use std::io::BufReader;
     let file = std::fs::File::open(path).ok()?;
     let mut reader = BufReader::new(file);
-    let mut first = String::new();
-    reader.read_line(&mut first).ok()?;
-    serde_json::from_str(first.trim()).ok()
+    let first =
+        crate::sanitize::read_line_capped(&mut reader, crate::sanitize::MAX_VALIDATED_BYTES)
+            .ok()??;
+    if first.exceeded {
+        return None;
+    }
+    serde_json::from_str(first.line.trim()).ok()
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn index_appears_empty(path: &std::path::Path) -> bool {
-    use std::io::{BufRead, BufReader};
+    use std::io::BufReader;
     let Ok(file) = std::fs::File::open(path) else {
         return true;
     };
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     // Skip header (first line); if no second line, index is empty.
-    reader
-        .lines()
-        .skip(1)
-        .find(|line| matches!(line, Ok(s) if !s.trim().is_empty()))
+    if crate::sanitize::read_line_capped(&mut reader, crate::sanitize::MAX_VALIDATED_BYTES)
+        .ok()
+        .flatten()
         .is_none()
+    {
+        return true;
+    }
+    loop {
+        match crate::sanitize::read_line_capped(&mut reader, crate::sanitize::MAX_VALIDATED_BYTES) {
+            Ok(Some(line)) if !line.line.trim().is_empty() => return false,
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return true,
+        }
+    }
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]

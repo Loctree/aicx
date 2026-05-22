@@ -24,6 +24,10 @@ fn unique_test_dir(name: &str) -> PathBuf {
 }
 
 fn gcp_service_account_json() -> (String, Vec<String>) {
+    gcp_service_account_json_with_padding(0)
+}
+
+fn gcp_service_account_json_with_padding(padding_len: usize) -> (String, Vec<String>) {
     let private_key_id = chars('1', 40);
     let client_email = "aicx-redaction-test@aicx-test.iam.gserviceaccount.com".to_string();
     let private_key = format!(
@@ -34,10 +38,12 @@ fn gcp_service_account_json() -> (String, Vec<String>) {
         "\\n-----END PRIVATE KEY-----",
         "\\n"
     );
+    let padding = chars('Z', padding_len);
     let json = format!(
         r#"{{
   "type": "service_account",
   "project_id": "aicx-test",
+  "padding": "{padding}",
   "private_key_id": "{private_key_id}",
   "private_key": "{private_key}",
   "client_email": "{client_email}",
@@ -46,6 +52,25 @@ fn gcp_service_account_json() -> (String, Vec<String>) {
     );
 
     (json, vec![private_key_id, private_key, client_email])
+}
+
+#[test]
+fn redact_secrets_handles_large_gcp_service_account_json() {
+    let (gcp_json, raw_values) = gcp_service_account_json_with_padding(4096);
+    assert!(
+        gcp_json.len() > 4096,
+        "fixture must exceed 4 KiB, got {} bytes",
+        gcp_json.len()
+    );
+
+    let redacted = redact_secrets(&gcp_json);
+
+    for raw in raw_values {
+        assert!(!redacted.contains(&raw), "redacted output leaked: {raw}");
+    }
+    assert!(redacted.contains(r#""private_key_id": "[REDACTED_GCP_PRIVATE_KEY_ID]""#));
+    assert!(redacted.contains(r#""private_key": "[REDACTED_GCP_PRIVATE_KEY]""#));
+    assert!(redacted.contains(r#""client_email": "[REDACTED_GCP_CLIENT_EMAIL]""#));
 }
 
 #[test]
@@ -70,7 +95,7 @@ fn extract_outputs_do_not_leak_modern_secret_families() {
             "eyJ{}.eyJ{}.{}",
             chars('J', 12),
             chars('K', 12),
-            chars('L', 16)
+            chars('L', 43)
         ),
         format!("sk_live_{}", chars('M', 24)),
         format!("sk_test_{}", chars('N', 24)),
@@ -95,7 +120,7 @@ fn extract_outputs_do_not_leak_modern_secret_families() {
             agent: "codex".to_string(),
             session_id: "secret-redaction-e2e".to_string(),
             role: if idx % 2 == 0 { "user" } else { "assistant" }.to_string(),
-            message: redact_secrets(payload),
+            message: payload.clone(),
             repo_project: "Loctree/aicx".to_string(),
             source_path: Some("/Users/silver/Git/aicx".to_string()),
             branch: Some("fix/bug-tracker-pass-1".to_string()),

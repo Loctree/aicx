@@ -1686,3 +1686,678 @@ apply path, but does not mutate the live canonical store by itself.
 - shlex jest battle-tested library dla shell quoting; hand-rolled escape NIE łapie shell substitution metacharacters.
 
 **Related.** 43 remaining findings (9 P1 + 23 P2 + 11 P3) + 3 pass-2 leftovers consolidated w `docs/bug-tracker-aicx-followup-pass-3.md`. PR #5 unblocked dla merge po Plan A.
+
+## 2026-05-21 — sanitize central IO caps (L-1 foundation) · `self-sha-in-report`
+
+**Symptom.** L-1 z pass-3 wskazywało, że `read_to_string_validated(path)` waliduje ścieżkę, ale dalej używa uncapped `fs::read_to_string`, a capped `read_line_limited` istnieje tylko prywatnie w bin crate `src/sources.rs`. Downstream A-2/A-3 nie miały wspólnego API do bezpiecznego czytania dużych plików/linii.
+
+**Root cause.** Limit 8 MiB z pass-1 był zamknięty w `src/sources.rs` (`MAX_LINE_BYTES` + `read_line_limited`). Workspace-shared `aicx_parser::sanitize` nie miało ani total-byte cap dla validated reads, ani publicznego capped `read_line` helpera.
+
+**Fix.**
+- `crates/aicx-parser/src/sanitize.rs`: dodano `MAX_VALIDATED_BYTES = 8 * 1024 * 1024`, typed `SanitizeError::FileTooLarge`, capped `read_to_string_validated` (metadata check + bounded `take(MAX+1)` read) oraz publiczny `read_line_capped` mirrorujący kontrakt `src/sources.rs`.
+- `crates/aicx-parser/src/lib.rs`: dodano re-export `MAX_VALIDATED_BYTES` i `read_line_capped`.
+- `crates/aicx-parser/tests/sanitize_caps.rs`: dodano regresje dla pliku `MAX_VALIDATED_BYTES + 1` oraz oversized-line skip do kolejnej poprawnej linii.
+
+**Touched.**
+- `crates/aicx-parser/src/sanitize.rs` — centralny validated IO cap + capped line helper.
+- `crates/aicx-parser/src/lib.rs` — publiczne re-exporty dla downstream A-2/A-3.
+- `crates/aicx-parser/tests/sanitize_caps.rs` — integration regression coverage.
+
+**Tests.** `cargo build --workspace`, `cargo test --workspace -- --test-threads=4`, `cargo clippy --workspace -- -D warnings`, `cargo fmt --check` zielone. Targeted: `cargo test -p aicx-parser --test sanitize_caps`; existing happy path: `cargo test -p aicx-parser test_read_to_string_validated`.
+
+**Lessons.**
+- Shared safety helper powinien żyć w workspace crate zanim kolejne fale zaczną patchować call site’y; inaczej każdy moduł odtwarza własny cap-pattern.
+- `read_to_string` hardening musi ograniczać alokację przed body read, nie tylko zgłaszać błąd po fakcie.
+- Self-referential commit SHA nie jest możliwy w tym samym commicie; finalny SHA tego wpisu jest zapisany w raporcie A-1.
+
+**Related.** Closes L-1 foundation z `docs/bug-tracker-aicx-followup-pass-3.md`; kontynuuje audit `26d8123` / `docs/scope-overflow.md`. A-2/A-3 nadal odpowiadają za wiring call site’ów z listy audytu.
+
+## 2026-05-22 — semantic index NDJSON readers capped (L-1 sweep #2) · `self-sha-in-report`
+
+**Symptom.** Audit `26d8123` wykazał, że semantic-index read path dalej używał nieograniczonych `BufReader::lines()` / `read_line` w `src/api.rs`, `src/vector_index.rs`, `src/search_engine.rs` i brute-force dense adapterze. Adwersarialna linia NDJSON mogła wymusić niekontrolowaną alokację zanim parser zgłosił błąd.
+
+**Root cause.** A-1 (`6482bff`) dodało workspace-shared `aicx_parser::sanitize::read_line_capped`, ale downstream readers wciąż korzystały z convenience iteratorów standard library, które nie mają per-line cap i buforują całą linię.
+
+**Fix.**
+- `src/api.rs`: row-count semantic indexu przechodzi przez `read_line_capped`, header skip + data count bez `BufReader::lines()`.
+- `src/vector_index.rs`: dodano lokalny adapter capped-line zachowujący semantykę `BufRead::lines()` (strip `\n`/`\r\n`) i podpięto go w header rewrite, committed-reader, resume checkpoint, incremental baseline, committed-body seed oraz query scan.
+- `src/search_engine.rs`: header preview i empty-index detection czytają przez `read_line_capped`; oversized header nie jest parsowany jako prawidłowy status.
+- `crates/aicx-retrieve/src/adapter_brute_force.rs`: brute-force NDJSON load używa `read_line_capped`; oversized body row jest raportowany jako corrupt i reader przechodzi do następnej poprawnej linii.
+- `crates/aicx-retrieve/Cargo.toml`: dodano zależność path `aicx-parser` dla helpera A-1.
+
+**Touched.**
+- `src/api.rs` — `count_index_rows`.
+- `src/vector_index.rs` — semantic NDJSON readers + capped iterator regression.
+- `src/search_engine.rs` — `read_index_header`, `index_appears_empty`.
+- `crates/aicx-retrieve/src/adapter_brute_force.rs` — `load_ndjson` + oversized-row regression.
+- `crates/aicx-retrieve/Cargo.toml` — parser helper dependency.
+
+**Tests.** `cargo build --workspace`, `cargo test --workspace -- --test-threads=4`, `cargo clippy --workspace -- -D warnings`, `cargo fmt --check` zielone. Targeted: `cargo test capped_index_lines_error_on_oversized_and_advance_to_next_line -- --nocapture`; `cargo test -p aicx-retrieve load_skips_oversized_row_and_reads_following_row -- --nocapture`. `rg 'BufReader::lines\(\)|\.read_line\(' src/api.rs src/vector_index.rs src/search_engine.rs crates/aicx-retrieve/src/adapter_brute_force.rs` zwraca zero trafień.
+
+**Lessons.**
+- `BufRead::lines()` jest wygodne, ale w ścieżkach NDJSON indexu nie daje kontroli nad alokacją; capped adapter powinien być bliżej call-site’u niż parser JSON.
+- Oversized row nie musi oznaczać tego samego w każdym module: query/header paths mogą failować typed error, a brute-force body może policzyć corrupt row i kontynuować po drained newline.
+- Self-referential commit SHA nie jest możliwy w tym samym commicie; finalny SHA tego wpisu jest zapisany w raporcie A-2.
+
+**Related.** Closes A-2 / L-1 sweep #2 z `docs/bug-tracker-aicx-followup-pass-3.md`; implements semantic-NDJSON portion of audit `26d8123` / `docs/scope-overflow.md`; follows A-1 foundation `6482bff`.
+
+## 2026-05-22 — extractor/UI diagnostic readers capped (L-1 close-out) · `self-sha-in-report`
+
+**Symptom.** Audit `26d8123` nadal wskazywał ostatnie extractor/UI/diagnostic miejsca, gdzie `BufReader::lines()` albo bezpośrednie `read_to_string` mogły alokować nieograniczoną linię lub plik przed walidacją rozmiaru. A-1 (`6482bff`) i A-2 (`7230ba0`) zamknęły helpery oraz semantic-NDJSON path, ale pass A nie był jeszcze domknięty.
+
+**Root cause.** Pozostałe call site’y były rozproszone po CLI, extractorach, wizardzie, doctorze, dashboardzie i metadata loaders. Część z nich czytała operator-controlled albo store-controlled pliki, ale bez wspólnego 8 MiB cap helpera nie było jednolitej granicy alokacji ani trwałej klasyfikacji.
+
+**Fix.**
+- `src/main.rs`, `src/output.rs`, `src/sources.rs`: pozostałe `BufReader::lines()` w scope A-3 zamienione na `sanitize::read_line_capped`; oversized line jest pomijana po drainie do następnej linii.
+- `src/wizard/screens/corpus.rs`, `src/wizard/screens/intents.rs`, `src/doctor.rs`: produkcyjne preview/diagnostic reads przeszły na `read_to_string_validated`.
+- `src/state.rs`, `src/store.rs`, `src/dashboard_server.rs`, `crates/aicx-parser/src/segmentation.rs`: metadata/dashboard/Gemini-map reads sklasyfikowane jako cap-safe i podpięte do `read_to_string_validated` zamiast zostawiać uncapped wyjątki.
+- Dodano focused regressions dla oversized line advance w sync markdown scannerze i oversized chunk preview rejection w wizard corpus screen.
+
+**Bounded classification.**
+- `src/state.rs:195` — capped; `state.json` jest internal metadata, ale może rosnąć z watermarkami/hashami, więc cap jest bezpieczniejszy niż stały komentarz bounded.
+- `src/state.rs:208` — capped; `.bak` dziedziczy ryzyko `state.json`.
+- `src/store.rs:601` — capped; `index.json` jest generated metadata, ale manifest może rosnąć wraz z corpus size.
+- `src/store.rs:1386` — capped; sidecar JSON jest mały-by-design, ale cap nie zmienia poprawnego happy path i usuwa silent unbounded read.
+- `src/doctor.rs:605` — capped; diagnostic index read powinien respektować tę samą granicę co store loader.
+- `src/doctor.rs:955` — capped; diagnostic state read powinien respektować tę samą granicę co `StateManager`.
+- `src/dashboard_server.rs:1105` — capped; dashboard-served chunk content może być user/operator corpus data, 8 MiB wystarcza dla sensownego chunk preview i zamyka unbounded response read.
+- `crates/aicx-parser/src/segmentation.rs:73` — capped; Gemini project map jest config-like i mały-by-intent, ale cap jest tani i utrzymuje jeden IO contract.
+
+**Touched.**
+- `src/main.rs` — `read_codex_session_meta_id`.
+- `src/output.rs` — `find_last_sync_timestamp` + oversized-line regression.
+- `src/sources.rs` — `load_codescribe_lexicon`.
+- `src/wizard/screens/corpus.rs` — selected chunk preview + oversized-file regression.
+- `src/wizard/screens/intents.rs` — intent source chunk preview.
+- `src/doctor.rs` — index/state/empty-body diagnostics.
+- `src/state.rs` — state + backup loads.
+- `src/store.rs` — index + sidecar loads.
+- `src/dashboard_server.rs` — chunk content API read.
+- `crates/aicx-parser/src/segmentation.rs` — Gemini project map loader.
+
+**Tests.** `cargo build --workspace`, `cargo test --workspace -- --test-threads=4`, `cargo clippy --workspace -- -D warnings`, `cargo fmt --check` zielone. Targeted: `cargo test -p aicx output::tests::test_find_last_sync_timestamp_skips_oversized_line_and_advances -- --test-threads=1`; `cargo test -p aicx wizard::screens::corpus::tests::selected_preview_rejects_oversized_chunk_file -- --test-threads=1`. Required `rg` gates over `src/main.rs`, `src/output.rs`, and `src/sources.rs` zwracają zero trafień.
+
+**Lessons.**
+- W metadata pathach „mały w praktyce” nie musi oznaczać „bounded forever”; jeśli cap helper nie zmienia API, lepiej capować niż zostawiać trwały wyjątek.
+- Line cap musi zachować progress po oversized line, inaczej pojedyncza długa linia blokuje dalsze poprawne rekordy.
+- Self-referential commit SHA nie jest możliwy w tym samym commicie; finalny SHA tego wpisu jest zapisany w raporcie A-3.
+
+**Related.** Closes A-3 / L-1 extractor/UI diagnostic close-out z `docs/bug-tracker-aicx-followup-pass-3.md`; implements remaining split #3 from audit `26d8123` / `docs/scope-overflow.md`; follows A-1 `6482bff` and A-2 `7230ba0`.
+
+---
+
+## 2026-05-21 — Wave E tests/docs hygiene sweep (K-1 + N-1 + N-6 + N-12) · `same-commit`
+
+**Symptom.** Pass-3 Wave E zebrał cztery luźne hygiene bugs: pusty fake test
+`tests/dashboard_security.rs`, current-state docs wskazujące na emerytowane
+root-crate parser paths, brak jawnych `CHANGELOG.md` wpisów dla nowych crate'ów
+oraz działający, ale mniej czytelny hex-prefix truncation pattern dla
+`stable_blake3_128`.
+
+**Root cause.** Po pass-2 część zmian była realnie domknięta w kodzie, ale
+ogon dokumentacyjno-testowy został rozjechany: test udawał asercję, docs nie
+nadążyły za ekstrakcją parser crate, release notes nie wymieniały całego
+workspace expansion, a BLAKE3 truncation ukrywał byte boundary za slicingiem
+hex stringa.
+
+**Fix.**
+- Usunięto pusty `tests/dashboard_security.rs`; gap zapisany w
+  `docs/BACKLOG.md` zamiast utrzymywać compliance theater.
+- `docs/ARCHITECTURE.md` wskazuje current parser crate paths dla chunker/sanitize.
+- `CHANGELOG.md` jawnie wymienia `aicx-monitor` i
+  `aicx-progress-contracts`; istniejący `aicx-retrieve` wpis zostaje bez zmian.
+- `stable_blake3_128` używa byte-truncation (`hash.as_bytes()[..16]`) +
+  `hex::encode`, z direct `hex` dependency i regression testem starego
+  32-znakowego kontraktu.
+
+**Touched.**
+- `tests/dashboard_security.rs` — deleted fake test.
+- `docs/BACKLOG.md` — K-1 gap note.
+- `docs/ARCHITECTURE.md` — parser crate paths.
+- `CHANGELOG.md` — explicit new crate entries.
+- `crates/aicx-parser/CHANGELOG.md` — removed stale in-tree path literals from
+  historical migration note.
+- `Cargo.toml`, `Cargo.lock` — direct `hex` dependency for root crate.
+- `src/state/migration.rs` — BLAKE3-128 truncation pattern + contract test.
+
+**Tests.** `cargo build --workspace`; `cargo test --workspace -- --test-threads=4`;
+`cargo clippy --workspace -- -D warnings`; `cargo fmt --check`; targeted
+`cargo test -p aicx test_blake3_128 --lib`.
+
+**Lessons.**
+- Fake tests should be deleted or made behavioral; a comment-only test is worse
+  than an explicit backlog item.
+- Simple doc regexes can match correct crate paths too; report whether hits are
+  stale root paths or intentional current paths.
+
+**Related.** Closes K-1, N-1, N-6, and N-12 from
+`docs/bug-tracker-aicx-followup-pass-3.md`. Final commit SHA is recorded in the
+worker report because a file cannot stably contain its own commit hash.
+## 2026-05-21 — release-linux SHA256SUMS aggregation (J-1) · `pending-this-commit`
+
+**Symptom.** `.github/workflows/release-linux.yml` publikował Linux slim unsigned
+`.tar.gz` assety bez agregującego `SHA256SUMS`, więc użytkownik nie miał prostego
+release-side polecenia do weryfikacji integralności przed instalacją.
+
+**Root cause.** Nowszy Linux matrix workflow miał już `download-artifact`
+z `merge-multiple: true` i upload `dist/*`, ale nie generował checksum file w
+agregatorze. Starszy unified release path miał własne SHA sidecars, więc luka
+dotyczyła tylko `release-linux.yml`.
+
+**Fix.**
+- `.github/workflows/release-linux.yml`: dodano krok `Generate SHA256SUMS` w
+  `upload-release`, po pobraniu matrix artifactów i przed `gh release upload`.
+- `docs/RELEASES.md`: dodano sekcję `Asset verification` z komendą
+  `sha256sum -c SHA256SUMS` dla katalogu zawierającego checksum file i `.tar.gz`.
+
+**Touched.**
+- `.github/workflows/release-linux.yml` — `upload-release` aggregator job.
+- `docs/RELEASES.md` — end-user asset verification docs.
+
+**Tests.** `actionlint` run: new `Generate SHA256SUMS` step clean; pre-existing
+SC2086 warnings remain in `Package artifacts` scope. Python PyYAML unavailable,
+Ruby YAML parse OK. `cargo build --workspace` OK. `cargo fmt --check` OK.
+
+**Lessons.**
+- Agregator release job to właściwe miejsce na jeden `SHA256SUMS` dla matrix
+  artifactów: uploadowy `dist/*` obejmuje checksum file bez osobnego polecenia.
+- Uwaga protokołowa: finalny commit SHA jest znany dopiero po commicie; raport
+  B-1 zapisuje finalny SHA dla tej pozycji J-1.
+
+**Related.** J-1 z `docs/bug-tracker-aicx-followup-pass-3.md`.
+
+## 2026-05-22 — Cross.toml cross-rs image pin (J-2) · `pending-this-commit`
+
+**Symptom.** `Cross.toml` używał `ghcr.io/cross-rs/...:main` dla obu Linux
+builder images. `:main` jest moving tagiem, więc release artifact build mógł
+po cichu pobrać inny obraz niż poprzedni green run.
+
+**Root cause.** Cross-rs image refs były traktowane jak konfiguracja runtime,
+ale bez supply-chain identity pin. Workflow release-linux czyta `Cross.toml`,
+więc ruchomy GHCR tag siedział bezpośrednio na ścieżce publikacji Linux assetów.
+
+**Fix.**
+- `Cross.toml`: oba obrazy zmienione z `:main` na `0.2.5@sha256:<digest>`.
+- `docs/RELEASES.md`: dodano maintainer note z ręcznym protokołem bumpowania
+  pinów po wybraniu nowego release `cross-rs`.
+
+**Touched.**
+- `Cross.toml` — Linux cross-rs image refs.
+- `docs/RELEASES.md` — release maintainer protocol.
+
+**Tests.** TOML parse OK. `cargo build --workspace` OK. `cargo fmt --check` OK.
+`rg -n ':main' Cross.toml` zero hits.
+
+**Lessons.**
+- Release builder image jest częścią supply chain tak samo jak action pin albo
+  checksum sidecar; moving tag nie powinien siedzieć na release path.
+- `cross-rs` release tag to `v0.2.5`, ale GHCR image tag to `0.2.5`; zapis
+  `0.2.5@sha256:<digest>` zachowuje czytelny version anchor i immutable digest.
+- Finalny commit SHA jest znany dopiero po commicie; raport B-2 zapisuje finalny
+  SHA dla tej pozycji J-2.
+
+**Related.** J-2 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows
+`9d1a9c1` (B-1 release SHA256SUMS).
+
+## 2026-05-22 — auth token CSPRNG portability (J-3) · `pending-this-commit`
+
+**Symptom.** `src/auth.rs::generate_token` otwierał `/dev/urandom` bezpośrednio.
+Na Linux/macOS dawało to 32 bajty entropii, ale na Windows ścieżka nie istnieje,
+więc wygenerowanie tokenu auth kończyłoby się błędem runtime.
+
+**Root cause.** Generator tokenu był powiązany z unixowym device file zamiast
+używać cross-platformowego OS CSPRNG API. Kontrakt 256-bit pozostał poprawny
+tylko na systemach z `/dev/urandom`.
+
+**Fix.**
+- `Cargo.toml`: dodano jawne `getrandom = "0.3"` jako bezpośredni kontrakt
+  dependency dla auth-token entropy.
+- `src/auth.rs`: `generate_token` używa `getrandom::fill(&mut buf)` z kontekstem
+  błędu, zachowując 32-bajtowy bufor i istniejący `hex_encode` pipeline.
+- Usunięto import `std::io::Read`, bo direct file read nie jest już potrzebny.
+
+**Touched.**
+- `Cargo.toml` — direct dependency `getrandom`.
+- `src/auth.rs` — `generate_token` entropy source + unit test.
+
+**Tests.** Dodano `test_generate_token_shape_and_uniqueness_sanity`: dwa tokeny
+mają po 64 znaki hex i kolejne wywołania dają różne wartości. Pełne gates J-3
+zapisuje raport B-3.
+
+**Lessons.**
+- Auth-token entropy source powinno być API-level OS CSPRNG contract, nie
+  platform-specific path. `/dev/urandom` wygląda prosto, ale koduje Unix-only
+  runtime assumption.
+- Finalny commit SHA jest znany dopiero po commicie; raport B-3 zapisuje finalny
+  SHA dla tej pozycji J-3.
+
+**Related.** J-3 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows
+`9d1a9c1` (B-1 release SHA256SUMS) + `643fa4c` (B-2 Cross.toml pin).
+
+## 2026-05-22 — GCP service-account field redaction without object-size gate (J-7) · `pending-this-commit`
+
+**Symptom.** Duży GCP service-account JSON (>2.5 KiB po `"type":
+"service_account"`) redagował `"private_key"` osobnym regexem, ale
+`"private_key_id"` i `"client_email"` mogły zostać w outputach bez redakcji.
+
+**Root cause.** `redact_gcp_service_account_fields` odpalało per-field regexes
+tylko wewnątrz `RE_GCP_SERVICE_ACCOUNT_OBJECT.replace_all(...)`. Wrapper miał
+limit `[^{}]{0,2500}`, więc realny większy service-account object nie matchował
+i pola nie przechodziły przez istniejące standalone regexes.
+
+**Fix.**
+- Usunięto `RE_GCP_SERVICE_ACCOUNT_OBJECT` jako misleading defense-in-depth.
+- `RE_GCP_PRIVATE_KEY_ID_FIELD` i `RE_GCP_CLIENT_EMAIL_FIELD` działają teraz na
+  całym tekście, niezależnie od rozmiaru obiektu JSON.
+- Fast lookup `SECRET_LOOKUP_SET` dostał wzorce dla `"private_key_id"` i
+  `"client_email"`, żeby early-return nie omijał field-only path.
+
+**Touched.**
+- `src/redact.rs` — GCP service-account field pipeline + unit regression.
+- `tests/secret_redaction_e2e.rs` — 4 KiB synthesized GCP service-account
+  fixture.
+
+**Tests.** Dodano e2e regression dla >4 KiB service-account JSON oraz unit test
+dla field-only `private_key_id`/`client_email` triggera. Pełne gates J-7 zapisuje
+raport B-4.
+
+**Lessons.**
+- Regex wrapper z limitem długości nie może być gate'em dla pól, które mają
+  bezpieczne standalone redaction patterns.
+- Fast negative path musi znać te same rodziny sekretów, które redaguje pełny
+  pipeline; inaczej poprawny regex może nigdy nie zostać uruchomiony.
+
+**Related.** J-7 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows
+`9d1a9c1` (B-1 release SHA256SUMS) + `643fa4c` (B-2 Cross.toml pin) +
+`6c7d06d` (B-3 auth getrandom).
+
+## 2026-05-22 — auth token file refused on Windows (J-4) · `pending-this-commit`
+
+**Symptom.** `src/auth.rs::persist_token_file` chronił wygenerowany token
+`~/.aicx/auth-token` przez chmod `0600` tylko pod `#[cfg(unix)]`. Na Windows
+brakowało równoważnego ograniczenia DACL, więc wygenerowany token mógłby zostać
+zapisany z domyślnymi ACL.
+
+**Root cause.** Ścieżka persistowania tokena miała Unix-only protection jako
+post-write chmod, ale nie miała Windows-specific policy. Pass-3 J-4 wybrał lean
+wariant refusal zamiast dokładania `windows-acl`, bo Windows nie jest jeszcze
+oficjalnie wspieranym token-file targetem.
+
+**Fix.**
+- `src/auth.rs::persist_token_file`: dodano `#[cfg(windows)]` early-return
+  przed `create_dir_all` i `fs::write`, z komunikatem wskazującym
+  `--auth-token <token>` jako explicit-pass workaround.
+- Linux/macOS path zostaje logicznie bez zmian: write token file, potem Unix
+  chmod `0600`.
+- `SECURITY.md`: udokumentowano Unix-only token-file storage i Windows policy.
+
+**Touched.**
+- `src/auth.rs` — refuse point w `persist_token_file`.
+- `SECURITY.md` — auth token storage policy.
+
+**Tests.** `cargo build --workspace` OK.
+`cargo test --workspace -- --test-threads=4` OK.
+`cargo clippy --workspace -- -D warnings` OK. `cargo fmt --check` OK.
+
+**Lessons.**
+- Jeśli platforma nie ma zaimplementowanej ochrony sekretu na storage path,
+  lepszy jest jawny refusal przed utworzeniem pliku niż ciche poleganie na
+  domyślnych ACL.
+- Refuse point najbezpieczniej trzymać przy samym sinku (`persist_token_file`),
+  bo chroni obecnego callera i przyszłe użycia funkcji.
+- Finalny commit SHA jest znany dopiero po commicie; raport C-1 zapisuje
+  finalny SHA dla tej pozycji J-4.
+
+**Related.** J-4 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows
+`9d1a9c1` (B-1 release SHA256SUMS) + `643fa4c` (B-2 Cross.toml pin) +
+`6c7d06d` (B-3 auth getrandom) + `81622d9` (B-4 GCP redaction).
+
+---
+
+## 2026-05-22 — auth token file atomic create mode 0600 (J-5) · `pending-this-commit`
+
+**Symptom.** `src/auth.rs::persist_token_file` tworzył token file przez
+`std::fs::write`, a dopiero potem robił Unix `chmod 0600`. Między `open/create`
+i `chmod` plik mógł chwilowo istnieć z uprawnieniami zależnymi od `umask`
+(np. `0644`), więc lokalny proces mógł odczytać token w oknie TOCTOU.
+
+**Root cause.** Ochrona sekretu była ustawiana po utworzeniu pliku zamiast w
+tym samym syscallu, który tworzy plik. `set_permissions` naprawia stan docelowy,
+ale nie cofa momentu, w którym plik już istniał z domyślnym mode.
+
+**Fix.**
+- `src/auth.rs::persist_token_file` na Unix używa teraz
+  `OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)`,
+  więc mode jest nadawany atomowo podczas `O_CREAT`.
+- Zapis treści tokena idzie przez `write_all` + `flush`; usunięto osobny
+  `set_permissions` po zapisie.
+- Semantyka rotacji: istniejący token file nie jest nadpisywany. Rotacja albo
+  recovery po pustym/starym pliku wymaga unlink-first, potem ponownego
+  wygenerowania/zapisania tokena.
+- Dla platform bez Unix mode i bez Windows ACL policy dodano odmowę zapisu
+  zamiast cichego persistowania pliku bez znanej ochrony.
+
+**Touched.**
+- `src/auth.rs` — `persist_token_file` Unix create path + unit regression.
+
+**Tests.** Dodano `test_persist_token_file_refuses_existing_file`, który
+sprawdza `AlreadyExists` i brak nadpisania istniejącego token file. Istniejący
+`test_load_auth_token_generates_when_missing` nadal asercyjnie sprawdza mode
+`0600` po pierwszym persist.
+
+**Lessons.**
+- Sekret zapisany do pliku musi dostać restrykcyjny mode w momencie utworzenia,
+  nie w osobnym kroku po zapisie.
+- `create_new(true)` jest celowo ostrzejsze od overwrite: bezpieczna rotacja
+  tokena powinna być jawna i unlink-first, nie przypadkowa przez truncate.
+- Finalny commit SHA jest znany dopiero po commicie; raport C-2 zapisuje
+  finalny SHA dla tej pozycji J-5.
+
+**Related.** J-5 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows Wave B
+B-1..B-4 + C-1 `d2d41e1`.
+
+---
+
+## 2026-05-22 — state hash field separator + blake3-128-v2 migration (J-6 + K-2) · `pending-this-commit`
+
+**Symptom.** `src/state.rs::content_hash` i `overlap_hash` składały pola do
+jednego bufora przez raw concatenation. Dla `content_hash` dawało to
+hash-splitting surface: inny podział `(agent, timestamp, message)` mógł
+prowadzić do identycznego byte streamu. Dodatkowo `CHANGELOG.md` nie opisywał
+wcześniejszej migracji `siphash13-v1` → `blake3-128-v1`.
+
+**Root cause.** Format wejścia do `stable_blake3_128` nie miał separatora ani
+length-prefixów między polami. Cache `seen_hashes` zależy od dokładnych bajtów
+hashowanego wejścia, więc naprawa formatu wymagała kolejnego bumpa
+`hash_algorithm` i jednorazowego resetu cache przy pierwszym loadzie.
+
+**Fix.**
+- `content_hash` i `overlap_hash` używają wspólnego field-hash helpera z
+  length-prefixem przed każdym polem.
+- `BLAKE3_128_ALGORITHM` podniesiono z `blake3-128-v1` do
+  `blake3-128-v2`; istniejący path migracji czyści `seen_hashes` dla
+  `siphash13-v1`, pustego/legacy stanu oraz `blake3-128-v1`.
+- `CHANGELOG.md` dostał `### Breaking` w Unreleased z retroaktywnym G-1
+  `siphash13-v1` → `blake3-128-v1` i nowym J-6
+  `blake3-128-v1` → `blake3-128-v2`.
+
+**Touched.**
+- `src/state.rs` — `content_hash`, `overlap_hash`, regression tests.
+- `src/state/migration.rs` — current algorithm constant + v1→v2 migration test.
+- `CHANGELOG.md` — Unreleased Breaking notes.
+- `docs/BUGFIXES.md` — ten wpis.
+
+**Tests.** Dodano regression dla legacy raw-concat collision pair oraz test
+`blake3-128-v1` → `blake3-128-v2` resetu `seen_hashes`. Pełne gate’y D-1 zapisuje
+raport workerowy.
+
+**Lessons.**
+- Hash stabilny między release'ami musi mieć jawnie wersjonowany input format,
+  nie tylko jawnie wersjonowany algorytm.
+- Jeśli naprawa dedup hashy zmienia byte stream, `seen_hashes` jest cache'em
+  starego formatu i musi zostać wyczyszczony zamiast mieszany z nowymi hashami.
+
+**Related.** J-6 + K-2 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows
+Wave B B-1..B-4 + Wave C C-1..C-2.
+
+---
+## 2026-05-22 — auth/dashboard/sanitize P2 hardening batch 1 (M-1..M-6) · `pending H-1 commit`
+
+**Symptom.** Pass-3 Area M P2 hardening zostawił sześć defense-in-depth gaps: `auth_middleware` robił length mismatch przez `constant_time_eq`; Bearer endpoints nie miały brute-force/DoS throttlingu; `/api/regenerate` pozwalał POST bez `Origin` i bez `Referer`; `cross_search.limit` silently clampował do 200; 403 body zdradzało nazwy security headers; `is_under_allowed_base` na macOS dopuszczał dowolne `/Users/{x}/...`.
+
+**Root cause.** Warstwy bezpieczeństwa powstawały iteracyjnie po Plan A (`2fb1ccf`): Bearer + action header + CORS istniały, ale brakowało małych kontraktowych domknięć po usunięciu martwego CSRF gate. Sanitize miał legacy convenience allowlist zbyt szeroki względem current-user intent.
+
+**Fix.**
+- M-1: `auth_middleware` zwraca 401 przy `provided.len() != expected.len()` przed `constant_time_eq`.
+- M-2: `tower_governor` 0.8.0 rate limit (100 burst, 1 token / 600ms) siedzi na enforced Bearer routerach; dashboard i MCP HTTP serwują przez `into_make_service_with_connect_info::<SocketAddr>()`.
+- M-3: `/api/regenerate` domyślnie wymaga `Origin` albo `Referer` zgodnego z `DashboardCorsPolicy`; `--allow-no-origin` jest explicit tooling escape hatch.
+- M-4: `cross_search.limit > 200` nadal clampuje dla kompatybilności, ale odpowiedź success dostaje `X-Clamped-Limit: 200`.
+- M-5: dashboard security 403 body jest opaque `{"ok":false,"error":"Forbidden"}`, a szczegółowy powód trafia do `tracing::warn!`.
+- M-6: `is_under_allowed_base` akceptuje tylko `dirs::home_dir()`, `dirs::cache_dir()`, `dirs::data_dir()` current user plus istniejącą temp policy; szerokie macOS `/Users/*` znika.
+
+**Touched.** `Cargo.toml`, `Cargo.lock`, `crates/aicx-parser/Cargo.toml`, `crates/aicx-parser/src/sanitize.rs`, `src/auth.rs`, `src/dashboard_server.rs`, `src/main.rs`, `src/mcp.rs`, `tests/dashboard_auth.rs`, `tests/mcp_slim.rs`.
+
+**Tests.** Targeted green: `cargo test --test dashboard_auth`, `cargo test dashboard_server::tests:: --lib`, `cargo test -p aicx-parser sanitize::tests::`. Full workspace gates recorded in H-1 report.
+
+**Lessons.** `tower_governor` per-IP is not just a layer call: Axum must provide peer `ConnectInfo`, or the limiter turns into 500-before-auth. Security-body opacity should not erase operator observability — log detail is the place for header names and source URLs, not client JSON.
+
+**Related.** Closes M-1, M-2, M-3, M-4, M-5, M-6 z `docs/bug-tracker-aicx-followup-pass-3.md`; H-1 Wave H batch 1.
+
+---
+
+## 2026-05-22 — parser/retrieve/MCP/output quality sweep (M-7..M-13) · `this H-2 commit`
+
+**Symptom.** Pass-3 Area M P2 quality sweep zostawił siedem mniejszych
+footgunów: debug builds automatycznie dopuszczały tempfile-backed `/tmp`;
+retrieve manifest mismatch errors zlewały count/commit/doc-count różnice w
+generyczny `GenerationMismatch`; `HybridIndex::commit()` miał redundantny
+`.expect`; MCP negative-cache mutex używał `.lock().unwrap()`; `aicx_steer`
+slim response serializował przez `.unwrap()`; conversation-first output API
+wymagało ręcznej redakcji sekretów; CSP server shell nadal używał
+`'unsafe-inline'`.
+
+**Root cause.** Część kodu była poprawna logicznie, ale krucha diagnostycznie:
+defense-in-depth błędy trafiały w generyczne varianty, panic-prone helpery
+opierały się na "to się nie wydarzy", a redakcja siedziała w callerach zamiast
+w publicznym output API. M-13 okazało się szersze niż `dashboard.rs`: pełny fix
+nonce wymaga także HTTP `Content-Security-Policy` headera przy serwowaniu HTML.
+
+**Fix.**
+- M-7: temp allowlist wymaga `AICX_ALLOW_TMP=1` także w debug/dev runs; cargo
+  test harness zachowuje tempfile allowance bez powrotu do szerokiego
+  `debug_assertions`.
+- M-8: dodane dedykowane `RetrieveError::{DenseCountMismatch,
+  LexicalDocCountMismatch, LexicalCommitMismatch}` z named fields i call-site
+  tests.
+- M-9: `HybridIndex::commit()` zwraca wcześniej sprawdzony borrow bez
+  `.expect("manifest checked above")`; dodany test błędu commit-before-build.
+- M-10: MCP embedder negative-cache mutex używa descriptively-named `.expect`
+  helpera zamiast `.lock().unwrap()` w hot path.
+- M-11: `aicx_steer` slim serialization propaguje błąd przez structured
+  `McpError` zamiast panikować.
+- M-12: `write_conversation_*` redaktują przez `redact_secrets` domyślnie;
+  dodane explicit `*_with_redaction(..., false)` dla opt-out i podpięte CLI
+  call-site'y żeby `--no-redact-secrets` zachował dotychczasowy kontrakt.
+- M-13: nie zaimplementowane w tym commicie; zapisany scope-overflow artifact
+  z follow-up planem, bo pełny fix wymaga touchnięcia `dashboard_server.rs`
+  (H-1/no-touch w tym briefie).
+
+**Touched.**
+- `crates/aicx-parser/src/sanitize.rs` — M-7 temp allowlist policy.
+- `crates/aicx-retrieve/src/error.rs`, `manifest.rs`, `orchestrator.rs` —
+  M-8/M-9 typed errors + clean commit borrow.
+- `src/mcp.rs` — M-10/M-11 mutex expect helper + steer serialization error path.
+- `src/output.rs`, `src/main.rs`, `tests/secret_redaction_e2e.rs` — M-12
+  redact-by-default API + explicit CLI opt-out preservation.
+- `CONTRIBUTING.md` — M-7 env var note.
+- `~/.vibecrafted/artifacts/Loctree/aicx/2026_0522/bugtracker-aicx-pass-3/reports/H-2_M-7-to-M-13-quality_scope-overflow.md`
+  — M-13 split note.
+
+**Tests.** Targeted green before full gates:
+`cargo test -p aicx-parser sanitize::tests::test_tmp_allowlist_hybrid_policy -- --exact`;
+`cargo test -p aicx-retrieve`; `cargo test --test secret_redaction_e2e`;
+`cargo test -p aicx --lib mcp::tests::steer_response_with_nan_score_serializes_without_panic -- --exact`;
+`cargo test -p aicx --lib write_conversation_outputs`;
+`cargo test -p aicx --lib embedder_negative_cache`.
+
+**Lessons.**
+- `cfg(test)` does not reach dependency crates in integration tests; if policy
+  depends on "cargo test may use temp dirs", verify the actual test harness
+  path instead of smuggling back full debug-build allowance.
+- Public output APIs should be safe by default. Caller-side redaction is too
+  easy to skip, but opt-out still needs to be explicit for deliberate local
+  exports.
+- CSP nonce work is not done until the HTTP response header and rendered inline
+  elements share the same nonce. Meta-only cleanup is a half-fix.
+
+**Related.** Closes M-7, M-8, M-9, M-10, M-11, M-12 z
+`docs/bug-tracker-aicx-followup-pass-3.md`; M-13 scope-overflow documented for
+the next Wave H cut.
+
+---
+
+## 2026-05-22 — dashboard/state/locks test-state polish (M-14..M-18) · `this H-3 commit`
+
+**Symptom.** Pass-3 Area M P2 zostawił pięć test/state footgunów: dashboard
+inline-markdown testy assertowały literalny JS marker zamiast zachowania;
+`atomic_write` tempfile name używał tylko PID+nanos; lock holder sidecar działał
+tylko dla `lance.lock`; state load parsował ten sam JSON kilkukrotnie; backup
+recovery zwracało odzyskany stan bez naprawienia corrupt primary.
+
+**Root cause.** Kod był funkcjonalny w zwykłej ścieżce, ale kruchy pod refactor,
+concurrency i incident triage. Testy dashboardu były spięte z implementacją JS,
+lock sidecar był G-2-specific zamiast default dla lockfiles, a state loader
+rozdzielał strict/legacy detection przez kolejne `from_str` passy.
+
+**Fix.**
+- M-14: `inlineMarkdown`/`renderMarkdown` wyciągnięte do
+  `src/dashboard_inline_markdown.js`; Rust testy odpalają Node i sprawdzają
+  zachowanie unsafe scheme / href escaping zamiast markerów w stringu.
+- M-15: `stage_tempfile` dodaje process-local `AtomicU64` do nazwy tempfile;
+  stress test 100 concurrent writes potwierdza brak kolizji i stray tmp.
+- M-16: holder `.holder` sidecar powstaje dla wszystkich lockfile acquire
+  (exclusive i shared), z `mode=`/`token=` i cleanupem tylko własnego sidecara;
+  `lance.lock` zachowuje `run_kind=aicx index`.
+- M-17: state load parsuje `serde_json::Value` raz, potem robi
+  `from_value::<StateManager>` / `from_value::<LegacySiphashStateManager>`.
+- M-18: po udanym backup recovery primary `state.json` jest atomowo
+  self-healed z odzyskanego stanu bez nadpisywania dobrej backup treści corrupt
+  primary bytes.
+
+**Touched.** `src/dashboard.rs`, `src/dashboard_inline_markdown.js`,
+`src/store/atomic_write.rs`, `src/locks.rs`, `src/state.rs`.
+
+**Tests.** Targeted green: dashboard inline markdown Node behavior; atomic_write
+100 concurrent writers; locks unit suite; state load/migration tests. Full gates
+green: `cargo build --workspace`, `cargo test --workspace -- --test-threads=4`,
+`cargo clippy --workspace -- -D warnings`, `cargo fmt --check`. Informacyjnie:
+wygenerowany 1,930,014 B `state.json` przez `AICX_HOME=<tmp> aicx state --info`
+przeszedł w `real 0.19s` na nowej single-parse ścieżce.
+
+**Lessons.** Testy security-sensitive renderingu powinny wykonywać renderer, nie
+szukać markerów implementacji. Lock sidecary muszą mieć identity token, bo
+shared locks mogą się legalnie nakładać. Backup recovery nie może używać zwykłej
+rotacji backupu, jeśli primary jest znanym corrupt wejściem.
+
+**Related.** Closes M-14, M-15, M-16, M-17, M-18 z
+`docs/bug-tracker-aicx-followup-pass-3.md`; H-3 Wave H batch 3. M-13 pozostaje
+scope-overflow z H-2, bez zmian w tym commicie.
+
+---
+
+## 2026-05-22 — deps/CI/dashboard env polish (M-19..M-22) · `this H-4 commit`
+
+**Symptom.** Ostatni batch Area M P2 zostawił dependency/security-warning drift
+(`lru`, `paste`, RSA Marvin przez optional `rust-memex`), `retrieval-eval.yml`
+bez `cancel-in-progress`, jedyny workflow checkout na `@v4`, oraz dashboard
+cross-search spawnujący memex CLI z pełnym `env_clear()` bez jawnego kontraktu
+`HOME`/`XDG_*`.
+
+**Root cause.** `ratatui 0.29` trzymał stare `lru 0.12.5`, a optional
+`rust-memex 0.6.5` dalej wnosi transitive Lance/Tantivy/DataFusion/paste/RSA
+powierzchnię, której AICX nie używa jako własnego crypto hot path. CI workflow
+drift był zwykłym starzeniem YAML-a, a memex cross-search miał dobry PATH-safe
+model, ale nie miał opisanej minimalnej env allowlisty dla config-dir lookupów.
+
+**Fix.**
+- M-19: `ratatui` podbite do `0.30`, co usuwa stare `lru` z bezpośredniego TUI
+  stacka; `.cargo/audit.toml` i `cargo-audit.toml` dokumentują ignore dla
+  remaining optional `rust-memex` advisories: RSA Marvin, `paste`, oraz stare
+  `lru` przez Tantivy 0.24/Lance do czasu upstream fixa.
+- M-20: `retrieval-eval.yml` dostał top-level `concurrency` z
+  `cancel-in-progress: true`.
+- M-21: `retrieval-eval.yml` wyrównany do `actions/checkout@v6`; wszystkie
+  workflow checkouty są teraz na tym samym majorze.
+- M-22: `run_memex_cli` czyści env, po czym przepuszcza tylko `HOME`,
+  `XDG_CONFIG_HOME`, `XDG_DATA_HOME`; `PATH` nadal nie przechodzi.
+- M-22: `docs/ARCHITECTURE.md` opisuje dashboard cross-search memex CLI env
+  boundary.
+
+**Touched.**
+- `Cargo.toml`, `Cargo.lock` — `ratatui 0.30` + lock refresh.
+- `.cargo/audit.toml`, `cargo-audit.toml` — cargo-audit ignore/rationale.
+- `.github/workflows/retrieval-eval.yml` — concurrency + checkout v6.
+- `src/dashboard_server.rs` — memex CLI env allowlist + regression test.
+- `docs/ARCHITECTURE.md` — spawn/env contract.
+
+**Tests.** Zielone: `cargo build --workspace`;
+`cargo test --workspace -- --test-threads=4`;
+`cargo clippy --workspace -- -D warnings`; `cargo fmt --check`; `cargo audit`;
+`cargo test -p aicx dashboard_server::tests::run_memex_cli_passes_home_xdg_without_path`;
+`actionlint .github/workflows/retrieval-eval.yml`.
+Pełne `actionlint .github/workflows/*.yml` nadal blokuje pre-existing SC2086 w
+`release-linux.yml:83`, poza zakresem M-20/M-21. Lokalny host nie ma
+`rust-memex`/`rmcp-memex` binary ani sibling checkout, więc prawdziwy external
+memex smoke nie był możliwy; test repo weryfikuje sam spawn/env contract przez
+`/usr/bin/env`.
+
+**Lessons.**
+- Cargo audit config dla lokalnego `cargo-audit 0.22.0` musi żyć w
+  `.cargo/audit.toml`; top-level `cargo-audit.toml` jest dokumentacyjnym
+  aliasem pod brief/operatorów, ale nie jest czytany przez tę wersję narzędzia.
+- `env_clear()` nie powinno cicho blokować config-dir lookupów; allowlista
+  `HOME`/`XDG_*` zachowuje izolację bez wracania do parent `PATH`.
+- Optional upstream deps mogą dalej trafiać do `Cargo.lock` i `cargo audit`,
+  nawet jeśli default build ich nie używa. Oddziel "resolved in our direct
+  stack" od "upstream optional surface waiting for replacement".
+
+**Related.** Closes M-19, M-20, M-21, M-22 z
+`docs/bug-tracker-aicx-followup-pass-3.md`; pass-3 N-10 zostaje user-facing
+known-issue follow-upem dla RSA Marvin statusu.
+
+---
+
+## 2026-05-22 — P3 hygiene sweep: config, regex, docs, redact (N-2..N-10) · `this I-1 commit`
+
+**Symptom.** Pass-3 zostawił osiem P3 hygiene itemów: dashboard cross-search
+memex timeout był zakodowany na 30s, defensywne saturating arithmetic nie miało
+komentarza, date-dir heuristic w state migration był shape-only bez opisu,
+JWT redaction była zbyt szeroka, brakowało Stripe `whsec_*`, lock timeout 60s
+nie miał rationale, a user-facing changelog nie mówił o transitive RSA Marvin
+statusie.
+
+**Root cause.** To nie były pojedyncze runtime awarie, tylko małe drift-punkty:
+konfiguracja siedziała w literalach, shape-only heurystyki były rozproszone po
+state migration i parser segmentation, a redaction lookup-set i replacement
+pipeline nie miały pełnego Stripe webhook coverage.
+
+**Fix.**
+- N-2: `DashboardServerConfig.memex_timeout_secs` + CLI
+  `--memex-timeout-secs` z domyślnym 30s; background dashboard spawn propaguje
+  override.
+- N-3: komentarz przy `parse_relative_time` wyjaśnia saturating arithmetic na
+  adversarial input.
+- N-4/N-5: `looks_like_date_dir` ma doc-comment z edge-case'ami, prywatny
+  shape helper i test; parser `looks_like_date_pattern` dokumentuje alignment
+  compact `YYYY_MMDD` semantics.
+- N-7/N-8: JWT regex dostał bardziej typowe segment length bounds, false-positive
+  fixtures zostają niezmienione, a `whsec_*` trafia do lookup-setu i replacement
+  pipeline.
+- N-9/N-10: lock timeout rationale opisany przy const; CHANGELOG ma `Known
+  Issues` dla RSA Marvin Attack jako optional `rust-memex` transitive surface.
+- N-11: `docs/BACKLOG.md` dostał `[prview] cargo geiger timeout 600s` jako
+  upstream/out-of-scope item.
+
+**Touched.**
+- `src/dashboard_server.rs` — memex timeout config + saturating comment + tests.
+- `src/main.rs` — dashboard CLI timeout flag + background propagation + parse tests.
+- `src/state/migration.rs` — compact date-dir heuristic docs/helper/test.
+- `crates/aicx-parser/src/segmentation.rs` — shared semantics documentation.
+- `src/redact.rs` — JWT bounds + Stripe webhook secret redaction tests.
+- `src/locks.rs` — default timeout rationale.
+- `CHANGELOG.md`, `docs/BACKLOG.md` — user-facing known issue + upstream backlog.
+
+**Tests.** Added targeted unit coverage for dashboard timeout CLI parsing,
+compact date-dir semantics, JWT false-positive non-redaction, and Stripe webhook
+secret redaction. Full gate results recorded in the I-1 worker report.
+
+**Lessons.**
+- Same-commit BUGFIXES entries cannot embed their final Git SHA without a
+  self-referential hash problem; use the existing `this <wave> commit` convention
+  in-file and put the concrete SHA in the dispatch report.
+- Redaction fast-path `RegexSet` must stay in lockstep with every replacement
+  regex, otherwise a new detector may never run.
+
+**Related.** Closes N-2, N-3, N-4, N-5, N-7, N-8, N-9, N-10 z
+`docs/bug-tracker-aicx-followup-pass-3.md`; N-11 tracked in `docs/BACKLOG.md`
+as out-of-scope upstream prview-rs work.

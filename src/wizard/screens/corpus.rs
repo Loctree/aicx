@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::PathBuf;
 
+use crate::sanitize;
 use crate::store::{self, StoredContextFile};
 
 #[derive(Debug, Clone)]
@@ -129,7 +129,7 @@ impl CorpusScreen {
         let Some(entry) = self.entries.get(self.selected) else {
             return "No chunk selected.".to_string();
         };
-        match fs::read_to_string(&entry.path) {
+        match sanitize::read_to_string_validated(&entry.path) {
             Ok(raw) => raw.lines().take(50).collect::<Vec<_>>().join("\n"),
             Err(error) => format!("Failed to read {}: {error}", entry.path.display()),
         }
@@ -192,5 +192,50 @@ fn move_index(current: usize, len: usize, delta: isize) -> usize {
         current.saturating_sub(delta.unsigned_abs()).min(len - 1)
     } else {
         current.saturating_add(delta as usize).min(len - 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, File};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("aicx-corpus-{name}-{id}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn selected_preview_rejects_oversized_chunk_file() {
+        let dir = unique_test_dir("oversized");
+        let path = dir.join("chunk.md");
+        File::create(&path)
+            .unwrap()
+            .set_len((sanitize::MAX_VALIDATED_BYTES + 1) as u64)
+            .unwrap();
+        let screen = CorpusScreen {
+            all_files: Vec::new(),
+            entries: vec![CorpusEntry {
+                label: "oversized".to_string(),
+                path: path.clone(),
+                haystack: String::new(),
+            }],
+            selected: 0,
+            column: CorpusColumn::Chunks,
+            search: String::new(),
+            status: String::new(),
+        };
+
+        let preview = screen.selected_preview();
+
+        assert!(preview.contains("Failed to read"));
+        assert!(preview.contains("exceeds validated read cap"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

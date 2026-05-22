@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 pub const SIPHASH13_ALGORITHM: &str = "siphash13-v1";
-pub const BLAKE3_128_ALGORITHM: &str = "blake3-128-v1";
+pub const BLAKE3_128_ALGORITHM: &str = "blake3-128-v2";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StateMigrationReport {
@@ -33,9 +33,7 @@ pub fn stable_siphasher13() -> SipHasher13 {
 
 pub fn stable_blake3_128(input: &[u8]) -> String {
     let hash = blake3::hash(input);
-    let hex = hash.to_hex();
-    // take 128-bit prefix (16 bytes = 32 hex chars)
-    hex[..32].to_string()
+    hex::encode(&hash.as_bytes()[..16])
 }
 
 pub fn is_legacy_siphash13_algorithm(hash_algorithm: &str) -> bool {
@@ -179,14 +177,23 @@ fn discover_store_buckets(store_root: &Path) -> Result<Vec<String>> {
     Ok(buckets)
 }
 
+/// Returns true for canonical compact store date directories (`YYYY_MMDD`,
+/// e.g. `2026_0521`) so migration bucket discovery skips day buckets.
+///
+/// Shape-only by design: impossible calendar values like `2026_9999` still
+/// count as date-shaped, while full forms (`2026-05-21`, `2026_05_21`) or
+/// names with prefixes/suffixes do not. Keep the `YYYY_MMDD` arm aligned with
+/// `crates/aicx-parser` repo-name date rejection.
 fn looks_like_date_dir(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            name.len() == 9
-                && name.as_bytes().get(4) == Some(&b'_')
-                && name.chars().filter(|ch| ch.is_ascii_digit()).count() == 8
-        })
+        .is_some_and(looks_like_compact_store_date_name)
+}
+
+fn looks_like_compact_store_date_name(name: &str) -> bool {
+    name.len() == 9
+        && name.as_bytes().get(4) == Some(&b'_')
+        && name.chars().filter(|ch| ch.is_ascii_digit()).count() == 8
 }
 
 #[cfg(test)]
@@ -217,6 +224,26 @@ mod tests {
     }
 
     #[test]
+    fn test_blake3_v1_migration_clears_state_on_v2_bump() {
+        let mut state = StateManager {
+            hash_algorithm: "blake3-128-v1".to_string(),
+            ..Default::default()
+        };
+        state
+            .seen_hashes
+            .entry("test".to_string())
+            .or_default()
+            .insert("old-blake3-v1-hash".to_string());
+
+        let report = migrate_loaded_state(&mut state);
+
+        assert!(report.hash_algorithm_changed);
+        assert_eq!(report.cleared_seen_hashes, 1);
+        assert!(state.seen_hashes.is_empty());
+        assert_eq!(state.hash_algorithm, BLAKE3_128_ALGORITHM);
+    }
+
+    #[test]
     fn test_blake3_128_collision_resistance() {
         let mut hashes = std::collections::HashSet::new();
         for i in 0..1000 {
@@ -224,5 +251,31 @@ mod tests {
             let hash = stable_blake3_128(input.as_bytes());
             assert!(hashes.insert(hash));
         }
+    }
+
+    #[test]
+    fn test_blake3_128_matches_hex_prefix_contract() {
+        let input = b"x";
+        let old_prefix_contract = blake3::hash(input).to_hex()[..32].to_string();
+
+        let hash = stable_blake3_128(input);
+
+        assert_eq!(hash, old_prefix_contract);
+        assert_eq!(hash.len(), 32);
+    }
+
+    #[test]
+    fn looks_like_date_dir_matches_compact_store_bucket_shape() {
+        assert!(looks_like_date_dir(Path::new("/store/Org/Repo/2026_0521")));
+        assert!(looks_like_date_dir(Path::new("/store/Org/Repo/2026_9999")));
+        assert!(!looks_like_date_dir(Path::new(
+            "/store/Org/Repo/2026-05-21"
+        )));
+        assert!(!looks_like_date_dir(Path::new(
+            "/store/Org/Repo/2026_05_21"
+        )));
+        assert!(!looks_like_date_dir(Path::new(
+            "/store/Org/Repo/release-2026_0521"
+        )));
     }
 }

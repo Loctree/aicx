@@ -10,10 +10,12 @@ use aicx::auth::{self, AuthConfig, AuthSource};
 use axum::{
     Router,
     body::Body,
+    extract::ConnectInfo,
     http::{Request, StatusCode, header::AUTHORIZATION},
     routing::get,
 };
 use http_body_util::BodyExt;
+use std::net::SocketAddr;
 use tower::ServiceExt;
 
 fn auth_on(token: &str) -> AuthConfig {
@@ -30,6 +32,17 @@ fn build_protected_api_router(token: &str) -> Router {
     auth::require_auth_layer(api, auth_on(token))
 }
 
+fn request(uri: &str, bearer: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder().uri(uri);
+    if let Some(token) = bearer {
+        builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let mut req = builder.body(Body::empty()).expect("request");
+    let peer: SocketAddr = "127.0.0.1:49152".parse().expect("peer addr");
+    req.extensions_mut().insert(ConnectInfo(peer));
+    req
+}
+
 async fn body_to_string(resp: axum::response::Response) -> String {
     let bytes = resp
         .into_body()
@@ -44,12 +57,7 @@ async fn body_to_string(resp: axum::response::Response) -> String {
 async fn test_dashboard_api_browse_without_token_401() {
     let app = build_protected_api_router("right-token");
     let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/browse")
-                .body(Body::empty())
-                .expect("request"),
-        )
+        .oneshot(request("/api/browse", None))
         .await
         .expect("oneshot");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -61,13 +69,7 @@ async fn test_dashboard_api_browse_without_token_401() {
 async fn test_dashboard_api_browse_with_wrong_token_returns_401_same_shape() {
     let app = build_protected_api_router("right-token");
     let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/browse")
-                .header(AUTHORIZATION, "Bearer wrong-token")
-                .body(Body::empty())
-                .expect("request"),
-        )
+        .oneshot(request("/api/browse", Some("wrong-token")))
         .await
         .expect("oneshot");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -79,16 +81,42 @@ async fn test_dashboard_api_browse_with_wrong_token_returns_401_same_shape() {
 }
 
 #[tokio::test]
+async fn test_dashboard_api_browse_with_wrong_length_token_returns_401_same_shape() {
+    let app = build_protected_api_router("right-token");
+    let response = app
+        .oneshot(request("/api/browse", Some("short")))
+        .await
+        .expect("oneshot");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = body_to_string(response).await;
+    assert_eq!(body, r#"{"error":"unauthorized"}"#);
+}
+
+#[tokio::test]
+async fn test_invalid_bearer_burst_rate_limited_after_threshold() {
+    let app = build_protected_api_router("right-token");
+
+    for _ in 0..100 {
+        let response = app
+            .clone()
+            .oneshot(request("/api/browse", Some("wrong-token")))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let response = app
+        .oneshot(request("/api/browse", Some("wrong-token")))
+        .await
+        .expect("oneshot");
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
 async fn test_dashboard_correct_token_passes() {
     let app = build_protected_api_router("right-token");
     let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/browse")
-                .header(AUTHORIZATION, "Bearer right-token")
-                .body(Body::empty())
-                .expect("request"),
-        )
+        .oneshot(request("/api/browse", Some("right-token")))
         .await
         .expect("oneshot");
     assert_eq!(response.status(), StatusCode::OK);
@@ -103,12 +131,7 @@ async fn test_disabled_auth_does_not_gate_requests() {
         AuthConfig::disabled(),
     );
     let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/browse")
-                .body(Body::empty())
-                .expect("request"),
-        )
+        .oneshot(request("/api/browse", None))
         .await
         .expect("oneshot");
     assert_eq!(response.status(), StatusCode::OK);

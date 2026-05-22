@@ -590,11 +590,17 @@ impl AicxMcpServer {
         }
     }
 
+    fn embedder_unavailable_guard(&self) -> std::sync::MutexGuard<'_, Option<Instant>> {
+        self.embedder_unavailable_until.lock().expect(
+            "embedder_unavailable_until mutex poisoned; negative-cache state is only mutated by AicxMcpServer",
+        )
+    }
+
     /// D-6: returns remaining negative-cache TTL when the embedder was
     /// flagged unavailable. Side effect: lazily clears the entry when it
     /// has expired so a subsequent retry hits the embedder again.
     fn embedder_negative_cache_remaining(&self, now: Instant) -> Option<Duration> {
-        let mut guard = self.embedder_unavailable_until.lock().unwrap();
+        let mut guard = self.embedder_unavailable_guard();
         match *guard {
             Some(until) if until > now => Some(until.duration_since(now)),
             Some(_) => {
@@ -608,7 +614,7 @@ impl AicxMcpServer {
     /// D-6: arm the negative cache for `ttl` from `now`. Called after a
     /// real embedder failure so subsequent requests fail-fast.
     fn mark_embedder_unavailable(&self, now: Instant, ttl: Duration) {
-        let mut guard = self.embedder_unavailable_until.lock().unwrap();
+        let mut guard = self.embedder_unavailable_guard();
         *guard = Some(now + ttl);
     }
 
@@ -1106,7 +1112,7 @@ impl AicxMcpServer {
                 results: items.len(),
                 items,
             })
-            .unwrap()
+            .map_err(|e| McpError::internal_error(format!("Serialize steer JSON: {e}"), None))?
         } else {
             serde_json::to_string(&SteerResponse {
                 oracle_status,
@@ -1358,9 +1364,12 @@ pub async fn run_http(port: u16, auth_config: AuthConfig) -> anyhow::Result<()> 
         );
     }
 
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP HTTP server error: {e}"))
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("MCP HTTP server error: {e}"))
 }
 
 /// Legacy compatibility wrapper for callers that still use the old `run_sse` name.
@@ -1547,6 +1556,23 @@ mod tests {
     }
 
     #[test]
+    fn steer_response_with_nan_score_serializes_without_panic() {
+        let json = serde_json::to_string(&SteerResponse {
+            oracle_status: OracleStatus::metadata_steer(std::path::Path::new("/tmp"), 1, 1, true),
+            results: 1,
+            items: vec![serde_json::json!({
+                "path": "/tmp/chunk.md",
+                "score": f32::NAN,
+            })],
+        })
+        .expect("serde_json normalizes non-finite Value numbers instead of panicking");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&json).expect("steer JSON should parse");
+        assert!(payload["items"][0]["score"].is_null());
+    }
+
+    #[test]
     fn search_params_roundtrip_include_new_optional_filters() {
         let params: SearchParams =
             serde_json::from_str(r#"{"query":"dashboard"}"#).expect("search params should parse");
@@ -1623,7 +1649,7 @@ mod tests {
         let server = AicxMcpServer::new();
         let now = Instant::now();
         {
-            let mut guard = server.embedder_unavailable_until.lock().unwrap();
+            let mut guard = server.embedder_unavailable_guard();
             *guard = Some(now + MCP_EMBEDDER_NEGATIVE_TTL);
         }
 

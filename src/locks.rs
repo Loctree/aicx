@@ -11,9 +11,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Default lock wait budget. Pass-2 raised this from 5s to 60s to avoid false
+/// failures during slow store/index operations, accepting a longer visible
+/// freeze when a lock holder is genuinely stuck.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 const STALE_AFTER: Duration = Duration::from_secs(60);
 const RETRY_DELAY: Duration = Duration::from_millis(25);
@@ -27,18 +31,26 @@ enum LockMode {
 #[derive(Debug)]
 pub struct LockHandle {
     file: File,
-    holder_sidecar: Option<PathBuf>,
+    holder_sidecar: Option<HolderSidecar>,
     local_guard: Option<LocalGuard>,
 }
 
 impl Drop for LockHandle {
     fn drop(&mut self) {
-        if let Some(path) = &self.holder_sidecar {
-            let _ = fs::remove_file(path);
+        if let Some(sidecar) = &self.holder_sidecar
+            && holder_sidecar_belongs_to_handle(sidecar)
+        {
+            let _ = fs::remove_file(&sidecar.path);
         }
         let _ = fcntl_unlock(&self.file);
         self.local_guard.take();
     }
+}
+
+#[derive(Debug)]
+struct HolderSidecar {
+    path: PathBuf,
+    token: String,
 }
 
 pub fn acquire_exclusive(path: impl AsRef<Path>) -> Result<LockHandle> {
@@ -131,11 +143,12 @@ fn acquire_with_timeout(path: &Path, mode: LockMode, timeout: Duration) -> Resul
     }
 }
 
-fn write_holder(file: &mut File, path: &Path, mode: LockMode) -> Result<Option<PathBuf>> {
+fn write_holder(file: &mut File, path: &Path, mode: LockMode) -> Result<Option<HolderSidecar>> {
     let holder = Holder::new(
         std::process::id(),
         SystemTime::now(),
         holder_run_kind(path, mode),
+        mode,
     );
     let should_write_sidecar = should_write_holder_sidecar(path, mode);
     if should_write_sidecar {
@@ -180,14 +193,18 @@ struct Holder {
     pid: u32,
     timestamp: DateTime<Utc>,
     run_kind: String,
+    mode: LockMode,
+    token: String,
 }
 
 impl Holder {
-    fn new(pid: u32, timestamp: SystemTime, run_kind: &str) -> Self {
+    fn new(pid: u32, timestamp: SystemTime, run_kind: &str, mode: LockMode) -> Self {
         Self {
             pid,
             timestamp: DateTime::<Utc>::from(timestamp),
             run_kind: run_kind.to_string(),
+            mode,
+            token: new_holder_token(pid, timestamp, mode),
         }
     }
 
@@ -215,6 +232,8 @@ fn parse_holder_sidecar(contents: &str) -> Result<Option<Holder>> {
     let mut pid = None;
     let mut timestamp = None;
     let mut run_kind = None;
+    let mut mode = None;
+    let mut token = None;
     for line in contents.lines() {
         if let Some(value) = line.strip_prefix("pid=") {
             pid = value.trim().parse::<u32>().ok();
@@ -224,6 +243,10 @@ fn parse_holder_sidecar(contents: &str) -> Result<Option<Holder>> {
                 .map(|ts| ts.with_timezone(&Utc));
         } else if let Some(value) = line.strip_prefix("run_kind=") {
             run_kind = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("mode=") {
+            mode = LockMode::from_sidecar_value(value.trim());
+        } else if let Some(value) = line.strip_prefix("token=") {
+            token = Some(value.trim().to_string());
         }
     }
 
@@ -232,24 +255,31 @@ fn parse_holder_sidecar(contents: &str) -> Result<Option<Holder>> {
             pid,
             timestamp,
             run_kind: run_kind.unwrap_or_else(|| "unknown".to_string()),
+            mode: mode.unwrap_or(LockMode::Exclusive),
+            token: token.unwrap_or_default(),
         }),
         _ => None,
     })
 }
 
-fn write_holder_sidecar(path: &Path, holder: &Holder) -> Result<Option<PathBuf>> {
+fn write_holder_sidecar(path: &Path, holder: &Holder) -> Result<Option<HolderSidecar>> {
     let Some(sidecar) = holder_sidecar_path(path) else {
         return Ok(None);
     };
     let content = format!(
-        "pid={}\ntimestamp={}\nrun_kind={}\n",
+        "pid={}\ntimestamp={}\nrun_kind={}\nmode={}\ntoken={}\n",
         holder.pid,
         holder.timestamp.to_rfc3339_opts(SecondsFormat::Secs, true),
-        holder.run_kind
+        holder.run_kind,
+        holder.mode.sidecar_value(),
+        holder.token
     );
     crate::store::atomic_write::atomic_write(&sidecar, content.as_bytes())
         .with_context(|| format!("write lock holder sidecar: {}", sidecar.display()))?;
-    Ok(Some(sidecar))
+    Ok(Some(HolderSidecar {
+        path: sidecar,
+        token: holder.token.clone(),
+    }))
 }
 
 fn holder_sidecar_path(path: &Path) -> Option<PathBuf> {
@@ -259,18 +289,21 @@ fn holder_sidecar_path(path: &Path) -> Option<PathBuf> {
 }
 
 fn should_write_holder_sidecar(path: &Path, mode: LockMode) -> bool {
-    mode == LockMode::Exclusive && is_lance_lock_path(path)
-}
-
-fn is_lance_lock_path(path: &Path) -> bool {
-    path.file_name().is_some_and(|name| name == "lance.lock")
+    // Sidecar identifies the BLOCKING holder for timeout-waiting acquirers.
+    // Multiple shared holders racing on a single sidecar token would have
+    // one cleanup wipe the file while siblings still hold — making
+    // diagnostics unreliable. Exclusive-only keeps the contract honest.
+    matches!(mode, LockMode::Exclusive) && path.file_name().is_some()
 }
 
 fn holder_run_kind(path: &Path, mode: LockMode) -> &'static str {
-    if should_write_holder_sidecar(path, mode) {
-        "aicx index"
-    } else {
-        "unknown"
+    let _ = mode;
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some("lance.lock" | "index.lock") => "aicx index",
+        Some("state.lock") => "aicx state",
+        Some("steer.lock") => "aicx steer",
+        Some("mcp.lock") => "aicx mcp",
+        _ => "unknown",
     }
 }
 
@@ -280,10 +313,6 @@ enum TimeoutAction {
 }
 
 fn handle_lock_timeout(path: &Path, mode: LockMode) -> Result<TimeoutAction> {
-    if !is_lance_lock_path(path) {
-        return Ok(TimeoutAction::Fail(lock_timeout_error(path, mode)));
-    }
-
     let Some(holder) = read_holder_sidecar(path)? else {
         return Ok(TimeoutAction::Fail(lock_timeout_error(path, mode)));
     };
@@ -323,6 +352,27 @@ fn lock_timeout_error(path: &Path, mode: LockMode) -> anyhow::Error {
 
 fn recovered_stale_dead_message(holder: &Holder) -> String {
     format!("recovered stale lock from dead PID {}", holder.pid)
+}
+
+static HOLDER_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn new_holder_token(pid: u32, timestamp: SystemTime, mode: LockMode) -> String {
+    let nanos = timestamp
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let counter = HOLDER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{}-{}-{}", pid, mode.sidecar_value(), nanos, counter)
+}
+
+fn holder_sidecar_belongs_to_handle(sidecar: &HolderSidecar) -> bool {
+    let Ok(contents) = fs::read_to_string(&sidecar.path) else {
+        return false;
+    };
+    let Ok(Some(holder)) = parse_holder_sidecar(&contents) else {
+        return false;
+    };
+    holder.token == sidecar.token
 }
 
 fn age_minutes(age: Duration) -> u64 {
@@ -398,6 +448,21 @@ impl LockMode {
         match self {
             LockMode::Shared => "shared",
             LockMode::Exclusive => "exclusive",
+        }
+    }
+
+    fn sidecar_value(self) -> &'static str {
+        match self {
+            LockMode::Shared => "shared",
+            LockMode::Exclusive => "exclusive",
+        }
+    }
+
+    fn from_sidecar_value(value: &str) -> Option<Self> {
+        match value {
+            "shared" => Some(LockMode::Shared),
+            "exclusive" => Some(LockMode::Exclusive),
+            _ => None,
         }
     }
 }
@@ -541,6 +606,23 @@ mod tests {
         path
     }
 
+    fn temp_named_lock(name: &str, file_name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aicx-named-lock-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(file_name);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(holder_sidecar_path(&path).unwrap());
+        path
+    }
+
     struct ForcedWouldBlockGuard;
 
     impl ForcedWouldBlockGuard {
@@ -642,6 +724,46 @@ mod tests {
         assert!(contents.contains("timestamp="));
         assert!(contents.contains("T"));
         assert!(contents.contains("run_kind=aicx index"));
+        assert!(contents.contains("mode=exclusive"));
+        assert!(contents.contains("token="));
+        release(handle);
+        assert!(!sidecar.exists());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn non_lance_exclusive_lock_writes_sidecar_and_cleans_up_on_release() {
+        let path = temp_named_lock("state-sidecar", "state.lock");
+        let sidecar = holder_sidecar_path(&path).unwrap();
+        let handle = acquire_exclusive(&path).expect("acquire state lock");
+
+        let contents = fs::read_to_string(&sidecar).expect("holder sidecar");
+        assert!(contents.contains(&format!("pid={}", std::process::id())));
+        assert!(contents.contains("run_kind=aicx state"));
+        assert!(contents.contains("mode=exclusive"));
+
+        release(handle);
+        assert!(!sidecar.exists());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn shared_lock_does_not_write_sidecar() {
+        // Per PR #6 review (Copilot): shared locks do NOT write holder
+        // sidecars. Concurrent shared acquirers would race on the same
+        // sidecar token, letting one releaser wipe the file while siblings
+        // still hold — making timeout diagnostics for waiting exclusive
+        // acquirers unreliable. Sidecars are exclusive-only.
+        let path = temp_named_lock("mcp-shared-no-sidecar", "mcp.lock");
+        let sidecar = holder_sidecar_path(&path).unwrap();
+        let handle = acquire_shared(&path).expect("acquire shared mcp lock");
+
+        assert!(
+            !sidecar.exists(),
+            "shared lock unexpectedly wrote holder sidecar at {}",
+            sidecar.display()
+        );
+
         release(handle);
         assert!(!sidecar.exists());
         let _ = fs::remove_dir_all(path.parent().unwrap());
@@ -655,6 +777,7 @@ mod tests {
             dead_pid,
             SystemTime::now() - Duration::from_secs(125),
             "aicx index",
+            LockMode::Exclusive,
         );
         write_holder_sidecar(&path, &holder).expect("write stale holder");
 
@@ -678,6 +801,7 @@ mod tests {
             std::process::id(),
             SystemTime::now() - Duration::from_secs(125),
             "aicx index",
+            LockMode::Exclusive,
         );
         write_holder_sidecar(&path, &holder).expect("write alive holder");
 

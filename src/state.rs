@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::sanitize;
 use crate::store::atomic_write::atomic_write;
 
 pub mod migration;
@@ -192,7 +193,11 @@ impl StateManager {
         }
 
         let backup_path = Self::backup_path(path);
-        let contents = fs::read_to_string(path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        // state.json uses a dedicated, larger cap than the generic 8 MiB
+        // validated-read limit — long-lived installs legitimately grow
+        // `seen_hashes` / run history past that. See
+        // [`sanitize::read_state_json_validated`].
+        let contents = sanitize::read_state_json_validated(path)
             .with_context(|| format!("Failed to read state file: {}", path.display()))?;
 
         let state: Self =
@@ -205,11 +210,11 @@ impl StateManager {
                         "state.json parse failed"
                     );
                     if backup_path.exists() {
-                        let backup = fs::read_to_string(&backup_path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+                        let backup = sanitize::read_state_json_validated(&backup_path)
                             .with_context(|| {
                                 format!("Failed to read state backup: {}", backup_path.display())
                             })?;
-                        Self::deserialize_and_migrate_contents(
+                        let recovered = Self::deserialize_and_migrate_contents(
                             &backup_path,
                             &backup,
                             &mut warn_legacy,
@@ -218,7 +223,9 @@ impl StateManager {
                             anyhow!(
                                 "state.json malformed AND backup unreadable: {err} / {backup_err}"
                             )
-                        })?
+                        })?;
+                        recovered.save_recovered_backup_to_primary(path)?;
+                        recovered
                     } else {
                         return Err(anyhow!(
                             "state.json corrupted, no backup; manual recovery needed: {}",
@@ -228,6 +235,21 @@ impl StateManager {
                 }
             };
         Ok(state)
+    }
+
+    fn save_recovered_backup_to_primary(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create config dir: {}", parent.display()))?;
+        }
+        let json = serde_json::to_string_pretty(self).context("Failed to serialize state")?;
+        atomic_write(path, json.as_bytes()).with_context(|| {
+            format!(
+                "Failed to self-heal state file from backup: {}",
+                path.display()
+            )
+        })?;
+        Ok(())
     }
 
     fn deserialize_and_migrate_contents<W>(
@@ -255,24 +277,28 @@ impl StateManager {
     fn deserialize_current_or_legacy_siphash(
         contents: &str,
     ) -> std::result::Result<(Self, bool), serde_json::Error> {
-        match serde_json::from_str(contents) {
+        // Fast path: try strict deserialization directly from the string. This
+        // avoids the cost of a full `serde_json::Value` DOM allocation on every
+        // non-legacy load (the common case). Only fall through to the Value
+        // path when the strict shape fails — that's the legacy-detection branch
+        // and we need the parsed Value to inspect `hash_algorithm` anyway.
+        match serde_json::from_str::<Self>(contents) {
             Ok(state) => Ok((state, false)),
             Err(strict_err) => {
-                if !Self::is_legacy_siphash_state_json(contents) {
-                    return Err(strict_err);
+                let value: serde_json::Value =
+                    serde_json::from_str(contents).map_err(|_| strict_err)?;
+                if !Self::is_legacy_siphash_state_value(&value) {
+                    // Re-borrow strict_err is moved into the map_err above; rebuild it.
+                    return Err(serde_json::from_str::<Self>(contents).unwrap_err());
                 }
-
-                serde_json::from_str::<LegacySiphashStateManager>(contents)
+                serde_json::from_value::<LegacySiphashStateManager>(value)
                     .map(|legacy| (legacy.into_current_state(), true))
-                    .map_err(|_| strict_err)
+                    .map_err(|_| serde_json::from_str::<Self>(contents).unwrap_err())
             }
         }
     }
 
-    fn is_legacy_siphash_state_json(contents: &str) -> bool {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(contents) else {
-            return false;
-        };
+    fn is_legacy_siphash_state_value(value: &serde_json::Value) -> bool {
         value
             .get("hash_algorithm")
             .and_then(|algorithm| algorithm.as_str())
@@ -368,11 +394,8 @@ impl StateManager {
     /// identification. Session ID is excluded because Claude Code stores
     /// the same user message in multiple session JSONL files.
     pub fn content_hash(agent: &str, timestamp: i64, message: &str) -> String {
-        let mut data = Vec::new();
-        data.extend_from_slice(agent.as_bytes());
-        data.extend_from_slice(&timestamp.to_le_bytes());
-        data.extend_from_slice(message.as_bytes());
-        migration::stable_blake3_128(&data)
+        let timestamp = timestamp.to_le_bytes();
+        Self::stable_hash_fields(&[agent.as_bytes(), &timestamp, message.as_bytes()])
     }
 
     /// Compute an overlap hash for cross-agent dedup.
@@ -387,10 +410,19 @@ impl StateManager {
     /// different agents collapse into one.
     pub fn overlap_hash(timestamp: i64, message: &str) -> String {
         let bucket = timestamp / 60; // 60-second window
-        let mut data = Vec::new();
-        data.extend_from_slice(&bucket.to_le_bytes());
-        data.extend_from_slice(message.as_bytes());
-        migration::stable_blake3_128(&data)
+        let bucket = bucket.to_le_bytes();
+        Self::stable_hash_fields(&[&bucket, message.as_bytes()])
+    }
+
+    fn stable_hash_fields(fields: &[&[u8]]) -> String {
+        // Incremental blake3 hashing avoids intermediate Vec allocation for large messages.
+        let mut hasher = blake3::Hasher::new();
+        for field in fields {
+            hasher.update(&(field.len() as u64).to_le_bytes());
+            hasher.update(field);
+        }
+        // 128-bit prefix (16 bytes = 32 hex chars) — matches `migration::stable_blake3_128` contract.
+        hex::encode(&hasher.finalize().as_bytes()[..16])
     }
 
     /// Returns `true` if this hash has NOT been seen before for the given project.
@@ -571,6 +603,31 @@ mod tests {
     }
 
     #[test]
+    fn test_content_hash_separates_legacy_concat_collision() {
+        fn legacy_content_hash(agent: &str, timestamp: i64, message: &str) -> String {
+            let mut data = Vec::new();
+            data.extend_from_slice(agent.as_bytes());
+            data.extend_from_slice(&timestamp.to_le_bytes());
+            data.extend_from_slice(message.as_bytes());
+            migration::stable_blake3_128(&data)
+        }
+
+        let left = ("a\0\0\0\0\0\0\0\0", 0, "bc");
+        let right = ("a", 0, "\0\0\0\0\0\0\0\0bc");
+
+        assert_eq!(
+            legacy_content_hash(left.0, left.1, left.2),
+            legacy_content_hash(right.0, right.1, right.2),
+            "legacy raw concatenation should demonstrate the split collision"
+        );
+        assert_ne!(
+            StateManager::content_hash(left.0, left.1, left.2),
+            StateManager::content_hash(right.0, right.1, right.2),
+            "field boundaries should split the triples"
+        );
+    }
+
+    #[test]
     fn test_overlap_hash_ignores_agent() {
         let prompt = "Deploy the new auth module to staging and run integration tests";
         let ts = 1700000000i64;
@@ -607,6 +664,21 @@ mod tests {
         let h1 = StateManager::overlap_hash(ts, "prompt A");
         let h2 = StateManager::overlap_hash(ts, "prompt B");
         assert_ne!(h1, h2, "different message → different overlap hash");
+    }
+
+    #[test]
+    fn test_overlap_hash_uses_field_boundary_between_bucket_and_message() {
+        let timestamp = 0i64;
+        let message = "broadcast prompt";
+        let mut legacy_data = Vec::new();
+        legacy_data.extend_from_slice(&(timestamp / 60).to_le_bytes());
+        legacy_data.extend_from_slice(message.as_bytes());
+
+        assert_ne!(
+            StateManager::overlap_hash(timestamp, message),
+            migration::stable_blake3_128(&legacy_data),
+            "overlap hash should move off the legacy raw-concat byte stream"
+        );
     }
 
     #[test]
@@ -725,6 +797,13 @@ mod tests {
 
         assert_eq!(loaded.get_watermark("claude:test"), Some(ts(20)));
         assert!(!loaded.is_new("project", "202"));
+        let repaired_primary: StateManager =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(repaired_primary.get_watermark("claude:test"), Some(ts(20)));
+        assert!(!repaired_primary.is_new("project", "202"));
+        let repaired = StateManager::load_from_path(&path).unwrap();
+        assert_eq!(repaired.get_watermark("claude:test"), Some(ts(20)));
+        assert!(!repaired.is_new("project", "202"));
         cleanup_state_path(&path);
     }
 

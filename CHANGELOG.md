@@ -5,12 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+### Breaking
+
+- state.json hash algorithm is now `blake3-128-v2` with length-prefixed
+  field encoding (closes the raw-concat hash-splitting risk). Any older
+  state — including legacy `siphash13-v1` (introduced in pass-2 G-1) and
+  any interim `blake3-128-v1` builds — is treated as a legacy cache:
+  current code migrates directly to `v2` on load and clears
+  `seen_hashes` once. After upgrade, the first `aicx store` will
+  re-process the recent `-H` window once. No data loss, but timeline
+  may show duplicates if a parallel ingest is running.
+
 ### Added
 - `aicx extract` batch conversation export command for emitting multiple
   session transcripts in a single pass without writing to the canonical store.
 - `extract --conversation` output now carries `message_kind` and
   `collapse_stub_kind` metadata per message and surfaces extract
   statistics in the JSON projection.
+- `aicx-monitor` crate for live CPU, RAM, GPU, and embedder process telemetry
+  snapshots during long-running aicx pipelines.
+- `aicx-progress-contracts` crate for shared indexing progress event contracts,
+  telemetry snapshots, and sink traits across producers and UI consumers.
 - Explicit `-p` filter syntax for `aicx index` and `aicx search`:
   `-p owner/repo` (strict slug), `-p owner/` (org wildcard),
   `-p /repo` (cross-org repo wildcard), `-p name` (cross-org match on
@@ -104,6 +119,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Secret redaction now catches inline assignments such as
   `BRAVE_API_KEY="…"` or `api_key = "…"` embedded in prose and code
   spans, not only line-start environment declarations.
+
+### Known Issues
+
+- `cargo audit` still reports the RSA Marvin Attack advisory through the
+  optional `rust-memex` transitive dependency surface. AICX does not use that
+  RSA path as its own crypto hot path; the ignore rationale is tracked in
+  `cargo-audit.toml` / `.cargo/audit.toml` until the upstream dependency stack
+  clears it.
 
 ## [0.8.0] - 2026-05-15
 

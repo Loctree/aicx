@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::oracle::OracleReadiness;
+use crate::sanitize;
 use crate::steer_index;
 use crate::store;
 use crate::validation::{is_valid_repo_bucket_name, is_valid_repo_project_slug};
@@ -602,7 +603,7 @@ fn check_index_consistency(base: &Path) -> CheckResult {
             },
         };
     }
-    let raw = match std::fs::read_to_string(&index_path) {
+    let raw = match sanitize::read_to_string_validated(&index_path) {
         Ok(raw) => raw,
         Err(err) => {
             return CheckResult {
@@ -952,7 +953,7 @@ fn check_state(base: &Path) -> CheckResult {
             recommendation: Some("Will be created on first `aicx store` run".to_string()),
         };
     }
-    let raw = match std::fs::read_to_string(&state_path) {
+    let raw = match sanitize::read_to_string_validated(&state_path) {
         Ok(s) => s,
         Err(e) => {
             return CheckResult {
@@ -1152,7 +1153,7 @@ fn empty_body_report(base: &Path) -> EmptyBodyReport {
         if file.path.extension().and_then(|ext| ext.to_str()) != Some("md") {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&file.path) else {
+        let Ok(content) = sanitize::read_to_string_validated(&file.path) else {
             continue;
         };
         if !chunk_body_is_empty(&content) && chunk_body_after_header(&content).trim().len() >= 50 {
@@ -1326,7 +1327,8 @@ fn empty_body_quarantine_root(base: &Path, timestamp: &str) -> PathBuf {
 }
 
 fn empty_body_quarantine_timestamp() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    // Match `quarantine_bucket` pattern; RFC3339 with `:` breaks Windows path components.
+    chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string()
 }
 
 pub fn render_rebuild_sidecars_script(base: &Path) -> Result<String> {

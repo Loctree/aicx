@@ -598,7 +598,7 @@ fn load_index_at(base: &Path) -> Result<StoreIndex> {
 }
 
 fn read_and_parse_index(path: &Path) -> Result<StoreIndex> {
-    let contents = fs::read_to_string(path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let contents = sanitize::read_to_string_validated(path)
         .with_context(|| format!("read failed: {}", path.display()))?;
     serde_json::from_str(&contents).with_context(|| format!("parse failed: {}", path.display()))
 }
@@ -1383,7 +1383,7 @@ pub fn sidecar_path_for_chunk(chunk_path: &Path) -> PathBuf {
 
 fn load_sidecar_from_path(sidecar_path: &Path) -> Option<chunker::ChunkMetadataSidecar> {
     let sidecar_path = sanitize::validate_read_path(sidecar_path).ok()?;
-    let content = fs::read_to_string(&sidecar_path).ok()?;
+    let content = sanitize::read_to_string_validated(&sidecar_path).ok()?;
     serde_json::from_str(&content).ok()
 }
 

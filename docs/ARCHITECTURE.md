@@ -33,14 +33,16 @@ flowchart TD
 ## Module Map (Codebase Mapping)
 
 Library modules (see `src/lib.rs`):
+Parser-owned entries use their current crate paths; the old root-crate module
+locations are retired.
 
 - `src/sources.rs`: source discovery + extraction
 - `src/state.rs`: dedup hashes + incremental watermarks
 - `src/store.rs`: canonical store layout under `~/.aicx/` + `index.json`
-- `src/chunker.rs`: semantic windowing chunker (token heuristic + overlap + highlight extraction)
+- `crates/aicx-parser/src/chunker.rs`: semantic windowing chunker (token heuristic + overlap + highlight extraction)
 - `src/output.rs`: local report writer (`-o`) + optional loctree snapshot inclusion
 - `src/redact.rs`: secret redaction (regex engine)
-- `src/sanitize.rs`: path validation for reads/writes (defense against traversal)
+- `crates/aicx-parser/src/sanitize.rs`: path validation for reads/writes (defense against traversal)
 - `src/steer_index.rs`: fast metadata index for steering-aware retrieval
 - `src/reports_extractor.rs`: scans `~/.vibecrafted/artifacts` and renders a standalone HTML/JSON dossier for workflow and marbles artifact review
 - `crates/aicx-embeddings`: reusable local GGUF embedding provider library
@@ -82,6 +84,16 @@ Note on heavy retrieval:
   canonical store externally.
 - AICX native embeddings are exposed as a reusable library, not as an automatic
   background indexing daemon.
+
+Dashboard cross-search still has one legacy external boundary:
+`/api/search/cross` shells out to the resolved absolute `rust-memex` or
+`rmcp-memex` binary. The spawn environment is intentionally cleared, then only
+`HOME`, `XDG_CONFIG_HOME`, and `XDG_DATA_HOME` are passed through for config-dir
+resolution. `PATH` is never passed; the binary must be resolved before
+`env_clear()` so a user-controlled `PATH` cannot change what gets executed.
+If the memex CLI becomes fully self-contained, these variables may be absent and
+the child process must still fail with a normal command error, not by inheriting
+the parent environment.
 
 Framework note:
 - Repo-local `.ai-context/` artifacts are now owned by higher-level workflow tooling such as `/vc-init`, not by the retired `aicx init` flow.
@@ -130,7 +142,7 @@ Recency filtering in `aicx_search` and `aicx_steer` uses canonical chunk dates f
 ## Security Model (Pragmatic)
 
 Two mechanisms protect your machine and your data:
-- Path validation (read/write) in `src/sanitize.rs`.
+- Path validation (read/write) in `crates/aicx-parser/src/sanitize.rs`.
 - Best-effort secret redaction in `src/redact.rs` (enabled by default).
 
 Redaction is conservative by design: it’s OK to over-redact sometimes; it’s not OK to leak tokens into committed artifacts. The flag lives only on corpus-building commands that create or rewrite artifacts, not on read-only search and steering surfaces.

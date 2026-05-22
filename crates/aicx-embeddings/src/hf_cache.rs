@@ -158,6 +158,24 @@ fn find_snapshot_in_base(base: &Path, repo: &str, filename: &str) -> Result<Path
     }
 }
 
+/// Verify that `path` is a non-empty regular file. Returns the failure
+/// reason so callers can build a precise partial-cache error.
+fn validate_cache_file(path: &Path) -> Result<(), String> {
+    let metadata = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) => {
+            return Err(format!("cannot stat cache file: {err}"));
+        }
+    };
+    if !metadata.is_file() {
+        return Err("entry is not a regular file".to_string());
+    }
+    if metadata.len() == 0 {
+        return Err("cache file is 0 bytes (likely truncated download)".to_string());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,22 +242,4 @@ mod tests {
             }
         }
     }
-}
-
-/// Verify that `path` is a non-empty regular file. Returns the failure
-/// reason so callers can build a precise partial-cache error.
-fn validate_cache_file(path: &Path) -> Result<(), String> {
-    let metadata = match fs::metadata(path) {
-        Ok(meta) => meta,
-        Err(err) => {
-            return Err(format!("cannot stat cache file: {err}"));
-        }
-    };
-    if !metadata.is_file() {
-        return Err("entry is not a regular file".to_string());
-    }
-    if metadata.len() == 0 {
-        return Err("cache file is 0 bytes (likely truncated download)".to_string());
-    }
-    Ok(())
 }

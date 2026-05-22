@@ -124,9 +124,9 @@ impl Manifest {
         }
 
         if self.lexical_commit_id != other.lexical_commit_id {
-            return Err(ManifestError::GenerationMismatch {
-                lexical_gen: self.lexical_commit_id.clone(),
-                dense_gen: other.lexical_commit_id.clone(),
+            return Err(ManifestError::LexicalCommitMismatch {
+                expected: self.lexical_commit_id.clone(),
+                actual: other.lexical_commit_id.clone(),
             });
         }
 
