@@ -199,6 +199,34 @@ fn test_extract_claude_file_parses_text_only_blocks() {
 }
 
 #[test]
+fn test_watermark_filter_drops_only_strictly_lt() {
+    let root = unique_test_dir("watermark-strict-lt");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"type":"user","message":{"role":"user","content":"before watermark"},"timestamp":"2026-02-01T00:00:00Z","sessionId":"sess-watermark","cwd":"/tmp/aicx"}
+{"type":"user","message":{"role":"user","content":"at watermark"},"timestamp":"2026-02-01T00:00:01Z","sessionId":"sess-watermark","cwd":"/tmp/aicx"}
+{"type":"user","message":{"role":"user","content":"after watermark"},"timestamp":"2026-02-01T00:00:02Z","sessionId":"sess-watermark","cwd":"/tmp/aicx"}"#;
+    write_file(&tmp, content);
+
+    let watermark = Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 1).single().unwrap();
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: Some(watermark),
+    };
+
+    let entries = extract_claude_file(&tmp, &config).unwrap();
+    let messages: Vec<_> = entries.iter().map(|entry| entry.message.as_str()).collect();
+
+    assert_eq!(messages, vec!["at watermark", "after watermark"]);
+    assert!(entries.iter().all(|entry| entry.timestamp >= watermark));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn test_extract_claude_file_classifies_frame_kinds_from_fixture() {
     let root = unique_test_dir("claude-frame-kind");
     let tmp = root.join("session.jsonl");

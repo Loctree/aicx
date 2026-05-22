@@ -2489,3 +2489,44 @@ emitowac dopiero po wyczerpaniu alternatyw, z numerem linii i malym snippetem,
 zeby operator mogl znalezc konkretna uszkodzona linie bez zalewania logu.
 
 **Related.** Closes bug #2 narrowed Codex scope z pass-4 Wave C-1.
+
+---
+
+## 2026-05-22 — watermark strict less-than boundary (#7) · `this D-3 commit`
+
+**Symptom.** Incremental extractory traktowaly wpis o timestampie rownym
+watermarkowi jako juz widziany. Przy kolizji timestampu na granicy runow nowy
+wpis z tym samym sekundowym/milisekundowym stemplem byl cicho odrzucany zanim
+doszedl do dedupu.
+
+**Root cause.** Dwanaście read-side filtrow watermarku w `src/sources.rs`
+uzywalo `timestamp <= watermark` albo rownowaznego wariantu Junie
+`modified <= watermark`. Watermark zapisuje ostatni znany timestamp, wiec
+porownanie inclusive zamykalo granice i tracilo tie-row.
+
+**Fix.**
+- Zmieniono wszystkie 11 bezposrednich filtrow `timestamp <= watermark` na
+  strict `timestamp < watermark`.
+- Zmieniono odwrócony Junie file-anchor guard z `modified <= watermark` na
+  `modified < watermark`.
+- Dodano regression test `test_watermark_filter_drops_only_strictly_lt`: wpis
+  T-1 wypada, wpisy T i T+1 zostaja.
+
+**Touched.**
+- `src/sources.rs` — read-side watermark filters.
+- `src/sources/tests.rs` — regression test boundary T-1/T/T+1.
+
+**Tests.** Zielone: `cargo build --release --bin aicx`;
+`cargo clippy --bin aicx --all-targets -- -D warnings`;
+`cargo test --lib watermark_filter_drops_only_strictly`;
+`cargo test --lib sources::tests`. Pelne `cargo test --lib` zostaje na znanym
+baseline: 565 passed, 3 failed (`state::tests::test_state_path_is_under_store`,
+`store::tests::test_chunks_dir`, `store::tests::test_store_base_dir`) przez
+pre-existing `.aicx`/`AICX_HOME` kontrakt.
+
+**Lessons.** Watermark na samym timestampie powinien byc granica exclusive na
+read-side. Koszt pierwszego runu po fixie to jednorazowe ponowne przeczytanie
+wpisu granicznego, ktore dedup przechwyci; koszt `<=` to cicha utrata ties.
+
+**Related.** Closes bug #7 z pass-4 Wave D-3; usuwa #7 leg z silent-loss
+triangle (#2 narrowed + #7 + #19). #19 zostaje w D-2-cluster.

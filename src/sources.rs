@@ -722,7 +722,7 @@ fn extract_claude_line_entries(
     config: &ExtractionConfig,
     warnings: &mut Vec<ClaudeSessionWarning>,
 ) -> Vec<TimelineEntry> {
-    if timestamp < config.cutoff || config.watermark.is_some_and(|wm| timestamp <= wm) {
+    if timestamp < config.cutoff || config.watermark.is_some_and(|wm| timestamp < wm) {
         return Vec::new();
     }
 
@@ -2079,7 +2079,7 @@ fn extract_gemini_antigravity_step_outputs(
         if timestamp < config.cutoff {
             continue;
         }
-        if config.watermark.is_some_and(|wm| timestamp <= wm) {
+        if config.watermark.is_some_and(|wm| timestamp < wm) {
             continue;
         }
 
@@ -2314,7 +2314,7 @@ fn antigravity_json_message_to_entries(
     if timestamp < config.cutoff {
         return Vec::new();
     }
-    if config.watermark.is_some_and(|wm| timestamp <= wm) {
+    if config.watermark.is_some_and(|wm| timestamp < wm) {
         return Vec::new();
     }
 
@@ -2460,7 +2460,7 @@ fn parse_antigravity_transcript_text(
         if timestamp < config.cutoff {
             continue;
         }
-        if config.watermark.is_some_and(|wm| timestamp <= wm) {
+        if config.watermark.is_some_and(|wm| timestamp < wm) {
             continue;
         }
 
@@ -2782,7 +2782,7 @@ pub fn extract_claude_history(config: &ExtractionConfig) -> Result<Vec<TimelineE
         if timestamp < config.cutoff {
             continue;
         }
-        if config.watermark.is_some_and(|wm| timestamp <= wm) {
+        if config.watermark.is_some_and(|wm| timestamp < wm) {
             continue;
         }
 
@@ -3235,7 +3235,7 @@ fn build_codex_history_entries(
             if timestamp < config.cutoff {
                 continue;
             }
-            if config.watermark.is_some_and(|wm| timestamp <= wm) {
+            if config.watermark.is_some_and(|wm| timestamp < wm) {
                 continue;
             }
 
@@ -3560,7 +3560,7 @@ fn parse_codex_session_events_with_diagnostics(
         if timestamp < config.cutoff {
             continue;
         }
-        if config.watermark.is_some_and(|wm| timestamp <= wm) {
+        if config.watermark.is_some_and(|wm| timestamp < wm) {
             continue;
         }
 
@@ -3793,7 +3793,7 @@ fn parse_gemini_session_with_diagnostics(
         }
 
         // Respect watermark
-        if config.watermark.is_some_and(|wm| timestamp <= wm) {
+        if config.watermark.is_some_and(|wm| timestamp < wm) {
             continue;
         }
 
@@ -4443,7 +4443,7 @@ pub fn extract_junie(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
             && modified < config.cutoff
             && config
                 .watermark
-                .is_none_or(|watermark| modified <= watermark)
+                .is_none_or(|watermark| modified < watermark)
         {
             continue;
         }
@@ -4565,7 +4565,7 @@ fn junie_timestamp_in_window(timestamp: DateTime<Utc>, config: &ExtractionConfig
 
     if config
         .watermark
-        .is_some_and(|watermark| timestamp <= watermark)
+        .is_some_and(|watermark| timestamp < watermark)
     {
         return false;
     }
@@ -4909,7 +4909,7 @@ fn parse_codescribe_transcript_with_lexicon(
     let mut entries = Vec::new();
     for segment in segments {
         let timestamp = codescribe_timestamp(path, date, segment.start_ms);
-        if timestamp < config.cutoff || config.watermark.is_some_and(|w| timestamp <= w) {
+        if timestamp < config.cutoff || config.watermark.is_some_and(|w| timestamp < w) {
             continue;
         }
 
@@ -5214,7 +5214,7 @@ fn parse_operator_markdown_document(
         };
         let timestamp = base_timestamp + Duration::seconds(sequence);
         sequence += 1;
-        if timestamp < config.cutoff || config.watermark.is_some_and(|w| timestamp <= w) {
+        if timestamp < config.cutoff || config.watermark.is_some_and(|w| timestamp < w) {
             continue;
         }
 
