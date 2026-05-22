@@ -4864,15 +4864,23 @@ fn parse_codescribe_transcript_with_lexicon(
     home: &Path,
 ) -> Result<Vec<TimelineEntry>> {
     let content = sanitize::read_to_string_validated(path)?;
-    
+
     let mut project_hint = None;
     let (frontmatter, body) = split_operator_frontmatter(&content);
-    if let Some(project) = frontmatter.project.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(project) = frontmatter
+        .project
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         project_hint = Some(project.trim().to_string());
     } else {
         let lower_body = body.to_ascii_lowercase();
         for filter in &config.project_filter {
-            let repo = filter.split_once('/').map(|(_, r)| r).unwrap_or(filter).to_ascii_lowercase();
+            let repo = filter
+                .split_once('/')
+                .map(|(_, r)| r)
+                .unwrap_or(filter)
+                .to_ascii_lowercase();
             if lower_body.contains(&repo) {
                 project_hint = Some(filter.clone());
                 break;
@@ -5008,8 +5016,12 @@ fn resolve_codescribe_cwd_hint(home: &Path, project_hint: Option<&str>) -> Optio
             home.join("Libraxis").join(org).join(repo),
             home.join("Libraxis")
                 .join("01_deployed_libraxis_vm")
-                .join(org).join(repo),
-            home.join("Libraxis").join("vc-runtime").join(org).join(repo),
+                .join(org)
+                .join(repo),
+            home.join("Libraxis")
+                .join("vc-runtime")
+                .join(org)
+                .join(repo),
             home.join("hosted").join(org).join(repo),
             home.join("vc-workspace").join(org).join(repo),
         ]
@@ -5058,8 +5070,8 @@ pub fn discover_operator_markdown_from(
         dirs.push(repo_root.join("docs").join("operator"));
     }
 
-    let cutoff = caller_cutoff
-        .unwrap_or_else(|| Utc::now() - Duration::days(OPERATOR_MD_RECENT_DAYS));
+    let cutoff =
+        caller_cutoff.unwrap_or_else(|| Utc::now() - Duration::days(OPERATOR_MD_RECENT_DAYS));
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
 
@@ -5462,10 +5474,14 @@ fn resolve_operator_cwd_hint(
         vec![
             home.join(org).join(repo),
             home.join("Libraxis").join(org).join(repo),
-            home.join("Libraxis").join("vc-runtime").join(org).join(repo),
+            home.join("Libraxis")
+                .join("vc-runtime")
+                .join(org)
+                .join(repo),
             home.join("Libraxis")
                 .join("01_deployed_libraxis_vm")
-                .join(org).join(repo),
+                .join(org)
+                .join(repo),
             home.join("hosted").join(org).join(repo),
             home.join("vc-workspace").join(org).join(repo),
         ]

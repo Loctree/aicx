@@ -953,8 +953,7 @@ fn write_context_session_first_outcome_at(
                     .map(|d| d.as_nanos())
                     .unwrap_or(0);
                 let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("chunk");
-                let quar_path =
-                    quarantine_dir.join(format!("{}-orphan-{}.md", stem, stamp));
+                let quar_path = quarantine_dir.join(format!("{}-orphan-{}.md", stem, stamp));
                 fs::rename(&path, &quar_path).with_context(|| {
                     format!(
                         "Failed to quarantine orphan {} -> {}",

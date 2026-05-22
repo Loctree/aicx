@@ -2574,7 +2574,10 @@ fn test_extract_codex_file_project_filter_accepts_path_segment() {
 fn test_codescribe_filter_per_transcript_not_splattered() {
     let root = unique_test_dir("codescribe-splatter");
     let home = root.join("home");
-    let day = home.join(".codescribe").join("transcriptions").join("2026-05-22");
+    let day = home
+        .join(".codescribe")
+        .join("transcriptions")
+        .join("2026-05-22");
     fs::create_dir_all(&day).unwrap();
 
     // Create the expected repo directories so that resolve_codescribe_cwd_hint works
@@ -2588,7 +2591,8 @@ fn test_codescribe_filter_per_transcript_not_splattered() {
     write_file(&day.join("100000_match.json"), content_matching);
 
     // Transcript 2: explicit project frontmatter to contradict the fallback
-    let content_unmatching = "---\nproject: acme/widgets\n---\n### Maciej:\nlet's work on widgets.\n";
+    let content_unmatching =
+        "---\nproject: acme/widgets\n---\n### Maciej:\nlet's work on widgets.\n";
     write_file(&day.join("110000_unmatch.md"), content_unmatching);
 
     let config = ExtractionConfig {
@@ -2602,7 +2606,7 @@ fn test_codescribe_filter_per_transcript_not_splattered() {
     // Only the matching one should survive
     assert_eq!(entries.len(), 1);
     assert!(entries[0].message.contains("Loctree/aicx"));
-    
+
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -2610,7 +2614,7 @@ fn test_codescribe_filter_per_transcript_not_splattered() {
 fn test_operator_md_owner_repo_decode_preserves_owner() {
     let root = unique_test_dir("operator-owner-repo");
     let home = root.join("home");
-    
+
     // Create directories
     let acme_dir = home.join("acme").join("widgets");
     fs::create_dir_all(&acme_dir).unwrap();
@@ -2639,7 +2643,10 @@ fn test_discover_operator_markdown_honors_caller_cutoff_for_all_time() {
 
     // A markdown file with mtime 90 days ago — well outside the legacy 30d default.
     let ancient = downloads.join("ancient-decision.md");
-    write_file(&ancient, "Decision: ancient choice from before the 30d window.");
+    write_file(
+        &ancient,
+        "Decision: ancient choice from before the 30d window.",
+    );
     let ninety_days_ago = (Utc::now() - Duration::days(90)).timestamp();
     set_mtime(&ancient, ninety_days_ago);
 
@@ -2666,7 +2673,10 @@ fn test_discover_operator_markdown_default_30d_when_no_caller_cutoff() {
 
     // Recent file: mtime defaults to "now" via fs::write — inside 30d default.
     let recent = downloads.join("recent.md");
-    write_file(&recent, "Decision: recent choice within the 30d default window.");
+    write_file(
+        &recent,
+        "Decision: recent choice within the 30d default window.",
+    );
 
     // Ancient file: mtime 90 days ago — outside 30d default.
     let ancient = downloads.join("ancient.md");

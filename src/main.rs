@@ -3712,17 +3712,14 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     } else {
         let dedup_phase =
             aicx::progress::Phase::start(reporter.clone(), "dedup", Some(pre_dedup as u64));
-        let deduped =
-            dedup_segments_per_repo(segments, &mut state, full_rescan, |scanned| {
-                dedup_phase.tick(scanned as u64)
-            });
+        let deduped = dedup_segments_per_repo(segments, &mut state, full_rescan, |scanned| {
+            dedup_phase.tick(scanned as u64)
+        });
         let post = deduped.iter().map(|s| s.entries.len()).sum::<usize>();
         let skipped = pre_dedup.saturating_sub(post);
         dedup_phase.finish_ok(format!("kept {post} / {pre_dedup} (skipped {skipped})"));
         if skipped > 0 {
-            eprintln!(
-                "  Dedup: {pre_dedup} → {post} entries (skipped {skipped} seen)"
-            );
+            eprintln!("  Dedup: {pre_dedup} → {post} entries (skipped {skipped} seen)");
         }
         deduped
     };
@@ -3772,7 +3769,10 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         .collect();
     output_entries.sort_by_key(|e| e.timestamp);
 
-    let mut sessions: Vec<String> = output_entries.iter().map(|e| e.session_id.clone()).collect();
+    let mut sessions: Vec<String> = output_entries
+        .iter()
+        .map(|e| e.session_id.clone())
+        .collect();
     sessions.sort();
     sessions.dedup();
 
@@ -4241,9 +4241,7 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         "kept {post_dedup} / {pre_dedup} (skipped {dedup_skipped})"
     ));
     if dedup_skipped > 0 {
-        eprintln!(
-            "  Dedup: {pre_dedup} → {post_dedup} entries (skipped {dedup_skipped} seen)"
-        );
+        eprintln!("  Dedup: {pre_dedup} → {post_dedup} entries (skipped {dedup_skipped} seen)");
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -7825,7 +7823,13 @@ mod tests {
     // Pipeline-reorder cluster tests (#6, #8, #19)
     // ====================================================================
 
-    fn mk_entry(agent: &str, session: &str, ts_secs: i64, message: &str, cwd: Option<&str>) -> timeline::TimelineEntry {
+    fn mk_entry(
+        agent: &str,
+        session: &str,
+        ts_secs: i64,
+        message: &str,
+        cwd: Option<&str>,
+    ) -> timeline::TimelineEntry {
         timeline::TimelineEntry {
             timestamp: chrono::DateTime::<chrono::Utc>::from_timestamp(ts_secs, 0).unwrap(),
             agent: agent.to_string(),
@@ -7892,7 +7896,12 @@ mod tests {
         // Now confirm dedup_segments_per_repo, given the redacted form,
         // marks `seen_hashes` under the post-redact hash (not the raw).
         let mut state = StateManager::default();
-        let seg = mk_segment(Some(("VetCoders", "aicx")), "claude", "s1", vec![entry_redacted]);
+        let seg = mk_segment(
+            Some(("VetCoders", "aicx")),
+            "claude",
+            "s1",
+            vec![entry_redacted],
+        );
         let kept = dedup_segments_per_repo(vec![seg], &mut state, false, |_| {});
         assert_eq!(kept.iter().map(|s| s.entries.len()).sum::<usize>(), 1);
         assert!(
@@ -7912,12 +7921,34 @@ mod tests {
     #[test]
     fn test_dedup_keyed_per_canonical_repo() {
         let same_message = "echo of the same boilerplate operator-md stub";
-        let entry_a = mk_entry("claude", "session-a", 1_700_000_000, same_message, Some("/tmp/a"));
-        let entry_b = mk_entry("claude", "session-b", 1_700_000_001, same_message, Some("/tmp/b"));
+        let entry_a = mk_entry(
+            "claude",
+            "session-a",
+            1_700_000_000,
+            same_message,
+            Some("/tmp/a"),
+        );
+        let entry_b = mk_entry(
+            "claude",
+            "session-b",
+            1_700_000_001,
+            same_message,
+            Some("/tmp/b"),
+        );
 
         // Two segments, two different canonical repos, identical content.
-        let seg_a = mk_segment(Some(("VetCoders", "repo-a")), "claude", "session-a", vec![entry_a.clone()]);
-        let seg_b = mk_segment(Some(("VetCoders", "repo-b")), "claude", "session-b", vec![entry_b.clone()]);
+        let seg_a = mk_segment(
+            Some(("VetCoders", "repo-a")),
+            "claude",
+            "session-a",
+            vec![entry_a.clone()],
+        );
+        let seg_b = mk_segment(
+            Some(("VetCoders", "repo-b")),
+            "claude",
+            "session-b",
+            vec![entry_b.clone()],
+        );
 
         let mut state = StateManager::default();
         let kept = dedup_segments_per_repo(vec![seg_a, seg_b], &mut state, false, |_| {});
@@ -7958,11 +7989,24 @@ mod tests {
 
         // Re-running dedup with the same segments should now SKIP both,
         // because each repo bucket already saw its own hash.
-        let seg_a2 = mk_segment(Some(("VetCoders", "repo-a")), "claude", "session-a", vec![entry_a]);
-        let seg_b2 = mk_segment(Some(("VetCoders", "repo-b")), "claude", "session-b", vec![entry_b]);
+        let seg_a2 = mk_segment(
+            Some(("VetCoders", "repo-a")),
+            "claude",
+            "session-a",
+            vec![entry_a],
+        );
+        let seg_b2 = mk_segment(
+            Some(("VetCoders", "repo-b")),
+            "claude",
+            "session-b",
+            vec![entry_b],
+        );
         let kept2 = dedup_segments_per_repo(vec![seg_a2, seg_b2], &mut state, false, |_| {});
         let total2: usize = kept2.iter().map(|s| s.entries.len()).sum();
-        assert_eq!(total2, 0, "second pass must dedup both — proves per-repo state persists");
+        assert_eq!(
+            total2, 0,
+            "second pass must dedup both — proves per-repo state persists"
+        );
     }
 
     /// #19: watermark advances from the raw-extract latest captured
@@ -8022,7 +8066,9 @@ mod tests {
             legacy_state.update_watermark("source-key", latest.timestamp);
         }
         assert_eq!(
-            legacy_state.get_watermark("source-key").map(|ts| ts.timestamp()),
+            legacy_state
+                .get_watermark("source-key")
+                .map(|ts| ts.timestamp()),
             Some(t_b),
             "legacy ordering would have produced this lagging watermark — verified for contrast"
         );

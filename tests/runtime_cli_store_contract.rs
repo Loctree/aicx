@@ -1172,8 +1172,12 @@ fn test_run_store_saves_state_on_empty_result() {
 
     let state = read_state(&home);
     let runs = state["runs"].as_array().expect("runs array in state.json");
-    assert_eq!(runs.len(), 1, "state should save run history even when no entries were extracted via store");
-    
+    assert_eq!(
+        runs.len(),
+        1,
+        "state should save run history even when no entries were extracted via store"
+    );
+
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -1184,15 +1188,16 @@ fn test_run_extraction_saves_state_on_empty_result() {
     let history = home.join(".codex").join("history.jsonl");
     write_codex_history(&history, "empty-sess", None, &[]);
 
-    let output = parse_stdout_json(&run_aicx(
-        &home,
-        &["all", "-H", "24", "--emit", "json"],
-    ));
+    let output = parse_stdout_json(&run_aicx(&home, &["all", "-H", "24", "--emit", "json"]));
     assert_eq!(output["total_entries"].as_u64(), Some(0));
 
     let state = read_state(&home);
     let runs = state["runs"].as_array().expect("runs array in state.json");
-    assert_eq!(runs.len(), 1, "state should save run history even when no entries were extracted via all/extract");
-    
+    assert_eq!(
+        runs.len(),
+        1,
+        "state should save run history even when no entries were extracted via all/extract"
+    );
+
     let _ = fs::remove_dir_all(&root);
 }
