@@ -289,8 +289,11 @@ fn holder_sidecar_path(path: &Path) -> Option<PathBuf> {
 }
 
 fn should_write_holder_sidecar(path: &Path, mode: LockMode) -> bool {
-    let _ = mode;
-    path.file_name().is_some()
+    // Sidecar identifies the BLOCKING holder for timeout-waiting acquirers.
+    // Multiple shared holders racing on a single sidecar token would have
+    // one cleanup wipe the file while siblings still hold — making
+    // diagnostics unreliable. Exclusive-only keeps the contract honest.
+    matches!(mode, LockMode::Exclusive) && path.file_name().is_some()
 }
 
 fn holder_run_kind(path: &Path, mode: LockMode) -> &'static str {
@@ -745,15 +748,21 @@ mod tests {
     }
 
     #[test]
-    fn shared_lock_writes_sidecar_and_cleans_up_on_release() {
-        let path = temp_named_lock("mcp-shared-sidecar", "mcp.lock");
+    fn shared_lock_does_not_write_sidecar() {
+        // Per PR #6 review (Copilot): shared locks do NOT write holder
+        // sidecars. Concurrent shared acquirers would race on the same
+        // sidecar token, letting one releaser wipe the file while siblings
+        // still hold — making timeout diagnostics for waiting exclusive
+        // acquirers unreliable. Sidecars are exclusive-only.
+        let path = temp_named_lock("mcp-shared-no-sidecar", "mcp.lock");
         let sidecar = holder_sidecar_path(&path).unwrap();
         let handle = acquire_shared(&path).expect("acquire shared mcp lock");
 
-        let contents = fs::read_to_string(&sidecar).expect("holder sidecar");
-        assert!(contents.contains(&format!("pid={}", std::process::id())));
-        assert!(contents.contains("run_kind=aicx mcp"));
-        assert!(contents.contains("mode=shared"));
+        assert!(
+            !sidecar.exists(),
+            "shared lock unexpectedly wrote holder sidecar at {}",
+            sidecar.display()
+        );
 
         release(handle);
         assert!(!sidecar.exists());

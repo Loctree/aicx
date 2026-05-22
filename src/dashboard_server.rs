@@ -234,9 +234,12 @@ fn clamp_cross_search_limit(requested: usize) -> (usize, bool) {
 
 fn apply_clamped_limit_header(response: &mut Response, clamped: bool) {
     if clamped {
+        // Format from the constant so the header tracks any future MAX_LIMIT bump.
+        let value = HeaderValue::from_str(&CROSS_SEARCH_MAX_LIMIT.to_string())
+            .expect("CROSS_SEARCH_MAX_LIMIT is numeric; always a valid header value");
         response.headers_mut().insert(
             HeaderName::from_static(CROSS_SEARCH_CLAMPED_LIMIT_HEADER),
-            HeaderValue::from_static("200"),
+            value,
         );
     }
 }

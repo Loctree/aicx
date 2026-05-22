@@ -354,6 +354,21 @@ pub fn read_line_capped<R: BufRead>(
     if exceeded {
         let ended_at_newline = buf.last().copied() == Some(b'\n');
         buf.truncate(max_bytes);
+        // Walk back past UTF-8 continuation bytes (0b10xxxxxx) so we don't
+        // chop a multi-byte sequence mid-codepoint; otherwise a valid input
+        // line would surface as InvalidData purely because of the cap.
+        while let Some(&last) = buf.last() {
+            if (last & 0xC0) == 0x80 {
+                buf.pop();
+            } else if last >= 0xC0 {
+                // Lead byte of a multi-byte sequence whose continuation bytes
+                // were just stripped — drop the lead too.
+                buf.pop();
+                break;
+            } else {
+                break;
+            }
+        }
         if !ended_at_newline {
             drain_until_newline(reader)?;
         }

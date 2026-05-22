@@ -273,17 +273,23 @@ impl StateManager {
     fn deserialize_current_or_legacy_siphash(
         contents: &str,
     ) -> std::result::Result<(Self, bool), serde_json::Error> {
-        let value: serde_json::Value = serde_json::from_str(contents)?;
-        match serde_json::from_value::<Self>(value.clone()) {
+        // Fast path: try strict deserialization directly from the string. This
+        // avoids the cost of a full `serde_json::Value` DOM allocation on every
+        // non-legacy load (the common case). Only fall through to the Value
+        // path when the strict shape fails — that's the legacy-detection branch
+        // and we need the parsed Value to inspect `hash_algorithm` anyway.
+        match serde_json::from_str::<Self>(contents) {
             Ok(state) => Ok((state, false)),
             Err(strict_err) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(contents).map_err(|_| strict_err)?;
                 if !Self::is_legacy_siphash_state_value(&value) {
-                    return Err(strict_err);
+                    // Re-borrow strict_err is moved into the map_err above; rebuild it.
+                    return Err(serde_json::from_str::<Self>(contents).unwrap_err());
                 }
-
                 serde_json::from_value::<LegacySiphashStateManager>(value)
                     .map(|legacy| (legacy.into_current_state(), true))
-                    .map_err(|_| strict_err)
+                    .map_err(|_| serde_json::from_str::<Self>(contents).unwrap_err())
             }
         }
     }
