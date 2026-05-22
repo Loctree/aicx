@@ -33,9 +33,7 @@ pub fn stable_siphasher13() -> SipHasher13 {
 
 pub fn stable_blake3_128(input: &[u8]) -> String {
     let hash = blake3::hash(input);
-    let hex = hash.to_hex();
-    // take 128-bit prefix (16 bytes = 32 hex chars)
-    hex[..32].to_string()
+    hex::encode(&hash.as_bytes()[..16])
 }
 
 pub fn is_legacy_siphash13_algorithm(hash_algorithm: &str) -> bool {
@@ -224,5 +222,16 @@ mod tests {
             let hash = stable_blake3_128(input.as_bytes());
             assert!(hashes.insert(hash));
         }
+    }
+
+    #[test]
+    fn test_blake3_128_matches_hex_prefix_contract() {
+        let input = b"x";
+        let old_prefix_contract = blake3::hash(input).to_hex()[..32].to_string();
+
+        let hash = stable_blake3_128(input);
+
+        assert_eq!(hash, old_prefix_contract);
+        assert_eq!(hash.len(), 32);
     }
 }
