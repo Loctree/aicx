@@ -16,6 +16,8 @@ pub use chunker::{
 };
 pub use frontmatter::ReportFrontmatter;
 pub use sanitize::{filter_self_echo, is_self_echo, normalize_query};
+#[rustfmt::skip]
+pub use sanitize::{read_line_capped, MAX_VALIDATED_BYTES};
 pub use segmentation::{
     ProjectHashRegistry, TieredIdentity, classify_cwd_tier, infer_repo_identity_from_entry,
     infer_tiered_identity_from_entry, semantic_segments, semantic_segments_with_registry,

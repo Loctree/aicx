@@ -1686,3 +1686,28 @@ apply path, but does not mutate the live canonical store by itself.
 - shlex jest battle-tested library dla shell quoting; hand-rolled escape NIE łapie shell substitution metacharacters.
 
 **Related.** 43 remaining findings (9 P1 + 23 P2 + 11 P3) + 3 pass-2 leftovers consolidated w `docs/bug-tracker-aicx-followup-pass-3.md`. PR #5 unblocked dla merge po Plan A.
+
+## 2026-05-21 — sanitize central IO caps (L-1 foundation) · `self-sha-in-report`
+
+**Symptom.** L-1 z pass-3 wskazywało, że `read_to_string_validated(path)` waliduje ścieżkę, ale dalej używa uncapped `fs::read_to_string`, a capped `read_line_limited` istnieje tylko prywatnie w bin crate `src/sources.rs`. Downstream A-2/A-3 nie miały wspólnego API do bezpiecznego czytania dużych plików/linii.
+
+**Root cause.** Limit 8 MiB z pass-1 był zamknięty w `src/sources.rs` (`MAX_LINE_BYTES` + `read_line_limited`). Workspace-shared `aicx_parser::sanitize` nie miało ani total-byte cap dla validated reads, ani publicznego capped `read_line` helpera.
+
+**Fix.**
+- `crates/aicx-parser/src/sanitize.rs`: dodano `MAX_VALIDATED_BYTES = 8 * 1024 * 1024`, typed `SanitizeError::FileTooLarge`, capped `read_to_string_validated` (metadata check + bounded `take(MAX+1)` read) oraz publiczny `read_line_capped` mirrorujący kontrakt `src/sources.rs`.
+- `crates/aicx-parser/src/lib.rs`: dodano re-export `MAX_VALIDATED_BYTES` i `read_line_capped`.
+- `crates/aicx-parser/tests/sanitize_caps.rs`: dodano regresje dla pliku `MAX_VALIDATED_BYTES + 1` oraz oversized-line skip do kolejnej poprawnej linii.
+
+**Touched.**
+- `crates/aicx-parser/src/sanitize.rs` — centralny validated IO cap + capped line helper.
+- `crates/aicx-parser/src/lib.rs` — publiczne re-exporty dla downstream A-2/A-3.
+- `crates/aicx-parser/tests/sanitize_caps.rs` — integration regression coverage.
+
+**Tests.** `cargo build --workspace`, `cargo test --workspace -- --test-threads=4`, `cargo clippy --workspace -- -D warnings`, `cargo fmt --check` zielone. Targeted: `cargo test -p aicx-parser --test sanitize_caps`; existing happy path: `cargo test -p aicx-parser test_read_to_string_validated`.
+
+**Lessons.**
+- Shared safety helper powinien żyć w workspace crate zanim kolejne fale zaczną patchować call site’y; inaczej każdy moduł odtwarza własny cap-pattern.
+- `read_to_string` hardening musi ograniczać alokację przed body read, nie tylko zgłaszać błąd po fakcie.
+- Self-referential commit SHA nie jest możliwy w tym samym commicie; finalny SHA tego wpisu jest zapisany w raporcie A-1.
+
+**Related.** Closes L-1 foundation z `docs/bug-tracker-aicx-followup-pass-3.md`; kontynuuje audit `26d8123` / `docs/scope-overflow.md`. A-2/A-3 nadal odpowiadają za wiring call site’ów z listy audytu.
