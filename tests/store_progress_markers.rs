@@ -261,6 +261,32 @@ fn heartbeat_keeps_extract_phase_alive_during_opaque_subcall() {
 }
 
 #[test]
+fn heartbeat_with_backoff_emits_fewer_ticks_than_constant_interval() {
+    // On a 20-minute segment phase, a constant 2s heartbeat emits ~600
+    // ticks — that floods the structured log. Backoff doubles the
+    // interval each tick (capped at `max`) so a long phase converges
+    // to one tick per `max`. This test runs for ~1.2s with initial=50ms
+    // max=400ms: a constant 50ms heartbeat would fire ~24 times; the
+    // backoff schedule (50, 100, 200, 400, 400, 400) fires ~5-6 times.
+    let reporter = Arc::new(CapturingReporter::default());
+    let phase = Phase::start(reporter.clone(), "segment", None);
+    let hb = Heartbeat::spawn_with_backoff(
+        phase.clone(),
+        Duration::from_millis(50),
+        Duration::from_millis(400),
+    );
+    std::thread::sleep(Duration::from_millis(1200));
+    hb.stop();
+    phase.finish_ok("done");
+
+    let ticks = reporter.tick_count("segment");
+    assert!(
+        (3..=12).contains(&ticks),
+        "expected backoff to land in [3, 12] ticks over 1.2s with initial=50ms max=400ms, got {ticks}"
+    );
+}
+
+#[test]
 fn heartbeat_floor_pins_tick_value_to_real_progress() {
     // Floor lets real-progress jumps (e.g. an agent's extractor just
     // returned 750 entries) override the bare heartbeat counter so the

@@ -246,7 +246,27 @@ impl Heartbeat {
     /// clamped to at least 250ms so a stray zero from a caller doesn't
     /// hot-spin a thread.
     pub fn spawn(phase: Phase, interval: Duration) -> Self {
-        let interval = interval.max(Duration::from_millis(250));
+        // Constant-interval variant is a degenerate backoff where the
+        // upper bound equals the initial value. Delegating keeps the
+        // backoff loop the single source of truth.
+        Self::spawn_with_backoff(phase, interval, interval)
+    }
+
+    /// Spawn a heartbeat that ticks on an exponential-backoff schedule:
+    /// `initial`, `2*initial`, `4*initial`, ..., capped at `max`. Use
+    /// this for long opaque phases (multi-minute segmentation, large
+    /// extract scans) where a constant 2s tick floods the structured
+    /// log without telling the operator anything new past the first few
+    /// ticks. Initial ticks land fast so operators see the phase came
+    /// alive; later ticks settle to the cap so a 20-minute phase emits
+    /// ~20 heartbeat lines instead of ~600.
+    ///
+    /// `initial` is clamped to ≥250ms (anti hot-spin) and `max` is
+    /// clamped to ≥`initial` (so callers can't accidentally invert
+    /// the schedule).
+    pub fn spawn_with_backoff(phase: Phase, initial: Duration, max: Duration) -> Self {
+        let initial = initial.max(Duration::from_millis(250));
+        let max = max.max(initial);
         let stop = Arc::new(AtomicBool::new(false));
         let floor = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let stop_clone = stop.clone();
@@ -254,6 +274,7 @@ impl Heartbeat {
         let phase_clone = phase.clone();
         let handle = thread::spawn(move || {
             let mut count: u64 = 0;
+            let mut interval = initial;
             while !stop_clone.load(Ordering::Relaxed) {
                 thread::sleep(interval);
                 if stop_clone.load(Ordering::Relaxed) {
@@ -263,6 +284,8 @@ impl Heartbeat {
                 let f = floor_clone.load(Ordering::Relaxed);
                 let value = count.max(f);
                 phase_clone.tick(value);
+                // Double the interval for the next sleep, capped at `max`.
+                interval = interval.checked_mul(2).unwrap_or(max).min(max);
             }
         });
         Self {

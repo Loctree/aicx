@@ -3989,9 +3989,14 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
     let mut all_entries = Vec::new();
     let mut agents_done: u64 = 0;
     for &ag in &agents {
-        let hb = aicx::progress::Heartbeat::spawn(
+        // Backoff so a long single-agent extract (e.g. ~/.claude/projects/
+        // walking thousands of JSONL files) doesn't flood the structured
+        // log with one tick every 2s; first few ticks fire fast so the
+        // operator sees the spinner come alive, then settle to a 60s cap.
+        let hb = aicx::progress::Heartbeat::spawn_with_backoff(
             extract_phase.clone(),
             std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(60),
         );
         let agent_entries_result = match ag {
             "claude" => sources::extract_claude(&config),
@@ -4150,9 +4155,15 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
     // ──────────────────────────────────────────────────────────────────
     let segment_phase = aicx::progress::Phase::start(reporter.clone(), "segment", None);
     let segments = {
-        let hb = aicx::progress::Heartbeat::spawn(
+        // Backoff: segmentation on a full-rescan corpus (400k+ entries)
+        // can take 15-20 minutes. A constant 2s tick floods the log
+        // with ~600 redundant heartbeat lines; backoff caps at 60s so
+        // the same run emits ~20 lines while still proving the phase
+        // is alive in the first few seconds.
+        let hb = aicx::progress::Heartbeat::spawn_with_backoff(
             segment_phase.clone(),
             std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(60),
         );
         let result = aicx::segmentation::semantic_segments(&all_entries);
         hb.stop();
