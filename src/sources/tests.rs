@@ -96,14 +96,21 @@ fn test_repo_name_from_cwd() {
 fn test_decode_claude_project_path_with_leading_dash() {
     let encoded = "-Users-maciejgad-hosted-VetCoders-CodeScribe";
     let decoded = decode_claude_project_path(encoded);
-    assert_eq!(decoded, "Users/maciejgad/hosted/VetCoders/CodeScribe");
+    assert_eq!(decoded, "Users-maciejgad-hosted-VetCoders-CodeScribe");
 }
 
 #[test]
 fn test_decode_claude_project_path_without_leading_dash() {
     let encoded = "Users-maciejgad-projects-foo";
     let decoded = decode_claude_project_path(encoded);
-    assert_eq!(decoded, "Users/maciejgad/projects/foo");
+    assert_eq!(decoded, "Users-maciejgad-projects-foo");
+}
+
+#[test]
+fn test_claude_dir_decode_preserves_hyphenated_repo() {
+    let decoded = decode_claude_project_path("vista-portal-frontend");
+    assert_eq!(decoded, "vista-portal-frontend");
+    assert_ne!(decoded, "vista/portal/frontend");
 }
 
 #[test]
@@ -123,7 +130,27 @@ fn test_decode_claude_project_path_empty() {
 fn test_decode_claude_project_path_deep_nesting() {
     let encoded = "-a-b-c-d-e-f";
     let decoded = decode_claude_project_path(encoded);
-    assert_eq!(decoded, "a/b/c/d/e/f");
+    assert_eq!(decoded, "a-b-c-d-e-f");
+}
+
+#[test]
+fn test_claude_filter_no_suffix_leak() {
+    let filters = vec!["vista".to_string()];
+
+    assert!(!claude_project_dir_matches_filter(
+        "nextra-docs-vista",
+        &filters
+    ));
+    assert!(!claude_project_dir_matches_filter("vista-portal", &filters));
+    assert!(!claude_project_dir_matches_filter(
+        "-Users-silver-Git-nextra-docs-vista",
+        &filters
+    ));
+    assert!(claude_project_dir_matches_filter("vista", &filters));
+    assert!(claude_project_dir_matches_filter(
+        "vista-portal",
+        &["vista-portal".to_string()]
+    ));
 }
 
 #[test]
@@ -648,6 +675,73 @@ fn test_codex_session_diagnostics_aggregates_counts() {
     assert_eq!(diagnostics.mismatch, 1);
     assert_eq!(diagnostics.unparsable_ts, 3);
     assert_eq!(diagnostics.unknown_msg_type, 4);
+
+    diagnostics.observe(&[CodexSessionWarning::LineParseError {
+        line_number: 7,
+        snippet: "{\"broken\":".to_string(),
+    }]);
+    assert_eq!(diagnostics.line_parse_error, 1);
+}
+
+#[test]
+fn test_codex_history_silent_skip_emits_warning() {
+    let root = unique_test_dir("codex-history-line-parse-warning");
+    let tmp = root.join("history.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let valid = r#"{"session_id":"history-a","text":"hello history","ts":1770000000,"role":"user","cwd":"/tmp/aicx"}"#;
+    let malformed = format!(r#"{{"session_id":"broken","text":"{}""#, "x".repeat(240));
+    let content = format!("{valid}\n{malformed}\n");
+    write_file(&tmp, &content);
+
+    let (entries, warnings) =
+        parse_codex_file_with_diagnostics(&tmp, &default_config(true)).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].message, "hello history");
+
+    let warning = warnings
+        .iter()
+        .find_map(|warning| match warning {
+            CodexSessionWarning::LineParseError {
+                line_number,
+                snippet,
+            } => Some((*line_number, snippet)),
+            _ => None,
+        })
+        .expect("malformed Codex history JSONL line should warn");
+    assert_eq!(warning.0, 2);
+    assert_eq!(warning.1.chars().count(), 200);
+    assert!(malformed.starts_with(warning.1));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_codex_session_event_silent_skip_emits_warning() {
+    let root = unique_test_dir("codex-session-line-parse-warning");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"session-a","cwd":"/tmp/a"}}
+{"timestamp":
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello session"}}"#;
+    write_file(&tmp, content);
+
+    let (entries, warnings) =
+        parse_codex_session_file_with_diagnostics(&tmp, &default_config(true)).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].message, "hello session");
+    assert!(warnings.iter().any(|warning| {
+        matches!(
+            warning,
+            CodexSessionWarning::LineParseError {
+                line_number: 2,
+                snippet,
+            } if snippet.trim_end() == "{\"timestamp\":"
+        )
+    }));
+
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1831,14 +1925,10 @@ fn test_read_line_capped_returns_normal_line() {
 #[test]
 fn test_read_line_capped_skips_to_next_line_after_oversized() {
     let mut reader = Cursor::new(b"aaaaaaaaa\nok\n".to_vec());
-    let first = sanitize::read_line_capped(&mut reader, 4)
-        .unwrap()
-        .unwrap();
+    let first = sanitize::read_line_capped(&mut reader, 4).unwrap().unwrap();
     assert!(first.exceeded);
     assert_eq!(first.line, "aaaa");
-    let second = sanitize::read_line_capped(&mut reader, 4)
-        .unwrap()
-        .unwrap();
+    let second = sanitize::read_line_capped(&mut reader, 4).unwrap().unwrap();
     assert_eq!(second.line, "ok\n");
 }
 
@@ -2448,6 +2538,66 @@ fn test_extract_codex_file_project_filter_accepts_path_segment() {
 
     let entries = extract_codex_file(&tmp, &config).unwrap();
     assert_eq!(entries.len(), 1, "vista-portal filter must match path");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_codescribe_filter_per_transcript_not_splattered() {
+    let root = unique_test_dir("codescribe-splatter");
+    let home = root.join("home");
+    let day = home.join(".codescribe").join("transcriptions").join("2026-05-22");
+    fs::create_dir_all(&day).unwrap();
+
+    // Create the expected repo directories so that resolve_codescribe_cwd_hint works
+    let aicx_dir = home.join("Loctree").join("aicx");
+    fs::create_dir_all(&aicx_dir).unwrap();
+    let widgets_dir = home.join("acme").join("widgets");
+    fs::create_dir_all(&widgets_dir).unwrap();
+
+    // Transcript 1: explicitly mentions "aicx" in content (JSON)
+    let content_matching = r#"{"segments":[{"start":0,"end":1,"speaker":"Maciej","text":"let's work on Loctree/aicx today."}]}"#;
+    write_file(&day.join("100000_match.json"), content_matching);
+
+    // Transcript 2: explicit project frontmatter to contradict the fallback
+    let content_unmatching = "---\nproject: acme/widgets\n---\n### Maciej:\nlet's work on widgets.\n";
+    write_file(&day.join("110000_unmatch.md"), content_unmatching);
+
+    let config = ExtractionConfig {
+        project_filter: vec!["Loctree/aicx".to_string()],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_codescribe_from_home(&home, &config).unwrap();
+    // Only the matching one should survive
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].message.contains("Loctree/aicx"));
+    
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_operator_md_owner_repo_decode_preserves_owner() {
+    let root = unique_test_dir("operator-owner-repo");
+    let home = root.join("home");
+    
+    // Create directories
+    let acme_dir = home.join("acme").join("widgets");
+    fs::create_dir_all(&acme_dir).unwrap();
+    let globex_dir = home.join("globex").join("widgets");
+    fs::create_dir_all(&globex_dir).unwrap();
+
+    // Acme
+    let acme_cwd = resolve_operator_cwd_hint(&home, Path::new("dummy"), Some("acme/widgets"));
+    assert_eq!(acme_cwd.as_deref(), Some(acme_dir.to_str().unwrap()));
+
+    // Globex
+    let globex_cwd = resolve_operator_cwd_hint(&home, Path::new("dummy"), Some("globex/widgets"));
+    assert_eq!(globex_cwd.as_deref(), Some(globex_dir.to_str().unwrap()));
+
+    assert_ne!(acme_cwd, globex_cwd);
 
     let _ = fs::remove_dir_all(&root);
 }

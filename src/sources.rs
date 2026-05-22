@@ -1087,24 +1087,18 @@ fn claude_project_dir_matches_filter(dir_name: &str, filters: &[String]) -> bool
         return true;
     }
     let decoded = decode_claude_project_path(dir_name);
-    let dir_lower = dir_name.to_ascii_lowercase();
 
     filters.iter().any(|filter| {
         let filter = filter.trim();
         if filter.is_empty() {
             return false;
         }
-        let filter_lower = filter.to_ascii_lowercase();
-        if filter.contains('/') {
-            project_filter_matches_path(&decoded, &[filter.to_string()])
-        } else {
-            decoded
-                .rsplit('/')
-                .next()
-                .is_some_and(|segment| segment.eq_ignore_ascii_case(filter))
-                || dir_lower == filter_lower
-                || dir_lower.ends_with(&format!("-{filter_lower}"))
+        let filter = filter.strip_prefix('/').unwrap_or(filter);
+        if filter.is_empty() {
+            return false;
         }
+
+        decoded.eq_ignore_ascii_case(filter) || dir_name.eq_ignore_ascii_case(filter)
     })
 }
 
@@ -1764,6 +1758,15 @@ pub fn extract_claude_file(path: &Path, config: &ExtractionConfig) -> Result<Vec
 /// - Codex history format (`~/.codex/history.jsonl`) — `CodexEntry` per line.
 /// - Codex session format (`~/.codex/sessions/**/**/*.jsonl`) — `CodexSessionEvent` per line.
 pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
+    let (entries, warnings) = parse_codex_file_with_diagnostics(path, config)?;
+    emit_codex_session_warnings(path, &warnings);
+    Ok(entries)
+}
+
+fn parse_codex_file_with_diagnostics(
+    path: &Path,
+    config: &ExtractionConfig,
+) -> Result<(Vec<TimelineEntry>, Vec<CodexSessionWarning>)> {
     let file = sanitize::open_file_validated(path)?;
     let mut reader = BufReader::new(file);
     let mut history_records = Vec::new();
@@ -1787,12 +1790,15 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
         if first_non_empty.is_none() {
             first_non_empty = Some(line.clone());
         }
-        if let Ok(entry) = serde_json::from_str::<CodexEntry>(&line) {
-            history_records.push(entry);
-            continue;
-        }
-        if let Ok(event) = serde_json::from_str::<CodexSessionEvent>(&line) {
-            session_events.push(event);
+        match serde_json::from_str::<CodexEntry>(&line) {
+            Ok(entry) => {
+                history_records.push(entry);
+                continue;
+            }
+            Err(_) => match serde_json::from_str::<CodexSessionEvent>(&line) {
+                Ok(event) => session_events.push(event),
+                Err(_) => warnings.push(codex_line_parse_error(line_number, &line)),
+            },
         }
     }
 
@@ -1804,8 +1810,7 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
     }
 
     let Some(first_line) = first_non_empty else {
-        emit_codex_session_warnings(path, &warnings);
-        return Ok(vec![]);
+        return Ok((vec![], warnings));
     };
 
     if !history_records.is_empty() || !session_events.is_empty() {
@@ -1833,9 +1838,8 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
             warnings.extend(session_warnings);
             entries.append(&mut session_entries);
         }
-        emit_codex_session_warnings(path, &warnings);
         entries.sort_by_key(|a| a.timestamp);
-        return Ok(entries);
+        return Ok((entries, warnings));
     }
 
     // Check for legacy JSON format ({"session": {...}, "items": [...]})
@@ -2917,6 +2921,10 @@ pub(crate) enum CodexSessionWarning {
         count: usize,
         samples: Vec<String>,
     },
+    LineParseError {
+        line_number: usize,
+        snippet: String,
+    },
     ContentSanitization {
         warning: sanitize::ContentSanitizationWarning,
     },
@@ -2969,6 +2977,15 @@ impl CodexSessionWarning {
                 count,
                 MAX_LINE_BYTES,
                 samples.join(", ")
+            ),
+            CodexSessionWarning::LineParseError {
+                line_number,
+                snippet,
+            } => format!(
+                "Codex warning: {} skipped malformed JSONL line {}; snippet: {}",
+                path.display(),
+                line_number,
+                snippet
             ),
             CodexSessionWarning::ContentSanitization { warning } => format!(
                 "Codex content warning: {} {}",
@@ -3030,6 +3047,9 @@ fn emit_codex_session_warnings(path: &Path, warnings: &[CodexSessionWarning]) {
             CodexSessionWarning::OversizedLine { count, .. } => {
                 diagnostics::record("codex", DiagnosticKind::OversizedLine, *count, path);
             }
+            CodexSessionWarning::LineParseError { .. } => {
+                diagnostics::record("codex", DiagnosticKind::LineParseError, 1, path);
+            }
             CodexSessionWarning::ContentSanitization { warning } => {
                 record_content_sanitization("codex", warning, path);
             }
@@ -3054,6 +3074,7 @@ pub(crate) struct CodexSessionDiagnostics {
     pub(crate) unknown_msg_type: usize,
     pub(crate) mixed_format: usize,
     pub(crate) oversized_line: usize,
+    pub(crate) line_parse_error: usize,
     pub(crate) content_sanitization: usize,
 }
 
@@ -3077,6 +3098,9 @@ impl CodexSessionDiagnostics {
                 CodexSessionWarning::OversizedLine { count, .. } => {
                     self.oversized_line += count;
                 }
+                CodexSessionWarning::LineParseError { .. } => {
+                    self.line_parse_error += 1;
+                }
                 CodexSessionWarning::ContentSanitization { .. } => {
                     self.content_sanitization += 1;
                 }
@@ -3092,6 +3116,7 @@ impl CodexSessionDiagnostics {
             && self.unknown_msg_type == 0
             && self.mixed_format == 0
             && self.oversized_line == 0
+            && self.line_parse_error == 0
             && self.content_sanitization == 0
     }
 }
@@ -3296,8 +3321,9 @@ fn parse_codex_session_file_with_diagnostics(
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(ev) = serde_json::from_str::<CodexSessionEvent>(&line) {
-            events.push(ev);
+        match serde_json::from_str::<CodexSessionEvent>(&line) {
+            Ok(ev) => events.push(ev),
+            Err(_) => warnings.push(codex_line_parse_error(line_number, &line)),
         }
     }
 
@@ -3312,6 +3338,13 @@ fn parse_codex_session_file_with_diagnostics(
         parse_codex_session_events_with_diagnostics(path, &events, config);
     warnings.extend(event_warnings);
     Ok((entries, warnings))
+}
+
+fn codex_line_parse_error(line_number: usize, line: &str) -> CodexSessionWarning {
+    CodexSessionWarning::LineParseError {
+        line_number,
+        snippet: line.chars().take(200).collect(),
+    }
 }
 
 fn parse_codex_session_events_with_diagnostics(
@@ -4812,8 +4845,7 @@ pub fn parse_codescribe_transcript(
 ) -> Result<Vec<TimelineEntry>> {
     let home = dirs::home_dir().context("No home dir")?;
     let lexicon = load_codescribe_lexicon(&home);
-    let cwd_hint = resolve_codescribe_cwd_hint(&home, &config.project_filter);
-    parse_codescribe_transcript_with_lexicon(path, date, config, &lexicon, cwd_hint.as_deref())
+    parse_codescribe_transcript_with_lexicon(path, date, config, &lexicon, &home)
 }
 
 fn parse_codescribe_transcript_with_lexicon(
@@ -4821,9 +4853,35 @@ fn parse_codescribe_transcript_with_lexicon(
     date: NaiveDate,
     config: &ExtractionConfig,
     lexicon: &CodescribeLexicon,
-    cwd_hint: Option<&str>,
+    home: &Path,
 ) -> Result<Vec<TimelineEntry>> {
     let content = sanitize::read_to_string_validated(path)?;
+    
+    let mut project_hint = None;
+    let (frontmatter, body) = split_operator_frontmatter(&content);
+    if let Some(project) = frontmatter.project.as_deref().filter(|value| !value.trim().is_empty()) {
+        project_hint = Some(project.trim().to_string());
+    } else {
+        let lower_body = body.to_ascii_lowercase();
+        for filter in &config.project_filter {
+            let repo = filter.split_once('/').map(|(_, r)| r).unwrap_or(filter).to_ascii_lowercase();
+            if lower_body.contains(&repo) {
+                project_hint = Some(filter.clone());
+                break;
+            }
+        }
+    }
+
+    if project_hint.is_none() {
+        // TODO: codescribe transcript has no embedded identity in frontmatter or content.
+        // Keeping the global filter as a fallback for that path-only case.
+        if config.project_filter.len() == 1 {
+            project_hint = config.project_filter.first().cloned();
+        }
+    }
+
+    let cwd_hint_owned = resolve_codescribe_cwd_hint(home, project_hint.as_deref());
+    let cwd_hint = cwd_hint_owned.as_deref();
     let segments = match path.extension().and_then(|ext| ext.to_str()) {
         Some("json") => parse_codescribe_json(&content)?,
         Some("md") => parse_codescribe_markdown(&content),
@@ -4895,7 +4953,6 @@ pub fn extract_codescribe_from_home(
     config: &ExtractionConfig,
 ) -> Result<Vec<TimelineEntry>> {
     let lexicon = load_codescribe_lexicon(home);
-    let cwd_hint = resolve_codescribe_cwd_hint(home, &config.project_filter);
     let mut entries = Vec::new();
 
     for transcript in discover_codescribe_transcripts(home) {
@@ -4904,7 +4961,7 @@ pub fn extract_codescribe_from_home(
             transcript.date,
             config,
             &lexicon,
-            cwd_hint.as_deref(),
+            home,
         ) {
             Ok(mut parsed) => entries.append(&mut parsed),
             Err(e) => eprintln!(
@@ -4915,32 +4972,51 @@ pub fn extract_codescribe_from_home(
         }
     }
 
+    if !config.project_filter.is_empty() {
+        entries.retain(|entry| {
+            if let Some(cwd) = &entry.cwd {
+                project_filter_matches_path(cwd, &config.project_filter)
+            } else {
+                false
+            }
+        });
+    }
+
     entries.sort_by_key(|entry| entry.timestamp);
     Ok(entries)
 }
 
-fn resolve_codescribe_cwd_hint(home: &Path, project_filter: &[String]) -> Option<String> {
-    let filter = project_filter.first()?;
-    if project_filter.len() != 1 {
+fn resolve_codescribe_cwd_hint(home: &Path, project_hint: Option<&str>) -> Option<String> {
+    let project = project_hint?.trim();
+    if project.is_empty() {
         return None;
     }
 
-    let repo = filter
-        .rsplit('/')
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
+    let (org, repo) = project.split_once('/').unwrap_or(("", project));
 
-    let candidates = [
-        home.join(repo),
-        home.join("Libraxis").join(repo),
-        home.join("Libraxis")
-            .join("01_deployed_libraxis_vm")
-            .join(repo),
-        home.join("Libraxis").join("vc-runtime").join(repo),
-        home.join("hosted").join("VetCoders").join(repo),
-        home.join("vc-workspace").join("VetCoders").join(repo),
-    ];
+    let candidates = if !org.is_empty() {
+        vec![
+            home.join(org).join(repo),
+            home.join("Libraxis").join(org).join(repo),
+            home.join("Libraxis")
+                .join("01_deployed_libraxis_vm")
+                .join(org).join(repo),
+            home.join("Libraxis").join("vc-runtime").join(org).join(repo),
+            home.join("hosted").join(org).join(repo),
+            home.join("vc-workspace").join(org).join(repo),
+        ]
+    } else {
+        vec![
+            home.join(repo),
+            home.join("Libraxis").join(repo),
+            home.join("Libraxis")
+                .join("01_deployed_libraxis_vm")
+                .join(repo),
+            home.join("Libraxis").join("vc-runtime").join(repo),
+            home.join("hosted").join("VetCoders").join(repo),
+            home.join("vc-workspace").join("VetCoders").join(repo),
+        ]
+    };
 
     candidates
         .into_iter()
@@ -5363,22 +5439,31 @@ fn resolve_operator_cwd_hint(
     if project.is_empty() {
         return None;
     }
-    let repo = project
-        .rsplit('/')
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
+    let (org, repo) = project.split_once('/').unwrap_or(("", project));
 
-    let candidates = [
-        home.join(repo),
-        home.join("Libraxis").join(repo),
-        home.join("Libraxis").join("vc-runtime").join(repo),
-        home.join("Libraxis")
-            .join("01_deployed_libraxis_vm")
-            .join(repo),
-        home.join("hosted").join("VetCoders").join(repo),
-        home.join("vc-workspace").join("VetCoders").join(repo),
-    ];
+    let candidates = if !org.is_empty() {
+        vec![
+            home.join(org).join(repo),
+            home.join("Libraxis").join(org).join(repo),
+            home.join("Libraxis").join("vc-runtime").join(org).join(repo),
+            home.join("Libraxis")
+                .join("01_deployed_libraxis_vm")
+                .join(org).join(repo),
+            home.join("hosted").join(org).join(repo),
+            home.join("vc-workspace").join(org).join(repo),
+        ]
+    } else {
+        vec![
+            home.join(repo),
+            home.join("Libraxis").join(repo),
+            home.join("Libraxis").join("vc-runtime").join(repo),
+            home.join("Libraxis")
+                .join("01_deployed_libraxis_vm")
+                .join(repo),
+            home.join("hosted").join("VetCoders").join(repo),
+            home.join("vc-workspace").join("VetCoders").join(repo),
+        ]
+    };
 
     candidates
         .into_iter()
@@ -5887,14 +5972,16 @@ fn count_codex_sessions(path: &std::path::Path) -> Result<usize> {
 
 /// Decode a Claude project path from the encoded directory name.
 ///
-/// Claude encodes project paths by replacing `/` with `-` in directory names.
-/// Leading dash (from the root `/`) is stripped.
+/// Claude's project-dir encoding is lossy: `-` may be either a literal
+/// repository-name character or an encoded `/`. Replacing every dash with `/`
+/// turns hyphenated repos into fake path segments, so this helper preserves the
+/// stored name and only removes the leading absolute-path sentinel.
 ///
 /// Example: `-Users-maciejgad-hosted-VetCoders-CodeScribe`
-///       -> `Users/maciejgad/hosted/VetCoders/CodeScribe`
+///       -> `Users-maciejgad-hosted-VetCoders-CodeScribe`
 pub fn decode_claude_project_path(encoded: &str) -> String {
     let stripped = encoded.strip_prefix('-').unwrap_or(encoded);
-    stripped.replace('-', "/")
+    stripped.to_string()
 }
 
 /// Extract text content from a Claude message value.
