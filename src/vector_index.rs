@@ -1288,15 +1288,22 @@ fn load_resume_tmp_index(
     }))
 }
 
-/// G-3 incremental baseline parsed from the existing committed index. The
-/// `cutoff` field is the `header.generated_at` lifted into a comparable
-/// [`std::time::SystemTime`] so the file-mtime filter does not allocate
-/// per-call. `embedded_ids` captures the row IDs that already live in the
-/// committed file, used as a sanity gate (a chunk whose id is already in
-/// the committed body never re-embeds, regardless of mtime drift).
+/// G-3 incremental baseline parsed from the existing committed index.
+///
+/// `embedded_ids` captures the row IDs that already live in the
+/// committed file. A chunk whose id is already in the committed body
+/// never re-embeds under the incremental walk (`--full-rescan` is the
+/// explicit refresh path).
+///
+/// `cutoff` is the `header.generated_at` lifted into a comparable
+/// [`std::time::SystemTime`]. It is retained as parsed-and-validated
+/// metadata so the loader can still reject a committed file with a
+/// malformed timestamp; the partition logic itself no longer consults
+/// mtime now that the missing-id rule is authoritative.
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 #[derive(Debug, Clone)]
 pub(crate) struct IncrementalBaseline {
+    #[allow(dead_code)] // validated at parse time; kept for diagnostics & future reconcile mode
     pub(crate) cutoff: std::time::SystemTime,
     pub(crate) embedded_ids: std::collections::HashSet<String>,
 }
@@ -1411,9 +1418,23 @@ fn load_incremental_baseline(
 }
 
 /// Return the subset of `files` that need to be embedded under the
-/// incremental walk: chunk path mtime strictly newer than the baseline
-/// `cutoff` AND id not already in the committed body. Pure function so
-/// it can be exercised against a synthetic corpus in tests.
+/// incremental walk.
+///
+/// **Rule: missing-id always wins.** A chunk whose id is not in the
+/// committed body is re-embedded regardless of mtime — this is the
+/// shape produced by backup / rsync / quarantine restore, where a real
+/// chunk may surface with an mtime older than `generated_at`. Without
+/// this rule incremental indexing would silently drop those chunks and
+/// only `--full-rescan` could recover them.
+///
+/// **Crash-recovery guard.** Any id already present in the committed
+/// body is skipped here. Refreshing an already-embedded chunk is the
+/// explicit job of `--full-rescan`; doing it silently under the
+/// incremental walk would risk crash-loop double writes after a
+/// partial rebuild.
+///
+/// Pure function so it can be exercised against a synthetic corpus in
+/// tests.
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn partition_incremental_files(
     files: &[crate::store::StoredContextFile],
@@ -1422,23 +1443,23 @@ fn partition_incremental_files(
     files
         .iter()
         .filter(|stored| {
-            // Crash-recovery guard: if the id was already written into the
-            // committed body, never re-embed regardless of mtime drift.
             let entry_id = chunk_id_from_path(&stored.path);
-            if baseline.embedded_ids.contains(&entry_id) {
-                return false;
+            // Missing-id always wins. A chunk restored from backup /
+            // rsync / quarantine may carry an mtime older than the
+            // committed `header.generated_at`, but if its id is absent
+            // from the committed body we MUST re-embed it — otherwise
+            // Layer 2 semantic search silently drifts incomplete and
+            // operators are forced into `--full-rescan` to recover.
+            // Note: mtime is intentionally not consulted for this case;
+            // restored chunks may have any clock value.
+            if !baseline.embedded_ids.contains(&entry_id) {
+                return true;
             }
-            // Primary gate: sidecar/chunk mtime newer than the committed
-            // header.generated_at. Missing mtime (filesystem refused stat)
-            // defaults to "include" — better to embed once and let dedup
-            // catch it than silently skip a real new chunk.
-            let mtime = std::fs::metadata(&stored.path)
-                .and_then(|m| m.modified())
-                .ok();
-            match mtime {
-                Some(ts) => ts > baseline.cutoff,
-                None => true,
-            }
+            // Crash-recovery guard: id is already in the committed body
+            // -> never re-embed under the incremental walk. Genuine
+            // refresh / reconcile of an already-embedded chunk is the
+            // job of `--full-rescan`, not silent drift here.
+            false
         })
         .cloned()
         .collect()
@@ -1831,10 +1852,10 @@ mod iter3_tests {
     fn partition_incremental_files_keeps_only_unembedded_and_fresh() {
         // G-3 partition logic on a synthetic corpus. The committed
         // baseline knows about ids `a` and `b`; chunk `c` is brand new.
-        // The mtime of `b` is younger than the cutoff, but its id is in
-        // the committed set so it MUST stay skipped — crash-recovery
-        // guard. Chunk `a` is older than cutoff AND in the set, also
-        // skipped. Chunk `c` (new id, fresh mtime) is the only survivor.
+        // `a` is older than cutoff AND committed -> skip; `b` is newer
+        // than cutoff but already committed -> skip (crash-recovery
+        // guard); `c` is the only survivor (new id wins regardless of
+        // mtime, plus its mtime is fresh here anyway).
         use std::collections::HashSet;
 
         let dir = tempdir_for_test();
@@ -1883,6 +1904,70 @@ mod iter3_tests {
             .map(|stored| chunk_id_from_path(&stored.path))
             .collect();
         assert_eq!(ids, vec!["c".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn partition_incremental_files_reembeds_missing_id_with_old_mtime() {
+        // Regression for PR #6 follow-up: a chunk restored from backup /
+        // rsync / quarantine restore may have an mtime OLDER than the
+        // committed `header.generated_at`, but if its id is not in the
+        // committed body the incremental walk MUST still pick it up.
+        // Otherwise Layer 2 semantic search silently drifts incomplete
+        // and operators are forced into `--full-rescan` to recover.
+        use std::collections::HashSet;
+
+        let dir = tempdir_for_test();
+        let cutoff_dt = chrono::DateTime::parse_from_rfc3339("2026-05-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        // Chunk `restored` has an old mtime (way before the cutoff) and
+        // no entry in the committed embedded_ids set — exactly the
+        // backup-restore shape we want to cover.
+        let restored_path = dir.join("restored.md");
+        std::fs::write(&restored_path, "# restored chunk").unwrap();
+        let old_ts: std::time::SystemTime =
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+                .into();
+        filetime::set_file_mtime(&restored_path, filetime::FileTime::from_system_time(old_ts))
+            .unwrap();
+
+        let files = vec![crate::store::StoredContextFile {
+            path: restored_path,
+            project: "test".into(),
+            repo: None,
+            date_compact: "20260101".into(),
+            date_iso: "2026-01-01".into(),
+            kind: crate::timeline::Kind::Other,
+            agent: "claude".into(),
+            session_id: "restored".into(),
+            chunk: 0,
+        }];
+
+        // Committed baseline mentions other ids, never `restored`.
+        let mut embedded_ids = HashSet::new();
+        embedded_ids.insert("a".to_string());
+        embedded_ids.insert("b".to_string());
+        let baseline = IncrementalBaseline {
+            cutoff: cutoff_dt.into(),
+            embedded_ids,
+        };
+
+        let to_embed = partition_incremental_files(&files, &baseline);
+        let ids: Vec<String> = to_embed
+            .iter()
+            .map(|stored| chunk_id_from_path(&stored.path))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["restored".to_string()],
+            "missing-id chunk with old mtime must be re-embedded"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

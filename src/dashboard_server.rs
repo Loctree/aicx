@@ -470,6 +470,9 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
     eprintln!("  CORS: {}", config.cors_policy.describe());
     if auth_enforced {
         eprintln!("  Auth: enabled on /api/* (source: {auth_source_label})");
+        if let Some(msg) = auth::proxy_rate_limit_warning(config.host) {
+            eprintln!("  ⚠ Rate-limit (proxy): {msg}");
+        }
     } else {
         eprintln!(
             "  Auth: DISABLED ({auth_source_label}) — /api/* surface is reachable by anyone who can hit {addr}"
@@ -1463,6 +1466,14 @@ async fn run_memex_cli(
 
     let mut command = tokio::process::Command::new(binary);
     apply_memex_cli_env(&mut command);
+    // PR #6 follow-up: if the `tokio::time::timeout` wrapper below fires,
+    // the `wait_with_output` future is dropped before the child finishes.
+    // Without `kill_on_drop(true)` the underlying memex / rust-memex /
+    // rmcp-memex process keeps running in the background, leaking
+    // descriptors and CPU on every cross-search timeout. Setting it here
+    // (before spawn) guarantees the runtime kills the child when the
+    // Child handle is dropped on timeout.
+    command.kill_on_drop(true);
     let child = command
         .args(args)
         .stdout(std::process::Stdio::piped())
@@ -2353,6 +2364,100 @@ mod tests {
                     "memex CLI env should pass {key} when parent has it:\n{stdout}"
                 );
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_memex_cli_timeout_kills_child_process() {
+        // PR #6 follow-up regression: when the wrapping `tokio::time::timeout`
+        // fires, the spawned memex/rmcp-memex child must be terminated by
+        // `kill_on_drop(true)`. Otherwise a flaky/slow memex install can
+        // leak background processes on every cross-search call.
+        //
+        // The test drives `run_memex_cli` with a tiny shell program that
+        // records its PID into a tempfile and then sleeps far past the
+        // configured timeout. After the timeout error we poll `kill(0)` on
+        // the recorded PID and assert it disappears — proving the runtime
+        // really killed it on drop.
+        use std::io::Read;
+        use std::path::PathBuf;
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let pid_file: PathBuf = std::env::temp_dir().join(format!(
+            "aicx_memex_killondrop_{}_{}.pid",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&pid_file);
+        let script = format!(
+            "printf '%s' \"$$\" > {pid}; sleep 30",
+            pid = pid_file.display()
+        );
+
+        let result = runtime.block_on(run_memex_cli(
+            Some("/bin/sh"),
+            &["-c", &script],
+            "kill probe",
+            1,
+        ));
+        assert!(
+            result.is_err(),
+            "expected `run_memex_cli` to time out, got {:?}",
+            result
+        );
+
+        let mut pid_text = String::new();
+        let mut read_attempts = 0;
+        loop {
+            if let Ok(mut f) = std::fs::File::open(&pid_file) {
+                pid_text.clear();
+                if f.read_to_string(&mut pid_text).is_ok() && !pid_text.trim().is_empty() {
+                    break;
+                }
+            }
+            read_attempts += 1;
+            assert!(
+                read_attempts < 50,
+                "child shell never wrote pid file at {}",
+                pid_file.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let pid: i32 = pid_text.trim().parse().unwrap_or_else(|_| {
+            panic!("non-numeric pid in {}: {:?}", pid_file.display(), pid_text)
+        });
+
+        // Poll for the child to disappear. `kill(0)` returns 0 while the
+        // process is alive and -1/ESRCH once it is gone. With
+        // `kill_on_drop(true)` the runtime sends SIGKILL almost
+        // immediately after the timeout error; we allow ~2s of slack so
+        // CI noise does not cause false failures.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut alive = true;
+        while std::time::Instant::now() < deadline {
+            let rc = unsafe { libc::kill(pid, 0) };
+            if rc == -1 {
+                alive = false;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        let _ = std::fs::remove_file(&pid_file);
+        if alive {
+            // Best-effort cleanup so a regression does not leave the
+            // sleeping shell behind in the test runner.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            panic!(
+                "memex CLI child {} survived run_memex_cli timeout — kill_on_drop missing?",
+                pid
+            );
         }
     }
 

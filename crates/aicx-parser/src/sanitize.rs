@@ -28,9 +28,23 @@ const AICX_ALLOW_TMP_ENV: &str = "AICX_ALLOW_TMP";
 
 pub const MAX_VALIDATED_BYTES: usize = 8 * 1024 * 1024;
 
+/// Separate cap for long-lived JSON state files (e.g. `state.json`). The
+/// generic 8 MiB validated-read cap is tuned for corpus / sidecar inputs,
+/// but a real AICX install accumulates many projects' `seen_hashes` and
+/// run history over months. Applying the generic cap would hard-fail on
+/// startup for legitimate large states. 128 MiB is well above any
+/// realistic state size yet still catches runaway growth or a corrupted
+/// file masquerading as state.
+pub const MAX_STATE_JSON_BYTES: usize = 128 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SanitizeError {
     FileTooLarge {
+        path: PathBuf,
+        max_bytes: usize,
+        actual_bytes: u64,
+    },
+    StateFileTooLarge {
         path: PathBuf,
         max_bytes: usize,
         actual_bytes: u64,
@@ -47,6 +61,19 @@ impl fmt::Display for SanitizeError {
             } => write!(
                 f,
                 "File '{}' exceeds validated read cap: {} bytes > {} bytes",
+                path.display(),
+                actual_bytes,
+                max_bytes
+            ),
+            SanitizeError::StateFileTooLarge {
+                path,
+                max_bytes,
+                actual_bytes,
+            } => write!(
+                f,
+                "State file '{}' is too large: {} bytes > {} bytes. \
+                 This is not generic JSON corruption — the file exceeds the dedicated state cap. \
+                 Investigate runaway `seen_hashes` growth or restore from `.bak` before retrying.",
                 path.display(),
                 actual_bytes,
                 max_bytes
@@ -298,35 +325,63 @@ pub fn create_file_validated(path: &Path) -> Result<std::fs::File> {
 
 /// Read a UTF-8 text file only after validating the path.
 pub fn read_to_string_validated(path: &Path) -> Result<String> {
+    read_to_string_with_cap(path, MAX_VALIDATED_BYTES, false)
+}
+
+/// Read AICX `state.json` (or its `.bak`) under the dedicated state cap.
+///
+/// Long-lived installs legitimately grow `seen_hashes`, run history, and
+/// per-project state into the tens of MiB. The generic 8 MiB cap is
+/// tuned for corpus inputs and would hard-fail those installs at
+/// startup, ahead of backup recovery. This entry point uses
+/// [`MAX_STATE_JSON_BYTES`] and surfaces a state-specific error so the
+/// failure mode is unmistakable (and obviously distinct from generic
+/// JSON corruption).
+pub fn read_state_json_validated(path: &Path) -> Result<String> {
+    read_to_string_with_cap(path, MAX_STATE_JSON_BYTES, true)
+}
+
+fn read_to_string_with_cap(path: &Path, max_bytes: usize, is_state: bool) -> Result<String> {
     let validated = validate_read_path(path)?;
     let metadata = std::fs::metadata(&validated)
         .map_err(|e| anyhow!("Failed to stat '{}': {}", validated.display(), e))?;
-    if metadata.len() > MAX_VALIDATED_BYTES as u64 {
-        return Err(SanitizeError::FileTooLarge {
-            path: validated,
-            max_bytes: MAX_VALIDATED_BYTES,
-            actual_bytes: metadata.len(),
-        }
-        .into());
+    if metadata.len() > max_bytes as u64 {
+        return Err(too_large_error(validated, max_bytes, metadata.len(), is_state).into());
     }
 
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let file = std::fs::File::open(&validated)
         .map_err(|e| anyhow!("Failed to open '{}': {}", validated.display(), e))?;
-    let mut reader = file.take(MAX_VALIDATED_BYTES.saturating_add(1) as u64);
+    let mut reader = file.take(max_bytes.saturating_add(1) as u64);
     let mut bytes = Vec::new();
     reader
         .read_to_end(&mut bytes)
         .map_err(|e| anyhow!("Failed to read '{}': {}", validated.display(), e))?;
-    if bytes.len() > MAX_VALIDATED_BYTES {
-        return Err(SanitizeError::FileTooLarge {
-            path: validated,
-            max_bytes: MAX_VALIDATED_BYTES,
-            actual_bytes: bytes.len() as u64,
-        }
-        .into());
+    if bytes.len() > max_bytes {
+        return Err(too_large_error(validated, max_bytes, bytes.len() as u64, is_state).into());
     }
     String::from_utf8(bytes).map_err(|e| anyhow!("Failed to read '{}': {}", validated.display(), e))
+}
+
+fn too_large_error(
+    path: PathBuf,
+    max_bytes: usize,
+    actual_bytes: u64,
+    is_state: bool,
+) -> SanitizeError {
+    if is_state {
+        SanitizeError::StateFileTooLarge {
+            path,
+            max_bytes,
+            actual_bytes,
+        }
+    } else {
+        SanitizeError::FileTooLarge {
+            path,
+            max_bytes,
+            actual_bytes,
+        }
+    }
 }
 
 /// Read a directory only after validating it as an allowed directory path.

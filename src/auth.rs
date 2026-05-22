@@ -254,6 +254,21 @@ async fn auth_middleware(
 
 /// Wrap a router with the Bearer auth middleware. Pass-through when
 /// `config.token` is `None` (operator opted out of auth).
+///
+/// **Rate-limit contract (local-first, NOT proxy-aware).** The governor
+/// uses `tower_governor`'s default key extractor, which buckets requests
+/// by the peer socket address. AICX is local-first: in the loopback /
+/// Tailscale / direct-bind case that maps one bucket per actual client
+/// and behaves as intended.
+///
+/// Behind a reverse proxy (nginx, Caddy, Cloudflare), every request
+/// arrives from a small number of proxy IPs, so all proxied users share
+/// a single bucket — one noisy client can starve the rest with `429`s.
+/// The bind path emits an operator warning when auth is enforced and the
+/// server is bound to a non-loopback address; resolving that into a
+/// trusted-header proxy mode is tracked as a follow-up (Option B in the
+/// PR #6 review). Do not market this layer as multi-user / proxy-safe
+/// until that work lands.
 pub fn require_auth_layer<S>(router: Router<S>, config: AuthConfig) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -266,6 +281,8 @@ where
         return router;
     }
 
+    // Peer-IP / local-first bucket. See the function doc-comment for the
+    // proxy contract this intentionally does not provide.
     let governor_config = GovernorConfigBuilder::default()
         .per_millisecond(AUTH_RATE_LIMIT_REPLENISH_MS)
         .burst_size(AUTH_RATE_LIMIT_BURST)
@@ -273,6 +290,26 @@ where
         .expect("auth rate limit config is non-zero");
 
     router.layer(GovernorLayer::new(governor_config))
+}
+
+/// Operator-facing description of the rate-limit / proxy contract.
+///
+/// Returned as `Some(message)` when the operator binds to a non-loopback
+/// address with auth enabled — exactly the configuration where a
+/// reverse proxy is plausible and where the peer-IP bucket could be
+/// silently shared across many real users. Returned as `None` when the
+/// bind is loopback (rate-limit semantics match operator expectations).
+pub fn proxy_rate_limit_warning(host: std::net::IpAddr) -> Option<&'static str> {
+    if host.is_loopback() {
+        None
+    } else {
+        Some(
+            "Rate limit on /api/* is peer-IP / local-first and NOT proxy-aware. \
+             Behind a reverse proxy every user shares the proxy's bucket, so a single \
+             noisy client can starve others with 429. Proxy-aware key extraction \
+             (trusted-header opt-in) is tracked as a follow-up.",
+        )
+    }
 }
 
 #[cfg(test)]
@@ -288,6 +325,36 @@ mod tests {
         unsafe {
             std::env::remove_var("AICX_HTTP_AUTH_TOKEN");
         }
+    }
+
+    #[test]
+    fn test_proxy_rate_limit_warning_is_silent_on_loopback() {
+        // PR #6 follow-up regression for the rate-limit/proxy contract:
+        // local-first binds (the AICX default) must NOT emit the
+        // proxy-shared-bucket warning — that would be noise and would
+        // train operators to ignore it.
+        let v4 = std::net::IpAddr::from([127u8, 0, 0, 1]);
+        assert!(super::proxy_rate_limit_warning(v4).is_none());
+        let v6 = std::net::IpAddr::from([0u16, 0, 0, 0, 0, 0, 0, 1]);
+        assert!(super::proxy_rate_limit_warning(v6).is_none());
+    }
+
+    #[test]
+    fn test_proxy_rate_limit_warning_fires_for_non_loopback_bind() {
+        // The same path that gates non-loopback bind (must have auth +
+        // explicit CORS) must surface the peer-IP / proxy limitation so
+        // the operator does not assume multi-user safety behind a
+        // reverse proxy.
+        let v4 = std::net::IpAddr::from([0u8, 0, 0, 0]);
+        let msg = super::proxy_rate_limit_warning(v4)
+            .expect("non-loopback bind must emit proxy rate-limit warning");
+        assert!(
+            msg.contains("peer-IP") && msg.contains("proxy"),
+            "warning must reference peer-IP / proxy contract: {msg}"
+        );
+
+        let tailscale = std::net::IpAddr::from([100u8, 75, 30, 90]);
+        assert!(super::proxy_rate_limit_warning(tailscale).is_some());
     }
 
     #[test]

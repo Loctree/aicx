@@ -193,7 +193,11 @@ impl StateManager {
         }
 
         let backup_path = Self::backup_path(path);
-        let contents = sanitize::read_to_string_validated(path)
+        // state.json uses a dedicated, larger cap than the generic 8 MiB
+        // validated-read limit — long-lived installs legitimately grow
+        // `seen_hashes` / run history past that. See
+        // [`sanitize::read_state_json_validated`].
+        let contents = sanitize::read_state_json_validated(path)
             .with_context(|| format!("Failed to read state file: {}", path.display()))?;
 
         let state: Self =
@@ -206,7 +210,7 @@ impl StateManager {
                         "state.json parse failed"
                     );
                     if backup_path.exists() {
-                        let backup = sanitize::read_to_string_validated(&backup_path)
+                        let backup = sanitize::read_state_json_validated(&backup_path)
                             .with_context(|| {
                                 format!("Failed to read state backup: {}", backup_path.display())
                             })?;
