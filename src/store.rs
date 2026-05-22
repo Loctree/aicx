@@ -1113,8 +1113,7 @@ where
         // proportional) which broke the contract test
         // `store_cli_defaults_to_incremental_and_full_rescan_recovers_backfill`.
         let chunks_written = outcome.written_paths.len();
-        let chunks_total =
-            chunks_written + outcome.deduped_chunks + outcome.skipped_empty_body;
+        let chunks_total = chunks_written + outcome.deduped_chunks + outcome.skipped_empty_body;
         let entries_committed_to_disk = if chunks_total == 0 || chunks_written == 0 {
             0
         } else {
@@ -4340,13 +4339,9 @@ mod tests {
             ),
         ];
 
-        let first = store_semantic_segments_at(
-            &root,
-            &entries,
-            &ChunkerConfig::default(),
-            |_, _| {},
-        )
-        .expect("first store");
+        let first =
+            store_semantic_segments_at(&root, &entries, &ChunkerConfig::default(), |_, _| {})
+                .expect("first store");
         assert!(
             !first.written_paths.is_empty(),
             "first run must actually write something"
@@ -4375,13 +4370,9 @@ mod tests {
         // Re-run with the same entries. Every chunk's content_sha256
         // is already on disk, so `write_context_session_first_outcome_at`
         // increments `deduped_chunks` instead of producing a new path.
-        let second = store_semantic_segments_at(
-            &root,
-            &entries,
-            &ChunkerConfig::default(),
-            |_, _| {},
-        )
-        .expect("second store");
+        let second =
+            store_semantic_segments_at(&root, &entries, &ChunkerConfig::default(), |_, _| {})
+                .expect("second store");
         assert!(
             second.written_paths.is_empty(),
             "second run must not write any new files when every chunk dedups"

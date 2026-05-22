@@ -1831,14 +1831,10 @@ fn test_read_line_capped_returns_normal_line() {
 #[test]
 fn test_read_line_capped_skips_to_next_line_after_oversized() {
     let mut reader = Cursor::new(b"aaaaaaaaa\nok\n".to_vec());
-    let first = sanitize::read_line_capped(&mut reader, 4)
-        .unwrap()
-        .unwrap();
+    let first = sanitize::read_line_capped(&mut reader, 4).unwrap().unwrap();
     assert!(first.exceeded);
     assert_eq!(first.line, "aaaa");
-    let second = sanitize::read_line_capped(&mut reader, 4)
-        .unwrap()
-        .unwrap();
+    let second = sanitize::read_line_capped(&mut reader, 4).unwrap().unwrap();
     assert_eq!(second.line, "ok\n");
 }
 
