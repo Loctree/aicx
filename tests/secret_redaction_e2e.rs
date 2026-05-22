@@ -2,6 +2,7 @@ use aicx::output::{
     ConversationExtractStats, ConversationMessage, ReportMetadata, write_conversation_json,
     write_conversation_markdown,
 };
+use aicx::redact::redact_secrets;
 use chrono::{TimeZone, Utc};
 use std::fs;
 use std::path::PathBuf;
