@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 pub const SIPHASH13_ALGORITHM: &str = "siphash13-v1";
-pub const BLAKE3_128_ALGORITHM: &str = "blake3-128-v1";
+pub const BLAKE3_128_ALGORITHM: &str = "blake3-128-v2";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StateMigrationReport {
@@ -210,6 +210,26 @@ mod tests {
             .insert("somehash".to_string());
 
         let report = migrate_loaded_state(&mut state);
+        assert!(report.hash_algorithm_changed);
+        assert_eq!(report.cleared_seen_hashes, 1);
+        assert!(state.seen_hashes.is_empty());
+        assert_eq!(state.hash_algorithm, BLAKE3_128_ALGORITHM);
+    }
+
+    #[test]
+    fn test_blake3_v1_migration_clears_state_on_v2_bump() {
+        let mut state = StateManager {
+            hash_algorithm: "blake3-128-v1".to_string(),
+            ..Default::default()
+        };
+        state
+            .seen_hashes
+            .entry("test".to_string())
+            .or_default()
+            .insert("old-blake3-v1-hash".to_string());
+
+        let report = migrate_loaded_state(&mut state);
+
         assert!(report.hash_algorithm_changed);
         assert_eq!(report.cleared_seen_hashes, 1);
         assert!(state.seen_hashes.is_empty());

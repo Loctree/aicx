@@ -1911,3 +1911,47 @@ sprawdza `AlreadyExists` i brak nadpisania istniejącego token file. Istniejący
 B-1..B-4 + C-1 `d2d41e1`.
 
 ---
+
+## 2026-05-22 — state hash field separator + blake3-128-v2 migration (J-6 + K-2) · `pending-this-commit`
+
+**Symptom.** `src/state.rs::content_hash` i `overlap_hash` składały pola do
+jednego bufora przez raw concatenation. Dla `content_hash` dawało to
+hash-splitting surface: inny podział `(agent, timestamp, message)` mógł
+prowadzić do identycznego byte streamu. Dodatkowo `CHANGELOG.md` nie opisywał
+wcześniejszej migracji `siphash13-v1` → `blake3-128-v1`.
+
+**Root cause.** Format wejścia do `stable_blake3_128` nie miał separatora ani
+length-prefixów między polami. Cache `seen_hashes` zależy od dokładnych bajtów
+hashowanego wejścia, więc naprawa formatu wymagała kolejnego bumpa
+`hash_algorithm` i jednorazowego resetu cache przy pierwszym loadzie.
+
+**Fix.**
+- `content_hash` i `overlap_hash` używają wspólnego field-hash helpera z
+  length-prefixem przed każdym polem.
+- `BLAKE3_128_ALGORITHM` podniesiono z `blake3-128-v1` do
+  `blake3-128-v2`; istniejący path migracji czyści `seen_hashes` dla
+  `siphash13-v1`, pustego/legacy stanu oraz `blake3-128-v1`.
+- `CHANGELOG.md` dostał `### Breaking` w Unreleased z retroaktywnym G-1
+  `siphash13-v1` → `blake3-128-v1` i nowym J-6
+  `blake3-128-v1` → `blake3-128-v2`.
+
+**Touched.**
+- `src/state.rs` — `content_hash`, `overlap_hash`, regression tests.
+- `src/state/migration.rs` — current algorithm constant + v1→v2 migration test.
+- `CHANGELOG.md` — Unreleased Breaking notes.
+- `docs/BUGFIXES.md` — ten wpis.
+
+**Tests.** Dodano regression dla legacy raw-concat collision pair oraz test
+`blake3-128-v1` → `blake3-128-v2` resetu `seen_hashes`. Pełne gate’y D-1 zapisuje
+raport workerowy.
+
+**Lessons.**
+- Hash stabilny między release'ami musi mieć jawnie wersjonowany input format,
+  nie tylko jawnie wersjonowany algorytm.
+- Jeśli naprawa dedup hashy zmienia byte stream, `seen_hashes` jest cache'em
+  starego formatu i musi zostać wyczyszczony zamiast mieszany z nowymi hashami.
+
+**Related.** J-6 + K-2 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows
+Wave B B-1..B-4 + Wave C C-1..C-2.
+
+---
