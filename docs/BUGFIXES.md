@@ -1711,3 +1711,32 @@ apply path, but does not mutate the live canonical store by itself.
 - Self-referential commit SHA nie jest możliwy w tym samym commicie; finalny SHA tego wpisu jest zapisany w raporcie A-1.
 
 **Related.** Closes L-1 foundation z `docs/bug-tracker-aicx-followup-pass-3.md`; kontynuuje audit `26d8123` / `docs/scope-overflow.md`. A-2/A-3 nadal odpowiadają za wiring call site’ów z listy audytu.
+
+## 2026-05-22 — semantic index NDJSON readers capped (L-1 sweep #2) · `self-sha-in-report`
+
+**Symptom.** Audit `26d8123` wykazał, że semantic-index read path dalej używał nieograniczonych `BufReader::lines()` / `read_line` w `src/api.rs`, `src/vector_index.rs`, `src/search_engine.rs` i brute-force dense adapterze. Adwersarialna linia NDJSON mogła wymusić niekontrolowaną alokację zanim parser zgłosił błąd.
+
+**Root cause.** A-1 (`6482bff`) dodało workspace-shared `aicx_parser::sanitize::read_line_capped`, ale downstream readers wciąż korzystały z convenience iteratorów standard library, które nie mają per-line cap i buforują całą linię.
+
+**Fix.**
+- `src/api.rs`: row-count semantic indexu przechodzi przez `read_line_capped`, header skip + data count bez `BufReader::lines()`.
+- `src/vector_index.rs`: dodano lokalny adapter capped-line zachowujący semantykę `BufRead::lines()` (strip `\n`/`\r\n`) i podpięto go w header rewrite, committed-reader, resume checkpoint, incremental baseline, committed-body seed oraz query scan.
+- `src/search_engine.rs`: header preview i empty-index detection czytają przez `read_line_capped`; oversized header nie jest parsowany jako prawidłowy status.
+- `crates/aicx-retrieve/src/adapter_brute_force.rs`: brute-force NDJSON load używa `read_line_capped`; oversized body row jest raportowany jako corrupt i reader przechodzi do następnej poprawnej linii.
+- `crates/aicx-retrieve/Cargo.toml`: dodano zależność path `aicx-parser` dla helpera A-1.
+
+**Touched.**
+- `src/api.rs` — `count_index_rows`.
+- `src/vector_index.rs` — semantic NDJSON readers + capped iterator regression.
+- `src/search_engine.rs` — `read_index_header`, `index_appears_empty`.
+- `crates/aicx-retrieve/src/adapter_brute_force.rs` — `load_ndjson` + oversized-row regression.
+- `crates/aicx-retrieve/Cargo.toml` — parser helper dependency.
+
+**Tests.** `cargo build --workspace`, `cargo test --workspace -- --test-threads=4`, `cargo clippy --workspace -- -D warnings`, `cargo fmt --check` zielone. Targeted: `cargo test capped_index_lines_error_on_oversized_and_advance_to_next_line -- --nocapture`; `cargo test -p aicx-retrieve load_skips_oversized_row_and_reads_following_row -- --nocapture`. `rg 'BufReader::lines\(\)|\.read_line\(' src/api.rs src/vector_index.rs src/search_engine.rs crates/aicx-retrieve/src/adapter_brute_force.rs` zwraca zero trafień.
+
+**Lessons.**
+- `BufRead::lines()` jest wygodne, ale w ścieżkach NDJSON indexu nie daje kontroli nad alokacją; capped adapter powinien być bliżej call-site’u niż parser JSON.
+- Oversized row nie musi oznaczać tego samego w każdym module: query/header paths mogą failować typed error, a brute-force body może policzyć corrupt row i kontynuować po drained newline.
+- Self-referential commit SHA nie jest możliwy w tym samym commicie; finalny SHA tego wpisu jest zapisany w raporcie A-2.
+
+**Related.** Closes A-2 / L-1 sweep #2 z `docs/bug-tracker-aicx-followup-pass-3.md`; implements semantic-NDJSON portion of audit `26d8123` / `docs/scope-overflow.md`; follows A-1 foundation `6482bff`.
