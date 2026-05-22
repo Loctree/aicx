@@ -2601,3 +2601,88 @@ fn test_operator_md_owner_repo_decode_preserves_owner() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn test_discover_operator_markdown_honors_caller_cutoff_for_all_time() {
+    let root = unique_test_dir("operator-md-cutoff-all-time");
+    let home = root.join("home");
+    let downloads = home.join("Downloads");
+    fs::create_dir_all(&downloads).unwrap();
+
+    // A markdown file with mtime 90 days ago — well outside the legacy 30d default.
+    let ancient = downloads.join("ancient-decision.md");
+    write_file(&ancient, "Decision: ancient choice from before the 30d window.");
+    let ninety_days_ago = (Utc::now() - Duration::days(90)).timestamp();
+    set_mtime(&ancient, ninety_days_ago);
+
+    // Caller cutoff = epoch == "all time"; mirrors `aicx store -H 0`.
+    let epoch = Utc.timestamp_opt(0, 0).single().unwrap();
+    let discovered = discover_operator_markdown_from(&home, None, Some(epoch));
+
+    assert_eq!(
+        discovered.len(),
+        1,
+        "epoch caller cutoff must discover markdown regardless of mtime age",
+    );
+    assert_eq!(discovered[0].path, ancient);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_discover_operator_markdown_default_30d_when_no_caller_cutoff() {
+    let root = unique_test_dir("operator-md-cutoff-default");
+    let home = root.join("home");
+    let downloads = home.join("Downloads");
+    fs::create_dir_all(&downloads).unwrap();
+
+    // Recent file: mtime defaults to "now" via fs::write — inside 30d default.
+    let recent = downloads.join("recent.md");
+    write_file(&recent, "Decision: recent choice within the 30d default window.");
+
+    // Ancient file: mtime 90 days ago — outside 30d default.
+    let ancient = downloads.join("ancient.md");
+    write_file(&ancient, "Decision: pre-default-window history.");
+    let ninety_days_ago = (Utc::now() - Duration::days(90)).timestamp();
+    set_mtime(&ancient, ninety_days_ago);
+
+    // None caller cutoff → legacy 30d default preserved.
+    let discovered = discover_operator_markdown_from(&home, None, None);
+
+    assert_eq!(
+        discovered.len(),
+        1,
+        "None caller cutoff must preserve the 30d default; ancient file should be filtered",
+    );
+    assert_eq!(discovered[0].path, recent);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_discover_operator_markdown_honors_caller_cutoff_when_narrower() {
+    let root = unique_test_dir("operator-md-cutoff-narrower");
+    let home = root.join("home");
+    let downloads = home.join("Downloads");
+    fs::create_dir_all(&downloads).unwrap();
+
+    // Fixture is 15 days old: inside the 30d default, outside a 7d caller window.
+    let fifteen_days_old = downloads.join("fifteen-days-old.md");
+    write_file(
+        &fifteen_days_old,
+        "Decision: 15-day-old choice should not survive a 7-day caller cutoff.",
+    );
+    let fifteen_days = (Utc::now() - Duration::days(15)).timestamp();
+    set_mtime(&fifteen_days_old, fifteen_days);
+
+    // Caller cutoff = 7 days ago — narrower than the 30d default.
+    let seven_days_ago = Utc::now() - Duration::days(7);
+    let discovered = discover_operator_markdown_from(&home, None, Some(seven_days_ago));
+
+    assert!(
+        discovered.is_empty(),
+        "15-day-old markdown must be excluded by a 7-day caller cutoff (narrower than 30d default)",
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

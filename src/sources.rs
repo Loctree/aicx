@@ -37,6 +37,14 @@ const CODESCRIBE_NO_SPEECH_MARKERS: &[&str] = &[
 ];
 const OPERATOR_MD_AGENT: &str = "operator";
 const OPERATOR_MD_KIND: &str = "operator-md";
+/// Default discovery window applied when a caller does NOT supply its own cutoff.
+///
+/// Historically this acted as an unconditional ceiling, which silently capped
+/// `aicx store --agent operator-md -H 0` (all-time backfill) at 30 days. It
+/// is now a *default* honored only when `caller_cutoff` is `None` in
+/// [`discover_operator_markdown_from`]. Callers that thread an
+/// `ExtractionConfig::cutoff` through (e.g. the store pipeline) bypass this
+/// default entirely, so explicit lookback flags are honored.
 const OPERATOR_MD_RECENT_DAYS: i64 = 30;
 const UNPROTECTED_SOURCE_WARNING: &str = "unprotected source material; run `aicx sources protect --root <path> --backend git-local --apply` to opt in";
 const EXACT_SHORT_DUP_MAX_CHARS: usize = 1000;
@@ -5026,13 +5034,21 @@ fn resolve_codescribe_cwd_hint(home: &Path, project_hint: Option<&str>) -> Optio
 
 /// Discover recent operator markdown files from the standard operator inboxes.
 pub fn discover_operator_markdown(home: &Path) -> Vec<OperatorMarkdown> {
-    discover_operator_markdown_from(home, None)
+    discover_operator_markdown_from(home, None, None)
 }
 
-/// Discover recent operator markdown files, optionally including `<repo>/docs/operator`.
+/// Discover operator markdown files, optionally including `<repo>/docs/operator`.
+///
+/// `caller_cutoff` is the earliest file-mtime the caller is interested in:
+/// - `None` falls back to a 30-day default window
+///   ([`OPERATOR_MD_RECENT_DAYS`]). This is the legacy convenience for source
+///   enumeration paths that have no [`ExtractionConfig`] to hand in.
+/// - `Some(t)` honors `t` directly. `t = UNIX epoch` therefore means
+///   "all time", which is what `aicx store --agent operator-md -H 0` needs.
 pub fn discover_operator_markdown_from(
     home: &Path,
     repo_root: Option<&Path>,
+    caller_cutoff: Option<DateTime<Utc>>,
 ) -> Vec<OperatorMarkdown> {
     let mut dirs = vec![
         home.join("Downloads"),
@@ -5042,7 +5058,8 @@ pub fn discover_operator_markdown_from(
         dirs.push(repo_root.join("docs").join("operator"));
     }
 
-    let cutoff = Utc::now() - Duration::days(OPERATOR_MD_RECENT_DAYS);
+    let cutoff = caller_cutoff
+        .unwrap_or_else(|| Utc::now() - Duration::days(OPERATOR_MD_RECENT_DAYS));
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
 
@@ -5102,7 +5119,7 @@ pub fn extract_operator_markdown_from_home_and_repo(
 ) -> Result<Vec<TimelineEntry>> {
     let mut entries = Vec::new();
 
-    for document in discover_operator_markdown_from(home, repo_root) {
+    for document in discover_operator_markdown_from(home, repo_root, Some(config.cutoff)) {
         match parse_operator_markdown_document(home, &document, config) {
             Ok(mut parsed) => entries.append(&mut parsed),
             Err(e) => eprintln!(

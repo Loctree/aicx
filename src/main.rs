@@ -830,7 +830,9 @@ enum Commands {
         #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
-        /// Agent filter: claude, codex, gemini, junie, codescribe, operator-md (default: all agents)
+        /// Agent filter: one of claude, codex, gemini, junie, codescribe, operator-md.
+        /// Default: claude+codex+gemini+junie+codescribe (operator-md is opt-in
+        /// via `--agent operator-md`).
         #[arg(short, long, value_parser = ["claude", "codex", "gemini", "junie", "codescribe", "operator-md"])]
         agent: Option<String>,
 
