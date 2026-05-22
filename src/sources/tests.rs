@@ -2302,6 +2302,30 @@ fn test_project_filter_matches_owner_repo_segments() {
 }
 
 #[test]
+fn test_project_filter_matches_path_local_checkout_matches_canonical() {
+    assert!(project_filter_matches_path(
+        "/Users/silver/Git/aicx",
+        &["Loctree/aicx".to_string()]
+    ));
+}
+
+#[test]
+fn test_project_filter_matches_path_strict_owner_repo() {
+    assert!(project_filter_matches_path(
+        "/x/Loctree/aicx",
+        &["Loctree/aicx".to_string()]
+    ));
+}
+
+#[test]
+fn test_project_filter_matches_path_substring_does_not_leak() {
+    assert!(!project_filter_matches_path(
+        "/x/vista-portal",
+        &["vista".to_string()]
+    ));
+}
+
+#[test]
 fn test_project_filter_matches_owner_wildcard_segment() {
     assert!(project_filter_matches_path(
         "/Users/silver/Git/Loctree/aicx",

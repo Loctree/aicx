@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::sanitize;
+use crate::store::project_filter_matches;
 use crate::timeline::FrameKind;
 pub use crate::timeline::{
     CollapseStubKind, ConversationMessage, ExtractionConfig, MessageKind, SourceInfo, TimelineEntry,
@@ -972,10 +973,47 @@ fn infer_gemini_project_hint_from_session_path(path: &Path) -> Option<String> {
     normalize_project_hint(&project)
 }
 
-/// Check if any project filter matches the given path by strict path segment.
+fn project_filter_matches_identity(
+    organization: &str,
+    repository: &str,
+    filters: &[String],
+) -> bool {
+    filters.is_empty()
+        || filters
+            .iter()
+            .any(|filter| project_filter_matches(organization, repository, filter))
+}
+
+fn canonical_project_parts(value: &str) -> Option<(String, String)> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('\\')
+        || trimmed.contains(":\\")
+    {
+        return None;
+    }
+
+    let mut parts = trimmed.split(['/', '\\']);
+    let organization = parts
+        .next()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())?;
+    let repository = parts
+        .next()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    Some((organization.to_string(), repository.to_string()))
+}
+
+/// Check if any project filter matches the given path or canonical identity.
 ///
 /// Mirrors store filter forms without substring matching:
-/// - `owner/repo` => adjacent path segments.
+/// - `owner/repo` => canonical identity, adjacent path segments, or path basename fallback.
 /// - `owner/` => exact owner segment.
 /// - `/repo` => exact repo segment.
 /// - `name` => exact path segment.
@@ -983,6 +1021,11 @@ fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool {
     if filters.is_empty() {
         return true;
     }
+
+    if let Some((organization, repository)) = canonical_project_parts(cwd) {
+        return project_filter_matches_identity(&organization, &repository, filters);
+    }
+
     let path_segments: Vec<String> = cwd
         .split(['/', '\\'])
         .map(str::trim)
@@ -1021,9 +1064,18 @@ fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool {
             if parts.next().is_some() {
                 return false;
             }
-            return path_segments
+            if path_segments
                 .windows(2)
-                .any(|pair| pair[0] == owner && pair[1] == repo);
+                .any(|pair| pair[0] == owner && pair[1] == repo)
+            {
+                return true;
+            }
+
+            // TODO(C-2/C-3 canonical-supply): this path-only fallback exists for
+            // source adapters that have not supplied canonical org/repo yet.
+            // It lets `-p owner/repo` match a checkout rooted at `/.../repo`
+            // without reintroducing substring matching.
+            return path_segments.last().is_some_and(|segment| segment == repo);
         }
 
         path_segments.iter().any(|segment| segment == &filter)
