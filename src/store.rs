@@ -1044,22 +1044,42 @@ pub fn store_semantic_segments_at<F>(
     base: &Path,
     entries: &[TimelineEntry],
     chunker_config: &ChunkerConfig,
+    progress: F,
+) -> Result<StoreWriteSummary>
+where
+    F: FnMut(usize, usize),
+{
+    if entries.is_empty() {
+        return Ok(StoreWriteSummary::default());
+    }
+    let segments = semantic_segments(entries);
+    store_segments_at(base, &segments, chunker_config, progress)
+}
+
+/// Write pre-computed [`SemanticSegment`]s to the canonical store. This
+/// is the underlying primitive — callers that already paid for
+/// segmentation (e.g. the CLI's phased pipeline that emits a
+/// `segment`-phase heartbeat before the first `.md` write) reuse those
+/// segments here instead of re-segmenting from raw entries.
+pub fn store_segments_at<F>(
+    base: &Path,
+    segments: &[SemanticSegment],
+    chunker_config: &ChunkerConfig,
     mut progress: F,
 ) -> Result<StoreWriteSummary>
 where
     F: FnMut(usize, usize),
 {
     let mut summary = StoreWriteSummary::default();
-    if entries.is_empty() {
+    if segments.is_empty() {
         return Ok(summary);
     }
 
     let _lock = crate::locks::acquire_exclusive(base.join("locks").join("index.lock"))?;
-    let segments = semantic_segments(entries);
     let total_segments = segments.len();
     let mut index = load_index_at(base)?;
 
-    for (segment_idx, segment) in segments.into_iter().enumerate() {
+    for (segment_idx, segment) in segments.iter().enumerate() {
         let date = segment
             .entries
             .first()
@@ -1067,7 +1087,7 @@ where
             .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
         let project = canonical_project_slug(&segment.project_label());
 
-        let outcome = write_semantic_segment_at(base, &segment, &date, chunker_config)?;
+        let outcome = write_semantic_segment_at(base, segment, &date, chunker_config)?;
         summary.skipped_empty_body += outcome.skipped_empty_body;
         summary.deduped_chunks += outcome.deduped_chunks;
         update_index(
