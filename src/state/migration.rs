@@ -92,26 +92,19 @@ pub fn generate_case_bucket_merge_script(store_root: &Path) -> Result<BucketCase
     script.push_str("shopt -s dotglob nullglob\n\n");
 
     for merge in &merges {
-        script.push_str(&format!(
-            "mkdir -p \"$STORE_ROOT/{}\"\n",
-            shell_escape_double_quoted(&merge.canonical_bucket)
-        ));
+        let canonical = shlex_quote_bucket(&merge.canonical_bucket)?;
+        script.push_str(&format!("mkdir -p \"$STORE_ROOT\"/{canonical}\n"));
         for source in &merge.source_buckets {
             if source == &merge.canonical_bucket {
                 continue;
             }
+            let src = shlex_quote_bucket(source)?;
+            script.push_str(&format!("if [[ -d \"$STORE_ROOT\"/{src} ]]; then\n"));
             script.push_str(&format!(
-                "if [[ -d \"$STORE_ROOT/{}\" ]]; then\n",
-                shell_escape_double_quoted(source)
+                "  mv -n \"$STORE_ROOT\"/{src}/* \"$STORE_ROOT\"/{canonical}/\n"
             ));
             script.push_str(&format!(
-                "  mv -n \"$STORE_ROOT/{}\"/* \"$STORE_ROOT/{}/\"\n",
-                shell_escape_double_quoted(source),
-                shell_escape_double_quoted(&merge.canonical_bucket)
-            ));
-            script.push_str(&format!(
-                "  rmdir \"$STORE_ROOT/{}\" 2>/dev/null || true\n",
-                shell_escape_double_quoted(source)
+                "  rmdir \"$STORE_ROOT\"/{src} 2>/dev/null || true\n"
             ));
             script.push_str("fi\n");
         }
@@ -119,6 +112,17 @@ pub fn generate_case_bucket_merge_script(store_root: &Path) -> Result<BucketCase
     }
 
     Ok(BucketCaseMergeScript { merges, script })
+}
+
+/// Shell-quote a bucket name for safe embedding in the generated migration
+/// script. Uses `shlex::try_quote` (single-quote-based, defangs `$(...)`,
+/// backticks, `${...}`, `!`, all shell metacharacters). NUL byte in a bucket
+/// name (impossible on POSIX filesystems) is the only `try_quote` failure
+/// mode — surface it as an error so the script is not emitted at all.
+fn shlex_quote_bucket(bucket: &str) -> Result<String> {
+    shlex::try_quote(bucket)
+        .map(|cow| cow.into_owned())
+        .map_err(|e| anyhow::anyhow!("bucket {bucket:?} cannot be safely shell-quoted: {e}"))
 }
 
 fn plan_case_bucket_merges(store_root: &Path) -> Result<Vec<BucketCaseMerge>> {
@@ -183,10 +187,6 @@ fn looks_like_date_dir(path: &Path) -> bool {
                 && name.as_bytes().get(4) == Some(&b'_')
                 && name.chars().filter(|ch| ch.is_ascii_digit()).count() == 8
         })
-}
-
-fn shell_escape_double_quoted(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(test)]

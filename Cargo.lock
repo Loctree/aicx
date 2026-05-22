@@ -82,6 +82,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "shlex",
  "siphasher",
  "tokio",
  "toml 0.8.23",
