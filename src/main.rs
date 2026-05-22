@@ -3974,30 +3974,28 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     }
 
     // Update state (hashes already marked during dedup filtering above)
-    if !output_entries.is_empty() {
-        if force || full_rescan {
-            // When --force or --full-rescan bypasses persisted dedup state, we still
-            // mark entries as seen so future incremental runs remain honest.
-            for e in &output_entries {
-                let exact =
-                    StateManager::content_hash(&e.agent, e.timestamp.timestamp(), &e.message);
-                let overlap = StateManager::overlap_hash(e.timestamp.timestamp(), &e.message);
-                state.mark_seen(&project_name, exact);
-                state.mark_seen(&overlap_project, overlap);
-            }
+    if force || full_rescan {
+        // When --force or --full-rescan bypasses persisted dedup state, we still
+        // mark entries as seen so future incremental runs remain honest.
+        for e in &output_entries {
+            let exact =
+                StateManager::content_hash(&e.agent, e.timestamp.timestamp(), &e.message);
+            let overlap = StateManager::overlap_hash(e.timestamp.timestamp(), &e.message);
+            state.mark_seen(&project_name, exact);
+            state.mark_seen(&overlap_project, overlap);
         }
-
-        if let Some(latest) = output_entries.last() {
-            state.update_watermark(&source_key, latest.timestamp);
-        }
-
-        state.record_run(
-            output_entries.len(),
-            agents.iter().map(|s| s.to_string()).collect(),
-        );
-        state.prune_old_hashes(50_000);
-        state.save()?;
     }
+
+    if let Some(latest) = output_entries.last() {
+        state.update_watermark(&source_key, latest.timestamp);
+    }
+
+    state.record_run(
+        output_entries.len(),
+        agents.iter().map(|s| s.to_string()).collect(),
+    );
+    state.prune_old_hashes(50_000);
+    state.save()?;
 
     if output_entries.is_empty() {
         eprintln!(
@@ -4187,28 +4185,15 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         eprintln!("  Filtered {echo_filtered} self-echo entries");
     }
 
+    let mut stored_count = 0;
+    let mut all_written_paths = Vec::new();
+    let mut scope_surface = StoreScopeSurface::empty(&project);
+    let mut skipped_empty_body = 0;
+    let mut deduped_chunks = 0;
+
     if all_entries.is_empty() {
         eprintln!("No entries found.");
-        if let StdoutEmit::Json = emit {
-            let scope_surface = StoreScopeSurface::empty(&project);
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "total_entries": 0,
-                    "total_chunks": 0,
-                    "requested_source_filters": scope_surface.requested_source_filters,
-                    "resolved_repositories": scope_surface.resolved_repositories,
-                    "includes_non_repository_contexts": scope_surface.includes_non_repository_contexts,
-                    "resolved_store_buckets": scope_surface.resolved_store_buckets,
-                    "repos": scope_surface.repository_buckets(),
-                    "store_paths": Vec::<String>::new(),
-                    "written_empty_body_skipped": 0,
-                    "deduped_chunks": 0,
-                }))?
-            );
-        }
-        return Ok(());
-    }
+    } else {
 
     // Apply redaction in-place (single TimelineEntry type)
     if redact_secrets {
@@ -4290,9 +4275,9 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
             return Err(e);
         }
     };
-    let stored_count = store_summary.total_entries;
-    let all_written_paths = store_summary.written_paths.clone();
-    let scope_surface = StoreScopeSurface::from_store_summary(&project, &store_summary);
+    /* let stored_count = ... hoisted */
+    /* let all_written_paths = ... hoisted */
+    /* let scope_surface = ... hoisted */
 
     // Update fast local metadata index
     if let Ok(rt) = tokio::runtime::Runtime::new() {
@@ -4336,6 +4321,13 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         render_resolved_store_buckets(&scope_surface)
     );
 
+        stored_count = store_summary.total_entries;
+        all_written_paths = store_summary.written_paths.clone();
+        scope_surface = StoreScopeSurface::from_store_summary(&project, &store_summary);
+        skipped_empty_body = store_summary.skipped_empty_body;
+        deduped_chunks = store_summary.deduped_chunks;
+    }
+
     if let Some(latest) = all_entries.last() {
         state.update_watermark(&source_key, latest.timestamp);
     }
@@ -4376,8 +4368,8 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
                     "resolved_store_buckets": scope_surface.resolved_store_buckets,
                     "repos": scope_surface.repository_buckets(),
                     "store_paths": store_paths,
-                    "written_empty_body_skipped": store_summary.skipped_empty_body,
-                    "deduped_chunks": store_summary.deduped_chunks,
+                    "written_empty_body_skipped": skipped_empty_body,
+                    "deduped_chunks": deduped_chunks,
                 }))?
             );
         }
