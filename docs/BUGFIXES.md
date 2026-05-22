@@ -1633,3 +1633,56 @@ apply path, but does not mutate the live canonical store by itself.
 - Pass-3 (or pass-2.5) potrzebuje konkretnej, narrow per-site brief dla każdego cap-missing site — zamiast jednego "wide sweep" brief.
 
 **Related.** Closes I-1 z `docs/bug-tracker-aicx-followup-pass-2.md` AS AUDIT; full BufReader cap implementation zostaje **open** dla pass-3 (referencuje commit `26d8123` audit doc).
+
+## 2026-05-21 — PR #5 CI hotfix: semgrep nosemgrep relocations + diagnostics test race · `cbf021e`
+
+**Symptom.** PR #5 (`fix/bug-tracker-2nd-pass`) Linux CI failed na Semgrep (3 path-traversal findings w `src/output.rs`). Lokalnie pełne gates ujawniły race condition: 3 testy parallel failowały (`diagnostics::tests::summary_aggregates_per_extractor` + 2 codex secondaries via PoisonError).
+
+**Root cause (semgrep).** Pass-1 merge commit (`e79c3d57`) wprowadziło broken nosemgrep pattern: `nosemgrep + rationale-comment + target-line` jako 3 osobne linie. Semgrep honors `nosemgrep` tylko bezpośrednio nad/na target line; rationale comment między nimi BLOKUJE suppression. Pre-pass-1 working pattern (`2a2f8179`) miał rationale ABOVE + nosemgrep INLINE z target.
+
+**Root cause (race).** G-4 (`ae30779`) wprowadził globalny `Mutex<DiagnosticsState>`. `summary_aggregates_per_extractor` przejmował lock per-`record()` call (acquire-release w pętli), tworząc race window gdzie parallel `extract_*_file` tests (production paths calling `diagnostics::record`) pollutowały aggregator między setup a assert.
+
+**Fix.**
+- `src/output.rs`: nosemgrep relocated to INLINE pattern matching pre-pass-1 convention (3 path-traversal sites). Plus inline nosemgrep + uniqueness rationale dla L1012 `temp_dir` test helper (process::id + atomic counter + name).
+- `src/diagnostics.rs`: `summary_aggregates_per_extractor` refactored — hold lock for full test duration + record inline against `&mut state`. Recover from prior-test poison silently (state wiped on entry anyway). Cascading 2 codex secondary failures resolve automatically (no more panic → no more poison).
+
+**Touched.**
+- `src/output.rs` (+11/-11 nosemgrep relocations + temp_dir gate).
+- `src/diagnostics.rs` (+24/-3 race-safe summary test).
+
+**Tests.** make test parallel default exit 0, 26 `test result: ok`, 0 FAILED (×2 consecutive runs for jitter confidence). make clippy / make fmt / `semgrep --config auto --error --quiet` (CI-matching) all exit 0.
+
+**Lessons.**
+- Semgrep `nosemgrep` honors suppression only when DIRECTLY adjacent to target (same-line OR line-immediately-before). Intervening rationale comments break it silently.
+- Global mutexes shared between production + test code paths need either (a) test-level serialization OR (b) test asserting on LOCAL state copy. Acquire-release per record() leaves race windows.
+
+**Related.** PR #5 Linux CI was failing on `cbf021e`'s parent baseline; this commit unblocks merge. Race fix is general (no other tests fail today, but future contributors writing similar assertions would have hit it).
+
+## 2026-05-21 — PR #5 deep review fixes: CSRF drop + CORS wildcard + shell-injection (Plan A) · `2fb1ccf` + `d2c30aa`
+
+**Symptom.** Deep review of PR #5 (`~/AI_notes/projects/aicx/reports/2026-05-21_pr5-bug-tracker-pass2-deep-review_claude.md`) surfaced 48 findings (2 P0 / 12 P1 / 23 P2 / 11 P3). Plan A addressed 5 (2 P0 + 3 P1 effective) to unblock merge; reszta przeniesiona do `docs/bug-tracker-aicx-followup-pass-3.md`.
+
+**Root cause + fix per Plan A item.**
+
+1. **P0 CSRF token never delivered (`2fb1ccf`).** `render_server_shell_html(title: &str)` nie wstrzykiwała tokenu w HTML; JS fetch wysyłał tylko action header. Server 403'ował wszystko bez `x-csrf-token`. Production endpoint dead. Test harness ukrywał problem hardcoded `csrf_token: "test"`. **Fix:** dropped CSRF gate entirely. Bearer auth + Origin/Referer cross-origin check + action header continue carrying CSRF protection.
+
+2. **P0 CSRF entropy claimed weak (`2fb1ccf`).** Review twierdziło że `RandomState::new().build_hasher().finish()` zwraca "initial seed", ~32-64 bit entropy. **VERDICT: overstated.** Rust libstd seeds RandomState przez OS-keyed thread-local CSPRNG; SipHash finalization na empty hasher zwraca unrecoverable function of 128-bit keys. Realna entropia ~128-bit per call × 2 calls + pid + nanos. Code BYŁO non-idiomatic for token generation, nie weak — ale dropping the gate makes it moot.
+
+3. **P1 state lost-updates claim (`2fb1ccf` doc-only).** Review twierdziło że `save_to_path_with_writer` zgubił `acquire_exclusive` lock vs pre-patch. **VERDICT: not a regression.** Wszyscy 4 production save() callers w `src/main.rs` (L3470 run_extract, L3873 run_store, L5424 run_state, plus inner L4069 within run_store scope) trzymają `_state_guard` przez full read-modify-write cycle. Re-acquire inside save() would deadlock. Added clarifying comment dokumentujący caller-side contract dla future readers.
+
+4. **P1 CORS `All` reflective origin (`2fb1ccf`).** Pass-2 zmieniło `Self::All => Some(HeaderValue::from_static("*"))` → `Self::All => HeaderValue::from_str(origin).ok()`. Reflecting request origin upgrade'uje wildcard policy do "attacker-controlled echo" jeśli kiedyś server doda `Access-Control-Allow-Credentials: true`. **Fix:** restored wildcard return. Test renamed + 2 assertions (well-known + attacker-shaped origins both yield `*`).
+
+5. **P1 Shell injection in bucket merge script (`d2c30aa`).** `shell_escape_double_quoted` escaped tylko `\\` i `\"`, nie `$(...)`, backticks, `${...}`, `!`. Bucket names z filesystem (operator-owned, low vector ale defense-in-depth) embed'owane w double-quoted bash string. **Fix:** switched to `shlex::try_quote` (single-quote-based, defangs every shell meta). Removed `shell_escape_double_quoted` helper. STORE_ROOT stays double-quoted for env-var expansion; buckets embedded as shlex-quoted units. Added `shlex = "1"` dep.
+
+**Touched.**
+- `2fb1ccf`: `src/dashboard_server.rs` (CSRF + CORS), `src/state.rs` (doc comment).
+- `d2c30aa`: `Cargo.toml` + `Cargo.lock` (shlex dep), `src/state/migration.rs` (shlex switch + helper removed).
+
+**Tests.** Po każdym commitcie pełne gates green: make test (26 `test result: ok`, 0 FAILED), make clippy, make fmt, `semgrep --config auto --error --quiet`.
+
+**Lessons.**
+- Review claims o krypto/security wymagają weryfikacji literalnej (np. P0-CSRF-entropy claim okazał się overstated; P1-state-lost-updates claim okazał się false alarm). "Bezlitosne deep review" warto cenić ALE każdy claim z ranga P0/P1 wymaga independent confirmation przed fixiem.
+- Drop > inject when broken third gate na top of two working ones — Bearer + Origin/Referer carry the protection, CSRF token w tym design był martwym kodem zaciemniającym intencję.
+- shlex jest battle-tested library dla shell quoting; hand-rolled escape NIE łapie shell substitution metacharacters.
+
+**Related.** 43 remaining findings (9 P1 + 23 P2 + 11 P3) + 3 pass-2 leftovers consolidated w `docs/bug-tracker-aicx-followup-pass-3.md`. PR #5 unblocked dla merge po Plan A.
