@@ -1090,20 +1090,43 @@ where
         let outcome = write_semantic_segment_at(base, segment, &date, chunker_config)?;
         summary.skipped_empty_body += outcome.skipped_empty_body;
         summary.deduped_chunks += outcome.deduped_chunks;
-        update_index(
-            &mut index,
-            &project,
-            &segment.agent,
-            &compact_date(&date),
-            segment.entries.len(),
-        );
-        *summary
-            .project_summary
-            .entry(project)
-            .or_default()
-            .entry(segment.agent.clone())
-            .or_insert(0) += segment.entries.len();
-        summary.total_entries += segment.entries.len();
+
+        // Count entries proportionally to chunks actually written to
+        // disk. Previously this added `segment.entries.len()`
+        // unconditionally, which meant a `--full-rescan` over an
+        // already-stored corpus pumped `index.json.total_entries` by
+        // the full entry count on every run even though
+        // `write_context_session_first_outcome_at` had short-circuited
+        // every chunk on content_sha256 dedup. Now: when nothing landed
+        // on disk, the index/summary stay flat; partial-new segments
+        // contribute their proportional share.
+        let chunks_written = outcome.written_paths.len();
+        let chunks_total =
+            chunks_written + outcome.deduped_chunks + outcome.skipped_empty_body;
+        let entries_recorded = if chunks_total == 0 || chunks_written == 0 {
+            0
+        } else {
+            // Round-half-up integer division so a one-chunk-written
+            // segment doesn't truncate to 0 entries.
+            (segment.entries.len() * chunks_written + chunks_total / 2) / chunks_total
+        };
+
+        if entries_recorded > 0 {
+            update_index(
+                &mut index,
+                &project,
+                &segment.agent,
+                &compact_date(&date),
+                entries_recorded,
+            );
+            *summary
+                .project_summary
+                .entry(project)
+                .or_default()
+                .entry(segment.agent.clone())
+                .or_insert(0) += entries_recorded;
+            summary.total_entries += entries_recorded;
+        }
         summary.written_paths.extend(outcome.written_paths);
         progress(segment_idx + 1, total_segments);
     }
@@ -4258,6 +4281,108 @@ mod tests {
 
         assert_eq!(summary.total_entries, 4);
         assert_eq!(progress_updates, vec![(1, 3), (2, 3), (3, 3)]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn store_segments_does_not_pump_index_when_rerun_dedupes_everything() {
+        // Regression guard: previously `store_segments_at` unconditionally
+        // added `segment.entries.len()` to `summary.total_entries` and
+        // bumped `index.json` per segment, even when every chunk was
+        // short-circuited by `content_sha256` dedup inside
+        // `write_context_session_first_outcome_at`. Effect: re-running
+        // `--full-rescan` on an already-stored corpus inflated
+        // `index.json.total_entries` on every run despite zero new files
+        // hitting disk. Lock the new proportional accounting in.
+        let root = retrieval_test_root("store-segments-rerun-dedup");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let entries = vec![
+            semantic_entry(
+                (2026, 4, 1, 10, 0, 0),
+                "sess-x",
+                "user",
+                "First message in a tracked conversation.",
+                None,
+            ),
+            semantic_entry(
+                (2026, 4, 1, 10, 1, 0),
+                "sess-x",
+                "assistant",
+                "Reply that exercises canonical chunking output.",
+                None,
+            ),
+        ];
+
+        let first = store_semantic_segments_at(
+            &root,
+            &entries,
+            &ChunkerConfig::default(),
+            |_, _| {},
+        )
+        .expect("first store");
+        assert!(
+            !first.written_paths.is_empty(),
+            "first run must actually write something"
+        );
+        assert_eq!(
+            first.total_entries,
+            entries.len(),
+            "first run records every entry (no dedup on a fresh store)"
+        );
+        assert_eq!(
+            first.deduped_chunks, 0,
+            "first run cannot dedup against an empty store"
+        );
+
+        // Snapshot index.total_entries after the first run for the
+        // post-rerun comparison below.
+        let index_after_first = load_index_at(&root).expect("load index after first");
+        let total_after_first: usize = index_after_first
+            .projects
+            .values()
+            .flat_map(|p| p.agents.values())
+            .map(|a| a.total_entries)
+            .sum();
+        assert_eq!(total_after_first, entries.len());
+
+        // Re-run with the same entries. Every chunk's content_sha256
+        // is already on disk, so `write_context_session_first_outcome_at`
+        // increments `deduped_chunks` instead of producing a new path.
+        let second = store_semantic_segments_at(
+            &root,
+            &entries,
+            &ChunkerConfig::default(),
+            |_, _| {},
+        )
+        .expect("second store");
+        assert!(
+            second.written_paths.is_empty(),
+            "second run must not write any new files when every chunk dedups"
+        );
+        assert!(
+            second.deduped_chunks >= 1,
+            "second run must report dedup hits (got {})",
+            second.deduped_chunks
+        );
+        assert_eq!(
+            second.total_entries, 0,
+            "second run must NOT pump total_entries when nothing was written"
+        );
+
+        let index_after_second = load_index_at(&root).expect("load index after second");
+        let total_after_second: usize = index_after_second
+            .projects
+            .values()
+            .flat_map(|p| p.agents.values())
+            .map(|a| a.total_entries)
+            .sum();
+        assert_eq!(
+            total_after_second, total_after_first,
+            "index.json.total_entries must not grow on a full-rescan that produced zero new chunks"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
