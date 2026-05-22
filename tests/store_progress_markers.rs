@@ -180,8 +180,13 @@ fn full_store_pipeline_emits_pre_write_phase_markers_before_any_chunk_tick() {
     echo.tick(11000);
     echo.finish_ok("kept 10800 / 11000 (filtered 200)");
 
-    let segment = Phase::start(reporter.clone(), "segment", Some(10800));
-    segment.tick(10800);
+    // Segment phase intentionally runs with total=None so the heartbeat
+    // counter doesn't get rendered as a misleading `N/entries_total = 0%`
+    // ratio on TTY. The phase still emits at least one tick (here
+    // simulating a heartbeat fire) before finish so operators see it as
+    // alive during long in-memory segmentation passes.
+    let segment = Phase::start(reporter.clone(), "segment", None);
+    segment.tick(1);
     segment.finish_ok("10800 entries → 420 segments");
 
     let chunk = Phase::start(reporter.clone(), "chunk", Some(420));

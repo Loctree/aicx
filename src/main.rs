@@ -4138,14 +4138,17 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
     // Segment phase
     //
     // `semantic_segments` is a single in-memory pass that produces the
-    // segment list before any write touches disk. Without a phase
-    // marker the operator sees nothing while it runs on a large
-    // corpus; we wrap the call in a heartbeat so the spinner advances
-    // and the `[aicx][phase=segment ...]` markers fire even on
-    // multi-minute segmentation passes.
+    // segment list before any write touches disk. There's no
+    // mid-flight per-entry counter we can hook into, so the phase
+    // intentionally uses `total=None` and a heartbeat — the heartbeat
+    // counter then renders as `processed N | elapsed Xs` on TTY (and
+    // omits `total=...` from the structured surface) instead of
+    // showing a misleading `64/412674 = 0%` where `64` is the
+    // heartbeat tick count and `412674` is the entries denominator.
+    // The finish summary still reports the real `entries → segments`
+    // numbers once they're known.
     // ──────────────────────────────────────────────────────────────────
-    let segment_phase =
-        aicx::progress::Phase::start(reporter.clone(), "segment", Some(all_entries.len() as u64));
+    let segment_phase = aicx::progress::Phase::start(reporter.clone(), "segment", None);
     let segments = {
         let hb = aicx::progress::Heartbeat::spawn(
             segment_phase.clone(),
@@ -4155,7 +4158,6 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         hb.stop();
         result
     };
-    segment_phase.tick(all_entries.len() as u64);
     let segment_count = segments.len();
     segment_phase.finish_ok(format!(
         "{} entries → {} segments",
