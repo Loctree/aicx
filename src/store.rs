@@ -247,14 +247,38 @@ pub struct StoreIgnoreMatcher {
     rules: Vec<IgnoreRule>,
 }
 
-/// Returns the AICX base directory: `$AICX_HOME` or `~/.aicx/`
+/// Resolve the canonical AICX home directory from the environment.
 ///
-/// Creates the directory if it doesn't exist.
-pub fn store_base_dir() -> Result<PathBuf> {
+/// Returns `$AICX_HOME` when set and non-empty, otherwise `~/.aicx`.
+/// Pure: no filesystem side effects, no directory creation. Use
+/// [`store_base_dir`] for the side-effecting public variant.
+///
+/// Why factored out: this is the only place the env contract is
+/// resolved. Tests mock the env around this call without touching
+/// `mkdir`; pure helpers like [`store_base_dir_for`], [`chunks_dir_for`],
+/// and `state_path_for` (in `src/state.rs`) accept the resolved path
+/// and stay deterministic / parallel-safe.
+pub fn resolve_aicx_home() -> Result<PathBuf> {
     let dir = match std::env::var_os("AICX_HOME") {
         Some(value) if !value.is_empty() => PathBuf::from(value),
         _ => dirs::home_dir().context("No home directory")?.join(".aicx"),
     };
+    Ok(dir)
+}
+
+/// Pure: builds the AICX base directory under an explicit `home`.
+///
+/// No env reads, no filesystem creation. Use in tests to assert
+/// path-shape invariants without depending on `$AICX_HOME` or `$HOME`.
+pub fn store_base_dir_for(home: &Path) -> PathBuf {
+    home.to_path_buf()
+}
+
+/// Returns the AICX base directory: `$AICX_HOME` or `~/.aicx/`
+///
+/// Creates the directory if it doesn't exist.
+pub fn store_base_dir() -> Result<PathBuf> {
+    let dir = store_base_dir_for(&resolve_aicx_home()?);
     fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create store dir: {}", dir.display()))?;
     Ok(dir)
@@ -456,9 +480,17 @@ pub fn project_dir(project: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Returns the chunks directory: `~/.aicx/chunks/`
+/// Pure: builds the chunks directory under an explicit `home`.
+///
+/// No env reads, no filesystem creation. Used in tests to verify
+/// chunks-dir shape without depending on `$AICX_HOME`.
+pub fn chunks_dir_for(home: &Path) -> PathBuf {
+    store_base_dir_for(home).join("chunks")
+}
+
+/// Returns the chunks directory: `<base>/chunks/`
 pub fn chunks_dir() -> Result<PathBuf> {
-    let dir = store_base_dir()?.join("chunks");
+    let dir = chunks_dir_for(&store_base_dir()?);
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -3675,19 +3707,124 @@ mod tests {
     use filetime::{FileTime, set_file_mtime};
     use std::env;
 
-    #[test]
-    fn test_store_base_dir() {
-        if let Ok(path) = store_base_dir() {
-            assert!(path.to_string_lossy().contains(".aicx"));
+    // ──────────────────────────────────────────────────────────────────
+    // AICX-home / store-base / chunks-dir contract tests.
+    //
+    // The legacy tests asserted `path.contains(".aicx")` which was a
+    // literal-pattern relic from before `$AICX_HOME` override existed.
+    // Under any pinned `AICX_HOME` (e.g. the operator's
+    // `AICX_HOME=/Users/silver/aicx`) those asserts silently failed and
+    // accumulated as "pre-existing baseline failures" — pass-4
+    // operator-agent + operator agreed that is exactly the anti-pattern
+    // we refuse to ship.
+    //
+    // Replacement strategy (pass-4):
+    //   * `store_base_dir_for` / `chunks_dir_for` / `state_path_for`
+    //     are pure functions tested with explicit paths — parallel-safe,
+    //     deterministic, no env touched.
+    //   * `resolve_aicx_home` is tested under a process-wide Mutex
+    //     because env reads are global; the Mutex pattern keeps the two
+    //     env-touching tests serialized within `cargo test` without
+    //     pulling in a `serial_test` dependency.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Shared lock for tests that mutate `$AICX_HOME`. `Mutex<()>` is
+    /// const-constructible in modern Rust so no `Lazy` machinery is
+    /// needed. We always recover from poisoning via `into_inner()` —
+    /// a panicking test still leaves the env in a known shape because
+    /// every env-touching test restores via a [`Drop`] guard.
+    static AICX_HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: restores `$AICX_HOME` to its prior value (or unset
+    /// state) when dropped. Used by env-resolution tests so panics do
+    /// not leak global env mutations into sibling tests.
+    struct AicxHomeEnvGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl AicxHomeEnvGuard {
+        fn capture() -> Self {
+            Self {
+                prev: env::var_os("AICX_HOME"),
+            }
+        }
+    }
+
+    impl Drop for AicxHomeEnvGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                // SAFETY: `set_var` / `remove_var` are `unsafe` from Rust
+                // 2024 because they race against other threads reading
+                // env. The `AICX_HOME_ENV_LOCK` Mutex guarantees we hold
+                // exclusive access for the duration of the test +
+                // restore, so the race window is closed.
+                Some(value) => unsafe { env::set_var("AICX_HOME", value) },
+                None => unsafe { env::remove_var("AICX_HOME") },
+            }
         }
     }
 
     #[test]
-    fn test_chunks_dir() {
-        if let Ok(path) = chunks_dir() {
-            assert!(path.to_string_lossy().contains(".aicx"));
-            assert!(path.to_string_lossy().contains("chunks"));
-        }
+    fn test_store_base_dir_for_is_identity_on_explicit_home() {
+        let home = PathBuf::from("/tmp/test-aicx-base");
+        assert_eq!(store_base_dir_for(&home), home);
+    }
+
+    #[test]
+    fn test_chunks_dir_for_lives_under_home_and_named_chunks() {
+        let home = PathBuf::from("/tmp/test-aicx-chunks");
+        let chunks = chunks_dir_for(&home);
+        assert!(
+            chunks.starts_with(&home),
+            "chunks_dir_for should live under home; got {chunks:?}"
+        );
+        assert_eq!(
+            chunks.file_name().and_then(|n| n.to_str()),
+            Some("chunks"),
+            "chunks_dir_for should end with `chunks`; got {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_aicx_home_honors_explicit_env_var() {
+        let _serial = AICX_HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = AicxHomeEnvGuard::capture();
+        // SAFETY: lock is held; sibling env-touching tests cannot race.
+        unsafe { env::set_var("AICX_HOME", "/tmp/test-aicx-resolve") };
+        let resolved = resolve_aicx_home().expect("resolve_aicx_home should succeed");
+        assert_eq!(resolved, PathBuf::from("/tmp/test-aicx-resolve"));
+    }
+
+    #[test]
+    fn test_resolve_aicx_home_falls_back_to_dot_aicx_when_env_unset() {
+        let _serial = AICX_HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = AicxHomeEnvGuard::capture();
+        // SAFETY: lock is held; sibling env-touching tests cannot race.
+        unsafe { env::remove_var("AICX_HOME") };
+        let resolved = resolve_aicx_home().expect("resolve_aicx_home should succeed");
+        assert!(
+            resolved.ends_with(".aicx"),
+            "default home should end with .aicx; got {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_aicx_home_treats_empty_env_var_as_unset() {
+        let _serial = AICX_HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = AicxHomeEnvGuard::capture();
+        // SAFETY: lock is held; sibling env-touching tests cannot race.
+        unsafe { env::set_var("AICX_HOME", "") };
+        let resolved = resolve_aicx_home().expect("resolve_aicx_home should succeed");
+        assert!(
+            resolved.ends_with(".aicx"),
+            "empty AICX_HOME should fall back to ~/.aicx; got {resolved:?}"
+        );
     }
 
     #[test]

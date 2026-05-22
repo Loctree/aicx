@@ -164,11 +164,20 @@ impl Default for StateManager {
     }
 }
 
+/// Pure: builds the state-file path under an explicit AICX home.
+///
+/// No env reads, no filesystem creation. Used in tests to assert the
+/// `<home>/state.json` invariant without depending on `$AICX_HOME` or
+/// `$HOME`. The public [`StateManager::state_path`] wraps this with
+/// the env-resolving, side-effecting [`crate::store::store_base_dir`].
+pub(crate) fn state_path_for(home: &Path) -> PathBuf {
+    home.join("state.json")
+}
+
 impl StateManager {
-    /// Returns the path to the state file: `~/.aicx/state.json`
+    /// Returns the path to the state file: `<base>/state.json`
     fn state_path() -> Result<PathBuf> {
-        let base = crate::store::store_base_dir()?;
-        Ok(base.join("state.json"))
+        Ok(state_path_for(&crate::store::store_base_dir()?))
     }
 
     /// Load state from disk. Creates a fresh default state only when the file
@@ -1083,11 +1092,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Replaces the legacy `test_state_path_is_under_store` which asserted
+    // `path.contains(".aicx")` — a literal-pattern relic from before
+    // `$AICX_HOME` override existed. Under any pinned `AICX_HOME` (e.g.
+    // the operator's `AICX_HOME=/Users/silver/aicx`) that asserted
+    // false-positive failed silently as a "baseline failure". Pass-4
+    // op-agent + operator agreed to refuse that anti-pattern: the
+    // contract is "state path lives under base dir, named state.json"
+    // — env resolution and `mkdir` are tested separately in
+    // `src/store.rs::tests`.
     #[test]
-    fn test_state_path_is_under_store() {
-        if let Ok(path) = StateManager::state_path() {
-            assert!(path.to_string_lossy().contains(".aicx"));
-            assert!(path.to_string_lossy().ends_with("state.json"));
-        }
+    fn test_state_path_for_lives_under_home_and_named_state_json() {
+        let home = PathBuf::from("/tmp/test-aicx-state");
+        let state = super::state_path_for(&home);
+        assert!(
+            state.starts_with(&home),
+            "state_path_for should live under home; got {state:?}"
+        );
+        assert_eq!(
+            state.file_name().and_then(|n| n.to_str()),
+            Some("state.json"),
+            "state_path_for should end with state.json; got {state:?}"
+        );
     }
 }
