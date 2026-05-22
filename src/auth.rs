@@ -18,6 +18,10 @@ use serde::Serialize;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
+
+const AUTH_RATE_LIMIT_BURST: u32 = 100;
+const AUTH_RATE_LIMIT_REPLENISH_MS: u64 = 600;
 
 /// Where the active token came from. Used for the startup log line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,11 +212,18 @@ async fn auth_middleware(
         .and_then(|value| value.to_str().ok())
         .and_then(|raw| raw.strip_prefix("Bearer "));
 
-    match presented {
-        Some(provided) if constant_time_eq(provided.as_bytes(), expected.as_bytes()) => {
-            next.run(request).await
-        }
-        _ => unauthorized_response(),
+    let Some(provided) = presented else {
+        return unauthorized_response();
+    };
+
+    if provided.len() != expected.len() {
+        return unauthorized_response();
+    }
+
+    if constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+        next.run(request).await
+    } else {
+        unauthorized_response()
     }
 }
 
@@ -222,8 +233,21 @@ pub fn require_auth_layer<S>(router: Router<S>, config: AuthConfig) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
+    let auth_enforced = config.is_enforced();
     let state = Arc::new(config);
-    router.layer(middleware::from_fn_with_state(state, auth_middleware))
+    let router = router.layer(middleware::from_fn_with_state(state, auth_middleware));
+
+    if !auth_enforced {
+        return router;
+    }
+
+    let governor_config = GovernorConfigBuilder::default()
+        .per_millisecond(AUTH_RATE_LIMIT_REPLENISH_MS)
+        .burst_size(AUTH_RATE_LIMIT_BURST)
+        .finish()
+        .expect("auth rate limit config is non-zero");
+
+    router.layer(GovernorLayer::new(governor_config))
 }
 
 #[cfg(test)]

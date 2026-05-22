@@ -1686,3 +1686,25 @@ apply path, but does not mutate the live canonical store by itself.
 - shlex jest battle-tested library dla shell quoting; hand-rolled escape NIE łapie shell substitution metacharacters.
 
 **Related.** 43 remaining findings (9 P1 + 23 P2 + 11 P3) + 3 pass-2 leftovers consolidated w `docs/bug-tracker-aicx-followup-pass-3.md`. PR #5 unblocked dla merge po Plan A.
+
+## 2026-05-22 — auth/dashboard/sanitize P2 hardening batch 1 (M-1..M-6) · `pending H-1 commit`
+
+**Symptom.** Pass-3 Area M P2 hardening zostawił sześć defense-in-depth gaps: `auth_middleware` robił length mismatch przez `constant_time_eq`; Bearer endpoints nie miały brute-force/DoS throttlingu; `/api/regenerate` pozwalał POST bez `Origin` i bez `Referer`; `cross_search.limit` silently clampował do 200; 403 body zdradzało nazwy security headers; `is_under_allowed_base` na macOS dopuszczał dowolne `/Users/{x}/...`.
+
+**Root cause.** Warstwy bezpieczeństwa powstawały iteracyjnie po Plan A (`2fb1ccf`): Bearer + action header + CORS istniały, ale brakowało małych kontraktowych domknięć po usunięciu martwego CSRF gate. Sanitize miał legacy convenience allowlist zbyt szeroki względem current-user intent.
+
+**Fix.**
+- M-1: `auth_middleware` zwraca 401 przy `provided.len() != expected.len()` przed `constant_time_eq`.
+- M-2: `tower_governor` 0.8.0 rate limit (100 burst, 1 token / 600ms) siedzi na enforced Bearer routerach; dashboard i MCP HTTP serwują przez `into_make_service_with_connect_info::<SocketAddr>()`.
+- M-3: `/api/regenerate` domyślnie wymaga `Origin` albo `Referer` zgodnego z `DashboardCorsPolicy`; `--allow-no-origin` jest explicit tooling escape hatch.
+- M-4: `cross_search.limit > 200` nadal clampuje dla kompatybilności, ale odpowiedź success dostaje `X-Clamped-Limit: 200`.
+- M-5: dashboard security 403 body jest opaque `{"ok":false,"error":"Forbidden"}`, a szczegółowy powód trafia do `tracing::warn!`.
+- M-6: `is_under_allowed_base` akceptuje tylko `dirs::home_dir()`, `dirs::cache_dir()`, `dirs::data_dir()` current user plus istniejącą temp policy; szerokie macOS `/Users/*` znika.
+
+**Touched.** `Cargo.toml`, `Cargo.lock`, `crates/aicx-parser/Cargo.toml`, `crates/aicx-parser/src/sanitize.rs`, `src/auth.rs`, `src/dashboard_server.rs`, `src/main.rs`, `src/mcp.rs`, `tests/dashboard_auth.rs`, `tests/mcp_slim.rs`.
+
+**Tests.** Targeted green: `cargo test --test dashboard_auth`, `cargo test dashboard_server::tests:: --lib`, `cargo test -p aicx-parser sanitize::tests::`. Full workspace gates recorded in H-1 report.
+
+**Lessons.** `tower_governor` per-IP is not just a layer call: Axum must provide peer `ConnectInfo`, or the limiter turns into 500-before-auth. Security-body opacity should not erase operator observability — log detail is the place for header names and source URLs, not client JSON.
+
+**Related.** Closes M-1, M-2, M-3, M-4, M-5, M-6 z `docs/bug-tracker-aicx-followup-pass-3.md`; H-1 Wave H batch 1.

@@ -1358,9 +1358,12 @@ pub async fn run_http(port: u16, auth_config: AuthConfig) -> anyhow::Result<()> 
         );
     }
 
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP HTTP server error: {e}"))
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("MCP HTTP server error: {e}"))
 }
 
 /// Legacy compatibility wrapper for callers that still use the old `run_sse` name.

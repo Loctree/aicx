@@ -58,11 +58,24 @@ fn contains_traversal(path: &str) -> bool {
         .any(|c| matches!(c, Component::ParentDir))
 }
 
-/// Get the user's home directory.
-fn home_dir() -> Result<PathBuf> {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|_| anyhow!("Cannot determine home directory from $HOME"))
+fn current_user_allowed_bases() -> Result<Vec<PathBuf>> {
+    let mut bases = Vec::new();
+    for base in [dirs::home_dir(), dirs::cache_dir(), dirs::data_dir()]
+        .into_iter()
+        .flatten()
+    {
+        if !bases.iter().any(|existing| existing == &base) {
+            bases.push(base);
+        }
+    }
+
+    if bases.is_empty() {
+        return Err(anyhow!(
+            "Cannot determine current user allowed base directories"
+        ));
+    }
+
+    Ok(bases)
 }
 
 /// Canonicalize a path, returning error if it doesn't exist.
@@ -97,16 +110,8 @@ fn is_temp_allowlist_path(path: &Path) -> bool {
 
 /// Validate that a path is under an allowed base directory.
 fn is_under_allowed_base(path: &Path) -> Result<bool> {
-    let home = home_dir()?;
-
-    if path.starts_with(&home) {
-        return Ok(true);
-    }
-
-    #[cfg(target_os = "macos")]
-    if path.starts_with("/Users") {
-        let components: Vec<_> = path.components().collect();
-        if components.len() >= 3 {
+    for base in current_user_allowed_bases()? {
+        if path.starts_with(base) {
             return Ok(true);
         }
     }
@@ -465,6 +470,27 @@ mod tests {
             let _env = EnvVarGuard::set(AICX_ALLOW_TMP_ENV, Some("true"));
             assert!(!temp_allowlist_enabled_for_build(false, false));
         }
+    }
+
+    #[test]
+    fn test_current_user_allowed_bases_are_accepted() {
+        for base in current_user_allowed_bases().expect("current user dirs") {
+            assert!(
+                is_under_allowed_base(&base.join("aicx-sanitize-test")).expect("allowlist check"),
+                "current user base should be allowed: {}",
+                base.display()
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_other_user_path_rejected() {
+        let path = Path::new("/Users/other_user/Documents/secret.txt");
+        assert!(
+            !is_under_allowed_base(path).expect("allowlist check"),
+            "macOS /Users allowlist must not generalize across users"
+        );
     }
 
     #[test]

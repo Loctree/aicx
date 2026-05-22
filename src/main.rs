@@ -303,6 +303,10 @@ struct DashboardArgs {
     #[arg(long, requires = "serve", default_value_t = true, action = clap::ArgAction::Set)]
     require_auth: bool,
 
+    /// Allow mutating dashboard API calls without Origin or Referer (tooling escape hatch).
+    #[arg(long, requires = "serve")]
+    allow_no_origin: bool,
+
     /// Document title
     #[arg(long, default_value = DEFAULT_DASHBOARD_TITLE)]
     title: String,
@@ -1757,6 +1761,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 allow_cors_origins: None,
                 auth_token: None,
                 require_auth: true,
+                allow_no_origin: false,
                 artifact: args.artifact.unwrap_or(default_dashboard_output_path()?),
                 title: args.title,
                 preview_chars: args.preview_chars,
@@ -5466,6 +5471,7 @@ struct DashboardServerRunArgs {
     allow_cors_origins: Option<String>,
     auth_token: Option<String>,
     require_auth: bool,
+    allow_no_origin: bool,
     artifact: PathBuf,
     title: String,
     preview_chars: usize,
@@ -5505,6 +5511,7 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
             allow_cors_origins: args.allow_cors_origins.as_deref(),
             auth_token: args.auth_token.as_deref(),
             require_auth: args.require_auth,
+            allow_no_origin: args.allow_no_origin,
         });
     }
 
@@ -5526,6 +5533,7 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
         host,
         port: args.port,
         auth: auth_config,
+        allow_no_origin: args.allow_no_origin,
     };
 
     if !args.no_open {
@@ -5558,6 +5566,7 @@ struct DashboardServerBackgroundArgs<'a> {
     allow_cors_origins: Option<&'a str>,
     auth_token: Option<&'a str>,
     require_auth: bool,
+    allow_no_origin: bool,
 }
 
 fn spawn_dashboard_server_background(args: DashboardServerBackgroundArgs<'_>) -> Result<()> {
@@ -5589,6 +5598,9 @@ fn spawn_dashboard_server_background(args: DashboardServerBackgroundArgs<'_>) ->
     command
         .arg("--require-auth")
         .arg(if args.require_auth { "true" } else { "false" });
+    if args.allow_no_origin {
+        command.arg("--allow-no-origin");
+    }
     if args.title != DEFAULT_DASHBOARD_TITLE {
         command.arg("--title").arg(args.title);
     }
@@ -5663,6 +5675,7 @@ fn run_dashboard_command(args: DashboardArgs) -> Result<()> {
             allow_cors_origins: args.allow_cors_origins,
             auth_token: args.auth_token,
             require_auth: args.require_auth,
+            allow_no_origin: args.allow_no_origin,
             artifact: default_dashboard_output_path()?,
             title: args.title,
             preview_chars: args.preview_chars,
@@ -6836,6 +6849,7 @@ mod tests {
             "0.0.0.0",
             "--allow-cors-origins",
             "all",
+            "--allow-no-origin",
             "--bg",
         ])
         .expect("remote dashboard serve flags should parse");
@@ -6844,6 +6858,7 @@ mod tests {
             Some(Commands::Dashboard(args)) => {
                 assert!(args.serve);
                 assert!(args.bg);
+                assert!(args.allow_no_origin);
                 assert_eq!(args.host.as_deref(), Some("0.0.0.0"));
                 assert_eq!(args.allow_cors_origins.as_deref(), Some("all"));
             }
