@@ -59,13 +59,19 @@ pub struct ProjectHashRegistry {
 }
 
 impl ProjectHashRegistry {
-    /// Load from the default location (`~/.aicx/gemini-project-map.json`).
-    /// Returns an empty registry if the file doesn't exist or can't be parsed.
+    /// Load from the default location. Honors `AICX_HOME` (operator's
+    /// explicit store-root override) before falling back to
+    /// `~/.aicx/gemini-project-map.json`. Returns an empty registry if
+    /// the file doesn't exist or can't be parsed — callers can rely on
+    /// this method without an existence check.
     pub fn load_default() -> Self {
-        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        let base = std::env::var_os("AICX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".aicx")));
+        let Some(base) = base else {
             return Self::default();
         };
-        let path = home.join(".aicx").join("gemini-project-map.json");
+        let path = base.join("gemini-project-map.json");
         Self::load_from(&path)
     }
 
@@ -91,7 +97,12 @@ impl ProjectHashRegistry {
 }
 
 pub fn semantic_segments(entries: &[TimelineEntry]) -> Vec<SemanticSegment> {
-    semantic_segments_with_registry(entries, &ProjectHashRegistry::default())
+    // Load the project-hash registry from disk (AICX_HOME or ~/.aicx),
+    // not the empty `Default`. Without this, Gemini sessions whose
+    // identity arrives as a `projectHash` always resolved to Opaque
+    // even when the operator's `gemini-project-map.json` was sitting
+    // right there — the helper existed but no hot path called it.
+    semantic_segments_with_registry(entries, &ProjectHashRegistry::load_default())
 }
 
 pub fn semantic_segments_with_registry(
@@ -1539,5 +1550,74 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_hash_registry_load_default_honors_aicx_home_then_falls_back_to_home() {
+        // The registry path was hard-coded to `$HOME/.aicx/...` and
+        // ignored the operator's `AICX_HOME` override. Confirm the
+        // helper now honors AICX_HOME first, falls back to HOME/.aicx,
+        // and returns an empty registry (not panic) when neither env
+        // var resolves to an existing file.
+        let aicx_home = mk_tmp_dir("registry-aicx-home");
+        fs::create_dir_all(&aicx_home).unwrap();
+        let map_path = aicx_home.join("gemini-project-map.json");
+        fs::write(
+            &map_path,
+            r#"{ "mappings": { "abc123": "/tmp/aicx-test-registry-target" } }"#,
+        )
+        .unwrap();
+
+        // Serialize env mutation so we don't fight other tests that
+        // also touch HOME/AICX_HOME — the segmentation module owns no
+        // other env-touching tests today, but this guard is cheap.
+        let prev_aicx_home = std::env::var_os("AICX_HOME");
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: This is a single-threaded test and we restore the
+        // previous values before returning.
+        unsafe {
+            std::env::set_var("AICX_HOME", &aicx_home);
+        }
+
+        let loaded = ProjectHashRegistry::load_default();
+        assert_eq!(
+            loaded.mappings.get("abc123").map(String::as_str),
+            Some("/tmp/aicx-test-registry-target"),
+            "AICX_HOME-rooted registry must load via load_default"
+        );
+
+        // Falling back to HOME/.aicx when AICX_HOME is unset.
+        let home_root = mk_tmp_dir("registry-home-fallback");
+        let home_aicx = home_root.join(".aicx");
+        fs::create_dir_all(&home_aicx).unwrap();
+        fs::write(
+            home_aicx.join("gemini-project-map.json"),
+            r#"{ "mappings": { "def456": "/tmp/aicx-test-registry-home" } }"#,
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("AICX_HOME");
+            std::env::set_var("HOME", &home_root);
+        }
+        let loaded_home = ProjectHashRegistry::load_default();
+        assert_eq!(
+            loaded_home.mappings.get("def456").map(String::as_str),
+            Some("/tmp/aicx-test-registry-home"),
+            "HOME/.aicx must remain the fallback when AICX_HOME is unset"
+        );
+
+        // Restore env to whatever the runner had before.
+        unsafe {
+            match prev_aicx_home {
+                Some(v) => std::env::set_var("AICX_HOME", v),
+                None => std::env::remove_var("AICX_HOME"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = fs::remove_dir_all(&aicx_home);
+        let _ = fs::remove_dir_all(&home_root);
     }
 }

@@ -1044,22 +1044,42 @@ pub fn store_semantic_segments_at<F>(
     base: &Path,
     entries: &[TimelineEntry],
     chunker_config: &ChunkerConfig,
+    progress: F,
+) -> Result<StoreWriteSummary>
+where
+    F: FnMut(usize, usize),
+{
+    if entries.is_empty() {
+        return Ok(StoreWriteSummary::default());
+    }
+    let segments = semantic_segments(entries);
+    store_segments_at(base, &segments, chunker_config, progress)
+}
+
+/// Write pre-computed [`SemanticSegment`]s to the canonical store. This
+/// is the underlying primitive — callers that already paid for
+/// segmentation (e.g. the CLI's phased pipeline that emits a
+/// `segment`-phase heartbeat before the first `.md` write) reuse those
+/// segments here instead of re-segmenting from raw entries.
+pub fn store_segments_at<F>(
+    base: &Path,
+    segments: &[SemanticSegment],
+    chunker_config: &ChunkerConfig,
     mut progress: F,
 ) -> Result<StoreWriteSummary>
 where
     F: FnMut(usize, usize),
 {
     let mut summary = StoreWriteSummary::default();
-    if entries.is_empty() {
+    if segments.is_empty() {
         return Ok(summary);
     }
 
     let _lock = crate::locks::acquire_exclusive(base.join("locks").join("index.lock"))?;
-    let segments = semantic_segments(entries);
     let total_segments = segments.len();
     let mut index = load_index_at(base)?;
 
-    for (segment_idx, segment) in segments.into_iter().enumerate() {
+    for (segment_idx, segment) in segments.iter().enumerate() {
         let date = segment
             .entries
             .first()
@@ -1067,23 +1087,46 @@ where
             .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
         let project = canonical_project_slug(&segment.project_label());
 
-        let outcome = write_semantic_segment_at(base, &segment, &date, chunker_config)?;
+        let outcome = write_semantic_segment_at(base, segment, &date, chunker_config)?;
         summary.skipped_empty_body += outcome.skipped_empty_body;
         summary.deduped_chunks += outcome.deduped_chunks;
-        update_index(
-            &mut index,
-            &project,
-            &segment.agent,
-            &compact_date(&date),
-            segment.entries.len(),
-        );
-        *summary
-            .project_summary
-            .entry(project)
-            .or_default()
-            .entry(segment.agent.clone())
-            .or_insert(0) += segment.entries.len();
-        summary.total_entries += segment.entries.len();
+
+        // Count entries proportionally to chunks actually written to
+        // disk. Previously this added `segment.entries.len()`
+        // unconditionally, which meant a `--full-rescan` over an
+        // already-stored corpus pumped `index.json.total_entries` by
+        // the full entry count on every run even though
+        // `write_context_session_first_outcome_at` had short-circuited
+        // every chunk on content_sha256 dedup. Now: when nothing landed
+        // on disk, the index/summary stay flat; partial-new segments
+        // contribute their proportional share.
+        let chunks_written = outcome.written_paths.len();
+        let chunks_total =
+            chunks_written + outcome.deduped_chunks + outcome.skipped_empty_body;
+        let entries_recorded = if chunks_total == 0 || chunks_written == 0 {
+            0
+        } else {
+            // Round-half-up integer division so a one-chunk-written
+            // segment doesn't truncate to 0 entries.
+            (segment.entries.len() * chunks_written + chunks_total / 2) / chunks_total
+        };
+
+        if entries_recorded > 0 {
+            update_index(
+                &mut index,
+                &project,
+                &segment.agent,
+                &compact_date(&date),
+                entries_recorded,
+            );
+            *summary
+                .project_summary
+                .entry(project)
+                .or_default()
+                .entry(segment.agent.clone())
+                .or_insert(0) += entries_recorded;
+            summary.total_entries += entries_recorded;
+        }
         summary.written_paths.extend(outcome.written_paths);
         progress(segment_idx + 1, total_segments);
     }
@@ -1333,13 +1376,29 @@ fn context_files_since_at(
     cutoff: SystemTime,
     project_filter: Option<&str>,
 ) -> Result<Vec<StoredContextFile>> {
-    let filter = project_filter.map(|value| value.to_ascii_lowercase());
+    // Strict project filter via `project_filter_matches` (same
+    // semantics as `aicx search`, `aicx store -p ...` etc.) so the
+    // `refs`/MCP/since paths don't leak `-p vista` into `vista-portal`,
+    // `vista-datasets`, etc. `StoredContextFile.project` is the
+    // canonical `<org>/<repo>` slug (or the non-repo bucket name for
+    // entries without a resolved repo identity); split on '/' to feed
+    // the org+repo pair into the matcher.
+    let filter = project_filter
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let cutoff_date = DateTime::<Utc>::from(cutoff).format("%Y-%m-%d").to_string();
     let mut files = scan_context_files_at(base)?;
     files.retain(|file| {
-        let matches_project = filter
-            .as_ref()
-            .is_none_or(|needle| file.project.to_ascii_lowercase().contains(needle));
+        let matches_project = match filter {
+            None => true,
+            Some(f) => {
+                let (org, repo) = file
+                    .project
+                    .split_once('/')
+                    .unwrap_or(("", file.project.as_str()));
+                project_filter_matches(org, repo, f)
+            }
+        };
         // Discovery recency is anchored to the canonical chunk date encoded in the
         // store layout, not filesystem mtime which can drift during migration/copy.
         let matches_cutoff = file.date_iso >= cutoff_date;
@@ -4226,6 +4285,108 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn store_segments_does_not_pump_index_when_rerun_dedupes_everything() {
+        // Regression guard: previously `store_segments_at` unconditionally
+        // added `segment.entries.len()` to `summary.total_entries` and
+        // bumped `index.json` per segment, even when every chunk was
+        // short-circuited by `content_sha256` dedup inside
+        // `write_context_session_first_outcome_at`. Effect: re-running
+        // `--full-rescan` on an already-stored corpus inflated
+        // `index.json.total_entries` on every run despite zero new files
+        // hitting disk. Lock the new proportional accounting in.
+        let root = retrieval_test_root("store-segments-rerun-dedup");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let entries = vec![
+            semantic_entry(
+                (2026, 4, 1, 10, 0, 0),
+                "sess-x",
+                "user",
+                "First message in a tracked conversation.",
+                None,
+            ),
+            semantic_entry(
+                (2026, 4, 1, 10, 1, 0),
+                "sess-x",
+                "assistant",
+                "Reply that exercises canonical chunking output.",
+                None,
+            ),
+        ];
+
+        let first = store_semantic_segments_at(
+            &root,
+            &entries,
+            &ChunkerConfig::default(),
+            |_, _| {},
+        )
+        .expect("first store");
+        assert!(
+            !first.written_paths.is_empty(),
+            "first run must actually write something"
+        );
+        assert_eq!(
+            first.total_entries,
+            entries.len(),
+            "first run records every entry (no dedup on a fresh store)"
+        );
+        assert_eq!(
+            first.deduped_chunks, 0,
+            "first run cannot dedup against an empty store"
+        );
+
+        // Snapshot index.total_entries after the first run for the
+        // post-rerun comparison below.
+        let index_after_first = load_index_at(&root).expect("load index after first");
+        let total_after_first: usize = index_after_first
+            .projects
+            .values()
+            .flat_map(|p| p.agents.values())
+            .map(|a| a.total_entries)
+            .sum();
+        assert_eq!(total_after_first, entries.len());
+
+        // Re-run with the same entries. Every chunk's content_sha256
+        // is already on disk, so `write_context_session_first_outcome_at`
+        // increments `deduped_chunks` instead of producing a new path.
+        let second = store_semantic_segments_at(
+            &root,
+            &entries,
+            &ChunkerConfig::default(),
+            |_, _| {},
+        )
+        .expect("second store");
+        assert!(
+            second.written_paths.is_empty(),
+            "second run must not write any new files when every chunk dedups"
+        );
+        assert!(
+            second.deduped_chunks >= 1,
+            "second run must report dedup hits (got {})",
+            second.deduped_chunks
+        );
+        assert_eq!(
+            second.total_entries, 0,
+            "second run must NOT pump total_entries when nothing was written"
+        );
+
+        let index_after_second = load_index_at(&root).expect("load index after second");
+        let total_after_second: usize = index_after_second
+            .projects
+            .values()
+            .flat_map(|p| p.agents.values())
+            .map(|a| a.total_entries)
+            .sum();
+        assert_eq!(
+            total_after_second, total_after_first,
+            "index.json.total_entries must not grow on a full-rescan that produced zero new chunks"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     // ================================================================
     // Repo-centric retrieval tests
     // ================================================================
@@ -4556,6 +4717,53 @@ mod tests {
                 .and_then(|name| name.to_str())
                 .unwrap(),
             "2026_0331_claude_sess-new_001.md"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn context_files_since_does_not_leak_substring_into_neighbor_repos() {
+        // Regression guard: `context_files_since_at` previously filtered
+        // by `file.project.contains(needle)`, so `-p vista` returned
+        // entries from `vista-portal` AND `vista-datasets`. We migrated
+        // to the strict `project_filter_matches` matcher; lock that in.
+        let root = retrieval_test_root("context-files-no-substring-leak");
+        let _ = fs::remove_dir_all(&root);
+
+        let vista = root
+            .join("store")
+            .join("VetCoders")
+            .join("vista")
+            .join("2026_0401")
+            .join("reports")
+            .join("claude")
+            .join("2026_0401_claude_sess-vista_001.md");
+        let vista_portal = root
+            .join("store")
+            .join("VetCoders")
+            .join("vista-portal")
+            .join("2026_0401")
+            .join("reports")
+            .join("claude")
+            .join("2026_0401_claude_sess-portal_001.md");
+        write_chunk_file(&vista, "vista canonical chunk");
+        write_chunk_file(&vista_portal, "vista-portal canonical chunk");
+
+        let cutoff: SystemTime = Utc.with_ymd_and_hms(2026, 3, 30, 0, 0, 0).unwrap().into();
+        let files = context_files_since_at(&root, cutoff, Some("vista"))
+            .expect("strict filter should succeed");
+
+        // Exactly one file matches `-p vista` (the literal `vista`
+        // repo); `vista-portal` must NOT slip in via substring match.
+        assert_eq!(files.len(), 1, "got {files:?}");
+        assert!(
+            files[0]
+                .path
+                .to_string_lossy()
+                .contains("/vista/2026_0401/"),
+            "expected vista hit, got {:?}",
+            files[0].path
         );
 
         let _ = fs::remove_dir_all(&root);
