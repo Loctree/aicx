@@ -1,8 +1,8 @@
 //! Shared HTTP Bearer-token auth for MCP HTTP transport and dashboard server.
 //!
 //! Single token loaded from CLI override, `AICX_HTTP_AUTH_TOKEN`, `~/.aicx/auth-token`,
-//! or generated and persisted (mode 0600). Compared in constant time. Mismatch and
-//! missing produce the same 401 body to defeat oracle probing.
+//! or generated and persisted on Unix (mode 0600). Compared in constant time.
+//! Mismatch and missing produce the same 401 body to defeat oracle probing.
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
@@ -141,25 +141,37 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn persist_token_file(path: &PathBuf, token: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Create token directory {}", parent.display()))?;
-    }
-    std::fs::write(path, format!("{}\n", token))
-        .with_context(|| format!("Write token file {}", path.display()))?;
-
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)
-            .with_context(|| format!("Stat token file {}", path.display()))?
-            .permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(path, perms)
-            .with_context(|| format!("Set mode 0600 on token file {}", path.display()))?;
+        let _ = token;
+        return Err(anyhow!(
+            "Refusing to persist aicx auth token file {} on Windows because this build does not configure restricted file ACLs. Run aicx auth on Linux/macOS, or pass --auth-token <token> explicitly so the token file is never written.",
+            path.display()
+        ));
     }
 
-    Ok(())
+    #[cfg(not(windows))]
+    {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Create token directory {}", parent.display()))?;
+        }
+        std::fs::write(path, format!("{}\n", token))
+            .with_context(|| format!("Write token file {}", path.display()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path)
+                .with_context(|| format!("Stat token file {}", path.display()))?
+                .permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(path, perms)
+                .with_context(|| format!("Set mode 0600 on token file {}", path.display()))?;
+        }
+
+        Ok(())
+    }
 }
 
 /// Hand-rolled constant-time byte slice comparison. Returns true iff the inputs

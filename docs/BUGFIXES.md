@@ -1824,3 +1824,46 @@ raport B-4.
 **Related.** J-7 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows
 `9d1a9c1` (B-1 release SHA256SUMS) + `643fa4c` (B-2 Cross.toml pin) +
 `6c7d06d` (B-3 auth getrandom).
+
+## 2026-05-22 — auth token file refused on Windows (J-4) · `pending-this-commit`
+
+**Symptom.** `src/auth.rs::persist_token_file` chronił wygenerowany token
+`~/.aicx/auth-token` przez chmod `0600` tylko pod `#[cfg(unix)]`. Na Windows
+brakowało równoważnego ograniczenia DACL, więc wygenerowany token mógłby zostać
+zapisany z domyślnymi ACL.
+
+**Root cause.** Ścieżka persistowania tokena miała Unix-only protection jako
+post-write chmod, ale nie miała Windows-specific policy. Pass-3 J-4 wybrał lean
+wariant refusal zamiast dokładania `windows-acl`, bo Windows nie jest jeszcze
+oficjalnie wspieranym token-file targetem.
+
+**Fix.**
+- `src/auth.rs::persist_token_file`: dodano `#[cfg(windows)]` early-return
+  przed `create_dir_all` i `fs::write`, z komunikatem wskazującym
+  `--auth-token <token>` jako explicit-pass workaround.
+- Linux/macOS path zostaje logicznie bez zmian: write token file, potem Unix
+  chmod `0600`.
+- `SECURITY.md`: udokumentowano Unix-only token-file storage i Windows policy.
+
+**Touched.**
+- `src/auth.rs` — refuse point w `persist_token_file`.
+- `SECURITY.md` — auth token storage policy.
+
+**Tests.** `cargo build --workspace` OK.
+`cargo test --workspace -- --test-threads=4` OK.
+`cargo clippy --workspace -- -D warnings` OK. `cargo fmt --check` OK.
+
+**Lessons.**
+- Jeśli platforma nie ma zaimplementowanej ochrony sekretu na storage path,
+  lepszy jest jawny refusal przed utworzeniem pliku niż ciche poleganie na
+  domyślnych ACL.
+- Refuse point najbezpieczniej trzymać przy samym sinku (`persist_token_file`),
+  bo chroni obecnego callera i przyszłe użycia funkcji.
+- Finalny commit SHA jest znany dopiero po commicie; raport C-1 zapisuje
+  finalny SHA dla tej pozycji J-4.
+
+**Related.** J-4 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows
+`9d1a9c1` (B-1 release SHA256SUMS) + `643fa4c` (B-2 Cross.toml pin) +
+`6c7d06d` (B-3 auth getrandom) + `81622d9` (B-4 GCP redaction).
+
+---
