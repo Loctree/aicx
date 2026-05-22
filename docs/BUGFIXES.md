@@ -1779,3 +1779,52 @@ nonce wymaga także HTTP `Content-Security-Policy` headera przy serwowaniu HTML.
 **Related.** Closes M-7, M-8, M-9, M-10, M-11, M-12 z
 `docs/bug-tracker-aicx-followup-pass-3.md`; M-13 scope-overflow documented for
 the next Wave H cut.
+
+---
+
+## 2026-05-22 — dashboard/state/locks test-state polish (M-14..M-18) · `this H-3 commit`
+
+**Symptom.** Pass-3 Area M P2 zostawił pięć test/state footgunów: dashboard
+inline-markdown testy assertowały literalny JS marker zamiast zachowania;
+`atomic_write` tempfile name używał tylko PID+nanos; lock holder sidecar działał
+tylko dla `lance.lock`; state load parsował ten sam JSON kilkukrotnie; backup
+recovery zwracało odzyskany stan bez naprawienia corrupt primary.
+
+**Root cause.** Kod był funkcjonalny w zwykłej ścieżce, ale kruchy pod refactor,
+concurrency i incident triage. Testy dashboardu były spięte z implementacją JS,
+lock sidecar był G-2-specific zamiast default dla lockfiles, a state loader
+rozdzielał strict/legacy detection przez kolejne `from_str` passy.
+
+**Fix.**
+- M-14: `inlineMarkdown`/`renderMarkdown` wyciągnięte do
+  `src/dashboard_inline_markdown.js`; Rust testy odpalają Node i sprawdzają
+  zachowanie unsafe scheme / href escaping zamiast markerów w stringu.
+- M-15: `stage_tempfile` dodaje process-local `AtomicU64` do nazwy tempfile;
+  stress test 100 concurrent writes potwierdza brak kolizji i stray tmp.
+- M-16: holder `.holder` sidecar powstaje dla wszystkich lockfile acquire
+  (exclusive i shared), z `mode=`/`token=` i cleanupem tylko własnego sidecara;
+  `lance.lock` zachowuje `run_kind=aicx index`.
+- M-17: state load parsuje `serde_json::Value` raz, potem robi
+  `from_value::<StateManager>` / `from_value::<LegacySiphashStateManager>`.
+- M-18: po udanym backup recovery primary `state.json` jest atomowo
+  self-healed z odzyskanego stanu bez nadpisywania dobrej backup treści corrupt
+  primary bytes.
+
+**Touched.** `src/dashboard.rs`, `src/dashboard_inline_markdown.js`,
+`src/store/atomic_write.rs`, `src/locks.rs`, `src/state.rs`.
+
+**Tests.** Targeted green: dashboard inline markdown Node behavior; atomic_write
+100 concurrent writers; locks unit suite; state load/migration tests. Full gates
+green: `cargo build --workspace`, `cargo test --workspace -- --test-threads=4`,
+`cargo clippy --workspace -- -D warnings`, `cargo fmt --check`. Informacyjnie:
+wygenerowany 1,930,014 B `state.json` przez `AICX_HOME=<tmp> aicx state --info`
+przeszedł w `real 0.19s` na nowej single-parse ścieżce.
+
+**Lessons.** Testy security-sensitive renderingu powinny wykonywać renderer, nie
+szukać markerów implementacji. Lock sidecary muszą mieć identity token, bo
+shared locks mogą się legalnie nakładać. Backup recovery nie może używać zwykłej
+rotacji backupu, jeśli primary jest znanym corrupt wejściem.
+
+**Related.** Closes M-14, M-15, M-16, M-17, M-18 z
+`docs/bug-tracker-aicx-followup-pass-3.md`; H-3 Wave H batch 3. M-13 pozostaje
+scope-overflow z H-2, bez zmian w tym commicie.
