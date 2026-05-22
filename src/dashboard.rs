@@ -15,6 +15,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::process::Command;
 use std::time::SystemTime;
 
 #[cfg(test)]
@@ -24,6 +26,7 @@ const MAX_JSON_PARSE_BYTES: u64 = 8 * 1024 * 1024;
 const SEARCH_READ_BYTES: u64 = 256 * 1024;
 const MAX_SEARCH_TEXT_CHARS: usize = 12_000;
 const MAX_DETAIL_CHARS: usize = 32_000;
+const DASHBOARD_INLINE_MARKDOWN_SCRIPT: &str = include_str!("dashboard_inline_markdown.js");
 
 /// Optional dataset scope applied before dashboard generation or server startup.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -381,7 +384,7 @@ pub fn render_server_shell_html(title: &str) -> String {
 "##,
         html_escape(title),
         DASHBOARD_CSS,
-        DASHBOARD_SERVER_SCRIPT
+        format_args!("{DASHBOARD_INLINE_MARKDOWN_SCRIPT}\n{DASHBOARD_SERVER_SCRIPT}")
     )
 }
 
@@ -1897,55 +1900,7 @@ const DASHBOARD_SERVER_SCRIPT: &str = r#"
     browseRecords: [], mode: 'browse', expanded: false,
   };
 
-  /* --- markdown renderer ------------------------------------------------- */
-  const renderMarkdown = (src) => {
-    if (!src) return '';
-    const esc = (s) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    let html = '';
-    let inCode = false;
-    let codeLang = '';
-    let codeLines = [];
-    const lines = src.split('\n');
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if (inCode) {
-        if (line.startsWith('```')) {
-          html += '<pre><code' + (codeLang ? ' class="lang-' + esc(codeLang) + '"' : '') + '>' + esc(codeLines.join('\n')) + '</code></pre>';
-          inCode = false; codeLines = []; codeLang = '';
-        } else { codeLines.push(line); }
-        continue;
-      }
-      if (line.startsWith('```')) { inCode = true; codeLang = line.slice(3).trim(); continue; }
-      if (line.startsWith('---') && line.replace(/-/g,'').trim() === '') { html += '<hr>'; continue; }
-      const hm = line.match(/^(#{1,6})\s+(.*)/);
-      if (hm) { const lvl = hm[1].length; html += '<h' + lvl + '>' + inlineMarkdown(hm[2]) + '</h' + lvl + '>'; continue; }
-      if (line.startsWith('> ')) { html += '<blockquote>' + inlineMarkdown(line.slice(2)) + '</blockquote>'; continue; }
-      const lm = line.match(/^(\s*[-*])\s+(.*)/);
-      if (lm) { html += '<ul><li>' + inlineMarkdown(lm[2]) + '</li></ul>'; continue; }
-      const om = line.match(/^(\s*\d+\.)\s+(.*)/);
-      if (om) { html += '<ol><li>' + inlineMarkdown(om[2]) + '</li></ol>'; continue; }
-      if (line.trim() === '') { html += '<br>'; continue; }
-      html += '<p>' + inlineMarkdown(line) + '</p>';
-    }
-    if (inCode) { html += '<pre><code>' + esc(codeLines.join('\n')) + '</code></pre>'; }
-    return html.replace(/<\/ul><ul>/g, '').replace(/<\/ol><ol>/g, '');
-  };
-  const inlineMarkdown = (s) => {
-    const esc = (t) => t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    let html = esc(s)
-      .replace(/`([^`]+)`/g, '<code>$1</code>')
-      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-      .replace(/\*([^*]+)\*/g, '<em>$1</em>');
-    return html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, label, url) => {
-      const u = url.trim();
-      const lower = u.toLowerCase();
-      if (lower.startsWith('javascript:') || lower.startsWith('data:') || lower.startsWith('vbscript:') || lower.startsWith('blob:') || lower.startsWith('file:')) {
-        return '[' + label + '](' + url + ')';
-      }
-      const href = u.replace(/"/g, '&quot;');
-      return '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' + label + '</a>';
-    });
-  };
+  const renderMarkdown = AicxMarkdown.renderMarkdown;
 
   /* --- URL state --------------------------------------------------------- */
   const pushUrlState = () => {
@@ -2266,6 +2221,28 @@ mod tests {
             .join(format!("{}_{}", name, Utc::now().timestamp_micros()));
         fs::create_dir_all(&dir).expect("create dir");
         dir
+    }
+
+    fn inline_markdown_via_node(markdown: &str) -> String {
+        let module_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/dashboard_inline_markdown.js"
+        );
+        let output = Command::new("node")
+            .arg("-e")
+            .arg(
+                "const md=require(process.argv[1]); process.stdout.write(md.inlineMarkdown(process.argv[2]));",
+            )
+            .arg(module_path)
+            .arg(markdown)
+            .output()
+            .expect("node is required for dashboard markdown behavior tests");
+        assert!(
+            output.status.success(),
+            "node inlineMarkdown failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("node output is utf8")
     }
 
     #[test]
@@ -2667,20 +2644,23 @@ mod tests {
 
     #[test]
     fn test_inline_markdown_javascript_scheme_renders_as_text() {
-        let html = render_server_shell_html("test");
-        assert!(html.contains("lower.startsWith('javascript:')"));
+        let html = inline_markdown_via_node("[x](javascript:alert(1))");
+        assert_eq!(html, "[x](javascript:alert(1))");
+        assert!(!html.contains("<a "));
     }
 
     #[test]
     fn test_inline_markdown_data_scheme_renders_as_text() {
-        let html = render_server_shell_html("test");
-        assert!(html.contains("lower.startsWith('data:')"));
+        let html = inline_markdown_via_node("[x](data:text/html,boom)");
+        assert_eq!(html, "[x](data:text/html,boom)");
+        assert!(!html.contains("<a "));
     }
 
     #[test]
     fn test_inline_markdown_quote_break_attempt_does_not_inject_attribute() {
-        let html = render_server_shell_html("test");
-        assert!(html.contains("u.replace(/\"/g, '&quot;')"));
+        let html = inline_markdown_via_node("[x](https://example.com/\" onclick=\"alert(1))");
+        assert!(html.contains("<a href=\"https://example.com/&quot; onclick=&quot;alert(1\""));
+        assert!(!html.contains("\" onclick=\""));
     }
 
     #[test]

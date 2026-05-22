@@ -88,9 +88,9 @@ fn lexical_commit_mismatch_is_typed() {
 
     assert_eq!(
         left.validate_against(&right),
-        Err(RetrieveError::GenerationMismatch {
-            lexical_gen: "lex-commit-1".to_string(),
-            dense_gen: "lex-commit-2".to_string(),
+        Err(RetrieveError::LexicalCommitMismatch {
+            expected: "lex-commit-1".to_string(),
+            actual: "lex-commit-2".to_string(),
         })
     );
 }

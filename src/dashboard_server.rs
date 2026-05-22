@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Query, State, rejection::QueryRejection},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -35,8 +35,12 @@ use crate::sanitize;
 
 const REGENERATE_HEADER_NAME: &str = "x-ai-contexters-action";
 const REGENERATE_HEADER_VALUE: &str = "regenerate";
+const CROSS_SEARCH_MAX_LIMIT: usize = 200;
+const CROSS_SEARCH_CLAMPED_LIMIT_HEADER: &str = "x-clamped-limit";
 const MAX_SCORE_FILTER: u8 = 100;
 const LOCALHOST_ORIGINS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+const MEMEX_CLI_ENV_PASSTHROUGH: [&str; 3] = ["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"];
+pub const DEFAULT_MEMEX_TIMEOUT_SECS: u64 = 30;
 const TAILSCALE_MAGICDNS_SUFFIX: &str = ".ts.net";
 const TAILSCALE_RANGE_BASE: u32 = u32::from_be_bytes([100, 64, 0, 0]);
 const TAILSCALE_RANGE_END: u32 = u32::from_be_bytes([100, 127, 255, 255]);
@@ -115,6 +119,8 @@ pub struct DashboardServerConfig {
     pub host: IpAddr,
     pub port: u16,
     pub auth: AuthConfig,
+    pub allow_no_origin: bool,
+    pub memex_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +207,38 @@ struct ErrorResponse {
 
 fn default_search_limit() -> usize {
     20
+}
+
+fn forbidden_response(reason: &'static str, detail: impl std::fmt::Display) -> Response {
+    tracing::warn!(
+        reason,
+        detail = %detail,
+        "dashboard security check rejected request"
+    );
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorResponse {
+            ok: false,
+            error: "Forbidden".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+fn clamp_cross_search_limit(requested: usize) -> (usize, bool) {
+    (
+        requested.min(CROSS_SEARCH_MAX_LIMIT),
+        requested > CROSS_SEARCH_MAX_LIMIT,
+    )
+}
+
+fn apply_clamped_limit_header(response: &mut Response, clamped: bool) {
+    if clamped {
+        response.headers_mut().insert(
+            HeaderName::from_static(CROSS_SEARCH_CLAMPED_LIMIT_HEADER),
+            HeaderValue::from_static("200"),
+        );
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -420,6 +458,11 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         "  Required header: {}: {}",
         REGENERATE_HEADER_NAME, REGENERATE_HEADER_VALUE
     );
+    if config.allow_no_origin {
+        eprintln!("  Mutation origin gate: allow no-Origin/no-Referer requests");
+    } else {
+        eprintln!("  Mutation origin gate: require Origin or Referer");
+    }
     eprintln!("  Store: {}", config.store_root.display());
     eprintln!("  CORS: {}", config.cors_policy.describe());
     if auth_enforced {
@@ -430,9 +473,12 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         );
     }
 
-    axum::serve(listener, app)
-        .await
-        .context("Dashboard server runtime terminated unexpectedly")
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("Dashboard server runtime terminated unexpectedly")
 }
 
 pub fn validate_dashboard_host_policy(
@@ -483,18 +529,13 @@ async fn dashboard_cors_middleware(
                     apply_cors_headers(response.headers_mut(), allow_origin, true);
                     response
                 } else {
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(ErrorResponse {
-                            ok: false,
-                            error: format!(
-                                "Origin '{}' is not permitted by dashboard CORS policy '{}'.",
-                                origin,
-                                state.config.cors_policy.describe()
-                            ),
-                        }),
+                    forbidden_response(
+                        "cors_preflight_origin_rejected",
+                        format!(
+                            "origin={origin}; policy={}",
+                            state.config.cors_policy.describe()
+                        ),
                     )
-                        .into_response()
                 }
             }
             None => next.run(request).await,
@@ -634,44 +675,41 @@ async fn regenerate_dashboard(
     State(state): State<Arc<DashboardServerState>>,
     headers: HeaderMap,
 ) -> Response {
-    // Mutation gate: require the action header (CSRF protection is provided by
-    // the Bearer auth layer + the Origin/Referer check below). Browser code
-    // sends the action header from same-origin fetch; cross-origin attackers
-    // would also need to hit the auth-protected `/api/*` surface, and any
-    // origin-present POST must match the configured CORS policy.
+    // Mutation gate: require the action header, Bearer auth, and by default an
+    // Origin/Referer that matches the configured dashboard origin policy.
     let header_ok = headers
         .get(REGENERATE_HEADER_NAME)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.eq_ignore_ascii_case(REGENERATE_HEADER_VALUE));
 
     if !header_ok {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse {
-                ok: false,
-                error: format!("Missing or invalid required header: {REGENERATE_HEADER_NAME}"),
-            }),
-        )
-            .into_response();
+        return forbidden_response(
+            "missing_or_invalid_action_header",
+            format!("expected {REGENERATE_HEADER_NAME}: {REGENERATE_HEADER_VALUE}"),
+        );
     }
 
     let origin_str = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
     let referer_str = headers.get(header::REFERER).and_then(|v| v.to_str().ok());
+    let source_url = origin_str.or(referer_str);
 
-    // We mandate that if a browser sends an Origin or Referer (which it will for cross-origin POSTs),
-    // it must match the allowed origins for this dashboard instance to prevent CSRF.
-    if let Some(source_url) = origin_str.or(referer_str) {
-        let is_valid_source = state.config.cors_policy.allows_origin(source_url);
-        if !is_valid_source {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(ErrorResponse {
-                    ok: false,
-                    error: "Cross-origin regenerate request rejected by CORS policy".to_string(),
-                }),
-            )
-                .into_response();
-        }
+    if source_url.is_none() && !state.config.allow_no_origin {
+        return forbidden_response(
+            "missing_origin_or_referer",
+            "mutating dashboard request had neither Origin nor Referer",
+        );
+    }
+
+    if let Some(source_url) = source_url
+        && !state.config.cors_policy.allows_origin(source_url)
+    {
+        return forbidden_response(
+            "origin_or_referer_rejected",
+            format!(
+                "source={source_url}; policy={}",
+                state.config.cors_policy.describe()
+            ),
+        );
     }
 
     if state.rebuilding.swap(true, Ordering::SeqCst) {
@@ -827,6 +865,7 @@ fn parse_relative_time(s: &str) -> Option<i64> {
     } else {
         return None;
     };
+    // saturate on overflow rather than panic; user input may be adversarial
     Some(now.saturating_sub(num.saturating_mul(unit)))
 }
 
@@ -1400,27 +1439,42 @@ async fn semantic_search(
 // survive only for the cross-search endpoint (separate doctrine; lands
 // in its own cut when that surface migrates in-process).
 
+fn apply_memex_cli_env(command: &mut tokio::process::Command) {
+    command.env_clear();
+    for key in MEMEX_CLI_ENV_PASSTHROUGH {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+}
+
 async fn run_memex_cli(
     binary_path: Option<&str>,
     args: &[&str],
     action: &str,
+    timeout_secs: u64,
 ) -> Result<(String, std::process::Output)> {
     let binary = binary_path.ok_or_else(|| {
         anyhow::anyhow!("Semantic search (vector backend) is an optional capability. Failed to run memex {action}: missing compatible memex CLI (rust-memex or rmcp-memex). Please install the vector backend or fall back to default lexical search.")
     })?;
 
-    let child = tokio::process::Command::new(binary)
+    let mut command = tokio::process::Command::new(binary);
+    apply_memex_cli_env(&mut command);
+    let child = command
         .args(args)
-        .env_clear()
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .context(format!("Failed to spawn {binary} {action}"))?;
 
-    let output = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
-        .await
-        .map_err(|_| anyhow::anyhow!("{binary} timed out after 30s"))?
-        .context(format!("Failed to collect output for {binary} {action}"))?;
+    let timeout_secs = timeout_secs.max(1);
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("{binary} timed out after {timeout_secs}s"))?
+    .context(format!("Failed to collect output for {binary} {action}"))?;
 
     Ok((binary.to_string(), output))
 }
@@ -1457,7 +1511,7 @@ async fn cross_search(
             .into_response();
     }
 
-    let limit = params.limit.min(200);
+    let (limit, clamped_limit) = clamp_cross_search_limit(params.limit);
     let mode = params.mode;
     let projects = if params.projects.is_empty() {
         params.project.into_iter().collect::<Vec<_>>()
@@ -1471,11 +1525,16 @@ async fn cross_search(
         limit,
         &mode,
         &projects,
+        state.config.memex_timeout_secs,
     )
     .await;
 
     match result {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(response) => {
+            let mut response = (StatusCode::OK, Json(response)).into_response();
+            apply_clamped_limit_header(&mut response, clamped_limit);
+            response
+        }
         Err(err) => {
             if let Some(err) = err.downcast_ref::<std::io::Error>()
                 && err.kind() == std::io::ErrorKind::NotFound
@@ -1505,6 +1564,7 @@ async fn run_memex_cross_search(
     limit: usize,
     mode: &str,
     projects: &[String],
+    timeout_secs: u64,
 ) -> Result<MemexSearchResponse> {
     let mut args = vec![
         "cross-search".to_string(),
@@ -1520,7 +1580,8 @@ async fn run_memex_cross_search(
         args.push(project.clone());
     }
     let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    let (binary, output) = run_memex_cli(memex_cli_path, &arg_refs, "cross-search").await?;
+    let (binary, output) =
+        run_memex_cli(memex_cli_path, &arg_refs, "cross-search", timeout_secs).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1826,6 +1887,40 @@ fn write_dashboard_artifact(path: &Path, html: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
+    use std::io;
+    use std::sync::{Arc as StdArc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct CapturedLogWriter {
+        buffer: StdArc<Mutex<Vec<u8>>>,
+    }
+
+    struct CapturedLogGuard {
+        buffer: StdArc<Mutex<Vec<u8>>>,
+    }
+
+    impl io::Write for CapturedLogGuard {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer.lock().expect("log buffer poisoned").extend(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogWriter {
+        type Writer = CapturedLogGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogGuard {
+                buffer: self.buffer.clone(),
+            }
+        }
+    }
 
     fn mk_tmp_dir(name: &str) -> PathBuf {
         let dir = std::env::current_dir()
@@ -1847,7 +1942,42 @@ mod tests {
         .expect("seed file");
     }
 
+    async fn response_body_to_string(response: Response) -> String {
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect response body")
+            .to_bytes();
+        String::from_utf8(bytes.to_vec()).expect("utf8 body")
+    }
+
+    fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
+        let buffer = StdArc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CapturedLogWriter {
+                buffer: buffer.clone(),
+            })
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let logs = String::from_utf8(buffer.lock().expect("log buffer poisoned").clone())
+            .expect("utf8 logs");
+        (result, logs)
+    }
+
     fn mk_state(root: PathBuf, artifact_path: PathBuf) -> Arc<DashboardServerState> {
+        mk_state_with_origin_escape(root, artifact_path, false)
+    }
+
+    fn mk_state_with_origin_escape(
+        root: PathBuf,
+        artifact_path: PathBuf,
+        allow_no_origin: bool,
+    ) -> Arc<DashboardServerState> {
         Arc::new(DashboardServerState {
             config: DashboardServerConfig {
                 store_root: root,
@@ -1859,6 +1989,8 @@ mod tests {
                 host: "127.0.0.1".parse().expect("host"),
                 port: 8033,
                 auth: AuthConfig::disabled(),
+                allow_no_origin,
+                memex_timeout_secs: DEFAULT_MEMEX_TIMEOUT_SECS,
             },
             shell_html: "<html>shell</html>".to_string(),
             snapshot: RwLock::new(DashboardSnapshot {
@@ -2006,7 +2138,109 @@ mod tests {
         let response =
             runtime.block_on(regenerate_dashboard(State(state.clone()), HeaderMap::new()));
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = runtime.block_on(response_body_to_string(response));
+        assert_eq!(body, r#"{"ok":false,"error":"Forbidden"}"#);
         assert!(!state.rebuilding.load(Ordering::SeqCst));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regenerate_logs_detailed_reason_without_leaking_403_body() {
+        let root = mk_tmp_dir("dashboard_server_forbidden_log");
+        let artifact_path = root.join("dashboard.html");
+        seed_store(&root);
+        let state = mk_state(root.clone(), artifact_path);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let (response, logs) = capture_logs(|| {
+            runtime.block_on(regenerate_dashboard(State(state.clone()), HeaderMap::new()))
+        });
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = runtime.block_on(response_body_to_string(response));
+        assert_eq!(body, r#"{"ok":false,"error":"Forbidden"}"#);
+        assert!(logs.contains("missing_or_invalid_action_header"));
+        assert!(logs.contains(REGENERATE_HEADER_NAME));
+        assert!(!body.contains(REGENERATE_HEADER_NAME));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regenerate_rejects_missing_origin_and_referer() {
+        let root = mk_tmp_dir("dashboard_server_missing_origin");
+        let artifact_path = root.join("dashboard.html");
+        seed_store(&root);
+        let state = mk_state(root.clone(), artifact_path);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            REGENERATE_HEADER_NAME,
+            HeaderValue::from_static(REGENERATE_HEADER_VALUE),
+        );
+        let response = runtime.block_on(regenerate_dashboard(State(state.clone()), headers));
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = runtime.block_on(response_body_to_string(response));
+        assert_eq!(body, r#"{"ok":false,"error":"Forbidden"}"#);
+        assert!(!state.rebuilding.load(Ordering::SeqCst));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regenerate_accepts_no_origin_when_escape_hatch_enabled() {
+        let root = mk_tmp_dir("dashboard_server_no_origin_escape");
+        let artifact_path = root.join("dashboard.html");
+        seed_store(&root);
+        let state = mk_state_with_origin_escape(root.clone(), artifact_path, true);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            REGENERATE_HEADER_NAME,
+            HeaderValue::from_static(REGENERATE_HEADER_VALUE),
+        );
+        let response = runtime.block_on(regenerate_dashboard(State(state), headers));
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regenerate_rejects_cross_origin_referer() {
+        let root = mk_tmp_dir("dashboard_server_cross_origin_referer");
+        let artifact_path = root.join("dashboard.html");
+        seed_store(&root);
+        let state = mk_state(root.clone(), artifact_path);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            REGENERATE_HEADER_NAME,
+            HeaderValue::from_static(REGENERATE_HEADER_VALUE),
+        );
+        headers.insert(header::REFERER, "https://evil.example".parse().unwrap());
+        let response = runtime.block_on(regenerate_dashboard(State(state), headers));
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = runtime.block_on(response_body_to_string(response));
+        assert_eq!(body, r#"{"ok":false,"error":"Forbidden"}"#);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2067,6 +2301,56 @@ mod tests {
         let err = validate_score_filter(Some(MAX_SCORE_FILTER + 1))
             .expect_err("score above 100 should be rejected");
         assert_eq!(err, "score must be between 0 and 100");
+    }
+
+    #[test]
+    fn cross_search_limit_clamp_sets_signal_header() {
+        let (limit, clamped) = clamp_cross_search_limit(500);
+        assert_eq!(limit, CROSS_SEARCH_MAX_LIMIT);
+        assert!(clamped);
+
+        let mut response = (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response();
+        apply_clamped_limit_header(&mut response, clamped);
+        assert_eq!(
+            response.headers().get(CROSS_SEARCH_CLAMPED_LIMIT_HEADER),
+            Some(&HeaderValue::from_static("200"))
+        );
+    }
+
+    #[test]
+    fn run_memex_cli_passes_home_xdg_without_path() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let env_binary = "/usr/bin/env";
+        assert!(
+            Path::new(env_binary).exists(),
+            "{env_binary} must exist for env passthrough test"
+        );
+
+        let (_binary, output) = runtime
+            .block_on(run_memex_cli(
+                Some(env_binary),
+                &[],
+                "env probe",
+                DEFAULT_MEMEX_TIMEOUT_SECS,
+            ))
+            .expect("env probe");
+        assert!(output.status.success(), "env probe should succeed");
+        let stdout = String::from_utf8(output.stdout).expect("utf8 env output");
+        let lines = stdout.lines().collect::<Vec<_>>();
+
+        assert!(
+            !lines.iter().any(|line| line.starts_with("PATH=")),
+            "memex CLI env must not inherit PATH:\n{stdout}"
+        );
+        for key in MEMEX_CLI_ENV_PASSTHROUGH {
+            if std::env::var_os(key).is_some() {
+                let prefix = format!("{key}=");
+                assert!(
+                    lines.iter().any(|line| line.starts_with(&prefix)),
+                    "memex CLI env should pass {key} when parent has it:\n{stdout}"
+                );
+            }
+        }
     }
 
     #[test]

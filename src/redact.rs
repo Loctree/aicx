@@ -41,11 +41,13 @@ static RE_AWS_SESSION: LazyLock<Regex> =
 static RE_GOOGLE_API_KEY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\bAIza[0-9A-Za-z_-]{35}\b").expect("regex"));
 static RE_JWT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
+    Regex::new(r"\beyJ[A-Za-z0-9_-]{8,128}\.eyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{32,512}\b")
         .expect("regex")
 });
 static RE_STRIPE_KEY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{24,}\b").expect("regex"));
+static RE_STRIPE_WEBHOOK_SECRET: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bwhsec_[A-Za-z0-9]{20,}\b").expect("regex"));
 
 static RE_GCP_JSON_PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?s)(?P<prefix>"private_key"\s*:\s*)"-----BEGIN[^"]+-----END[^"]+""#)
@@ -75,8 +77,9 @@ static SECRET_LOOKUP_SET: LazyLock<RegexSet> = LazyLock::new(|| {
         r"\bAKIA[0-9A-Z]{16}\b",
         r"\bASIA[0-9A-Z]{16}\b",
         r"\bAIza[0-9A-Za-z_-]{35}\b",
-        r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+        r"\beyJ[A-Za-z0-9_-]{8,128}\.eyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{32,512}\b",
         r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{24,}\b",
+        r"\bwhsec_[A-Za-z0-9]{20,}\b",
         r#"(?s)"private_key"\s*:\s*"-----BEGIN[^"]+-----END[^"]+""#,
         r#""private_key_id"\s*:\s*"[^"]+""#,
         r#""client_email"\s*:\s*"[^"]+""#,
@@ -229,6 +232,11 @@ pub fn redact_secrets(text: &str) -> String {
     if let Cow::Owned(s) = RE_STRIPE_KEY.replace_all(&out, "[REDACTED_STRIPE_KEY]") {
         out = s;
     }
+    if let Cow::Owned(s) =
+        RE_STRIPE_WEBHOOK_SECRET.replace_all(&out, "[REDACTED_STRIPE_WEBHOOK_SECRET]")
+    {
+        out = s;
+    }
 
     out
 }
@@ -362,9 +370,33 @@ mod tests {
             "eyJ{}.eyJ{}.{}",
             chars('J', 12),
             chars('K', 12),
-            chars('L', 16)
+            chars('L', 43)
         );
         assert_redacted(&token, "[REDACTED_JWT]");
+    }
+
+    #[test]
+    fn does_not_redact_jwt_like_strings_with_short_signature() {
+        let s = format!(
+            "trace eyJ{}.eyJ{}.{}",
+            chars('A', 12),
+            chars('B', 12),
+            chars('C', 16)
+        );
+        let r = redact_secrets(&s);
+        assert_eq!(r, s);
+    }
+
+    #[test]
+    fn does_not_redact_jwt_like_strings_with_oversized_header() {
+        let s = format!(
+            "fixture eyJ{}.eyJ{}.{}",
+            chars('A', 180),
+            chars('B', 12),
+            chars('C', 43)
+        );
+        let r = redact_secrets(&s);
+        assert_eq!(r, s);
     }
 
     #[test]
@@ -383,6 +415,12 @@ mod tests {
     fn redacts_stripe_restricted_key() {
         let token = format!("rk_live_{}", chars('O', 24));
         assert_redacted(&token, "[REDACTED_STRIPE_KEY]");
+    }
+
+    #[test]
+    fn redacts_stripe_webhook_secret() {
+        let token = format!("whsec_{}", chars('P', 24));
+        assert_redacted(&token, "[REDACTED_STRIPE_WEBHOOK_SECRET]");
     }
 
     #[test]

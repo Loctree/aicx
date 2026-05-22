@@ -72,6 +72,7 @@ Bez ozdobników. Bez hype. Bez "production-ready". Fakty + ścieżka recovery.
 - 2026-05-11 [loctree/lsp] Plan 03 closure-adjusted (CodeLens używa no-op `Command { command: "" }` zamiast literal `command: None` z original task) — udokumentować w task/tracker zamiast zostawiać jako quiet diff. — open
 - 2026-05-11 [loctree/audit] Plan 21 source restore (P1 z 22_task_audit_report) — original task file zaginął, jest reconstruction; jeśli oryginał miał inne kryteria, reconstruction może nie matchować. — open
 - 2026-05-21 [aicx/tests] K-1 fake `tests/dashboard_security.rs` removed instead of pretending PATH-safe `run_memex_cli` behavior was tested. Recover: add a real integration test around PATH shim resolution if dashboard command execution becomes public/testable. — open
+- 2026-05-22 [prview] cargo geiger timeout 600s — upstream issue in prview-rs (out of aicx scope). Recover: track/fix in prview-rs, not this repository. — open
 
 ---
 

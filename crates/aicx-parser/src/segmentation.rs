@@ -612,6 +612,8 @@ fn is_probably_repo_name(value: &str) -> bool {
 /// shape-only (digits + separator placement); we do not validate that the
 /// month/day fall within a real calendar — `2026-99-99` is still rejected as
 /// "repo-like" because the *intent* is clearly a date bucket, not a repo.
+/// The `YYYY_MMDD` arm is intentionally aligned with state migration's
+/// compact store date-dir skip heuristic.
 fn looks_like_date_pattern(value: &str) -> bool {
     let bytes = value.as_bytes();
     match bytes.len() {

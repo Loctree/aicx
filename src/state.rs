@@ -210,7 +210,7 @@ impl StateManager {
                             .with_context(|| {
                                 format!("Failed to read state backup: {}", backup_path.display())
                             })?;
-                        Self::deserialize_and_migrate_contents(
+                        let recovered = Self::deserialize_and_migrate_contents(
                             &backup_path,
                             &backup,
                             &mut warn_legacy,
@@ -219,7 +219,9 @@ impl StateManager {
                             anyhow!(
                                 "state.json malformed AND backup unreadable: {err} / {backup_err}"
                             )
-                        })?
+                        })?;
+                        recovered.save_recovered_backup_to_primary(path)?;
+                        recovered
                     } else {
                         return Err(anyhow!(
                             "state.json corrupted, no backup; manual recovery needed: {}",
@@ -229,6 +231,21 @@ impl StateManager {
                 }
             };
         Ok(state)
+    }
+
+    fn save_recovered_backup_to_primary(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create config dir: {}", parent.display()))?;
+        }
+        let json = serde_json::to_string_pretty(self).context("Failed to serialize state")?;
+        atomic_write(path, json.as_bytes()).with_context(|| {
+            format!(
+                "Failed to self-heal state file from backup: {}",
+                path.display()
+            )
+        })?;
+        Ok(())
     }
 
     fn deserialize_and_migrate_contents<W>(
@@ -256,24 +273,22 @@ impl StateManager {
     fn deserialize_current_or_legacy_siphash(
         contents: &str,
     ) -> std::result::Result<(Self, bool), serde_json::Error> {
-        match serde_json::from_str(contents) {
+        let value: serde_json::Value = serde_json::from_str(contents)?;
+        match serde_json::from_value::<Self>(value.clone()) {
             Ok(state) => Ok((state, false)),
             Err(strict_err) => {
-                if !Self::is_legacy_siphash_state_json(contents) {
+                if !Self::is_legacy_siphash_state_value(&value) {
                     return Err(strict_err);
                 }
 
-                serde_json::from_str::<LegacySiphashStateManager>(contents)
+                serde_json::from_value::<LegacySiphashStateManager>(value)
                     .map(|legacy| (legacy.into_current_state(), true))
                     .map_err(|_| strict_err)
             }
         }
     }
 
-    fn is_legacy_siphash_state_json(contents: &str) -> bool {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(contents) else {
-            return false;
-        };
+    fn is_legacy_siphash_state_value(value: &serde_json::Value) -> bool {
         value
             .get("hash_algorithm")
             .and_then(|algorithm| algorithm.as_str())
@@ -770,6 +785,13 @@ mod tests {
 
         assert_eq!(loaded.get_watermark("claude:test"), Some(ts(20)));
         assert!(!loaded.is_new("project", "202"));
+        let repaired_primary: StateManager =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(repaired_primary.get_watermark("claude:test"), Some(ts(20)));
+        assert!(!repaired_primary.is_new("project", "202"));
+        let repaired = StateManager::load_from_path(&path).unwrap();
+        assert_eq!(repaired.get_watermark("claude:test"), Some(ts(20)));
+        assert!(!repaired.is_new("project", "202"));
         cleanup_state_path(&path);
     }
 

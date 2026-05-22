@@ -121,6 +121,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `BRAVE_API_KEY="…"` or `api_key = "…"` embedded in prose and code
   spans, not only line-start environment declarations.
 
+### Known Issues
+
+- `cargo audit` still reports the RSA Marvin Attack advisory through the
+  optional `rust-memex` transitive dependency surface. AICX does not use that
+  RSA path as its own crypto hot path; the ignore rationale is tracked in
+  `cargo-audit.toml` / `.cargo/audit.toml` until the upstream dependency stack
+  clears it.
+
 ## [0.8.0] - 2026-05-15
 
 ### Added

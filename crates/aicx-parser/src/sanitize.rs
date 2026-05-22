@@ -97,11 +97,24 @@ fn contains_traversal(path: &str) -> bool {
         .any(|c| matches!(c, Component::ParentDir))
 }
 
-/// Get the user's home directory.
-fn home_dir() -> Result<PathBuf> {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|_| anyhow!("Cannot determine home directory from $HOME"))
+fn current_user_allowed_bases() -> Result<Vec<PathBuf>> {
+    let mut bases = Vec::new();
+    for base in [dirs::home_dir(), dirs::cache_dir(), dirs::data_dir()]
+        .into_iter()
+        .flatten()
+    {
+        if !bases.iter().any(|existing| existing == &base) {
+            bases.push(base);
+        }
+    }
+
+    if bases.is_empty() {
+        return Err(anyhow!(
+            "Cannot determine current user allowed base directories"
+        ));
+    }
+
+    Ok(bases)
 }
 
 /// Canonicalize a path, returning error if it doesn't exist.
@@ -110,21 +123,37 @@ fn canonicalize_existing(path: &Path) -> Result<PathBuf> {
         .map_err(|e| anyhow!("Cannot canonicalize path '{}': {}", path.display(), e))
 }
 
-/// Hybrid temp-dir policy for pass-2 D-7 retry:
-/// test/non-release builds always allow tempfile-backed `/tmp` paths, while
-/// release builds require `AICX_ALLOW_TMP=1` so production does not silently
-/// accept temp targets. This preserves the 121 tempfile-dependent tests broken
-/// by the reverted env-only attempt (`2f7a375`); `debug_assertions` covers
-/// Cargo test binaries where `aicx-parser` is compiled as a dependency and
-/// therefore does not receive this crate's `cfg(test)`.
+/// Cargo test builds allow tempfile-backed `/tmp` paths, while normal debug and
+/// release builds require `AICX_ALLOW_TMP=1` so local dev runs follow the same
+/// explicit opt-in contract as production.
 fn temp_allowlist_enabled() -> bool {
-    temp_allowlist_enabled_for_build(cfg!(test), cfg!(debug_assertions))
+    temp_allowlist_enabled_for_runtime(cfg!(test), running_under_cargo_test_harness())
 }
 
-fn temp_allowlist_enabled_for_build(is_test_build: bool, is_non_release_build: bool) -> bool {
+fn temp_allowlist_enabled_for_runtime(is_test_build: bool, is_cargo_test_harness: bool) -> bool {
     is_test_build
-        || is_non_release_build
+        || is_cargo_test_harness
         || std::env::var(AICX_ALLOW_TMP_ENV).is_ok_and(|value| value == "1")
+}
+
+fn running_under_cargo_test_harness() -> bool {
+    std::env::current_exe().ok().is_some_and(|exe| {
+        let mut saw_target = false;
+        let mut saw_debug_or_release = false;
+        let mut saw_deps = false;
+        for component in exe.components() {
+            let text = component.as_os_str().to_string_lossy();
+            if text == "target" {
+                saw_target = true;
+            } else if saw_target && (text == "debug" || text == "release") {
+                saw_debug_or_release = true;
+            } else if saw_debug_or_release && text == "deps" {
+                saw_deps = true;
+                break;
+            }
+        }
+        saw_deps
+    })
 }
 
 fn is_temp_allowlist_path(path: &Path) -> bool {
@@ -136,16 +165,8 @@ fn is_temp_allowlist_path(path: &Path) -> bool {
 
 /// Validate that a path is under an allowed base directory.
 fn is_under_allowed_base(path: &Path) -> Result<bool> {
-    let home = home_dir()?;
-
-    if path.starts_with(&home) {
-        return Ok(true);
-    }
-
-    #[cfg(target_os = "macos")]
-    if path.starts_with("/Users") {
-        let components: Vec<_> = path.components().collect();
-        if components.len() >= 3 {
+    for base in current_user_allowed_bases()? {
+        if path.starts_with(base) {
             return Ok(true);
         }
     }
@@ -560,20 +581,41 @@ mod tests {
     fn test_tmp_allowlist_hybrid_policy() {
         {
             let _env = EnvVarGuard::set(AICX_ALLOW_TMP_ENV, None);
-            assert!(temp_allowlist_enabled_for_build(true, false));
-            assert!(temp_allowlist_enabled_for_build(false, true));
-            assert!(!temp_allowlist_enabled_for_build(false, false));
+            assert!(temp_allowlist_enabled_for_runtime(true, false));
+            assert!(temp_allowlist_enabled_for_runtime(false, true));
+            assert!(!temp_allowlist_enabled_for_runtime(false, false));
         }
 
         {
             let _env = EnvVarGuard::set(AICX_ALLOW_TMP_ENV, Some("1"));
-            assert!(temp_allowlist_enabled_for_build(false, false));
+            assert!(temp_allowlist_enabled_for_runtime(false, false));
         }
 
         {
             let _env = EnvVarGuard::set(AICX_ALLOW_TMP_ENV, Some("true"));
-            assert!(!temp_allowlist_enabled_for_build(false, false));
+            assert!(!temp_allowlist_enabled_for_runtime(false, false));
         }
+    }
+
+    #[test]
+    fn test_current_user_allowed_bases_are_accepted() {
+        for base in current_user_allowed_bases().expect("current user dirs") {
+            assert!(
+                is_under_allowed_base(&base.join("aicx-sanitize-test")).expect("allowlist check"),
+                "current user base should be allowed: {}",
+                base.display()
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_other_user_path_rejected() {
+        let path = Path::new("/Users/other_user/Documents/secret.txt");
+        assert!(
+            !is_under_allowed_base(path).expect("allowlist check"),
+            "macOS /Users allowlist must not generalize across users"
+        );
     }
 
     #[test]

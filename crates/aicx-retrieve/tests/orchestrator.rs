@@ -172,6 +172,27 @@ fn build_commit_load_query_round_trip() {
 }
 
 #[test]
+fn commit_before_build_hybrid_returns_error() {
+    let dim = 4;
+    let temp = TempDir::new().unwrap();
+    let mut index = HybridIndex::new(
+        boxed_lexical(temp.path()),
+        boxed_dense(dim),
+        Box::new(ReciprocalRankFusion::default()),
+        temp.path(),
+        fingerprint(dim),
+    );
+
+    let err = index
+        .commit()
+        .expect_err("commit without manifest should fail");
+    assert!(
+        err.to_string()
+            .contains("cannot commit hybrid index before build_hybrid")
+    );
+}
+
+#[test]
 fn manifest_dim_mismatch_fails_fast() {
     let dim = 4;
     let (temp, _, _, _) = build_committed_index(12, dim);
@@ -188,6 +209,25 @@ fn manifest_dim_mismatch_fails_fast() {
         RetrieveError::DimMismatch {
             expected: dim,
             actual: dim + 1,
+        },
+    );
+}
+
+#[test]
+fn manifest_dense_count_mismatch_fails_fast() {
+    let dim = 4;
+    let (temp, _, _, _) = build_committed_index(12, dim);
+    let manifest_path = temp.path().join("manifest.json");
+    let mut manifest = Manifest::read_from_path(&manifest_path).unwrap();
+    manifest.dense_count = 99;
+    manifest.write_to_path(&manifest_path).unwrap();
+
+    let err = expect_load_err(load_index(temp.path(), dim, SOURCE_HASH));
+    assert_retrieve_error(
+        err,
+        RetrieveError::DenseCountMismatch {
+            expected: 99,
+            actual: 12,
         },
     );
 }
@@ -237,9 +277,28 @@ fn manifest_lexical_commit_mismatch_fails_fast() {
     let err = expect_load_err(load_index(temp.path(), dim, SOURCE_HASH));
     assert_retrieve_error(
         err,
-        RetrieveError::GenerationMismatch {
-            lexical_gen: "edited-lexical-commit".to_string(),
-            dense_gen: original,
+        RetrieveError::LexicalCommitMismatch {
+            expected: "edited-lexical-commit".to_string(),
+            actual: original,
+        },
+    );
+}
+
+#[test]
+fn manifest_lexical_doc_count_mismatch_fails_fast() {
+    let dim = 4;
+    let (temp, _, _, _) = build_committed_index(12, dim);
+    let manifest_path = temp.path().join("manifest.json");
+    let mut manifest = Manifest::read_from_path(&manifest_path).unwrap();
+    manifest.lexical_doc_count = 99;
+    manifest.write_to_path(&manifest_path).unwrap();
+
+    let err = expect_load_err(load_index(temp.path(), dim, SOURCE_HASH));
+    assert_retrieve_error(
+        err,
+        RetrieveError::LexicalDocCountMismatch {
+            expected: 99,
+            actual: 12,
         },
     );
 }

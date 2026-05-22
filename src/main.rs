@@ -303,6 +303,14 @@ struct DashboardArgs {
     #[arg(long, requires = "serve", default_value_t = true, action = clap::ArgAction::Set)]
     require_auth: bool,
 
+    /// Allow mutating dashboard API calls without Origin or Referer (tooling escape hatch).
+    #[arg(long, requires = "serve")]
+    allow_no_origin: bool,
+
+    /// Timeout for external rust-memex/rmcp-memex cross-search calls, in seconds.
+    #[arg(long, requires = "serve", default_value_t = dashboard_server::DEFAULT_MEMEX_TIMEOUT_SECS)]
+    memex_timeout_secs: u64,
+
     /// Document title
     #[arg(long, default_value = DEFAULT_DASHBOARD_TITLE)]
     title: String,
@@ -1757,6 +1765,8 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 allow_cors_origins: None,
                 auth_token: None,
                 require_auth: true,
+                allow_no_origin: false,
+                memex_timeout_secs: dashboard_server::DEFAULT_MEMEX_TIMEOUT_SECS,
                 artifact: args.artifact.unwrap_or(default_dashboard_output_path()?),
                 title: args.title,
                 preview_chars: args.preview_chars,
@@ -2686,11 +2696,12 @@ fn write_conversation_batch_session(
 
     if !dry_run {
         let output_path = conversation_batch_output_path(out_dir, agent_label, session_id);
-        output::write_conversation_json(
+        output::write_conversation_json_with_redaction(
             &output_path,
             &projection.messages,
             &metadata,
             &extract_stats,
+            false,
         )?;
     }
 
@@ -3011,14 +3022,20 @@ fn run_extract_session(
             .unwrap_or("md")
             .to_lowercase();
         if ext == "json" {
-            output::write_conversation_json(
+            output::write_conversation_json_with_redaction(
                 &output_path,
                 &projection.messages,
                 &metadata,
                 &extract_stats,
+                false,
             )?;
         } else {
-            output::write_conversation_markdown(&output_path, &projection.messages, &metadata)?;
+            output::write_conversation_markdown_with_redaction(
+                &output_path,
+                &projection.messages,
+                &metadata,
+                false,
+            )?;
         }
     } else {
         let ext = output_path
@@ -3162,14 +3179,20 @@ fn run_extract_file(
             .to_lowercase();
 
         if ext == "json" {
-            output::write_conversation_json(
+            output::write_conversation_json_with_redaction(
                 &output_path,
                 &projection.messages,
                 &metadata,
                 &extract_stats,
+                false,
             )?;
         } else {
-            output::write_conversation_markdown(&output_path, &projection.messages, &metadata)?;
+            output::write_conversation_markdown_with_redaction(
+                &output_path,
+                &projection.messages,
+                &metadata,
+                false,
+            )?;
         }
     } else {
         let ext = output_path
@@ -3760,16 +3783,22 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
 
             if out_format == OutputFormat::Markdown || out_format == OutputFormat::Both {
                 let md_path = local_dir.join(format!("{}_conversation_{}.md", prefix, date_str));
-                output::write_conversation_markdown(&md_path, &projection.messages, &metadata)?;
+                output::write_conversation_markdown_with_redaction(
+                    &md_path,
+                    &projection.messages,
+                    &metadata,
+                    false,
+                )?;
             }
             if out_format == OutputFormat::Json || out_format == OutputFormat::Both {
                 let json_path =
                     local_dir.join(format!("{}_conversation_{}.json", prefix, date_str));
-                output::write_conversation_json(
+                output::write_conversation_json_with_redaction(
                     &json_path,
                     &projection.messages,
                     &metadata,
                     &extract_stats,
+                    false,
                 )?;
             }
         } else {
@@ -5472,6 +5501,8 @@ struct DashboardServerRunArgs {
     allow_cors_origins: Option<String>,
     auth_token: Option<String>,
     require_auth: bool,
+    allow_no_origin: bool,
+    memex_timeout_secs: u64,
     artifact: PathBuf,
     title: String,
     preview_chars: usize,
@@ -5511,6 +5542,8 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
             allow_cors_origins: args.allow_cors_origins.as_deref(),
             auth_token: args.auth_token.as_deref(),
             require_auth: args.require_auth,
+            allow_no_origin: args.allow_no_origin,
+            memex_timeout_secs: args.memex_timeout_secs,
         });
     }
 
@@ -5532,6 +5565,8 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
         host,
         port: args.port,
         auth: auth_config,
+        allow_no_origin: args.allow_no_origin,
+        memex_timeout_secs: args.memex_timeout_secs,
     };
 
     if !args.no_open {
@@ -5564,6 +5599,8 @@ struct DashboardServerBackgroundArgs<'a> {
     allow_cors_origins: Option<&'a str>,
     auth_token: Option<&'a str>,
     require_auth: bool,
+    allow_no_origin: bool,
+    memex_timeout_secs: u64,
 }
 
 fn spawn_dashboard_server_background(args: DashboardServerBackgroundArgs<'_>) -> Result<()> {
@@ -5595,6 +5632,14 @@ fn spawn_dashboard_server_background(args: DashboardServerBackgroundArgs<'_>) ->
     command
         .arg("--require-auth")
         .arg(if args.require_auth { "true" } else { "false" });
+    if args.allow_no_origin {
+        command.arg("--allow-no-origin");
+    }
+    if args.memex_timeout_secs != dashboard_server::DEFAULT_MEMEX_TIMEOUT_SECS {
+        command
+            .arg("--memex-timeout-secs")
+            .arg(args.memex_timeout_secs.to_string());
+    }
     if args.title != DEFAULT_DASHBOARD_TITLE {
         command.arg("--title").arg(args.title);
     }
@@ -5669,6 +5714,8 @@ fn run_dashboard_command(args: DashboardArgs) -> Result<()> {
             allow_cors_origins: args.allow_cors_origins,
             auth_token: args.auth_token,
             require_auth: args.require_auth,
+            allow_no_origin: args.allow_no_origin,
+            memex_timeout_secs: args.memex_timeout_secs,
             artifact: default_dashboard_output_path()?,
             title: args.title,
             preview_chars: args.preview_chars,
@@ -6299,6 +6346,36 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_memex_timeout_defaults_to_30_seconds() {
+        let cli = Cli::try_parse_from(["aicx", "dashboard", "--serve"])
+            .expect("dashboard serve command should parse");
+
+        match cli.command {
+            Some(Commands::Dashboard(args)) => {
+                assert_eq!(
+                    args.memex_timeout_secs,
+                    dashboard_server::DEFAULT_MEMEX_TIMEOUT_SECS
+                );
+            }
+            _ => panic!("expected dashboard command"),
+        }
+    }
+
+    #[test]
+    fn dashboard_memex_timeout_accepts_cli_override() {
+        let cli =
+            Cli::try_parse_from(["aicx", "dashboard", "--serve", "--memex-timeout-secs", "75"])
+                .expect("dashboard serve command should parse");
+
+        match cli.command {
+            Some(Commands::Dashboard(args)) => {
+                assert_eq!(args.memex_timeout_secs, 75);
+            }
+            _ => panic!("expected dashboard command"),
+        }
+    }
+
+    #[test]
     fn all_defaults_to_silent_stdout() {
         let cli = Cli::try_parse_from(["aicx", "all"]).expect("all command should parse");
 
@@ -6842,6 +6919,7 @@ mod tests {
             "0.0.0.0",
             "--allow-cors-origins",
             "all",
+            "--allow-no-origin",
             "--bg",
         ])
         .expect("remote dashboard serve flags should parse");
@@ -6850,6 +6928,7 @@ mod tests {
             Some(Commands::Dashboard(args)) => {
                 assert!(args.serve);
                 assert!(args.bg);
+                assert!(args.allow_no_origin);
                 assert_eq!(args.host.as_deref(), Some("0.0.0.0"));
                 assert_eq!(args.allow_cors_origins.as_deref(), Some("all"));
             }
