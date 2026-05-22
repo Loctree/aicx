@@ -864,10 +864,6 @@ enum Commands {
         /// What to print to stdout: paths, json, none (default: none)
         #[arg(long, value_enum, default_value_t = StdoutEmit::None)]
         emit: StdoutEmit,
-
-        /// Respect artifact_family metadata when routing immutable artifacts (default: true)
-        #[arg(long, default_value_t = true)]
-        respect_artifact_family: bool,
     },
 
     /// Ingest operator-owned source documents into the canonical corpus.
@@ -1619,7 +1615,6 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             include_assistant: include_assistant_flag,
             no_noise_filter,
             emit,
-            respect_artifact_family,
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
             warn_incremental_legacy_flag(incremental);
@@ -1633,7 +1628,6 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 emit,
                 redact_secrets: redaction.redact_secrets,
                 noise_filter_enabled: !no_noise_filter,
-                respect_artifact_family,
             })?;
         }
         Some(Commands::Ingest {
@@ -1677,7 +1671,6 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 emit,
                 redact_secrets: redaction.redact_secrets,
                 noise_filter_enabled: !no_noise_filter,
-                respect_artifact_family: true,
             })?;
         }
         Some(Commands::List) => {
@@ -3447,7 +3440,6 @@ struct StoreRunArgs {
     /// `ChunkerConfig::noise_filter_enabled`; the CLI surface is
     /// `--no-noise-filter` (negated to keep the default ergonomic).
     noise_filter_enabled: bool,
-    respect_artifact_family: bool,
 }
 
 fn resolve_store_agents(agent: Option<&str>) -> Result<Vec<&'static str>> {
@@ -4017,11 +4009,7 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         emit,
         redact_secrets,
         noise_filter_enabled,
-        respect_artifact_family,
     } = args;
-    if !respect_artifact_family {
-        eprintln!("  [warn] --respect-artifact-family=false: legacy routing mode active");
-    }
 
     let cutoff = cutoff.unwrap_or_else(|| lookback_cutoff(hours));
 
