@@ -90,7 +90,11 @@ impl DashboardCorsPolicy {
 
     fn response_allow_origin(&self, origin: &str) -> Option<HeaderValue> {
         match self {
-            Self::All => HeaderValue::from_str(origin).ok(),
+            // CORS spec: `*` is incompatible with `Access-Control-Allow-Credentials: true`,
+            // and the browser refuses cross-origin credentialed requests when wildcard is
+            // returned. Reflecting the request origin here would defeat the protection
+            // by upgrading a wide-open allowlist into an attacker-controlled echo.
+            Self::All => Some(HeaderValue::from_static("*")),
             _ if self.allows_origin(origin) => HeaderValue::from_str(origin).ok(),
             _ => None,
         }
@@ -143,7 +147,6 @@ struct DashboardServerState {
     shell_html: String,
     snapshot: RwLock<DashboardSnapshot>,
     rebuilding: AtomicBool,
-    csrf_token: String,
     memex_cli_path: Option<String>,
 }
 
@@ -345,19 +348,6 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
     let initial = rebuild_dashboard(&config).context("Initial dashboard build failed")?;
     let shell_html = dashboard::render_server_shell_html(&config.title);
 
-    let csrf_token = {
-        use std::collections::hash_map::RandomState;
-        use std::hash::{BuildHasher, Hasher};
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let pid = std::process::id();
-        let hash1 = RandomState::new().build_hasher().finish();
-        let hash2 = RandomState::new().build_hasher().finish();
-        format!("{:016x}{:016x}{:08x}{:016x}", hash1, hash2, pid, ts)
-    };
-
     let memex_cli_path = which::which("rust-memex")
         .or_else(|_| which::which("rmcp-memex"))
         .ok()
@@ -368,7 +358,6 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         shell_html,
         snapshot: RwLock::new(DashboardSnapshot::from_build(initial)),
         rebuilding: AtomicBool::new(false),
-        csrf_token: csrf_token.clone(),
         memex_cli_path,
     });
 
@@ -644,25 +633,22 @@ async fn regenerate_dashboard(
     State(state): State<Arc<DashboardServerState>>,
     headers: HeaderMap,
 ) -> Response {
+    // Mutation gate: require the action header (CSRF protection is provided by
+    // the Bearer auth layer + the Origin/Referer check below). Browser code
+    // sends the action header from same-origin fetch; cross-origin attackers
+    // would also need to hit the auth-protected `/api/*` surface, and any
+    // origin-present POST must match the configured CORS policy.
     let header_ok = headers
         .get(REGENERATE_HEADER_NAME)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.eq_ignore_ascii_case(REGENERATE_HEADER_VALUE));
 
-    let csrf_ok = headers
-        .get("x-csrf-token")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v == state.csrf_token);
-
-    if !header_ok || !csrf_ok {
+    if !header_ok {
         return (
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
                 ok: false,
-                error: format!(
-                    "Missing or invalid required header: x-csrf-token or {}",
-                    REGENERATE_HEADER_NAME
-                ),
+                error: format!("Missing or invalid required header: {REGENERATE_HEADER_NAME}"),
             }),
         )
             .into_response();
@@ -1892,7 +1878,6 @@ mod tests {
                 last_error: None,
             }),
             rebuilding: AtomicBool::new(false),
-            csrf_token: "test".to_string(),
             memex_cli_path: None,
         })
     }
@@ -2043,7 +2028,6 @@ mod tests {
             REGENERATE_HEADER_NAME,
             HeaderValue::from_static(REGENERATE_HEADER_VALUE),
         );
-        headers.insert("x-csrf-token", "test".parse().unwrap());
         headers.insert(header::ORIGIN, "http://127.0.0.1:4000".parse().unwrap());
         let response = runtime.block_on(regenerate_dashboard(State(state.clone()), headers));
         assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -2069,7 +2053,6 @@ mod tests {
             REGENERATE_HEADER_NAME,
             HeaderValue::from_static(REGENERATE_HEADER_VALUE),
         );
-        headers.insert("x-csrf-token", "test".parse().unwrap());
         headers.insert(header::ORIGIN, "http://127.0.0.1:4000".parse().unwrap());
         let response = runtime.block_on(regenerate_dashboard(State(state), headers));
         assert_eq!(response.status(), StatusCode::OK);
@@ -2086,11 +2069,20 @@ mod tests {
     }
 
     #[test]
-    fn test_cors_all_reflects_allowlisted_origin_not_wildcard() {
+    fn test_cors_all_returns_wildcard_not_reflected_origin() {
         let policy = DashboardCorsPolicy::All;
+        // `Self::All` must return the literal wildcard so credentialed
+        // cross-origin requests are refused by the browser. Reflecting the
+        // request origin would let an attacker upgrade `All` into an echo
+        // server for cookies/credentials if the server ever set
+        // `Access-Control-Allow-Credentials: true`.
         assert_eq!(
             policy.response_allow_origin("https://example.com"),
-            Some(HeaderValue::from_str("https://example.com").unwrap())
+            Some(HeaderValue::from_static("*"))
+        );
+        assert_eq!(
+            policy.response_allow_origin("https://attacker.example.com"),
+            Some(HeaderValue::from_static("*"))
         );
     }
 

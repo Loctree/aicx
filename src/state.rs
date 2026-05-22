@@ -332,6 +332,10 @@ impl StateManager {
                 .with_context(|| format!("Failed to create config dir: {}", parent.display()))?;
         }
 
+        // Note: caller is responsible for holding `state_lock_path()` exclusive
+        // around the full read-modify-write cycle (see run_store/run_state/etc.
+        // in main.rs). Re-acquiring here would deadlock.
+
         let json = serde_json::to_string_pretty(self).context("Failed to serialize state")?;
 
         if path.exists() {
