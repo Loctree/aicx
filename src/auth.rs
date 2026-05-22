@@ -1,8 +1,8 @@
 //! Shared HTTP Bearer-token auth for MCP HTTP transport and dashboard server.
 //!
 //! Single token loaded from CLI override, `AICX_HTTP_AUTH_TOKEN`, `~/.aicx/auth-token`,
-//! or generated and persisted (mode 0600). Compared in constant time. Mismatch and
-//! missing produce the same 401 body to defeat oracle probing.
+//! or generated and persisted on Unix (mode 0600). Compared in constant time.
+//! Mismatch and missing produce the same 401 body to defeat oracle probing.
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
@@ -15,7 +15,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
-use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -126,9 +125,8 @@ pub fn load_auth_config(cli_token: Option<&str>, require_auth: bool) -> Result<A
 
 fn generate_token() -> Result<String> {
     let mut buf = [0u8; 32];
-    let mut file =
-        std::fs::File::open("/dev/urandom").context("Open /dev/urandom for token entropy")?;
-    file.read_exact(&mut buf).context("Read /dev/urandom")?;
+    getrandom::fill(&mut buf)
+        .map_err(|err| anyhow!("Generate random bytes for auth token: {err}"))?;
     Ok(hex_encode(&buf))
 }
 
@@ -143,25 +141,52 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn persist_token_file(path: &PathBuf, token: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Create token directory {}", parent.display()))?;
+    #[cfg(windows)]
+    {
+        let _ = token;
+        return Err(anyhow!(
+            "Refusing to persist aicx auth token file {} on Windows because this build does not configure restricted file ACLs. Run aicx auth on Linux/macOS, or pass --auth-token <token> explicitly so the token file is never written.",
+            path.display()
+        ));
     }
-    std::fs::write(path, format!("{}\n", token))
-        .with_context(|| format!("Write token file {}", path.display()))?;
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)
-            .with_context(|| format!("Stat token file {}", path.display()))?
-            .permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(path, perms)
-            .with_context(|| format!("Set mode 0600 on token file {}", path.display()))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Create token directory {}", parent.display()))?;
+        }
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| {
+                format!(
+                    "Create token file {} atomically with mode 0600",
+                    path.display()
+                )
+            })?;
+        file.write_all(format!("{}\n", token).as_bytes())
+            .with_context(|| format!("Write token file {}", path.display()))?;
+        file.flush()
+            .with_context(|| format!("Flush token file {}", path.display()))?;
+
+        Ok(())
     }
 
-    Ok(())
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = token;
+        Err(anyhow!(
+            "Refusing to persist aicx auth token file {} because this platform does not expose Unix mode 0600 or Windows restricted ACL handling. Pass --auth-token <token> explicitly so the token file is never written.",
+            path.display()
+        ))
+    }
 }
 
 /// Hand-rolled constant-time byte slice comparison. Returns true iff the inputs
@@ -239,6 +264,18 @@ mod tests {
         unsafe {
             std::env::remove_var("AICX_HTTP_AUTH_TOKEN");
         }
+    }
+
+    #[test]
+    fn test_generate_token_shape_and_uniqueness_sanity() {
+        let first = generate_token().expect("generate first token");
+        let second = generate_token().expect("generate second token");
+
+        assert_eq!(first.len(), 64, "32 bytes hex-encoded = 64 chars");
+        assert_eq!(second.len(), 64, "32 bytes hex-encoded = 64 chars");
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(second.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second, "two CSPRNG tokens should differ");
     }
 
     #[test]
@@ -321,6 +358,34 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600, "persisted token must be 0600");
         }
+        let _ = std::fs::remove_file(&tmp_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_persist_token_file_refuses_existing_file() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "aicx-auth-existing-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let tmp_path = tmp_dir.join("auth-token");
+        std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
+        std::fs::write(&tmp_path, "existing-token\n").expect("write existing token");
+
+        let err = persist_token_file(&tmp_path, "replacement-token")
+            .expect_err("existing token file must not be overwritten");
+        let io_err = err
+            .root_cause()
+            .downcast_ref::<std::io::Error>()
+            .expect("root cause should be io error");
+        assert_eq!(io_err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&tmp_path).expect("read existing token"),
+            "existing-token\n"
+        );
+
         let _ = std::fs::remove_file(&tmp_path);
         let _ = std::fs::remove_dir(&tmp_dir);
     }

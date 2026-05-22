@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+### Breaking
+
+- state.json hash algorithm migrated from `siphash13-v1` to
+  `blake3-128-v1`. The dedup cache (`seen_hashes`) is cleared on first
+  load after upgrade; `aicx store` will re-process the recent `-H`
+  window once. No data loss, but timeline may show duplicates if a
+  parallel ingest is running.
+- state.json hash algorithm bumped from `blake3-128-v1` to
+  `blake3-128-v2` (added field separator to close hash-splitting risk;
+  implemented as length-prefixed field encoding). Same one-time
+  `seen_hashes` reset behavior as the prior migration.
+
 ### Added
 - `aicx extract` batch conversation export command for emitting multiple
   session transcripts in a single pass without writing to the canonical store.

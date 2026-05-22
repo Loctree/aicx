@@ -1833,3 +1833,271 @@ hex stringa.
 **Related.** Closes K-1, N-1, N-6, and N-12 from
 `docs/bug-tracker-aicx-followup-pass-3.md`. Final commit SHA is recorded in the
 worker report because a file cannot stably contain its own commit hash.
+## 2026-05-21 — release-linux SHA256SUMS aggregation (J-1) · `pending-this-commit`
+
+**Symptom.** `.github/workflows/release-linux.yml` publikował Linux slim unsigned
+`.tar.gz` assety bez agregującego `SHA256SUMS`, więc użytkownik nie miał prostego
+release-side polecenia do weryfikacji integralności przed instalacją.
+
+**Root cause.** Nowszy Linux matrix workflow miał już `download-artifact`
+z `merge-multiple: true` i upload `dist/*`, ale nie generował checksum file w
+agregatorze. Starszy unified release path miał własne SHA sidecars, więc luka
+dotyczyła tylko `release-linux.yml`.
+
+**Fix.**
+- `.github/workflows/release-linux.yml`: dodano krok `Generate SHA256SUMS` w
+  `upload-release`, po pobraniu matrix artifactów i przed `gh release upload`.
+- `docs/RELEASES.md`: dodano sekcję `Asset verification` z komendą
+  `sha256sum -c SHA256SUMS` dla katalogu zawierającego checksum file i `.tar.gz`.
+
+**Touched.**
+- `.github/workflows/release-linux.yml` — `upload-release` aggregator job.
+- `docs/RELEASES.md` — end-user asset verification docs.
+
+**Tests.** `actionlint` run: new `Generate SHA256SUMS` step clean; pre-existing
+SC2086 warnings remain in `Package artifacts` scope. Python PyYAML unavailable,
+Ruby YAML parse OK. `cargo build --workspace` OK. `cargo fmt --check` OK.
+
+**Lessons.**
+- Agregator release job to właściwe miejsce na jeden `SHA256SUMS` dla matrix
+  artifactów: uploadowy `dist/*` obejmuje checksum file bez osobnego polecenia.
+- Uwaga protokołowa: finalny commit SHA jest znany dopiero po commicie; raport
+  B-1 zapisuje finalny SHA dla tej pozycji J-1.
+
+**Related.** J-1 z `docs/bug-tracker-aicx-followup-pass-3.md`.
+
+## 2026-05-22 — Cross.toml cross-rs image pin (J-2) · `pending-this-commit`
+
+**Symptom.** `Cross.toml` używał `ghcr.io/cross-rs/...:main` dla obu Linux
+builder images. `:main` jest moving tagiem, więc release artifact build mógł
+po cichu pobrać inny obraz niż poprzedni green run.
+
+**Root cause.** Cross-rs image refs były traktowane jak konfiguracja runtime,
+ale bez supply-chain identity pin. Workflow release-linux czyta `Cross.toml`,
+więc ruchomy GHCR tag siedział bezpośrednio na ścieżce publikacji Linux assetów.
+
+**Fix.**
+- `Cross.toml`: oba obrazy zmienione z `:main` na `0.2.5@sha256:<digest>`.
+- `docs/RELEASES.md`: dodano maintainer note z ręcznym protokołem bumpowania
+  pinów po wybraniu nowego release `cross-rs`.
+
+**Touched.**
+- `Cross.toml` — Linux cross-rs image refs.
+- `docs/RELEASES.md` — release maintainer protocol.
+
+**Tests.** TOML parse OK. `cargo build --workspace` OK. `cargo fmt --check` OK.
+`rg -n ':main' Cross.toml` zero hits.
+
+**Lessons.**
+- Release builder image jest częścią supply chain tak samo jak action pin albo
+  checksum sidecar; moving tag nie powinien siedzieć na release path.
+- `cross-rs` release tag to `v0.2.5`, ale GHCR image tag to `0.2.5`; zapis
+  `0.2.5@sha256:<digest>` zachowuje czytelny version anchor i immutable digest.
+- Finalny commit SHA jest znany dopiero po commicie; raport B-2 zapisuje finalny
+  SHA dla tej pozycji J-2.
+
+**Related.** J-2 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows
+`9d1a9c1` (B-1 release SHA256SUMS).
+
+## 2026-05-22 — auth token CSPRNG portability (J-3) · `pending-this-commit`
+
+**Symptom.** `src/auth.rs::generate_token` otwierał `/dev/urandom` bezpośrednio.
+Na Linux/macOS dawało to 32 bajty entropii, ale na Windows ścieżka nie istnieje,
+więc wygenerowanie tokenu auth kończyłoby się błędem runtime.
+
+**Root cause.** Generator tokenu był powiązany z unixowym device file zamiast
+używać cross-platformowego OS CSPRNG API. Kontrakt 256-bit pozostał poprawny
+tylko na systemach z `/dev/urandom`.
+
+**Fix.**
+- `Cargo.toml`: dodano jawne `getrandom = "0.3"` jako bezpośredni kontrakt
+  dependency dla auth-token entropy.
+- `src/auth.rs`: `generate_token` używa `getrandom::fill(&mut buf)` z kontekstem
+  błędu, zachowując 32-bajtowy bufor i istniejący `hex_encode` pipeline.
+- Usunięto import `std::io::Read`, bo direct file read nie jest już potrzebny.
+
+**Touched.**
+- `Cargo.toml` — direct dependency `getrandom`.
+- `src/auth.rs` — `generate_token` entropy source + unit test.
+
+**Tests.** Dodano `test_generate_token_shape_and_uniqueness_sanity`: dwa tokeny
+mają po 64 znaki hex i kolejne wywołania dają różne wartości. Pełne gates J-3
+zapisuje raport B-3.
+
+**Lessons.**
+- Auth-token entropy source powinno być API-level OS CSPRNG contract, nie
+  platform-specific path. `/dev/urandom` wygląda prosto, ale koduje Unix-only
+  runtime assumption.
+- Finalny commit SHA jest znany dopiero po commicie; raport B-3 zapisuje finalny
+  SHA dla tej pozycji J-3.
+
+**Related.** J-3 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows
+`9d1a9c1` (B-1 release SHA256SUMS) + `643fa4c` (B-2 Cross.toml pin).
+
+## 2026-05-22 — GCP service-account field redaction without object-size gate (J-7) · `pending-this-commit`
+
+**Symptom.** Duży GCP service-account JSON (>2.5 KiB po `"type":
+"service_account"`) redagował `"private_key"` osobnym regexem, ale
+`"private_key_id"` i `"client_email"` mogły zostać w outputach bez redakcji.
+
+**Root cause.** `redact_gcp_service_account_fields` odpalało per-field regexes
+tylko wewnątrz `RE_GCP_SERVICE_ACCOUNT_OBJECT.replace_all(...)`. Wrapper miał
+limit `[^{}]{0,2500}`, więc realny większy service-account object nie matchował
+i pola nie przechodziły przez istniejące standalone regexes.
+
+**Fix.**
+- Usunięto `RE_GCP_SERVICE_ACCOUNT_OBJECT` jako misleading defense-in-depth.
+- `RE_GCP_PRIVATE_KEY_ID_FIELD` i `RE_GCP_CLIENT_EMAIL_FIELD` działają teraz na
+  całym tekście, niezależnie od rozmiaru obiektu JSON.
+- Fast lookup `SECRET_LOOKUP_SET` dostał wzorce dla `"private_key_id"` i
+  `"client_email"`, żeby early-return nie omijał field-only path.
+
+**Touched.**
+- `src/redact.rs` — GCP service-account field pipeline + unit regression.
+- `tests/secret_redaction_e2e.rs` — 4 KiB synthesized GCP service-account
+  fixture.
+
+**Tests.** Dodano e2e regression dla >4 KiB service-account JSON oraz unit test
+dla field-only `private_key_id`/`client_email` triggera. Pełne gates J-7 zapisuje
+raport B-4.
+
+**Lessons.**
+- Regex wrapper z limitem długości nie może być gate'em dla pól, które mają
+  bezpieczne standalone redaction patterns.
+- Fast negative path musi znać te same rodziny sekretów, które redaguje pełny
+  pipeline; inaczej poprawny regex może nigdy nie zostać uruchomiony.
+
+**Related.** J-7 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows
+`9d1a9c1` (B-1 release SHA256SUMS) + `643fa4c` (B-2 Cross.toml pin) +
+`6c7d06d` (B-3 auth getrandom).
+
+## 2026-05-22 — auth token file refused on Windows (J-4) · `pending-this-commit`
+
+**Symptom.** `src/auth.rs::persist_token_file` chronił wygenerowany token
+`~/.aicx/auth-token` przez chmod `0600` tylko pod `#[cfg(unix)]`. Na Windows
+brakowało równoważnego ograniczenia DACL, więc wygenerowany token mógłby zostać
+zapisany z domyślnymi ACL.
+
+**Root cause.** Ścieżka persistowania tokena miała Unix-only protection jako
+post-write chmod, ale nie miała Windows-specific policy. Pass-3 J-4 wybrał lean
+wariant refusal zamiast dokładania `windows-acl`, bo Windows nie jest jeszcze
+oficjalnie wspieranym token-file targetem.
+
+**Fix.**
+- `src/auth.rs::persist_token_file`: dodano `#[cfg(windows)]` early-return
+  przed `create_dir_all` i `fs::write`, z komunikatem wskazującym
+  `--auth-token <token>` jako explicit-pass workaround.
+- Linux/macOS path zostaje logicznie bez zmian: write token file, potem Unix
+  chmod `0600`.
+- `SECURITY.md`: udokumentowano Unix-only token-file storage i Windows policy.
+
+**Touched.**
+- `src/auth.rs` — refuse point w `persist_token_file`.
+- `SECURITY.md` — auth token storage policy.
+
+**Tests.** `cargo build --workspace` OK.
+`cargo test --workspace -- --test-threads=4` OK.
+`cargo clippy --workspace -- -D warnings` OK. `cargo fmt --check` OK.
+
+**Lessons.**
+- Jeśli platforma nie ma zaimplementowanej ochrony sekretu na storage path,
+  lepszy jest jawny refusal przed utworzeniem pliku niż ciche poleganie na
+  domyślnych ACL.
+- Refuse point najbezpieczniej trzymać przy samym sinku (`persist_token_file`),
+  bo chroni obecnego callera i przyszłe użycia funkcji.
+- Finalny commit SHA jest znany dopiero po commicie; raport C-1 zapisuje
+  finalny SHA dla tej pozycji J-4.
+
+**Related.** J-4 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows
+`9d1a9c1` (B-1 release SHA256SUMS) + `643fa4c` (B-2 Cross.toml pin) +
+`6c7d06d` (B-3 auth getrandom) + `81622d9` (B-4 GCP redaction).
+
+---
+
+## 2026-05-22 — auth token file atomic create mode 0600 (J-5) · `pending-this-commit`
+
+**Symptom.** `src/auth.rs::persist_token_file` tworzył token file przez
+`std::fs::write`, a dopiero potem robił Unix `chmod 0600`. Między `open/create`
+i `chmod` plik mógł chwilowo istnieć z uprawnieniami zależnymi od `umask`
+(np. `0644`), więc lokalny proces mógł odczytać token w oknie TOCTOU.
+
+**Root cause.** Ochrona sekretu była ustawiana po utworzeniu pliku zamiast w
+tym samym syscallu, który tworzy plik. `set_permissions` naprawia stan docelowy,
+ale nie cofa momentu, w którym plik już istniał z domyślnym mode.
+
+**Fix.**
+- `src/auth.rs::persist_token_file` na Unix używa teraz
+  `OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)`,
+  więc mode jest nadawany atomowo podczas `O_CREAT`.
+- Zapis treści tokena idzie przez `write_all` + `flush`; usunięto osobny
+  `set_permissions` po zapisie.
+- Semantyka rotacji: istniejący token file nie jest nadpisywany. Rotacja albo
+  recovery po pustym/starym pliku wymaga unlink-first, potem ponownego
+  wygenerowania/zapisania tokena.
+- Dla platform bez Unix mode i bez Windows ACL policy dodano odmowę zapisu
+  zamiast cichego persistowania pliku bez znanej ochrony.
+
+**Touched.**
+- `src/auth.rs` — `persist_token_file` Unix create path + unit regression.
+
+**Tests.** Dodano `test_persist_token_file_refuses_existing_file`, który
+sprawdza `AlreadyExists` i brak nadpisania istniejącego token file. Istniejący
+`test_load_auth_token_generates_when_missing` nadal asercyjnie sprawdza mode
+`0600` po pierwszym persist.
+
+**Lessons.**
+- Sekret zapisany do pliku musi dostać restrykcyjny mode w momencie utworzenia,
+  nie w osobnym kroku po zapisie.
+- `create_new(true)` jest celowo ostrzejsze od overwrite: bezpieczna rotacja
+  tokena powinna być jawna i unlink-first, nie przypadkowa przez truncate.
+- Finalny commit SHA jest znany dopiero po commicie; raport C-2 zapisuje
+  finalny SHA dla tej pozycji J-5.
+
+**Related.** J-5 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows Wave B
+B-1..B-4 + C-1 `d2d41e1`.
+
+---
+
+## 2026-05-22 — state hash field separator + blake3-128-v2 migration (J-6 + K-2) · `pending-this-commit`
+
+**Symptom.** `src/state.rs::content_hash` i `overlap_hash` składały pola do
+jednego bufora przez raw concatenation. Dla `content_hash` dawało to
+hash-splitting surface: inny podział `(agent, timestamp, message)` mógł
+prowadzić do identycznego byte streamu. Dodatkowo `CHANGELOG.md` nie opisywał
+wcześniejszej migracji `siphash13-v1` → `blake3-128-v1`.
+
+**Root cause.** Format wejścia do `stable_blake3_128` nie miał separatora ani
+length-prefixów między polami. Cache `seen_hashes` zależy od dokładnych bajtów
+hashowanego wejścia, więc naprawa formatu wymagała kolejnego bumpa
+`hash_algorithm` i jednorazowego resetu cache przy pierwszym loadzie.
+
+**Fix.**
+- `content_hash` i `overlap_hash` używają wspólnego field-hash helpera z
+  length-prefixem przed każdym polem.
+- `BLAKE3_128_ALGORITHM` podniesiono z `blake3-128-v1` do
+  `blake3-128-v2`; istniejący path migracji czyści `seen_hashes` dla
+  `siphash13-v1`, pustego/legacy stanu oraz `blake3-128-v1`.
+- `CHANGELOG.md` dostał `### Breaking` w Unreleased z retroaktywnym G-1
+  `siphash13-v1` → `blake3-128-v1` i nowym J-6
+  `blake3-128-v1` → `blake3-128-v2`.
+
+**Touched.**
+- `src/state.rs` — `content_hash`, `overlap_hash`, regression tests.
+- `src/state/migration.rs` — current algorithm constant + v1→v2 migration test.
+- `CHANGELOG.md` — Unreleased Breaking notes.
+- `docs/BUGFIXES.md` — ten wpis.
+
+**Tests.** Dodano regression dla legacy raw-concat collision pair oraz test
+`blake3-128-v1` → `blake3-128-v2` resetu `seen_hashes`. Pełne gate’y D-1 zapisuje
+raport workerowy.
+
+**Lessons.**
+- Hash stabilny między release'ami musi mieć jawnie wersjonowany input format,
+  nie tylko jawnie wersjonowany algorytm.
+- Jeśli naprawa dedup hashy zmienia byte stream, `seen_hashes` jest cache'em
+  starego formatu i musi zostać wyczyszczony zamiast mieszany z nowymi hashami.
+
+**Related.** J-6 + K-2 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows
+Wave B B-1..B-4 + Wave C C-1..C-2.
+
+---

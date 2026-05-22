@@ -26,6 +26,13 @@ This document is the maintainer path from green CI to public release artifacts.
   `.sha256` sidecars.
 - Public v0.6.5 archives are slim unsigned `.tar.gz` bundles for macOS arm64,
   Linux x64 GNU, and Linux arm64 GNU.
+- Linux cross builds pin `cross-rs` builder images to release `v0.2.5`
+  (`0.2.5@sha256:9e5b39c09874bc1816c675ed11afca2c2ed6cee0c4ed2b3c1d5763c346c9ae3f`
+  for x86_64 GNU and
+  `0.2.5@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4`
+  for aarch64 musl). Operators manually bump both `Cross.toml` image refs
+  when a new `cross-rs` release is worth tracking; automated image updates are
+  outside the pass-3 scope.
 - The npm surface lives under `distribution/npm/`, but it is not the supported
   v0.6.5 install path until its platform mapping is updated from the older
   zip/musl shape.
@@ -72,6 +79,19 @@ Each archive contains:
 - `README.md`
 - `docs/COMMANDS.md`
 - `docs/RELEASES.md`
+
+### Asset verification
+
+Download `SHA256SUMS` into the same directory as the `.tar.gz` release assets,
+then run:
+
+```bash
+sha256sum -c SHA256SUMS
+```
+
+The command expects `SHA256SUMS` and the referenced archives to be colocated.
+It exits non-zero if any archive is missing or does not match the published
+checksum.
 
 The maintainer-local macOS signing path expects these operator-owned inputs:
 

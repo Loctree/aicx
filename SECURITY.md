@@ -28,6 +28,16 @@ If you discover a security vulnerability in aicx, please report it responsibly.
 
 Security fixes are applied to the latest release on the `main` branch.
 
+## Auth Token Storage
+
+Generated auth tokens are persisted only on Unix platforms, where `aicx` sets
+`~/.aicx/auth-token` to mode `0600` after writing it. Windows token-file
+persistence is refused before the token file is written because this build does
+not configure a restricted Windows DACL.
+
+On Windows, pass a token explicitly with `--auth-token <token>` or use
+`AICX_HTTP_AUTH_TOKEN` so no token file is created.
+
 ---
 
 Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders

@@ -369,11 +369,8 @@ impl StateManager {
     /// identification. Session ID is excluded because Claude Code stores
     /// the same user message in multiple session JSONL files.
     pub fn content_hash(agent: &str, timestamp: i64, message: &str) -> String {
-        let mut data = Vec::new();
-        data.extend_from_slice(agent.as_bytes());
-        data.extend_from_slice(&timestamp.to_le_bytes());
-        data.extend_from_slice(message.as_bytes());
-        migration::stable_blake3_128(&data)
+        let timestamp = timestamp.to_le_bytes();
+        Self::stable_hash_fields(&[agent.as_bytes(), &timestamp, message.as_bytes()])
     }
 
     /// Compute an overlap hash for cross-agent dedup.
@@ -388,9 +385,16 @@ impl StateManager {
     /// different agents collapse into one.
     pub fn overlap_hash(timestamp: i64, message: &str) -> String {
         let bucket = timestamp / 60; // 60-second window
+        let bucket = bucket.to_le_bytes();
+        Self::stable_hash_fields(&[&bucket, message.as_bytes()])
+    }
+
+    fn stable_hash_fields(fields: &[&[u8]]) -> String {
         let mut data = Vec::new();
-        data.extend_from_slice(&bucket.to_le_bytes());
-        data.extend_from_slice(message.as_bytes());
+        for field in fields {
+            data.extend_from_slice(&(field.len() as u64).to_le_bytes());
+            data.extend_from_slice(field);
+        }
         migration::stable_blake3_128(&data)
     }
 
@@ -572,6 +576,31 @@ mod tests {
     }
 
     #[test]
+    fn test_content_hash_separates_legacy_concat_collision() {
+        fn legacy_content_hash(agent: &str, timestamp: i64, message: &str) -> String {
+            let mut data = Vec::new();
+            data.extend_from_slice(agent.as_bytes());
+            data.extend_from_slice(&timestamp.to_le_bytes());
+            data.extend_from_slice(message.as_bytes());
+            migration::stable_blake3_128(&data)
+        }
+
+        let left = ("a\0\0\0\0\0\0\0\0", 0, "bc");
+        let right = ("a", 0, "\0\0\0\0\0\0\0\0bc");
+
+        assert_eq!(
+            legacy_content_hash(left.0, left.1, left.2),
+            legacy_content_hash(right.0, right.1, right.2),
+            "legacy raw concatenation should demonstrate the split collision"
+        );
+        assert_ne!(
+            StateManager::content_hash(left.0, left.1, left.2),
+            StateManager::content_hash(right.0, right.1, right.2),
+            "field boundaries should split the triples"
+        );
+    }
+
+    #[test]
     fn test_overlap_hash_ignores_agent() {
         let prompt = "Deploy the new auth module to staging and run integration tests";
         let ts = 1700000000i64;
@@ -608,6 +637,21 @@ mod tests {
         let h1 = StateManager::overlap_hash(ts, "prompt A");
         let h2 = StateManager::overlap_hash(ts, "prompt B");
         assert_ne!(h1, h2, "different message → different overlap hash");
+    }
+
+    #[test]
+    fn test_overlap_hash_uses_field_boundary_between_bucket_and_message() {
+        let timestamp = 0i64;
+        let message = "broadcast prompt";
+        let mut legacy_data = Vec::new();
+        legacy_data.extend_from_slice(&(timestamp / 60).to_le_bytes());
+        legacy_data.extend_from_slice(message.as_bytes());
+
+        assert_ne!(
+            StateManager::overlap_hash(timestamp, message),
+            migration::stable_blake3_128(&legacy_data),
+            "overlap hash should move off the legacy raw-concat byte stream"
+        );
     }
 
     #[test]
