@@ -15,7 +15,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
@@ -120,11 +120,35 @@ pub fn load_auth_config(cli_token: Option<&str>, require_auth: bool) -> Result<A
     }
 
     let token = generate_token().context("Generate HTTP auth token")?;
-    persist_token_file(&path, &token).context("Persist HTTP auth token to file")?;
-    Ok(AuthConfig {
-        token: Some(token),
-        source: AuthSource::Generated(path),
-    })
+    match persist_token_file(&path, &token).context("Persist HTTP auth token to file")? {
+        TokenPersistOutcome::Created | TokenPersistOutcome::Overwrote => Ok(AuthConfig {
+            token: Some(token),
+            source: AuthSource::Generated(path),
+        }),
+        TokenPersistOutcome::AdoptedExisting(existing) => Ok(AuthConfig {
+            // Startup race: another process created a usable token file
+            // between our existence check and our create_new attempt.
+            // Adopt theirs instead of failing the entire auth init.
+            token: Some(existing),
+            source: AuthSource::File(path),
+        }),
+    }
+}
+
+/// Outcome of [`persist_token_file`]. Distinguishes between the
+/// happy-path create, recovering from a startup race against another
+/// process, and atomically replacing a truncated / empty existing file.
+#[derive(Debug)]
+enum TokenPersistOutcome {
+    /// We won the create race and wrote our token to disk.
+    Created,
+    /// The file already existed and held a non-empty token; the caller
+    /// should adopt that token instead of the one it just generated.
+    AdoptedExisting(String),
+    /// The file existed but was empty / whitespace-only (truncated or
+    /// manually edited); we atomically replaced it with our token while
+    /// preserving mode 0600.
+    Overwrote,
 }
 
 fn generate_token() -> Result<String> {
@@ -144,7 +168,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn persist_token_file(path: &PathBuf, token: &str) -> Result<()> {
+fn persist_token_file(path: &PathBuf, token: &str) -> Result<TokenPersistOutcome> {
     #[cfg(windows)]
     {
         let _ = token;
@@ -156,7 +180,7 @@ fn persist_token_file(path: &PathBuf, token: &str) -> Result<()> {
 
     #[cfg(unix)]
     {
-        use std::io::Write;
+        use std::io::{ErrorKind, Write};
         use std::os::unix::fs::OpenOptionsExt;
 
         if let Some(parent) = path.parent() {
@@ -164,23 +188,49 @@ fn persist_token_file(path: &PathBuf, token: &str) -> Result<()> {
                 .with_context(|| format!("Create token directory {}", parent.display()))?;
         }
 
-        let mut file = std::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(path)
-            .with_context(|| {
+        {
+            Ok(mut file) => {
+                file.write_all(format!("{}\n", token).as_bytes())
+                    .with_context(|| format!("Write token file {}", path.display()))?;
+                file.flush()
+                    .with_context(|| format!("Flush token file {}", path.display()))?;
+                Ok(TokenPersistOutcome::Created)
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                // Two cases collapse here:
+                //   1. Startup race — another process won create_new between
+                //      load_auth_config's `path.exists()` check and ours.
+                //   2. Empty-file recovery — the file exists but was
+                //      truncated or hand-edited to whitespace, so
+                //      load_auth_config fell through to generate+persist.
+                // Reading the file once tells us which case we're in and
+                // lets us avoid aborting the entire auth init on either.
+                let existing = std::fs::read_to_string(path).with_context(|| {
+                    format!(
+                        "Re-read existing token file after AlreadyExists: {}",
+                        path.display()
+                    )
+                })?;
+                let trimmed = existing.trim();
+                if !trimmed.is_empty() {
+                    return Ok(TokenPersistOutcome::AdoptedExisting(trimmed.to_string()));
+                }
+                atomic_replace_token_file(path, token)
+                    .with_context(|| format!("Replace empty token file {}", path.display()))?;
+                Ok(TokenPersistOutcome::Overwrote)
+            }
+            Err(err) => Err(err).with_context(|| {
                 format!(
                     "Create token file {} atomically with mode 0600",
                     path.display()
                 )
-            })?;
-        file.write_all(format!("{}\n", token).as_bytes())
-            .with_context(|| format!("Write token file {}", path.display()))?;
-        file.flush()
-            .with_context(|| format!("Flush token file {}", path.display()))?;
-
-        Ok(())
+            }),
+        }
     }
 
     #[cfg(all(not(unix), not(windows)))]
@@ -191,6 +241,66 @@ fn persist_token_file(path: &PathBuf, token: &str) -> Result<()> {
             path.display()
         ))
     }
+}
+
+/// Atomically replace an existing (empty / whitespace-only) token file
+/// with a fresh token while preserving mode 0600. Implemented as
+/// "write tempfile sibling with create_new + 0600, then rename" so a
+/// crash mid-write never truncates the destination. Called only from
+/// the recovery branch of [`persist_token_file`].
+#[cfg(unix)]
+fn atomic_replace_token_file(path: &Path, token: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Token file path has no parent: {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("Token file path has no filename: {}", path.display()))?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let mut rand = [0u8; 8];
+    getrandom::fill(&mut rand)
+        .map_err(|err| anyhow!("Generate random tmp suffix for token replace: {err}"))?;
+    let tmp_path = parent.join(format!(
+        ".{}.tmp.{}.{}.{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        nanos,
+        hex_encode(&rand),
+    ));
+
+    let res = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .with_context(|| format!("Create tmp token file {}", tmp_path.display()))?;
+        file.write_all(format!("{}\n", token).as_bytes())
+            .with_context(|| format!("Write tmp token file {}", tmp_path.display()))?;
+        file.flush()
+            .with_context(|| format!("Flush tmp token file {}", tmp_path.display()))?;
+        // Drop the handle so the rename is unambiguous on platforms that
+        // care about an open writer crossing a rename boundary.
+        drop(file);
+        std::fs::rename(&tmp_path, path).with_context(|| {
+            format!(
+                "Rename tmp token file {} -> {}",
+                tmp_path.display(),
+                path.display()
+            )
+        })
+    })();
+
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    res
 }
 
 /// Hand-rolled constant-time byte slice comparison. Returns true iff the inputs
@@ -455,7 +565,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_persist_token_file_refuses_existing_file() {
+    fn test_persist_token_file_adopts_existing_valid_token() {
+        // PR #6 follow-up regression: simulate the startup race where
+        // another process wrote a valid token between our existence
+        // check and our `create_new(true)` attempt. The recovery path
+        // MUST re-read the file and return `AdoptedExisting` instead of
+        // aborting auth initialisation with `AlreadyExists`.
         let tmp_dir = std::env::temp_dir().join(format!(
             "aicx-auth-existing-{}-{}",
             std::process::id(),
@@ -465,18 +580,108 @@ mod tests {
         std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
         std::fs::write(&tmp_path, "existing-token\n").expect("write existing token");
 
-        let err = persist_token_file(&tmp_path, "replacement-token")
-            .expect_err("existing token file must not be overwritten");
-        let io_err = err
-            .root_cause()
-            .downcast_ref::<std::io::Error>()
-            .expect("root cause should be io error");
-        assert_eq!(io_err.kind(), std::io::ErrorKind::AlreadyExists);
+        let outcome = persist_token_file(&tmp_path, "replacement-token")
+            .expect("AlreadyExists with valid content must recover via adoption");
+        match outcome {
+            TokenPersistOutcome::AdoptedExisting(token) => {
+                assert_eq!(token, "existing-token");
+            }
+            other => panic!("expected AdoptedExisting, got {other:?}"),
+        }
+        // Existing content must not be clobbered when we adopt it.
         assert_eq!(
             std::fs::read_to_string(&tmp_path).expect("read existing token"),
             "existing-token\n"
         );
 
+        let _ = std::fs::remove_file(&tmp_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_persist_token_file_overwrites_empty_existing_file() {
+        // PR #6 follow-up regression: an empty / whitespace-only token
+        // file is treated as unusable by load_auth_config, so it falls
+        // through to generate + persist. The recovery path MUST
+        // atomically replace the empty file with the fresh token (mode
+        // 0600 preserved) and signal `Overwrote` so the caller surfaces
+        // `AuthSource::Generated`.
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "aicx-auth-empty-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let tmp_path = tmp_dir.join("auth-token");
+        std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
+        // Whitespace-only is exactly the shape load_auth_config rejects.
+        std::fs::write(&tmp_path, "   \n").expect("write empty token");
+
+        let fresh = generate_token().expect("generate replacement token");
+        let outcome = persist_token_file(&tmp_path, &fresh)
+            .expect("empty token file must be atomically replaced");
+        match outcome {
+            TokenPersistOutcome::Overwrote => {}
+            other => panic!("expected Overwrote, got {other:?}"),
+        }
+
+        let on_disk = std::fs::read_to_string(&tmp_path).expect("read replaced token");
+        assert_eq!(on_disk.trim(), fresh);
+        let mode = std::fs::metadata(&tmp_path)
+            .expect("stat replaced token")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "atomic replace must preserve mode 0600 on the destination"
+        );
+
+        // Sibling tempfiles must be cleaned up (no `.auth-token.tmp.*` left).
+        let leftovers: Vec<_> = std::fs::read_dir(&tmp_dir)
+            .expect("read tmp dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".auth-token.tmp.")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "atomic replace left tempfiles behind: {leftovers:?}"
+        );
+
+        let _ = std::fs::remove_file(&tmp_path);
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_persist_token_file_first_writer_returns_created() {
+        // Happy path: target does not exist, we win create_new, outcome
+        // is `Created`. Reaffirms that the recovery branch did not
+        // silently take over the normal create path.
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "aicx-auth-firstwriter-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let tmp_path = tmp_dir.join("auth-token");
+        let fresh = generate_token().expect("generate token");
+        let outcome = persist_token_file(&tmp_path, &fresh).expect("persist new token");
+        match outcome {
+            TokenPersistOutcome::Created => {}
+            other => panic!("expected Created, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&tmp_path)
+                .expect("read persisted")
+                .trim(),
+            fresh
+        );
         let _ = std::fs::remove_file(&tmp_path);
         let _ = std::fs::remove_dir(&tmp_dir);
     }
