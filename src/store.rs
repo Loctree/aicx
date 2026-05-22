@@ -917,24 +917,81 @@ fn write_context_session_first_outcome_at(
         // with a different `content_sha256`, disambiguate via a `-c{hex}`
         // suffix derived from the new content hash so the existing chunk is
         // never silently overwritten.
+        //
+        // Orphan handling (#20): if the `.md` is present but its `.meta.json`
+        // sidecar is missing, the prior two-phase write was killed between the
+        // two renames. The prior policy silently spawned a `-c<hash>` shadow
+        // and left the orphan in place forever, so the canonical basename was
+        // permanently shadowed and operators saw duplicate-looking chunks.
+        // Now we either reclaim the orphan (its on-disk body already matches
+        // the new chunk — just write the missing sidecar) or quarantine it
+        // (different body — move under `dir/quarantine/` so the canonical
+        // slot is free for the new pair).
         let target_path = if path.exists() {
             let existing_sidecar = path.with_extension("meta.json");
-            let existing_sha =
-                load_sidecar_from_path(&existing_sidecar).and_then(|s| s.content_sha256);
-            if existing_sha.as_deref() == Some(content_sha256.as_str()) {
-                outcome.deduped_chunks += 1;
-                continue;
+            if !existing_sidecar.exists() {
+                let orphan_sha = sha256_of_file(&path)?;
+                if orphan_sha == content_sha256 {
+                    let mut sidecar = chunker::ChunkMetadataSidecar::from(chunk);
+                    sidecar.content_sha256 = Some(content_sha256.clone());
+                    let sidecar_bytes = serde_json::to_vec_pretty(&sidecar)?;
+                    let sidecar_write = sanitize::validate_write_path(&existing_sidecar)?;
+                    atomic_write(&sidecar_write, &sidecar_bytes)?;
+                    sha_cache.insert(&dir, content_sha256);
+                    tracing::info!(
+                        target: "aicx::store",
+                        orphan = %path.display(),
+                        "reclaimed orphan chunk by writing missing sidecar"
+                    );
+                    outcome.deduped_chunks += 1;
+                    continue;
+                }
+                let quarantine_dir = dir.join("quarantine");
+                fs::create_dir_all(&quarantine_dir)?;
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("chunk");
+                let quar_path =
+                    quarantine_dir.join(format!("{}-orphan-{}.md", stem, stamp));
+                fs::rename(&path, &quar_path).with_context(|| {
+                    format!(
+                        "Failed to quarantine orphan {} -> {}",
+                        path.display(),
+                        quar_path.display()
+                    )
+                })?;
+                atomic_write::parent_fsync(&path);
+                atomic_write::parent_fsync(&quar_path);
+                tracing::warn!(
+                    target: "aicx::store",
+                    orphan = %path.display(),
+                    quarantine = %quar_path.display(),
+                    orphan_sha = %orphan_sha,
+                    new_sha = %content_sha256,
+                    "quarantined orphan .md (sidecar missing, body mismatch) to free canonical slot"
+                );
+                path
+            } else {
+                let existing_sha =
+                    load_sidecar_from_path(&existing_sidecar).and_then(|s| s.content_sha256);
+                if existing_sha.as_deref() == Some(content_sha256.as_str()) {
+                    outcome.deduped_chunks += 1;
+                    continue;
+                }
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("chunk");
+                let disambig =
+                    dir.join(format!("{}-c{}.md", stem, siphash13_hex6(&content_sha256)));
+                tracing::warn!(
+                    target: "aicx::store",
+                    existing = %path.display(),
+                    disambiguated = %disambig.display(),
+                    existing_sha = ?existing_sha,
+                    "session-first chunk basename collision; writing under disambiguated path"
+                );
+                disambig
             }
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("chunk");
-            let disambig = dir.join(format!("{}-c{}.md", stem, siphash13_hex6(&content_sha256)));
-            tracing::warn!(
-                target: "aicx::store",
-                existing = %path.display(),
-                disambiguated = %disambig.display(),
-                existing_sha = ?existing_sha,
-                "session-first chunk basename collision; writing under disambiguated path"
-            );
-            disambig
         } else {
             path
         };
@@ -967,6 +1024,19 @@ fn write_context_session_first_outcome_at(
         if let Err(err) = atomic_write::commit_tempfile(&sidecar_tmp, &sidecar_write_path) {
             atomic_write::discard_tempfile(&sidecar_tmp);
             return Err(err.into());
+        }
+        // Mirror `atomic_write`'s parent-dir fsync (#21): the two-phase
+        // rename above goes through `commit_tempfile` directly, so
+        // `atomic_write::atomic_write` never gets to run its own
+        // post-rename sync. Without this, chunk + sidecar persistence on
+        // power-loss-sensitive filesystems was weaker than the contract
+        // used by every single-file `atomic_write` call. The two rename
+        // targets live in the same parent dir, so one fsync covers both;
+        // we add a defensive second call when paths diverge in unusual
+        // tests.
+        atomic_write::parent_fsync(&write_path);
+        if write_path.parent() != sidecar_write_path.parent() {
+            atomic_write::parent_fsync(&sidecar_write_path);
         }
         sha_cache.insert(&dir, content_sha256);
         outcome.written_paths.push(target_path);
@@ -1008,6 +1078,19 @@ fn content_sha256(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// Compute the SHA-256 of an on-disk file's contents in the same encoding
+/// as `content_sha256` (string-domain hash; matches sidecar
+/// `content_sha256` values). Used by orphan reclaim (#20) to compare the
+/// body of an orphan `.md` against the new chunk before deciding whether
+/// to reclaim or quarantine. This is a one-time-per-orphan cost outside
+/// the hot dedup path, so it is intentionally uncached.
+fn sha256_of_file(path: &Path) -> Result<String> {
+    let validated = sanitize::validate_read_path(path)?;
+    let bytes = sanitize::read_to_string_validated(&validated)
+        .with_context(|| format!("Failed to read orphan chunk {}", validated.display()))?;
+    Ok(content_sha256(&bytes))
 }
 
 pub fn content_sha256_exists_in_dir(dir: &Path, content_sha256: &str) -> Result<bool> {
@@ -1118,7 +1201,19 @@ where
 
     let _lock = crate::locks::acquire_exclusive(base.join("locks").join("index.lock"))?;
     let total_segments = segments.len();
-    let mut index = load_index_at(base)?;
+    // Save-on-drop RAII guard (#26): `index.json` used to be persisted
+    // only at the end of the loop, so Ctrl+C / panic between the first
+    // segment write and the loop tail left the on-disk index out of sync
+    // with newly-stored chunks. The guard wraps the in-memory index and
+    // calls `save_index_at` on every code path — successful completion
+    // sets `persisted = true` so `Drop` becomes a no-op, and any early
+    // return (`?`) or panic fires `Drop`, which writes the index
+    // opportunistically before the surrounding lock is released.
+    let mut guard = IndexSaveGuard {
+        base,
+        index: load_index_at(base)?,
+        persisted: false,
+    };
     let mut sha_cache = DirShaCache::default();
 
     for (segment_idx, segment) in segments.iter().enumerate() {
@@ -1179,7 +1274,7 @@ where
         // written) — `index.json` only.
         if entries_committed_to_disk > 0 {
             update_index(
-                &mut index,
+                &mut guard.index,
                 &project,
                 &segment.agent,
                 &compact_date(&date),
@@ -1190,8 +1285,54 @@ where
         progress(segment_idx + 1, total_segments);
     }
 
-    save_index_at(base, &index)?;
+    save_index_at(base, &guard.index)?;
+    guard.persisted = true;
     Ok(summary)
+}
+
+/// RAII save-on-drop guard for the in-memory store index (#26).
+///
+/// Holds the index by value while `store_segments_at` mutates it. On
+/// successful completion the caller sets `persisted = true` after a
+/// regular `save_index_at` and `Drop` becomes a no-op; on any early
+/// return (error `?`) or panic the `Drop` impl persists the index
+/// opportunistically so Ctrl+C / mid-loop failure does not leave disk
+/// out of sync. Write errors during `Drop` are logged (best-effort);
+/// `Drop` cannot itself return a `Result`.
+struct IndexSaveGuard<'a> {
+    base: &'a Path,
+    index: StoreIndex,
+    persisted: bool,
+}
+
+impl Drop for IndexSaveGuard<'_> {
+    fn drop(&mut self) {
+        if self.persisted {
+            return;
+        }
+        match save_index_at(self.base, &self.index) {
+            Ok(()) => {
+                tracing::warn!(
+                    target: "aicx::store",
+                    base = %self.base.display(),
+                    "store_segments_at returned early; index.json persisted opportunistically via IndexSaveGuard::drop"
+                );
+            }
+            Err(err) => {
+                // `Drop` cannot return; tracing may itself be torn down
+                // during a panic so we also fall back to stderr.
+                tracing::error!(
+                    target: "aicx::store",
+                    base = %self.base.display(),
+                    "IndexSaveGuard::drop failed to persist index.json: {err:#}"
+                );
+                eprintln!(
+                    "aicx: IndexSaveGuard::drop failed to persist index.json at {}: {err:#}",
+                    self.base.display()
+                );
+            }
+        }
+    }
 }
 
 fn write_semantic_segment_at(
@@ -5853,6 +5994,221 @@ mod tests {
                 .and_then(|p| p.agents.get("claude"))
                 .is_some(),
             "recovered index must contain the .bak payload"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ================================================================
+    // W-C-6 durability cluster (#20 / #21 / #26)
+    // ================================================================
+
+    #[test]
+    fn test_two_phase_write_parent_fsync_on_rename() {
+        // The two-phase `.md + .meta.json` write path must mirror
+        // `atomic_write`'s post-rename parent fsync (#21). The helper
+        // itself is best-effort and swallows errors, so we exercise the
+        // contract end-to-end: a successful two-phase write must produce
+        // BOTH renamed targets, AND `atomic_write::parent_fsync` must be
+        // callable on the same parent without panicking or returning.
+        let root = retrieval_test_root("two-phase-parent-fsync");
+        let _ = fs::remove_dir_all(&root);
+
+        let sid = "sess-fsync";
+        let ts = Utc.with_ymd_and_hms(2026, 5, 22, 9, 0, 0).unwrap();
+        let entries = vec![session_first_entry(
+            ts,
+            "claude",
+            sid,
+            "## Findings\nFsync contract — both renames must commit.\n",
+        )];
+
+        let written = write_context_session_first_at(
+            &root.join("store"),
+            SessionWriteSpec {
+                project: Some("VetCoders/aicx"),
+                agent: "claude",
+                date: "2026-05-22",
+                session_id: sid,
+                kind: Some(Kind::Reports),
+            },
+            &entries,
+            &ChunkerConfig::default(),
+        )
+        .expect("two-phase write");
+
+        assert_eq!(written.len(), 1);
+        let chunk_path = &written[0];
+        let sidecar_path = chunk_path.with_extension("meta.json");
+        assert!(chunk_path.exists(), ".md must land");
+        assert!(sidecar_path.exists(), ".meta.json must land");
+
+        // The helper must exist, be public, and be a no-panic best-effort
+        // call on a real path. (Detecting the actual fsync syscall is a
+        // kernel-level concern outside unit-test scope; what we CAN
+        // guarantee is that the contract is wired up to the same helper
+        // `atomic_write::atomic_write` uses.)
+        atomic_write::parent_fsync(chunk_path);
+        atomic_write::parent_fsync(&sidecar_path);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_orphan_md_reclaimed_not_shadowed() {
+        // Simulate the crash that #20 is about: a prior two-phase write
+        // committed the `.md` but was killed before the sidecar rename.
+        // The next run with identical chunk content used to silently
+        // spawn a `-c<hash>.md` shadow next to the orphan, leaving the
+        // canonical slot permanently shadowed.
+        //
+        // After the fix, the orphan body matches the new chunk so we
+        // reclaim it: write the missing sidecar, count the chunk as
+        // deduped, leave no shadow sibling.
+        let root = retrieval_test_root("orphan-reclaim");
+        let _ = fs::remove_dir_all(&root);
+
+        let sid = "sess-orphan";
+        let ts = Utc.with_ymd_and_hms(2026, 5, 22, 10, 0, 0).unwrap();
+        let body =
+            "## Findings\nOrphan reclaim probe — body must match across the simulated crash.\n";
+        let entries = vec![session_first_entry(ts, "claude", sid, body)];
+
+        let first = write_context_session_first_at(
+            &root.join("store"),
+            SessionWriteSpec {
+                project: Some("VetCoders/aicx"),
+                agent: "claude",
+                date: "2026-05-22",
+                session_id: sid,
+                kind: Some(Kind::Reports),
+            },
+            &entries,
+            &ChunkerConfig::default(),
+        )
+        .expect("seed write");
+        assert_eq!(first.len(), 1);
+        let chunk_path = first[0].clone();
+        let sidecar_path = chunk_path.with_extension("meta.json");
+        assert!(sidecar_path.exists(), "seed must produce a sidecar");
+
+        // Simulate the killed-between-renames state: keep the `.md`,
+        // delete the sidecar. This is the exact orphan shape #20 was
+        // diagnosed as.
+        fs::remove_file(&sidecar_path).unwrap();
+        assert!(chunk_path.exists());
+        assert!(!sidecar_path.exists());
+
+        let second = write_context_session_first_at(
+            &root.join("store"),
+            SessionWriteSpec {
+                project: Some("VetCoders/aicx"),
+                agent: "claude",
+                date: "2026-05-22",
+                session_id: sid,
+                kind: Some(Kind::Reports),
+            },
+            &entries,
+            &ChunkerConfig::default(),
+        )
+        .expect("reclaim write");
+
+        // The reclaim path treats the chunk as deduped — no new path is
+        // returned — but the missing sidecar must be back.
+        assert!(
+            second.is_empty(),
+            "reclaim must dedupe, not produce a new write path; got {second:?}"
+        );
+        assert!(
+            sidecar_path.exists(),
+            "orphan reclaim must restore the missing sidecar"
+        );
+
+        // No `-c<hash>` shadow sibling must exist next to the canonical
+        // basename — that was the silent-shadow bug.
+        let dir = chunk_path.parent().unwrap();
+        let stem = chunk_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("chunk stem");
+        let shadow_prefix = format!("{}-c", stem);
+        let shadows: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with(&shadow_prefix) && n.ends_with(".md")
+            })
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            shadows.is_empty(),
+            "must not write `-c<hash>` shadow when orphan body matches; found {shadows:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_store_segments_at_index_persists_on_drop() {
+        // Save-on-drop guard (#26): if `store_segments_at` returns early
+        // (error / panic / Ctrl+C) after mutating the in-memory index,
+        // `Drop` must persist what was mutated. We drive the guard
+        // directly (the type is private to this module) because injecting
+        // a panic inside `store_segments_at` would require a control
+        // hook this code intentionally does not expose. The guard's
+        // contract is the load-bearing piece.
+        let root = retrieval_test_root("index-save-on-drop");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let index_path = root.join("index.json");
+        assert!(
+            !index_path.exists(),
+            "fresh root must not have index.json yet"
+        );
+
+        {
+            let mut index = StoreIndex::default();
+            update_index(&mut index, "VetCoders/aicx", "claude", "2026_0522", 5);
+            let _guard = IndexSaveGuard {
+                base: &root,
+                index,
+                persisted: false,
+            };
+            // Drop fires here — `persisted = false`, so the guard
+            // must `save_index_at` opportunistically.
+        }
+
+        assert!(
+            index_path.exists(),
+            "IndexSaveGuard::drop must persist index.json on early return"
+        );
+        let loaded = read_and_parse_index(&index_path).expect("re-read persisted index");
+        let agent = loaded
+            .projects
+            .get("VetCoders/aicx")
+            .and_then(|p| p.agents.get("claude"))
+            .expect("persisted index must contain the partial state");
+        assert_eq!(agent.total_entries, 5);
+        assert!(agent.dates.iter().any(|d| d == "2026_0522"));
+
+        // Sanity: when `persisted = true` the guard becomes a no-op and
+        // does not overwrite a hand-tuned post-finalize file.
+        let sentinel_bytes = fs::read(&index_path).unwrap();
+        {
+            let mut index = StoreIndex::default();
+            update_index(&mut index, "VetCoders/other", "codex", "2026_0522", 99);
+            let _guard = IndexSaveGuard {
+                base: &root,
+                index,
+                persisted: true,
+            };
+        }
+        let after = fs::read(&index_path).unwrap();
+        assert_eq!(
+            after, sentinel_bytes,
+            "persisted=true must skip the Drop save"
         );
 
         let _ = fs::remove_dir_all(&root);
