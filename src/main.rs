@@ -3340,26 +3340,10 @@ fn warn_legacy_subcommand(legacy: &str, replacement: &str) {
     eprintln!("# Note: `aicx {legacy}` is deprecated; use `aicx {replacement}` instead.");
 }
 
-fn dedup_entries_for_state(
-    entries: Vec<timeline::TimelineEntry>,
-    state: &mut StateManager,
-    project_name: &str,
-    overlap_project: &str,
-    full_rescan: bool,
-) -> Vec<timeline::TimelineEntry> {
-    dedup_entries_for_state_with_progress(
-        entries,
-        state,
-        project_name,
-        overlap_project,
-        full_rescan,
-        |_| {},
-    )
-}
-
-/// Dedup wrapper that calls `progress(entries_scanned)` periodically so a
+/// Dedup with periodic `progress(entries_scanned)` callbacks so a
 /// caller-side `Phase` heartbeat reflects real work even when a long
-/// `--full-rescan` corpus is grinding through hashing.
+/// `--full-rescan` corpus is grinding through hashing. Pass `|_| {}`
+/// if you don't want progress.
 fn dedup_entries_for_state_with_progress<F>(
     entries: Vec<timeline::TimelineEntry>,
     state: &mut StateManager,
@@ -3572,23 +3556,57 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         render_requested_source_filters(&project)
     );
 
-    // Extract from requested sources
+    let structured_emit = matches!(emit, StdoutEmit::Json);
+    let reporter = aicx::progress::select_reporter(structured_emit);
+    let failures = aicx::progress::FailureLog::new();
+
+    // ──────────────────────────────────────────────────────────────────
+    // Extract phase — same phased UX as `run_store` so `aicx all`,
+    // `aicx claude`, `aicx codex` etc. don't stall silently for 15-20
+    // minutes during a --full-rescan/-H 0 sweep of agent stores.
+    // Heartbeat uses exponential backoff (2s → 60s cap) so long
+    // single-agent extracts emit a handful of ticks, not hundreds.
+    // ──────────────────────────────────────────────────────────────────
+    let extract_phase =
+        aicx::progress::Phase::start(reporter.clone(), "extract", Some(agents.len() as u64));
     let mut entries = Vec::new();
-
+    let mut agents_done: u64 = 0;
     for &agent in agents {
-        let agent_entries = match agent {
-            "claude" => sources::extract_claude(&config)?,
-            "codex" => sources::extract_codex(&config)?,
-            "gemini" => sources::extract_gemini(&config)?,
-            "junie" => sources::extract_junie(&config)?,
-            "codescribe" => sources::extract_codescribe(&config)?,
-            "operator-md" => sources::extract_operator_markdown(&config)?,
-            _ => Vec::new(),
+        let hb = aicx::progress::Heartbeat::spawn_with_backoff(
+            extract_phase.clone(),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(60),
+        );
+        let agent_entries_result = match agent {
+            "claude" => sources::extract_claude(&config),
+            "codex" => sources::extract_codex(&config),
+            "gemini" => sources::extract_gemini(&config),
+            "junie" => sources::extract_junie(&config),
+            "codescribe" => sources::extract_codescribe(&config),
+            "operator-md" => sources::extract_operator_markdown(&config),
+            _ => Ok(Vec::new()),
         };
-
+        hb.stop();
+        let agent_entries = match agent_entries_result {
+            Ok(entries) => entries,
+            Err(e) => {
+                let record =
+                    extract_phase.finish_err(&e, aicx::progress::recovery_hint_for("extract"));
+                failures.record(record);
+                let _ = aicx::progress::render_failure_tail(&failures);
+                return Err(e);
+            }
+        };
         eprintln!("  [{}] {} entries", agent, agent_entries.len());
         entries.extend(agent_entries);
+        agents_done += 1;
+        extract_phase.tick(agents_done);
     }
+    extract_phase.finish_ok(format!(
+        "{} agents → {} entries",
+        agents.len(),
+        entries.len()
+    ));
 
     // Two-level dedup (skip if --force):
     //
@@ -3603,13 +3621,23 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     let pre_dedup = entries.len();
     let overlap_project = format!("_overlap:{project_name}");
     if !force {
-        entries = dedup_entries_for_state(
+        let dedup_phase =
+            aicx::progress::Phase::start(reporter.clone(), "dedup", Some(pre_dedup as u64));
+        entries = dedup_entries_for_state_with_progress(
             entries,
             &mut state,
             &project_name,
             &overlap_project,
             full_rescan,
+            |scanned| dedup_phase.tick(scanned as u64),
         );
+        let dedup_skipped = pre_dedup.saturating_sub(entries.len());
+        dedup_phase.finish_ok(format!(
+            "kept {} / {} (skipped {})",
+            entries.len(),
+            pre_dedup,
+            dedup_skipped
+        ));
     }
 
     if pre_dedup != entries.len() {
@@ -3626,8 +3654,27 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
 
     // Filter self-echo (aicx's own search/rank/store calls that create feedback loops)
     let pre_echo = entries.len();
-    entries.retain(|e| !aicx::sanitize::is_self_echo(&e.message));
-    let echo_filtered = pre_echo - entries.len();
+    let echo_phase =
+        aicx::progress::Phase::start(reporter.clone(), "self_echo", Some(pre_echo as u64));
+    {
+        const ECHO_TICK_EVERY: usize = 500;
+        let mut scanned: usize = 0;
+        entries.retain(|e| {
+            scanned += 1;
+            if scanned.is_multiple_of(ECHO_TICK_EVERY) {
+                echo_phase.tick(scanned as u64);
+            }
+            !aicx::sanitize::is_self_echo(&e.message)
+        });
+        echo_phase.tick(scanned as u64);
+    }
+    let echo_filtered = pre_echo.saturating_sub(entries.len());
+    echo_phase.finish_ok(format!(
+        "kept {} / {} (filtered {})",
+        entries.len(),
+        pre_echo,
+        echo_filtered
+    ));
     if echo_filtered > 0 {
         eprintln!("  Filtered {echo_filtered} self-echo entries");
     }
@@ -3662,17 +3709,43 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     let mut written_empty_body_skipped = 0usize;
     let mut scope_surface = StoreScopeSurface::empty(&project);
 
-    let structured_emit = matches!(emit, StdoutEmit::Json);
-    let reporter = aicx::progress::select_reporter(structured_emit);
-    let failures = aicx::progress::FailureLog::new();
-
     if !output_entries.is_empty() {
-        let chunk_phase = aicx::progress::Phase::start(
-            reporter.clone(),
-            "chunk",
-            Some(output_entries.len() as u64),
+        // ──────────────────────────────────────────────────────────────
+        // Segment phase — heartbeat-only (total=None, exp-backoff). See
+        // run_store for the rationale: there's no honest mid-flight
+        // counter inside `semantic_segments`, so the structured surface
+        // gets a heartbeat counter rendered as `processed N | elapsed
+        // Xs` rather than a misleading `N/entries_total = 0%`.
+        // ──────────────────────────────────────────────────────────────
+        let segment_phase = aicx::progress::Phase::start(reporter.clone(), "segment", None);
+        let segments = {
+            let hb = aicx::progress::Heartbeat::spawn_with_backoff(
+                segment_phase.clone(),
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(60),
+            );
+            let result = aicx::segmentation::semantic_segments(&output_entries);
+            hb.stop();
+            result
+        };
+        let segment_count = segments.len();
+        segment_phase.finish_ok(format!(
+            "{} entries → {} segments",
+            output_entries.len(),
+            segment_count
+        ));
+
+        // Chunk phase — denominator is segments (not entries), so the
+        // ratio reflects actual write progress.
+        let chunk_phase =
+            aicx::progress::Phase::start(reporter.clone(), "chunk", Some(segment_count as u64));
+        let store_result = store::store_segments_at(
+            &aicx::store::store_base_dir()?,
+            &segments,
+            &chunker_config,
+            |done, _total| chunk_phase.tick(done as u64),
         );
-        let store_summary = match store::store_semantic_segments(&output_entries, &chunker_config) {
+        let store_summary = match store_result {
             Ok(summary) => {
                 let written = summary.written_paths.len() as u64;
                 chunk_phase.finish_ok(format!("{written} chunks"));
