@@ -1686,3 +1686,36 @@ apply path, but does not mutate the live canonical store by itself.
 - shlex jest battle-tested library dla shell quoting; hand-rolled escape NIE łapie shell substitution metacharacters.
 
 **Related.** 43 remaining findings (9 P1 + 23 P2 + 11 P3) + 3 pass-2 leftovers consolidated w `docs/bug-tracker-aicx-followup-pass-3.md`. PR #5 unblocked dla merge po Plan A.
+
+## 2026-05-21 — release-linux SHA256SUMS aggregation (J-1) · `pending-this-commit`
+
+**Symptom.** `.github/workflows/release-linux.yml` publikował Linux slim unsigned
+`.tar.gz` assety bez agregującego `SHA256SUMS`, więc użytkownik nie miał prostego
+release-side polecenia do weryfikacji integralności przed instalacją.
+
+**Root cause.** Nowszy Linux matrix workflow miał już `download-artifact`
+z `merge-multiple: true` i upload `dist/*`, ale nie generował checksum file w
+agregatorze. Starszy unified release path miał własne SHA sidecars, więc luka
+dotyczyła tylko `release-linux.yml`.
+
+**Fix.**
+- `.github/workflows/release-linux.yml`: dodano krok `Generate SHA256SUMS` w
+  `upload-release`, po pobraniu matrix artifactów i przed `gh release upload`.
+- `docs/RELEASES.md`: dodano sekcję `Asset verification` z komendą
+  `sha256sum -c SHA256SUMS` dla katalogu zawierającego checksum file i `.tar.gz`.
+
+**Touched.**
+- `.github/workflows/release-linux.yml` — `upload-release` aggregator job.
+- `docs/RELEASES.md` — end-user asset verification docs.
+
+**Tests.** `actionlint` run: new `Generate SHA256SUMS` step clean; pre-existing
+SC2086 warnings remain in `Package artifacts` scope. Python PyYAML unavailable,
+Ruby YAML parse OK. `cargo build --workspace` OK. `cargo fmt --check` OK.
+
+**Lessons.**
+- Agregator release job to właściwe miejsce na jeden `SHA256SUMS` dla matrix
+  artifactów: uploadowy `dist/*` obejmuje checksum file bez osobnego polecenia.
+- Uwaga protokołowa: finalny commit SHA jest znany dopiero po commicie; raport
+  B-1 zapisuje finalny SHA dla tej pozycji J-1.
+
+**Related.** J-1 z `docs/bug-tracker-aicx-followup-pass-3.md`.

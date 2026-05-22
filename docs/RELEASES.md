@@ -73,6 +73,19 @@ Each archive contains:
 - `docs/COMMANDS.md`
 - `docs/RELEASES.md`
 
+### Asset verification
+
+Download `SHA256SUMS` into the same directory as the `.tar.gz` release assets,
+then run:
+
+```bash
+sha256sum -c SHA256SUMS
+```
+
+The command expects `SHA256SUMS` and the referenced archives to be colocated.
+It exits non-zero if any archive is missing or does not match the published
+checksum.
+
 The maintainer-local macOS signing path expects these operator-owned inputs:
 
 - `MACOS_CERT_P12_BASE64`
