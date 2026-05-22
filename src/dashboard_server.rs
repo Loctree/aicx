@@ -31,6 +31,7 @@ use crate::auth::{self, AuthConfig};
 use crate::dashboard::{
     self, DashboardPayload, DashboardRecord, DashboardScope, DashboardStats, project_matches_filter,
 };
+use crate::sanitize;
 
 const REGENERATE_HEADER_NAME: &str = "x-ai-contexters-action";
 const REGENERATE_HEADER_VALUE: &str = "regenerate";
@@ -1088,7 +1089,7 @@ async fn get_chunk(
         }
     };
 
-    let content = match std::fs::read_to_string(&file_path) {
+    let content = match sanitize::read_to_string_validated(&file_path) {
         Ok(c) => c,
         Err(err) => {
             return (

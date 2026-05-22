@@ -10,6 +10,8 @@
 
 use anyhow::{Result, anyhow};
 use std::borrow::Cow;
+use std::fmt;
+use std::io::{self, BufRead, Read};
 use std::path::{Component, Path, PathBuf};
 
 /// Known safe extractor agent names.
@@ -24,6 +26,37 @@ pub const ALLOWED_AGENTS: &[&str] = &[
 
 const AICX_ALLOW_TMP_ENV: &str = "AICX_ALLOW_TMP";
 
+pub const MAX_VALIDATED_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SanitizeError {
+    FileTooLarge {
+        path: PathBuf,
+        max_bytes: usize,
+        actual_bytes: u64,
+    },
+}
+
+impl fmt::Display for SanitizeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SanitizeError::FileTooLarge {
+                path,
+                max_bytes,
+                actual_bytes,
+            } => write!(
+                f,
+                "File '{}' exceeds validated read cap: {} bytes > {} bytes",
+                path.display(),
+                actual_bytes,
+                max_bytes
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SanitizeError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentSanitizationWarning {
     NullByteStripped(usize),
@@ -35,6 +68,12 @@ pub enum ContentSanitizationWarning {
 pub struct SanitizedContent<'a> {
     pub text: Cow<'a, str>,
     pub warnings: Vec<ContentSanitizationWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CappedLine {
+    pub line: String,
+    pub exceeded: bool,
 }
 
 // ============================================================================
@@ -239,9 +278,34 @@ pub fn create_file_validated(path: &Path) -> Result<std::fs::File> {
 /// Read a UTF-8 text file only after validating the path.
 pub fn read_to_string_validated(path: &Path) -> Result<String> {
     let validated = validate_read_path(path)?;
+    let metadata = std::fs::metadata(&validated)
+        .map_err(|e| anyhow!("Failed to stat '{}': {}", validated.display(), e))?;
+    if metadata.len() > MAX_VALIDATED_BYTES as u64 {
+        return Err(SanitizeError::FileTooLarge {
+            path: validated,
+            max_bytes: MAX_VALIDATED_BYTES,
+            actual_bytes: metadata.len(),
+        }
+        .into());
+    }
+
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    std::fs::read_to_string(&validated)
-        .map_err(|e| anyhow!("Failed to read '{}': {}", validated.display(), e))
+    let file = std::fs::File::open(&validated)
+        .map_err(|e| anyhow!("Failed to open '{}': {}", validated.display(), e))?;
+    let mut reader = file.take(MAX_VALIDATED_BYTES.saturating_add(1) as u64);
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|e| anyhow!("Failed to read '{}': {}", validated.display(), e))?;
+    if bytes.len() > MAX_VALIDATED_BYTES {
+        return Err(SanitizeError::FileTooLarge {
+            path: validated,
+            max_bytes: MAX_VALIDATED_BYTES,
+            actual_bytes: bytes.len() as u64,
+        }
+        .into());
+    }
+    String::from_utf8(bytes).map_err(|e| anyhow!("Failed to read '{}': {}", validated.display(), e))
 }
 
 /// Read a directory only after validating it as an allowed directory path.
@@ -250,6 +314,51 @@ pub fn read_dir_validated(path: &Path) -> Result<std::fs::ReadDir> {
     // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     std::fs::read_dir(&validated)
         .map_err(|e| anyhow!("Failed to read dir '{}': {}", validated.display(), e))
+}
+
+pub fn read_line_capped<R: BufRead>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> io::Result<Option<CappedLine>> {
+    let mut buf = Vec::new();
+    let read = {
+        let mut limited = reader.take(max_bytes.saturating_add(1) as u64);
+        limited.read_until(b'\n', &mut buf)?
+    };
+    if read == 0 {
+        return Ok(None);
+    }
+
+    let exceeded = buf.len() > max_bytes;
+    if exceeded {
+        let ended_at_newline = buf.last().copied() == Some(b'\n');
+        buf.truncate(max_bytes);
+        if !ended_at_newline {
+            drain_until_newline(reader)?;
+        }
+    }
+
+    let line =
+        String::from_utf8(buf).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    Ok(Some(CappedLine { line, exceeded }))
+}
+
+fn drain_until_newline<R: BufRead>(reader: &mut R) -> io::Result<()> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        let consume = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |idx| idx + 1);
+        let ended_at_newline = available.get(consume.saturating_sub(1)) == Some(&b'\n');
+        reader.consume(consume);
+        if ended_at_newline {
+            return Ok(());
+        }
+    }
 }
 
 // ============================================================================

@@ -1686,3 +1686,100 @@ apply path, but does not mutate the live canonical store by itself.
 - shlex jest battle-tested library dla shell quoting; hand-rolled escape NIE łapie shell substitution metacharacters.
 
 **Related.** 43 remaining findings (9 P1 + 23 P2 + 11 P3) + 3 pass-2 leftovers consolidated w `docs/bug-tracker-aicx-followup-pass-3.md`. PR #5 unblocked dla merge po Plan A.
+
+## 2026-05-21 — sanitize central IO caps (L-1 foundation) · `self-sha-in-report`
+
+**Symptom.** L-1 z pass-3 wskazywało, że `read_to_string_validated(path)` waliduje ścieżkę, ale dalej używa uncapped `fs::read_to_string`, a capped `read_line_limited` istnieje tylko prywatnie w bin crate `src/sources.rs`. Downstream A-2/A-3 nie miały wspólnego API do bezpiecznego czytania dużych plików/linii.
+
+**Root cause.** Limit 8 MiB z pass-1 był zamknięty w `src/sources.rs` (`MAX_LINE_BYTES` + `read_line_limited`). Workspace-shared `aicx_parser::sanitize` nie miało ani total-byte cap dla validated reads, ani publicznego capped `read_line` helpera.
+
+**Fix.**
+- `crates/aicx-parser/src/sanitize.rs`: dodano `MAX_VALIDATED_BYTES = 8 * 1024 * 1024`, typed `SanitizeError::FileTooLarge`, capped `read_to_string_validated` (metadata check + bounded `take(MAX+1)` read) oraz publiczny `read_line_capped` mirrorujący kontrakt `src/sources.rs`.
+- `crates/aicx-parser/src/lib.rs`: dodano re-export `MAX_VALIDATED_BYTES` i `read_line_capped`.
+- `crates/aicx-parser/tests/sanitize_caps.rs`: dodano regresje dla pliku `MAX_VALIDATED_BYTES + 1` oraz oversized-line skip do kolejnej poprawnej linii.
+
+**Touched.**
+- `crates/aicx-parser/src/sanitize.rs` — centralny validated IO cap + capped line helper.
+- `crates/aicx-parser/src/lib.rs` — publiczne re-exporty dla downstream A-2/A-3.
+- `crates/aicx-parser/tests/sanitize_caps.rs` — integration regression coverage.
+
+**Tests.** `cargo build --workspace`, `cargo test --workspace -- --test-threads=4`, `cargo clippy --workspace -- -D warnings`, `cargo fmt --check` zielone. Targeted: `cargo test -p aicx-parser --test sanitize_caps`; existing happy path: `cargo test -p aicx-parser test_read_to_string_validated`.
+
+**Lessons.**
+- Shared safety helper powinien żyć w workspace crate zanim kolejne fale zaczną patchować call site’y; inaczej każdy moduł odtwarza własny cap-pattern.
+- `read_to_string` hardening musi ograniczać alokację przed body read, nie tylko zgłaszać błąd po fakcie.
+- Self-referential commit SHA nie jest możliwy w tym samym commicie; finalny SHA tego wpisu jest zapisany w raporcie A-1.
+
+**Related.** Closes L-1 foundation z `docs/bug-tracker-aicx-followup-pass-3.md`; kontynuuje audit `26d8123` / `docs/scope-overflow.md`. A-2/A-3 nadal odpowiadają za wiring call site’ów z listy audytu.
+
+## 2026-05-22 — semantic index NDJSON readers capped (L-1 sweep #2) · `self-sha-in-report`
+
+**Symptom.** Audit `26d8123` wykazał, że semantic-index read path dalej używał nieograniczonych `BufReader::lines()` / `read_line` w `src/api.rs`, `src/vector_index.rs`, `src/search_engine.rs` i brute-force dense adapterze. Adwersarialna linia NDJSON mogła wymusić niekontrolowaną alokację zanim parser zgłosił błąd.
+
+**Root cause.** A-1 (`6482bff`) dodało workspace-shared `aicx_parser::sanitize::read_line_capped`, ale downstream readers wciąż korzystały z convenience iteratorów standard library, które nie mają per-line cap i buforują całą linię.
+
+**Fix.**
+- `src/api.rs`: row-count semantic indexu przechodzi przez `read_line_capped`, header skip + data count bez `BufReader::lines()`.
+- `src/vector_index.rs`: dodano lokalny adapter capped-line zachowujący semantykę `BufRead::lines()` (strip `\n`/`\r\n`) i podpięto go w header rewrite, committed-reader, resume checkpoint, incremental baseline, committed-body seed oraz query scan.
+- `src/search_engine.rs`: header preview i empty-index detection czytają przez `read_line_capped`; oversized header nie jest parsowany jako prawidłowy status.
+- `crates/aicx-retrieve/src/adapter_brute_force.rs`: brute-force NDJSON load używa `read_line_capped`; oversized body row jest raportowany jako corrupt i reader przechodzi do następnej poprawnej linii.
+- `crates/aicx-retrieve/Cargo.toml`: dodano zależność path `aicx-parser` dla helpera A-1.
+
+**Touched.**
+- `src/api.rs` — `count_index_rows`.
+- `src/vector_index.rs` — semantic NDJSON readers + capped iterator regression.
+- `src/search_engine.rs` — `read_index_header`, `index_appears_empty`.
+- `crates/aicx-retrieve/src/adapter_brute_force.rs` — `load_ndjson` + oversized-row regression.
+- `crates/aicx-retrieve/Cargo.toml` — parser helper dependency.
+
+**Tests.** `cargo build --workspace`, `cargo test --workspace -- --test-threads=4`, `cargo clippy --workspace -- -D warnings`, `cargo fmt --check` zielone. Targeted: `cargo test capped_index_lines_error_on_oversized_and_advance_to_next_line -- --nocapture`; `cargo test -p aicx-retrieve load_skips_oversized_row_and_reads_following_row -- --nocapture`. `rg 'BufReader::lines\(\)|\.read_line\(' src/api.rs src/vector_index.rs src/search_engine.rs crates/aicx-retrieve/src/adapter_brute_force.rs` zwraca zero trafień.
+
+**Lessons.**
+- `BufRead::lines()` jest wygodne, ale w ścieżkach NDJSON indexu nie daje kontroli nad alokacją; capped adapter powinien być bliżej call-site’u niż parser JSON.
+- Oversized row nie musi oznaczać tego samego w każdym module: query/header paths mogą failować typed error, a brute-force body może policzyć corrupt row i kontynuować po drained newline.
+- Self-referential commit SHA nie jest możliwy w tym samym commicie; finalny SHA tego wpisu jest zapisany w raporcie A-2.
+
+**Related.** Closes A-2 / L-1 sweep #2 z `docs/bug-tracker-aicx-followup-pass-3.md`; implements semantic-NDJSON portion of audit `26d8123` / `docs/scope-overflow.md`; follows A-1 foundation `6482bff`.
+
+## 2026-05-22 — extractor/UI diagnostic readers capped (L-1 close-out) · `self-sha-in-report`
+
+**Symptom.** Audit `26d8123` nadal wskazywał ostatnie extractor/UI/diagnostic miejsca, gdzie `BufReader::lines()` albo bezpośrednie `read_to_string` mogły alokować nieograniczoną linię lub plik przed walidacją rozmiaru. A-1 (`6482bff`) i A-2 (`7230ba0`) zamknęły helpery oraz semantic-NDJSON path, ale pass A nie był jeszcze domknięty.
+
+**Root cause.** Pozostałe call site’y były rozproszone po CLI, extractorach, wizardzie, doctorze, dashboardzie i metadata loaders. Część z nich czytała operator-controlled albo store-controlled pliki, ale bez wspólnego 8 MiB cap helpera nie było jednolitej granicy alokacji ani trwałej klasyfikacji.
+
+**Fix.**
+- `src/main.rs`, `src/output.rs`, `src/sources.rs`: pozostałe `BufReader::lines()` w scope A-3 zamienione na `sanitize::read_line_capped`; oversized line jest pomijana po drainie do następnej linii.
+- `src/wizard/screens/corpus.rs`, `src/wizard/screens/intents.rs`, `src/doctor.rs`: produkcyjne preview/diagnostic reads przeszły na `read_to_string_validated`.
+- `src/state.rs`, `src/store.rs`, `src/dashboard_server.rs`, `crates/aicx-parser/src/segmentation.rs`: metadata/dashboard/Gemini-map reads sklasyfikowane jako cap-safe i podpięte do `read_to_string_validated` zamiast zostawiać uncapped wyjątki.
+- Dodano focused regressions dla oversized line advance w sync markdown scannerze i oversized chunk preview rejection w wizard corpus screen.
+
+**Bounded classification.**
+- `src/state.rs:195` — capped; `state.json` jest internal metadata, ale może rosnąć z watermarkami/hashami, więc cap jest bezpieczniejszy niż stały komentarz bounded.
+- `src/state.rs:208` — capped; `.bak` dziedziczy ryzyko `state.json`.
+- `src/store.rs:601` — capped; `index.json` jest generated metadata, ale manifest może rosnąć wraz z corpus size.
+- `src/store.rs:1386` — capped; sidecar JSON jest mały-by-design, ale cap nie zmienia poprawnego happy path i usuwa silent unbounded read.
+- `src/doctor.rs:605` — capped; diagnostic index read powinien respektować tę samą granicę co store loader.
+- `src/doctor.rs:955` — capped; diagnostic state read powinien respektować tę samą granicę co `StateManager`.
+- `src/dashboard_server.rs:1105` — capped; dashboard-served chunk content może być user/operator corpus data, 8 MiB wystarcza dla sensownego chunk preview i zamyka unbounded response read.
+- `crates/aicx-parser/src/segmentation.rs:73` — capped; Gemini project map jest config-like i mały-by-intent, ale cap jest tani i utrzymuje jeden IO contract.
+
+**Touched.**
+- `src/main.rs` — `read_codex_session_meta_id`.
+- `src/output.rs` — `find_last_sync_timestamp` + oversized-line regression.
+- `src/sources.rs` — `load_codescribe_lexicon`.
+- `src/wizard/screens/corpus.rs` — selected chunk preview + oversized-file regression.
+- `src/wizard/screens/intents.rs` — intent source chunk preview.
+- `src/doctor.rs` — index/state/empty-body diagnostics.
+- `src/state.rs` — state + backup loads.
+- `src/store.rs` — index + sidecar loads.
+- `src/dashboard_server.rs` — chunk content API read.
+- `crates/aicx-parser/src/segmentation.rs` — Gemini project map loader.
+
+**Tests.** `cargo build --workspace`, `cargo test --workspace -- --test-threads=4`, `cargo clippy --workspace -- -D warnings`, `cargo fmt --check` zielone. Targeted: `cargo test -p aicx output::tests::test_find_last_sync_timestamp_skips_oversized_line_and_advances -- --test-threads=1`; `cargo test -p aicx wizard::screens::corpus::tests::selected_preview_rejects_oversized_chunk_file -- --test-threads=1`. Required `rg` gates over `src/main.rs`, `src/output.rs`, and `src/sources.rs` zwracają zero trafień.
+
+**Lessons.**
+- W metadata pathach „mały w praktyce” nie musi oznaczać „bounded forever”; jeśli cap helper nie zmienia API, lepiej capować niż zostawiać trwały wyjątek.
+- Line cap musi zachować progress po oversized line, inaczej pojedyncza długa linia blokuje dalsze poprawne rekordy.
+- Self-referential commit SHA nie jest możliwy w tym samym commicie; finalny SHA tego wpisu jest zapisany w raporcie A-3.
+
+**Related.** Closes A-3 / L-1 extractor/UI diagnostic close-out z `docs/bug-tracker-aicx-followup-pass-3.md`; implements remaining split #3 from audit `26d8123` / `docs/scope-overflow.md`; follows A-1 `6482bff` and A-2 `7230ba0`.

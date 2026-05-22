@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::sanitize;
 use crate::store::atomic_write::atomic_write;
 
 pub mod migration;
@@ -192,7 +193,7 @@ impl StateManager {
         }
 
         let backup_path = Self::backup_path(path);
-        let contents = fs::read_to_string(path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        let contents = sanitize::read_to_string_validated(path)
             .with_context(|| format!("Failed to read state file: {}", path.display()))?;
 
         let state: Self =
@@ -205,7 +206,7 @@ impl StateManager {
                         "state.json parse failed"
                     );
                     if backup_path.exists() {
-                        let backup = fs::read_to_string(&backup_path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+                        let backup = sanitize::read_to_string_validated(&backup_path)
                             .with_context(|| {
                                 format!("Failed to read state backup: {}", backup_path.display())
                             })?;

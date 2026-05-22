@@ -5,6 +5,7 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
+use crate::sanitize;
 use crate::timeline::{Kind, RepoIdentity, SemanticSegment, SourceTier, TimelineEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -70,7 +71,7 @@ impl ProjectHashRegistry {
 
     /// Load from a specific path.
     pub fn load_from(path: &Path) -> Self {
-        std::fs::read_to_string(path)
+        sanitize::read_to_string_validated(path)
             .ok()
             .and_then(|content| serde_json::from_str(&content).ok())
             .unwrap_or_default()

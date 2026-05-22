@@ -15,9 +15,10 @@
 
 use std::fs;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Component, Path, PathBuf};
 
+use aicx_parser::sanitize::{MAX_VALIDATED_BYTES, read_line_capped};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
@@ -146,12 +147,19 @@ impl BruteForceAdapter {
     pub fn load_ndjson(&mut self, path: &Path) -> Result<LoadStats> {
         let file = open_validated(path)
             .with_context(|| format!("open brute-force index: {}", path.display()))?;
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
+        let mut reader = BufReader::new(file);
 
-        let header_line = lines
-            .next()
-            .ok_or_else(|| anyhow!("empty brute-force index: {}", path.display()))??;
+        let header_line = read_line_capped(&mut reader, MAX_VALIDATED_BYTES)
+            .with_context(|| format!("read brute-force header in {}", path.display()))?
+            .ok_or_else(|| anyhow!("empty brute-force index: {}", path.display()))?;
+        if header_line.exceeded {
+            anyhow::bail!(
+                "brute-force header line exceeds {} bytes in {}",
+                MAX_VALIDATED_BYTES,
+                path.display()
+            );
+        }
+        let header_line = strip_line_ending(header_line.line);
         let header: BruteForceHeader = serde_json::from_str(&header_line)
             .with_context(|| format!("parse header in {}", path.display()))?;
 
@@ -174,12 +182,28 @@ impl BruteForceAdapter {
 
         self.entries.clear();
         let mut stats = LoadStats::default();
-        for line in lines {
-            let line = line?;
+        let mut line_no = 2usize;
+        while let Some(line) = read_line_capped(&mut reader, MAX_VALIDATED_BYTES)
+            .with_context(|| format!("read brute-force line {} in {}", line_no, path.display()))?
+        {
+            let exceeded = line.exceeded;
+            let line = strip_line_ending(line.line);
             if line.is_empty() {
+                line_no += 1;
                 continue;
             }
             stats.total_data_lines += 1;
+            if exceeded {
+                stats.corrupt_count += 1;
+                tracing::warn!(
+                    target: "aicx_retrieve::brute_force",
+                    line_no,
+                    max_bytes = MAX_VALIDATED_BYTES,
+                    "oversized NDJSON line in brute-force index skipped"
+                );
+                line_no += 1;
+                continue;
+            }
             match serde_json::from_str::<DenseEntry>(&line) {
                 Ok(entry) => {
                     if entry.embedding.len() != self.dim {
@@ -205,9 +229,20 @@ impl BruteForceAdapter {
                     );
                 }
             }
+            line_no += 1;
         }
         Ok(stats)
     }
+}
+
+fn strip_line_ending(mut line: String) -> String {
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+    line
 }
 
 /// Diagnostics from a brute-force NDJSON load. Mirrors the shape
@@ -632,6 +667,41 @@ mod tests {
         assert_eq!(stats.total_data_lines, 3);
         assert_eq!(stats.corrupt_count, 1);
         assert_eq!(reader.count(), 2, "only valid rows loaded");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_skips_oversized_row_and_reads_following_row() {
+        let dir = tempdir();
+        let path = dir.join("with-oversized.ndjson");
+        let header = BruteForceHeader {
+            schema_version: BRUTE_FORCE_SCHEMA_VERSION.to_string(),
+            dim: 2,
+            distance: Distance::Cosine,
+            entry_count: 2,
+        };
+        let valid =
+            DenseEntry::from_chunk(&make_chunk("after-oversized", "claude", vec![1.0, 0.0]));
+
+        let mut contents = serde_json::to_string(&header).unwrap();
+        contents.push('\n');
+        contents.push_str(&"x".repeat(MAX_VALIDATED_BYTES + 1));
+        contents.push('\n');
+        contents.push_str(&serde_json::to_string(&valid).unwrap());
+        contents.push('\n');
+        fs::write(&path, contents).unwrap();
+
+        let mut reader = BruteForceAdapter::new(2);
+        let stats = reader.load_ndjson(&path).expect("load with oversized row");
+        assert_eq!(stats.total_data_lines, 2);
+        assert_eq!(stats.corrupt_count, 1);
+        assert_eq!(reader.count(), 1);
+
+        let hits = reader
+            .query(&[1.0, 0.0], 1, &FilterSet::default())
+            .expect("query valid row after oversized row");
+        assert_eq!(hits[0].chunk_id, "after-oversized");
 
         let _ = fs::remove_dir_all(&dir);
     }

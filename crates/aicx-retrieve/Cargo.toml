@@ -15,6 +15,7 @@ categories = ["text-processing", "development-tools"]
 
 [dependencies]
 anyhow = "1.0"
+aicx-parser = { path = "../aicx-parser" }
 blake3 = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"

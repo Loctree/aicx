@@ -4610,10 +4610,12 @@ fn load_codescribe_lexicon(home: &Path) -> CodescribeLexicon {
     };
 
     let mut entries = Vec::new();
-    for line in BufReader::new(file)
-        .lines()
-        .map_while(std::result::Result::ok)
-    {
+    let mut reader = BufReader::new(file);
+    while let Ok(Some(line)) = sanitize::read_line_capped(&mut reader, MAX_LINE_BYTES) {
+        if line.exceeded {
+            continue;
+        }
+        let line = line.line;
         if line.trim().is_empty() {
             continue;
         }
