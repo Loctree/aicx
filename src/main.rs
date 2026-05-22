@@ -3682,16 +3682,21 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
 
     // ──────────────────────────────────────────────────────────────────
     // Segment phase — moved UP so per-canonical-repo dedup (#8) can key
-    // on each segment's repo identity.
+    // on each segment's repo identity. Progress denominator = entry
+    // count so operators see real percentage during long rescans.
     // ──────────────────────────────────────────────────────────────────
-    let segment_phase = aicx::progress::Phase::start(reporter.clone(), "segment", None);
+    let segment_total = entries.len() as u64;
+    let segment_phase =
+        aicx::progress::Phase::start(reporter.clone(), "segment", Some(segment_total));
     let segments = {
         let hb = aicx::progress::Heartbeat::spawn_with_backoff(
             segment_phase.clone(),
             std::time::Duration::from_secs(2),
             std::time::Duration::from_secs(60),
         );
-        let result = aicx::segmentation::semantic_segments(&entries);
+        let result = aicx::segmentation::semantic_segments_with_progress(&entries, |processed| {
+            hb.raise_floor(processed as u64)
+        });
         hb.stop();
         result
     };
@@ -4202,17 +4207,23 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
     // ──────────────────────────────────────────────────────────────────
     // Segment phase (moved UP, ahead of dedup): per-canonical-repo dedup
     // (#8) needs the canonical repo identity from each segment, so
-    // segmentation runs first. Heartbeat-only because semantic_segments
-    // has no honest mid-flight counter.
+    // segmentation runs first. Progress denominator = entry count so
+    // operators see real percentage during long rescans (pass-4 UX
+    // follow-up to D-2-cluster).
     // ──────────────────────────────────────────────────────────────────
-    let segment_phase = aicx::progress::Phase::start(reporter.clone(), "segment", None);
+    let segment_total = all_entries.len() as u64;
+    let segment_phase =
+        aicx::progress::Phase::start(reporter.clone(), "segment", Some(segment_total));
     let segments = {
         let hb = aicx::progress::Heartbeat::spawn_with_backoff(
             segment_phase.clone(),
             std::time::Duration::from_secs(2),
             std::time::Duration::from_secs(60),
         );
-        let result = aicx::segmentation::semantic_segments(&all_entries);
+        let result =
+            aicx::segmentation::semantic_segments_with_progress(&all_entries, |processed| {
+                hb.raise_floor(processed as u64)
+            });
         hb.stop();
         result
     };
