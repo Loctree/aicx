@@ -3859,6 +3859,19 @@ Outcome:
             // distributed across many (session, chunk) buckets so the bucket
             // index keeps each lookup O(1). The previous O(N²) shape on this
             // input ran ~100M comparisons.
+            //
+            // The threshold guards against quadratic regression, not micro-
+            // benchmarks the runner's TSC. Run the dedup three times on
+            // independent clones and take the median elapsed; assert against
+            // a generous 500ms cap. Rationale:
+            //
+            //  * Linear (current) implementation lands well under 100ms on
+            //    every runner we've measured (M-series Mac, x86_64 Linux CI).
+            //  * Quadratic regression on N=10k explodes to multiple seconds,
+            //    so 500ms still catches it with ~5x safety margin.
+            //  * Median-of-3 smooths the one-in-a-while shared-runner load
+            //    spike (the prior `< 200ms` cap tripped on a 201.98ms outlier
+            //    on macos-self-hosted while linux passed the same test).
             let mut records = Vec::with_capacity(10_000);
             for i in 0..5_000 {
                 let session = format!("s{:04}", i % 250);
@@ -3879,17 +3892,25 @@ Outcome:
             }
             assert_eq!(records.len(), 10_000);
 
-            let start = std::time::Instant::now();
-            drop_truncated_duplicate_records(&mut records);
-            let elapsed = start.elapsed();
+            let mut samples: Vec<std::time::Duration> = Vec::with_capacity(3);
+            let mut last_result: Vec<IntentRecord> = Vec::new();
+            for _ in 0..3 {
+                let mut run = records.clone();
+                let start = std::time::Instant::now();
+                drop_truncated_duplicate_records(&mut run);
+                samples.push(start.elapsed());
+                last_result = run;
+            }
+            samples.sort();
+            let median = samples[1];
 
             assert!(
-                elapsed.as_millis() < 200,
-                "dedup must run in < 200ms on 10k records (got {elapsed:?}) — quadratic regression suspected"
+                median.as_millis() < 500,
+                "dedup must run in < 500ms (median of 3) on 10k records (got {median:?}; samples {samples:?}) — quadratic regression suspected"
             );
-            assert_eq!(records.len(), 5_000);
+            assert_eq!(last_result.len(), 5_000);
             assert!(
-                records
+                last_result
                     .iter()
                     .all(|r| !r.summary.contains("...[truncated]"))
             );
