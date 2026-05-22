@@ -2431,24 +2431,27 @@ mod tests {
             panic!("non-numeric pid in {}: {:?}", pid_file.display(), pid_text)
         });
 
-        // Poll for the child to disappear. `kill(0)` returns 0 while the
-        // process is alive and -1/ESRCH once it is gone. With
-        // `kill_on_drop(true)` the runtime sends SIGKILL almost
-        // immediately after the timeout error; we allow ~2s of slack so
-        // CI noise does not cause false failures.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let mut alive = true;
+        // Poll for the child to be killed. `kill(0)` returns 0 while the
+        // process exists (running OR zombie) and -1/ESRCH once it has
+        // been reaped. On Linux self-hosted CI the reaper can lag a few
+        // seconds, and a SIGKILLed child sits in zombie state until its
+        // tokio runtime parent waits on it. We therefore treat
+        //   * `kill(0) == -1` (reaped) OR
+        //   * `/proc/<pid>/status` reporting state `Z` / `X` (zombie/dead)
+        // as success. Otherwise the child is genuinely still running and
+        // `kill_on_drop` is the regression.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut killed = false;
         while std::time::Instant::now() < deadline {
-            let rc = unsafe { libc::kill(pid, 0) };
-            if rc == -1 {
-                alive = false;
+            if memex_child_is_dead_or_zombie(pid) {
+                killed = true;
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
 
         let _ = std::fs::remove_file(&pid_file);
-        if alive {
+        if !killed {
             // Best-effort cleanup so a regression does not leave the
             // sleeping shell behind in the test runner.
             unsafe {
@@ -2459,6 +2462,34 @@ mod tests {
                 pid
             );
         }
+    }
+
+    /// Return true when `pid` is either reaped (`kill(0)` -> ESRCH) or
+    /// observable as a zombie / dying process on Linux. Used by the
+    /// kill_on_drop regression test to tolerate the SIGKILL → reap lag
+    /// that surfaces on slow CI runners without weakening the contract
+    /// (a process that is still actively running fails the check).
+    #[cfg(unix)]
+    fn memex_child_is_dead_or_zombie(pid: i32) -> bool {
+        let rc = unsafe { libc::kill(pid, 0) };
+        if rc == -1 {
+            return true; // ESRCH — process gone (reaped).
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+                for line in status.lines() {
+                    if let Some(state) = line.strip_prefix("State:\t") {
+                        // First token is the single-letter state: R, S, D,
+                        // T, t, Z, X, I. Z = zombie, X = dead. Both mean
+                        // SIGKILL landed and the child is on its way out.
+                        let letter = state.chars().next().unwrap_or('?');
+                        return letter == 'Z' || letter == 'X';
+                    }
+                }
+            }
+        }
+        false
     }
 
     #[test]
