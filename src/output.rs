@@ -15,7 +15,7 @@ use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -498,12 +498,15 @@ fn find_last_sync_timestamp(path: &Path) -> Result<Option<DateTime<Utc>>> {
     let validated = sanitize::validate_read_path(path)?;
     // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
     let file = File::open(&validated)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
 
     let mut last_sync: Option<DateTime<Utc>> = None;
 
-    for line in reader.lines() {
-        let line = line?;
+    while let Some(line) = sanitize::read_line_capped(&mut reader, sanitize::MAX_VALIDATED_BYTES)? {
+        if line.exceeded {
+            continue;
+        }
+        let line = line.line.trim_end_matches(['\r', '\n']);
         if let Some(ts) = line
             .strip_prefix("<!-- sync: ")
             .and_then(|s| s.strip_suffix(" -->"))
@@ -1981,6 +1984,25 @@ mod tests {
             rfind_subslice(&tail, STRIP_FOOTER_MARKER).is_none(),
             "marker must be absent from the trimmed file's tail"
         );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_find_last_sync_timestamp_skips_oversized_line_and_advances() {
+        let dir = unique_test_dir("sync_oversized");
+        let path = dir.join("timeline.md");
+        let expected = "2026-05-22T03:00:00Z";
+        let mut content = "x".repeat(crate::sanitize::MAX_VALIDATED_BYTES + 1);
+        content.push('\n');
+        content.push_str(&format!("<!-- sync: {expected} -->\n"));
+        fs::write(&path, content).unwrap();
+
+        let found = find_last_sync_timestamp(&path).unwrap();
+        let expected = chrono::DateTime::parse_from_rfc3339(expected)
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(found.unwrap(), expected);
         cleanup(&dir);
     }
 }

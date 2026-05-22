@@ -26,7 +26,7 @@ use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::io::{self, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
@@ -2715,8 +2715,14 @@ fn read_codex_session_meta_id(path: &Path) -> Option<String> {
     // Route through the project-wide validated opener so symlink/path-safety
     // guarantees apply uniformly to every place that ingests Codex rollouts.
     let file = aicx::sanitize::open_file_validated(path).ok()?;
-    let reader = BufReader::new(file);
-    for line in reader.lines().map_while(std::result::Result::ok) {
+    let mut reader = BufReader::new(file);
+    while let Ok(Some(line)) =
+        aicx::sanitize::read_line_capped(&mut reader, aicx::sanitize::MAX_VALIDATED_BYTES)
+    {
+        if line.exceeded {
+            continue;
+        }
+        let line = line.line;
         if !line.contains("\"session_meta\"") {
             continue;
         }
