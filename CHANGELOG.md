@@ -7,15 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Breaking
 
-- state.json hash algorithm migrated from `siphash13-v1` to
-  `blake3-128-v1`. The dedup cache (`seen_hashes`) is cleared on first
-  load after upgrade; `aicx store` will re-process the recent `-H`
-  window once. No data loss, but timeline may show duplicates if a
-  parallel ingest is running.
-- state.json hash algorithm bumped from `blake3-128-v1` to
-  `blake3-128-v2` (added field separator to close hash-splitting risk;
-  implemented as length-prefixed field encoding). Same one-time
-  `seen_hashes` reset behavior as the prior migration.
+- state.json hash algorithm is now `blake3-128-v2` with length-prefixed
+  field encoding (closes the raw-concat hash-splitting risk). Any older
+  state — including legacy `siphash13-v1` (introduced in pass-2 G-1) and
+  any interim `blake3-128-v1` builds — is treated as a legacy cache:
+  current code migrates directly to `v2` on load and clears
+  `seen_hashes` once. After upgrade, the first `aicx store` will
+  re-process the recent `-H` window once. No data loss, but timeline
+  may show duplicates if a parallel ingest is running.
 
 ### Added
 - `aicx extract` batch conversation export command for emitting multiple

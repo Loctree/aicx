@@ -7,7 +7,7 @@ This is the piece that makes the tool useful for:
 - fast onboarding for new agents,
 - avoiding “paste 4000 lines of history” prompts.
 
-Implementation lives in `src/chunker.rs`.
+Implementation lives in `crates/aicx-parser/src/chunker.rs`.
 
 ## Chunk Model
 
@@ -35,7 +35,7 @@ high-signal marker (checklist items, intent lines, results, or keyword-based hig
 
 ## Tuning Knobs
 
-Defaults (see `ChunkerConfig::default()` in `src/chunker.rs`):
+Defaults (see `ChunkerConfig::default()` in `crates/aicx-parser/src/chunker.rs`):
 - `target_tokens=1500`
 - `min_tokens=500`
 - `max_tokens=2500`
@@ -49,7 +49,7 @@ Practical guidance:
 ## Signals + Highlight Extraction
 
 Chunks compute lightweight “signals” and “highlights” (see `extract_signals` and
-`extract_highlights` in `src/chunker.rs`).
+`extract_highlights` in `crates/aicx-parser/src/chunker.rs`).
 
 Signals (persisted in the chunk text as `[signals]...[/signals]`):
 - TODO checklist extraction (`- [ ]`, `- [x]`) with a prominent "RED LIGHT" marker when open items exist
@@ -80,4 +80,4 @@ The current chunker is correct and tested, but there are clear performance wins 
 3. Replace the per-date `BTreeMap` grouping with a single-pass scan of already-sorted entries.
 4. Reduce per-chunk string work in hot paths (chunk IDs and text builders).
 
-If you implement these, keep tests in `src/chunker.rs` as the behavioral contract.
+If you implement these, keep tests in `crates/aicx-parser/src/chunker.rs` as the behavioral contract.

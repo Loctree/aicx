@@ -1327,7 +1327,8 @@ fn empty_body_quarantine_root(base: &Path, timestamp: &str) -> PathBuf {
 }
 
 fn empty_body_quarantine_timestamp() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    // Match `quarantine_bucket` pattern; RFC3339 with `:` breaks Windows path components.
+    chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string()
 }
 
 pub fn render_rebuild_sidecars_script(base: &Path) -> Result<String> {

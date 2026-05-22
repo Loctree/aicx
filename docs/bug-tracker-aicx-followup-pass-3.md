@@ -1188,3 +1188,116 @@ _Pass-3 plan written 2026-05-21 by Claude operator-agent after Plan A
 (PR #5 follow-up commits `2fb1ccf` + `d2c30aa`) landed. Read with
 `vc-init` / `vc-scaffold` at next session start to validate against
 then-current HEAD before dispatching._
+
+---
+
+# Pass-3 Closure Status (polarized SSOT)
+
+> **Authoritative truth for pass-3 closure.** This block is the
+> single source of truth for "what landed, what was deferred, what
+> is still open" for pass-3. Generated 2026-05-22 by `vc-polarize`
+> after the `vc-audit` falsification pass against branch
+> `fix/bug-tracker-aicx-pass-3` @ `b204ea6`. Where this block
+> disagrees with merge-commit titles, CHANGELOG narrative, or
+> BUGFIXES entries, **this block wins** — those surfaces must be
+> aligned to it on the next pass.
+>
+> Audit evidence:
+> `~/.vibecrafted/artifacts/Loctree/aicx/2026_0521/reports/20260521_235027_20260521_2350_perform-the-vc-audit-skill-on-this-repository__claude.md`
+>
+> Prism score: 13/15 (doctrine band).
+
+## Verdict counts
+
+| Verdict                          | Count |
+| -------------------------------- | ----- |
+| PASS                             | 26    |
+| PASS_WITH_GAPS                   | 9     |
+| STAGE_PASS                       | 1     |
+| PARTIAL                          | 1     |
+| FULL_PLAN_INCOMPLETE_BY_DESIGN   | 3     |
+| FAIL                             | 0     |
+| UNVERIFIED                       | 0     |
+| **Total task IDs**               | **41**|
+
+## What landed (PASS)
+
+J-1, J-2, J-3, J-4, J-5, J-6, J-7, K-1, K-2, M-1, M-5, M-6, M-7, M-8,
+M-9, M-12, M-14, M-15, M-16, M-17, M-20, M-21, M-22, M-23, N-2, N-3,
+N-4, N-6, N-8, N-9, N-10, N-11, N-12.
+
+## What landed but tests are thin (PASS_WITH_GAPS, P2/P3)
+
+| Task | Gap | Closure action |
+| ---- | --- | -------------- |
+| M-2  | Rate-limit code present, no 429 regression test | Add bounded 429 test |
+| M-3  | Origin/Referer enforced, no 403-without-Origin unit test | Add unit test |
+| M-4  | Clamped-limit signal header sent, no header unit test | Add header unit test |
+| M-10 | `.expect(...)` documents mutex poisoning, does **not** recover; "recovery path test" sub-clause unmet | Add poisoned-mutex recovery test or accept descriptive-only stance and amend the plan |
+| M-11 | `to_string` error propagated, no NaN-score MCP response test | Add NaN unit test |
+| M-18 | Self-heal save path present, no corrupt-primary regression test | Add corrupt-primary test |
+| M-19 | `lru 0.12.5` (RUSTSEC-2026-0002) still transitively pinned; ignored with documented rationale in `cargo-audit.toml`. Acceptable per task wording | Re-audit when rust-memex/Lance/Tantivy upgrade |
+| N-1  | 4 listed groups swept; `docs/DISTILLATION.md` was a 5th surface — closed 2026-05-22 by polarize cut (this commit) | None — closed in this pass |
+| N-7  | `RE_JWT` tightened, no curated FPR corpus test | Add curated-corpus test |
+
+## What was explicitly deferred by design (FULL_PLAN_INCOMPLETE_BY_DESIGN)
+
+| Task | Why deferred | Next step |
+| ---- | ------------ | --------- |
+| **M-13** | CSP nonce / response-header CSP / headless browser test exceeded the pass-3 H-2 scope. Decision documented in commit body of `cff619f`: _"Document M-13 CSP nonce/header scope overflow for a follow-up instead of landing a partial meta-only fix."_ Scope-overflow artifact: `~/.vibecrafted/artifacts/Loctree/aicx/2026_0522/bugtracker-aicx-pass-3/reports/H-2_M-7-to-M-13-quality_scope-overflow.md`. `src/dashboard.rs:269` still carries `'unsafe-inline'` for `script-src` and `style-src`. | Schedule as pass-3.5 or fold into next Wave J |
+| **L-2** | Operator-runtime task; `aicx store --full-rescan` must be executed against canonical operator store. Pass-3 plan defined it as operator-side smoke, not in-code work. `docs/BACKLOG.md:33` still records 188 orphan + 40 missing tuples | Operator runs `aicx store --full-rescan`, updates BACKLOG.md with post-run counters |
+| **L-3** | Cross-repo (vibecrafted A13). Out of aicx repo scope | Lands in vibecrafted-runtime-pass-1 |
+
+## What is partial in code (PARTIAL)
+
+| Task | Status | Next step |
+| ---- | ------ | --------- |
+| **N-5** | Codex added a doc-comment "Keep aligned" but the two crates still carry independent date-shape heuristics: `src/state/migration.rs::looks_like_compact_store_date_name` vs `crates/aicx-parser/src/segmentation.rs::is_probably_repo_name`. Doc-alignment is not de-duplication | Extract shared helper into a small shared crate or copy with a single explicit test that binds both paths to the same fixtures |
+
+## What is staged but unverified at HEAD
+
+A parallel actor modified `CHANGELOG.md`, `src/doctor.rs`, `src/redact.rs`,
+`src/state.rs` during the audit window (dirty-tree at audit time).
+These edits are **not** part of pass-3 closure narrative; the operator
+must triage them independently and assign them to pass-4 or a hotfix
+chain. They do not invalidate any verdict in this block.
+
+## Merge-commit narrative correction
+
+Merge commit `479b875` titled
+_"merge: pass-3 area M+N — P2 quality + P3 hygiene batch (M-1..M-22 + N-2..N-10)"_
+implies M-13 landed. **It did not.** The commit body parenthetically
+admits the deferral but the title is what `git log --oneline`
+readers will see. Do not amend the published commit; instead, treat
+**this Pass-3 Closure Status block** as the authoritative narrative
+and link to it from any release-notes / PR description that cites
+pass-3 completion.
+
+## Regression contract (polarize doctrine band)
+
+Future agents touching pass-3 surfaces must:
+
+1. Read this Closure Status block before claiming any pass-3 task as
+   "done."
+2. Not re-promote a `FULL_PLAN_INCOMPLETE_BY_DESIGN` task to PASS via
+   a commit title without first landing the deferred work in code.
+3. Treat `docs/BACKLOG.md:33` (L-2) and `src/dashboard.rs:269`
+   (M-13) as live runtime witnesses; if they are unchanged, the
+   corresponding task is unchanged.
+4. When adding regression tests for the PASS_WITH_GAPS table, mark
+   the gap closed here, not only in BUGFIXES.md.
+
+## Rejected polarization alternatives (recorded for audit trail)
+
+- **"Merge-commit titles are the source of truth."** Rejected:
+  `479b875` overstates scope (M-13). Titles describe intent at commit
+  time, not closure-truth.
+- **"Code reality is enough; no doc fix needed."** Rejected: future
+  `git log` readers and release-notes authors will be misled. The
+  polarize cut is exactly to give them an SSOT they can cite.
+- **"Block pass-3 closure until M-13 lands."** Rejected: M-13 was
+  explicitly deferred-by-design with a scope-overflow artifact;
+  gating closure on it would invalidate honest deferral as a
+  practice.
+- **"Average the two narratives."** Forbidden by polarize doctrine
+  (`SKILL.md` Anti-Patterns).

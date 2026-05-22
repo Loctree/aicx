@@ -242,29 +242,16 @@ pub fn redact_secrets(text: &str) -> String {
 }
 
 fn redact_gcp_service_account_fields(text: &str) -> Cow<'_, str> {
-    let mut out = Cow::Borrowed(text);
-
-    if RE_GCP_PRIVATE_KEY_ID_FIELD.is_match(out.as_ref()) {
-        out = Cow::Owned(
-            RE_GCP_PRIVATE_KEY_ID_FIELD
-                .replace_all(out.as_ref(), |caps: &Captures| {
-                    redact_json_string_field(caps, "[REDACTED_GCP_PRIVATE_KEY_ID]")
-                })
-                .into_owned(),
-        );
+    // `replace_all` returns `Cow::Borrowed` when no match — chain without redundant is_match probes.
+    let intermediate = RE_GCP_PRIVATE_KEY_ID_FIELD.replace_all(text, |caps: &Captures| {
+        redact_json_string_field(caps, "[REDACTED_GCP_PRIVATE_KEY_ID]")
+    });
+    match RE_GCP_CLIENT_EMAIL_FIELD.replace_all(intermediate.as_ref(), |caps: &Captures| {
+        redact_json_string_field(caps, "[REDACTED_GCP_CLIENT_EMAIL]")
+    }) {
+        Cow::Borrowed(_) => intermediate,
+        Cow::Owned(s) => Cow::Owned(s),
     }
-
-    if RE_GCP_CLIENT_EMAIL_FIELD.is_match(out.as_ref()) {
-        out = Cow::Owned(
-            RE_GCP_CLIENT_EMAIL_FIELD
-                .replace_all(out.as_ref(), |caps: &Captures| {
-                    redact_json_string_field(caps, "[REDACTED_GCP_CLIENT_EMAIL]")
-                })
-                .into_owned(),
-        );
-    }
-
-    out
 }
 
 fn redact_json_string_field(caps: &Captures, replacement: &str) -> String {

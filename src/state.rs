@@ -405,12 +405,14 @@ impl StateManager {
     }
 
     fn stable_hash_fields(fields: &[&[u8]]) -> String {
-        let mut data = Vec::new();
+        // Incremental blake3 hashing avoids intermediate Vec allocation for large messages.
+        let mut hasher = blake3::Hasher::new();
         for field in fields {
-            data.extend_from_slice(&(field.len() as u64).to_le_bytes());
-            data.extend_from_slice(field);
+            hasher.update(&(field.len() as u64).to_le_bytes());
+            hasher.update(field);
         }
-        migration::stable_blake3_128(&data)
+        // 128-bit prefix (16 bytes = 32 hex chars) — matches `migration::stable_blake3_128` contract.
+        hex::encode(&hasher.finalize().as_bytes()[..16])
     }
 
     /// Returns `true` if this hash has NOT been seen before for the given project.
