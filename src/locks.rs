@@ -15,6 +15,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Default lock wait budget. Pass-2 raised this from 5s to 60s to avoid false
+/// failures during slow store/index operations, accepting a longer visible
+/// freeze when a lock holder is genuinely stuck.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 const STALE_AFTER: Duration = Duration::from_secs(60);
 const RETRY_DELAY: Duration = Duration::from_millis(25);

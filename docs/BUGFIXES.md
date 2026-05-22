@@ -1890,3 +1890,60 @@ memex smoke nie był możliwy; test repo weryfikuje sam spawn/env contract przez
 **Related.** Closes M-19, M-20, M-21, M-22 z
 `docs/bug-tracker-aicx-followup-pass-3.md`; pass-3 N-10 zostaje user-facing
 known-issue follow-upem dla RSA Marvin statusu.
+
+---
+
+## 2026-05-22 — P3 hygiene sweep: config, regex, docs, redact (N-2..N-10) · `this I-1 commit`
+
+**Symptom.** Pass-3 zostawił osiem P3 hygiene itemów: dashboard cross-search
+memex timeout był zakodowany na 30s, defensywne saturating arithmetic nie miało
+komentarza, date-dir heuristic w state migration był shape-only bez opisu,
+JWT redaction była zbyt szeroka, brakowało Stripe `whsec_*`, lock timeout 60s
+nie miał rationale, a user-facing changelog nie mówił o transitive RSA Marvin
+statusie.
+
+**Root cause.** To nie były pojedyncze runtime awarie, tylko małe drift-punkty:
+konfiguracja siedziała w literalach, shape-only heurystyki były rozproszone po
+state migration i parser segmentation, a redaction lookup-set i replacement
+pipeline nie miały pełnego Stripe webhook coverage.
+
+**Fix.**
+- N-2: `DashboardServerConfig.memex_timeout_secs` + CLI
+  `--memex-timeout-secs` z domyślnym 30s; background dashboard spawn propaguje
+  override.
+- N-3: komentarz przy `parse_relative_time` wyjaśnia saturating arithmetic na
+  adversarial input.
+- N-4/N-5: `looks_like_date_dir` ma doc-comment z edge-case'ami, prywatny
+  shape helper i test; parser `looks_like_date_pattern` dokumentuje alignment
+  compact `YYYY_MMDD` semantics.
+- N-7/N-8: JWT regex dostał bardziej typowe segment length bounds, false-positive
+  fixtures zostają niezmienione, a `whsec_*` trafia do lookup-setu i replacement
+  pipeline.
+- N-9/N-10: lock timeout rationale opisany przy const; CHANGELOG ma `Known
+  Issues` dla RSA Marvin Attack jako optional `rust-memex` transitive surface.
+- N-11: `docs/BACKLOG.md` dostał `[prview] cargo geiger timeout 600s` jako
+  upstream/out-of-scope item.
+
+**Touched.**
+- `src/dashboard_server.rs` — memex timeout config + saturating comment + tests.
+- `src/main.rs` — dashboard CLI timeout flag + background propagation + parse tests.
+- `src/state/migration.rs` — compact date-dir heuristic docs/helper/test.
+- `crates/aicx-parser/src/segmentation.rs` — shared semantics documentation.
+- `src/redact.rs` — JWT bounds + Stripe webhook secret redaction tests.
+- `src/locks.rs` — default timeout rationale.
+- `CHANGELOG.md`, `docs/BACKLOG.md` — user-facing known issue + upstream backlog.
+
+**Tests.** Added targeted unit coverage for dashboard timeout CLI parsing,
+compact date-dir semantics, JWT false-positive non-redaction, and Stripe webhook
+secret redaction. Full gate results recorded in the I-1 worker report.
+
+**Lessons.**
+- Same-commit BUGFIXES entries cannot embed their final Git SHA without a
+  self-referential hash problem; use the existing `this <wave> commit` convention
+  in-file and put the concrete SHA in the dispatch report.
+- Redaction fast-path `RegexSet` must stay in lockstep with every replacement
+  regex, otherwise a new detector may never run.
+
+**Related.** Closes N-2, N-3, N-4, N-5, N-7, N-8, N-9, N-10 z
+`docs/bug-tracker-aicx-followup-pass-3.md`; N-11 tracked in `docs/BACKLOG.md`
+as out-of-scope upstream prview-rs work.

@@ -179,14 +179,23 @@ fn discover_store_buckets(store_root: &Path) -> Result<Vec<String>> {
     Ok(buckets)
 }
 
+/// Returns true for canonical compact store date directories (`YYYY_MMDD`,
+/// e.g. `2026_0521`) so migration bucket discovery skips day buckets.
+///
+/// Shape-only by design: impossible calendar values like `2026_9999` still
+/// count as date-shaped, while full forms (`2026-05-21`, `2026_05_21`) or
+/// names with prefixes/suffixes do not. Keep the `YYYY_MMDD` arm aligned with
+/// `crates/aicx-parser` repo-name date rejection.
 fn looks_like_date_dir(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            name.len() == 9
-                && name.as_bytes().get(4) == Some(&b'_')
-                && name.chars().filter(|ch| ch.is_ascii_digit()).count() == 8
-        })
+        .is_some_and(looks_like_compact_store_date_name)
+}
+
+fn looks_like_compact_store_date_name(name: &str) -> bool {
+    name.len() == 9
+        && name.as_bytes().get(4) == Some(&b'_')
+        && name.chars().filter(|ch| ch.is_ascii_digit()).count() == 8
 }
 
 #[cfg(test)]
@@ -224,5 +233,20 @@ mod tests {
             let hash = stable_blake3_128(input.as_bytes());
             assert!(hashes.insert(hash));
         }
+    }
+
+    #[test]
+    fn looks_like_date_dir_matches_compact_store_bucket_shape() {
+        assert!(looks_like_date_dir(Path::new("/store/Org/Repo/2026_0521")));
+        assert!(looks_like_date_dir(Path::new("/store/Org/Repo/2026_9999")));
+        assert!(!looks_like_date_dir(Path::new(
+            "/store/Org/Repo/2026-05-21"
+        )));
+        assert!(!looks_like_date_dir(Path::new(
+            "/store/Org/Repo/2026_05_21"
+        )));
+        assert!(!looks_like_date_dir(Path::new(
+            "/store/Org/Repo/release-2026_0521"
+        )));
     }
 }

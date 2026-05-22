@@ -69,7 +69,7 @@ fn extract_outputs_do_not_leak_modern_secret_families() {
             "eyJ{}.eyJ{}.{}",
             chars('J', 12),
             chars('K', 12),
-            chars('L', 16)
+            chars('L', 43)
         ),
         format!("sk_live_{}", chars('M', 24)),
         format!("sk_test_{}", chars('N', 24)),
