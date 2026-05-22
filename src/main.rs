@@ -3299,31 +3299,46 @@ const INCREMENTAL_LEGACY_NOTE: &str =
 const LEGACY_ALL_WATERMARK_AGENTS: &[&str] = &["claude", "codex", "gemini", "junie", "codescribe"];
 const LEGACY_ALL_WATERMARK_KEY: &str = "claude+codex+gemini+junie";
 
-fn extraction_source_key(agents: &[&str], project: &[String]) -> String {
-    let agent_key = if agents == LEGACY_ALL_WATERMARK_AGENTS {
+fn normalized_source_key_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut normalized = parts
+        .into_iter()
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    normalized.sort_unstable();
+    normalized
+}
+
+fn normalized_project_source_key(project: &[String]) -> String {
+    if project.is_empty() {
+        "all".to_string()
+    } else {
+        normalized_source_key_parts(project.iter().map(String::as_str)).join("+")
+    }
+}
+
+fn normalized_agent_source_key(agents: &[&str]) -> String {
+    let normalized_agents = normalized_source_key_parts(agents.iter().copied());
+    let legacy_all_agents =
+        normalized_source_key_parts(LEGACY_ALL_WATERMARK_AGENTS.iter().copied());
+    if normalized_agents == legacy_all_agents {
         LEGACY_ALL_WATERMARK_KEY.to_string()
     } else {
-        agents.join("+")
-    };
-    format!(
-        "{}:{}",
-        agent_key,
-        if project.is_empty() {
-            "all".to_string()
-        } else {
-            project.join("+")
-        }
-    )
+        normalized_agents.join("+")
+    }
+}
+
+fn extraction_source_key(agents: &[&str], project: &[String]) -> String {
+    let agent_key = normalized_agent_source_key(agents);
+    let project_key = normalized_project_source_key(project);
+    format!("{agent_key}:{project_key}")
 }
 
 fn extraction_source_key_aliases(agents: &[&str], project: &[String]) -> Vec<String> {
-    let project_key = if project.is_empty() {
-        "all".to_string()
-    } else {
-        project.join("+")
-    };
+    let project_key = normalized_project_source_key(project);
     let mut aliases = Vec::new();
-    if agents == LEGACY_ALL_WATERMARK_AGENTS {
+    if normalized_source_key_parts(agents.iter().copied())
+        == normalized_source_key_parts(LEGACY_ALL_WATERMARK_AGENTS.iter().copied())
+    {
         aliases.push(format!(
             "claude+codex+gemini+junie+codescribe:{project_key}"
         ));
@@ -5548,9 +5563,17 @@ fn dedup_steer_metadata(metadatas: &mut Vec<serde_json::Value>) {
     });
 }
 
+fn refs_cutoff(hours: u64) -> std::time::SystemTime {
+    if hours == 0 {
+        std::time::UNIX_EPOCH
+    } else {
+        std::time::SystemTime::now() - std::time::Duration::from_secs(hours.saturating_mul(3600))
+    }
+}
+
 /// List chunks in the canonical store, filtered by recency.
 fn run_refs(hours: u64, project: Option<String>, emit: RefsEmit, strict: bool) -> Result<()> {
-    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
+    let cutoff = refs_cutoff(hours);
     let mut files = store::context_files_since(cutoff, project.as_deref())?;
     if strict {
         files.retain(|file| !is_noise_artifact(&file.path));
@@ -6260,6 +6283,46 @@ mod tests {
             cutoff,
             all_time_cutoff(),
             "hours=0 must collapse to the Unix-epoch all-time sentinel"
+        );
+    }
+
+    #[test]
+    fn test_refs_cutoff_zero_returns_unix_epoch() {
+        let cutoff = crate::refs_cutoff(0);
+        assert_eq!(
+            cutoff,
+            std::time::UNIX_EPOCH,
+            "hours=0 must collapse to UNIX_EPOCH"
+        );
+    }
+
+    #[test]
+    fn test_extraction_source_key_is_order_insensitive() {
+        let project_a = vec!["a".to_string(), "b".to_string()];
+        let project_b = vec!["b".to_string(), "a".to_string()];
+
+        assert_eq!(
+            extraction_source_key(LEGACY_ALL_WATERMARK_AGENTS, &project_a),
+            extraction_source_key(LEGACY_ALL_WATERMARK_AGENTS, &project_b)
+        );
+        assert_eq!(
+            extraction_source_key_aliases(LEGACY_ALL_WATERMARK_AGENTS, &project_a),
+            extraction_source_key_aliases(LEGACY_ALL_WATERMARK_AGENTS, &project_b)
+        );
+    }
+
+    #[test]
+    fn test_extraction_source_key_is_case_insensitive() {
+        let project_a = vec!["Foo".to_string()];
+        let project_b = vec!["foo".to_string()];
+
+        assert_eq!(
+            extraction_source_key(LEGACY_ALL_WATERMARK_AGENTS, &project_a),
+            extraction_source_key(LEGACY_ALL_WATERMARK_AGENTS, &project_b)
+        );
+        assert_eq!(
+            extraction_source_key_aliases(LEGACY_ALL_WATERMARK_AGENTS, &project_a),
+            extraction_source_key_aliases(LEGACY_ALL_WATERMARK_AGENTS, &project_b)
         );
     }
 
