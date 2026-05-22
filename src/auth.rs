@@ -15,7 +15,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
-use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -126,9 +125,8 @@ pub fn load_auth_config(cli_token: Option<&str>, require_auth: bool) -> Result<A
 
 fn generate_token() -> Result<String> {
     let mut buf = [0u8; 32];
-    let mut file =
-        std::fs::File::open("/dev/urandom").context("Open /dev/urandom for token entropy")?;
-    file.read_exact(&mut buf).context("Read /dev/urandom")?;
+    getrandom::fill(&mut buf)
+        .map_err(|err| anyhow!("Generate random bytes for auth token: {err}"))?;
     Ok(hex_encode(&buf))
 }
 
@@ -239,6 +237,18 @@ mod tests {
         unsafe {
             std::env::remove_var("AICX_HTTP_AUTH_TOKEN");
         }
+    }
+
+    #[test]
+    fn test_generate_token_shape_and_uniqueness_sanity() {
+        let first = generate_token().expect("generate first token");
+        let second = generate_token().expect("generate second token");
+
+        assert_eq!(first.len(), 64, "32 bytes hex-encoded = 64 chars");
+        assert_eq!(second.len(), 64, "32 bytes hex-encoded = 64 chars");
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(second.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second, "two CSPRNG tokens should differ");
     }
 
     #[test]

@@ -69,6 +69,7 @@ dependencies = [
  "dirs",
  "filetime",
  "futures",
+ "getrandom 0.3.4",
  "globset",
  "http-body-util",
  "indicatif",

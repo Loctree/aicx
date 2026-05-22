@@ -1752,3 +1752,38 @@ więc ruchomy GHCR tag siedział bezpośrednio na ścieżce publikacji Linux ass
 
 **Related.** J-2 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows
 `9d1a9c1` (B-1 release SHA256SUMS).
+
+## 2026-05-22 — auth token CSPRNG portability (J-3) · `pending-this-commit`
+
+**Symptom.** `src/auth.rs::generate_token` otwierał `/dev/urandom` bezpośrednio.
+Na Linux/macOS dawało to 32 bajty entropii, ale na Windows ścieżka nie istnieje,
+więc wygenerowanie tokenu auth kończyłoby się błędem runtime.
+
+**Root cause.** Generator tokenu był powiązany z unixowym device file zamiast
+używać cross-platformowego OS CSPRNG API. Kontrakt 256-bit pozostał poprawny
+tylko na systemach z `/dev/urandom`.
+
+**Fix.**
+- `Cargo.toml`: dodano jawne `getrandom = "0.3"` jako bezpośredni kontrakt
+  dependency dla auth-token entropy.
+- `src/auth.rs`: `generate_token` używa `getrandom::fill(&mut buf)` z kontekstem
+  błędu, zachowując 32-bajtowy bufor i istniejący `hex_encode` pipeline.
+- Usunięto import `std::io::Read`, bo direct file read nie jest już potrzebny.
+
+**Touched.**
+- `Cargo.toml` — direct dependency `getrandom`.
+- `src/auth.rs` — `generate_token` entropy source + unit test.
+
+**Tests.** Dodano `test_generate_token_shape_and_uniqueness_sanity`: dwa tokeny
+mają po 64 znaki hex i kolejne wywołania dają różne wartości. Pełne gates J-3
+zapisuje raport B-3.
+
+**Lessons.**
+- Auth-token entropy source powinno być API-level OS CSPRNG contract, nie
+  platform-specific path. `/dev/urandom` wygląda prosto, ale koduje Unix-only
+  runtime assumption.
+- Finalny commit SHA jest znany dopiero po commicie; raport B-3 zapisuje finalny
+  SHA dla tej pozycji J-3.
+
+**Related.** J-3 z `docs/bug-tracker-aicx-followup-pass-3.md`, follows
+`9d1a9c1` (B-1 release SHA256SUMS) + `643fa4c` (B-2 Cross.toml pin).
