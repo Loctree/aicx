@@ -17,7 +17,7 @@ use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, 
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -41,12 +41,6 @@ const UNPROTECTED_SOURCE_WARNING: &str = "unprotected source material; run `aicx
 const EXACT_SHORT_DUP_MAX_CHARS: usize = 1000;
 const EXACT_SHORT_DUP_WINDOW_MS: i64 = 2_000;
 const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
-
-#[derive(Debug)]
-struct LimitedLine {
-    line: String,
-    exceeded: bool,
-}
 
 #[derive(Debug, Clone)]
 pub struct ConversationProjection {
@@ -157,50 +151,13 @@ fn drop_exact_short_user_duplicates(messages: Vec<ConversationMessage>) -> Conve
     }
 }
 
-fn read_line_limited<R: BufRead>(
-    reader: &mut R,
-    max_bytes: usize,
-) -> io::Result<Option<LimitedLine>> {
-    let mut buf = Vec::new();
-    let read = {
-        let mut limited = reader.take(max_bytes.saturating_add(1) as u64);
-        limited.read_until(b'\n', &mut buf)?
-    };
-    if read == 0 {
-        return Ok(None);
-    }
-
-    let exceeded = buf.len() > max_bytes;
-    if exceeded {
-        let ended_at_newline = buf.last().copied() == Some(b'\n');
-        buf.truncate(max_bytes);
-        if !ended_at_newline {
-            drain_until_newline(reader)?;
-        }
-    }
-
-    let line =
-        String::from_utf8(buf).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    Ok(Some(LimitedLine { line, exceeded }))
-}
-
-fn drain_until_newline<R: BufRead>(reader: &mut R) -> io::Result<()> {
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            return Ok(());
-        }
-        let consume = available
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(available.len(), |idx| idx + 1);
-        let ended_at_newline = available.get(consume.saturating_sub(1)) == Some(&b'\n');
-        reader.consume(consume);
-        if ended_at_newline {
-            return Ok(());
-        }
-    }
-}
+// Note: line reading goes through `aicx_parser::sanitize::read_line_capped`,
+// which walks back past UTF-8 continuation bytes when an oversized line is
+// truncated. The previously-private `read_line_limited` here truncated at
+// the raw byte boundary and would surface `InvalidData` on any input where
+// `max_bytes` landed inside a multi-byte codepoint — that follow-up was
+// half-done (one call site already used the capped helper; the rest were
+// still on the legacy truncator).
 
 fn observe_oversized_line(count: &mut usize, samples: &mut Vec<String>, line_number: usize) {
     *count += 1;
@@ -1628,7 +1585,7 @@ fn parse_claude_jsonl_with_diagnostics(
     let mut fallback_ts_samples = Vec::new();
     let mut line_number = 0usize;
 
-    while let Some(limited) = read_line_limited(&mut reader, MAX_LINE_BYTES)? {
+    while let Some(limited) = sanitize::read_line_capped(&mut reader, MAX_LINE_BYTES)? {
         line_number += 1;
         if limited.exceeded {
             observe_oversized_line(&mut oversized_count, &mut oversized_samples, line_number);
@@ -1765,7 +1722,7 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
     let mut oversized_samples = Vec::new();
     let mut line_number = 0usize;
 
-    while let Some(limited) = read_line_limited(&mut reader, MAX_LINE_BYTES)? {
+    while let Some(limited) = sanitize::read_line_capped(&mut reader, MAX_LINE_BYTES)? {
         line_number += 1;
         if limited.exceeded {
             observe_oversized_line(&mut oversized_count, &mut oversized_samples, line_number);
@@ -2694,7 +2651,7 @@ pub fn extract_claude_history(config: &ExtractionConfig) -> Result<Vec<TimelineE
     let mut invalid_epoch_samples = Vec::new();
     let mut line_number = 0usize;
 
-    while let Some(limited) = read_line_limited(&mut reader, MAX_LINE_BYTES)? {
+    while let Some(limited) = sanitize::read_line_capped(&mut reader, MAX_LINE_BYTES)? {
         line_number += 1;
         if limited.exceeded {
             observe_oversized_line(&mut oversized_count, &mut oversized_samples, line_number);
@@ -2827,7 +2784,7 @@ pub fn extract_codex(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     let mut oversized_samples = Vec::new();
     let mut line_number = 0usize;
 
-    while let Some(limited) = read_line_limited(&mut reader, MAX_LINE_BYTES)? {
+    while let Some(limited) = sanitize::read_line_capped(&mut reader, MAX_LINE_BYTES)? {
         line_number += 1;
         if limited.exceeded {
             observe_oversized_line(&mut oversized_count, &mut oversized_samples, line_number);
@@ -3277,7 +3234,7 @@ fn parse_codex_session_file_with_diagnostics(
     let mut oversized_count = 0usize;
     let mut oversized_samples = Vec::new();
     let mut line_number = 0usize;
-    while let Some(limited) = read_line_limited(&mut reader, MAX_LINE_BYTES)? {
+    while let Some(limited) = sanitize::read_line_capped(&mut reader, MAX_LINE_BYTES)? {
         line_number += 1;
         if limited.exceeded {
             observe_oversized_line(&mut oversized_count, &mut oversized_samples, line_number);
@@ -3989,7 +3946,7 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
     let mut oversized_samples = Vec::new();
     let mut line_number = 0usize;
 
-    while let Some(limited) = read_line_limited(&mut reader, MAX_LINE_BYTES)? {
+    while let Some(limited) = sanitize::read_line_capped(&mut reader, MAX_LINE_BYTES)? {
         line_number += 1;
         if limited.exceeded {
             observe_oversized_line(&mut oversized_count, &mut oversized_samples, line_number);
@@ -5844,7 +5801,7 @@ fn count_codex_sessions(path: &std::path::Path) -> Result<usize> {
     let mut oversized_samples = Vec::new();
     let mut line_number = 0usize;
 
-    while let Some(limited) = read_line_limited(&mut reader, MAX_LINE_BYTES)? {
+    while let Some(limited) = sanitize::read_line_capped(&mut reader, MAX_LINE_BYTES)? {
         line_number += 1;
         if limited.exceeded {
             observe_oversized_line(&mut oversized_count, &mut oversized_samples, line_number);

@@ -490,7 +490,10 @@ enum ConfigAction {
 enum IndexAction {
     /// Show freshness and pending-corpus status for the semantic index.
     Status {
-        /// Repo or store-bucket filter (case-insensitive substring)
+        /// Strict project filter: `owner/repo`, `/repo` (cross-org repo
+        /// name), `owner/` (org wildcard), or `name` (matches org OR
+        /// repo). Substring matching is intentionally disabled — `-p vista`
+        /// no longer leaks into `vista-portal`/`vista-datasets`.
         #[arg(short, long)]
         project: Option<String>,
 
@@ -938,7 +941,10 @@ enum Commands {
         #[arg(short = 'H', long, default_value = "48")]
         hours: u64,
 
-        /// Repo or store-bucket filter (case-insensitive substring)
+        /// Strict project filter: `owner/repo`, `/repo` (cross-org repo
+        /// name), `owner/` (org wildcard), or `name` (matches org OR
+        /// repo). Substring matching is intentionally disabled — `-p vista`
+        /// no longer leaks into `vista-portal`/`vista-datasets`.
         #[arg(short, long)]
         project: Option<String>,
 
@@ -1303,7 +1309,10 @@ enum Commands {
     /// Classify stored chunks into 9-type intent entries and report counts.
     #[command(name = "migrate-intent-schema")]
     MigrateIntentSchema {
-        /// Project filter (case-insensitive substring, defaults to scanning the whole store)
+        /// Strict project filter: `owner/repo`, `/repo` (cross-org repo
+        /// name), `owner/` (org wildcard), or `name` (matches org OR
+        /// repo). Omit to scan the whole store. Substring matching is
+        /// intentionally disabled.
         #[arg(short, long)]
         project: Option<String>,
 

@@ -1811,21 +1811,34 @@ fn test_parse_rfc3339_or_naive_utc_rejects_garbage() {
     assert!(parse_rfc3339_or_naive_utc("not-a-timestamp").is_err());
 }
 
+// `read_line_limited` was removed in favor of
+// `aicx_parser::sanitize::read_line_capped`, which adds UTF-8 boundary
+// walk-back so an oversized line whose cut lands inside a multi-byte
+// codepoint doesn't surface as `InvalidData`. The two smoke tests
+// below were carried over verbatim against the new helper so the
+// migration is locked in. Full UTF-8 boundary coverage lives in
+// `crates/aicx-parser/tests/sanitize_caps.rs`.
 #[test]
-fn test_read_line_limited_returns_normal_line() {
+fn test_read_line_capped_returns_normal_line() {
     let mut reader = Cursor::new(b"{\"ok\":true}\nnext\n".to_vec());
-    let line = read_line_limited(&mut reader, 32).unwrap().unwrap();
+    let line = sanitize::read_line_capped(&mut reader, 32)
+        .unwrap()
+        .unwrap();
     assert!(!line.exceeded);
     assert_eq!(line.line, "{\"ok\":true}\n");
 }
 
 #[test]
-fn test_read_line_limited_skips_to_next_line_after_oversized() {
+fn test_read_line_capped_skips_to_next_line_after_oversized() {
     let mut reader = Cursor::new(b"aaaaaaaaa\nok\n".to_vec());
-    let first = read_line_limited(&mut reader, 4).unwrap().unwrap();
+    let first = sanitize::read_line_capped(&mut reader, 4)
+        .unwrap()
+        .unwrap();
     assert!(first.exceeded);
     assert_eq!(first.line, "aaaa");
-    let second = read_line_limited(&mut reader, 4).unwrap().unwrap();
+    let second = sanitize::read_line_capped(&mut reader, 4)
+        .unwrap()
+        .unwrap();
     assert_eq!(second.line, "ok\n");
 }
 

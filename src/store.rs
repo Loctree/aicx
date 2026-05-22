@@ -1353,13 +1353,29 @@ fn context_files_since_at(
     cutoff: SystemTime,
     project_filter: Option<&str>,
 ) -> Result<Vec<StoredContextFile>> {
-    let filter = project_filter.map(|value| value.to_ascii_lowercase());
+    // Strict project filter via `project_filter_matches` (same
+    // semantics as `aicx search`, `aicx store -p ...` etc.) so the
+    // `refs`/MCP/since paths don't leak `-p vista` into `vista-portal`,
+    // `vista-datasets`, etc. `StoredContextFile.project` is the
+    // canonical `<org>/<repo>` slug (or the non-repo bucket name for
+    // entries without a resolved repo identity); split on '/' to feed
+    // the org+repo pair into the matcher.
+    let filter = project_filter
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let cutoff_date = DateTime::<Utc>::from(cutoff).format("%Y-%m-%d").to_string();
     let mut files = scan_context_files_at(base)?;
     files.retain(|file| {
-        let matches_project = filter
-            .as_ref()
-            .is_none_or(|needle| file.project.to_ascii_lowercase().contains(needle));
+        let matches_project = match filter {
+            None => true,
+            Some(f) => {
+                let (org, repo) = file
+                    .project
+                    .split_once('/')
+                    .unwrap_or(("", file.project.as_str()));
+                project_filter_matches(org, repo, f)
+            }
+        };
         // Discovery recency is anchored to the canonical chunk date encoded in the
         // store layout, not filesystem mtime which can drift during migration/copy.
         let matches_cutoff = file.date_iso >= cutoff_date;
@@ -4576,6 +4592,53 @@ mod tests {
                 .and_then(|name| name.to_str())
                 .unwrap(),
             "2026_0331_claude_sess-new_001.md"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn context_files_since_does_not_leak_substring_into_neighbor_repos() {
+        // Regression guard: `context_files_since_at` previously filtered
+        // by `file.project.contains(needle)`, so `-p vista` returned
+        // entries from `vista-portal` AND `vista-datasets`. We migrated
+        // to the strict `project_filter_matches` matcher; lock that in.
+        let root = retrieval_test_root("context-files-no-substring-leak");
+        let _ = fs::remove_dir_all(&root);
+
+        let vista = root
+            .join("store")
+            .join("VetCoders")
+            .join("vista")
+            .join("2026_0401")
+            .join("reports")
+            .join("claude")
+            .join("2026_0401_claude_sess-vista_001.md");
+        let vista_portal = root
+            .join("store")
+            .join("VetCoders")
+            .join("vista-portal")
+            .join("2026_0401")
+            .join("reports")
+            .join("claude")
+            .join("2026_0401_claude_sess-portal_001.md");
+        write_chunk_file(&vista, "vista canonical chunk");
+        write_chunk_file(&vista_portal, "vista-portal canonical chunk");
+
+        let cutoff: SystemTime = Utc.with_ymd_and_hms(2026, 3, 30, 0, 0, 0).unwrap().into();
+        let files = context_files_since_at(&root, cutoff, Some("vista"))
+            .expect("strict filter should succeed");
+
+        // Exactly one file matches `-p vista` (the literal `vista`
+        // repo); `vista-portal` must NOT slip in via substring match.
+        assert_eq!(files.len(), 1, "got {files:?}");
+        assert!(
+            files[0]
+                .path
+                .to_string_lossy()
+                .contains("/vista/2026_0401/"),
+            "expected vista hit, got {:?}",
+            files[0].path
         );
 
         let _ = fs::remove_dir_all(&root);
