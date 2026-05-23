@@ -393,10 +393,11 @@ fn too_large_error(
 /// Read a directory only after validating it as an allowed directory path.
 pub fn read_dir_validated(path: &Path) -> Result<std::fs::ReadDir> {
     let validated = validate_dir_path(path)?;
-    // FP: validate_dir_path (line 302) calls validate_read_path (line 215),
+    // FP: `pub fn validate_dir_path(path: &Path) -> Result<PathBuf>`
+    // (line 302) delegates to `validate_read_path(path: &Path)` (line 215),
     // which rejects traversal, canonicalizes the existing dir, and enforces
     // the allowed-base policy before this directory iterator is created.
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- FP: validate_dir_path line 302 -> validate_read_path line 215 rejects traversal, canonicalizes, and enforces allowed-base policy.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- FP: validate_dir_path(Path) at line 302 -> validate_read_path(Path) at line 215 rejects traversal, canonicalizes, and enforces allowed-base policy.
     std::fs::read_dir(&validated)
         .map_err(|e| anyhow!("Failed to read dir '{}': {}", validated.display(), e))
 }

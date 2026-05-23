@@ -2624,3 +2624,42 @@ same aktywne suppressions. `fs::metadata(path)` + pozniejszy open i
 **Lessons.** `loct suppressions == 0` nie konczy security audit, jesli w
 okolicy zostal ten sam syscall smell. Po silencer-strip warto przejsc jeszcze
 po klasie bledow, nie tylko po komentarzach.
+
+---
+
+## 2026-05-23 — nosemgrep migration-artifact path authority follow-up · `this worker`
+
+**Symptom.** Targeted Semgrep z normalnym `nosem` handlingiem byl zielony na
+aktualnym checkoutcie, ale `--disable-nosem` plus reczny przeglad pokazal, ze
+`write_migration_artifacts` nadal traktowal serializowane pola
+`manifest.manifest_path` i `manifest.report_path` jako authority dla zapisu.
+Komentarz mowil o walidacji przed zapisem, lecz starszy ksztalt wykonywal
+`fs::create_dir_all(parent)` przed `validate_write_path`.
+
+**Root cause.** Manifest jest artefaktem raportowym, nie zrodlem prawdy dla
+runtime write path. Rehydrating `PathBuf` ze stringa manifestu tworzylo
+niepotrzebny taint edge i pozwalalo pre-validation filesystem side effect.
+
+**Fix.**
+- `write_migration_artifacts` przyjmuje teraz runtime `store_root: &Path`.
+- Sciezki artefaktow sa odtwarzane przez `migration_manifest_path(store_root)`
+  i `migration_report_path(store_root)`, potem walidowane przez
+  `sanitize::validate_write_path`, a parent creation zostaje w
+  `atomic_write` po walidacji.
+- Dwa stare migration `nosemgrep` zniknely; pozostale dwa path-traversal
+  suppressions sa directory-iterator FP z konkretnym odniesieniem do
+  `validate_dir_path(path: &Path) -> Result<PathBuf>` i
+  `validate_read_path(path: &Path)`.
+
+**Tests.** Zielone: `cargo fmt --all --check`;
+targeted Semgrep on audited files z normalnym `nosem` handlingiem = 0 findings;
+targeted Semgrep `--disable-nosem` = tylko 2 directory-iterator FP;
+`cargo test -p aicx-parser test_read_dir_validated`;
+`cargo test migration_writes_manifest_report_and_non_repo_rebuilds`;
+`cargo clippy --all-targets --all-features -- -D warnings`;
+`git diff --check`. `cargo run --quiet -- doctor` zostal przerwany po ~60s
+bez outputu/runtime verdictu.
+
+**Lessons.** Raportowy manifest nie powinien byc potem traktowany jak zaufany
+plan zapisu. Gdy runtime ma pierwotny `store_root`, odtwarzaj sciezki z
+lokalnych helperow zamiast round-trip przez serializowany string.
