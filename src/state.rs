@@ -424,13 +424,22 @@ impl StateManager {
 
         let json = serde_json::to_string_pretty(self).context("Failed to serialize state")?;
 
-        if path.exists() {
-            let previous = fs::read(path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-                .with_context(|| format!("Failed to read state file: {}", path.display()))?;
-            let backup_path = Self::backup_path(path);
-            write_atomic(&backup_path, &previous).with_context(|| {
-                format!("Failed to write state backup: {}", backup_path.display())
-            })?;
+        match fs::OpenOptions::new().read(true).open(path) {
+            Ok(mut previous_file) => {
+                let mut previous = Vec::new();
+                previous_file
+                    .read_to_end(&mut previous)
+                    .with_context(|| format!("Failed to read state file: {}", path.display()))?;
+                let backup_path = Self::backup_path(path);
+                write_atomic(&backup_path, &previous).with_context(|| {
+                    format!("Failed to write state backup: {}", backup_path.display())
+                })?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to open state file: {}", path.display()));
+            }
         }
 
         write_atomic(path, json.as_bytes())

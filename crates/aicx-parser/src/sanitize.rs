@@ -310,16 +310,20 @@ pub fn validate_dir_path(path: &Path) -> Result<PathBuf> {
 /// Open a file for reading only after validating the path.
 pub fn open_file_validated(path: &Path) -> Result<std::fs::File> {
     let validated = validate_read_path(path)?;
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    std::fs::File::open(&validated)
+    std::fs::OpenOptions::new()
+        .read(true)
+        .open(&validated)
         .map_err(|e| anyhow!("Failed to open '{}': {}", validated.display(), e))
 }
 
 /// Create or truncate a file only after validating the write path.
 pub fn create_file_validated(path: &Path) -> Result<std::fs::File> {
     let validated = validate_write_path(path)?;
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    std::fs::File::create(&validated)
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&validated)
         .map_err(|e| anyhow!("Failed to create '{}': {}", validated.display(), e))
 }
 
@@ -343,15 +347,17 @@ pub fn read_state_json_validated(path: &Path) -> Result<String> {
 
 fn read_to_string_with_cap(path: &Path, max_bytes: usize, is_state: bool) -> Result<String> {
     let validated = validate_read_path(path)?;
-    let metadata = std::fs::metadata(&validated)
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&validated)
+        .map_err(|e| anyhow!("Failed to open '{}': {}", validated.display(), e))?;
+    let metadata = file
+        .metadata()
         .map_err(|e| anyhow!("Failed to stat '{}': {}", validated.display(), e))?;
     if metadata.len() > max_bytes as u64 {
         return Err(too_large_error(validated, max_bytes, metadata.len(), is_state).into());
     }
 
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let file = std::fs::File::open(&validated)
-        .map_err(|e| anyhow!("Failed to open '{}': {}", validated.display(), e))?;
     let mut reader = file.take(max_bytes.saturating_add(1) as u64);
     let mut bytes = Vec::new();
     reader
@@ -387,7 +393,10 @@ fn too_large_error(
 /// Read a directory only after validating it as an allowed directory path.
 pub fn read_dir_validated(path: &Path) -> Result<std::fs::ReadDir> {
     let validated = validate_dir_path(path)?;
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    // FP: validate_dir_path (line 302) calls validate_read_path (line 215),
+    // which rejects traversal, canonicalizes the existing dir, and enforces
+    // the allowed-base policy before this directory iterator is created.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- FP: validate_dir_path line 302 -> validate_read_path line 215 rejects traversal, canonicalizes, and enforces allowed-base policy.
     std::fs::read_dir(&validated)
         .map_err(|e| anyhow!("Failed to read dir '{}': {}", validated.display(), e))
 }

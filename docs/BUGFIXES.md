@@ -2530,3 +2530,61 @@ wpisu granicznego, ktore dedup przechwyci; koszt `<=` to cicha utrata ties.
 
 **Related.** Closes bug #7 z pass-4 Wave D-3; usuwa #7 leg z silent-loss
 triangle (#2 narrowed + #7 + #19). #19 zostaje w D-2-cluster.
+
+---
+
+## 2026-05-23 — nosemgrep TOCTOU sweep for path traversal suppressions · `this commit`
+
+**Symptom.** `loct suppressions --type nosemgrep` pokazywal 26 Rust
+silencerow: 25 dla `rust.actix.path-traversal.tainted-path.tainted-path` i 1
+dla `rust.lang.security.temp-dir.temp-dir`. Czesc komentarzy chowala realne
+TOCTOU okna typu `metadata/exists/copy/open` na tej samej sciezce.
+
+**Root cause.** Starszy wzorzec opieral sie na caller-side
+`validate_*_path`, a potem ponownie resolve'owal path przez `File::open`,
+`File::create`, `fs::metadata`, `fs::read`, albo `fs::copy`. Semgrep nie widzi
+inter-procedural sanitizerow, ale kilka miejsc bylo prawdziwym multi-resolve
+bugiem, nie tylko false positive.
+
+**Fix.**
+- `sanitize::{open_file_validated,create_file_validated}` przeszly na
+  `OpenOptions`, a `read_to_string_with_cap` bierze `metadata()` z otwartego
+  deskryptora zamiast osobnego `fs::metadata`.
+- Output append/truncate paths uzywaja sanitizer helperow, a stream-copy kopiuje
+  miedzy otwartymi FD zamiast `File::open`/`File::create` po prewalidacji.
+- `state.json` backup i `index.json.bak` przestaly robic `exists/read/copy`;
+  backup otwiera source raz i czyta/kopiuje z tego handle.
+- `fs::copy` w migration salvage zastapiony `io::copy` miedzy walidowanymi
+  file handles.
+- `atomic_write::stage_tempfile` uzywa `OpenOptions::create_new(true)`.
+- Pozostale directory/path construction FP maja jawny sanitizer reason w
+  komentarzu; `loct suppressions --type nosemgrep` nie raportuje juz target listy.
+
+**Touched.**
+- `crates/aicx-parser/src/sanitize.rs` — validated open/create/read cap/read dir.
+- `crates/aicx-retrieve/src/adapter_brute_force.rs` — persistence open/create.
+- `crates/aicx-retrieve/src/manifest.rs` — manifest open/create/read.
+- `src/output.rs` — report writes, append/truncate, rotation read dir.
+- `src/state.rs` — state backup read path.
+- `src/store.rs` — index backup, orphan hash read, read dir, migration artifacts,
+  legacy salvage copy.
+- `src/store/atomic_write.rs` — unique tempfile creation.
+
+**Tests.** Zielone: `cargo fmt --check`, `cargo check`,
+`cargo clippy --all-targets -- -D warnings`, Semgrep target scan on touched files
+with normal `nosem` handling = 0 findings, `loct suppressions --type nosemgrep`
+= `(no matches)`, `cargo test -p aicx-parser`, `cargo test -p aicx-retrieve`,
+targeted `aicx` tests for output/state/atomic_write. Full `cargo test` was
+interrupted after `search_engine::tests::fail_fast_carries_actionable_recommendation`
+ran for over 2 minutes; prior test stream was green up to that unrelated hang.
+
+**Lessons.**
+- `validate_*_path` is not enough when the code then asks the kernel to resolve
+  the same path again for metadata/copy/open. Prefer one open handle, then
+  `metadata()`/streaming from that handle.
+- `fs::copy(src, dst)` hides two independent path resolutions. Use
+  `io::copy(&mut src_file, &mut dst_file)` when either side has security meaning.
+- Local lexical validators in retrieve (`validate_index_path`,
+  `validate_manifest_path`) are a duplicate-but-bounded pattern: they protect
+  crate-local artifact paths, while `aicx_parser::sanitize` remains the stronger
+  allowlist/canonicalization contract for CLI/store paths.

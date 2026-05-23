@@ -67,7 +67,10 @@ pub fn stage_tempfile(target: &Path, content: &[u8]) -> io::Result<PathBuf> {
     let tmp = parent.join(tmp_name);
 
     let res = (|| -> io::Result<()> {
-        let mut file = fs::File::create(&tmp)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)?;
         file.write_all(content)?;
         file.flush()?;
         file.sync_all()

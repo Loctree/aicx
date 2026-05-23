@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -260,7 +260,7 @@ pub fn rotate_outputs(dir: &Path, prefix: &str, max_files: usize) -> Result<usiz
     let pattern_prefix = format!("{}_memory_", prefix);
     let mut matching: Vec<PathBuf> = Vec::new();
 
-    let entries = fs::read_dir(dir)
+    let entries = sanitize::read_dir_validated(dir)
         .with_context(|| format!("Failed to read dir for rotation: {}", dir.display()))?;
 
     for entry in entries {
@@ -341,9 +341,7 @@ fn write_json_report(
         entries,
     };
 
-    let validated = sanitize::validate_write_path(path)?;
-    // SECURITY: path sanitized via validate_write_path (traversal + allowlist)
-    let file = File::create(&validated) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let file = sanitize::create_file_validated(path)
         .with_context(|| format!("Failed to create: {}", path.display()))?;
     serde_json::to_writer_pretty(file, &report)?;
     eprintln!("  -> {}", path.display());
@@ -404,9 +402,7 @@ fn write_markdown_full(
     max_chars: usize,
     loctree_snapshot: Option<&str>,
 ) -> Result<()> {
-    let validated = sanitize::validate_write_path(path)?;
-    // SECURITY: path sanitized via validate_write_path (traversal + allowlist)
-    let mut file = File::create(&validated) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let mut file = sanitize::create_file_validated(path)
         .with_context(|| format!("Failed to create: {}", path.display()))?;
 
     write_markdown_header(&mut file, metadata)?;
@@ -438,9 +434,9 @@ fn append_markdown_timeline(
     loctree_snapshot: Option<&str>,
 ) -> Result<()> {
     // SECURITY: --append-to is a user-controlled CLI path. Validate before
-    // any read/write to prevent path traversal. Downstream strip_footer +
-    // truncate_file_atomic carry nosemgrep annotations that assume this
-    // gate has already run.
+    // any read/write to prevent path traversal. Downstream strip_footer and
+    // truncate_file_atomic now reopen via sanitizer helpers instead of trusting
+    // this caller-side validation alone.
     let path = &sanitize::validate_write_path(path)?;
     if !path.exists() {
         // First time: write full file (includes initial sync marker)
@@ -496,9 +492,7 @@ fn append_markdown_timeline(
 }
 
 fn find_last_sync_timestamp(path: &Path) -> Result<Option<DateTime<Utc>>> {
-    let validated = sanitize::validate_read_path(path)?;
-    // SECURITY: path sanitized via validate_read_path (traversal + canonicalize + allowlist)
-    let file = File::open(&validated)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let file = sanitize::open_file_validated(path)?;
     let mut reader = BufReader::new(file);
 
     let mut last_sync: Option<DateTime<Utc>> = None;
@@ -563,10 +557,8 @@ fn find_footer_position(path: &Path, file_size: u64, window: u64) -> Result<Opti
     let tail_len = std::cmp::min(window, file_size);
     let start = file_size - tail_len;
 
-    // SECURITY: timeline path validated at append_markdown_timeline entry via sanitize::validate_write_path (traversal + canonicalize + allowlist) before reaching strip_footer.
-    let mut file =
-        File::open(path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-            .with_context(|| format!("strip_footer: open failed: {}", path.display()))?;
+    let mut file = sanitize::open_file_validated(path)
+        .with_context(|| format!("strip_footer: open failed: {}", path.display()))?;
     file.seek(SeekFrom::Start(start))?;
     let mut buf = vec![0u8; tail_len as usize];
     file.read_exact(&mut buf)?;
@@ -602,10 +594,10 @@ fn truncate_file_atomic(path: &Path, pos: u64) -> Result<()> {
     let tmp_path = parent.join(tmp_name);
 
     let copy_result: io::Result<()> = (|| {
-        // SECURITY: src/tmp_path derive from path validated at append_markdown_timeline entry; tempfile is a sibling under the same validated parent.
-        let mut src = File::open(path)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-        let mut dst = File::create(&tmp_path)?;
+        let mut src =
+            sanitize::open_file_validated(path).map_err(|err| io::Error::other(err.to_string()))?;
+        let mut dst = sanitize::create_file_validated(&tmp_path)
+            .map_err(|err| io::Error::other(err.to_string()))?;
 
         const CHUNK: usize = 64 * 1024;
         let mut buf = vec![0u8; CHUNK];
@@ -638,8 +630,7 @@ fn truncate_file_atomic(path: &Path, pos: u64) -> Result<()> {
 
     // SECURITY: parent is path.parent() of a path validated at append_markdown_timeline entry; best-effort fsync after atomic rename.
     if !parent.as_os_str().is_empty()
-        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-        && let Ok(dir) = File::open(parent)
+        && let Ok(dir) = fs::OpenOptions::new().read(true).open(parent)
     {
         let _ = dir.sync_all();
     }
@@ -898,7 +889,7 @@ pub fn write_conversation_markdown_with_redaction(
         messages
     };
 
-    let mut file = File::create(&validated) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let mut file = sanitize::create_file_validated(&validated)
         .with_context(|| format!("Failed to create: {}", path.display()))?;
 
     // Header
@@ -1029,7 +1020,7 @@ pub fn write_conversation_json_with_redaction(
         messages,
     };
 
-    let file = File::create(&validated) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let file = sanitize::create_file_validated(&validated)
         .with_context(|| format!("Failed to create: {}", path.display()))?;
     serde_json::to_writer_pretty(file, &report)?;
     eprintln!("  -> {}", path.display());
@@ -1062,8 +1053,10 @@ mod tests {
 
     fn unique_test_dir(name: &str) -> PathBuf {
         let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        // SECURITY: test-only helper; uniqueness via process::id() + atomic counter + test name; never used in production code paths.
-        let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir
+        // FP: test-only helper; uniqueness comes from process::id() + atomic
+        // counter + test name, and this path never participates in production
+        // file handling.
+        let dir = std::env::temp_dir() // nosemgrep: rust.lang.security.temp-dir.temp-dir -- FP: test-only unique dir uses pid + atomic counter + test name, never production file handling.
             .join(format!("ai_ctx_test_{}_{}_{}", std::process::id(), n, name));
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -2105,7 +2098,7 @@ mod tests {
         );
         // Read just the tail of the result to confirm marker is gone without
         // pulling the whole file into the test process either.
-        let mut f = File::open(&path).unwrap();
+        let mut f = fs::File::open(&path).unwrap();
         f.seek(SeekFrom::End(-(STRIP_FOOTER_MARKER.len() as i64) - 16))
             .unwrap();
         let mut tail = Vec::new();

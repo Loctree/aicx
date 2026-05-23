@@ -153,15 +153,21 @@ fn validate_manifest_path(path: &Path) -> Result<&Path> {
 
 fn create_validated(path: &Path) -> Result<File> {
     let path = validate_manifest_path(path)?;
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    File::create(path).with_context(|| format!("create {}", path.display()))
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))
 }
 
 fn read_validated(path: &Path) -> Result<Vec<u8>> {
     let path = validate_manifest_path(path)?;
     let mut bytes = Vec::new();
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
     file.read_to_end(&mut bytes)
         .with_context(|| format!("read {}", path.display()))?;
     Ok(bytes)

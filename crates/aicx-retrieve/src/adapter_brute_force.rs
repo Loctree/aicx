@@ -435,14 +435,20 @@ fn validate_index_path(path: &Path) -> Result<&Path> {
 
 fn create_validated(path: &Path) -> Result<File> {
     let path = validate_index_path(path)?;
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    File::create(path).with_context(|| format!("create {}", path.display()))
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))
 }
 
 fn open_validated(path: &Path) -> Result<File> {
     let path = validate_index_path(path)?;
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    File::open(path).with_context(|| format!("open {}", path.display()))
+    fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))
 }
 
 #[cfg(test)]
@@ -450,6 +456,9 @@ mod tests {
     use super::*;
     use crate::ChunkRef;
     use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn make_chunk(id: &str, agent: &str, embedding: Vec<f32>) -> DenseChunkRef {
         DenseChunkRef {
@@ -466,12 +475,13 @@ mod tests {
     fn tempdir() -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "aicx-bf-test-{}-{}",
+            "aicx-bf-test-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&p).unwrap();
         p

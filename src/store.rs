@@ -233,16 +233,30 @@ fn save_index_at(base: &Path, index: &StoreIndex) -> Result<()> {
     let json = serde_json::to_string_pretty(index).context("Failed to serialize index")?;
 
     // Best-effort: snapshot the previous index to `.bak` BEFORE the swap so a
-    // crash mid-write still leaves a recoverable copy. Errors here are logged
-    // but never block the save itself.
-    if path.exists() {
-        let bak = path.with_extension("json.bak");
-        let copy_result = fs::copy(&path, &bak); // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-        if let Err(err) = copy_result {
+    // crash mid-write still leaves a recoverable copy. Open the source once
+    // and stream from that FD to avoid path re-resolution between exists/copy.
+    let bak = path.with_extension("json.bak");
+    match fs::OpenOptions::new().read(true).open(&path) {
+        Ok(mut src) => {
+            let copy_result: Result<u64> = (|| {
+                let mut dst = sanitize::create_file_validated(&bak)?;
+                std::io::copy(&mut src, &mut dst)
+                    .with_context(|| format!("copy {} -> {}", path.display(), bak.display()))
+            })();
+            if let Err(err) = copy_result {
+                tracing::warn!(
+                    src = %path.display(),
+                    dst = %bak.display(),
+                    "failed to snapshot index to .bak before save: {err}"
+                );
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
             tracing::warn!(
                 src = %path.display(),
                 dst = %bak.display(),
-                "failed to snapshot index to .bak before save: {err}"
+                "failed to open index before .bak snapshot: {err}"
             );
         }
     }
@@ -721,18 +735,9 @@ fn content_sha256(content: &str) -> String {
 /// is intentionally uncached.
 fn sha256_of_file(path: &Path) -> Result<String> {
     use std::io::Read;
-    // `validated` is the return value of `sanitize::validate_read_path`,
-    // which rejects symlink escapes, traversal sequences, and any path
-    // outside the allowlisted store roots. The semgrep rule below
-    // pattern-matches on the `File::open(<var>)` shape without seeing
-    // the validation gate; the rule is a structural best-practice
-    // trigger, not evidence of a real traversal sink. Suppression
-    // must sit on the line IMMEDIATELY preceding the flagged call
-    // (project convention — mirrors src/output.rs:501, src/store.rs:656).
-    let validated = sanitize::validate_read_path(path)?;
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let file = std::fs::File::open(&validated)
-        .with_context(|| format!("Failed to open orphan chunk {}", validated.display()))?;
+    let display_path = path.display().to_string();
+    let file = sanitize::open_file_validated(path)
+        .with_context(|| format!("Failed to open orphan chunk {}", display_path))?;
     let mut reader = std::io::BufReader::new(file);
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
@@ -740,7 +745,7 @@ fn sha256_of_file(path: &Path) -> Result<String> {
     loop {
         let n = reader
             .read(&mut buf)
-            .with_context(|| format!("Failed to read orphan chunk {}", validated.display()))?;
+            .with_context(|| format!("Failed to read orphan chunk {}", display_path))?;
         if n == 0 {
             break;
         }
@@ -748,7 +753,7 @@ fn sha256_of_file(path: &Path) -> Result<String> {
         if total > sanitize::MAX_VALIDATED_BYTES {
             anyhow::bail!(
                 "Orphan chunk {} exceeds the {} byte read cap",
-                validated.display(),
+                display_path,
                 sanitize::MAX_VALIDATED_BYTES
             );
         }
@@ -1127,7 +1132,11 @@ pub fn context_files_since(
 
 fn read_store_dir(path: &Path) -> Result<fs::ReadDir> {
     let validated = sanitize::validate_dir_path(path)?;
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    // FP: validate_dir_path (crates/aicx-parser/src/sanitize.rs:302)
+    // delegates to validate_read_path (line 215), which rejects traversal,
+    // canonicalizes the directory, and checks the allowed-base policy before
+    // returning the canonical path used here.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- FP: validate_dir_path in crates/aicx-parser/src/sanitize.rs:302 -> validate_read_path line 215 canonicalizes and enforces allowed-base policy.
     fs::read_dir(&validated)
         .with_context(|| format!("Failed to read store dir {}", validated.display()))
 }
@@ -2336,7 +2345,10 @@ fn build_migration_manifest_at(
 }
 
 fn write_migration_artifacts(manifest: &MigrationManifest) -> Result<()> {
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    // FP: manifest_path was generated by migration_manifest_path(store_root)
+    // in build_migration_manifest and is passed through validate_write_path
+    // below before atomic_write performs any filesystem write.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- FP: migration_manifest_path(store_root) output is validated by validate_write_path before atomic_write writes.
     let manifest_path = PathBuf::from(&manifest.manifest_path);
     if let Some(parent) = manifest_path.parent() {
         fs::create_dir_all(parent)?;
@@ -2345,7 +2357,10 @@ fn write_migration_artifacts(manifest: &MigrationManifest) -> Result<()> {
     let manifest_path = sanitize::validate_write_path(&manifest_path)?;
     atomic_write(&manifest_path, manifest_json.as_bytes())?;
 
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    // FP: report_path was generated by migration_report_path(store_root)
+    // in build_migration_manifest and is passed through validate_write_path
+    // below before atomic_write performs any filesystem write.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- FP: migration_report_path(store_root) output is validated by validate_write_path before atomic_write writes.
     let report_path = PathBuf::from(&manifest.report_path);
     if let Some(parent) = report_path.parent() {
         fs::create_dir_all(parent)?;
@@ -3096,8 +3111,9 @@ fn preserve_legacy_item(
             fs::create_dir_all(parent)?;
         }
         let destination = sanitize::validate_write_path(&destination)?;
-        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-        fs::copy(legacy_file, &destination)?;
+        let mut src = sanitize::open_file_validated(&legacy_file)?;
+        let mut dst = sanitize::create_file_validated(&destination)?;
+        std::io::copy(&mut src, &mut dst)?;
         preserved.push(destination);
     }
 
