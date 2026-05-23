@@ -2361,3 +2361,172 @@ secret redaction. Full gate results recorded in the I-1 worker report.
 **Related.** Closes N-2, N-3, N-4, N-5, N-7, N-8, N-9, N-10 z
 `docs/bug-tracker-aicx-followup-pass-3.md`; N-11 tracked in `docs/BACKLOG.md`
 as out-of-scope upstream prview-rs work.
+
+---
+
+## 2026-05-22 — `chunks_by_run_id_at` strict project filter (#18-ogon) · `this B-4 commit`
+
+**Symptom.** `chunks_by_run_id_at` dalej filtrowal projekt przez substring
+`file.project.to_ascii_lowercase().contains(needle)`, chociaz sibling
+`context_files_since_at` byl juz po migracji do strict
+`project_filter_matches`. W praktyce `aicx steer --run-id ... -p vista` moglo
+przyniesc chunki z `vista-portal` albo innych sasiednich repo z tym samym
+`run_id`.
+
+**Root cause.** Migracja z `e55961f` zamknela strict semantics dla
+`context_files_since_at`, ale nie przeniosla tego samego wzorca do ogona
+`chunks_by_run_id_at`.
+
+**Fix.**
+- `chunks_by_run_id_at` trimuje pusty filtr tak jak sibling i rozdziela
+  kanoniczny slug `StoredContextFile.project` przez `split_once('/')`.
+- Projekt jest teraz sprawdzany przez `project_filter_matches(org, repo, f)`,
+  bez substringowego przecieku.
+- Dodany regression test
+  `chunks_by_run_id_does_not_leak_substring_into_neighbor_repos`: dwa chunki
+  z tym samym `run_id` w `VetCoders/vista` i `VetCoders/vista-portal`, filtr
+  `Some("vista")` musi zwrocic tylko literalne `vista`.
+
+**Touched.** `src/store.rs`.
+
+**Tests.** Zielone: `cargo build --release --bin aicx`;
+`cargo clippy --bin aicx --all-targets -- -D warnings`;
+`cargo test --lib chunks_by_run_id`; `cargo test --lib context_files_since`.
+Pelne `cargo test --lib` zostaje na znanym baseline:
+546 passed, 3 failed (`state::tests::test_state_path_is_under_store`,
+`store::tests::test_chunks_dir`, `store::tests::test_store_base_dir`) przez
+pre-existing `.aicx`/`AICX_HOME` kontrakt.
+
+**Lessons.** Przy migracji wspolnego kontraktu filtrowania trzeba domknac
+wszystkie wrappery, nie tylko pierwszy widoczny callsite; testy powinny uzywac
+par sasiednich repo z tym samym identyfikatorem runa, bo dopiero wtedy stary
+substring robi falszywie zielony wynik.
+
+**Related.** Closes #18-ogon z pass-4 Wave B-4.
+
+---
+
+## 2026-05-22 — dir-scoped chunk sha cache (#25) · `this C-7 commit`
+
+**Symptom.** `aicx store --full-rescan -H 0` potrafil zatrzymac sie na kilka
+minut na pojedynczym ticku chunk-phase. Operator widzial 237 sekund przerwy
+miedzy dwoma tickami na goracym katalogu z wieloma sidecarami.
+
+**Root cause.** `write_context_session_first_outcome_at` wolal
+`content_sha256_exists_in_dir` dla kazdego nowego chunka. Helper skanowal i
+parsowal wszystkie `*.meta.json` w katalogu, wiec jeden batch w hot dir mial
+koszt `O(N*M)` zamiast `O(N+M)`.
+
+**Fix.**
+- Dodany `DirShaCache` (`HashMap<PathBuf, HashSet<String>>`) z leniwym
+  wczytaniem hashy per katalog.
+- `store_segments_at` trzyma jeden cache przez cale wywolanie i przekazuje go
+  do `write_semantic_segment_at` oraz `write_context_session_first_outcome_at`.
+- Po udanym zapisie `.meta.json` nowy `content_sha256` trafia do cache, wiec
+  duplikaty z tego samego batcha dedupuja bez ponownego skanu katalogu.
+- `content_sha256_exists_in_dir` zostaje jako niecache'owany fallback.
+
+**Touched.**
+- `src/store.rs` — `DirShaCache`, hot-path dedup, testy cache.
+
+**Tests.** Dodane:
+`test_dir_sha_cache_contains_after_insert`,
+`test_dir_sha_cache_lazy_population`,
+`test_dir_sha_cache_does_not_cross_dirs`.
+Pelne wyniki bramek zapisane w raporcie Wave C-7.
+
+**Lessons.**
+- Dedupe po sidecarach musi miec batch-local cache. Inaczej poprawny
+  semantycznie helper staje sie ukrytym mnoznikiem kosztu przy full-rescan.
+- Cache jest per `store_segments_at`, wiec zaklada single-process batch scope;
+  wieloprocesowa invalidacja hot dir pozostaje poza tym cieciem.
+
+**Related.** Closes bug #25 z pass-4 Wave C-7.
+
+---
+
+## 2026-05-22 — Codex malformed JSONL lines emit warnings (#2 narrowed) · `this C-1 commit`
+
+**Symptom.** Dwa Codex parser loops w `src/sources.rs` uzywaly kaskady
+`if let Ok(...) = serde_json::from_str(...)` bez `Err` branch. Malformed line w
+Codex history albo session JSONL byla po prostu pominieta, a operator nie widzial
+ani per-file logu, ani summary.
+
+**Root cause.** Codex mial juz kanal `CodexSessionWarning` dla meta/timestamp/
+oversized/mixed-format problemow, ale sam JSON parse failure nie byl modelem
+diagnostycznym. Direct-file parser dodatkowo zwracal tylko `Vec<TimelineEntry>`,
+wiec testy nie mogly asercyjnie sprawdzic warningow dla historii.
+
+**Fix.**
+- Dodany `CodexSessionWarning::LineParseError { line_number, snippet }`, ze
+  snippetem ucietym do 200 znakow.
+- Codex history/session direct-file parser i Codex session-event parser zamienily
+  silent `if let Ok` na jawny `match`, z zachowaniem probowania alternatywnego
+  formatu przed ostrzezeniem.
+- Direct-file Codex path ma prywatna funkcje diagnostyczna zwracajaca
+  `(entries, warnings)`, a publiczne `extract_codex_file` nadal emituje przez
+  `emit_codex_session_warnings`.
+- `diagnostics::DiagnosticKind::LineParseError` trafia do structured logu i
+  per-extractor summary jako malformed JSONL skipped.
+
+**Touched.**
+- `src/sources.rs` — warning variant, parser branches, diagnostic helper.
+- `src/sources/tests.rs` — dwa regression tests dla history i session event path.
+- `src/diagnostics.rs` — summary/diagnostic kind dla parse errors.
+
+**Tests.** Zielone: `cargo build --release --bin aicx`;
+`cargo clippy --bin aicx --all-targets -- -D warnings`;
+`cargo test --lib codex_history_silent`;
+`cargo test --lib codex_session_event_silent`;
+`cargo test --lib sources::tests`. Pelne `cargo test --lib` zostaje na znanym
+baseline: 559 passed, 3 failed (`state::tests::test_state_path_is_under_store`,
+`store::tests::test_chunks_dir`, `store::tests::test_store_base_dir`) przez
+pre-existing `.aicx`/`AICX_HOME` kontrakt.
+
+**Lessons.** JSONL parsers nie powinny traktowac per-line parse failure jak
+neutralnego braku danych. Jesli parser probuje kilku formatow, warning nalezy
+emitowac dopiero po wyczerpaniu alternatyw, z numerem linii i malym snippetem,
+zeby operator mogl znalezc konkretna uszkodzona linie bez zalewania logu.
+
+**Related.** Closes bug #2 narrowed Codex scope z pass-4 Wave C-1.
+
+---
+
+## 2026-05-22 — watermark strict less-than boundary (#7) · `this D-3 commit`
+
+**Symptom.** Incremental extractory traktowaly wpis o timestampie rownym
+watermarkowi jako juz widziany. Przy kolizji timestampu na granicy runow nowy
+wpis z tym samym sekundowym/milisekundowym stemplem byl cicho odrzucany zanim
+doszedl do dedupu.
+
+**Root cause.** Dwanaście read-side filtrow watermarku w `src/sources.rs`
+uzywalo `timestamp <= watermark` albo rownowaznego wariantu Junie
+`modified <= watermark`. Watermark zapisuje ostatni znany timestamp, wiec
+porownanie inclusive zamykalo granice i tracilo tie-row.
+
+**Fix.**
+- Zmieniono wszystkie 11 bezposrednich filtrow `timestamp <= watermark` na
+  strict `timestamp < watermark`.
+- Zmieniono odwrócony Junie file-anchor guard z `modified <= watermark` na
+  `modified < watermark`.
+- Dodano regression test `test_watermark_filter_drops_only_strictly_lt`: wpis
+  T-1 wypada, wpisy T i T+1 zostaja.
+
+**Touched.**
+- `src/sources.rs` — read-side watermark filters.
+- `src/sources/tests.rs` — regression test boundary T-1/T/T+1.
+
+**Tests.** Zielone: `cargo build --release --bin aicx`;
+`cargo clippy --bin aicx --all-targets -- -D warnings`;
+`cargo test --lib watermark_filter_drops_only_strictly`;
+`cargo test --lib sources::tests`. Pelne `cargo test --lib` zostaje na znanym
+baseline: 565 passed, 3 failed (`state::tests::test_state_path_is_under_store`,
+`store::tests::test_chunks_dir`, `store::tests::test_store_base_dir`) przez
+pre-existing `.aicx`/`AICX_HOME` kontrakt.
+
+**Lessons.** Watermark na samym timestampie powinien byc granica exclusive na
+read-side. Koszt pierwszego runu po fixie to jednorazowe ponowne przeczytanie
+wpisu granicznego, ktore dedup przechwyci; koszt `<=` to cicha utrata ties.
+
+**Related.** Closes bug #7 z pass-4 Wave D-3; usuwa #7 leg z silent-loss
+triangle (#2 narrowed + #7 + #19). #19 zostaje w D-2-cluster.

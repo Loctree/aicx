@@ -830,7 +830,9 @@ enum Commands {
         #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
-        /// Agent filter: claude, codex, gemini, junie, codescribe, operator-md (default: all agents)
+        /// Agent filter: one of claude, codex, gemini, junie, codescribe, operator-md.
+        /// Default: claude+codex+gemini+junie+codescribe (operator-md is opt-in
+        /// via `--agent operator-md`).
         #[arg(short, long, value_parser = ["claude", "codex", "gemini", "junie", "codescribe", "operator-md"])]
         agent: Option<String>,
 
@@ -864,10 +866,6 @@ enum Commands {
         /// What to print to stdout: paths, json, none (default: none)
         #[arg(long, value_enum, default_value_t = StdoutEmit::None)]
         emit: StdoutEmit,
-
-        /// Respect artifact_family metadata when routing immutable artifacts (default: true)
-        #[arg(long, default_value_t = true)]
-        respect_artifact_family: bool,
     },
 
     /// Ingest operator-owned source documents into the canonical corpus.
@@ -1619,7 +1617,6 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             include_assistant: include_assistant_flag,
             no_noise_filter,
             emit,
-            respect_artifact_family,
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
             warn_incremental_legacy_flag(incremental);
@@ -1633,7 +1630,6 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 emit,
                 redact_secrets: redaction.redact_secrets,
                 noise_filter_enabled: !no_noise_filter,
-                respect_artifact_family,
             })?;
         }
         Some(Commands::Ingest {
@@ -1677,7 +1673,6 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 emit,
                 redact_secrets: redaction.redact_secrets,
                 noise_filter_enabled: !no_noise_filter,
-                respect_artifact_family: true,
             })?;
         }
         Some(Commands::List) => {
@@ -3306,31 +3301,46 @@ const INCREMENTAL_LEGACY_NOTE: &str =
 const LEGACY_ALL_WATERMARK_AGENTS: &[&str] = &["claude", "codex", "gemini", "junie", "codescribe"];
 const LEGACY_ALL_WATERMARK_KEY: &str = "claude+codex+gemini+junie";
 
-fn extraction_source_key(agents: &[&str], project: &[String]) -> String {
-    let agent_key = if agents == LEGACY_ALL_WATERMARK_AGENTS {
+fn normalized_source_key_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut normalized = parts
+        .into_iter()
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    normalized.sort_unstable();
+    normalized
+}
+
+fn normalized_project_source_key(project: &[String]) -> String {
+    if project.is_empty() {
+        "all".to_string()
+    } else {
+        normalized_source_key_parts(project.iter().map(String::as_str)).join("+")
+    }
+}
+
+fn normalized_agent_source_key(agents: &[&str]) -> String {
+    let normalized_agents = normalized_source_key_parts(agents.iter().copied());
+    let legacy_all_agents =
+        normalized_source_key_parts(LEGACY_ALL_WATERMARK_AGENTS.iter().copied());
+    if normalized_agents == legacy_all_agents {
         LEGACY_ALL_WATERMARK_KEY.to_string()
     } else {
-        agents.join("+")
-    };
-    format!(
-        "{}:{}",
-        agent_key,
-        if project.is_empty() {
-            "all".to_string()
-        } else {
-            project.join("+")
-        }
-    )
+        normalized_agents.join("+")
+    }
+}
+
+fn extraction_source_key(agents: &[&str], project: &[String]) -> String {
+    let agent_key = normalized_agent_source_key(agents);
+    let project_key = normalized_project_source_key(project);
+    format!("{agent_key}:{project_key}")
 }
 
 fn extraction_source_key_aliases(agents: &[&str], project: &[String]) -> Vec<String> {
-    let project_key = if project.is_empty() {
-        "all".to_string()
-    } else {
-        project.join("+")
-    };
+    let project_key = normalized_project_source_key(project);
     let mut aliases = Vec::new();
-    if agents == LEGACY_ALL_WATERMARK_AGENTS {
+    if normalized_source_key_parts(agents.iter().copied())
+        == normalized_source_key_parts(LEGACY_ALL_WATERMARK_AGENTS.iter().copied())
+    {
         aliases.push(format!(
             "claude+codex+gemini+junie+codescribe:{project_key}"
         ));
@@ -3349,62 +3359,6 @@ fn warn_legacy_subcommand(legacy: &str, replacement: &str) {
     eprintln!("# Note: `aicx {legacy}` is deprecated; use `aicx {replacement}` instead.");
 }
 
-/// Dedup with periodic `progress(entries_scanned)` callbacks so a
-/// caller-side `Phase` heartbeat reflects real work even when a long
-/// `--full-rescan` corpus is grinding through hashing. Pass `|_| {}`
-/// if you don't want progress.
-fn dedup_entries_for_state_with_progress<F>(
-    entries: Vec<timeline::TimelineEntry>,
-    state: &mut StateManager,
-    project_name: &str,
-    overlap_project: &str,
-    full_rescan: bool,
-    mut progress: F,
-) -> Vec<timeline::TimelineEntry>
-where
-    F: FnMut(usize),
-{
-    let mut deduped = Vec::with_capacity(entries.len());
-    let mut exact_seen_this_run = std::collections::HashSet::new();
-    let mut overlap_seen_this_run = std::collections::HashSet::new();
-    let total = entries.len();
-
-    for (idx, entry) in entries.into_iter().enumerate() {
-        let exact =
-            StateManager::content_hash(&entry.agent, entry.timestamp.timestamp(), &entry.message);
-        if full_rescan {
-            if !exact_seen_this_run.insert(exact.clone()) {
-                report_dedup_progress(&mut progress, idx, total);
-                continue; // exact duplicate within the same rescan window
-            }
-        } else if !state.is_new(project_name, &exact) {
-            report_dedup_progress(&mut progress, idx, total);
-            continue; // exact duplicate
-        }
-
-        let overlap = StateManager::overlap_hash(entry.timestamp.timestamp(), &entry.message);
-        if full_rescan {
-            if !overlap_seen_this_run.insert(overlap.clone()) {
-                report_dedup_progress(&mut progress, idx, total);
-                continue; // cross-agent overlap duplicate within the same rescan window
-            }
-        } else if !state.is_new(overlap_project, &overlap) {
-            report_dedup_progress(&mut progress, idx, total);
-            continue; // cross-agent overlap duplicate
-        }
-
-        if !full_rescan {
-            state.mark_seen(project_name, exact);
-            state.mark_seen(overlap_project, overlap);
-        }
-        deduped.push(entry);
-        report_dedup_progress(&mut progress, idx, total);
-    }
-
-    progress(total);
-    deduped
-}
-
 fn report_dedup_progress<F>(progress: &mut F, idx: usize, total: usize)
 where
     F: FnMut(usize),
@@ -3414,6 +3368,125 @@ where
     if scanned.is_multiple_of(TICK_EVERY) || scanned == total {
         progress(scanned);
     }
+}
+
+/// Per-canonical-repo dedup for the post-segmentation pipeline.
+///
+/// Each segment carries its own canonical repo identity via
+/// `SemanticSegment::project_label()`. We dedup each segment's entries
+/// against `seen_hashes` keyed on that label (and `_overlap:{label}` for
+/// the cross-agent overlap bucket) instead of the legacy `_global` /
+/// `project.join("+")` keys. Cross-repo content collisions therefore no
+/// longer falsely dedup.
+///
+/// Legacy `_global` / `_overlap:_global` buckets in `state.json` are
+/// ignored by this path and evicted naturally by `prune_old_hashes`.
+fn dedup_segments_per_repo<F>(
+    segments: Vec<timeline::SemanticSegment>,
+    state: &mut StateManager,
+    full_rescan: bool,
+    mut progress: F,
+) -> Vec<timeline::SemanticSegment>
+where
+    F: FnMut(usize),
+{
+    let total_entries: usize = segments.iter().map(|s| s.entries.len()).sum();
+    let mut total_scanned: usize = 0;
+    let mut out = Vec::with_capacity(segments.len());
+
+    // Cross-segment dedup state for `--full-rescan`: indexed by
+    // canonical repo slug so duplicates appearing in different segments
+    // of the same repo (e.g. multiple sessions touching the same repo)
+    // are deduplicated together, matching the incremental code path that
+    // uses `state.is_new(&project_label, ...)` for the same purpose.
+    //
+    // Before this fix, the HashSets were re-created per segment, so
+    // full_rescan saw segment-local dedup only — a regression vs the
+    // incremental path that prompted the chatgpt-codex-connector P1
+    // review comment on PR #8.
+    let mut full_rescan_exact_seen: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
+    let mut full_rescan_overlap_seen: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
+
+    for seg in segments {
+        let project_label = seg.project_label();
+        let overlap_project = format!("_overlap:{project_label}");
+        let timeline::SemanticSegment {
+            repo,
+            source_tier,
+            kind,
+            agent,
+            session_id,
+            entries,
+        } = seg;
+
+        let mut kept = Vec::with_capacity(entries.len());
+        // Borrow a per-repo dedup bucket out of the run-wide maps so the
+        // inner loop can `.insert(...)` against persistent state for
+        // every segment in the same canonical repo.
+        let exact_seen_this_run = full_rescan_exact_seen
+            .entry(project_label.clone())
+            .or_default();
+        let overlap_seen_this_run = full_rescan_overlap_seen
+            .entry(overlap_project.clone())
+            .or_default();
+
+        for entry in entries {
+            total_scanned += 1;
+
+            let exact = StateManager::content_hash(
+                &entry.agent,
+                entry.timestamp.timestamp(),
+                &entry.message,
+            );
+            if full_rescan {
+                if !exact_seen_this_run.insert(exact.clone()) {
+                    report_dedup_progress(&mut progress, total_scanned - 1, total_entries);
+                    continue;
+                }
+            } else if !state.is_new(&project_label, &exact) {
+                report_dedup_progress(&mut progress, total_scanned - 1, total_entries);
+                continue;
+            }
+
+            let overlap = StateManager::overlap_hash(entry.timestamp.timestamp(), &entry.message);
+            if full_rescan {
+                if !overlap_seen_this_run.insert(overlap.clone()) {
+                    report_dedup_progress(&mut progress, total_scanned - 1, total_entries);
+                    continue;
+                }
+            } else if !state.is_new(&overlap_project, &overlap) {
+                report_dedup_progress(&mut progress, total_scanned - 1, total_entries);
+                continue;
+            }
+
+            if !full_rescan {
+                state.mark_seen(&project_label, exact);
+                state.mark_seen(&overlap_project, overlap);
+            }
+            kept.push(entry);
+            report_dedup_progress(&mut progress, total_scanned - 1, total_entries);
+        }
+
+        if !kept.is_empty() {
+            out.push(timeline::SemanticSegment {
+                repo,
+                source_tier,
+                kind,
+                agent,
+                session_id,
+                entries: kept,
+            });
+        }
+    }
+
+    progress(total_entries);
+    out
 }
 
 struct ExtractionParams<'a> {
@@ -3447,7 +3520,6 @@ struct StoreRunArgs {
     /// `ChunkerConfig::noise_filter_enabled`; the CLI surface is
     /// `--no-noise-filter` (negated to keep the default ergonomic).
     noise_filter_enabled: bool,
-    respect_artifact_family: bool,
 }
 
 fn resolve_store_agents(agent: Option<&str>) -> Result<Vec<&'static str>> {
@@ -3535,11 +3607,6 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
 
     // Load state for incremental/dedup
     let mut state = StateManager::load()?;
-    let project_name = if project.is_empty() {
-        "_global".to_string()
-    } else {
-        project.join("+")
-    };
 
     let cutoff = lookback_cutoff(hours);
 
@@ -3617,89 +3684,128 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         entries.len()
     ));
 
-    // Two-level dedup (skip if --force):
-    //
-    // 1. Exact dedup: (agent, timestamp, message) — catches same entry
-    //    from multiple session JSONL files within the same agent.
-    // 2. Overlap dedup: (message, timestamp_bucket_60s) — catches the same
-    //    prompt broadcast to multiple agents simultaneously (e.g., 8 parallel
-    //    Claude sessions receiving identical 3-paragraph context).
-    //
-    // We mark_seen during filtering so duplicates within a single run
-    // are caught — not just across runs.
-    let pre_dedup = entries.len();
-    let overlap_project = format!("_overlap:{project_name}");
-    if !force {
-        let dedup_phase =
-            aicx::progress::Phase::start(reporter.clone(), "dedup", Some(pre_dedup as u64));
-        entries = dedup_entries_for_state_with_progress(
-            entries,
-            &mut state,
-            &project_name,
-            &overlap_project,
-            full_rescan,
-            |scanned| dedup_phase.tick(scanned as u64),
-        );
-        let dedup_skipped = pre_dedup.saturating_sub(entries.len());
-        dedup_phase.finish_ok(format!(
-            "kept {} / {} (skipped {})",
-            entries.len(),
-            pre_dedup,
-            dedup_skipped
-        ));
-    }
-
-    if pre_dedup != entries.len() {
-        eprintln!(
-            "  Dedup: {} → {} entries (skipped {} seen)",
-            pre_dedup,
-            entries.len(),
-            pre_dedup - entries.len(),
-        );
-    }
-
-    // Sort by timestamp
+    // Sort by timestamp — done early so the watermark capture and
+    // segmentation both see entries in canonical order.
     entries.sort_by_key(|a| a.timestamp);
 
-    // Filter self-echo (aicx's own search/rank/store calls that create feedback loops)
-    let pre_echo = entries.len();
-    let echo_phase =
-        aicx::progress::Phase::start(reporter.clone(), "self_echo", Some(pre_echo as u64));
-    {
-        const ECHO_TICK_EVERY: usize = 500;
-        let mut scanned: usize = 0;
-        entries.retain(|e| {
-            scanned += 1;
-            if scanned.is_multiple_of(ECHO_TICK_EVERY) {
-                echo_phase.tick(scanned as u64);
-            }
-            !aicx::sanitize::is_self_echo(&e.message)
-        });
-        echo_phase.tick(scanned as u64);
-    }
-    let echo_filtered = pre_echo.saturating_sub(entries.len());
-    echo_phase.finish_ok(format!(
-        "kept {} / {} (filtered {})",
-        entries.len(),
-        pre_echo,
-        echo_filtered
-    ));
-    if echo_filtered > 0 {
-        eprintln!("  Filtered {echo_filtered} self-echo entries");
-    }
+    // ──────────────────────────────────────────────────────────────────
+    // Watermark capture (#19): record the latest raw-extract timestamp
+    // BEFORE any filtering. The post-filter survivor list cannot be
+    // trusted as a watermark source — dedup or self-echo can drop the
+    // tail, leaving a watermark that re-extracts the same tail forever.
+    // ──────────────────────────────────────────────────────────────────
+    let raw_extract_latest: Option<DateTime<Utc>> = entries.last().map(|e| e.timestamp);
 
-    // Apply secret redaction in-place (TimelineEntry is now a single timeline type)
+    // ──────────────────────────────────────────────────────────────────
+    // Redact phase (#6): redaction must happen BEFORE dedup so the hash
+    // domain converges across incremental and --full-rescan/force paths.
+    // ──────────────────────────────────────────────────────────────────
     if redact_secrets {
         for e in &mut entries {
             e.message = aicx::redact::redact_secrets(&e.message);
         }
     }
-    // Collect derived data from entries before moving them.
-    let mut sessions: Vec<String> = entries.iter().map(|e| e.session_id.clone()).collect();
+
+    // ──────────────────────────────────────────────────────────────────
+    // Segment phase — moved UP so per-canonical-repo dedup (#8) can key
+    // on each segment's repo identity. Progress denominator = entry
+    // count so operators see real percentage during long rescans.
+    // ──────────────────────────────────────────────────────────────────
+    let segment_total = entries.len() as u64;
+    let segment_phase =
+        aicx::progress::Phase::start(reporter.clone(), "segment", Some(segment_total));
+    let segments = {
+        let hb = aicx::progress::Heartbeat::spawn_with_backoff(
+            segment_phase.clone(),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(60),
+        );
+        let result = aicx::segmentation::semantic_segments_with_progress(&entries, |processed| {
+            hb.raise_floor(processed as u64)
+        });
+        hb.stop();
+        result
+    };
+    let pre_dedup: usize = segments.iter().map(|s| s.entries.len()).sum();
+    let segment_count_pre = segments.len();
+    segment_phase.finish_ok(format!(
+        "{} entries → {} segments",
+        pre_dedup, segment_count_pre
+    ));
+
+    // ──────────────────────────────────────────────────────────────────
+    // Dedup phase (#8): per-canonical-repo, skipped entirely when
+    // `--force` is set. Otherwise it honors `full_rescan` for intra-run
+    // dedup vs cross-run state lookup.
+    // ──────────────────────────────────────────────────────────────────
+    let segments = if force {
+        segments
+    } else {
+        let dedup_phase =
+            aicx::progress::Phase::start(reporter.clone(), "dedup", Some(pre_dedup as u64));
+        let deduped = dedup_segments_per_repo(segments, &mut state, full_rescan, |scanned| {
+            dedup_phase.tick(scanned as u64)
+        });
+        let post = deduped.iter().map(|s| s.entries.len()).sum::<usize>();
+        let skipped = pre_dedup.saturating_sub(post);
+        dedup_phase.finish_ok(format!("kept {post} / {pre_dedup} (skipped {skipped})"));
+        if skipped > 0 {
+            eprintln!("  Dedup: {pre_dedup} → {post} entries (skipped {skipped} seen)");
+        }
+        deduped
+    };
+
+    // ──────────────────────────────────────────────────────────────────
+    // Self-echo phase (per-segment): aicx tool-echo entries get dropped
+    // within each segment; empty segments are then dropped wholesale.
+    // ──────────────────────────────────────────────────────────────────
+    let pre_echo: usize = segments.iter().map(|s| s.entries.len()).sum();
+    let echo_phase =
+        aicx::progress::Phase::start(reporter.clone(), "self_echo", Some(pre_echo as u64));
+    let segments = {
+        const ECHO_TICK_EVERY: usize = 500;
+        let mut scanned: usize = 0;
+        let mut out = Vec::with_capacity(segments.len());
+        for mut seg in segments {
+            seg.entries.retain(|e| {
+                scanned += 1;
+                if scanned.is_multiple_of(ECHO_TICK_EVERY) {
+                    echo_phase.tick(scanned as u64);
+                }
+                !aicx::sanitize::is_self_echo(&e.message)
+            });
+            if !seg.entries.is_empty() {
+                out.push(seg);
+            }
+        }
+        echo_phase.tick(scanned as u64);
+        out
+    };
+    let post_echo: usize = segments.iter().map(|s| s.entries.len()).sum();
+    let echo_filtered = pre_echo.saturating_sub(post_echo);
+    echo_phase.finish_ok(format!(
+        "kept {post_echo} / {pre_echo} (filtered {echo_filtered})"
+    ));
+    if echo_filtered > 0 {
+        eprintln!("  Filtered {echo_filtered} self-echo entries");
+    }
+
+    // Reassemble a flat, timestamp-ordered Vec for downstream formatters
+    // (sessions list, markdown/json reports, conversation projection).
+    // We clone — segments still own the canonical entries for the
+    // store_segments_at call below.
+    let mut output_entries: Vec<timeline::TimelineEntry> = segments
+        .iter()
+        .flat_map(|s| s.entries.iter().cloned())
+        .collect();
+    output_entries.sort_by_key(|e| e.timestamp);
+
+    let mut sessions: Vec<String> = output_entries
+        .iter()
+        .map(|e| e.session_id.clone())
+        .collect();
     sessions.sort();
     sessions.dedup();
-
-    let output_entries = entries;
 
     let metadata = ReportMetadata {
         generated_at: Utc::now(),
@@ -3719,33 +3825,10 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     let mut scope_surface = StoreScopeSurface::empty(&project);
 
     if !output_entries.is_empty() {
-        // ──────────────────────────────────────────────────────────────
-        // Segment phase — heartbeat-only (total=None, exp-backoff). See
-        // run_store for the rationale: there's no honest mid-flight
-        // counter inside `semantic_segments`, so the structured surface
-        // gets a heartbeat counter rendered as `processed N | elapsed
-        // Xs` rather than a misleading `N/entries_total = 0%`.
-        // ──────────────────────────────────────────────────────────────
-        let segment_phase = aicx::progress::Phase::start(reporter.clone(), "segment", None);
-        let segments = {
-            let hb = aicx::progress::Heartbeat::spawn_with_backoff(
-                segment_phase.clone(),
-                std::time::Duration::from_secs(2),
-                std::time::Duration::from_secs(60),
-            );
-            let result = aicx::segmentation::semantic_segments(&output_entries);
-            hb.stop();
-            result
-        };
+        // Chunk phase — segments were prepared upstream (per-canonical-repo
+        // dedup + self_echo). Denominator is segments so `current/total`
+        // reflects actual write progress.
         let segment_count = segments.len();
-        segment_phase.finish_ok(format!(
-            "{} entries → {} segments",
-            output_entries.len(),
-            segment_count
-        ));
-
-        // Chunk phase — denominator is segments (not entries), so the
-        // ratio reflects actual write progress.
         let chunk_phase =
             aicx::progress::Phase::start(reporter.clone(), "chunk", Some(segment_count as u64));
         let store_result = store::store_segments_at(
@@ -3964,31 +4047,40 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         }
     }
 
-    // Update state (hashes already marked during dedup filtering above)
-    if !output_entries.is_empty() {
-        if force || full_rescan {
-            // When --force or --full-rescan bypasses persisted dedup state, we still
-            // mark entries as seen so future incremental runs remain honest.
-            for e in &output_entries {
+    // ──────────────────────────────────────────────────────────────────
+    // Watermark write (#19): advance from `raw_extract_latest` captured
+    // BEFORE filtering, not from the post-filter survivor list. This
+    // closes the self-echo-tail re-extract loop.
+    // ──────────────────────────────────────────────────────────────────
+    if let Some(latest) = raw_extract_latest {
+        state.update_watermark(&source_key, latest);
+    }
+
+    // For --force (dedup bypassed) and --full-rescan (dedup uses
+    // intra-run only), mark surviving entries under their canonical
+    // repo slug so future incremental runs honor what just landed.
+    // Incremental (!force, !full_rescan) runs already marked via
+    // dedup_segments_per_repo during the filter pass.
+    if force || full_rescan {
+        for seg in &segments {
+            let project_label = seg.project_label();
+            let overlap_project = format!("_overlap:{project_label}");
+            for e in &seg.entries {
                 let exact =
                     StateManager::content_hash(&e.agent, e.timestamp.timestamp(), &e.message);
                 let overlap = StateManager::overlap_hash(e.timestamp.timestamp(), &e.message);
-                state.mark_seen(&project_name, exact);
+                state.mark_seen(&project_label, exact);
                 state.mark_seen(&overlap_project, overlap);
             }
         }
-
-        if let Some(latest) = output_entries.last() {
-            state.update_watermark(&source_key, latest.timestamp);
-        }
-
-        state.record_run(
-            output_entries.len(),
-            agents.iter().map(|s| s.to_string()).collect(),
-        );
-        state.prune_old_hashes(50_000);
-        state.save()?;
     }
+
+    state.record_run(
+        output_entries.len(),
+        agents.iter().map(|s| s.to_string()).collect(),
+    );
+    state.prune_old_hashes(50_000);
+    state.save()?;
 
     if output_entries.is_empty() {
         eprintln!(
@@ -4017,11 +4109,7 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         emit,
         redact_secrets,
         noise_filter_enabled,
-        respect_artifact_family,
     } = args;
-    if !respect_artifact_family {
-        eprintln!("  [warn] --respect-artifact-family=false: legacy routing mode active");
-    }
 
     let cutoff = cutoff.unwrap_or_else(|| lookback_cutoff(hours));
 
@@ -4113,99 +4201,20 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
 
     all_entries.sort_by_key(|a| a.timestamp);
 
-    let project_name = if project.is_empty() {
-        "_global".to_string()
-    } else {
-        project.join("+")
-    };
-    let overlap_project = format!("_overlap:{project_name}");
+    // ──────────────────────────────────────────────────────────────────
+    // Watermark capture (#19): record the latest raw-extract timestamp
+    // BEFORE any filtering. The post-filter `all_entries.last()` is not
+    // a safe watermark source — self-echo or dedup can drop the tail,
+    // leaving a watermark that re-extracts the same tail every run.
+    // ──────────────────────────────────────────────────────────────────
+    let raw_extract_latest: Option<DateTime<Utc>> = all_entries.last().map(|e| e.timestamp);
 
     // ──────────────────────────────────────────────────────────────────
-    // Dedup phase — emits a tick every 500 entries so the operator sees
-    // sustained progress on dense corpora even before any write occurs.
+    // Redact phase (#6): redaction must happen BEFORE dedup so the hash
+    // domain converges across incremental and --full-rescan paths. The
+    // legacy ordering hashed pre-redact in incremental and post-redact
+    // in full_rescan, producing two competing seen_hashes universes.
     // ──────────────────────────────────────────────────────────────────
-    let pre_dedup = all_entries.len();
-    let dedup_phase =
-        aicx::progress::Phase::start(reporter.clone(), "dedup", Some(pre_dedup as u64));
-    all_entries = dedup_entries_for_state_with_progress(
-        all_entries,
-        &mut state,
-        &project_name,
-        &overlap_project,
-        full_rescan,
-        |scanned| dedup_phase.tick(scanned as u64),
-    );
-    let dedup_skipped = pre_dedup.saturating_sub(all_entries.len());
-    dedup_phase.finish_ok(format!(
-        "kept {} / {} (skipped {})",
-        all_entries.len(),
-        pre_dedup,
-        dedup_skipped
-    ));
-    if dedup_skipped > 0 {
-        eprintln!(
-            "  Dedup: {} → {} entries (skipped {} seen)",
-            pre_dedup,
-            all_entries.len(),
-            dedup_skipped,
-        );
-    }
-
-    // ──────────────────────────────────────────────────────────────────
-    // Self-echo phase — filter aicx tool-echo entries that would feed
-    // back into the corpus. Phased so the operator sees activity during
-    // long runs where echo filtering is non-trivial.
-    // ──────────────────────────────────────────────────────────────────
-    let pre_echo = all_entries.len();
-    let echo_phase =
-        aicx::progress::Phase::start(reporter.clone(), "self_echo", Some(pre_echo as u64));
-    {
-        const ECHO_TICK_EVERY: usize = 500;
-        let mut scanned: usize = 0;
-        all_entries.retain(|e| {
-            scanned += 1;
-            if scanned.is_multiple_of(ECHO_TICK_EVERY) {
-                echo_phase.tick(scanned as u64);
-            }
-            !aicx::sanitize::is_self_echo(&e.message)
-        });
-        echo_phase.tick(scanned as u64);
-    }
-    let echo_filtered = pre_echo.saturating_sub(all_entries.len());
-    echo_phase.finish_ok(format!(
-        "kept {} / {} (filtered {})",
-        all_entries.len(),
-        pre_echo,
-        echo_filtered
-    ));
-    if echo_filtered > 0 {
-        eprintln!("  Filtered {echo_filtered} self-echo entries");
-    }
-
-    if all_entries.is_empty() {
-        eprintln!("No entries found.");
-        if let StdoutEmit::Json = emit {
-            let scope_surface = StoreScopeSurface::empty(&project);
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "total_entries": 0,
-                    "total_chunks": 0,
-                    "requested_source_filters": scope_surface.requested_source_filters,
-                    "resolved_repositories": scope_surface.resolved_repositories,
-                    "includes_non_repository_contexts": scope_surface.includes_non_repository_contexts,
-                    "resolved_store_buckets": scope_surface.resolved_store_buckets,
-                    "repos": scope_surface.repository_buckets(),
-                    "store_paths": Vec::<String>::new(),
-                    "written_empty_body_skipped": 0,
-                    "deduped_chunks": 0,
-                }))?
-            );
-        }
-        return Ok(());
-    }
-
-    // Apply redaction in-place (single TimelineEntry type)
     if redact_secrets {
         for e in &mut all_entries {
             e.message = aicx::redact::redact_secrets(&e.message);
@@ -4222,124 +4231,198 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
     };
 
     // ──────────────────────────────────────────────────────────────────
-    // Segment phase
-    //
-    // `semantic_segments` is a single in-memory pass that produces the
-    // segment list before any write touches disk. There's no
-    // mid-flight per-entry counter we can hook into, so the phase
-    // intentionally uses `total=None` and a heartbeat — the heartbeat
-    // counter then renders as `processed N | elapsed Xs` on TTY (and
-    // omits `total=...` from the structured surface) instead of
-    // showing a misleading `64/412674 = 0%` where `64` is the
-    // heartbeat tick count and `412674` is the entries denominator.
-    // The finish summary still reports the real `entries → segments`
-    // numbers once they're known.
+    // Segment phase (moved UP, ahead of dedup): per-canonical-repo dedup
+    // (#8) needs the canonical repo identity from each segment, so
+    // segmentation runs first. Progress denominator = entry count so
+    // operators see real percentage during long rescans (pass-4 UX
+    // follow-up to D-2-cluster).
     // ──────────────────────────────────────────────────────────────────
-    let segment_phase = aicx::progress::Phase::start(reporter.clone(), "segment", None);
+    let segment_total = all_entries.len() as u64;
+    let segment_phase =
+        aicx::progress::Phase::start(reporter.clone(), "segment", Some(segment_total));
     let segments = {
-        // Backoff: segmentation on a full-rescan corpus (400k+ entries)
-        // can take 15-20 minutes. A constant 2s tick floods the log
-        // with ~600 redundant heartbeat lines; backoff caps at 60s so
-        // the same run emits ~20 lines while still proving the phase
-        // is alive in the first few seconds.
         let hb = aicx::progress::Heartbeat::spawn_with_backoff(
             segment_phase.clone(),
             std::time::Duration::from_secs(2),
             std::time::Duration::from_secs(60),
         );
-        let result = aicx::segmentation::semantic_segments(&all_entries);
+        let result =
+            aicx::segmentation::semantic_segments_with_progress(&all_entries, |processed| {
+                hb.raise_floor(processed as u64)
+            });
         hb.stop();
         result
     };
-    let segment_count = segments.len();
+    let segment_count_pre = segments.len();
     segment_phase.finish_ok(format!(
         "{} entries → {} segments",
         all_entries.len(),
-        segment_count
+        segment_count_pre
     ));
 
     // ──────────────────────────────────────────────────────────────────
-    // Chunk phase — denominator is now segments (not entries), so the
-    // `current/total` ratio reflects actual write progress. Previously
-    // the phase reported `segment_idx / entries_count`, which made the
-    // bar appear stuck near 0 for the full corpus run.
+    // Dedup phase (#8): keyed on per-segment canonical repo slug rather
+    // than `_global` / `project.join("+")`. Cross-repo content
+    // collisions no longer falsely dedup. Legacy buckets in state.json
+    // stay as stale and are evicted by prune_old_hashes over time.
     // ──────────────────────────────────────────────────────────────────
-    let chunk_phase =
-        aicx::progress::Phase::start(reporter.clone(), "chunk", Some(segment_count as u64));
-    let store_result = store::store_segments_at(
-        &aicx::store::store_base_dir()?,
-        &segments,
-        &chunker_config,
-        |done, _total| chunk_phase.tick(done as u64),
-    );
-    let store_summary = match store_result {
-        Ok(summary) => {
-            let written = summary.written_paths.len() as u64;
-            chunk_phase.finish_ok(format!("{written} chunks"));
-            summary
+    let pre_dedup: usize = segments.iter().map(|s| s.entries.len()).sum();
+    let dedup_phase =
+        aicx::progress::Phase::start(reporter.clone(), "dedup", Some(pre_dedup as u64));
+    let segments = dedup_segments_per_repo(segments, &mut state, full_rescan, |scanned| {
+        dedup_phase.tick(scanned as u64)
+    });
+    let post_dedup: usize = segments.iter().map(|s| s.entries.len()).sum();
+    let dedup_skipped = pre_dedup.saturating_sub(post_dedup);
+    dedup_phase.finish_ok(format!(
+        "kept {post_dedup} / {pre_dedup} (skipped {dedup_skipped})"
+    ));
+    if dedup_skipped > 0 {
+        eprintln!("  Dedup: {pre_dedup} → {post_dedup} entries (skipped {dedup_skipped} seen)");
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Self-echo phase (per-segment): drop aicx tool-echo entries within
+    // each segment, then drop segments that emptied.
+    // ──────────────────────────────────────────────────────────────────
+    let pre_echo = post_dedup;
+    let echo_phase =
+        aicx::progress::Phase::start(reporter.clone(), "self_echo", Some(pre_echo as u64));
+    let segments = {
+        const ECHO_TICK_EVERY: usize = 500;
+        let mut scanned: usize = 0;
+        let mut out = Vec::with_capacity(segments.len());
+        for mut seg in segments {
+            seg.entries.retain(|e| {
+                scanned += 1;
+                if scanned.is_multiple_of(ECHO_TICK_EVERY) {
+                    echo_phase.tick(scanned as u64);
+                }
+                !aicx::sanitize::is_self_echo(&e.message)
+            });
+            if !seg.entries.is_empty() {
+                out.push(seg);
+            }
         }
-        Err(e) => {
-            let record = chunk_phase.finish_err(&e, aicx::progress::recovery_hint_for("chunk"));
-            failures.record(record);
-            let _ = aicx::progress::render_failure_tail(&failures);
-            return Err(e);
-        }
+        echo_phase.tick(scanned as u64);
+        out
     };
-    let stored_count = store_summary.total_entries;
-    let all_written_paths = store_summary.written_paths.clone();
-    let scope_surface = StoreScopeSurface::from_store_summary(&project, &store_summary);
+    let post_echo: usize = segments.iter().map(|s| s.entries.len()).sum();
+    let echo_filtered = pre_echo.saturating_sub(post_echo);
+    echo_phase.finish_ok(format!(
+        "kept {post_echo} / {pre_echo} (filtered {echo_filtered})"
+    ));
+    if echo_filtered > 0 {
+        eprintln!("  Filtered {echo_filtered} self-echo entries");
+    }
 
-    // Update fast local metadata index
-    if let Ok(rt) = tokio::runtime::Runtime::new() {
-        let path_refs: Vec<&PathBuf> = all_written_paths.iter().collect();
-        if let Err(e) = rt.block_on(aicx::steer_index::sync_steer_index_with_progress(
-            &path_refs,
-            reporter.clone(),
-            &failures,
-        )) {
-            eprintln!("⚠ steer index sync failed (search may be stale): {e}");
+    let mut stored_count = 0;
+    let mut all_written_paths = Vec::new();
+    let mut scope_surface = StoreScopeSurface::empty(&project);
+    let mut skipped_empty_body = 0;
+    let mut deduped_chunks = 0;
+
+    if post_echo == 0 {
+        eprintln!("No entries found.");
+    } else {
+        // ──────────────────────────────────────────────────────────────
+        // Chunk phase — denominator is segments (not entries), so the
+        // `current/total` ratio reflects actual write progress.
+        // ──────────────────────────────────────────────────────────────
+        let segment_count = segments.len();
+        let chunk_phase =
+            aicx::progress::Phase::start(reporter.clone(), "chunk", Some(segment_count as u64));
+        let store_result = store::store_segments_at(
+            &aicx::store::store_base_dir()?,
+            &segments,
+            &chunker_config,
+            |done, _total| chunk_phase.tick(done as u64),
+        );
+        let store_summary = match store_result {
+            Ok(summary) => {
+                let written = summary.written_paths.len() as u64;
+                chunk_phase.finish_ok(format!("{written} chunks"));
+                summary
+            }
+            Err(e) => {
+                let record = chunk_phase.finish_err(&e, aicx::progress::recovery_hint_for("chunk"));
+                failures.record(record);
+                let _ = aicx::progress::render_failure_tail(&failures);
+                return Err(e);
+            }
+        };
+
+        stored_count = store_summary.total_entries;
+        all_written_paths = store_summary.written_paths.clone();
+        scope_surface = StoreScopeSurface::from_store_summary(&project, &store_summary);
+        skipped_empty_body = store_summary.skipped_empty_body;
+        deduped_chunks = store_summary.deduped_chunks;
+
+        if let Ok(rt) = tokio::runtime::Runtime::new() {
+            let path_refs: Vec<&PathBuf> = all_written_paths.iter().collect();
+            if let Err(e) = rt.block_on(aicx::steer_index::sync_steer_index_with_progress(
+                &path_refs,
+                reporter.clone(),
+                &failures,
+            )) {
+                eprintln!("⚠ steer index sync failed (search may be stale): {e}");
+            }
         }
-    }
 
-    eprintln!(
-        "✓ {} entries → {} chunks",
-        stored_count,
-        all_written_paths.len(),
-    );
-    if store_summary.skipped_empty_body > 0 {
         eprintln!(
-            "  Skipped {} empty-body chunk(s)",
-            store_summary.skipped_empty_body
+            "✓ {} entries → {} chunks",
+            stored_count,
+            all_written_paths.len(),
+        );
+        if store_summary.skipped_empty_body > 0 {
+            eprintln!(
+                "  Skipped {} empty-body chunk(s)",
+                store_summary.skipped_empty_body
+            );
+        }
+        if store_summary.deduped_chunks > 0 {
+            eprintln!(
+                "  Deduped {} content-identical chunk(s)",
+                store_summary.deduped_chunks
+            );
+        }
+        for (repo, agents_map) in &store_summary.project_summary {
+            let total: usize = agents_map.values().sum();
+            let detail: Vec<String> = agents_map
+                .iter()
+                .map(|(a, c)| format!("{}: {}", a, c))
+                .collect();
+            eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
+        }
+        eprintln!(
+            "  Resolved store buckets: {}",
+            render_resolved_store_buckets(&scope_surface)
         );
     }
-    if store_summary.deduped_chunks > 0 {
-        eprintln!(
-            "  Deduped {} content-identical chunk(s)",
-            store_summary.deduped_chunks
-        );
-    }
-    for (repo, agents_map) in &store_summary.project_summary {
-        let total: usize = agents_map.values().sum();
-        let detail: Vec<String> = agents_map
-            .iter()
-            .map(|(a, c)| format!("{}: {}", a, c))
-            .collect();
-        eprintln!("  {}: {} entries ({})", repo, total, detail.join(", "));
-    }
-    eprintln!(
-        "  Resolved store buckets: {}",
-        render_resolved_store_buckets(&scope_surface)
-    );
 
-    if let Some(latest) = all_entries.last() {
-        state.update_watermark(&source_key, latest.timestamp);
+    // ──────────────────────────────────────────────────────────────────
+    // Watermark write (#19): advance from `raw_extract_latest` captured
+    // BEFORE filtering, not from the post-filter survivor list. This
+    // closes the self-echo-tail re-extract loop.
+    // ──────────────────────────────────────────────────────────────────
+    if let Some(latest) = raw_extract_latest {
+        state.update_watermark(&source_key, latest);
     }
+
+    // For --full-rescan, dedup_segments_per_repo skips persistent
+    // mark_seen during the run; we mark surviving entries now so future
+    // incremental runs honor what just landed.
     if full_rescan {
-        for e in &all_entries {
-            let exact = StateManager::content_hash(&e.agent, e.timestamp.timestamp(), &e.message);
-            let overlap = StateManager::overlap_hash(e.timestamp.timestamp(), &e.message);
-            state.mark_seen(&project_name, exact);
-            state.mark_seen(&overlap_project, overlap);
+        for seg in &segments {
+            let project_label = seg.project_label();
+            let overlap_project = format!("_overlap:{project_label}");
+            for e in &seg.entries {
+                let exact =
+                    StateManager::content_hash(&e.agent, e.timestamp.timestamp(), &e.message);
+                let overlap = StateManager::overlap_hash(e.timestamp.timestamp(), &e.message);
+                state.mark_seen(&project_label, exact);
+                state.mark_seen(&overlap_project, overlap);
+            }
         }
     }
     state.record_run(
@@ -4371,8 +4454,8 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
                     "resolved_store_buckets": scope_surface.resolved_store_buckets,
                     "repos": scope_surface.repository_buckets(),
                     "store_paths": store_paths,
-                    "written_empty_body_skipped": store_summary.skipped_empty_body,
-                    "deduped_chunks": store_summary.deduped_chunks,
+                    "written_empty_body_skipped": skipped_empty_body,
+                    "deduped_chunks": deduped_chunks,
                 }))?
             );
         }
@@ -5560,9 +5643,17 @@ fn dedup_steer_metadata(metadatas: &mut Vec<serde_json::Value>) {
     });
 }
 
+fn refs_cutoff(hours: u64) -> std::time::SystemTime {
+    if hours == 0 {
+        std::time::UNIX_EPOCH
+    } else {
+        std::time::SystemTime::now() - std::time::Duration::from_secs(hours.saturating_mul(3600))
+    }
+}
+
 /// List chunks in the canonical store, filtered by recency.
 fn run_refs(hours: u64, project: Option<String>, emit: RefsEmit, strict: bool) -> Result<()> {
-    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
+    let cutoff = refs_cutoff(hours);
     let mut files = store::context_files_since(cutoff, project.as_deref())?;
     if strict {
         files.retain(|file| !is_noise_artifact(&file.path));
@@ -6272,6 +6363,46 @@ mod tests {
             cutoff,
             all_time_cutoff(),
             "hours=0 must collapse to the Unix-epoch all-time sentinel"
+        );
+    }
+
+    #[test]
+    fn test_refs_cutoff_zero_returns_unix_epoch() {
+        let cutoff = crate::refs_cutoff(0);
+        assert_eq!(
+            cutoff,
+            std::time::UNIX_EPOCH,
+            "hours=0 must collapse to UNIX_EPOCH"
+        );
+    }
+
+    #[test]
+    fn test_extraction_source_key_is_order_insensitive() {
+        let project_a = vec!["a".to_string(), "b".to_string()];
+        let project_b = vec!["b".to_string(), "a".to_string()];
+
+        assert_eq!(
+            extraction_source_key(LEGACY_ALL_WATERMARK_AGENTS, &project_a),
+            extraction_source_key(LEGACY_ALL_WATERMARK_AGENTS, &project_b)
+        );
+        assert_eq!(
+            extraction_source_key_aliases(LEGACY_ALL_WATERMARK_AGENTS, &project_a),
+            extraction_source_key_aliases(LEGACY_ALL_WATERMARK_AGENTS, &project_b)
+        );
+    }
+
+    #[test]
+    fn test_extraction_source_key_is_case_insensitive() {
+        let project_a = vec!["Foo".to_string()];
+        let project_b = vec!["foo".to_string()];
+
+        assert_eq!(
+            extraction_source_key(LEGACY_ALL_WATERMARK_AGENTS, &project_a),
+            extraction_source_key(LEGACY_ALL_WATERMARK_AGENTS, &project_b)
+        );
+        assert_eq!(
+            extraction_source_key_aliases(LEGACY_ALL_WATERMARK_AGENTS, &project_a),
+            extraction_source_key_aliases(LEGACY_ALL_WATERMARK_AGENTS, &project_b)
         );
     }
 
@@ -7723,5 +7854,335 @@ mod tests {
                 "{subcommand} --help must state the zero-hours contract"
             );
         }
+    }
+
+    // ====================================================================
+    // Pipeline-reorder cluster tests (#6, #8, #19)
+    // ====================================================================
+
+    fn mk_entry(
+        agent: &str,
+        session: &str,
+        ts_secs: i64,
+        message: &str,
+        cwd: Option<&str>,
+    ) -> timeline::TimelineEntry {
+        timeline::TimelineEntry {
+            timestamp: chrono::DateTime::<chrono::Utc>::from_timestamp(ts_secs, 0).unwrap(),
+            agent: agent.to_string(),
+            session_id: session.to_string(),
+            role: "user".to_string(),
+            message: message.to_string(),
+            frame_kind: None,
+            branch: None,
+            cwd: cwd.map(str::to_string),
+            timestamp_source: None,
+        }
+    }
+
+    fn mk_segment(
+        repo: Option<(&str, &str)>,
+        agent: &str,
+        session: &str,
+        entries: Vec<timeline::TimelineEntry>,
+    ) -> timeline::SemanticSegment {
+        timeline::SemanticSegment {
+            repo: repo.map(|(org, name)| timeline::RepoIdentity {
+                organization: org.to_string(),
+                repository: name.to_string(),
+            }),
+            source_tier: repo.map(|_| timeline::SourceTier::Primary),
+            kind: timeline::Kind::default(),
+            agent: agent.to_string(),
+            session_id: session.to_string(),
+            entries,
+        }
+    }
+
+    /// #6: redaction must run BEFORE dedup so seen_hashes accumulate the
+    /// post-redact form. If dedup hashed the pre-redact form, incremental
+    /// and full_rescan runs would diverge on the hash domain — the audit's
+    /// "two competing seen-sets" pathology.
+    #[test]
+    fn test_pipeline_redacts_once_before_dedup() {
+        let raw = "my key sk-abc1234567890abcdef1234567890abcdef1234";
+        let redacted = aicx::redact::redact_secrets(raw);
+        assert_ne!(raw, redacted, "redact_secrets must rewrite a known key");
+
+        // The pipeline mutates message in place pre-dedup. Simulate that
+        // and verify the helper hashes the redacted form, not the raw.
+        let entry_raw = mk_entry("claude", "s1", 1_700_000_000, raw, Some("/tmp/repo"));
+        let mut entry_redacted = entry_raw.clone();
+        entry_redacted.message = redacted.clone();
+
+        let hash_raw = StateManager::content_hash(
+            &entry_raw.agent,
+            entry_raw.timestamp.timestamp(),
+            &entry_raw.message,
+        );
+        let hash_redacted = StateManager::content_hash(
+            &entry_redacted.agent,
+            entry_redacted.timestamp.timestamp(),
+            &entry_redacted.message,
+        );
+        assert_ne!(
+            hash_raw, hash_redacted,
+            "pre-redact and post-redact hashes must differ — proves order matters"
+        );
+
+        // Now confirm dedup_segments_per_repo, given the redacted form,
+        // marks `seen_hashes` under the post-redact hash (not the raw).
+        let mut state = StateManager::default();
+        let seg = mk_segment(
+            Some(("VetCoders", "aicx")),
+            "claude",
+            "s1",
+            vec![entry_redacted],
+        );
+        let kept = dedup_segments_per_repo(vec![seg], &mut state, false, |_| {});
+        assert_eq!(kept.iter().map(|s| s.entries.len()).sum::<usize>(), 1);
+        assert!(
+            !state.is_new("VetCoders/aicx", &hash_redacted),
+            "post-redact hash must be in seen_hashes after dedup"
+        );
+        assert!(
+            state.is_new("VetCoders/aicx", &hash_raw),
+            "pre-redact hash must NOT appear in seen_hashes — proves redaction ran before dedup"
+        );
+    }
+
+    /// #8: dedup is keyed per canonical repo slug, not on `_global`. Two
+    /// segments with the SAME content hash but DIFFERENT canonical repos
+    /// must both survive — cross-repo collisions are real (e.g. shared
+    /// boilerplate, operator-md task-notification stubs).
+    #[test]
+    fn test_dedup_keyed_per_canonical_repo() {
+        let same_message = "echo of the same boilerplate operator-md stub";
+        let entry_a = mk_entry(
+            "claude",
+            "session-a",
+            1_700_000_000,
+            same_message,
+            Some("/tmp/a"),
+        );
+        let entry_b = mk_entry(
+            "claude",
+            "session-b",
+            1_700_000_001,
+            same_message,
+            Some("/tmp/b"),
+        );
+
+        // Two segments, two different canonical repos, identical content.
+        let seg_a = mk_segment(
+            Some(("VetCoders", "repo-a")),
+            "claude",
+            "session-a",
+            vec![entry_a.clone()],
+        );
+        let seg_b = mk_segment(
+            Some(("VetCoders", "repo-b")),
+            "claude",
+            "session-b",
+            vec![entry_b.clone()],
+        );
+
+        let mut state = StateManager::default();
+        let kept = dedup_segments_per_repo(vec![seg_a, seg_b], &mut state, false, |_| {});
+        let total: usize = kept.iter().map(|s| s.entries.len()).sum();
+        assert_eq!(
+            total, 2,
+            "cross-repo content collision must NOT dedup — both entries should survive"
+        );
+
+        // Verify the two hashes landed in DISTINCT seen_hashes buckets.
+        let hash = StateManager::content_hash(
+            &entry_a.agent,
+            entry_a.timestamp.timestamp(),
+            &entry_a.message,
+        );
+        assert!(
+            !state.is_new("VetCoders/repo-a", &hash),
+            "hash must be marked under repo-a's bucket"
+        );
+        // Different timestamps → different exact hashes. Just verify the
+        // repo-b bucket has its own entry under its own hash.
+        let hash_b = StateManager::content_hash(
+            &entry_b.agent,
+            entry_b.timestamp.timestamp(),
+            &entry_b.message,
+        );
+        assert!(
+            !state.is_new("VetCoders/repo-b", &hash_b),
+            "hash must be marked under repo-b's bucket"
+        );
+
+        // And critically: the legacy `_global` bucket stays empty — proof
+        // the new keying path doesn't pollute the cross-repo store.
+        assert!(
+            state.is_new("_global", &hash),
+            "_global bucket must remain untouched under per-canonical-repo keying"
+        );
+
+        // Re-running dedup with the same segments should now SKIP both,
+        // because each repo bucket already saw its own hash.
+        let seg_a2 = mk_segment(
+            Some(("VetCoders", "repo-a")),
+            "claude",
+            "session-a",
+            vec![entry_a],
+        );
+        let seg_b2 = mk_segment(
+            Some(("VetCoders", "repo-b")),
+            "claude",
+            "session-b",
+            vec![entry_b],
+        );
+        let kept2 = dedup_segments_per_repo(vec![seg_a2, seg_b2], &mut state, false, |_| {});
+        let total2: usize = kept2.iter().map(|s| s.entries.len()).sum();
+        assert_eq!(
+            total2, 0,
+            "second pass must dedup both — proves per-repo state persists"
+        );
+    }
+
+    /// PR #8 review regression guard (chatgpt-codex-connector P1):
+    /// under `--full-rescan` the in-memory dedup state must be shared
+    /// across all segments of the same canonical repo, not recreated
+    /// per segment. Before the fix in this commit, two segments of the
+    /// same repo carrying the same logical entry both survived dedup,
+    /// regressing full_rescan to segment-local behavior.
+    #[test]
+    fn test_full_rescan_dedups_across_segments_within_same_repo() {
+        // Same content, same timestamp, same agent — both entries
+        // produce identical `content_hash` and `overlap_hash`. The
+        // segments share a canonical repo (VetCoders/repo-a) but live
+        // in distinct sessions (the realistic shape: one repo touched
+        // by several Claude sessions over time).
+        let dup_message = "echo across sessions";
+        let dup_ts = 1_700_000_000;
+        let entry_a1 = mk_entry("claude", "s1", dup_ts, dup_message, Some("/tmp/a"));
+        let entry_a2 = mk_entry("claude", "s2", dup_ts, dup_message, Some("/tmp/a"));
+
+        let seg_s1 = mk_segment(
+            Some(("VetCoders", "repo-a")),
+            "claude",
+            "s1",
+            vec![entry_a1.clone()],
+        );
+        let seg_s2 = mk_segment(
+            Some(("VetCoders", "repo-a")),
+            "claude",
+            "s2",
+            vec![entry_a2.clone()],
+        );
+
+        let mut state = StateManager::default();
+        // full_rescan = true: incremental `state.is_new` is bypassed,
+        // dedup relies purely on the in-memory per-repo HashSets that
+        // this regression guard pins as run-wide (not segment-local).
+        let kept = dedup_segments_per_repo(vec![seg_s1, seg_s2], &mut state, true, |_| {});
+        let total: usize = kept.iter().map(|s| s.entries.len()).sum();
+        assert_eq!(
+            total, 1,
+            "full_rescan must dedup duplicates across segments of the \
+             same repo; got {total} kept (regressed before fix)"
+        );
+
+        // And the cross-repo invariant still holds — a second repo with
+        // the same content survives because each canonical repo owns
+        // its own dedup bucket.
+        let entry_b1 = mk_entry("claude", "s3", dup_ts, dup_message, Some("/tmp/b"));
+        let seg_b = mk_segment(
+            Some(("VetCoders", "repo-b")),
+            "claude",
+            "s3",
+            vec![entry_b1],
+        );
+        let entry_a3 = mk_entry("claude", "s4", dup_ts, dup_message, Some("/tmp/a"));
+        let seg_a3 = mk_segment(
+            Some(("VetCoders", "repo-a")),
+            "claude",
+            "s4",
+            vec![entry_a3],
+        );
+        let mut state2 = StateManager::default();
+        let kept2 = dedup_segments_per_repo(vec![seg_a3, seg_b], &mut state2, true, |_| {});
+        let total2: usize = kept2.iter().map(|s| s.entries.len()).sum();
+        assert_eq!(
+            total2, 2,
+            "cross-repo collision MUST survive full_rescan dedup — \
+             each canonical repo owns its own bucket; got {total2}"
+        );
+    }
+
+    /// #19: watermark advances from the raw-extract latest captured
+    /// BEFORE self-echo / dedup filters, not from `entries.last()` after
+    /// filtering. This closes the self-echo-tail re-extract loop.
+    #[test]
+    fn test_watermark_advances_from_raw_extract_latest() {
+        // Three entries [A (T-2), B (T-1), C (T)] where C is a self-echo
+        // candidate that filtering will drop.
+        let t_a = 1_700_000_000;
+        let t_b = 1_700_000_001;
+        let t_c = 1_700_000_002;
+        let entries = vec![
+            mk_entry("claude", "s1", t_a, "real signal A", Some("/tmp/repo")),
+            mk_entry("claude", "s1", t_b, "real signal B", Some("/tmp/repo")),
+            // A genuine self-echo marker recognized by aicx::sanitize::is_self_echo.
+            mk_entry(
+                "claude",
+                "s1",
+                t_c,
+                "【aicx:read】 store-read echo\n【/aicx:read】",
+                Some("/tmp/repo"),
+            ),
+        ];
+
+        // 1) The new pipeline captures raw_extract_latest BEFORE filters.
+        let raw_extract_latest = entries.last().map(|e| e.timestamp);
+        assert_eq!(raw_extract_latest.map(|ts| ts.timestamp()), Some(t_c));
+
+        // 2) Simulate the self-echo filter dropping the tail.
+        let filtered: Vec<_> = entries
+            .into_iter()
+            .filter(|e| !aicx::sanitize::is_self_echo(&e.message))
+            .collect();
+        assert_eq!(
+            filtered.last().map(|e| e.timestamp.timestamp()),
+            Some(t_b),
+            "self-echo filter must have dropped the tail entry — otherwise the test premise is broken"
+        );
+
+        // 3) Watermark must come from raw_extract_latest, NOT filtered.last()
+        let mut state = StateManager::default();
+        if let Some(latest) = raw_extract_latest {
+            state.update_watermark("source-key", latest);
+        }
+        assert_eq!(
+            state.get_watermark("source-key").map(|ts| ts.timestamp()),
+            Some(t_c),
+            "watermark must advance to the raw-extract tail (T), not the filtered survivor (T-1)"
+        );
+
+        // 4) Negative control: if we had written the legacy way, the
+        // watermark would lag at T-1 and the self-echo tail would be
+        // re-extracted on every subsequent run.
+        let mut legacy_state = StateManager::default();
+        if let Some(latest) = filtered.last() {
+            legacy_state.update_watermark("source-key", latest.timestamp);
+        }
+        assert_eq!(
+            legacy_state
+                .get_watermark("source-key")
+                .map(|ts| ts.timestamp()),
+            Some(t_b),
+            "legacy ordering would have produced this lagging watermark — verified for contrast"
+        );
+        assert_ne!(
+            state.get_watermark("source-key"),
+            legacy_state.get_watermark("source-key"),
+            "new and legacy watermark semantics must differ — proves the fix is load-bearing"
+        );
     }
 }

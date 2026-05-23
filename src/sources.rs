@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::sanitize;
+use crate::store::project_filter_matches;
 use crate::timeline::FrameKind;
 pub use crate::timeline::{
     CollapseStubKind, ConversationMessage, ExtractionConfig, MessageKind, SourceInfo, TimelineEntry,
@@ -36,6 +37,14 @@ const CODESCRIBE_NO_SPEECH_MARKERS: &[&str] = &[
 ];
 const OPERATOR_MD_AGENT: &str = "operator";
 const OPERATOR_MD_KIND: &str = "operator-md";
+/// Default discovery window applied when a caller does NOT supply its own cutoff.
+///
+/// Historically this acted as an unconditional ceiling, which silently capped
+/// `aicx store --agent operator-md -H 0` (all-time backfill) at 30 days. It
+/// is now a *default* honored only when `caller_cutoff` is `None` in
+/// [`discover_operator_markdown_from`]. Callers that thread an
+/// `ExtractionConfig::cutoff` through (e.g. the store pipeline) bypass this
+/// default entirely, so explicit lookback flags are honored.
 const OPERATOR_MD_RECENT_DAYS: i64 = 30;
 const UNPROTECTED_SOURCE_WARNING: &str = "unprotected source material; run `aicx sources protect --root <path> --backend git-local --apply` to opt in";
 const EXACT_SHORT_DUP_MAX_CHARS: usize = 1000;
@@ -713,7 +722,7 @@ fn extract_claude_line_entries(
     config: &ExtractionConfig,
     warnings: &mut Vec<ClaudeSessionWarning>,
 ) -> Vec<TimelineEntry> {
-    if timestamp < config.cutoff || config.watermark.is_some_and(|wm| timestamp <= wm) {
+    if timestamp < config.cutoff || config.watermark.is_some_and(|wm| timestamp < wm) {
         return Vec::new();
     }
 
@@ -972,17 +981,133 @@ fn infer_gemini_project_hint_from_session_path(path: &Path) -> Option<String> {
     normalize_project_hint(&project)
 }
 
-/// Check if any project filter matches the given path by strict path segment.
+fn project_filter_matches_identity(
+    organization: &str,
+    repository: &str,
+    filters: &[String],
+) -> bool {
+    filters.is_empty()
+        || filters
+            .iter()
+            .any(|filter| project_filter_matches(organization, repository, filter))
+}
+
+/// Detect Windows-style absolute paths so Tier 1 canonical resolution
+/// also fires for `C:\Users\...` / `C:/Users/...` / UNC `\\server\share`
+/// shapes. Without this, Windows local checkouts where the canonical
+/// `(owner, repository)` lives only in `.git/config` (not in path
+/// segments) silently fall through to Tier 3 segment-adjacency matching
+/// and `-p owner/repo` filters cannot reach them.
 ///
-/// Mirrors store filter forms without substring matching:
-/// - `owner/repo` => adjacent path segments.
-/// - `owner/` => exact owner segment.
-/// - `/repo` => exact repo segment.
-/// - `name` => exact path segment.
+/// Surfaced by `chatgpt-codex-connector` P1 on PR #8 at src/sources.rs:1069.
+fn is_windows_absolute_path(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    // Drive-letter form: `C:\…` or `C:/…` (`X:` for any ASCII letter).
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return true;
+    }
+    // UNC form: `\\server\share…`.
+    s.starts_with("\\\\")
+}
+
+fn canonical_project_parts(value: &str) -> Option<(String, String)> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('\\')
+        || trimmed.contains(":\\")
+    {
+        return None;
+    }
+
+    let mut parts = trimmed.split(['/', '\\']);
+    let organization = parts
+        .next()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())?;
+    let repository = parts
+        .next()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    Some((organization.to_string(), repository.to_string()))
+}
+
+/// Check if any project filter matches the given path or canonical identity.
+///
+/// Resolution tiers (in order):
+///
+/// 1. **Canonical identity from `aicx_parser::segmentation::infer_tiered_identity_from_cwd`**
+///    — consults `cwd`'s `.git/config` remote URL, then known-layout
+///    heuristics, then URL-shape inference. This is the **ground truth**
+///    resolver, the same one `semantic_segments` uses to bucket entries.
+/// 2. **Literal `owner/repo` canonical string** — for inputs that are
+///    already a slash-shaped slug (not a path).
+/// 3. **Strict adjacent path segments** — `owner/repo` requires both
+///    segments to appear adjacent in the path. `owner/` matches any
+///    occurrence of `owner`. `/repo` matches any occurrence of `repo`.
+///    Bare `name` matches any segment equal to `name`.
+///
+/// The previous "tier 3 relax" (path's last segment equals filter's
+/// repo, even when the owner is absent from the path) is **gone**.
+/// It caused the cross-org leak flagged by `chatgpt-codex-connector` P1
+/// on PR #8 (filter `Loctree/aicx` matched `/.../VetCoders/aicx`).
+/// The original bug #14 workflow (`-p Loctree/aicx` against
+/// `/Users/silver/Git/aicx`) now travels through Tier 1: when the local
+/// path has a `.git/config` pointing at `github.com/Loctree/aicx`, the
+/// canonical resolver returns `(Loctree, aicx)` and the filter matches
+/// honestly — by ground truth, not by path-noise heuristic. For paths
+/// with no resolvable canonical identity (no `.git`, no URL shape, no
+/// known layout), `-p owner/repo` requires strict adjacency.
 fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool {
     if filters.is_empty() {
         return true;
     }
+
+    // Tier 1: ground-truth canonical resolver (git remote → known layout
+    // → URL shape). Same machinery `semantic_segments` uses to bucket
+    // entries, so the filter and the bucketer cannot disagree.
+    //
+    // We only invoke Tier 1 when the cwd LOOKS LIKE A REAL CWD — an
+    // absolute path, a `~/...` home-relative path, or a URL shape. For
+    // anything else (relative path strings, encoded Claude dir names,
+    // bare segments) Tier 1's internal `discover_git_root` would walk
+    // ancestors that resolve relative to the *test runner's own cwd*,
+    // spuriously locking onto the running process's `.git` and
+    // reporting THAT remote's identity. Guarding here is cheaper and
+    // honester than patching `discover_git_root` at the parser layer.
+    let cwd_trimmed = cwd.trim();
+    let resolvable_shape = cwd_trimmed.starts_with('/')
+        || cwd_trimmed.starts_with('~')
+        || cwd_trimmed.starts_with("http://")
+        || cwd_trimmed.starts_with("https://")
+        || cwd_trimmed.starts_with("git@")
+        || cwd_trimmed.starts_with("ssh://")
+        || cwd_trimmed.starts_with("git://")
+        || is_windows_absolute_path(cwd_trimmed);
+    if resolvable_shape
+        && let Some(tiered) = aicx_parser::segmentation::infer_tiered_identity_from_cwd(Some(cwd))
+    {
+        return project_filter_matches_identity(
+            &tiered.identity.organization,
+            &tiered.identity.repository,
+            filters,
+        );
+    }
+
+    // Tier 2: cwd is already a literal `owner/repo` slug (not a path).
+    if let Some((organization, repository)) = canonical_project_parts(cwd) {
+        return project_filter_matches_identity(&organization, &repository, filters);
+    }
+
+    // Tier 3: strict path-segment matching, no last-segment relax.
     let path_segments: Vec<String> = cwd
         .split(['/', '\\'])
         .map(str::trim)
@@ -1021,6 +1146,11 @@ fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool {
             if parts.next().is_some() {
                 return false;
             }
+            // Strict adjacency — no last-segment relax. Cross-org leak
+            // (filter `Loctree/aicx` matching `/.../VetCoders/aicx`)
+            // is impossible in this branch. For a local checkout to
+            // match by canonical identity, Tier 1 must resolve it via
+            // `.git/config` remote URL.
             return path_segments
                 .windows(2)
                 .any(|pair| pair[0] == owner && pair[1] == repo);
@@ -1030,29 +1160,104 @@ fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool {
     })
 }
 
+/// Token-aware "does this body mention `repo` as a whole word?" check.
+///
+/// Splits the (already-lowercased) body on runs of non-identifier
+/// characters — alphanumerics, `-`, and `_` count as in-word, everything
+/// else is a separator. Returns true iff some resulting token equals
+/// `repo_lower` byte-for-byte.
+///
+/// This is used by codescribe project-hint inference (sources.rs ~4943):
+/// the prior `lower_body.contains(&repo)` substring match was flagged in
+/// the gemini-code-assist MEDIUM PR #8 review for re-introducing a
+/// suffix-leak (`-p vista` matched bodies mentioning `vista-portal`).
+/// Token-equality is consistent with the rest of pass-4's strict
+/// identity matchers (e.g. `project_filter_matches`).
+fn body_mentions_repo_token(body_lower: &str, repo_lower: &str) -> bool {
+    if repo_lower.is_empty() {
+        return false;
+    }
+    body_lower
+        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+        .any(|token| token == repo_lower)
+}
+
+/// Soft pre-filter on Claude project directory names.
+///
+/// The Claude on-disk encoding is the original cwd with `/` replaced by
+/// `-` (optionally prefixed with a leading `-` for absolute paths). The
+/// encoding is **inherently lossy** — given `-Users-silver-Git-vista` we
+/// cannot recover whether the original was `/Users/silver/Git/vista`
+/// (single-segment repo `vista`) or `/Users/silver/Git/nextra-docs-vista`
+/// or `/Users-silver/Git/vista`, etc.
+///
+/// This function therefore acts as a **permissive pre-filter** at the
+/// directory-listing stage. Three legal match shapes for a bare `repo`
+/// filter:
+///
+///   1. Exact: `dir_name == filter` (single-component repo, no prefix).
+///   2. Leading-dash exact: `dir_name == "-{filter}"` (single-component
+///      repo encoded as absolute path).
+///   3. Last-chunk: `dir_name.ends_with("-{filter}")` (filter looks like
+///      a plausible last cwd segment).
+///
+/// For `owner/repo` filters (containing `/`), we defer to the strict
+/// path-shaped matcher on a best-effort decoded form.
+///
+/// Case 3 reintroduces a controlled ambiguity — `-p vista` will match
+/// both `-Users-silver-Git-vista` (correct) **and**
+/// `-Users-silver-Git-nextra-docs-vista` (likely not what the operator
+/// meant). That ambiguity is **inherent** to the Claude encoding and
+/// cannot be resolved from the directory name alone. The strict
+/// per-entry `cwd` filter inside `extract_claude` (sources.rs ~1587,
+/// `entry.cwd.as_deref().is_some_and(|c| project_filter_matches_path(c, ...))`)
+/// resolves it precisely when the entry carries a `cwd` field — the
+/// common case. Sessions without `cwd` were previously dropped by the
+/// over-restrictive equality check; this relaxation keeps them reachable
+/// so the strict per-entry pass can decide.
+///
+/// History: the previous `decoded.eq_ignore_ascii_case(filter) ||
+/// dir_name.eq_ignore_ascii_case(filter)` required the filter to be the
+/// **whole** encoded dir name (e.g. `-p Users-silver-Git-aicx`) instead
+/// of just the repo name. That broke every existing `-p reponame`
+/// invocation against absolute-path Claude dirs and was the regression
+/// flagged by gemini-code-assist HIGH + chatgpt-codex-connector P1
+/// comments on PR #8.
 fn claude_project_dir_matches_filter(dir_name: &str, filters: &[String]) -> bool {
     if filters.is_empty() {
         return true;
     }
-    let decoded = decode_claude_project_path(dir_name);
-    let dir_lower = dir_name.to_ascii_lowercase();
 
     filters.iter().any(|filter| {
         let filter = filter.trim();
         if filter.is_empty() {
             return false;
         }
-        let filter_lower = filter.to_ascii_lowercase();
+
         if filter.contains('/') {
-            project_filter_matches_path(&decoded, &[filter.to_string()])
-        } else {
-            decoded
-                .rsplit('/')
-                .next()
-                .is_some_and(|segment| segment.eq_ignore_ascii_case(filter))
-                || dir_lower == filter_lower
-                || dir_lower.ends_with(&format!("-{filter_lower}"))
+            // owner/repo or /repo: defer to the strict path matcher on a
+            // best-effort decoded form. Decode is lossy (hyphens vs
+            // slashes ambiguous) but the path matcher's adjacency
+            // semantics tolerate that; the per-entry cwd filter
+            // downstream catches the strict case.
+            let decoded = decode_claude_project_path(dir_name);
+            return project_filter_matches_path(&decoded, &[filter.to_string()]);
         }
+
+        let needle_lower = filter.to_ascii_lowercase();
+        let dir_lower = dir_name.to_ascii_lowercase();
+
+        // Shape 1: exact (no leading dash, single-component).
+        if dir_lower == needle_lower {
+            return true;
+        }
+        // Shape 2: leading-dash exact (single-component as absolute).
+        let dash_exact = format!("-{needle_lower}");
+        if dir_lower == dash_exact {
+            return true;
+        }
+        // Shape 3: last-`-`-chunk match (plausible last cwd segment).
+        dir_lower.ends_with(&dash_exact)
     })
 }
 
@@ -1712,6 +1917,15 @@ pub fn extract_claude_file(path: &Path, config: &ExtractionConfig) -> Result<Vec
 /// - Codex history format (`~/.codex/history.jsonl`) — `CodexEntry` per line.
 /// - Codex session format (`~/.codex/sessions/**/**/*.jsonl`) — `CodexSessionEvent` per line.
 pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
+    let (entries, warnings) = parse_codex_file_with_diagnostics(path, config)?;
+    emit_codex_session_warnings(path, &warnings);
+    Ok(entries)
+}
+
+fn parse_codex_file_with_diagnostics(
+    path: &Path,
+    config: &ExtractionConfig,
+) -> Result<(Vec<TimelineEntry>, Vec<CodexSessionWarning>)> {
     let file = sanitize::open_file_validated(path)?;
     let mut reader = BufReader::new(file);
     let mut history_records = Vec::new();
@@ -1735,12 +1949,15 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
         if first_non_empty.is_none() {
             first_non_empty = Some(line.clone());
         }
-        if let Ok(entry) = serde_json::from_str::<CodexEntry>(&line) {
-            history_records.push(entry);
-            continue;
-        }
-        if let Ok(event) = serde_json::from_str::<CodexSessionEvent>(&line) {
-            session_events.push(event);
+        match serde_json::from_str::<CodexEntry>(&line) {
+            Ok(entry) => {
+                history_records.push(entry);
+                continue;
+            }
+            Err(_) => match serde_json::from_str::<CodexSessionEvent>(&line) {
+                Ok(event) => session_events.push(event),
+                Err(_) => warnings.push(codex_line_parse_error(line_number, &line)),
+            },
         }
     }
 
@@ -1752,8 +1969,7 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
     }
 
     let Some(first_line) = first_non_empty else {
-        emit_codex_session_warnings(path, &warnings);
-        return Ok(vec![]);
+        return Ok((vec![], warnings));
     };
 
     if !history_records.is_empty() || !session_events.is_empty() {
@@ -1781,9 +1997,8 @@ pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
             warnings.extend(session_warnings);
             entries.append(&mut session_entries);
         }
-        emit_codex_session_warnings(path, &warnings);
         entries.sort_by_key(|a| a.timestamp);
-        return Ok(entries);
+        return Ok((entries, warnings));
     }
 
     // Check for legacy JSON format ({"session": {...}, "items": [...]})
@@ -2015,7 +2230,7 @@ fn extract_gemini_antigravity_step_outputs(
         if timestamp < config.cutoff {
             continue;
         }
-        if config.watermark.is_some_and(|wm| timestamp <= wm) {
+        if config.watermark.is_some_and(|wm| timestamp < wm) {
             continue;
         }
 
@@ -2250,7 +2465,7 @@ fn antigravity_json_message_to_entries(
     if timestamp < config.cutoff {
         return Vec::new();
     }
-    if config.watermark.is_some_and(|wm| timestamp <= wm) {
+    if config.watermark.is_some_and(|wm| timestamp < wm) {
         return Vec::new();
     }
 
@@ -2396,7 +2611,7 @@ fn parse_antigravity_transcript_text(
         if timestamp < config.cutoff {
             continue;
         }
-        if config.watermark.is_some_and(|wm| timestamp <= wm) {
+        if config.watermark.is_some_and(|wm| timestamp < wm) {
             continue;
         }
 
@@ -2718,7 +2933,7 @@ pub fn extract_claude_history(config: &ExtractionConfig) -> Result<Vec<TimelineE
         if timestamp < config.cutoff {
             continue;
         }
-        if config.watermark.is_some_and(|wm| timestamp <= wm) {
+        if config.watermark.is_some_and(|wm| timestamp < wm) {
             continue;
         }
 
@@ -2865,6 +3080,10 @@ pub(crate) enum CodexSessionWarning {
         count: usize,
         samples: Vec<String>,
     },
+    LineParseError {
+        line_number: usize,
+        snippet: String,
+    },
     ContentSanitization {
         warning: sanitize::ContentSanitizationWarning,
     },
@@ -2917,6 +3136,15 @@ impl CodexSessionWarning {
                 count,
                 MAX_LINE_BYTES,
                 samples.join(", ")
+            ),
+            CodexSessionWarning::LineParseError {
+                line_number,
+                snippet,
+            } => format!(
+                "Codex warning: {} skipped malformed JSONL line {}; snippet: {}",
+                path.display(),
+                line_number,
+                snippet
             ),
             CodexSessionWarning::ContentSanitization { warning } => format!(
                 "Codex content warning: {} {}",
@@ -2978,6 +3206,9 @@ fn emit_codex_session_warnings(path: &Path, warnings: &[CodexSessionWarning]) {
             CodexSessionWarning::OversizedLine { count, .. } => {
                 diagnostics::record("codex", DiagnosticKind::OversizedLine, *count, path);
             }
+            CodexSessionWarning::LineParseError { .. } => {
+                diagnostics::record("codex", DiagnosticKind::LineParseError, 1, path);
+            }
             CodexSessionWarning::ContentSanitization { warning } => {
                 record_content_sanitization("codex", warning, path);
             }
@@ -3002,6 +3233,7 @@ pub(crate) struct CodexSessionDiagnostics {
     pub(crate) unknown_msg_type: usize,
     pub(crate) mixed_format: usize,
     pub(crate) oversized_line: usize,
+    pub(crate) line_parse_error: usize,
     pub(crate) content_sanitization: usize,
 }
 
@@ -3025,6 +3257,9 @@ impl CodexSessionDiagnostics {
                 CodexSessionWarning::OversizedLine { count, .. } => {
                     self.oversized_line += count;
                 }
+                CodexSessionWarning::LineParseError { .. } => {
+                    self.line_parse_error += 1;
+                }
                 CodexSessionWarning::ContentSanitization { .. } => {
                     self.content_sanitization += 1;
                 }
@@ -3040,6 +3275,7 @@ impl CodexSessionDiagnostics {
             && self.unknown_msg_type == 0
             && self.mixed_format == 0
             && self.oversized_line == 0
+            && self.line_parse_error == 0
             && self.content_sanitization == 0
     }
 }
@@ -3150,7 +3386,7 @@ fn build_codex_history_entries(
             if timestamp < config.cutoff {
                 continue;
             }
-            if config.watermark.is_some_and(|wm| timestamp <= wm) {
+            if config.watermark.is_some_and(|wm| timestamp < wm) {
                 continue;
             }
 
@@ -3244,8 +3480,9 @@ fn parse_codex_session_file_with_diagnostics(
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(ev) = serde_json::from_str::<CodexSessionEvent>(&line) {
-            events.push(ev);
+        match serde_json::from_str::<CodexSessionEvent>(&line) {
+            Ok(ev) => events.push(ev),
+            Err(_) => warnings.push(codex_line_parse_error(line_number, &line)),
         }
     }
 
@@ -3260,6 +3497,13 @@ fn parse_codex_session_file_with_diagnostics(
         parse_codex_session_events_with_diagnostics(path, &events, config);
     warnings.extend(event_warnings);
     Ok((entries, warnings))
+}
+
+fn codex_line_parse_error(line_number: usize, line: &str) -> CodexSessionWarning {
+    CodexSessionWarning::LineParseError {
+        line_number,
+        snippet: line.chars().take(200).collect(),
+    }
 }
 
 fn parse_codex_session_events_with_diagnostics(
@@ -3467,7 +3711,7 @@ fn parse_codex_session_events_with_diagnostics(
         if timestamp < config.cutoff {
             continue;
         }
-        if config.watermark.is_some_and(|wm| timestamp <= wm) {
+        if config.watermark.is_some_and(|wm| timestamp < wm) {
             continue;
         }
 
@@ -3700,7 +3944,7 @@ fn parse_gemini_session_with_diagnostics(
         }
 
         // Respect watermark
-        if config.watermark.is_some_and(|wm| timestamp <= wm) {
+        if config.watermark.is_some_and(|wm| timestamp < wm) {
             continue;
         }
 
@@ -4350,7 +4594,7 @@ pub fn extract_junie(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
             && modified < config.cutoff
             && config
                 .watermark
-                .is_none_or(|watermark| modified <= watermark)
+                .is_none_or(|watermark| modified < watermark)
         {
             continue;
         }
@@ -4472,7 +4716,7 @@ fn junie_timestamp_in_window(timestamp: DateTime<Utc>, config: &ExtractionConfig
 
     if config
         .watermark
-        .is_some_and(|watermark| timestamp <= watermark)
+        .is_some_and(|watermark| timestamp < watermark)
     {
         return false;
     }
@@ -4760,8 +5004,7 @@ pub fn parse_codescribe_transcript(
 ) -> Result<Vec<TimelineEntry>> {
     let home = dirs::home_dir().context("No home dir")?;
     let lexicon = load_codescribe_lexicon(&home);
-    let cwd_hint = resolve_codescribe_cwd_hint(&home, &config.project_filter);
-    parse_codescribe_transcript_with_lexicon(path, date, config, &lexicon, cwd_hint.as_deref())
+    parse_codescribe_transcript_with_lexicon(path, date, config, &lexicon, &home)
 }
 
 fn parse_codescribe_transcript_with_lexicon(
@@ -4769,9 +5012,49 @@ fn parse_codescribe_transcript_with_lexicon(
     date: NaiveDate,
     config: &ExtractionConfig,
     lexicon: &CodescribeLexicon,
-    cwd_hint: Option<&str>,
+    home: &Path,
 ) -> Result<Vec<TimelineEntry>> {
     let content = sanitize::read_to_string_validated(path)?;
+
+    let mut project_hint = None;
+    let (frontmatter, body) = split_operator_frontmatter(&content);
+    if let Some(project) = frontmatter
+        .project
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        project_hint = Some(project.trim().to_string());
+    } else {
+        let lower_body = body.to_ascii_lowercase();
+        for filter in &config.project_filter {
+            let repo = filter
+                .split_once('/')
+                .map(|(_, r)| r)
+                .unwrap_or(filter)
+                .to_ascii_lowercase();
+            // Use token-equality (not raw substring) so `-p vista` does
+            // not falsely attribute a transcript that mentions
+            // `vista-portal`. This addresses the gemini-code-assist
+            // MEDIUM comment on PR #8: substring `lower_body.contains`
+            // re-introduced the suffix-leak shape that the strict
+            // identity matchers in this PR were specifically removing.
+            if body_mentions_repo_token(&lower_body, &repo) {
+                project_hint = Some(filter.clone());
+                break;
+            }
+        }
+    }
+
+    if project_hint.is_none() {
+        // TODO: codescribe transcript has no embedded identity in frontmatter or content.
+        // Keeping the global filter as a fallback for that path-only case.
+        if config.project_filter.len() == 1 {
+            project_hint = config.project_filter.first().cloned();
+        }
+    }
+
+    let cwd_hint_owned = resolve_codescribe_cwd_hint(home, project_hint.as_deref());
+    let cwd_hint = cwd_hint_owned.as_deref();
     let segments = match path.extension().and_then(|ext| ext.to_str()) {
         Some("json") => parse_codescribe_json(&content)?,
         Some("md") => parse_codescribe_markdown(&content),
@@ -4791,7 +5074,7 @@ fn parse_codescribe_transcript_with_lexicon(
     let mut entries = Vec::new();
     for segment in segments {
         let timestamp = codescribe_timestamp(path, date, segment.start_ms);
-        if timestamp < config.cutoff || config.watermark.is_some_and(|w| timestamp <= w) {
+        if timestamp < config.cutoff || config.watermark.is_some_and(|w| timestamp < w) {
             continue;
         }
 
@@ -4843,7 +5126,6 @@ pub fn extract_codescribe_from_home(
     config: &ExtractionConfig,
 ) -> Result<Vec<TimelineEntry>> {
     let lexicon = load_codescribe_lexicon(home);
-    let cwd_hint = resolve_codescribe_cwd_hint(home, &config.project_filter);
     let mut entries = Vec::new();
 
     for transcript in discover_codescribe_transcripts(home) {
@@ -4852,7 +5134,7 @@ pub fn extract_codescribe_from_home(
             transcript.date,
             config,
             &lexicon,
-            cwd_hint.as_deref(),
+            home,
         ) {
             Ok(mut parsed) => entries.append(&mut parsed),
             Err(e) => eprintln!(
@@ -4863,32 +5145,55 @@ pub fn extract_codescribe_from_home(
         }
     }
 
+    if !config.project_filter.is_empty() {
+        entries.retain(|entry| {
+            if let Some(cwd) = &entry.cwd {
+                project_filter_matches_path(cwd, &config.project_filter)
+            } else {
+                false
+            }
+        });
+    }
+
     entries.sort_by_key(|entry| entry.timestamp);
     Ok(entries)
 }
 
-fn resolve_codescribe_cwd_hint(home: &Path, project_filter: &[String]) -> Option<String> {
-    let filter = project_filter.first()?;
-    if project_filter.len() != 1 {
+fn resolve_codescribe_cwd_hint(home: &Path, project_hint: Option<&str>) -> Option<String> {
+    let project = project_hint?.trim();
+    if project.is_empty() {
         return None;
     }
 
-    let repo = filter
-        .rsplit('/')
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
+    let (org, repo) = project.split_once('/').unwrap_or(("", project));
 
-    let candidates = [
-        home.join(repo),
-        home.join("Libraxis").join(repo),
-        home.join("Libraxis")
-            .join("01_deployed_libraxis_vm")
-            .join(repo),
-        home.join("Libraxis").join("vc-runtime").join(repo),
-        home.join("hosted").join("VetCoders").join(repo),
-        home.join("vc-workspace").join("VetCoders").join(repo),
-    ];
+    let candidates = if !org.is_empty() {
+        vec![
+            home.join(org).join(repo),
+            home.join("Libraxis").join(org).join(repo),
+            home.join("Libraxis")
+                .join("01_deployed_libraxis_vm")
+                .join(org)
+                .join(repo),
+            home.join("Libraxis")
+                .join("vc-runtime")
+                .join(org)
+                .join(repo),
+            home.join("hosted").join(org).join(repo),
+            home.join("vc-workspace").join(org).join(repo),
+        ]
+    } else {
+        vec![
+            home.join(repo),
+            home.join("Libraxis").join(repo),
+            home.join("Libraxis")
+                .join("01_deployed_libraxis_vm")
+                .join(repo),
+            home.join("Libraxis").join("vc-runtime").join(repo),
+            home.join("hosted").join("VetCoders").join(repo),
+            home.join("vc-workspace").join("VetCoders").join(repo),
+        ]
+    };
 
     candidates
         .into_iter()
@@ -4898,13 +5203,21 @@ fn resolve_codescribe_cwd_hint(home: &Path, project_filter: &[String]) -> Option
 
 /// Discover recent operator markdown files from the standard operator inboxes.
 pub fn discover_operator_markdown(home: &Path) -> Vec<OperatorMarkdown> {
-    discover_operator_markdown_from(home, None)
+    discover_operator_markdown_from(home, None, None)
 }
 
-/// Discover recent operator markdown files, optionally including `<repo>/docs/operator`.
+/// Discover operator markdown files, optionally including `<repo>/docs/operator`.
+///
+/// `caller_cutoff` is the earliest file-mtime the caller is interested in:
+/// - `None` falls back to a 30-day default window
+///   ([`OPERATOR_MD_RECENT_DAYS`]). This is the legacy convenience for source
+///   enumeration paths that have no [`ExtractionConfig`] to hand in.
+/// - `Some(t)` honors `t` directly. `t = UNIX epoch` therefore means
+///   "all time", which is what `aicx store --agent operator-md -H 0` needs.
 pub fn discover_operator_markdown_from(
     home: &Path,
     repo_root: Option<&Path>,
+    caller_cutoff: Option<DateTime<Utc>>,
 ) -> Vec<OperatorMarkdown> {
     let mut dirs = vec![
         home.join("Downloads"),
@@ -4914,7 +5227,8 @@ pub fn discover_operator_markdown_from(
         dirs.push(repo_root.join("docs").join("operator"));
     }
 
-    let cutoff = Utc::now() - Duration::days(OPERATOR_MD_RECENT_DAYS);
+    let cutoff =
+        caller_cutoff.unwrap_or_else(|| Utc::now() - Duration::days(OPERATOR_MD_RECENT_DAYS));
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
 
@@ -4974,7 +5288,7 @@ pub fn extract_operator_markdown_from_home_and_repo(
 ) -> Result<Vec<TimelineEntry>> {
     let mut entries = Vec::new();
 
-    for document in discover_operator_markdown_from(home, repo_root) {
+    for document in discover_operator_markdown_from(home, repo_root, Some(config.cutoff)) {
         match parse_operator_markdown_document(home, &document, config) {
             Ok(mut parsed) => entries.append(&mut parsed),
             Err(e) => eprintln!(
@@ -5069,7 +5383,7 @@ fn parse_operator_markdown_document(
         };
         let timestamp = base_timestamp + Duration::seconds(sequence);
         sequence += 1;
-        if timestamp < config.cutoff || config.watermark.is_some_and(|w| timestamp <= w) {
+        if timestamp < config.cutoff || config.watermark.is_some_and(|w| timestamp < w) {
             continue;
         }
 
@@ -5311,22 +5625,35 @@ fn resolve_operator_cwd_hint(
     if project.is_empty() {
         return None;
     }
-    let repo = project
-        .rsplit('/')
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
+    let (org, repo) = project.split_once('/').unwrap_or(("", project));
 
-    let candidates = [
-        home.join(repo),
-        home.join("Libraxis").join(repo),
-        home.join("Libraxis").join("vc-runtime").join(repo),
-        home.join("Libraxis")
-            .join("01_deployed_libraxis_vm")
-            .join(repo),
-        home.join("hosted").join("VetCoders").join(repo),
-        home.join("vc-workspace").join("VetCoders").join(repo),
-    ];
+    let candidates = if !org.is_empty() {
+        vec![
+            home.join(org).join(repo),
+            home.join("Libraxis").join(org).join(repo),
+            home.join("Libraxis")
+                .join("vc-runtime")
+                .join(org)
+                .join(repo),
+            home.join("Libraxis")
+                .join("01_deployed_libraxis_vm")
+                .join(org)
+                .join(repo),
+            home.join("hosted").join(org).join(repo),
+            home.join("vc-workspace").join(org).join(repo),
+        ]
+    } else {
+        vec![
+            home.join(repo),
+            home.join("Libraxis").join(repo),
+            home.join("Libraxis").join("vc-runtime").join(repo),
+            home.join("Libraxis")
+                .join("01_deployed_libraxis_vm")
+                .join(repo),
+            home.join("hosted").join("VetCoders").join(repo),
+            home.join("vc-workspace").join("VetCoders").join(repo),
+        ]
+    };
 
     candidates
         .into_iter()
@@ -5835,14 +6162,16 @@ fn count_codex_sessions(path: &std::path::Path) -> Result<usize> {
 
 /// Decode a Claude project path from the encoded directory name.
 ///
-/// Claude encodes project paths by replacing `/` with `-` in directory names.
-/// Leading dash (from the root `/`) is stripped.
+/// Claude's project-dir encoding is lossy: `-` may be either a literal
+/// repository-name character or an encoded `/`. Replacing every dash with `/`
+/// turns hyphenated repos into fake path segments, so this helper preserves the
+/// stored name and only removes the leading absolute-path sentinel.
 ///
 /// Example: `-Users-maciejgad-hosted-VetCoders-CodeScribe`
-///       -> `Users/maciejgad/hosted/VetCoders/CodeScribe`
+///       -> `Users-maciejgad-hosted-VetCoders-CodeScribe`
 pub fn decode_claude_project_path(encoded: &str) -> String {
     let stripped = encoded.strip_prefix('-').unwrap_or(encoded);
-    stripped.replace('-', "/")
+    stripped.to_string()
 }
 
 /// Extract text content from a Claude message value.

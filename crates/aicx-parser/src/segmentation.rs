@@ -105,9 +105,34 @@ pub fn semantic_segments(entries: &[TimelineEntry]) -> Vec<SemanticSegment> {
     semantic_segments_with_registry(entries, &ProjectHashRegistry::load_default())
 }
 
+/// Same as [`semantic_segments`] but emits per-session cumulative
+/// entry-processed counts to `progress`, so callers can pin a
+/// `Heartbeat` floor to real work done (rather than ticking blind).
+/// Pass-4 follow-up: the segment phase moved AHEAD of dedup, so for
+/// large corpora the progress bar needs a real denominator to stay
+/// honest.
+pub fn semantic_segments_with_progress(
+    entries: &[TimelineEntry],
+    progress: impl FnMut(usize),
+) -> Vec<SemanticSegment> {
+    semantic_segments_with_registry_and_progress(
+        entries,
+        &ProjectHashRegistry::load_default(),
+        progress,
+    )
+}
+
 pub fn semantic_segments_with_registry(
     entries: &[TimelineEntry],
     registry: &ProjectHashRegistry,
+) -> Vec<SemanticSegment> {
+    semantic_segments_with_registry_and_progress(entries, registry, |_| {})
+}
+
+pub fn semantic_segments_with_registry_and_progress(
+    entries: &[TimelineEntry],
+    registry: &ProjectHashRegistry,
+    mut progress: impl FnMut(usize),
 ) -> Vec<SemanticSegment> {
     let mut sessions: HashMap<(String, String), Vec<TimelineEntry>> = HashMap::new();
     for entry in entries {
@@ -118,8 +143,10 @@ pub fn semantic_segments_with_registry(
     }
 
     let mut ordered = Vec::new();
+    let mut processed_entries: usize = 0;
 
     for ((agent, session_id), mut session_entries) in sessions {
+        let session_len = session_entries.len();
         session_entries.sort_by_key(|left| left.timestamp);
 
         let mut current_tiered: Option<TieredIdentity> = None;
@@ -170,6 +197,9 @@ pub fn semantic_segments_with_registry(
                 current_entries,
             ));
         }
+
+        processed_entries += session_len;
+        progress(processed_entries);
     }
 
     ordered.sort_by(|left, right| {
@@ -375,7 +405,16 @@ fn infer_tiered_identity_from_text(text: &str) -> Option<TieredIdentity> {
     })
 }
 
-fn infer_tiered_identity_from_cwd(cwd: Option<&str>) -> Option<TieredIdentity> {
+/// Resolve a canonical `(organization, repository)` identity from a
+/// cwd string by consulting ground-truth signals — git remote URL,
+/// then known-layout heuristics, finally URL-shape inference.
+///
+/// Returns `None` when no canonical identity can be honestly resolved.
+/// Made `pub` so `src/sources.rs::project_filter_matches_path` can use
+/// the same canonical resolver instead of the prior path-segment
+/// heuristic (which leaked cross-org per `chatgpt-codex-connector`
+/// P1 review on PR #8; see Wave F-2 follow-up commit body).
+pub fn infer_tiered_identity_from_cwd(cwd: Option<&str>) -> Option<TieredIdentity> {
     let cwd = cwd?.trim();
     if cwd.is_empty() || looks_like_weak_source_identifier(cwd) {
         return None;

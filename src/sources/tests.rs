@@ -96,14 +96,21 @@ fn test_repo_name_from_cwd() {
 fn test_decode_claude_project_path_with_leading_dash() {
     let encoded = "-Users-maciejgad-hosted-VetCoders-CodeScribe";
     let decoded = decode_claude_project_path(encoded);
-    assert_eq!(decoded, "Users/maciejgad/hosted/VetCoders/CodeScribe");
+    assert_eq!(decoded, "Users-maciejgad-hosted-VetCoders-CodeScribe");
 }
 
 #[test]
 fn test_decode_claude_project_path_without_leading_dash() {
     let encoded = "Users-maciejgad-projects-foo";
     let decoded = decode_claude_project_path(encoded);
-    assert_eq!(decoded, "Users/maciejgad/projects/foo");
+    assert_eq!(decoded, "Users-maciejgad-projects-foo");
+}
+
+#[test]
+fn test_claude_dir_decode_preserves_hyphenated_repo() {
+    let decoded = decode_claude_project_path("vista-portal-frontend");
+    assert_eq!(decoded, "vista-portal-frontend");
+    assert_ne!(decoded, "vista/portal/frontend");
 }
 
 #[test]
@@ -123,7 +130,153 @@ fn test_decode_claude_project_path_empty() {
 fn test_decode_claude_project_path_deep_nesting() {
     let encoded = "-a-b-c-d-e-f";
     let decoded = decode_claude_project_path(encoded);
-    assert_eq!(decoded, "a/b/c/d/e/f");
+    assert_eq!(decoded, "a-b-c-d-e-f");
+}
+
+// Replaces the previous `test_claude_filter_no_suffix_leak` which asserted
+// the over-restrictive whole-string equality shape introduced by an
+// earlier pass-4 cut. The reviewer bots (gemini HIGH + chatgpt-codex P1
+// on PR #8) correctly flagged that the old shape broke every legit
+// `-p reponame` invocation against an absolute-path Claude dir like
+// `-Users-silver-Git-aicx`. The new shape is a deliberate **soft
+// prefilter** at the directory-listing stage paired with a strict
+// per-entry `cwd` filter inside `extract_claude` — see the doc comment
+// on `claude_project_dir_matches_filter` for the trade-off rationale.
+
+#[test]
+fn test_claude_dir_filter_accepts_repo_in_last_path_segment() {
+    // Real-world common case: filter is a repo name; encoded dir is the
+    // absolute cwd. The repo name appears as the last `-`-chunk of the
+    // encoded form. All three should match.
+    let aicx = vec!["aicx".to_string()];
+    assert!(claude_project_dir_matches_filter(
+        "-Users-silver-Git-aicx",
+        &aicx
+    ));
+    assert!(claude_project_dir_matches_filter("-aicx", &aicx));
+    assert!(claude_project_dir_matches_filter("aicx", &aicx));
+}
+
+#[test]
+fn test_claude_dir_filter_case_insensitive_on_repo_name() {
+    let mixed = vec!["AiCx".to_string()];
+    assert!(claude_project_dir_matches_filter(
+        "-Users-silver-Git-aicx",
+        &mixed
+    ));
+}
+
+#[test]
+fn test_claude_dir_filter_rejects_non_last_segment_match() {
+    // `vista` is NOT the last `-`-chunk of these encoded forms, so the
+    // soft prefilter rejects them.
+    let vista = vec!["vista".to_string()];
+    assert!(!claude_project_dir_matches_filter("vista-portal", &vista));
+    assert!(!claude_project_dir_matches_filter(
+        "-Users-silver-Git-vista-portal",
+        &vista
+    ));
+    // The leading `vista-` substring is also not enough — the soft
+    // prefilter wants `-vista` at the END (or exact match).
+    assert!(!claude_project_dir_matches_filter("vista-app", &vista));
+}
+
+#[test]
+fn test_claude_dir_filter_hyphenated_repo_matches_exactly() {
+    // A hyphenated repo name `vista-portal` must match its own encoded
+    // dir name. Three shapes again.
+    let vista_portal = vec!["vista-portal".to_string()];
+    assert!(claude_project_dir_matches_filter(
+        "vista-portal",
+        &vista_portal
+    ));
+    assert!(claude_project_dir_matches_filter(
+        "-vista-portal",
+        &vista_portal
+    ));
+    assert!(claude_project_dir_matches_filter(
+        "-Users-silver-Git-vista-portal",
+        &vista_portal
+    ));
+}
+
+#[test]
+fn test_claude_dir_filter_owner_repo_form_cannot_decide_from_encoded_dir_alone() {
+    // `owner/repo` filter is INHERENTLY undecidable from a Claude
+    // encoded dir name alone — the encoding turned `/` into `-` losslessly
+    // with no way to recover the owner/repo boundary. After the #15 fix
+    // `decode_claude_project_path` no longer mangles hyphens into
+    // slashes, so the soft prefilter cannot honestly say "yes this
+    // encoded dir matches Loctree/aicx". It returns false here and lets
+    // the strict per-entry `cwd` filter (which sees the unambiguous
+    // original path) make the final call.
+    let lo = vec!["Loctree/aicx".to_string()];
+    assert!(
+        !claude_project_dir_matches_filter("-Users-silver-Git-Loctree-aicx", &lo),
+        "owner/repo dir-name prefilter is intentionally pessimistic — \
+         per-entry cwd resolves the strict case downstream"
+    );
+
+    // The corollary: an unrelated repo also doesn't match. (Symmetric.)
+    assert!(!claude_project_dir_matches_filter(
+        "-Users-silver-Git-VetCoders-loct-io",
+        &lo
+    ));
+
+    // A path-shaped CWD (not a Claude-encoded dir) DOES match via the
+    // strict path matcher — this is the entry-level shape that runs
+    // INSIDE extract_claude per-entry. Documented here so the contract
+    // between the soft dir prefilter and the strict entry filter is
+    // visible to readers of just the test module. (Function is private
+    // to `super::` aka `crate::sources`; reachable via `use super::*`
+    // at the top of this tests module.)
+    assert!(
+        project_filter_matches_path("/Users/silver/Git/Loctree/aicx", &lo),
+        "the strict matcher (used per-entry on real cwd values) DOES \
+         match Loctree/aicx against a proper /-separated cwd"
+    );
+}
+
+#[test]
+fn test_body_mentions_repo_token_no_substring_leak() {
+    // Regression guard for the codescribe project-hint inference site
+    // (sources.rs ~4943). Token-equality semantics: `-p vista` must NOT
+    // pick up a body mentioning `vista-portal`; `-p vista-portal` MUST.
+    let body = "dyskusja o vista-portal i jakies inne tematy oraz osobny vista projekt"
+        .to_ascii_lowercase();
+    assert!(body_mentions_repo_token(&body, "vista"));
+    assert!(body_mentions_repo_token(&body, "vista-portal"));
+
+    let body_only_compound = "ta sesja dotyczy vista-portal".to_ascii_lowercase();
+    assert!(!body_mentions_repo_token(&body_only_compound, "vista"));
+    assert!(body_mentions_repo_token(
+        &body_only_compound,
+        "vista-portal"
+    ));
+
+    // Punctuation + URLs count as token separators.
+    let body_url = "see https://example.com/vista for details".to_ascii_lowercase();
+    assert!(body_mentions_repo_token(&body_url, "vista"));
+
+    // Empty repo never matches.
+    assert!(!body_mentions_repo_token(&body, ""));
+}
+
+#[test]
+fn test_claude_dir_filter_inherent_ambiguity_is_a_soft_prefilter_concern() {
+    // The Claude encoding is inherently lossy. `-Users-silver-Git-nextra-docs-vista`
+    // is ambiguously either a 6-segment path ending in `vista` (`-p vista`
+    // match) or a 4-segment path ending in `nextra-docs-vista` (`-p vista`
+    // should NOT match). The dir-name pre-filter cannot decide — the
+    // strict per-entry `cwd` filter in `extract_claude` resolves it when
+    // `cwd` is present. We document the trade-off by asserting that the
+    // pre-filter LETS THIS THROUGH (the alternative is dropping legit
+    // sessions whose downstream `cwd` would have matched).
+    let vista = vec!["vista".to_string()];
+    assert!(claude_project_dir_matches_filter(
+        "-Users-silver-Git-nextra-docs-vista",
+        &vista
+    ));
 }
 
 #[test]
@@ -167,6 +320,34 @@ fn test_extract_claude_file_parses_text_only_blocks() {
     );
     assert_eq!(user_entries[0].message, "Hello");
     assert_eq!(agent_entries[0].message, "Hi");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_watermark_filter_drops_only_strictly_lt() {
+    let root = unique_test_dir("watermark-strict-lt");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"type":"user","message":{"role":"user","content":"before watermark"},"timestamp":"2026-02-01T00:00:00Z","sessionId":"sess-watermark","cwd":"/tmp/aicx"}
+{"type":"user","message":{"role":"user","content":"at watermark"},"timestamp":"2026-02-01T00:00:01Z","sessionId":"sess-watermark","cwd":"/tmp/aicx"}
+{"type":"user","message":{"role":"user","content":"after watermark"},"timestamp":"2026-02-01T00:00:02Z","sessionId":"sess-watermark","cwd":"/tmp/aicx"}"#;
+    write_file(&tmp, content);
+
+    let watermark = Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 1).single().unwrap();
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: Some(watermark),
+    };
+
+    let entries = extract_claude_file(&tmp, &config).unwrap();
+    let messages: Vec<_> = entries.iter().map(|entry| entry.message.as_str()).collect();
+
+    assert_eq!(messages, vec!["at watermark", "after watermark"]);
+    assert!(entries.iter().all(|entry| entry.timestamp >= watermark));
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -648,6 +829,73 @@ fn test_codex_session_diagnostics_aggregates_counts() {
     assert_eq!(diagnostics.mismatch, 1);
     assert_eq!(diagnostics.unparsable_ts, 3);
     assert_eq!(diagnostics.unknown_msg_type, 4);
+
+    diagnostics.observe(&[CodexSessionWarning::LineParseError {
+        line_number: 7,
+        snippet: "{\"broken\":".to_string(),
+    }]);
+    assert_eq!(diagnostics.line_parse_error, 1);
+}
+
+#[test]
+fn test_codex_history_silent_skip_emits_warning() {
+    let root = unique_test_dir("codex-history-line-parse-warning");
+    let tmp = root.join("history.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let valid = r#"{"session_id":"history-a","text":"hello history","ts":1770000000,"role":"user","cwd":"/tmp/aicx"}"#;
+    let malformed = format!(r#"{{"session_id":"broken","text":"{}""#, "x".repeat(240));
+    let content = format!("{valid}\n{malformed}\n");
+    write_file(&tmp, &content);
+
+    let (entries, warnings) =
+        parse_codex_file_with_diagnostics(&tmp, &default_config(true)).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].message, "hello history");
+
+    let warning = warnings
+        .iter()
+        .find_map(|warning| match warning {
+            CodexSessionWarning::LineParseError {
+                line_number,
+                snippet,
+            } => Some((*line_number, snippet)),
+            _ => None,
+        })
+        .expect("malformed Codex history JSONL line should warn");
+    assert_eq!(warning.0, 2);
+    assert_eq!(warning.1.chars().count(), 200);
+    assert!(malformed.starts_with(warning.1));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_codex_session_event_silent_skip_emits_warning() {
+    let root = unique_test_dir("codex-session-line-parse-warning");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"session-a","cwd":"/tmp/a"}}
+{"timestamp":
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello session"}}"#;
+    write_file(&tmp, content);
+
+    let (entries, warnings) =
+        parse_codex_session_file_with_diagnostics(&tmp, &default_config(true)).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].message, "hello session");
+    assert!(warnings.iter().any(|warning| {
+        matches!(
+            warning,
+            CodexSessionWarning::LineParseError {
+                line_number: 2,
+                snippet,
+            } if snippet.trim_end() == "{\"timestamp\":"
+        )
+    }));
+
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -2298,6 +2546,134 @@ fn test_project_filter_matches_owner_repo_segments() {
 }
 
 #[test]
+fn test_project_filter_matches_path_local_checkout_without_git_does_not_match_owner() {
+    // Pass-4 Wave F-2 (PR #8 follow-up to chatgpt-codex-connector P1):
+    // the old "last-segment relax" that let `-p Loctree/aicx` match
+    // `/Users/silver/Git/aicx` regardless of owner is gone. It leaked
+    // cross-org: filter `Loctree/aicx` ALSO matched `/.../VetCoders/aicx`.
+    //
+    // Bug #14's original intent ("local checkout matches canonical
+    // identity") now travels through Tier 1 — `aicx_parser::segmentation::
+    // infer_tiered_identity_from_cwd` consults the local `.git/config`
+    // remote URL and answers honestly. This unit test only exercises
+    // paths with NO `.git` (cwd is a random tmp-ish path), so Tier 1
+    // returns None and the strict adjacency path correctly refuses.
+    //
+    // The "with git remote" case is covered by
+    // `aicx_parser::segmentation` tests; here we lock in the strict
+    // behavior so the cross-org leak cannot silently come back.
+    assert!(
+        !project_filter_matches_path("/some/non-git/scratch/aicx", &["Loctree/aicx".to_string()]),
+        "without a .git remote pointing at Loctree/aicx, the path-only \
+         strict matcher must NOT accept `-p Loctree/aicx` for a directory \
+         that merely ends in `aicx` — that's the cross-org leak we removed"
+    );
+    // The symmetric anti-leak: a checkout literally under `/VetCoders/aicx`
+    // must also be rejected by `-p Loctree/aicx` at the strict tier.
+    assert!(
+        !project_filter_matches_path(
+            "/some/non-git/scratch/VetCoders/aicx",
+            &["Loctree/aicx".to_string()]
+        ),
+        "cross-org leak guard: `-p Loctree/aicx` must NOT accept a path \
+         under /VetCoders/aicx"
+    );
+    // And the positive control: strict adjacency `Loctree/aicx` in the
+    // path DOES match (this is Tier 3 strict behavior).
+    assert!(project_filter_matches_path(
+        "/some/non-git/scratch/Loctree/aicx",
+        &["Loctree/aicx".to_string()]
+    ));
+}
+
+#[test]
+fn test_project_filter_matches_path_tier1_resolves_canonical_from_remote_url() {
+    // Tier 1 also matches when `cwd` is itself a remote URL string —
+    // `infer_repo_identity_from_remote_like` parses common shapes.
+    // This locks in the canonical-resolver wiring without needing a
+    // real `.git/config` on disk.
+    assert!(
+        project_filter_matches_path(
+            "https://github.com/Loctree/aicx",
+            &["Loctree/aicx".to_string()]
+        ),
+        "Tier 1 must resolve a github HTTPS URL to Loctree/aicx"
+    );
+    assert!(
+        !project_filter_matches_path(
+            "https://github.com/VetCoders/aicx",
+            &["Loctree/aicx".to_string()]
+        ),
+        "Tier 1 must reject a github URL whose owner differs from the filter"
+    );
+}
+
+#[test]
+fn test_is_windows_absolute_path_recognizes_drive_letter_and_unc() {
+    // Drive-letter form, both separators
+    assert!(is_windows_absolute_path("C:\\Users\\silver\\Git\\aicx"));
+    assert!(is_windows_absolute_path("C:/Users/silver/Git/aicx"));
+    assert!(is_windows_absolute_path("d:\\code"));
+    assert!(is_windows_absolute_path("Z:/work"));
+    // UNC form
+    assert!(is_windows_absolute_path("\\\\fileserver\\share\\repo"));
+    // Negative cases
+    assert!(!is_windows_absolute_path("/Users/silver/Git/aicx")); // Unix
+    assert!(!is_windows_absolute_path("Loctree/aicx")); // canonical slug
+    assert!(!is_windows_absolute_path("C")); // too short
+    assert!(!is_windows_absolute_path("C:")); // missing separator
+    assert!(!is_windows_absolute_path("C:doc.txt")); // drive-letter relative (Windows-legal but not absolute)
+    assert!(!is_windows_absolute_path("12:\\foo")); // not a letter
+    assert!(!is_windows_absolute_path("\\single-backslash")); // not UNC
+    assert!(!is_windows_absolute_path("")); // empty
+}
+
+#[test]
+fn test_project_filter_matches_path_windows_segments_match_through_tier3() {
+    // Regression for chatgpt-codex-connector P1 at src/sources.rs:1069:
+    // Tier 3 must still recognize backslash-separated path segments.
+    // Even when Tier 1 (canonical resolver) returns None for a Windows
+    // path on a non-Windows CI runner (no `.git` on disk), the strict
+    // adjacency matcher on `\` / `/` segments must accept the filter.
+    //
+    // The Tier 1 path itself (Windows .git/config resolution on a
+    // Windows runner) is not asserted in unit tests because the parser
+    // may relative-resolve a fake Windows shape against the test
+    // process's own cwd. That cross-platform behavior is covered by
+    // the resolver's own crate tests, not here.
+    assert!(
+        project_filter_matches_path(
+            "C:\\repos\\Loctree\\aicx",
+            &["Loctree/aicx".to_string()]
+        ),
+        "Tier 3 must accept adjacent `Loctree\\aicx` segments in a Windows path"
+    );
+    assert!(
+        project_filter_matches_path(
+            "\\\\fileserver\\share\\Loctree\\aicx",
+            &["Loctree/aicx".to_string()]
+        ),
+        "Tier 3 must accept adjacent `Loctree\\aicx` segments in a UNC path"
+    );
+}
+
+#[test]
+fn test_project_filter_matches_path_strict_owner_repo() {
+    assert!(project_filter_matches_path(
+        "/x/Loctree/aicx",
+        &["Loctree/aicx".to_string()]
+    ));
+}
+
+#[test]
+fn test_project_filter_matches_path_substring_does_not_leak() {
+    assert!(!project_filter_matches_path(
+        "/x/vista-portal",
+        &["vista".to_string()]
+    ));
+}
+
+#[test]
 fn test_project_filter_matches_owner_wildcard_segment() {
     assert!(project_filter_matches_path(
         "/Users/silver/Git/Loctree/aicx",
@@ -2420,6 +2796,161 @@ fn test_extract_codex_file_project_filter_accepts_path_segment() {
 
     let entries = extract_codex_file(&tmp, &config).unwrap();
     assert_eq!(entries.len(), 1, "vista-portal filter must match path");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_codescribe_filter_per_transcript_not_splattered() {
+    let root = unique_test_dir("codescribe-splatter");
+    let home = root.join("home");
+    let day = home
+        .join(".codescribe")
+        .join("transcriptions")
+        .join("2026-05-22");
+    fs::create_dir_all(&day).unwrap();
+
+    // Create the expected repo directories so that resolve_codescribe_cwd_hint works
+    let aicx_dir = home.join("Loctree").join("aicx");
+    fs::create_dir_all(&aicx_dir).unwrap();
+    let widgets_dir = home.join("acme").join("widgets");
+    fs::create_dir_all(&widgets_dir).unwrap();
+
+    // Transcript 1: explicitly mentions "aicx" in content (JSON)
+    let content_matching = r#"{"segments":[{"start":0,"end":1,"speaker":"Maciej","text":"let's work on Loctree/aicx today."}]}"#;
+    write_file(&day.join("100000_match.json"), content_matching);
+
+    // Transcript 2: explicit project frontmatter to contradict the fallback
+    let content_unmatching =
+        "---\nproject: acme/widgets\n---\n### Maciej:\nlet's work on widgets.\n";
+    write_file(&day.join("110000_unmatch.md"), content_unmatching);
+
+    let config = ExtractionConfig {
+        project_filter: vec!["Loctree/aicx".to_string()],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_codescribe_from_home(&home, &config).unwrap();
+    // Only the matching one should survive
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].message.contains("Loctree/aicx"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_operator_md_owner_repo_decode_preserves_owner() {
+    let root = unique_test_dir("operator-owner-repo");
+    let home = root.join("home");
+
+    // Create directories
+    let acme_dir = home.join("acme").join("widgets");
+    fs::create_dir_all(&acme_dir).unwrap();
+    let globex_dir = home.join("globex").join("widgets");
+    fs::create_dir_all(&globex_dir).unwrap();
+
+    // Acme
+    let acme_cwd = resolve_operator_cwd_hint(&home, Path::new("dummy"), Some("acme/widgets"));
+    assert_eq!(acme_cwd.as_deref(), Some(acme_dir.to_str().unwrap()));
+
+    // Globex
+    let globex_cwd = resolve_operator_cwd_hint(&home, Path::new("dummy"), Some("globex/widgets"));
+    assert_eq!(globex_cwd.as_deref(), Some(globex_dir.to_str().unwrap()));
+
+    assert_ne!(acme_cwd, globex_cwd);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_discover_operator_markdown_honors_caller_cutoff_for_all_time() {
+    let root = unique_test_dir("operator-md-cutoff-all-time");
+    let home = root.join("home");
+    let downloads = home.join("Downloads");
+    fs::create_dir_all(&downloads).unwrap();
+
+    // A markdown file with mtime 90 days ago — well outside the legacy 30d default.
+    let ancient = downloads.join("ancient-decision.md");
+    write_file(
+        &ancient,
+        "Decision: ancient choice from before the 30d window.",
+    );
+    let ninety_days_ago = (Utc::now() - Duration::days(90)).timestamp();
+    set_mtime(&ancient, ninety_days_ago);
+
+    // Caller cutoff = epoch == "all time"; mirrors `aicx store -H 0`.
+    let epoch = Utc.timestamp_opt(0, 0).single().unwrap();
+    let discovered = discover_operator_markdown_from(&home, None, Some(epoch));
+
+    assert_eq!(
+        discovered.len(),
+        1,
+        "epoch caller cutoff must discover markdown regardless of mtime age",
+    );
+    assert_eq!(discovered[0].path, ancient);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_discover_operator_markdown_default_30d_when_no_caller_cutoff() {
+    let root = unique_test_dir("operator-md-cutoff-default");
+    let home = root.join("home");
+    let downloads = home.join("Downloads");
+    fs::create_dir_all(&downloads).unwrap();
+
+    // Recent file: mtime defaults to "now" via fs::write — inside 30d default.
+    let recent = downloads.join("recent.md");
+    write_file(
+        &recent,
+        "Decision: recent choice within the 30d default window.",
+    );
+
+    // Ancient file: mtime 90 days ago — outside 30d default.
+    let ancient = downloads.join("ancient.md");
+    write_file(&ancient, "Decision: pre-default-window history.");
+    let ninety_days_ago = (Utc::now() - Duration::days(90)).timestamp();
+    set_mtime(&ancient, ninety_days_ago);
+
+    // None caller cutoff → legacy 30d default preserved.
+    let discovered = discover_operator_markdown_from(&home, None, None);
+
+    assert_eq!(
+        discovered.len(),
+        1,
+        "None caller cutoff must preserve the 30d default; ancient file should be filtered",
+    );
+    assert_eq!(discovered[0].path, recent);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_discover_operator_markdown_honors_caller_cutoff_when_narrower() {
+    let root = unique_test_dir("operator-md-cutoff-narrower");
+    let home = root.join("home");
+    let downloads = home.join("Downloads");
+    fs::create_dir_all(&downloads).unwrap();
+
+    // Fixture is 15 days old: inside the 30d default, outside a 7d caller window.
+    let fifteen_days_old = downloads.join("fifteen-days-old.md");
+    write_file(
+        &fifteen_days_old,
+        "Decision: 15-day-old choice should not survive a 7-day caller cutoff.",
+    );
+    let fifteen_days = (Utc::now() - Duration::days(15)).timestamp();
+    set_mtime(&fifteen_days_old, fifteen_days);
+
+    // Caller cutoff = 7 days ago — narrower than the 30d default.
+    let seven_days_ago = Utc::now() - Duration::days(7);
+    let discovered = discover_operator_markdown_from(&home, None, Some(seven_days_ago));
+
+    assert!(
+        discovered.is_empty(),
+        "15-day-old markdown must be excluded by a 7-day caller cutoff (narrower than 30d default)",
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

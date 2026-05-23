@@ -102,6 +102,16 @@ fn sync_parent_best_effort(path: &Path) {
     }
 }
 
+/// Best-effort parent-directory fsync after a rename. Callers that own a
+/// custom two-phase rename sequence (e.g. `.md` + `.meta.json`) use this
+/// to match the durability contract of [`atomic_write`]. Errors are
+/// intentionally swallowed — the underlying file write is already durable;
+/// this only hardens directory-entry persistence on power-loss-sensitive
+/// filesystems.
+pub fn parent_fsync(path: &Path) {
+    sync_parent_best_effort(path);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
