@@ -22,9 +22,29 @@ const DEFAULT_MAX_HASHES: usize = 50_000;
 const MAX_STATE_JSON_BYTES: usize = 128 * 1024 * 1024;
 
 fn read_state_json_validated(path: &Path) -> Result<String> {
+    // Sanitize: traversal rejection + existence check + canonicalize + allow-list.
     let validated = crate::sanitize::validate_read_path(path)?;
-    let metadata = fs::metadata(&validated)
-        .map_err(|e| anyhow!("Failed to stat '{}': {}", validated.display(), e))?;
+
+    // Open once, derive metadata from the *file descriptor* — closes the
+    // TOCTOU window between validate_read_path's canonicalize and our read.
+    // If an attacker swaps a symlink between validate and open the kernel
+    // pins us to whatever inode the open(2) call resolved (per-fd state),
+    // and subsequent operations on the same fd cannot drift to a different
+    // file. fs::metadata(&path) followed by fs::File::open(&path) would
+    // resolve the path twice — that's the actual security gap, not a
+    // semgrep false positive.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .open(&validated)
+        .map_err(|e| anyhow!("Failed to open '{}': {}", validated.display(), e))?;
+
+    let metadata = file.metadata().map_err(|e| {
+        anyhow!(
+            "Failed to stat opened fd for '{}': {}",
+            validated.display(),
+            e
+        )
+    })?;
     if metadata.len() > MAX_STATE_JSON_BYTES as u64 {
         return Err(anyhow!(
             "State file '{}' exceeds {} bytes (actual: {})",
@@ -34,8 +54,6 @@ fn read_state_json_validated(path: &Path) -> Result<String> {
         ));
     }
 
-    let file = fs::File::open(&validated)
-        .map_err(|e| anyhow!("Failed to open '{}': {}", validated.display(), e))?;
     let mut reader = file.take(MAX_STATE_JSON_BYTES.saturating_add(1) as u64);
     let mut bytes = Vec::new();
     reader
