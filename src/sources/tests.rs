@@ -50,11 +50,11 @@ fn frame_kinds(entries: &[TimelineEntry]) -> Vec<Option<FrameKind>> {
 fn test_repo_name_from_cwd() {
     // Fallback behavior
     assert_eq!(
-        repo_name_from_cwd(Some("/Users/polyversai/Libraxis/lbrx-services"), &[]),
+        repo_name_from_cwd(Some("/Users/test-user/test-org/lbrx-services"), &[]),
         "lbrx-services"
     );
     assert_eq!(
-        repo_name_from_cwd(Some("/Users/polyversai/Libraxis/mlx-batch-runner"), &[]),
+        repo_name_from_cwd(Some("/Users/test-user/test-org/mlx-batch-runner"), &[]),
         "mlx-batch-runner"
     );
     assert_eq!(repo_name_from_cwd(None, &[]), "unknown");
@@ -64,7 +64,7 @@ fn test_repo_name_from_cwd() {
     // Single project filter
     assert_eq!(
         repo_name_from_cwd(
-            Some("/Users/polyversai/Libraxis/lbrx-services/subfolder"),
+            Some("/Users/test-user/test-org/lbrx-services/subfolder"),
             &["lbrx".to_string()]
         ),
         "lbrx"
@@ -74,7 +74,7 @@ fn test_repo_name_from_cwd() {
     let filters = vec!["lbrx-services".to_string(), "foo".to_string()];
     assert_eq!(
         repo_name_from_cwd(
-            Some("/Users/polyversai/Libraxis/lbrx-services/subfolder"),
+            Some("/Users/test-user/test-org/lbrx-services/subfolder"),
             &filters
         ),
         "lbrx-services"
@@ -138,7 +138,7 @@ fn test_decode_claude_project_path_deep_nesting() {
 // earlier pass-4 cut. The reviewer bots (gemini HIGH + chatgpt-codex P1
 // on PR #8) correctly flagged that the old shape broke every legit
 // `-p reponame` invocation against an absolute-path Claude dir like
-// `-Users-silver-Git-aicx`. The new shape is a deliberate **soft
+// `-Users-test-user-Git-aicx`. The new shape is a deliberate **soft
 // prefilter** at the directory-listing stage paired with a strict
 // per-entry `cwd` filter inside `extract_claude` — see the doc comment
 // on `claude_project_dir_matches_filter` for the trade-off rationale.
@@ -150,7 +150,7 @@ fn test_claude_dir_filter_accepts_repo_in_last_path_segment() {
     // encoded form. All three should match.
     let aicx = vec!["aicx".to_string()];
     assert!(claude_project_dir_matches_filter(
-        "-Users-silver-Git-aicx",
+        "-Users-test-user-Git-aicx",
         &aicx
     ));
     assert!(claude_project_dir_matches_filter("-aicx", &aicx));
@@ -161,7 +161,7 @@ fn test_claude_dir_filter_accepts_repo_in_last_path_segment() {
 fn test_claude_dir_filter_case_insensitive_on_repo_name() {
     let mixed = vec!["AiCx".to_string()];
     assert!(claude_project_dir_matches_filter(
-        "-Users-silver-Git-aicx",
+        "-Users-test-user-Git-aicx",
         &mixed
     ));
 }
@@ -173,7 +173,7 @@ fn test_claude_dir_filter_rejects_non_last_segment_match() {
     let vista = vec!["vista".to_string()];
     assert!(!claude_project_dir_matches_filter("vista-portal", &vista));
     assert!(!claude_project_dir_matches_filter(
-        "-Users-silver-Git-vista-portal",
+        "-Users-test-user-Git-vista-portal",
         &vista
     ));
     // The leading `vista-` substring is also not enough — the soft
@@ -195,7 +195,7 @@ fn test_claude_dir_filter_hyphenated_repo_matches_exactly() {
         &vista_portal
     ));
     assert!(claude_project_dir_matches_filter(
-        "-Users-silver-Git-vista-portal",
+        "-Users-test-user-Git-vista-portal",
         &vista_portal
     ));
 }
@@ -212,14 +212,14 @@ fn test_claude_dir_filter_owner_repo_form_cannot_decide_from_encoded_dir_alone()
     // original path) make the final call.
     let lo = vec!["Loctree/aicx".to_string()];
     assert!(
-        !claude_project_dir_matches_filter("-Users-silver-Git-Loctree-aicx", &lo),
+        !claude_project_dir_matches_filter("-Users-test-user-Git-Loctree-aicx", &lo),
         "owner/repo dir-name prefilter is intentionally pessimistic — \
          per-entry cwd resolves the strict case downstream"
     );
 
     // The corollary: an unrelated repo also doesn't match. (Symmetric.)
     assert!(!claude_project_dir_matches_filter(
-        "-Users-silver-Git-VetCoders-loct-io",
+        "-Users-test-user-Git-VetCoders-loct-io",
         &lo
     ));
 
@@ -231,7 +231,7 @@ fn test_claude_dir_filter_owner_repo_form_cannot_decide_from_encoded_dir_alone()
     // to `super::` aka `crate::sources`; reachable via `use super::*`
     // at the top of this tests module.)
     assert!(
-        project_filter_matches_path("/Users/silver/Git/Loctree/aicx", &lo),
+        project_filter_matches_path("/Users/test-user/Git/Loctree/aicx", &lo),
         "the strict matcher (used per-entry on real cwd values) DOES \
          match Loctree/aicx against a proper /-separated cwd"
     );
@@ -264,7 +264,7 @@ fn test_body_mentions_repo_token_no_substring_leak() {
 
 #[test]
 fn test_claude_dir_filter_inherent_ambiguity_is_a_soft_prefilter_concern() {
-    // The Claude encoding is inherently lossy. `-Users-silver-Git-nextra-docs-vista`
+    // The Claude encoding is inherently lossy. `-Users-test-user-Git-nextra-docs-vista`
     // is ambiguously either a 6-segment path ending in `vista` (`-p vista`
     // match) or a 4-segment path ending in `nextra-docs-vista` (`-p vista`
     // should NOT match). The dir-name pre-filter cannot decide — the
@@ -274,7 +274,7 @@ fn test_claude_dir_filter_inherent_ambiguity_is_a_soft_prefilter_concern() {
     // sessions whose downstream `cwd` would have matched).
     let vista = vec!["vista".to_string()];
     assert!(claude_project_dir_matches_filter(
-        "-Users-silver-Git-nextra-docs-vista",
+        "-Users-test-user-Git-nextra-docs-vista",
         &vista
     ));
 }
@@ -1151,7 +1151,7 @@ fn test_extract_gemini_file_prefers_session_path_project_over_content_hints() {
     let _ = fs::remove_dir_all(&root);
 
     let content = r##"{"sessionId":"6d5b2959-c56b-4c90-b198-41eb2ce399da","projectHash":"atomic-orbitals-b716c2b71310439897d3f81602f6c799","startTime":"2026-05-17T11:29:00.000Z","kind":"main"}
-{"id":"u1","timestamp":"2026-05-17T11:29:01.000Z","type":"user","content":[{"cwd":"/Users/silver/Desktop/screenshot/Screenshot","text":"Review this screenshot for Vista Portal."}]}
+{"id":"u1","timestamp":"2026-05-17T11:29:01.000Z","type":"user","content":[{"cwd":"/Users/test-user/Desktop/screenshot/Screenshot","text":"Review this screenshot for Vista Portal."}]}
 {"id":"a1","timestamp":"2026-05-17T11:29:02.000Z","type":"gemini","content":"The screenshot review belongs to the Vista Portal session."}"##;
     write_file(&tmp, content);
 
@@ -2540,7 +2540,7 @@ fn test_junie_session_id_wrapper_uses_ancestor_logic() {
 #[test]
 fn test_project_filter_matches_owner_repo_segments() {
     assert!(project_filter_matches_path(
-        "/Users/silver/Git/Loctree/aicx/src",
+        "/Users/test-user/Git/Loctree/aicx/src",
         &["Loctree/aicx".to_string()]
     ));
 }
@@ -2549,7 +2549,7 @@ fn test_project_filter_matches_owner_repo_segments() {
 fn test_project_filter_matches_path_local_checkout_without_git_does_not_match_owner() {
     // Pass-4 Wave F-2 (PR #8 follow-up to chatgpt-codex-connector P1):
     // the old "last-segment relax" that let `-p Loctree/aicx` match
-    // `/Users/silver/Git/aicx` regardless of owner is gone. It leaked
+    // `/Users/test-user/Git/aicx` regardless of owner is gone. It leaked
     // cross-org: filter `Loctree/aicx` ALSO matched `/.../VetCoders/aicx`.
     //
     // Bug #14's original intent ("local checkout matches canonical
@@ -2611,14 +2611,14 @@ fn test_project_filter_matches_path_tier1_resolves_canonical_from_remote_url() {
 #[test]
 fn test_is_windows_absolute_path_recognizes_drive_letter_and_unc() {
     // Drive-letter form, both separators
-    assert!(is_windows_absolute_path("C:\\Users\\silver\\Git\\aicx"));
-    assert!(is_windows_absolute_path("C:/Users/silver/Git/aicx"));
+    assert!(is_windows_absolute_path("C:\\Users\\test-user\\Git\\aicx"));
+    assert!(is_windows_absolute_path("C:/Users/test-user/Git/aicx"));
     assert!(is_windows_absolute_path("d:\\code"));
     assert!(is_windows_absolute_path("Z:/work"));
     // UNC form
     assert!(is_windows_absolute_path("\\\\fileserver\\share\\repo"));
     // Negative cases
-    assert!(!is_windows_absolute_path("/Users/silver/Git/aicx")); // Unix
+    assert!(!is_windows_absolute_path("/Users/test-user/Git/aicx")); // Unix
     assert!(!is_windows_absolute_path("Loctree/aicx")); // canonical slug
     assert!(!is_windows_absolute_path("C")); // too short
     assert!(!is_windows_absolute_path("C:")); // missing separator
@@ -2676,7 +2676,7 @@ fn test_project_filter_matches_path_substring_does_not_leak() {
 #[test]
 fn test_project_filter_matches_owner_wildcard_segment() {
     assert!(project_filter_matches_path(
-        "/Users/silver/Git/Loctree/aicx",
+        "/Users/test-user/Git/Loctree/aicx",
         &["Loctree/".to_string()]
     ));
 }
@@ -2684,7 +2684,7 @@ fn test_project_filter_matches_owner_wildcard_segment() {
 #[test]
 fn test_project_filter_matches_repo_wildcard_segment() {
     assert!(project_filter_matches_path(
-        "/Users/silver/Git/Other/aicx",
+        "/Users/test-user/Git/Other/aicx",
         &["/aicx".to_string()]
     ));
 }
@@ -2692,7 +2692,7 @@ fn test_project_filter_matches_repo_wildcard_segment() {
 #[test]
 fn test_project_filter_rejects_vista_for_vista_portal() {
     assert!(!project_filter_matches_path(
-        "/Users/silver/Git/vista-portal",
+        "/Users/test-user/Git/vista-portal",
         &["vista".to_string()]
     ));
 }
@@ -2715,11 +2715,11 @@ fn test_project_filter_matches_path_strict_segments() {
 
     // No word-boundary matching inside a segment.
     assert!(!project_filter_matches_path(
-        "/Users/silver/Git/vista-portal-pr15-hotfix",
+        "/Users/test-user/Git/vista-portal-pr15-hotfix",
         &["portal".to_string()]
     ));
     assert!(!project_filter_matches_path(
-        "/Users/silver/Git/vista-portal-pr15-hotfix",
+        "/Users/test-user/Git/vista-portal-pr15-hotfix",
         &["vista-portal".to_string()]
     ));
 

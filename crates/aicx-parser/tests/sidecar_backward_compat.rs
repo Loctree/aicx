@@ -16,7 +16,7 @@ const OLD_SIDECAR_JSON: &str = r#"{
   "agent": "claude",
   "date": "2026-04-25",
   "session_id": "2921f021-3af4-4d6f-b378-73ad9575268e",
-  "cwd": "/Users/polyversai/Libraxis/vc-runtime/aicx",
+  "cwd": "/Users/test-user/test-org/vc-runtime/aicx",
   "kind": "conversations",
   "frame_kind": "agent_reply",
   "agent_model": "claude-opus-4-7",

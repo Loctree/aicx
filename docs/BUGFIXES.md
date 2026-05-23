@@ -204,9 +204,9 @@ w `store.rs` przechodzą; `cargo test --lib -p aicx` = 398 passed.
   daje orphan przy crashu między nimi.
 
 **Related.** Area B Wave-A (B-1 P0 + B-4 P1 + B-5 P1) z
-`/Users/silver/Downloads/bug-tracker-aicx.md` linie 645-1058.
+`~/Downloads/bug-tracker-aicx.md` linie 645-1058.
 SUBAGENT_02 audit:
-`/Users/silver/AI_notes/projects/aicx/reports/subagents/SUBAGENT_02_audit-area-B--20-05-2026.md`.
+`~/AI_notes/projects/aicx/reports/subagents/SUBAGENT_02_audit-area-B--20-05-2026.md`.
 Wave-2 (`state.rs` atomic save + outer state lock w `run_store`)
 zużyje ten sam `atomic_write` helper.
 
@@ -465,7 +465,7 @@ test piszący conversation `.md` + `.json` przez `aicx::output`.
 - JSON-escaped private keys nie są tym samym przypadkiem co raw PEM block;
   potrzebują field-aware redakcji przed ogólnym PEM replacerem.
 
-**Related.** Area C P1 1.1-1.10 z `/Users/silver/Downloads/bug-tracker-aicx.md`.
+**Related.** Area C P1 1.1-1.10 z `~/Downloads/bug-tracker-aicx.md`.
 
 ---
 
@@ -508,7 +508,7 @@ blokuje je równoległy out-of-scope diff w `crates/aicx-embeddings/src/cloud.rs
   został już poprawiony — po zmianie kontraktu sprawdź consumer tests w tej
   samej paczce.
 
-**Related.** A-10 z `/Users/silver/Downloads/bug-tracker-aicx.md`, Area A.
+**Related.** A-10 z `~/Downloads/bug-tracker-aicx.md`, Area A.
 
 ---
 
@@ -559,8 +559,8 @@ i atomic tempfile; follow-up commit: `ec4f74e`.
   (`aicx state`), bo inaczej reset/info zostałyby poza nowym kontraktem.
 
 **Related.** Area B Wave-B (B-2 + B-3) z
-`/Users/silver/Downloads/bug-tracker-aicx.md` linie 645-1058 oraz
-`/Users/silver/AI_notes/projects/aicx/reports/subagents/SUBAGENT_02_audit-area-B--20-05-2026.md`.
+`~/Downloads/bug-tracker-aicx.md` linie 645-1058 oraz
+`~/AI_notes/projects/aicx/reports/subagents/SUBAGENT_02_audit-area-B--20-05-2026.md`.
 
 ---
 
@@ -653,8 +653,8 @@ aicx --lib output::` (30/30), `make precheck`, `make test`, `make clippy`,
   poniżej w sekcji Living Tree; kod w drzewie jest poprawny i gaty zielone.
 
 **Related.** Area C Priority-2 (2.1–2.5) z
-`/Users/silver/Downloads/bug-tracker-aicx.md` linie 1278–1333 oraz
-`/Users/silver/AI_notes/projects/aicx/reports/subagents/SUBAGENT_03_audit-area-C--20-05-2026.md`.
+`~/Downloads/bug-tracker-aicx.md` linie 1278–1333 oraz
+`~/AI_notes/projects/aicx/reports/subagents/SUBAGENT_03_audit-area-C--20-05-2026.md`.
 
 ---
 
@@ -720,11 +720,11 @@ regresji w `src/main.rs::tests::serve_help_prefers_http_name_and_stays_compact`;
   wygląda wygodnie tylko do pierwszego repo typu `vista-portal`.
 
 **Related.** Area A (A-1..A-25) z
-`/Users/silver/Downloads/bug-tracker-aicx.md` linie 15-643 oraz Area C P3
+`~/Downloads/bug-tracker-aicx.md` linie 15-643 oraz Area C P3
 linie 1335-1396; audyty
-`/Users/silver/AI_notes/projects/aicx/reports/subagents/SUBAGENT_01_audit-area-A--20-05-2026.md`
+`~/AI_notes/projects/aicx/reports/subagents/SUBAGENT_01_audit-area-A--20-05-2026.md`
 i
-`/Users/silver/AI_notes/projects/aicx/reports/subagents/SUBAGENT_03_audit-area-C--20-05-2026.md`.
+`~/AI_notes/projects/aicx/reports/subagents/SUBAGENT_03_audit-area-C--20-05-2026.md`.
 - B-6: Switched deduplication to BLAKE3-128 collision-resistant algorithm.
 - B-7: Bumped default state lock timeout to 60s and plumbed --lock-timeout flag.
 
@@ -1116,7 +1116,7 @@ ale content path nigdy nie zgłaszał warningu, bo nigdy nie patrzył.
 **Related.** Closes A-7 (NUL/CRLF/RLO policy) + A-25 (zero-width/bidi
 normalization) z Area A w `docs/bug-tracker-aicx`. Recovery dispatch
 dla failed `bugtracker-W4-A-unicode-20260520`. Report:
-`/Users/silver/AI_notes/projects/aicx/reports/subagents/SUBAGENT_W4A_unicode-recovery-20-05-2026.md`.
+`~/AI_notes/projects/aicx/reports/subagents/SUBAGENT_W4A_unicode-recovery-20-05-2026.md`.
 ---
 
 ## 2026-05-20 — doctor exit-code truth + sidecar coverage de-dupe + MCP session guard (Area F F-P2-12/F-P3-15/F-P1-P2-3) · `{commit-sha}`
@@ -1178,7 +1178,7 @@ dla failed `bugtracker-W4-A-unicode-20260520`. Report:
   wrapper jest mniejszym ryzykiem niż forkowanie transportu.
 
 **Related.** Closes F-P2-12, F-P3-15, F-P1/P2-3 from Area F. Report:
-`/Users/silver/.vibecrafted/artifacts/Loctree/aicx/2026_0520/reports/20260520_135025_20260520_1350_perform-the-vc-justdo-skill-on-this-repository_codex.md`.
+`~/.vibecrafted/artifacts/Loctree/aicx/2026_0520/reports/20260520_135025_20260520_1350_perform-the-vc-justdo-skill-on-this-repository_codex.md`.
 
 ---
 
@@ -1227,7 +1227,7 @@ contractu dla read callers: empty result + `tracing::warn!`.
 
 **Related.** Closes D-1 from docs/bug-tracker-aicx Area D; recovery #2 for
 failed `bugtracker-W4-D-steer-locks-*` runs. Report:
-`/Users/silver/.vibecrafted/artifacts/Loctree/aicx/2026_0520/reports/20260520_143717_20260520_1437_perform-the-vc-justdo-skill-on-this-repository_codex.md`.
+`~/.vibecrafted/artifacts/Loctree/aicx/2026_0520/reports/20260520_143717_20260520_1437_perform-the-vc-justdo-skill-on-this-repository_codex.md`.
 
 ## 2026-05-20 — D-bundle tail + F-P3-18 audit log · `pending-commit`
 
@@ -1329,7 +1329,7 @@ logu wejścia do każdego MCP tool handlera.
 **Related.** Closes D-2, D-3, D-5, D-6, D-7 IMPL, D-8, D-9, D-11 from Area D;
 D-12 already landed via `453f166`. Closes F-P3-18 from Area F. Final dispatch
 in bug-tracker-aicx plan recovery wave. Report:
-`/Users/silver/.vibecrafted/artifacts/Loctree/aicx/2026_0520/reports/20260520_165547_20260520_1655_perform-the-vc-justdo-skill-on-this-repository_claude.md`.
+`~/.vibecrafted/artifacts/Loctree/aicx/2026_0520/reports/20260520_165547_20260520_1655_perform-the-vc-justdo-skill-on-this-repository_claude.md`.
 
 ## 2026-05-21 — legacy siphash state load migration · `0c9ba5e`
 
