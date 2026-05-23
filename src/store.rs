@@ -1117,11 +1117,51 @@ fn content_sha256(content: &str) -> String {
 /// body of an orphan `.md` against the new chunk before deciding whether
 /// to reclaim or quarantine. This is a one-time-per-orphan cost outside
 /// the hot dedup path, so it is intentionally uncached.
+/// Stream-hash a file's bytes into a hex SHA-256, with an explicit
+/// 64 KiB read buffer and a hard 8 MiB cap (matching
+/// `sanitize::MAX_VALIDATED_BYTES`).
+///
+/// Rationale: the previous implementation called
+/// `sanitize::read_to_string_validated` which DOES have the same 8 MiB
+/// cap, but materialises the whole file in memory as a `String` before
+/// hashing. The gemini-code-assist MEDIUM PR #8 review noted the
+/// "reads entire file into memory" pattern even though the cap was in
+/// place. Streaming bytes through the hasher directly is just as bound
+/// (we check the cumulative byte count) and avoids the intermediate
+/// allocation. As a bonus it tolerates files that are not valid UTF-8
+/// — the hash still produces a deterministic result for any byte
+/// sequence, where the prior implementation would error on invalid
+/// UTF-8 in the orphan-reclaim path (#20).
+///
+/// This is a one-time-per-orphan cost outside the hot dedup path, so it
+/// is intentionally uncached.
 fn sha256_of_file(path: &Path) -> Result<String> {
+    use std::io::Read;
     let validated = sanitize::validate_read_path(path)?;
-    let bytes = sanitize::read_to_string_validated(&validated)
-        .with_context(|| format!("Failed to read orphan chunk {}", validated.display()))?;
-    Ok(content_sha256(&bytes))
+    let file = std::fs::File::open(&validated)
+        .with_context(|| format!("Failed to open orphan chunk {}", validated.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut total: usize = 0;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .with_context(|| format!("Failed to read orphan chunk {}", validated.display()))?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n);
+        if total > sanitize::MAX_VALIDATED_BYTES {
+            anyhow::bail!(
+                "Orphan chunk {} exceeds the {} byte read cap",
+                validated.display(),
+                sanitize::MAX_VALIDATED_BYTES
+            );
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 pub fn content_sha256_exists_in_dir(dir: &Path, content_sha256: &str) -> Result<bool> {
