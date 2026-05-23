@@ -307,10 +307,6 @@ struct DashboardArgs {
     #[arg(long, requires = "serve")]
     allow_no_origin: bool,
 
-    /// Timeout for external rust-memex/rmcp-memex cross-search calls, in seconds.
-    #[arg(long, requires = "serve", default_value_t = dashboard_server::DEFAULT_MEMEX_TIMEOUT_SECS)]
-    memex_timeout_secs: u64,
-
     /// Document title
     #[arg(long, default_value = DEFAULT_DASHBOARD_TITLE)]
     title: String,
@@ -1770,7 +1766,6 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 auth_token: None,
                 require_auth: true,
                 allow_no_origin: false,
-                memex_timeout_secs: dashboard_server::DEFAULT_MEMEX_TIMEOUT_SECS,
                 artifact: args.artifact.unwrap_or(default_dashboard_output_path()?),
                 title: args.title,
                 preview_chars: args.preview_chars,
@@ -5839,7 +5834,6 @@ struct DashboardServerRunArgs {
     auth_token: Option<String>,
     require_auth: bool,
     allow_no_origin: bool,
-    memex_timeout_secs: u64,
     artifact: PathBuf,
     title: String,
     preview_chars: usize,
@@ -5880,7 +5874,6 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
             auth_token: args.auth_token.as_deref(),
             require_auth: args.require_auth,
             allow_no_origin: args.allow_no_origin,
-            memex_timeout_secs: args.memex_timeout_secs,
         });
     }
 
@@ -5903,7 +5896,6 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
         port: args.port,
         auth: auth_config,
         allow_no_origin: args.allow_no_origin,
-        memex_timeout_secs: args.memex_timeout_secs,
     };
 
     if !args.no_open {
@@ -5937,7 +5929,6 @@ struct DashboardServerBackgroundArgs<'a> {
     auth_token: Option<&'a str>,
     require_auth: bool,
     allow_no_origin: bool,
-    memex_timeout_secs: u64,
 }
 
 fn spawn_dashboard_server_background(args: DashboardServerBackgroundArgs<'_>) -> Result<()> {
@@ -5971,11 +5962,6 @@ fn spawn_dashboard_server_background(args: DashboardServerBackgroundArgs<'_>) ->
         .arg(if args.require_auth { "true" } else { "false" });
     if args.allow_no_origin {
         command.arg("--allow-no-origin");
-    }
-    if args.memex_timeout_secs != dashboard_server::DEFAULT_MEMEX_TIMEOUT_SECS {
-        command
-            .arg("--memex-timeout-secs")
-            .arg(args.memex_timeout_secs.to_string());
     }
     if args.title != DEFAULT_DASHBOARD_TITLE {
         command.arg("--title").arg(args.title);
@@ -6052,7 +6038,6 @@ fn run_dashboard_command(args: DashboardArgs) -> Result<()> {
             auth_token: args.auth_token,
             require_auth: args.require_auth,
             allow_no_origin: args.allow_no_origin,
-            memex_timeout_secs: args.memex_timeout_secs,
             artifact: default_dashboard_output_path()?,
             title: args.title,
             preview_chars: args.preview_chars,
@@ -6719,36 +6704,6 @@ mod tests {
                 assert!(matches!(emit, StdoutEmit::None));
             }
             _ => panic!("expected codex command"),
-        }
-    }
-
-    #[test]
-    fn dashboard_memex_timeout_defaults_to_30_seconds() {
-        let cli = Cli::try_parse_from(["aicx", "dashboard", "--serve"])
-            .expect("dashboard serve command should parse");
-
-        match cli.command {
-            Some(Commands::Dashboard(args)) => {
-                assert_eq!(
-                    args.memex_timeout_secs,
-                    dashboard_server::DEFAULT_MEMEX_TIMEOUT_SECS
-                );
-            }
-            _ => panic!("expected dashboard command"),
-        }
-    }
-
-    #[test]
-    fn dashboard_memex_timeout_accepts_cli_override() {
-        let cli =
-            Cli::try_parse_from(["aicx", "dashboard", "--serve", "--memex-timeout-secs", "75"])
-                .expect("dashboard serve command should parse");
-
-        match cli.command {
-            Some(Commands::Dashboard(args)) => {
-                assert_eq!(args.memex_timeout_secs, 75);
-            }
-            _ => panic!("expected dashboard command"),
         }
     }
 

@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Query, State, rejection::QueryRejection},
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -35,12 +35,8 @@ use crate::sanitize;
 
 const REGENERATE_HEADER_NAME: &str = "x-ai-contexters-action";
 const REGENERATE_HEADER_VALUE: &str = "regenerate";
-const CROSS_SEARCH_MAX_LIMIT: usize = 200;
-const CROSS_SEARCH_CLAMPED_LIMIT_HEADER: &str = "x-clamped-limit";
 const MAX_SCORE_FILTER: u8 = 100;
 const LOCALHOST_ORIGINS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
-const MEMEX_CLI_ENV_PASSTHROUGH: [&str; 3] = ["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"];
-pub const DEFAULT_MEMEX_TIMEOUT_SECS: u64 = 30;
 const TAILSCALE_MAGICDNS_SUFFIX: &str = ".ts.net";
 const TAILSCALE_RANGE_BASE: u32 = u32::from_be_bytes([100, 64, 0, 0]);
 const TAILSCALE_RANGE_END: u32 = u32::from_be_bytes([100, 127, 255, 255]);
@@ -120,7 +116,6 @@ pub struct DashboardServerConfig {
     pub port: u16,
     pub auth: AuthConfig,
     pub allow_no_origin: bool,
-    pub memex_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -154,7 +149,6 @@ struct DashboardServerState {
     shell_html: String,
     snapshot: RwLock<DashboardSnapshot>,
     rebuilding: AtomicBool,
-    memex_cli_path: Option<String>,
 }
 
 #[derive(Debug)]
@@ -225,34 +219,16 @@ fn forbidden_response(reason: &'static str, detail: impl std::fmt::Display) -> R
         .into_response()
 }
 
-fn clamp_cross_search_limit(requested: usize) -> (usize, bool) {
-    (
-        requested.min(CROSS_SEARCH_MAX_LIMIT),
-        requested > CROSS_SEARCH_MAX_LIMIT,
-    )
-}
-
-fn apply_clamped_limit_header(response: &mut Response, clamped: bool) {
-    if clamped {
-        // Format from the constant so the header tracks any future MAX_LIMIT bump.
-        let value = HeaderValue::from_str(&CROSS_SEARCH_MAX_LIMIT.to_string())
-            .expect("CROSS_SEARCH_MAX_LIMIT is numeric; always a valid header value");
-        response.headers_mut().insert(
-            HeaderName::from_static(CROSS_SEARCH_CLAMPED_LIMIT_HEADER),
-            value,
-        );
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct SemanticSearchParams {
     q: String,
     #[serde(default = "default_search_limit")]
     limit: usize,
-    /// Optional project filter (case-insensitive substring match). Prefer
-    /// `projects` for cross-project search.
+    /// Optional project filter routed through the canonical
+    /// `aicx::store::project_filter_matches` helper. Strict semantics: no
+    /// substring matching. Prefer `projects` for cross-project search.
     project: Option<String>,
-    /// Optional project filters for cross-project search.
+    /// Optional project filters for cross-project search (strict).
     #[serde(default)]
     projects: Vec<String>,
     /// Optional minimum score threshold (0-100)
@@ -261,29 +237,6 @@ struct SemanticSearchParams {
     frame_kind: Option<crate::timeline::FrameKind>,
     /// Optional canonical corpus kind filter
     kind: Option<String>,
-}
-
-// default_namespace / default_search_mode removed 2026-05-10: the
-// `ns` + `mode` fields they backed lived on the old memex-CLI shim and
-// have no meaning for the in-process semantic dispatch. Cross-search
-// keeps `default_search_mode` inline via its own struct's default.
-fn default_search_mode() -> String {
-    "hybrid".to_string()
-}
-
-#[derive(Debug, Deserialize)]
-struct CrossSearchParams {
-    q: String,
-    #[serde(default = "default_search_limit")]
-    limit: usize,
-    #[serde(default = "default_search_mode")]
-    mode: String,
-    /// Optional project filter (case-insensitive substring match). Prefer
-    /// `projects` for cross-project search.
-    project: Option<String>,
-    /// Optional project filters for cross-project search.
-    #[serde(default)]
-    projects: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -310,14 +263,6 @@ struct FuzzySearchResponse {
     total_scanned: usize,
 }
 
-#[derive(Debug, Serialize)]
-struct MemexSearchResponse {
-    ok: bool,
-    query: String,
-    source: String,
-    results: serde_json::Value,
-}
-
 #[derive(Debug, Deserialize)]
 struct SteerSearchParams {
     /// Filter by run_id (exact)
@@ -330,9 +275,9 @@ struct SteerSearchParams {
     kind: Option<String>,
     /// Filter by frame/channel
     frame_kind: Option<crate::timeline::FrameKind>,
-    /// Filter by project (case-insensitive substring)
+    /// Filter by project (strict, via `aicx::store::project_filter_matches`)
     project: Option<String>,
-    /// Filter by multiple project substrings
+    /// Filter by multiple project filters (strict)
     #[serde(default)]
     projects: Vec<String>,
     /// Filter by date (YYYY-MM-DD or range)
@@ -390,17 +335,11 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
     let initial = rebuild_dashboard(&config).context("Initial dashboard build failed")?;
     let shell_html = dashboard::render_server_shell_html(&config.title);
 
-    let memex_cli_path = which::which("rust-memex")
-        .or_else(|_| which::which("rmcp-memex"))
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned());
-
     let state = Arc::new(DashboardServerState {
         config: config.clone(),
         shell_html,
         snapshot: RwLock::new(DashboardSnapshot::from_build(initial)),
         rebuilding: AtomicBool::new(false),
-        memex_cli_path,
     });
 
     let auth_source_label = config.auth.source.describe();
@@ -425,7 +364,7 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         .route("/api/context", get(get_context))
         .route("/api/regenerate", post(regenerate_dashboard))
         .route("/api/search/semantic", get(semantic_search))
-        .route("/api/search/cross", get(cross_search))
+        .route("/api/search/cross", get(cross_search_gone))
         .route("/api/search/steer", get(steer_search));
 
     let api_router = auth::require_auth_layer(api_router, config.auth.clone());
@@ -454,7 +393,6 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
     eprintln!(
         "  Semantic:  GET  http://{addr}/api/search/semantic?q=<query>&project=<p>&score=<min>"
     );
-    eprintln!("  Cross:     GET  http://{addr}/api/search/cross?q=<query>");
     eprintln!("  Steer:     GET  http://{addr}/api/search/steer?run_id=<id>&project=<p>");
     eprintln!("  PWA:       GET  http://{addr}/manifest.webmanifest");
     eprintln!(
@@ -875,6 +813,13 @@ fn parse_relative_time(s: &str) -> Option<i64> {
     Some(now.saturating_sub(num.saturating_mul(unit)))
 }
 
+/// Combine a startup `--project` scope with the request-level `project` /
+/// `projects` filters into a single list. The rollup is canonical-equality
+/// only: a request filter is kept when it matches the startup scope
+/// case-insensitively after trimming. The previous reverse-substring
+/// rollup (`request.contains(scope)`) silently collapsed `vista` +
+/// `vista-portal` into the same bucket — that's bug #28 and intentionally
+/// gone here.
 fn merge_project_scopes(
     scope: Option<&str>,
     request: Option<String>,
@@ -890,8 +835,8 @@ fn merge_project_scopes(
         if merged.is_empty() {
             merged.push(scope.to_string());
         } else {
-            let scope_lower = scope.to_ascii_lowercase();
-            merged.retain(|request| request.to_ascii_lowercase().contains(&scope_lower));
+            let scope_trimmed = scope.trim();
+            merged.retain(|request| request.trim().eq_ignore_ascii_case(scope_trimmed));
             if merged.is_empty() {
                 merged.push(scope.to_string());
             }
@@ -963,7 +908,7 @@ async fn get_browse(
         .iter()
         .filter(|r| {
             if let Some(ref p) = params.project
-                && !r.project.eq_ignore_ascii_case(p)
+                && !project_matches_filter(&r.project, Some(p))
             {
                 return false;
             }
@@ -1438,180 +1383,21 @@ async fn semantic_search(
     }
 }
 
-// run_memex_search removed 2026-05-10: dashboard semantic search is
-// now in-process via `crate::search_engine::try_semantic_search`.
-// External `rust-memex` / `rmcp-memex` CLI spawn is no longer used for
-// the `/api/search/semantic` path. `run_memex_cli` + `run_memex_cross_search`
-// survive only for the cross-search endpoint (separate doctrine; lands
-// in its own cut when that surface migrates in-process).
-
-fn apply_memex_cli_env(command: &mut tokio::process::Command) {
-    command.env_clear();
-    for key in MEMEX_CLI_ENV_PASSTHROUGH {
-        if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
-        }
-    }
-}
-
-async fn run_memex_cli(
-    binary_path: Option<&str>,
-    args: &[&str],
-    action: &str,
-    timeout_secs: u64,
-) -> Result<(String, std::process::Output)> {
-    let binary = binary_path.ok_or_else(|| {
-        anyhow::anyhow!("Semantic search (vector backend) is an optional capability. Failed to run memex {action}: missing compatible memex CLI (rust-memex or rmcp-memex). Please install the vector backend or fall back to default lexical search.")
-    })?;
-
-    let mut command = tokio::process::Command::new(binary);
-    apply_memex_cli_env(&mut command);
-    // PR #6 follow-up: if the `tokio::time::timeout` wrapper below fires,
-    // the `wait_with_output` future is dropped before the child finishes.
-    // Without `kill_on_drop(true)` the underlying memex / rust-memex /
-    // rmcp-memex process keeps running in the background, leaking
-    // descriptors and CPU on every cross-search timeout. Setting it here
-    // (before spawn) guarantees the runtime kills the child when the
-    // Child handle is dropped on timeout.
-    command.kill_on_drop(true);
-    let child = command
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context(format!("Failed to spawn {binary} {action}"))?;
-
-    let timeout_secs = timeout_secs.max(1);
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        child.wait_with_output(),
+// Cross-namespace memex CLI fork removed: `aicx` no longer shells out to
+// `rust-memex` / `rmcp-memex`. AICX is the canonical corpus surface
+// (operator decision 2026-05-23). The `/api/search/cross` route is kept
+// so a client polling the endpoint gets a clean Gone surface instead of
+// a 404 that looks like a routing mistake — see `cross_search_gone`.
+async fn cross_search_gone() -> Response {
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": "cross_search_removed",
+            "reason": "The /api/search/cross endpoint backed by the rust-memex / rmcp-memex CLI fork has been removed. AICX is the canonical corpus; use /api/search/semantic instead.",
+        })),
     )
-    .await
-    .map_err(|_| anyhow::anyhow!("{binary} timed out after {timeout_secs}s"))?
-    .context(format!("Failed to collect output for {binary} {action}"))?;
-
-    Ok((binary.to_string(), output))
-}
-
-/// Cross-namespace semantic search via the configured memex CLI.
-///
-/// Searches all namespaces at once, merging and ranking results.
-async fn cross_search(
-    State(state): State<Arc<DashboardServerState>>,
-    params: Result<Query<CrossSearchParams>, QueryRejection>,
-) -> Response {
-    let Query(params) = match params {
-        Ok(q) => q,
-        Err(rejection) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    ok: false,
-                    error: format!("Invalid query parameters: {rejection}"),
-                }),
-            )
-                .into_response();
-        }
-    };
-    let query = params.q.trim().to_string();
-    if query.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                ok: false,
-                error: "Query parameter 'q' is required".to_string(),
-            }),
-        )
-            .into_response();
-    }
-
-    let (limit, clamped_limit) = clamp_cross_search_limit(params.limit);
-    let mode = params.mode;
-    let projects = if params.projects.is_empty() {
-        params.project.into_iter().collect::<Vec<_>>()
-    } else {
-        params.projects
-    };
-
-    let result = run_memex_cross_search(
-        state.memex_cli_path.as_deref(),
-        &query,
-        limit,
-        &mode,
-        &projects,
-        state.config.memex_timeout_secs,
-    )
-    .await;
-
-    match result {
-        Ok(response) => {
-            let mut response = (StatusCode::OK, Json(response)).into_response();
-            apply_clamped_limit_header(&mut response, clamped_limit);
-            response
-        }
-        Err(err) => {
-            if let Some(err) = err.downcast_ref::<std::io::Error>()
-                && err.kind() == std::io::ErrorKind::NotFound
-            {
-                let payload = serde_json::json!({
-                    "ok": false,
-                    "error": "semantic_search_unavailable",
-                    "reason": format!("{err}"),
-                });
-                return (StatusCode::UNPROCESSABLE_ENTITY, Json(payload)).into_response();
-            }
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    ok: false,
-                    error: format!("Search task failed: {err:#}"),
-                }),
-            )
-                .into_response()
-        }
-    }
-}
-
-async fn run_memex_cross_search(
-    memex_cli_path: Option<&str>,
-    query: &str,
-    limit: usize,
-    mode: &str,
-    projects: &[String],
-    timeout_secs: u64,
-) -> Result<MemexSearchResponse> {
-    let mut args = vec![
-        "cross-search".to_string(),
-        query.to_string(),
-        "--limit".to_string(),
-        limit.to_string(),
-        "--mode".to_string(),
-        mode.to_string(),
-        "--json".to_string(),
-    ];
-    for project in projects {
-        args.push("--project".to_string());
-        args.push(project.clone());
-    }
-    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    let (binary, output) =
-        run_memex_cli(memex_cli_path, &arg_refs, "cross-search", timeout_secs).await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("{binary} cross-search failed: {}", stderr.trim());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let results: serde_json::Value =
-        serde_json::from_str(&stdout).unwrap_or(serde_json::Value::String(stdout.to_string()));
-
-    Ok(MemexSearchResponse {
-        ok: true,
-        query: query.to_string(),
-        source: format!("{binary} cross-search --mode {}", mode),
-        results,
-    })
+        .into_response()
 }
 
 /// Steering-metadata search across stored chunks.
@@ -2004,7 +1790,6 @@ mod tests {
                 port: 8033,
                 auth: AuthConfig::disabled(),
                 allow_no_origin,
-                memex_timeout_secs: DEFAULT_MEMEX_TIMEOUT_SECS,
             },
             shell_html: "<html>shell</html>".to_string(),
             snapshot: RwLock::new(DashboardSnapshot {
@@ -2025,7 +1810,6 @@ mod tests {
                 last_error: None,
             }),
             rebuilding: AtomicBool::new(false),
-            memex_cli_path: None,
         })
     }
 
@@ -2317,179 +2101,48 @@ mod tests {
         assert_eq!(err, "score must be between 0 and 100");
     }
 
+    // Bug #28 regression: `merge_project_scopes` must roll up by canonical
+    // case-insensitive equality, not by reverse substring. `vista` no longer
+    // collapses `vista-portal` into the same bucket.
     #[test]
-    fn cross_search_limit_clamp_sets_signal_header() {
-        let (limit, clamped) = clamp_cross_search_limit(500);
-        assert_eq!(limit, CROSS_SEARCH_MAX_LIMIT);
-        assert!(clamped);
-
-        let mut response = (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response();
-        apply_clamped_limit_header(&mut response, clamped);
+    fn merge_project_scopes_rejects_substring_rollup() {
+        let merged = merge_project_scopes(
+            Some("vista"),
+            None,
+            vec!["vista-portal".to_string(), "vetcoders/vista".to_string()],
+        );
         assert_eq!(
-            response.headers().get(CROSS_SEARCH_CLAMPED_LIMIT_HEADER),
-            Some(&HeaderValue::from_static("200"))
+            merged,
+            vec!["vista".to_string()],
+            "reverse-substring rollup leaked: vista-portal / vetcoders/vista must NOT be retained when scope is `vista`"
         );
     }
 
     #[test]
-    fn run_memex_cli_passes_home_xdg_without_path() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let env_binary = "/usr/bin/env";
-        assert!(
-            Path::new(env_binary).exists(),
-            "{env_binary} must exist for env passthrough test"
+    fn merge_project_scopes_keeps_canonical_match_case_insensitive() {
+        let merged = merge_project_scopes(
+            Some("Vetcoders/Vista"),
+            None,
+            vec![
+                "vetcoders/vista".to_string(),
+                "vetcoders/vista-portal".to_string(),
+            ],
         );
-
-        let (_binary, output) = runtime
-            .block_on(run_memex_cli(
-                Some(env_binary),
-                &[],
-                "env probe",
-                DEFAULT_MEMEX_TIMEOUT_SECS,
-            ))
-            .expect("env probe");
-        assert!(output.status.success(), "env probe should succeed");
-        let stdout = String::from_utf8(output.stdout).expect("utf8 env output");
-        let lines = stdout.lines().collect::<Vec<_>>();
-
-        assert!(
-            !lines.iter().any(|line| line.starts_with("PATH=")),
-            "memex CLI env must not inherit PATH:\n{stdout}"
+        assert_eq!(
+            merged,
+            vec!["vetcoders/vista".to_string()],
+            "canonical-equality rollup must keep only the exact match (case-insensitive)"
         );
-        for key in MEMEX_CLI_ENV_PASSTHROUGH {
-            if std::env::var_os(key).is_some() {
-                let prefix = format!("{key}=");
-                assert!(
-                    lines.iter().any(|line| line.starts_with(&prefix)),
-                    "memex CLI env should pass {key} when parent has it:\n{stdout}"
-                );
-            }
-        }
     }
 
-    #[cfg(unix)]
     #[test]
-    fn run_memex_cli_timeout_kills_child_process() {
-        // PR #6 follow-up regression: when the wrapping `tokio::time::timeout`
-        // fires, the spawned memex/rmcp-memex child must be terminated by
-        // `kill_on_drop(true)`. Otherwise a flaky/slow memex install can
-        // leak background processes on every cross-search call.
-        //
-        // The test drives `run_memex_cli` with a tiny shell program that
-        // records its PID into a tempfile and then sleeps far past the
-        // configured timeout. After the timeout error we poll `kill(0)` on
-        // the recorded PID and assert it disappears — proving the runtime
-        // really killed it on drop.
-        use std::io::Read;
-        use std::path::PathBuf;
-
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let pid_file: PathBuf = std::env::temp_dir().join(format!(
-            "aicx_memex_killondrop_{}_{}.pid",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let _ = std::fs::remove_file(&pid_file);
-        let script = format!(
-            "printf '%s' \"$$\" > {pid}; sleep 30",
-            pid = pid_file.display()
+    fn merge_project_scopes_falls_back_to_scope_when_no_overlap() {
+        let merged = merge_project_scopes(Some("vista"), None, vec!["vista-portal".to_string()]);
+        assert_eq!(
+            merged,
+            vec!["vista".to_string()],
+            "when no request matches the scope canonically, fall back to scope alone"
         );
-
-        let result = runtime.block_on(run_memex_cli(
-            Some("/bin/sh"),
-            &["-c", &script],
-            "kill probe",
-            1,
-        ));
-        assert!(
-            result.is_err(),
-            "expected `run_memex_cli` to time out, got {:?}",
-            result
-        );
-
-        let mut pid_text = String::new();
-        let mut read_attempts = 0;
-        loop {
-            if let Ok(mut f) = std::fs::File::open(&pid_file) {
-                pid_text.clear();
-                if f.read_to_string(&mut pid_text).is_ok() && !pid_text.trim().is_empty() {
-                    break;
-                }
-            }
-            read_attempts += 1;
-            assert!(
-                read_attempts < 50,
-                "child shell never wrote pid file at {}",
-                pid_file.display()
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let pid: i32 = pid_text.trim().parse().unwrap_or_else(|_| {
-            panic!("non-numeric pid in {}: {:?}", pid_file.display(), pid_text)
-        });
-
-        // Poll for the child to be killed. `kill(0)` returns 0 while the
-        // process exists (running OR zombie) and -1/ESRCH once it has
-        // been reaped. On Linux self-hosted CI the reaper can lag a few
-        // seconds, and a SIGKILLed child sits in zombie state until its
-        // tokio runtime parent waits on it. We therefore treat
-        //   * `kill(0) == -1` (reaped) OR
-        //   * `/proc/<pid>/status` reporting state `Z` / `X` (zombie/dead)
-        // as success. Otherwise the child is genuinely still running and
-        // `kill_on_drop` is the regression.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-        let mut killed = false;
-        while std::time::Instant::now() < deadline {
-            if memex_child_is_dead_or_zombie(pid) {
-                killed = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-
-        let _ = std::fs::remove_file(&pid_file);
-        if !killed {
-            // Best-effort cleanup so a regression does not leave the
-            // sleeping shell behind in the test runner.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
-            panic!(
-                "memex CLI child {} survived run_memex_cli timeout — kill_on_drop missing?",
-                pid
-            );
-        }
-    }
-
-    /// Return true when `pid` is either reaped (`kill(0)` -> ESRCH) or
-    /// observable as a zombie / dying process on Linux. Used by the
-    /// kill_on_drop regression test to tolerate the SIGKILL → reap lag
-    /// that surfaces on slow CI runners without weakening the contract
-    /// (a process that is still actively running fails the check).
-    #[cfg(unix)]
-    fn memex_child_is_dead_or_zombie(pid: i32) -> bool {
-        let rc = unsafe { libc::kill(pid, 0) };
-        if rc == -1 {
-            return true; // ESRCH — process gone (reaped).
-        }
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
-                for line in status.lines() {
-                    if let Some(state) = line.strip_prefix("State:\t") {
-                        // First token is the single-letter state: R, S, D,
-                        // T, t, Z, X, I. Z = zombie, X = dead. Both mean
-                        // SIGKILL landed and the child is on its way out.
-                        let letter = state.chars().next().unwrap_or('?');
-                        return letter == 'Z' || letter == 'X';
-                    }
-                }
-            }
-        }
-        false
     }
 
     #[test]

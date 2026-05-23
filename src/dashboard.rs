@@ -56,12 +56,23 @@ impl DashboardScope {
     }
 }
 
+/// Strict project filter shared with `aicx::store::project_filter_matches`.
+///
+/// Splits the canonical project slug into `<organization>/<repository>` (or
+/// `("", bucket)` when the slug is a single segment) and routes the user
+/// filter through the canonical helper. Substring matching is intentionally
+/// gone: `-p vista` no longer matches `vista-portal`. An empty / None filter
+/// keeps the legacy "no filter applied" behavior.
 pub fn project_matches_filter(project: &str, filter: Option<&str>) -> bool {
-    filter.is_none_or(|needle| {
-        project
-            .to_ascii_lowercase()
-            .contains(&needle.to_ascii_lowercase())
-    })
+    let Some(needle) = filter else {
+        return true;
+    };
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return true;
+    }
+    let (organization, repository) = project.split_once('/').unwrap_or(("", project));
+    crate::store::project_filter_matches(organization, repository, needle)
 }
 
 pub fn date_matches_hours_scope(date_iso: &str, hours: Option<u64>) -> bool {
@@ -2561,11 +2572,19 @@ mod tests {
         )
         .expect("beta file");
 
+        // Bug #27/#28 regression: the startup scope filter is now strict
+        // (routes through `aicx::store::project_filter_matches`). The old
+        // assertion used `Some("alpha")` and relied on substring matching
+        // against canonical slug `local/alpha-project` — that was the
+        // very leak the strict filter is designed to kill. The strict
+        // matcher accepts `alpha-project` (cross-org repo-name match),
+        // `local/alpha-project` (exact slug), `local/` (org wildcard),
+        // or `/alpha-project` (repo wildcard).
         let scoped = scan_store(
             &root,
             120,
             &DashboardScope {
-                project: Some("alpha".to_string()),
+                project: Some("alpha-project".to_string()),
                 hours: Some(72),
             },
         )
@@ -2578,7 +2597,7 @@ mod tests {
                 .payload
                 .assumptions
                 .iter()
-                .any(|line| line.contains("project/store buckets containing: alpha"))
+                .any(|line| line.contains("project/store buckets containing: alpha-project"))
         );
         assert!(
             scoped
@@ -2586,6 +2605,24 @@ mod tests {
                 .assumptions
                 .iter()
                 .any(|line| line.contains("last 72 hour(s)"))
+        );
+
+        // Bug #27 positive guard: the substring-only filter `alpha` MUST
+        // NOT match canonical `local/alpha-project` under strict
+        // semantics. The dashboard layer used to silently leak this.
+        let substring_leak = scan_store(
+            &root,
+            120,
+            &DashboardScope {
+                project: Some("alpha".to_string()),
+                hours: Some(72),
+            },
+        )
+        .expect("substring-leak scoped scan");
+        assert!(
+            substring_leak.payload.records.is_empty(),
+            "strict filter must NOT match `alpha` against `local/alpha-project`; got {} records",
+            substring_leak.payload.records.len()
         );
 
         let _ = fs::remove_dir_all(root);
