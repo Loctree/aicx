@@ -2642,10 +2642,7 @@ fn test_project_filter_matches_path_windows_segments_match_through_tier3() {
     // process's own cwd. That cross-platform behavior is covered by
     // the resolver's own crate tests, not here.
     assert!(
-        project_filter_matches_path(
-            "C:\\repos\\Loctree\\aicx",
-            &["Loctree/aicx".to_string()]
-        ),
+        project_filter_matches_path("C:\\repos\\Loctree\\aicx", &["Loctree/aicx".to_string()]),
         "Tier 3 must accept adjacent `Loctree\\aicx` segments in a Windows path"
     );
     assert!(
