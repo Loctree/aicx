@@ -2546,11 +2546,66 @@ fn test_project_filter_matches_owner_repo_segments() {
 }
 
 #[test]
-fn test_project_filter_matches_path_local_checkout_matches_canonical() {
+fn test_project_filter_matches_path_local_checkout_without_git_does_not_match_owner() {
+    // Pass-4 Wave F-2 (PR #8 follow-up to chatgpt-codex-connector P1):
+    // the old "last-segment relax" that let `-p Loctree/aicx` match
+    // `/Users/silver/Git/aicx` regardless of owner is gone. It leaked
+    // cross-org: filter `Loctree/aicx` ALSO matched `/.../VetCoders/aicx`.
+    //
+    // Bug #14's original intent ("local checkout matches canonical
+    // identity") now travels through Tier 1 — `aicx_parser::segmentation::
+    // infer_tiered_identity_from_cwd` consults the local `.git/config`
+    // remote URL and answers honestly. This unit test only exercises
+    // paths with NO `.git` (cwd is a random tmp-ish path), so Tier 1
+    // returns None and the strict adjacency path correctly refuses.
+    //
+    // The "with git remote" case is covered by
+    // `aicx_parser::segmentation` tests; here we lock in the strict
+    // behavior so the cross-org leak cannot silently come back.
+    assert!(
+        !project_filter_matches_path("/some/non-git/scratch/aicx", &["Loctree/aicx".to_string()]),
+        "without a .git remote pointing at Loctree/aicx, the path-only \
+         strict matcher must NOT accept `-p Loctree/aicx` for a directory \
+         that merely ends in `aicx` — that's the cross-org leak we removed"
+    );
+    // The symmetric anti-leak: a checkout literally under `/VetCoders/aicx`
+    // must also be rejected by `-p Loctree/aicx` at the strict tier.
+    assert!(
+        !project_filter_matches_path(
+            "/some/non-git/scratch/VetCoders/aicx",
+            &["Loctree/aicx".to_string()]
+        ),
+        "cross-org leak guard: `-p Loctree/aicx` must NOT accept a path \
+         under /VetCoders/aicx"
+    );
+    // And the positive control: strict adjacency `Loctree/aicx` in the
+    // path DOES match (this is Tier 3 strict behavior).
     assert!(project_filter_matches_path(
-        "/Users/silver/Git/aicx",
+        "/some/non-git/scratch/Loctree/aicx",
         &["Loctree/aicx".to_string()]
     ));
+}
+
+#[test]
+fn test_project_filter_matches_path_tier1_resolves_canonical_from_remote_url() {
+    // Tier 1 also matches when `cwd` is itself a remote URL string —
+    // `infer_repo_identity_from_remote_like` parses common shapes.
+    // This locks in the canonical-resolver wiring without needing a
+    // real `.git/config` on disk.
+    assert!(
+        project_filter_matches_path(
+            "https://github.com/Loctree/aicx",
+            &["Loctree/aicx".to_string()]
+        ),
+        "Tier 1 must resolve a github HTTPS URL to Loctree/aicx"
+    );
+    assert!(
+        !project_filter_matches_path(
+            "https://github.com/VetCoders/aicx",
+            &["Loctree/aicx".to_string()]
+        ),
+        "Tier 1 must reject a github URL whose owner differs from the filter"
+    );
 }
 
 #[test]
