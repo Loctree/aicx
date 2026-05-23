@@ -77,12 +77,25 @@ fn cache_bases() -> Vec<PathBuf> {
     }
     if let Some(home) = dirs::home_dir() {
         out.push(home.join(".cache").join("huggingface").join("hub"));
-        out.push(home.join(".aicx").join("embeddings"));
-        out.push(home.join(".aicx").join("embeddings").join("hub"));
+    }
+    if let Some(aicx_home) = resolve_aicx_home() {
+        out.push(aicx_home.join("embeddings"));
+        out.push(aicx_home.join("embeddings").join("hub"));
     }
     out.sort();
     out.dedup();
     out
+}
+
+/// Local mirror of `aicx::store::resolve_aicx_home`. Returns the resolved
+/// AICX home: `$AICX_HOME` when set + non-empty, otherwise `~/.aicx`.
+/// Duplicated because `aicx-embeddings` is a leaf crate (the main
+/// `aicx` crate depends on it, not the other way around).
+fn resolve_aicx_home() -> Option<PathBuf> {
+    match env::var_os("AICX_HOME") {
+        Some(value) if !value.is_empty() => Some(PathBuf::from(value)),
+        _ => dirs::home_dir().map(|home| home.join(".aicx")),
+    }
 }
 
 fn find_snapshot_in_base(base: &Path, repo: &str, filename: &str) -> Result<PathBuf, HfCacheMiss> {

@@ -3876,6 +3876,65 @@ mod tests {
         );
     }
 
+    /// Integration guard: every canonical-root resolver in the workspace
+    /// must agree on `$AICX_HOME` when it is pinned. Covers the split-brain
+    /// regression (bugs #25 + #40) where seven sites still hard-coded
+    /// `dirs::home_dir().join(".aicx")` while `store_base_dir` honored the
+    /// env override. If a future change re-introduces that drift this test
+    /// flips red.
+    #[test]
+    fn test_canonical_resolvers_agree_on_pinned_home() {
+        let _serial = AICX_HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = AicxHomeEnvGuard::capture();
+        let pinned = PathBuf::from("/tmp/test-aicx-canonical-agree");
+        // SAFETY: lock is held; sibling env-touching tests cannot race.
+        unsafe { env::set_var("AICX_HOME", &pinned) };
+
+        // 1. The resolver itself.
+        let resolved = resolve_aicx_home().expect("resolver should succeed");
+        assert_eq!(resolved, pinned, "resolve_aicx_home mismatch");
+
+        // 2. corpus::default_roots — first entry routes through resolver.
+        let roots = crate::corpus::default_roots().expect("corpus roots should succeed");
+        assert_eq!(
+            roots.first(),
+            Some(&pinned),
+            "corpus::default_roots[0] should equal pinned AICX_HOME; got {roots:?}"
+        );
+
+        // 3. aicx-embeddings::config::config_search_paths — every
+        //    AICX-rooted candidate must live under the pinned root. The
+        //    `AICX_EMBEDDER_CONFIG` override is ignored here because it is
+        //    a separate operator escape hatch, not an AICX_HOME consumer.
+        //    Gated on the embedder feature flags that pull in the crate.
+        #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+        {
+            let search_paths = aicx_embeddings::config_search_paths();
+            let aicx_rooted: Vec<_> = search_paths
+                .iter()
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|name| name == "config.toml" || name == "embedder.toml")
+                })
+                .collect();
+            assert!(
+                !aicx_rooted.is_empty(),
+                "config_search_paths should include AICX-rooted candidates"
+            );
+            for path in &aicx_rooted {
+                assert!(
+                    path.starts_with(&pinned),
+                    "config_search_paths candidate {} should live under pinned AICX_HOME {}",
+                    path.display(),
+                    pinned.display()
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_get_context_path_new_layout() {
         // Case-preserving canonical (relaxed 2026-05-12): `CodeScribe`

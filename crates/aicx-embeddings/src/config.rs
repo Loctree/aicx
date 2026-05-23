@@ -132,15 +132,30 @@ pub fn config_search_paths() -> Vec<PathBuf> {
     // are fallbacks. Canonical `config.toml` outranks legacy
     // `embedder.toml` so operators migrating to the new schema see their
     // changes immediately.
+    //
+    // Root resolution mirrors `aicx::store::resolve_aicx_home`: `$AICX_HOME`
+    // wins when set+non-empty, otherwise `~/.aicx`. Duplicated locally
+    // because aicx-embeddings is a leaf crate (the main `aicx` crate
+    // depends on it, not the other way around) and we deliberately avoid
+    // pulling the full crate just to share one 4-line resolver.
     let mut out = Vec::new();
     if let Some(path) = env_string("AICX_EMBEDDER_CONFIG") {
         out.push(PathBuf::from(path));
     }
-    if let Some(home) = dirs::home_dir() {
-        out.push(home.join(".aicx").join("config.toml")); // canonical, highest priority
-        out.push(home.join(".aicx").join("embedder.toml")); // legacy fallback
+    if let Some(root) = aicx_home_root() {
+        out.push(root.join("config.toml")); // canonical, highest priority
+        out.push(root.join("embedder.toml")); // legacy fallback
     }
     out
+}
+
+/// Local mirror of `aicx::store::resolve_aicx_home`. Returns the resolved
+/// AICX home: `$AICX_HOME` when set + non-empty, otherwise `~/.aicx`.
+fn aicx_home_root() -> Option<PathBuf> {
+    match std::env::var_os("AICX_HOME") {
+        Some(value) if !value.is_empty() => Some(PathBuf::from(value)),
+        _ => dirs::home_dir().map(|home| home.join(".aicx")),
+    }
 }
 
 fn load_config_file() -> Option<crate::NativeEmbedderConfigSection> {

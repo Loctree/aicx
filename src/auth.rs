@@ -72,9 +72,14 @@ impl AuthConfig {
 }
 
 /// Resolution rule for the canonical persistent token file.
+///
+/// Lives at `<AICX_HOME>/auth-token` — i.e. honors `$AICX_HOME` when set,
+/// falls back to `~/.aicx/auth-token` otherwise. Routes through the
+/// canonical resolver so an operator pinning `AICX_HOME` does not end
+/// up with an auth token stranded in the default `~/.aicx` while
+/// everything else moves.
 fn default_token_path() -> Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("Unable to resolve home directory"))?;
-    Ok(home.join(".aicx").join("auth-token"))
+    Ok(crate::store::resolve_aicx_home()?.join("auth-token"))
 }
 
 /// Load auth configuration from (in order): CLI override, env, file, or generate.

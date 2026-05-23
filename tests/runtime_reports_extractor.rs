@@ -94,6 +94,10 @@ fn run_aicx(home: &Path, args: &[&str]) -> Output {
         .args(args)
         .env("HOME", home)
         .env("AICX_ALLOW_TMP", "1")
+        // Drop any operator-pinned AICX_HOME so the spawned binary
+        // resolves under the test's temp HOME — see frame_kind_contract.rs
+        // for the full reasoning.
+        .env_remove("AICX_HOME")
         .output()
         .expect("run aicx")
 }

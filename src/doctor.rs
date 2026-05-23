@@ -80,6 +80,21 @@ fn default_schema_version_2() -> u32 {
     2
 }
 
+/// Label for the AICX root used in operator-facing recommendation strings.
+///
+/// When `$AICX_HOME` is pinned to a non-default location, the operator
+/// needs to see the resolved path — otherwise doctor recommendations
+/// like "rm -rf ~/.aicx/steer_db" point at the wrong directory. When
+/// the env override is unset (or empty), keep the familiar `~/.aicx`
+/// literal because that matches what most operators expect and what
+/// the existing install docs reference.
+fn doctor_home_label() -> String {
+    match std::env::var_os("AICX_HOME") {
+        Some(value) if !value.is_empty() => PathBuf::from(value).display().to_string(),
+        _ => "~/.aicx".to_string(),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DoctorReport {
     #[serde(default = "default_schema_version_2")]
@@ -335,10 +350,10 @@ fn check_context_corpus(base: &Path) -> CheckResult {
                     "context-corpus: scan failed at {}: {err}",
                     corpus_root.display()
                 ),
-                recommendation: Some(
-                    "Inspect ~/.aicx/context-corpus/ for permission or filesystem issues"
-                        .to_string(),
-                ),
+                recommendation: Some(format!(
+                    "Inspect {}/context-corpus/ for permission or filesystem issues",
+                    doctor_home_label()
+                )),
             };
         }
     };
@@ -599,7 +614,10 @@ fn check_index_consistency(base: &Path) -> CheckResult {
             recommendation: if chunk_keys.is_empty() {
                 None
             } else {
-                Some("Run `aicx store --full-rescan` to rebuild ~/.aicx/index.json".to_string())
+                Some(format!(
+                    "Run `aicx store --full-rescan` to rebuild {}/index.json",
+                    doctor_home_label()
+                ))
             },
         };
     }
@@ -610,9 +628,10 @@ fn check_index_consistency(base: &Path) -> CheckResult {
                 name: "index_consistency".to_string(),
                 severity: Severity::Critical,
                 detail: format!("Failed to read index.json: {err}"),
-                recommendation: Some(
-                    "Check filesystem permissions on ~/.aicx/index.json".to_string(),
-                ),
+                recommendation: Some(format!(
+                    "Check filesystem permissions on {}/index.json",
+                    doctor_home_label()
+                )),
             };
         }
     };
@@ -623,10 +642,10 @@ fn check_index_consistency(base: &Path) -> CheckResult {
                 name: "index_consistency".to_string(),
                 severity: Severity::Critical,
                 detail: format!("index.json is malformed JSON: {err}"),
-                recommendation: Some(
-                    "Backup and rebuild ~/.aicx/index.json via `aicx store --full-rescan`"
-                        .to_string(),
-                ),
+                recommendation: Some(format!(
+                    "Backup and rebuild {}/index.json via `aicx store --full-rescan`",
+                    doctor_home_label()
+                )),
             };
         }
     };
@@ -687,7 +706,10 @@ fn check_index_consistency(base: &Path) -> CheckResult {
         recommendation: if orphaned.is_empty() && missing.is_empty() {
             None
         } else {
-            Some("Run `aicx store --full-rescan` to reconcile ~/.aicx/index.json with the canonical store".to_string())
+            Some(format!(
+                "Run `aicx store --full-rescan` to reconcile {}/index.json with the canonical store",
+                doctor_home_label()
+            ))
         },
     }
 }
@@ -892,8 +914,10 @@ async fn check_steer_lance(base: &Path) -> CheckResult {
                 recommendation: Some(if critical {
                     "Run `aicx doctor --fix` to delete and rebuild from canonical store".to_string()
                 } else {
-                    "Investigate logs; persistent issues may need manual `rm -rf ~/.aicx/steer_db`"
-                        .to_string()
+                    format!(
+                        "Investigate logs; persistent issues may need manual `rm -rf {}/steer_db`",
+                        doctor_home_label()
+                    )
                 }),
             }
         }
@@ -960,9 +984,10 @@ fn check_state(base: &Path) -> CheckResult {
                 name: "state".to_string(),
                 severity: Severity::Critical,
                 detail: format!("Failed to read state.json: {e}"),
-                recommendation: Some(
-                    "Check filesystem permissions on ~/.aicx/state.json".to_string(),
-                ),
+                recommendation: Some(format!(
+                    "Check filesystem permissions on {}/state.json",
+                    doctor_home_label()
+                )),
             };
         }
     };
@@ -977,9 +1002,10 @@ fn check_state(base: &Path) -> CheckResult {
             name: "state".to_string(),
             severity: Severity::Critical,
             detail: format!("state.json is malformed JSON: {e}"),
-            recommendation: Some(
-                "Backup and remove ~/.aicx/state.json; will rebuild on next run".to_string(),
-            ),
+            recommendation: Some(format!(
+                "Backup and remove {}/state.json; will rebuild on next run",
+                doctor_home_label()
+            )),
         },
     }
 }

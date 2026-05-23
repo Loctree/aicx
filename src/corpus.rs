@@ -130,8 +130,9 @@ impl NoiseClass {
 
 pub fn default_roots() -> Result<Vec<PathBuf>> {
     let home = dirs::home_dir().context("No home directory")?;
+    let aicx_home = crate::store::resolve_aicx_home()?;
     Ok(vec![
-        home.join(".aicx"),
+        aicx_home,
         home.join(".ai-contexters"),
         home.join(".xcia"),
     ])

@@ -5014,9 +5014,9 @@ timeout_secs = 30
 "#;
 
 fn canonical_config_path() -> Result<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory for ~/.aicx/config.toml"))?;
-    Ok(home.join(".aicx").join("config.toml"))
+    Ok(aicx::store::resolve_aicx_home()
+        .context("cannot resolve AICX home for config.toml")?
+        .join("config.toml"))
 }
 
 /// Dispatch `aicx config <action>`.
