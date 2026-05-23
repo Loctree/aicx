@@ -1084,6 +1084,15 @@ fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool {
     // reporting THAT remote's identity. Guarding here is cheaper and
     // honester than patching `discover_git_root` at the parser layer.
     let cwd_trimmed = cwd.trim();
+    // Windows-shape admission is gated behind `cfg!(windows)`. On
+    // non-Windows runners, `Path::ancestors()` over a `C:\...` string
+    // resolves the empty trailing component against the test process's
+    // own cwd and spuriously locks onto the running git remote — the
+    // same Tier-1 leak `resolvable_shape` was designed to prevent for
+    // unanchored relative paths. Gating by compile-time platform keeps
+    // Windows local-checkout matching (codex P1 src/sources.rs:1069)
+    // honest on Windows runners while non-Windows runners cleanly fall
+    // through to Tier 3 segment matching.
     let resolvable_shape = cwd_trimmed.starts_with('/')
         || cwd_trimmed.starts_with('~')
         || cwd_trimmed.starts_with("http://")
@@ -1091,7 +1100,7 @@ fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool {
         || cwd_trimmed.starts_with("git@")
         || cwd_trimmed.starts_with("ssh://")
         || cwd_trimmed.starts_with("git://")
-        || is_windows_absolute_path(cwd_trimmed);
+        || (cfg!(windows) && is_windows_absolute_path(cwd_trimmed));
     if resolvable_shape
         && let Some(tiered) = aicx_parser::segmentation::infer_tiered_identity_from_cwd(Some(cwd))
     {
