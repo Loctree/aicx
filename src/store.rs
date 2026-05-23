@@ -1138,6 +1138,13 @@ fn content_sha256(content: &str) -> String {
 fn sha256_of_file(path: &Path) -> Result<String> {
     use std::io::Read;
     let validated = sanitize::validate_read_path(path)?;
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    // `validated` came out of `sanitize::validate_read_path`, which
+    // rejects symlink escapes, traversal sequences, and any path
+    // outside the allowlisted store roots. The semgrep rule pattern-
+    // matches on the `File::open(<var>)` shape without seeing the
+    // validation gate immediately above; the rule is a structural
+    // best-practice trigger, not evidence of a real traversal sink.
     let file = std::fs::File::open(&validated)
         .with_context(|| format!("Failed to open orphan chunk {}", validated.display()))?;
     let mut reader = std::io::BufReader::new(file);

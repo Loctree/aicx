@@ -207,10 +207,27 @@ struct DiagnosticsState {
 static STATE: OnceLock<Mutex<DiagnosticsState>> = OnceLock::new();
 
 fn lock_state() -> MutexGuard<'static, DiagnosticsState> {
+    // Recover from poisoned mutex via `into_inner()` rather than
+    // `.expect()`. A poisoned diagnostics mutex means a prior caller
+    // panicked while holding the lock — production should continue
+    // accumulating diagnostics, and tests must not cascade-fail on
+    // an unrelated sibling test's panic.
+    //
+    // Concrete trigger: parallel `cargo test` schedules where
+    // `diagnostics::tests::lock_test_init` (calls `reset_for_tests` +
+    // `init`) races with `sources::tests::test_extract_codex_file_*`
+    // (calls production `record` → `lock_state`). If any test panics
+    // mid-mutation, every sibling test that touches the global state
+    // hits the cascade panic at this site. Recovery here keeps the
+    // race window from amplifying one flake into five failures.
+    //
+    // The mirror pattern already lives in `summary_aggregates_per_extractor`
+    // (further down the test module) where it is annotated with the
+    // same rationale — this site is now consistent.
     STATE
         .get_or_init(|| Mutex::new(DiagnosticsState::default()))
         .lock()
-        .expect("diagnostics state poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Initialize the diagnostics aggregator for this CLI run.
