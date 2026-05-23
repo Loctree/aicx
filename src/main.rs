@@ -3394,6 +3394,25 @@ where
     let mut total_scanned: usize = 0;
     let mut out = Vec::with_capacity(segments.len());
 
+    // Cross-segment dedup state for `--full-rescan`: indexed by
+    // canonical repo slug so duplicates appearing in different segments
+    // of the same repo (e.g. multiple sessions touching the same repo)
+    // are deduplicated together, matching the incremental code path that
+    // uses `state.is_new(&project_label, ...)` for the same purpose.
+    //
+    // Before this fix, the HashSets were re-created per segment, so
+    // full_rescan saw segment-local dedup only — a regression vs the
+    // incremental path that prompted the chatgpt-codex-connector P1
+    // review comment on PR #8.
+    let mut full_rescan_exact_seen: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
+    let mut full_rescan_overlap_seen: std::collections::HashMap<
+        String,
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
+
     for seg in segments {
         let project_label = seg.project_label();
         let overlap_project = format!("_overlap:{project_label}");
@@ -3407,8 +3426,15 @@ where
         } = seg;
 
         let mut kept = Vec::with_capacity(entries.len());
-        let mut exact_seen_this_run = std::collections::HashSet::new();
-        let mut overlap_seen_this_run = std::collections::HashSet::new();
+        // Borrow a per-repo dedup bucket out of the run-wide maps so the
+        // inner loop can `.insert(...)` against persistent state for
+        // every segment in the same canonical repo.
+        let exact_seen_this_run = full_rescan_exact_seen
+            .entry(project_label.clone())
+            .or_default();
+        let overlap_seen_this_run = full_rescan_overlap_seen
+            .entry(overlap_project.clone())
+            .or_default();
 
         for entry in entries {
             total_scanned += 1;
@@ -8017,6 +8043,76 @@ mod tests {
         assert_eq!(
             total2, 0,
             "second pass must dedup both — proves per-repo state persists"
+        );
+    }
+
+    /// PR #8 review regression guard (chatgpt-codex-connector P1):
+    /// under `--full-rescan` the in-memory dedup state must be shared
+    /// across all segments of the same canonical repo, not recreated
+    /// per segment. Before the fix in this commit, two segments of the
+    /// same repo carrying the same logical entry both survived dedup,
+    /// regressing full_rescan to segment-local behavior.
+    #[test]
+    fn test_full_rescan_dedups_across_segments_within_same_repo() {
+        // Same content, same timestamp, same agent — both entries
+        // produce identical `content_hash` and `overlap_hash`. The
+        // segments share a canonical repo (VetCoders/repo-a) but live
+        // in distinct sessions (the realistic shape: one repo touched
+        // by several Claude sessions over time).
+        let dup_message = "echo across sessions";
+        let dup_ts = 1_700_000_000;
+        let entry_a1 = mk_entry("claude", "s1", dup_ts, dup_message, Some("/tmp/a"));
+        let entry_a2 = mk_entry("claude", "s2", dup_ts, dup_message, Some("/tmp/a"));
+
+        let seg_s1 = mk_segment(
+            Some(("VetCoders", "repo-a")),
+            "claude",
+            "s1",
+            vec![entry_a1.clone()],
+        );
+        let seg_s2 = mk_segment(
+            Some(("VetCoders", "repo-a")),
+            "claude",
+            "s2",
+            vec![entry_a2.clone()],
+        );
+
+        let mut state = StateManager::default();
+        // full_rescan = true: incremental `state.is_new` is bypassed,
+        // dedup relies purely on the in-memory per-repo HashSets that
+        // this regression guard pins as run-wide (not segment-local).
+        let kept = dedup_segments_per_repo(vec![seg_s1, seg_s2], &mut state, true, |_| {});
+        let total: usize = kept.iter().map(|s| s.entries.len()).sum();
+        assert_eq!(
+            total, 1,
+            "full_rescan must dedup duplicates across segments of the \
+             same repo; got {total} kept (regressed before fix)"
+        );
+
+        // And the cross-repo invariant still holds — a second repo with
+        // the same content survives because each canonical repo owns
+        // its own dedup bucket.
+        let entry_b1 = mk_entry("claude", "s3", dup_ts, dup_message, Some("/tmp/b"));
+        let seg_b = mk_segment(
+            Some(("VetCoders", "repo-b")),
+            "claude",
+            "s3",
+            vec![entry_b1],
+        );
+        let entry_a3 = mk_entry("claude", "s4", dup_ts, dup_message, Some("/tmp/a"));
+        let seg_a3 = mk_segment(
+            Some(("VetCoders", "repo-a")),
+            "claude",
+            "s4",
+            vec![entry_a3],
+        );
+        let mut state2 = StateManager::default();
+        let kept2 = dedup_segments_per_repo(vec![seg_a3, seg_b], &mut state2, true, |_| {});
+        let total2: usize = kept2.iter().map(|s| s.entries.len()).sum();
+        assert_eq!(
+            total2, 2,
+            "cross-repo collision MUST survive full_rescan dedup — \
+             each canonical repo owns its own bucket; got {total2}"
         );
     }
 
