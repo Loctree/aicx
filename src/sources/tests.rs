@@ -133,23 +133,124 @@ fn test_decode_claude_project_path_deep_nesting() {
     assert_eq!(decoded, "a-b-c-d-e-f");
 }
 
-#[test]
-fn test_claude_filter_no_suffix_leak() {
-    let filters = vec!["vista".to_string()];
+// Replaces the previous `test_claude_filter_no_suffix_leak` which asserted
+// the over-restrictive whole-string equality shape introduced by an
+// earlier pass-4 cut. The reviewer bots (gemini HIGH + chatgpt-codex P1
+// on PR #8) correctly flagged that the old shape broke every legit
+// `-p reponame` invocation against an absolute-path Claude dir like
+// `-Users-silver-Git-aicx`. The new shape is a deliberate **soft
+// prefilter** at the directory-listing stage paired with a strict
+// per-entry `cwd` filter inside `extract_claude` — see the doc comment
+// on `claude_project_dir_matches_filter` for the trade-off rationale.
 
-    assert!(!claude_project_dir_matches_filter(
-        "nextra-docs-vista",
-        &filters
+#[test]
+fn test_claude_dir_filter_accepts_repo_in_last_path_segment() {
+    // Real-world common case: filter is a repo name; encoded dir is the
+    // absolute cwd. The repo name appears as the last `-`-chunk of the
+    // encoded form. All three should match.
+    let aicx = vec!["aicx".to_string()];
+    assert!(claude_project_dir_matches_filter(
+        "-Users-silver-Git-aicx",
+        &aicx
     ));
-    assert!(!claude_project_dir_matches_filter("vista-portal", &filters));
-    assert!(!claude_project_dir_matches_filter(
-        "-Users-silver-Git-nextra-docs-vista",
-        &filters
+    assert!(claude_project_dir_matches_filter("-aicx", &aicx));
+    assert!(claude_project_dir_matches_filter("aicx", &aicx));
+}
+
+#[test]
+fn test_claude_dir_filter_case_insensitive_on_repo_name() {
+    let mixed = vec!["AiCx".to_string()];
+    assert!(claude_project_dir_matches_filter(
+        "-Users-silver-Git-aicx",
+        &mixed
     ));
-    assert!(claude_project_dir_matches_filter("vista", &filters));
+}
+
+#[test]
+fn test_claude_dir_filter_rejects_non_last_segment_match() {
+    // `vista` is NOT the last `-`-chunk of these encoded forms, so the
+    // soft prefilter rejects them.
+    let vista = vec!["vista".to_string()];
+    assert!(!claude_project_dir_matches_filter("vista-portal", &vista));
+    assert!(!claude_project_dir_matches_filter(
+        "-Users-silver-Git-vista-portal",
+        &vista
+    ));
+    // The leading `vista-` substring is also not enough — the soft
+    // prefilter wants `-vista` at the END (or exact match).
+    assert!(!claude_project_dir_matches_filter("vista-app", &vista));
+}
+
+#[test]
+fn test_claude_dir_filter_hyphenated_repo_matches_exactly() {
+    // A hyphenated repo name `vista-portal` must match its own encoded
+    // dir name. Three shapes again.
+    let vista_portal = vec!["vista-portal".to_string()];
     assert!(claude_project_dir_matches_filter(
         "vista-portal",
-        &["vista-portal".to_string()]
+        &vista_portal
+    ));
+    assert!(claude_project_dir_matches_filter(
+        "-vista-portal",
+        &vista_portal
+    ));
+    assert!(claude_project_dir_matches_filter(
+        "-Users-silver-Git-vista-portal",
+        &vista_portal
+    ));
+}
+
+#[test]
+fn test_claude_dir_filter_owner_repo_form_cannot_decide_from_encoded_dir_alone() {
+    // `owner/repo` filter is INHERENTLY undecidable from a Claude
+    // encoded dir name alone — the encoding turned `/` into `-` losslessly
+    // with no way to recover the owner/repo boundary. After the #15 fix
+    // `decode_claude_project_path` no longer mangles hyphens into
+    // slashes, so the soft prefilter cannot honestly say "yes this
+    // encoded dir matches Loctree/aicx". It returns false here and lets
+    // the strict per-entry `cwd` filter (which sees the unambiguous
+    // original path) make the final call.
+    let lo = vec!["Loctree/aicx".to_string()];
+    assert!(
+        !claude_project_dir_matches_filter("-Users-silver-Git-Loctree-aicx", &lo),
+        "owner/repo dir-name prefilter is intentionally pessimistic — \
+         per-entry cwd resolves the strict case downstream"
+    );
+
+    // The corollary: an unrelated repo also doesn't match. (Symmetric.)
+    assert!(!claude_project_dir_matches_filter(
+        "-Users-silver-Git-VetCoders-loct-io",
+        &lo
+    ));
+
+    // A path-shaped CWD (not a Claude-encoded dir) DOES match via the
+    // strict path matcher — this is the entry-level shape that runs
+    // INSIDE extract_claude per-entry. Documented here so the contract
+    // between the soft dir prefilter and the strict entry filter is
+    // visible to readers of just the test module. (Function is private
+    // to `super::` aka `crate::sources`; reachable via `use super::*`
+    // at the top of this tests module.)
+    assert!(
+        project_filter_matches_path("/Users/silver/Git/Loctree/aicx", &lo),
+        "the strict matcher (used per-entry on real cwd values) DOES \
+         match Loctree/aicx against a proper /-separated cwd"
+    );
+}
+
+#[test]
+fn test_claude_dir_filter_inherent_ambiguity_is_a_soft_prefilter_concern() {
+    // The Claude encoding is inherently lossy. `-Users-silver-Git-nextra-docs-vista`
+    // is ambiguously either a 6-segment path ending in `vista` (`-p vista`
+    // match) or a 4-segment path ending in `nextra-docs-vista` (`-p vista`
+    // should NOT match). The dir-name pre-filter cannot decide — the
+    // strict per-entry `cwd` filter in `extract_claude` resolves it when
+    // `cwd` is present. We document the trade-off by asserting that the
+    // pre-filter LETS THIS THROUGH (the alternative is dropping legit
+    // sessions whose downstream `cwd` would have matched).
+    let vista = vec!["vista".to_string()];
+    assert!(claude_project_dir_matches_filter(
+        "-Users-silver-Git-nextra-docs-vista",
+        &vista
     ));
 }
 

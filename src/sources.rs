@@ -1090,23 +1090,82 @@ fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool {
     })
 }
 
+/// Soft pre-filter on Claude project directory names.
+///
+/// The Claude on-disk encoding is the original cwd with `/` replaced by
+/// `-` (optionally prefixed with a leading `-` for absolute paths). The
+/// encoding is **inherently lossy** — given `-Users-silver-Git-vista` we
+/// cannot recover whether the original was `/Users/silver/Git/vista`
+/// (single-segment repo `vista`) or `/Users/silver/Git/nextra-docs-vista`
+/// or `/Users-silver/Git/vista`, etc.
+///
+/// This function therefore acts as a **permissive pre-filter** at the
+/// directory-listing stage. Three legal match shapes for a bare `repo`
+/// filter:
+///
+///   1. Exact: `dir_name == filter` (single-component repo, no prefix).
+///   2. Leading-dash exact: `dir_name == "-{filter}"` (single-component
+///      repo encoded as absolute path).
+///   3. Last-chunk: `dir_name.ends_with("-{filter}")` (filter looks like
+///      a plausible last cwd segment).
+///
+/// For `owner/repo` filters (containing `/`), we defer to the strict
+/// path-shaped matcher on a best-effort decoded form.
+///
+/// Case 3 reintroduces a controlled ambiguity — `-p vista` will match
+/// both `-Users-silver-Git-vista` (correct) **and**
+/// `-Users-silver-Git-nextra-docs-vista` (likely not what the operator
+/// meant). That ambiguity is **inherent** to the Claude encoding and
+/// cannot be resolved from the directory name alone. The strict
+/// per-entry `cwd` filter inside `extract_claude` (sources.rs ~1587,
+/// `entry.cwd.as_deref().is_some_and(|c| project_filter_matches_path(c, ...))`)
+/// resolves it precisely when the entry carries a `cwd` field — the
+/// common case. Sessions without `cwd` were previously dropped by the
+/// over-restrictive equality check; this relaxation keeps them reachable
+/// so the strict per-entry pass can decide.
+///
+/// History: the previous `decoded.eq_ignore_ascii_case(filter) ||
+/// dir_name.eq_ignore_ascii_case(filter)` required the filter to be the
+/// **whole** encoded dir name (e.g. `-p Users-silver-Git-aicx`) instead
+/// of just the repo name. That broke every existing `-p reponame`
+/// invocation against absolute-path Claude dirs and was the regression
+/// flagged by gemini-code-assist HIGH + chatgpt-codex-connector P1
+/// comments on PR #8.
 fn claude_project_dir_matches_filter(dir_name: &str, filters: &[String]) -> bool {
     if filters.is_empty() {
         return true;
     }
-    let decoded = decode_claude_project_path(dir_name);
 
     filters.iter().any(|filter| {
         let filter = filter.trim();
         if filter.is_empty() {
             return false;
         }
-        let filter = filter.strip_prefix('/').unwrap_or(filter);
-        if filter.is_empty() {
-            return false;
+
+        if filter.contains('/') {
+            // owner/repo or /repo: defer to the strict path matcher on a
+            // best-effort decoded form. Decode is lossy (hyphens vs
+            // slashes ambiguous) but the path matcher's adjacency
+            // semantics tolerate that; the per-entry cwd filter
+            // downstream catches the strict case.
+            let decoded = decode_claude_project_path(dir_name);
+            return project_filter_matches_path(&decoded, &[filter.to_string()]);
         }
 
-        decoded.eq_ignore_ascii_case(filter) || dir_name.eq_ignore_ascii_case(filter)
+        let needle_lower = filter.to_ascii_lowercase();
+        let dir_lower = dir_name.to_ascii_lowercase();
+
+        // Shape 1: exact (no leading dash, single-component).
+        if dir_lower == needle_lower {
+            return true;
+        }
+        // Shape 2: leading-dash exact (single-component as absolute).
+        let dash_exact = format!("-{needle_lower}");
+        if dir_lower == dash_exact {
+            return true;
+        }
+        // Shape 3: last-`-`-chunk match (plausible last cwd segment).
+        dir_lower.ends_with(&dash_exact)
     })
 }
 
