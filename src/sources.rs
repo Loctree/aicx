@@ -1079,15 +1079,50 @@ fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool {
                 return true;
             }
 
-            // TODO(C-2/C-3 canonical-supply): this path-only fallback exists for
-            // source adapters that have not supplied canonical org/repo yet.
-            // It lets `-p owner/repo` match a checkout rooted at `/.../repo`
-            // without reintroducing substring matching.
+            // Deliberate relaxation: when the path's last segment equals
+            // the filter's repo, accept even if the owner is absent from
+            // the path. This is the workflow that originally surfaced
+            // bug #14 (`-p Loctree/aicx` against a local checkout at
+            // `/Users/silver/Git/aicx`) — strict owner+repo enforcement
+            // would re-break it.
+            //
+            // The gemini-code-assist MEDIUM comment on PR #8 correctly
+            // notes this softens strict identity matching: a checkout
+            // at `/Users/silver/Git/aicx` matches `-p AnyOwner/aicx`
+            // regardless of owner. Pass-4 op-agent + operator accept
+            // that as the intentional trade-off — source adapters that
+            // CAN supply canonical org/repo route through
+            // `store::project_filter_matches` upstream and get strict
+            // enforcement; this fallback exists only for adapters that
+            // see paths but not git remotes. Future pass can tighten
+            // by carrying canonical identity through the adapter chain.
             return path_segments.last().is_some_and(|segment| segment == repo);
         }
 
         path_segments.iter().any(|segment| segment == &filter)
     })
+}
+
+/// Token-aware "does this body mention `repo` as a whole word?" check.
+///
+/// Splits the (already-lowercased) body on runs of non-identifier
+/// characters — alphanumerics, `-`, and `_` count as in-word, everything
+/// else is a separator. Returns true iff some resulting token equals
+/// `repo_lower` byte-for-byte.
+///
+/// This is used by codescribe project-hint inference (sources.rs ~4943):
+/// the prior `lower_body.contains(&repo)` substring match was flagged in
+/// the gemini-code-assist MEDIUM PR #8 review for re-introducing a
+/// suffix-leak (`-p vista` matched bodies mentioning `vista-portal`).
+/// Token-equality is consistent with the rest of pass-4's strict
+/// identity matchers (e.g. `project_filter_matches`).
+fn body_mentions_repo_token(body_lower: &str, repo_lower: &str) -> bool {
+    if repo_lower.is_empty() {
+        return false;
+    }
+    body_lower
+        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+        .any(|token| token == repo_lower)
 }
 
 /// Soft pre-filter on Claude project directory names.
@@ -4940,7 +4975,13 @@ fn parse_codescribe_transcript_with_lexicon(
                 .map(|(_, r)| r)
                 .unwrap_or(filter)
                 .to_ascii_lowercase();
-            if lower_body.contains(&repo) {
+            // Use token-equality (not raw substring) so `-p vista` does
+            // not falsely attribute a transcript that mentions
+            // `vista-portal`. This addresses the gemini-code-assist
+            // MEDIUM comment on PR #8: substring `lower_body.contains`
+            // re-introduced the suffix-leak shape that the strict
+            // identity matchers in this PR were specifically removing.
+            if body_mentions_repo_token(&lower_body, &repo) {
                 project_hint = Some(filter.clone());
                 break;
             }

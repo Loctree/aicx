@@ -238,6 +238,31 @@ fn test_claude_dir_filter_owner_repo_form_cannot_decide_from_encoded_dir_alone()
 }
 
 #[test]
+fn test_body_mentions_repo_token_no_substring_leak() {
+    // Regression guard for the codescribe project-hint inference site
+    // (sources.rs ~4943). Token-equality semantics: `-p vista` must NOT
+    // pick up a body mentioning `vista-portal`; `-p vista-portal` MUST.
+    let body = "dyskusja o vista-portal i jakies inne tematy oraz osobny vista projekt"
+        .to_ascii_lowercase();
+    assert!(body_mentions_repo_token(&body, "vista"));
+    assert!(body_mentions_repo_token(&body, "vista-portal"));
+
+    let body_only_compound = "ta sesja dotyczy vista-portal".to_ascii_lowercase();
+    assert!(!body_mentions_repo_token(&body_only_compound, "vista"));
+    assert!(body_mentions_repo_token(
+        &body_only_compound,
+        "vista-portal"
+    ));
+
+    // Punctuation + URLs count as token separators.
+    let body_url = "see https://example.com/vista for details".to_ascii_lowercase();
+    assert!(body_mentions_repo_token(&body_url, "vista"));
+
+    // Empty repo never matches.
+    assert!(!body_mentions_repo_token(&body, ""));
+}
+
+#[test]
 fn test_claude_dir_filter_inherent_ambiguity_is_a_soft_prefilter_concern() {
     // The Claude encoding is inherently lossy. `-Users-silver-Git-nextra-docs-vista`
     // is ambiguously either a 6-segment path ending in `vista` (`-p vista`
