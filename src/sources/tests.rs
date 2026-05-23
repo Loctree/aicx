@@ -2609,6 +2609,55 @@ fn test_project_filter_matches_path_tier1_resolves_canonical_from_remote_url() {
 }
 
 #[test]
+fn test_is_windows_absolute_path_recognizes_drive_letter_and_unc() {
+    // Drive-letter form, both separators
+    assert!(is_windows_absolute_path("C:\\Users\\silver\\Git\\aicx"));
+    assert!(is_windows_absolute_path("C:/Users/silver/Git/aicx"));
+    assert!(is_windows_absolute_path("d:\\code"));
+    assert!(is_windows_absolute_path("Z:/work"));
+    // UNC form
+    assert!(is_windows_absolute_path("\\\\fileserver\\share\\repo"));
+    // Negative cases
+    assert!(!is_windows_absolute_path("/Users/silver/Git/aicx")); // Unix
+    assert!(!is_windows_absolute_path("Loctree/aicx")); // canonical slug
+    assert!(!is_windows_absolute_path("C")); // too short
+    assert!(!is_windows_absolute_path("C:")); // missing separator
+    assert!(!is_windows_absolute_path("C:doc.txt")); // drive-letter relative (Windows-legal but not absolute)
+    assert!(!is_windows_absolute_path("12:\\foo")); // not a letter
+    assert!(!is_windows_absolute_path("\\single-backslash")); // not UNC
+    assert!(!is_windows_absolute_path("")); // empty
+}
+
+#[test]
+fn test_project_filter_matches_path_windows_segments_match_through_tier3() {
+    // Regression for chatgpt-codex-connector P1 at src/sources.rs:1069:
+    // Tier 3 must still recognize backslash-separated path segments.
+    // Even when Tier 1 (canonical resolver) returns None for a Windows
+    // path on a non-Windows CI runner (no `.git` on disk), the strict
+    // adjacency matcher on `\` / `/` segments must accept the filter.
+    //
+    // The Tier 1 path itself (Windows .git/config resolution on a
+    // Windows runner) is not asserted in unit tests because the parser
+    // may relative-resolve a fake Windows shape against the test
+    // process's own cwd. That cross-platform behavior is covered by
+    // the resolver's own crate tests, not here.
+    assert!(
+        project_filter_matches_path(
+            "C:\\repos\\Loctree\\aicx",
+            &["Loctree/aicx".to_string()]
+        ),
+        "Tier 3 must accept adjacent `Loctree\\aicx` segments in a Windows path"
+    );
+    assert!(
+        project_filter_matches_path(
+            "\\\\fileserver\\share\\Loctree\\aicx",
+            &["Loctree/aicx".to_string()]
+        ),
+        "Tier 3 must accept adjacent `Loctree\\aicx` segments in a UNC path"
+    );
+}
+
+#[test]
 fn test_project_filter_matches_path_strict_owner_repo() {
     assert!(project_filter_matches_path(
         "/x/Loctree/aicx",

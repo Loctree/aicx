@@ -992,6 +992,28 @@ fn project_filter_matches_identity(
             .any(|filter| project_filter_matches(organization, repository, filter))
 }
 
+/// Detect Windows-style absolute paths so Tier 1 canonical resolution
+/// also fires for `C:\Users\...` / `C:/Users/...` / UNC `\\server\share`
+/// shapes. Without this, Windows local checkouts where the canonical
+/// `(owner, repository)` lives only in `.git/config` (not in path
+/// segments) silently fall through to Tier 3 segment-adjacency matching
+/// and `-p owner/repo` filters cannot reach them.
+///
+/// Surfaced by `chatgpt-codex-connector` P1 on PR #8 at src/sources.rs:1069.
+fn is_windows_absolute_path(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    // Drive-letter form: `C:\…` or `C:/…` (`X:` for any ASCII letter).
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        return true;
+    }
+    // UNC form: `\\server\share…`.
+    s.starts_with("\\\\")
+}
+
 fn canonical_project_parts(value: &str) -> Option<(String, String)> {
     let trimmed = value.trim();
     if trimmed.is_empty()
@@ -1068,7 +1090,8 @@ fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool {
         || cwd_trimmed.starts_with("https://")
         || cwd_trimmed.starts_with("git@")
         || cwd_trimmed.starts_with("ssh://")
-        || cwd_trimmed.starts_with("git://");
+        || cwd_trimmed.starts_with("git://")
+        || is_windows_absolute_path(cwd_trimmed);
     if resolvable_shape
         && let Some(tiered) = aicx_parser::segmentation::infer_tiered_identity_from_cwd(Some(cwd))
     {
