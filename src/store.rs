@@ -11,7 +11,6 @@
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeZone, Utc};
-use globset::{Glob, GlobMatcher};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -28,102 +27,8 @@ use crate::chunker::{self, ChunkerConfig};
 use crate::sanitize;
 use crate::segmentation::semantic_segments;
 use crate::sources::{self, ExtractionConfig};
-pub use crate::timeline::Kind;
 use crate::timeline::{RepoIdentity, SemanticSegment, TimelineEntry};
-use crate::validation::is_valid_repo_project_slug;
-
-// ============================================================================
-// Kind classification
-// ============================================================================
-
-// ── Kind heuristics ────────────────────────────────────────────────────────
-
-const PLAN_KEYWORDS: &[&str] = &[
-    "implementation plan",
-    "plan:",
-    "## plan",
-    "step 1:",
-    "step 2:",
-    "step 3:",
-    "action items",
-    "milestones",
-    "roadmap",
-    "todo list",
-    "acceptance criteria",
-    "## steps",
-    "## phases",
-];
-
-const REPORT_KEYWORDS: &[&str] = &[
-    "## findings",
-    "## summary",
-    "## report",
-    "audit report",
-    "coverage report",
-    "test results",
-    "## metrics",
-    "## recommendations",
-    "## conclusion",
-    "status report",
-    "incident report",
-    "pr review",
-    "code review",
-];
-
-/// Classify a set of timeline entries into a canonical `Kind`.
-///
-/// Uses a lightweight keyword-scoring approach:
-/// - Scans assistant messages (where classification signal is strongest)
-/// - Scores plan vs report keywords
-/// - Conversations win by default when neither plan nor report signal is strong
-///
-/// The approach is intentionally conservative: ambiguous content falls to
-/// `Conversations` (the most common kind), not `Other`.
-pub fn classify_kind(entries: &[TimelineEntry]) -> Kind {
-    if entries.is_empty() {
-        return Kind::Other;
-    }
-
-    let mut plan_score: u32 = 0;
-    let mut report_score: u32 = 0;
-    let mut has_conversation = false;
-
-    for entry in entries {
-        let lower = entry.message.to_lowercase();
-
-        // Only count strong signals from assistant messages
-        if entry.role == "assistant" {
-            for kw in PLAN_KEYWORDS {
-                if lower.contains(kw) {
-                    plan_score += 1;
-                }
-            }
-            for kw in REPORT_KEYWORDS {
-                if lower.contains(kw) {
-                    report_score += 1;
-                }
-            }
-        }
-
-        // Any user+assistant exchange = conversation evidence
-        if entry.role == "user" || entry.role == "assistant" {
-            has_conversation = true;
-        }
-    }
-
-    // Threshold: need at least 3 keyword hits to classify as plan or report
-    let threshold = 3;
-
-    if plan_score >= threshold && plan_score > report_score {
-        Kind::Plans
-    } else if report_score >= threshold && report_score > plan_score {
-        Kind::Reports
-    } else if has_conversation {
-        Kind::Conversations
-    } else {
-        Kind::Other
-    }
-}
+pub use aicx_parser::{classify_kind, timeline::Kind};
 
 // ============================================================================
 // Session-first filename generation
@@ -189,345 +94,24 @@ fn siphash13_hex6(input: &str) -> String {
 // Path helpers
 // ============================================================================
 
-pub const NON_REPOSITORY_CONTEXTS: &str = "non-repository-contexts";
-pub const CANONICAL_STORE_DIRNAME: &str = "store";
-pub const CONTEXT_CORPUS_DIRNAME: &str = "context-corpus";
-pub const LOCT_CONTEXT_PACK_FAMILY: &str = "loct-context-pack";
-pub const CONTEXT_CORPUS_SCHEMA_VERSION: &str = "context_corpus.v1";
-pub const LEGACY_SALVAGE_DIRNAME: &str = "legacy-store";
-pub const AICX_IGNORE_FILENAME: &str = ".aicxignore";
-const MIGRATION_DIRNAME: &str = "migration";
-const MIGRATION_MANIFEST_FILENAME: &str = "manifest.json";
-const MIGRATION_REPORT_FILENAME: &str = "report.md";
+pub(crate) mod ignore;
+pub(crate) mod paths;
 
-pub(crate) fn canonical_project_slug(project: &str) -> String {
-    project
-        .split('/')
-        .map(canonical_bucket_segment)
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-/// Trim whitespace from a bucket segment. Case is preserved; dot-prefix and
-/// underscore-prefix bucket names (`.aicx`, `.codescribe`, `.github`,
-/// `_internal`, `.scripts`) are accepted as-is by `is_valid_repo_bucket_name`
-/// (relaxed 2026-05-12 from prior lowercase-only + leading-char-restricted
-/// schema). Mid-segment garbage from extractor bugs (newlines, shell
-/// metacharacters, leading `$`/`{`/`<`) is intentionally NOT sanitized so the
-/// validator surfaces it instead of silently normalizing junk into a
-/// filesystem path.
-fn canonical_bucket_segment(segment: &str) -> String {
-    segment.trim().to_string()
-}
-
-fn canonical_path_segment(value: &str, label: &str) -> Result<String> {
-    let cleaned = value.trim().to_ascii_lowercase();
-    if cleaned.is_empty()
-        || cleaned.contains('/')
-        || cleaned.contains('\\')
-        || cleaned.contains("..")
-        || !cleaned
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
-    {
-        anyhow::bail!("invalid context corpus {label} segment: {value:?}");
-    }
-    Ok(cleaned)
-}
-
-#[derive(Debug, Clone)]
-struct IgnoreRule {
-    negate: bool,
-    matcher: GlobMatcher,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct StoreIgnoreMatcher {
-    base: PathBuf,
-    rules: Vec<IgnoreRule>,
-}
-
-/// Resolve the canonical AICX home directory from the environment.
-///
-/// Returns `$AICX_HOME` when set and non-empty, otherwise `~/.aicx`.
-/// Pure: no filesystem side effects, no directory creation. Use
-/// [`store_base_dir`] for the side-effecting public variant.
-///
-/// Why factored out: this is the only place the env contract is
-/// resolved. Tests mock the env around this call without touching
-/// `mkdir`; pure helpers like [`store_base_dir_for`], [`chunks_dir_for`],
-/// and `state_path_for` (in `src/state.rs`) accept the resolved path
-/// and stay deterministic / parallel-safe.
-pub fn resolve_aicx_home() -> Result<PathBuf> {
-    let dir = match std::env::var_os("AICX_HOME") {
-        Some(value) if !value.is_empty() => PathBuf::from(value),
-        _ => dirs::home_dir().context("No home directory")?.join(".aicx"),
-    };
-    Ok(dir)
-}
-
-/// Pure: builds the AICX base directory under an explicit `home`.
-///
-/// No env reads, no filesystem creation. Use in tests to assert
-/// path-shape invariants without depending on `$AICX_HOME` or `$HOME`.
-pub fn store_base_dir_for(home: &Path) -> PathBuf {
-    home.to_path_buf()
-}
-
-/// Returns the AICX base directory: `$AICX_HOME` or `~/.aicx/`
-///
-/// Creates the directory if it doesn't exist.
-pub fn store_base_dir() -> Result<PathBuf> {
-    let dir = store_base_dir_for(&resolve_aicx_home()?);
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("Failed to create store dir: {}", dir.display()))?;
-    Ok(dir)
-}
-
-/// Returns the canonical repo-centric store root: `~/.aicx/store/`
-pub fn canonical_store_dir() -> Result<PathBuf> {
-    let dir = store_base_dir()?.join(CANONICAL_STORE_DIRNAME);
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-/// Returns the immutable context-corpus root: `~/.aicx/context-corpus/`.
-pub fn context_corpus_root_dir() -> Result<PathBuf> {
-    let dir = store_base_dir()?.join(CONTEXT_CORPUS_DIRNAME);
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-pub fn aicx_context_corpus_dir(org: &str, repo: &str, date: &str, batch: &str) -> Result<PathBuf> {
-    let org = canonical_path_segment(org, "org")?;
-    let repo = canonical_path_segment(repo, "repo")?;
-    let date = compact_date(date);
-    let batch = canonical_path_segment(batch, "batch")?;
-    let dir = context_corpus_root_dir()?
-        .join(org)
-        .join(repo)
-        .join(date)
-        .join(LOCT_CONTEXT_PACK_FAMILY)
-        .join(batch);
-    fs::create_dir_all(dir.join("raw"))?;
-    fs::create_dir_all(dir.join("sidecars"))?;
-    Ok(dir)
-}
-
-/// Returns the non-repository fallback root: `~/.aicx/non-repository-contexts/`
-pub fn non_repository_contexts_dir() -> Result<PathBuf> {
-    let dir = store_base_dir()?.join(NON_REPOSITORY_CONTEXTS);
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-/// Returns the legacy input-store root used for truthful migration inventory.
-pub fn legacy_store_base_dir() -> Result<PathBuf> {
-    Ok(dirs::home_dir()
-        .context("No home directory")?
-        .join(".ai-contexters"))
-}
-
-fn legacy_salvage_dir(base: &Path) -> PathBuf {
-    base.join(LEGACY_SALVAGE_DIRNAME)
-}
-
-fn migration_dir(base: &Path) -> PathBuf {
-    base.join(MIGRATION_DIRNAME)
-}
-
-fn migration_manifest_path(base: &Path) -> PathBuf {
-    migration_dir(base).join(MIGRATION_MANIFEST_FILENAME)
-}
-
-fn migration_report_path(base: &Path) -> PathBuf {
-    migration_dir(base).join(MIGRATION_REPORT_FILENAME)
-}
-
-impl StoreIgnoreMatcher {
-    fn load(base: &Path) -> Result<Self> {
-        let path = base.join(AICX_IGNORE_FILENAME);
-        if !path.exists() {
-            return Ok(Self {
-                base: base.to_path_buf(),
-                rules: Vec::new(),
-            });
-        }
-
-        let raw = sanitize::read_to_string_validated(&path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        let mut rules = Vec::new();
-
-        for (line_no, line) in raw.lines().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-
-            let negate = trimmed.starts_with('!');
-            let pattern = trimmed.trim_start_matches('!').trim();
-            if pattern.is_empty() {
-                continue;
-            }
-
-            let normalized = normalize_aicx_ignore_pattern(pattern);
-            let matcher = Glob::new(&normalized)
-                .with_context(|| {
-                    format!(
-                        "Invalid {} pattern at line {}: {}",
-                        path.display(),
-                        line_no + 1,
-                        trimmed
-                    )
-                })?
-                .compile_matcher();
-
-            rules.push(IgnoreRule { negate, matcher });
-        }
-
-        Ok(Self {
-            base: base.to_path_buf(),
-            rules,
-        })
-    }
-
-    pub fn is_ignored(&self, path: &Path) -> bool {
-        if self.rules.is_empty() {
-            return false;
-        }
-
-        let Ok(relative) = path.strip_prefix(&self.base) else {
-            return false;
-        };
-        let relative = normalize_relative_store_path(relative);
-        if relative.is_empty() {
-            return false;
-        }
-
-        let mut ignored = false;
-        for rule in &self.rules {
-            if rule.matcher.is_match(&relative) {
-                ignored = !rule.negate;
-            }
-        }
-        ignored
-    }
-}
-
-fn normalize_relative_store_path(path: &Path) -> String {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-fn normalize_aicx_ignore_pattern(pattern: &str) -> String {
-    let mut normalized = pattern
-        .trim()
-        .trim_start_matches("./")
-        .trim_start_matches('/')
-        .replace('\\', "/");
-
-    while normalized.contains("//") {
-        normalized = normalized.replace("//", "/");
-    }
-
-    if normalized.ends_with('/') {
-        normalized.push_str("**");
-    }
-
-    normalized
-}
-
-pub fn load_ignore_matcher_at(base: &Path) -> Result<StoreIgnoreMatcher> {
-    StoreIgnoreMatcher::load(base)
-}
-
-pub fn filter_ignored_paths_at<P>(base: &Path, paths: &[P]) -> Result<(Vec<PathBuf>, usize)>
-where
-    P: AsRef<Path>,
-{
-    let matcher = load_ignore_matcher_at(base)?;
-    if matcher.rules.is_empty() {
-        return Ok((
-            paths
-                .iter()
-                .map(|path| path.as_ref().to_path_buf())
-                .collect(),
-            0,
-        ));
-    }
-
-    let mut kept = Vec::with_capacity(paths.len());
-    let mut ignored = 0usize;
-
-    for path in paths {
-        let path = path.as_ref();
-        if matcher.is_ignored(path) {
-            ignored += 1;
-        } else {
-            kept.push(path.to_path_buf());
-        }
-    }
-
-    Ok((kept, ignored))
-}
-
-/// Returns the project directory: `~/.aicx/store/<project>/`
-pub fn project_dir(project: &str) -> Result<PathBuf> {
-    let dir = validated_store_project_dir(&canonical_store_dir()?, project)?;
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-/// Pure: builds the chunks directory under an explicit `home`.
-///
-/// No env reads, no filesystem creation. Used in tests to verify
-/// chunks-dir shape without depending on `$AICX_HOME`.
-pub fn chunks_dir_for(home: &Path) -> PathBuf {
-    store_base_dir_for(home).join("chunks")
-}
-
-/// Returns the chunks directory: `<base>/chunks/`
-pub fn chunks_dir() -> Result<PathBuf> {
-    let dir = chunks_dir_for(&store_base_dir()?);
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-/// Full path for a specific context markdown file.
-///
-/// Layout: `~/.aicx/store/<project>/<date>/<time>_<agent>-context.md`
-pub fn get_context_path(project: &str, agent: &str, date: &str, time: &str) -> Result<PathBuf> {
-    let dir = validated_store_project_dir(&canonical_store_dir()?, project)?.join(date);
-    fs::create_dir_all(&dir)?;
-    Ok(dir.join(format!("{}_{}-context.md", time, agent)))
-}
-
-/// Full path for a specific context JSON file.
-///
-/// Layout: `~/.aicx/store/<project>/<date>/<time>_<agent>-context.json`
-pub fn get_context_json_path(
-    project: &str,
-    agent: &str,
-    date: &str,
-    time: &str,
-) -> Result<PathBuf> {
-    let dir = validated_store_project_dir(&canonical_store_dir()?, project)?.join(date);
-    fs::create_dir_all(&dir)?;
-    Ok(dir.join(format!("{}_{}-context.json", time, agent)))
-}
-
-fn validated_store_project_dir(root: &Path, project: &str) -> Result<PathBuf> {
-    let canonical = canonical_project_slug(project);
-    if !is_valid_repo_project_slug(&canonical) {
-        anyhow::bail!(
-            "invalid canonical store project bucket {:?}; expected lowercase <bucket> or <org>/<repo> with [a-z0-9][a-z0-9._-]{{0,99}} segments",
-            project
-        );
-    }
-    Ok(root.join(canonical))
-}
+pub use ignore::{
+    AICX_IGNORE_FILENAME, StoreIgnoreMatcher, filter_ignored_paths_at, load_ignore_matcher_at,
+};
+pub(crate) use paths::canonical_project_slug;
+pub use paths::{
+    CANONICAL_STORE_DIRNAME, CONTEXT_CORPUS_DIRNAME, CONTEXT_CORPUS_SCHEMA_VERSION,
+    LEGACY_SALVAGE_DIRNAME, LOCT_CONTEXT_PACK_FAMILY, NON_REPOSITORY_CONTEXTS,
+    aicx_context_corpus_dir, canonical_store_dir, chunks_dir, chunks_dir_for,
+    context_corpus_root_dir, get_context_json_path, get_context_path, legacy_store_base_dir,
+    non_repository_contexts_dir, project_dir, resolve_aicx_home, store_base_dir,
+    store_base_dir_for,
+};
+use paths::{
+    legacy_salvage_dir, migration_manifest_path, migration_report_path, validated_store_project_dir,
+};
 
 // ============================================================================
 // Index types
@@ -1498,10 +1082,7 @@ pub fn scan_context_files_project_at(
 
 pub fn scan_context_files_raw_at(base: &Path) -> Result<Vec<StoredContextFile>> {
     let base = sanitize::validate_dir_path(base)?;
-    let ignore = StoreIgnoreMatcher {
-        base: base.clone(),
-        rules: Vec::new(),
-    };
+    let ignore = StoreIgnoreMatcher::empty_at(&base);
     scan_context_files_with_ignore(&base, &ignore)
 }
 
