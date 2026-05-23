@@ -2588,3 +2588,39 @@ ran for over 2 minutes; prior test stream was green up to that unrelated hang.
   `validate_manifest_path`) are a duplicate-but-bounded pattern: they protect
   crate-local artifact paths, while `aicx_parser::sanitize` remains the stronger
   allowlist/canonicalization contract for CLI/store paths.
+
+---
+
+## 2026-05-23 — nosemgrep TOCTOU follow-up: single-FD footer scan and raw-pack copy · `this follow-up`
+
+**Symptom.** Po sweepie `0607a8e` lista nosemgrep byla juz pusta, ale reczny
+audyt zostawil dwa miejsca, ktore nadal zaslugiwaly na fd-based domkniecie:
+`strip_footer` bral rozmiar przez path metadata, a potem osobno otwieral plik
+do skanu i kopii; `ingest_loct_context_pack` kopiowal raw chunk przez
+`fs::copy`.
+
+**Root cause.** Silencer-count byl czysty, lecz model ryzyka byl szerszy niz
+same aktywne suppressions. `fs::metadata(path)` + pozniejszy open i
+`fs::copy(src, dst)` nadal rozkladaja operacje na niezalezne resolve'y.
+
+**Fix.**
+- `src/output.rs`: `strip_footer` otwiera walidowany plik raz, bierze
+  `metadata()` z tego FD, skanuje tail przez ten sam handle i streamuje prefix
+  do temp file po `seek(0)` na tym samym handle.
+- `src/store.rs`: raw context-pack copy uzywa `io::copy` miedzy otwartym source
+  FD i destination FD, z flush + sync na destination.
+
+**Touched.**
+- `src/output.rs` — single-FD footer metadata/scan/copy.
+- `src/store.rs` — raw chunk fd-based copy.
+
+**Tests.** Zielone: `cargo fmt --all --check`; `make semgrep`;
+`loct suppressions --type nosemgrep` = `(no matches)`;
+`cargo clippy --locked --all-features --all-targets -- -D warnings`;
+`cargo test --locked strip_footer --all-targets`; `AICX_ALLOW_TMP=1 cargo test
+--locked --features e2e-aicx context_pack_ingest_retains_immutable_pack_and_live_reads_skip_examples
+--test e2e_context_pack_ingest`.
+
+**Lessons.** `loct suppressions == 0` nie konczy security audit, jesli w
+okolicy zostal ten sam syscall smell. Po silencer-strip warto przejsc jeszcze
+po klasie bledow, nie tylko po komentarzach.

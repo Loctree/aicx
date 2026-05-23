@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -1440,7 +1440,11 @@ pub fn ingest_loct_context_pack(pack_dir: &Path) -> Result<ContextCorpusIngestSu
                 .unwrap_or(&sidecar.id)
         ));
 
-        fs::copy(&raw_path, sanitize::validate_write_path(&raw_target)?)?;
+        let mut raw_src = sanitize::open_file_validated(&raw_path)?;
+        let mut raw_dst = sanitize::create_file_validated(&raw_target)?;
+        io::copy(&mut raw_src, &mut raw_dst)?;
+        raw_dst.flush()?;
+        raw_dst.sync_all()?;
         let mut file = sanitize::create_file_validated(&sidecar_target)?;
         file.write_all(serde_json::to_vec_pretty(&sidecar)?.as_slice())?;
         summary.raw_written += 1;
