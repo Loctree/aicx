@@ -1,6 +1,16 @@
 # AICX Build System
 # Local developer flow + release/readiness helpers
 
+# --- Cargo PATH discovery ---------------------------------------------------
+# Surface cargo from ~/.cargo/bin when the calling shell (uv-run, sh -c,
+# CI runners that strip PATH) didn't source ~/.cargo/env. Idempotent —
+# no-op when cargo is already reachable, silent when rustup isn't installed.
+ifeq (,$(shell command -v cargo 2>/dev/null))
+  ifneq (,$(wildcard $(HOME)/.cargo/bin/cargo))
+    export PATH := $(HOME)/.cargo/bin:$(PATH)
+  endif
+endif
+
 .PHONY: all build build-native release-binaries install install-bin install-config install-cargo git-hooks
 .PHONY: precheck precheck-native test test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
 .PHONY: embeddings-check embeddings-test embeddings-clippy embeddings-hydrate embeddings-info
