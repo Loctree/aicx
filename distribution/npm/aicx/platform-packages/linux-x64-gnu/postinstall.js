@@ -22,16 +22,28 @@ const streamPipeline = promisify(pipeline);
 const GITHUB_REPO = "Loctree/aicx";
 const VERSION = require("./package.json").version;
 
+// Asset naming reflects release_bundle.sh BUNDLE_BASENAME output: no
+// "-unsigned" tag (every Loctree archive is GPG-signed), "-unknown-" stripped
+// from linux triples, macOS .zip (Apple codesigned + notarized), Linux .tar.gz,
+// Windows .zip with .exe binaries inside.
 const BINARY_MAPPINGS = {
   "@loctree/aicx-darwin-arm64": {
-    file: `aicx-v${VERSION}-aarch64-apple-darwin-slim-unsigned.tar.gz`,
-    bundleDir: `aicx-v${VERSION}-aarch64-apple-darwin-slim-unsigned`,
-    archiveType: "tar.gz",
+    file: `aicx-v${VERSION}-aarch64-apple-darwin-slim.zip`,
+    bundleDir: `aicx-v${VERSION}-aarch64-apple-darwin-slim`,
+    archiveType: "zip",
+    exeSuffix: "",
   },
   "@loctree/aicx-linux-x64-gnu": {
-    file: `aicx-v${VERSION}-x86_64-unknown-linux-gnu-slim-unsigned.tar.gz`,
-    bundleDir: `aicx-v${VERSION}-x86_64-unknown-linux-gnu-slim-unsigned`,
+    file: `aicx-v${VERSION}-x86_64-linux-gnu-slim.tar.gz`,
+    bundleDir: `aicx-v${VERSION}-x86_64-linux-gnu-slim`,
     archiveType: "tar.gz",
+    exeSuffix: "",
+  },
+  "@loctree/aicx-win32-x64-gnu": {
+    file: `aicx-v${VERSION}-x86_64-pc-windows-gnu-slim.zip`,
+    bundleDir: `aicx-v${VERSION}-x86_64-pc-windows-gnu-slim`,
+    archiveType: "zip",
+    exeSuffix: ".exe",
   },
 };
 
@@ -108,8 +120,9 @@ async function install() {
     process.exit(1);
   }
 
-  const targetAicx = join(__dirname, "aicx");
-  const targetAicxMcp = join(__dirname, "aicx-mcp");
+  const exe = mapping.exeSuffix || "";
+  const targetAicx = join(__dirname, `aicx${exe}`);
+  const targetAicxMcp = join(__dirname, `aicx-mcp${exe}`);
   if (existsSync(targetAicx) && existsSync(targetAicxMcp)) {
     console.log(`Binaries already exist at ${__dirname}`);
     return;
@@ -132,10 +145,12 @@ async function install() {
     extractArchive(archivePath, tempDir, mapping.archiveType);
 
     const bundleDir = join(tempDir, mapping.bundleDir);
-    copyFileSync(join(bundleDir, "aicx"), targetAicx);
-    copyFileSync(join(bundleDir, "aicx-mcp"), targetAicxMcp);
-    chmodSync(targetAicx, 0o755);
-    chmodSync(targetAicxMcp, 0o755);
+    copyFileSync(join(bundleDir, `aicx${exe}`), targetAicx);
+    copyFileSync(join(bundleDir, `aicx-mcp${exe}`), targetAicxMcp);
+    if (process.platform !== "win32") {
+      chmodSync(targetAicx, 0o755);
+      chmodSync(targetAicxMcp, 0o755);
+    }
 
     unlinkSync(archivePath);
     rmSync(tempDir, { recursive: true, force: true });

@@ -1,0 +1,30 @@
+{
+  "name": "@loctree/aicx-win32-x64-gnu",
+  "version": "0.9.0",
+  "description": "aicx + aicx-mcp binaries for Windows x64 (MinGW-w64 GNU)",
+  "keywords": [
+    "aicx",
+    "mcp",
+    "win32",
+    "x64",
+    "gnu"
+  ],
+  "license": "BUSL-1.1",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Loctree/aicx.git",
+    "directory": "distribution/npm/aicx/platform-packages/win32-x64-gnu"
+  },
+  "files": [
+    "postinstall.js"
+  ],
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  }
+}
