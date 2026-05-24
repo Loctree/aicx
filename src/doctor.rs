@@ -535,54 +535,136 @@ fn check_semantic_health() -> CheckResult {
     }
 }
 
+/// Enumerate per-bucket subdirectories under `<aicx_home>/indexed/`.
+///
+/// Each bucket holds a `embeddings.ndjson` (atomically committed) and
+/// optionally a `embeddings.ndjson.tmp` checkpoint. Buckets are either
+/// `_all` (cross-project query target) or a `canonical_bucket_name`
+/// derived from `<owner>/<repo>` per `api::semantic_index_path_for_bucket`.
+fn list_indexed_buckets(indexed_root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(indexed_root) else {
+        return Vec::new();
+    };
+    let mut buckets: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+        .filter_map(|entry| entry.file_name().to_str().map(String::from))
+        .collect();
+    buckets.sort();
+    buckets
+}
+
+/// Bug #37: doctor freshness must inspect the SEMANTIC index that
+/// `aicx index` actually writes — `<aicx_home>/indexed/<bucket>/embeddings.ndjson`
+/// (see `api::semantic_index_path_for_bucket`). The legacy check used
+/// `steer_db` / `steer_bm25` mtimes (metadata steer indexes), so it
+/// reported "fresh" while the real semantic corpus was missing or stale.
+///
+/// Recovery hint uses the post-A-1 canonical flag set: `aicx index` for
+/// incremental refresh, `aicx index --full-rescan` for a from-zero
+/// rebuild. Path interpolation flows through `doctor_home_label` so the
+/// recommendation tracks `$AICX_HOME` like the other 8 doctor strings.
 fn check_index_freshness(base: &Path) -> CheckResult {
+    let indexed_root = base.join("indexed");
     let newest_chunk = newest_mtime(&base.join("store"))
         .into_iter()
         .chain(newest_mtime(&base.join("non-repository-contexts")))
         .max();
-    let index_mtime = newest_mtime(&base.join("steer_db"))
-        .into_iter()
-        .chain(newest_mtime(&base.join("steer_bm25")))
-        .max();
 
-    match (newest_chunk, index_mtime) {
-        (None, _) => CheckResult {
+    let Some(newest_chunk) = newest_chunk else {
+        return CheckResult {
             name: "index_freshness".to_string(),
             severity: Severity::Green,
             detail: "no canonical chunks found; no index lag".to_string(),
             recommendation: None,
-        },
-        (Some(_), None) => CheckResult {
+        };
+    };
+
+    let buckets = list_indexed_buckets(&indexed_root);
+    if buckets.is_empty() {
+        return CheckResult {
             name: "index_freshness".to_string(),
             severity: Severity::Critical,
-            detail: "canonical chunks exist but no semantic/steer index mtime was found"
-                .to_string(),
-            recommendation: Some(
-                "Run `aicx index --dry-run` to probe, then rebuild steer metadata".to_string(),
+            detail: format!(
+                "canonical chunks exist but no semantic index buckets under {}/indexed/",
+                doctor_home_label()
             ),
-        },
-        (Some(chunk), Some(index)) => {
-            let lag = chunk.duration_since(index).unwrap_or(Duration::ZERO);
-            let severity = if lag > Duration::from_secs(72 * 3600) {
-                Severity::Critical
-            } else if lag > Duration::from_secs(24 * 3600) {
-                Severity::Warning
-            } else {
-                Severity::Green
-            };
-            CheckResult {
-                name: "index_freshness".to_string(),
-                severity,
-                detail: format!("semantic lag: {} seconds", lag.as_secs()),
-                recommendation: if severity == Severity::Green {
-                    None
+            recommendation: Some(format!(
+                "Run `aicx index` to materialize {}/indexed/<bucket>/embeddings.ndjson \
+                 (use `aicx index --full-rescan` for a from-zero rebuild)",
+                doctor_home_label()
+            )),
+        };
+    }
+
+    let mut missing: Vec<String> = Vec::new();
+    let mut max_lag = Duration::ZERO;
+    let mut stale_count = 0usize;
+    let mut fresh_count = 0usize;
+
+    for bucket in &buckets {
+        let index_path = indexed_root.join(bucket).join("embeddings.ndjson");
+        match index_path.metadata().and_then(|m| m.modified()) {
+            Err(_) => missing.push(bucket.clone()),
+            Ok(index_mtime) => {
+                let lag = newest_chunk
+                    .duration_since(index_mtime)
+                    .unwrap_or(Duration::ZERO);
+                if lag > Duration::ZERO {
+                    stale_count += 1;
+                    if lag > max_lag {
+                        max_lag = lag;
+                    }
                 } else {
-                    Some(
-                        "Run `aicx index --dry-run` and refresh the materialized index".to_string(),
-                    )
-                },
+                    fresh_count += 1;
+                }
             }
         }
+    }
+
+    if !missing.is_empty() {
+        return CheckResult {
+            name: "index_freshness".to_string(),
+            severity: Severity::Critical,
+            detail: format!(
+                "semantic index missing for {} bucket(s): {}",
+                missing.len(),
+                missing.join(", ")
+            ),
+            recommendation: Some(format!(
+                "Run `aicx index` to materialize {}/indexed/<bucket>/embeddings.ndjson \
+                 (use `aicx index --full-rescan` for a from-zero rebuild)",
+                doctor_home_label()
+            )),
+        };
+    }
+
+    if stale_count > 0 {
+        let severity = if max_lag > Duration::from_secs(72 * 3600) {
+            Severity::Critical
+        } else {
+            Severity::Warning
+        };
+        return CheckResult {
+            name: "index_freshness".to_string(),
+            severity,
+            detail: format!(
+                "semantic index stale in {stale_count} bucket(s); max lag {} seconds",
+                max_lag.as_secs()
+            ),
+            recommendation: Some(format!(
+                "Run `aicx index` to refresh {}/indexed/<bucket>/embeddings.ndjson \
+                 (use `aicx index --full-rescan` to rebuild from zero)",
+                doctor_home_label()
+            )),
+        };
+    }
+
+    CheckResult {
+        name: "index_freshness".to_string(),
+        severity: Severity::Green,
+        detail: format!("semantic index fresh across {fresh_count} bucket(s)"),
+        recommendation: None,
     }
 }
 
@@ -2345,6 +2427,179 @@ mod tests {
         assert_eq!(report.sidecars, report.sidecar_coverage);
         assert_eq!(report.sidecars.name, "sidecars");
         assert_eq!(report.sidecars.severity, Severity::Critical);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Bug #37: freshness must inspect the actual semantic index at
+    /// `<base>/indexed/<bucket>/embeddings.ndjson` and recommend the
+    /// post-A-1 canonical `--full-rescan` flag.
+    #[test]
+    fn index_freshness_reports_missing_when_chunks_exist_but_no_indexed_dir() {
+        let tmp = unique_test_dir("freshness-missing");
+        // Plant one chunk in the canonical store.
+        let chunk_dir = tmp
+            .join("store")
+            .join("VetCoders")
+            .join("aicx")
+            .join("2026_0506")
+            .join("conversations")
+            .join("claude");
+        std::fs::create_dir_all(&chunk_dir).unwrap();
+        std::fs::write(chunk_dir.join("2026_0506_claude_sess-a_001.md"), "chunk").unwrap();
+        // NO `indexed/` directory at all.
+
+        let result = check_index_freshness(&tmp);
+        assert_eq!(
+            result.severity,
+            Severity::Critical,
+            "missing index buckets must be Critical"
+        );
+        assert!(
+            result.detail.contains("no semantic index buckets"),
+            "detail must mention missing buckets, got: {}",
+            result.detail
+        );
+        let rec = result
+            .recommendation
+            .expect("recovery hint required when missing");
+        assert!(
+            rec.contains("aicx index"),
+            "recovery must invoke `aicx index`, got: {rec}"
+        );
+        assert!(
+            rec.contains("--full-rescan"),
+            "recovery must reference canonical `--full-rescan` flag, got: {rec}"
+        );
+        assert!(
+            !rec.contains(&format!("--{}", "fresh ")),
+            "recovery must NOT use legacy fresh flag, got: {rec}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn index_freshness_reports_missing_when_bucket_dir_lacks_embeddings_file() {
+        let tmp = unique_test_dir("freshness-bucket-empty");
+        let chunk_dir = tmp.join("store").join("Acme").join("svc");
+        std::fs::create_dir_all(&chunk_dir).unwrap();
+        std::fs::write(chunk_dir.join("chunk.md"), "chunk").unwrap();
+        // Bucket dir exists but no embeddings.ndjson committed — only the
+        // temp checkpoint, mirroring a crashed embed loop.
+        let bucket_dir = tmp.join("indexed").join("_all");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+        std::fs::write(bucket_dir.join("embeddings.ndjson.tmp"), "partial").unwrap();
+
+        let result = check_index_freshness(&tmp);
+        assert_eq!(result.severity, Severity::Critical);
+        assert!(
+            result.detail.contains("missing"),
+            "detail must say missing, got: {}",
+            result.detail
+        );
+        assert!(
+            result
+                .recommendation
+                .as_ref()
+                .is_some_and(|r| r.contains("--full-rescan"))
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn index_freshness_reports_stale_when_chunk_mtime_exceeds_index_mtime() {
+        use filetime::{FileTime, set_file_mtime};
+        let tmp = unique_test_dir("freshness-stale");
+
+        let chunk_dir = tmp.join("store").join("VetCoders").join("aicx");
+        std::fs::create_dir_all(&chunk_dir).unwrap();
+        let chunk_path = chunk_dir.join("chunk.md");
+        std::fs::write(&chunk_path, "chunk body").unwrap();
+
+        let bucket_dir = tmp.join("indexed").join("_all");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+        let index_path = bucket_dir.join("embeddings.ndjson");
+        std::fs::write(&index_path, "{\"id\":\"a\"}\n").unwrap();
+
+        // newest_mtime walks parent dirs too — their creation mtimes land
+        // at ~now. Use "now" as the chunk reference frame and back-date the
+        // index 2h so the lag is a clean <72h Warning regardless of
+        // directory metadata.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        set_file_mtime(&chunk_path, FileTime::from_unix_time(now, 0)).unwrap();
+        set_file_mtime(&index_path, FileTime::from_unix_time(now - 7_200, 0)).unwrap();
+
+        let result = check_index_freshness(&tmp);
+        assert_eq!(result.severity, Severity::Warning, "<72h lag is Warning");
+        assert!(
+            result.detail.contains("stale"),
+            "detail must say stale, got: {}",
+            result.detail
+        );
+        let rec = result
+            .recommendation
+            .expect("stale must carry recovery hint");
+        assert!(rec.contains("aicx index"), "got: {rec}");
+        assert!(rec.contains("--full-rescan"), "got: {rec}");
+        assert!(
+            !rec.contains(&format!("--{}", "fresh ")),
+            "no legacy fresh-flag literal, got: {rec}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn index_freshness_reports_fresh_when_index_mtime_meets_or_exceeds_chunks() {
+        use filetime::{FileTime, set_file_mtime};
+        let tmp = unique_test_dir("freshness-fresh");
+
+        let chunk_dir = tmp.join("store").join("VetCoders").join("aicx");
+        std::fs::create_dir_all(&chunk_dir).unwrap();
+        let chunk_path = chunk_dir.join("chunk.md");
+        std::fs::write(&chunk_path, "chunk body").unwrap();
+
+        let bucket_dir = tmp.join("indexed").join("_all");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+        let index_path = bucket_dir.join("embeddings.ndjson");
+        std::fs::write(&index_path, "{\"id\":\"a\"}\n").unwrap();
+
+        // Index committed AFTER the chunk → fresh.
+        let t0 = 1_700_000_000i64;
+        set_file_mtime(&chunk_path, FileTime::from_unix_time(t0, 0)).unwrap();
+        set_file_mtime(&index_path, FileTime::from_unix_time(t0 + 60, 0)).unwrap();
+        // Also pin parent dir mtimes so `newest_mtime` (which walks dirs)
+        // does not pick up a post-creation directory mtime that races
+        // ahead of the index file.
+        set_file_mtime(&chunk_dir, FileTime::from_unix_time(t0, 0)).unwrap();
+        set_file_mtime(tmp.join("store"), FileTime::from_unix_time(t0, 0)).unwrap();
+        set_file_mtime(
+            tmp.join("store").join("VetCoders"),
+            FileTime::from_unix_time(t0, 0),
+        )
+        .unwrap();
+
+        let result = check_index_freshness(&tmp);
+        assert_eq!(
+            result.severity,
+            Severity::Green,
+            "got detail: {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("fresh"),
+            "detail must say fresh, got: {}",
+            result.detail
+        );
+        assert!(
+            result.recommendation.is_none(),
+            "fresh state needs no recovery hint"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
