@@ -12,8 +12,7 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet, hash_map::Entry};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -92,8 +91,13 @@ fn siphash13_hex6(input: &str) -> String {
 // Path helpers
 // ============================================================================
 
+pub(crate) mod dedupe;
 pub(crate) mod ignore;
 pub(crate) mod paths;
+pub(crate) mod sidecar;
+
+pub use dedupe::content_sha256_exists_in_dir;
+use dedupe::{DirShaCache, content_sha256, sha256_of_file};
 
 pub use ignore::{
     AICX_IGNORE_FILENAME, StoreIgnoreMatcher, filter_ignored_paths_at, load_ignore_matcher_at,
@@ -108,6 +112,8 @@ pub use paths::{
     non_repository_contexts_dir, project_dir, resolve_aicx_home, store_base_dir,
     store_base_dir_for,
 };
+use sidecar::load_sidecar_from_path;
+pub use sidecar::{is_context_corpus_sidecar, load_sidecar, sidecar_path_for_chunk};
 
 // ============================================================================
 // Index types
@@ -699,118 +705,6 @@ fn chunk_line_has_signal(line: &str) -> bool {
     true
 }
 
-fn content_sha256(content: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-/// Compute the SHA-256 of an on-disk file's contents in the same encoding
-/// as `content_sha256` (string-domain hash; matches sidecar
-/// `content_sha256` values). Used by orphan reclaim (#20) to compare the
-/// body of an orphan `.md` against the new chunk before deciding whether
-/// to reclaim or quarantine. This is a one-time-per-orphan cost outside
-/// the hot dedup path, so it is intentionally uncached.
-/// Stream-hash a file's bytes into a hex SHA-256, with an explicit
-/// 64 KiB read buffer and a hard 8 MiB cap (matching
-/// `sanitize::MAX_VALIDATED_BYTES`).
-///
-/// Rationale: the previous implementation called
-/// `sanitize::read_to_string_validated` which DOES have the same 8 MiB
-/// cap, but materialises the whole file in memory as a `String` before
-/// hashing. The gemini-code-assist MEDIUM PR #8 review noted the
-/// "reads entire file into memory" pattern even though the cap was in
-/// place. Streaming bytes through the hasher directly is just as bound
-/// (we check the cumulative byte count) and avoids the intermediate
-/// allocation. As a bonus it tolerates files that are not valid UTF-8
-/// — the hash still produces a deterministic result for any byte
-/// sequence, where the prior implementation would error on invalid
-/// UTF-8 in the orphan-reclaim path (#20).
-///
-/// This is a one-time-per-orphan cost outside the hot dedup path, so it
-/// is intentionally uncached.
-fn sha256_of_file(path: &Path) -> Result<String> {
-    use std::io::Read;
-    let display_path = path.display().to_string();
-    let file = sanitize::open_file_validated(path)
-        .with_context(|| format!("Failed to open orphan chunk {}", display_path))?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    let mut total: usize = 0;
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .with_context(|| format!("Failed to read orphan chunk {}", display_path))?;
-        if n == 0 {
-            break;
-        }
-        total = total.saturating_add(n);
-        if total > sanitize::MAX_VALIDATED_BYTES {
-            anyhow::bail!(
-                "Orphan chunk {} exceeds the {} byte read cap",
-                display_path,
-                sanitize::MAX_VALIDATED_BYTES
-            );
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-pub fn content_sha256_exists_in_dir(dir: &Path, content_sha256: &str) -> Result<bool> {
-    Ok(content_sha256s_in_dir(dir)?.contains(content_sha256))
-}
-
-fn content_sha256s_in_dir(dir: &Path) -> Result<HashSet<String>> {
-    let mut hashes = HashSet::new();
-    if !dir.exists() {
-        return Ok(hashes);
-    }
-    for entry in read_store_dir(dir)?.filter_map(|entry| entry.ok()) {
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-        if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_none_or(|name| !name.ends_with(".meta.json"))
-        {
-            continue;
-        }
-        let Some(sidecar) = load_sidecar_from_path(&path) else {
-            continue;
-        };
-        if let Some(content_sha256) = sidecar.content_sha256 {
-            hashes.insert(content_sha256);
-        }
-    }
-    Ok(hashes)
-}
-
-#[derive(Debug, Default)]
-struct DirShaCache {
-    by_dir: HashMap<PathBuf, HashSet<String>>,
-}
-
-impl DirShaCache {
-    fn contains(&mut self, dir: &Path, sha: &str) -> Result<bool> {
-        let hashes = match self.by_dir.entry(dir.to_path_buf()) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(content_sha256s_in_dir(dir)?),
-        };
-        Ok(hashes.contains(sha))
-    }
-
-    fn insert(&mut self, dir: &Path, sha: String) {
-        self.by_dir
-            .entry(dir.to_path_buf())
-            .or_default()
-            .insert(sha);
-    }
-}
-
 pub fn store_semantic_segments(
     entries: &[TimelineEntry],
     chunker_config: &ChunkerConfig,
@@ -1274,53 +1168,6 @@ fn context_files_since_at(
         matches_project && matches_cutoff
     });
     Ok(files)
-}
-
-/// Load the metadata sidecar for a context file, if it exists.
-pub fn load_sidecar(chunk_path: &Path) -> Option<chunker::ChunkMetadataSidecar> {
-    let sidecar_path = sidecar_path_for_chunk(chunk_path);
-    load_sidecar_from_path(&sidecar_path)
-}
-
-pub fn sidecar_path_for_chunk(chunk_path: &Path) -> PathBuf {
-    let adjacent = chunk_path.with_extension("meta.json");
-    if adjacent.exists() {
-        return adjacent;
-    }
-    if let (Some(parent), Some(stem)) = (chunk_path.parent(), chunk_path.file_stem()) {
-        if parent.file_name().and_then(|name| name.to_str()) == Some("raw")
-            && let Some(pack_dir) = parent.parent()
-        {
-            let sidecar = pack_dir
-                .join("sidecars")
-                .join(format!("{}.json", stem.to_string_lossy()));
-            if sidecar.exists() {
-                return sidecar;
-            }
-        }
-
-        let sidecar = parent
-            .join("sidecars")
-            .join(format!("{}.json", stem.to_string_lossy()));
-        if sidecar.exists() {
-            return sidecar;
-        }
-    }
-    adjacent
-}
-
-fn load_sidecar_from_path(sidecar_path: &Path) -> Option<chunker::ChunkMetadataSidecar> {
-    let sidecar_path = sanitize::validate_read_path(sidecar_path).ok()?;
-    let content = sanitize::read_to_string_validated(&sidecar_path).ok()?;
-    serde_json::from_str(&content).ok()
-}
-
-pub fn is_context_corpus_sidecar(sidecar: &chunker::ChunkMetadataSidecar) -> bool {
-    sidecar.artifact_family.as_deref() == Some(LOCT_CONTEXT_PACK_FAMILY)
-        || sidecar
-            .truth_status
-            .as_ref()
-            .is_some_and(|status| status.role == chunker::TruthRole::Example)
 }
 
 #[derive(Debug, Clone)]
