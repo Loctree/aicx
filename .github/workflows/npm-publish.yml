@@ -61,9 +61,13 @@ jobs:
           RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
         run: |
           base_url="https://github.com/Loctree/aicx/releases/download/${RELEASE_TAG}"
+          # Signed-only release surface. macOS ships .zip (notarized via ditto);
+          # Linux ships .tar.gz (GPG-detached); Windows ships .zip (GPG-detached
+          # MinGW-w64 build). All three carry GPG .asc sidecars.
           assets=(
-            "aicx-v${{ steps.meta.outputs.version }}-aarch64-apple-darwin-slim-unsigned.tar.gz"
-            "aicx-v${{ steps.meta.outputs.version }}-x86_64-unknown-linux-gnu-slim-unsigned.tar.gz"
+            "aicx-v${{ steps.meta.outputs.version }}-aarch64-apple-darwin-slim.zip"
+            "aicx-v${{ steps.meta.outputs.version }}-x86_64-linux-gnu-slim.tar.gz"
+            "aicx-v${{ steps.meta.outputs.version }}-x86_64-pc-windows-gnu-slim.zip"
           )
           for asset in "${assets[@]}"; do
             curl -fsLI "${base_url}/${asset}" >/dev/null
@@ -89,6 +93,7 @@ jobs:
         platform:
           - darwin-arm64
           - linux-x64-gnu
+          - win32-x64-gnu
     steps:
       - uses: actions/checkout@v6
 

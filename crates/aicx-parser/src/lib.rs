@@ -15,7 +15,7 @@ pub use chunker::{
     Chunk, ChunkMetadataSidecar, ChunkerConfig, LearningUse, TruthRole, TruthStatus, classify_kind,
 };
 pub use frontmatter::ReportFrontmatter;
-pub use sanitize::{filter_self_echo, is_self_echo, normalize_query};
+pub use sanitize::{filter_self_echo, is_self_echo, normalize_query, read_state_json_validated};
 #[rustfmt::skip]
 pub use sanitize::{read_line_capped, MAX_VALIDATED_BYTES};
 pub use segmentation::{

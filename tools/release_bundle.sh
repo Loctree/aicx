@@ -4,9 +4,10 @@ set -euo pipefail
 # Build an AICX release bundle.
 #
 # Modes:
-#   - default: signed + notarized macOS bundle
-#   - AICX_RELEASE_BUNDLE_ONLY_BINARIES=1: unsigned slim tar.gz for foundation
-#     bundles such as Loctree release packaging
+#   - default: Apple-codesigned + notarized macOS bundle, GPG-detached
+#   - AICX_RELEASE_BUNDLE_ONLY_BINARIES=1: GPG-detached slim tar.gz for
+#     non-Apple targets (linux/bsd). No Apple codesign here, but every
+#     archive is still GPG-signed — Loctree never ships unsigned artifacts.
 #
 # Inputs are read from either:
 #   - KEYS=/path/to/keys-dir
@@ -21,6 +22,23 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+
+# Pick the newest Python ≥ 3.11 available. tomllib is stdlib only from 3.11,
+# and bash scripts don't inherit .zshrc PATH ordering, so we detect explicitly
+# instead of trusting `python3`. Caller can override with PYTHON=...
+PYTHON="${PYTHON:-$(command -v python3.14 2>/dev/null \
+  || command -v python3.13 2>/dev/null \
+  || command -v python3.12 2>/dev/null \
+  || command -v python3.11 2>/dev/null \
+  || command -v python3 2>/dev/null)}"
+if [[ -z "$PYTHON" ]]; then
+  echo "Error: no Python interpreter found (need 3.11+ for stdlib tomllib)." >&2
+  exit 1
+fi
+if ! "$PYTHON" -c 'import tomllib' >/dev/null 2>&1; then
+  echo "Error: $PYTHON lacks stdlib tomllib — need Python 3.11+." >&2
+  exit 1
+fi
 
 KEYS_DIR="${KEYS:-${AICX_KEYS_DIR:-$HOME/.keys}}"
 NOTARY_PROFILE_VALUE="${NOTARY_PROFILE:-${AICX_NOTARY_PROFILE:-}}"
@@ -82,7 +100,7 @@ read_trimmed_file() {
     echo "Error: missing required file: $path" >&2
     exit 1
   fi
-  python3 - "$path" <<'PY'
+  "$PYTHON" - "$path" <<'PY'
 from pathlib import Path
 import sys
 print(Path(sys.argv[1]).read_text(encoding="utf-8", errors="ignore").strip())
@@ -91,7 +109,7 @@ PY
 
 toml_value() {
   local key="$1"
-  python3 - "$REPO_ROOT/Cargo.toml" "$key" <<'PY'
+  "$PYTHON" - "$REPO_ROOT/Cargo.toml" "$key" <<'PY'
 import sys, tomllib
 from pathlib import Path
 path = Path(sys.argv[1])
@@ -108,6 +126,16 @@ host_target() {
   rustc -vV | sed -n 's/^host: //p'
 }
 
+# Map a rust target triple to a clean release asset name. Linux triples drop
+# the cosmetic `unknown` vendor (`x86_64-unknown-linux-gnu` → `x86_64-linux-gnu`).
+# Apple targets stay as-is because `apple-darwin` is genuinely informative.
+clean_target() {
+  case "$1" in
+    *-unknown-linux-*) echo "${1//-unknown-linux-/-linux-}" ;;
+    *) echo "$1" ;;
+  esac
+}
+
 write_release_manifest() {
   local output="$1"
   local version="$2"
@@ -119,7 +147,7 @@ write_release_manifest() {
 
   full_commit=$(git -C "$REPO_ROOT" rev-parse HEAD)
   commit=$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD)
-  python3 - "$output" "$version" "$target" "$flavor" "$signed" "$notarized" "$full_commit" "$commit" <<'PY'
+  "$PYTHON" - "$output" "$version" "$target" "$flavor" "$signed" "$notarized" "$full_commit" "$commit" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -176,12 +204,11 @@ if [[ "$DRY_RUN" != "1" ]]; then
 fi
 
 require_cmd cargo
-require_cmd python3
 
 require_cmd shasum
 
 if [[ "${AICX_RELEASE_BUNDLE_ONLY_BINARIES:-0}" == "1" ]]; then
-  echo "=== AICX unsigned bundle (binaries-only, no codesign/notarize) ==="
+  echo "=== AICX GPG-signed bundle (binaries-only, no Apple codesign) ==="
   TARGET="${TARGET:-$(host_target)}"
   case "$TARGET" in
     *windows*) echo "Error: release-bundle-only-binaries does not support Windows targets yet: $TARGET" >&2; exit 1 ;;
@@ -191,7 +218,7 @@ if [[ "${AICX_RELEASE_BUNDLE_ONLY_BINARIES:-0}" == "1" ]]; then
   if [[ -z "$PACKAGE_NAME" ]]; then
     PACKAGE_NAME="$(toml_value package.name)"
   fi
-  DIST_DIR=$(python3 - "$DIST_DIR" <<'PY'
+  DIST_DIR=$("$PYTHON" - "$DIST_DIR" <<'PY'
 import os, sys
 print(os.path.abspath(os.path.expanduser(sys.argv[1])))
 PY
@@ -220,9 +247,19 @@ AICX_CARGO_BUILD_CMD explicitly to opt into cross-compilation.
 EOF
     exit 1
   fi
-  BUNDLE_BASENAME="${PACKAGE_NAME}-v${VERSION}-${TARGET}-${BUILD_FLAVOR}-unsigned"
+  ASSET_TARGET="$(clean_target "$TARGET")"
+  # Loctree releases are never shipped unsigned — GPG detached-sign is
+  # mandatory below. The basename intentionally omits any "-unsigned" tag.
+  BUNDLE_BASENAME="${PACKAGE_NAME}-v${VERSION}-${ASSET_TARGET}-${BUILD_FLAVOR}"
   BUNDLE_DIR="$DIST_DIR/$BUNDLE_BASENAME"
-  ARCHIVE_PATH="$DIST_DIR/${BUNDLE_BASENAME}.tar.gz"
+  # Windows targets produce .zip + .exe binaries; everything else stays tar.gz.
+  if [[ "$TARGET" == *windows* ]]; then
+    EXE_SUFFIX=".exe"
+    ARCHIVE_PATH="$DIST_DIR/${BUNDLE_BASENAME}.zip"
+  else
+    EXE_SUFFIX=""
+    ARCHIVE_PATH="$DIST_DIR/${BUNDLE_BASENAME}.tar.gz"
+  fi
   CHECKSUM_PATH="${ARCHIVE_PATH}.sha256"
 
   echo "Repo:            $REPO_ROOT"
@@ -263,28 +300,84 @@ EOF
 
   rm -rf "$BUNDLE_DIR"
   mkdir -p "$BUNDLE_DIR/docs"
-  cp "$RELEASE_DIR/aicx" "$BUNDLE_DIR/aicx"
-  cp "$RELEASE_DIR/aicx-mcp" "$BUNDLE_DIR/aicx-mcp"
+  cp "$RELEASE_DIR/aicx${EXE_SUFFIX}" "$BUNDLE_DIR/aicx${EXE_SUFFIX}"
+  cp "$RELEASE_DIR/aicx-mcp${EXE_SUFFIX}" "$BUNDLE_DIR/aicx-mcp${EXE_SUFFIX}"
   cp "$REPO_ROOT/LICENSE" "$BUNDLE_DIR/LICENSE"
   cp "$REPO_ROOT/README.md" "$BUNDLE_DIR/README.md"
-  cp "$REPO_ROOT/install.sh" "$BUNDLE_DIR/install.sh"
   cp "$REPO_ROOT/docs/COMMANDS.md" "$BUNDLE_DIR/docs/COMMANDS.md"
   cp "$REPO_ROOT/docs/RELEASES.md" "$BUNDLE_DIR/docs/RELEASES.md"
   write_release_manifest "$BUNDLE_DIR/release-manifest.json" "$VERSION" "$TARGET" "$BUILD_FLAVOR" 0 0
-  chmod +x "$BUNDLE_DIR/install.sh"
+  if [[ "$TARGET" == *windows* ]]; then
+    # No install.sh on Windows; PowerShell users invoke the .exe directly.
+    :
+  else
+    cp "$REPO_ROOT/install.sh" "$BUNDLE_DIR/install.sh"
+    chmod +x "$BUNDLE_DIR/install.sh"
+  fi
 
-  echo "[2/3] Packaging tar.gz archive..."
-  rm -f "$ARCHIVE_PATH" "$CHECKSUM_PATH"
-  (cd "$DIST_DIR" && tar -czf "$ARCHIVE_PATH" "$BUNDLE_BASENAME")
+  echo "[2/3] Packaging archive..."
+  rm -f "$ARCHIVE_PATH" "$CHECKSUM_PATH" "${ARCHIVE_PATH}.asc"
+  if [[ "$TARGET" == *windows* ]]; then
+    # Portable zip via Python stdlib — works on every runner regardless of
+    # whether `zip` is on PATH.
+    ( cd "$DIST_DIR" && "$PYTHON" -c "
+import sys, zipfile, os
+src = sys.argv[1]
+dst = sys.argv[2]
+with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED) as zf:
+    for root, _, files in os.walk(src):
+        for f in files:
+            full = os.path.join(root, f)
+            zf.write(full, os.path.relpath(full, os.path.dirname(src)))
+" "$BUNDLE_BASENAME" "$(basename "$ARCHIVE_PATH")" )
+  else
+    (cd "$DIST_DIR" && tar -czf "$ARCHIVE_PATH" "$BUNDLE_BASENAME")
+  fi
   (cd "$DIST_DIR" && shasum -a 256 "$(basename "$ARCHIVE_PATH")") > "$CHECKSUM_PATH"
 
+  # Bundle staging directory only matters for inspection; remove it so it
+  # never reaches `gh release upload` (which fails on directories).
+  rm -rf "$BUNDLE_DIR"
+
+  # GPG detached signature is mandatory — Loctree releases never ship unsigned.
+  if [[ -z "${LOCTREE_GPG_KEY_ID:-}" ]]; then
+    echo "Error: LOCTREE_GPG_KEY_ID is not set — refusing to produce an unsigned release archive." >&2
+    echo "Export it in your shell (e.g. .zshrc) or pass LOCTREE_GPG_KEY_ID=... inline." >&2
+    exit 1
+  fi
+  PASSPHRASE_FILE="${LOCTREE_GPG_PASSPHRASE_FILE:-$HOME/.keys/.gpg.passphrase}"
+  if [[ ! -r "$PASSPHRASE_FILE" ]]; then
+    echo "Error: GPG passphrase file not readable at $PASSPHRASE_FILE." >&2
+    echo "Provide LOCTREE_GPG_PASSPHRASE_FILE=/path or place the passphrase at \$HOME/.keys/.gpg.passphrase (mode 600)." >&2
+    exit 1
+  fi
+  require_cmd gpg
+  if ! gpg --list-secret-keys "${LOCTREE_GPG_KEY_ID}" >/dev/null 2>&1; then
+    echo "Error: GPG secret key ${LOCTREE_GPG_KEY_ID} not imported on this host." >&2
+    exit 1
+  fi
+  echo "[2b/3] GPG detached-signing archive with ${LOCTREE_GPG_KEY_ID}..."
+  gpg --batch --yes --armor --pinentry-mode loopback \
+    --passphrase-file "$PASSPHRASE_FILE" \
+    --sig-notation "apple-developer-team-id@loctree.io=MW223P3NPX" \
+    --sig-notation "release-source@loctree.io=Loctree/aicx" \
+    --detach-sign --local-user "${LOCTREE_GPG_KEY_ID}" \
+    "$ARCHIVE_PATH"
+
+  # Export public key alongside artifacts so consumers can import + verify
+  # without keyserver lookup. ASCII armor, small, redistributable.
+  gpg --export --armor "${LOCTREE_GPG_KEY_ID}" \
+    > "${DIST_DIR}/loctree-release-pubkey.asc"
+
   echo "[3/3] Final artifact summary..."
-  echo "Bundle dir:      $BUNDLE_DIR"
   echo "Archive:         $ARCHIVE_PATH"
   echo "Checksum:        $CHECKSUM_PATH"
+  if [[ -f "${ARCHIVE_PATH}.asc" ]]; then
+    echo "Signature:       ${ARCHIVE_PATH}.asc"
+  fi
   echo ""
-  echo "Note: this archive is intentionally unsigned. Consumers that need a notarized"
-  echo "      build should use \`make release-bundle KEYS=...\` instead."
+  echo "Note: this archive is GPG-signed (.asc) but not Apple-codesigned/notarized."
+  echo "      For Apple-notarized macOS builds use \`make release-bundle KEYS=...\`."
 
   if [[ "$CLEAN_AFTER_BUILD" == "1" ]]; then
     echo ""
@@ -318,7 +411,7 @@ if [[ "$TARGET" != *apple-darwin ]]; then
   exit 1
 fi
 
-KEYS_DIR=$(python3 - "$KEYS_DIR" <<'PY'
+KEYS_DIR=$("$PYTHON" - "$KEYS_DIR" <<'PY'
 import os, sys
 print(os.path.expanduser(sys.argv[1]))
 PY
@@ -349,7 +442,7 @@ VERSION="$(toml_value package.version)"
 if [[ -z "$PACKAGE_NAME" ]]; then
   PACKAGE_NAME="$(toml_value package.name)"
 fi
-DIST_DIR=$(python3 - "$DIST_DIR" <<'PY'
+DIST_DIR=$("$PYTHON" - "$DIST_DIR" <<'PY'
 import os, sys
 print(os.path.abspath(os.path.expanduser(sys.argv[1])))
 PY
@@ -365,7 +458,11 @@ if [[ -n "$FEATURES_VALUE" ]]; then
 else
   BUILD_FLAVOR="${AICX_BUNDLE_FLAVOR:-slim}"
 fi
-BUNDLE_BASENAME="${PACKAGE_NAME}-v${VERSION}-${TARGET}-${BUILD_FLAVOR}-signed"
+ASSET_TARGET="$(clean_target "$TARGET")"
+# Signed+notarized macOS bundle. Basename intentionally omits "-signed" —
+# every Loctree release archive is signed by definition (Apple codesign +
+# GPG detached). The .zip extension + .asc sidecar carry the proof.
+BUNDLE_BASENAME="${PACKAGE_NAME}-v${VERSION}-${ASSET_TARGET}-${BUILD_FLAVOR}"
 BUNDLE_DIR="$DIST_DIR/$BUNDLE_BASENAME"
 ARCHIVE_PATH="$DIST_DIR/${BUNDLE_BASENAME}.zip"
 CHECKSUM_PATH="${ARCHIVE_PATH}.sha256"
@@ -465,9 +562,36 @@ for binary in "$BUNDLE_DIR/aicx" "$BUNDLE_DIR/aicx-mcp"; do
 done
 
 echo "[4/6] Packaging notarization archive..."
-rm -f "$ARCHIVE_PATH" "$CHECKSUM_PATH" "$NOTARY_LOG_PATH"
+rm -f "$ARCHIVE_PATH" "$CHECKSUM_PATH" "$NOTARY_LOG_PATH" "${ARCHIVE_PATH}.asc"
 ditto -c -k --keepParent "$BUNDLE_DIR" "$ARCHIVE_PATH"
 shasum -a 256 "$ARCHIVE_PATH" > "$CHECKSUM_PATH"
+
+# GPG detached signature is mandatory — Loctree releases never ship unsigned.
+if [[ -z "${LOCTREE_GPG_KEY_ID:-}" ]]; then
+  echo "Error: LOCTREE_GPG_KEY_ID is not set — refusing to produce an unsigned signed/notarized bundle." >&2
+  exit 1
+fi
+PASSPHRASE_FILE="${LOCTREE_GPG_PASSPHRASE_FILE:-$HOME/.keys/.gpg.passphrase}"
+if [[ ! -r "$PASSPHRASE_FILE" ]]; then
+  echo "Error: GPG passphrase file not readable at $PASSPHRASE_FILE." >&2
+  exit 1
+fi
+require_cmd gpg
+if ! gpg --list-secret-keys "${LOCTREE_GPG_KEY_ID}" >/dev/null 2>&1; then
+  echo "Error: GPG secret key ${LOCTREE_GPG_KEY_ID} not imported on this host." >&2
+  exit 1
+fi
+echo "  GPG detached-signing zip with ${LOCTREE_GPG_KEY_ID}..."
+gpg --batch --yes --armor --pinentry-mode loopback \
+  --passphrase-file "$PASSPHRASE_FILE" \
+  --sig-notation "apple-developer-team-id@loctree.io=MW223P3NPX" \
+  --sig-notation "release-source@loctree.io=Loctree/aicx" \
+  --detach-sign --local-user "${LOCTREE_GPG_KEY_ID}" \
+  "$ARCHIVE_PATH"
+
+# Export public key alongside the notarized macOS bundle for verification.
+gpg --export --armor "${LOCTREE_GPG_KEY_ID}" \
+  > "${DIST_DIR}/loctree-release-pubkey.asc"
 
 echo "[5/6] Submitting archive for notarization..."
 if [[ -n "$NOTARY_PROFILE_VALUE" ]]; then
@@ -484,11 +608,17 @@ else
     --output-format json > "$NOTARY_LOG_PATH"
 fi
 
+# Bundle staging directory only matters for inspection; remove it so it
+# never reaches `gh release upload` (which fails on directories).
+rm -rf "$BUNDLE_DIR"
+
 echo "[6/6] Final artifact summary..."
-echo "Bundle dir:      $BUNDLE_DIR"
 echo "Archive:         $ARCHIVE_PATH"
 echo "Checksum:        $CHECKSUM_PATH"
 echo "Notary log:      $NOTARY_LOG_PATH"
+if [[ -f "${ARCHIVE_PATH}.asc" ]]; then
+  echo "Signature:       ${ARCHIVE_PATH}.asc"
+fi
 echo ""
 echo "Note: zip archives are notarized server-side but cannot be stapled like .pkg/.dmg/.app."
 

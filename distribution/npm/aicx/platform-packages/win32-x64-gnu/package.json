@@ -1,28 +1,25 @@
 {
-  "name": "@loctree/aicx-linux-x64-gnu",
+  "name": "@loctree/aicx-win32-x64-gnu",
   "version": "0.9.0",
-  "description": "aicx + aicx-mcp binaries for Linux x64 (glibc)",
+  "description": "aicx + aicx-mcp binaries for Windows x64 (MinGW-w64 GNU)",
   "keywords": [
     "aicx",
     "mcp",
-    "linux",
+    "win32",
     "x64",
     "gnu"
   ],
   "license": "BUSL-1.1",
   "os": [
-    "linux"
+    "win32"
   ],
   "cpu": [
     "x64"
   ],
-  "libc": [
-    "glibc"
-  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Loctree/aicx.git",
-    "directory": "distribution/npm/aicx/platform-packages/linux-x64-gnu"
+    "directory": "distribution/npm/aicx/platform-packages/win32-x64-gnu"
   },
   "files": [
     "postinstall.js"

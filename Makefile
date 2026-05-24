@@ -1,6 +1,16 @@
 # AICX Build System
 # Local developer flow + release/readiness helpers
 
+# --- Cargo PATH discovery ---------------------------------------------------
+# Surface cargo from ~/.cargo/bin when the calling shell (uv-run, sh -c,
+# CI runners that strip PATH) didn't source ~/.cargo/env. Idempotent —
+# no-op when cargo is already reachable, silent when rustup isn't installed.
+ifeq (,$(shell command -v cargo 2>/dev/null))
+  ifneq (,$(wildcard $(HOME)/.cargo/bin/cargo))
+    export PATH := $(HOME)/.cargo/bin:$(PATH)
+  endif
+endif
+
 .PHONY: all build build-native release-binaries install install-bin install-config install-cargo git-hooks
 .PHONY: precheck precheck-native test test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
 .PHONY: embeddings-check embeddings-test embeddings-clippy embeddings-hydrate embeddings-info
@@ -11,6 +21,12 @@ all: build
 PACKAGE_NAME := $(shell grep '^name = ' Cargo.toml | head -n 1 | cut -d '"' -f 2)
 VERSION := $(shell grep '^version = ' Cargo.toml | head -n 1 | cut -d '"' -f 2)
 TAG := v$(VERSION)
+
+# --- Python discovery (release tooling needs stdlib tomllib, i.e. 3.11+) ----
+# macOS system python3 is 3.9 (no tomllib). Pick the newest available 3.11+
+# from PATH; fall back to plain python3 (scripts will fail-fast with a clear
+# message if it's < 3.11).
+PYTHON := $(shell command -v python3.14 2>/dev/null || command -v python3.13 2>/dev/null || command -v python3.12 2>/dev/null || command -v python3.11 2>/dev/null || command -v python3)
 KEYS ?= $(if $(AICX_KEYS_DIR),$(AICX_KEYS_DIR),$(HOME)/.keys)
 NOTARY_PROFILE ?= $(AICX_NOTARY_PROFILE)
 CLEAN ?= 1
@@ -58,7 +74,7 @@ release-binaries:
 				echo "  codesign skipped (set CODESIGN=1 and MACOS_DEVELOPER_ID_APPLICATION for release)"; \
 			fi ;; \
 	esac
-	@python3 -c 'import json, pathlib, sys; staging=pathlib.Path(sys.argv[1]); version=sys.argv[2]; commit=sys.argv[3]; data={"source":"loctree-aicx","commit":commit,"components":[{"name":"aicx","version":version,"source":"loctree-aicx"},{"name":"aicx-mcp","version":version,"source":"loctree-aicx"}]}; path=staging/"components"/"loctree-aicx.json"; path.write_text(json.dumps(data, indent=2)+"\n", encoding="utf-8"); print(f"  metadata -> {path}")' "$(STAGING_DIR)" "$(VERSION)" "$$(git rev-parse --short=12 HEAD)"
+	@$(PYTHON) -c 'import json, pathlib, sys; staging=pathlib.Path(sys.argv[1]); version=sys.argv[2]; commit=sys.argv[3]; data={"source":"loctree-aicx","commit":commit,"components":[{"name":"aicx","version":version,"source":"loctree-aicx"},{"name":"aicx-mcp","version":version,"source":"loctree-aicx"}]}; path=staging/"components"/"loctree-aicx.json"; path.write_text(json.dumps(data, indent=2)+"\n", encoding="utf-8"); print(f"  metadata -> {path}")' "$(STAGING_DIR)" "$(VERSION)" "$$(git rev-parse --short=12 HEAD)"
 
 release-binaries-linux:
 	@for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-musl; do \
@@ -98,7 +114,7 @@ precheck-native:
 	cargo check --locked -p aicx --features native-embedder --all-targets
 
 manifest-check:
-	@python3 -c 'import sys, re; text = open("Cargo.toml", "r").read(); bad = [m.group(1) for m in re.finditer(r"^([\w-]+)\s*=.*path\s*=", text, re.MULTILINE) if m.group(1) not in ("rmcp-memex", "aicx-embeddings", "aicx-retrieve", "aicx-parser", "aicx-monitor", "aicx-progress-contracts", "path")]; sys.exit("Manifest policy check failed:\n  - Unexpected local path dependency: " + ", ".join(bad)) if bad else print("Manifest policy: ok (approved local product deps only)")'
+	@$(PYTHON) -c 'import sys, re; text = open("Cargo.toml", "r").read(); bad = [m.group(1) for m in re.finditer(r"^([\w-]+)\s*=.*path\s*=", text, re.MULTILINE) if m.group(1) not in ("rmcp-memex", "aicx-embeddings", "aicx-retrieve", "aicx-parser", "aicx-monitor", "aicx-progress-contracts", "path")]; sys.exit("Manifest policy check failed:\n  - Unexpected local path dependency: " + ", ".join(bad)) if bad else print("Manifest policy: ok (approved local product deps only)")'
 
 test:
 	cargo test --locked -p aicx --all-targets
@@ -224,11 +240,11 @@ version-show:
 	fi
 
 version-check:
-	@python3 tools/release_sync.py check
+	@$(PYTHON) tools/release_sync.py check
 
 version-bump:
 ifeq ($(origin VERSION),command line)
-	@python3 tools/release_sync.py bump "$(VERSION)"
+	@$(PYTHON) tools/release_sync.py bump "$(VERSION)"
 	@echo ""
 	@echo "Versioned release surfaces synced from Cargo.toml into docs + distribution/npm."
 	@echo "Cargo.lock is intentionally not touched by version-bump."
@@ -243,10 +259,10 @@ version-patch bump-patch:
 	@$(MAKE) version-bump VERSION=patch
 
 changelog-close:
-	@python3 tools/changelog_close.py $(if $(CHANGELOG_GENERATE),--generate-if-empty)
+	@$(PYTHON) tools/changelog_close.py $(if $(CHANGELOG_GENERATE),--generate-if-empty)
 
 release-notes:
-	@python3 tools/release_sync.py notes $(if $(origin VERSION),$(VERSION),) $(if $(OUTPUT),--output $(OUTPUT),)
+	@$(PYTHON) tools/release_sync.py notes $(if $(origin VERSION),$(VERSION),) $(if $(OUTPUT),--output $(OUTPUT),)
 
 release-plan:
 	@echo "AICX release flow"
@@ -283,7 +299,7 @@ ifeq ($(origin VERSION),command line)
 	@$(MAKE) changelog-close CHANGELOG_GENERATE=1
 	@cargo update --package $(PACKAGE_NAME) --offline
 	@$(MAKE) version-check
-	@python3 tools/release_sync.py notes --output dist/release-notes.md
+	@$(PYTHON) tools/release_sync.py notes --output dist/release-notes.md
 	@$(MAKE) precheck
 else
 	@echo "VERSION is required. Usage: make release-prepare VERSION={patch|minor|major|x.y.z}" >&2 && exit 1
@@ -298,7 +314,7 @@ endif
 	@echo "  make release-bundle KEYS=$(HOME)/.keys [CLEAN=0]"
 
 release-check:
-	@python3 tools/release_sync.py check --require-version-section
+	@$(PYTHON) tools/release_sync.py check --require-version-section
 	@$(MAKE) check
 	@echo "Release readiness passed."
 
@@ -307,8 +323,18 @@ release-tag:
 		echo "Tag $(TAG) already exists."; \
 		exit 1; \
 	fi
-	git tag -a "$(TAG)" -m "Release $(TAG)"
-	@echo "Created annotated tag $(TAG)"
+	@key="$${LOCTREE_GPG_KEY_ID:-}"; \
+	if [ -z "$$key" ]; then \
+		echo "LOCTREE_GPG_KEY_ID is not set — refusing to create unsigned release tag." >&2; \
+		echo "Export the org's GPG key id in your shell (zshrc) or pass LOCTREE_GPG_KEY_ID=... inline." >&2; \
+		exit 1; \
+	fi; \
+	pp="$${LOCTREE_GPG_PASSPHRASE_FILE:-$$HOME/.keys/.gpg.passphrase}"; \
+	if [ -r "$$pp" ]; then \
+		echo "warmup" | gpg --batch --pinentry-mode loopback --passphrase-file "$$pp" --local-user "$$key" --detach-sign -o /dev/null 2>/dev/null || true; \
+	fi; \
+	git tag -as -u "$$key" "$(TAG)" -m "Release $(TAG)"
+	@echo "Created GPG-signed annotated tag $(TAG)"
 
 release-push:
 	git push origin "$(TAG)"

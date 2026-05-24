@@ -1,7 +1,7 @@
 [package]
 name = "aicx"
 
-version = "0.8.1"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.91.1"
 description = "Operator CLI + MCP server: canonical corpus first, optional semantic index second (Claude Code, Codex, Gemini)"
@@ -119,3 +119,25 @@ path = "src/lib.rs"
 [profile.release]
 lto = true
 strip = true
+
+# Debian package metadata. Built via `cargo deb --no-build` after the normal
+# cargo release build on the linux runner. Used by the release.yml CI to ship
+# `aicx_<version>_<arch>.deb` alongside the tar.gz archive for apt-install UX.
+[package.metadata.deb]
+maintainer = "Loctree Release <release@loct.io>"
+copyright = "2024-2026 LibraxisAI"
+license-file = ["LICENSE", "0"]
+extended-description = """
+Operator CLI + MCP server for AI sessions: canonical corpus first, optional \
+semantic index second. Designed for Claude Code, Codex, and Gemini.\
+"""
+depends = "$auto"
+section = "utility"
+priority = "optional"
+assets = [
+    ["target/release/aicx", "usr/bin/", "755"],
+    ["target/release/aicx-mcp", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/aicx/README", "644"],
+    ["LICENSE", "usr/share/doc/aicx/LICENSE", "644"],
+    ["CHANGELOG.md", "usr/share/doc/aicx/CHANGELOG", "644"],
+]
