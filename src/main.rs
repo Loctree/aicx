@@ -6210,7 +6210,7 @@ fn run_reports_extractor(args: ReportsExtractorRunArgs) -> Result<()> {
     let repo = if let Some(repo) = args.repo {
         repo
     } else {
-        infer_repo_name_from_cwd()?
+        sources::infer_repo_name_from_current_dir()?
     };
     let date_from = parse_cli_date(args.date_from.as_deref(), "--date-from")?;
     let date_to = parse_cli_date(args.date_to.as_deref(), "--date-to")?;
@@ -6273,32 +6273,6 @@ fn default_reports_bundle_path(output: &Path) -> PathBuf {
         .and_then(|value| value.to_str())
         .unwrap_or("aicx-reports");
     parent.join(format!("{stem}.bundle.json"))
-}
-
-fn infer_repo_name_from_cwd() -> Result<String> {
-    let cwd = std::env::current_dir().context("Cannot determine current directory")?;
-    let mut probe = cwd.as_path();
-    loop {
-        if probe.join(".git").exists() {
-            let repo = probe
-                .file_name()
-                .and_then(|name| name.to_str())
-                .filter(|name| !name.trim().is_empty())
-                .ok_or_else(|| anyhow::anyhow!("Could not infer --repo from git root"))?;
-            return Ok(repo.to_string());
-        }
-        let Some(parent) = probe.parent() else {
-            break;
-        };
-        probe = parent;
-    }
-
-    let repo = cwd
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Could not infer --repo from the current directory"))?;
-    Ok(repo.to_string())
 }
 
 fn parse_cli_date(value: Option<&str>, flag_name: &str) -> Result<Option<NaiveDate>> {
