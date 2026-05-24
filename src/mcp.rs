@@ -829,10 +829,11 @@ impl AicxMcpServer {
                 .map_err(|e| {
                     McpError::internal_error(format!("Serialize search JSON: {e}"), None)
                 })?;
-        let payload = inject_filter_pushdown_diagnostic(&rendered, pushdown_diagnostic.as_ref())
-            .map_err(|e| {
-                McpError::internal_error(format!("Inject filter_pushdown JSON: {e}"), None)
-            })?;
+        let payload = crate::search_engine::inject_filter_pushdown_diagnostic(
+            &rendered,
+            pushdown_diagnostic.as_ref(),
+        )
+        .map_err(|e| McpError::internal_error(format!("Inject filter_pushdown JSON: {e}"), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(payload)]))
     }
@@ -1414,22 +1415,9 @@ fn parse_date_filter_mcp(date: &str) -> (Option<String>, Option<String>) {
     }
 }
 
-/// Merge an optional `filter_pushdown` diagnostic into the JSON payload
-/// rendered by `rank::render_search_json_with_oracle`. Additive: callers
-/// that ignore the field see the canonical search response untouched.
-fn inject_filter_pushdown_diagnostic(
-    rendered: &str,
-    diagnostic: Option<&crate::search_engine::FilterPushdownDiagnostic>,
-) -> Result<String, serde_json::Error> {
-    let Some(diag) = diagnostic else {
-        return Ok(rendered.to_string());
-    };
-    let mut value: serde_json::Value = serde_json::from_str(rendered)?;
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("filter_pushdown".to_string(), serde_json::to_value(diag)?);
-    }
-    serde_json::to_string(&value)
-}
+// `inject_filter_pushdown_diagnostic` extracted to `aicx::search_engine`
+// — shared with the CLI path in `src/main.rs` (gemini-code-assist
+// review on PR #9: DRY).
 
 fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, McpError> {
     match score {

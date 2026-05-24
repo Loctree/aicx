@@ -4935,7 +4935,10 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         };
         let rendered =
             rank::render_search_json_with_oracle(&root, &results, scanned, oracle_status)?;
-        let payload = inject_filter_pushdown_diagnostic(&rendered, pushdown_diagnostic.as_ref())?;
+        let payload = aicx::search_engine::inject_filter_pushdown_diagnostic(
+            &rendered,
+            pushdown_diagnostic.as_ref(),
+        )?;
         println!("{}", payload);
         return Ok(());
     }
@@ -4996,23 +4999,9 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Merge an optional `filter_pushdown` diagnostic into the JSON payload
-/// rendered by `rank::render_search_json_with_oracle`. Keeps the
-/// payload shape additive — callers that ignore the field see the
-/// canonical search response untouched.
-fn inject_filter_pushdown_diagnostic(
-    rendered: &str,
-    diagnostic: Option<&aicx::search_engine::FilterPushdownDiagnostic>,
-) -> Result<String> {
-    let Some(diag) = diagnostic else {
-        return Ok(rendered.to_string());
-    };
-    let mut value: serde_json::Value = serde_json::from_str(rendered)?;
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("filter_pushdown".to_string(), serde_json::to_value(diag)?);
-    }
-    Ok(serde_json::to_string(&value)?)
-}
+// `inject_filter_pushdown_diagnostic` extracted to `aicx::search_engine`
+// to share one implementation between this CLI path and the MCP path
+// in `src/mcp.rs` (gemini-code-assist review on PR #9: DRY).
 
 /// Default canonical config template written by `aicx config init`.
 ///

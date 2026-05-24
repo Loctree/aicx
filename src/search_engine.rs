@@ -813,6 +813,28 @@ pub struct FilteredSemanticOutcome {
     pub diagnostic: Option<FilterPushdownDiagnostic>,
 }
 
+/// Merge an optional `filter_pushdown` diagnostic into a JSON payload
+/// rendered by `rank::render_search_json_with_oracle` (or any
+/// equivalent caller). Additive shape: callers that ignore the field
+/// see the canonical search response untouched.
+///
+/// Shared between `aicx search` (CLI, `src/main.rs`) and `aicx_search`
+/// (MCP, `src/mcp.rs`) so both surfaces emit byte-identical diagnostic
+/// JSON.
+pub fn inject_filter_pushdown_diagnostic(
+    rendered: &str,
+    diagnostic: Option<&FilterPushdownDiagnostic>,
+) -> Result<String, serde_json::Error> {
+    let Some(diag) = diagnostic else {
+        return Ok(rendered.to_string());
+    };
+    let mut value: serde_json::Value = serde_json::from_str(rendered)?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("filter_pushdown".to_string(), serde_json::to_value(diag)?);
+    }
+    serde_json::to_string(&value)
+}
+
 /// Bounded examined-pool ratio. The retrieval wrapper fetches at most
 /// `max(user_limit * RATIO, MIN)` candidates from the hybrid index, then
 /// applies post-filters across that pool. Anything beyond the cap is
