@@ -57,6 +57,8 @@ jobs:
       - name: Install protoc
         uses: arduino/setup-protoc@v3
         with:
+          # Pin fully-qualified version (see ci.yml comment + issue #108).
+          version: 'v23.4'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Resolve release tag
@@ -203,6 +205,8 @@ jobs:
       - name: Install protoc
         uses: arduino/setup-protoc@v3
         with:
+          # Pin fully-qualified version (see ci.yml comment + issue #108).
+          version: 'v23.4'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: dtolnay/rust-toolchain@stable

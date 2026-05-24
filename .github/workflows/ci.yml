@@ -54,6 +54,13 @@ jobs:
       - name: Install protoc
         uses: arduino/setup-protoc@v3
         with:
+          # Pin fully-qualified version to bypass arduino/setup-protoc
+          # GitHub release-API lookup that fails intermittently on the
+          # macos-self-hosted runner (per arduino/setup-protoc#108).
+          # v23.4 matches the version Linux successfully resolved at
+          # tool-cache stage today, so prost-build/tonic-build compat
+          # is identical to the known-good Linux build.
+          version: 'v23.4'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-python@v6
