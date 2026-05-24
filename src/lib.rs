@@ -28,11 +28,8 @@ pub mod reports_extractor;
 pub mod search_engine;
 pub mod sources;
 pub mod state;
-#[cfg(feature = "lance")]
 pub mod steer_index;
-#[cfg(not(feature = "lance"))]
-#[path = "steer_index_stub.rs"]
-pub mod steer_index;
+mod steer_index_contract;
 pub mod store;
 pub mod validation;
 pub mod vector_index;
