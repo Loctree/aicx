@@ -224,8 +224,15 @@ pub(crate) const CONFIG_FILE_MAX_BYTES: u64 = 1024 * 1024;
 /// allocating the rest of the file. On cap-hit returns
 /// `io::ErrorKind::FileTooLarge` so the caller can log at a higher level
 /// than generic IO errors. Bug #39.
+///
+/// `path` comes from `config_search_paths()` — an internal resolver that
+/// returns canonical `$AICX_HOME/config.toml`, `$AICX_HOME/embedder.toml`,
+/// or `$AICX_EMBEDDER_CONFIG` (operator-controlled env). It is not user
+/// input in the path-traversal sense, but we still open via explicit
+/// `OpenOptions::new().read(true)` to match the codebase's
+/// pass-3 hardening pattern (see commits `9682007` and `095c988`).
 pub(crate) fn read_config_file_capped(path: &Path, max_bytes: u64) -> io::Result<String> {
-    let file = fs::File::open(path)?;
+    let file = fs::OpenOptions::new().read(true).open(path)?;
     let mut bytes = Vec::new();
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;
