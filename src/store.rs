@@ -1400,7 +1400,36 @@ pub fn ingest_loct_context_pack(pack_dir: &Path) -> Result<ContextCorpusIngestSu
         anyhow::bail!("loct context pack contains no raw/*.md chunks");
     }
 
+    // Bug #34: reject mixed-project packs before any chunk lands on disk.
+    // The legacy code took (org, repo) from the FIRST sidecar and assumed
+    // every other record belonged there; a packaging mistake silently
+    // routed records into the wrong project bucket.
     let (org, repo) = context_corpus_repo_from_sidecar(&items[0].2)?;
+    let first_sidecar_path = items[0].1.clone();
+    if let Some((offender_path, offender_org, offender_repo)) =
+        items.iter().skip(1).find_map(|(_, sidecar_path, sidecar)| {
+            context_corpus_repo_from_sidecar(sidecar)
+                .ok()
+                .and_then(|(other_org, other_repo)| {
+                    (other_org != org || other_repo != repo).then_some((
+                        sidecar_path.clone(),
+                        other_org,
+                        other_repo,
+                    ))
+                })
+        })
+    {
+        anyhow::bail!(
+            "loct context pack {} mixes projects: first sidecar {} declares {}/{}, but sidecar {} declares {}/{}",
+            pack_dir.display(),
+            first_sidecar_path.display(),
+            org,
+            repo,
+            offender_path.display(),
+            offender_org,
+            offender_repo,
+        );
+    }
     let date = items[0].2.date.clone();
     let batch = pack_dir
         .file_name()
@@ -6044,5 +6073,108 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Bug #34: loct context pack homogeneity validation.
+    // Pre-ingest check rejects packs whose sidecars declare more than
+    // one (org, repo) tuple, before any chunk hits disk. Homogeneous
+    // packs are unaffected (covered by tests/e2e_context_pack_ingest.rs).
+    // ──────────────────────────────────────────────────────────────────
+
+    fn unique_pack_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        env::temp_dir().join(format!(
+            "aicx-pack-consistency-{name}-{}-{nanos}",
+            std::process::id(),
+        ))
+    }
+
+    fn write_pack_sidecar(pack: &Path, stem: &str, project: &str, date: &str) {
+        let raw = pack.join("raw").join(format!("{stem}.md"));
+        let sidecar = pack.join("sidecars").join(format!("{stem}.json"));
+        fs::create_dir_all(raw.parent().unwrap()).unwrap();
+        fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        fs::write(
+            &raw,
+            format!(
+                "[project: {project} | agent: loct-context-pack | date: {date}]\n\n[signals]\nDecision:\n- [decision] test\n[/signals]\n",
+            ),
+        )
+        .unwrap();
+        let body = serde_json::json!({
+            "id": stem,
+            "project": project,
+            "agent": "loct-context-pack",
+            "date": date,
+            "session_id": stem,
+            "kind": "reports",
+            "artifact_family": "loct-context-pack",
+            "schema_version": "context_corpus.v1",
+            "truth_status": {
+                "role": "example",
+                "runtime_authoritative": false,
+                "stale_against_current_head": false,
+            },
+        });
+        fs::write(&sidecar, body.to_string()).unwrap();
+    }
+
+    #[test]
+    fn ingest_loct_context_pack_rejects_mixed_projects() {
+        let pack = unique_pack_dir("mixed");
+        write_pack_sidecar(&pack, "alpha", "VetCoders/aicx", "2026-05-08");
+        write_pack_sidecar(&pack, "beta", "Loctree/aicx", "2026-05-08");
+
+        let err = ingest_loct_context_pack(&pack)
+            .expect_err("mixed-project pack must fail pre-ingest validation");
+        let message = format!("{err:#}");
+
+        // Names both project tuples.
+        assert!(
+            message.contains("VetCoders/aicx") || message.contains("vetcoders/aicx"),
+            "error should name first project tuple; got {message}"
+        );
+        assert!(
+            message.contains("Loctree/aicx") || message.contains("loctree/aicx"),
+            "error should name offending project tuple; got {message}"
+        );
+        // Names at least one offending sidecar path.
+        assert!(
+            message.contains("beta.json"),
+            "error should name offending sidecar path; got {message}"
+        );
+        // Explicit "mixes projects" framing.
+        assert!(
+            message.contains("mixes projects"),
+            "error should use the mixes-projects framing; got {message}"
+        );
+
+        let _ = fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn ingest_loct_context_pack_rejects_empty_pack() {
+        let pack = unique_pack_dir("empty");
+        fs::create_dir_all(pack.join("raw")).unwrap();
+        fs::create_dir_all(pack.join("sidecars")).unwrap();
+
+        let err = ingest_loct_context_pack(&pack)
+            .expect_err("pack with no raw/*.md chunks must fail pre-ingest validation");
+        let message = format!("{err:#}");
+        // Distinct failure mode from mixed-projects (#34 brief edge call).
+        assert!(
+            message.contains("no raw/*.md chunks"),
+            "empty pack must surface the empty-pack failure mode, not 'mixes projects'; got {message}"
+        );
+        assert!(
+            !message.contains("mixes projects"),
+            "empty pack must not be reported as mixed-projects; got {message}"
+        );
+
+        let _ = fs::remove_dir_all(&pack);
     }
 }
