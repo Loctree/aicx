@@ -1059,7 +1059,10 @@ fn check_state(base: &Path) -> CheckResult {
             recommendation: Some("Will be created on first `aicx store` run".to_string()),
         };
     }
-    let raw = match sanitize::read_to_string_validated(&state_path) {
+    // state.json has a dedicated 128 MiB cap (see sanitize::MAX_STATE_JSON_BYTES);
+    // the generic 8 MiB validated reader rejects realistic dedup histories
+    // (200k+ chunks → state.json ~25 MB). Use the state-specific reader.
+    let raw = match sanitize::read_state_json_validated(&state_path) {
         Ok(s) => s,
         Err(e) => {
             return CheckResult {
@@ -1895,6 +1898,52 @@ mod tests {
     fn test_severity_unknown_is_default_not_warning() {
         let default_res = CheckResult::default();
         assert_eq!(default_res.severity, Severity::Unknown);
+    }
+
+    #[test]
+    fn check_state_accepts_state_json_above_generic_cap() {
+        // Regression for the case where doctor::check_state called
+        // sanitize::read_to_string_validated (generic 8 MiB cap) on
+        // state.json. Real installations with 200k+ chunks produce
+        // state.json ≥ 20 MiB, which the generic reader rejected,
+        // surfacing a spurious Critical. The fix routes through
+        // sanitize::read_state_json_validated (dedicated 128 MiB cap,
+        // see crates/aicx-parser/src/sanitize.rs). This test writes a
+        // ≥ 9 MiB state.json (above generic, well below dedicated)
+        // and asserts the check returns Green.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let base = std::env::temp_dir().join(format!(
+            "aicx-doctor-state-cap-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&base).expect("create base");
+        let state_path = base.join("state.json");
+        // 9 MiB of `A` padding embedded in a valid JSON envelope, above
+        // the 8 MiB generic cap, well under the 128 MiB state cap.
+        let padding = "A".repeat(9 * 1024 * 1024);
+        let body = format!(r#"{{"pad":"{}","seen_hashes":{{}},"runs":[]}}"#, padding);
+        std::fs::write(&state_path, &body).expect("write state.json");
+
+        let result = check_state(&base);
+
+        // Cleanup before assertion so a failure does not leave the dir.
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(
+            result.severity,
+            Severity::Green,
+            "≥9 MiB state.json must pass under the dedicated 128 MiB cap; got: {:?}",
+            result
+        );
+        assert!(
+            result.detail.contains("parses cleanly"),
+            "expected 'parses cleanly' detail, got: {}",
+            result.detail
+        );
     }
 
     #[test]
