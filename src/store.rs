@@ -1343,7 +1343,7 @@ pub struct ContextCorpusIngestSummary {
     pub index_path: PathBuf,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ContextCorpusIndexRow {
     id: String,
     path: String,
@@ -1441,7 +1441,19 @@ pub fn ingest_loct_context_pack(pack_dir: &Path) -> Result<ContextCorpusIngestSu
     let index_path = target.join("index.jsonl");
 
     let mut seen_hashes = context_corpus_hashes_in_dir(&target_sidecars)?;
-    let mut index_rows = Vec::new();
+
+    // Bug #35: index.jsonl was unconditionally truncated on re-ingest,
+    // erasing rows for chunks the second pack didn't re-present. Load
+    // the existing manifest, then merge new rows by id so the on-disk
+    // index always contains the union of previously-stored + newly-
+    // ingested chunks.
+    let mut index_rows = read_context_corpus_index_rows(&index_path)?;
+    let mut id_to_pos: HashMap<String, usize> = index_rows
+        .iter()
+        .enumerate()
+        .map(|(idx, row)| (row.id.clone(), idx))
+        .collect();
+
     let mut summary = ContextCorpusIngestSummary {
         target_dir: target.clone(),
         index_path: index_path.clone(),
@@ -1480,7 +1492,7 @@ pub fn ingest_loct_context_pack(pack_dir: &Path) -> Result<ContextCorpusIngestSu
         summary.raw_written += 1;
         summary.sidecars_written += 1;
 
-        index_rows.push(ContextCorpusIndexRow {
+        let row = ContextCorpusIndexRow {
             id: sidecar.id.clone(),
             path: raw_target.display().to_string(),
             artifact_family: sidecar.artifact_family.clone(),
@@ -1495,7 +1507,14 @@ pub fn ingest_loct_context_pack(pack_dir: &Path) -> Result<ContextCorpusIngestSu
             keywords: sidecar.keywords.clone(),
             band: sidecar.frame_kind.map(|kind| kind.as_str().to_string()),
             content_sha256: sidecar.content_sha256.clone(),
-        });
+        };
+        match id_to_pos.get(&row.id).copied() {
+            Some(idx) => index_rows[idx] = row,
+            None => {
+                id_to_pos.insert(row.id.clone(), index_rows.len());
+                index_rows.push(row);
+            }
+        }
     }
 
     write_context_corpus_index(&index_path, &index_rows)?;
@@ -1589,11 +1608,40 @@ fn context_corpus_hashes_in_dir(sidecars_dir: &Path) -> Result<HashMap<String, S
 }
 
 fn write_context_corpus_index(path: &Path, rows: &[ContextCorpusIndexRow]) -> Result<()> {
-    let mut writer = sanitize::create_file_validated(path)?;
+    let mut buf = Vec::with_capacity(rows.len() * 256);
     for row in rows {
-        writeln!(writer, "{}", serde_json::to_string(row)?)?;
+        serde_json::to_writer(&mut buf, row)?;
+        buf.push(b'\n');
     }
+    // Atomic rename keeps the manifest crash-consistent: readers either
+    // see the prior full index or the new full index, never a partial
+    // truncation. Required by bug #35's preservation contract.
+    atomic_write(path, &buf)
+        .map_err(|err| anyhow!("write context corpus index {}: {}", path.display(), err))?;
     Ok(())
+}
+
+fn read_context_corpus_index_rows(path: &Path) -> Result<Vec<ContextCorpusIndexRow>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = sanitize::read_to_string_validated(path)?;
+    let mut rows = Vec::new();
+    for (line_no, raw_line) in content.lines().enumerate() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let row: ContextCorpusIndexRow = serde_json::from_str(trimmed).with_context(|| {
+            format!(
+                "parse context corpus index row at {}:{}",
+                path.display(),
+                line_no + 1
+            )
+        })?;
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 /// Find stored chunks whose sidecar metadata matches a run ID.
@@ -6176,5 +6224,242 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&pack);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Bug #35: re-ingest must preserve index.jsonl rows.
+    // Previously the index was truncated and rewritten with only the
+    // NEW rows from the second pack, dropping the manifest entries for
+    // chunks that were stored by the first pack. The fix merges new
+    // rows into the loaded set by id and atomic-writes the union.
+    // ──────────────────────────────────────────────────────────────────
+
+    fn unique_ingest_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        env::temp_dir().join(format!(
+            "aicx-index-preserve-{name}-{}-{nanos}",
+            std::process::id(),
+        ))
+    }
+
+    fn reset_pack_dir(pack: &Path) {
+        let _ = fs::remove_dir_all(pack);
+        fs::create_dir_all(pack.join("raw")).unwrap();
+        fs::create_dir_all(pack.join("sidecars")).unwrap();
+    }
+
+    fn write_pack_chunk(pack: &Path, stem: &str, project: &str, date: &str, body: &str) {
+        let raw = pack.join("raw").join(format!("{stem}.md"));
+        let sidecar = pack.join("sidecars").join(format!("{stem}.json"));
+        fs::create_dir_all(raw.parent().unwrap()).unwrap();
+        fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        let raw_content = format!(
+            "[project: {project} | agent: loct-context-pack | date: {date}]\n\n[signals]\nDecision:\n- [decision] {body}\n[/signals]\n",
+        );
+        fs::write(&raw, raw_content).unwrap();
+        let sidecar_body = serde_json::json!({
+            "id": stem,
+            "project": project,
+            "agent": "loct-context-pack",
+            "date": date,
+            "session_id": stem,
+            "kind": "reports",
+            "artifact_family": "loct-context-pack",
+            "schema_version": "context_corpus.v1",
+            "truth_status": {
+                "role": "example",
+                "runtime_authoritative": false,
+                "stale_against_current_head": false,
+            },
+        });
+        fs::write(&sidecar, sidecar_body.to_string()).unwrap();
+    }
+
+    fn read_index_ids(index_path: &Path) -> Vec<String> {
+        let raw = fs::read_to_string(index_path).expect("index.jsonl readable");
+        raw.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let value: serde_json::Value =
+                    serde_json::from_str(line).expect("index row is valid json");
+                value["id"]
+                    .as_str()
+                    .expect("index row has string id")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Helper: stage AICX_HOME under a fresh temp dir and run `body`.
+    /// Holds [`AICX_HOME_ENV_LOCK`] so concurrent env-touching tests
+    /// stay serialised — same pattern as
+    /// `test_resolve_aicx_home_honors_explicit_env_var`.
+    fn with_isolated_aicx_home<F: FnOnce(&Path)>(label: &str, body: F) {
+        let _serial = AICX_HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = AicxHomeEnvGuard::capture();
+        let aicx_home = unique_ingest_dir(label);
+        fs::create_dir_all(&aicx_home).unwrap();
+        // SAFETY: the lock is held; sibling env-touching tests cannot race.
+        unsafe { env::set_var("AICX_HOME", &aicx_home) };
+        body(&aicx_home);
+        let _ = fs::remove_dir_all(&aicx_home);
+    }
+
+    #[test]
+    fn ingest_loct_context_pack_preserves_index_on_identical_reingest() {
+        with_isolated_aicx_home("identical", |_home| {
+            let pack = unique_ingest_dir("identical-pack").join("batch-alpha");
+            reset_pack_dir(&pack);
+            write_pack_chunk(
+                &pack,
+                "alpha",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "first chunk",
+            );
+            write_pack_chunk(
+                &pack,
+                "beta",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "second chunk",
+            );
+
+            let first = ingest_loct_context_pack(&pack).expect("first ingest");
+            let first_ids = read_index_ids(&first.index_path);
+            assert_eq!(first_ids.len(), 2, "first ingest writes both ids");
+            assert!(first_ids.iter().any(|id| id == "alpha"));
+            assert!(first_ids.iter().any(|id| id == "beta"));
+
+            let second = ingest_loct_context_pack(&pack).expect("second ingest");
+            assert_eq!(
+                second.deduped_chunks, 2,
+                "identical re-ingest must dedup every chunk"
+            );
+            assert_eq!(second.raw_written, 0);
+            let second_ids = read_index_ids(&second.index_path);
+            assert_eq!(
+                second_ids.len(),
+                2,
+                "identical re-ingest must NOT truncate index.jsonl (bug #35)"
+            );
+            assert!(second_ids.iter().any(|id| id == "alpha"));
+            assert!(second_ids.iter().any(|id| id == "beta"));
+
+            let _ = fs::remove_dir_all(pack.parent().unwrap());
+        });
+    }
+
+    #[test]
+    fn ingest_loct_context_pack_unions_old_and_new_on_reingest() {
+        with_isolated_aicx_home("union", |_home| {
+            let pack = unique_ingest_dir("union-pack").join("batch-alpha");
+            reset_pack_dir(&pack);
+            write_pack_chunk(
+                &pack,
+                "alpha",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "first chunk",
+            );
+            let first = ingest_loct_context_pack(&pack).expect("first ingest");
+            let first_ids = read_index_ids(&first.index_path);
+            assert_eq!(first_ids, vec!["alpha".to_string()]);
+
+            // Second pack carries the same alpha chunk plus a brand-new
+            // gamma chunk; the union must include both.
+            reset_pack_dir(&pack);
+            write_pack_chunk(
+                &pack,
+                "alpha",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "first chunk",
+            );
+            write_pack_chunk(
+                &pack,
+                "gamma",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "third chunk",
+            );
+
+            let second = ingest_loct_context_pack(&pack).expect("second ingest");
+            assert_eq!(second.deduped_chunks, 1, "alpha is content-identical");
+            assert_eq!(second.raw_written, 1, "gamma is brand-new");
+            let second_ids = read_index_ids(&second.index_path);
+            assert_eq!(second_ids.len(), 2);
+            assert!(second_ids.iter().any(|id| id == "alpha"));
+            assert!(second_ids.iter().any(|id| id == "gamma"));
+
+            let _ = fs::remove_dir_all(pack.parent().unwrap());
+        });
+    }
+
+    #[test]
+    fn ingest_loct_context_pack_preserves_rows_for_subset_reingest() {
+        with_isolated_aicx_home("subset", |_home| {
+            let pack = unique_ingest_dir("subset-pack").join("batch-alpha");
+            reset_pack_dir(&pack);
+            write_pack_chunk(
+                &pack,
+                "alpha",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "first chunk",
+            );
+            write_pack_chunk(
+                &pack,
+                "beta",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "second chunk",
+            );
+            write_pack_chunk(
+                &pack,
+                "gamma",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "third chunk",
+            );
+            let first = ingest_loct_context_pack(&pack).expect("first ingest");
+            let first_ids = read_index_ids(&first.index_path);
+            assert_eq!(first_ids.len(), 3);
+
+            // Operator's most common pathology: second ingest only carries
+            // a subset of the already-stored chunks. The rows for the
+            // not-re-presented chunks (beta, gamma) MUST stay in the index.
+            reset_pack_dir(&pack);
+            write_pack_chunk(
+                &pack,
+                "alpha",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "first chunk",
+            );
+
+            let second = ingest_loct_context_pack(&pack).expect("subset re-ingest");
+            assert_eq!(second.raw_written, 0);
+            assert_eq!(second.deduped_chunks, 1);
+            let second_ids = read_index_ids(&second.index_path);
+            assert_eq!(
+                second_ids.len(),
+                3,
+                "subset re-ingest must preserve rows for chunks not re-presented (bug #35)"
+            );
+            for expected in ["alpha", "beta", "gamma"] {
+                assert!(
+                    second_ids.iter().any(|id| id == expected),
+                    "subset re-ingest dropped row for {expected}; got {second_ids:?}"
+                );
+            }
+
+            let _ = fs::remove_dir_all(pack.parent().unwrap());
+        });
     }
 }
