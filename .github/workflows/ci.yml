@@ -37,31 +37,30 @@ jobs:
           ref: ${{ env.RUST_MEMEX_REF }}
           path: rust-memex
 
-      - name: Ensure unzip on self-hosted Linux
-        if: runner.os == 'Linux'
+      - name: Install protoc
+        # Manual install instead of arduino/setup-protoc@v3 — that action
+        # GitHub-API-fetches release metadata even for pinned versions,
+        # which times out intermittently on the macos-self-hosted runner
+        # (arduino/setup-protoc#108; observed 2026-05-24 PR #9 macOS:
+        # 34s "unable to get latest version" hang after 2+ successful
+        # runs). brew/apt provide protoc v23+, prost-build / tonic-build
+        # compatible.
+        shell: bash
         run: |
-          if command -v unzip >/dev/null 2>&1; then
+          if command -v protoc >/dev/null 2>&1; then
+            echo "protoc already installed: $(protoc --version)"
             exit 0
           fi
-          if command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install --yes unzip
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq protobuf-compiler
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            brew install protobuf
           else
-            echo "unzip is required on Linux runners for setup-protoc" >&2
+            echo "::error::Unsupported OS for protoc install: $RUNNER_OS"
             exit 1
           fi
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          # Pin fully-qualified version to bypass arduino/setup-protoc
-          # GitHub release-API lookup that fails intermittently on the
-          # macos-self-hosted runner (per arduino/setup-protoc#108).
-          # v23.4 matches the version Linux successfully resolved at
-          # tool-cache stage today, so prost-build/tonic-build compat
-          # is identical to the known-good Linux build.
-          version: 'v23.4'
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          protoc --version
 
       - uses: actions/setup-python@v6
         if: runner.os == 'Linux'
