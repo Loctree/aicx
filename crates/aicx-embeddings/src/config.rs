@@ -1,9 +1,10 @@
 use std::env;
 use std::fs;
+use std::io::{self, Read};
 use std::path::Path;
 use std::path::PathBuf;
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     BackendPreference, EmbeddingConfig, EmbeddingProfile, EmbeddingProfileSpec,
@@ -211,13 +212,53 @@ fn aicx_home_root() -> Option<PathBuf> {
     }
 }
 
+/// Hard upper bound for the embedder config file size. Realistic
+/// `config.toml` files are < 4 KiB; 1 MiB is ~250× that and still small
+/// enough that an accidental / hostile giant blob (e.g. a log rotated
+/// onto the config path, a binary mistakenly renamed) cannot OOM the
+/// embedder during startup. Bug #39.
+pub(crate) const CONFIG_FILE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Bounded replacement for `fs::read_to_string` on the embedder config
+/// path. Reads up to `max_bytes + 1` so cap-hits are observable without
+/// allocating the rest of the file. On cap-hit returns
+/// `io::ErrorKind::FileTooLarge` so the caller can log at a higher level
+/// than generic IO errors. Bug #39.
+pub(crate) fn read_config_file_capped(path: &Path, max_bytes: u64) -> io::Result<String> {
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!(
+                "embedder config '{}' exceeds {}-byte cap (read ≥ {} bytes; refusing to load)",
+                path.display(),
+                max_bytes,
+                bytes.len()
+            ),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
 fn load_config_file() -> Option<crate::NativeEmbedderConfigSection> {
     for path in config_search_paths() {
         if !path.exists() {
             continue;
         }
-        let raw = match fs::read_to_string(&path) {
+        let raw = match read_config_file_capped(&path, CONFIG_FILE_MAX_BYTES) {
             Ok(raw) => raw,
+            Err(err) if err.kind() == io::ErrorKind::FileTooLarge => {
+                warn!(
+                    target: "aicx_embeddings::config",
+                    "refusing oversized embedder config {}: {}",
+                    path.display(),
+                    err
+                );
+                continue;
+            }
             Err(err) => {
                 debug!(
                     target: "aicx_embeddings::config",
@@ -454,6 +495,56 @@ mod tests {
         let effective = first_existing(paths).expect("canonical should win");
         assert_eq!(effective.1, ConfigSource::Canonical);
         assert_eq!(effective.0, canonical);
+    }
+
+    #[test]
+    fn bounded_read_rejects_oversized_config_with_path_and_cap_in_error() {
+        let home = tmp_dir("bounded-oversize");
+        let path = home.join("config.toml");
+        // Cap small to keep the test fast; payload = cap + 1024 bytes.
+        let cap: u64 = 2048;
+        let payload = vec![b'x'; (cap as usize) + 1024];
+        fs::write(&path, &payload).unwrap();
+
+        let err = read_config_file_capped(&path, cap)
+            .expect_err("oversized file must error under bounded read");
+        assert_eq!(err.kind(), io::ErrorKind::FileTooLarge);
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "error must name the file path: {msg}",
+        );
+        assert!(
+            msg.contains(&cap.to_string()),
+            "error must name the cap value: {msg}",
+        );
+    }
+
+    #[test]
+    fn bounded_read_happy_path_loads_realistic_config() {
+        let home = tmp_dir("bounded-happy");
+        let path = home.join("config.toml");
+        let body = "[embedder]\nbackend = \"native\"\nprofile = \"base\"\n";
+        fs::write(&path, body).unwrap();
+
+        let raw = read_config_file_capped(&path, CONFIG_FILE_MAX_BYTES)
+            .expect("realistic config must load under 1 MiB cap");
+        assert_eq!(raw, body);
+    }
+
+    #[test]
+    fn bounded_read_empty_file_returns_empty_string() {
+        let home = tmp_dir("bounded-empty");
+        let path = home.join("config.toml");
+        fs::write(&path, "").unwrap();
+
+        let raw = read_config_file_capped(&path, CONFIG_FILE_MAX_BYTES)
+            .expect("empty config must load cleanly");
+        assert!(raw.is_empty(), "empty file must produce empty string");
+        // toml parser must still accept an empty document — preserves the
+        // pre-bounded-read behavior where an empty config = all defaults.
+        let parsed: Result<NativeEmbedderConfigFile, _> = toml::from_str(&raw);
+        assert!(parsed.is_ok(), "toml must accept empty document");
     }
 
     #[test]
