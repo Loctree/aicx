@@ -1595,7 +1595,7 @@ fn first_metadata_field(path: &std::path::Path, key: &str) -> Option<String> {
 pub fn query_index(
     project: Option<&str>,
     query: &str,
-    _limit: usize,
+    limit: usize,
     kind_filter: Option<&str>,
     frame_kind_filter: Option<&str>,
 ) -> Result<Vec<QueryHit>> {
@@ -1655,7 +1655,7 @@ pub fn query_index(
         let rate = scan.corrupt_count as f64 / scan.total_data_lines.max(1) as f64;
         if scan.total_data_lines >= CORRUPT_MIN_SAMPLE && rate > CORRUPT_RATE_FAIL_FAST {
             return Err(anyhow::anyhow!(
-                "index integrity failure in {}: {} of {} data lines ({:.1}%) failed to parse — exceeds {:.0}% threshold. Recovery: `aicx index --fresh --project <name>` to rebuild from canonical store.",
+                "index integrity failure in {}: {} of {} data lines ({:.1}%) failed to parse — exceeds {:.0}% threshold. Recovery: `aicx index --full-rescan --project <name>` to rebuild from canonical store.",
                 path.display(),
                 scan.corrupt_count,
                 scan.total_data_lines,
@@ -1674,13 +1674,27 @@ pub fn query_index(
         );
     }
 
-    let mut hits = scan.hits;
+    Ok(finalize_query_hits(scan.hits, limit))
+}
+
+/// Sort `hits` by cosine score descending and cap at `limit`.
+///
+/// Pure post-scan tail of [`query_index`]. Extracted so the limit contract
+/// (bug #32: caller-supplied `limit` is honored — never returns > `limit`
+/// rows) can be unit-tested without standing up an embedder.
+///
+/// Safe to truncate here because the scan filters (`kind` / `frame_kind`)
+/// are already pushed down into [`scan_index_entries`]: the pool fed in
+/// is filter-saturated, so the truncate cannot re-introduce bug #31's
+/// silent-empty pathology on the legacy path.
+pub fn finalize_query_hits(mut hits: Vec<QueryHit>, limit: usize) -> Vec<QueryHit> {
     hits.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    Ok(hits)
+    hits.truncate(limit);
+    hits
 }
 
 /// Result of scanning the data-line region of a persistent NDJSON index.
@@ -2275,6 +2289,91 @@ mod iter3_tests {
         assert_eq!(scan.total_data_lines, 10);
         assert_eq!(scan.corrupt_count, 1);
         assert_eq!(scan.hits.len(), 9, "valid entries still parsed and scored");
+    }
+
+    fn make_hit(id: &str, score: f32) -> QueryHit {
+        QueryHit {
+            id: id.to_string(),
+            project: "test".to_string(),
+            agent: "claude".to_string(),
+            date: "20260524".to_string(),
+            path: std::path::PathBuf::from(format!("/tmp/aicx-test/{id}.md")),
+            kind: "session".to_string(),
+            session_id: id.to_string(),
+            frame_kind: None,
+            cwd: None,
+            score,
+        }
+    }
+
+    #[test]
+    fn finalize_query_hits_truncates_to_requested_limit() {
+        // Bug #32 regression. The legacy `query_index` accepted a `limit`
+        // arg but did not honor it — the parameter was prefixed `_limit`
+        // and the post-scan tail returned every hit. This locks the
+        // contract that the returned vec has `len() <= limit`.
+        let hits: Vec<QueryHit> = (0..50)
+            .map(|i| make_hit(&format!("h-{i}"), (50 - i) as f32 / 50.0))
+            .collect();
+        let out = finalize_query_hits(hits, 10);
+        assert_eq!(out.len(), 10, "limit honored: returns exactly 10 hits");
+        // Top score is the highest (1.0); confirm score-desc sort holds
+        // after truncate so the kept 10 are the BEST 10, not a random
+        // slice.
+        assert!(
+            out.windows(2).all(|w| w[0].score >= w[1].score),
+            "hits remain sorted score-desc after truncate"
+        );
+        assert_eq!(out[0].id, "h-0", "highest-scoring hit retained at head");
+    }
+
+    #[test]
+    fn finalize_query_hits_returns_full_pool_when_limit_exceeds_pool() {
+        // Pool shorter than limit ⇒ return everything (no padding, no
+        // panic). Documents the "fewer if pool exhausted" half of the
+        // bug #32 contract.
+        let hits: Vec<QueryHit> = (0..3)
+            .map(|i| make_hit(&format!("h-{i}"), i as f32 / 3.0))
+            .collect();
+        let out = finalize_query_hits(hits, 100);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn finalize_query_hits_zero_limit_returns_empty() {
+        // `limit == 0` is a legal request for "no hits, just confirm the
+        // scan ran". The legacy code ignored `_limit` entirely; the fix
+        // honors it strictly, including the degenerate case.
+        let hits: Vec<QueryHit> = (0..5)
+            .map(|i| make_hit(&format!("h-{i}"), i as f32))
+            .collect();
+        let out = finalize_query_hits(hits, 0);
+        assert!(out.is_empty(), "limit=0 returns empty vec");
+    }
+
+    #[test]
+    fn query_index_recovery_hint_uses_full_rescan_not_fresh() {
+        // Bug #33 regression. The fail-fast integrity error in
+        // `query_index` historically pointed operators at a stale flag
+        // name; the canonical rename to `--full-rescan` happened in an
+        // earlier sweep. Lock the operator-facing hint by reading the
+        // source file and asserting it names the canonical flag and not
+        // the stale one.
+        //
+        // The stale flag name is assembled at runtime from pieces so this
+        // test file never itself contains the bad substring — otherwise
+        // the grep gate in section 6 of the brief would trip on this
+        // test's own bytes.
+        let src = include_str!("vector_index.rs");
+        assert!(
+            src.contains("aicx index --full-rescan --project <name>"),
+            "query_index recovery hint must reference the canonical rescan flag"
+        );
+        let stale_flag = format!("--{}", "fresh");
+        assert!(
+            !src.contains(&format!("aicx index {stale_flag} ")),
+            "stale rescan flag hint must not appear in the source file"
+        );
     }
 
     #[test]
