@@ -407,9 +407,14 @@ pub struct SteerParams {
     pub kind: Option<String>,
     /// Filter by frame/channel: user_msg, agent_reply, internal_thought, tool_call
     pub frame_kind: Option<FrameKind>,
-    /// Filter by project (case-insensitive substring)
+    /// Filter by project using strict canonical `<organization>/<repository>`
+    /// matching (case-insensitive). Bare names match either an organization
+    /// or a repository token; `owner/` matches every repo under that owner;
+    /// `/repo` matches that repo across all owners. Substring matching is
+    /// intentionally not supported — `vista` does NOT match `vista-portal`.
     pub project: Option<String>,
-    /// Optional project filters for cross-project steering.
+    /// Optional project filters for cross-project steering. Each entry uses
+    /// the same strict canonical semantics as `project`.
     pub projects: Option<Vec<String>>,
     /// Filter by date (YYYY-MM-DD, or range like 2026-03-20..2026-03-28)
     pub date: Option<String>,
@@ -993,7 +998,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_steer",
-        description = "Retrieve chunks by steering metadata. Supports project/projects, run_id, prompt_id, agent, kind, frame_kind, and date filters."
+        description = "Retrieve chunks by steering metadata. Supports project/projects (strict canonical <organization>/<repository> matching — `vista` does NOT match `vista-portal`; use `owner/repo`, `owner/`, or `/repo` wildcards for explicit scopes), run_id, prompt_id, agent, kind, frame_kind, and date filters."
     )]
     async fn steer(
         &self,
