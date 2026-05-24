@@ -696,7 +696,6 @@ fn fuzzy_search_store_one(
 ) -> io::Result<(Vec<FuzzyResult>, usize)> {
     let normalized_query = normalize_query(query);
     let query_terms: Vec<&str> = normalized_query.split_whitespace().collect();
-    let project_filter_lower = project_filter.map(|filter| filter.to_lowercase());
 
     let mut results = Vec::new();
     let mut total_scanned = 0usize;
@@ -716,10 +715,19 @@ fn fuzzy_search_store_one(
             continue;
         }
 
-        if let Some(ref filter) = project_filter_lower
-            && !stored_file.project.to_lowercase().contains(filter)
-        {
-            continue;
+        // Strict canonical project filter: split the stored `<owner>/<repo>`
+        // slug and delegate to `store::project_filter_matches` so the rank
+        // fallback fuzzy path agrees with store / dashboard / steer / mcp.
+        // Substring fallback (`-p vista` matching `vista-portal`, etc.) is
+        // intentionally removed — Bug #38.
+        if let Some(filter) = project_filter {
+            let (organization, repository) = stored_file
+                .project
+                .split_once('/')
+                .unwrap_or(("", stored_file.project.as_str()));
+            if !store::project_filter_matches(organization, repository, filter) {
+                continue;
+            }
         }
 
         total_scanned += 1;

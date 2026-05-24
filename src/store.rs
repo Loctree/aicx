@@ -1687,7 +1687,7 @@ fn scan_repo_store(
 /// no longer matched `vista-portal`, `VistaBrain`, `vista-datasets`, etc.
 /// Operators get the same effect with `-p vetcoders/Vista -p vetcoders/vista-portal …`
 /// when they really mean a list.
-pub(crate) fn project_filter_matches(organization: &str, repository: &str, filter: &str) -> bool {
+pub fn project_filter_matches(organization: &str, repository: &str, filter: &str) -> bool {
     let filter = filter.trim();
     if filter.is_empty() {
         return false;
