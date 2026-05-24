@@ -625,7 +625,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_search",
-        description = "Semantic search over the canonical corpus. Fails fast with kind/reason/recommendation when the index or embedder is not ready."
+        description = "Semantic search over the canonical corpus. Fails fast with kind/reason/recommendation when the index or embedder is not ready. Filter pushdown (agent/score/date/hours) iterates a bounded retrieval pool (up to 10x the requested limit) so a corpus whose top-N raw hits all sit outside the filter window still surfaces inside-window matches further down the ranking instead of returning silent-empty. When the cap is examined without satisfying the limit, the response carries a `filter_pushdown` payload with `kind=\"filter_yielded_partial\"` so callers can distinguish bounded under-delivery from a genuinely empty corpus."
     )]
     async fn search(
         &self,
@@ -707,29 +707,51 @@ impl AicxMcpServer {
             },
             None => None,
         };
-        let fetch_limit = if score.is_some() || date.is_some() || hours > 0 {
-            limit.saturating_mul(5).max(50)
-        } else {
-            limit
-        };
-
         let store_root = store::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
 
-        // Semantic-only dispatch. No fuzzy fallback. When a precondition
-        // is missing (embedder unhydrated, index not built, ...) return
-        // a structured McpError carrying the same `kind` + `reason` +
-        // `recommendation` triple the CLI fail-fast surface emits, so an
-        // MCP caller has the same diagnostic to act on.
-        let outcome = match crate::search_engine::try_semantic_search(
+        // Build the canonical filter pushdown for the retrieval primitive.
+        // Date filter (explicit `date` or shorthand `since`) wins over
+        // `--hours`, preserving the legacy precedence.
+        let date_effective = date.clone().or(params.since.clone());
+        let (date_lo, date_hi) = if let Some(ref date_filter) = date_effective {
+            parse_date_filter_mcp(date_filter)
+        } else {
+            (None, params.until.clone())
+        };
+        let hours_cutoff = if hours > 0 && date_lo.is_none() && date_hi.is_none() {
+            let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
+            Some(cutoff.format("%Y-%m-%d").to_string())
+        } else {
+            None
+        };
+        let post_filters = crate::search_engine::SemanticSearchFilters {
+            agent: params.agent.clone(),
+            score_min: score,
+            date_lo: date_lo.clone(),
+            date_hi: date_hi.clone(),
+            hours_cutoff: hours_cutoff.clone(),
+        };
+
+        // Semantic-only dispatch with filter pushdown. No fuzzy fallback.
+        // The wrapper iterates a bounded retrieval pool (`FILTER_EXAMINED_CAP_RATIO`
+        // x `limit`) so the canonical pathology — top-N raw hits sit
+        // outside the filter window while valid hits exist below — does
+        // not surface as silent-empty. When a precondition is missing
+        // (embedder unhydrated, index not built, ...) the wrapper still
+        // returns a structured McpError carrying the same `kind` +
+        // `reason` + `recommendation` triple the CLI fail-fast surface
+        // emits.
+        let filtered = match crate::search_engine::try_semantic_search_filtered(
             &store_root,
             &query,
-            fetch_limit,
+            limit,
             &project_scopes,
             frame_kind,
             kind_filter.map(|kind| kind.dir_name()),
+            &post_filters,
         ) {
-            Ok(outcome) => outcome,
+            Ok(filtered) => filtered,
             Err(err) => {
                 // D-6: arm the negative cache on real embedder failures so
                 // subsequent requests fail-fast for MCP_EMBEDDER_NEGATIVE_TTL
@@ -757,44 +779,13 @@ impl AicxMcpServer {
                 ));
             }
         };
+        let crate::search_engine::FilteredSemanticOutcome {
+            outcome,
+            diagnostic: pushdown_diagnostic,
+        } = filtered;
         let scanned = outcome.scanned;
         let retrieval_status = outcome.retrieval_status.clone();
-        let results = outcome.results;
-
-        let mut results = results;
-
-        if let Some(min_score) = score {
-            results.retain(|result| result.score >= min_score);
-        }
-        if let Some(ref agent_filter) = params.agent {
-            results.retain(|r| r.agent == *agent_filter);
-        }
-
-        let date_effective = date.or(params.since.clone());
-        let (lo, hi) = if let Some(ref date_filter) = date_effective {
-            parse_date_filter_mcp(date_filter)
-        } else {
-            (None, params.until.clone())
-        };
-
-        let mut results: Vec<_> = if lo.is_some() || hi.is_some() {
-            results
-                .into_iter()
-                .filter(|result| {
-                    lo.as_deref().is_none_or(|lo| result.date.as_str() >= lo)
-                        && hi.as_deref().is_none_or(|hi| result.date.as_str() <= hi)
-                })
-                .collect()
-        } else if hours > 0 {
-            let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
-            let cutoff_date = cutoff.format("%Y-%m-%d").to_string();
-            results
-                .into_iter()
-                .filter(|result| result.date >= cutoff_date)
-                .collect()
-        } else {
-            results
-        };
+        let mut results = outcome.results;
 
         if let Some(sort_order) = params.sort.as_deref() {
             results.sort_by(|a, b| {
@@ -833,13 +824,17 @@ impl AicxMcpServer {
                 source_paths_verified,
             )
         };
-        let json =
+        let rendered =
             rank::render_search_json_with_oracle(&store_root, &results, scanned, oracle_status)
                 .map_err(|e| {
                     McpError::internal_error(format!("Serialize search JSON: {e}"), None)
                 })?;
+        let payload = inject_filter_pushdown_diagnostic(&rendered, pushdown_diagnostic.as_ref())
+            .map_err(|e| {
+                McpError::internal_error(format!("Inject filter_pushdown JSON: {e}"), None)
+            })?;
 
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![Content::text(payload)]))
     }
 
     #[tool(
@@ -1417,6 +1412,23 @@ fn parse_date_filter_mcp(date: &str) -> (Option<String>, Option<String>) {
     } else {
         (Some(date.to_string()), Some(date.to_string()))
     }
+}
+
+/// Merge an optional `filter_pushdown` diagnostic into the JSON payload
+/// rendered by `rank::render_search_json_with_oracle`. Additive: callers
+/// that ignore the field see the canonical search response untouched.
+fn inject_filter_pushdown_diagnostic(
+    rendered: &str,
+    diagnostic: Option<&crate::search_engine::FilterPushdownDiagnostic>,
+) -> Result<String, serde_json::Error> {
+    let Some(diag) = diagnostic else {
+        return Ok(rendered.to_string());
+    };
+    let mut value: serde_json::Value = serde_json::from_str(rendered)?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("filter_pushdown".to_string(), serde_json::to_value(diag)?);
+    }
+    serde_json::to_string(&value)
 }
 
 fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, McpError> {

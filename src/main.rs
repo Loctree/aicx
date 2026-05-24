@@ -4742,47 +4742,88 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     };
 
     let root = store::store_base_dir()?;
-    // Fetch more results pre-filter so score/date/hours filtering has material to work with.
-    let fetch_limit = if effective_date.is_some()
-        || filters.score.is_some()
-        || hours > 0
-        || filters.since.is_some()
-        || filters.until.is_some()
-    {
-        filters.limit.saturating_mul(5).max(50)
+
+    // Build the canonical filter pushdown for the retrieval primitive.
+    // The explicit date filter wins over `--hours`, matching legacy
+    // precedence preserved by the wrapper.
+    let (date_lo, date_hi) = if let Some(ref d) = effective_date {
+        parse_date_filter(d)?
     } else {
-        filters.limit
+        (filters.since.clone(), filters.until.clone())
+    };
+    let hours_cutoff = if hours > 0 && date_lo.is_none() && date_hi.is_none() {
+        Some(lookback_cutoff(hours).format("%Y-%m-%d").to_string())
+    } else {
+        None
+    };
+    let post_filters = aicx::search_engine::SemanticSearchFilters {
+        agent: filters.agent.clone(),
+        score_min: filters.score,
+        date_lo: date_lo.clone(),
+        date_hi: date_hi.clone(),
+        hours_cutoff: hours_cutoff.clone(),
     };
 
     let resolved_projects = resolve_project_filters_or_error(projects)?;
     let scopes = project_scopes(&resolved_projects);
 
-    let (mut results, scanned, semantic_status) = if no_semantic {
-        let (results, scanned) = rank::fuzzy_search_store(
+    let (mut results, scanned, semantic_status, pushdown_diagnostic) = if no_semantic {
+        // Fuzzy path keeps the legacy "fetch then post-filter" shape —
+        // `rank::fuzzy_search_store` is not on the hybrid retrieval
+        // primitive and is operator-requested explicitly via
+        // `--no-semantic`, so we leave it alone.
+        let fuzzy_fetch_limit = if post_filters.is_active() {
+            filters.limit.saturating_mul(5).max(50)
+        } else {
+            filters.limit
+        };
+        let (mut results, scanned) = rank::fuzzy_search_store(
             &root,
             &search_query,
-            fetch_limit,
+            fuzzy_fetch_limit,
             &scopes,
             filters.frame_kind.map(Into::into),
         )?;
-        (results, scanned, None)
+        if let Some(min_score) = post_filters.score_min {
+            results.retain(|r| r.score >= min_score);
+        }
+        if let Some(ref agent_filter) = post_filters.agent {
+            results.retain(|r| r.agent == *agent_filter);
+        }
+        if post_filters.date_lo.is_some() || post_filters.date_hi.is_some() {
+            let lo = post_filters.date_lo.as_deref();
+            let hi = post_filters.date_hi.as_deref();
+            results.retain(|r| {
+                lo.is_none_or(|lo| r.date.as_str() >= lo)
+                    && hi.is_none_or(|hi| r.date.as_str() <= hi)
+            });
+        } else if let Some(ref cutoff) = post_filters.hours_cutoff {
+            let cutoff = cutoff.as_str();
+            results.retain(|r| r.date.as_str() >= cutoff);
+        }
+        (results, scanned, None, None)
     } else {
-        match aicx::search_engine::try_semantic_search(
+        match aicx::search_engine::try_semantic_search_filtered(
             &root,
             &search_query,
-            fetch_limit,
+            filters.limit,
             &scopes,
             filters.frame_kind.map(Into::into),
             kind_filter.map(|kind| kind.dir_name()),
+            &post_filters,
         ) {
-            Ok(outcome) => {
+            Ok(filtered) => {
+                let aicx::search_engine::FilteredSemanticOutcome {
+                    outcome,
+                    diagnostic,
+                } = filtered;
                 let status = (
                     outcome.backend_label,
                     outcome.model_id.clone(),
                     outcome.scanned,
                     outcome.retrieval_status.clone(),
                 );
-                (outcome.results, outcome.scanned, Some(status))
+                (outcome.results, outcome.scanned, Some(status), diagnostic)
             }
             Err(err) => {
                 let payload = serde_json::json!({
@@ -4810,42 +4851,12 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         }
     };
 
+    // Defensive kind retain: the semantic path pushes `kind_filter`
+    // into the hybrid query, but we keep the explicit check so a future
+    // index regression cannot smuggle off-kind hits past the operator.
     if let Some(kind_filter) = kind_filter {
         results.retain(|r| r.kind == kind_filter.dir_name());
     }
-    if let Some(min_score) = filters.score {
-        results.retain(|r| r.score >= min_score);
-    }
-    if let Some(agent_filter) = &filters.agent {
-        results.retain(|r| r.agent == *agent_filter);
-    }
-
-    // Apply date filter (day granularity) — takes priority over hours.
-    let (lo, hi) = if let Some(ref d) = effective_date {
-        let bounds = parse_date_filter(d)?;
-        (bounds.0, bounds.1)
-    } else {
-        (filters.since.clone(), filters.until.clone())
-    };
-
-    let mut results: Vec<_> = if lo.is_some() || hi.is_some() {
-        results
-            .into_iter()
-            .filter(|r| {
-                lo.as_ref().is_none_or(|lo| r.date.as_str() >= lo.as_str())
-                    && hi.as_ref().is_none_or(|hi| r.date.as_str() <= hi.as_str())
-            })
-            .collect()
-    } else if hours > 0 {
-        let cutoff = lookback_cutoff(hours);
-        let cutoff_date = cutoff.format("%Y-%m-%d").to_string();
-        results
-            .into_iter()
-            .filter(|r| r.date >= cutoff_date)
-            .collect()
-    } else {
-        results
-    };
 
     if let Some(sort_order) = filters.sort {
         results.sort_by(|a, b| {
@@ -4896,15 +4907,29 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
             }
             None => rank::search_oracle_status(&root, &results, scanned),
         };
-        println!(
-            "{}",
-            rank::render_search_json_with_oracle(&root, &results, scanned, oracle_status)?
-        );
+        let rendered =
+            rank::render_search_json_with_oracle(&root, &results, scanned, oracle_status)?;
+        let payload = inject_filter_pushdown_diagnostic(&rendered, pushdown_diagnostic.as_ref())?;
+        println!("{}", payload);
         return Ok(());
     }
 
     if results.is_empty() {
         eprintln!("No matches for {:?} (scanned {} chunks).", query, scanned);
+        if let Some(ref diag) = pushdown_diagnostic {
+            eprintln!(
+                "  filter_pushdown: kind={} examined={} matched={} requested_limit={} cap_ratio={}x",
+                diag.kind,
+                diag.examined,
+                diag.matched,
+                diag.requested_limit,
+                diag.examined_cap_ratio
+            );
+            eprintln!(
+                "  hint: examined the bounded retrieval cap; widen the filter \
+                 or rebuild the index if the corpus is expected to satisfy it."
+            );
+        }
         return Ok(());
     }
 
@@ -4915,27 +4940,52 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     let _ = io::stdout().flush();
 
     if io::stderr().is_terminal() {
-        eprintln!(
-            "\n{}",
-            match semantic_status {
-                Some((semantic_backend, semantic_model_id, semantic_scanned, retrieval_status)) => {
-                    aicx::search_engine::render_semantic_status_line(
-                        semantic_backend,
-                        &semantic_model_id,
-                        results.len(),
-                        semantic_scanned,
-                        retrieval_status.as_ref(),
-                    )
-                }
-                None => format!(
-                    "{} result(s) from {} scanned chunks. oracle_status: backend=filesystem_fuzzy index=none fallback=operator_requested loctree_scope_safe=false",
+        let base_line = match semantic_status {
+            Some((semantic_backend, semantic_model_id, semantic_scanned, retrieval_status)) => {
+                aicx::search_engine::render_semantic_status_line(
+                    semantic_backend,
+                    &semantic_model_id,
                     results.len(),
-                    scanned
-                ),
+                    semantic_scanned,
+                    retrieval_status.as_ref(),
+                )
             }
-        );
+            None => format!(
+                "{} result(s) from {} scanned chunks. oracle_status: backend=filesystem_fuzzy index=none fallback=operator_requested loctree_scope_safe=false",
+                results.len(),
+                scanned
+            ),
+        };
+        let suffix = pushdown_diagnostic
+            .as_ref()
+            .map(|d| {
+                format!(
+                    " filter_pushdown={} examined={} matched={} requested_limit={}",
+                    d.kind, d.examined, d.matched, d.requested_limit
+                )
+            })
+            .unwrap_or_default();
+        eprintln!("\n{}{}", base_line, suffix);
     }
     Ok(())
+}
+
+/// Merge an optional `filter_pushdown` diagnostic into the JSON payload
+/// rendered by `rank::render_search_json_with_oracle`. Keeps the
+/// payload shape additive — callers that ignore the field see the
+/// canonical search response untouched.
+fn inject_filter_pushdown_diagnostic(
+    rendered: &str,
+    diagnostic: Option<&aicx::search_engine::FilterPushdownDiagnostic>,
+) -> Result<String> {
+    let Some(diag) = diagnostic else {
+        return Ok(rendered.to_string());
+    };
+    let mut value: serde_json::Value = serde_json::from_str(rendered)?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("filter_pushdown".to_string(), serde_json::to_value(diag)?);
+    }
+    Ok(serde_json::to_string(&value)?)
 }
 
 /// Default canonical config template written by `aicx config init`.
