@@ -5882,7 +5882,7 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
             "! Warning: dashboard server is binding beyond loopback on http://{}:{}",
             host, args.port
         );
-        eprintln!("  CORS policy: {}", cors_policy.describe());
+        eprintln!("  CORS policy: {}", cors_policy.label());
     }
 
     let config = DashboardServerConfig {
