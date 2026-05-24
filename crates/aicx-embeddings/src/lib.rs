@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 pub mod cloud;
 mod config;
-mod hf_cache;
+pub mod hf_cache;
 
 #[cfg(feature = "gguf")]
 mod gguf;

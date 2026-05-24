@@ -5134,6 +5134,19 @@ fn run_config_show(json: bool) -> Result<()> {
     let (effective_path_display, effective_branch, marker_line) =
         describe_effective_config(&effective);
 
+    // HF cache probing: surface whether the configured profile is hydrated
+    // and which other profiles (if any) have a usable snapshot already.
+    // Lets operators recover from the "runtime default base 0.6B missing,
+    // premium 1.7B already cached" situation without grep-debugging.
+    let current_cache_path = aicx::embedder::hf_cache::snapshot_path_for_profile(cfg.profile);
+    let cache_present = current_cache_path.is_some();
+    let cached_profiles = aicx::embedder::hf_cache::detect_cached_profiles();
+    let suggested_profile = if !cache_present {
+        cached_profiles.iter().find(|&&p| p != cfg.profile).copied()
+    } else {
+        None
+    };
+
     if json {
         let payload = serde_json::json!({
             "backend": cfg.backend.as_str(),
@@ -5144,6 +5157,8 @@ fn run_config_show(json: bool) -> Result<()> {
                 "dimension_hint": resolved.dimension_hint,
                 "approx_size": resolved.approx_size,
                 "from_legacy_repo": resolved.from_legacy_repo,
+                "cache_present": cache_present,
+                "cache_path": current_cache_path.as_ref().map(|p| p.display().to_string()),
             },
             "cloud": cfg.cloud.as_ref().map(|c| serde_json::json!({
                 "url": c.url,
@@ -5157,6 +5172,8 @@ fn run_config_show(json: bool) -> Result<()> {
             "effective_branch": effective_branch,
             "config_path": canonical_path.as_ref().map(|p| p.display().to_string()),
             "cloud_section_present": cloud_set,
+            "available_cached_profiles": cached_profiles.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+            "suggested_profile": suggested_profile.map(|p| p.as_str()),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
@@ -5180,6 +5197,23 @@ fn run_config_show(json: bool) -> Result<()> {
     eprintln!("  native.approx_size:    {}", resolved.approx_size);
     if resolved.from_legacy_repo {
         eprintln!("  native.from_legacy_repo: true (auto-mapped to F2LLM GGUF)");
+    }
+    eprintln!("  native.cache_present:  {cache_present}");
+    if let Some(path) = &current_cache_path {
+        eprintln!("  native.cache_path:     {}", path.display());
+    }
+    if !cached_profiles.is_empty() {
+        let names: Vec<&str> = cached_profiles.iter().map(|p| p.as_str()).collect();
+        eprintln!("  available_cached_profiles: {}", names.join(", "));
+    } else {
+        eprintln!("  available_cached_profiles: <none — run `hf download` first>");
+    }
+    if let Some(sug) = suggested_profile {
+        let sug_name = sug.as_str();
+        eprintln!(
+            "  suggested_profile:     {sug_name} (HF cache has it hydrated — set \
+             `AICX_EMBEDDER_PROFILE={sug_name}` or `profile = \"{sug_name}\"` in config.toml)"
+        );
     }
     if let Some(cloud) = &cfg.cloud {
         eprintln!("  cloud.url:           {}", cloud.url);
