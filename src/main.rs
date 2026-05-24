@@ -486,12 +486,18 @@ enum ConfigAction {
 enum IndexAction {
     /// Show freshness and pending-corpus status for the semantic index.
     Status {
-        /// Strict project filter: `owner/repo`, `/repo` (cross-org repo
-        /// name), `owner/` (org wildcard), or `name` (matches org OR
-        /// repo). Substring matching is intentionally disabled — `-p vista`
-        /// no longer leaks into `vista-portal`/`vista-datasets`.
-        #[arg(short, long)]
-        project: Option<String>,
+        /// Strict project filter, repeatable. Same shapes as `aicx index`:
+        ///   `-p owner/repo`   strict `<owner>/<repo>` slug match
+        ///   `-p owner/`       all repos under that owner (org wildcard)
+        ///   `-p /repo`        same repo name across every owner
+        ///   `-p name`         name matches an owner OR a repo (cross-org)
+        ///
+        /// Routed through the same canonical resolver as `aicx index`
+        /// (`resolve_filters_to_slugs` / `project_filter_matches`), so
+        /// `aicx index status -p X` and `aicx index -p X` always agree on
+        /// which buckets exist for the same `-p`.
+        #[arg(short, long, value_delimiter = ',')]
+        project: Vec<String>,
 
         /// Emit JSON status instead of plain text
         #[arg(short = 'j', long)]
@@ -1848,7 +1854,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             full_rescan,
         }) => match action {
             Some(IndexAction::Status { project, json }) => {
-                run_index_status(project.as_deref(), json)?;
+                run_index_status(&project, json)?;
             }
             None => run_index(&project, sample, json, dry_run, full_rescan)?,
         },
@@ -4649,6 +4655,26 @@ fn project_scopes(projects: &[String]) -> Vec<Option<&str>> {
     }
 }
 
+/// Canonical project resolver shared by `aicx index` and `aicx index
+/// status`. Routes raw user `-p` filters through
+/// `resolve_project_filters_or_error` (and ultimately
+/// `aicx::store::project_filter_matches`) so both commands canonicalize
+/// the same filter the same way and therefore agree on the resulting
+/// bucket set. Without this single chokepoint, `aicx index status -p X`
+/// could compute a bucket like `_codescribe` that `aicx index -p X`
+/// never built (bug #36).
+///
+/// `None` represents the `_all` cross-project bucket; `Some(slug)` is a
+/// canonical `<owner>/<repo>` slug exactly as `index` builds buckets for.
+fn resolve_index_scopes(projects: &[String]) -> Result<Vec<Option<String>>> {
+    let resolved = resolve_project_filters_or_error(projects)?;
+    Ok(if resolved.is_empty() {
+        vec![None]
+    } else {
+        resolved.into_iter().map(Some).collect()
+    })
+}
+
 /// Resolve user `-p` filters into canonical `<owner>/<repo>` slugs by
 /// enumerating the on-disk store. Empty input → empty output (caller treats
 /// it as "all projects"). Non-empty input that matches zero projects returns
@@ -5299,16 +5325,8 @@ fn run_index(
     dry_run: bool,
     full_rescan: bool,
 ) -> Result<()> {
-    let resolved_projects = resolve_project_filters_or_error(projects)?;
-    let scopes: Vec<Option<&str>> = if resolved_projects.is_empty() {
-        vec![None]
-    } else {
-        resolved_projects
-            .iter()
-            .map(String::as_str)
-            .map(Some)
-            .collect::<Vec<_>>()
-    };
+    let resolved_scopes = resolve_index_scopes(projects)?;
+    let scopes: Vec<Option<&str>> = resolved_scopes.iter().map(Option::as_deref).collect();
 
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr()) && !json;
 
@@ -5372,72 +5390,111 @@ fn run_index(
     Ok(())
 }
 
-fn run_index_status(project: Option<&str>, json: bool) -> Result<()> {
+fn run_index_status(projects: &[String], json: bool) -> Result<()> {
+    let resolved_scopes = resolve_index_scopes(projects)?;
     let client = aicx::Aicx::from_env()?;
-    let status = client.index_status(project)?;
+
+    let mut reports: Vec<(Option<String>, aicx::IndexStatus)> =
+        Vec::with_capacity(resolved_scopes.len());
+    for scope in &resolved_scopes {
+        let status = client.index_status(scope.as_deref())?;
+        reports.push((scope.clone(), status));
+    }
+
     if json {
-        println!("{}", serde_json::to_string_pretty(&status)?);
+        if reports.len() == 1 {
+            println!("{}", serde_json::to_string_pretty(&reports[0].1)?);
+        } else {
+            let payload = reports
+                .iter()
+                .map(|(scope, status)| {
+                    serde_json::json!({
+                        "project": scope.as_deref().unwrap_or("_all"),
+                        "status": status,
+                    })
+                })
+                .collect::<Vec<_>>();
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        }
     } else {
-        eprintln!("aicx index status");
-        eprintln!(
-            "  readiness:              {}",
-            match status.readiness {
-                aicx::IndexReadiness::Ready => "ready",
-                aicx::IndexReadiness::Pending => "pending (only temp checkpoint)",
-                aicx::IndexReadiness::Missing => "missing",
+        for (idx, (scope, status)) in reports.iter().enumerate() {
+            if reports.len() > 1 {
+                if idx > 0 {
+                    eprintln!();
+                }
+                eprintln!(
+                    "scope: {}",
+                    scope
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("_all")
+                );
             }
-        );
-        eprintln!("  backend:                {}", status.backend);
-        eprintln!("  project_bucket:         {}", status.project_bucket);
-        eprintln!("  canonical_chunks:       {}", status.canonical_chunks);
-        eprintln!(
-            "  semantic_index_present: {}",
-            status.semantic_index_present
-        );
-        eprintln!(
-            "  semantic_index_path:    {}",
-            status.semantic_index_path.as_deref().unwrap_or("<none>")
-        );
-        eprintln!("  semantic_index_rows:    {}", status.semantic_index_rows);
-        eprintln!(
-            "  committed_at:           {}",
-            status.committed_at.as_deref().unwrap_or("<none>")
-        );
-        eprintln!(
-            "  newest_chunk_mtime:     {}",
-            status.newest_chunk_mtime.as_deref().unwrap_or("<none>")
-        );
-        eprintln!(
-            "  semantic_index_mtime:   {}",
-            status.semantic_index_mtime.as_deref().unwrap_or("<none>")
-        );
-        eprintln!(
-            "  semantic_lag_secs:      {}",
-            status
-                .semantic_lag_secs
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "<unknown>".to_string())
-        );
-        eprintln!("  pending_chunks:         {}", status.pending_chunks);
-        eprintln!("  temp_index_present:     {}", status.temp_index_present);
-        eprintln!(
-            "  temp_index_path:        {}",
-            status.temp_index_path.as_deref().unwrap_or("<none>")
-        );
-        eprintln!("  temp_index_rows:        {}", status.temp_index_rows);
-        eprintln!(
-            "  temp_index_mtime:       {}",
-            status.temp_index_mtime.as_deref().unwrap_or("<none>")
-        );
-        eprintln!(
-            "  temp_index_bytes:       {}",
-            status
-                .temp_index_bytes
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "<none>".to_string())
-        );
+            print_index_status_text(status);
+        }
     }
     Ok(())
+}
+
+fn print_index_status_text(status: &aicx::IndexStatus) {
+    eprintln!("aicx index status");
+    eprintln!(
+        "  readiness:              {}",
+        match status.readiness {
+            aicx::IndexReadiness::Ready => "ready",
+            aicx::IndexReadiness::Pending => "pending (only temp checkpoint)",
+            aicx::IndexReadiness::Missing => "missing",
+        }
+    );
+    eprintln!("  backend:                {}", status.backend);
+    eprintln!("  project_bucket:         {}", status.project_bucket);
+    eprintln!("  canonical_chunks:       {}", status.canonical_chunks);
+    eprintln!(
+        "  semantic_index_present: {}",
+        status.semantic_index_present
+    );
+    eprintln!(
+        "  semantic_index_path:    {}",
+        status.semantic_index_path.as_deref().unwrap_or("<none>")
+    );
+    eprintln!("  semantic_index_rows:    {}", status.semantic_index_rows);
+    eprintln!(
+        "  committed_at:           {}",
+        status.committed_at.as_deref().unwrap_or("<none>")
+    );
+    eprintln!(
+        "  newest_chunk_mtime:     {}",
+        status.newest_chunk_mtime.as_deref().unwrap_or("<none>")
+    );
+    eprintln!(
+        "  semantic_index_mtime:   {}",
+        status.semantic_index_mtime.as_deref().unwrap_or("<none>")
+    );
+    eprintln!(
+        "  semantic_lag_secs:      {}",
+        status
+            .semantic_lag_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string())
+    );
+    eprintln!("  pending_chunks:         {}", status.pending_chunks);
+    eprintln!("  temp_index_present:     {}", status.temp_index_present);
+    eprintln!(
+        "  temp_index_path:        {}",
+        status.temp_index_path.as_deref().unwrap_or("<none>")
+    );
+    eprintln!("  temp_index_rows:        {}", status.temp_index_rows);
+    eprintln!(
+        "  temp_index_mtime:       {}",
+        status.temp_index_mtime.as_deref().unwrap_or("<none>")
+    );
+    eprintln!(
+        "  temp_index_bytes:       {}",
+        status
+            .temp_index_bytes
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<none>".to_string())
+    );
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -6439,6 +6496,109 @@ mod tests {
             extraction_source_key_aliases(LEGACY_ALL_WATERMARK_AGENTS, &project_a),
             extraction_source_key_aliases(LEGACY_ALL_WATERMARK_AGENTS, &project_b)
         );
+    }
+
+    /// Bug #36 regression: prove `aicx index status -p X` and
+    /// `aicx index -p X` produce the same bucket set for every canonical
+    /// filter shape. Both surfaces must canonicalize through
+    /// `aicx::store::resolve_filters_to_slugs` before computing bucket
+    /// paths, so any `-p X` that `index` would build IS the bucket set
+    /// that `index status` reports on (and vice versa).
+    #[test]
+    fn index_status_routes_through_index_canonical_resolver() {
+        use std::collections::BTreeSet;
+
+        let root = unique_test_dir("index-status-canonical");
+        let _ = fs::remove_dir_all(&root);
+        let canonical_root = root.join("store");
+
+        // Canonical on-disk store: 4 buckets across 2 orgs / 3 repo names.
+        // Mixed case mirrors real-world GitHub slugs (filesystem preserves it).
+        let bucket_slugs = [
+            "VetCoders/Loctree",
+            "VetCoders/aicx",
+            "Szowesgad/Loctree",
+            "Szowesgad/CodeScribe",
+        ];
+        for slug in bucket_slugs {
+            fs::create_dir_all(canonical_root.join(slug)).unwrap();
+        }
+
+        // Corresponding semantic index buckets (lowercase + `/` → `_`).
+        for bucket in [
+            "vetcoders_loctree",
+            "vetcoders_aicx",
+            "szowesgad_loctree",
+            "szowesgad_codescribe",
+        ] {
+            let dir = root.join("indexed").join(bucket);
+            fs::create_dir_all(&dir).unwrap();
+            // Header + one row so semantic_index_present flips to true.
+            write_file(
+                &dir.join("embeddings.ndjson"),
+                "{\"schema_version\":\"1.0\"}\n{\"id\":\"a\"}\n",
+            );
+        }
+
+        // The 4 canonical filter shapes from the bug brief.
+        let shapes: &[(&str, &[&str])] = &[
+            // strict slug
+            ("VetCoders/Loctree", &["vetcoders_loctree"]),
+            // org wildcard
+            ("VetCoders/", &["vetcoders_aicx", "vetcoders_loctree"]),
+            // cross-org repo
+            ("/Loctree", &["szowesgad_loctree", "vetcoders_loctree"]),
+            // bare name (matches as repo name across orgs)
+            ("Loctree", &["szowesgad_loctree", "vetcoders_loctree"]),
+        ];
+
+        for (filter, expected_buckets) in shapes {
+            // Step 1: canonical resolver (the shared chokepoint both
+            // `aicx index` and `aicx index status` route through after
+            // bug #36 is fixed).
+            let resolved =
+                aicx::store::resolve_filters_to_slugs_at(&canonical_root, &[(*filter).to_string()])
+                    .unwrap_or_else(|e| panic!("resolver failed for {filter:?}: {e}"));
+
+            assert!(
+                !resolved.is_empty(),
+                "filter {filter:?} must resolve to at least one slug"
+            );
+
+            // Step 2: for each canonical slug, ask the public status API
+            // (exactly what `run_index_status` calls). The bucket it
+            // reports IS the bucket `run_index` would have built.
+            let actual_buckets: BTreeSet<String> = resolved
+                .iter()
+                .map(|slug| {
+                    aicx::api::index_status_at(&root, Some(slug.as_str()))
+                        .unwrap_or_else(|e| panic!("index_status_at failed for slug {slug:?}: {e}"))
+                        .project_bucket
+                })
+                .collect();
+
+            let expected: BTreeSet<String> =
+                expected_buckets.iter().map(|s| (*s).to_string()).collect();
+
+            assert_eq!(
+                actual_buckets, expected,
+                "filter {filter:?}: `aicx index status` bucket set must equal `aicx index` bucket set"
+            );
+
+            // And every reported bucket must actually be Ready on disk
+            // — proves the canonical slug round-trips to an existing
+            // index file, not a phantom like `_codescribe`.
+            for bucket in &actual_buckets {
+                let path = root.join("indexed").join(bucket).join("embeddings.ndjson");
+                assert!(
+                    path.exists(),
+                    "filter {filter:?} resolved to bucket {bucket:?} but no index file exists at {}",
+                    path.display()
+                );
+            }
+        }
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
