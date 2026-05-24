@@ -49,9 +49,9 @@ pub fn enforce_embed_input_budget(text: &str) -> Result<&str> {
     Ok(text)
 }
 pub use config::{
-    DEFAULT_BASE_FILENAME, DEFAULT_BASE_REPO, DEFAULT_DEV_FILENAME, DEFAULT_DEV_REPO,
-    DEFAULT_PREMIUM_FILENAME, DEFAULT_PREMIUM_REPO, config_search_paths, find_cached_model_file,
-    profile_spec,
+    ConfigSource, DEFAULT_BASE_FILENAME, DEFAULT_BASE_REPO, DEFAULT_DEV_FILENAME, DEFAULT_DEV_REPO,
+    DEFAULT_PREMIUM_FILENAME, DEFAULT_PREMIUM_REPO, config_search_paths,
+    config_search_paths_with_source, effective_config_source, find_cached_model_file, profile_spec,
 };
 
 /// Backend preference from config/env.

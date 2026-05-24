@@ -5140,6 +5140,11 @@ fn run_config_show(json: bool) -> Result<()> {
     let resolved = cfg.resolved_model();
     let cloud_set = cfg.cloud.is_some();
 
+    let canonical_path = canonical_config_path().ok();
+    let effective = aicx::embedder::effective_config_source();
+    let (effective_path_display, effective_branch, marker_line) =
+        describe_effective_config(&effective);
+
     if json {
         let payload = serde_json::json!({
             "backend": cfg.backend.as_str(),
@@ -5158,20 +5163,26 @@ fn run_config_show(json: bool) -> Result<()> {
                 "dimension": c.effective_dimension(),
                 "timeout_secs": c.effective_timeout_secs(),
             })),
-            "config_path": canonical_config_path().ok().map(|p| p.display().to_string()),
+            "canonical_config_path": canonical_path.as_ref().map(|p| p.display().to_string()),
+            "effective_config_path": effective.as_ref().map(|(p, _)| p.display().to_string()),
+            "effective_branch": effective_branch,
+            "config_path": canonical_path.as_ref().map(|p| p.display().to_string()),
             "cloud_section_present": cloud_set,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
 
-    let path_display = canonical_config_path()
-        .ok()
+    let canonical_display = canonical_path
+        .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<unresolved>".to_string());
 
     eprintln!("aicx config show — resolved embedder configuration");
-    eprintln!("  config_path: {path_display}");
+    eprintln!("  canonical_config_path: {canonical_display}");
+    eprintln!("  effective_config_path: {effective_path_display}");
+    eprintln!("  effective_branch:      {effective_branch}");
+    eprintln!("  {marker_line}");
     eprintln!("  backend:     {}", cfg.backend.as_str());
     eprintln!("  profile:     {}", cfg.profile.as_str());
     eprintln!("  native.repo:           {}", resolved.repo);
@@ -5194,6 +5205,46 @@ fn run_config_show(json: bool) -> Result<()> {
         eprintln!("  cloud:               <not configured> (run `aicx config init` to bootstrap)");
     }
     Ok(())
+}
+
+/// Render the human-readable `(effective_path, branch_name, marker_line)`
+/// triple used by both the plain-text and JSON paths of `aicx config show`.
+/// `None` means no config file was found and the embedder runs on built-in
+/// defaults — the marker then nudges `aicx config init`.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn describe_effective_config(
+    effective: &Option<(PathBuf, aicx::embedder::ConfigSource)>,
+) -> (String, &'static str, String) {
+    use aicx::embedder::ConfigSource;
+    match effective {
+        Some((path, ConfigSource::Env)) => (
+            path.display().to_string(),
+            "env",
+            format!(
+                "(loaded from: env $AICX_EMBEDDER_CONFIG -> {})",
+                path.display()
+            ),
+        ),
+        Some((path, ConfigSource::Canonical)) => (
+            path.display().to_string(),
+            "canonical",
+            format!("(loaded from: canonical -> {})", path.display()),
+        ),
+        Some((path, ConfigSource::Legacy)) => (
+            path.display().to_string(),
+            "legacy",
+            format!(
+                "(loaded from: legacy embedder.toml -> {} — run `aicx config init` to migrate to canonical config.toml)",
+                path.display()
+            ),
+        ),
+        None => (
+            "<built-in defaults>".to_string(),
+            "defaults",
+            "(no config file found; using built-in defaults — run `aicx config init` to materialize one)"
+                .to_string(),
+        ),
+    }
 }
 
 #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
@@ -6447,6 +6498,58 @@ mod tests {
     use super::*;
     use filetime::{FileTime, set_file_mtime};
     use std::fs;
+
+    /// Bug #26 regression: the four branches of `aicx config show`
+    /// must each render a distinct marker so an operator can tell at
+    /// a glance which file the embedder actually loaded (env override,
+    /// legacy embedder.toml, canonical config.toml, or built-in
+    /// defaults). Tests the pure marker formatter; the resolver itself
+    /// is covered in `aicx_embeddings::config::tests`.
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn config_show_marker_covers_all_four_branches() {
+        use aicx::embedder::ConfigSource;
+
+        let env_path = PathBuf::from("/tmp/op-override.toml");
+        let (path, branch, marker) =
+            describe_effective_config(&Some((env_path.clone(), ConfigSource::Env)));
+        assert_eq!(branch, "env");
+        assert_eq!(path, env_path.display().to_string());
+        assert!(
+            marker.contains("$AICX_EMBEDDER_CONFIG"),
+            "env marker must name the override var: {marker}"
+        );
+        assert!(marker.contains(&env_path.display().to_string()));
+
+        let canonical = PathBuf::from("/tmp/.aicx/config.toml");
+        let (path, branch, marker) =
+            describe_effective_config(&Some((canonical.clone(), ConfigSource::Canonical)));
+        assert_eq!(branch, "canonical");
+        assert_eq!(path, canonical.display().to_string());
+        assert!(marker.contains("canonical"));
+
+        let legacy = PathBuf::from("/tmp/.aicx/embedder.toml");
+        let (path, branch, marker) =
+            describe_effective_config(&Some((legacy.clone(), ConfigSource::Legacy)));
+        assert_eq!(branch, "legacy");
+        assert_eq!(path, legacy.display().to_string());
+        assert!(
+            marker.contains("aicx config init"),
+            "legacy marker must nudge migration: {marker}"
+        );
+
+        let (path, branch, marker) = describe_effective_config(&None);
+        assert_eq!(branch, "defaults");
+        assert_eq!(path, "<built-in defaults>");
+        assert!(
+            marker.contains("aicx config init"),
+            "defaults marker must nudge `aicx config init`: {marker}"
+        );
+        assert!(
+            marker.contains("no config file found"),
+            "defaults marker must say no file was found: {marker}"
+        );
+    }
 
     #[test]
     fn lookback_cutoff_zero_returns_all_time() {
