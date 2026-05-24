@@ -95,7 +95,13 @@ jobs:
 
       - name: cargo test
         working-directory: aicx
-        run: cargo test --locked --all-targets
+        # Cross-module AICX_HOME env-var contamination on macOS CI at default
+        # parallelism: vector_index / steer_index / crates / store tests each
+        # carry their own AICX_HOME_ENV_LOCK (or none), so identical/union
+        # re-ingest assertions race on std::env::set_var. --test-threads=2
+        # serializes the contending probes deterministically. Proper fix
+        # (shared pub(crate) lock) is tracked as a Wave F backlog item.
+        run: cargo test --locked --all-targets -- --test-threads=2
 
       - name: cargo test native GGUF
         working-directory: aicx
