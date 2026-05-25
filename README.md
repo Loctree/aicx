@@ -67,25 +67,32 @@ aicx --help
 aicx-mcp --version
 ```
 
+Before it writes binaries, `install.sh` scans the active install surface with
+`which -a aicx`, prints every version it can resolve, and warns if `PATH` might
+keep using another channel. After install it compares the installed binary with
+the `PATH`-resolved binary. Use `bash install.sh --dry-run` to preview shadow
+cleanup, or `AICX_INSTALL_FORCE=1` for non-interactive installs you have already
+checked.
+
 Direct release download with checksum and GPG verification:
 
 ```bash
-version=0.7.4
+version=0.9.0
 case "$(uname -s)-$(uname -m)" in
-  Darwin-arm64) target=aarch64-apple-darwin ;;
-  Linux-x86_64) target=x86_64-unknown-linux-gnu ;;
+  Darwin-arm64) target=aarch64-apple-darwin; ext=zip ;;
+  Linux-x86_64) target=x86_64-linux-gnu; ext=tar.gz ;;
   *) echo "unsupported platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
 esac
 
-asset="aicx-v${version}-${target}-slim-unsigned.tar.gz"
+asset="aicx-v${version}-${target}-slim.${ext}"
 base="https://github.com/Loctree/aicx/releases/download/v${version}"
 
 curl -fLO "${base}/${asset}"
 curl -fLO "${base}/${asset}.sha256"
-curl -fLO "${base}/${asset}.sig"
+curl -fLO "${base}/${asset}.asc"
 
 shasum -a 256 -c "${asset}.sha256"
-gpg --verify "${asset}.sig" "${asset}"
+gpg --verify "${asset}.asc" "${asset}"
 tar -xzf "${asset}"
 ```
 
@@ -112,15 +119,18 @@ From an existing checkout, you can force the same release path:
 
 ```bash
 AICX_INSTALL_MODE=release bash install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.6.6 bash install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.9.0 bash install.sh
 ```
 
-Current release assets are slim unsigned `.tar.gz` bundles for macOS arm64,
-Linux x64 GNU, and Linux arm64 GNU. The `.sha256` sidecar is mandatory.
+Current release assets are slim bundles for macOS arm64, Linux x64 GNU, and
+Windows x64 GNU. The `.sha256` sidecar is mandatory; detached `.asc` signatures
+are published with release archives.
 
-The npm wrapper track exists under `distribution/npm/`, but it is not the
-supported v0.6.5 install path until its platform packages are aligned with the
-current GitHub Release asset shape.
+The npm wrapper track exists under `distribution/npm/` and ships platform
+packages for macOS arm64, Linux x64 GNU, and Windows x64 GNU. npm postinstall
+warns about `~/.local/bin` or cargo-bin shadows by default. Set
+`AICX_NPM_REPLACE_LOCAL=1` if npm should remove older or equal local shadows
+during install.
 
 From an accessible GitHub repo when you want unreleased source:
 
@@ -143,6 +153,9 @@ cargo install --path . --locked --bin aicx --bin aicx-mcp
 
 `install.sh` prefers a colocated release bundle first, then a local checkout, and otherwise falls back to the published
 install path.
+
+See [`docs/install-paths.md`](./docs/install-paths.md) for the full channel map
+and shadow cleanup model.
 
 Maintainer-local signed bundle path on macOS:
 
