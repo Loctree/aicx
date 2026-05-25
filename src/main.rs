@@ -830,7 +830,12 @@ enum Commands {
         #[arg(long)]
         limit: Option<usize>,
 
-        /// Preview discovery/projection without writing JSON files.
+        /// Preview discovery without writing; emits a JSON envelope on
+        /// stdout (sessions_discovered, by_kind, by_agent, filters_applied)
+        /// and a human-readable summary banner on stderr.
+        ///
+        /// Pipe-friendly: `aicx conversations --dry-run --out-dir /tmp | jq .`
+        /// returns valid JSON; the operator banner still prints on stderr.
         #[arg(long)]
         dry_run: bool,
     },
@@ -2881,23 +2886,112 @@ fn run_conversations_batch(options: ConversationsBatchOptions) -> Result<()> {
     };
 
     let entries = sources::extract_claude(&config)?;
+
+    // Pre-compute discovery-aware histograms so dry-run can emit a
+    // pipe-friendly JSON envelope alongside the human banner (Wave D
+    // Cut D1 / B-P0-04 dual-channel parity with
+    // `migrate-intent-schema --dry-run`).
+    let by_kind = conversations_discovery_by_kind(&entries);
+    let by_agent = conversations_discovery_by_agent(&entries);
+
+    let dry_run = options.dry_run;
+    let hours = options.hours;
+    let limit = options.limit;
+    let project_filter_snapshot = options.project_filter.clone();
+    let agent_label = options.agent.clone();
+
     let summary = write_conversation_batch_outputs(ConversationBatchWriteOptions {
         agent_label: &options.agent,
         entries,
         project_filter: options.project_filter,
         out_dir: options.out_dir,
         limit: options.limit,
-        dry_run: options.dry_run,
+        dry_run,
         redaction_enabled: options.redact_secrets,
     })?;
 
-    eprintln!("sessions_discovered={}", summary.sessions_discovered);
-    eprintln!("sessions_written={}", summary.sessions_written);
-    eprintln!("messages_total={}", summary.messages_total);
-    eprintln!("output_dir={}", summary.output_dir.display());
-    eprintln!("failed_sessions={}", summary.failed_sessions);
+    if dry_run {
+        // Dual-channel emission (B-P0-04): JSON envelope on stdout for
+        // pipeline consumers (`aicx conversations --dry-run | jq .`),
+        // styled human banner on stderr for operators. Mirror the
+        // `migrate-intent-schema --dry-run` gold-pattern.
+        let envelope = serde_json::json!({
+            "dry_run": true,
+            "agent": agent_label,
+            "sessions_discovered": summary.sessions_discovered,
+            "messages_total": summary.messages_total,
+            "by_kind": by_kind,
+            "by_agent": by_agent,
+            "filters_applied": {
+                "project": project_filter_snapshot,
+                "hours": hours,
+                "limit": limit,
+            },
+            "output_dir": summary.output_dir.display().to_string(),
+        });
+        match serde_json::to_string_pretty(&envelope) {
+            Ok(rendered) => println!("{rendered}"),
+            Err(_) => println!("{envelope}"),
+        }
+
+        eprintln!("=== Conversations Dry-Run ===");
+        eprintln!("Agent:              {}", agent_label);
+        eprintln!("Sessions discovered: {}", summary.sessions_discovered);
+        eprintln!("Messages total:      {}", summary.messages_total);
+        eprintln!(
+            "Output dir (would write to): {}",
+            summary.output_dir.display()
+        );
+        if !by_kind.is_empty() {
+            eprintln!();
+            eprintln!("Per frame_kind:");
+            let mut kinds: Vec<(&String, &usize)> = by_kind.iter().collect();
+            kinds.sort_by(|a, b| b.1.cmp(a.1));
+            for (kind, count) in kinds {
+                eprintln!("  {:<24} {}", kind, count);
+            }
+        }
+    } else {
+        eprintln!("sessions_discovered={}", summary.sessions_discovered);
+        eprintln!("sessions_written={}", summary.sessions_written);
+        eprintln!("messages_total={}", summary.messages_total);
+        eprintln!("output_dir={}", summary.output_dir.display());
+        eprintln!("failed_sessions={}", summary.failed_sessions);
+    }
 
     Ok(())
+}
+
+/// Frame-kind histogram across the extracted timeline entries.
+///
+/// Used by the dry-run JSON envelope (B-P0-04). Entries without a
+/// `frame_kind` are bucketed under `"unknown"` so operators see the
+/// "noise floor" for sessions where the parser could not classify.
+fn conversations_discovery_by_kind(entries: &[timeline::TimelineEntry]) -> BTreeMap<String, usize> {
+    let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
+    for entry in entries {
+        let bucket = entry
+            .frame_kind
+            .map(|kind| kind.as_str().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        *by_kind.entry(bucket).or_insert(0) += 1;
+    }
+    by_kind
+}
+
+/// Agent histogram across the extracted timeline entries.
+///
+/// In conversations v1 the agent is always `"claude"` (the only
+/// supported source), but the field is emitted for forward-compat with
+/// future multi-agent exports.
+fn conversations_discovery_by_agent(
+    entries: &[timeline::TimelineEntry],
+) -> BTreeMap<String, usize> {
+    let mut by_agent: BTreeMap<String, usize> = BTreeMap::new();
+    for entry in entries {
+        *by_agent.entry(entry.agent.clone()).or_insert(0) += 1;
+    }
+    by_agent
 }
 
 fn write_conversation_batch_outputs(
