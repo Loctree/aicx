@@ -165,7 +165,7 @@ pub fn emit_and_error(cmd_name: &str, json: bool, failure: StructuredFailure) ->
 pub fn want_json_envelope(explicit_json_flag: bool) -> bool {
     explicit_json_flag
         || std::env::var("AICX_JSON")
-            .map(|v| !v.is_empty() && v != "0" && v.to_ascii_lowercase() != "false")
+            .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(false)
 }
 
