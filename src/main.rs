@@ -511,7 +511,7 @@ enum IndexAction {
 #[derive(Debug, Subcommand)]
 enum Commands {
     // ── Layer 1: Canonical corpus ─────────────────────────────────────
-    /// Extract + store Claude Code sessions into the canonical corpus (layer 1).
+    /// Extract + store Claude Code sessions into the canonical corpus (canonical corpus extraction).
     ///
     /// Reads ~/.claude/projects/ logs, deduplicates, chunks, and writes
     /// steerable markdown to ~/.aicx/.
@@ -581,7 +581,7 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract + store Codex sessions into the canonical corpus (layer 1).
+    /// Extract + store Codex sessions into the canonical corpus (canonical corpus extraction).
     ///
     /// Reads ~/.codex/history.jsonl, deduplicates, chunks, and writes
     /// steerable markdown to ~/.aicx/.
@@ -651,7 +651,7 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract + store from all agents (Claude + Codex + Gemini + Junie + CodeScribe) into the canonical corpus (layer 1).
+    /// Extract + store from all agents (Claude + Codex + Gemini + Junie + CodeScribe) into the canonical corpus (canonical corpus extraction).
     ///
     /// The daily-driver command: runs each extractor, deduplicates, chunks, and
     /// writes steerable markdown to ~/.aicx/. By default, uses per-source
@@ -819,7 +819,7 @@ enum Commands {
         dry_run: bool,
     },
 
-    /// Build the canonical corpus in ~/.aicx/ from agent logs (layer 1).
+    /// Build the canonical corpus in ~/.aicx/ from agent logs (canonical corpus extraction).
     ///
     /// Store-first corpus builder: extracts, deduplicates, chunks, and writes
     /// steerable markdown. By default, this command uses per-source watermarks
@@ -1031,7 +1031,7 @@ enum Commands {
         kind: Option<String>,
     },
 
-    /// Stream newly-arriving intents/chunks in a follow-like mode.
+    /// Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals.
     Tail {
         /// Repo or store-bucket filters. Omit to scan all projects.
         /// Repeated `-p` flags or comma list (`-p a,b`) form a union.
@@ -1258,7 +1258,7 @@ enum Commands {
         json: bool,
     },
 
-    /// Retrieve chunks by steering metadata.
+    /// Retrieve chunks by steering metadata (requires --features lance).
     Steer {
         /// Filter by run_id (exact match)
         #[arg(long)]
