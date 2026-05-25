@@ -150,3 +150,29 @@ Likely bounded / not-applicable direct reads:
      and `src/doctor.rs:1155`.
    - Decide whether state/lock/config metadata reads should be capped or
      documented permanently as bounded internal files.
+
+## 2026-05-24 PR #5 polarize addendum
+
+`vc-polarize` for SC-01 chose one boundary: PR #5 is a consolidated
+stabilization review surface, not a place to absorb more release/security scope.
+Keep new work out of this PR unless it closes an existing merge blocker.
+
+Current live evidence:
+
+- Loctree prism pass: score 11/15, band `9..12`, payload
+  `/Users/maciejgad/.vibecrafted/artifacts/Loctree/aicx/2026_0524/polarize/polr-222423-57363/prism.json`.
+- GitHub PR #5 is open, non-draft, mergeable, with green remote checks.
+- Local `make test` is red under Node.js v26 on the three
+  `dashboard::tests::test_inline_markdown_*` tests because
+  `require(...)` does not expose `md.inlineMarkdown`.
+- `docs/BUGFIXES.md` already records M-13 as deferred; keep that truth unless a
+  dedicated CSP nonce/header implementation lands in a separate scoped cut.
+
+Split / block list before merge:
+
+- Fix or explicitly platform-gate the dashboard inline-markdown Node harness.
+- Keep H-2 Layer 1 store/index reconciliation operator-side until a separate
+  PR owns it.
+- Keep broader extractor/UI diagnostic read-cap work in a separate follow-up.
+- Do not add new release-channel, installer, CSP nonce, or heartbeat work to
+  PR #5 unless the operator explicitly reopens the scope.

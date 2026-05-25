@@ -73,6 +73,7 @@ Bez ozdobników. Bez hype. Bez "production-ready". Fakty + ścieżka recovery.
 - 2026-05-11 [loctree/audit] Plan 21 source restore (P1 z 22_task_audit_report) — original task file zaginął, jest reconstruction; jeśli oryginał miał inne kryteria, reconstruction może nie matchować. — open
 - 2026-05-21 [aicx/tests] K-1 fake `tests/dashboard_security.rs` removed instead of pretending PATH-safe `run_memex_cli` behavior was tested. Recover: add a real integration test around PATH shim resolution if dashboard command execution becomes public/testable. — open
 - 2026-05-22 [prview] cargo geiger timeout 600s — upstream issue in prview-rs (out of aicx scope). Recover: track/fix in prview-rs, not this repository. — open
+- 2026-05-24 [aicx/pr5] PR #5 SC-01 polarize gate: branch remains a consolidated pass-2/3/4 stabilization PR, but local `make test` is red under Node.js v26 on `dashboard::tests::test_inline_markdown_*` (`md.inlineMarkdown is not a function`). Do not add more scope to PR #5; split release/security/follow-up work into separate PRs and fix or explicitly platform-gate the inline-markdown harness before merge. Recover: `make test` plus PR body/doc alignment from `/Users/maciejgad/.vibecrafted/artifacts/Loctree/aicx/2026_0524/polarize/polr-222423-57363/prism.json`. — open
 
 ---
 
