@@ -391,11 +391,13 @@ fn canonical_extractor_key(extractor: &str) -> &'static str {
         "codex" => "codex",
         "gemini" => "gemini",
         "junie" => "junie",
-        other => {
-            // Fallback: leak a static string for ad-hoc extractor labels. Only
-            // hit by unexpected callers; production code uses the 4 known keys.
-            debug_assert!(false, "unknown extractor key: {other}");
-            "claude"
+        _ => {
+            // Unknown extractor → explicit "unknown" bucket, never silent
+            // attribution to claude. Drop the debug_assert because legit
+            // future extractors will hit this path before they are added
+            // to the canonical key list, and release builds previously
+            // misattributed silently to the claude bucket.
+            "unknown"
         }
     }
 }
@@ -467,6 +469,37 @@ mod tests {
         let id = run_id().expect("run_id present after init");
         assert!(!id.is_empty());
         assert!(id.contains('Z') || id.contains('-'));
+    }
+
+    #[test]
+    fn unknown_extractor_routes_to_unknown_bucket_not_claude() {
+        // Regression guard for the release-build silent fallthrough that
+        // misattributed any unrecognized extractor name (e.g. a future
+        // "qwen" or a typo) into the "claude" bucket because
+        // `debug_assert!` is a no-op outside debug builds.
+        lock_test_init(false, None);
+        let p = PathBuf::from("/tmp/test.jsonl");
+        record("qwen", DiagnosticKind::FallbackTimestamp, 1, &p);
+        let state = lock_state();
+        let unknown = state
+            .extractors
+            .get("unknown")
+            .expect("unknown bucket present");
+        assert_eq!(
+            unknown.counts.get(&DiagnosticKind::FallbackTimestamp),
+            Some(&1),
+            "unknown extractor must route to the unknown bucket"
+        );
+        let claude_count = state
+            .extractors
+            .get("claude")
+            .and_then(|c| c.counts.get(&DiagnosticKind::FallbackTimestamp))
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(
+            claude_count, 0,
+            "unknown extractor must NOT bleed into the claude bucket"
+        );
     }
 
     #[test]
