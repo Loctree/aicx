@@ -2245,7 +2245,7 @@ mod tests {
         let output = Command::new("node")
             .arg("-e")
             .arg(
-                "const md=require(process.argv[1]); process.stdout.write(md.inlineMarkdown(process.argv[2]));",
+                "require(process.argv[1]); process.stdout.write(globalThis.AicxMarkdown.inlineMarkdown(process.argv[2]));",
             )
             .arg(module_path)
             .arg(markdown)
