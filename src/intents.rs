@@ -502,7 +502,7 @@ fn extend_with_cap<T>(
     target.extend(additions.into_iter().take(room));
     if !*warned {
         eprintln!(
-            "aicx::intents: {bucket_name} cap of {MAX_CANDIDATES} reached; dropped {dropped} entries"
+            "aicx intents: warning: {bucket_name} cap of {MAX_CANDIDATES} reached; dropped {dropped} entries"
         );
         *warned = true;
     }
