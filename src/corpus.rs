@@ -888,7 +888,9 @@ fn inc(map: &mut BTreeMap<String, usize>, key: String) {
 fn push_counts(out: &mut String, label: &str, counts: &BTreeMap<String, usize>) {
     out.push_str(&format!("{label}:\n"));
     if counts.is_empty() {
-        out.push_str("  (none)\n");
+        // Sentinel uniformity (Wave B §1.1, B-P1-07): `<none>` is the
+        // canonical "explicitly empty" marker across text output.
+        out.push_str("  <none>\n");
     } else {
         for (key, value) in counts {
             out.push_str(&format!("  {key}: {value}\n"));

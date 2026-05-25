@@ -1779,6 +1779,12 @@ pub fn format_report_text(report: &DoctorReport, verbose: bool) -> String {
     let mut out = String::new();
     out.push_str("aicx doctor report\n");
     out.push_str(&format!("Overall: {:?}\n\n", report.overall));
+    // B-P3-27 (Wave A3 §11 P1.6): `sidecar_coverage` is literally
+    // `sidecars.clone()` (see `populate_doctor_report`), so emitting it
+    // again here produced two identical `[Severity] sidecars: ...`
+    // rows. The JSON serializer still carries both fields for
+    // back-compat with the previous schema; the text path renders
+    // sidecars exactly once.
     let checks = [
         &report.canonical_store,
         &report.steer_lance,
@@ -1790,7 +1796,6 @@ pub fn format_report_text(report: &DoctorReport, verbose: bool) -> String {
         &report.semantic_health,
         &report.index_freshness,
         &report.index_consistency,
-        &report.sidecar_coverage,
         &report.embedder_warmth,
         &report.empty_body_chunks,
         &report.content_dedup,
