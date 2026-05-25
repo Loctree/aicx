@@ -1641,6 +1641,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
             warn_incremental_legacy_flag(incremental);
+            warn_pending_mutation("claude");
             run_extraction(ExtractionParams {
                 agents: &["claude"],
                 project,
@@ -1679,6 +1680,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
             warn_incremental_legacy_flag(incremental);
+            warn_pending_mutation("codex");
             run_extraction(ExtractionParams {
                 agents: &["codex"],
                 project,
@@ -1716,6 +1718,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
             warn_incremental_legacy_flag(incremental);
+            warn_pending_mutation("all");
             run_extraction(ExtractionParams {
                 agents: &["claude", "codex", "gemini", "junie", "codescribe"],
                 project,
@@ -1880,6 +1883,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
             warn_incremental_legacy_flag(incremental);
+            warn_pending_mutation("store");
             run_store(StoreRunArgs {
                 project,
                 agent,
@@ -2128,7 +2132,12 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             Some(IndexAction::Status { project, json }) => {
                 run_index_status(&project, json)?;
             }
-            None => run_index(&project, sample, json, dry_run, full_rescan)?,
+            None => {
+                if !dry_run {
+                    warn_pending_mutation("index");
+                }
+                run_index(&project, sample, json, dry_run, full_rescan)?
+            }
         },
         Some(Commands::Config { action }) => {
             run_config(action)?;
@@ -2165,6 +2174,9 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             store_root,
             no_intent_schema,
         }) => {
+            if !dry_run {
+                warn_pending_mutation("migrate");
+            }
             let manifest =
                 aicx::store::run_migration_with_paths(dry_run, legacy_root, store_root.clone())?;
             if !no_intent_schema {
@@ -2180,6 +2192,9 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             store_root,
             dry_run,
         }) => {
+            if !dry_run {
+                warn_pending_mutation("migrate-intent-schema");
+            }
             let report = if let Some(store_root) = store_root {
                 intents::migrate_intent_schema_dry_run_at(
                     &store_root.join(store::CANONICAL_STORE_DIRNAME),
@@ -3662,6 +3677,64 @@ fn warn_incremental_legacy_flag(flag_used: bool) {
     if flag_used {
         eprintln!("{INCREMENTAL_LEGACY_NOTE}");
     }
+}
+
+/// Default delay (seconds) after emitting a mutation warning, giving the
+/// operator a window to Ctrl-C before any filesystem writes start. The
+/// delay is configurable via the `AICX_MUTATION_WARN_DELAY_SECONDS` env
+/// var so CI / wrappers can shorten it. Set to `0` for no pause.
+const MUTATION_WARN_DELAY_SECONDS_DEFAULT: u64 = 3;
+
+/// Emit a non-blocking note before a subcommand starts mutating
+/// `~/.aicx/`, then sleep briefly so the operator can Ctrl-C if they
+/// invoked the command by accident.
+///
+/// Wave D Cut D1 (B-P0-03): seven subcommands (`all`, `claude`, `codex`,
+/// `store`, `migrate`, `migrate-intent-schema`, `index`) write to the
+/// canonical store on bare no-arg invocations. Operators occasionally
+/// trigger them by accident (typoed subcommand, muscle-memory from a
+/// different repo, etc.). This warning gives a 3-second confirmation
+/// window without changing the dry-run-default polarity (that lands in
+/// D4 if approved).
+///
+/// Suppressed entirely when `AICX_NO_MUTATION_WARN=1` is set so shipped
+/// scripts (`vc-init`, `vibecrafted-mcp`, `install.sh`, automation) can
+/// invoke `aicx` programmatically without the pause.
+///
+/// The delay (default 3s) is configurable via
+/// `AICX_MUTATION_WARN_DELAY_SECONDS`. A value of `0` keeps the warning
+/// but skips the sleep entirely.
+fn warn_pending_mutation(cmd: &str) {
+    if mutation_warn_suppressed() {
+        return;
+    }
+    let delay = mutation_warn_delay_seconds();
+    if delay == 0 {
+        eprintln!(
+            "aicx {cmd}: note: about to write to ~/.aicx/. Pass --dry-run to preview \
+             (where supported) or set AICX_NO_MUTATION_WARN=1 to silence this note."
+        );
+        return;
+    }
+    eprintln!(
+        "aicx {cmd}: note: about to write to ~/.aicx/. Pass --dry-run to preview \
+         (where supported) or Ctrl-C within {delay}s to abort. \
+         Set AICX_NO_MUTATION_WARN=1 to silence this note."
+    );
+    std::thread::sleep(std::time::Duration::from_secs(delay));
+}
+
+fn mutation_warn_suppressed() -> bool {
+    std::env::var("AICX_NO_MUTATION_WARN")
+        .map(|value| !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+}
+
+fn mutation_warn_delay_seconds() -> u64 {
+    std::env::var("AICX_MUTATION_WARN_DELAY_SECONDS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(MUTATION_WARN_DELAY_SECONDS_DEFAULT)
 }
 
 fn warn_legacy_subcommand(legacy: &str, replacement: &str) {
