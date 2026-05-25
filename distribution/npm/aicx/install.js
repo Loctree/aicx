@@ -50,10 +50,32 @@ function whichAll(binaryName) {
   return commandOutput(command, args).split(/\r?\n/).filter(Boolean);
 }
 
-function cleanupShadowDir(dir, targetVersion) {
-  const suffix = process.platform === "win32" ? ".exe" : "";
-  const candidateAicx = join(dir, `aicx${suffix}`);
-  const candidateMcp = join(dir, `aicx-mcp${suffix}`);
+// Each scope branch constructs the candidate path with all-literal join args
+// (homedir() is a Node builtin, the subdir + binary names are string literals).
+// No variable is forwarded into join, so there is no path that an attacker
+// could influence — the only choice points are platform (.exe suffix) and
+// the closed `scope` enum, both validated locally.
+function cleanupShadowDir(scope, targetVersion) {
+  const isWin = process.platform === "win32";
+  let candidateAicx;
+  let candidateMcp;
+  if (scope === "local-bin") {
+    candidateAicx = isWin
+      ? join(homedir(), ".local", "bin", "aicx.exe")
+      : join(homedir(), ".local", "bin", "aicx");
+    candidateMcp = isWin
+      ? join(homedir(), ".local", "bin", "aicx-mcp.exe")
+      : join(homedir(), ".local", "bin", "aicx-mcp");
+  } else if (scope === "cargo-bin") {
+    candidateAicx = isWin
+      ? join(homedir(), ".cargo", "bin", "aicx.exe")
+      : join(homedir(), ".cargo", "bin", "aicx");
+    candidateMcp = isWin
+      ? join(homedir(), ".cargo", "bin", "aicx-mcp.exe")
+      : join(homedir(), ".cargo", "bin", "aicx-mcp");
+  } else {
+    return; // unknown scope — refuse to operate
+  }
   if (!existsSync(candidateAicx)) return;
 
   const candidateVersion = binaryVersion(candidateAicx);
@@ -89,8 +111,8 @@ function scanAicxShadows(installedPath, targetVersion) {
   }
 
   if (envFlag("AICX_NPM_REPLACE_LOCAL")) {
-    cleanupShadowDir(join(homedir(), ".local", "bin"), targetVersion);
-    cleanupShadowDir(join(homedir(), ".cargo", "bin"), targetVersion);
+    cleanupShadowDir("local-bin", targetVersion);
+    cleanupShadowDir("cargo-bin", targetVersion);
   }
 }
 

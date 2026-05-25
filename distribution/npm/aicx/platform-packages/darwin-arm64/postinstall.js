@@ -88,21 +88,32 @@ function whichAll(binaryName) {
   return commandOutput(command, args).split(/\r?\n/).filter(Boolean);
 }
 
-// Closed enum of shadow scopes. The `scope` parameter is matched against this
-// set inside the function — callers cannot inject arbitrary paths. Each branch
-// constructs the cleanup dir from homedir() + hardcoded subdir parts.
-const SHADOW_SCOPES = Object.freeze({
-  "local-bin": [".local", "bin"],
-  "cargo-bin": [".cargo", "bin"],
-});
-
+// Each scope branch constructs the candidate path with all-literal join args
+// (homedir() is a Node builtin, the subdir + binary names are string literals).
+// No variable is forwarded into join, so there is no path that an attacker
+// could influence — the only choice points are platform (.exe suffix) and
+// the closed `scope` enum, both validated locally.
 function cleanupShadowDir(scope, targetVersion) {
-  const parts = SHADOW_SCOPES[scope];
-  if (!parts) return; // unknown scope — refuse to operate
-  const dir = join(homedir(), ...parts);
-  const suffix = process.platform === "win32" ? ".exe" : "";
-  const candidateAicx = join(dir, `aicx${suffix}`);
-  const candidateMcp = join(dir, `aicx-mcp${suffix}`);
+  const isWin = process.platform === "win32";
+  let candidateAicx;
+  let candidateMcp;
+  if (scope === "local-bin") {
+    candidateAicx = isWin
+      ? join(homedir(), ".local", "bin", "aicx.exe")
+      : join(homedir(), ".local", "bin", "aicx");
+    candidateMcp = isWin
+      ? join(homedir(), ".local", "bin", "aicx-mcp.exe")
+      : join(homedir(), ".local", "bin", "aicx-mcp");
+  } else if (scope === "cargo-bin") {
+    candidateAicx = isWin
+      ? join(homedir(), ".cargo", "bin", "aicx.exe")
+      : join(homedir(), ".cargo", "bin", "aicx");
+    candidateMcp = isWin
+      ? join(homedir(), ".cargo", "bin", "aicx-mcp.exe")
+      : join(homedir(), ".cargo", "bin", "aicx-mcp");
+  } else {
+    return; // unknown scope — refuse to operate
+  }
   if (!existsSync(candidateAicx)) return;
 
   const candidateVersion = binaryVersion(candidateAicx);
