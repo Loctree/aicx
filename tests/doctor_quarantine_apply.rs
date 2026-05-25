@@ -63,7 +63,7 @@ fn apply_empty_body_quarantine_moves_to_recoverable_dir_not_delete() {
     .expect("write full chunk");
 
     let opts = DoctorOptions {
-        fix: false,
+        rebuild_steer_index: false,
         fix_buckets: false,
         dry_run: false,
         rebuild_sidecars: false,

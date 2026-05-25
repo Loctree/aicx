@@ -3,8 +3,16 @@
 //! `aicx doctor` performs an integrity audit of the canonical store, the
 //! steer index (Lance + BM25), state.json, sidecar coverage, and corpus
 //! bucket names. With
-//! `--fix`, safe corrective actions are applied: corrupted steer indexes
-//! are rebuilt from canonical store via `steer_index::rebuild_steer_index_if_needed`.
+//! `--rebuild-steer-index` (formerly `--fix`, kept as a deprecated alias),
+//! the steer index is deleted and rebuilt from the canonical store via
+//! `steer_index::rebuild_steer_index_if_needed`. The flag was renamed in
+//! 2026-05-25 (Wave D / Cut D1) because the original `--fix` was a no-op
+//! for most warning classes (sidecars, index consistency, empty bodies),
+//! addressing only the corrupted-steer-index case. The narrower name
+//! matches the actual contract; other remediations live behind their
+//! dedicated flags (`--prune-empty-bodies`, `--fix-buckets`,
+//! `aicx store --full-rescan`).
+//!
 //! With `--fix-buckets`, suspicious top-level store buckets are moved to
 //! timestamped quarantine. With `--prune-empty-bodies --apply`, empty-body
 //! chunks and their sidecars are moved to a recoverable empty-body quarantine.
@@ -29,7 +37,12 @@ use crate::validation::{is_valid_repo_bucket_name, is_valid_repo_project_slug};
 
 #[derive(Debug, Clone)]
 pub struct DoctorOptions {
-    pub fix: bool,
+    /// Rebuild the steer index from the canonical store if it is corrupted
+    /// or schema-incompatible. Wired to CLI flag `--rebuild-steer-index`
+    /// (legacy alias: `--fix`, deprecated 2026-05-25). Does NOT address
+    /// sidecar coverage, index consistency, or empty-body chunks — those
+    /// have dedicated flags.
+    pub rebuild_steer_index: bool,
     pub fix_buckets: bool,
     /// When `fix_buckets` is true and `dry_run` is also true, the doctor
     /// emits the planned canonicalize/quarantine actions as `fixes_applied`
@@ -185,7 +198,7 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
     };
     let apply_empty_bodies = opts.prune_empty_bodies && opts.apply_prune_empty_bodies;
 
-    if opts.fix
+    if opts.rebuild_steer_index
         && (steer_lance.severity == Severity::Critical || steer_bm25.severity == Severity::Critical)
     {
         match attempt_steer_rebuild(base).await {
@@ -263,7 +276,7 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
         }
     }
 
-    if opts.fix || opts.fix_buckets || apply_empty_bodies {
+    if opts.rebuild_steer_index || opts.fix_buckets || apply_empty_bodies {
         canonical_store = check_canonical_store(base);
         steer_lance = check_steer_lance(base).await;
         steer_bm25 = check_steer_bm25(base);
@@ -526,7 +539,7 @@ fn native_embedder_ping() -> std::result::Result<String, String> {
 }
 
 #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
-fn check_semantic_health() -> CheckResult {
+fn check_semantic_health(_opts: &DoctorOptions) -> CheckResult {
     CheckResult {
         name: "semantic_health".to_string(),
         severity: Severity::Critical,
@@ -994,7 +1007,7 @@ async fn check_steer_lance(base: &Path) -> CheckResult {
                 },
                 detail: format!("Lance probe failed: {msg}"),
                 recommendation: Some(if critical {
-                    "Run `aicx doctor --fix` to delete and rebuild from canonical store".to_string()
+                    "Run `aicx doctor --rebuild-steer-index` to delete and rebuild from canonical store".to_string()
                 } else {
                     format!(
                         "Investigate logs; persistent issues may need manual `rm -rf {}/steer_db`",
@@ -1991,7 +2004,7 @@ mod tests {
     #[test]
     fn test_check_embedder_warmth_without_smoke_returns_skipped() {
         let opts = DoctorOptions {
-            fix: false,
+            rebuild_steer_index: false,
             fix_buckets: false,
             dry_run: false,
             rebuild_sidecars: false,
@@ -2393,7 +2406,7 @@ mod tests {
         .unwrap();
 
         let opts = DoctorOptions {
-            fix: false,
+            rebuild_steer_index: false,
             fix_buckets: false,
             dry_run: false,
             rebuild_sidecars: false,
@@ -2465,7 +2478,7 @@ mod tests {
         .unwrap();
 
         let opts = DoctorOptions {
-            fix: false,
+            rebuild_steer_index: false,
             fix_buckets: false,
             dry_run: false,
             rebuild_sidecars: false,

@@ -1349,17 +1349,25 @@ enum Commands {
     /// Diagnose and optionally repair the canonical store and steer index.
     ///
     /// Runs integrity checks on the Lance steer DB, BM25 index, state.json,
-    /// sidecar coverage, and corpus bucket names. With --fix, applies safe corrective actions:
-    /// corrupted steer indexes are deleted and rebuilt from the canonical
-    /// store (which is treated as ground truth and never modified).
+    /// sidecar coverage, and corpus bucket names. With
+    /// `--rebuild-steer-index`, corrupted steer indexes are deleted and
+    /// rebuilt from the canonical store (which is treated as ground truth
+    /// and never modified). Other remediations live behind dedicated flags
+    /// (`--prune-empty-bodies`, `--fix-buckets`, `aicx store --full-rescan`).
     ///
-    /// Exit codes: 0 on green/warning or after successful --fix; 1 if
-    /// critical issues are detected without --fix.
+    /// Exit codes: 0 on green/warning or after successful rebuild; 1 if
+    /// critical issues are detected without remediation.
     #[command(display_order = 12)]
     Doctor {
-        /// Apply safe corrective actions for detected issues
-        #[arg(long)]
-        fix: bool,
+        /// Delete and rebuild the steer index from the canonical store
+        /// when corrupted or schema-incompatible. Narrower contract than
+        /// the legacy `--fix` (which was a no-op for sidecars/index
+        /// consistency/empty bodies — those have dedicated flags).
+        ///
+        /// Legacy alias: `--fix` is accepted with a deprecation warning
+        /// and will be removed in v1.0.
+        #[arg(long = "rebuild-steer-index", alias = "fix")]
+        rebuild_steer_index: bool,
 
         /// Move suspicious top-level corpus buckets to $HOME/.aicx/quarantine/.
         /// Buckets that are merely CamelCase (legitimate GitHub orgs like
@@ -2187,7 +2195,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             println!("{json}");
         }
         Some(Commands::Doctor {
-            fix,
+            rebuild_steer_index,
             fix_buckets,
             dry_run,
             rebuild_sidecars,
@@ -2199,8 +2207,17 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             format,
             oracle,
         }) => {
+            // Surface the legacy `--fix` form as deprecated so callers can
+            // migrate. We cannot tell from the parsed bool whether the
+            // operator typed `--fix` or `--rebuild-steer-index`; inspect
+            // the raw argv instead. The flag accepts both via Clap alias.
+            if rebuild_steer_index && std::env::args().any(|arg| arg == "--fix") {
+                eprintln!(
+                    "aicx doctor: warning: '--fix' is deprecated; use '--rebuild-steer-index'. The old flag will be removed in v1.0."
+                );
+            }
             let opts = aicx::doctor::DoctorOptions {
-                fix,
+                rebuild_steer_index,
                 fix_buckets,
                 dry_run,
                 rebuild_sidecars,
@@ -2247,7 +2264,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }
         Some(Commands::Health) => {
             let opts = aicx::doctor::DoctorOptions {
-                fix: false,
+                rebuild_steer_index: false,
                 fix_buckets: false,
                 dry_run: false,
                 rebuild_sidecars: false,

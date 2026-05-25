@@ -139,7 +139,7 @@ impl std::error::Error for SteerIncompatible {}
 
 fn warn_if_steer_incompatible(err: &anyhow::Error) {
     if let Some(incompatible) = err.downcast_ref::<SteerIncompatible>() {
-        tracing::warn!("{incompatible}; run `aicx doctor --fix`");
+        tracing::warn!("{incompatible}; run `aicx doctor --rebuild-steer-index`");
     }
 }
 
@@ -626,7 +626,7 @@ async fn bootstrap_steer_index_if_missing_at(base: &Path) -> Result<bool> {
         let incompatible = SteerIncompatible::not_bootstrapped(format!(
             "BM25 index is missing (store has {expected_docs} files)"
         ));
-        tracing::warn!("{incompatible}; run `aicx doctor --fix`");
+        tracing::warn!("{incompatible}; run `aicx doctor --rebuild-steer-index`");
         return Err(incompatible.into());
     }
 
@@ -640,7 +640,7 @@ async fn bootstrap_steer_index_if_missing_at(base: &Path) -> Result<bool> {
     let incompatible = SteerIncompatible::not_bootstrapped(format!(
         "BM25 index has {bm25_docs} docs but store has {expected_docs} files"
     ));
-    tracing::warn!("{incompatible}; run `aicx doctor --fix`");
+    tracing::warn!("{incompatible}; run `aicx doctor --rebuild-steer-index`");
     Err(incompatible.into())
 }
 

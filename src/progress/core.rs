@@ -95,7 +95,7 @@ impl Phase {
 /// hint or omit the line entirely.
 pub fn recovery_hint_for(phase: &str) -> Option<&'static str> {
     match phase {
-        "steer_sync" | "bm25_sync" => Some("aicx doctor --fix"),
+        "steer_sync" | "bm25_sync" => Some("aicx doctor --rebuild-steer-index"),
         "extract" | "dedup" | "self_echo" | "segment" | "chunk" => Some("aicx store --full-rescan"),
         _ => None,
     }
