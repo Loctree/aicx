@@ -2663,3 +2663,52 @@ bez outputu/runtime verdictu.
 **Lessons.** Raportowy manifest nie powinien byc potem traktowany jak zaufany
 plan zapisu. Gdy runtime ma pierwotny `store_root`, odtwarzaj sciezki z
 lokalnych helperow zamiast round-trip przez serializowany string.
+
+---
+
+## 2026-05-24 — install path shadow detection · `pending commit`
+
+**Symptom.** Operator mial dwa `aicx` w lokalnym install surface:
+`~/.local/bin/aicx` raportowal 0.7.4 i wygrywal w `PATH`, a swiezy source build
+w `~/.cargo/bin/aicx` raportowal 0.9.0. Shell i agenty uzywaly starego runtime
+mimo poprawnego build/install w cargo-bin.
+
+**Root cause.** Install channels byly niesymetryczne. Bundle install czyscil
+cargo-bin shadows, ale source install i `make install-bin` nie czyscily
+`~/.local/bin`, a npm postinstall nie widzial lokalnych/cargo shadows. Brakowalo
+tez pre-install inventory i post-install porownania target binary vs `PATH`.
+
+**Fix.**
+- `install.sh` dostal pre-install `which -a aicx` scan, `--dry-run`,
+  `--force`, version-aware cleanup starszych/rownych shadows i post-install
+  warning gdy `PATH` dalej rozwiązuje inna binarke.
+- `make install-bin` uzywa shellowego shadow precheck przed `cargo install` i
+  path sanity check po instalacji.
+- npm root/platform postinstall ostrzegaja o shadowach i opcjonalnie usuwaja
+  starsze/rowne `~/.local/bin` / cargo-bin shadows przez
+  `AICX_NPM_REPLACE_LOCAL=1`.
+- `tools/release-channel-check.sh` lapie drift wersji miedzy Cargo.toml,
+  npm wrapperem i platform packages; release CI odpala go przed publish flow.
+- Docs mapuja piec install paths i recovery commands.
+
+**Touched.**
+- `install.sh` — shell scan/cleanup/dry-run/path sanity.
+- `Makefile` — `install-bin` shadow pre/post hooks, release version gate.
+- `distribution/npm/aicx/install.js` — npm wrapper shadow warning/opt-in cleanup.
+- `distribution/npm/aicx/platform-packages/*/postinstall.js` — platform package
+  shadow warning/opt-in cleanup.
+- `tools/release-channel-check.sh` — release channel version consistency.
+- `.github/workflows/release.yml` — CI gate.
+- `README.md`, `distribution/INSTALLER.md`, `docs/install-paths.md` — install
+  path docs.
+
+**Tests.** Syntax: `bash -n install.sh tools/release-channel-check.sh`,
+`node --check` for all touched npm installers. Smokes: `bash install.sh
+--dry-run`, fake `/tmp/.../aicx` shadow dry-run, release-channel pass, and
+intentional npm version mismatch fail.
+
+**Lessons.**
+- Installer cleanup musi byc dwukierunkowy, bo `PATH` nie wie ktory channel byl
+  "ostatnio poprawny".
+- Package-manager postinstall nie powinien promptowac; ostrzezenie domyslnie,
+  cleanup tylko przez explicit env.
