@@ -162,15 +162,23 @@ Current live evidence:
 - Loctree prism pass: score 11/15, band `9..12`, payload
   `/Users/maciejgad/.vibecrafted/artifacts/Loctree/aicx/2026_0524/polarize/polr-222423-57363/prism.json`.
 - GitHub PR #5 is open, non-draft, mergeable, with green remote checks.
-- Local `make test` is red under Node.js v26 on the three
-  `dashboard::tests::test_inline_markdown_*` tests because
-  `require(...)` does not expose `md.inlineMarkdown`.
+- Local `cargo test --lib dashboard::tests::test_inline_markdown -- --test-threads=1`
+  is green after `2030d3f` switched the Node harness to
+  `globalThis.AicxMarkdown`.
+- Local full `make test` is still red: isolated
+  `vector_index::iter3_tests::query_index_recovery_hint_uses_full_rescan_not_fresh`
+  fails because the recovery message does not contain `--full-rescan`, and
+  full parallel execution also exposed a flaky dashboard-server log-capture
+  assertion that passes in isolation.
 - `docs/BUGFIXES.md` already records M-13 as deferred; keep that truth unless a
   dedicated CSP nonce/header implementation lands in a separate scoped cut.
 
 Split / block list before merge:
 
-- Fix or explicitly platform-gate the dashboard inline-markdown Node harness.
+- Fix the vector-index recovery-hint regression so the canonical operator
+  recovery path is `aicx index --full-rescan --project <name>`.
+- Stabilize or quarantine the dashboard-server log-capture assertion under full
+  parallel `make test`.
 - Keep H-2 Layer 1 store/index reconciliation operator-side until a separate
   PR owns it.
 - Keep broader extractor/UI diagnostic read-cap work in a separate follow-up.
