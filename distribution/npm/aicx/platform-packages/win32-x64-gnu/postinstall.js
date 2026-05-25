@@ -12,7 +12,7 @@ const {
   unlinkSync,
   writeFileSync,
 } = require("fs");
-const { tmpdir } = require("os");
+const { homedir, tmpdir } = require("os");
 const { join } = require("path");
 const { pipeline } = require("stream");
 const { promisify } = require("util");
@@ -46,6 +46,91 @@ const BINARY_MAPPINGS = {
     exeSuffix: ".exe",
   },
 };
+
+function envFlag(name) {
+  return /^(1|true|yes|on)$/i.test(process.env[name] || "");
+}
+
+function commandOutput(command, args) {
+  try {
+    return execFileSync(command, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch (error) {
+    return "";
+  }
+}
+
+function parseSemver(text) {
+  const match = String(text || "").match(/(\d+)\.(\d+)\.(\d+)/);
+  return match ? match[0] : "";
+}
+
+function compareSemver(left, right) {
+  const a = left.split(".").map(Number);
+  const b = right.split(".").map(Number);
+  if (a.length !== 3 || b.length !== 3 || a.some(Number.isNaN) || b.some(Number.isNaN)) {
+    return null;
+  }
+  for (let i = 0; i < 3; i += 1) {
+    if (a[i] < b[i]) return -1;
+    if (a[i] > b[i]) return 1;
+  }
+  return 0;
+}
+
+function binaryVersion(binaryPath) {
+  if (!existsSync(binaryPath)) return "";
+  return parseSemver(commandOutput(binaryPath, ["--version"]));
+}
+
+function whichAll(binaryName) {
+  const command = process.platform === "win32" ? "where" : "which";
+  const args = process.platform === "win32" ? [binaryName] : ["-a", binaryName];
+  return commandOutput(command, args).split(/\r?\n/).filter(Boolean);
+}
+
+function cleanupShadowDir(dir, targetVersion) {
+  const suffix = process.platform === "win32" ? ".exe" : "";
+  const candidateAicx = join(dir, `aicx${suffix}`);
+  const candidateMcp = join(dir, `aicx-mcp${suffix}`);
+  if (!existsSync(candidateAicx)) return;
+
+  const candidateVersion = binaryVersion(candidateAicx);
+  const comparison = compareSemver(candidateVersion, targetVersion);
+  if (comparison === null || comparison > 0) {
+    console.warn(`[AICX npm] Shadow retained at ${candidateAicx} (version: ${candidateVersion || "unknown"})`);
+    return;
+  }
+
+  for (const path of [candidateAicx, candidateMcp]) {
+    if (!existsSync(path)) continue;
+    unlinkSync(path);
+    console.warn(`[AICX npm] Removed older/equal shadow binary: ${path}`);
+  }
+}
+
+function scanAicxShadows(installedPath, targetVersion) {
+  const pathBinaries = Array.from(new Set(whichAll("aicx")));
+  if (pathBinaries.length === 0) return;
+
+  console.warn("[AICX npm] Existing aicx binaries on PATH:");
+  for (const path of pathBinaries) {
+    const version = commandOutput(path, ["--version"]) || "unknown";
+    console.warn(`  ${path} -> ${version}`);
+  }
+
+  const resolved = pathBinaries[0];
+  if (resolved && resolved !== installedPath) {
+    console.warn("[AICX npm] WARNING: PATH may resolve to a different aicx than this npm package.");
+    console.warn(`  npm package binary: ${installedPath} -> ${targetVersion}`);
+    console.warn(`  PATH resolves to:   ${resolved}`);
+    console.warn("  Set AICX_NPM_REPLACE_LOCAL=1 to remove older/equal ~/.local/bin or cargo-bin shadows during npm install.");
+  }
+
+  if (envFlag("AICX_NPM_REPLACE_LOCAL")) {
+    cleanupShadowDir(join(homedir(), ".local", "bin"), targetVersion);
+    cleanupShadowDir(join(homedir(), ".cargo", "bin"), targetVersion);
+  }
+}
 
 async function downloadFile(url, destPath) {
   return new Promise((resolve, reject) => {
@@ -125,6 +210,7 @@ async function install() {
   const targetAicxMcp = join(__dirname, `aicx-mcp${exe}`);
   if (existsSync(targetAicx) && existsSync(targetAicxMcp)) {
     console.log(`Binaries already exist at ${__dirname}`);
+    scanAicxShadows(targetAicx, VERSION);
     return;
   }
 
@@ -156,6 +242,7 @@ async function install() {
     rmSync(tempDir, { recursive: true, force: true });
 
     console.log(`Successfully installed aicx binaries to ${__dirname}`);
+    scanAicxShadows(targetAicx, VERSION);
   } catch (error) {
     rmSync(tempDir, { recursive: true, force: true });
     console.error(`
