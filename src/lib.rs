@@ -8,6 +8,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod cli;
 pub mod corpus;
 pub mod dashboard;
 pub mod dashboard_server;
