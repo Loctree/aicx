@@ -1405,6 +1405,142 @@ enum Commands {
     },
 }
 
+/// Detect `aicx <cmd>` invocations that clap would otherwise reject with
+/// a generic "the following required arguments were not provided" or
+/// "missing required subcommand" error. Returns a `(cmd_name,
+/// StructuredFailure)` pair when the canonical bad shape is present,
+/// `None` otherwise.
+///
+/// Covers (Wave C §3.2):
+/// - `aicx ingest` with no `--source <SOURCE>`
+/// - `aicx conversations` with no `--out-dir <DIR>`
+/// - `aicx sources` with no subcommand
+///
+/// Heuristic only: we exit early when we see `--help`/`-h`/`--version`
+/// so clap's own help rendering wins.
+fn detect_missing_required_boundary<I>(
+    args: I,
+) -> Option<(&'static str, aicx::cli::failure::StructuredFailure)>
+where
+    I: IntoIterator<Item = String>,
+{
+    let args: Vec<String> = args.into_iter().collect();
+    if args
+        .iter()
+        .any(|a| a == "--help" || a == "-h" || a == "--version" || a == "-V")
+    {
+        return None;
+    }
+
+    // Locate the leftmost top-level subcommand. We accept arbitrary
+    // top-level flags before it (e.g. `aicx --verbose ingest`).
+    let cmd_idx = args
+        .iter()
+        .position(|a| matches!(a.as_str(), "ingest" | "conversations" | "sources"))?;
+
+    let cmd = args[cmd_idx].as_str();
+    let tail = &args[cmd_idx + 1..];
+
+    match cmd {
+        "ingest" => {
+            // `--source` is required (no default).
+            if tail
+                .iter()
+                .any(|a| a == "--source" || a.starts_with("--source="))
+            {
+                return None;
+            }
+            Some((
+                "aicx ingest",
+                aicx::cli::failure::StructuredFailure::new(
+                    "missing_required_arg",
+                    "argument --source <SOURCE> is required",
+                    "rerun with --source <name>, e.g. aicx ingest --source loct-context-pack <PACK_DIR>",
+                )
+                .with_fallback("aicx ingest --source loct-context-pack <PACK_DIR>"),
+            ))
+        }
+        "conversations" => {
+            // `--out-dir` is required (no default).
+            if tail
+                .iter()
+                .any(|a| a == "--out-dir" || a.starts_with("--out-dir="))
+            {
+                return None;
+            }
+            Some((
+                "aicx conversations",
+                aicx::cli::failure::StructuredFailure::new(
+                    "missing_required_arg",
+                    "argument --out-dir <DIR> is required",
+                    "rerun with --out-dir <path>, e.g. aicx conversations --out-dir ~/.aicx/conversations",
+                )
+                .with_fallback("aicx conversations --out-dir ~/.aicx/conversations"),
+            ))
+        }
+        "sources" => {
+            // First positional after `sources` must be a known subcommand.
+            // `help` is clap's own — skip so it renders normally.
+            if let Some(next) = tail.iter().find(|a| !a.starts_with('-')) {
+                if matches!(next.as_str(), "protect" | "help") {
+                    return None;
+                }
+                None
+            } else {
+                // No further positional → subcommand missing.
+                Some((
+                    "aicx sources",
+                    aicx::cli::failure::StructuredFailure::new(
+                        "missing_subcommand",
+                        "aicx sources requires a subcommand (protect)",
+                        "pick the action you want, e.g. aicx sources protect --root <PATH>",
+                    )
+                    .with_fallback("aicx sources protect --root <PATH>"),
+                ))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Detect the `aicx config --show` mistake before clap rejects it with a
+/// generic "unexpected argument" error. Returns a [`StructuredFailure`]
+/// when the canonical bad shape is present, `None` otherwise.
+///
+/// Bad shape: a positional `config` followed (eventually) by `--show`,
+/// with no intervening `show`/`init` positional that would mean the user
+/// already picked a subcommand. We accept arbitrary top-level flags
+/// before `config` (e.g. `aicx --verbose config --show`) and arbitrary
+/// flags after `--show` (e.g. `aicx config --show --json`).
+fn detect_config_show_flag_mistake<I>(args: I) -> Option<aicx::cli::failure::StructuredFailure>
+where
+    I: IntoIterator<Item = String>,
+{
+    let args: Vec<String> = args.into_iter().collect();
+
+    // Step 1: locate the first positional that equals `config`.
+    let config_idx = args.iter().position(|a| a == "config")?;
+
+    // Step 2: walk forward; if we hit `show`/`init` first, the user is
+    // already on a valid subcommand path → no mistake.
+    for arg in &args[config_idx + 1..] {
+        if arg == "show" || arg == "init" {
+            return None;
+        }
+        if arg == "--show" {
+            return Some(
+                aicx::cli::failure::StructuredFailure::new(
+                    "flag_not_recognized",
+                    "'--show' is not a valid flag for 'aicx config'",
+                    "use the subcommand form: aicx config show",
+                )
+                .with_fallback("aicx config show"),
+            );
+        }
+    }
+    None
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1412,6 +1548,29 @@ fn main() -> Result<()> {
                 .add_directive("ai_contexters=info".parse().unwrap()),
         )
         .init();
+
+    // Pre-parse intercept (B-P1-12): `aicx config --show` is a common
+    // discoverability mistake — `--show` is a subcommand-positional, not
+    // a flag. Catch it before clap and emit the structured hint pointing
+    // at `aicx config show`. We only fire when the args follow the
+    // canonical bad shape so that legitimate parses are never affected.
+    if let Some(failure) = detect_config_show_flag_mistake(std::env::args().skip(1)) {
+        let json = aicx::cli::failure::want_json_envelope(false);
+        aicx::cli::failure::emit_and_error("aicx config", json, failure);
+        std::process::exit(2);
+    }
+
+    // Pre-parse intercept (B-P1-08): clap-default "missing required
+    // argument" rendering doesn't match the structured failure-as-state
+    // identity (Wave B §1.2). For the boundary cases where the surface
+    // is most likely to be hit by new operators — `aicx ingest`,
+    // `aicx conversations`, `aicx sources` — emit the structured
+    // envelope and exit 2 instead of letting clap own the output.
+    if let Some((cmd_name, failure)) = detect_missing_required_boundary(std::env::args().skip(1)) {
+        let json = aicx::cli::failure::want_json_envelope(false);
+        aicx::cli::failure::emit_and_error(cmd_name, json, failure);
+        std::process::exit(2);
+    }
 
     let cli = Cli::parse();
 
@@ -1554,11 +1713,25 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
 
+            let json = aicx::cli::failure::want_json_envelope(false);
+
             // Session mode: --session [+ --agent] -> scan sources, filter by session_id.
             if let Some(session_id) = session {
-                let agent = agent
-                    .or(format)
-                    .context("--session requires --agent {claude|codex|gemini|junie}")?;
+                let agent = match agent.or(format) {
+                    Some(a) => a,
+                    None => {
+                        return Err(aicx::cli::failure::emit_and_error(
+                            "aicx extract",
+                            json,
+                            aicx::cli::failure::StructuredFailure::new(
+                                "missing_required_arg",
+                                "--session requires --agent {claude|codex|gemini|junie}",
+                                "rerun with --agent <name>, e.g. aicx extract --session <id> --agent claude",
+                            )
+                            .with_fallback("aicx extract --session <ID> --agent claude"),
+                        ));
+                    }
+                };
                 run_extract_session(
                     &session_id,
                     agent,
@@ -1574,10 +1747,51 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 )?;
             } else {
                 // File mode (legacy): --format <agent> + positional input + -o.
-                let format = format
-                    .context("file-mode extract requires --format {claude|codex|gemini|gemini-antigravity|junie}")?;
-                let input = input.context("file-mode extract requires a positional INPUT path")?;
-                let output = output.context("file-mode extract requires -o/--output <FILE>")?;
+                let format = match format {
+                    Some(f) => f,
+                    None => {
+                        return Err(aicx::cli::failure::emit_and_error(
+                            "aicx extract",
+                            json,
+                            aicx::cli::failure::StructuredFailure::new(
+                                "mode_mismatch",
+                                "file-mode extract requires --format {claude|codex|gemini|gemini-antigravity|junie}",
+                                "pass --format <agent> with positional INPUT and -o <FILE>, or switch to session mode with --session <id> --agent <name>",
+                            )
+                            .with_fallback(
+                                "aicx extract --format claude path/to/session.jsonl -o /tmp/out.md",
+                            ),
+                        ));
+                    }
+                };
+                let input = match input {
+                    Some(i) => i,
+                    None => {
+                        return Err(aicx::cli::failure::emit_and_error(
+                            "aicx extract",
+                            json,
+                            aicx::cli::failure::StructuredFailure::new(
+                                "input_path_required",
+                                "file-mode extract requires a positional INPUT path",
+                                "append the agent log path, e.g. aicx extract --format claude ~/.claude/projects/<repo>/<session>.jsonl -o /tmp/out.md",
+                            ),
+                        ));
+                    }
+                };
+                let output = match output {
+                    Some(o) => o,
+                    None => {
+                        return Err(aicx::cli::failure::emit_and_error(
+                            "aicx extract",
+                            json,
+                            aicx::cli::failure::StructuredFailure::new(
+                                "output_path_required",
+                                "file-mode extract requires -o/--output <FILE>",
+                                "add -o /path/to/out.md to write the extracted markdown",
+                            ),
+                        ));
+                    }
+                };
                 run_extract_file(
                     format,
                     project,
@@ -1649,9 +1863,24 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             input,
         }) => {
             if matches!(source, IngestSource::LoctContextPack) {
-                let input = input
-                    .as_deref()
-                    .context("aicx ingest --source loct-context-pack requires <PACK_DIR>")?;
+                let input = match input.as_deref() {
+                    Some(p) => p,
+                    None => {
+                        let json = aicx::cli::failure::want_json_envelope(false);
+                        return Err(aicx::cli::failure::emit_and_error(
+                            "aicx ingest",
+                            json,
+                            aicx::cli::failure::StructuredFailure::new(
+                                "input_path_required",
+                                "aicx ingest --source loct-context-pack requires <PACK_DIR>",
+                                "append the pack directory path, e.g. aicx ingest --source loct-context-pack ~/.vibecrafted/inbox/loct-context-pack-2026-05-25",
+                            )
+                            .with_fallback(
+                                "aicx ingest --source loct-context-pack <PACK_DIR>",
+                            ),
+                        ));
+                    }
+                };
                 let summary = store::ingest_loct_context_pack(input)?;
                 match emit {
                     StdoutEmit::Paths => println!("{}", summary.target_dir.display()),
@@ -6549,6 +6778,49 @@ mod tests {
     use super::*;
     use filetime::{FileTime, set_file_mtime};
     use std::fs;
+
+    /// Regression: B-P1-12 — detector must fire on the canonical bad shape.
+    #[test]
+    fn detect_config_show_flag_fires_on_canonical_mistake() {
+        let args = ["config", "--show"].iter().map(|s| s.to_string());
+        let hit = detect_config_show_flag_mistake(args).expect("should detect mistake");
+        assert_eq!(hit.kind, "flag_not_recognized");
+        assert!(hit.recommendation.contains("aicx config show"));
+        assert!(
+            hit.fallback
+                .as_ref()
+                .is_some_and(|fb| fb.command == "aicx config show")
+        );
+    }
+
+    #[test]
+    fn detect_config_show_flag_ignores_legitimate_subcommand() {
+        let args = ["config", "show"].iter().map(|s| s.to_string());
+        assert!(detect_config_show_flag_mistake(args).is_none());
+    }
+
+    #[test]
+    fn detect_config_show_flag_ignores_init_subcommand() {
+        let args = ["config", "init", "--show"].iter().map(|s| s.to_string());
+        assert!(
+            detect_config_show_flag_mistake(args).is_none(),
+            "once the user picked a subcommand, --show is the subcommand's problem"
+        );
+    }
+
+    #[test]
+    fn detect_config_show_flag_ignores_unrelated_commands() {
+        let args = ["claude", "--show"].iter().map(|s| s.to_string());
+        assert!(detect_config_show_flag_mistake(args).is_none());
+    }
+
+    #[test]
+    fn detect_config_show_flag_accepts_global_flags_before_config() {
+        let args = ["--verbose", "config", "--show"]
+            .iter()
+            .map(|s| s.to_string());
+        assert!(detect_config_show_flag_mistake(args).is_some());
+    }
 
     /// Bug #26 regression: the four branches of `aicx config show`
     /// must each render a distinct marker so an operator can tell at
