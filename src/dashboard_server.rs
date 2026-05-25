@@ -1752,7 +1752,17 @@ mod tests {
         String::from_utf8(bytes.to_vec()).expect("utf8 body")
     }
 
+    // Serialize all capture_logs callers. tracing's thread-local default
+    // subscriber loses races when multiple tests run in parallel against the
+    // same global state — one test's subscriber leaks across the scope of
+    // another, producing intermittent missing-log assertions. Holding this
+    // mutex for the duration of capture_logs makes the call deterministic.
+    static CAPTURE_LOGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
+        let _serial = CAPTURE_LOGS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let buffer = StdArc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_writer(CapturedLogWriter {
