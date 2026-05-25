@@ -2229,7 +2229,34 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             };
             let rt = tokio::runtime::Runtime::new()
                 .context("Failed to start tokio runtime for doctor")?;
-            let report = rt.block_on(aicx::doctor::run(&opts))?;
+            let report = match rt.block_on(aicx::doctor::run(&opts)) {
+                Ok(report) => report,
+                Err(err) => {
+                    // CLI-boundary failure-as-state for doctor. Catch the
+                    // historical `--prune-empty-bodies` crash class (chunk
+                    // path outside aicx root) and any other run failure
+                    // here so the surface stays uniform with the rest of
+                    // the family (per Wave B §1.2 / Cut D2 contract).
+                    let json = aicx::cli::failure::want_json_envelope(format == "json");
+                    let message = format!("{err:#}");
+                    let kind = if message.contains("outside aicx canonical root")
+                        || message.contains("outside store root")
+                    {
+                        "path_outside_aicx_root"
+                    } else {
+                        "doctor_run_failed"
+                    };
+                    let failure = aicx::cli::failure::StructuredFailure::new(
+                        kind,
+                        message,
+                        "rerun with --verbose to see per-check details; \
+                         if the path is genuinely outside ~/.aicx report it \
+                         to the operator (possible store corruption or misconfigured roots)",
+                    );
+                    let wrapped = aicx::cli::failure::emit_and_error("aicx doctor", json, failure);
+                    return Err(wrapped);
+                }
+            };
 
             if oracle {
                 let status = aicx::doctor::oracle_readiness(&report);

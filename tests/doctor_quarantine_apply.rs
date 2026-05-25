@@ -146,7 +146,13 @@ fn apply_empty_body_quarantine_moves_to_recoverable_dir_not_delete() {
         })
         .expect("empty-bodies-<timestamp> quarantine root must exist");
 
+    // After D1 (B-P0-02), quarantine layout mirrors paths relative to the
+    // aicx canonical root (base) instead of `base/store/` only. This lets
+    // chunks under `non-repository-contexts/` survive the rename instead
+    // of crashing with `outside store root`. Existing store/ chunks
+    // simply gain a `store/` prefix inside quarantine.
     let moved_chunk = quarantine_root
+        .join("store")
         .join("VetCoders")
         .join("aicx")
         .join("2026_0506")
@@ -173,6 +179,157 @@ fn apply_empty_body_quarantine_moves_to_recoverable_dir_not_delete() {
     assert!(
         moved_bytes.starts_with(b"[project: VetCoders/aicx | agent: claude | date: 2026-05-06"),
         "quarantined chunk content must match original (rename preserves bytes)"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Regression for B-P0-02 (Wave D Cut D1): `aicx doctor --prune-empty-bodies`
+/// used to hard-crash with `empty-body chunk is outside store root` the
+/// moment a candidate came from `<base>/non-repository-contexts/...`
+/// rather than `<base>/store/...`. On prod the operator had ~4418 such
+/// candidates, all unreachable. The fix expanded the prefix check from
+/// `<base>/store/` to the entire aicx canonical root `<base>/`.
+#[test]
+fn apply_empty_body_quarantine_accepts_non_repository_contexts() {
+    let base = unique_base("apply-empty-bodies-non-repo");
+
+    // Place an empty-body chunk under non-repository-contexts. This is
+    // where chunks land when `aicx store` cannot infer a repo from cwd.
+    let chunk_dir = base
+        .join("non-repository-contexts")
+        .join("2026_0506")
+        .join("conversations")
+        .join("claude");
+    std::fs::create_dir_all(&chunk_dir).expect("create non-repo chunk dir");
+
+    let empty_chunk = chunk_dir.join("2026_0506_claude_sess-nonrepo_001.md");
+    let empty_sidecar = empty_chunk.with_extension("meta.json");
+    std::fs::write(
+        &empty_chunk,
+        "[project: non-repository-contexts | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
+    )
+    .expect("write empty non-repo chunk");
+    std::fs::write(&empty_sidecar, "{}").expect("write empty non-repo sidecar");
+
+    let opts = DoctorOptions {
+        rebuild_steer_index: false,
+        fix_buckets: false,
+        dry_run: false,
+        rebuild_sidecars: false,
+        prune_empty_bodies: true,
+        apply_prune_empty_bodies: true,
+        check_dedup: false,
+        verbose: false,
+        smoke: false,
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread runtime");
+    let report = rt
+        .block_on(run_at(&base, &opts))
+        .expect("doctor must NOT crash on non-repository-contexts chunks");
+
+    assert!(
+        report
+            .fixes_applied
+            .iter()
+            .any(|line| line.contains("quarantined 1 empty-body chunk(s) and 1 sidecar(s)")),
+        "non-repo chunk must be quarantined: {:?}",
+        report.fixes_applied
+    );
+
+    // Verify the moved file landed under the quarantine root, with its
+    // non-repository-contexts layout preserved.
+    let quarantine_parent = base.join("quarantine");
+    let quarantine_root = std::fs::read_dir(&quarantine_parent)
+        .expect("read quarantine parent dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("empty-bodies-"))
+        })
+        .expect("empty-bodies-<timestamp> quarantine root must exist");
+
+    let moved_chunk = quarantine_root
+        .join("non-repository-contexts")
+        .join("2026_0506")
+        .join("conversations")
+        .join("claude")
+        .join("2026_0506_claude_sess-nonrepo_001.md");
+    assert!(
+        moved_chunk.exists(),
+        "non-repo chunk must be renamed under quarantine root: {}",
+        moved_chunk.display()
+    );
+    assert!(
+        !empty_chunk.exists(),
+        "source non-repo chunk must be moved out of {}",
+        empty_chunk.display()
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Regression for B-P0-02 dry-run path: `aicx doctor --prune-empty-bodies`
+/// (no `--apply`) renders a reviewable bash script. Before D1 the script
+/// rendering also crashed on `non-repository-contexts` candidates because
+/// the same prefix check was used. Verify the script renders cleanly and
+/// references the non-repo chunk path.
+#[test]
+fn prune_empty_bodies_script_renders_for_non_repository_contexts() {
+    let base = unique_base("prune-script-non-repo");
+
+    let chunk_dir = base
+        .join("non-repository-contexts")
+        .join("2026_0506")
+        .join("conversations")
+        .join("claude");
+    std::fs::create_dir_all(&chunk_dir).expect("create non-repo chunk dir");
+    let empty_chunk = chunk_dir.join("2026_0506_claude_sess-script_001.md");
+    std::fs::write(
+        &empty_chunk,
+        "[project: non-repository-contexts | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
+    )
+    .expect("write empty non-repo chunk");
+
+    let opts = DoctorOptions {
+        rebuild_steer_index: false,
+        fix_buckets: false,
+        dry_run: false,
+        rebuild_sidecars: false,
+        prune_empty_bodies: true,
+        apply_prune_empty_bodies: false, // dry-run script path
+        check_dedup: false,
+        verbose: false,
+        smoke: false,
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread runtime");
+    let report = rt
+        .block_on(run_at(&base, &opts))
+        .expect("script rendering must NOT crash on non-repo chunk");
+
+    let script = report
+        .prune_empty_bodies_script
+        .as_ref()
+        .expect("script must be emitted when prune is requested without --apply");
+    assert!(
+        script.contains("non-repository-contexts/2026_0506/conversations/claude"),
+        "script must reference non-repo chunk path: {}",
+        script
+    );
+    assert!(
+        script.contains("mv -n --"),
+        "script must contain at least one mv directive: {}",
+        script
     );
 
     let _ = std::fs::remove_dir_all(&base);

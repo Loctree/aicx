@@ -1435,13 +1435,28 @@ fn empty_body_quarantine_destination(
     quarantine_root: &Path,
     path: &Path,
 ) -> Result<PathBuf> {
-    let store_root =
-        std::fs::canonicalize(base.join("store")).context("canonicalize store root")?;
+    // Empty-body chunks live under either the canonical store
+    // (`~/.aicx/store/<org>/<repo>/…`) or the non-repository fallback
+    // (`~/.aicx/non-repository-contexts/<date>/…`); both roots are
+    // scanned by `store::scan_context_files_at`. Previously the prefix
+    // check only accepted `~/.aicx/store/`, which made
+    // `aicx doctor --prune-empty-bodies` crash with
+    // `empty-body chunk is outside store root` the moment any candidate
+    // came from the non-repository corpus (operator observed ~4418
+    // candidates on prod). Accept any path under `base` (the canonical
+    // `~/.aicx/` home) and preserve its `base`-relative layout under
+    // the quarantine root so recovery stays straightforward.
+    let aicx_root = std::fs::canonicalize(base)
+        .with_context(|| format!("canonicalize aicx root: {}", base.display()))?;
     let chunk_path = std::fs::canonicalize(path)
         .with_context(|| format!("canonicalize empty-body chunk: {}", path.display()))?;
-    let relative = chunk_path
-        .strip_prefix(&store_root)
-        .with_context(|| format!("empty-body chunk is outside store root: {}", path.display()))?;
+    let relative = chunk_path.strip_prefix(&aicx_root).with_context(|| {
+        format!(
+            "empty-body chunk path '{}' is outside aicx canonical root '{}'",
+            path.display(),
+            aicx_root.display()
+        )
+    })?;
     Ok(quarantine_root.join(relative))
 }
 
@@ -2447,7 +2462,13 @@ mod tests {
                     .is_some_and(|name| name.starts_with("empty-bodies-"))
             })
             .expect("empty-body quarantine root should exist");
+        // After D1 (B-P0-02 fix), quarantine layout mirrors paths relative
+        // to the aicx canonical root (`base`) instead of `<base>/store/`,
+        // so previously-stored chunks gain a `store/` prefix in quarantine
+        // and `non-repository-contexts/` chunks survive the rename instead
+        // of crashing on the prefix check.
         let moved = quarantine_root
+            .join("store")
             .join("VetCoders")
             .join("aicx")
             .join("2026_0506")
