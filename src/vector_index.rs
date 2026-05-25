@@ -353,13 +353,17 @@ const CORRUPT_WARN_HEAD: usize = 5;
 /// `_all` bucket path so an operator can index every chunk in one file.
 pub fn index_path(project: Option<&str>) -> Result<PathBuf> {
     let base = crate::store::store_base_dir()?;
+    Ok(index_path_for(&base, project))
+}
+
+fn index_path_for(base: &Path, project: Option<&str>) -> PathBuf {
     // `store_base_dir()` resolves to the AICX home (`~/.aicx`), not the
     // corpus store (`~/.aicx/store`). Keep the vector index inside the
     // operator-owned AICX home so build, status, and search all agree.
     let index_root = base.join(INDEX_DIR_NAME);
-    Ok(index_root
+    index_root
         .join(index_bucket_name(project))
-        .join(INDEX_FILE_NAME))
+        .join(INDEX_FILE_NAME)
 }
 
 pub fn context_corpus_index_path(project: Option<&str>) -> Result<PathBuf> {
@@ -1595,12 +1599,10 @@ fn first_metadata_field(path: &std::path::Path, key: &str) -> Option<String> {
 pub fn query_index(
     project: Option<&str>,
     query: &str,
-    _limit: usize,
+    limit: usize,
     kind_filter: Option<&str>,
     frame_kind_filter: Option<&str>,
 ) -> Result<Vec<QueryHit>> {
-    use std::io::BufReader;
-
     let path = index_path(project)?;
     if !path.exists() {
         return Ok(Vec::new());
@@ -1617,18 +1619,37 @@ pub fn query_index(
     let query_embedding = engine.embed(query).with_context(|| "embed query")?;
     drop(engine);
 
+    query_index_with_embedding(
+        &path,
+        &query_embedding,
+        limit,
+        kind_filter,
+        frame_kind_filter,
+    )
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn query_index_with_embedding(
+    path: &Path,
+    query_embedding: &[f32],
+    limit: usize,
+    kind_filter: Option<&str>,
+    frame_kind_filter: Option<&str>,
+) -> Result<Vec<QueryHit>> {
+    use std::io::BufReader;
+
     let _lock = crate::locks::acquire_shared(crate::locks::lance_lock_path()?)?;
 
     // `open_file_validated` validates the path against canonical roots
     // BEFORE opening — blocks any path-traversal attempt that an
     // operator-controlled `project` could inject into the lookup. Index
     // files must always live under the canonical `~/.aicx/indexed` tree.
-    let file = crate::sanitize::open_file_validated(&path)
+    let file = crate::sanitize::open_file_validated(path)
         .with_context(|| format!("open index: {}", path.display()))?;
     let mut reader = BufReader::new(file);
 
     // First line is header
-    let header_line = match read_index_line_capped(&mut reader, &path, 1, "query index header") {
+    let header_line = match read_index_line_capped(&mut reader, path, 1, "query index header") {
         Ok(Some(line)) => line,
         Ok(None) => return Ok(Vec::new()),
         Err(err) => return Err(err.into()),
@@ -1644,43 +1665,66 @@ pub fn query_index(
     }
 
     let scan = scan_index_entries(
-        capped_index_lines(reader, &path, 2, "query index data"),
-        &query_embedding,
+        capped_index_lines(reader, path, 2, "query index data"),
+        query_embedding,
         kind_filter,
         frame_kind_filter,
     )
     .with_context(|| format!("scan index entries in {}", path.display()))?;
 
-    if scan.corrupt_count > 0 {
-        let rate = scan.corrupt_count as f64 / scan.total_data_lines.max(1) as f64;
-        if scan.total_data_lines >= CORRUPT_MIN_SAMPLE && rate > CORRUPT_RATE_FAIL_FAST {
-            return Err(anyhow::anyhow!(
-                "index integrity failure in {}: {} of {} data lines ({:.1}%) failed to parse — exceeds {:.0}% threshold. Recovery: `aicx index --fresh --project <name>` to rebuild from canonical store.",
-                path.display(),
-                scan.corrupt_count,
-                scan.total_data_lines,
-                rate * 100.0,
-                CORRUPT_RATE_FAIL_FAST * 100.0,
-            ));
-        }
-        tracing::warn!(
-            target: "aicx::vector_index",
-            corrupt = scan.corrupt_count,
-            total = scan.total_data_lines,
-            rate_pct = rate * 100.0,
-            threshold_pct = CORRUPT_RATE_FAIL_FAST * 100.0,
-            index = %path.display(),
-            "index integrity: corrupt NDJSON lines tolerated below fail-fast threshold"
-        );
+    enforce_index_integrity(path, &scan)?;
+
+    Ok(finalize_query_hits(scan.hits, limit))
+}
+
+fn enforce_index_integrity(path: &Path, scan: &ScanResult) -> Result<()> {
+    if scan.corrupt_count == 0 {
+        return Ok(());
     }
 
-    let mut hits = scan.hits;
+    let rate = scan.corrupt_count as f64 / scan.total_data_lines.max(1) as f64;
+    if scan.total_data_lines >= CORRUPT_MIN_SAMPLE && rate > CORRUPT_RATE_FAIL_FAST {
+        return Err(anyhow::anyhow!(
+            "index integrity failure in {}: {} of {} data lines ({:.1}%) failed to parse — exceeds {:.0}% threshold. Recovery: `aicx index --full-rescan --project <name>` to rebuild from canonical store.",
+            path.display(),
+            scan.corrupt_count,
+            scan.total_data_lines,
+            rate * 100.0,
+            CORRUPT_RATE_FAIL_FAST * 100.0,
+        ));
+    }
+
+    tracing::warn!(
+        target: "aicx::vector_index",
+        corrupt = scan.corrupt_count,
+        total = scan.total_data_lines,
+        rate_pct = rate * 100.0,
+        threshold_pct = CORRUPT_RATE_FAIL_FAST * 100.0,
+        index = %path.display(),
+        "index integrity: corrupt NDJSON lines tolerated below fail-fast threshold"
+    );
+
+    Ok(())
+}
+
+/// Sort `hits` by cosine score descending and cap at `limit`.
+///
+/// Pure post-scan tail of [`query_index`]. Extracted so the limit contract
+/// (bug #32: caller-supplied `limit` is honored — never returns > `limit`
+/// rows) can be unit-tested without standing up an embedder.
+///
+/// Safe to truncate here because the scan filters (`kind` / `frame_kind`)
+/// are already pushed down into [`scan_index_entries`]: the pool fed in
+/// is filter-saturated, so the truncate cannot re-introduce bug #31's
+/// silent-empty pathology on the legacy path.
+pub fn finalize_query_hits(mut hits: Vec<QueryHit>, limit: usize) -> Vec<QueryHit> {
     hits.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    Ok(hits)
+    hits.truncate(limit);
+    hits
 }
 
 /// Result of scanning the data-line region of a persistent NDJSON index.
@@ -1826,12 +1870,8 @@ mod iter3_tests {
 
     #[test]
     fn index_path_collapses_slashes_to_underscores() {
-        // Round-trip via env override so the test is hermetic.
         let dir = tempdir_for_test();
-        unsafe {
-            std::env::set_var("AICX_HOME", &dir);
-        }
-        let path = index_path(Some("vetcoders/aicx")).expect("path");
+        let path = index_path_for(&dir, Some("vetcoders/aicx"));
         let path_str = path.to_string_lossy();
         assert!(
             path_str.contains("vetcoders_aicx"),
@@ -1841,9 +1881,6 @@ mod iter3_tests {
             path_str.ends_with("embeddings.ndjson"),
             "expected NDJSON filename in {path_str}"
         );
-        unsafe {
-            std::env::remove_var("AICX_HOME");
-        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2165,19 +2202,13 @@ mod iter3_tests {
     #[test]
     fn index_path_uses_all_bucket_for_no_project_filter() {
         let dir = tempdir_for_test();
-        unsafe {
-            std::env::set_var("AICX_HOME", &dir);
-        }
-        let path = index_path(None).expect("path");
+        let path = index_path_for(&dir, None);
         assert!(
             path.to_string_lossy().contains("_all"),
             "expected _all bucket in {}",
             path.display()
         );
         assert_eq!(path, dir.join("indexed").join("_all").join(INDEX_FILE_NAME));
-        unsafe {
-            std::env::remove_var("AICX_HOME");
-        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2275,6 +2306,109 @@ mod iter3_tests {
         assert_eq!(scan.total_data_lines, 10);
         assert_eq!(scan.corrupt_count, 1);
         assert_eq!(scan.hits.len(), 9, "valid entries still parsed and scored");
+    }
+
+    fn make_hit(id: &str, score: f32) -> QueryHit {
+        QueryHit {
+            id: id.to_string(),
+            project: "test".to_string(),
+            agent: "claude".to_string(),
+            date: "20260524".to_string(),
+            path: std::path::PathBuf::from(format!("/tmp/aicx-test/{id}.md")),
+            kind: "session".to_string(),
+            session_id: id.to_string(),
+            frame_kind: None,
+            cwd: None,
+            score,
+        }
+    }
+
+    #[test]
+    fn finalize_query_hits_truncates_to_requested_limit() {
+        // Bug #32 regression. The legacy `query_index` accepted a `limit`
+        // arg but did not honor it — the parameter was prefixed `_limit`
+        // and the post-scan tail returned every hit. This locks the
+        // contract that the returned vec has `len() <= limit`.
+        let hits: Vec<QueryHit> = (0..50)
+            .map(|i| make_hit(&format!("h-{i}"), (50 - i) as f32 / 50.0))
+            .collect();
+        let out = finalize_query_hits(hits, 10);
+        assert_eq!(out.len(), 10, "limit honored: returns exactly 10 hits");
+        // Top score is the highest (1.0); confirm score-desc sort holds
+        // after truncate so the kept 10 are the BEST 10, not a random
+        // slice.
+        assert!(
+            out.windows(2).all(|w| w[0].score >= w[1].score),
+            "hits remain sorted score-desc after truncate"
+        );
+        assert_eq!(out[0].id, "h-0", "highest-scoring hit retained at head");
+    }
+
+    #[test]
+    fn finalize_query_hits_returns_full_pool_when_limit_exceeds_pool() {
+        // Pool shorter than limit ⇒ return everything (no padding, no
+        // panic). Documents the "fewer if pool exhausted" half of the
+        // bug #32 contract.
+        let hits: Vec<QueryHit> = (0..3)
+            .map(|i| make_hit(&format!("h-{i}"), i as f32 / 3.0))
+            .collect();
+        let out = finalize_query_hits(hits, 100);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn finalize_query_hits_zero_limit_returns_empty() {
+        // `limit == 0` is a legal request for "no hits, just confirm the
+        // scan ran". The legacy code ignored `_limit` entirely; the fix
+        // honors it strictly, including the degenerate case.
+        let hits: Vec<QueryHit> = (0..5)
+            .map(|i| make_hit(&format!("h-{i}"), i as f32))
+            .collect();
+        let out = finalize_query_hits(hits, 0);
+        assert!(out.is_empty(), "limit=0 returns empty vec");
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn query_index_recovery_hint_uses_full_rescan_not_fresh() {
+        // Bug #33 regression. Exercise the same post-embedder query helper
+        // that opens the on-disk index, scans NDJSON data rows, and surfaces
+        // the operator-facing recovery hint when corruption exceeds policy.
+        let root = tempdir_for_test();
+        let path = index_path_for(&root, Some("recovery-hint"));
+        std::fs::create_dir_all(path.parent().expect("index parent")).unwrap();
+
+        let header = IndexHeader {
+            schema_version: INDEX_SCHEMA_VERSION.to_string(),
+            model_id: "test-model".to_string(),
+            model_profile: "base".to_string(),
+            dimension: 2,
+            generated_at: "2026-05-24T18:13:11Z".to_string(),
+            entry_count: 20,
+        };
+        let mut body = serde_json::to_string(&header).expect("serialize header");
+        body.push('\n');
+        for i in 0..18 {
+            body.push_str(&make_entry_line(&format!("ok-{i}"), vec![1.0, 0.0]));
+            body.push('\n');
+        }
+        body.push_str("{not valid json\n");
+        body.push_str("{still not valid json\n");
+        std::fs::write(&path, body).expect("write corrupt fixture index");
+
+        let err = query_index_with_embedding(&path, &[1.0, 0.0], 10, None, None)
+            .expect_err("corrupt fixture should fail-fast");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("--full-rescan"),
+            "query_index recovery hint must reference the canonical rescan flag"
+        );
+        let stale_flag = format!("--{}", "fresh");
+        assert!(
+            !message.contains(&stale_flag),
+            "stale rescan flag hint must not appear in the recovery message"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

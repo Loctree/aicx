@@ -40,24 +40,24 @@ jobs:
           ref: ${{ env.RUST_MEMEX_REF }}
           path: rust-memex
 
-      - name: Ensure unzip on self-hosted Linux
-        if: runner.os == 'Linux'
+      - name: Install protoc
+        # Manual install — see ci.yml for rationale (arduino/setup-protoc#108).
+        shell: bash
         run: |
-          if command -v unzip >/dev/null 2>&1; then
+          if command -v protoc >/dev/null 2>&1; then
+            echo "protoc already installed: $(protoc --version)"
             exit 0
           fi
-          if command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install --yes unzip
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq protobuf-compiler
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            brew install protobuf
           else
-            echo "unzip is required on Linux runners for setup-protoc" >&2
+            echo "::error::Unsupported OS for protoc install: $RUNNER_OS"
             exit 1
           fi
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          protoc --version
 
       - name: Resolve release tag
         id: meta
@@ -186,24 +186,24 @@ jobs:
           ref: ${{ env.RUST_MEMEX_REF }}
           path: rust-memex
 
-      - name: Ensure unzip on self-hosted Linux
-        if: runner.os == 'Linux'
+      - name: Install protoc
+        # Manual install — see ci.yml for rationale (arduino/setup-protoc#108).
+        shell: bash
         run: |
-          if command -v unzip >/dev/null 2>&1; then
+          if command -v protoc >/dev/null 2>&1; then
+            echo "protoc already installed: $(protoc --version)"
             exit 0
           fi
-          if command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install --yes unzip
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq protobuf-compiler
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            brew install protobuf
           else
-            echo "unzip is required on Linux runners for setup-protoc" >&2
+            echo "::error::Unsupported OS for protoc install: $RUNNER_OS"
             exit 1
           fi
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          protoc --version
 
       - uses: dtolnay/rust-toolchain@stable
         with:

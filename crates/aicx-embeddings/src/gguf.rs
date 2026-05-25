@@ -203,7 +203,13 @@ fn resolve_model_path(
     if config.model_path.is_none() {
         match crate::hf_cache::find_snapshot_with_file_verbose(&resolved.repo, &resolved.filename) {
             Ok(snapshot) => return Ok(snapshot.join(&resolved.filename)),
-            Err(miss) => return Err(miss.into_error(&resolved.repo, &resolved.filename)),
+            Err(miss) => {
+                return Err(miss.into_error(
+                    &resolved.repo,
+                    &resolved.filename,
+                    Some(resolved.profile),
+                ));
+            }
         }
     }
     find_cached_model_file(&resolved.repo, &resolved.filename).ok_or_else(|| {

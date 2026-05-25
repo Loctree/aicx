@@ -755,6 +755,223 @@ fn semantic_preview_lines(path: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+/// Caller-supplied filters applied INSIDE the retrieval primitive by
+/// [`try_semantic_search_filtered`]. Previously the CLI / MCP / dashboard
+/// paths fetched a top-N pool from the index and applied these checks
+/// afterward, so a corpus whose top-N all sat outside the user's filter
+/// window returned a silent empty result even when valid hits existed
+/// further down the ranking. Pushing the filters into the retrieval
+/// wrapper closes that gap.
+#[derive(Debug, Default, Clone)]
+pub struct SemanticSearchFilters {
+    /// Exact-match agent slug (e.g. `"claude"`, `"codex"`).
+    pub agent: Option<String>,
+    /// Minimum chunk score on the canonical 0..=100 scale.
+    pub score_min: Option<u8>,
+    /// Inclusive lower date bound, day granularity (`YYYY-MM-DD`).
+    pub date_lo: Option<String>,
+    /// Inclusive upper date bound, day granularity (`YYYY-MM-DD`).
+    pub date_hi: Option<String>,
+    /// Pre-computed `YYYY-MM-DD` lower bound derived from `--hours`,
+    /// applied only when neither `date_lo` nor `date_hi` is set so the
+    /// explicit date filter wins (matching legacy precedence).
+    pub hours_cutoff: Option<String>,
+}
+
+impl SemanticSearchFilters {
+    /// True iff at least one post-fetch filter is active.
+    pub fn is_active(&self) -> bool {
+        self.agent.is_some()
+            || self.score_min.is_some()
+            || self.date_lo.is_some()
+            || self.date_hi.is_some()
+            || self.hours_cutoff.is_some()
+    }
+}
+
+/// Diagnostic emitted when filter pushdown examined the full bounded
+/// pool but still failed to satisfy the user's `limit`. The presence of
+/// this payload tells the caller "we ran out of candidates inside the
+/// cap, not because the underlying corpus is empty." Surfaced to JSON +
+/// stderr so operators can decide whether to widen filters or raise the
+/// cap rather than misreading the partial set as "nothing exists."
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FilterPushdownDiagnostic {
+    pub kind: &'static str,
+    pub examined: usize,
+    pub matched: usize,
+    pub requested_limit: usize,
+    pub examined_cap_ratio: usize,
+}
+
+/// Result of [`try_semantic_search_filtered`]. `outcome.results` carries
+/// the FILTERED candidate set (NOT truncated to user `limit`) so the
+/// caller can apply its own sort order before taking the final slice.
+#[derive(Debug)]
+pub struct FilteredSemanticOutcome {
+    pub outcome: SemanticSearchOutcome,
+    pub diagnostic: Option<FilterPushdownDiagnostic>,
+}
+
+/// Merge an optional `filter_pushdown` diagnostic into a JSON payload
+/// rendered by `rank::render_search_json_with_oracle` (or any
+/// equivalent caller). Additive shape: callers that ignore the field
+/// see the canonical search response untouched.
+///
+/// Shared between `aicx search` (CLI, `src/main.rs`) and `aicx_search`
+/// (MCP, `src/mcp.rs`) so both surfaces emit byte-identical diagnostic
+/// JSON.
+pub fn inject_filter_pushdown_diagnostic(
+    rendered: &str,
+    diagnostic: Option<&FilterPushdownDiagnostic>,
+) -> Result<String, serde_json::Error> {
+    let Some(diag) = diagnostic else {
+        return Ok(rendered.to_string());
+    };
+    let mut value: serde_json::Value = serde_json::from_str(rendered)?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("filter_pushdown".to_string(), serde_json::to_value(diag)?);
+    }
+    serde_json::to_string(&value)
+}
+
+/// Bounded examined-pool ratio. The retrieval wrapper fetches at most
+/// `max(user_limit * RATIO, MIN)` candidates from the hybrid index, then
+/// applies post-filters across that pool. Anything beyond the cap is
+/// considered "underlying pool exhausted" relative to this query, even
+/// if the corpus has more chunks — the bound exists so a very tight
+/// filter cannot pin the embedder / index against a multi-million-chunk
+/// store.
+pub const FILTER_EXAMINED_CAP_RATIO: usize = 10;
+/// Floor for the examined pool size so tiny user limits (e.g. `--limit 1`)
+/// still have enough material for filter pushdown to be meaningful.
+pub const FILTER_EXAMINED_CAP_MIN: usize = 50;
+
+/// Filter-aware semantic retrieval. Wraps [`try_semantic_search`] with a
+/// bounded examined-pool fetch + canonical post-filter application so
+/// CLI (`aicx search`) and MCP (`aicx_search`) share one truth for the
+/// pushdown shape. Returns up to `examined_cap` filtered candidates,
+/// already restricted to the filter window; the caller is responsible
+/// for the final sort + `take(user_limit)`.
+///
+/// When filters are active and the wrapper exhausted the cap without
+/// satisfying `user_limit`, the diagnostic flags `filter_yielded_partial`
+/// so the caller can surface the situation to operators instead of
+/// rendering a misleading silent empty.
+pub fn try_semantic_search_filtered(
+    store_root: &Path,
+    query: &str,
+    user_limit: usize,
+    project_filters: &[Option<&str>],
+    frame_kind_filter: Option<FrameKind>,
+    kind_filter: Option<&str>,
+    post_filters: &SemanticSearchFilters,
+) -> std::result::Result<FilteredSemanticOutcome, SemanticError> {
+    let fetch_limit = if post_filters.is_active() {
+        user_limit
+            .saturating_mul(FILTER_EXAMINED_CAP_RATIO)
+            .max(FILTER_EXAMINED_CAP_MIN)
+    } else {
+        user_limit.max(1)
+    };
+
+    let outcome = try_semantic_search(
+        store_root,
+        query,
+        fetch_limit,
+        project_filters,
+        frame_kind_filter,
+        kind_filter,
+    )?;
+
+    let SemanticSearchOutcome {
+        results,
+        scanned,
+        backend_label,
+        model_id,
+        retrieval_status,
+    } = outcome;
+
+    let examined = results.len();
+    let filtered = apply_semantic_post_filters(results, post_filters);
+    let matched = filtered.len();
+    let diagnostic = partial_pushdown_diagnostic(
+        post_filters.is_active(),
+        examined,
+        matched,
+        user_limit,
+        fetch_limit,
+    );
+
+    Ok(FilteredSemanticOutcome {
+        outcome: SemanticSearchOutcome {
+            results: filtered,
+            scanned,
+            backend_label,
+            model_id,
+            retrieval_status,
+        },
+        diagnostic,
+    })
+}
+
+/// Pure helper for the post-fetch filter pass. Kept `pub(crate)` so unit
+/// tests can drive it without spinning up the embedder + hybrid index.
+pub(crate) fn apply_semantic_post_filters(
+    mut results: Vec<FuzzyResult>,
+    filters: &SemanticSearchFilters,
+) -> Vec<FuzzyResult> {
+    if let Some(min) = filters.score_min {
+        results.retain(|r| r.score >= min);
+    }
+    if let Some(ref agent) = filters.agent {
+        results.retain(|r| r.agent == *agent);
+    }
+    if filters.date_lo.is_some() || filters.date_hi.is_some() {
+        let lo = filters.date_lo.as_deref();
+        let hi = filters.date_hi.as_deref();
+        results.retain(|r| {
+            lo.is_none_or(|lo| r.date.as_str() >= lo) && hi.is_none_or(|hi| r.date.as_str() <= hi)
+        });
+    } else if let Some(ref cutoff) = filters.hours_cutoff {
+        let cutoff = cutoff.as_str();
+        results.retain(|r| r.date.as_str() >= cutoff);
+    }
+    results
+}
+
+/// Decide whether to emit a `filter_yielded_partial` diagnostic. Encoded
+/// as a standalone helper so the decision rule is unit-testable without
+/// reaching into the retrieval primitive.
+pub(crate) fn partial_pushdown_diagnostic(
+    filters_active: bool,
+    examined: usize,
+    matched: usize,
+    user_limit: usize,
+    fetch_limit: usize,
+) -> Option<FilterPushdownDiagnostic> {
+    if !filters_active {
+        return None;
+    }
+    if matched >= user_limit {
+        return None;
+    }
+    // We only flag "partial under cap" when the wrapper fetched the full
+    // examined cap without satisfying the limit. A short pool (examined
+    // < fetch_limit) means the index itself ran out of candidates, which
+    // is a corpus-side signal — not a pushdown-cap signal.
+    if examined < fetch_limit {
+        return None;
+    }
+    Some(FilterPushdownDiagnostic {
+        kind: "filter_yielded_partial",
+        examined,
+        matched,
+        requested_limit: user_limit,
+        examined_cap_ratio: FILTER_EXAMINED_CAP_RATIO,
+    })
+}
+
 /// Compose the canonical `oracle_status` line emitted to stderr after a
 /// successful semantic search call.
 pub fn render_semantic_status_line(
@@ -858,6 +1075,256 @@ mod tests {
         assert!(line.contains("index=hybrid"));
         assert!(line.contains("model=F2LLM-v2-0.6B.Q4_K_M.gguf"));
         assert!(line.contains("loctree_scope_safe=true"));
+    }
+
+    fn fake_hit(rank: usize, date: &str, agent: &str, score: u8) -> FuzzyResult {
+        FuzzyResult {
+            file: format!("rank-{rank}.md"),
+            path: format!("rank-{rank}.md"),
+            project: "test/repo".to_string(),
+            kind: "conversations".to_string(),
+            frame_kind: None,
+            agent: agent.to_string(),
+            date: date.to_string(),
+            timestamp: None,
+            score,
+            label: format!("test:{rank}"),
+            density: 0.5,
+            matched_lines: Vec::new(),
+            session_id: None,
+            cwd: None,
+        }
+    }
+
+    /// Bug #31 regression: top-N raw semantic hits sit outside the
+    /// filter window, but valid hits exist further down the pool. The
+    /// pushdown wrapper must surface the inside-window hits at user
+    /// `limit=10`, not silently return zero.
+    #[test]
+    fn filter_pushdown_recovers_hits_when_top_n_sit_outside_window() {
+        // 50-chunk pool: ranks 0..10 dated 2026-05-22 (outside the
+        // "since 2026-05-23" window), ranks 10..30 dated 2026-05-23
+        // (inside), ranks 30..50 dated 2026-05-21 (also outside).
+        let pool: Vec<FuzzyResult> = (0..50)
+            .map(|rank| {
+                let date = if rank < 10 {
+                    "2026-05-22"
+                } else if rank < 30 {
+                    "2026-05-23"
+                } else {
+                    "2026-05-21"
+                };
+                fake_hit(rank, date, "claude", 50)
+            })
+            .collect();
+
+        // Honesty check: without filters, the pool's top 10 are all
+        // outside the 2026-05-23 window — proves the test corpus is
+        // shaped to expose the pre-fix bug.
+        let untouched =
+            apply_semantic_post_filters(pool.clone(), &SemanticSearchFilters::default());
+        let pre_fix_top_ten: Vec<&str> =
+            untouched.iter().take(10).map(|r| r.date.as_str()).collect();
+        assert!(
+            pre_fix_top_ten.iter().all(|d| *d == "2026-05-22"),
+            "test corpus precondition failed: top-10 should all be 2026-05-22, got {:?}",
+            pre_fix_top_ten
+        );
+
+        // Pushdown: hours cutoff at 2026-05-23 should retain ranks
+        // 10..30 (20 hits), all inside the window.
+        let filters = SemanticSearchFilters {
+            hours_cutoff: Some("2026-05-23".to_string()),
+            ..Default::default()
+        };
+        let filtered = apply_semantic_post_filters(pool.clone(), &filters);
+        assert_eq!(
+            filtered.len(),
+            20,
+            "expected 20 inside-window hits to survive, got {}",
+            filtered.len()
+        );
+        for r in filtered.iter().take(10) {
+            assert_eq!(
+                r.date.as_str(),
+                "2026-05-23",
+                "filter survivor outside window: {}",
+                r.date
+            );
+        }
+
+        // No partial diagnostic: matched (20) >= user_limit (10).
+        let diag = partial_pushdown_diagnostic(
+            filters.is_active(),
+            pool.len(),
+            filtered.len(),
+            10,
+            FILTER_EXAMINED_CAP_MIN,
+        );
+        assert!(
+            diag.is_none(),
+            "expected no partial diagnostic when limit satisfied, got {diag:?}"
+        );
+    }
+
+    /// Pool fully examined but filters yield fewer than user limit →
+    /// wrapper must emit `filter_yielded_partial` so the caller can
+    /// surface "examined the cap, found N < limit" instead of pretending
+    /// the corpus is empty.
+    #[test]
+    fn filter_pushdown_emits_partial_when_cap_examined_under_limit() {
+        let user_limit = 10;
+        let fetch_limit = FILTER_EXAMINED_CAP_MIN; // 50
+        let examined = fetch_limit; // pool returned the full cap
+        let matched = 3;
+
+        let diag = partial_pushdown_diagnostic(true, examined, matched, user_limit, fetch_limit)
+            .expect("expected partial diagnostic when cap examined and filters under-deliver");
+        assert_eq!(diag.kind, "filter_yielded_partial");
+        assert_eq!(diag.examined, examined);
+        assert_eq!(diag.matched, matched);
+        assert_eq!(diag.requested_limit, user_limit);
+        assert_eq!(diag.examined_cap_ratio, FILTER_EXAMINED_CAP_RATIO);
+    }
+
+    #[test]
+    fn inject_filter_pushdown_none_is_byte_preserving_pass_through() {
+        let rendered = "{this is intentionally not json";
+
+        let injected = inject_filter_pushdown_diagnostic(rendered, None)
+            .expect("None diagnostic should not parse or mutate rendered payload");
+
+        assert_eq!(injected, rendered);
+    }
+
+    #[test]
+    fn inject_filter_pushdown_some_adds_object_field() {
+        let diag = FilterPushdownDiagnostic {
+            kind: "filter_yielded_partial",
+            examined: 50,
+            matched: 3,
+            requested_limit: 10,
+            examined_cap_ratio: FILTER_EXAMINED_CAP_RATIO,
+        };
+
+        let injected = inject_filter_pushdown_diagnostic(r#"{"results":3}"#, Some(&diag))
+            .expect("object payload should accept filter_pushdown diagnostic");
+        let payload: serde_json::Value =
+            serde_json::from_str(&injected).expect("injected payload should remain JSON");
+
+        assert_eq!(payload["results"], 3);
+        assert_eq!(payload["filter_pushdown"]["kind"], "filter_yielded_partial");
+        assert_eq!(payload["filter_pushdown"]["examined"], 50);
+        assert_eq!(payload["filter_pushdown"]["matched"], 3);
+        assert_eq!(payload["filter_pushdown"]["requested_limit"], 10);
+        assert_eq!(
+            payload["filter_pushdown"]["examined_cap_ratio"],
+            FILTER_EXAMINED_CAP_RATIO
+        );
+    }
+
+    #[test]
+    fn inject_filter_pushdown_some_leaves_non_object_root_shape() {
+        let diag = FilterPushdownDiagnostic {
+            kind: "filter_yielded_partial",
+            examined: 50,
+            matched: 3,
+            requested_limit: 10,
+            examined_cap_ratio: FILTER_EXAMINED_CAP_RATIO,
+        };
+
+        let injected = inject_filter_pushdown_diagnostic(r#"[{"results":3}]"#, Some(&diag))
+            .expect("non-object root should still round-trip as JSON");
+        let payload: serde_json::Value =
+            serde_json::from_str(&injected).expect("round-tripped payload should parse");
+
+        assert!(payload.is_array());
+        assert_eq!(payload[0]["results"], 3);
+        assert!(payload.get("filter_pushdown").is_none());
+    }
+
+    #[test]
+    fn inject_filter_pushdown_some_overwrites_existing_field() {
+        let diag = FilterPushdownDiagnostic {
+            kind: "filter_yielded_partial",
+            examined: 100,
+            matched: 9,
+            requested_limit: 25,
+            examined_cap_ratio: FILTER_EXAMINED_CAP_RATIO,
+        };
+
+        let injected = inject_filter_pushdown_diagnostic(
+            r#"{"filter_pushdown":{"kind":"stale"},"results":9}"#,
+            Some(&diag),
+        )
+        .expect("existing diagnostic field should be replaced by current diagnostic");
+        let payload: serde_json::Value =
+            serde_json::from_str(&injected).expect("injected payload should remain JSON");
+
+        assert_eq!(payload["filter_pushdown"]["kind"], "filter_yielded_partial");
+        assert_eq!(payload["filter_pushdown"]["examined"], 100);
+        assert_eq!(payload["filter_pushdown"]["matched"], 9);
+        assert_eq!(payload["filter_pushdown"]["requested_limit"], 25);
+    }
+
+    /// Short pool (corpus-side exhaustion) is NOT a partial-cap event —
+    /// the diagnostic stays silent so the caller can distinguish
+    /// "examined cap, still under-delivered" from "corpus genuinely
+    /// small" and surface different operator guidance.
+    #[test]
+    fn filter_pushdown_silent_when_pool_shorter_than_cap() {
+        let user_limit = 10;
+        let fetch_limit = FILTER_EXAMINED_CAP_MIN;
+        let examined = 12; // index ran out of candidates well below the cap
+        let matched = 2;
+
+        let diag = partial_pushdown_diagnostic(true, examined, matched, user_limit, fetch_limit);
+        assert!(
+            diag.is_none(),
+            "short-pool exhaustion must not raise the partial-cap diagnostic, got {diag:?}"
+        );
+    }
+
+    /// Inactive filter set is a pass-through: no diagnostic, no retain
+    /// pruning. Verifies the wrapper does not pay any cost when the
+    /// caller has no filters to push down.
+    #[test]
+    fn filter_pushdown_no_filters_is_pass_through() {
+        let pool: Vec<FuzzyResult> = (0..5)
+            .map(|rank| fake_hit(rank, "2026-05-23", "claude", 50))
+            .collect();
+        let filters = SemanticSearchFilters::default();
+        let filtered = apply_semantic_post_filters(pool.clone(), &filters);
+        assert_eq!(filtered.len(), pool.len(), "pass-through must keep all");
+        let diag = partial_pushdown_diagnostic(filters.is_active(), 5, 5, 10, 50);
+        assert!(diag.is_none());
+    }
+
+    /// Date range + agent + score compose correctly inside the wrapper
+    /// so the CLI / MCP do not need to re-implement the predicate
+    /// stack. Locks the precedence: explicit date range wins over the
+    /// `--hours` cutoff (matches legacy ordering preserved by the
+    /// wrapper).
+    #[test]
+    fn filter_pushdown_composes_agent_date_score() {
+        let pool = vec![
+            fake_hit(0, "2026-05-20", "claude", 80),
+            fake_hit(1, "2026-05-22", "claude", 40),
+            fake_hit(2, "2026-05-23", "codex", 90),
+            fake_hit(3, "2026-05-23", "claude", 90),
+            fake_hit(4, "2026-05-24", "claude", 95),
+        ];
+        let filters = SemanticSearchFilters {
+            agent: Some("claude".to_string()),
+            score_min: Some(75),
+            date_lo: Some("2026-05-23".to_string()),
+            date_hi: Some("2026-05-24".to_string()),
+            // hours_cutoff is set but ignored because date_lo/hi wins.
+            hours_cutoff: Some("2026-05-01".to_string()),
+        };
+        let filtered = apply_semantic_post_filters(pool, &filters);
+        let ids: Vec<&str> = filtered.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(ids, vec!["test:3", "test:4"]);
     }
 
     #[test]

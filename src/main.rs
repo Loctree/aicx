@@ -233,6 +233,7 @@ enum SourcesCommands {
 
 #[derive(Debug, Args, Clone)]
 struct RetrievalFilters {
+    /// Maximum number of results to return.
     #[arg(long, default_value_t = 10)]
     limit: usize,
     #[arg(long, value_enum)]
@@ -248,6 +249,8 @@ struct RetrievalFilters {
     #[arg(long, value_enum)]
     frame_kind: Option<FrameKindArg>,
 }
+
+const MAX_CLI_SEARCH_LIMIT: usize = 10_000;
 
 #[derive(Debug, Clone, Args)]
 struct DashboardArgs {
@@ -486,12 +489,18 @@ enum ConfigAction {
 enum IndexAction {
     /// Show freshness and pending-corpus status for the semantic index.
     Status {
-        /// Strict project filter: `owner/repo`, `/repo` (cross-org repo
-        /// name), `owner/` (org wildcard), or `name` (matches org OR
-        /// repo). Substring matching is intentionally disabled — `-p vista`
-        /// no longer leaks into `vista-portal`/`vista-datasets`.
-        #[arg(short, long)]
-        project: Option<String>,
+        /// Strict project filter, repeatable. Same shapes as `aicx index`:
+        ///   `-p owner/repo`   strict `<owner>/<repo>` slug match
+        ///   `-p owner/`       all repos under that owner (org wildcard)
+        ///   `-p /repo`        same repo name across every owner
+        ///   `-p name`         name matches an owner OR a repo (cross-org)
+        ///
+        /// Routed through the same canonical resolver as `aicx index`
+        /// (`resolve_filters_to_slugs` / `project_filter_matches`), so
+        /// `aicx index status -p X` and `aicx index -p X` always agree on
+        /// which buckets exist for the same `-p`.
+        #[arg(short, long, value_delimiter = ',')]
+        project: Vec<String>,
 
         /// Emit JSON status instead of plain text
         #[arg(short = 'j', long)]
@@ -1848,7 +1857,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             full_rescan,
         }) => match action {
             Some(IndexAction::Status { project, json }) => {
-                run_index_status(project.as_deref(), json)?;
+                run_index_status(&project, json)?;
             }
             None => run_index(&project, sample, json, dry_run, full_rescan)?,
         },
@@ -4649,6 +4658,26 @@ fn project_scopes(projects: &[String]) -> Vec<Option<&str>> {
     }
 }
 
+/// Canonical project resolver shared by `aicx index` and `aicx index
+/// status`. Routes raw user `-p` filters through
+/// `resolve_project_filters_or_error` (and ultimately
+/// `aicx::store::project_filter_matches`) so both commands canonicalize
+/// the same filter the same way and therefore agree on the resulting
+/// bucket set. Without this single chokepoint, `aicx index status -p X`
+/// could compute a bucket like `_codescribe` that `aicx index -p X`
+/// never built (bug #36).
+///
+/// `None` represents the `_all` cross-project bucket; `Some(slug)` is a
+/// canonical `<owner>/<repo>` slug exactly as `index` builds buckets for.
+fn resolve_index_scopes(projects: &[String]) -> Result<Vec<Option<String>>> {
+    let resolved = resolve_project_filters_or_error(projects)?;
+    Ok(if resolved.is_empty() {
+        vec![None]
+    } else {
+        resolved.into_iter().map(Some).collect()
+    })
+}
+
 /// Resolve user `-p` filters into canonical `<owner>/<repo>` slugs by
 /// enumerating the on-disk store. Empty input → empty output (caller treats
 /// it as "all projects"). Non-empty input that matches zero projects returns
@@ -4713,6 +4742,26 @@ struct SearchRunArgs<'a> {
     no_semantic: bool,
 }
 
+fn validate_cli_search_limit(limit: usize) -> Result<()> {
+    if limit > MAX_CLI_SEARCH_LIMIT {
+        anyhow::bail!(
+            "search --limit {limit} exceeds the hard cap of {MAX_CLI_SEARCH_LIMIT}; \
+             narrow the query/filter or run multiple smaller searches"
+        );
+    }
+    Ok(())
+}
+
+fn search_examined_fetch_limit(user_limit: usize, filters_active: bool) -> usize {
+    if filters_active {
+        user_limit
+            .saturating_mul(aicx::search_engine::FILTER_EXAMINED_CAP_RATIO)
+            .max(aicx::search_engine::FILTER_EXAMINED_CAP_MIN)
+    } else {
+        user_limit
+    }
+}
+
 fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     let SearchRunArgs {
         query,
@@ -4724,6 +4773,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         kind,
         no_semantic,
     } = args;
+    validate_cli_search_limit(filters.limit)?;
     let kind_filter = kind.and_then(aicx::timeline::Kind::parse);
     // Extract inline date hints from query if no explicit --date given
     let (effective_query, inline_date) = if date.is_none() {
@@ -4742,47 +4792,85 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     };
 
     let root = store::store_base_dir()?;
-    // Fetch more results pre-filter so score/date/hours filtering has material to work with.
-    let fetch_limit = if effective_date.is_some()
-        || filters.score.is_some()
-        || hours > 0
-        || filters.since.is_some()
-        || filters.until.is_some()
-    {
-        filters.limit.saturating_mul(5).max(50)
+
+    // Build the canonical filter pushdown for the retrieval primitive.
+    // The explicit date filter wins over `--hours`, matching legacy
+    // precedence preserved by the wrapper.
+    let (date_lo, date_hi) = if let Some(ref d) = effective_date {
+        parse_date_filter(d)?
     } else {
-        filters.limit
+        (filters.since.clone(), filters.until.clone())
+    };
+    let hours_cutoff = if hours > 0 && date_lo.is_none() && date_hi.is_none() {
+        Some(lookback_cutoff(hours).format("%Y-%m-%d").to_string())
+    } else {
+        None
+    };
+    let post_filters = aicx::search_engine::SemanticSearchFilters {
+        agent: filters.agent.clone(),
+        score_min: filters.score,
+        date_lo: date_lo.clone(),
+        date_hi: date_hi.clone(),
+        hours_cutoff: hours_cutoff.clone(),
     };
 
     let resolved_projects = resolve_project_filters_or_error(projects)?;
     let scopes = project_scopes(&resolved_projects);
 
-    let (mut results, scanned, semantic_status) = if no_semantic {
-        let (results, scanned) = rank::fuzzy_search_store(
+    let (mut results, scanned, semantic_status, pushdown_diagnostic) = if no_semantic {
+        // Fuzzy path keeps the legacy "fetch then post-filter" shape —
+        // `rank::fuzzy_search_store` is not on the hybrid retrieval
+        // primitive and is operator-requested explicitly via
+        // `--no-semantic`, so we leave it alone.
+        let fuzzy_fetch_limit =
+            search_examined_fetch_limit(filters.limit, post_filters.is_active());
+        let (mut results, scanned) = rank::fuzzy_search_store(
             &root,
             &search_query,
-            fetch_limit,
+            fuzzy_fetch_limit,
             &scopes,
             filters.frame_kind.map(Into::into),
         )?;
-        (results, scanned, None)
+        if let Some(min_score) = post_filters.score_min {
+            results.retain(|r| r.score >= min_score);
+        }
+        if let Some(ref agent_filter) = post_filters.agent {
+            results.retain(|r| r.agent == *agent_filter);
+        }
+        if post_filters.date_lo.is_some() || post_filters.date_hi.is_some() {
+            let lo = post_filters.date_lo.as_deref();
+            let hi = post_filters.date_hi.as_deref();
+            results.retain(|r| {
+                lo.is_none_or(|lo| r.date.as_str() >= lo)
+                    && hi.is_none_or(|hi| r.date.as_str() <= hi)
+            });
+        } else if let Some(ref cutoff) = post_filters.hours_cutoff {
+            let cutoff = cutoff.as_str();
+            results.retain(|r| r.date.as_str() >= cutoff);
+        }
+        (results, scanned, None, None)
     } else {
-        match aicx::search_engine::try_semantic_search(
+        match aicx::search_engine::try_semantic_search_filtered(
             &root,
             &search_query,
-            fetch_limit,
+            filters.limit,
             &scopes,
             filters.frame_kind.map(Into::into),
             kind_filter.map(|kind| kind.dir_name()),
+            &post_filters,
         ) {
-            Ok(outcome) => {
+            Ok(filtered) => {
+                let aicx::search_engine::FilteredSemanticOutcome {
+                    outcome,
+                    diagnostic,
+                } = filtered;
                 let status = (
                     outcome.backend_label,
                     outcome.model_id.clone(),
                     outcome.scanned,
                     outcome.retrieval_status.clone(),
                 );
-                (outcome.results, outcome.scanned, Some(status))
+                (outcome.results, outcome.scanned, Some(status), diagnostic)
             }
             Err(err) => {
                 let payload = serde_json::json!({
@@ -4810,42 +4898,12 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         }
     };
 
+    // Defensive kind retain: the semantic path pushes `kind_filter`
+    // into the hybrid query, but we keep the explicit check so a future
+    // index regression cannot smuggle off-kind hits past the operator.
     if let Some(kind_filter) = kind_filter {
         results.retain(|r| r.kind == kind_filter.dir_name());
     }
-    if let Some(min_score) = filters.score {
-        results.retain(|r| r.score >= min_score);
-    }
-    if let Some(agent_filter) = &filters.agent {
-        results.retain(|r| r.agent == *agent_filter);
-    }
-
-    // Apply date filter (day granularity) — takes priority over hours.
-    let (lo, hi) = if let Some(ref d) = effective_date {
-        let bounds = parse_date_filter(d)?;
-        (bounds.0, bounds.1)
-    } else {
-        (filters.since.clone(), filters.until.clone())
-    };
-
-    let mut results: Vec<_> = if lo.is_some() || hi.is_some() {
-        results
-            .into_iter()
-            .filter(|r| {
-                lo.as_ref().is_none_or(|lo| r.date.as_str() >= lo.as_str())
-                    && hi.as_ref().is_none_or(|hi| r.date.as_str() <= hi.as_str())
-            })
-            .collect()
-    } else if hours > 0 {
-        let cutoff = lookback_cutoff(hours);
-        let cutoff_date = cutoff.format("%Y-%m-%d").to_string();
-        results
-            .into_iter()
-            .filter(|r| r.date >= cutoff_date)
-            .collect()
-    } else {
-        results
-    };
 
     if let Some(sort_order) = filters.sort {
         results.sort_by(|a, b| {
@@ -4896,15 +4954,32 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
             }
             None => rank::search_oracle_status(&root, &results, scanned),
         };
-        println!(
-            "{}",
-            rank::render_search_json_with_oracle(&root, &results, scanned, oracle_status)?
-        );
+        let rendered =
+            rank::render_search_json_with_oracle(&root, &results, scanned, oracle_status)?;
+        let payload = aicx::search_engine::inject_filter_pushdown_diagnostic(
+            &rendered,
+            pushdown_diagnostic.as_ref(),
+        )?;
+        println!("{}", payload);
         return Ok(());
     }
 
     if results.is_empty() {
         eprintln!("No matches for {:?} (scanned {} chunks).", query, scanned);
+        if let Some(ref diag) = pushdown_diagnostic {
+            eprintln!(
+                "  filter_pushdown: kind={} examined={} matched={} requested_limit={} cap_ratio={}x",
+                diag.kind,
+                diag.examined,
+                diag.matched,
+                diag.requested_limit,
+                diag.examined_cap_ratio
+            );
+            eprintln!(
+                "  hint: examined the bounded retrieval cap; widen the filter \
+                 or rebuild the index if the corpus is expected to satisfy it."
+            );
+        }
         return Ok(());
     }
 
@@ -4915,28 +4990,39 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     let _ = io::stdout().flush();
 
     if io::stderr().is_terminal() {
-        eprintln!(
-            "\n{}",
-            match semantic_status {
-                Some((semantic_backend, semantic_model_id, semantic_scanned, retrieval_status)) => {
-                    aicx::search_engine::render_semantic_status_line(
-                        semantic_backend,
-                        &semantic_model_id,
-                        results.len(),
-                        semantic_scanned,
-                        retrieval_status.as_ref(),
-                    )
-                }
-                None => format!(
-                    "{} result(s) from {} scanned chunks. oracle_status: backend=filesystem_fuzzy index=none fallback=operator_requested loctree_scope_safe=false",
+        let base_line = match semantic_status {
+            Some((semantic_backend, semantic_model_id, semantic_scanned, retrieval_status)) => {
+                aicx::search_engine::render_semantic_status_line(
+                    semantic_backend,
+                    &semantic_model_id,
                     results.len(),
-                    scanned
-                ),
+                    semantic_scanned,
+                    retrieval_status.as_ref(),
+                )
             }
-        );
+            None => format!(
+                "{} result(s) from {} scanned chunks. oracle_status: backend=filesystem_fuzzy index=none fallback=operator_requested loctree_scope_safe=false",
+                results.len(),
+                scanned
+            ),
+        };
+        let suffix = pushdown_diagnostic
+            .as_ref()
+            .map(|d| {
+                format!(
+                    " filter_pushdown={} examined={} matched={} requested_limit={}",
+                    d.kind, d.examined, d.matched, d.requested_limit
+                )
+            })
+            .unwrap_or_default();
+        eprintln!("\n{}{}", base_line, suffix);
     }
     Ok(())
 }
+
+// `inject_filter_pushdown_diagnostic` extracted to `aicx::search_engine`
+// to share one implementation between this CLI path and the MCP path
+// in `src/mcp.rs` (gemini-code-assist review on PR #9: DRY).
 
 /// Default canonical config template written by `aicx config init`.
 ///
@@ -5064,6 +5150,24 @@ fn run_config_show(json: bool) -> Result<()> {
     let resolved = cfg.resolved_model();
     let cloud_set = cfg.cloud.is_some();
 
+    let canonical_path = canonical_config_path().ok();
+    let effective = aicx::embedder::effective_config_source();
+    let (effective_path_display, effective_branch, marker_line) =
+        describe_effective_config(&effective);
+
+    // HF cache probing: surface whether the configured profile is hydrated
+    // and which other profiles (if any) have a usable snapshot already.
+    // Lets operators recover from the "runtime default base 0.6B missing,
+    // premium 1.7B already cached" situation without grep-debugging.
+    let current_cache_path = aicx::embedder::hf_cache::snapshot_path_for_profile(cfg.profile);
+    let cache_present = current_cache_path.is_some();
+    let cached_profiles = aicx::embedder::hf_cache::detect_cached_profiles();
+    let suggested_profile = if !cache_present {
+        cached_profiles.iter().find(|&&p| p != cfg.profile).copied()
+    } else {
+        None
+    };
+
     if json {
         let payload = serde_json::json!({
             "backend": cfg.backend.as_str(),
@@ -5074,6 +5178,8 @@ fn run_config_show(json: bool) -> Result<()> {
                 "dimension_hint": resolved.dimension_hint,
                 "approx_size": resolved.approx_size,
                 "from_legacy_repo": resolved.from_legacy_repo,
+                "cache_present": cache_present,
+                "cache_path": current_cache_path.as_ref().map(|p| p.display().to_string()),
             },
             "cloud": cfg.cloud.as_ref().map(|c| serde_json::json!({
                 "url": c.url,
@@ -5082,20 +5188,28 @@ fn run_config_show(json: bool) -> Result<()> {
                 "dimension": c.effective_dimension(),
                 "timeout_secs": c.effective_timeout_secs(),
             })),
-            "config_path": canonical_config_path().ok().map(|p| p.display().to_string()),
+            "canonical_config_path": canonical_path.as_ref().map(|p| p.display().to_string()),
+            "effective_config_path": effective.as_ref().map(|(p, _)| p.display().to_string()),
+            "effective_branch": effective_branch,
+            "config_path": canonical_path.as_ref().map(|p| p.display().to_string()),
             "cloud_section_present": cloud_set,
+            "available_cached_profiles": cached_profiles.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+            "suggested_profile": suggested_profile.map(|p| p.as_str()),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
 
-    let path_display = canonical_config_path()
-        .ok()
+    let canonical_display = canonical_path
+        .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<unresolved>".to_string());
 
     eprintln!("aicx config show — resolved embedder configuration");
-    eprintln!("  config_path: {path_display}");
+    eprintln!("  canonical_config_path: {canonical_display}");
+    eprintln!("  effective_config_path: {effective_path_display}");
+    eprintln!("  effective_branch:      {effective_branch}");
+    eprintln!("  {marker_line}");
     eprintln!("  backend:     {}", cfg.backend.as_str());
     eprintln!("  profile:     {}", cfg.profile.as_str());
     eprintln!("  native.repo:           {}", resolved.repo);
@@ -5104,6 +5218,23 @@ fn run_config_show(json: bool) -> Result<()> {
     eprintln!("  native.approx_size:    {}", resolved.approx_size);
     if resolved.from_legacy_repo {
         eprintln!("  native.from_legacy_repo: true (auto-mapped to F2LLM GGUF)");
+    }
+    eprintln!("  native.cache_present:  {cache_present}");
+    if let Some(path) = &current_cache_path {
+        eprintln!("  native.cache_path:     {}", path.display());
+    }
+    if !cached_profiles.is_empty() {
+        let names: Vec<&str> = cached_profiles.iter().map(|p| p.as_str()).collect();
+        eprintln!("  available_cached_profiles: {}", names.join(", "));
+    } else {
+        eprintln!("  available_cached_profiles: <none — run `hf download` first>");
+    }
+    if let Some(sug) = suggested_profile {
+        let sug_name = sug.as_str();
+        eprintln!(
+            "  suggested_profile:     {sug_name} (HF cache has it hydrated — set \
+             `AICX_EMBEDDER_PROFILE={sug_name}` or `profile = \"{sug_name}\"` in config.toml)"
+        );
     }
     if let Some(cloud) = &cfg.cloud {
         eprintln!("  cloud.url:           {}", cloud.url);
@@ -5118,6 +5249,46 @@ fn run_config_show(json: bool) -> Result<()> {
         eprintln!("  cloud:               <not configured> (run `aicx config init` to bootstrap)");
     }
     Ok(())
+}
+
+/// Render the human-readable `(effective_path, branch_name, marker_line)`
+/// triple used by both the plain-text and JSON paths of `aicx config show`.
+/// `None` means no config file was found and the embedder runs on built-in
+/// defaults — the marker then nudges `aicx config init`.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn describe_effective_config(
+    effective: &Option<(PathBuf, aicx::embedder::ConfigSource)>,
+) -> (String, &'static str, String) {
+    use aicx::embedder::ConfigSource;
+    match effective {
+        Some((path, ConfigSource::Env)) => (
+            path.display().to_string(),
+            "env",
+            format!(
+                "(loaded from: env $AICX_EMBEDDER_CONFIG -> {})",
+                path.display()
+            ),
+        ),
+        Some((path, ConfigSource::Canonical)) => (
+            path.display().to_string(),
+            "canonical",
+            format!("(loaded from: canonical -> {})", path.display()),
+        ),
+        Some((path, ConfigSource::Legacy)) => (
+            path.display().to_string(),
+            "legacy",
+            format!(
+                "(loaded from: legacy embedder.toml -> {} — run `aicx config init` to migrate to canonical config.toml)",
+                path.display()
+            ),
+        ),
+        None => (
+            "<built-in defaults>".to_string(),
+            "defaults",
+            "(no config file found; using built-in defaults — run `aicx config init` to materialize one)"
+                .to_string(),
+        ),
+    }
 }
 
 #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
@@ -5249,16 +5420,8 @@ fn run_index(
     dry_run: bool,
     full_rescan: bool,
 ) -> Result<()> {
-    let resolved_projects = resolve_project_filters_or_error(projects)?;
-    let scopes: Vec<Option<&str>> = if resolved_projects.is_empty() {
-        vec![None]
-    } else {
-        resolved_projects
-            .iter()
-            .map(String::as_str)
-            .map(Some)
-            .collect::<Vec<_>>()
-    };
+    let resolved_scopes = resolve_index_scopes(projects)?;
+    let scopes: Vec<Option<&str>> = resolved_scopes.iter().map(Option::as_deref).collect();
 
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr()) && !json;
 
@@ -5322,72 +5485,118 @@ fn run_index(
     Ok(())
 }
 
-fn run_index_status(project: Option<&str>, json: bool) -> Result<()> {
+fn run_index_status(projects: &[String], json: bool) -> Result<()> {
+    let resolved_scopes = resolve_index_scopes(projects)?;
     let client = aicx::Aicx::from_env()?;
-    let status = client.index_status(project)?;
+
+    let mut reports: Vec<(Option<String>, aicx::IndexStatus)> =
+        Vec::with_capacity(resolved_scopes.len());
+    for scope in &resolved_scopes {
+        let status = client.index_status(scope.as_deref())?;
+        reports.push((scope.clone(), status));
+    }
+
     if json {
-        println!("{}", serde_json::to_string_pretty(&status)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&index_status_json_payload(&reports))?
+        );
     } else {
-        eprintln!("aicx index status");
-        eprintln!(
-            "  readiness:              {}",
-            match status.readiness {
-                aicx::IndexReadiness::Ready => "ready",
-                aicx::IndexReadiness::Pending => "pending (only temp checkpoint)",
-                aicx::IndexReadiness::Missing => "missing",
+        for (idx, (scope, status)) in reports.iter().enumerate() {
+            if reports.len() > 1 {
+                if idx > 0 {
+                    eprintln!();
+                }
+                eprintln!(
+                    "scope: {}",
+                    scope
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("_all")
+                );
             }
-        );
-        eprintln!("  backend:                {}", status.backend);
-        eprintln!("  project_bucket:         {}", status.project_bucket);
-        eprintln!("  canonical_chunks:       {}", status.canonical_chunks);
-        eprintln!(
-            "  semantic_index_present: {}",
-            status.semantic_index_present
-        );
-        eprintln!(
-            "  semantic_index_path:    {}",
-            status.semantic_index_path.as_deref().unwrap_or("<none>")
-        );
-        eprintln!("  semantic_index_rows:    {}", status.semantic_index_rows);
-        eprintln!(
-            "  committed_at:           {}",
-            status.committed_at.as_deref().unwrap_or("<none>")
-        );
-        eprintln!(
-            "  newest_chunk_mtime:     {}",
-            status.newest_chunk_mtime.as_deref().unwrap_or("<none>")
-        );
-        eprintln!(
-            "  semantic_index_mtime:   {}",
-            status.semantic_index_mtime.as_deref().unwrap_or("<none>")
-        );
-        eprintln!(
-            "  semantic_lag_secs:      {}",
-            status
-                .semantic_lag_secs
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "<unknown>".to_string())
-        );
-        eprintln!("  pending_chunks:         {}", status.pending_chunks);
-        eprintln!("  temp_index_present:     {}", status.temp_index_present);
-        eprintln!(
-            "  temp_index_path:        {}",
-            status.temp_index_path.as_deref().unwrap_or("<none>")
-        );
-        eprintln!("  temp_index_rows:        {}", status.temp_index_rows);
-        eprintln!(
-            "  temp_index_mtime:       {}",
-            status.temp_index_mtime.as_deref().unwrap_or("<none>")
-        );
-        eprintln!(
-            "  temp_index_bytes:       {}",
-            status
-                .temp_index_bytes
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "<none>".to_string())
-        );
+            print_index_status_text(status);
+        }
     }
     Ok(())
+}
+
+fn index_status_json_payload(reports: &[(Option<String>, aicx::IndexStatus)]) -> serde_json::Value {
+    serde_json::Value::Array(
+        reports
+            .iter()
+            .map(|(scope, status)| {
+                serde_json::json!({
+                    "project": scope
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("_all"),
+                    "status": status,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn print_index_status_text(status: &aicx::IndexStatus) {
+    eprintln!("aicx index status");
+    eprintln!(
+        "  readiness:              {}",
+        match status.readiness {
+            aicx::IndexReadiness::Ready => "ready",
+            aicx::IndexReadiness::Pending => "pending (only temp checkpoint)",
+            aicx::IndexReadiness::Missing => "missing",
+        }
+    );
+    eprintln!("  backend:                {}", status.backend);
+    eprintln!("  project_bucket:         {}", status.project_bucket);
+    eprintln!("  canonical_chunks:       {}", status.canonical_chunks);
+    eprintln!(
+        "  semantic_index_present: {}",
+        status.semantic_index_present
+    );
+    eprintln!(
+        "  semantic_index_path:    {}",
+        status.semantic_index_path.as_deref().unwrap_or("<none>")
+    );
+    eprintln!("  semantic_index_rows:    {}", status.semantic_index_rows);
+    eprintln!(
+        "  committed_at:           {}",
+        status.committed_at.as_deref().unwrap_or("<none>")
+    );
+    eprintln!(
+        "  newest_chunk_mtime:     {}",
+        status.newest_chunk_mtime.as_deref().unwrap_or("<none>")
+    );
+    eprintln!(
+        "  semantic_index_mtime:   {}",
+        status.semantic_index_mtime.as_deref().unwrap_or("<none>")
+    );
+    eprintln!(
+        "  semantic_lag_secs:      {}",
+        status
+            .semantic_lag_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string())
+    );
+    eprintln!("  pending_chunks:         {}", status.pending_chunks);
+    eprintln!("  temp_index_present:     {}", status.temp_index_present);
+    eprintln!(
+        "  temp_index_path:        {}",
+        status.temp_index_path.as_deref().unwrap_or("<none>")
+    );
+    eprintln!("  temp_index_rows:        {}", status.temp_index_rows);
+    eprintln!(
+        "  temp_index_mtime:       {}",
+        status.temp_index_mtime.as_deref().unwrap_or("<none>")
+    );
+    eprintln!(
+        "  temp_index_bytes:       {}",
+        status
+            .temp_index_bytes
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<none>".to_string())
+    );
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -6341,6 +6550,58 @@ mod tests {
     use filetime::{FileTime, set_file_mtime};
     use std::fs;
 
+    /// Bug #26 regression: the four branches of `aicx config show`
+    /// must each render a distinct marker so an operator can tell at
+    /// a glance which file the embedder actually loaded (env override,
+    /// legacy embedder.toml, canonical config.toml, or built-in
+    /// defaults). Tests the pure marker formatter; the resolver itself
+    /// is covered in `aicx_embeddings::config::tests`.
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn config_show_marker_covers_all_four_branches() {
+        use aicx::embedder::ConfigSource;
+
+        let env_path = PathBuf::from("/tmp/op-override.toml");
+        let (path, branch, marker) =
+            describe_effective_config(&Some((env_path.clone(), ConfigSource::Env)));
+        assert_eq!(branch, "env");
+        assert_eq!(path, env_path.display().to_string());
+        assert!(
+            marker.contains("$AICX_EMBEDDER_CONFIG"),
+            "env marker must name the override var: {marker}"
+        );
+        assert!(marker.contains(&env_path.display().to_string()));
+
+        let canonical = PathBuf::from("/tmp/.aicx/config.toml");
+        let (path, branch, marker) =
+            describe_effective_config(&Some((canonical.clone(), ConfigSource::Canonical)));
+        assert_eq!(branch, "canonical");
+        assert_eq!(path, canonical.display().to_string());
+        assert!(marker.contains("canonical"));
+
+        let legacy = PathBuf::from("/tmp/.aicx/embedder.toml");
+        let (path, branch, marker) =
+            describe_effective_config(&Some((legacy.clone(), ConfigSource::Legacy)));
+        assert_eq!(branch, "legacy");
+        assert_eq!(path, legacy.display().to_string());
+        assert!(
+            marker.contains("aicx config init"),
+            "legacy marker must nudge migration: {marker}"
+        );
+
+        let (path, branch, marker) = describe_effective_config(&None);
+        assert_eq!(branch, "defaults");
+        assert_eq!(path, "<built-in defaults>");
+        assert!(
+            marker.contains("aicx config init"),
+            "defaults marker must nudge `aicx config init`: {marker}"
+        );
+        assert!(
+            marker.contains("no config file found"),
+            "defaults marker must say no file was found: {marker}"
+        );
+    }
+
     #[test]
     fn lookback_cutoff_zero_returns_all_time() {
         let cutoff = lookback_cutoff(0);
@@ -6389,6 +6650,213 @@ mod tests {
             extraction_source_key_aliases(LEGACY_ALL_WATERMARK_AGENTS, &project_a),
             extraction_source_key_aliases(LEGACY_ALL_WATERMARK_AGENTS, &project_b)
         );
+    }
+
+    /// Bug #36 regression: prove `aicx index status -p X` and
+    /// `aicx index -p X` produce the same bucket set for every canonical
+    /// filter shape. Both surfaces must canonicalize through
+    /// `aicx::store::resolve_filters_to_slugs` before computing bucket
+    /// paths, so any `-p X` that `index` would build IS the bucket set
+    /// that `index status` reports on (and vice versa).
+    #[test]
+    fn index_status_routes_through_index_canonical_resolver() {
+        use std::collections::BTreeSet;
+
+        let root = unique_test_dir("index-status-canonical");
+        let _ = fs::remove_dir_all(&root);
+        let canonical_root = root.join("store");
+
+        // Canonical on-disk store: 4 buckets across 2 orgs / 3 repo names.
+        // Mixed case mirrors real-world GitHub slugs (filesystem preserves it).
+        let bucket_slugs = [
+            "VetCoders/Loctree",
+            "VetCoders/aicx",
+            "Szowesgad/Loctree",
+            "Szowesgad/CodeScribe",
+        ];
+        for slug in bucket_slugs {
+            fs::create_dir_all(canonical_root.join(slug)).unwrap();
+        }
+
+        // Corresponding semantic index buckets (lowercase + `/` → `_`).
+        for bucket in [
+            "vetcoders_loctree",
+            "vetcoders_aicx",
+            "szowesgad_loctree",
+            "szowesgad_codescribe",
+        ] {
+            let dir = root.join("indexed").join(bucket);
+            fs::create_dir_all(&dir).unwrap();
+            // Header + one row so semantic_index_present flips to true.
+            write_file(
+                &dir.join("embeddings.ndjson"),
+                "{\"schema_version\":\"1.0\"}\n{\"id\":\"a\"}\n",
+            );
+        }
+
+        // The 4 canonical filter shapes from the bug brief.
+        let shapes: &[(&str, &[&str])] = &[
+            // strict slug
+            ("VetCoders/Loctree", &["vetcoders_loctree"]),
+            // org wildcard
+            ("VetCoders/", &["vetcoders_aicx", "vetcoders_loctree"]),
+            // cross-org repo
+            ("/Loctree", &["szowesgad_loctree", "vetcoders_loctree"]),
+            // bare name (matches as repo name across orgs)
+            ("Loctree", &["szowesgad_loctree", "vetcoders_loctree"]),
+        ];
+
+        for (filter, expected_buckets) in shapes {
+            // Step 1: canonical resolver (the shared chokepoint both
+            // `aicx index` and `aicx index status` route through after
+            // bug #36 is fixed).
+            let resolved =
+                aicx::store::resolve_filters_to_slugs_at(&canonical_root, &[(*filter).to_string()])
+                    .unwrap_or_else(|e| panic!("resolver failed for {filter:?}: {e}"));
+
+            assert!(
+                !resolved.is_empty(),
+                "filter {filter:?} must resolve to at least one slug"
+            );
+
+            // Step 2: for each canonical slug, ask the public status API
+            // (exactly what `run_index_status` calls). The bucket it
+            // reports IS the bucket `run_index` would have built.
+            let actual_buckets: BTreeSet<String> = resolved
+                .iter()
+                .map(|slug| {
+                    aicx::api::index_status_at(&root, Some(slug.as_str()))
+                        .unwrap_or_else(|e| panic!("index_status_at failed for slug {slug:?}: {e}"))
+                        .project_bucket
+                })
+                .collect();
+
+            let expected: BTreeSet<String> =
+                expected_buckets.iter().map(|s| (*s).to_string()).collect();
+
+            assert_eq!(
+                actual_buckets, expected,
+                "filter {filter:?}: `aicx index status` bucket set must equal `aicx index` bucket set"
+            );
+
+            // And every reported bucket must actually be Ready on disk
+            // — proves the canonical slug round-trips to an existing
+            // index file, not a phantom like `_codescribe`.
+            for bucket in &actual_buckets {
+                let path = root.join("indexed").join(bucket).join("embeddings.ndjson");
+                assert!(
+                    path.exists(),
+                    "filter {filter:?} resolved to bucket {bucket:?} but no index file exists at {}",
+                    path.display()
+                );
+            }
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn dummy_index_status(bucket: &str) -> aicx::IndexStatus {
+        aicx::IndexStatus {
+            canonical_chunks: 3,
+            semantic_index_present: true,
+            semantic_index_path: Some(format!("/tmp/{bucket}/embeddings.ndjson")),
+            semantic_index_rows: 3,
+            newest_chunk_mtime: Some("2026-05-24T00:00:00Z".to_string()),
+            semantic_index_mtime: Some("2026-05-24T00:01:00Z".to_string()),
+            semantic_lag_secs: Some(60),
+            pending_chunks: 0,
+            temp_index_present: false,
+            temp_index_path: None,
+            temp_index_rows: 0,
+            temp_index_mtime: None,
+            temp_index_bytes: None,
+            readiness: aicx::IndexReadiness::Ready,
+            backend: "ndjson".to_string(),
+            project_bucket: bucket.to_string(),
+            committed_at: Some("2026-05-24T00:01:00Z".to_string()),
+        }
+    }
+
+    #[test]
+    fn index_status_json_payload_is_always_array_for_single_scope() {
+        let reports = vec![(None, dummy_index_status("_all"))];
+        let payload = index_status_json_payload(&reports);
+        let items = payload
+            .as_array()
+            .expect("index status JSON must be a stable array envelope");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["project"], "_all");
+        assert_eq!(items[0]["status"]["project_bucket"], "_all");
+    }
+
+    #[test]
+    fn index_status_json_payload_is_array_for_multiple_scopes() {
+        let reports = vec![
+            (
+                Some("VetCoders/aicx".to_string()),
+                dummy_index_status("vetcoders_aicx"),
+            ),
+            (
+                Some("Loctree/loctree-suite".to_string()),
+                dummy_index_status("loctree_loctree-suite"),
+            ),
+        ];
+        let payload = index_status_json_payload(&reports);
+        let items = payload
+            .as_array()
+            .expect("multi-scope index status JSON must use the same envelope");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["project"], "VetCoders/aicx");
+        assert_eq!(items[1]["project"], "Loctree/loctree-suite");
+        assert_eq!(items[0]["status"]["project_bucket"], "vetcoders_aicx");
+        assert_eq!(
+            items[1]["status"]["project_bucket"],
+            "loctree_loctree-suite"
+        );
+    }
+
+    #[test]
+    fn run_search_rejects_limit_over_hard_cap_before_store_access() {
+        let filters = RetrievalFilters {
+            limit: MAX_CLI_SEARCH_LIMIT + 1,
+            sort: None,
+            score: None,
+            agent: None,
+            since: None,
+            until: None,
+            frame_kind: None,
+        };
+
+        let err = run_search(SearchRunArgs {
+            query: "dashboard",
+            projects: &[],
+            hours: 0,
+            date: None,
+            json: false,
+            filters,
+            kind: None,
+            no_semantic: true,
+        })
+        .expect_err("oversized search limit must fail before reading the store");
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("search --limit"));
+        assert!(rendered.contains(&MAX_CLI_SEARCH_LIMIT.to_string()));
+    }
+
+    #[test]
+    fn fuzzy_fetch_limit_uses_semantic_filter_cap_constants() {
+        assert_eq!(
+            search_examined_fetch_limit(1, true),
+            aicx::search_engine::FILTER_EXAMINED_CAP_MIN
+        );
+        assert_eq!(
+            search_examined_fetch_limit(10, true),
+            10 * aicx::search_engine::FILTER_EXAMINED_CAP_RATIO
+        );
+        assert_eq!(search_examined_fetch_limit(1, false), 1);
     }
 
     #[test]
@@ -6636,6 +7104,22 @@ mod tests {
         assert!(stem.len() <= DEFAULT_SESSION_EXTRACT_FILENAME_STEM_MAX_BYTES);
         assert_eq!(suffix.len(), 16);
         assert!(suffix.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn default_session_extract_path_normal_input_passthrough() {
+        // Closes Klaudiusz audit gap I-3 (P3): a UUID-like session id that
+        // uses only the safe charset (`[a-zA-Z0-9-_.]`) and fits under
+        // DEFAULT_SESSION_EXTRACT_FILENAME_STEM_MAX_BYTES must round-trip
+        // verbatim into the filename — no hash suffix, no sanitization
+        // collapse. Regression guard for the `is_already_safe` fast path.
+        let session_id = "019e27c0-e492-7790-9c33-52b3dddd1067";
+        let file_name = default_session_extract_file_name(session_id);
+        assert_eq!(
+            file_name,
+            format!("{session_id}.md"),
+            "normal UUID-like session id must pass through unchanged"
+        );
     }
 
     #[test]
