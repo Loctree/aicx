@@ -1187,6 +1187,86 @@ mod tests {
         assert_eq!(diag.examined_cap_ratio, FILTER_EXAMINED_CAP_RATIO);
     }
 
+    #[test]
+    fn inject_filter_pushdown_none_is_byte_preserving_pass_through() {
+        let rendered = "{this is intentionally not json";
+
+        let injected = inject_filter_pushdown_diagnostic(rendered, None)
+            .expect("None diagnostic should not parse or mutate rendered payload");
+
+        assert_eq!(injected, rendered);
+    }
+
+    #[test]
+    fn inject_filter_pushdown_some_adds_object_field() {
+        let diag = FilterPushdownDiagnostic {
+            kind: "filter_yielded_partial",
+            examined: 50,
+            matched: 3,
+            requested_limit: 10,
+            examined_cap_ratio: FILTER_EXAMINED_CAP_RATIO,
+        };
+
+        let injected = inject_filter_pushdown_diagnostic(r#"{"results":3}"#, Some(&diag))
+            .expect("object payload should accept filter_pushdown diagnostic");
+        let payload: serde_json::Value =
+            serde_json::from_str(&injected).expect("injected payload should remain JSON");
+
+        assert_eq!(payload["results"], 3);
+        assert_eq!(payload["filter_pushdown"]["kind"], "filter_yielded_partial");
+        assert_eq!(payload["filter_pushdown"]["examined"], 50);
+        assert_eq!(payload["filter_pushdown"]["matched"], 3);
+        assert_eq!(payload["filter_pushdown"]["requested_limit"], 10);
+        assert_eq!(
+            payload["filter_pushdown"]["examined_cap_ratio"],
+            FILTER_EXAMINED_CAP_RATIO
+        );
+    }
+
+    #[test]
+    fn inject_filter_pushdown_some_leaves_non_object_root_shape() {
+        let diag = FilterPushdownDiagnostic {
+            kind: "filter_yielded_partial",
+            examined: 50,
+            matched: 3,
+            requested_limit: 10,
+            examined_cap_ratio: FILTER_EXAMINED_CAP_RATIO,
+        };
+
+        let injected = inject_filter_pushdown_diagnostic(r#"[{"results":3}]"#, Some(&diag))
+            .expect("non-object root should still round-trip as JSON");
+        let payload: serde_json::Value =
+            serde_json::from_str(&injected).expect("round-tripped payload should parse");
+
+        assert!(payload.is_array());
+        assert_eq!(payload[0]["results"], 3);
+        assert!(payload.get("filter_pushdown").is_none());
+    }
+
+    #[test]
+    fn inject_filter_pushdown_some_overwrites_existing_field() {
+        let diag = FilterPushdownDiagnostic {
+            kind: "filter_yielded_partial",
+            examined: 100,
+            matched: 9,
+            requested_limit: 25,
+            examined_cap_ratio: FILTER_EXAMINED_CAP_RATIO,
+        };
+
+        let injected = inject_filter_pushdown_diagnostic(
+            r#"{"filter_pushdown":{"kind":"stale"},"results":9}"#,
+            Some(&diag),
+        )
+        .expect("existing diagnostic field should be replaced by current diagnostic");
+        let payload: serde_json::Value =
+            serde_json::from_str(&injected).expect("injected payload should remain JSON");
+
+        assert_eq!(payload["filter_pushdown"]["kind"], "filter_yielded_partial");
+        assert_eq!(payload["filter_pushdown"]["examined"], 100);
+        assert_eq!(payload["filter_pushdown"]["matched"], 9);
+        assert_eq!(payload["filter_pushdown"]["requested_limit"], 25);
+    }
+
     /// Short pool (corpus-side exhaustion) is NOT a partial-cap event —
     /// the diagnostic stays silent so the caller can distinguish
     /// "examined cap, still under-delivered" from "corpus genuinely

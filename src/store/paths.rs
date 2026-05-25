@@ -90,17 +90,35 @@ pub fn canonical_store_dir() -> Result<PathBuf> {
 
 /// Returns the immutable context-corpus root: `$AICX_HOME/context-corpus/`.
 pub fn context_corpus_root_dir() -> Result<PathBuf> {
-    let dir = store_base_dir()?.join(CONTEXT_CORPUS_DIRNAME);
+    let dir = context_corpus_root_dir_for(&store_base_dir()?);
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
+/// Pure: builds the immutable context-corpus root under an explicit `home`.
+///
+/// No env reads, no filesystem creation. Used by tests that must exercise
+/// context-corpus ingest behavior without racing on process-global env vars.
+pub(crate) fn context_corpus_root_dir_for(home: &Path) -> PathBuf {
+    store_base_dir_for(home).join(CONTEXT_CORPUS_DIRNAME)
+}
+
 pub fn aicx_context_corpus_dir(org: &str, repo: &str, date: &str, batch: &str) -> Result<PathBuf> {
+    aicx_context_corpus_dir_for(&store_base_dir()?, org, repo, date, batch)
+}
+
+pub(crate) fn aicx_context_corpus_dir_for(
+    home: &Path,
+    org: &str,
+    repo: &str,
+    date: &str,
+    batch: &str,
+) -> Result<PathBuf> {
     let org = canonical_path_segment(org, "org")?;
     let repo = canonical_path_segment(repo, "repo")?;
     let date = super::compact_date(date);
     let batch = canonical_path_segment(batch, "batch")?;
-    let dir = context_corpus_root_dir()?
+    let dir = context_corpus_root_dir_for(home)
         .join(org)
         .join(repo)
         .join(date)

@@ -90,6 +90,10 @@ fn siphash13_hex6(input: &str) -> String {
     format!("{:06x}", (hasher.finish() & 0x00FF_FFFF) as u32)
 }
 
+fn chunk_sequence_from_id(id: &str) -> Option<u32> {
+    id.rsplit('_').next().and_then(parse_chunk_component)
+}
+
 // ============================================================================
 // Path helpers
 // ============================================================================
@@ -110,7 +114,8 @@ pub use paths::{
     store_base_dir_for,
 };
 use paths::{
-    legacy_salvage_dir, migration_manifest_path, migration_report_path, validated_store_project_dir,
+    aicx_context_corpus_dir_for, legacy_salvage_dir, migration_manifest_path,
+    migration_report_path, validated_store_project_dir,
 };
 
 // ============================================================================
@@ -340,6 +345,7 @@ pub struct StoreWriteSummary {
 #[derive(Debug, Clone, Default)]
 struct SessionWriteOutcome {
     written_paths: Vec<PathBuf>,
+    written_date_counts: BTreeMap<String, usize>,
     skipped_empty_body: usize,
     deduped_chunks: usize,
 }
@@ -514,7 +520,6 @@ fn write_context_session_first_outcome_at(
         .map(canonical_project_slug)
         .unwrap_or_else(|| NON_REPOSITORY_CONTEXTS.to_string());
     let chunks = chunker::chunk_entries(entries, &project_label, spec.agent, chunker_config);
-    let date_dir = compact_date(spec.date);
 
     let mut outcome = SessionWriteOutcome::default();
 
@@ -523,7 +528,13 @@ fn write_context_session_first_outcome_at(
             outcome.skipped_empty_body += 1;
             continue;
         }
-        let chunk_num = (idx as u32) + 1;
+        let chunk_date = if chunk.date.trim().is_empty() {
+            spec.date
+        } else {
+            chunk.date.as_str()
+        };
+        let date_dir = compact_date(chunk_date);
+        let chunk_num = chunk_sequence_from_id(&chunk.id).unwrap_or((idx as u32) + 1);
         let mut dir = root.join(&date_dir).join(kind.dir_name()).join(spec.agent);
         if spec.project.is_some() {
             dir = validated_store_project_dir(root, &project_label)?
@@ -533,7 +544,7 @@ fn write_context_session_first_outcome_at(
         }
         fs::create_dir_all(&dir)?;
 
-        let filename = session_basename(spec.date, spec.agent, spec.session_id, chunk_num);
+        let filename = session_basename(chunk_date, spec.agent, spec.session_id, chunk_num);
         let path = dir.join(&filename);
         let content_sha256 = content_sha256(&chunk.text);
         if sha_cache.contains(&dir, &content_sha256)? {
@@ -668,6 +679,10 @@ fn write_context_session_first_outcome_at(
             atomic_write::parent_fsync(&sidecar_write_path);
         }
         sha_cache.insert(&dir, content_sha256);
+        *outcome
+            .written_date_counts
+            .entry(date_dir.clone())
+            .or_default() += 1;
         outcome.written_paths.push(target_path);
     }
 
@@ -942,13 +957,38 @@ where
         // On-disk-truth counter (proportional to chunks actually
         // written) — `index.json` only.
         if entries_committed_to_disk > 0 {
-            update_index(
-                &mut guard.index,
-                &project,
-                &segment.agent,
-                &compact_date(&date),
-                entries_committed_to_disk,
-            );
+            if outcome.written_date_counts.is_empty() {
+                update_index(
+                    &mut guard.index,
+                    &project,
+                    &segment.agent,
+                    &compact_date(&date),
+                    entries_committed_to_disk,
+                );
+            } else {
+                let total_written: usize = outcome.written_date_counts.values().sum();
+                let mut remaining_entries = entries_committed_to_disk;
+                let mut remaining_dates = outcome.written_date_counts.len();
+                for (date, chunks_for_date) in &outcome.written_date_counts {
+                    let entry_count = if remaining_dates == 1 {
+                        remaining_entries
+                    } else {
+                        let proportional =
+                            entries_committed_to_disk * chunks_for_date / total_written;
+                        let count = proportional.max(1).min(remaining_entries);
+                        remaining_entries = remaining_entries.saturating_sub(count);
+                        remaining_dates -= 1;
+                        count
+                    };
+                    update_index(
+                        &mut guard.index,
+                        &project,
+                        &segment.agent,
+                        date,
+                        entry_count,
+                    );
+                }
+            }
         }
         summary.written_paths.extend(outcome.written_paths);
         progress(segment_idx + 1, total_segments);
@@ -1356,6 +1396,13 @@ struct ContextCorpusIndexRow {
 }
 
 pub fn ingest_loct_context_pack(pack_dir: &Path) -> Result<ContextCorpusIngestSummary> {
+    ingest_loct_context_pack_into(pack_dir, None)
+}
+
+fn ingest_loct_context_pack_into(
+    pack_dir: &Path,
+    home: Option<&Path>,
+) -> Result<ContextCorpusIngestSummary> {
     let pack_dir = sanitize::validate_dir_path(pack_dir)?;
     let raw_dir = pack_dir.join("raw");
     let sidecars_dir = pack_dir.join("sidecars");
@@ -1435,7 +1482,10 @@ pub fn ingest_loct_context_pack(pack_dir: &Path) -> Result<ContextCorpusIngestSu
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("batch");
-    let target = aicx_context_corpus_dir(&org, &repo, &date, batch)?;
+    let target = match home {
+        Some(home) => aicx_context_corpus_dir_for(home, &org, &repo, &date, batch)?,
+        None => aicx_context_corpus_dir(&org, &repo, &date, batch)?,
+    };
     let target_raw = target.join("raw");
     let target_sidecars = target.join("sidecars");
     let index_path = target.join("index.jsonl");
@@ -1753,6 +1803,10 @@ fn scan_repo_store(
 }
 
 /// Decide whether `<organization>/<repository>` matches a single `-p` filter.
+///
+/// This is intentionally public: integration tests and downstream callers use
+/// it as the canonical project-filter contract, so signature or semantic changes
+/// are public API changes.
 ///
 /// Semantics (case-insensitive throughout):
 /// - `-p owner/repo` → strict `<owner>/<repo>` slug equality.
@@ -2096,12 +2150,26 @@ fn parse_session_basename(name: &str, agent: &str, date_compact: &str) -> Option
         return None;
     }
 
-    if chunk_str.len() != 3 || !chunk_str.chars().all(|ch| ch.is_ascii_digit()) {
+    let chunk = parse_chunk_component(chunk_str)?;
+    Some((session_id.to_string(), chunk))
+}
+
+fn parse_chunk_component(value: &str) -> Option<u32> {
+    let digits = match value.split_once("-c") {
+        Some((digits, suffix))
+            if suffix.len() == 6 && suffix.chars().all(|ch| ch.is_ascii_hexdigit()) =>
+        {
+            digits
+        }
+        Some(_) => return None,
+        None => value,
+    };
+
+    if digits.len() < 3 || !digits.chars().all(|ch| ch.is_ascii_digit()) {
         return None;
     }
 
-    let chunk = chunk_str.parse().ok()?;
-    Some((session_id.to_string(), chunk))
+    digits.parse().ok()
 }
 
 pub fn expand_compact_date(compact: &str) -> String {
@@ -4335,6 +4403,75 @@ mod tests {
     }
 
     #[test]
+    fn store_semantic_segments_uses_chunk_date_for_multi_day_sessions() {
+        let root = retrieval_test_root("multi-day-chunk-date");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let entries = vec![
+            semantic_entry(
+                (2026, 3, 21, 23, 59, 0),
+                "sess-multiday",
+                "assistant",
+                "Day one answer with enough signal to become a stored chunk.",
+                None,
+            ),
+            semantic_entry(
+                (2026, 3, 22, 0, 1, 0),
+                "sess-multiday",
+                "assistant",
+                "Day two answer from the same session must land under its own date.",
+                None,
+            ),
+        ];
+
+        let summary =
+            store_semantic_segments_at(&root, &entries, &ChunkerConfig::default(), |_, _| {})
+                .expect("store semantic segments");
+
+        let day_one = root
+            .join(NON_REPOSITORY_CONTEXTS)
+            .join("2026_0321")
+            .join("conversations")
+            .join("codex")
+            .join("2026_0321_codex_sess-multiday_001.md");
+        let day_two = root
+            .join(NON_REPOSITORY_CONTEXTS)
+            .join("2026_0322")
+            .join("conversations")
+            .join("codex")
+            .join("2026_0322_codex_sess-multiday_001.md");
+
+        assert!(
+            summary.written_paths.contains(&day_one),
+            "first day's chunk must use its own date path"
+        );
+        assert!(
+            summary.written_paths.contains(&day_two),
+            "second day's chunk must use chunk.date, not the segment's first date"
+        );
+        assert!(
+            !summary.written_paths.iter().any(|path| {
+                path.file_name().and_then(|name| name.to_str())
+                    == Some("2026_0321_codex_sess-multiday_002.md")
+            }),
+            "multi-day chunks must not be globally renumbered into the first date"
+        );
+
+        let day_one = day_one.canonicalize().unwrap();
+        let day_two = day_two.canonicalize().unwrap();
+        let scanned = scan_context_files_at(&root).expect("scan stored files");
+        assert!(scanned.iter().any(|file| {
+            file.path == day_one && file.date_iso == "2026-03-21" && file.chunk == 1
+        }));
+        assert!(scanned.iter().any(|file| {
+            file.path == day_two && file.date_iso == "2026-03-22" && file.chunk == 1
+        }));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn test_store_semantic_segments_reports_progress_per_segment() {
         let root = retrieval_test_root("segmentation-progress");
         let _ = fs::remove_dir_all(&root);
@@ -4638,6 +4775,54 @@ mod tests {
             file.repo.as_ref().unwrap().slug(),
             "VetCoders/ai-contexters"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_and_read_accept_four_digit_and_collision_suffix_chunks() {
+        let root = retrieval_test_root("wide-seq-and-collision-scan");
+        let _ = fs::remove_dir_all(&root);
+
+        let chunk_dir = root
+            .join("store")
+            .join("VetCoders")
+            .join("aicx")
+            .join("2026_0321")
+            .join("conversations")
+            .join("claude");
+        let four_digit = chunk_dir.join("2026_0321_claude_sess-big_1000.md");
+        let collision = chunk_dir.join("2026_0321_claude_sess-collide_022-cabcdef.md");
+        write_chunk_file(&four_digit, "Chunk one thousand must remain discoverable.");
+        write_chunk_file(
+            &collision,
+            "Collision-disambiguated chunk must remain readable.",
+        );
+        let four_digit = four_digit.canonicalize().unwrap();
+        let collision = collision.canonicalize().unwrap();
+
+        let scanned = scan_context_files_at(&root).expect("scan should succeed");
+        assert_eq!(
+            scanned.len(),
+            2,
+            "scanner must not drop valid writer output"
+        );
+        assert!(scanned.iter().any(|file| {
+            file.path == four_digit && file.session_id == "sess-big" && file.chunk == 1000
+        }));
+        assert!(scanned.iter().any(|file| {
+            file.path == collision && file.session_id == "sess-collide" && file.chunk == 22
+        }));
+
+        let by_four_digit = read_context_chunk_at(&root, four_digit.to_str().unwrap(), Some(32))
+            .expect("absolute _1000 path should read");
+        assert_eq!(by_four_digit.chunk, 1000);
+        assert!(by_four_digit.truncated);
+
+        let by_collision = read_context_chunk_at(&root, collision.to_str().unwrap(), None)
+            .expect("absolute -cHASH path should read");
+        assert_eq!(by_collision.chunk, 22);
+        assert_eq!(by_collision.session_id, "sess-collide");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -6293,51 +6478,126 @@ mod tests {
             .collect()
     }
 
-    /// Helper: stage AICX_HOME under a fresh temp dir and run `body`.
-    /// Holds [`AICX_HOME_ENV_LOCK`] so concurrent env-touching tests
-    /// stay serialised — same pattern as
-    /// `test_resolve_aicx_home_honors_explicit_env_var`.
-    fn with_isolated_aicx_home<F: FnOnce(&Path)>(label: &str, body: F) {
-        let _serial = AICX_HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let _guard = AicxHomeEnvGuard::capture();
+    fn with_temp_ingest_home<F: FnOnce(&Path)>(label: &str, body: F) {
         let aicx_home = unique_ingest_dir(label);
         fs::create_dir_all(&aicx_home).unwrap();
-        // SAFETY: the lock is held; sibling env-touching tests cannot race.
-        unsafe { env::set_var("AICX_HOME", &aicx_home) };
         body(&aicx_home);
         let _ = fs::remove_dir_all(&aicx_home);
     }
 
-    // Sibling to `ingest_loct_context_pack_preserves_rows_for_subset_reingest`
-    // (already removed in pass-5 commit 2c11c3c, same root cause). The
-    // `identical_reingest` test also relied on env-mediated `AICX_HOME`
-    // resolution across two `ingest_loct_context_pack` calls and is
-    // contended by parallel sibling tests in `vector_index`,
-    // `steer_index`, and `crates/aicx-parser/src/segmentation.rs` that
-    // mutate `AICX_HOME` without acquiring this module's
-    // `AICX_HOME_ENV_LOCK`. CI macOS at default parallelism reproduces
-    // the leak deterministically (`left: 0, right: 2`), while solo +
-    // local `--test-threads=2` runs pass.
-    //
-    // Removed per the same operator doctrine: tests reflect runtime;
-    // if a test is flaky under realistic test-environment parallelism
-    // for reasons independent of the runtime contract, the test is
-    // the thing to remove. The runtime behavior (REWRITE-FULL preserves
-    // both rows on identical re-ingest) is correct and stays verified
-    // by the sibling `ingest_loct_context_pack_unions_old_and_new_on_reingest`
-    // test (it ingests alpha, then re-ingests alpha+gamma; the alpha
-    // row must persist through the second ingest, which exercises the
-    // identical-dedupe path as a subset of the union case).
-    //
-    // Cross-module `AICX_HOME_ENV_LOCK` unification (4 contaminating
-    // test modules → shared `pub(crate)` lock) is tracked as a Wave F
-    // backlog item and will restore this test cleanly when landed.
+    #[test]
+    fn ingest_loct_context_pack_preserves_rows_for_subset_reingest() {
+        with_temp_ingest_home("subset", |home| {
+            let pack = unique_ingest_dir("subset-pack").join("batch-alpha");
+            reset_pack_dir(&pack);
+            write_pack_chunk(
+                &pack,
+                "alpha",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "first chunk",
+            );
+            write_pack_chunk(
+                &pack,
+                "beta",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "second chunk",
+            );
+            let first = ingest_loct_context_pack_into(&pack, Some(home)).expect("first ingest");
+            let first_ids = read_index_ids(&first.index_path);
+            assert_eq!(first_ids.len(), 2);
+            assert!(first_ids.iter().any(|id| id == "alpha"));
+            assert!(first_ids.iter().any(|id| id == "beta"));
+
+            // The second pack only re-presents alpha. The old bug rewrote
+            // index.jsonl from the second batch and dropped beta.
+            reset_pack_dir(&pack);
+            write_pack_chunk(
+                &pack,
+                "alpha",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "first chunk",
+            );
+
+            let second = ingest_loct_context_pack_into(&pack, Some(home)).expect("second ingest");
+            assert_eq!(second.deduped_chunks, 1, "alpha is content-identical");
+            assert_eq!(
+                second.raw_written, 0,
+                "no brand-new chunks in subset re-ingest"
+            );
+            let second_ids = read_index_ids(&second.index_path);
+            assert_eq!(second_ids.len(), 2);
+            assert!(second_ids.iter().any(|id| id == "alpha"));
+            assert!(
+                second_ids.iter().any(|id| id == "beta"),
+                "index.jsonl must preserve chunks not re-presented by the second pack"
+            );
+
+            let _ = fs::remove_dir_all(pack.parent().unwrap());
+        });
+    }
+
+    #[test]
+    fn ingest_loct_context_pack_preserves_rows_for_identical_reingest() {
+        with_temp_ingest_home("identical", |home| {
+            let pack = unique_ingest_dir("identical-pack").join("batch-alpha");
+            reset_pack_dir(&pack);
+            write_pack_chunk(
+                &pack,
+                "alpha",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "first chunk",
+            );
+            write_pack_chunk(
+                &pack,
+                "beta",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "second chunk",
+            );
+            let first = ingest_loct_context_pack_into(&pack, Some(home)).expect("first ingest");
+            assert_eq!(read_index_ids(&first.index_path).len(), 2);
+
+            reset_pack_dir(&pack);
+            write_pack_chunk(
+                &pack,
+                "alpha",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "first chunk",
+            );
+            write_pack_chunk(
+                &pack,
+                "beta",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "second chunk",
+            );
+
+            let second = ingest_loct_context_pack_into(&pack, Some(home)).expect("second ingest");
+            assert_eq!(
+                second.deduped_chunks, 2,
+                "both chunks are content-identical"
+            );
+            assert_eq!(
+                second.raw_written, 0,
+                "identical re-ingest writes no new raw chunks"
+            );
+            let second_ids = read_index_ids(&second.index_path);
+            assert_eq!(second_ids.len(), 2);
+            assert!(second_ids.iter().any(|id| id == "alpha"));
+            assert!(second_ids.iter().any(|id| id == "beta"));
+
+            let _ = fs::remove_dir_all(pack.parent().unwrap());
+        });
+    }
 
     #[test]
     fn ingest_loct_context_pack_unions_old_and_new_on_reingest() {
-        with_isolated_aicx_home("union", |_home| {
+        with_temp_ingest_home("union", |home| {
             let pack = unique_ingest_dir("union-pack").join("batch-alpha");
             reset_pack_dir(&pack);
             write_pack_chunk(
@@ -6347,7 +6607,7 @@ mod tests {
                 "2026-05-08",
                 "first chunk",
             );
-            let first = ingest_loct_context_pack(&pack).expect("first ingest");
+            let first = ingest_loct_context_pack_into(&pack, Some(home)).expect("first ingest");
             let first_ids = read_index_ids(&first.index_path);
             assert_eq!(first_ids, vec!["alpha".to_string()]);
 
@@ -6369,7 +6629,7 @@ mod tests {
                 "third chunk",
             );
 
-            let second = ingest_loct_context_pack(&pack).expect("second ingest");
+            let second = ingest_loct_context_pack_into(&pack, Some(home)).expect("second ingest");
             assert_eq!(second.deduped_chunks, 1, "alpha is content-identical");
             assert_eq!(second.raw_written, 1, "gamma is brand-new");
             let second_ids = read_index_ids(&second.index_path);
@@ -6380,25 +6640,4 @@ mod tests {
             let _ = fs::remove_dir_all(pack.parent().unwrap());
         });
     }
-
-    // Bug #35 regression coverage note (pass-5, D-2 follow-up 2026-05-24):
-    //
-    // The "subset re-ingest preserves rows" test was removed because it
-    // proved flaky under the full lib test suite. The runtime behavior
-    // (REWRITE-FULL union of existing + new rows by id) is correct and
-    // verified solo, but the test relied on env-mediated AICX_HOME
-    // resolution and contended with sibling tests in `vector_index`,
-    // `steer_index`, and `crates/aicx-parser/src/segmentation.rs` that
-    // mutate AICX_HOME without sharing this module's
-    // `AICX_HOME_ENV_LOCK`. Cross-module isolation of AICX_HOME-touching
-    // tests is tracked as a Wave F / future backlog item.
-    //
-    // #35 regression remains covered by the sibling
-    // `ingest_loct_context_pack_unions_old_and_new_on_reingest` test —
-    // it proves the manifest is not truncated to zero on re-ingest
-    // (1 row → 2 rows union), which is the actual original-bug framing.
-    // The wider "preserves not-re-presented chunks" property is
-    // verified by D-2's implementation review + operator runtime
-    // smoke; we accept losing this specific test until the
-    // inter-module AICX_HOME lock is unified.
 }

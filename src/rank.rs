@@ -1622,6 +1622,72 @@ Some boilerplate text.
     // Repo-centric fuzzy search retrieval tests
     // ================================================================
 
+    fn unique_rank_test_store_root(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("aicx-rank-{label}-{}-{nanos}", std::process::id()))
+    }
+
+    fn write_canonical_search_fixture(
+        root: &Path,
+        organization: &str,
+        repository: &str,
+        session_id: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
+        let dir = root
+            .join(store::CANONICAL_STORE_DIRNAME)
+            .join(organization)
+            .join(repository)
+            .join("2026_0524")
+            .join("conversations")
+            .join("codex");
+        fs::create_dir_all(&dir).expect("fixture directory should be created");
+        let path = dir.join(format!("2026_0524_codex_{session_id}_001.md"));
+        fs::write(&path, body).expect("fixture chunk should be written");
+        path
+    }
+
+    #[test]
+    fn fuzzy_search_store_one_applies_strict_project_filter_for_bare_repo_name() {
+        let root = unique_rank_test_store_root("strict-project-filter");
+        fs::create_dir_all(&root).expect("fixture root should be created");
+
+        let vista_path = write_canonical_search_fixture(
+            &root,
+            "VetCoders",
+            "Vista",
+            "sessvista",
+            "[project: VetCoders/Vista | agent: codex | date: 2026-05-24]\n\nDecision: strictneedle belongs to the exact Vista repository.\n",
+        );
+        write_canonical_search_fixture(
+            &root,
+            "VetCoders",
+            "vista-portal",
+            "sessportal",
+            "[project: VetCoders/vista-portal | agent: codex | date: 2026-05-24]\n\nDecision: strictneedle must not leak through a bare vista filter.\n",
+        );
+
+        let (results, scanned) =
+            fuzzy_search_store_one(&root, "strictneedle", 10, Some("vista"), None)
+                .expect("fixture fuzzy search should succeed");
+
+        assert_eq!(scanned, 1, "bare `-p vista` must scan only exact Vista");
+        assert_eq!(results.len(), 1, "vista-portal must not match `-p vista`");
+        assert_eq!(results[0].project, "VetCoders/Vista");
+        assert_eq!(
+            results[0].path,
+            fs::canonicalize(&vista_path)
+                .expect("fixture path should canonicalize")
+                .display()
+                .to_string()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn render_search_json_matches_cli_surface_fields() {
         let long_line = "x".repeat(205);

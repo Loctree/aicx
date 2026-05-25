@@ -233,6 +233,7 @@ enum SourcesCommands {
 
 #[derive(Debug, Args, Clone)]
 struct RetrievalFilters {
+    /// Maximum number of results to return.
     #[arg(long, default_value_t = 10)]
     limit: usize,
     #[arg(long, value_enum)]
@@ -248,6 +249,8 @@ struct RetrievalFilters {
     #[arg(long, value_enum)]
     frame_kind: Option<FrameKindArg>,
 }
+
+const MAX_CLI_SEARCH_LIMIT: usize = 10_000;
 
 #[derive(Debug, Clone, Args)]
 struct DashboardArgs {
@@ -4739,6 +4742,26 @@ struct SearchRunArgs<'a> {
     no_semantic: bool,
 }
 
+fn validate_cli_search_limit(limit: usize) -> Result<()> {
+    if limit > MAX_CLI_SEARCH_LIMIT {
+        anyhow::bail!(
+            "search --limit {limit} exceeds the hard cap of {MAX_CLI_SEARCH_LIMIT}; \
+             narrow the query/filter or run multiple smaller searches"
+        );
+    }
+    Ok(())
+}
+
+fn search_examined_fetch_limit(user_limit: usize, filters_active: bool) -> usize {
+    if filters_active {
+        user_limit
+            .saturating_mul(aicx::search_engine::FILTER_EXAMINED_CAP_RATIO)
+            .max(aicx::search_engine::FILTER_EXAMINED_CAP_MIN)
+    } else {
+        user_limit
+    }
+}
+
 fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     let SearchRunArgs {
         query,
@@ -4750,6 +4773,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         kind,
         no_semantic,
     } = args;
+    validate_cli_search_limit(filters.limit)?;
     let kind_filter = kind.and_then(aicx::timeline::Kind::parse);
     // Extract inline date hints from query if no explicit --date given
     let (effective_query, inline_date) = if date.is_none() {
@@ -4798,11 +4822,8 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         // `rank::fuzzy_search_store` is not on the hybrid retrieval
         // primitive and is operator-requested explicitly via
         // `--no-semantic`, so we leave it alone.
-        let fuzzy_fetch_limit = if post_filters.is_active() {
-            filters.limit.saturating_mul(5).max(50)
-        } else {
-            filters.limit
-        };
+        let fuzzy_fetch_limit =
+            search_examined_fetch_limit(filters.limit, post_filters.is_active());
         let (mut results, scanned) = rank::fuzzy_search_store(
             &root,
             &search_query,
@@ -5476,20 +5497,10 @@ fn run_index_status(projects: &[String], json: bool) -> Result<()> {
     }
 
     if json {
-        if reports.len() == 1 {
-            println!("{}", serde_json::to_string_pretty(&reports[0].1)?);
-        } else {
-            let payload = reports
-                .iter()
-                .map(|(scope, status)| {
-                    serde_json::json!({
-                        "project": scope.as_deref().unwrap_or("_all"),
-                        "status": status,
-                    })
-                })
-                .collect::<Vec<_>>();
-            println!("{}", serde_json::to_string_pretty(&payload)?);
-        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&index_status_json_payload(&reports))?
+        );
     } else {
         for (idx, (scope, status)) in reports.iter().enumerate() {
             if reports.len() > 1 {
@@ -5508,6 +5519,23 @@ fn run_index_status(projects: &[String], json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn index_status_json_payload(reports: &[(Option<String>, aicx::IndexStatus)]) -> serde_json::Value {
+    serde_json::Value::Array(
+        reports
+            .iter()
+            .map(|(scope, status)| {
+                serde_json::json!({
+                    "project": scope
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("_all"),
+                    "status": status,
+                })
+            })
+            .collect(),
+    )
 }
 
 fn print_index_status_text(status: &aicx::IndexStatus) {
@@ -6725,6 +6753,110 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn dummy_index_status(bucket: &str) -> aicx::IndexStatus {
+        aicx::IndexStatus {
+            canonical_chunks: 3,
+            semantic_index_present: true,
+            semantic_index_path: Some(format!("/tmp/{bucket}/embeddings.ndjson")),
+            semantic_index_rows: 3,
+            newest_chunk_mtime: Some("2026-05-24T00:00:00Z".to_string()),
+            semantic_index_mtime: Some("2026-05-24T00:01:00Z".to_string()),
+            semantic_lag_secs: Some(60),
+            pending_chunks: 0,
+            temp_index_present: false,
+            temp_index_path: None,
+            temp_index_rows: 0,
+            temp_index_mtime: None,
+            temp_index_bytes: None,
+            readiness: aicx::IndexReadiness::Ready,
+            backend: "ndjson".to_string(),
+            project_bucket: bucket.to_string(),
+            committed_at: Some("2026-05-24T00:01:00Z".to_string()),
+        }
+    }
+
+    #[test]
+    fn index_status_json_payload_is_always_array_for_single_scope() {
+        let reports = vec![(None, dummy_index_status("_all"))];
+        let payload = index_status_json_payload(&reports);
+        let items = payload
+            .as_array()
+            .expect("index status JSON must be a stable array envelope");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["project"], "_all");
+        assert_eq!(items[0]["status"]["project_bucket"], "_all");
+    }
+
+    #[test]
+    fn index_status_json_payload_is_array_for_multiple_scopes() {
+        let reports = vec![
+            (
+                Some("VetCoders/aicx".to_string()),
+                dummy_index_status("vetcoders_aicx"),
+            ),
+            (
+                Some("Loctree/loctree-suite".to_string()),
+                dummy_index_status("loctree_loctree-suite"),
+            ),
+        ];
+        let payload = index_status_json_payload(&reports);
+        let items = payload
+            .as_array()
+            .expect("multi-scope index status JSON must use the same envelope");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["project"], "VetCoders/aicx");
+        assert_eq!(items[1]["project"], "Loctree/loctree-suite");
+        assert_eq!(items[0]["status"]["project_bucket"], "vetcoders_aicx");
+        assert_eq!(
+            items[1]["status"]["project_bucket"],
+            "loctree_loctree-suite"
+        );
+    }
+
+    #[test]
+    fn run_search_rejects_limit_over_hard_cap_before_store_access() {
+        let filters = RetrievalFilters {
+            limit: MAX_CLI_SEARCH_LIMIT + 1,
+            sort: None,
+            score: None,
+            agent: None,
+            since: None,
+            until: None,
+            frame_kind: None,
+        };
+
+        let err = run_search(SearchRunArgs {
+            query: "dashboard",
+            projects: &[],
+            hours: 0,
+            date: None,
+            json: false,
+            filters,
+            kind: None,
+            no_semantic: true,
+        })
+        .expect_err("oversized search limit must fail before reading the store");
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("search --limit"));
+        assert!(rendered.contains(&MAX_CLI_SEARCH_LIMIT.to_string()));
+    }
+
+    #[test]
+    fn fuzzy_fetch_limit_uses_semantic_filter_cap_constants() {
+        assert_eq!(
+            search_examined_fetch_limit(1, true),
+            aicx::search_engine::FILTER_EXAMINED_CAP_MIN
+        );
+        assert_eq!(
+            search_examined_fetch_limit(10, true),
+            10 * aicx::search_engine::FILTER_EXAMINED_CAP_RATIO
+        );
+        assert_eq!(search_examined_fetch_limit(1, false), 1);
     }
 
     #[test]

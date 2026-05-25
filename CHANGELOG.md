@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+### Changed
+
+- `aicx index status --json` now always emits an array of
+  `{project, status}` objects, including the default `_all` scope, so
+  machine consumers no longer need to handle a single-scope object shape.
+- `aicx search --limit` now fails above the explicit 10,000 result cap
+  instead of allowing unbounded candidate-pool expansion, and the explicit
+  fuzzy fallback uses the same filter examined-pool ratio as semantic search.
+
 ## [0.9.0] - 2026-05-23
 
 ### Breaking
