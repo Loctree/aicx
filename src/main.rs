@@ -231,21 +231,37 @@ enum SourcesCommands {
     },
 }
 
+/// Shared retrieval grammar (B-P1-11) used by `aicx search`,
+/// `aicx steer`, `aicx intents`, and `aicx tail`. One struct, one
+/// set of `help` bodies — so every retrieval command renders the same
+/// vocabulary in `--help` output.
 #[derive(Debug, Args, Clone)]
 struct RetrievalFilters {
     /// Maximum number of results to return.
     #[arg(long, default_value_t = 10)]
     limit: usize,
+
+    /// Sort order applied after filtering. Default: command-specific.
     #[arg(long, value_enum)]
     sort: Option<SortOrder>,
+
+    /// Minimum score threshold (0-100; semantic match confidence).
     #[arg(long)]
     score: Option<u8>,
+
+    /// Agent name filter: claude | codex | gemini | junie | codescribe.
     #[arg(long)]
     agent: Option<String>,
+
+    /// Lower date bound: YYYY-MM-DD or relative (e.g., 2026-04-23..).
     #[arg(long)]
     since: Option<String>,
+
+    /// Upper date bound: YYYY-MM-DD.
     #[arg(long)]
     until: Option<String>,
+
+    /// Frame channel filter: user_msg | agent_reply | internal_thought | tool_call.
     #[arg(long, value_enum)]
     frame_kind: Option<FrameKindArg>,
 }
@@ -1389,8 +1405,19 @@ enum Commands {
         #[arg(long, default_value = "text")]
         format: String,
 
-        /// Report AICX Oracle readiness: ready | degraded | unsafe_for_loctree_scope
-        #[arg(long)]
+        /// Report AICX Oracle readiness: ready | degraded | unsafe_for_loctree_scope.
+        ///
+        /// Severity vocabulary mapping (B-P1-06):
+        ///   ready                    ← all checks Green
+        ///   degraded                 ← any Warning, or non-Green dashboard route
+        ///   unsafe_for_loctree_scope ← any Critical in canonical / sidecars / content
+        ///
+        /// Doctor's per-check `severity` field uses TitleCase variants
+        /// (Green / Warning / Critical / NotConfigured / Skipped /
+        /// Unknown). The JSON serde renders them lowercase
+        /// (`"green"`/`"warning"`/...) so machine consumers can match
+        /// on stable tokens.
+        #[arg(long, verbatim_doc_comment)]
         oracle: bool,
     },
 
@@ -5475,12 +5502,12 @@ fn run_config_show(json: bool) -> Result<()> {
         eprintln!("  cloud.model:         {}", cloud.model);
         eprintln!(
             "  cloud.api_key_env:   {}",
-            cloud.api_key_env.as_deref().unwrap_or("<unset>")
+            cloud.api_key_env.as_deref().unwrap_or("<none>")
         );
         eprintln!("  cloud.dimension:     {}", cloud.effective_dimension());
         eprintln!("  cloud.timeout_secs:  {}", cloud.effective_timeout_secs());
     } else {
-        eprintln!("  cloud:               <not configured> (run `aicx config init` to bootstrap)");
+        eprintln!("  cloud:               <none> (run `aicx config init` to bootstrap)");
     }
     Ok(())
 }
