@@ -6975,6 +6975,22 @@ mod tests {
     }
 
     #[test]
+    fn default_session_extract_path_normal_input_passthrough() {
+        // Closes Klaudiusz audit gap I-3 (P3): a UUID-like session id that
+        // uses only the safe charset (`[a-zA-Z0-9-_.]`) and fits under
+        // DEFAULT_SESSION_EXTRACT_FILENAME_STEM_MAX_BYTES must round-trip
+        // verbatim into the filename — no hash suffix, no sanitization
+        // collapse. Regression guard for the `is_already_safe` fast path.
+        let session_id = "019e27c0-e492-7790-9c33-52b3dddd1067";
+        let file_name = default_session_extract_file_name(session_id);
+        assert_eq!(
+            file_name,
+            format!("{session_id}.md"),
+            "normal UUID-like session id must pass through unchanged"
+        );
+    }
+
+    #[test]
     fn conversation_batch_safe_session_filename_passes_through_safe_ids() {
         let id = "019e27c0-e492-7790-9c33-52b3dddd1067";
         assert_eq!(conversation_batch_safe_session_filename(id), id);
