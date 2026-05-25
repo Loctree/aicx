@@ -243,6 +243,7 @@ version-show:
 
 version-check:
 	@$(PYTHON) tools/release_sync.py check
+	@bash tools/release-channel-check.sh
 
 version-bump:
 ifeq ($(origin VERSION),command line)
@@ -316,6 +317,7 @@ endif
 	@echo "  make release-bundle KEYS=$(HOME)/.keys [CLEAN=0]"
 
 release-check:
+	@bash tools/release-channel-check.sh
 	@$(PYTHON) tools/release_sync.py check --require-version-section
 	@$(MAKE) check
 	@echo "Release readiness passed."
