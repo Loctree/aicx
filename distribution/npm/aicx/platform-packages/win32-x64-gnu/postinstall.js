@@ -88,7 +88,18 @@ function whichAll(binaryName) {
   return commandOutput(command, args).split(/\r?\n/).filter(Boolean);
 }
 
-function cleanupShadowDir(dir, targetVersion) {
+// Closed enum of shadow scopes. The `scope` parameter is matched against this
+// set inside the function — callers cannot inject arbitrary paths. Each branch
+// constructs the cleanup dir from homedir() + hardcoded subdir parts.
+const SHADOW_SCOPES = Object.freeze({
+  "local-bin": [".local", "bin"],
+  "cargo-bin": [".cargo", "bin"],
+});
+
+function cleanupShadowDir(scope, targetVersion) {
+  const parts = SHADOW_SCOPES[scope];
+  if (!parts) return; // unknown scope — refuse to operate
+  const dir = join(homedir(), ...parts);
   const suffix = process.platform === "win32" ? ".exe" : "";
   const candidateAicx = join(dir, `aicx${suffix}`);
   const candidateMcp = join(dir, `aicx-mcp${suffix}`);
@@ -127,8 +138,8 @@ function scanAicxShadows(installedPath, targetVersion) {
   }
 
   if (envFlag("AICX_NPM_REPLACE_LOCAL")) {
-    cleanupShadowDir(join(homedir(), ".local", "bin"), targetVersion);
-    cleanupShadowDir(join(homedir(), ".cargo", "bin"), targetVersion);
+    cleanupShadowDir("local-bin", targetVersion);
+    cleanupShadowDir("cargo-bin", targetVersion);
   }
 }
 
