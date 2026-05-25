@@ -90,7 +90,9 @@ install:
 	@$(MAKE) git-hooks
 
 install-bin:
+	AICX_INSTALL_MODE=local ./install.sh --shadow-check-only
 	cargo install --path . --locked --force --bin aicx --bin aicx-mcp
+	AICX_INSTALL_MODE=local ./install.sh --verify-path-only
 
 install-config:
 	./install.sh --skip-install
