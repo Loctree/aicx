@@ -970,7 +970,9 @@ enum Commands {
         #[arg(long)]
         reset: bool,
 
-        /// Project to reset (with --reset)
+        /// Project filter (applies to --info as well as --reset).
+        /// Supports the standard shapes: `-p owner/repo`, `-p owner/`,
+        /// `-p /repo`, or a bare `-p name` (cross-org).
         #[arg(short, long)]
         project: Option<String>,
 
@@ -1720,7 +1722,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 let agent = match agent.or(format) {
                     Some(a) => a,
                     None => {
-                        return Err(aicx::cli::failure::emit_and_error(
+                        aicx::cli::failure::emit_and_error(
                             "aicx extract",
                             json,
                             aicx::cli::failure::StructuredFailure::new(
@@ -1729,7 +1731,8 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                                 "rerun with --agent <name>, e.g. aicx extract --session <id> --agent claude",
                             )
                             .with_fallback("aicx extract --session <ID> --agent claude"),
-                        ));
+                        );
+                        std::process::exit(2);
                     }
                 };
                 run_extract_session(
@@ -1750,7 +1753,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 let format = match format {
                     Some(f) => f,
                     None => {
-                        return Err(aicx::cli::failure::emit_and_error(
+                        aicx::cli::failure::emit_and_error(
                             "aicx extract",
                             json,
                             aicx::cli::failure::StructuredFailure::new(
@@ -1761,13 +1764,14 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                             .with_fallback(
                                 "aicx extract --format claude path/to/session.jsonl -o /tmp/out.md",
                             ),
-                        ));
+                        );
+                        std::process::exit(2);
                     }
                 };
                 let input = match input {
                     Some(i) => i,
                     None => {
-                        return Err(aicx::cli::failure::emit_and_error(
+                        aicx::cli::failure::emit_and_error(
                             "aicx extract",
                             json,
                             aicx::cli::failure::StructuredFailure::new(
@@ -1775,13 +1779,14 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                                 "file-mode extract requires a positional INPUT path",
                                 "append the agent log path, e.g. aicx extract --format claude ~/.claude/projects/<repo>/<session>.jsonl -o /tmp/out.md",
                             ),
-                        ));
+                        );
+                        std::process::exit(2);
                     }
                 };
                 let output = match output {
                     Some(o) => o,
                     None => {
-                        return Err(aicx::cli::failure::emit_and_error(
+                        aicx::cli::failure::emit_and_error(
                             "aicx extract",
                             json,
                             aicx::cli::failure::StructuredFailure::new(
@@ -1789,7 +1794,8 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                                 "file-mode extract requires -o/--output <FILE>",
                                 "add -o /path/to/out.md to write the extracted markdown",
                             ),
-                        ));
+                        );
+                        std::process::exit(2);
                     }
                 };
                 run_extract_file(
@@ -1867,7 +1873,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                     Some(p) => p,
                     None => {
                         let json = aicx::cli::failure::want_json_envelope(false);
-                        return Err(aicx::cli::failure::emit_and_error(
+                        aicx::cli::failure::emit_and_error(
                             "aicx ingest",
                             json,
                             aicx::cli::failure::StructuredFailure::new(
@@ -1875,10 +1881,9 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                                 "aicx ingest --source loct-context-pack requires <PACK_DIR>",
                                 "append the pack directory path, e.g. aicx ingest --source loct-context-pack ~/.vibecrafted/inbox/loct-context-pack-2026-05-25",
                             )
-                            .with_fallback(
-                                "aicx ingest --source loct-context-pack <PACK_DIR>",
-                            ),
-                        ));
+                            .with_fallback("aicx ingest --source loct-context-pack <PACK_DIR>"),
+                        );
+                        std::process::exit(2);
                     }
                 };
                 let summary = store::ingest_loct_context_pack(input)?;
@@ -6230,11 +6235,35 @@ fn run_state(reset: bool, project: Option<String>, info: bool) -> Result<()> {
     let mut state = StateManager::load()?;
 
     if info {
+        // B-P1-13: honor `--project` filter on --info as well as on --reset.
+        // When set, narrow the seen-hash listing (and totals) to buckets that
+        // match the filter via the canonical project_filter_matches resolver
+        // (`<owner>/<repo>` strict, `<owner>/` org wildcard, `/<repo>` repo
+        // wildcard, bare `name` cross-org). Watermarks and runs are global
+        // and remain unfiltered.
+        let filter = project.as_deref().map(str::trim).filter(|s| !s.is_empty());
         eprintln!("=== State Info ===");
-        eprintln!("  Total hashes: {}", state.total_hashes());
-        eprintln!("  Projects: {}", state.seen_hashes.len());
-        for (proj, set) in &state.seen_hashes {
-            eprintln!("    {}: {} hashes", proj, set.len());
+        if let Some(f) = filter {
+            eprintln!("Filtered by project: {}", f);
+        }
+        if let Some(f) = filter {
+            let matched: Vec<(&String, &aicx::state::SeenHashSet)> = state
+                .seen_hashes
+                .iter()
+                .filter(|(bucket, _)| state_bucket_matches_project_filter(bucket, f))
+                .collect();
+            let total: usize = matched.iter().map(|(_, set)| set.len()).sum();
+            eprintln!("  Total hashes (filtered): {}", total);
+            eprintln!("  Projects (filtered):     {}", matched.len());
+            for (proj, set) in &matched {
+                eprintln!("    {}: {} hashes", proj, set.len());
+            }
+        } else {
+            eprintln!("  Total hashes: {}", state.total_hashes());
+            eprintln!("  Projects: {}", state.seen_hashes.len());
+            for (proj, set) in &state.seen_hashes {
+                eprintln!("    {}: {} hashes", proj, set.len());
+            }
         }
         eprintln!("  Watermarks: {}", state.last_processed.len());
         for (src, ts) in &state.last_processed {
@@ -6259,6 +6288,26 @@ fn run_state(reset: bool, project: Option<String>, info: bool) -> Result<()> {
 
     eprintln!("Use --info to show state or --reset to clear. See --help.");
     Ok(())
+}
+
+/// Apply the canonical `project_filter_matches` resolver to a state-store
+/// bucket key. Buckets are stored as lowercase `<owner>/<repo>` (see
+/// `aicx::state::migration::canonical_state_bucket`); buckets that don't
+/// split into exactly two segments are matched against the bare filter
+/// only (cross-org name match) and never against the slug or org-wildcard
+/// shapes.
+fn state_bucket_matches_project_filter(bucket: &str, filter: &str) -> bool {
+    let mut parts = bucket.splitn(2, '/');
+    match (parts.next(), parts.next()) {
+        (Some(org), Some(repo)) if !org.is_empty() && !repo.is_empty() => {
+            store::project_filter_matches(org, repo, filter)
+        }
+        _ => {
+            // Legacy / non-slug bucket: treat the whole key as the repo
+            // side so a bare `-p <name>` still works.
+            store::project_filter_matches("", bucket, filter)
+        }
+    }
 }
 
 struct DashboardServerRunArgs {
