@@ -78,7 +78,7 @@ fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
 ///   Layer 2 (optional semantic index): local embedding-backed retrieval for native builds,
 ///     while the canonical corpus stays portable and useful without it.
 /// Quick start:
-///   aicx all -H 4                      # build canonical corpus (layer 1)
+///   aicx all -H 4                      # build canonical corpus
 #[derive(Debug, Parser)]
 #[command(name = "aicx")]
 #[command(author = "M&K (c)2026 VetCoders")]
@@ -511,7 +511,7 @@ enum IndexAction {
 #[derive(Debug, Subcommand)]
 enum Commands {
     // ── Layer 1: Canonical corpus ─────────────────────────────────────
-    /// Extract + store Claude Code sessions into the canonical corpus (layer 1).
+    /// Extract + store Claude Code sessions into the canonical corpus.
     ///
     /// Reads ~/.claude/projects/ logs, deduplicates, chunks, and writes
     /// steerable markdown to ~/.aicx/.
@@ -581,7 +581,7 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract + store Codex sessions into the canonical corpus (layer 1).
+    /// Extract + store Codex sessions into the canonical corpus.
     ///
     /// Reads ~/.codex/history.jsonl, deduplicates, chunks, and writes
     /// steerable markdown to ~/.aicx/.
@@ -651,7 +651,7 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract + store from all agents (Claude + Codex + Gemini + Junie + CodeScribe) into the canonical corpus (layer 1).
+    /// Extract + store from all agents (Claude + Codex + Gemini + Junie + CodeScribe) into the canonical corpus.
     ///
     /// The daily-driver command: runs each extractor, deduplicates, chunks, and
     /// writes steerable markdown to ~/.aicx/. By default, uses per-source
@@ -819,7 +819,7 @@ enum Commands {
         dry_run: bool,
     },
 
-    /// Build the canonical corpus in ~/.aicx/ from agent logs (layer 1).
+    /// Build the canonical corpus in ~/.aicx/ from agent logs.
     ///
     /// Store-first corpus builder: extracts, deduplicates, chunks, and writes
     /// steerable markdown. By default, this command uses per-source watermarks
@@ -935,7 +935,7 @@ enum Commands {
         smoke_test: bool,
     },
 
-    /// List chunks in the canonical store (layer 1 inventory).
+    /// List chunks in the canonical store inventory.
     ///
     /// Shows what extractors have already written to ~/.aicx/.
     #[command(display_order = 11)]
@@ -979,7 +979,7 @@ enum Commands {
         info: bool,
     },
 
-    /// Generate a searchable HTML dashboard from the canonical store (layer 1), or serve it locally.
+    /// Generate a searchable HTML dashboard from the canonical store, or serve it locally.
     Dashboard(#[command(flatten)] DashboardArgs),
 
     /// Extract Vibecrafted workflow and marbles reports into a standalone HTML explorer.
@@ -7615,6 +7615,25 @@ mod tests {
         assert!(!rendered.contains("used if no subcommand is provided"));
         assert!(!rendered.contains("Project filter (used if no subcommand is provided)"));
         assert!(!rendered.contains("Hours to look back (used if no subcommand is provided)"));
+    }
+
+    #[test]
+    fn primary_help_does_not_expose_layer_one_jargon() {
+        let mut cmd = Cli::command();
+        let mut rendered = cmd.render_long_help().to_string();
+
+        for subcommand in ["claude", "codex", "all", "store", "refs", "dashboard"] {
+            let mut subcmd = Cli::command();
+            let subcmd = subcmd
+                .find_subcommand_mut(subcommand)
+                .unwrap_or_else(|| panic!("{subcommand} subcommand should exist"));
+            rendered.push_str(&subcmd.render_long_help().to_string());
+        }
+
+        assert!(
+            !rendered.to_lowercase().contains("(layer 1"),
+            "primary help should describe the corpus directly, not leak layer-one jargon"
+        );
     }
 
     #[test]

@@ -2753,3 +2753,39 @@ odwracania z hashami, wiec "recoverable" bylo bardziej obietnica niz kontrakt.
 **Lessons.** Quarantine bez manifestu to tylko "move somewhere". Operator UX
 powinien miec dwie prawdy naraz: przyjazny picker dla czlowieka i zero-prompt
 JSON path dla CI.
+
+---
+
+## 2026-05-25 — CLI help layer-one jargon leak · `this workflow`
+
+**Symptom.** Wave E zostawil jawny follow-up: primary CLI help nadal pokazywal
+operatorowi parentetyczne `(layer 1)` w kilku komendach, szczegolnie
+`refs` i `dashboard`. To byl wewnetrzny model architektury, nie dobra etykieta
+dla buyer/user-facing discovery surface.
+
+**Root cause.** Wczesniejsze polish cuty zdjely czesc `layer 1` z helpa, ale
+nie objely calego klastra doc-commentow Clap ani zsynchronizowanego
+`docs/COMMANDS.md`. Brakowalo tez testu pilnujacego primary help surface.
+
+**Fix.**
+- Usunieto parentetyczne `(layer 1)` z helpa `claude`, `codex`, `all`,
+  `store`, `refs`, `dashboard` oraz quick-start comment.
+- Zsynchronizowano `docs/COMMANDS.md` dla tych samych command descriptions.
+- Dodano regression test, ktory renderuje primary help + wybrane subcommands
+  i odrzuca powrot `(layer 1...)`.
+- Domknieto przy okazji nowy strict-clippy fallout w
+  `crates/aicx-embeddings/src/hf_cache.rs` bez suppressions.
+
+**Touched.**
+- `src/main.rs` — Clap doc-comment copy + help regression test.
+- `docs/COMMANDS.md` — user-facing command copy.
+- `crates/aicx-embeddings/src/hf_cache.rs` — `from_ref` cleanup w testach.
+
+**Tests.** Targeted: `cargo test primary_help_does_not_expose_layer_one_jargon`.
+Gate: `cargo fmt --all --check`; `cargo test help`;
+`cargo clippy --workspace --all-targets -- -D warnings`.
+
+**Lessons.** Architektura moze miec layer naming w docs konceptualnych, ale
+primary CLI discovery powinno nazywac rzecz po funkcji: corpus, store,
+dashboard. Gdy czyscisz help text, renderuj help w tescie zamiast zakladac, ze
+doc-comment grep pokrywa realny output.
