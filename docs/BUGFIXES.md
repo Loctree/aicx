@@ -2712,3 +2712,44 @@ intentional npm version mismatch fail.
   "ostatnio poprawny".
 - Package-manager postinstall nie powinien promptowac; ostrzezenie domyslnie,
   cleanup tylko przez explicit env.
+
+---
+
+## 2026-05-25 — doctor cleanup UX gate + quarantine restore manifest · `pending commit`
+
+**Symptom.** `aicx doctor` dalej bylo dla operatora sciana raportu albo
+jednostrzalowym apply. Empty-body cleanup mial juz recoverable rename, ale nie
+mial manifestu restore, a automatyzacja nie miala jasnego `--force --yes`
+surface z maszynowym raportem.
+
+**Root cause.** Doctor laczyl diagnostyke z recovery przez stare flagi, bez
+warstwy wyboru akcji. Quarantine bylo filesystem move, lecz bez trwalego planu
+odwracania z hashami, wiec "recoverable" bylo bardziej obietnica niz kontrakt.
+
+**Fix.**
+- Dodano interactive doctor cleanup: TTY-only multi-select, dry-run preview,
+  druga bramka apply i progress spinner per faza.
+- Dodano `--yes` / `--force`; `--force` pomija dry-run preview, a
+  `--format json` zwraca strukturalny raport faz cleanup.
+- Empty-body quarantine zapisuje `manifest.json` ze sciezkami i SHA-256.
+- Dodano `aicx doctor --restore-quarantine <slug>` z refusal-on-overwrite i
+  hash verification przed restore.
+- Legacy flagi (`--fix`, `--fix-buckets`, `--prune-empty-bodies --apply`)
+  zostaja po starym torze bez promptow.
+
+**Touched.**
+- `src/doctor.rs` — cleanup planner/runtime, restore manifest, hash checks.
+- `src/main.rs` — `--yes`, `--force`, `--restore-quarantine` parser/runtime.
+- `tests/doctor_quarantine_apply.rs` — manifest + restore round-trip.
+- `tests/runtime_cli_store_contract.rs` — `--force --yes --format json`.
+- `Cargo.toml` — `inquire`.
+- `CHANGELOG.md` — release note.
+
+**Tests.** Targeted green:
+`cargo test --test doctor_quarantine_apply -- --nocapture`;
+`cargo test --test runtime_cli_store_contract test_doctor_force_yes_json_is_machine_readable_cleanup_report -- --nocapture`;
+`cargo check --workspace`.
+
+**Lessons.** Quarantine bez manifestu to tylko "move somewhere". Operator UX
+powinien miec dwie prawdy naraz: przyjazny picker dla czlowieka i zero-prompt
+JSON path dla CI.

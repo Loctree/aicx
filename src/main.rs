@@ -1370,6 +1370,18 @@ enum Commands {
         #[arg(long, requires = "prune_empty_bodies")]
         apply: bool,
 
+        /// Restore files from a quarantine manifest slug.
+        #[arg(long, value_name = "SLUG")]
+        restore_quarantine: Option<String>,
+
+        /// Assume yes on doctor cleanup prompts.
+        #[arg(short = 'y', long)]
+        yes: bool,
+
+        /// Skip dry-run preview and prompts; intended for CI cleanup runs.
+        #[arg(long)]
+        force: bool,
+
         /// Report duplicate content_sha256 groups across store and context-corpus
         #[arg(long)]
         check_dedup: bool,
@@ -1932,12 +1944,78 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             rebuild_sidecars,
             prune_empty_bodies,
             apply,
+            restore_quarantine,
+            yes,
+            force,
             check_dedup,
             verbose,
             smoke,
             format,
             oracle,
         }) => {
+            if let Some(slug) = restore_quarantine {
+                let report = aicx::doctor::restore_quarantine(&slug)?;
+                match format.as_str() {
+                    "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                    _ => print!("{}", aicx::doctor::format_restore_text(&report)),
+                }
+                std::process::exit(if report.failures.is_empty() { 0 } else { 1 });
+            }
+
+            let legacy_or_readonly = fix
+                || fix_buckets
+                || dry_run
+                || rebuild_sidecars
+                || prune_empty_bodies
+                || apply
+                || check_dedup
+                || oracle
+                || format == "json";
+            if force || yes {
+                let rt = tokio::runtime::Runtime::new()
+                    .context("Failed to start tokio runtime for doctor cleanup")?;
+                let base = aicx::store::store_base_dir()
+                    .context("Failed to resolve aicx store base directory")?;
+                let cleanup = rt.block_on(aicx::doctor::run_automated_cleanup_at(
+                    &base,
+                    force,
+                    verbose,
+                    smoke,
+                    format != "json",
+                ))?;
+                match format.as_str() {
+                    "json" => println!("{}", serde_json::to_string_pretty(&cleanup)?),
+                    _ => print!("{}", aicx::doctor::format_cleanup_run_text(&cleanup)),
+                }
+                let failed = cleanup.applied.iter().any(|phase| phase.status != "ok");
+                std::process::exit(
+                    if failed || cleanup.final_report.overall == aicx::doctor::Severity::Critical {
+                        1
+                    } else {
+                        0
+                    },
+                );
+            }
+
+            if !legacy_or_readonly && io::stdin().is_terminal() {
+                let rt = tokio::runtime::Runtime::new()
+                    .context("Failed to start tokio runtime for doctor interactive cleanup")?;
+                let base = aicx::store::store_base_dir()
+                    .context("Failed to resolve aicx store base directory")?;
+                let cleanup = rt.block_on(aicx::doctor::run_interactive_cleanup_at(
+                    &base, verbose, smoke,
+                ))?;
+                print!("{}", aicx::doctor::format_cleanup_run_text(&cleanup));
+                let failed = cleanup.applied.iter().any(|phase| phase.status != "ok");
+                std::process::exit(
+                    if failed || cleanup.final_report.overall == aicx::doctor::Severity::Critical {
+                        1
+                    } else {
+                        0
+                    },
+                );
+            }
+
             let opts = aicx::doctor::DoctorOptions {
                 fix,
                 fix_buckets,

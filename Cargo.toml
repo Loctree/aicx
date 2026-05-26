@@ -76,6 +76,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1"
 indicatif = "0.18"
+inquire = "0.7"
 globset = "0.4"
 ratatui = "0.30"
 crossterm = "0.29"

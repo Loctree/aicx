@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `aicx doctor` now has an operator cleanup flow: default TTY runs use an
+  interactive multi-select + dry-run/apply gate, `--force --yes --format json`
+  emits machine-readable cleanup phases, and empty-body quarantine writes a
+  restore manifest consumed by `--restore-quarantine <slug>`.
 - `aicx index status --json` now always emits an array of
   `{project, status}` objects, including the default `_all` scope, so
   machine consumers no longer need to handle a single-scope object shape.
