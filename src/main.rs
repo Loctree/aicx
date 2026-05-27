@@ -2285,7 +2285,6 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                         0
                     },
                 );
-            } else {
             }
 
             if !legacy_or_readonly && io::stdin().is_terminal() {
