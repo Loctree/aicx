@@ -281,6 +281,26 @@ fn test_doctor_fix_critical_returns_non_zero_exit() {
 }
 
 #[test]
+fn test_doctor_force_yes_json_is_machine_readable_cleanup_report() {
+    let root = unique_test_dir("doctor-force-yes-json");
+    let home = root.join("home");
+
+    let output = run_aicx(&home, &["doctor", "--force", "--yes", "--format", "json"]);
+    let report = parse_stdout_json(&output);
+    assert_eq!(report["mode"].as_str(), Some("force"));
+    assert!(
+        report["selected"].as_array().is_some(),
+        "force cleanup JSON should expose selected actions"
+    );
+    assert!(
+        report["final_report"]["overall"].is_string(),
+        "force cleanup JSON should include final doctor report"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn list_cli_reports_unprotected_sources_without_creating_git() {
     let root = unique_test_dir("source-list-unprotected");
     let home = root.join("home");

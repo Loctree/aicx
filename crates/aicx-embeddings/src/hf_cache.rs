@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn detect_cached_profiles_in_returns_empty_for_empty_base() {
         let base = tempdir();
-        let found = detect_cached_profiles_in(&[base.clone()]);
+        let found = detect_cached_profiles_in(std::slice::from_ref(&base));
         assert!(found.is_empty(), "empty cache must yield zero profiles");
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -355,7 +355,7 @@ mod tests {
         let base = tempdir();
         hydrate_profile_snapshot(&base, crate::EmbeddingProfile::Premium);
 
-        let found = detect_cached_profiles_in(&[base.clone()]);
+        let found = detect_cached_profiles_in(std::slice::from_ref(&base));
         assert_eq!(
             found,
             vec![crate::EmbeddingProfile::Premium],
@@ -370,7 +370,7 @@ mod tests {
         hydrate_profile_snapshot(&base, crate::EmbeddingProfile::Premium);
         hydrate_profile_snapshot(&base, crate::EmbeddingProfile::Base);
 
-        let found = detect_cached_profiles_in(&[base.clone()]);
+        let found = detect_cached_profiles_in(std::slice::from_ref(&base));
         assert_eq!(
             found,
             vec![

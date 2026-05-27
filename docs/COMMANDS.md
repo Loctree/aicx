@@ -69,7 +69,7 @@ source contents in local git history is intended. See
 
 ## `aicx claude`
 
-Extract + store Claude Code sessions into the canonical corpus (layer 1).
+Extract + store Claude Code sessions into the canonical corpus.
 
 ```bash
 aicx claude [OPTIONS]
@@ -128,7 +128,7 @@ aicx claude -p CodeScribe -H 24 --emit json | jq .
 
 ## `aicx codex`
 
-Extract + store Codex sessions into the canonical corpus (layer 1).
+Extract + store Codex sessions into the canonical corpus.
 
 ```bash
 aicx codex [OPTIONS]
@@ -144,7 +144,7 @@ aicx codex -p CodeScribe -H 48 --loctree --emit json | jq .
 
 ## `aicx all`
 
-Extract + store from all agents (Claude + Codex + Gemini + Junie) into the canonical corpus (layer 1).
+Extract + store from all agents (Claude + Codex + Gemini + Junie) into the canonical corpus.
 
 ```bash
 aicx all [OPTIONS]
@@ -171,7 +171,7 @@ aicx all -H 48 --user-only
 
 ## `aicx extract`
 
-Extract a single session file and write to a specific output path (layer 1, direct).
+Extract a single session file and write to a specific output path.
 
 Bypasses the canonical store — useful for one-off inspection or piping.
 
@@ -197,7 +197,7 @@ aicx extract --format gemini-antigravity ~/.gemini/antigravity/conversations/<uu
 
 ## `aicx store`
 
-Build the canonical corpus in `~/.aicx/` from agent logs (layer 1).
+Build the canonical corpus in `~/.aicx/` from agent logs.
 
 Store-first corpus builder: extracts, deduplicates, chunks, and writes steerable
 markdown. Like `claude`, `codex`, and `all`, it uses per-source watermarks by
@@ -449,7 +449,7 @@ retrieval.
 
 ## `aicx refs`
 
-List chunks in the canonical store (layer 1 inventory).
+List chunks in the canonical store inventory.
 
 Shows what extractors have already written to `~/.aicx/`. Use this to verify
 corpus contents after extraction — `refs` operates on canonical chunks, not
@@ -505,7 +505,7 @@ aicx intents -p CodeScribe loctree-suite --strict --kind decision
 
 ## `aicx dashboard`
 
-Generate a searchable HTML dashboard from the canonical store (layer 1), or serve it locally.
+Generate a searchable HTML dashboard from the canonical store, or serve it locally.
 
 ```bash
 aicx dashboard [OPTIONS]

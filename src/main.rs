@@ -81,7 +81,7 @@ fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
 ///   aicx all -H 4                      # build canonical corpus (layer 1)
 #[derive(Debug, Parser)]
 #[command(name = "aicx")]
-#[command(author = "M&K (c)2026 VetCoders")]
+#[command(author = "(c)2026 VetCoders")]
 #[command(version)]
 #[command(verbatim_doc_comment)]
 struct Cli {
@@ -527,10 +527,10 @@ enum IndexAction {
 #[derive(Debug, Subcommand)]
 enum Commands {
     // ── Layer 1: Canonical corpus ─────────────────────────────────────
-    /// Extract + store Claude Code sessions into the canonical corpus (canonical corpus extraction).
+    /// Extract and store Agents' sessions into the canonical corpus (canonical corpus extraction).
     ///
-    /// Reads ~/.claude/projects/ logs, deduplicates, chunks, and writes
-    /// steerable markdown to ~/.aicx/.
+    /// Reads claude-code session files, then
+    /// writes steerable Markdown files to a central store.
     #[command(display_order = 2)]
     Claude {
         #[command(flatten)]
@@ -597,10 +597,10 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract + store Codex sessions into the canonical corpus (canonical corpus extraction).
+    /// Extract and store Codex sessions into the canonical corpus (layer 1).
     ///
-    /// Reads ~/.codex/history.jsonl, deduplicates, chunks, and writes
-    /// steerable markdown to ~/.aicx/.
+    /// Reads codex session files, then
+    /// writes steerable Markdown files to a central store.
     #[command(display_order = 3)]
     Codex {
         #[command(flatten)]
@@ -667,7 +667,7 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract + store from all agents (Claude + Codex + Gemini + Junie + CodeScribe) into the canonical corpus (canonical corpus extraction).
+    /// Extract and store from all agents (Claude + Codex + Gemini + Junie + CodeScribe) into the canonical corpus.
     ///
     /// The daily-driver command: runs each extractor, deduplicates, chunks, and
     /// writes steerable markdown to ~/.aicx/. By default, uses per-source
@@ -840,10 +840,10 @@ enum Commands {
         dry_run: bool,
     },
 
-    /// Build the canonical corpus in ~/.aicx/ from agent logs (canonical corpus extraction).
+    /// Build the canonical corpus in from local agents' session files.
     ///
     /// Store-first corpus builder: extracts, deduplicates, chunks, and writes
-    /// steerable markdown. By default, this command uses per-source watermarks
+    /// steerable Markdown. By default, this command uses per-source watermarks
     /// to skip previously scanned history. Use --full-rescan for backfills
     /// and targeted re-extraction when you need to ignore the watermark.
     ///
@@ -956,7 +956,7 @@ enum Commands {
         smoke_test: bool,
     },
 
-    /// List chunks in the canonical store (layer 1 inventory).
+    /// List chunks in the canonical store inventory.
     ///
     /// Shows what extractors have already written to ~/.aicx/.
     #[command(display_order = 11)]
@@ -1002,7 +1002,7 @@ enum Commands {
         info: bool,
     },
 
-    /// Generate a searchable HTML dashboard from the canonical store (layer 1), or serve it locally.
+    /// Generate a searchable HTML dashboard from the canonical store, or serve it locally.
     Dashboard(#[command(flatten)] DashboardArgs),
 
     /// Extract Vibecrafted workflow and marbles reports into a standalone HTML explorer.
@@ -1400,6 +1400,18 @@ enum Commands {
         /// With --prune-empty-bodies, move empty-body chunks into recoverable quarantine
         #[arg(long, requires = "prune_empty_bodies")]
         apply: bool,
+
+        /// Restore files from a quarantine manifest slug.
+        #[arg(long, value_name = "SLUG")]
+        restore_quarantine: Option<String>,
+
+        /// Assume yes on doctor cleanup prompts.
+        #[arg(short = 'y', long)]
+        yes: bool,
+
+        /// Skip dry-run preview and prompts; intended for CI cleanup runs.
+        #[arg(long)]
+        force: bool,
 
         /// Report duplicate content_sha256 groups across store and context-corpus
         #[arg(long)]
@@ -2221,12 +2233,79 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             rebuild_sidecars,
             prune_empty_bodies,
             apply,
+                 restore_quarantine,
+                 yes,
+                 force,
             check_dedup,
             verbose,
             smoke,
             format,
             oracle,
         }) => {
+            if let Some(slug) = restore_quarantine {
+                let report = aicx::doctor::restore_quarantine(&slug)?;
+                match format.as_str() {
+                    "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+                    _ => print!("{}", aicx::doctor::format_restore_text(&report)),
+                }
+                std::process::exit(if report.failures.is_empty() { 0 } else { 1 });
+            }
+
+            let fix = rebuild_steer_index; // Assuming `fix` is an alias for `--rebuild-steer-index`.
+            let legacy_or_readonly = fix
+                || fix_buckets
+                || dry_run
+                || rebuild_sidecars
+                || prune_empty_bodies
+                || apply
+                || check_dedup
+                || oracle
+                || format == "json";
+            if force || yes {
+                let rt = tokio::runtime::Runtime::new()
+                    .context("Failed to start tokio runtime for doctor cleanup")?;
+                let base = aicx::store::store_base_dir()
+                    .context("Failed to resolve aicx store base directory")?;
+                let cleanup = rt.block_on(aicx::doctor::run_automated_cleanup_at(
+                    &base,
+                    force,
+                    verbose,
+                    smoke,
+                    format != "json",
+                ))?;
+                match format.as_str() {
+                    "json" => println!("{}", serde_json::to_string_pretty(&cleanup)?),
+                    _ => print!("{}", aicx::doctor::format_cleanup_run_text(&cleanup)),
+                }
+                let failed = cleanup.applied.iter().any(|phase| phase.status != "ok");
+                std::process::exit(
+                    if failed || cleanup.final_report.overall == aicx::doctor::Severity::Critical {
+                        1
+                    } else {
+                        0
+                    },
+                );
+            } else {}
+
+            if !legacy_or_readonly && io::stdin().is_terminal() {
+                let rt = tokio::runtime::Runtime::new()
+                    .context("Failed to start tokio runtime for doctor interactive cleanup")?;
+                let base = aicx::store::store_base_dir()
+                    .context("Failed to resolve aicx store base directory")?;
+                let cleanup = rt.block_on(aicx::doctor::run_interactive_cleanup_at(
+                    &base, verbose, smoke,
+                ))?;
+                print!("{}", aicx::doctor::format_cleanup_run_text(&cleanup));
+                let failed = cleanup.applied.iter().any(|phase| phase.status != "ok");
+                std::process::exit(
+                    if failed || cleanup.final_report.overall == aicx::doctor::Severity::Critical {
+                        1
+                    } else {
+                        0
+                    },
+                );
+            }
+
             // Surface the legacy `--fix` form as deprecated so callers can
             // migrate. We cannot tell from the parsed bool whether the
             // operator typed `--fix` or `--rebuild-steer-index`; inspect
@@ -8096,6 +8175,25 @@ mod tests {
         assert!(!rendered.contains("used if no subcommand is provided"));
         assert!(!rendered.contains("Project filter (used if no subcommand is provided)"));
         assert!(!rendered.contains("Hours to look back (used if no subcommand is provided)"));
+    }
+
+    #[test]
+    fn primary_help_does_not_expose_layer_one_jargon() {
+        let mut cmd = Cli::command();
+        let mut rendered = cmd.render_long_help().to_string();
+
+        for subcommand in ["claude", "codex", "all", "store", "refs", "dashboard"] {
+            let mut subcmd = Cli::command();
+            let subcmd = subcmd
+                .find_subcommand_mut(subcommand)
+                .unwrap_or_else(|| panic!("{subcommand} subcommand should exist"));
+            rendered.push_str(&subcmd.render_long_help().to_string());
+        }
+
+        assert!(
+            !rendered.to_lowercase().contains("(layer 1"),
+            "primary help should describe the corpus directly, not leak layer-one jargon"
+        );
     }
 
     #[test]

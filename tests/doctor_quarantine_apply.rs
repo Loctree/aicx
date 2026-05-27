@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aicx::doctor::{DoctorOptions, Severity, run_at};
+use aicx::doctor::{DoctorOptions, Severity, restore_quarantine_at, run_at};
 
 fn unique_base(label: &str) -> PathBuf {
     let suffix = SystemTime::now()
@@ -179,6 +179,32 @@ fn apply_empty_body_quarantine_moves_to_recoverable_dir_not_delete() {
     assert!(
         moved_bytes.starts_with(b"[project: VetCoders/aicx | agent: claude | date: 2026-05-06"),
         "quarantined chunk content must match original (rename preserves bytes)"
+    );
+
+    let manifest = quarantine_root.join("manifest.json");
+    assert!(
+        manifest.exists(),
+        "quarantine manifest must exist for restore: {}",
+        manifest.display()
+    );
+    let slug = quarantine_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("quarantine slug")
+        .to_string();
+    let restore = restore_quarantine_at(&base, &slug).expect("restore quarantine");
+    assert_eq!(restore.restored, 2, "chunk + sidecar should restore");
+    assert_eq!(restore.skipped, 0);
+    assert!(
+        restore.failures.is_empty(),
+        "restore failures: {:?}",
+        restore.failures
+    );
+    assert!(empty_chunk.exists(), "empty chunk should be restored");
+    assert!(empty_sidecar.exists(), "empty sidecar should be restored");
+    assert!(
+        !moved_chunk.exists(),
+        "quarantined chunk should move back during restore"
     );
 
     let _ = std::fs::remove_dir_all(&base);
