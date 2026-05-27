@@ -277,7 +277,7 @@ pub async fn run_automated_cleanup_at(
         smoke,
         if force { "force" } else { "yes" },
     )
-        .await
+    .await
 }
 
 pub async fn run_interactive_cleanup_at(
@@ -352,11 +352,11 @@ pub async fn run_interactive_cleanup_at(
         smoke,
         "interactive",
     )
-        .await
-        .map(|mut report| {
-            report.dry_run = dry_run;
-            report
-        })
+    .await
+    .map(|mut report| {
+        report.dry_run = dry_run;
+        report
+    })
 }
 
 pub fn format_cleanup_run_text(report: &DoctorCleanupRunReport) -> String {
@@ -573,7 +573,7 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
 
 fn base_doctor_options(verbose: bool, smoke: bool) -> DoctorOptions {
     DoctorOptions {
-        fix: false,
+        rebuild_steer_index: false,
         fix_buckets: false,
         dry_run: false,
         rebuild_sidecars: false,
@@ -698,7 +698,7 @@ async fn apply_cleanup_action(
 ) -> Result<String> {
     let opts = match fix {
         DoctorFixId::RebuildSteerIndex => DoctorOptions {
-            fix: true,
+            rebuild_steer_index: true,
             ..base_doctor_options(verbose, smoke)
         },
         DoctorFixId::QuarantineBuckets => DoctorOptions {
