@@ -139,8 +139,7 @@ fn partition_incremental_files_reembeds_missing_id_with_old_mtime() {
             .unwrap()
             .with_timezone(&chrono::Utc)
             .into();
-    filetime::set_file_mtime(&restored_path, filetime::FileTime::from_system_time(old_ts))
-        .unwrap();
+    filetime::set_file_mtime(&restored_path, filetime::FileTime::from_system_time(old_ts)).unwrap();
 
     let files = vec![crate::store::StoredContextFile {
         path: restored_path,
@@ -630,8 +629,7 @@ fn scan_index_entries_kind_filter_excludes_non_matching() {
     ];
     // make_entry_line defaults `kind = "session"`. Asking for "report"
     // should drop everything.
-    let scan =
-        scan_index_entries(ok_lines(lines.clone()), &q, Some("report"), None).expect("scan");
+    let scan = scan_index_entries(ok_lines(lines.clone()), &q, Some("report"), None).expect("scan");
     assert_eq!(scan.total_data_lines, 2);
     assert_eq!(scan.corrupt_count, 0);
     assert_eq!(scan.hits.len(), 0);
