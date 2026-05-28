@@ -28,6 +28,11 @@ pub use crate::timeline::{
     CollapseStubKind, ConversationMessage, ExtractionConfig, MessageKind, SourceInfo, TimelineEntry,
 };
 
+// During Faza 1 transition, pull shared logic from the new location
+pub use super::shared::conversation::{
+    ConversationProjection, to_conversation, to_conversation_with_stats,
+};
+
 const CODESCRIBE_AGENT: &str = "codescribe";
 const CODESCRIBE_TRANSCRIPT_KIND: &str = "transcript";
 const CODESCRIBE_NO_SPEECH_MARKERS: &[&str] = &[
@@ -47,118 +52,11 @@ const OPERATOR_MD_KIND: &str = "operator-md";
 /// default entirely, so explicit lookback flags are honored.
 const OPERATOR_MD_RECENT_DAYS: i64 = 30;
 const UNPROTECTED_SOURCE_WARNING: &str = "unprotected source material; run `aicx sources protect --root <path> --backend git-local --apply` to opt in";
-const EXACT_SHORT_DUP_MAX_CHARS: usize = 1000;
-const EXACT_SHORT_DUP_WINDOW_MS: i64 = 2_000;
+// Constants moved to shared/conversation.rs during Faza 1
 const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Debug, Clone)]
-pub struct ConversationProjection {
-    pub messages: Vec<ConversationMessage>,
-    pub exact_short_duplicates_dropped: usize,
-}
-
-/// Project timeline entries into a denoised conversation stream.
-///
-/// Filters to only `user` and `assistant` roles, resolves repo/project identity
-/// from `cwd` + project filter, and preserves provenance fields.
-pub fn to_conversation(
-    entries: &[TimelineEntry],
-    project_filter: &[String],
-) -> Vec<ConversationMessage> {
-    to_conversation_with_stats(entries, project_filter).messages
-}
-
-pub fn to_conversation_with_stats(
-    entries: &[TimelineEntry],
-    project_filter: &[String],
-) -> ConversationProjection {
-    let messages: Vec<ConversationMessage> = entries
-        .iter()
-        .filter(|entry| {
-            matches!(
-                entry.frame_kind,
-                Some(FrameKind::UserMsg | FrameKind::AgentReply)
-            ) || (entry.frame_kind.is_none() && (entry.role == "user" || entry.role == "assistant"))
-        })
-        .map(|e| {
-            let (message_kind, collapse_stub_kind) = classify_conversation_message(&e.message);
-
-            ConversationMessage {
-                timestamp: e.timestamp,
-                agent: e.agent.clone(),
-                session_id: e.session_id.clone(),
-                role: e.role.clone(),
-                message: e.message.clone(),
-                repo_project: repo_name_from_cwd(e.cwd.as_deref(), project_filter),
-                source_path: e.cwd.clone(),
-                branch: e.branch.clone(),
-                message_kind,
-                collapse_stub_kind,
-            }
-        })
-        .collect();
-
-    drop_exact_short_user_duplicates(messages)
-}
-
-/// Compute a stable 64-bit key for `(agent, session_id, trimmed message)`
-/// without allocating new `String`s on the hot dedup path. Uses SipHash-1-3
-/// with null-byte delimiters between the fields to avoid prefix collisions
-/// between e.g. `("a", "bc", "d")` and `("ab", "c", "d")`.
-///
-/// `agent` is part of the key because extractors can emit a shared fallback
-/// session id (for example `extract_claude_history` uses `"history"` when
-/// `sessionId` is absent). Without the agent in the key, identical short
-/// prompts from two unrelated agent streams within a 2 s window would be
-/// silently merged.
-fn exact_short_dup_key(agent: &str, session_id: &str, trimmed: &str) -> u64 {
-    use siphasher::sip::SipHasher13;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = SipHasher13::new();
-    agent.hash(&mut hasher);
-    0u8.hash(&mut hasher);
-    session_id.hash(&mut hasher);
-    0u8.hash(&mut hasher);
-    trimmed.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn drop_exact_short_user_duplicates(messages: Vec<ConversationMessage>) -> ConversationProjection {
-    let mut deduped: Vec<ConversationMessage> = Vec::with_capacity(messages.len());
-    let mut last_seen_user: HashMap<u64, DateTime<Utc>> = HashMap::new();
-    let mut exact_short_duplicates_dropped = 0;
-
-    for msg in messages {
-        let trimmed = msg.message.trim();
-        let is_short_user = msg.role == "user" && trimmed.len() <= EXACT_SHORT_DUP_MAX_CHARS;
-        let is_exact_short_duplicate = if is_short_user {
-            let key = exact_short_dup_key(&msg.agent, &msg.session_id, trimmed);
-            let is_duplicate = last_seen_user.get(&key).is_some_and(|previous_timestamp| {
-                msg.timestamp
-                    .signed_duration_since(*previous_timestamp)
-                    .num_milliseconds()
-                    .abs()
-                    <= EXACT_SHORT_DUP_WINDOW_MS
-            });
-
-            last_seen_user.insert(key, msg.timestamp);
-            is_duplicate
-        } else {
-            false
-        };
-
-        if !is_exact_short_duplicate {
-            deduped.push(msg);
-        } else {
-            exact_short_duplicates_dropped += 1;
-        }
-    }
-
-    ConversationProjection {
-        messages: deduped,
-        exact_short_duplicates_dropped,
-    }
-}
+// Conversation projection logic has been moved to src/sources/shared/conversation.rs
+// Re-exported here for backward compatibility during transition.
 
 // Note: line reading goes through `aicx_parser::sanitize::read_line_capped`,
 // which walks back past UTF-8 continuation bytes when an oversized line is
@@ -194,41 +92,7 @@ fn short_path_hash(path: &Path) -> String {
     format!("{hash:016x}").chars().take(12).collect::<String>()
 }
 
-fn classify_conversation_message(message: &str) -> (MessageKind, Option<CollapseStubKind>) {
-    let trimmed_start = message.trim_start();
-
-    if trimmed_start.starts_with("<skill-ref:") {
-        return (MessageKind::CollapseStub, Some(CollapseStubKind::SkillRef));
-    }
-    if trimmed_start.starts_with("<dedup-ref:") {
-        return (MessageKind::CollapseStub, Some(CollapseStubKind::DedupRef));
-    }
-
-    if message.contains("This session is being continued")
-        || message.contains("<local-command-caveat>")
-        || message.contains("<command-name>/compact</command-name>")
-    {
-        return (MessageKind::ContinuationSummary, None);
-    }
-
-    let workflow_signals = [
-        "run_id:",
-        "prompt_id:",
-        "status: prompt",
-        "Perform the vc-",
-        "VC Agents Worker Charter",
-        "Report path:",
-    ];
-    let workflow_signal_count = workflow_signals
-        .iter()
-        .filter(|signal| message.contains(**signal))
-        .count();
-    if workflow_signal_count >= 2 {
-        return (MessageKind::WorkflowPrompt, None);
-    }
-
-    (MessageKind::Conversation, None)
-}
+// classify_conversation_message moved to shared/conversation.rs during Faza 1
 
 // ============================================================================
 // Internal deserialization types
