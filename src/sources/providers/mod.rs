@@ -1,6 +1,22 @@
+pub mod claude;
+pub mod codescribe;
+pub mod codex;
+pub mod gemini;
 pub mod junie;
+pub mod operator_markdown;
 
-// Future providers will be extracted in subsequent waves of the rozpierducha:
-// pub mod claude;
-// pub mod codex;
-// etc.
+pub use claude::{extract_claude, extract_claude_file, extract_claude_history};
+pub use codescribe::{
+    CodescribeTranscript, discover_codescribe_transcripts, discover_codescribe_transcripts_at,
+    extract_codescribe, extract_codescribe_from_home, parse_codescribe_transcript,
+};
+pub use codex::{extract_codex, extract_codex_file, extract_codex_sessions};
+pub use gemini::{extract_gemini, extract_gemini_antigravity_file, extract_gemini_file};
+pub use junie::{extract_junie, extract_junie_file};
+pub use operator_markdown::{
+    OperatorMarkdown, discover_operator_markdown, discover_operator_markdown_from,
+    extract_operator_markdown, extract_operator_markdown_from_home,
+    extract_operator_markdown_from_home_and_repo,
+};
+
+pub(crate) use codex::count_codex_sessions;

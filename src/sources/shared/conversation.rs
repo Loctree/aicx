@@ -1,18 +1,5 @@
-//! Conversation projection and deduplication logic.
-//!
-//! This module is responsible for turning raw timeline entries into clean,
-//! denoised conversation streams suitable for downstream use (intents, reports, etc.).
-//!
-//! Extracted during the 2026-05-27 sources monolith decomposition.
-
-use chrono::{DateTime, Utc};
-use std::collections::HashMap;
-
-use crate::timeline::{
-    CollapseStubKind, ConversationMessage, FrameKind, MessageKind, TimelineEntry,
-};
-
-use super::project_filter::repo_name_from_cwd;
+#![allow(unused_imports)]
+use super::*;
 
 const EXACT_SHORT_DUP_MAX_CHARS: usize = 1000;
 const EXACT_SHORT_DUP_WINDOW_MS: i64 = 2_000;
@@ -67,7 +54,16 @@ pub fn to_conversation_with_stats(
     drop_exact_short_user_duplicates(messages)
 }
 
-/// Compute a stable 64-bit key for `(agent, session_id, trimmed message)`.
+/// Compute a stable 64-bit key for `(agent, session_id, trimmed message)`
+/// without allocating new `String`s on the hot dedup path. Uses SipHash-1-3
+/// with null-byte delimiters between the fields to avoid prefix collisions
+/// between e.g. `("a", "bc", "d")` and `("ab", "c", "d")`.
+///
+/// `agent` is part of the key because extractors can emit a shared fallback
+/// session id (for example `extract_claude_history` uses `"history"` when
+/// `sessionId` is absent). Without the agent in the key, identical short
+/// prompts from two unrelated agent streams within a 2 s window would be
+/// silently merged.
 fn exact_short_dup_key(agent: &str, session_id: &str, trimmed: &str) -> u64 {
     use siphasher::sip::SipHasher13;
     use std::hash::{Hash, Hasher};
@@ -117,9 +113,7 @@ fn drop_exact_short_user_duplicates(messages: Vec<ConversationMessage>) -> Conve
     }
 }
 
-pub(crate) fn classify_conversation_message(
-    message: &str,
-) -> (MessageKind, Option<CollapseStubKind>) {
+fn classify_conversation_message(message: &str) -> (MessageKind, Option<CollapseStubKind>) {
     let trimmed_start = message.trim_start();
 
     if trimmed_start.starts_with("<skill-ref:") {
@@ -144,8 +138,11 @@ pub(crate) fn classify_conversation_message(
         "VC Agents Worker Charter",
         "Report path:",
     ];
-
-    if workflow_signals.iter().any(|s| message.contains(s)) {
+    let workflow_signal_count = workflow_signals
+        .iter()
+        .filter(|signal| message.contains(**signal))
+        .count();
+    if workflow_signal_count >= 2 {
         return (MessageKind::WorkflowPrompt, None);
     }
 
