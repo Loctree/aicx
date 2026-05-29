@@ -7185,6 +7185,87 @@ mod tests {
     }
 
     #[test]
+    fn default_session_extract_path_whitespace_only_uses_safe_fallback() {
+        // Whitespace-only ids collapse to nothing safe → "session" stem + hash,
+        // never a filename made of spaces. Pass-6 (AUD-5) coverage gap.
+        let file_name = default_session_extract_file_name("   ");
+        assert!(
+            file_name.starts_with("session-"),
+            "whitespace-only id must fall back to session-<hash>, got {file_name}"
+        );
+        assert!(file_name.ends_with(".md"));
+        assert!(
+            !file_name.chars().any(char::is_whitespace),
+            "filename must contain no whitespace, got {file_name}"
+        );
+    }
+
+    #[test]
+    fn default_session_extract_path_unicode_control_chars_are_stripped() {
+        // RTL override (U+202E), zero-width space (U+200B) and a combining
+        // acute (U+0301) must never survive into the on-disk filename.
+        let file_name = default_session_extract_file_name("a\u{202E}b\u{200B}c\u{0301}");
+        assert!(file_name.ends_with(".md"));
+        assert!(
+            file_name.is_ascii(),
+            "filename must be pure ASCII, got {file_name:?}"
+        );
+        let stem = file_name.strip_suffix(".md").expect("md extension");
+        assert!(
+            stem.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
+            "filename stem must only use safe chars, got {stem:?}"
+        );
+    }
+
+    #[test]
+    fn default_session_extract_path_backslash_is_not_a_path_separator() {
+        // A backslash in the session id must sanitize to a safe char, never
+        // leak as a Windows path separator that could split the component.
+        let path = default_session_extract_path("claude", "a\\b").expect("path resolves");
+        let file_name = path
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            !file_name.contains('\\'),
+            "no backslash in filename: {file_name}"
+        );
+        assert!(
+            !file_name.contains('/'),
+            "no slash in filename: {file_name}"
+        );
+        // The extract dir is .../extracts/<agent>/<file>; the backslash must not
+        // have introduced an extra directory level.
+        assert!(
+            path.ends_with(
+                std::path::PathBuf::from("extracts")
+                    .join("claude")
+                    .join(&file_name)
+            ),
+            "session id must stay a single path component, got {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn default_session_extract_path_oversized_with_extension_like_suffix_is_capped() {
+        // Distinct from the pure-'a' oversized case: a surviving '.' (an
+        // extension-like suffix in the input) must not break the byte-slice cap.
+        let file_name = default_session_extract_file_name(&format!("{}.txt", "a".repeat(300)));
+        let stem = file_name
+            .strip_suffix(".md")
+            .expect("default extract filename should use markdown extension");
+        let (_, suffix) = stem
+            .rsplit_once('-')
+            .expect("oversized session id should carry hash suffix");
+        assert!(stem.len() <= DEFAULT_SESSION_EXTRACT_FILENAME_STEM_MAX_BYTES);
+        assert_eq!(suffix.len(), 16);
+        assert!(suffix.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
     fn default_session_extract_path_normal_input_passthrough() {
         // Closes Klaudiusz audit gap I-3 (P3): a UUID-like session id that
         // uses only the safe charset (`[a-zA-Z0-9-_.]`) and fits under
