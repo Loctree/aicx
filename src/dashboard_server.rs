@@ -1687,40 +1687,8 @@ fn write_dashboard_artifact(path: &Path, html: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::capture_logs;
     use http_body_util::BodyExt;
-    use std::io;
-    use std::sync::{Arc as StdArc, Mutex};
-    use tracing_subscriber::fmt::MakeWriter;
-
-    #[derive(Clone)]
-    struct CapturedLogWriter {
-        buffer: StdArc<Mutex<Vec<u8>>>,
-    }
-
-    struct CapturedLogGuard {
-        buffer: StdArc<Mutex<Vec<u8>>>,
-    }
-
-    impl io::Write for CapturedLogGuard {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.buffer.lock().expect("log buffer poisoned").extend(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for CapturedLogWriter {
-        type Writer = CapturedLogGuard;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            CapturedLogGuard {
-                buffer: self.buffer.clone(),
-            }
-        }
-    }
 
     fn mk_tmp_dir(name: &str) -> PathBuf {
         let dir = std::env::current_dir()
@@ -1750,33 +1718,6 @@ mod tests {
             .expect("collect response body")
             .to_bytes();
         String::from_utf8(bytes.to_vec()).expect("utf8 body")
-    }
-
-    // Serialize all capture_logs callers. tracing's thread-local default
-    // subscriber loses races when multiple tests run in parallel against the
-    // same global state — one test's subscriber leaks across the scope of
-    // another, producing intermittent missing-log assertions. Holding this
-    // mutex for the duration of capture_logs makes the call deterministic.
-    static CAPTURE_LOGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
-        let _serial = CAPTURE_LOGS_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let buffer = StdArc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(CapturedLogWriter {
-                buffer: buffer.clone(),
-            })
-            .with_ansi(false)
-            .without_time()
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-
-        let result = tracing::subscriber::with_default(subscriber, f);
-        let logs = String::from_utf8(buffer.lock().expect("log buffer poisoned").clone())
-            .expect("utf8 logs");
-        (result, logs)
     }
 
     fn mk_state(root: PathBuf, artifact_path: PathBuf) -> Arc<DashboardServerState> {
