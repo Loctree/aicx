@@ -165,13 +165,19 @@ Current live evidence:
 - Local `cargo test --lib dashboard::tests::test_inline_markdown -- --test-threads=1`
   is green after `2030d3f` switched the Node harness to
   `globalThis.AicxMarkdown`.
-- Local full `make test` is GREEN at `abeb7ba` (verified 2026-05-28 pass-6,
-  exit 0, 0 failed across all binaries). Both former SC-01 blockers are
-  closed: `vector_index::iter3_tests::query_index_recovery_hint_uses_full_rescan_not_fresh`
-  passes (the recovery hint at `vector_index.rs:1688` now carries the
-  canonical `aicx index --full-rescan --project <name>`), and the
-  dashboard-server log-capture assertion was serialized via a static mutex
-  (`623c65a`) so it no longer flakes under full parallel `make test`.
+- Local full `make test` is GREEN on a clean run (verified 2026-05-28 pass-6,
+  exit 0, 0 failed across all binaries). The recovery-hint SC-01 blocker is
+  fully closed: `vector_index::iter3_tests::query_index_recovery_hint_uses_full_rescan_not_fresh`
+  passes (the recovery hint at `vector_index.rs:1688` now carries the canonical
+  `aicx index --full-rescan --project <name>`). The dashboard-server
+  log-capture assertion is greatly stabilized by a static mutex (`623c65a`),
+  but a residual intermittent flake of
+  `dashboard_server::tests::regenerate_logs_detailed_reason_without_leaking_403_body`
+  can still surface under full parallel `make test` (observed ~1/3 runs in
+  pass-6); it passes in isolation and on retry. Root cause is tracing's
+  thread-local `with_default` + the process-global level/interest cache
+  (`dashboard_server.rs:1773` `with_max_level(WARN)`), which the per-call
+  mutex cannot fully isolate from sibling test threads.
 - `docs/BUGFIXES.md` already records M-13 as deferred; keep that truth unless a
   dedicated CSP nonce/header implementation lands in a separate scoped cut.
 
@@ -179,8 +185,14 @@ Split / block list before merge:
 
 - [done @abeb7ba] vector-index recovery-hint regression fixed — canonical
   operator recovery path is `aicx index --full-rescan --project <name>`.
-- [done @623c65a] dashboard-server log-capture assertion serialized via a
-  static mutex; stable under full parallel `make test`.
+- [partial @623c65a] dashboard-server log-capture assertion serialized via a
+  static mutex — flake greatly reduced but NOT eliminated; a residual
+  intermittent failure remains under full parallel `make test`. Reliable gate:
+  rerun, run the test in isolation, or reduce `--test-threads`. Proper fix
+  (assert the 403 reason via the response/return value rather than via
+  captured tracing logs, or serialize all tracing-emitting tests) is tracked
+  in `docs/BACKLOG.md` — NOT a hard merge blocker (remote CI green; passes on
+  retry), but it must not be claimed as fully fixed.
 - Keep H-2 Layer 1 store/index reconciliation operator-side until a separate
   PR owns it. Sharp caveat: `aicx store --full-rescan` is additive-only — it
   backfills `missing` index tuples but does NOT prune `orphaned` ones (the
