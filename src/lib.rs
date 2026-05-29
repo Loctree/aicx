@@ -38,6 +38,10 @@ pub mod validation;
 pub mod vector_index;
 pub mod wizard;
 
+/// Test-only shared tracing capture (deterministic under parallel `cargo test`).
+#[cfg(test)]
+mod test_support;
+
 pub use aicx_parser as parser;
 pub use aicx_parser::{chunker, frontmatter, sanitize, segmentation, timeline, types};
 pub use api::{
