@@ -165,22 +165,34 @@ Current live evidence:
 - Local `cargo test --lib dashboard::tests::test_inline_markdown -- --test-threads=1`
   is green after `2030d3f` switched the Node harness to
   `globalThis.AicxMarkdown`.
-- Local full `make test` is still red: isolated
-  `vector_index::iter3_tests::query_index_recovery_hint_uses_full_rescan_not_fresh`
-  fails because the recovery message does not contain `--full-rescan`, and
-  full parallel execution also exposed a flaky dashboard-server log-capture
-  assertion that passes in isolation.
+- Local full `make test` is GREEN at `abeb7ba` (verified 2026-05-28 pass-6,
+  exit 0, 0 failed across all binaries). Both former SC-01 blockers are
+  closed: `vector_index::iter3_tests::query_index_recovery_hint_uses_full_rescan_not_fresh`
+  passes (the recovery hint at `vector_index.rs:1688` now carries the
+  canonical `aicx index --full-rescan --project <name>`), and the
+  dashboard-server log-capture assertion was serialized via a static mutex
+  (`623c65a`) so it no longer flakes under full parallel `make test`.
 - `docs/BUGFIXES.md` already records M-13 as deferred; keep that truth unless a
   dedicated CSP nonce/header implementation lands in a separate scoped cut.
 
 Split / block list before merge:
 
-- Fix the vector-index recovery-hint regression so the canonical operator
-  recovery path is `aicx index --full-rescan --project <name>`.
-- Stabilize or quarantine the dashboard-server log-capture assertion under full
-  parallel `make test`.
+- [done @abeb7ba] vector-index recovery-hint regression fixed — canonical
+  operator recovery path is `aicx index --full-rescan --project <name>`.
+- [done @623c65a] dashboard-server log-capture assertion serialized via a
+  static mutex; stable under full parallel `make test`.
 - Keep H-2 Layer 1 store/index reconciliation operator-side until a separate
-  PR owns it.
+  PR owns it. Sharp caveat: `aicx store --full-rescan` is additive-only — it
+  backfills `missing` index tuples but does NOT prune `orphaned` ones (the
+  store update path is `.entry().or_default()`). Doctor's "reconcile" wording
+  over-promises orphan pruning; a true orphan-prune/reconcile pass is a
+  separate future cut.
 - Keep broader extractor/UI diagnostic read-cap work in a separate follow-up.
+  The general read sites are already capped (central `read_to_string_validated`
+  8 MiB cap + `read_line_capped` + the semantic NDJSON cap wired across
+  `vector_index.rs`, `api.rs`, `search_engine.rs`, `adapter_brute_force.rs`).
+  The only remaining uncapped reads are two trusted child-subprocess pipes in
+  `src/wizard/screens/store.rs:131` (stderr) and `:140` (stdout), which read
+  our own `aicx store` child — low-risk, deferred.
 - Do not add new release-channel, installer, CSP nonce, or heartbeat work to
   PR #5 unless the operator explicitly reopens the scope.
