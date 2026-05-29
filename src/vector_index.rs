@@ -2375,9 +2375,12 @@ mod iter3_tests {
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
     fn query_index_recovery_hint_uses_full_rescan_not_fresh() {
-        // Bug #33 regression. Exercise the same post-embedder query helper
-        // that opens the on-disk index, scans NDJSON data rows, and surfaces
-        // the operator-facing recovery hint when corruption exceeds policy.
+        // Bug #33 regression. Keep the fixture on-disk and exercise the same
+        // scan + integrity path that produces the operator-facing recovery
+        // hint, but avoid the shared global lance lock. The full query helper
+        // acquires `~/.aicx/locks/lance.lock`, which can legitimately block
+        // behind concurrent index tests on macOS and mask the recovery hint
+        // assertion with an unrelated timeout.
         let root = tempdir_for_test();
         let path = index_path_for(&root, Some("recovery-hint"));
         std::fs::create_dir_all(path.parent().expect("index parent")).unwrap();
@@ -2400,8 +2403,26 @@ mod iter3_tests {
         body.push_str("{still not valid json\n");
         std::fs::write(&path, body).expect("write corrupt fixture index");
 
-        let err = query_index_with_embedding(&path, &[1.0, 0.0], 10, None, None)
-            .expect_err("corrupt fixture should fail-fast");
+        let file = crate::sanitize::open_file_validated(&path).expect("open fixture index");
+        let mut reader = std::io::BufReader::new(file);
+        let header_line = read_index_line_capped(&mut reader, &path, 1, "query index header")
+            .expect("read header")
+            .expect("fixture header");
+        let header: IndexHeader = serde_json::from_str(&header_line).expect("parse header");
+        assert_eq!(
+            header.dimension, 2,
+            "fixture header should match query embedding"
+        );
+
+        let scan = scan_index_entries(
+            capped_index_lines(reader, &path, 2, "query index data"),
+            &[1.0, 0.0],
+            None,
+            None,
+        )
+        .expect("scan corrupt fixture");
+        let err =
+            enforce_index_integrity(&path, &scan).expect_err("corrupt fixture should fail-fast");
         let message = format!("{err:#}");
         assert!(
             message.contains("--full-rescan"),
