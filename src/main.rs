@@ -2475,6 +2475,30 @@ fn extract_input_format_label(format: ExtractInputFormat) -> &'static str {
 /// Resolve the default output path for `aicx extract --session ...`:
 /// `~/.aicx/extracts/<agent>/<session_id>.md`.
 const DEFAULT_SESSION_EXTRACT_FILENAME_STEM_MAX_BYTES: usize = 180;
+const SESSION_HASH_SUFFIX_BYTES: usize = 17; // '-' + 16 hex chars
+const CONVERSATION_BATCH_JSON_EXTENSION: &str = ".json";
+const CONVERSATION_BATCH_FILENAME_STEM_MAX_BYTES: usize =
+    255 - CONVERSATION_BATCH_JSON_EXTENSION.len();
+
+fn stable_session_hash_suffix(session_id: &str) -> String {
+    use siphasher::sip::SipHasher13;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = SipHasher13::new();
+    session_id.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn capped_session_stem_with_hash(base: &str, session_id: &str, max_stem_bytes: usize) -> String {
+    let base_max_len = max_stem_bytes - SESSION_HASH_SUFFIX_BYTES;
+    let capped_base = if base.len() > base_max_len {
+        &base[..base_max_len]
+    } else {
+        base
+    };
+    let suffix = stable_session_hash_suffix(session_id);
+    format!("{capped_base}-{suffix}")
+}
 
 fn default_session_extract_path(agent_label: &str, session_id: &str) -> Result<PathBuf> {
     let base = aicx::store::store_base_dir()?;
@@ -2512,19 +2536,11 @@ fn default_session_extract_path(agent_label: &str, session_id: &str) -> Result<P
 
         let safe = safe.trim_matches(|ch| ch == '_' || ch == '.');
         let base = if safe.is_empty() { "session" } else { safe };
-        let base_max_len = DEFAULT_SESSION_EXTRACT_FILENAME_STEM_MAX_BYTES - 17;
-        let capped_base = if base.len() > base_max_len {
-            &base[..base_max_len]
-        } else {
-            base
-        };
-
-        use siphasher::sip::SipHasher13;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = SipHasher13::new();
-        session_id.hash(&mut hasher);
-        let suffix = hasher.finish();
-        format!("{capped_base}-{suffix:016x}")
+        capped_session_stem_with_hash(
+            base,
+            session_id,
+            DEFAULT_SESSION_EXTRACT_FILENAME_STEM_MAX_BYTES,
+        )
     };
     Ok(base
         .join("extracts")
@@ -2578,7 +2594,15 @@ fn conversation_batch_safe_session_filename(session_id: &str) -> String {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
     if is_already_safe {
-        return session_id.to_string();
+        return if session_id.len() <= CONVERSATION_BATCH_FILENAME_STEM_MAX_BYTES {
+            session_id.to_string()
+        } else {
+            capped_session_stem_with_hash(
+                session_id,
+                session_id,
+                CONVERSATION_BATCH_FILENAME_STEM_MAX_BYTES,
+            )
+        };
     }
 
     // Otherwise the id contains characters we cannot put on disk. Replace
@@ -2609,18 +2633,12 @@ fn conversation_batch_safe_session_filename(session_id: &str) -> String {
 
     let safe = safe.trim_matches('_');
     let base = if safe.is_empty() { "session" } else { safe };
-
-    use siphasher::sip::SipHasher13;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = SipHasher13::new();
-    session_id.hash(&mut hasher);
-    let suffix = hasher.finish();
-    format!("{base}-{suffix:016x}")
+    capped_session_stem_with_hash(base, session_id, CONVERSATION_BATCH_FILENAME_STEM_MAX_BYTES)
 }
 
 fn conversation_batch_output_path(out_dir: &Path, agent_label: &str, session_id: &str) -> PathBuf {
     out_dir.join(agent_label).join(format!(
-        "{}.json",
+        "{}{CONVERSATION_BATCH_JSON_EXTENSION}",
         conversation_batch_safe_session_filename(session_id)
     ))
 }
@@ -7327,6 +7345,51 @@ mod tests {
     }
 
     #[test]
+    fn conversation_batch_safe_session_filename_caps_oversized_safe_ids() {
+        let safe = conversation_batch_safe_session_filename(&"a".repeat(300));
+        let (_, suffix) = safe
+            .rsplit_once('-')
+            .expect("oversized safe id should carry hash suffix");
+
+        assert!(safe.len() <= 250, "batch JSON stem is too long: {safe}");
+        assert_eq!(suffix.len(), 16);
+        assert!(suffix.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn conversation_batch_safe_session_filename_caps_oversized_unsafe_ids() {
+        let safe = conversation_batch_safe_session_filename(&format!("{}///", "a".repeat(300)));
+        let (_, suffix) = safe
+            .rsplit_once('-')
+            .expect("oversized unsafe id should carry hash suffix");
+
+        assert!(safe.len() <= 250, "batch JSON stem is too long: {safe}");
+        assert_eq!(suffix.len(), 16);
+        assert!(suffix.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert!(
+            safe.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')),
+            "batch JSON stem must stay within safe filename chars: {safe}"
+        );
+    }
+
+    #[test]
+    fn conversation_batch_output_path_file_name_stays_under_name_max() {
+        let path = conversation_batch_output_path(
+            Path::new("/tmp/aicx-conversations"),
+            "claude",
+            &"a".repeat(300),
+        );
+        let file_name = path.file_name().expect("batch output path has file name");
+        let file_name = file_name.to_string_lossy();
+
+        assert!(
+            file_name.len() <= 255,
+            "batch output file name exceeds NAME_MAX: {file_name}"
+        );
+    }
+
+    #[test]
     fn claude_defaults_to_silent_stdout() {
         let cli = Cli::try_parse_from(["aicx", "claude"]).expect("claude command should parse");
 
@@ -8366,6 +8429,55 @@ mod tests {
             "expected a session-two_unsafe-<hash>.json file, got {entries:?}"
         );
         assert!(!out_dir.starts_with(aicx::store::store_base_dir().unwrap()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn conversations_batch_writes_oversized_session_id_output() {
+        let root = unique_test_dir("conversations-batch-long-session");
+        let out_dir = root.join("out");
+        let session_id = "a".repeat(300);
+        let entries = vec![timeline::TimelineEntry {
+            timestamp: Utc.with_ymd_and_hms(2026, 5, 14, 12, 0, 0).unwrap(),
+            agent: "claude".to_string(),
+            session_id: session_id.clone(),
+            role: "user".to_string(),
+            message: "hello long session".to_string(),
+            frame_kind: None,
+            branch: Some("main".to_string()),
+            cwd: Some("/tmp/project-one".to_string()),
+            timestamp_source: None,
+        }];
+
+        let summary = write_conversation_batch_outputs(ConversationBatchWriteOptions {
+            agent_label: "claude",
+            entries,
+            project_filter: vec![],
+            out_dir: out_dir.clone(),
+            limit: None,
+            dry_run: false,
+            redaction_enabled: false,
+        })
+        .expect("oversized session id should still write conversation JSON");
+        let path = conversation_batch_output_path(&out_dir, "claude", &session_id);
+        let file_name = path
+            .file_name()
+            .expect("batch output path should include file name")
+            .to_string_lossy();
+
+        assert_eq!(summary.sessions_discovered, 1);
+        assert_eq!(summary.sessions_written, 1);
+        assert_eq!(summary.failed_sessions, 0);
+        assert!(
+            path.exists(),
+            "expected batch output file at {}",
+            path.display()
+        );
+        assert!(
+            file_name.len() <= 255,
+            "batch output file name exceeds NAME_MAX: {file_name}"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
