@@ -737,17 +737,25 @@ fn build_candidate_query(filter: &SteerFilter<'_>) -> Option<String> {
 }
 
 fn metadata_matches(meta: &serde_json::Value, filter: &SteerFilter<'_>) -> bool {
-    let project_lower = filter.project.map(str::to_ascii_lowercase);
     let agent_lower = filter.agent.map(str::to_ascii_lowercase);
     let kind_lower = filter.kind.map(str::to_ascii_lowercase);
 
-    if let Some(ref needle) = project_lower {
-        if let Some(p) = meta.get("project").and_then(|v| v.as_str()) {
-            if !p.to_ascii_lowercase().contains(needle) {
+    // Strict canonical project filter: split the stored `<owner>/<repo>`
+    // slug and delegate to `aicx::store::project_filter_matches` so the
+    // steer-index path agrees with `aicx search`, dashboard, refs/since,
+    // and rank. Substring fallback (`-p vista` matching `vista-portal`,
+    // `vista-datasets`, etc.) is intentionally removed — Bug #29.
+    if let Some(needle) = filter.project {
+        let needle = needle.trim();
+        if !needle.is_empty() {
+            if let Some(stored) = meta.get("project").and_then(|v| v.as_str()) {
+                let (organization, repository) = stored.split_once('/').unwrap_or(("", stored));
+                if !crate::store::project_filter_matches(organization, repository, needle) {
+                    return false;
+                }
+            } else {
                 return false;
             }
-        } else {
-            return false;
         }
     }
     if let Some(ref needle) = agent_lower {
@@ -1185,6 +1193,7 @@ mod tests {
                 date: "2026-04-05".to_string(),
                 session_id: "session123".to_string(),
                 cwd: Some("/Users/maciejgad/vc-workspace/VetCoders/ai-contexters".to_string()),
+                timestamp_source: None,
                 kind: Kind::Reports,
                 run_id: Some("impl-055522".to_string()),
                 prompt_id: Some("20260405_045135".to_string()),
@@ -1240,6 +1249,7 @@ mod tests {
             date: "2026-03-31".to_string(),
             session_id: "sess-1".to_string(),
             cwd: Some("/Users/tester/workspaces/ai-contexters".to_string()),
+            timestamp_source: None,
             kind: Kind::Reports,
             run_id: Some(run_id.to_string()),
             prompt_id: Some(prompt_id.to_string()),
@@ -1628,5 +1638,41 @@ mod tests {
         assert!(query.contains("mrbl"));
         assert!(query.contains("claude"));
         assert!(query.contains("vibecrafted"));
+    }
+
+    #[test]
+    fn metadata_matches_project_filter_is_strict_not_substring() {
+        // Bug #29: steer-index candidate filter used to substring-match
+        // `-p vista` against `vista-portal`. It now routes through the
+        // canonical `aicx::store::project_filter_matches`, so the bare
+        // name `vista` must NOT match a `vetcoders/vista-portal` slug.
+        let meta = json!({ "project": "vetcoders/vista-portal" });
+        let filter = SteerFilter {
+            project: Some("vista"),
+            ..SteerFilter::default()
+        };
+        assert!(
+            !metadata_matches(&meta, &filter),
+            "strict matcher must reject `vista` against `vetcoders/vista-portal`"
+        );
+
+        // Canonical strict slug still matches its exact target.
+        let meta_exact = json!({ "project": "Loctree/aicx" });
+        let filter_exact = SteerFilter {
+            project: Some("Loctree/aicx"),
+            ..SteerFilter::default()
+        };
+        assert!(
+            metadata_matches(&meta_exact, &filter_exact),
+            "exact slug must still match the canonical project"
+        );
+
+        // And the substring sibling `Loctree/aicx-portal` must NOT match
+        // `Loctree/aicx` either — same strict-equality rule for slugs.
+        let meta_sibling = json!({ "project": "Loctree/aicx-portal" });
+        assert!(
+            !metadata_matches(&meta_sibling, &filter_exact),
+            "strict matcher must reject `Loctree/aicx` against `Loctree/aicx-portal`"
+        );
     }
 }

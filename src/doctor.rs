@@ -6,7 +6,8 @@
 //! `--fix`, safe corrective actions are applied: corrupted steer indexes
 //! are rebuilt from canonical store via `steer_index::rebuild_steer_index_if_needed`.
 //! With `--fix-buckets`, suspicious top-level store buckets are moved to
-//! timestamped quarantine.
+//! timestamped quarantine. With `--prune-empty-bodies --apply`, empty-body
+//! chunks and their sidecars are moved to a recoverable empty-body quarantine.
 //!
 //! The canonical store (`~/.aicx/store/`) is treated as ground truth: doctor
 //! never deletes store contents. Bucket quarantine is a rename into
@@ -14,16 +15,20 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::oracle::OracleReadiness;
+use crate::sanitize;
 use crate::steer_index;
 use crate::store;
 use crate::validation::{is_valid_repo_bucket_name, is_valid_repo_project_slug};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
 pub struct DoctorOptions {
@@ -37,6 +42,7 @@ pub struct DoctorOptions {
     pub dry_run: bool,
     pub rebuild_sidecars: bool,
     pub prune_empty_bodies: bool,
+    pub apply_prune_empty_bodies: bool,
     pub check_dedup: bool,
     pub verbose: bool,
     pub smoke: bool,
@@ -77,6 +83,21 @@ fn default_schema_version_2() -> u32 {
     2
 }
 
+/// Label for the AICX root used in operator-facing recommendation strings.
+///
+/// When `$AICX_HOME` is pinned to a non-default location, the operator
+/// needs to see the resolved path — otherwise doctor recommendations
+/// like "rm -rf ~/.aicx/steer_db" point at the wrong directory. When
+/// the env override is unset (or empty), keep the familiar `~/.aicx`
+/// literal because that matches what most operators expect and what
+/// the existing install docs reference.
+fn doctor_home_label() -> String {
+    match std::env::var_os("AICX_HOME") {
+        Some(value) if !value.is_empty() => PathBuf::from(value).display().to_string(),
+        _ => "~/.aicx".to_string(),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DoctorReport {
     #[serde(default = "default_schema_version_2")]
@@ -112,6 +133,99 @@ pub struct DoctorReport {
     pub overall: Severity,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorFixId {
+    RebuildSteerIndex,
+    QuarantineBuckets,
+    QuarantineEmptyBodies,
+}
+
+impl DoctorFixId {
+    fn title(self) -> &'static str {
+        match self {
+            Self::RebuildSteerIndex => "Rebuild steer index",
+            Self::QuarantineBuckets => "Quarantine suspicious corpus buckets",
+            Self::QuarantineEmptyBodies => "Quarantine empty-body chunks",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DoctorFixChoice {
+    id: DoctorFixId,
+    title: String,
+    detail: String,
+}
+
+impl fmt::Display for DoctorFixChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} -- {}", self.title, self.detail)
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct DoctorDryRunPreview {
+    pub fix: DoctorFixId,
+    pub title: String,
+    pub summary: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DoctorApplyPhase {
+    pub fix: DoctorFixId,
+    pub title: String,
+    pub status: String,
+    pub detail: String,
+    pub elapsed_ms: u128,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DoctorCleanupRunReport {
+    pub mode: String,
+    pub selected: Vec<DoctorFixId>,
+    pub dry_run: Vec<DoctorDryRunPreview>,
+    pub applied: Vec<DoctorApplyPhase>,
+    pub final_report: DoctorReport,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct QuarantineManifest {
+    #[serde(default = "default_quarantine_manifest_schema")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub items: Vec<QuarantineManifestItem>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct QuarantineManifestItem {
+    #[serde(default)]
+    pub original_path: PathBuf,
+    #[serde(default)]
+    pub quarantined_path: PathBuf,
+    #[serde(default)]
+    pub sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct QuarantineRestoreReport {
+    pub slug: String,
+    pub manifest_path: PathBuf,
+    pub restored: usize,
+    pub skipped: usize,
+    pub failures: Vec<String>,
+}
+
+fn default_quarantine_manifest_schema() -> u32 {
+    1
+}
+
 #[derive(Debug, Serialize)]
 pub struct OracleReadinessReport {
     pub readiness: OracleReadiness,
@@ -127,6 +241,135 @@ pub struct OracleReadinessReport {
 pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
     let base = store::store_base_dir().context("Failed to resolve aicx store base directory")?;
     run_at(&base, opts).await
+}
+
+pub async fn run_automated_cleanup_at(
+    base: &Path,
+    force: bool,
+    verbose: bool,
+    smoke: bool,
+    progress: bool,
+) -> Result<DoctorCleanupRunReport> {
+    let initial = run_at(base, &base_doctor_options(verbose, smoke)).await?;
+    let selected = actionable_fixes(&initial)
+        .into_iter()
+        .map(|choice| choice.id)
+        .collect::<Vec<_>>();
+    run_cleanup_actions(
+        base,
+        selected,
+        force,
+        progress,
+        verbose,
+        smoke,
+        if force { "force" } else { "yes" },
+    )
+    .await
+}
+
+pub async fn run_interactive_cleanup_at(
+    base: &Path,
+    verbose: bool,
+    smoke: bool,
+) -> Result<DoctorCleanupRunReport> {
+    let initial = run_at(base, &base_doctor_options(verbose, smoke)).await?;
+    let choices = actionable_fixes(&initial);
+    if choices.is_empty() {
+        return Ok(DoctorCleanupRunReport {
+            mode: "interactive".to_string(),
+            selected: Vec::new(),
+            dry_run: Vec::new(),
+            applied: Vec::new(),
+            final_report: initial,
+        });
+    }
+
+    if !std::io::stdin().is_terminal() {
+        bail!("interactive doctor requires a TTY; pass --yes or --format json for automation");
+    }
+
+    let defaults = (0..choices.len()).collect::<Vec<_>>();
+    let selected = inquire::MultiSelect::new("aicx doctor fixes", choices.clone())
+        .with_default(&defaults)
+        .with_page_size(8)
+        .with_help_message(
+            "Space toggles, Enter confirms. No data is deleted; cleanup moves files to quarantine.",
+        )
+        .prompt()
+        .context("doctor selection cancelled")?;
+    let selected_ids = selected.iter().map(|choice| choice.id).collect::<Vec<_>>();
+    let dry_run = selected_ids
+        .iter()
+        .copied()
+        .map(|fix| dry_run_preview(base, fix))
+        .collect::<Result<Vec<_>>>()?;
+
+    if selected_ids.is_empty() {
+        let final_report = run_at(base, &base_doctor_options(verbose, smoke)).await?;
+        return Ok(DoctorCleanupRunReport {
+            mode: "interactive".to_string(),
+            selected: Vec::new(),
+            dry_run,
+            applied: Vec::new(),
+            final_report,
+        });
+    }
+
+    eprintln!("{}", format_dry_run_previews(&dry_run));
+    eprintln!(
+        "Dry run finished. No filesystem changes made.\nNo data will be lost. File movements are reversible from ~/.aicx/quarantine/ via `aicx doctor --restore-quarantine <slug>`."
+    );
+
+    let confirm_defaults = (0..selected.len()).collect::<Vec<_>>();
+    let confirmed = inquire::MultiSelect::new("Apply cleanup", selected)
+        .with_default(&confirm_defaults)
+        .with_page_size(8)
+        .with_help_message(
+            "Uncheck anything to skip it, Enter applies selected cleanup, Esc cancels.",
+        )
+        .prompt()
+        .context("doctor apply confirmation cancelled")?;
+
+    run_cleanup_actions(
+        base,
+        confirmed.iter().map(|choice| choice.id).collect(),
+        true,
+        true,
+        verbose,
+        smoke,
+        "interactive",
+    )
+    .await
+    .map(|mut report| {
+        report.dry_run = dry_run;
+        report
+    })
+}
+
+pub fn format_cleanup_run_text(report: &DoctorCleanupRunReport) -> String {
+    let mut out = String::new();
+    if report.selected.is_empty() {
+        out.push_str("aicx doctor: no actionable cleanup findings.\n");
+        out.push_str(&format_report_text(&report.final_report, false));
+        return out;
+    }
+    if !report.dry_run.is_empty() {
+        out.push_str(&format_dry_run_previews(&report.dry_run));
+        out.push('\n');
+    }
+    out.push_str("Apply complete.\n\n");
+    for phase in &report.applied {
+        out.push_str(&format!(
+            "  {} {}: {} ({:.2}s)\n",
+            if phase.status == "ok" { "OK" } else { "FAIL" },
+            phase.title,
+            phase.detail,
+            phase.elapsed_ms as f64 / 1000.0
+        ));
+    }
+    out.push_str("\nVerify quarantine:\n  ls ~/.aicx/quarantine/\n\n");
+    out.push_str("Restore if needed:\n  aicx doctor --restore-quarantine <slug>\n");
+    out
 }
 
 pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
@@ -160,11 +403,12 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
     } else {
         None
     };
-    let prune_empty_bodies_script = if opts.prune_empty_bodies {
+    let prune_empty_bodies_script = if opts.prune_empty_bodies && !opts.apply_prune_empty_bodies {
         Some(render_prune_empty_bodies_script(base)?)
     } else {
         None
     };
+    let apply_empty_bodies = opts.prune_empty_bodies && opts.apply_prune_empty_bodies;
 
     if opts.fix
         && (steer_lance.severity == Severity::Critical || steer_bm25.severity == Severity::Critical)
@@ -213,7 +457,44 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
         }
     }
 
-    if opts.fix || opts.fix_buckets {
+    if apply_empty_bodies {
+        match apply_empty_body_quarantine(base) {
+            Ok(report) if report.moved_chunks == 0 && report.failures.is_empty() => {
+                fixes_applied.push("no empty-body chunks to quarantine".to_string());
+            }
+            Ok(report) => {
+                if report.moved_chunks > 0 {
+                    let quarantine_root = report
+                        .quarantine_root
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "unknown quarantine root".to_string());
+                    fixes_applied.push(format!(
+                        "quarantined {} empty-body chunk(s) and {} sidecar(s) to {}",
+                        report.moved_chunks, report.moved_sidecars, quarantine_root
+                    ));
+                    if let Some(manifest_path) = report.manifest_path {
+                        fixes_applied.push(format!(
+                            "wrote quarantine manifest {}",
+                            manifest_path.display()
+                        ));
+                    }
+                }
+                for failure in report.failures.iter().take(10) {
+                    fixes_applied.push(format!("failed to quarantine empty-body chunk: {failure}"));
+                }
+                if report.failures.len() > 10 {
+                    fixes_applied.push(format!(
+                        "additional empty-body quarantine failures omitted: {}",
+                        report.failures.len() - 10
+                    ));
+                }
+            }
+            Err(e) => fixes_applied.push(format!("empty-body quarantine skipped: {e}")),
+        }
+    }
+
+    if opts.fix || opts.fix_buckets || apply_empty_bodies {
         canonical_store = check_canonical_store(base);
         steer_lance = check_steer_lance(base).await;
         steer_bm25 = check_steer_bm25(base);
@@ -277,6 +558,227 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
     })
 }
 
+fn base_doctor_options(verbose: bool, smoke: bool) -> DoctorOptions {
+    DoctorOptions {
+        fix: false,
+        fix_buckets: false,
+        dry_run: false,
+        rebuild_sidecars: false,
+        prune_empty_bodies: false,
+        apply_prune_empty_bodies: false,
+        check_dedup: false,
+        verbose,
+        smoke,
+    }
+}
+
+fn actionable_fixes(report: &DoctorReport) -> Vec<DoctorFixChoice> {
+    let mut choices = Vec::new();
+    if matches!(
+        report.steer_lance.severity,
+        Severity::Critical | Severity::Warning
+    ) || matches!(
+        report.steer_bm25.severity,
+        Severity::Critical | Severity::Warning
+    ) || matches!(report.index_freshness.severity, Severity::Critical)
+    {
+        choices.push(DoctorFixChoice {
+            id: DoctorFixId::RebuildSteerIndex,
+            title: DoctorFixId::RebuildSteerIndex.title().to_string(),
+            detail: "derived Lance/BM25 metadata, rebuilt from canonical chunks".to_string(),
+        });
+    }
+    if matches!(
+        report.corpus_buckets.severity,
+        Severity::Critical | Severity::Warning
+    ) {
+        choices.push(DoctorFixChoice {
+            id: DoctorFixId::QuarantineBuckets,
+            title: DoctorFixId::QuarantineBuckets.title().to_string(),
+            detail: "recoverable move of suspicious bucket paths".to_string(),
+        });
+    }
+    if matches!(
+        report.empty_body_chunks.severity,
+        Severity::Critical | Severity::Warning
+    ) {
+        choices.push(DoctorFixChoice {
+            id: DoctorFixId::QuarantineEmptyBodies,
+            title: DoctorFixId::QuarantineEmptyBodies.title().to_string(),
+            detail: "recoverable move to empty-body quarantine".to_string(),
+        });
+    }
+    choices
+}
+
+async fn run_cleanup_actions(
+    base: &Path,
+    selected: Vec<DoctorFixId>,
+    skip_dry_run: bool,
+    progress: bool,
+    verbose: bool,
+    smoke: bool,
+    mode: &str,
+) -> Result<DoctorCleanupRunReport> {
+    let dry_run = if skip_dry_run {
+        Vec::new()
+    } else {
+        selected
+            .iter()
+            .copied()
+            .map(|fix| dry_run_preview(base, fix))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let mut applied = Vec::new();
+    for fix in &selected {
+        let started = Instant::now();
+        let bar = if progress {
+            let bar = indicatif::ProgressBar::new_spinner();
+            bar.enable_steady_tick(Duration::from_millis(120));
+            bar.set_message(fix.title());
+            Some(bar)
+        } else {
+            None
+        };
+        let result = apply_cleanup_action(base, *fix, verbose, smoke).await;
+        if let Some(bar) = bar {
+            match &result {
+                Ok(_) => bar.finish_with_message(format!("{} done", fix.title())),
+                Err(err) => bar.finish_with_message(format!("{} failed: {err}", fix.title())),
+            }
+            if result.is_ok() {
+                eprintln!();
+            }
+        }
+        match result {
+            Ok(detail) => applied.push(DoctorApplyPhase {
+                fix: *fix,
+                title: fix.title().to_string(),
+                status: "ok".to_string(),
+                detail,
+                elapsed_ms: started.elapsed().as_millis(),
+            }),
+            Err(err) => applied.push(DoctorApplyPhase {
+                fix: *fix,
+                title: fix.title().to_string(),
+                status: "failed".to_string(),
+                detail: err.to_string(),
+                elapsed_ms: started.elapsed().as_millis(),
+            }),
+        }
+    }
+    let final_report = run_at(base, &base_doctor_options(verbose, smoke)).await?;
+    Ok(DoctorCleanupRunReport {
+        mode: mode.to_string(),
+        selected,
+        dry_run,
+        applied,
+        final_report,
+    })
+}
+
+async fn apply_cleanup_action(
+    base: &Path,
+    fix: DoctorFixId,
+    verbose: bool,
+    smoke: bool,
+) -> Result<String> {
+    let opts = match fix {
+        DoctorFixId::RebuildSteerIndex => DoctorOptions {
+            fix: true,
+            ..base_doctor_options(verbose, smoke)
+        },
+        DoctorFixId::QuarantineBuckets => DoctorOptions {
+            fix_buckets: true,
+            ..base_doctor_options(verbose, smoke)
+        },
+        DoctorFixId::QuarantineEmptyBodies => DoctorOptions {
+            prune_empty_bodies: true,
+            apply_prune_empty_bodies: true,
+            ..base_doctor_options(verbose, smoke)
+        },
+    };
+    let report = run_at(base, &opts).await?;
+    Ok(if report.fixes_applied.is_empty() {
+        "no changes needed".to_string()
+    } else {
+        report.fixes_applied.join("; ")
+    })
+}
+
+fn dry_run_preview(base: &Path, fix: DoctorFixId) -> Result<DoctorDryRunPreview> {
+    let summary = match fix {
+        DoctorFixId::RebuildSteerIndex => {
+            let candidates = ["steer_db", "steer_bm25", "steer_index_meta.json"]
+                .iter()
+                .map(|name| base.join(name))
+                .filter(|path| path.exists())
+                .map(|path| format!("Would remove derived path: {}", path.display()))
+                .collect::<Vec<_>>();
+            let mut summary = if candidates.is_empty() {
+                vec!["No existing steer index paths found; rebuild will materialize from canonical chunks.".to_string()]
+            } else {
+                candidates
+            };
+            summary
+                .push("Would rebuild Lance/BM25 steer metadata from canonical store.".to_string());
+            summary
+        }
+        DoctorFixId::QuarantineBuckets => {
+            let suspicious = scan_corpus_buckets(&base.join("store"))?;
+            if suspicious.is_empty() {
+                vec!["No suspicious corpus buckets found.".to_string()]
+            } else {
+                suspicious
+                    .iter()
+                    .take(20)
+                    .map(|bucket| format!("Would move bucket to quarantine: {bucket}"))
+                    .collect()
+            }
+        }
+        DoctorFixId::QuarantineEmptyBodies => {
+            let report = empty_body_report(base);
+            let timestamp = empty_body_quarantine_timestamp();
+            let mut summary = vec![
+                format!("Would move {} empty-body chunk(s).", report.empty),
+                format!(
+                    "Would write quarantine manifest under {}",
+                    empty_body_quarantine_root(base, &timestamp).display()
+                ),
+            ];
+            for (kind, count) in report.by_frame_kind.iter().take(8) {
+                summary.push(format!("frame_kind {kind}: {count}"));
+            }
+            summary
+        }
+    };
+    Ok(DoctorDryRunPreview {
+        fix,
+        title: fix.title().to_string(),
+        summary,
+    })
+}
+
+fn format_dry_run_previews(previews: &[DoctorDryRunPreview]) -> String {
+    let mut out = format!(
+        "You picked {} fix(es). Running dry-run preview:\n",
+        previews.len()
+    );
+    for (idx, preview) in previews.iter().enumerate() {
+        out.push_str(&format!(
+            "\n  [{}/{}] {}\n",
+            idx + 1,
+            previews.len(),
+            preview.title
+        ));
+        for line in &preview.summary {
+            out.push_str(&format!("    {line}\n"));
+        }
+    }
+    out.push_str("\nDry run finished. No filesystem changes made.\n");
+    out
+}
+
 fn check_context_corpus(base: &Path) -> CheckResult {
     let corpus_root = base.join(store::CONTEXT_CORPUS_DIRNAME);
     if !corpus_root.exists() {
@@ -300,10 +802,10 @@ fn check_context_corpus(base: &Path) -> CheckResult {
                     "context-corpus: scan failed at {}: {err}",
                     corpus_root.display()
                 ),
-                recommendation: Some(
-                    "Inspect ~/.aicx/context-corpus/ for permission or filesystem issues"
-                        .to_string(),
-                ),
+                recommendation: Some(format!(
+                    "Inspect {}/context-corpus/ for permission or filesystem issues",
+                    doctor_home_label()
+                )),
             };
         }
     };
@@ -485,54 +987,136 @@ fn check_semantic_health() -> CheckResult {
     }
 }
 
+/// Enumerate per-bucket subdirectories under `<aicx_home>/indexed/`.
+///
+/// Each bucket holds a `embeddings.ndjson` (atomically committed) and
+/// optionally a `embeddings.ndjson.tmp` checkpoint. Buckets are either
+/// `_all` (cross-project query target) or a `canonical_bucket_name`
+/// derived from `<owner>/<repo>` per `api::semantic_index_path_for_bucket`.
+fn list_indexed_buckets(indexed_root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(indexed_root) else {
+        return Vec::new();
+    };
+    let mut buckets: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+        .filter_map(|entry| entry.file_name().to_str().map(String::from))
+        .collect();
+    buckets.sort();
+    buckets
+}
+
+/// Bug #37: doctor freshness must inspect the SEMANTIC index that
+/// `aicx index` actually writes — `<aicx_home>/indexed/<bucket>/embeddings.ndjson`
+/// (see `api::semantic_index_path_for_bucket`). The legacy check used
+/// `steer_db` / `steer_bm25` mtimes (metadata steer indexes), so it
+/// reported "fresh" while the real semantic corpus was missing or stale.
+///
+/// Recovery hint uses the post-A-1 canonical flag set: `aicx index` for
+/// incremental refresh, `aicx index --full-rescan` for a from-zero
+/// rebuild. Path interpolation flows through `doctor_home_label` so the
+/// recommendation tracks `$AICX_HOME` like the other 8 doctor strings.
 fn check_index_freshness(base: &Path) -> CheckResult {
+    let indexed_root = base.join("indexed");
     let newest_chunk = newest_mtime(&base.join("store"))
         .into_iter()
         .chain(newest_mtime(&base.join("non-repository-contexts")))
         .max();
-    let index_mtime = newest_mtime(&base.join("steer_db"))
-        .into_iter()
-        .chain(newest_mtime(&base.join("steer_bm25")))
-        .max();
 
-    match (newest_chunk, index_mtime) {
-        (None, _) => CheckResult {
+    let Some(newest_chunk) = newest_chunk else {
+        return CheckResult {
             name: "index_freshness".to_string(),
             severity: Severity::Green,
             detail: "no canonical chunks found; no index lag".to_string(),
             recommendation: None,
-        },
-        (Some(_), None) => CheckResult {
+        };
+    };
+
+    let buckets = list_indexed_buckets(&indexed_root);
+    if buckets.is_empty() {
+        return CheckResult {
             name: "index_freshness".to_string(),
             severity: Severity::Critical,
-            detail: "canonical chunks exist but no semantic/steer index mtime was found"
-                .to_string(),
-            recommendation: Some(
-                "Run `aicx index --dry-run` to probe, then rebuild steer metadata".to_string(),
+            detail: format!(
+                "canonical chunks exist but no semantic index buckets under {}/indexed/",
+                doctor_home_label()
             ),
-        },
-        (Some(chunk), Some(index)) => {
-            let lag = chunk.duration_since(index).unwrap_or(Duration::ZERO);
-            let severity = if lag > Duration::from_secs(72 * 3600) {
-                Severity::Critical
-            } else if lag > Duration::from_secs(24 * 3600) {
-                Severity::Warning
-            } else {
-                Severity::Green
-            };
-            CheckResult {
-                name: "index_freshness".to_string(),
-                severity,
-                detail: format!("semantic lag: {} seconds", lag.as_secs()),
-                recommendation: if severity == Severity::Green {
-                    None
+            recommendation: Some(format!(
+                "Run `aicx index` to materialize {}/indexed/<bucket>/embeddings.ndjson \
+                 (use `aicx index --full-rescan` for a from-zero rebuild)",
+                doctor_home_label()
+            )),
+        };
+    }
+
+    let mut missing: Vec<String> = Vec::new();
+    let mut max_lag = Duration::ZERO;
+    let mut stale_count = 0usize;
+    let mut fresh_count = 0usize;
+
+    for bucket in &buckets {
+        let index_path = indexed_root.join(bucket).join("embeddings.ndjson");
+        match index_path.metadata().and_then(|m| m.modified()) {
+            Err(_) => missing.push(bucket.clone()),
+            Ok(index_mtime) => {
+                let lag = newest_chunk
+                    .duration_since(index_mtime)
+                    .unwrap_or(Duration::ZERO);
+                if lag > Duration::ZERO {
+                    stale_count += 1;
+                    if lag > max_lag {
+                        max_lag = lag;
+                    }
                 } else {
-                    Some(
-                        "Run `aicx index --dry-run` and refresh the materialized index".to_string(),
-                    )
-                },
+                    fresh_count += 1;
+                }
             }
         }
+    }
+
+    if !missing.is_empty() {
+        return CheckResult {
+            name: "index_freshness".to_string(),
+            severity: Severity::Critical,
+            detail: format!(
+                "semantic index missing for {} bucket(s): {}",
+                missing.len(),
+                missing.join(", ")
+            ),
+            recommendation: Some(format!(
+                "Run `aicx index` to materialize {}/indexed/<bucket>/embeddings.ndjson \
+                 (use `aicx index --full-rescan` for a from-zero rebuild)",
+                doctor_home_label()
+            )),
+        };
+    }
+
+    if stale_count > 0 {
+        let severity = if max_lag > Duration::from_secs(72 * 3600) {
+            Severity::Critical
+        } else {
+            Severity::Warning
+        };
+        return CheckResult {
+            name: "index_freshness".to_string(),
+            severity,
+            detail: format!(
+                "semantic index stale in {stale_count} bucket(s); max lag {} seconds",
+                max_lag.as_secs()
+            ),
+            recommendation: Some(format!(
+                "Run `aicx index` to refresh {}/indexed/<bucket>/embeddings.ndjson \
+                 (use `aicx index --full-rescan` to rebuild from zero)",
+                doctor_home_label()
+            )),
+        };
+    }
+
+    CheckResult {
+        name: "index_freshness".to_string(),
+        severity: Severity::Green,
+        detail: format!("semantic index fresh across {fresh_count} bucket(s)"),
+        recommendation: None,
     }
 }
 
@@ -564,20 +1148,24 @@ fn check_index_consistency(base: &Path) -> CheckResult {
             recommendation: if chunk_keys.is_empty() {
                 None
             } else {
-                Some("Run `aicx store --full-rescan` to rebuild ~/.aicx/index.json".to_string())
+                Some(format!(
+                    "Run `aicx store --full-rescan` to rebuild {}/index.json",
+                    doctor_home_label()
+                ))
             },
         };
     }
-    let raw = match std::fs::read_to_string(&index_path) {
+    let raw = match sanitize::read_to_string_validated(&index_path) {
         Ok(raw) => raw,
         Err(err) => {
             return CheckResult {
                 name: "index_consistency".to_string(),
                 severity: Severity::Critical,
                 detail: format!("Failed to read index.json: {err}"),
-                recommendation: Some(
-                    "Check filesystem permissions on ~/.aicx/index.json".to_string(),
-                ),
+                recommendation: Some(format!(
+                    "Check filesystem permissions on {}/index.json",
+                    doctor_home_label()
+                )),
             };
         }
     };
@@ -588,10 +1176,10 @@ fn check_index_consistency(base: &Path) -> CheckResult {
                 name: "index_consistency".to_string(),
                 severity: Severity::Critical,
                 detail: format!("index.json is malformed JSON: {err}"),
-                recommendation: Some(
-                    "Backup and rebuild ~/.aicx/index.json via `aicx store --full-rescan`"
-                        .to_string(),
-                ),
+                recommendation: Some(format!(
+                    "Backup and rebuild {}/index.json via `aicx store --full-rescan`",
+                    doctor_home_label()
+                )),
             };
         }
     };
@@ -652,7 +1240,10 @@ fn check_index_consistency(base: &Path) -> CheckResult {
         recommendation: if orphaned.is_empty() && missing.is_empty() {
             None
         } else {
-            Some("Run `aicx store --full-rescan` to reconcile ~/.aicx/index.json with the canonical store".to_string())
+            Some(format!(
+                "Run `aicx store --full-rescan` to reconcile {}/index.json with the canonical store",
+                doctor_home_label()
+            ))
         },
     }
 }
@@ -857,8 +1448,10 @@ async fn check_steer_lance(base: &Path) -> CheckResult {
                 recommendation: Some(if critical {
                     "Run `aicx doctor --fix` to delete and rebuild from canonical store".to_string()
                 } else {
-                    "Investigate logs; persistent issues may need manual `rm -rf ~/.aicx/steer_db`"
-                        .to_string()
+                    format!(
+                        "Investigate logs; persistent issues may need manual `rm -rf {}/steer_db`",
+                        doctor_home_label()
+                    )
                 }),
             }
         }
@@ -918,16 +1511,20 @@ fn check_state(base: &Path) -> CheckResult {
             recommendation: Some("Will be created on first `aicx store` run".to_string()),
         };
     }
-    let raw = match std::fs::read_to_string(&state_path) {
+    // state.json has a dedicated 128 MiB cap (see sanitize::MAX_STATE_JSON_BYTES);
+    // the generic 8 MiB validated reader rejects realistic dedup histories
+    // (200k+ chunks → state.json ~25 MB). Use the state-specific reader.
+    let raw = match sanitize::read_state_json_validated(&state_path) {
         Ok(s) => s,
         Err(e) => {
             return CheckResult {
                 name: "state".to_string(),
                 severity: Severity::Critical,
                 detail: format!("Failed to read state.json: {e}"),
-                recommendation: Some(
-                    "Check filesystem permissions on ~/.aicx/state.json".to_string(),
-                ),
+                recommendation: Some(format!(
+                    "Check filesystem permissions on {}/state.json",
+                    doctor_home_label()
+                )),
             };
         }
     };
@@ -942,9 +1539,10 @@ fn check_state(base: &Path) -> CheckResult {
             name: "state".to_string(),
             severity: Severity::Critical,
             detail: format!("state.json is malformed JSON: {e}"),
-            recommendation: Some(
-                "Backup and remove ~/.aicx/state.json; will rebuild on next run".to_string(),
-            ),
+            recommendation: Some(format!(
+                "Backup and remove {}/state.json; will rebuild on next run",
+                doctor_home_label()
+            )),
         },
     }
 }
@@ -1089,7 +1687,7 @@ fn check_empty_body_chunks(base: &Path) -> CheckResult {
         ),
         recommendation: if report.empty > 0 {
             Some(
-                "Run `aicx doctor --prune-empty-bodies` to emit a reviewable cleanup script"
+                "Run `aicx doctor --prune-empty-bodies --apply` to move empty-body chunks to quarantine, or omit `--apply` for a reviewable script"
                     .to_string(),
             )
         } else {
@@ -1118,7 +1716,7 @@ fn empty_body_report(base: &Path) -> EmptyBodyReport {
         if file.path.extension().and_then(|ext| ext.to_str()) != Some("md") {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&file.path) else {
+        let Ok(content) = sanitize::read_to_string_validated(&file.path) else {
             continue;
         };
         if !chunk_body_is_empty(&content) && chunk_body_after_header(&content).trim().len() >= 50 {
@@ -1171,18 +1769,352 @@ fn chunk_line_has_signal(line: &str) -> bool {
 pub fn render_prune_empty_bodies_script(base: &Path) -> Result<String> {
     let report = empty_body_report(base);
     let mut out = String::from("#!/usr/bin/env bash\nset -euo pipefail\n\n");
+    let timestamp = empty_body_quarantine_timestamp();
+    let quarantine_root = empty_body_quarantine_root(base, &timestamp);
     out.push_str("# Review before running. Generated by `aicx doctor --prune-empty-bodies`.\n");
+    out.push_str("# Moves empty-body chunks into recoverable quarantine; no files are deleted.\n");
     for path in report.empty_paths {
-        out.push_str("rm -f -- ");
+        let dst = empty_body_quarantine_destination(base, &quarantine_root, &path)?;
+        if let Some(parent) = dst.parent() {
+            out.push_str("mkdir -p -- ");
+            out.push_str(&shell_quote_path(parent));
+            out.push('\n');
+        }
+        out.push_str("mv -n -- ");
         out.push_str(&shell_quote_path(&path));
         out.push(' ');
-        out.push_str(&shell_quote_path(&path.with_extension("meta.json")));
+        out.push_str(&shell_quote_path(&dst));
         out.push('\n');
+        let sidecar = path.with_extension("meta.json");
+        if sidecar.exists() {
+            out.push_str("mv -n -- ");
+            out.push_str(&shell_quote_path(&sidecar));
+            out.push(' ');
+            out.push_str(&shell_quote_path(&dst.with_extension("meta.json")));
+            out.push('\n');
+        }
     }
-    if !out.contains("rm -f --") {
+    if !out.contains("mv -n --") {
         out.push_str("# No empty-body chunks detected.\n");
     }
     Ok(out)
+}
+
+#[derive(Debug, Default)]
+struct EmptyBodyQuarantineApplyReport {
+    quarantine_root: Option<PathBuf>,
+    manifest_path: Option<PathBuf>,
+    moved_chunks: usize,
+    moved_sidecars: usize,
+    failures: Vec<String>,
+    manifest_items: Vec<QuarantineManifestItem>,
+}
+
+struct EmptyBodyMove {
+    moved_sidecar: bool,
+    manifest_items: Vec<QuarantineManifestItem>,
+}
+
+fn apply_empty_body_quarantine(base: &Path) -> Result<EmptyBodyQuarantineApplyReport> {
+    let timestamp = empty_body_quarantine_timestamp();
+    apply_empty_body_quarantine_with_timestamp(base, &timestamp)
+}
+
+fn apply_empty_body_quarantine_with_timestamp(
+    base: &Path,
+    timestamp: &str,
+) -> Result<EmptyBodyQuarantineApplyReport> {
+    let report = empty_body_report(base);
+    let quarantine_root = empty_body_quarantine_root(base, timestamp);
+    let slug = quarantine_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(timestamp)
+        .to_string();
+    let mut apply_report = EmptyBodyQuarantineApplyReport::default();
+    if report.empty_paths.is_empty() {
+        return Ok(apply_report);
+    }
+
+    apply_report.quarantine_root = Some(quarantine_root.clone());
+    for path in report.empty_paths {
+        match quarantine_empty_body_chunk(base, &quarantine_root, &path) {
+            Ok(moved) => {
+                apply_report.moved_chunks += 1;
+                if moved.moved_sidecar {
+                    apply_report.moved_sidecars += 1;
+                }
+                apply_report.manifest_items.extend(moved.manifest_items);
+            }
+            Err(e) => apply_report
+                .failures
+                .push(format!("{}: {e}", path.display())),
+        }
+    }
+
+    if !apply_report.manifest_items.is_empty() {
+        let manifest = QuarantineManifest {
+            schema_version: 1,
+            category: "empty_bodies".to_string(),
+            slug,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            items: apply_report.manifest_items.clone(),
+        };
+        let manifest_path = quarantine_root.join("manifest.json");
+        if let Some(parent) = manifest_path.parent() {
+            std::fs::create_dir_all(parent).context("create quarantine manifest parent")?;
+        }
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)
+            .with_context(|| format!("write quarantine manifest {}", manifest_path.display()))?;
+        apply_report.manifest_path = Some(manifest_path);
+    }
+
+    Ok(apply_report)
+}
+
+fn quarantine_empty_body_chunk(
+    base: &Path,
+    quarantine_root: &Path,
+    path: &Path,
+) -> Result<EmptyBodyMove> {
+    let dst = empty_body_quarantine_destination(base, quarantine_root, path)?;
+    if dst.exists() {
+        bail!("destination already exists: {}", dst.display());
+    }
+    let chunk_sha = file_sha256(path)?;
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).context("create empty-body quarantine parent")?;
+    }
+    std::fs::rename(path, &dst)
+        .with_context(|| format!("rename empty-body chunk to {}", dst.display()))?;
+    let mut manifest_items = vec![QuarantineManifestItem {
+        original_path: path.to_path_buf(),
+        quarantined_path: dst.clone(),
+        sha256: chunk_sha,
+    }];
+
+    let sidecar = path.with_extension("meta.json");
+    if !sidecar.exists() {
+        return Ok(EmptyBodyMove {
+            moved_sidecar: false,
+            manifest_items,
+        });
+    }
+    let sidecar_dst = dst.with_extension("meta.json");
+    if sidecar_dst.exists() {
+        bail!(
+            "sidecar destination already exists: {}",
+            sidecar_dst.display()
+        );
+    }
+    let sidecar_sha = file_sha256(&sidecar)?;
+    std::fs::rename(&sidecar, &sidecar_dst)
+        .with_context(|| format!("rename empty-body sidecar to {}", sidecar_dst.display()))?;
+    manifest_items.push(QuarantineManifestItem {
+        original_path: sidecar,
+        quarantined_path: sidecar_dst,
+        sha256: sidecar_sha,
+    });
+    Ok(EmptyBodyMove {
+        moved_sidecar: true,
+        manifest_items,
+    })
+}
+
+fn empty_body_quarantine_destination(
+    base: &Path,
+    quarantine_root: &Path,
+    path: &Path,
+) -> Result<PathBuf> {
+    let store_root =
+        std::fs::canonicalize(base.join("store")).context("canonicalize store root")?;
+    let chunk_path = std::fs::canonicalize(path)
+        .with_context(|| format!("canonicalize empty-body chunk: {}", path.display()))?;
+    let relative = chunk_path
+        .strip_prefix(&store_root)
+        .with_context(|| format!("empty-body chunk is outside store root: {}", path.display()))?;
+    Ok(quarantine_root.join(relative))
+}
+
+fn empty_body_quarantine_root(base: &Path, timestamp: &str) -> PathBuf {
+    base.join("quarantine")
+        .join(format!("empty-bodies-{timestamp}"))
+}
+
+fn empty_body_quarantine_timestamp() -> String {
+    // Match `quarantine_bucket` pattern; RFC3339 with `:` breaks Windows path components.
+    chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string()
+}
+
+fn file_sha256(path: &Path) -> Result<String> {
+    let bytes = sanitize::read_to_string_validated(path)
+        .with_context(|| format!("read {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes.as_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn restore_quarantine(slug: &str) -> Result<QuarantineRestoreReport> {
+    let base = store::store_base_dir().context("Failed to resolve aicx store base directory")?;
+    restore_quarantine_at(&base, slug)
+}
+
+pub fn restore_quarantine_at(base: &Path, slug: &str) -> Result<QuarantineRestoreReport> {
+    let manifest_path = find_quarantine_manifest(base, slug)?
+        .with_context(|| format!("No quarantine manifest found for slug `{slug}`"))?;
+    let bytes = sanitize::read_to_string_validated(&manifest_path)
+        .with_context(|| format!("read quarantine manifest {}", manifest_path.display()))?;
+    let manifest: QuarantineManifest = serde_json::from_str(&bytes)
+        .with_context(|| format!("parse quarantine manifest {}", manifest_path.display()))?;
+
+    let mut report = QuarantineRestoreReport {
+        slug: if manifest.slug.is_empty() {
+            slug.to_string()
+        } else {
+            manifest.slug.clone()
+        },
+        manifest_path,
+        restored: 0,
+        skipped: 0,
+        failures: Vec::new(),
+    };
+
+    for item in manifest.items {
+        match restore_quarantine_item(&item) {
+            Ok(RestoreItemOutcome::Restored) => report.restored += 1,
+            Ok(RestoreItemOutcome::Skipped) => report.skipped += 1,
+            Err(err) => report.failures.push(format!(
+                "{} -> {}: {err}",
+                item.quarantined_path.display(),
+                item.original_path.display()
+            )),
+        }
+    }
+
+    Ok(report)
+}
+
+enum RestoreItemOutcome {
+    Restored,
+    Skipped,
+}
+
+fn restore_quarantine_item(item: &QuarantineManifestItem) -> Result<RestoreItemOutcome> {
+    if item.original_path.as_os_str().is_empty() || item.quarantined_path.as_os_str().is_empty() {
+        bail!("manifest item is missing original_path or quarantined_path");
+    }
+    if item.original_path.exists() {
+        if !item.sha256.is_empty() && file_sha256(&item.original_path)? == item.sha256 {
+            return Ok(RestoreItemOutcome::Skipped);
+        }
+        bail!(
+            "target exists with different content: {}",
+            item.original_path.display()
+        );
+    }
+    if !item.quarantined_path.exists() {
+        bail!("quarantined file is missing");
+    }
+    if !item.sha256.is_empty() {
+        let current = file_sha256(&item.quarantined_path)?;
+        if current != item.sha256 {
+            bail!(
+                "quarantined hash mismatch: expected {}, got {}",
+                item.sha256,
+                current
+            );
+        }
+    }
+    if let Some(parent) = item.original_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create restore parent {}", parent.display()))?;
+    }
+    std::fs::rename(&item.quarantined_path, &item.original_path).with_context(|| {
+        format!(
+            "restore {} to {}",
+            item.quarantined_path.display(),
+            item.original_path.display()
+        )
+    })?;
+    Ok(RestoreItemOutcome::Restored)
+}
+
+fn find_quarantine_manifest(base: &Path, slug: &str) -> Result<Option<PathBuf>> {
+    let root = base.join("quarantine");
+    if !root.exists() {
+        return Ok(None);
+    }
+    let direct = root.join(slug).join("manifest.json");
+    if let Some(path) = quarantine_manifest_candidate(&root, &direct)? {
+        return Ok(Some(path));
+    }
+    let empty_body_direct = root
+        .join(format!("empty-bodies-{slug}"))
+        .join("manifest.json");
+    if let Some(path) = quarantine_manifest_candidate(&root, &empty_body_direct)? {
+        return Ok(Some(path));
+    }
+    find_quarantine_manifest_recursive(&root, slug)
+}
+
+fn find_quarantine_manifest_recursive(dir: &Path, slug: &str) -> Result<Option<PathBuf>> {
+    for entry in
+        sanitize::read_dir_validated(dir).with_context(|| format!("read {}", dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if name == slug || name == format!("empty-bodies-{slug}") {
+            let manifest = path.join("manifest.json");
+            if let Some(path) = quarantine_manifest_candidate(dir, &manifest)? {
+                return Ok(Some(path));
+            }
+        }
+        if let Some(found) = find_quarantine_manifest_recursive(&path, slug)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+fn quarantine_manifest_candidate(root: &Path, path: &Path) -> Result<Option<PathBuf>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let root = std::fs::canonicalize(root)
+        .with_context(|| format!("canonicalize quarantine root {}", root.display()))?;
+    let manifest = std::fs::canonicalize(path)
+        .with_context(|| format!("canonicalize quarantine manifest {}", path.display()))?;
+    if !manifest.starts_with(&root) {
+        bail!(
+            "quarantine manifest escaped quarantine root: {}",
+            manifest.display()
+        );
+    }
+    Ok(Some(manifest))
+}
+
+pub fn format_restore_text(report: &QuarantineRestoreReport) -> String {
+    let mut out = format!(
+        "Restored quarantine `{}` from {}\n\n  restored: {}\n  skipped: {}\n",
+        report.slug,
+        report.manifest_path.display(),
+        report.restored,
+        report.skipped
+    );
+    if !report.failures.is_empty() {
+        out.push_str("  failures:\n");
+        for failure in &report.failures {
+            out.push_str(&format!("    - {failure}\n"));
+        }
+    }
+    out
 }
 
 pub fn render_rebuild_sidecars_script(base: &Path) -> Result<String> {
@@ -1644,6 +2576,52 @@ mod tests {
     }
 
     #[test]
+    fn check_state_accepts_state_json_above_generic_cap() {
+        // Regression for the case where doctor::check_state called
+        // sanitize::read_to_string_validated (generic 8 MiB cap) on
+        // state.json. Real installations with 200k+ chunks produce
+        // state.json ≥ 20 MiB, which the generic reader rejected,
+        // surfacing a spurious Critical. The fix routes through
+        // sanitize::read_state_json_validated (dedicated 128 MiB cap,
+        // see crates/aicx-parser/src/sanitize.rs). This test writes a
+        // ≥ 9 MiB state.json (above generic, well below dedicated)
+        // and asserts the check returns Green.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let base = std::env::temp_dir().join(format!(
+            "aicx-doctor-state-cap-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&base).expect("create base");
+        let state_path = base.join("state.json");
+        // 9 MiB of `A` padding embedded in a valid JSON envelope, above
+        // the 8 MiB generic cap, well under the 128 MiB state cap.
+        let padding = "A".repeat(9 * 1024 * 1024);
+        let body = format!(r#"{{"pad":"{}","seen_hashes":{{}},"runs":[]}}"#, padding);
+        std::fs::write(&state_path, &body).expect("write state.json");
+
+        let result = check_state(&base);
+
+        // Cleanup before assertion so a failure does not leave the dir.
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(
+            result.severity,
+            Severity::Green,
+            "≥9 MiB state.json must pass under the dedicated 128 MiB cap; got: {:?}",
+            result
+        );
+        assert!(
+            result.detail.contains("parses cleanly"),
+            "expected 'parses cleanly' detail, got: {}",
+            result.detail
+        );
+    }
+
+    #[test]
     fn test_aggregation_unknown_does_not_inflate_warning() {
         assert_eq!(
             max_severity(&[
@@ -1688,6 +2666,7 @@ mod tests {
             dry_run: false,
             rebuild_sidecars: false,
             prune_empty_bodies: false,
+            apply_prune_empty_bodies: false,
             check_dedup: false,
             verbose: false,
             smoke: false,
@@ -2048,10 +3027,92 @@ mod tests {
 
         let script = render_prune_empty_bodies_script(&tmp).unwrap();
         assert!(script.starts_with("#!/usr/bin/env bash"));
-        assert!(script.contains("rm -f --"));
+        assert!(script.contains("mv -n --"));
+        assert!(!script.contains("rm -f --"));
         assert!(script.contains("sess-empty"));
         assert!(!script.contains("sess-full"));
         assert!(empty.exists(), "script generation must not delete files");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn apply_prune_empty_bodies_moves_chunks_to_quarantine_and_rechecks() {
+        let tmp = unique_test_dir("apply-empty-bodies");
+        let dir = tmp
+            .join("store")
+            .join("VetCoders")
+            .join("aicx")
+            .join("2026_0506")
+            .join("conversations")
+            .join("claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("2026_0506_claude_sess-empty_001.md");
+        let full = dir.join("2026_0506_claude_sess-full_001.md");
+        let empty_sidecar = empty.with_extension("meta.json");
+        std::fs::write(
+            &empty,
+            "[project: VetCoders/aicx | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
+        )
+        .unwrap();
+        std::fs::write(&empty_sidecar, "{}").unwrap();
+        std::fs::write(
+            &full,
+            "[project: VetCoders/aicx | agent: claude | date: 2026-05-06]\n\nThis chunk carries enough real body content to avoid the empty-body threshold.",
+        )
+        .unwrap();
+
+        let opts = DoctorOptions {
+            fix: false,
+            fix_buckets: false,
+            dry_run: false,
+            rebuild_sidecars: false,
+            prune_empty_bodies: true,
+            apply_prune_empty_bodies: true,
+            check_dedup: false,
+            verbose: false,
+            smoke: false,
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let report = rt.block_on(run_at(&tmp, &opts)).unwrap();
+
+        assert_eq!(
+            report.empty_body_chunks.severity,
+            Severity::Green,
+            "detail: {}; fixes: {:?}",
+            report.empty_body_chunks.detail,
+            report.fixes_applied
+        );
+        assert!(report.empty_body_chunks.detail.contains("0 empty-body"));
+        assert!(report.prune_empty_bodies_script.is_none());
+        assert!(
+            report
+                .fixes_applied
+                .iter()
+                .any(|entry| entry.contains("quarantined 1 empty-body chunk(s) and 1 sidecar(s)"))
+        );
+        assert!(!empty.exists());
+        assert!(!empty_sidecar.exists());
+        assert!(full.exists());
+
+        let quarantine_root = std::fs::read_dir(tmp.join("quarantine"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("empty-bodies-"))
+            })
+            .expect("empty-body quarantine root should exist");
+        let moved = quarantine_root
+            .join("VetCoders")
+            .join("aicx")
+            .join("2026_0506")
+            .join("conversations")
+            .join("claude")
+            .join("2026_0506_claude_sess-empty_001.md");
+        assert!(moved.exists());
+        assert!(moved.with_extension("meta.json").exists());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -2079,6 +3140,7 @@ mod tests {
             dry_run: false,
             rebuild_sidecars: false,
             prune_empty_bodies: false,
+            apply_prune_empty_bodies: false,
             check_dedup: false,
             verbose: false,
             smoke: false,
@@ -2089,6 +3151,179 @@ mod tests {
         assert_eq!(report.sidecars, report.sidecar_coverage);
         assert_eq!(report.sidecars.name, "sidecars");
         assert_eq!(report.sidecars.severity, Severity::Critical);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Bug #37: freshness must inspect the actual semantic index at
+    /// `<base>/indexed/<bucket>/embeddings.ndjson` and recommend the
+    /// post-A-1 canonical `--full-rescan` flag.
+    #[test]
+    fn index_freshness_reports_missing_when_chunks_exist_but_no_indexed_dir() {
+        let tmp = unique_test_dir("freshness-missing");
+        // Plant one chunk in the canonical store.
+        let chunk_dir = tmp
+            .join("store")
+            .join("VetCoders")
+            .join("aicx")
+            .join("2026_0506")
+            .join("conversations")
+            .join("claude");
+        std::fs::create_dir_all(&chunk_dir).unwrap();
+        std::fs::write(chunk_dir.join("2026_0506_claude_sess-a_001.md"), "chunk").unwrap();
+        // NO `indexed/` directory at all.
+
+        let result = check_index_freshness(&tmp);
+        assert_eq!(
+            result.severity,
+            Severity::Critical,
+            "missing index buckets must be Critical"
+        );
+        assert!(
+            result.detail.contains("no semantic index buckets"),
+            "detail must mention missing buckets, got: {}",
+            result.detail
+        );
+        let rec = result
+            .recommendation
+            .expect("recovery hint required when missing");
+        assert!(
+            rec.contains("aicx index"),
+            "recovery must invoke `aicx index`, got: {rec}"
+        );
+        assert!(
+            rec.contains("--full-rescan"),
+            "recovery must reference canonical `--full-rescan` flag, got: {rec}"
+        );
+        assert!(
+            !rec.contains(&format!("--{}", "fresh ")),
+            "recovery must NOT use legacy fresh flag, got: {rec}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn index_freshness_reports_missing_when_bucket_dir_lacks_embeddings_file() {
+        let tmp = unique_test_dir("freshness-bucket-empty");
+        let chunk_dir = tmp.join("store").join("Acme").join("svc");
+        std::fs::create_dir_all(&chunk_dir).unwrap();
+        std::fs::write(chunk_dir.join("chunk.md"), "chunk").unwrap();
+        // Bucket dir exists but no embeddings.ndjson committed — only the
+        // temp checkpoint, mirroring a crashed embed loop.
+        let bucket_dir = tmp.join("indexed").join("_all");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+        std::fs::write(bucket_dir.join("embeddings.ndjson.tmp"), "partial").unwrap();
+
+        let result = check_index_freshness(&tmp);
+        assert_eq!(result.severity, Severity::Critical);
+        assert!(
+            result.detail.contains("missing"),
+            "detail must say missing, got: {}",
+            result.detail
+        );
+        assert!(
+            result
+                .recommendation
+                .as_ref()
+                .is_some_and(|r| r.contains("--full-rescan"))
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn index_freshness_reports_stale_when_chunk_mtime_exceeds_index_mtime() {
+        use filetime::{FileTime, set_file_mtime};
+        let tmp = unique_test_dir("freshness-stale");
+
+        let chunk_dir = tmp.join("store").join("VetCoders").join("aicx");
+        std::fs::create_dir_all(&chunk_dir).unwrap();
+        let chunk_path = chunk_dir.join("chunk.md");
+        std::fs::write(&chunk_path, "chunk body").unwrap();
+
+        let bucket_dir = tmp.join("indexed").join("_all");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+        let index_path = bucket_dir.join("embeddings.ndjson");
+        std::fs::write(&index_path, "{\"id\":\"a\"}\n").unwrap();
+
+        // newest_mtime walks parent dirs too — their creation mtimes land
+        // at ~now. Use "now" as the chunk reference frame and back-date the
+        // index 2h so the lag is a clean <72h Warning regardless of
+        // directory metadata.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        set_file_mtime(&chunk_path, FileTime::from_unix_time(now, 0)).unwrap();
+        set_file_mtime(&index_path, FileTime::from_unix_time(now - 7_200, 0)).unwrap();
+
+        let result = check_index_freshness(&tmp);
+        assert_eq!(result.severity, Severity::Warning, "<72h lag is Warning");
+        assert!(
+            result.detail.contains("stale"),
+            "detail must say stale, got: {}",
+            result.detail
+        );
+        let rec = result
+            .recommendation
+            .expect("stale must carry recovery hint");
+        assert!(rec.contains("aicx index"), "got: {rec}");
+        assert!(rec.contains("--full-rescan"), "got: {rec}");
+        assert!(
+            !rec.contains(&format!("--{}", "fresh ")),
+            "no legacy fresh-flag literal, got: {rec}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn index_freshness_reports_fresh_when_index_mtime_meets_or_exceeds_chunks() {
+        use filetime::{FileTime, set_file_mtime};
+        let tmp = unique_test_dir("freshness-fresh");
+
+        let chunk_dir = tmp.join("store").join("VetCoders").join("aicx");
+        std::fs::create_dir_all(&chunk_dir).unwrap();
+        let chunk_path = chunk_dir.join("chunk.md");
+        std::fs::write(&chunk_path, "chunk body").unwrap();
+
+        let bucket_dir = tmp.join("indexed").join("_all");
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+        let index_path = bucket_dir.join("embeddings.ndjson");
+        std::fs::write(&index_path, "{\"id\":\"a\"}\n").unwrap();
+
+        // Index committed AFTER the chunk → fresh.
+        let t0 = 1_700_000_000i64;
+        set_file_mtime(&chunk_path, FileTime::from_unix_time(t0, 0)).unwrap();
+        set_file_mtime(&index_path, FileTime::from_unix_time(t0 + 60, 0)).unwrap();
+        // Also pin parent dir mtimes so `newest_mtime` (which walks dirs)
+        // does not pick up a post-creation directory mtime that races
+        // ahead of the index file.
+        set_file_mtime(&chunk_dir, FileTime::from_unix_time(t0, 0)).unwrap();
+        set_file_mtime(tmp.join("store"), FileTime::from_unix_time(t0, 0)).unwrap();
+        set_file_mtime(
+            tmp.join("store").join("VetCoders"),
+            FileTime::from_unix_time(t0, 0),
+        )
+        .unwrap();
+
+        let result = check_index_freshness(&tmp);
+        assert_eq!(
+            result.severity,
+            Severity::Green,
+            "got detail: {}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains("fresh"),
+            "detail must say fresh, got: {}",
+            result.detail
+        );
+        assert!(
+            result.recommendation.is_none(),
+            "fresh state needs no recovery hint"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

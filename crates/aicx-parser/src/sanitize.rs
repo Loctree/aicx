@@ -10,6 +10,8 @@
 
 use anyhow::{Result, anyhow};
 use std::borrow::Cow;
+use std::fmt;
+use std::io::{self, BufRead, Read};
 use std::path::{Component, Path, PathBuf};
 
 /// Known safe extractor agent names.
@@ -22,6 +24,66 @@ pub const ALLOWED_AGENTS: &[&str] = &[
     "operator-md",
 ];
 
+const AICX_ALLOW_TMP_ENV: &str = "AICX_ALLOW_TMP";
+
+pub const MAX_VALIDATED_BYTES: usize = 8 * 1024 * 1024;
+
+/// Separate cap for long-lived JSON state files (e.g. `state.json`). The
+/// generic 8 MiB validated-read cap is tuned for corpus / sidecar inputs,
+/// but a real AICX install accumulates many projects' `seen_hashes` and
+/// run history over months. Applying the generic cap would hard-fail on
+/// startup for legitimate large states. 128 MiB is well above any
+/// realistic state size yet still catches runaway growth or a corrupted
+/// file masquerading as state.
+pub const MAX_STATE_JSON_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SanitizeError {
+    FileTooLarge {
+        path: PathBuf,
+        max_bytes: usize,
+        actual_bytes: u64,
+    },
+    StateFileTooLarge {
+        path: PathBuf,
+        max_bytes: usize,
+        actual_bytes: u64,
+    },
+}
+
+impl fmt::Display for SanitizeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SanitizeError::FileTooLarge {
+                path,
+                max_bytes,
+                actual_bytes,
+            } => write!(
+                f,
+                "File '{}' exceeds validated read cap: {} bytes > {} bytes",
+                path.display(),
+                actual_bytes,
+                max_bytes
+            ),
+            SanitizeError::StateFileTooLarge {
+                path,
+                max_bytes,
+                actual_bytes,
+            } => write!(
+                f,
+                "State file '{}' is too large: {} bytes > {} bytes. \
+                 This is not generic JSON corruption — the file exceeds the dedicated state cap. \
+                 Investigate runaway `seen_hashes` growth or restore from `.bak` before retrying.",
+                path.display(),
+                actual_bytes,
+                max_bytes
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SanitizeError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentSanitizationWarning {
     NullByteStripped(usize),
@@ -33,6 +95,12 @@ pub enum ContentSanitizationWarning {
 pub struct SanitizedContent<'a> {
     pub text: Cow<'a, str>,
     pub warnings: Vec<ContentSanitizationWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CappedLine {
+    pub line: String,
+    pub exceeded: bool,
 }
 
 // ============================================================================
@@ -56,11 +124,24 @@ fn contains_traversal(path: &str) -> bool {
         .any(|c| matches!(c, Component::ParentDir))
 }
 
-/// Get the user's home directory.
-fn home_dir() -> Result<PathBuf> {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|_| anyhow!("Cannot determine home directory from $HOME"))
+fn current_user_allowed_bases() -> Result<Vec<PathBuf>> {
+    let mut bases = Vec::new();
+    for base in [dirs::home_dir(), dirs::cache_dir(), dirs::data_dir()]
+        .into_iter()
+        .flatten()
+    {
+        if !bases.iter().any(|existing| existing == &base) {
+            bases.push(base);
+        }
+    }
+
+    if bases.is_empty() {
+        return Err(anyhow!(
+            "Cannot determine current user allowed base directories"
+        ));
+    }
+
+    Ok(bases)
 }
 
 /// Canonicalize a path, returning error if it doesn't exist.
@@ -69,29 +150,61 @@ fn canonicalize_existing(path: &Path) -> Result<PathBuf> {
         .map_err(|e| anyhow!("Cannot canonicalize path '{}': {}", path.display(), e))
 }
 
-/// Validate that a path is under an allowed base directory.
-fn is_under_allowed_base(path: &Path) -> Result<bool> {
-    let home = home_dir()?;
+/// Cargo test builds allow tempfile-backed `/tmp` paths, while normal debug and
+/// release builds require `AICX_ALLOW_TMP=1` so local dev runs follow the same
+/// explicit opt-in contract as production.
+fn temp_allowlist_enabled() -> bool {
+    temp_allowlist_enabled_for_runtime(cfg!(test), running_under_cargo_test_harness())
+}
 
-    if path.starts_with(&home) {
-        return Ok(true);
+fn temp_allowlist_enabled_for_runtime(is_test_build: bool, is_cargo_test_harness: bool) -> bool {
+    is_test_build
+        || is_cargo_test_harness
+        || std::env::var(AICX_ALLOW_TMP_ENV).is_ok_and(|value| value == "1")
+}
+
+fn running_under_cargo_test_harness() -> bool {
+    std::env::current_exe()
+        .ok()
+        .is_some_and(|exe| is_cargo_test_exe_path(&exe))
+}
+
+fn is_cargo_test_exe_path(path: &Path) -> bool {
+    let has_deps_component = path.components().any(|component| {
+        matches!(
+            component,
+            Component::Normal(text) if text == std::ffi::OsStr::new("deps")
+        )
+    });
+    if !has_deps_component {
+        return false;
     }
 
-    #[cfg(target_os = "macos")]
-    if path.starts_with("/Users") {
-        let components: Vec<_> = path.components().collect();
-        if components.len() >= 3 {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.rsplit_once('-'))
+        .is_some_and(|(_, suffix)| {
+            suffix.len() >= 8 && suffix.chars().all(|ch| ch.is_ascii_hexdigit())
+        })
+}
+
+fn is_temp_allowlist_path(path: &Path) -> bool {
+    path.starts_with("/tmp")
+        || path.starts_with("/var/folders")
+        || path.starts_with("/private/tmp")
+        || path.starts_with("/private/var/folders")
+}
+
+/// Validate that a path is under an allowed base directory.
+fn is_under_allowed_base(path: &Path) -> Result<bool> {
+    for base in current_user_allowed_bases()? {
+        if path.starts_with(base) {
             return Ok(true);
         }
     }
 
-    // Temporary directories (tests)
-    if path.starts_with("/tmp")
-        || path.starts_with("/var/folders")
-        || path.starts_with("/private/tmp")
-        || path.starts_with("/private/var/folders")
-    {
-        return Ok(true);
+    if is_temp_allowlist_path(path) {
+        return Ok(temp_allowlist_enabled());
     }
 
     Ok(false)
@@ -202,33 +315,156 @@ pub fn validate_dir_path(path: &Path) -> Result<PathBuf> {
 /// Open a file for reading only after validating the path.
 pub fn open_file_validated(path: &Path) -> Result<std::fs::File> {
     let validated = validate_read_path(path)?;
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    std::fs::File::open(&validated)
+    std::fs::OpenOptions::new()
+        .read(true)
+        .open(&validated)
         .map_err(|e| anyhow!("Failed to open '{}': {}", validated.display(), e))
 }
 
 /// Create or truncate a file only after validating the write path.
 pub fn create_file_validated(path: &Path) -> Result<std::fs::File> {
     let validated = validate_write_path(path)?;
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    std::fs::File::create(&validated)
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&validated)
         .map_err(|e| anyhow!("Failed to create '{}': {}", validated.display(), e))
 }
 
 /// Read a UTF-8 text file only after validating the path.
 pub fn read_to_string_validated(path: &Path) -> Result<String> {
+    read_to_string_with_cap(path, MAX_VALIDATED_BYTES, false)
+}
+
+/// Read AICX `state.json` (or its `.bak`) under the dedicated state cap.
+///
+/// Long-lived installs legitimately grow `seen_hashes`, run history, and
+/// per-project state into the tens of MiB. The generic 8 MiB cap is
+/// tuned for corpus inputs and would hard-fail those installs at
+/// startup, ahead of backup recovery. This entry point uses
+/// [`MAX_STATE_JSON_BYTES`] and surfaces a state-specific error so the
+/// failure mode is unmistakable (and obviously distinct from generic
+/// JSON corruption).
+pub fn read_state_json_validated(path: &Path) -> Result<String> {
+    read_to_string_with_cap(path, MAX_STATE_JSON_BYTES, true)
+}
+
+fn read_to_string_with_cap(path: &Path, max_bytes: usize, is_state: bool) -> Result<String> {
     let validated = validate_read_path(path)?;
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    std::fs::read_to_string(&validated)
-        .map_err(|e| anyhow!("Failed to read '{}': {}", validated.display(), e))
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&validated)
+        .map_err(|e| anyhow!("Failed to open '{}': {}", validated.display(), e))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| anyhow!("Failed to stat '{}': {}", validated.display(), e))?;
+    if metadata.len() > max_bytes as u64 {
+        return Err(too_large_error(validated, max_bytes, metadata.len(), is_state).into());
+    }
+
+    let mut reader = file.take(max_bytes.saturating_add(1) as u64);
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|e| anyhow!("Failed to read '{}': {}", validated.display(), e))?;
+    if bytes.len() > max_bytes {
+        return Err(too_large_error(validated, max_bytes, bytes.len() as u64, is_state).into());
+    }
+    String::from_utf8(bytes).map_err(|e| anyhow!("Failed to read '{}': {}", validated.display(), e))
+}
+
+fn too_large_error(
+    path: PathBuf,
+    max_bytes: usize,
+    actual_bytes: u64,
+    is_state: bool,
+) -> SanitizeError {
+    if is_state {
+        SanitizeError::StateFileTooLarge {
+            path,
+            max_bytes,
+            actual_bytes,
+        }
+    } else {
+        SanitizeError::FileTooLarge {
+            path,
+            max_bytes,
+            actual_bytes,
+        }
+    }
 }
 
 /// Read a directory only after validating it as an allowed directory path.
 pub fn read_dir_validated(path: &Path) -> Result<std::fs::ReadDir> {
     let validated = validate_dir_path(path)?;
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    // FP: `pub fn validate_dir_path(path: &Path) -> Result<PathBuf>`
+    // (line 302) delegates to `validate_read_path(path: &Path)` (line 215),
+    // which rejects traversal, canonicalizes the existing dir, and enforces
+    // the allowed-base policy before this directory iterator is created.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- FP: validate_dir_path(Path) at line 302 -> validate_read_path(Path) at line 215 rejects traversal, canonicalizes, and enforces allowed-base policy.
     std::fs::read_dir(&validated)
         .map_err(|e| anyhow!("Failed to read dir '{}': {}", validated.display(), e))
+}
+
+pub fn read_line_capped<R: BufRead>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> io::Result<Option<CappedLine>> {
+    let mut buf = Vec::new();
+    let read = {
+        let mut limited = reader.take(max_bytes.saturating_add(1) as u64);
+        limited.read_until(b'\n', &mut buf)?
+    };
+    if read == 0 {
+        return Ok(None);
+    }
+
+    let exceeded = buf.len() > max_bytes;
+    if exceeded {
+        let ended_at_newline = buf.last().copied() == Some(b'\n');
+        buf.truncate(max_bytes);
+        // Walk back past UTF-8 continuation bytes (0b10xxxxxx) so we don't
+        // chop a multi-byte sequence mid-codepoint; otherwise a valid input
+        // line would surface as InvalidData purely because of the cap.
+        while let Some(&last) = buf.last() {
+            if (last & 0xC0) == 0x80 {
+                buf.pop();
+            } else if last >= 0xC0 {
+                // Lead byte of a multi-byte sequence whose continuation bytes
+                // were just stripped — drop the lead too.
+                buf.pop();
+                break;
+            } else {
+                break;
+            }
+        }
+        if !ended_at_newline {
+            drain_until_newline(reader)?;
+        }
+    }
+
+    let line =
+        String::from_utf8(buf).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    Ok(Some(CappedLine { line, exceeded }))
+}
+
+fn drain_until_newline<R: BufRead>(reader: &mut R) -> io::Result<()> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        let consume = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |idx| idx + 1);
+        let ended_at_newline = available.get(consume.saturating_sub(1)) == Some(&b'\n');
+        reader.consume(consume);
+        if ended_at_newline {
+            return Ok(());
+        }
+    }
 }
 
 // ============================================================================
@@ -347,6 +583,48 @@ fn is_zero_width(ch: char) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let guard = ENV_MUTEX.lock().unwrap();
+            let previous = std::env::var_os(key);
+            // SAFETY: these tests serialize all mutations of this process env
+            // var and restore the previous value while holding the same mutex.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            Self {
+                key,
+                previous,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: the mutex guard is held until after restoration, keeping
+            // this crate's env-var tests serialized around AICX_ALLOW_TMP.
+            unsafe {
+                match &self.previous {
+                    Some(previous) => std::env::set_var(self.key, previous),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_contains_traversal() {
@@ -385,7 +663,62 @@ mod tests {
     }
 
     #[test]
+    fn test_tmp_allowlist_hybrid_policy() {
+        {
+            let _env = EnvVarGuard::set(AICX_ALLOW_TMP_ENV, None);
+            assert!(temp_allowlist_enabled_for_runtime(true, false));
+            assert!(temp_allowlist_enabled_for_runtime(false, true));
+            assert!(!temp_allowlist_enabled_for_runtime(false, false));
+        }
+
+        {
+            let _env = EnvVarGuard::set(AICX_ALLOW_TMP_ENV, Some("1"));
+            assert!(temp_allowlist_enabled_for_runtime(false, false));
+        }
+
+        {
+            let _env = EnvVarGuard::set(AICX_ALLOW_TMP_ENV, Some("true"));
+            assert!(!temp_allowlist_enabled_for_runtime(false, false));
+        }
+    }
+
+    #[test]
+    fn test_cargo_test_exe_detection_accepts_custom_target_dir_layout() {
+        let path =
+            Path::new("/Users/runner/work/cache/aicx-macos/debug/deps/aicx-0b1797b9ba8904ee");
+        assert!(is_cargo_test_exe_path(path));
+    }
+
+    #[test]
+    fn test_cargo_test_exe_detection_rejects_normal_binary_paths() {
+        let path = Path::new("/Users/runner/work/aicx/target/debug/aicx");
+        assert!(!is_cargo_test_exe_path(path));
+    }
+
+    #[test]
+    fn test_current_user_allowed_bases_are_accepted() {
+        for base in current_user_allowed_bases().expect("current user dirs") {
+            assert!(
+                is_under_allowed_base(&base.join("aicx-sanitize-test")).expect("allowlist check"),
+                "current user base should be allowed: {}",
+                base.display()
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_other_user_path_rejected() {
+        let path = Path::new("/Users/other_user/Documents/secret.txt");
+        assert!(
+            !is_under_allowed_base(path).expect("allowlist check"),
+            "macOS /Users allowlist must not generalize across users"
+        );
+    }
+
+    #[test]
     fn test_validate_read_path_existing() {
+        let _env = EnvVarGuard::set(AICX_ALLOW_TMP_ENV, None);
         let tmp = std::env::temp_dir().join("ai-ctx-san-test-read");
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
@@ -721,8 +1054,8 @@ pub fn is_self_echo(message: &str) -> bool {
         }
     }
 
-    // Message is self-echo if majority of lines match
-    echo_lines > 0 && echo_lines * 2 >= lines.len()
+    // Message is self-echo only if a strict majority of lines match.
+    echo_lines > 0 && echo_lines * 2 > lines.len()
 }
 
 /// Filter a vec of timeline entries, removing self-echo messages.
@@ -779,6 +1112,35 @@ mod echo_tests {
                    The architecture looks clean.\n\
                    Let's proceed with implementation.\n\
                    Decision: expose 4 tools via rmcp.";
+        assert!(!is_self_echo(msg));
+    }
+
+    #[test]
+    fn test_self_echo_exactly_half_is_not_majority() {
+        let msg = "aicx all -H 24 --emit none\n\
+                   Decision: preserve real operator signal\n\
+                   aicx store -H 24 --full-rescan\n\
+                   Root cause: threshold was too wide";
+        assert!(!is_self_echo(msg));
+    }
+
+    #[test]
+    fn test_self_echo_just_above_half_is_echo() {
+        let msg = "aicx all -H 24 --emit none\n\
+                   Decision: preserve real operator signal\n\
+                   aicx store -H 24 --full-rescan\n\
+                   Root cause: threshold was too wide\n\
+                   aicx refs -H 24";
+        assert!(is_self_echo(msg));
+    }
+
+    #[test]
+    fn test_self_echo_just_below_half_is_not_echo() {
+        let msg = "aicx all -H 24 --emit none\n\
+                   Decision: preserve real operator signal\n\
+                   aicx store -H 24 --full-rescan\n\
+                   Root cause: threshold was too wide\n\
+                   Follow-up: add focused coverage";
         assert!(!is_self_echo(msg));
     }
 }

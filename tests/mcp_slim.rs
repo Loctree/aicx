@@ -3,10 +3,12 @@ use aicx::mcp::{IntentsParams, RankParams, ReadParams, SearchParams, SteerParams
 use axum::{
     Router,
     body::Body,
+    extract::ConnectInfo,
     http::{Request, StatusCode, header::AUTHORIZATION},
     routing::get,
 };
 use http_body_util::BodyExt;
+use std::net::SocketAddr;
 use tower::ServiceExt;
 
 #[test]
@@ -76,6 +78,17 @@ fn build_protected_mcp_router(token: &str) -> Router {
     )
 }
 
+fn request(uri: &str, bearer: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder().uri(uri);
+    if let Some(token) = bearer {
+        builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let mut req = builder.body(Body::empty()).expect("request");
+    let peer: SocketAddr = "127.0.0.1:49153".parse().expect("peer addr");
+    req.extensions_mut().insert(ConnectInfo(peer));
+    req
+}
+
 async fn body_to_string(resp: axum::response::Response) -> String {
     let bytes = resp
         .into_body()
@@ -89,15 +102,7 @@ async fn body_to_string(resp: axum::response::Response) -> String {
 #[tokio::test]
 async fn test_mcp_http_without_auth_returns_401() {
     let app = build_protected_mcp_router("mcp-token");
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/mcp")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("oneshot");
+    let response = app.oneshot(request("/mcp", None)).await.expect("oneshot");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
         body_to_string(response).await,
@@ -109,13 +114,7 @@ async fn test_mcp_http_without_auth_returns_401() {
 async fn test_mcp_http_with_wrong_token_returns_401_same_shape() {
     let app = build_protected_mcp_router("mcp-token");
     let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/mcp")
-                .header(AUTHORIZATION, "Bearer not-the-token")
-                .body(Body::empty())
-                .expect("request"),
-        )
+        .oneshot(request("/mcp", Some("not-the-token")))
         .await
         .expect("oneshot");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -130,13 +129,7 @@ async fn test_mcp_http_with_wrong_token_returns_401_same_shape() {
 async fn test_mcp_http_with_correct_token_passes() {
     let app = build_protected_mcp_router("mcp-token");
     let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/mcp")
-                .header(AUTHORIZATION, "Bearer mcp-token")
-                .body(Body::empty())
-                .expect("request"),
-        )
+        .oneshot(request("/mcp", Some("mcp-token")))
         .await
         .expect("oneshot");
     assert_eq!(response.status(), StatusCode::OK);

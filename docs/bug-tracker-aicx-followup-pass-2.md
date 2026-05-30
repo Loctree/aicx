@@ -94,7 +94,7 @@ Error: state.json corrupted, no backup; manual recovery needed: ~/.aicx/state.js
 
 Example seen today:
 ```
-Claude session warning: /Users/silver/.claude/projects/-Users-silver-Git-vista/abc.jsonl
+Claude session warning: ~/.claude/projects/-Users-silver-Git-vista/abc.jsonl
   has 134 unparsable timestamp(s); frames dropped.
   Sample(s): line 1: <missing>, line 5: <missing>, line 10: <missing>, line 11: <missing>, line 34: <missing>
 Claude content warning: ... preserved zero-width character U+FEFF at byte offset 124

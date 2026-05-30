@@ -26,6 +26,13 @@ This document is the maintainer path from green CI to public release artifacts.
   `.sha256` sidecars.
 - Public v0.6.5 archives are slim unsigned `.tar.gz` bundles for macOS arm64,
   Linux x64 GNU, and Linux arm64 GNU.
+- Linux cross builds pin `cross-rs` builder images to release `v0.2.5`
+  (`0.2.5@sha256:9e5b39c09874bc1816c675ed11afca2c2ed6cee0c4ed2b3c1d5763c346c9ae3f`
+  for x86_64 GNU and
+  `0.2.5@sha256:702154f52b2d8091671aa2c84d5582d849f949977228c735ff8462f93cc0e1e4`
+  for aarch64 musl). Operators manually bump both `Cross.toml` image refs
+  when a new `cross-rs` release is worth tracking; automated image updates are
+  outside the pass-3 scope.
 - The npm surface lives under `distribution/npm/`, but it is not the supported
   v0.6.5 install path until its platform mapping is updated from the older
   zip/musl shape.
@@ -72,6 +79,19 @@ Each archive contains:
 - `README.md`
 - `docs/COMMANDS.md`
 - `docs/RELEASES.md`
+
+### Asset verification
+
+Download `SHA256SUMS` into the same directory as the `.tar.gz` release assets,
+then run:
+
+```bash
+sha256sum -c SHA256SUMS
+```
+
+The command expects `SHA256SUMS` and the referenced archives to be colocated.
+It exits non-zero if any archive is missing or does not match the published
+checksum.
 
 The maintainer-local macOS signing path expects these operator-owned inputs:
 
@@ -126,7 +146,7 @@ make release-bundle KEYS=~/.keys NOTARY_PROFILE=vc-notary
 make release-bundle KEYS=~/.keys CLEAN=0
 AICX_KEYS_DIR=~/.keys AICX_NOTARY_PROFILE=vc-notary make release-bundle
 bash install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.8.1 bash install.sh
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.9.0 bash install.sh
 ```
 
 Notes:
@@ -149,8 +169,8 @@ Notes:
 3. Create an annotated tag that matches the crate version.
 
 ```bash
-git tag -a v0.8.1 -m "aicx v0.8.1"
-git push origin v0.8.1
+git tag -a v0.9.0 -m "aicx v0.9.0"
+git push origin v0.9.0
 ```
 
 4. Wait for the `Release` workflow to finish and confirm the GitHub Release has all archives, `.sha256` files, and the expected body copied from `CHANGELOG.md`.

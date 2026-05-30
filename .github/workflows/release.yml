@@ -40,24 +40,24 @@ jobs:
           ref: ${{ env.RUST_MEMEX_REF }}
           path: rust-memex
 
-      - name: Ensure unzip on self-hosted Linux
-        if: runner.os == 'Linux'
+      - name: Install protoc
+        # Manual install — see ci.yml for rationale (arduino/setup-protoc#108).
+        shell: bash
         run: |
-          if command -v unzip >/dev/null 2>&1; then
+          if command -v protoc >/dev/null 2>&1; then
+            echo "protoc already installed: $(protoc --version)"
             exit 0
           fi
-          if command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install --yes unzip
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq protobuf-compiler
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            brew install protobuf
           else
-            echo "unzip is required on Linux runners for setup-protoc" >&2
+            echo "::error::Unsupported OS for protoc install: $RUNNER_OS"
             exit 1
           fi
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          protoc --version
 
       - name: Resolve release tag
         id: meta
@@ -89,7 +89,11 @@ jobs:
 
       - uses: actions/setup-python@v6
         with:
-          python-version: '3.x'
+          python-version: '3.12'
+
+      - name: Check release channel versions
+        working-directory: aicx
+        run: bash tools/release-channel-check.sh
 
       - name: Check Cargo.toml version matches tag
         working-directory: aicx
@@ -170,6 +174,9 @@ jobs:
           - runner_name: dragon-macos
             runner: '["self-hosted", "dragon-macos"]'
             target: aarch64-apple-darwin
+          - runner_name: windows-pc
+            runner: '["self-hosted", "windows-pc"]'
+            target: x86_64-pc-windows-gnu
 
     steps:
       - uses: actions/checkout@v6
@@ -183,30 +190,46 @@ jobs:
           ref: ${{ env.RUST_MEMEX_REF }}
           path: rust-memex
 
-      - name: Ensure unzip on self-hosted Linux
-        if: runner.os == 'Linux'
+      - name: Install protoc
+        # Manual install — see ci.yml for rationale (arduino/setup-protoc#108).
+        shell: bash
         run: |
-          if command -v unzip >/dev/null 2>&1; then
+          if command -v protoc >/dev/null 2>&1; then
+            echo "protoc already installed: $(protoc --version)"
             exit 0
           fi
-          if command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install --yes unzip
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq protobuf-compiler
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            brew install protobuf
           else
-            echo "unzip is required on Linux runners for setup-protoc" >&2
+            echo "::error::Unsupported OS for protoc install: $RUNNER_OS"
             exit 1
           fi
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          protoc --version
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build slim unsigned release archive
+      - name: Build signed + notarized macOS bundle (dragon-macos)
+        if: matrix.runner_name == 'dragon-macos'
+        shell: bash
+        working-directory: aicx
+        env:
+          TARGET: ${{ matrix.target }}
+          DIST_DIR: ${{ github.workspace }}/aicx/dist
+          AICX_BUNDLE_FLAVOR: slim
+          AICX_CLEAN_AFTER_BUILD: "0"
+          PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
+          LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}
+        run: |
+          # KEYS dir + .notary.env live on the dragon runner under $HOME/.keys.
+          KEYS="$HOME/.keys" ./tools/release_bundle.sh
+
+      - name: Build binaries-only release (ops-linux, GPG-detached)
+        if: matrix.runner_name == 'ops-linux'
         shell: bash
         working-directory: aicx
         env:
@@ -216,13 +239,77 @@ jobs:
           AICX_BUNDLE_FLAVOR: slim
           AICX_CLEAN_AFTER_BUILD: "0"
           PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
+          LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}
         run: |
           ./tools/release_bundle.sh
+
+      - name: Build binaries-only release (windows-pc, GPG-detached .zip)
+        if: matrix.runner_name == 'windows-pc'
+        shell: bash
+        working-directory: aicx
+        env:
+          TARGET: ${{ matrix.target }}
+          DIST_DIR: ${{ github.workspace }}/aicx/dist
+          AICX_RELEASE_BUNDLE_ONLY_BINARIES: "1"
+          AICX_BUNDLE_FLAVOR: slim
+          AICX_CLEAN_AFTER_BUILD: "0"
+          PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
+          LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}
+          # Strawberry Perl ships mingw-w64 gcc — required for windows-gnu target.
+          # Add it to PATH so cargo's linker finds it.
+          PATH: "C:\\Strawberry\\c\\bin;C:\\Program Files (x86)\\GnuPG\\bin;C:\\Program Files\\Git\\usr\\bin;${{ env.PATH }}"
+        run: |
+          ./tools/release_bundle.sh
+
+      - name: Build .deb (linux only)
+        if: contains(matrix.target, 'linux')
+        shell: bash
+        working-directory: aicx
+        env:
+          TARGET: ${{ matrix.target }}
+          DIST_DIR: ${{ github.workspace }}/aicx/dist
+          LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}
+        run: |
+          cargo install --quiet cargo-deb --locked || cargo install --quiet cargo-deb
+          cargo deb --target "${TARGET}" --no-build --output "${DIST_DIR}/"
+          PASSPHRASE_FILE="${HOME}/.keys/.gpg.passphrase"
+          if [[ -z "${LOCTREE_GPG_KEY_ID}" ]]; then
+            echo "::error::vars.LOCTREE_GPG_KEY_ID empty — refusing to publish unsigned .deb." >&2
+            exit 1
+          fi
+          if [[ ! -r "${PASSPHRASE_FILE}" ]]; then
+            echo "::error::Passphrase file ${PASSPHRASE_FILE} not readable on runner." >&2
+            exit 1
+          fi
+          # Checksum and detached-sign every deb produced for this target.
+          for deb in "${DIST_DIR}"/*.deb; do
+            [ -f "${deb}" ] || continue
+            ( cd "${DIST_DIR}" && shasum -a 256 "$(basename "${deb}")" ) > "${deb}.sha256"
+            gpg --batch --yes --armor --pinentry-mode loopback \
+              --passphrase-file "${PASSPHRASE_FILE}" \
+              --sig-notation "apple-developer-team-id@loctree.io=MW223P3NPX" \
+              --sig-notation "release-source@loctree.io=Loctree/aicx" \
+              --detach-sign --local-user "${LOCTREE_GPG_KEY_ID}" \
+              "${deb}"
+          done
 
       - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
-          path: aicx/dist/*
+          # Selective: archives + checksums + sigs + debs only — exclude bundle
+          # staging dirs that release_bundle.sh used to leave behind (those break
+          # gh release upload with "is a directory").
+          path: |
+            aicx/dist/*.tar.gz
+            aicx/dist/*.tar.gz.sha256
+            aicx/dist/*.tar.gz.asc
+            aicx/dist/*.zip
+            aicx/dist/*.zip.sha256
+            aicx/dist/*.zip.asc
+            aicx/dist/*.notary.json
+            aicx/dist/*.deb
+            aicx/dist/*.deb.sha256
+            aicx/dist/*.deb.asc
           if-no-files-found: error
 
       - name: Clean local build artifacts
@@ -248,6 +335,10 @@ jobs:
           pattern: release-*
           merge-multiple: true
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
       - name: Generate release notes from CHANGELOG
         env:
           RELEASE_VERSION: ${{ needs.verify.outputs.version }}
@@ -255,17 +346,62 @@ jobs:
         run: |
           python3 tools/release_sync.py notes "${RELEASE_VERSION}" --output "${RELEASE_NOTES_PATH}"
 
+      - name: GPG detached-sign release archives
+        env:
+          LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}
+        run: |
+          if [[ -z "${LOCTREE_GPG_KEY_ID}" ]]; then
+            echo "::error::vars.LOCTREE_GPG_KEY_ID is empty — refusing to publish unsigned release archives." >&2
+            exit 1
+          fi
+          PASSPHRASE_FILE="${HOME}/.keys/.gpg.passphrase"
+          if [[ ! -r "${PASSPHRASE_FILE}" ]]; then
+            echo "::error::Passphrase file ${PASSPHRASE_FILE} not readable on runner." >&2
+            exit 1
+          fi
+          if ! command -v gpg >/dev/null 2>&1; then
+            echo "::error::gpg not available on runner — cannot sign release archives." >&2
+            exit 1
+          fi
+          if ! gpg --list-secret-keys "${LOCTREE_GPG_KEY_ID}" >/dev/null 2>&1; then
+            echo "::error::GPG secret key ${LOCTREE_GPG_KEY_ID} is not imported on this runner." >&2
+            exit 1
+          fi
+          shopt -s nullglob
+          for asset in dist/*.tar.gz dist/*.zip; do
+            gpg --batch --yes --armor --pinentry-mode loopback \
+              --passphrase-file "${PASSPHRASE_FILE}" \
+              --sig-notation "apple-developer-team-id@loctree.io=MW223P3NPX" \
+              --sig-notation "release-source@loctree.io=Loctree/aicx" \
+              --detach-sign --local-user "${LOCTREE_GPG_KEY_ID}" \
+              "${asset}"
+          done
+          # Export pubkey as release asset so consumers can verify without keyservers.
+          gpg --export --armor "${LOCTREE_GPG_KEY_ID}" > dist/loctree-release-pubkey.asc
+
       - name: Create or update GitHub release
         env:
           GITHUB_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.verify.outputs.release_tag }}
           RELEASE_NOTES_PATH: ${{ runner.temp }}/release-notes.md
         run: |
+          # Selective glob — never upload directories (gh release upload bails
+          # on dirs with "is a directory"; this killed every CI release prior).
+          shopt -s nullglob
+          assets=( dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.tar.gz.asc \
+                   dist/*.zip dist/*.zip.sha256 dist/*.zip.asc \
+                   dist/*.notary.json \
+                   dist/*.deb dist/*.deb.sha256 dist/*.deb.asc \
+                   dist/loctree-release-pubkey.asc )
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "::error::No release assets matched — refusing to create empty release." >&2
+            exit 1
+          fi
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             gh release edit "${RELEASE_TAG}" --notes-file "${RELEASE_NOTES_PATH}"
-            gh release upload "${RELEASE_TAG}" dist/* --clobber
+            gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber
           else
-            gh release create "${RELEASE_TAG}" dist/* --notes-file "${RELEASE_NOTES_PATH}"
+            gh release create "${RELEASE_TAG}" "${assets[@]}" --notes-file "${RELEASE_NOTES_PATH}"
           fi
 
       - name: Clean downloaded release artifacts

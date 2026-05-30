@@ -198,6 +198,14 @@ fn run_aicx(home: &Path, args: &[&str]) -> Output {
     Command::new(ensure_aicx_binary_exists())
         .args(args)
         .env("HOME", home)
+        .env("AICX_ALLOW_TMP", "1")
+        // Drop any operator-pinned AICX_HOME so the spawned binary
+        // resolves under the test's temp HOME, not the operator's
+        // canonical install. Without this, an operator running
+        // `cargo test` with `AICX_HOME` exported sees the binary
+        // write into the pinned dir while sanitize's allowlist
+        // (rooted at the test's HOME) refuses to read it back.
+        .env_remove("AICX_HOME")
         .output()
         .expect("run aicx")
 }

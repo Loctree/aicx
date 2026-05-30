@@ -5,6 +5,7 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
+use crate::sanitize;
 use crate::timeline::{Kind, RepoIdentity, SemanticSegment, SourceTier, TimelineEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -58,19 +59,25 @@ pub struct ProjectHashRegistry {
 }
 
 impl ProjectHashRegistry {
-    /// Load from the default location (`~/.aicx/gemini-project-map.json`).
-    /// Returns an empty registry if the file doesn't exist or can't be parsed.
+    /// Load from the default location. Honors `AICX_HOME` (operator's
+    /// explicit store-root override) before falling back to
+    /// `~/.aicx/gemini-project-map.json`. Returns an empty registry if
+    /// the file doesn't exist or can't be parsed — callers can rely on
+    /// this method without an existence check.
     pub fn load_default() -> Self {
-        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        let base = std::env::var_os("AICX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".aicx")));
+        let Some(base) = base else {
             return Self::default();
         };
-        let path = home.join(".aicx").join("gemini-project-map.json");
+        let path = base.join("gemini-project-map.json");
         Self::load_from(&path)
     }
 
     /// Load from a specific path.
     pub fn load_from(path: &Path) -> Self {
-        std::fs::read_to_string(path)
+        sanitize::read_to_string_validated(path)
             .ok()
             .and_then(|content| serde_json::from_str(&content).ok())
             .unwrap_or_default()
@@ -90,12 +97,42 @@ impl ProjectHashRegistry {
 }
 
 pub fn semantic_segments(entries: &[TimelineEntry]) -> Vec<SemanticSegment> {
-    semantic_segments_with_registry(entries, &ProjectHashRegistry::default())
+    // Load the project-hash registry from disk (AICX_HOME or ~/.aicx),
+    // not the empty `Default`. Without this, Gemini sessions whose
+    // identity arrives as a `projectHash` always resolved to Opaque
+    // even when the operator's `gemini-project-map.json` was sitting
+    // right there — the helper existed but no hot path called it.
+    semantic_segments_with_registry(entries, &ProjectHashRegistry::load_default())
+}
+
+/// Same as [`semantic_segments`] but emits per-session cumulative
+/// entry-processed counts to `progress`, so callers can pin a
+/// `Heartbeat` floor to real work done (rather than ticking blind).
+/// Pass-4 follow-up: the segment phase moved AHEAD of dedup, so for
+/// large corpora the progress bar needs a real denominator to stay
+/// honest.
+pub fn semantic_segments_with_progress(
+    entries: &[TimelineEntry],
+    progress: impl FnMut(usize),
+) -> Vec<SemanticSegment> {
+    semantic_segments_with_registry_and_progress(
+        entries,
+        &ProjectHashRegistry::load_default(),
+        progress,
+    )
 }
 
 pub fn semantic_segments_with_registry(
     entries: &[TimelineEntry],
     registry: &ProjectHashRegistry,
+) -> Vec<SemanticSegment> {
+    semantic_segments_with_registry_and_progress(entries, registry, |_| {})
+}
+
+pub fn semantic_segments_with_registry_and_progress(
+    entries: &[TimelineEntry],
+    registry: &ProjectHashRegistry,
+    mut progress: impl FnMut(usize),
 ) -> Vec<SemanticSegment> {
     let mut sessions: HashMap<(String, String), Vec<TimelineEntry>> = HashMap::new();
     for entry in entries {
@@ -106,8 +143,10 @@ pub fn semantic_segments_with_registry(
     }
 
     let mut ordered = Vec::new();
+    let mut processed_entries: usize = 0;
 
     for ((agent, session_id), mut session_entries) in sessions {
+        let session_len = session_entries.len();
         session_entries.sort_by_key(|left| left.timestamp);
 
         let mut current_tiered: Option<TieredIdentity> = None;
@@ -158,6 +197,9 @@ pub fn semantic_segments_with_registry(
                 current_entries,
             ));
         }
+
+        processed_entries += session_len;
+        progress(processed_entries);
     }
 
     ordered.sort_by(|left, right| {
@@ -363,7 +405,16 @@ fn infer_tiered_identity_from_text(text: &str) -> Option<TieredIdentity> {
     })
 }
 
-fn infer_tiered_identity_from_cwd(cwd: Option<&str>) -> Option<TieredIdentity> {
+/// Resolve a canonical `(organization, repository)` identity from a
+/// cwd string by consulting ground-truth signals — git remote URL,
+/// then known-layout heuristics, finally URL-shape inference.
+///
+/// Returns `None` when no canonical identity can be honestly resolved.
+/// Made `pub` so `src/sources.rs::project_filter_matches_path` can use
+/// the same canonical resolver instead of the prior path-segment
+/// heuristic (which leaked cross-org per `chatgpt-codex-connector`
+/// P1 review on PR #8; see Wave F-2 follow-up commit body).
+pub fn infer_tiered_identity_from_cwd(cwd: Option<&str>) -> Option<TieredIdentity> {
     let cwd = cwd?.trim();
     if cwd.is_empty() || looks_like_weak_source_identifier(cwd) {
         return None;
@@ -611,6 +662,8 @@ fn is_probably_repo_name(value: &str) -> bool {
 /// shape-only (digits + separator placement); we do not validate that the
 /// month/day fall within a real calendar — `2026-99-99` is still rejected as
 /// "repo-like" because the *intent* is clearly a date bucket, not a repo.
+/// The `YYYY_MMDD` arm is intentionally aligned with state migration's
+/// compact store date-dir skip heuristic.
 fn looks_like_date_pattern(value: &str) -> bool {
     let bytes = value.as_bytes();
     match bytes.len() {
@@ -655,6 +708,7 @@ mod tests {
             message: message.to_string(),
             branch: None,
             cwd: cwd.map(ToOwned::to_owned),
+            timestamp_source: None,
             frame_kind: None,
         }
     }
@@ -1308,7 +1362,7 @@ mod tests {
         // Mac convention `/Users/<u>/Git/...` (capital G) must match the
         // lowercase `git` marker. Previously case-sensitive comparison rejected
         // it, sending identity inference into the now-removed text fallback.
-        let path = Path::new("/Users/silver/Git/VetCoders/ai-contexters/src/lib.rs");
+        let path = Path::new("/Users/test-user/Git/VetCoders/ai-contexters/src/lib.rs");
         let id = infer_repo_identity_from_known_layout(path).expect("Git (capital) matches");
         assert_eq!(id.organization, "VetCoders");
         assert_eq!(id.repository, "ai-contexters");
@@ -1535,5 +1589,74 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_hash_registry_load_default_honors_aicx_home_then_falls_back_to_home() {
+        // The registry path was hard-coded to `$HOME/.aicx/...` and
+        // ignored the operator's `AICX_HOME` override. Confirm the
+        // helper now honors AICX_HOME first, falls back to HOME/.aicx,
+        // and returns an empty registry (not panic) when neither env
+        // var resolves to an existing file.
+        let aicx_home = mk_tmp_dir("registry-aicx-home");
+        fs::create_dir_all(&aicx_home).unwrap();
+        let map_path = aicx_home.join("gemini-project-map.json");
+        fs::write(
+            &map_path,
+            r#"{ "mappings": { "abc123": "/tmp/aicx-test-registry-target" } }"#,
+        )
+        .unwrap();
+
+        // Serialize env mutation so we don't fight other tests that
+        // also touch HOME/AICX_HOME — the segmentation module owns no
+        // other env-touching tests today, but this guard is cheap.
+        let prev_aicx_home = std::env::var_os("AICX_HOME");
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: This is a single-threaded test and we restore the
+        // previous values before returning.
+        unsafe {
+            std::env::set_var("AICX_HOME", &aicx_home);
+        }
+
+        let loaded = ProjectHashRegistry::load_default();
+        assert_eq!(
+            loaded.mappings.get("abc123").map(String::as_str),
+            Some("/tmp/aicx-test-registry-target"),
+            "AICX_HOME-rooted registry must load via load_default"
+        );
+
+        // Falling back to HOME/.aicx when AICX_HOME is unset.
+        let home_root = mk_tmp_dir("registry-home-fallback");
+        let home_aicx = home_root.join(".aicx");
+        fs::create_dir_all(&home_aicx).unwrap();
+        fs::write(
+            home_aicx.join("gemini-project-map.json"),
+            r#"{ "mappings": { "def456": "/tmp/aicx-test-registry-home" } }"#,
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("AICX_HOME");
+            std::env::set_var("HOME", &home_root);
+        }
+        let loaded_home = ProjectHashRegistry::load_default();
+        assert_eq!(
+            loaded_home.mappings.get("def456").map(String::as_str),
+            Some("/tmp/aicx-test-registry-home"),
+            "HOME/.aicx must remain the fallback when AICX_HOME is unset"
+        );
+
+        // Restore env to whatever the runner had before.
+        unsafe {
+            match prev_aicx_home {
+                Some(v) => std::env::set_var("AICX_HOME", v),
+                None => std::env::remove_var("AICX_HOME"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = fs::remove_dir_all(&aicx_home);
+        let _ = fs::remove_dir_all(&home_root);
     }
 }

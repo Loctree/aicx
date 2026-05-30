@@ -1,6 +1,5 @@
-use std::fs;
-
 use crate::intents::{self, IntentDisplayFilters, IntentRecord, IntentSortOrder};
+use crate::sanitize;
 
 #[derive(Debug)]
 pub struct IntentsScreen {
@@ -85,10 +84,11 @@ impl IntentsScreen {
             self.preview = "No intent selected.".to_string();
             return;
         };
-        self.preview = match fs::read_to_string(&record.source_chunk) {
-            Ok(raw) => raw.lines().take(80).collect::<Vec<_>>().join("\n"),
-            Err(error) => format!("Failed to open {}: {error}", record.source_chunk),
-        };
+        self.preview =
+            match sanitize::read_to_string_validated(std::path::Path::new(&record.source_chunk)) {
+                Ok(raw) => raw.lines().take(80).collect::<Vec<_>>().join("\n"),
+                Err(error) => format!("Failed to open {}: {error}", record.source_chunk),
+            };
     }
 
     pub fn selected_preview(&self) -> String {

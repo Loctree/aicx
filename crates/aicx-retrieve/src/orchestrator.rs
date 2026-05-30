@@ -133,7 +133,7 @@ impl HybridIndex {
             .ok_or_else(|| anyhow!("cannot commit hybrid index before build_hybrid"))?;
         std::fs::create_dir_all(&self.manifest_dir)?;
         manifest.write_to_path(&self.manifest_path())?;
-        Ok(self.manifest.as_ref().expect("manifest checked above"))
+        Ok(manifest)
     }
 
     pub fn load_from_manifest(
@@ -206,21 +206,21 @@ fn validate_bindings(
         });
     }
     if manifest.dense_count != dense.count() {
-        return Err(RetrieveError::GenerationMismatch {
-            lexical_gen: manifest.dense_count.to_string(),
-            dense_gen: dense.count().to_string(),
+        return Err(RetrieveError::DenseCountMismatch {
+            expected: manifest.dense_count,
+            actual: dense.count(),
         });
     }
     if manifest.lexical_commit_id != lexical.commit_id().0 {
-        return Err(RetrieveError::GenerationMismatch {
-            lexical_gen: manifest.lexical_commit_id.clone(),
-            dense_gen: lexical.commit_id().0.clone(),
+        return Err(RetrieveError::LexicalCommitMismatch {
+            expected: manifest.lexical_commit_id.clone(),
+            actual: lexical.commit_id().0.clone(),
         });
     }
     if manifest.lexical_doc_count != lexical.doc_count() {
-        return Err(RetrieveError::GenerationMismatch {
-            lexical_gen: manifest.lexical_doc_count.to_string(),
-            dense_gen: lexical.doc_count().to_string(),
+        return Err(RetrieveError::LexicalDocCountMismatch {
+            expected: manifest.lexical_doc_count,
+            actual: lexical.doc_count(),
         });
     }
     if manifest.fusion_algorithm != fusion.name() {

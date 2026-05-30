@@ -11,6 +11,9 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Atomically write `content` to `path`. Creates parent directories as needed.
 pub fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
@@ -47,17 +50,27 @@ pub fn stage_tempfile(target: &Path, content: &[u8]) -> io::Result<PathBuf> {
         )
     })?;
 
-    // PID + nanos disambiguates concurrent writers in the same process and the
-    // same wall-second; the leading dot keeps the tempfile out of glob scans.
+    // PID + nanos + process-local counter disambiguates concurrent writers; the
+    // leading dot keeps the tempfile out of glob scans.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    let tmp_name = format!(".{}.tmp.{}.{}", file_name, std::process::id(), nanos);
+    let counter = TEMPFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_name = format!(
+        ".{}.tmp.{}.{}.{}",
+        file_name,
+        std::process::id(),
+        nanos,
+        counter
+    );
     let tmp = parent.join(tmp_name);
 
     let res = (|| -> io::Result<()> {
-        let mut file = fs::File::create(&tmp)?; // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)?;
         file.write_all(content)?;
         file.flush()?;
         file.sync_all()
@@ -92,12 +105,24 @@ fn sync_parent_best_effort(path: &Path) {
     }
 }
 
+/// Best-effort parent-directory fsync after a rename. Callers that own a
+/// custom two-phase rename sequence (e.g. `.md` + `.meta.json`) use this
+/// to match the durability contract of [`atomic_write`]. Errors are
+/// intentionally swallowed — the underlying file write is already durable;
+/// this only hardens directory-entry persistence on power-loss-sensitive
+/// filesystems.
+pub fn parent_fsync(path: &Path) {
+    sync_parent_best_effort(path);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::env;
     use std::fs;
     use std::path::PathBuf;
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_test_dir(label: &str) -> PathBuf {
@@ -169,6 +194,43 @@ mod tests {
                 } else {
                     None
                 }
+            })
+            .collect();
+        assert!(stray.is_empty(), "stray tempfile: {:?}", stray);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_atomic_write_100_concurrent_writes_do_not_collide() {
+        let dir = unique_test_dir("concurrent");
+        let path = dir.join("shared.txt");
+
+        let handles: Vec<_> = (0..100)
+            .map(|idx| {
+                let path = path.clone();
+                thread::spawn(move || {
+                    let content = format!("writer-{idx:03}:{}", "x".repeat(2048));
+                    atomic_write(&path, content.as_bytes()).unwrap();
+                    content
+                })
+            })
+            .collect();
+
+        let expected: HashSet<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("writer thread"))
+            .collect();
+        let final_contents = fs::read_to_string(&path).unwrap();
+        assert!(
+            expected.contains(&final_contents),
+            "final contents must be one complete writer payload"
+        );
+
+        let stray: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                (name.starts_with('.') && name.contains(".tmp.")).then_some(name)
             })
             .collect();
         assert!(stray.is_empty(), "stray tempfile: {:?}", stray);

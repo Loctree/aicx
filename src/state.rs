@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::store::atomic_write::atomic_write;
@@ -18,6 +19,57 @@ pub mod migration;
 
 /// Default maximum number of stored hashes before pruning.
 const DEFAULT_MAX_HASHES: usize = 50_000;
+const MAX_STATE_JSON_BYTES: usize = 128 * 1024 * 1024;
+
+fn read_state_json_validated(path: &Path) -> Result<String> {
+    // Sanitize: traversal rejection + existence check + canonicalize + allow-list.
+    let validated = crate::sanitize::validate_read_path(path)?;
+
+    // Open once, derive metadata from the *file descriptor* — closes the
+    // TOCTOU window between validate_read_path's canonicalize and our read.
+    // If an attacker swaps a symlink between validate and open the kernel
+    // pins us to whatever inode the open(2) call resolved (per-fd state),
+    // and subsequent operations on the same fd cannot drift to a different
+    // file. fs::metadata(&path) followed by fs::File::open(&path) would
+    // resolve the path twice — that's the actual security gap, not a
+    // semgrep false positive.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .open(&validated)
+        .map_err(|e| anyhow!("Failed to open '{}': {}", validated.display(), e))?;
+
+    let metadata = file.metadata().map_err(|e| {
+        anyhow!(
+            "Failed to stat opened fd for '{}': {}",
+            validated.display(),
+            e
+        )
+    })?;
+    if metadata.len() > MAX_STATE_JSON_BYTES as u64 {
+        return Err(anyhow!(
+            "State file '{}' exceeds {} bytes (actual: {})",
+            validated.display(),
+            MAX_STATE_JSON_BYTES,
+            metadata.len()
+        ));
+    }
+
+    let mut reader = file.take(MAX_STATE_JSON_BYTES.saturating_add(1) as u64);
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|e| anyhow!("Failed to read '{}': {}", validated.display(), e))?;
+    if bytes.len() > MAX_STATE_JSON_BYTES {
+        return Err(anyhow!(
+            "State file '{}' exceeds {} bytes (actual: {})",
+            validated.display(),
+            MAX_STATE_JSON_BYTES,
+            bytes.len()
+        ));
+    }
+
+    String::from_utf8(bytes).map_err(|e| anyhow!("Failed to read '{}': {}", validated.display(), e))
+}
 
 /// Per-project dedup hashes with insertion/LRU order preserved.
 #[derive(Debug, Clone, Default)]
@@ -118,6 +170,40 @@ pub struct StateManager {
     pub hash_algorithm: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct LegacySiphashStateManager {
+    #[serde(default)]
+    last_processed: HashMap<String, DateTime<Utc>>,
+    #[serde(default)]
+    seen_hashes: HashMap<String, Vec<u64>>,
+    #[serde(default)]
+    runs: Vec<RunRecord>,
+    hash_algorithm: String,
+}
+
+impl LegacySiphashStateManager {
+    fn into_current_state(self) -> StateManager {
+        let seen_hashes = self
+            .seen_hashes
+            .into_iter()
+            .map(|(project, hashes)| {
+                let mut set = SeenHashSet::default();
+                for hash in hashes {
+                    set.insert(hash.to_string());
+                }
+                (project, set)
+            })
+            .collect();
+
+        StateManager {
+            last_processed: self.last_processed,
+            seen_hashes,
+            runs: self.runs,
+            hash_algorithm: self.hash_algorithm,
+        }
+    }
+}
+
 impl Default for StateManager {
     fn default() -> Self {
         Self {
@@ -129,11 +215,20 @@ impl Default for StateManager {
     }
 }
 
+/// Pure: builds the state-file path under an explicit AICX home.
+///
+/// No env reads, no filesystem creation. Used in tests to assert the
+/// `<home>/state.json` invariant without depending on `$AICX_HOME` or
+/// `$HOME`. The public [`StateManager::state_path`] wraps this with
+/// the env-resolving, side-effecting [`crate::store::store_base_dir`].
+pub(crate) fn state_path_for(home: &Path) -> PathBuf {
+    home.join("state.json")
+}
+
 impl StateManager {
-    /// Returns the path to the state file: `~/.aicx/state.json`
+    /// Returns the path to the state file: `<base>/state.json`
     fn state_path() -> Result<PathBuf> {
-        let base = crate::store::store_base_dir()?;
-        Ok(base.join("state.json"))
+        Ok(state_path_for(&crate::store::store_base_dir()?))
     }
 
     /// Load state from disk. Creates a fresh default state only when the file
@@ -146,40 +241,162 @@ impl StateManager {
     }
 
     fn load_from_path(path: &Path) -> Result<Self> {
+        Self::load_from_path_with_legacy_warning(path, |message| eprintln!("{message}"))
+    }
+
+    fn load_from_path_with_legacy_warning<W>(path: &Path, mut warn_legacy: W) -> Result<Self>
+    where
+        W: FnMut(&str),
+    {
         if !path.exists() {
             return Ok(Self::default());
         }
 
         let backup_path = Self::backup_path(path);
-        let contents = fs::read_to_string(path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        // state.json uses a dedicated, larger cap than the generic 8 MiB
+        // validated-read limit — long-lived installs legitimately grow
+        // `seen_hashes` / run history past that. See
+        // [`sanitize::read_state_json_validated`].
+        let contents = read_state_json_validated(path)
             .with_context(|| format!("Failed to read state file: {}", path.display()))?;
 
-        let mut state: Self = match serde_json::from_str(&contents) {
-            Ok(state) => state,
-            Err(err) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "state.json parse failed"
-                );
-                if backup_path.exists() {
-                    let backup = fs::read_to_string(&backup_path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-                        .with_context(|| {
-                            format!("Failed to read state backup: {}", backup_path.display())
+        let state: Self =
+            match Self::deserialize_and_migrate_contents(path, &contents, &mut warn_legacy) {
+                Ok(state) => state,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "state.json parse failed"
+                    );
+                    if backup_path.exists() {
+                        let backup =
+                            read_state_json_validated(&backup_path).with_context(|| {
+                                format!("Failed to read state backup: {}", backup_path.display())
+                            })?;
+                        let recovered = Self::deserialize_and_migrate_contents(
+                            &backup_path,
+                            &backup,
+                            &mut warn_legacy,
+                        )
+                        .map_err(|backup_err| {
+                            anyhow!(
+                                "state.json malformed AND backup unreadable: {err} / {backup_err}"
+                            )
                         })?;
-                    serde_json::from_str(&backup).map_err(|backup_err| {
-                        anyhow!("state.json malformed AND backup unreadable: {err} / {backup_err}")
-                    })?
-                } else {
-                    return Err(anyhow!(
-                        "state.json corrupted, no backup; manual recovery needed: {}",
-                        path.display()
-                    ));
+                        recovered.save_recovered_backup_to_primary(path)?;
+                        recovered
+                    } else {
+                        return Err(anyhow!(
+                            "state.json corrupted, no backup; manual recovery needed: {}",
+                            path.display()
+                        ));
+                    }
                 }
-            }
-        };
-        state.apply_load_migrations();
+            };
         Ok(state)
+    }
+
+    fn save_recovered_backup_to_primary(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create config dir: {}", parent.display()))?;
+        }
+        let json = serde_json::to_string_pretty(self).context("Failed to serialize state")?;
+        atomic_write(path, json.as_bytes()).with_context(|| {
+            format!(
+                "Failed to self-heal state file from backup: {}",
+                path.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    fn deserialize_and_migrate_contents<W>(
+        path: &Path,
+        contents: &str,
+        warn_legacy: &mut W,
+    ) -> std::result::Result<Self, serde_json::Error>
+    where
+        W: FnMut(&str),
+    {
+        let (mut state, loaded_legacy_u64_shape) =
+            Self::deserialize_current_or_legacy_siphash(contents)?;
+        let previous_hash_algorithm = state.hash_algorithm.clone();
+        let report = state.apply_load_migrations();
+        Self::emit_load_migration_warning(
+            path,
+            &previous_hash_algorithm,
+            loaded_legacy_u64_shape,
+            &report,
+            warn_legacy,
+        );
+        Ok(state)
+    }
+
+    fn deserialize_current_or_legacy_siphash(
+        contents: &str,
+    ) -> std::result::Result<(Self, bool), serde_json::Error> {
+        // Fast path: try strict deserialization directly from the string. This
+        // avoids the cost of a full `serde_json::Value` DOM allocation on every
+        // non-legacy load (the common case). Only fall through to the Value
+        // path when the strict shape fails — that's the legacy-detection branch
+        // and we need the parsed Value to inspect `hash_algorithm` anyway.
+        match serde_json::from_str::<Self>(contents) {
+            Ok(state) => Ok((state, false)),
+            Err(strict_err) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(contents).map_err(|_| strict_err)?;
+                if !Self::is_legacy_siphash_state_value(&value) {
+                    // Re-borrow strict_err is moved into the map_err above; rebuild it.
+                    return Err(serde_json::from_str::<Self>(contents).unwrap_err());
+                }
+                serde_json::from_value::<LegacySiphashStateManager>(value)
+                    .map(|legacy| (legacy.into_current_state(), true))
+                    .map_err(|_| serde_json::from_str::<Self>(contents).unwrap_err())
+            }
+        }
+    }
+
+    fn is_legacy_siphash_state_value(value: &serde_json::Value) -> bool {
+        value
+            .get("hash_algorithm")
+            .and_then(|algorithm| algorithm.as_str())
+            .is_some_and(migration::is_legacy_siphash13_algorithm)
+    }
+
+    fn emit_load_migration_warning<W>(
+        path: &Path,
+        previous_hash_algorithm: &str,
+        loaded_legacy_u64_shape: bool,
+        report: &migration::StateMigrationReport,
+        warn_legacy: &mut W,
+    ) where
+        W: FnMut(&str),
+    {
+        if !report.hash_algorithm_changed {
+            return;
+        }
+
+        tracing::warn!(
+            path = %path.display(),
+            previous_hash_algorithm = %previous_hash_algorithm,
+            current_hash_algorithm = %migration::BLAKE3_128_ALGORITHM,
+            cleared_seen_hashes = report.cleared_seen_hashes,
+            legacy_u64_shape = loaded_legacy_u64_shape,
+            "state.json migrated from legacy hash algorithm"
+        );
+
+        let previous = if previous_hash_algorithm.trim().is_empty() {
+            "missing"
+        } else {
+            previous_hash_algorithm.trim()
+        };
+        warn_legacy(&format!(
+            "Warning: state.json migrated from legacy hash algorithm {previous} to {}; cleared {} legacy seen_hashes",
+            migration::BLAKE3_128_ALGORITHM,
+            report.cleared_seen_hashes
+        ));
     }
 
     /// Persist current state to disk. Creates parent directories if needed.
@@ -201,15 +418,28 @@ impl StateManager {
                 .with_context(|| format!("Failed to create config dir: {}", parent.display()))?;
         }
 
+        // Note: caller is responsible for holding `state_lock_path()` exclusive
+        // around the full read-modify-write cycle (see run_store/run_state/etc.
+        // in main.rs). Re-acquiring here would deadlock.
+
         let json = serde_json::to_string_pretty(self).context("Failed to serialize state")?;
 
-        if path.exists() {
-            let previous = fs::read(path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-                .with_context(|| format!("Failed to read state file: {}", path.display()))?;
-            let backup_path = Self::backup_path(path);
-            write_atomic(&backup_path, &previous).with_context(|| {
-                format!("Failed to write state backup: {}", backup_path.display())
-            })?;
+        match fs::OpenOptions::new().read(true).open(path) {
+            Ok(mut previous_file) => {
+                let mut previous = Vec::new();
+                previous_file
+                    .read_to_end(&mut previous)
+                    .with_context(|| format!("Failed to read state file: {}", path.display()))?;
+                let backup_path = Self::backup_path(path);
+                write_atomic(&backup_path, &previous).with_context(|| {
+                    format!("Failed to write state backup: {}", backup_path.display())
+                })?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to open state file: {}", path.display()));
+            }
         }
 
         write_atomic(path, json.as_bytes())
@@ -233,11 +463,8 @@ impl StateManager {
     /// identification. Session ID is excluded because Claude Code stores
     /// the same user message in multiple session JSONL files.
     pub fn content_hash(agent: &str, timestamp: i64, message: &str) -> String {
-        let mut data = Vec::new();
-        data.extend_from_slice(agent.as_bytes());
-        data.extend_from_slice(&timestamp.to_le_bytes());
-        data.extend_from_slice(message.as_bytes());
-        migration::stable_blake3_128(&data)
+        let timestamp = timestamp.to_le_bytes();
+        Self::stable_hash_fields(&[agent.as_bytes(), &timestamp, message.as_bytes()])
     }
 
     /// Compute an overlap hash for cross-agent dedup.
@@ -252,10 +479,19 @@ impl StateManager {
     /// different agents collapse into one.
     pub fn overlap_hash(timestamp: i64, message: &str) -> String {
         let bucket = timestamp / 60; // 60-second window
-        let mut data = Vec::new();
-        data.extend_from_slice(&bucket.to_le_bytes());
-        data.extend_from_slice(message.as_bytes());
-        migration::stable_blake3_128(&data)
+        let bucket = bucket.to_le_bytes();
+        Self::stable_hash_fields(&[&bucket, message.as_bytes()])
+    }
+
+    fn stable_hash_fields(fields: &[&[u8]]) -> String {
+        // Incremental blake3 hashing avoids intermediate Vec allocation for large messages.
+        let mut hasher = blake3::Hasher::new();
+        for field in fields {
+            hasher.update(&(field.len() as u64).to_le_bytes());
+            hasher.update(field);
+        }
+        // 128-bit prefix (16 bytes = 32 hex chars) — matches `migration::stable_blake3_128` contract.
+        hex::encode(&hasher.finalize().as_bytes()[..16])
     }
 
     /// Returns `true` if this hash has NOT been seen before for the given project.
@@ -436,6 +672,31 @@ mod tests {
     }
 
     #[test]
+    fn test_content_hash_separates_legacy_concat_collision() {
+        fn legacy_content_hash(agent: &str, timestamp: i64, message: &str) -> String {
+            let mut data = Vec::new();
+            data.extend_from_slice(agent.as_bytes());
+            data.extend_from_slice(&timestamp.to_le_bytes());
+            data.extend_from_slice(message.as_bytes());
+            migration::stable_blake3_128(&data)
+        }
+
+        let left = ("a\0\0\0\0\0\0\0\0", 0, "bc");
+        let right = ("a", 0, "\0\0\0\0\0\0\0\0bc");
+
+        assert_eq!(
+            legacy_content_hash(left.0, left.1, left.2),
+            legacy_content_hash(right.0, right.1, right.2),
+            "legacy raw concatenation should demonstrate the split collision"
+        );
+        assert_ne!(
+            StateManager::content_hash(left.0, left.1, left.2),
+            StateManager::content_hash(right.0, right.1, right.2),
+            "field boundaries should split the triples"
+        );
+    }
+
+    #[test]
     fn test_overlap_hash_ignores_agent() {
         let prompt = "Deploy the new auth module to staging and run integration tests";
         let ts = 1700000000i64;
@@ -472,6 +733,21 @@ mod tests {
         let h1 = StateManager::overlap_hash(ts, "prompt A");
         let h2 = StateManager::overlap_hash(ts, "prompt B");
         assert_ne!(h1, h2, "different message → different overlap hash");
+    }
+
+    #[test]
+    fn test_overlap_hash_uses_field_boundary_between_bucket_and_message() {
+        let timestamp = 0i64;
+        let message = "broadcast prompt";
+        let mut legacy_data = Vec::new();
+        legacy_data.extend_from_slice(&(timestamp / 60).to_le_bytes());
+        legacy_data.extend_from_slice(message.as_bytes());
+
+        assert_ne!(
+            StateManager::overlap_hash(timestamp, message),
+            migration::stable_blake3_128(&legacy_data),
+            "overlap hash should move off the legacy raw-concat byte stream"
+        );
     }
 
     #[test]
@@ -590,6 +866,92 @@ mod tests {
 
         assert_eq!(loaded.get_watermark("claude:test"), Some(ts(20)));
         assert!(!loaded.is_new("project", "202"));
+        let repaired_primary: StateManager =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(repaired_primary.get_watermark("claude:test"), Some(ts(20)));
+        assert!(!repaired_primary.is_new("project", "202"));
+        let repaired = StateManager::load_from_path(&path).unwrap();
+        assert_eq!(repaired.get_watermark("claude:test"), Some(ts(20)));
+        assert!(!repaired.is_new("project", "202"));
+        cleanup_state_path(&path);
+    }
+
+    #[test]
+    fn test_load_migrates_legacy_siphash_u64_state() {
+        let path = unique_state_path("legacy-siphash-u64");
+        let legacy_state = serde_json::json!({
+            "last_processed": {
+                "claude:test": "2026-05-20T12:00:00Z"
+            },
+            "seen_hashes": {
+                "Vista": [101_u64, 202_u64]
+            },
+            "runs": [
+                {
+                    "timestamp": "2026-05-20T12:30:00Z",
+                    "entries_added": 2,
+                    "sources": ["claude:test"]
+                }
+            ],
+            "hash_algorithm": migration::SIPHASH13_ALGORITHM
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&legacy_state).unwrap()).unwrap();
+
+        let mut warnings = Vec::new();
+        let loaded = StateManager::load_from_path_with_legacy_warning(&path, |message| {
+            warnings.push(message.to_string());
+        })
+        .unwrap();
+
+        assert_eq!(loaded.hash_algorithm, migration::BLAKE3_128_ALGORITHM);
+        assert!(loaded.seen_hashes.is_empty());
+        assert_eq!(loaded.total_hashes(), 0);
+        assert_eq!(loaded.get_watermark("claude:test"), Some(ts(1779278400)));
+        assert_eq!(loaded.runs.len(), 1);
+        assert_eq!(loaded.runs[0].entries_added, 2);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("migrated from legacy hash algorithm"));
+        assert!(warnings[0].contains(migration::SIPHASH13_ALGORITHM));
+        assert!(warnings[0].contains(migration::BLAKE3_128_ALGORITHM));
+        assert!(warnings[0].contains("cleared 2 legacy seen_hashes"));
+
+        loaded.save_to_path(&path).unwrap();
+        let persisted: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            persisted["hash_algorithm"],
+            serde_json::Value::String(migration::BLAKE3_128_ALGORITHM.to_string())
+        );
+        assert_eq!(persisted["seen_hashes"].as_object().unwrap().len(), 0);
+
+        cleanup_state_path(&path);
+    }
+
+    #[test]
+    fn test_load_rejects_non_legacy_schema_mismatch() {
+        let path = unique_state_path("non-legacy-schema-mismatch");
+        let invalid_current_state = serde_json::json!({
+            "last_processed": {},
+            "seen_hashes": {
+                "Vista": [101_u64]
+            },
+            "runs": [],
+            "hash_algorithm": migration::BLAKE3_128_ALGORITHM
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&invalid_current_state).unwrap(),
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let err = StateManager::load_from_path_with_legacy_warning(&path, |message| {
+            warnings.push(message.to_string());
+        })
+        .expect_err("non-legacy u64 hashes must still be rejected");
+
+        assert!(err.to_string().contains("state.json corrupted"));
+        assert!(warnings.is_empty());
         cleanup_state_path(&path);
     }
 
@@ -790,11 +1152,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Replaces the legacy `test_state_path_is_under_store` which asserted
+    // `path.contains(".aicx")` — a literal-pattern relic from before
+    // `$AICX_HOME` override existed. Under any pinned `AICX_HOME` (e.g.
+    // the operator's `AICX_HOME=/Users/silver/aicx`) that asserted
+    // false-positive failed silently as a "baseline failure". Pass-4
+    // op-agent + operator agreed to refuse that anti-pattern: the
+    // contract is "state path lives under base dir, named state.json"
+    // — env resolution and `mkdir` are tested separately in
+    // `src/store.rs::tests`.
     #[test]
-    fn test_state_path_is_under_store() {
-        if let Ok(path) = StateManager::state_path() {
-            assert!(path.to_string_lossy().contains(".aicx"));
-            assert!(path.to_string_lossy().ends_with("state.json"));
-        }
+    fn test_state_path_for_lives_under_home_and_named_state_json() {
+        let home = PathBuf::from("/tmp/test-aicx-state");
+        let state = super::state_path_for(&home);
+        assert!(
+            state.starts_with(&home),
+            "state_path_for should live under home; got {state:?}"
+        );
+        assert_eq!(
+            state.file_name().and_then(|n| n.to_str()),
+            Some("state.json"),
+            "state_path_for should end with state.json; got {state:?}"
+        );
     }
 }

@@ -15,6 +15,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::process::Command;
 use std::time::SystemTime;
 
 #[cfg(test)]
@@ -24,6 +26,7 @@ const MAX_JSON_PARSE_BYTES: u64 = 8 * 1024 * 1024;
 const SEARCH_READ_BYTES: u64 = 256 * 1024;
 const MAX_SEARCH_TEXT_CHARS: usize = 12_000;
 const MAX_DETAIL_CHARS: usize = 32_000;
+const DASHBOARD_INLINE_MARKDOWN_SCRIPT: &str = include_str!("dashboard_inline_markdown.js");
 
 /// Optional dataset scope applied before dashboard generation or server startup.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -53,12 +56,23 @@ impl DashboardScope {
     }
 }
 
+/// Strict project filter shared with `aicx::store::project_filter_matches`.
+///
+/// Splits the canonical project slug into `<organization>/<repository>` (or
+/// `("", bucket)` when the slug is a single segment) and routes the user
+/// filter through the canonical helper. Substring matching is intentionally
+/// gone: `-p vista` no longer matches `vista-portal`. An empty / None filter
+/// keeps the legacy "no filter applied" behavior.
 pub fn project_matches_filter(project: &str, filter: Option<&str>) -> bool {
-    filter.is_none_or(|needle| {
-        project
-            .to_ascii_lowercase()
-            .contains(&needle.to_ascii_lowercase())
-    })
+    let Some(needle) = filter else {
+        return true;
+    };
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return true;
+    }
+    let (organization, repository) = project.split_once('/').unwrap_or(("", project));
+    crate::store::project_filter_matches(organization, repository, needle)
 }
 
 pub fn date_matches_hours_scope(date_iso: &str, hours: Option<u64>) -> bool {
@@ -381,7 +395,7 @@ pub fn render_server_shell_html(title: &str) -> String {
 "##,
         html_escape(title),
         DASHBOARD_CSS,
-        DASHBOARD_SERVER_SCRIPT
+        format_args!("{DASHBOARD_INLINE_MARKDOWN_SCRIPT}\n{DASHBOARD_SERVER_SCRIPT}")
     )
 }
 
@@ -1897,55 +1911,7 @@ const DASHBOARD_SERVER_SCRIPT: &str = r#"
     browseRecords: [], mode: 'browse', expanded: false,
   };
 
-  /* --- markdown renderer ------------------------------------------------- */
-  const renderMarkdown = (src) => {
-    if (!src) return '';
-    const esc = (s) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    let html = '';
-    let inCode = false;
-    let codeLang = '';
-    let codeLines = [];
-    const lines = src.split('\n');
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if (inCode) {
-        if (line.startsWith('```')) {
-          html += '<pre><code' + (codeLang ? ' class="lang-' + esc(codeLang) + '"' : '') + '>' + esc(codeLines.join('\n')) + '</code></pre>';
-          inCode = false; codeLines = []; codeLang = '';
-        } else { codeLines.push(line); }
-        continue;
-      }
-      if (line.startsWith('```')) { inCode = true; codeLang = line.slice(3).trim(); continue; }
-      if (line.startsWith('---') && line.replace(/-/g,'').trim() === '') { html += '<hr>'; continue; }
-      const hm = line.match(/^(#{1,6})\s+(.*)/);
-      if (hm) { const lvl = hm[1].length; html += '<h' + lvl + '>' + inlineMarkdown(hm[2]) + '</h' + lvl + '>'; continue; }
-      if (line.startsWith('> ')) { html += '<blockquote>' + inlineMarkdown(line.slice(2)) + '</blockquote>'; continue; }
-      const lm = line.match(/^(\s*[-*])\s+(.*)/);
-      if (lm) { html += '<ul><li>' + inlineMarkdown(lm[2]) + '</li></ul>'; continue; }
-      const om = line.match(/^(\s*\d+\.)\s+(.*)/);
-      if (om) { html += '<ol><li>' + inlineMarkdown(om[2]) + '</li></ol>'; continue; }
-      if (line.trim() === '') { html += '<br>'; continue; }
-      html += '<p>' + inlineMarkdown(line) + '</p>';
-    }
-    if (inCode) { html += '<pre><code>' + esc(codeLines.join('\n')) + '</code></pre>'; }
-    return html.replace(/<\/ul><ul>/g, '').replace(/<\/ol><ol>/g, '');
-  };
-  const inlineMarkdown = (s) => {
-    const esc = (t) => t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    let html = esc(s)
-      .replace(/`([^`]+)`/g, '<code>$1</code>')
-      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-      .replace(/\*([^*]+)\*/g, '<em>$1</em>');
-    return html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, label, url) => {
-      const u = url.trim();
-      const lower = u.toLowerCase();
-      if (lower.startsWith('javascript:') || lower.startsWith('data:') || lower.startsWith('vbscript:') || lower.startsWith('blob:') || lower.startsWith('file:')) {
-        return '[' + label + '](' + url + ')';
-      }
-      const href = u.replace(/"/g, '&quot;');
-      return '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' + label + '</a>';
-    });
-  };
+  const renderMarkdown = AicxMarkdown.renderMarkdown;
 
   /* --- URL state --------------------------------------------------------- */
   const pushUrlState = () => {
@@ -2268,6 +2234,44 @@ mod tests {
         dir
     }
 
+    /// Run the inline-markdown JS module via `node`. Returns `None` if Node.js
+    /// is not on PATH (gracefully skip — `cargo test` stays runnable on
+    /// minimal Rust-only environments). Caller short-circuits the test.
+    fn inline_markdown_via_node(markdown: &str) -> Option<String> {
+        let module_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/dashboard_inline_markdown.js"
+        );
+        let output = Command::new("node")
+            .arg("-e")
+            .arg(
+                "require(process.argv[1]); process.stdout.write(globalThis.AicxMarkdown.inlineMarkdown(process.argv[2]));",
+            )
+            .arg(module_path)
+            .arg(markdown)
+            .output()
+            .ok()?;
+        assert!(
+            output.status.success(),
+            "node inlineMarkdown failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(String::from_utf8(output.stdout).expect("node output is utf8"))
+    }
+
+    /// Helper: emit a skip notice + return early when `node` isn't installed.
+    macro_rules! skip_if_no_node {
+        ($call:expr) => {
+            match $call {
+                Some(v) => v,
+                None => {
+                    eprintln!("[skip] dashboard inline-markdown behavior test: `node` not on PATH");
+                    return;
+                }
+            }
+        };
+    }
+
     #[test]
     fn parses_session_filename_variants() {
         let re = Regex::new(
@@ -2568,11 +2572,19 @@ mod tests {
         )
         .expect("beta file");
 
+        // Bug #27/#28 regression: the startup scope filter is now strict
+        // (routes through `aicx::store::project_filter_matches`). The old
+        // assertion used `Some("alpha")` and relied on substring matching
+        // against canonical slug `local/alpha-project` — that was the
+        // very leak the strict filter is designed to kill. The strict
+        // matcher accepts `alpha-project` (cross-org repo-name match),
+        // `local/alpha-project` (exact slug), `local/` (org wildcard),
+        // or `/alpha-project` (repo wildcard).
         let scoped = scan_store(
             &root,
             120,
             &DashboardScope {
-                project: Some("alpha".to_string()),
+                project: Some("alpha-project".to_string()),
                 hours: Some(72),
             },
         )
@@ -2585,7 +2597,7 @@ mod tests {
                 .payload
                 .assumptions
                 .iter()
-                .any(|line| line.contains("project/store buckets containing: alpha"))
+                .any(|line| line.contains("project/store buckets containing: alpha-project"))
         );
         assert!(
             scoped
@@ -2593,6 +2605,24 @@ mod tests {
                 .assumptions
                 .iter()
                 .any(|line| line.contains("last 72 hour(s)"))
+        );
+
+        // Bug #27 positive guard: the substring-only filter `alpha` MUST
+        // NOT match canonical `local/alpha-project` under strict
+        // semantics. The dashboard layer used to silently leak this.
+        let substring_leak = scan_store(
+            &root,
+            120,
+            &DashboardScope {
+                project: Some("alpha".to_string()),
+                hours: Some(72),
+            },
+        )
+        .expect("substring-leak scoped scan");
+        assert!(
+            substring_leak.payload.records.is_empty(),
+            "strict filter must NOT match `alpha` against `local/alpha-project`; got {} records",
+            substring_leak.payload.records.len()
         );
 
         let _ = fs::remove_dir_all(root);
@@ -2667,20 +2697,25 @@ mod tests {
 
     #[test]
     fn test_inline_markdown_javascript_scheme_renders_as_text() {
-        let html = render_server_shell_html("test");
-        assert!(html.contains("lower.startsWith('javascript:')"));
+        let html = skip_if_no_node!(inline_markdown_via_node("[x](javascript:alert(1))"));
+        assert_eq!(html, "[x](javascript:alert(1))");
+        assert!(!html.contains("<a "));
     }
 
     #[test]
     fn test_inline_markdown_data_scheme_renders_as_text() {
-        let html = render_server_shell_html("test");
-        assert!(html.contains("lower.startsWith('data:')"));
+        let html = skip_if_no_node!(inline_markdown_via_node("[x](data:text/html,boom)"));
+        assert_eq!(html, "[x](data:text/html,boom)");
+        assert!(!html.contains("<a "));
     }
 
     #[test]
     fn test_inline_markdown_quote_break_attempt_does_not_inject_attribute() {
-        let html = render_server_shell_html("test");
-        assert!(html.contains("u.replace(/\"/g, '&quot;')"));
+        let html = skip_if_no_node!(inline_markdown_via_node(
+            "[x](https://example.com/\" onclick=\"alert(1))"
+        ));
+        assert!(html.contains("<a href=\"https://example.com/&quot; onclick=&quot;alert(1\""));
+        assert!(!html.contains("\" onclick=\""));
     }
 
     #[test]

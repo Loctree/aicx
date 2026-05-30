@@ -18,9 +18,10 @@
 #![cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 
 pub use aicx_embeddings::{
-    BackendPreference, CloudEmbeddingConfig, EmbeddingConfig, EmbeddingEngine, EmbeddingModelInfo,
-    EmbeddingProfile, EmbeddingProfileSpec, LocalEmbeddingProvider, NativeEmbeddingSource,
-    ResolvedEmbeddingModel, config_search_paths, find_cached_model_file, l2_normalize,
+    BackendPreference, CloudEmbeddingConfig, ConfigSource, EmbeddingConfig, EmbeddingEngine,
+    EmbeddingModelInfo, EmbeddingProfile, EmbeddingProfileSpec, LocalEmbeddingProvider,
+    NativeEmbeddingSource, ResolvedEmbeddingModel, config_search_paths,
+    config_search_paths_with_source, effective_config_source, find_cached_model_file, l2_normalize,
     profile_spec, similarity,
 };
 
@@ -29,6 +30,8 @@ pub use aicx_embeddings::CloudEmbeddingProvider;
 
 #[cfg(feature = "cloud-embedder")]
 pub use aicx_embeddings::cloud;
+
+pub use aicx_embeddings::hf_cache;
 
 pub type EmbedderConfig = EmbeddingConfig;
 pub type EmbedderEngine = EmbeddingEngine;

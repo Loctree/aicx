@@ -21,6 +21,7 @@ fn entry(seconds_offset: i64, role: &str, message: &str) -> TimelineEntry {
         frame_kind: None,
         branch: None,
         cwd: None,
+        timestamp_source: None,
     }
 }
 

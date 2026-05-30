@@ -11,13 +11,12 @@
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeZone, Utc};
-use globset::{Glob, GlobMatcher};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -28,102 +27,8 @@ use crate::chunker::{self, ChunkerConfig};
 use crate::sanitize;
 use crate::segmentation::semantic_segments;
 use crate::sources::{self, ExtractionConfig};
-pub use crate::timeline::Kind;
 use crate::timeline::{RepoIdentity, SemanticSegment, TimelineEntry};
-use crate::validation::is_valid_repo_project_slug;
-
-// ============================================================================
-// Kind classification
-// ============================================================================
-
-// ── Kind heuristics ────────────────────────────────────────────────────────
-
-const PLAN_KEYWORDS: &[&str] = &[
-    "implementation plan",
-    "plan:",
-    "## plan",
-    "step 1:",
-    "step 2:",
-    "step 3:",
-    "action items",
-    "milestones",
-    "roadmap",
-    "todo list",
-    "acceptance criteria",
-    "## steps",
-    "## phases",
-];
-
-const REPORT_KEYWORDS: &[&str] = &[
-    "## findings",
-    "## summary",
-    "## report",
-    "audit report",
-    "coverage report",
-    "test results",
-    "## metrics",
-    "## recommendations",
-    "## conclusion",
-    "status report",
-    "incident report",
-    "pr review",
-    "code review",
-];
-
-/// Classify a set of timeline entries into a canonical `Kind`.
-///
-/// Uses a lightweight keyword-scoring approach:
-/// - Scans assistant messages (where classification signal is strongest)
-/// - Scores plan vs report keywords
-/// - Conversations win by default when neither plan nor report signal is strong
-///
-/// The approach is intentionally conservative: ambiguous content falls to
-/// `Conversations` (the most common kind), not `Other`.
-pub fn classify_kind(entries: &[TimelineEntry]) -> Kind {
-    if entries.is_empty() {
-        return Kind::Other;
-    }
-
-    let mut plan_score: u32 = 0;
-    let mut report_score: u32 = 0;
-    let mut has_conversation = false;
-
-    for entry in entries {
-        let lower = entry.message.to_lowercase();
-
-        // Only count strong signals from assistant messages
-        if entry.role == "assistant" {
-            for kw in PLAN_KEYWORDS {
-                if lower.contains(kw) {
-                    plan_score += 1;
-                }
-            }
-            for kw in REPORT_KEYWORDS {
-                if lower.contains(kw) {
-                    report_score += 1;
-                }
-            }
-        }
-
-        // Any user+assistant exchange = conversation evidence
-        if entry.role == "user" || entry.role == "assistant" {
-            has_conversation = true;
-        }
-    }
-
-    // Threshold: need at least 3 keyword hits to classify as plan or report
-    let threshold = 3;
-
-    if plan_score >= threshold && plan_score > report_score {
-        Kind::Plans
-    } else if report_score >= threshold && report_score > plan_score {
-        Kind::Reports
-    } else if has_conversation {
-        Kind::Conversations
-    } else {
-        Kind::Other
-    }
-}
+pub use aicx_parser::{classify_kind, timeline::Kind};
 
 // ============================================================================
 // Session-first filename generation
@@ -185,317 +90,33 @@ fn siphash13_hex6(input: &str) -> String {
     format!("{:06x}", (hasher.finish() & 0x00FF_FFFF) as u32)
 }
 
+fn chunk_sequence_from_id(id: &str) -> Option<u32> {
+    id.rsplit('_').next().and_then(parse_chunk_component)
+}
+
 // ============================================================================
 // Path helpers
 // ============================================================================
 
-pub const NON_REPOSITORY_CONTEXTS: &str = "non-repository-contexts";
-pub const CANONICAL_STORE_DIRNAME: &str = "store";
-pub const CONTEXT_CORPUS_DIRNAME: &str = "context-corpus";
-pub const LOCT_CONTEXT_PACK_FAMILY: &str = "loct-context-pack";
-pub const CONTEXT_CORPUS_SCHEMA_VERSION: &str = "context_corpus.v1";
-pub const LEGACY_SALVAGE_DIRNAME: &str = "legacy-store";
-pub const AICX_IGNORE_FILENAME: &str = ".aicxignore";
-const MIGRATION_DIRNAME: &str = "migration";
-const MIGRATION_MANIFEST_FILENAME: &str = "manifest.json";
-const MIGRATION_REPORT_FILENAME: &str = "report.md";
+pub(crate) mod ignore;
+pub(crate) mod paths;
 
-pub(crate) fn canonical_project_slug(project: &str) -> String {
-    project
-        .split('/')
-        .map(canonical_bucket_segment)
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-/// Trim whitespace from a bucket segment. Case is preserved; dot-prefix and
-/// underscore-prefix bucket names (`.aicx`, `.codescribe`, `.github`,
-/// `_internal`, `.scripts`) are accepted as-is by `is_valid_repo_bucket_name`
-/// (relaxed 2026-05-12 from prior lowercase-only + leading-char-restricted
-/// schema). Mid-segment garbage from extractor bugs (newlines, shell
-/// metacharacters, leading `$`/`{`/`<`) is intentionally NOT sanitized so the
-/// validator surfaces it instead of silently normalizing junk into a
-/// filesystem path.
-fn canonical_bucket_segment(segment: &str) -> String {
-    segment.trim().to_string()
-}
-
-fn canonical_path_segment(value: &str, label: &str) -> Result<String> {
-    let cleaned = value.trim().to_ascii_lowercase();
-    if cleaned.is_empty()
-        || cleaned.contains('/')
-        || cleaned.contains('\\')
-        || cleaned.contains("..")
-        || !cleaned
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
-    {
-        anyhow::bail!("invalid context corpus {label} segment: {value:?}");
-    }
-    Ok(cleaned)
-}
-
-#[derive(Debug, Clone)]
-struct IgnoreRule {
-    negate: bool,
-    matcher: GlobMatcher,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct StoreIgnoreMatcher {
-    base: PathBuf,
-    rules: Vec<IgnoreRule>,
-}
-
-/// Returns the AICX base directory: `$AICX_HOME` or `~/.aicx/`
-///
-/// Creates the directory if it doesn't exist.
-pub fn store_base_dir() -> Result<PathBuf> {
-    let dir = match std::env::var_os("AICX_HOME") {
-        Some(value) if !value.is_empty() => PathBuf::from(value),
-        _ => dirs::home_dir().context("No home directory")?.join(".aicx"),
-    };
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("Failed to create store dir: {}", dir.display()))?;
-    Ok(dir)
-}
-
-/// Returns the canonical repo-centric store root: `~/.aicx/store/`
-pub fn canonical_store_dir() -> Result<PathBuf> {
-    let dir = store_base_dir()?.join(CANONICAL_STORE_DIRNAME);
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-/// Returns the immutable context-corpus root: `~/.aicx/context-corpus/`.
-pub fn context_corpus_root_dir() -> Result<PathBuf> {
-    let dir = store_base_dir()?.join(CONTEXT_CORPUS_DIRNAME);
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-pub fn aicx_context_corpus_dir(org: &str, repo: &str, date: &str, batch: &str) -> Result<PathBuf> {
-    let org = canonical_path_segment(org, "org")?;
-    let repo = canonical_path_segment(repo, "repo")?;
-    let date = compact_date(date);
-    let batch = canonical_path_segment(batch, "batch")?;
-    let dir = context_corpus_root_dir()?
-        .join(org)
-        .join(repo)
-        .join(date)
-        .join(LOCT_CONTEXT_PACK_FAMILY)
-        .join(batch);
-    fs::create_dir_all(dir.join("raw"))?;
-    fs::create_dir_all(dir.join("sidecars"))?;
-    Ok(dir)
-}
-
-/// Returns the non-repository fallback root: `~/.aicx/non-repository-contexts/`
-pub fn non_repository_contexts_dir() -> Result<PathBuf> {
-    let dir = store_base_dir()?.join(NON_REPOSITORY_CONTEXTS);
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-/// Returns the legacy input-store root used for truthful migration inventory.
-pub fn legacy_store_base_dir() -> Result<PathBuf> {
-    Ok(dirs::home_dir()
-        .context("No home directory")?
-        .join(".ai-contexters"))
-}
-
-fn legacy_salvage_dir(base: &Path) -> PathBuf {
-    base.join(LEGACY_SALVAGE_DIRNAME)
-}
-
-fn migration_dir(base: &Path) -> PathBuf {
-    base.join(MIGRATION_DIRNAME)
-}
-
-fn migration_manifest_path(base: &Path) -> PathBuf {
-    migration_dir(base).join(MIGRATION_MANIFEST_FILENAME)
-}
-
-fn migration_report_path(base: &Path) -> PathBuf {
-    migration_dir(base).join(MIGRATION_REPORT_FILENAME)
-}
-
-impl StoreIgnoreMatcher {
-    fn load(base: &Path) -> Result<Self> {
-        let path = base.join(AICX_IGNORE_FILENAME);
-        if !path.exists() {
-            return Ok(Self {
-                base: base.to_path_buf(),
-                rules: Vec::new(),
-            });
-        }
-
-        let raw = sanitize::read_to_string_validated(&path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        let mut rules = Vec::new();
-
-        for (line_no, line) in raw.lines().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-
-            let negate = trimmed.starts_with('!');
-            let pattern = trimmed.trim_start_matches('!').trim();
-            if pattern.is_empty() {
-                continue;
-            }
-
-            let normalized = normalize_aicx_ignore_pattern(pattern);
-            let matcher = Glob::new(&normalized)
-                .with_context(|| {
-                    format!(
-                        "Invalid {} pattern at line {}: {}",
-                        path.display(),
-                        line_no + 1,
-                        trimmed
-                    )
-                })?
-                .compile_matcher();
-
-            rules.push(IgnoreRule { negate, matcher });
-        }
-
-        Ok(Self {
-            base: base.to_path_buf(),
-            rules,
-        })
-    }
-
-    pub fn is_ignored(&self, path: &Path) -> bool {
-        if self.rules.is_empty() {
-            return false;
-        }
-
-        let Ok(relative) = path.strip_prefix(&self.base) else {
-            return false;
-        };
-        let relative = normalize_relative_store_path(relative);
-        if relative.is_empty() {
-            return false;
-        }
-
-        let mut ignored = false;
-        for rule in &self.rules {
-            if rule.matcher.is_match(&relative) {
-                ignored = !rule.negate;
-            }
-        }
-        ignored
-    }
-}
-
-fn normalize_relative_store_path(path: &Path) -> String {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-fn normalize_aicx_ignore_pattern(pattern: &str) -> String {
-    let mut normalized = pattern
-        .trim()
-        .trim_start_matches("./")
-        .trim_start_matches('/')
-        .replace('\\', "/");
-
-    while normalized.contains("//") {
-        normalized = normalized.replace("//", "/");
-    }
-
-    if normalized.ends_with('/') {
-        normalized.push_str("**");
-    }
-
-    normalized
-}
-
-pub fn load_ignore_matcher_at(base: &Path) -> Result<StoreIgnoreMatcher> {
-    StoreIgnoreMatcher::load(base)
-}
-
-pub fn filter_ignored_paths_at<P>(base: &Path, paths: &[P]) -> Result<(Vec<PathBuf>, usize)>
-where
-    P: AsRef<Path>,
-{
-    let matcher = load_ignore_matcher_at(base)?;
-    if matcher.rules.is_empty() {
-        return Ok((
-            paths
-                .iter()
-                .map(|path| path.as_ref().to_path_buf())
-                .collect(),
-            0,
-        ));
-    }
-
-    let mut kept = Vec::with_capacity(paths.len());
-    let mut ignored = 0usize;
-
-    for path in paths {
-        let path = path.as_ref();
-        if matcher.is_ignored(path) {
-            ignored += 1;
-        } else {
-            kept.push(path.to_path_buf());
-        }
-    }
-
-    Ok((kept, ignored))
-}
-
-/// Returns the project directory: `~/.aicx/store/<project>/`
-pub fn project_dir(project: &str) -> Result<PathBuf> {
-    let dir = validated_store_project_dir(&canonical_store_dir()?, project)?;
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-/// Returns the chunks directory: `~/.aicx/chunks/`
-pub fn chunks_dir() -> Result<PathBuf> {
-    let dir = store_base_dir()?.join("chunks");
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-/// Full path for a specific context markdown file.
-///
-/// Layout: `~/.aicx/store/<project>/<date>/<time>_<agent>-context.md`
-pub fn get_context_path(project: &str, agent: &str, date: &str, time: &str) -> Result<PathBuf> {
-    let dir = validated_store_project_dir(&canonical_store_dir()?, project)?.join(date);
-    fs::create_dir_all(&dir)?;
-    Ok(dir.join(format!("{}_{}-context.md", time, agent)))
-}
-
-/// Full path for a specific context JSON file.
-///
-/// Layout: `~/.aicx/store/<project>/<date>/<time>_<agent>-context.json`
-pub fn get_context_json_path(
-    project: &str,
-    agent: &str,
-    date: &str,
-    time: &str,
-) -> Result<PathBuf> {
-    let dir = validated_store_project_dir(&canonical_store_dir()?, project)?.join(date);
-    fs::create_dir_all(&dir)?;
-    Ok(dir.join(format!("{}_{}-context.json", time, agent)))
-}
-
-fn validated_store_project_dir(root: &Path, project: &str) -> Result<PathBuf> {
-    let canonical = canonical_project_slug(project);
-    if !is_valid_repo_project_slug(&canonical) {
-        anyhow::bail!(
-            "invalid canonical store project bucket {:?}; expected lowercase <bucket> or <org>/<repo> with [a-z0-9][a-z0-9._-]{{0,99}} segments",
-            project
-        );
-    }
-    Ok(root.join(canonical))
-}
+pub use ignore::{
+    AICX_IGNORE_FILENAME, StoreIgnoreMatcher, filter_ignored_paths_at, load_ignore_matcher_at,
+};
+pub(crate) use paths::canonical_project_slug;
+pub use paths::{
+    CANONICAL_STORE_DIRNAME, CONTEXT_CORPUS_DIRNAME, CONTEXT_CORPUS_SCHEMA_VERSION,
+    LEGACY_SALVAGE_DIRNAME, LOCT_CONTEXT_PACK_FAMILY, NON_REPOSITORY_CONTEXTS,
+    aicx_context_corpus_dir, canonical_store_dir, chunks_dir, chunks_dir_for,
+    context_corpus_root_dir, get_context_json_path, get_context_path, legacy_store_base_dir,
+    non_repository_contexts_dir, project_dir, resolve_aicx_home, store_base_dir,
+    store_base_dir_for,
+};
+use paths::{
+    aicx_context_corpus_dir_for, legacy_salvage_dir, migration_manifest_path,
+    migration_report_path, validated_store_project_dir,
+};
 
 // ============================================================================
 // Index types
@@ -598,7 +219,7 @@ fn load_index_at(base: &Path) -> Result<StoreIndex> {
 }
 
 fn read_and_parse_index(path: &Path) -> Result<StoreIndex> {
-    let contents = fs::read_to_string(path) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let contents = sanitize::read_to_string_validated(path)
         .with_context(|| format!("read failed: {}", path.display()))?;
     serde_json::from_str(&contents).with_context(|| format!("parse failed: {}", path.display()))
 }
@@ -617,16 +238,30 @@ fn save_index_at(base: &Path, index: &StoreIndex) -> Result<()> {
     let json = serde_json::to_string_pretty(index).context("Failed to serialize index")?;
 
     // Best-effort: snapshot the previous index to `.bak` BEFORE the swap so a
-    // crash mid-write still leaves a recoverable copy. Errors here are logged
-    // but never block the save itself.
-    if path.exists() {
-        let bak = path.with_extension("json.bak");
-        let copy_result = fs::copy(&path, &bak); // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-        if let Err(err) = copy_result {
+    // crash mid-write still leaves a recoverable copy. Open the source once
+    // and stream from that FD to avoid path re-resolution between exists/copy.
+    let bak = path.with_extension("json.bak");
+    match fs::OpenOptions::new().read(true).open(&path) {
+        Ok(mut src) => {
+            let copy_result: Result<u64> = (|| {
+                let mut dst = sanitize::create_file_validated(&bak)?;
+                std::io::copy(&mut src, &mut dst)
+                    .with_context(|| format!("copy {} -> {}", path.display(), bak.display()))
+            })();
+            if let Err(err) = copy_result {
+                tracing::warn!(
+                    src = %path.display(),
+                    dst = %bak.display(),
+                    "failed to snapshot index to .bak before save: {err}"
+                );
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
             tracing::warn!(
                 src = %path.display(),
                 dst = %bak.display(),
-                "failed to snapshot index to .bak before save: {err}"
+                "failed to open index before .bak snapshot: {err}"
             );
         }
     }
@@ -710,6 +345,7 @@ pub struct StoreWriteSummary {
 #[derive(Debug, Clone, Default)]
 struct SessionWriteOutcome {
     written_paths: Vec<PathBuf>,
+    written_date_counts: BTreeMap<String, usize>,
     skipped_empty_body: usize,
     deduped_chunks: usize,
 }
@@ -830,6 +466,7 @@ pub fn write_context_session_first(
     chunker_config: &ChunkerConfig,
     kind: Option<Kind>,
 ) -> Result<Vec<PathBuf>> {
+    let mut sha_cache = DirShaCache::default();
     Ok(write_context_session_first_outcome_at(
         &canonical_store_dir()?,
         SessionWriteSpec {
@@ -841,6 +478,7 @@ pub fn write_context_session_first(
         },
         entries,
         chunker_config,
+        &mut sha_cache,
     )?
     .written_paths)
 }
@@ -852,7 +490,17 @@ fn write_context_session_first_at(
     entries: &[TimelineEntry],
     chunker_config: &ChunkerConfig,
 ) -> Result<Vec<PathBuf>> {
-    Ok(write_context_session_first_outcome_at(root, spec, entries, chunker_config)?.written_paths)
+    let mut sha_cache = DirShaCache::default();
+    Ok(
+        write_context_session_first_outcome_at(
+            root,
+            spec,
+            entries,
+            chunker_config,
+            &mut sha_cache,
+        )?
+        .written_paths,
+    )
 }
 
 fn write_context_session_first_outcome_at(
@@ -860,6 +508,7 @@ fn write_context_session_first_outcome_at(
     spec: SessionWriteSpec<'_>,
     entries: &[TimelineEntry],
     chunker_config: &ChunkerConfig,
+    sha_cache: &mut DirShaCache,
 ) -> Result<SessionWriteOutcome> {
     if entries.is_empty() {
         return Ok(SessionWriteOutcome::default());
@@ -871,7 +520,6 @@ fn write_context_session_first_outcome_at(
         .map(canonical_project_slug)
         .unwrap_or_else(|| NON_REPOSITORY_CONTEXTS.to_string());
     let chunks = chunker::chunk_entries(entries, &project_label, spec.agent, chunker_config);
-    let date_dir = compact_date(spec.date);
 
     let mut outcome = SessionWriteOutcome::default();
 
@@ -880,7 +528,13 @@ fn write_context_session_first_outcome_at(
             outcome.skipped_empty_body += 1;
             continue;
         }
-        let chunk_num = (idx as u32) + 1;
+        let chunk_date = if chunk.date.trim().is_empty() {
+            spec.date
+        } else {
+            chunk.date.as_str()
+        };
+        let date_dir = compact_date(chunk_date);
+        let chunk_num = chunk_sequence_from_id(&chunk.id).unwrap_or((idx as u32) + 1);
         let mut dir = root.join(&date_dir).join(kind.dir_name()).join(spec.agent);
         if spec.project.is_some() {
             dir = validated_store_project_dir(root, &project_label)?
@@ -890,10 +544,10 @@ fn write_context_session_first_outcome_at(
         }
         fs::create_dir_all(&dir)?;
 
-        let filename = session_basename(spec.date, spec.agent, spec.session_id, chunk_num);
+        let filename = session_basename(chunk_date, spec.agent, spec.session_id, chunk_num);
         let path = dir.join(&filename);
         let content_sha256 = content_sha256(&chunk.text);
-        if content_sha256_exists_in_dir(&dir, &content_sha256)? {
+        if sha_cache.contains(&dir, &content_sha256)? {
             outcome.deduped_chunks += 1;
             continue;
         }
@@ -904,24 +558,80 @@ fn write_context_session_first_outcome_at(
         // with a different `content_sha256`, disambiguate via a `-c{hex}`
         // suffix derived from the new content hash so the existing chunk is
         // never silently overwritten.
+        //
+        // Orphan handling (#20): if the `.md` is present but its `.meta.json`
+        // sidecar is missing, the prior two-phase write was killed between the
+        // two renames. The prior policy silently spawned a `-c<hash>` shadow
+        // and left the orphan in place forever, so the canonical basename was
+        // permanently shadowed and operators saw duplicate-looking chunks.
+        // Now we either reclaim the orphan (its on-disk body already matches
+        // the new chunk — just write the missing sidecar) or quarantine it
+        // (different body — move under `dir/quarantine/` so the canonical
+        // slot is free for the new pair).
         let target_path = if path.exists() {
             let existing_sidecar = path.with_extension("meta.json");
-            let existing_sha =
-                load_sidecar_from_path(&existing_sidecar).and_then(|s| s.content_sha256);
-            if existing_sha.as_deref() == Some(content_sha256.as_str()) {
-                outcome.deduped_chunks += 1;
-                continue;
+            if !existing_sidecar.exists() {
+                let orphan_sha = sha256_of_file(&path)?;
+                if orphan_sha == content_sha256 {
+                    let mut sidecar = chunker::ChunkMetadataSidecar::from(chunk);
+                    sidecar.content_sha256 = Some(content_sha256.clone());
+                    let sidecar_bytes = serde_json::to_vec_pretty(&sidecar)?;
+                    let sidecar_write = sanitize::validate_write_path(&existing_sidecar)?;
+                    atomic_write(&sidecar_write, &sidecar_bytes)?;
+                    sha_cache.insert(&dir, content_sha256);
+                    tracing::info!(
+                        target: "aicx::store",
+                        orphan = %path.display(),
+                        "reclaimed orphan chunk by writing missing sidecar"
+                    );
+                    outcome.deduped_chunks += 1;
+                    continue;
+                }
+                let quarantine_dir = dir.join("quarantine");
+                fs::create_dir_all(&quarantine_dir)?;
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("chunk");
+                let quar_path = quarantine_dir.join(format!("{}-orphan-{}.md", stem, stamp));
+                fs::rename(&path, &quar_path).with_context(|| {
+                    format!(
+                        "Failed to quarantine orphan {} -> {}",
+                        path.display(),
+                        quar_path.display()
+                    )
+                })?;
+                atomic_write::parent_fsync(&path);
+                atomic_write::parent_fsync(&quar_path);
+                tracing::warn!(
+                    target: "aicx::store",
+                    orphan = %path.display(),
+                    quarantine = %quar_path.display(),
+                    orphan_sha = %orphan_sha,
+                    new_sha = %content_sha256,
+                    "quarantined orphan .md (sidecar missing, body mismatch) to free canonical slot"
+                );
+                path
+            } else {
+                let existing_sha =
+                    load_sidecar_from_path(&existing_sidecar).and_then(|s| s.content_sha256);
+                if existing_sha.as_deref() == Some(content_sha256.as_str()) {
+                    outcome.deduped_chunks += 1;
+                    continue;
+                }
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("chunk");
+                let disambig =
+                    dir.join(format!("{}-c{}.md", stem, siphash13_hex6(&content_sha256)));
+                tracing::warn!(
+                    target: "aicx::store",
+                    existing = %path.display(),
+                    disambiguated = %disambig.display(),
+                    existing_sha = ?existing_sha,
+                    "session-first chunk basename collision; writing under disambiguated path"
+                );
+                disambig
             }
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("chunk");
-            let disambig = dir.join(format!("{}-c{}.md", stem, siphash13_hex6(&content_sha256)));
-            tracing::warn!(
-                target: "aicx::store",
-                existing = %path.display(),
-                disambiguated = %disambig.display(),
-                existing_sha = ?existing_sha,
-                "session-first chunk basename collision; writing under disambiguated path"
-            );
-            disambig
         } else {
             path
         };
@@ -931,7 +641,7 @@ fn write_context_session_first_outcome_at(
         let sidecar_write_path = sanitize::validate_write_path(&sidecar_path)?;
 
         let mut sidecar = chunker::ChunkMetadataSidecar::from(chunk);
-        sidecar.content_sha256 = Some(content_sha256);
+        sidecar.content_sha256 = Some(content_sha256.clone());
         let sidecar_bytes = serde_json::to_vec_pretty(&sidecar)?;
 
         // Two-phase commit: stage both tempfiles, then rename in order
@@ -955,6 +665,24 @@ fn write_context_session_first_outcome_at(
             atomic_write::discard_tempfile(&sidecar_tmp);
             return Err(err.into());
         }
+        // Mirror `atomic_write`'s parent-dir fsync (#21): the two-phase
+        // rename above goes through `commit_tempfile` directly, so
+        // `atomic_write::atomic_write` never gets to run its own
+        // post-rename sync. Without this, chunk + sidecar persistence on
+        // power-loss-sensitive filesystems was weaker than the contract
+        // used by every single-file `atomic_write` call. The two rename
+        // targets live in the same parent dir, so one fsync covers both;
+        // we add a defensive second call when paths diverge in unusual
+        // tests.
+        atomic_write::parent_fsync(&write_path);
+        if write_path.parent() != sidecar_write_path.parent() {
+            atomic_write::parent_fsync(&sidecar_write_path);
+        }
+        sha_cache.insert(&dir, content_sha256);
+        *outcome
+            .written_date_counts
+            .entry(date_dir.clone())
+            .or_default() += 1;
         outcome.written_paths.push(target_path);
     }
 
@@ -996,9 +724,67 @@ fn content_sha256(content: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn content_sha256_exists_in_dir(dir: &Path, content_sha256: &str) -> Result<bool> {
+/// Compute the SHA-256 of an on-disk file's contents in the same encoding
+/// as `content_sha256` (string-domain hash; matches sidecar
+/// `content_sha256` values). Used by orphan reclaim (#20) to compare the
+/// body of an orphan `.md` against the new chunk before deciding whether
+/// to reclaim or quarantine. This is a one-time-per-orphan cost outside
+/// the hot dedup path, so it is intentionally uncached.
+/// Stream-hash a file's bytes into a hex SHA-256, with an explicit
+/// 64 KiB read buffer and a hard 8 MiB cap (matching
+/// `sanitize::MAX_VALIDATED_BYTES`).
+///
+/// Rationale: the previous implementation called
+/// `sanitize::read_to_string_validated` which DOES have the same 8 MiB
+/// cap, but materialises the whole file in memory as a `String` before
+/// hashing. The gemini-code-assist MEDIUM PR #8 review noted the
+/// "reads entire file into memory" pattern even though the cap was in
+/// place. Streaming bytes through the hasher directly is just as bound
+/// (we check the cumulative byte count) and avoids the intermediate
+/// allocation. As a bonus it tolerates files that are not valid UTF-8
+/// — the hash still produces a deterministic result for any byte
+/// sequence, where the prior implementation would error on invalid
+/// UTF-8 in the orphan-reclaim path (#20).
+///
+/// This is a one-time-per-orphan cost outside the hot dedup path, so it
+/// is intentionally uncached.
+fn sha256_of_file(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let display_path = path.display().to_string();
+    let file = sanitize::open_file_validated(path)
+        .with_context(|| format!("Failed to open orphan chunk {}", display_path))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut total: usize = 0;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .with_context(|| format!("Failed to read orphan chunk {}", display_path))?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n);
+        if total > sanitize::MAX_VALIDATED_BYTES {
+            anyhow::bail!(
+                "Orphan chunk {} exceeds the {} byte read cap",
+                display_path,
+                sanitize::MAX_VALIDATED_BYTES
+            );
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn content_sha256_exists_in_dir(dir: &Path, content_sha256: &str) -> Result<bool> {
+    Ok(content_sha256s_in_dir(dir)?.contains(content_sha256))
+}
+
+fn content_sha256s_in_dir(dir: &Path) -> Result<HashSet<String>> {
+    let mut hashes = HashSet::new();
     if !dir.exists() {
-        return Ok(false);
+        return Ok(hashes);
     }
     for entry in read_store_dir(dir)?.filter_map(|entry| entry.ok()) {
         let path = entry.path();
@@ -1015,11 +801,33 @@ fn content_sha256_exists_in_dir(dir: &Path, content_sha256: &str) -> Result<bool
         let Some(sidecar) = load_sidecar_from_path(&path) else {
             continue;
         };
-        if sidecar.content_sha256.as_deref() == Some(content_sha256) {
-            return Ok(true);
+        if let Some(content_sha256) = sidecar.content_sha256 {
+            hashes.insert(content_sha256);
         }
     }
-    Ok(false)
+    Ok(hashes)
+}
+
+#[derive(Debug, Default)]
+struct DirShaCache {
+    by_dir: HashMap<PathBuf, HashSet<String>>,
+}
+
+impl DirShaCache {
+    fn contains(&mut self, dir: &Path, sha: &str) -> Result<bool> {
+        let hashes = match self.by_dir.entry(dir.to_path_buf()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(content_sha256s_in_dir(dir)?),
+        };
+        Ok(hashes.contains(sha))
+    }
+
+    fn insert(&mut self, dir: &Path, sha: String) {
+        self.by_dir
+            .entry(dir.to_path_buf())
+            .or_default()
+            .insert(sha);
+    }
 }
 
 pub fn store_semantic_segments(
@@ -1044,22 +852,55 @@ pub fn store_semantic_segments_at<F>(
     base: &Path,
     entries: &[TimelineEntry],
     chunker_config: &ChunkerConfig,
+    progress: F,
+) -> Result<StoreWriteSummary>
+where
+    F: FnMut(usize, usize),
+{
+    if entries.is_empty() {
+        return Ok(StoreWriteSummary::default());
+    }
+    let segments = semantic_segments(entries);
+    store_segments_at(base, &segments, chunker_config, progress)
+}
+
+/// Write pre-computed [`SemanticSegment`]s to the canonical store. This
+/// is the underlying primitive — callers that already paid for
+/// segmentation (e.g. the CLI's phased pipeline that emits a
+/// `segment`-phase heartbeat before the first `.md` write) reuse those
+/// segments here instead of re-segmenting from raw entries.
+pub fn store_segments_at<F>(
+    base: &Path,
+    segments: &[SemanticSegment],
+    chunker_config: &ChunkerConfig,
     mut progress: F,
 ) -> Result<StoreWriteSummary>
 where
     F: FnMut(usize, usize),
 {
     let mut summary = StoreWriteSummary::default();
-    if entries.is_empty() {
+    if segments.is_empty() {
         return Ok(summary);
     }
 
     let _lock = crate::locks::acquire_exclusive(base.join("locks").join("index.lock"))?;
-    let segments = semantic_segments(entries);
     let total_segments = segments.len();
-    let mut index = load_index_at(base)?;
+    // Save-on-drop RAII guard (#26): `index.json` used to be persisted
+    // only at the end of the loop, so Ctrl+C / panic between the first
+    // segment write and the loop tail left the on-disk index out of sync
+    // with newly-stored chunks. The guard wraps the in-memory index and
+    // calls `save_index_at` on every code path — successful completion
+    // sets `persisted = true` so `Drop` becomes a no-op, and any early
+    // return (`?`) or panic fires `Drop`, which writes the index
+    // opportunistically before the surrounding lock is released.
+    let mut guard = IndexSaveGuard {
+        base,
+        index: load_index_at(base)?,
+        persisted: false,
+    };
+    let mut sha_cache = DirShaCache::default();
 
-    for (segment_idx, segment) in segments.into_iter().enumerate() {
+    for (segment_idx, segment) in segments.iter().enumerate() {
         let date = segment
             .entries
             .first()
@@ -1067,29 +908,140 @@ where
             .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
         let project = canonical_project_slug(&segment.project_label());
 
-        let outcome = write_semantic_segment_at(base, &segment, &date, chunker_config)?;
+        let outcome =
+            write_semantic_segment_at(base, segment, &date, chunker_config, &mut sha_cache)?;
         summary.skipped_empty_body += outcome.skipped_empty_body;
         summary.deduped_chunks += outcome.deduped_chunks;
-        update_index(
-            &mut index,
-            &project,
-            &segment.agent,
-            &compact_date(&date),
-            segment.entries.len(),
-        );
+
+        // Two separate counters with two separate semantics:
+        //
+        // 1. `summary.total_entries` and `summary.project_summary` are
+        //    "this run processed N entries through the pipeline" —
+        //    used by CLI/JSON output that operators (and the
+        //    `runtime_cli_store_contract` test) expect to reflect the
+        //    full pipeline cost, regardless of whether the chunks
+        //    landed on disk or were dedup-skipped.
+        //
+        // 2. `update_index(...)` writes the on-disk-truth counter to
+        //    `index.json`. THAT one is proportional to chunks actually
+        //    written, so a `--full-rescan` over an already-stored
+        //    corpus doesn't pump the index counter on every run when
+        //    `write_context_session_first_outcome_at` short-circuits
+        //    every chunk on content_sha256 dedup. This is the
+        //    bug #1 fix from PR #7 — index reflects what's on disk,
+        //    not what the pipeline touched.
+        //
+        // Earlier in PR #7 these two semantics were collapsed (both
+        // proportional) which broke the contract test
+        // `store_cli_defaults_to_incremental_and_full_rescan_recovers_backfill`.
+        let chunks_written = outcome.written_paths.len();
+        let chunks_total = chunks_written + outcome.deduped_chunks + outcome.skipped_empty_body;
+        let entries_committed_to_disk = if chunks_total == 0 || chunks_written == 0 {
+            0
+        } else {
+            // Round-half-up integer division so a one-chunk-written
+            // segment doesn't truncate to 0 entries.
+            (segment.entries.len() * chunks_written + chunks_total / 2) / chunks_total
+        };
+
+        // Pipeline-processed counter (full segment entry count) —
+        // operator-facing CLI/JSON output + project_summary breakdown.
         *summary
             .project_summary
-            .entry(project)
+            .entry(project.clone())
             .or_default()
             .entry(segment.agent.clone())
             .or_insert(0) += segment.entries.len();
         summary.total_entries += segment.entries.len();
+
+        // On-disk-truth counter (proportional to chunks actually
+        // written) — `index.json` only.
+        if entries_committed_to_disk > 0 {
+            if outcome.written_date_counts.is_empty() {
+                update_index(
+                    &mut guard.index,
+                    &project,
+                    &segment.agent,
+                    &compact_date(&date),
+                    entries_committed_to_disk,
+                );
+            } else {
+                let total_written: usize = outcome.written_date_counts.values().sum();
+                let mut remaining_entries = entries_committed_to_disk;
+                let mut remaining_dates = outcome.written_date_counts.len();
+                for (date, chunks_for_date) in &outcome.written_date_counts {
+                    let entry_count = if remaining_dates == 1 {
+                        remaining_entries
+                    } else {
+                        let proportional =
+                            entries_committed_to_disk * chunks_for_date / total_written;
+                        let count = proportional.max(1).min(remaining_entries);
+                        remaining_entries = remaining_entries.saturating_sub(count);
+                        remaining_dates -= 1;
+                        count
+                    };
+                    update_index(
+                        &mut guard.index,
+                        &project,
+                        &segment.agent,
+                        date,
+                        entry_count,
+                    );
+                }
+            }
+        }
         summary.written_paths.extend(outcome.written_paths);
         progress(segment_idx + 1, total_segments);
     }
 
-    save_index_at(base, &index)?;
+    save_index_at(base, &guard.index)?;
+    guard.persisted = true;
     Ok(summary)
+}
+
+/// RAII save-on-drop guard for the in-memory store index (#26).
+///
+/// Holds the index by value while `store_segments_at` mutates it. On
+/// successful completion the caller sets `persisted = true` after a
+/// regular `save_index_at` and `Drop` becomes a no-op; on any early
+/// return (error `?`) or panic the `Drop` impl persists the index
+/// opportunistically so Ctrl+C / mid-loop failure does not leave disk
+/// out of sync. Write errors during `Drop` are logged (best-effort);
+/// `Drop` cannot itself return a `Result`.
+struct IndexSaveGuard<'a> {
+    base: &'a Path,
+    index: StoreIndex,
+    persisted: bool,
+}
+
+impl Drop for IndexSaveGuard<'_> {
+    fn drop(&mut self) {
+        if self.persisted {
+            return;
+        }
+        match save_index_at(self.base, &self.index) {
+            Ok(()) => {
+                tracing::warn!(
+                    target: "aicx::store",
+                    base = %self.base.display(),
+                    "store_segments_at returned early; index.json persisted opportunistically via IndexSaveGuard::drop"
+                );
+            }
+            Err(err) => {
+                // `Drop` cannot return; tracing may itself be torn down
+                // during a panic so we also fall back to stderr.
+                tracing::error!(
+                    target: "aicx::store",
+                    base = %self.base.display(),
+                    "IndexSaveGuard::drop failed to persist index.json: {err:#}"
+                );
+                eprintln!(
+                    "aicx: IndexSaveGuard::drop failed to persist index.json at {}: {err:#}",
+                    self.base.display()
+                );
+            }
+        }
+    }
 }
 
 fn write_semantic_segment_at(
@@ -1097,6 +1049,7 @@ fn write_semantic_segment_at(
     segment: &SemanticSegment,
     date: &str,
     chunker_config: &ChunkerConfig,
+    sha_cache: &mut DirShaCache,
 ) -> Result<SessionWriteOutcome> {
     // Only assertable identities (Primary/Secondary) earn canonical store placement.
     // Fallback/Opaque/None route to non-repository-contexts.
@@ -1122,6 +1075,7 @@ fn write_semantic_segment_at(
         },
         &segment.entries,
         chunker_config,
+        sha_cache,
     )
 }
 
@@ -1173,10 +1127,7 @@ pub fn scan_context_files_project_at(
 
 pub fn scan_context_files_raw_at(base: &Path) -> Result<Vec<StoredContextFile>> {
     let base = sanitize::validate_dir_path(base)?;
-    let ignore = StoreIgnoreMatcher {
-        base: base.clone(),
-        rules: Vec::new(),
-    };
+    let ignore = StoreIgnoreMatcher::empty_at(&base);
     scan_context_files_with_ignore(&base, &ignore)
 }
 
@@ -1221,7 +1172,12 @@ pub fn context_files_since(
 
 fn read_store_dir(path: &Path) -> Result<fs::ReadDir> {
     let validated = sanitize::validate_dir_path(path)?;
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    // FP: `pub fn validate_dir_path(path: &Path) -> Result<PathBuf>`
+    // (crates/aicx-parser/src/sanitize.rs:302) delegates to
+    // `validate_read_path(path: &Path)` (line 215), which rejects traversal,
+    // canonicalizes the directory, and checks the allowed-base policy before
+    // returning the canonical path used here.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- FP: validate_dir_path(Path) at crates/aicx-parser/src/sanitize.rs:302 -> validate_read_path(Path) at line 215 canonicalizes and enforces allowed-base policy.
     fs::read_dir(&validated)
         .with_context(|| format!("Failed to read store dir {}", validated.display()))
 }
@@ -1333,13 +1289,29 @@ fn context_files_since_at(
     cutoff: SystemTime,
     project_filter: Option<&str>,
 ) -> Result<Vec<StoredContextFile>> {
-    let filter = project_filter.map(|value| value.to_ascii_lowercase());
+    // Strict project filter via `project_filter_matches` (same
+    // semantics as `aicx search`, `aicx store -p ...` etc.) so the
+    // `refs`/MCP/since paths don't leak `-p vista` into `vista-portal`,
+    // `vista-datasets`, etc. `StoredContextFile.project` is the
+    // canonical `<org>/<repo>` slug (or the non-repo bucket name for
+    // entries without a resolved repo identity); split on '/' to feed
+    // the org+repo pair into the matcher.
+    let filter = project_filter
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let cutoff_date = DateTime::<Utc>::from(cutoff).format("%Y-%m-%d").to_string();
     let mut files = scan_context_files_at(base)?;
     files.retain(|file| {
-        let matches_project = filter
-            .as_ref()
-            .is_none_or(|needle| file.project.to_ascii_lowercase().contains(needle));
+        let matches_project = match filter {
+            None => true,
+            Some(f) => {
+                let (org, repo) = file
+                    .project
+                    .split_once('/')
+                    .unwrap_or(("", file.project.as_str()));
+                project_filter_matches(org, repo, f)
+            }
+        };
         // Discovery recency is anchored to the canonical chunk date encoded in the
         // store layout, not filesystem mtime which can drift during migration/copy.
         let matches_cutoff = file.date_iso >= cutoff_date;
@@ -1383,7 +1355,7 @@ pub fn sidecar_path_for_chunk(chunk_path: &Path) -> PathBuf {
 
 fn load_sidecar_from_path(sidecar_path: &Path) -> Option<chunker::ChunkMetadataSidecar> {
     let sidecar_path = sanitize::validate_read_path(sidecar_path).ok()?;
-    let content = fs::read_to_string(&sidecar_path).ok()?;
+    let content = sanitize::read_to_string_validated(&sidecar_path).ok()?;
     serde_json::from_str(&content).ok()
 }
 
@@ -1411,7 +1383,7 @@ pub struct ContextCorpusIngestSummary {
     pub index_path: PathBuf,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ContextCorpusIndexRow {
     id: String,
     path: String,
@@ -1424,6 +1396,13 @@ struct ContextCorpusIndexRow {
 }
 
 pub fn ingest_loct_context_pack(pack_dir: &Path) -> Result<ContextCorpusIngestSummary> {
+    ingest_loct_context_pack_into(pack_dir, None)
+}
+
+fn ingest_loct_context_pack_into(
+    pack_dir: &Path,
+    home: Option<&Path>,
+) -> Result<ContextCorpusIngestSummary> {
     let pack_dir = sanitize::validate_dir_path(pack_dir)?;
     let raw_dir = pack_dir.join("raw");
     let sidecars_dir = pack_dir.join("sidecars");
@@ -1468,19 +1447,63 @@ pub fn ingest_loct_context_pack(pack_dir: &Path) -> Result<ContextCorpusIngestSu
         anyhow::bail!("loct context pack contains no raw/*.md chunks");
     }
 
+    // Bug #34: reject mixed-project packs before any chunk lands on disk.
+    // The legacy code took (org, repo) from the FIRST sidecar and assumed
+    // every other record belonged there; a packaging mistake silently
+    // routed records into the wrong project bucket.
     let (org, repo) = context_corpus_repo_from_sidecar(&items[0].2)?;
+    let first_sidecar_path = items[0].1.clone();
+    if let Some((offender_path, offender_org, offender_repo)) =
+        items.iter().skip(1).find_map(|(_, sidecar_path, sidecar)| {
+            context_corpus_repo_from_sidecar(sidecar)
+                .ok()
+                .and_then(|(other_org, other_repo)| {
+                    (other_org != org || other_repo != repo).then_some((
+                        sidecar_path.clone(),
+                        other_org,
+                        other_repo,
+                    ))
+                })
+        })
+    {
+        anyhow::bail!(
+            "loct context pack {} mixes projects: first sidecar {} declares {}/{}, but sidecar {} declares {}/{}",
+            pack_dir.display(),
+            first_sidecar_path.display(),
+            org,
+            repo,
+            offender_path.display(),
+            offender_org,
+            offender_repo,
+        );
+    }
     let date = items[0].2.date.clone();
     let batch = pack_dir
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("batch");
-    let target = aicx_context_corpus_dir(&org, &repo, &date, batch)?;
+    let target = match home {
+        Some(home) => aicx_context_corpus_dir_for(home, &org, &repo, &date, batch)?,
+        None => aicx_context_corpus_dir(&org, &repo, &date, batch)?,
+    };
     let target_raw = target.join("raw");
     let target_sidecars = target.join("sidecars");
     let index_path = target.join("index.jsonl");
 
     let mut seen_hashes = context_corpus_hashes_in_dir(&target_sidecars)?;
-    let mut index_rows = Vec::new();
+
+    // Bug #35: index.jsonl was unconditionally truncated on re-ingest,
+    // erasing rows for chunks the second pack didn't re-present. Load
+    // the existing manifest, then merge new rows by id so the on-disk
+    // index always contains the union of previously-stored + newly-
+    // ingested chunks.
+    let mut index_rows = read_context_corpus_index_rows(&index_path)?;
+    let mut id_to_pos: HashMap<String, usize> = index_rows
+        .iter()
+        .enumerate()
+        .map(|(idx, row)| (row.id.clone(), idx))
+        .collect();
+
     let mut summary = ContextCorpusIngestSummary {
         target_dir: target.clone(),
         index_path: index_path.clone(),
@@ -1509,13 +1532,17 @@ pub fn ingest_loct_context_pack(pack_dir: &Path) -> Result<ContextCorpusIngestSu
                 .unwrap_or(&sidecar.id)
         ));
 
-        fs::copy(&raw_path, sanitize::validate_write_path(&raw_target)?)?;
+        let mut raw_src = sanitize::open_file_validated(&raw_path)?;
+        let mut raw_dst = sanitize::create_file_validated(&raw_target)?;
+        io::copy(&mut raw_src, &mut raw_dst)?;
+        raw_dst.flush()?;
+        raw_dst.sync_all()?;
         let mut file = sanitize::create_file_validated(&sidecar_target)?;
         file.write_all(serde_json::to_vec_pretty(&sidecar)?.as_slice())?;
         summary.raw_written += 1;
         summary.sidecars_written += 1;
 
-        index_rows.push(ContextCorpusIndexRow {
+        let row = ContextCorpusIndexRow {
             id: sidecar.id.clone(),
             path: raw_target.display().to_string(),
             artifact_family: sidecar.artifact_family.clone(),
@@ -1530,7 +1557,14 @@ pub fn ingest_loct_context_pack(pack_dir: &Path) -> Result<ContextCorpusIngestSu
             keywords: sidecar.keywords.clone(),
             band: sidecar.frame_kind.map(|kind| kind.as_str().to_string()),
             content_sha256: sidecar.content_sha256.clone(),
-        });
+        };
+        match id_to_pos.get(&row.id).copied() {
+            Some(idx) => index_rows[idx] = row,
+            None => {
+                id_to_pos.insert(row.id.clone(), index_rows.len());
+                index_rows.push(row);
+            }
+        }
     }
 
     write_context_corpus_index(&index_path, &index_rows)?;
@@ -1624,11 +1658,40 @@ fn context_corpus_hashes_in_dir(sidecars_dir: &Path) -> Result<HashMap<String, S
 }
 
 fn write_context_corpus_index(path: &Path, rows: &[ContextCorpusIndexRow]) -> Result<()> {
-    let mut writer = sanitize::create_file_validated(path)?;
+    let mut buf = Vec::with_capacity(rows.len() * 256);
     for row in rows {
-        writeln!(writer, "{}", serde_json::to_string(row)?)?;
+        serde_json::to_writer(&mut buf, row)?;
+        buf.push(b'\n');
     }
+    // Atomic rename keeps the manifest crash-consistent: readers either
+    // see the prior full index or the new full index, never a partial
+    // truncation. Required by bug #35's preservation contract.
+    atomic_write(path, &buf)
+        .map_err(|err| anyhow!("write context corpus index {}: {}", path.display(), err))?;
     Ok(())
+}
+
+fn read_context_corpus_index_rows(path: &Path) -> Result<Vec<ContextCorpusIndexRow>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = sanitize::read_to_string_validated(path)?;
+    let mut rows = Vec::new();
+    for (line_no, raw_line) in content.lines().enumerate() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let row: ContextCorpusIndexRow = serde_json::from_str(trimmed).with_context(|| {
+            format!(
+                "parse context corpus index row at {}:{}",
+                path.display(),
+                line_no + 1
+            )
+        })?;
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 /// Find stored chunks whose sidecar metadata matches a run ID.
@@ -1643,14 +1706,21 @@ fn chunks_by_run_id_at(
     project: Option<&str>,
     cutoff: SystemTime,
 ) -> Result<Vec<StoredContextFile>> {
-    let filter = project.map(|value| value.to_ascii_lowercase());
+    let project_filter = project.map(str::trim).filter(|value| !value.is_empty());
     let cutoff_date = DateTime::<Utc>::from(cutoff).format("%Y-%m-%d").to_string();
     let mut matched = Vec::new();
 
     for file in scan_context_files_at(base)? {
-        let matches_project = filter
-            .as_ref()
-            .is_none_or(|needle| file.project.to_ascii_lowercase().contains(needle));
+        let matches_project = match project_filter {
+            None => true,
+            Some(f) => {
+                let (org, repo) = file
+                    .project
+                    .split_once('/')
+                    .unwrap_or(("", file.project.as_str()));
+                project_filter_matches(org, repo, f)
+            }
+        };
         let matches_cutoff = file.date_iso >= cutoff_date;
 
         if !matches_project || !matches_cutoff {
@@ -1734,6 +1804,10 @@ fn scan_repo_store(
 
 /// Decide whether `<organization>/<repository>` matches a single `-p` filter.
 ///
+/// This is intentionally public: integration tests and downstream callers use
+/// it as the canonical project-filter contract, so signature or semantic changes
+/// are public API changes.
+///
 /// Semantics (case-insensitive throughout):
 /// - `-p owner/repo` → strict `<owner>/<repo>` slug equality.
 /// - `-p owner/` → every repo under this owner (org wildcard).
@@ -1744,7 +1818,7 @@ fn scan_repo_store(
 /// no longer matched `vista-portal`, `VistaBrain`, `vista-datasets`, etc.
 /// Operators get the same effect with `-p vetcoders/Vista -p vetcoders/vista-portal …`
 /// when they really mean a list.
-pub(crate) fn project_filter_matches(organization: &str, repository: &str, filter: &str) -> bool {
+pub fn project_filter_matches(organization: &str, repository: &str, filter: &str) -> bool {
     let filter = filter.trim();
     if filter.is_empty() {
         return false;
@@ -2076,12 +2150,26 @@ fn parse_session_basename(name: &str, agent: &str, date_compact: &str) -> Option
         return None;
     }
 
-    if chunk_str.len() != 3 || !chunk_str.chars().all(|ch| ch.is_ascii_digit()) {
+    let chunk = parse_chunk_component(chunk_str)?;
+    Some((session_id.to_string(), chunk))
+}
+
+fn parse_chunk_component(value: &str) -> Option<u32> {
+    let digits = match value.split_once("-c") {
+        Some((digits, suffix))
+            if suffix.len() == 6 && suffix.chars().all(|ch| ch.is_ascii_hexdigit()) =>
+        {
+            digits
+        }
+        Some(_) => return None,
+        None => value,
+    };
+
+    if digits.len() < 3 || !digits.chars().all(|ch| ch.is_ascii_digit()) {
         return None;
     }
 
-    let chunk = chunk_str.parse().ok()?;
-    Some((session_id.to_string(), chunk))
+    digits.parse().ok()
 }
 
 pub fn expand_compact_date(compact: &str) -> String {
@@ -2379,7 +2467,7 @@ fn run_migration_at(
     let manifest =
         build_migration_manifest_at(&normalized_legacy_root, store_root, dry_run, &items);
     if !dry_run {
-        write_migration_artifacts(&manifest)?;
+        write_migration_artifacts(store_root, &manifest)?;
     }
 
     Ok(manifest)
@@ -2406,23 +2494,15 @@ fn build_migration_manifest_at(
     }
 }
 
-fn write_migration_artifacts(manifest: &MigrationManifest) -> Result<()> {
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let manifest_path = PathBuf::from(&manifest.manifest_path);
-    if let Some(parent) = manifest_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let manifest_json = serde_json::to_string_pretty(manifest)?;
+fn write_migration_artifacts(store_root: &Path, manifest: &MigrationManifest) -> Result<()> {
+    let manifest_path = migration_manifest_path(store_root);
     let manifest_path = sanitize::validate_write_path(&manifest_path)?;
+    let manifest_json = serde_json::to_string_pretty(manifest)?;
     atomic_write(&manifest_path, manifest_json.as_bytes())?;
 
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-    let report_path = PathBuf::from(&manifest.report_path);
-    if let Some(parent) = report_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let report = render_migration_report(manifest);
+    let report_path = migration_report_path(store_root);
     let report_path = sanitize::validate_write_path(&report_path)?;
+    let report = render_migration_report(manifest);
     atomic_write(&report_path, report.as_bytes())?;
 
     Ok(())
@@ -3167,8 +3247,9 @@ fn preserve_legacy_item(
             fs::create_dir_all(parent)?;
         }
         let destination = sanitize::validate_write_path(&destination)?;
-        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
-        fs::copy(legacy_file, &destination)?;
+        let mut src = sanitize::open_file_validated(&legacy_file)?;
+        let mut dst = sanitize::create_file_validated(&destination)?;
+        std::io::copy(&mut src, &mut dst)?;
         preserved.push(destination);
     }
 
@@ -3408,18 +3489,182 @@ mod tests {
     use filetime::{FileTime, set_file_mtime};
     use std::env;
 
-    #[test]
-    fn test_store_base_dir() {
-        if let Ok(path) = store_base_dir() {
-            assert!(path.to_string_lossy().contains(".aicx"));
+    // ──────────────────────────────────────────────────────────────────
+    // AICX-home / store-base / chunks-dir contract tests.
+    //
+    // The legacy tests asserted `path.contains(".aicx")` which was a
+    // literal-pattern relic from before `$AICX_HOME` override existed.
+    // Under any pinned `AICX_HOME` (e.g. the operator's
+    // `AICX_HOME=/Users/silver/aicx`) those asserts silently failed and
+    // accumulated as "pre-existing baseline failures" — pass-4
+    // operator-agent + operator agreed that is exactly the anti-pattern
+    // we refuse to ship.
+    //
+    // Replacement strategy (pass-4):
+    //   * `store_base_dir_for` / `chunks_dir_for` / `state_path_for`
+    //     are pure functions tested with explicit paths — parallel-safe,
+    //     deterministic, no env touched.
+    //   * `resolve_aicx_home` is tested under a process-wide Mutex
+    //     because env reads are global; the Mutex pattern keeps the two
+    //     env-touching tests serialized within `cargo test` without
+    //     pulling in a `serial_test` dependency.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Shared lock for tests that mutate `$AICX_HOME`. `Mutex<()>` is
+    /// const-constructible in modern Rust so no `Lazy` machinery is
+    /// needed. We always recover from poisoning via `into_inner()` —
+    /// a panicking test still leaves the env in a known shape because
+    /// every env-touching test restores via a [`Drop`] guard.
+    static AICX_HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: restores `$AICX_HOME` to its prior value (or unset
+    /// state) when dropped. Used by env-resolution tests so panics do
+    /// not leak global env mutations into sibling tests.
+    struct AicxHomeEnvGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl AicxHomeEnvGuard {
+        fn capture() -> Self {
+            Self {
+                prev: env::var_os("AICX_HOME"),
+            }
+        }
+    }
+
+    impl Drop for AicxHomeEnvGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                // SAFETY: `set_var` / `remove_var` are `unsafe` from Rust
+                // 2024 because they race against other threads reading
+                // env. The `AICX_HOME_ENV_LOCK` Mutex guarantees we hold
+                // exclusive access for the duration of the test +
+                // restore, so the race window is closed.
+                Some(value) => unsafe { env::set_var("AICX_HOME", value) },
+                None => unsafe { env::remove_var("AICX_HOME") },
+            }
         }
     }
 
     #[test]
-    fn test_chunks_dir() {
-        if let Ok(path) = chunks_dir() {
-            assert!(path.to_string_lossy().contains(".aicx"));
-            assert!(path.to_string_lossy().contains("chunks"));
+    fn test_store_base_dir_for_is_identity_on_explicit_home() {
+        let home = PathBuf::from("/tmp/test-aicx-base");
+        assert_eq!(store_base_dir_for(&home), home);
+    }
+
+    #[test]
+    fn test_chunks_dir_for_lives_under_home_and_named_chunks() {
+        let home = PathBuf::from("/tmp/test-aicx-chunks");
+        let chunks = chunks_dir_for(&home);
+        assert!(
+            chunks.starts_with(&home),
+            "chunks_dir_for should live under home; got {chunks:?}"
+        );
+        assert_eq!(
+            chunks.file_name().and_then(|n| n.to_str()),
+            Some("chunks"),
+            "chunks_dir_for should end with `chunks`; got {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_aicx_home_honors_explicit_env_var() {
+        let _serial = AICX_HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = AicxHomeEnvGuard::capture();
+        // SAFETY: lock is held; sibling env-touching tests cannot race.
+        unsafe { env::set_var("AICX_HOME", "/tmp/test-aicx-resolve") };
+        let resolved = resolve_aicx_home().expect("resolve_aicx_home should succeed");
+        assert_eq!(resolved, PathBuf::from("/tmp/test-aicx-resolve"));
+    }
+
+    #[test]
+    fn test_resolve_aicx_home_falls_back_to_dot_aicx_when_env_unset() {
+        let _serial = AICX_HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = AicxHomeEnvGuard::capture();
+        // SAFETY: lock is held; sibling env-touching tests cannot race.
+        unsafe { env::remove_var("AICX_HOME") };
+        let resolved = resolve_aicx_home().expect("resolve_aicx_home should succeed");
+        assert!(
+            resolved.ends_with(".aicx"),
+            "default home should end with .aicx; got {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_aicx_home_treats_empty_env_var_as_unset() {
+        let _serial = AICX_HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = AicxHomeEnvGuard::capture();
+        // SAFETY: lock is held; sibling env-touching tests cannot race.
+        unsafe { env::set_var("AICX_HOME", "") };
+        let resolved = resolve_aicx_home().expect("resolve_aicx_home should succeed");
+        assert!(
+            resolved.ends_with(".aicx"),
+            "empty AICX_HOME should fall back to ~/.aicx; got {resolved:?}"
+        );
+    }
+
+    /// Integration guard: every canonical-root resolver in the workspace
+    /// must agree on `$AICX_HOME` when it is pinned. Covers the split-brain
+    /// regression (bugs #25 + #40) where seven sites still hard-coded
+    /// `dirs::home_dir().join(".aicx")` while `store_base_dir` honored the
+    /// env override. If a future change re-introduces that drift this test
+    /// flips red.
+    #[test]
+    fn test_canonical_resolvers_agree_on_pinned_home() {
+        let _serial = AICX_HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _guard = AicxHomeEnvGuard::capture();
+        let pinned = PathBuf::from("/tmp/test-aicx-canonical-agree");
+        // SAFETY: lock is held; sibling env-touching tests cannot race.
+        unsafe { env::set_var("AICX_HOME", &pinned) };
+
+        // 1. The resolver itself.
+        let resolved = resolve_aicx_home().expect("resolver should succeed");
+        assert_eq!(resolved, pinned, "resolve_aicx_home mismatch");
+
+        // 2. corpus::default_roots — first entry routes through resolver.
+        let roots = crate::corpus::default_roots().expect("corpus roots should succeed");
+        assert_eq!(
+            roots.first(),
+            Some(&pinned),
+            "corpus::default_roots[0] should equal pinned AICX_HOME; got {roots:?}"
+        );
+
+        // 3. aicx-embeddings::config::config_search_paths — every
+        //    AICX-rooted candidate must live under the pinned root. The
+        //    `AICX_EMBEDDER_CONFIG` override is ignored here because it is
+        //    a separate operator escape hatch, not an AICX_HOME consumer.
+        //    Gated on the embedder feature flags that pull in the crate.
+        #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+        {
+            let search_paths = aicx_embeddings::config_search_paths();
+            let aicx_rooted: Vec<_> = search_paths
+                .iter()
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|name| name == "config.toml" || name == "embedder.toml")
+                })
+                .collect();
+            assert!(
+                !aicx_rooted.is_empty(),
+                "config_search_paths should include AICX-rooted candidates"
+            );
+            for path in &aicx_rooted {
+                assert!(
+                    path.starts_with(&pinned),
+                    "config_search_paths candidate {} should live under pinned AICX_HOME {}",
+                    path.display(),
+                    pinned.display()
+                );
+            }
         }
     }
 
@@ -3586,6 +3831,7 @@ mod tests {
                 message: "hello world".to_string(),
                 branch: None,
                 cwd: None,
+                timestamp_source: None,
                 frame_kind: None,
             },
             TimelineEntry {
@@ -3596,6 +3842,7 @@ mod tests {
                 message: "hi there\nsecond line".to_string(),
                 branch: None,
                 cwd: None,
+                timestamp_source: None,
                 frame_kind: None,
             },
         ];
@@ -3701,6 +3948,7 @@ mod tests {
             message: message.to_string(),
             branch: None,
             cwd: None,
+            timestamp_source: None,
             frame_kind: None,
         }
     }
@@ -3952,6 +4200,7 @@ mod tests {
             message: "---\nrun_id: mrbl-001\nprompt_id: api-redesign_20260327\nmodel: gpt-5.4\nstarted_at: 2026-03-27T10:00:00Z\ncompleted_at: 2026-03-27T10:01:00Z\ntoken_usage: 1234\nfindings_count: 4\nframe_kind: agent_reply\nphase: implement\nmode: session-first\nskill_code: vc-workflow\nframework_version: 2026-03\n---\n## Findings\nTelemetry wiring landed.\n".to_string(),
             branch: None,
             cwd: None,
+            timestamp_source: None,
             frame_kind: None,
         }];
 
@@ -4030,6 +4279,7 @@ mod tests {
             message: "   \n\t".to_string(),
             branch: None,
             cwd: None,
+            timestamp_source: None,
             frame_kind: Some(crate::timeline::FrameKind::InternalThought),
         }];
 
@@ -4070,6 +4320,7 @@ mod tests {
             message: message.to_string(),
             branch: None,
             cwd: cwd.map(ToOwned::to_owned),
+            timestamp_source: None,
             frame_kind: None,
         }
     }
@@ -4152,6 +4403,75 @@ mod tests {
     }
 
     #[test]
+    fn store_semantic_segments_uses_chunk_date_for_multi_day_sessions() {
+        let root = retrieval_test_root("multi-day-chunk-date");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let entries = vec![
+            semantic_entry(
+                (2026, 3, 21, 23, 59, 0),
+                "sess-multiday",
+                "assistant",
+                "Day one answer with enough signal to become a stored chunk.",
+                None,
+            ),
+            semantic_entry(
+                (2026, 3, 22, 0, 1, 0),
+                "sess-multiday",
+                "assistant",
+                "Day two answer from the same session must land under its own date.",
+                None,
+            ),
+        ];
+
+        let summary =
+            store_semantic_segments_at(&root, &entries, &ChunkerConfig::default(), |_, _| {})
+                .expect("store semantic segments");
+
+        let day_one = root
+            .join(NON_REPOSITORY_CONTEXTS)
+            .join("2026_0321")
+            .join("conversations")
+            .join("codex")
+            .join("2026_0321_codex_sess-multiday_001.md");
+        let day_two = root
+            .join(NON_REPOSITORY_CONTEXTS)
+            .join("2026_0322")
+            .join("conversations")
+            .join("codex")
+            .join("2026_0322_codex_sess-multiday_001.md");
+
+        assert!(
+            summary.written_paths.contains(&day_one),
+            "first day's chunk must use its own date path"
+        );
+        assert!(
+            summary.written_paths.contains(&day_two),
+            "second day's chunk must use chunk.date, not the segment's first date"
+        );
+        assert!(
+            !summary.written_paths.iter().any(|path| {
+                path.file_name().and_then(|name| name.to_str())
+                    == Some("2026_0321_codex_sess-multiday_002.md")
+            }),
+            "multi-day chunks must not be globally renumbered into the first date"
+        );
+
+        let day_one = day_one.canonicalize().unwrap();
+        let day_two = day_two.canonicalize().unwrap();
+        let scanned = scan_context_files_at(&root).expect("scan stored files");
+        assert!(scanned.iter().any(|file| {
+            file.path == day_one && file.date_iso == "2026-03-21" && file.chunk == 1
+        }));
+        assert!(scanned.iter().any(|file| {
+            file.path == day_two && file.date_iso == "2026-03-22" && file.chunk == 1
+        }));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn test_store_semantic_segments_reports_progress_per_segment() {
         let root = retrieval_test_root("segmentation-progress");
         let _ = fs::remove_dir_all(&root);
@@ -4220,6 +4540,183 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn store_segments_does_not_pump_index_when_rerun_dedupes_everything() {
+        // Regression guard for the bug #1 fix: `index.json` previously
+        // pumped on every `--full-rescan` even when content_sha256
+        // dedup short-circuited every chunk. Lock the split semantics:
+        //
+        // - `summary.total_entries` and `summary.project_summary` are
+        //   PIPELINE-PROCESSED counts (full segment.entries.len()) —
+        //   they reflect what the run touched, not what landed on disk.
+        //   This preserves the `runtime_cli_store_contract` test's
+        //   expectation that a `--full-rescan` reports re-processed
+        //   entries even when everything dedups.
+        //
+        // - `index.json` totals are ON-DISK-TRUTH (proportional to
+        //   `outcome.written_paths.len()`) — a dedup-only re-run
+        //   contributes ZERO to the index counter, so the on-disk
+        //   stat doesn't inflate on every rescan.
+        let root = retrieval_test_root("store-segments-rerun-dedup");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let entries = vec![
+            semantic_entry(
+                (2026, 4, 1, 10, 0, 0),
+                "sess-x",
+                "user",
+                "First message in a tracked conversation.",
+                None,
+            ),
+            semantic_entry(
+                (2026, 4, 1, 10, 1, 0),
+                "sess-x",
+                "assistant",
+                "Reply that exercises canonical chunking output.",
+                None,
+            ),
+        ];
+
+        let first =
+            store_semantic_segments_at(&root, &entries, &ChunkerConfig::default(), |_, _| {})
+                .expect("first store");
+        assert!(
+            !first.written_paths.is_empty(),
+            "first run must actually write something"
+        );
+        assert_eq!(
+            first.total_entries,
+            entries.len(),
+            "first run records every entry (no dedup on a fresh store)"
+        );
+        assert_eq!(
+            first.deduped_chunks, 0,
+            "first run cannot dedup against an empty store"
+        );
+
+        // Snapshot index.total_entries after the first run for the
+        // post-rerun comparison below.
+        let index_after_first = load_index_at(&root).expect("load index after first");
+        let total_after_first: usize = index_after_first
+            .projects
+            .values()
+            .flat_map(|p| p.agents.values())
+            .map(|a| a.total_entries)
+            .sum();
+        assert_eq!(total_after_first, entries.len());
+
+        // Re-run with the same entries. Every chunk's content_sha256
+        // is already on disk, so `write_context_session_first_outcome_at`
+        // increments `deduped_chunks` instead of producing a new path.
+        let second =
+            store_semantic_segments_at(&root, &entries, &ChunkerConfig::default(), |_, _| {})
+                .expect("second store");
+        assert!(
+            second.written_paths.is_empty(),
+            "second run must not write any new files when every chunk dedups"
+        );
+        assert!(
+            second.deduped_chunks >= 1,
+            "second run must report dedup hits (got {})",
+            second.deduped_chunks
+        );
+        // `total_entries` is pipeline-processed (what the run touched),
+        // so a dedup-only re-run still reports the full segment count —
+        // this matches `runtime_cli_store_contract`'s contract that
+        // `--full-rescan` shows re-processed entries even when
+        // everything dedups.
+        assert_eq!(
+            second.total_entries,
+            entries.len(),
+            "second run reports full pipeline-processed entry count even when everything dedups"
+        );
+
+        let index_after_second = load_index_at(&root).expect("load index after second");
+        let total_after_second: usize = index_after_second
+            .projects
+            .values()
+            .flat_map(|p| p.agents.values())
+            .map(|a| a.total_entries)
+            .sum();
+        assert_eq!(
+            total_after_second, total_after_first,
+            "index.json.total_entries must not grow on a full-rescan that produced zero new chunks"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn write_dir_sha_cache_test_sidecar(dir: &Path, stem: &str, sha: &str) {
+        fs::create_dir_all(dir).unwrap();
+        let path = dir.join(format!("{stem}.meta.json"));
+        let sidecar = serde_json::json!({
+            "id": stem,
+            "project": "VetCoders/aicx",
+            "agent": "claude",
+            "date": "2026-05-22",
+            "session_id": "dir-sha-cache-test",
+            "kind": "reports",
+            "content_sha256": sha,
+        });
+        fs::write(path, serde_json::to_vec_pretty(&sidecar).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn test_dir_sha_cache_contains_after_insert() {
+        let root = retrieval_test_root("dir-sha-cache-insert");
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("store").join("VetCoders").join("aicx");
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut cache = DirShaCache::default();
+        assert!(!cache.contains(&dir, "sha-after-insert").unwrap());
+        cache.insert(&dir, "sha-after-insert".to_string());
+        assert!(cache.contains(&dir, "sha-after-insert").unwrap());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_dir_sha_cache_lazy_population() {
+        let root = retrieval_test_root("dir-sha-cache-lazy");
+        let _ = fs::remove_dir_all(&root);
+        let dir = root.join("store").join("VetCoders").join("aicx");
+        write_dir_sha_cache_test_sidecar(&dir, "old", "sha-old");
+
+        let mut cache = DirShaCache::default();
+        assert!(cache.contains(&dir, "sha-old").unwrap());
+
+        write_dir_sha_cache_test_sidecar(&dir, "new", "sha-new");
+        assert!(
+            !cache.contains(&dir, "sha-new").unwrap(),
+            "cache must not rescan a dir after first lazy population"
+        );
+
+        cache.insert(&dir, "sha-new".to_string());
+        assert!(cache.contains(&dir, "sha-new").unwrap());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_dir_sha_cache_does_not_cross_dirs() {
+        let root = retrieval_test_root("dir-sha-cache-dir-isolation");
+        let _ = fs::remove_dir_all(&root);
+        let left = root.join("store").join("VetCoders").join("aicx");
+        let right = root.join("store").join("Loctree").join("aicx");
+        write_dir_sha_cache_test_sidecar(&left, "left", "sha-left");
+        write_dir_sha_cache_test_sidecar(&right, "right", "sha-right");
+
+        let mut cache = DirShaCache::default();
+        assert!(cache.contains(&left, "sha-left").unwrap());
+        assert!(!cache.contains(&left, "sha-right").unwrap());
+        assert!(cache.contains(&right, "sha-right").unwrap());
+        assert!(!cache.contains(&right, "sha-left").unwrap());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     // ================================================================
     // Repo-centric retrieval tests
     // ================================================================
@@ -4278,6 +4775,54 @@ mod tests {
             file.repo.as_ref().unwrap().slug(),
             "VetCoders/ai-contexters"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_and_read_accept_four_digit_and_collision_suffix_chunks() {
+        let root = retrieval_test_root("wide-seq-and-collision-scan");
+        let _ = fs::remove_dir_all(&root);
+
+        let chunk_dir = root
+            .join("store")
+            .join("VetCoders")
+            .join("aicx")
+            .join("2026_0321")
+            .join("conversations")
+            .join("claude");
+        let four_digit = chunk_dir.join("2026_0321_claude_sess-big_1000.md");
+        let collision = chunk_dir.join("2026_0321_claude_sess-collide_022-cabcdef.md");
+        write_chunk_file(&four_digit, "Chunk one thousand must remain discoverable.");
+        write_chunk_file(
+            &collision,
+            "Collision-disambiguated chunk must remain readable.",
+        );
+        let four_digit = four_digit.canonicalize().unwrap();
+        let collision = collision.canonicalize().unwrap();
+
+        let scanned = scan_context_files_at(&root).expect("scan should succeed");
+        assert_eq!(
+            scanned.len(),
+            2,
+            "scanner must not drop valid writer output"
+        );
+        assert!(scanned.iter().any(|file| {
+            file.path == four_digit && file.session_id == "sess-big" && file.chunk == 1000
+        }));
+        assert!(scanned.iter().any(|file| {
+            file.path == collision && file.session_id == "sess-collide" && file.chunk == 22
+        }));
+
+        let by_four_digit = read_context_chunk_at(&root, four_digit.to_str().unwrap(), Some(32))
+            .expect("absolute _1000 path should read");
+        assert_eq!(by_four_digit.chunk, 1000);
+        assert!(by_four_digit.truncated);
+
+        let by_collision = read_context_chunk_at(&root, collision.to_str().unwrap(), None)
+            .expect("absolute -cHASH path should read");
+        assert_eq!(by_collision.chunk, 22);
+        assert_eq!(by_collision.session_id, "sess-collide");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -4550,6 +5095,124 @@ mod tests {
                 .and_then(|name| name.to_str())
                 .unwrap(),
             "2026_0331_claude_sess-new_001.md"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn context_files_since_does_not_leak_substring_into_neighbor_repos() {
+        // Regression guard: `context_files_since_at` previously filtered
+        // by `file.project.contains(needle)`, so `-p vista` returned
+        // entries from `vista-portal` AND `vista-datasets`. We migrated
+        // to the strict `project_filter_matches` matcher; lock that in.
+        let root = retrieval_test_root("context-files-no-substring-leak");
+        let _ = fs::remove_dir_all(&root);
+
+        let vista = root
+            .join("store")
+            .join("VetCoders")
+            .join("vista")
+            .join("2026_0401")
+            .join("reports")
+            .join("claude")
+            .join("2026_0401_claude_sess-vista_001.md");
+        let vista_portal = root
+            .join("store")
+            .join("VetCoders")
+            .join("vista-portal")
+            .join("2026_0401")
+            .join("reports")
+            .join("claude")
+            .join("2026_0401_claude_sess-portal_001.md");
+        write_chunk_file(&vista, "vista canonical chunk");
+        write_chunk_file(&vista_portal, "vista-portal canonical chunk");
+
+        let cutoff: SystemTime = Utc.with_ymd_and_hms(2026, 3, 30, 0, 0, 0).unwrap().into();
+        let files = context_files_since_at(&root, cutoff, Some("vista"))
+            .expect("strict filter should succeed");
+
+        // Exactly one file matches `-p vista` (the literal `vista`
+        // repo); `vista-portal` must NOT slip in via substring match.
+        assert_eq!(files.len(), 1, "got {files:?}");
+        assert!(
+            files[0]
+                .path
+                .to_string_lossy()
+                .contains("/vista/2026_0401/"),
+            "expected vista hit, got {:?}",
+            files[0].path
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn chunks_by_run_id_does_not_leak_substring_into_neighbor_repos() {
+        // Regression: `chunks_by_run_id_at` previously matched `-p vista`
+        // against `vista-portal`, `vista-datasets`, etc. via substring.
+        // Keep it aligned with strict `project_filter_matches` semantics.
+        let root = retrieval_test_root("chunks-by-run-id-no-substring-leak");
+        let _ = fs::remove_dir_all(&root);
+
+        let run_id = "just-122007-20901";
+        let vista = root
+            .join("store")
+            .join("VetCoders")
+            .join("vista")
+            .join("2026_0401")
+            .join("reports")
+            .join("claude")
+            .join("2026_0401_claude_sess-vista_001.md");
+        let vista_portal = root
+            .join("store")
+            .join("VetCoders")
+            .join("vista-portal")
+            .join("2026_0401")
+            .join("reports")
+            .join("claude")
+            .join("2026_0401_claude_sess-portal_001.md");
+        write_chunk_file(&vista, "vista run chunk");
+        write_chunk_file(&vista_portal, "vista-portal run chunk");
+        write_text(
+            &vista.with_extension("meta.json"),
+            &serde_json::json!({
+                "id": "vista-run",
+                "project": "VetCoders/vista",
+                "agent": "claude",
+                "date": "2026-04-01",
+                "session_id": "sess-vista",
+                "kind": "reports",
+                "run_id": run_id
+            })
+            .to_string(),
+        );
+        write_text(
+            &vista_portal.with_extension("meta.json"),
+            &serde_json::json!({
+                "id": "vista-portal-run",
+                "project": "VetCoders/vista-portal",
+                "agent": "claude",
+                "date": "2026-04-01",
+                "session_id": "sess-portal",
+                "kind": "reports",
+                "run_id": run_id
+            })
+            .to_string(),
+        );
+
+        let cutoff: SystemTime = Utc.with_ymd_and_hms(2026, 3, 30, 0, 0, 0).unwrap().into();
+        let files = chunks_by_run_id_at(&root, run_id, Some("vista"), cutoff)
+            .expect("strict run-id project filter should succeed");
+
+        assert_eq!(files.len(), 1, "got {files:?}");
+        assert!(
+            files[0]
+                .path
+                .to_string_lossy()
+                .contains("/vista/2026_0401/"),
+            "expected vista hit, got {:?}",
+            files[0].path
         );
 
         let _ = fs::remove_dir_all(&root);
@@ -5102,6 +5765,7 @@ mod tests {
             message: message.to_string(),
             branch: None,
             cwd: None,
+            timestamp_source: None,
             frame_kind: None,
         }
     }
@@ -5427,5 +6091,553 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // ================================================================
+    // W-C-6 durability cluster (#20 / #21 / #26)
+    // ================================================================
+
+    #[test]
+    fn test_two_phase_write_parent_fsync_on_rename() {
+        // The two-phase `.md + .meta.json` write path must mirror
+        // `atomic_write`'s post-rename parent fsync (#21). The helper
+        // itself is best-effort and swallows errors, so we exercise the
+        // contract end-to-end: a successful two-phase write must produce
+        // BOTH renamed targets, AND `atomic_write::parent_fsync` must be
+        // callable on the same parent without panicking or returning.
+        let root = retrieval_test_root("two-phase-parent-fsync");
+        let _ = fs::remove_dir_all(&root);
+
+        let sid = "sess-fsync";
+        let ts = Utc.with_ymd_and_hms(2026, 5, 22, 9, 0, 0).unwrap();
+        let entries = vec![session_first_entry(
+            ts,
+            "claude",
+            sid,
+            "## Findings\nFsync contract — both renames must commit.\n",
+        )];
+
+        let written = write_context_session_first_at(
+            &root.join("store"),
+            SessionWriteSpec {
+                project: Some("VetCoders/aicx"),
+                agent: "claude",
+                date: "2026-05-22",
+                session_id: sid,
+                kind: Some(Kind::Reports),
+            },
+            &entries,
+            &ChunkerConfig::default(),
+        )
+        .expect("two-phase write");
+
+        assert_eq!(written.len(), 1);
+        let chunk_path = &written[0];
+        let sidecar_path = chunk_path.with_extension("meta.json");
+        assert!(chunk_path.exists(), ".md must land");
+        assert!(sidecar_path.exists(), ".meta.json must land");
+
+        // The helper must exist, be public, and be a no-panic best-effort
+        // call on a real path. (Detecting the actual fsync syscall is a
+        // kernel-level concern outside unit-test scope; what we CAN
+        // guarantee is that the contract is wired up to the same helper
+        // `atomic_write::atomic_write` uses.)
+        atomic_write::parent_fsync(chunk_path);
+        atomic_write::parent_fsync(&sidecar_path);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_orphan_md_reclaimed_not_shadowed() {
+        // Simulate the crash that #20 is about: a prior two-phase write
+        // committed the `.md` but was killed before the sidecar rename.
+        // The next run with identical chunk content used to silently
+        // spawn a `-c<hash>.md` shadow next to the orphan, leaving the
+        // canonical slot permanently shadowed.
+        //
+        // After the fix, the orphan body matches the new chunk so we
+        // reclaim it: write the missing sidecar, count the chunk as
+        // deduped, leave no shadow sibling.
+        let root = retrieval_test_root("orphan-reclaim");
+        let _ = fs::remove_dir_all(&root);
+
+        let sid = "sess-orphan";
+        let ts = Utc.with_ymd_and_hms(2026, 5, 22, 10, 0, 0).unwrap();
+        let body =
+            "## Findings\nOrphan reclaim probe — body must match across the simulated crash.\n";
+        let entries = vec![session_first_entry(ts, "claude", sid, body)];
+
+        let first = write_context_session_first_at(
+            &root.join("store"),
+            SessionWriteSpec {
+                project: Some("VetCoders/aicx"),
+                agent: "claude",
+                date: "2026-05-22",
+                session_id: sid,
+                kind: Some(Kind::Reports),
+            },
+            &entries,
+            &ChunkerConfig::default(),
+        )
+        .expect("seed write");
+        assert_eq!(first.len(), 1);
+        let chunk_path = first[0].clone();
+        let sidecar_path = chunk_path.with_extension("meta.json");
+        assert!(sidecar_path.exists(), "seed must produce a sidecar");
+
+        // Simulate the killed-between-renames state: keep the `.md`,
+        // delete the sidecar. This is the exact orphan shape #20 was
+        // diagnosed as.
+        fs::remove_file(&sidecar_path).unwrap();
+        assert!(chunk_path.exists());
+        assert!(!sidecar_path.exists());
+
+        let second = write_context_session_first_at(
+            &root.join("store"),
+            SessionWriteSpec {
+                project: Some("VetCoders/aicx"),
+                agent: "claude",
+                date: "2026-05-22",
+                session_id: sid,
+                kind: Some(Kind::Reports),
+            },
+            &entries,
+            &ChunkerConfig::default(),
+        )
+        .expect("reclaim write");
+
+        // The reclaim path treats the chunk as deduped — no new path is
+        // returned — but the missing sidecar must be back.
+        assert!(
+            second.is_empty(),
+            "reclaim must dedupe, not produce a new write path; got {second:?}"
+        );
+        assert!(
+            sidecar_path.exists(),
+            "orphan reclaim must restore the missing sidecar"
+        );
+
+        // No `-c<hash>` shadow sibling must exist next to the canonical
+        // basename — that was the silent-shadow bug.
+        let dir = chunk_path.parent().unwrap();
+        let stem = chunk_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("chunk stem");
+        let shadow_prefix = format!("{}-c", stem);
+        let shadows: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with(&shadow_prefix) && n.ends_with(".md")
+            })
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            shadows.is_empty(),
+            "must not write `-c<hash>` shadow when orphan body matches; found {shadows:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_store_segments_at_index_persists_on_drop() {
+        // Save-on-drop guard (#26): if `store_segments_at` returns early
+        // (error / panic / Ctrl+C) after mutating the in-memory index,
+        // `Drop` must persist what was mutated. We drive the guard
+        // directly (the type is private to this module) because injecting
+        // a panic inside `store_segments_at` would require a control
+        // hook this code intentionally does not expose. The guard's
+        // contract is the load-bearing piece.
+        let root = retrieval_test_root("index-save-on-drop");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let index_path = root.join("index.json");
+        assert!(
+            !index_path.exists(),
+            "fresh root must not have index.json yet"
+        );
+
+        {
+            let mut index = StoreIndex::default();
+            update_index(&mut index, "VetCoders/aicx", "claude", "2026_0522", 5);
+            let _guard = IndexSaveGuard {
+                base: &root,
+                index,
+                persisted: false,
+            };
+            // Drop fires here — `persisted = false`, so the guard
+            // must `save_index_at` opportunistically.
+        }
+
+        assert!(
+            index_path.exists(),
+            "IndexSaveGuard::drop must persist index.json on early return"
+        );
+        let loaded = read_and_parse_index(&index_path).expect("re-read persisted index");
+        let agent = loaded
+            .projects
+            .get("VetCoders/aicx")
+            .and_then(|p| p.agents.get("claude"))
+            .expect("persisted index must contain the partial state");
+        assert_eq!(agent.total_entries, 5);
+        assert!(agent.dates.iter().any(|d| d == "2026_0522"));
+
+        // Sanity: when `persisted = true` the guard becomes a no-op and
+        // does not overwrite a hand-tuned post-finalize file.
+        let sentinel_bytes = fs::read(&index_path).unwrap();
+        {
+            let mut index = StoreIndex::default();
+            update_index(&mut index, "VetCoders/other", "codex", "2026_0522", 99);
+            let _guard = IndexSaveGuard {
+                base: &root,
+                index,
+                persisted: true,
+            };
+        }
+        let after = fs::read(&index_path).unwrap();
+        assert_eq!(
+            after, sentinel_bytes,
+            "persisted=true must skip the Drop save"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Bug #34: loct context pack homogeneity validation.
+    // Pre-ingest check rejects packs whose sidecars declare more than
+    // one (org, repo) tuple, before any chunk hits disk. Homogeneous
+    // packs are unaffected (covered by tests/e2e_context_pack_ingest.rs).
+    // ──────────────────────────────────────────────────────────────────
+
+    fn unique_pack_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        env::temp_dir().join(format!(
+            "aicx-pack-consistency-{name}-{}-{nanos}",
+            std::process::id(),
+        ))
+    }
+
+    fn write_pack_sidecar(pack: &Path, stem: &str, project: &str, date: &str) {
+        let raw = pack.join("raw").join(format!("{stem}.md"));
+        let sidecar = pack.join("sidecars").join(format!("{stem}.json"));
+        fs::create_dir_all(raw.parent().unwrap()).unwrap();
+        fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        fs::write(
+            &raw,
+            format!(
+                "[project: {project} | agent: loct-context-pack | date: {date}]\n\n[signals]\nDecision:\n- [decision] test\n[/signals]\n",
+            ),
+        )
+        .unwrap();
+        let body = serde_json::json!({
+            "id": stem,
+            "project": project,
+            "agent": "loct-context-pack",
+            "date": date,
+            "session_id": stem,
+            "kind": "reports",
+            "artifact_family": "loct-context-pack",
+            "schema_version": "context_corpus.v1",
+            "truth_status": {
+                "role": "example",
+                "runtime_authoritative": false,
+                "stale_against_current_head": false,
+            },
+        });
+        fs::write(&sidecar, body.to_string()).unwrap();
+    }
+
+    #[test]
+    fn ingest_loct_context_pack_rejects_mixed_projects() {
+        let pack = unique_pack_dir("mixed");
+        write_pack_sidecar(&pack, "alpha", "VetCoders/aicx", "2026-05-08");
+        write_pack_sidecar(&pack, "beta", "Loctree/aicx", "2026-05-08");
+
+        let err = ingest_loct_context_pack(&pack)
+            .expect_err("mixed-project pack must fail pre-ingest validation");
+        let message = format!("{err:#}");
+
+        // Names both project tuples.
+        assert!(
+            message.contains("VetCoders/aicx") || message.contains("vetcoders/aicx"),
+            "error should name first project tuple; got {message}"
+        );
+        assert!(
+            message.contains("Loctree/aicx") || message.contains("loctree/aicx"),
+            "error should name offending project tuple; got {message}"
+        );
+        // Names at least one offending sidecar path.
+        assert!(
+            message.contains("beta.json"),
+            "error should name offending sidecar path; got {message}"
+        );
+        // Explicit "mixes projects" framing.
+        assert!(
+            message.contains("mixes projects"),
+            "error should use the mixes-projects framing; got {message}"
+        );
+
+        let _ = fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn ingest_loct_context_pack_rejects_empty_pack() {
+        let pack = unique_pack_dir("empty");
+        fs::create_dir_all(pack.join("raw")).unwrap();
+        fs::create_dir_all(pack.join("sidecars")).unwrap();
+
+        let err = ingest_loct_context_pack(&pack)
+            .expect_err("pack with no raw/*.md chunks must fail pre-ingest validation");
+        let message = format!("{err:#}");
+        // Distinct failure mode from mixed-projects (#34 brief edge call).
+        assert!(
+            message.contains("no raw/*.md chunks"),
+            "empty pack must surface the empty-pack failure mode, not 'mixes projects'; got {message}"
+        );
+        assert!(
+            !message.contains("mixes projects"),
+            "empty pack must not be reported as mixed-projects; got {message}"
+        );
+
+        let _ = fs::remove_dir_all(&pack);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Bug #35: re-ingest must preserve index.jsonl rows.
+    // Previously the index was truncated and rewritten with only the
+    // NEW rows from the second pack, dropping the manifest entries for
+    // chunks that were stored by the first pack. The fix merges new
+    // rows into the loaded set by id and atomic-writes the union.
+    // ──────────────────────────────────────────────────────────────────
+
+    fn unique_ingest_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        env::temp_dir().join(format!(
+            "aicx-index-preserve-{name}-{}-{nanos}",
+            std::process::id(),
+        ))
+    }
+
+    fn reset_pack_dir(pack: &Path) {
+        let _ = fs::remove_dir_all(pack);
+        fs::create_dir_all(pack.join("raw")).unwrap();
+        fs::create_dir_all(pack.join("sidecars")).unwrap();
+    }
+
+    fn write_pack_chunk(pack: &Path, stem: &str, project: &str, date: &str, body: &str) {
+        let raw = pack.join("raw").join(format!("{stem}.md"));
+        let sidecar = pack.join("sidecars").join(format!("{stem}.json"));
+        fs::create_dir_all(raw.parent().unwrap()).unwrap();
+        fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        let raw_content = format!(
+            "[project: {project} | agent: loct-context-pack | date: {date}]\n\n[signals]\nDecision:\n- [decision] {body}\n[/signals]\n",
+        );
+        fs::write(&raw, raw_content).unwrap();
+        let sidecar_body = serde_json::json!({
+            "id": stem,
+            "project": project,
+            "agent": "loct-context-pack",
+            "date": date,
+            "session_id": stem,
+            "kind": "reports",
+            "artifact_family": "loct-context-pack",
+            "schema_version": "context_corpus.v1",
+            "truth_status": {
+                "role": "example",
+                "runtime_authoritative": false,
+                "stale_against_current_head": false,
+            },
+        });
+        fs::write(&sidecar, sidecar_body.to_string()).unwrap();
+    }
+
+    fn read_index_ids(index_path: &Path) -> Vec<String> {
+        let raw = fs::read_to_string(index_path).expect("index.jsonl readable");
+        raw.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let value: serde_json::Value =
+                    serde_json::from_str(line).expect("index row is valid json");
+                value["id"]
+                    .as_str()
+                    .expect("index row has string id")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn with_temp_ingest_home<F: FnOnce(&Path)>(label: &str, body: F) {
+        let aicx_home = unique_ingest_dir(label);
+        fs::create_dir_all(&aicx_home).unwrap();
+        body(&aicx_home);
+        let _ = fs::remove_dir_all(&aicx_home);
+    }
+
+    #[test]
+    fn ingest_loct_context_pack_preserves_rows_for_subset_reingest() {
+        with_temp_ingest_home("subset", |home| {
+            let pack = unique_ingest_dir("subset-pack").join("batch-alpha");
+            reset_pack_dir(&pack);
+            write_pack_chunk(
+                &pack,
+                "alpha",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "first chunk",
+            );
+            write_pack_chunk(
+                &pack,
+                "beta",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "second chunk",
+            );
+            let first = ingest_loct_context_pack_into(&pack, Some(home)).expect("first ingest");
+            let first_ids = read_index_ids(&first.index_path);
+            assert_eq!(first_ids.len(), 2);
+            assert!(first_ids.iter().any(|id| id == "alpha"));
+            assert!(first_ids.iter().any(|id| id == "beta"));
+
+            // The second pack only re-presents alpha. The old bug rewrote
+            // index.jsonl from the second batch and dropped beta.
+            reset_pack_dir(&pack);
+            write_pack_chunk(
+                &pack,
+                "alpha",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "first chunk",
+            );
+
+            let second = ingest_loct_context_pack_into(&pack, Some(home)).expect("second ingest");
+            assert_eq!(second.deduped_chunks, 1, "alpha is content-identical");
+            assert_eq!(
+                second.raw_written, 0,
+                "no brand-new chunks in subset re-ingest"
+            );
+            let second_ids = read_index_ids(&second.index_path);
+            assert_eq!(second_ids.len(), 2);
+            assert!(second_ids.iter().any(|id| id == "alpha"));
+            assert!(
+                second_ids.iter().any(|id| id == "beta"),
+                "index.jsonl must preserve chunks not re-presented by the second pack"
+            );
+
+            let _ = fs::remove_dir_all(pack.parent().unwrap());
+        });
+    }
+
+    #[test]
+    fn ingest_loct_context_pack_preserves_rows_for_identical_reingest() {
+        with_temp_ingest_home("identical", |home| {
+            let pack = unique_ingest_dir("identical-pack").join("batch-alpha");
+            reset_pack_dir(&pack);
+            write_pack_chunk(
+                &pack,
+                "alpha",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "first chunk",
+            );
+            write_pack_chunk(
+                &pack,
+                "beta",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "second chunk",
+            );
+            let first = ingest_loct_context_pack_into(&pack, Some(home)).expect("first ingest");
+            assert_eq!(read_index_ids(&first.index_path).len(), 2);
+
+            reset_pack_dir(&pack);
+            write_pack_chunk(
+                &pack,
+                "alpha",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "first chunk",
+            );
+            write_pack_chunk(
+                &pack,
+                "beta",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "second chunk",
+            );
+
+            let second = ingest_loct_context_pack_into(&pack, Some(home)).expect("second ingest");
+            assert_eq!(
+                second.deduped_chunks, 2,
+                "both chunks are content-identical"
+            );
+            assert_eq!(
+                second.raw_written, 0,
+                "identical re-ingest writes no new raw chunks"
+            );
+            let second_ids = read_index_ids(&second.index_path);
+            assert_eq!(second_ids.len(), 2);
+            assert!(second_ids.iter().any(|id| id == "alpha"));
+            assert!(second_ids.iter().any(|id| id == "beta"));
+
+            let _ = fs::remove_dir_all(pack.parent().unwrap());
+        });
+    }
+
+    #[test]
+    fn ingest_loct_context_pack_unions_old_and_new_on_reingest() {
+        with_temp_ingest_home("union", |home| {
+            let pack = unique_ingest_dir("union-pack").join("batch-alpha");
+            reset_pack_dir(&pack);
+            write_pack_chunk(
+                &pack,
+                "alpha",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "first chunk",
+            );
+            let first = ingest_loct_context_pack_into(&pack, Some(home)).expect("first ingest");
+            let first_ids = read_index_ids(&first.index_path);
+            assert_eq!(first_ids, vec!["alpha".to_string()]);
+
+            // Second pack carries the same alpha chunk plus a brand-new
+            // gamma chunk; the union must include both.
+            reset_pack_dir(&pack);
+            write_pack_chunk(
+                &pack,
+                "alpha",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "first chunk",
+            );
+            write_pack_chunk(
+                &pack,
+                "gamma",
+                "VetCoders/aicx",
+                "2026-05-08",
+                "third chunk",
+            );
+
+            let second = ingest_loct_context_pack_into(&pack, Some(home)).expect("second ingest");
+            assert_eq!(second.deduped_chunks, 1, "alpha is content-identical");
+            assert_eq!(second.raw_written, 1, "gamma is brand-new");
+            let second_ids = read_index_ids(&second.index_path);
+            assert_eq!(second_ids.len(), 2);
+            assert!(second_ids.iter().any(|id| id == "alpha"));
+            assert!(second_ids.iter().any(|id| id == "gamma"));
+
+            let _ = fs::remove_dir_all(pack.parent().unwrap());
+        });
     }
 }

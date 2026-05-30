@@ -1,10 +1,10 @@
 use std::env;
 use std::fs;
-#[cfg(feature = "gguf")]
+use std::io::{self, Read};
 use std::path::Path;
 use std::path::PathBuf;
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     BackendPreference, EmbeddingConfig, EmbeddingProfile, EmbeddingProfileSpec,
@@ -127,20 +127,127 @@ pub fn resolve_model(cfg: &EmbeddingConfig) -> ResolvedEmbeddingModel {
     }
 }
 
-pub fn config_search_paths() -> Vec<PathBuf> {
-    // Order = priority. The first existing file is loaded; later paths
-    // are fallbacks. Canonical `config.toml` outranks legacy
-    // `embedder.toml` so operators migrating to the new schema see their
-    // changes immediately.
-    let mut out = Vec::new();
-    if let Some(path) = env_string("AICX_EMBEDDER_CONFIG") {
-        out.push(PathBuf::from(path));
+/// Which precedence branch a config path came from. Lets the CLI
+/// (`aicx config show`) name the winning branch without grepping the
+/// resolved path back through the precedence list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// `$AICX_EMBEDDER_CONFIG` env override.
+    Env,
+    /// Canonical `<aicx_home>/config.toml`.
+    Canonical,
+    /// Legacy `<aicx_home>/embedder.toml`.
+    Legacy,
+}
+
+impl ConfigSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ConfigSource::Env => "env",
+            ConfigSource::Canonical => "canonical",
+            ConfigSource::Legacy => "legacy",
+        }
     }
-    if let Some(home) = dirs::home_dir() {
-        out.push(home.join(".aicx").join("config.toml")); // canonical, highest priority
-        out.push(home.join(".aicx").join("embedder.toml")); // legacy fallback
+}
+
+pub fn config_search_paths() -> Vec<PathBuf> {
+    config_search_paths_with_source()
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect()
+}
+
+/// Same precedence as [`config_search_paths`] but each candidate is
+/// tagged with the branch it came from. Order = priority; the first
+/// existing file wins.
+///
+/// Root resolution mirrors `aicx::store::resolve_aicx_home`: `$AICX_HOME`
+/// wins when set+non-empty, otherwise `~/.aicx`. Duplicated locally
+/// because aicx-embeddings is a leaf crate (the main `aicx` crate
+/// depends on it, not the other way around) and we deliberately avoid
+/// pulling the full crate just to share one 4-line resolver.
+pub fn config_search_paths_with_source() -> Vec<(PathBuf, ConfigSource)> {
+    build_search_paths(
+        env_string("AICX_EMBEDDER_CONFIG").as_deref(),
+        aicx_home_root().as_deref(),
+    )
+}
+
+/// Return the first candidate from [`config_search_paths_with_source`]
+/// that actually exists on disk. `None` means no file was found and the
+/// embedder runs on built-in defaults.
+pub fn effective_config_source() -> Option<(PathBuf, ConfigSource)> {
+    config_search_paths_with_source()
+        .into_iter()
+        .find(|(path, _)| path.exists())
+}
+
+/// Pure builder behind the env-reading public helpers. Kept separate so
+/// tests can exercise all four precedence branches without mutating
+/// process-global env vars.
+fn build_search_paths(
+    env_override: Option<&str>,
+    aicx_home: Option<&Path>,
+) -> Vec<(PathBuf, ConfigSource)> {
+    let mut out = Vec::new();
+    if let Some(path) = env_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        out.push((PathBuf::from(path), ConfigSource::Env));
+    }
+    if let Some(root) = aicx_home {
+        out.push((root.join("config.toml"), ConfigSource::Canonical));
+        out.push((root.join("embedder.toml"), ConfigSource::Legacy));
     }
     out
+}
+
+/// Local mirror of `aicx::store::resolve_aicx_home`. Returns the resolved
+/// AICX home: `$AICX_HOME` when set + non-empty, otherwise `~/.aicx`.
+fn aicx_home_root() -> Option<PathBuf> {
+    match std::env::var_os("AICX_HOME") {
+        Some(value) if !value.is_empty() => Some(PathBuf::from(value)),
+        _ => dirs::home_dir().map(|home| home.join(".aicx")),
+    }
+}
+
+/// Hard upper bound for the embedder config file size. Realistic
+/// `config.toml` files are < 4 KiB; 1 MiB is ~250× that and still small
+/// enough that an accidental / hostile giant blob (e.g. a log rotated
+/// onto the config path, a binary mistakenly renamed) cannot OOM the
+/// embedder during startup. Bug #39.
+pub(crate) const CONFIG_FILE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Bounded replacement for `fs::read_to_string` on the embedder config
+/// path. Reads up to `max_bytes + 1` so cap-hits are observable without
+/// allocating the rest of the file. On cap-hit returns
+/// `io::ErrorKind::FileTooLarge` so the caller can log at a higher level
+/// than generic IO errors. Bug #39.
+///
+/// `path` comes from `config_search_paths()` — an internal resolver that
+/// returns canonical `$AICX_HOME/config.toml`, `$AICX_HOME/embedder.toml`,
+/// or `$AICX_EMBEDDER_CONFIG` (operator-controlled env). It is not user
+/// input in the path-traversal sense, but we still open via explicit
+/// `OpenOptions::new().read(true)` to match the codebase's
+/// pass-3 hardening pattern (see commits `9682007` and `095c988`).
+pub(crate) fn read_config_file_capped(path: &Path, max_bytes: u64) -> io::Result<String> {
+    let file = fs::OpenOptions::new().read(true).open(path)?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!(
+                "embedder config '{}' exceeds {}-byte cap (read ≥ {} bytes; refusing to load)",
+                path.display(),
+                max_bytes,
+                bytes.len()
+            ),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
 fn load_config_file() -> Option<crate::NativeEmbedderConfigSection> {
@@ -148,8 +255,17 @@ fn load_config_file() -> Option<crate::NativeEmbedderConfigSection> {
         if !path.exists() {
             continue;
         }
-        let raw = match fs::read_to_string(&path) {
+        let raw = match read_config_file_capped(&path, CONFIG_FILE_MAX_BYTES) {
             Ok(raw) => raw,
+            Err(err) if err.kind() == io::ErrorKind::FileTooLarge => {
+                warn!(
+                    target: "aicx_embeddings::config",
+                    "refusing oversized embedder config {}: {}",
+                    path.display(),
+                    err
+                );
+                continue;
+            }
             Err(err) => {
                 debug!(
                     target: "aicx_embeddings::config",
@@ -291,4 +407,161 @@ fn env_bool(name: &str) -> Option<bool> {
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static UNIQ: AtomicUsize = AtomicUsize::new(0);
+
+    fn tmp_dir(label: &str) -> PathBuf {
+        let pid = std::process::id();
+        let seq = UNIQ.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("aicx-cfg-test-{label}-{pid}-{seq}"));
+        fs::create_dir_all(&dir).expect("create test temp dir");
+        dir
+    }
+
+    fn first_existing(paths: Vec<(PathBuf, ConfigSource)>) -> Option<(PathBuf, ConfigSource)> {
+        paths.into_iter().find(|(p, _)| p.exists())
+    }
+
+    #[test]
+    fn env_branch_wins_when_override_file_exists() {
+        let home = tmp_dir("env-branch-home");
+        fs::write(home.join("config.toml"), "").unwrap();
+        fs::write(home.join("embedder.toml"), "").unwrap();
+        let override_file = home.join("override.toml");
+        fs::write(&override_file, "").unwrap();
+
+        let paths = build_search_paths(Some(override_file.to_str().unwrap()), Some(&home));
+        let effective = first_existing(paths).expect("env override should win");
+        assert_eq!(effective.1, ConfigSource::Env);
+        assert_eq!(effective.0, override_file);
+        assert_eq!(effective.1.as_str(), "env");
+    }
+
+    #[test]
+    fn canonical_branch_wins_when_no_env_no_legacy_present() {
+        let home = tmp_dir("canonical-branch-home");
+        let canonical = home.join("config.toml");
+        fs::write(&canonical, "").unwrap();
+
+        let paths = build_search_paths(None, Some(&home));
+        let effective = first_existing(paths).expect("canonical should win");
+        assert_eq!(effective.1, ConfigSource::Canonical);
+        assert_eq!(effective.0, canonical);
+        assert_eq!(effective.1.as_str(), "canonical");
+    }
+
+    #[test]
+    fn legacy_branch_wins_when_only_embedder_toml_exists() {
+        let home = tmp_dir("legacy-branch-home");
+        let legacy = home.join("embedder.toml");
+        fs::write(&legacy, "").unwrap();
+
+        let paths = build_search_paths(None, Some(&home));
+        let effective = first_existing(paths).expect("legacy should win");
+        assert_eq!(effective.1, ConfigSource::Legacy);
+        assert_eq!(effective.0, legacy);
+        assert_eq!(effective.1.as_str(), "legacy");
+    }
+
+    #[test]
+    fn defaults_branch_when_no_file_present() {
+        let home = tmp_dir("defaults-branch-home");
+
+        let paths = build_search_paths(None, Some(&home));
+        assert!(
+            first_existing(paths).is_none(),
+            "no file should match — embedder must fall back to built-in defaults"
+        );
+    }
+
+    #[test]
+    fn empty_env_override_is_ignored() {
+        let home = tmp_dir("empty-env-home");
+        fs::write(home.join("config.toml"), "").unwrap();
+
+        let paths = build_search_paths(Some("   "), Some(&home));
+        let effective = first_existing(paths).expect("canonical should still win");
+        assert_eq!(effective.1, ConfigSource::Canonical);
+    }
+
+    #[test]
+    fn canonical_outranks_legacy_when_both_present() {
+        let home = tmp_dir("precedence-home");
+        let canonical = home.join("config.toml");
+        let legacy = home.join("embedder.toml");
+        fs::write(&canonical, "").unwrap();
+        fs::write(&legacy, "").unwrap();
+
+        let paths = build_search_paths(None, Some(&home));
+        let effective = first_existing(paths).expect("canonical should win");
+        assert_eq!(effective.1, ConfigSource::Canonical);
+        assert_eq!(effective.0, canonical);
+    }
+
+    #[test]
+    fn bounded_read_rejects_oversized_config_with_path_and_cap_in_error() {
+        let home = tmp_dir("bounded-oversize");
+        let path = home.join("config.toml");
+        // Cap small to keep the test fast; payload = cap + 1024 bytes.
+        let cap: u64 = 2048;
+        let payload = vec![b'x'; (cap as usize) + 1024];
+        fs::write(&path, &payload).unwrap();
+
+        let err = read_config_file_capped(&path, cap)
+            .expect_err("oversized file must error under bounded read");
+        assert_eq!(err.kind(), io::ErrorKind::FileTooLarge);
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "error must name the file path: {msg}",
+        );
+        assert!(
+            msg.contains(&cap.to_string()),
+            "error must name the cap value: {msg}",
+        );
+    }
+
+    #[test]
+    fn bounded_read_happy_path_loads_realistic_config() {
+        let home = tmp_dir("bounded-happy");
+        let path = home.join("config.toml");
+        let body = "[embedder]\nbackend = \"native\"\nprofile = \"base\"\n";
+        fs::write(&path, body).unwrap();
+
+        let raw = read_config_file_capped(&path, CONFIG_FILE_MAX_BYTES)
+            .expect("realistic config must load under 1 MiB cap");
+        assert_eq!(raw, body);
+    }
+
+    #[test]
+    fn bounded_read_empty_file_returns_empty_string() {
+        let home = tmp_dir("bounded-empty");
+        let path = home.join("config.toml");
+        fs::write(&path, "").unwrap();
+
+        let raw = read_config_file_capped(&path, CONFIG_FILE_MAX_BYTES)
+            .expect("empty config must load cleanly");
+        assert!(raw.is_empty(), "empty file must produce empty string");
+        // toml parser must still accept an empty document — preserves the
+        // pre-bounded-read behavior where an empty config = all defaults.
+        let parsed: Result<NativeEmbedderConfigFile, _> = toml::from_str(&raw);
+        assert!(parsed.is_ok(), "toml must accept empty document");
+    }
+
+    #[test]
+    fn config_search_paths_back_compat_drops_source() {
+        let home = tmp_dir("backcompat-home");
+        let paths = build_search_paths(Some("/tmp/x.toml"), Some(&home));
+        let plain: Vec<PathBuf> = paths.into_iter().map(|(p, _)| p).collect();
+        assert_eq!(plain.len(), 3);
+        assert_eq!(plain[0], PathBuf::from("/tmp/x.toml"));
+        assert_eq!(plain[1], home.join("config.toml"));
+        assert_eq!(plain[2], home.join("embedder.toml"));
+    }
 }

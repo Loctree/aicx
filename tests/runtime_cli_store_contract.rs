@@ -116,6 +116,8 @@ fn run_aicx(home: &Path, args: &[&str]) -> Output {
     Command::new(ensure_aicx_binary_exists())
         .args(args)
         .env("HOME", home)
+        .env("AICX_ALLOW_TMP", "1")
+        .env_remove("AICX_HOME")
         .output()
         .expect("run aicx")
 }
@@ -273,6 +275,26 @@ fn test_doctor_fix_critical_returns_non_zero_exit() {
     assert_eq!(
         report["sidecars"], report["sidecar_coverage"],
         "doctor JSON should expose the same sidecar check result under both legacy fields"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_doctor_force_yes_json_is_machine_readable_cleanup_report() {
+    let root = unique_test_dir("doctor-force-yes-json");
+    let home = root.join("home");
+
+    let output = run_aicx(&home, &["doctor", "--force", "--yes", "--format", "json"]);
+    let report = parse_stdout_json(&output);
+    assert_eq!(report["mode"].as_str(), Some("force"));
+    assert!(
+        report["selected"].as_array().is_some(),
+        "force cleanup JSON should expose selected actions"
+    );
+    assert!(
+        report["final_report"]["overall"].is_string(),
+        "force cleanup JSON should include final doctor report"
     );
 
     let _ = fs::remove_dir_all(&root);
@@ -1151,6 +1173,51 @@ fn store_cli_hours_zero_means_all_time() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(combined_store.contains("store ancient context should still land with hours zero"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_run_store_saves_state_on_empty_result() {
+    let root = unique_test_dir("store-empty-save");
+    let home = root.join("home");
+    let history = home.join(".codex").join("history.jsonl");
+    write_codex_history(&history, "empty-sess", None, &[]);
+
+    let output = parse_stdout_json(&run_aicx(
+        &home,
+        &["store", "--agent", "codex", "-H", "24", "--emit", "json"],
+    ));
+    assert_eq!(output["total_entries"].as_u64(), Some(0));
+
+    let state = read_state(&home);
+    let runs = state["runs"].as_array().expect("runs array in state.json");
+    assert_eq!(
+        runs.len(),
+        1,
+        "state should save run history even when no entries were extracted via store"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_run_extraction_saves_state_on_empty_result() {
+    let root = unique_test_dir("extract-empty-save");
+    let home = root.join("home");
+    let history = home.join(".codex").join("history.jsonl");
+    write_codex_history(&history, "empty-sess", None, &[]);
+
+    let output = parse_stdout_json(&run_aicx(&home, &["all", "-H", "24", "--emit", "json"]));
+    assert_eq!(output["total_entries"].as_u64(), Some(0));
+
+    let state = read_state(&home);
+    let runs = state["runs"].as_array().expect("runs array in state.json");
+    assert_eq!(
+        runs.len(),
+        1,
+        "state should save run history even when no entries were extracted via all/extract"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

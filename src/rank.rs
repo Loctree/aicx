@@ -696,7 +696,6 @@ fn fuzzy_search_store_one(
 ) -> io::Result<(Vec<FuzzyResult>, usize)> {
     let normalized_query = normalize_query(query);
     let query_terms: Vec<&str> = normalized_query.split_whitespace().collect();
-    let project_filter_lower = project_filter.map(|filter| filter.to_lowercase());
 
     let mut results = Vec::new();
     let mut total_scanned = 0usize;
@@ -716,10 +715,19 @@ fn fuzzy_search_store_one(
             continue;
         }
 
-        if let Some(ref filter) = project_filter_lower
-            && !stored_file.project.to_lowercase().contains(filter)
-        {
-            continue;
+        // Strict canonical project filter: split the stored `<owner>/<repo>`
+        // slug and delegate to `store::project_filter_matches` so the rank
+        // fallback fuzzy path agrees with store / dashboard / steer / mcp.
+        // Substring fallback (`-p vista` matching `vista-portal`, etc.) is
+        // intentionally removed — Bug #38.
+        if let Some(filter) = project_filter {
+            let (organization, repository) = stored_file
+                .project
+                .split_once('/')
+                .unwrap_or(("", stored_file.project.as_str()));
+            if !store::project_filter_matches(organization, repository, filter) {
+                continue;
+            }
         }
 
         total_scanned += 1;
@@ -1613,6 +1621,72 @@ Some boilerplate text.
     // ================================================================
     // Repo-centric fuzzy search retrieval tests
     // ================================================================
+
+    fn unique_rank_test_store_root(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("aicx-rank-{label}-{}-{nanos}", std::process::id()))
+    }
+
+    fn write_canonical_search_fixture(
+        root: &Path,
+        organization: &str,
+        repository: &str,
+        session_id: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
+        let dir = root
+            .join(store::CANONICAL_STORE_DIRNAME)
+            .join(organization)
+            .join(repository)
+            .join("2026_0524")
+            .join("conversations")
+            .join("codex");
+        fs::create_dir_all(&dir).expect("fixture directory should be created");
+        let path = dir.join(format!("2026_0524_codex_{session_id}_001.md"));
+        fs::write(&path, body).expect("fixture chunk should be written");
+        path
+    }
+
+    #[test]
+    fn fuzzy_search_store_one_applies_strict_project_filter_for_bare_repo_name() {
+        let root = unique_rank_test_store_root("strict-project-filter");
+        fs::create_dir_all(&root).expect("fixture root should be created");
+
+        let vista_path = write_canonical_search_fixture(
+            &root,
+            "VetCoders",
+            "Vista",
+            "sessvista",
+            "[project: VetCoders/Vista | agent: codex | date: 2026-05-24]\n\nDecision: strictneedle belongs to the exact Vista repository.\n",
+        );
+        write_canonical_search_fixture(
+            &root,
+            "VetCoders",
+            "vista-portal",
+            "sessportal",
+            "[project: VetCoders/vista-portal | agent: codex | date: 2026-05-24]\n\nDecision: strictneedle must not leak through a bare vista filter.\n",
+        );
+
+        let (results, scanned) =
+            fuzzy_search_store_one(&root, "strictneedle", 10, Some("vista"), None)
+                .expect("fixture fuzzy search should succeed");
+
+        assert_eq!(scanned, 1, "bare `-p vista` must scan only exact Vista");
+        assert_eq!(results.len(), 1, "vista-portal must not match `-p vista`");
+        assert_eq!(results[0].project, "VetCoders/Vista");
+        assert_eq!(
+            results[0].path,
+            fs::canonicalize(&vista_path)
+                .expect("fixture path should canonicalize")
+                .display()
+                .to_string()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn render_search_json_matches_cli_surface_fields() {

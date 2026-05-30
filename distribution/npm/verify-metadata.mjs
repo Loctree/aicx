@@ -16,21 +16,34 @@ const WRAPPER = {
   path: path.join(ROOT, "aicx", "package.json"),
   name: "@loctree/aicx",
 };
+// assetTriple reflects the cleaned name produced by release_bundle.sh
+// (`-unknown-` stripped from linux). archiveExt: macOS+Windows ship .zip
+// (Apple notarized .zip for darwin, plain .zip for windows-gnu); Linux .tar.gz.
 const PLATFORMS = [
   {
     key: "darwin-arm64",
     packageName: "@loctree/aicx-darwin-arm64",
     assetTriple: "aarch64-apple-darwin",
+    archiveExt: "zip",
     os: "darwin",
     cpu: "arm64",
   },
   {
     key: "linux-x64-gnu",
     packageName: "@loctree/aicx-linux-x64-gnu",
-    assetTriple: "x86_64-unknown-linux-gnu",
+    assetTriple: "x86_64-linux-gnu",
+    archiveExt: "tar.gz",
     os: "linux",
     cpu: "x64",
     libc: "glibc",
+  },
+  {
+    key: "win32-x64-gnu",
+    packageName: "@loctree/aicx-win32-x64-gnu",
+    assetTriple: "x86_64-pc-windows-gnu",
+    archiveExt: "zip",
+    os: "win32",
+    cpu: "x64",
   },
 ];
 
@@ -98,14 +111,16 @@ for (const platform of PLATFORMS) {
   assertIncludes(
     `${platform.key} postinstall`,
     postinstall,
-    `aicx-v\${VERSION}-${platform.assetTriple}-slim-unsigned.tar.gz`
+    `aicx-v\${VERSION}-${platform.assetTriple}-slim.${platform.archiveExt}`
   );
   assertIncludes(
     `${platform.key} postinstall`,
     postinstall,
-    `aicx-v\${VERSION}-${platform.assetTriple}-slim-unsigned`
+    `aicx-v\${VERSION}-${platform.assetTriple}-slim`
   );
-  assertNotIncludes(`${platform.key} postinstall`, postinstall, "unknown-linux-musl-slim-unsigned");
+  // Loctree releases never ship `-unsigned` assets — every archive is
+  // GPG-detached (and macOS additionally Apple-codesigned + notarized).
+  assertNotIncludes(`${platform.key} postinstall`, postinstall, "slim-unsigned");
 }
 
 if (process.exitCode) {

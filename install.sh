@@ -34,20 +34,34 @@ AICX_EMBEDDER_PICKER="${AICX_EMBEDDER_PICKER:-auto}"
 AICX_EMBEDDER_PROFILE="${AICX_EMBEDDER_PROFILE:-}"
 AICX_EMBEDDER_FILENAME="${AICX_EMBEDDER_FILENAME:-${AICX_EMBEDDER_FILE:-}}"
 AICX_EMBEDDER_CONFIG_PATH="${AICX_EMBEDDER_CONFIG_PATH:-$HOME/.aicx/embedder.toml}"
+AICX_INSTALL_FORCE="${AICX_INSTALL_FORCE:-0}"
+AICX_INSTALL_DRY_RUN="${AICX_INSTALL_DRY_RUN:-0}"
+AICX_CARGO_BIN_DIR="${AICX_CARGO_BIN_DIR:-${CARGO_INSTALL_ROOT:+$CARGO_INSTALL_ROOT/bin}}"
+if [ -z "$AICX_CARGO_BIN_DIR" ]; then
+  AICX_CARGO_BIN_DIR="$HOME/.cargo/bin"
+fi
 
 SKIP_INSTALL=0
+SHADOW_CHECK_ONLY=0
+VERIFY_PATH_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --skip-install) SKIP_INSTALL=1 ;;
+    --dry-run) AICX_INSTALL_DRY_RUN=1 ;;
+    --force) AICX_INSTALL_FORCE=1 ;;
+    --shadow-check-only) SHADOW_CHECK_ONLY=1 ;;
+    --verify-path-only) VERIFY_PATH_ONLY=1 ;;
     --release) AICX_INSTALL_MODE="release" ;;
     --release-tag=*) AICX_RELEASE_TAG="${arg#*=}" ;;
     --pick-embedder) AICX_EMBEDDER_PICKER="1" ;;
     --no-embedder-prompt) AICX_EMBEDDER_PICKER="0" ;;
     --embedder-profile=*) AICX_EMBEDDER_PROFILE="${arg#*=}" ;;
     --help|-h)
-      echo "Usage: install.sh [--skip-install]"
+      echo "Usage: install.sh [--skip-install] [--dry-run] [--force]"
       echo "  Install aicx + aicx-mcp and configure MCP for Claude Code, Codex, and Gemini."
       echo "  Run from a release bundle or the repo root / local checkout."
+      echo "  --dry-run shows shadow cleanup without installing or rewriting config."
+      echo "  --force skips the multiple-aicx PATH confirmation."
       echo ""
       echo "Install source is controlled by AICX_INSTALL_MODE:"
       echo "  auto    - prefer bundled binaries, then local checkout, otherwise verified GitHub Release"
@@ -86,6 +100,11 @@ resolve_aicx() {
     return 0
   fi
 
+  if [ -x "$AICX_CARGO_BIN_DIR/aicx" ]; then
+    AICX_RUN=("$AICX_CARGO_BIN_DIR/aicx")
+    return 0
+  fi
+
   if command -v aicx >/dev/null 2>&1; then
     AICX_RUN=("aicx")
     return 0
@@ -102,6 +121,12 @@ resolve_aicx() {
 resolve_aicx_mcp() {
   if [ -x "$AICX_BIN_DIR/aicx-mcp" ]; then
     AICX_MCP_COMMAND="$AICX_BIN_DIR/aicx-mcp"
+    AICX_MCP_ARGS_JSON='[]'
+    return 0
+  fi
+
+  if [ -x "$AICX_CARGO_BIN_DIR/aicx-mcp" ]; then
+    AICX_MCP_COMMAND="$AICX_CARGO_BIN_DIR/aicx-mcp"
     AICX_MCP_ARGS_JSON='[]'
     return 0
   fi
@@ -328,8 +353,254 @@ maybe_configure_native_embedder() {
 cleanup_old_binaries() {
   local path="$1"
   if [ -L "$path" ] || [ -f "$path" ]; then
+    if [ "$AICX_INSTALL_DRY_RUN" = "1" ]; then
+      echo "  would remove stale $(basename "$path") from $(dirname "$path")"
+      return 0
+    fi
     rm -f "$path"
     echo "  removed stale $(basename "$path") from $(dirname "$path")"
+  fi
+}
+
+strip_trailing_slash() {
+  local path="$1"
+  while [ "${#path}" -gt 1 ] && [ "${path%/}" != "$path" ]; do
+    path="${path%/}"
+  done
+  echo "$path"
+}
+
+same_path() {
+  [ "$(strip_trailing_slash "$1")" = "$(strip_trailing_slash "$2")" ]
+}
+
+extract_semver() {
+  local text="${1:-}"
+  if [[ "$text" =~ ([0-9]+)\.([0-9]+)\.([0-9]+)([-+][0-9A-Za-z.-]+)? ]]; then
+    echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+    return 0
+  fi
+  return 1
+}
+
+semver_le() {
+  local left="$1"
+  local right="$2"
+  local la lb lc ra rb rc part
+  IFS=. read -r la lb lc <<< "$left"
+  IFS=. read -r ra rb rc <<< "$right"
+  for part in "$la" "$lb" "$lc" "$ra" "$rb" "$rc"; do
+    case "$part" in
+      ''|*[!0-9]*) return 1 ;;
+    esac
+  done
+  if [ "$la" -lt "$ra" ]; then return 0; fi
+  if [ "$la" -gt "$ra" ]; then return 1; fi
+  if [ "$lb" -lt "$rb" ]; then return 0; fi
+  if [ "$lb" -gt "$rb" ]; then return 1; fi
+  [ "$lc" -le "$rc" ]
+}
+
+binary_semver() {
+  local path="$1"
+  local output
+  if ! [ -x "$path" ]; then
+    return 1
+  fi
+  output=$("$path" --version 2>/dev/null || true)
+  extract_semver "$output"
+}
+
+manifest_version() {
+  local line value
+  if [ ! -f "$MANIFEST_PATH" ]; then
+    return 1
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      version\ =\ \"*\")
+        value="${line#version = \"}"
+        value="${value%%\"*}"
+        echo "$value"
+        return 0
+        ;;
+    esac
+  done < "$MANIFEST_PATH"
+  return 1
+}
+
+npm_global_bin_dir() {
+  local bin_dir prefix
+  if ! command -v npm >/dev/null 2>&1; then
+    return 1
+  fi
+  bin_dir=$(npm bin -g 2>/dev/null || true)
+  if [ -n "$bin_dir" ] && [ -d "$bin_dir" ]; then
+    echo "$bin_dir"
+    return 0
+  fi
+  prefix=$(npm prefix -g 2>/dev/null || true)
+  if [ -n "$prefix" ]; then
+    echo "$prefix/bin"
+    return 0
+  fi
+  return 1
+}
+
+install_target_bin_dir() {
+  case "$1" in
+    bundle|release) echo "$AICX_BIN_DIR" ;;
+    local|git|crates) echo "$AICX_CARGO_BIN_DIR" ;;
+    *) echo "$AICX_BIN_DIR" ;;
+  esac
+}
+
+target_install_version() {
+  local mode="$1"
+  case "$mode" in
+    bundle)
+      binary_semver "$SCRIPT_DIR/aicx" || true
+      ;;
+    release)
+      if [ "$AICX_RELEASE_TAG" != "latest" ]; then
+        extract_semver "$AICX_RELEASE_TAG" || true
+      fi
+      ;;
+    local)
+      manifest_version || true
+      ;;
+    *)
+      echo ""
+      ;;
+  esac
+}
+
+scan_aicx_shadows() {
+  local target_path="$1"
+  local shadow_paths count path version resolved
+
+  echo "Scanning current aicx installation surface..."
+  shadow_paths=$(which -a aicx 2>/dev/null | sort -u || true)
+  if [ -z "$shadow_paths" ]; then
+    echo "  no existing aicx on PATH"
+    return 0
+  fi
+
+  echo "Found existing aicx installations:"
+  count=0
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    count=$((count + 1))
+    version=$("$path" --version 2>/dev/null || echo "unknown")
+    echo "  $path -> $version"
+  done <<< "$shadow_paths"
+
+  resolved=$(command -v aicx 2>/dev/null || true)
+  if [ "$count" -gt 1 ] || { [ -n "$resolved" ] && ! same_path "$resolved" "$target_path"; }; then
+    echo ""
+    echo "WARNING: Multiple or shadowing aicx binaries detected."
+    echo "  target install path: $target_path"
+    if [ -n "$resolved" ]; then
+      echo "  PATH currently resolves to: $resolved"
+    fi
+    if [ "$AICX_INSTALL_FORCE" != "1" ] && [ "$AICX_INSTALL_DRY_RUN" != "1" ]; then
+      if [ -t 0 ]; then
+        printf "Continue install? [y/N] "
+        read -r confirm
+        case "${confirm:-}" in
+          y|Y|yes|YES) ;;
+          *)
+            echo "Aborted. Set AICX_INSTALL_FORCE=1 or pass --force to skip this check."
+            exit 1
+            ;;
+        esac
+      else
+        echo "Aborted in non-interactive mode. Set AICX_INSTALL_FORCE=1 to skip this check."
+        exit 1
+      fi
+    fi
+  fi
+}
+
+cleanup_shadow_pair() {
+  local dir="$1"
+  local target_dir="$2"
+  local target_version="$3"
+  local candidate="$dir/aicx"
+  local candidate_version=""
+
+  if same_path "$dir" "$target_dir"; then
+    return 0
+  fi
+  if ! { [ -f "$candidate" ] || [ -L "$candidate" ]; }; then
+    return 0
+  fi
+
+  candidate_version=$(binary_semver "$candidate" || true)
+  if [ -z "$target_version" ] || [ -z "$candidate_version" ]; then
+    echo "  shadow retained at $candidate (version unknown; cleanup requires an older/equal version)"
+    return 0
+  fi
+
+  if semver_le "$candidate_version" "$target_version"; then
+    echo "  removing shadow aicx $candidate_version from $dir (target $target_version)"
+    cleanup_old_binaries "$dir/aicx"
+    cleanup_old_binaries "$dir/aicx-mcp"
+  else
+    echo "  newer aicx $candidate_version retained at $dir (target $target_version)"
+  fi
+}
+
+cleanup_shadow_aicx_binaries() {
+  local target_dir="$1"
+  local target_version="$2"
+  local npm_bin
+
+  echo "Checking canonical shadow install paths..."
+  cleanup_shadow_pair "$HOME/.local/bin" "$target_dir" "$target_version"
+  cleanup_shadow_pair "$AICX_CARGO_BIN_DIR" "$target_dir" "$target_version"
+  if npm_bin=$(npm_global_bin_dir); then
+    cleanup_shadow_pair "$npm_bin" "$target_dir" "$target_version"
+  fi
+}
+
+verify_install_path_resolution() {
+  local installed_path="$1"
+  local installed_version path_resolved path_resolved_version
+
+  if ! [ -x "$installed_path" ]; then
+    return 0
+  fi
+
+  installed_version=$("$installed_path" --version 2>/dev/null || echo "unknown")
+  path_resolved=$(command -v aicx 2>/dev/null || true)
+  if [ -z "$path_resolved" ]; then
+    echo ""
+    echo "=========================================="
+    echo "WARNING: installed aicx is not on PATH"
+    echo "  Installed to: $installed_path -> $installed_version"
+    echo "  Add $(dirname "$installed_path") to PATH before running aicx."
+    echo "=========================================="
+    return 0
+  fi
+  path_resolved_version=$(aicx --version 2>/dev/null || echo "unknown")
+  if [ -n "$path_resolved" ] && { ! same_path "$path_resolved" "$installed_path" || [ "$installed_version" != "$path_resolved_version" ]; }; then
+    echo ""
+    echo "=========================================="
+    echo "WARNING: PATH version mismatch detected"
+    echo "  Installed to: $installed_path -> $installed_version"
+    echo "  PATH resolves to: $path_resolved -> $path_resolved_version"
+    echo ""
+    echo "Other aicx binaries in PATH:"
+    which -a aicx 2>/dev/null | sort -u | while IFS= read -r path; do
+      if [ -n "$path" ] && ! same_path "$path" "$installed_path"; then
+        echo "  $path"
+      fi
+    done
+    echo ""
+    echo "To fix: ensure $(dirname "$installed_path") is before other aicx locations in your PATH,"
+    echo "or remove the older binary shown above."
+    echo "=========================================="
   fi
 }
 
@@ -352,13 +623,11 @@ install_bundle_binaries() {
 
   mkdir -p "$install_dir"
   echo "  target bin dir: $install_dir"
-  echo "  pruning stale user-local / cargo installs..."
+  echo "  pruning stale files in target bin dir..."
   cleanup_old_binaries "$install_dir/aicx"
   cleanup_old_binaries "$install_dir/aicx-mcp"
   cleanup_old_binaries "$install_dir/ai-contexters"
   cleanup_old_binaries "$install_dir/ai-contexters-mcp"
-  cleanup_old_binaries "$HOME/.cargo/bin/aicx"
-  cleanup_old_binaries "$HOME/.cargo/bin/aicx-mcp"
   cleanup_old_binaries "$HOME/.cargo/bin/ai-contexters"
   cleanup_old_binaries "$HOME/.cargo/bin/ai-contexters-mcp"
 
@@ -378,8 +647,8 @@ detect_release_target() {
       echo "  Use a local bundle install instead, or install from source with cargo." >&2
       exit 1
       ;;
-    Linux:x86_64) echo "x86_64-unknown-linux-gnu" ;;
-    Linux:aarch64|Linux:arm64) echo "aarch64-unknown-linux-gnu" ;;
+    Linux:x86_64) echo "x86_64-linux-gnu" ;;
+    Linux:aarch64|Linux:arm64) echo "aarch64-linux-gnu" ;;
     *)
       echo "Error: unsupported platform for release installer: ${os}/${arch}" >&2
       echo "  Use a local bundle install instead, or install from source with cargo." >&2
@@ -416,7 +685,7 @@ print(tag)
 }
 
 download_release_bundle() {
-  local release_tag target archive_name base_url tmp_dir archive_path checksum_path bundle_dir
+  local release_tag target archive_ext archive_name bundle_name base_url tmp_dir archive_path checksum_path bundle_dir
 
   if ! command -v curl >/dev/null 2>&1; then
     echo "Error: curl is required for release installer mode." >&2
@@ -428,7 +697,12 @@ download_release_bundle() {
   fi
   release_tag=$(resolve_release_tag)
   target=$(detect_release_target)
-  archive_name="aicx-${release_tag}-${target}-slim-unsigned.tar.gz"
+  case "$target" in
+    *apple-darwin|*windows-gnu) archive_ext="zip" ;;
+    *) archive_ext="tar.gz" ;;
+  esac
+  bundle_name="aicx-${release_tag}-${target}-slim"
+  archive_name="${bundle_name}.${archive_ext}"
   base_url="https://github.com/${AICX_RELEASE_REPO}/releases/download/${release_tag}"
   tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/aicx-release-install.XXXXXX")
   archive_path="$tmp_dir/$archive_name"
@@ -481,7 +755,7 @@ elif archive_path.name.endswith(".tar.gz"):
 else:
     raise SystemExit(f"Unsupported archive format: {archive_path.name}")
 PY
-  bundle_dir="$tmp_dir/aicx-${release_tag}-${target}-slim-unsigned"
+  bundle_dir="$tmp_dir/$bundle_name"
   if [ ! -f "$bundle_dir/install.sh" ]; then
     echo "Error: release bundle does not contain install.sh: $bundle_dir" >&2
     exit 1
@@ -490,6 +764,8 @@ PY
   echo "[4/4] Delegating to bundled installer..."
   AICX_INSTALL_MODE="bundle" \
   AICX_BIN_DIR="$AICX_BIN_DIR" \
+  AICX_INSTALL_FORCE="$AICX_INSTALL_FORCE" \
+  AICX_INSTALL_DRY_RUN="$AICX_INSTALL_DRY_RUN" \
   bash "$bundle_dir/install.sh"
   exit 0
 }
@@ -516,6 +792,24 @@ resolve_install_mode() {
 }
 
 INSTALL_MODE=$(resolve_install_mode)
+INSTALL_TARGET_BIN_DIR=$(install_target_bin_dir "$INSTALL_MODE")
+INSTALL_TARGET_AICX="$INSTALL_TARGET_BIN_DIR/aicx"
+INSTALL_TARGET_VERSION=$(target_install_version "$INSTALL_MODE")
+if [ "$VERIFY_PATH_ONLY" -eq 1 ]; then
+  verify_install_path_resolution "$INSTALL_TARGET_AICX"
+  exit 0
+fi
+if [ "$SKIP_INSTALL" -eq 0 ]; then
+  scan_aicx_shadows "$INSTALL_TARGET_AICX"
+  cleanup_shadow_aicx_binaries "$INSTALL_TARGET_BIN_DIR" "$INSTALL_TARGET_VERSION"
+fi
+if [ "$SHADOW_CHECK_ONLY" -eq 1 ]; then
+  exit 0
+fi
+if [ "$AICX_INSTALL_DRY_RUN" = "1" ]; then
+  echo "Dry run complete; no binaries installed and no config files changed."
+  exit 0
+fi
 if [ "$INSTALL_MODE" = "release" ]; then
   if [ "$SKIP_INSTALL" -eq 1 ]; then
     echo "Error: --skip-install cannot be combined with release download mode." >&2
@@ -568,6 +862,10 @@ if [ "$SKIP_INSTALL" -eq 0 ]; then
   fi
 else
   echo "[1/4] Skipping install (--skip-install)"
+fi
+
+if [ "$SKIP_INSTALL" -eq 0 ]; then
+  verify_install_path_resolution "$INSTALL_TARGET_AICX"
 fi
 
 # --- Step 2: Verify ---

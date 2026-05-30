@@ -407,9 +407,14 @@ pub struct SteerParams {
     pub kind: Option<String>,
     /// Filter by frame/channel: user_msg, agent_reply, internal_thought, tool_call
     pub frame_kind: Option<FrameKind>,
-    /// Filter by project (case-insensitive substring)
+    /// Filter by project using strict canonical `<organization>/<repository>`
+    /// matching (case-insensitive). Bare names match either an organization
+    /// or a repository token; `owner/` matches every repo under that owner;
+    /// `/repo` matches that repo across all owners. Substring matching is
+    /// intentionally not supported — `vista` does NOT match `vista-portal`.
     pub project: Option<String>,
-    /// Optional project filters for cross-project steering.
+    /// Optional project filters for cross-project steering. Each entry uses
+    /// the same strict canonical semantics as `project`.
     pub projects: Option<Vec<String>>,
     /// Filter by date (YYYY-MM-DD, or range like 2026-03-20..2026-03-28)
     pub date: Option<String>,
@@ -568,6 +573,51 @@ fn validate_string_len(val: Option<&str>, max: usize, field: &str) -> Result<(),
     Ok(())
 }
 
+#[derive(Debug)]
+struct McpSemanticFilterBuild {
+    post_filters: crate::search_engine::SemanticSearchFilters,
+}
+
+fn build_mcp_semantic_filters(
+    params: &SearchParams,
+    score: Option<u8>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> McpSemanticFilterBuild {
+    // Date filter (explicit `date` or shorthand `since`) wins over
+    // `--hours`, preserving the legacy precedence.
+    let date_effective = params.date.clone().or(params.since.clone());
+    let (date_lo, date_hi) = if let Some(ref date_filter) = date_effective {
+        parse_date_filter_mcp(date_filter)
+    } else {
+        (None, params.until.clone())
+    };
+    let hours = params.hours.unwrap_or(0);
+    let hours_cutoff = if hours > 0 && date_lo.is_none() && date_hi.is_none() {
+        let cutoff = now - chrono::Duration::hours(hours as i64);
+        Some(cutoff.format("%Y-%m-%d").to_string())
+    } else {
+        None
+    };
+
+    McpSemanticFilterBuild {
+        post_filters: crate::search_engine::SemanticSearchFilters {
+            agent: params.agent.clone(),
+            score_min: score,
+            date_lo,
+            date_hi,
+            hours_cutoff,
+        },
+    }
+}
+
+fn inject_mcp_filter_pushdown_payload(
+    rendered: &str,
+    diagnostic: Option<&crate::search_engine::FilterPushdownDiagnostic>,
+) -> Result<String, McpError> {
+    crate::search_engine::inject_filter_pushdown_diagnostic(rendered, diagnostic)
+        .map_err(|e| McpError::internal_error(format!("Inject filter_pushdown JSON: {e}"), None))
+}
+
 #[derive(Clone)]
 pub struct AicxMcpServer {
     #[allow(dead_code)]
@@ -590,11 +640,17 @@ impl AicxMcpServer {
         }
     }
 
+    fn embedder_unavailable_guard(&self) -> std::sync::MutexGuard<'_, Option<Instant>> {
+        self.embedder_unavailable_until.lock().expect(
+            "embedder_unavailable_until mutex poisoned; negative-cache state is only mutated by AicxMcpServer",
+        )
+    }
+
     /// D-6: returns remaining negative-cache TTL when the embedder was
     /// flagged unavailable. Side effect: lazily clears the entry when it
     /// has expired so a subsequent retry hits the embedder again.
     fn embedder_negative_cache_remaining(&self, now: Instant) -> Option<Duration> {
-        let mut guard = self.embedder_unavailable_until.lock().unwrap();
+        let mut guard = self.embedder_unavailable_guard();
         match *guard {
             Some(until) if until > now => Some(until.duration_since(now)),
             Some(_) => {
@@ -608,13 +664,13 @@ impl AicxMcpServer {
     /// D-6: arm the negative cache for `ttl` from `now`. Called after a
     /// real embedder failure so subsequent requests fail-fast.
     fn mark_embedder_unavailable(&self, now: Instant, ttl: Duration) {
-        let mut guard = self.embedder_unavailable_until.lock().unwrap();
+        let mut guard = self.embedder_unavailable_guard();
         *guard = Some(now + ttl);
     }
 
     #[tool(
         name = "aicx_search",
-        description = "Semantic search over the canonical corpus. Fails fast with kind/reason/recommendation when the index or embedder is not ready."
+        description = "Semantic search over the canonical corpus. Fails fast with kind/reason/recommendation when the index or embedder is not ready. Filter pushdown (agent/score/date/hours) iterates a bounded retrieval pool (up to 10x the requested limit) so a corpus whose top-N raw hits all sit outside the filter window still surfaces inside-window matches further down the ranking instead of returning silent-empty. When the cap is examined without satisfying the limit, the response carries a `filter_pushdown` payload with `kind=\"filter_yielded_partial\"` so callers can distinguish bounded under-delivery from a genuinely empty corpus."
     )]
     async fn search(
         &self,
@@ -663,18 +719,8 @@ impl AicxMcpServer {
             }
         }
 
-        let query = params.query;
-        let limit = params.limit.min(50);
-        let project = params.project;
-        let owned_projects = params
-            .projects
-            .clone()
-            .filter(|projects| !projects.is_empty())
-            .unwrap_or_else(|| project.clone().into_iter().collect());
-        let project_scopes = search_project_scopes(&owned_projects);
         let score = validate_score_filter(params.score)?;
-        let hours = params.hours.unwrap_or(0);
-        let date = params.date;
+        let filter_build = build_mcp_semantic_filters(&params, score, chrono::Utc::now());
         let frame_kind = params.frame_kind;
         let kind_filter = match params.kind.as_deref() {
             Some(kind) => match Kind::parse(kind) {
@@ -696,29 +742,39 @@ impl AicxMcpServer {
             },
             None => None,
         };
-        let fetch_limit = if score.is_some() || date.is_some() || hours > 0 {
-            limit.saturating_mul(5).max(50)
-        } else {
-            limit
-        };
-
+        let query = params.query;
+        let limit = params.limit.min(50);
+        let project = params.project;
+        let owned_projects = params
+            .projects
+            .clone()
+            .filter(|projects| !projects.is_empty())
+            .unwrap_or_else(|| project.clone().into_iter().collect());
+        let project_scopes = search_project_scopes(&owned_projects);
         let store_root = store::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
 
-        // Semantic-only dispatch. No fuzzy fallback. When a precondition
-        // is missing (embedder unhydrated, index not built, ...) return
-        // a structured McpError carrying the same `kind` + `reason` +
-        // `recommendation` triple the CLI fail-fast surface emits, so an
-        // MCP caller has the same diagnostic to act on.
-        let outcome = match crate::search_engine::try_semantic_search(
+        let post_filters = filter_build.post_filters;
+
+        // Semantic-only dispatch with filter pushdown. No fuzzy fallback.
+        // The wrapper iterates a bounded retrieval pool (`FILTER_EXAMINED_CAP_RATIO`
+        // x `limit`) so the canonical pathology — top-N raw hits sit
+        // outside the filter window while valid hits exist below — does
+        // not surface as silent-empty. When a precondition is missing
+        // (embedder unhydrated, index not built, ...) the wrapper still
+        // returns a structured McpError carrying the same `kind` +
+        // `reason` + `recommendation` triple the CLI fail-fast surface
+        // emits.
+        let filtered = match crate::search_engine::try_semantic_search_filtered(
             &store_root,
             &query,
-            fetch_limit,
+            limit,
             &project_scopes,
             frame_kind,
             kind_filter.map(|kind| kind.dir_name()),
+            &post_filters,
         ) {
-            Ok(outcome) => outcome,
+            Ok(filtered) => filtered,
             Err(err) => {
                 // D-6: arm the negative cache on real embedder failures so
                 // subsequent requests fail-fast for MCP_EMBEDDER_NEGATIVE_TTL
@@ -746,44 +802,13 @@ impl AicxMcpServer {
                 ));
             }
         };
+        let crate::search_engine::FilteredSemanticOutcome {
+            outcome,
+            diagnostic: pushdown_diagnostic,
+        } = filtered;
         let scanned = outcome.scanned;
         let retrieval_status = outcome.retrieval_status.clone();
-        let results = outcome.results;
-
-        let mut results = results;
-
-        if let Some(min_score) = score {
-            results.retain(|result| result.score >= min_score);
-        }
-        if let Some(ref agent_filter) = params.agent {
-            results.retain(|r| r.agent == *agent_filter);
-        }
-
-        let date_effective = date.or(params.since.clone());
-        let (lo, hi) = if let Some(ref date_filter) = date_effective {
-            parse_date_filter_mcp(date_filter)
-        } else {
-            (None, params.until.clone())
-        };
-
-        let mut results: Vec<_> = if lo.is_some() || hi.is_some() {
-            results
-                .into_iter()
-                .filter(|result| {
-                    lo.as_deref().is_none_or(|lo| result.date.as_str() >= lo)
-                        && hi.as_deref().is_none_or(|hi| result.date.as_str() <= hi)
-                })
-                .collect()
-        } else if hours > 0 {
-            let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
-            let cutoff_date = cutoff.format("%Y-%m-%d").to_string();
-            results
-                .into_iter()
-                .filter(|result| result.date >= cutoff_date)
-                .collect()
-        } else {
-            results
-        };
+        let mut results = outcome.results;
 
         if let Some(sort_order) = params.sort.as_deref() {
             results.sort_by(|a, b| {
@@ -822,13 +847,14 @@ impl AicxMcpServer {
                 source_paths_verified,
             )
         };
-        let json =
+        let rendered =
             rank::render_search_json_with_oracle(&store_root, &results, scanned, oracle_status)
                 .map_err(|e| {
                     McpError::internal_error(format!("Serialize search JSON: {e}"), None)
                 })?;
+        let payload = inject_mcp_filter_pushdown_payload(&rendered, pushdown_diagnostic.as_ref())?;
 
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![Content::text(payload)]))
     }
 
     #[tool(
@@ -987,7 +1013,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_steer",
-        description = "Retrieve chunks by steering metadata. Supports project/projects, run_id, prompt_id, agent, kind, frame_kind, and date filters."
+        description = "Retrieve chunks by steering metadata. Supports project/projects (strict canonical <organization>/<repository> matching — `vista` does NOT match `vista-portal`; use `owner/repo`, `owner/`, or `/repo` wildcards for explicit scopes), run_id, prompt_id, agent, kind, frame_kind, and date filters."
     )]
     async fn steer(
         &self,
@@ -1106,7 +1132,7 @@ impl AicxMcpServer {
                 results: items.len(),
                 items,
             })
-            .unwrap()
+            .map_err(|e| McpError::internal_error(format!("Serialize steer JSON: {e}"), None))?
         } else {
             serde_json::to_string(&SteerResponse {
                 oracle_status,
@@ -1358,9 +1384,12 @@ pub async fn run_http(port: u16, auth_config: AuthConfig) -> anyhow::Result<()> 
         );
     }
 
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP HTTP server error: {e}"))
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("MCP HTTP server error: {e}"))
 }
 
 /// Legacy compatibility wrapper for callers that still use the old `run_sse` name.
@@ -1405,6 +1434,10 @@ fn parse_date_filter_mcp(date: &str) -> (Option<String>, Option<String>) {
     }
 }
 
+// `inject_filter_pushdown_diagnostic` extracted to `aicx::search_engine`
+// — shared with the CLI path in `src/main.rs` (gemini-code-assist
+// review on PR #9: DRY).
+
 fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, McpError> {
     match score {
         Some(score) if score > MAX_SCORE_FILTER => Err(McpError::invalid_params(
@@ -1421,8 +1454,9 @@ mod tests {
         AicxMcpServer, AicxSessionManager, AicxSessionManagerError, MAX_SCORE_FILTER,
         MCP_EMBEDDER_NEGATIVE_TTL, MCP_SESSION_IDLE_TTL, MCP_SESSION_MAX_SESSIONS,
         MCP_SESSION_SWEEP_INTERVAL, McpTransport, RankItem, RankResponse, SearchParams,
-        SteerResponse, background_refresh_args, configured_mcp_session_manager,
-        parse_date_filter_mcp, spawn_mcp_session_cleanup, validate_score_filter,
+        SteerResponse, background_refresh_args, build_mcp_semantic_filters,
+        configured_mcp_session_manager, inject_mcp_filter_pushdown_payload, parse_date_filter_mcp,
+        spawn_mcp_session_cleanup, validate_score_filter, validate_string_len,
     };
     use crate::oracle::OracleStatus;
     use clap::ValueEnum as _;
@@ -1431,6 +1465,32 @@ mod tests {
         sync::Arc,
         time::{Duration, Instant},
     };
+
+    fn minimal_search_params() -> SearchParams {
+        SearchParams {
+            query: "dashboard".to_string(),
+            limit: 20,
+            project: None,
+            projects: None,
+            score: None,
+            hours: None,
+            agent: None,
+            date: None,
+            since: None,
+            until: None,
+            sort: None,
+            frame_kind: None,
+            kind: None,
+            slim: true,
+            verbose: false,
+        }
+    }
+
+    fn fixed_utc_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-05-24T12:00:00Z")
+            .expect("fixed timestamp")
+            .with_timezone(&chrono::Utc)
+    }
 
     #[test]
     fn background_refresh_args_use_all_and_quiet_stdout() {
@@ -1547,6 +1607,23 @@ mod tests {
     }
 
     #[test]
+    fn steer_response_with_nan_score_serializes_without_panic() {
+        let json = serde_json::to_string(&SteerResponse {
+            oracle_status: OracleStatus::metadata_steer(std::path::Path::new("/tmp"), 1, 1, true),
+            results: 1,
+            items: vec![serde_json::json!({
+                "path": "/tmp/chunk.md",
+                "score": f32::NAN,
+            })],
+        })
+        .expect("serde_json normalizes non-finite Value numbers instead of panicking");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&json).expect("steer JSON should parse");
+        assert!(payload["items"][0]["score"].is_null());
+    }
+
+    #[test]
     fn search_params_roundtrip_include_new_optional_filters() {
         let params: SearchParams =
             serde_json::from_str(r#"{"query":"dashboard"}"#).expect("search params should parse");
@@ -1555,6 +1632,113 @@ mod tests {
         assert!(params.score.is_none());
         assert!(params.hours.is_none());
         assert!(params.date.is_none());
+    }
+
+    #[test]
+    fn mcp_search_filter_build_uses_hours_when_no_date_bounds_exist() {
+        let mut params = minimal_search_params();
+        params.hours = Some(48);
+
+        let built = build_mcp_semantic_filters(&params, None, fixed_utc_now());
+
+        assert_eq!(
+            built.post_filters.hours_cutoff.as_deref(),
+            Some("2026-05-22")
+        );
+        assert!(built.post_filters.date_lo.is_none());
+        assert!(built.post_filters.date_hi.is_none());
+    }
+
+    #[test]
+    fn mcp_search_filter_build_date_range_wins_over_hours() {
+        let mut params = minimal_search_params();
+        params.hours = Some(168);
+        params.date = Some("2026-03-20..2026-03-28".to_string());
+        params.agent = Some("codex".to_string());
+
+        let built = build_mcp_semantic_filters(&params, Some(80), fixed_utc_now());
+
+        assert_eq!(built.post_filters.date_lo.as_deref(), Some("2026-03-20"));
+        assert_eq!(built.post_filters.date_hi.as_deref(), Some("2026-03-28"));
+        assert!(built.post_filters.hours_cutoff.is_none());
+        assert_eq!(built.post_filters.agent.as_deref(), Some("codex"));
+        assert_eq!(built.post_filters.score_min, Some(80));
+    }
+
+    #[test]
+    fn mcp_search_filter_build_until_bound_wins_over_hours() {
+        let mut params = minimal_search_params();
+        params.hours = Some(168);
+        params.until = Some("2026-05-20".to_string());
+
+        let built = build_mcp_semantic_filters(&params, None, fixed_utc_now());
+
+        assert!(built.post_filters.date_lo.is_none());
+        assert_eq!(built.post_filters.date_hi.as_deref(), Some("2026-05-20"));
+        assert!(built.post_filters.hours_cutoff.is_none());
+    }
+
+    #[test]
+    fn mcp_search_payload_includes_filter_pushdown_diagnostic() {
+        let diagnostic = crate::search_engine::FilterPushdownDiagnostic {
+            kind: "filter_yielded_partial",
+            examined: 50,
+            matched: 2,
+            requested_limit: 10,
+            examined_cap_ratio: 10,
+        };
+
+        let payload = inject_mcp_filter_pushdown_payload(
+            r#"{"oracle_status":{"backend":"hybrid_rrf"},"results":2,"items":[]}"#,
+            Some(&diagnostic),
+        )
+        .expect("diagnostic payload should inject");
+        let json: serde_json::Value =
+            serde_json::from_str(&payload).expect("payload should stay valid JSON");
+
+        assert_eq!(json["results"], 2);
+        assert_eq!(json["filter_pushdown"]["kind"], "filter_yielded_partial");
+        assert_eq!(json["filter_pushdown"]["examined"], 50);
+        assert_eq!(json["filter_pushdown"]["matched"], 2);
+        assert_eq!(json["filter_pushdown"]["requested_limit"], 10);
+        assert_eq!(json["filter_pushdown"]["examined_cap_ratio"], 10);
+    }
+
+    #[test]
+    fn mcp_search_payload_invalid_json_maps_to_internal_error() {
+        let diagnostic = crate::search_engine::FilterPushdownDiagnostic {
+            kind: "filter_yielded_partial",
+            examined: 50,
+            matched: 2,
+            requested_limit: 10,
+            examined_cap_ratio: 10,
+        };
+
+        let err = inject_mcp_filter_pushdown_payload("{not json", Some(&diagnostic))
+            .expect_err("invalid rendered JSON should map to MCP internal error");
+
+        assert_eq!(err.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert!(
+            err.message.contains("Inject filter_pushdown JSON"),
+            "unexpected error message: {}",
+            err.message
+        );
+        assert!(err.data.is_none());
+    }
+
+    #[test]
+    fn string_len_validation_rejects_oversized_fields() {
+        let err = validate_string_len(Some("abcd"), 3, "query")
+            .expect_err("oversized field should be rejected");
+
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message
+                .contains("Field 'query' exceeds max length 3 bytes"),
+            "unexpected error message: {}",
+            err.message
+        );
+        assert!(err.data.is_none());
     }
 
     #[test]
@@ -1623,7 +1807,7 @@ mod tests {
         let server = AicxMcpServer::new();
         let now = Instant::now();
         {
-            let mut guard = server.embedder_unavailable_until.lock().unwrap();
+            let mut guard = server.embedder_unavailable_guard();
             *guard = Some(now + MCP_EMBEDDER_NEGATIVE_TTL);
         }
 

@@ -13,6 +13,10 @@ const PLATFORM_PACKAGES = Object.freeze({
     name: "@loctree/aicx-linux-x64-gnu",
     root: `${__dirname}/node_modules/@loctree/aicx-linux-x64-gnu`,
   }),
+  "win32-x64-gnu": Object.freeze({
+    name: "@loctree/aicx-win32-x64-gnu",
+    root: `${__dirname}/node_modules/@loctree/aicx-win32-x64-gnu`,
+  }),
 });
 
 const BINARY_FILENAMES = Object.freeze({
@@ -54,6 +58,11 @@ function getPlatformKey() {
     return `${platform}-${normalizedArch}`;
   }
 
+  if (platform === "win32") {
+    // Currently only ship MinGW-w64 (gnu) Windows binaries.
+    return `${platform}-${normalizedArch}-gnu`;
+  }
+
   return null;
 }
 
@@ -66,7 +75,7 @@ function getPlatformPackage() {
   if (!platformKey) {
     throw new Error(
       `Unsupported platform: ${process.platform}-${process.arch}.\n` +
-      `AICX currently supports macOS (arm64) and Linux (x64 gnu).\n` +
+      `AICX currently supports macOS (arm64), Linux (x64 gnu), and Windows (x64 gnu).\n` +
       `Please build from source or download manually from: https://github.com/Loctree/aicx/releases`
     );
   }

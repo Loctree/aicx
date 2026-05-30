@@ -41,18 +41,17 @@ static RE_AWS_SESSION: LazyLock<Regex> =
 static RE_GOOGLE_API_KEY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\bAIza[0-9A-Za-z_-]{35}\b").expect("regex"));
 static RE_JWT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
+    Regex::new(r"\beyJ[A-Za-z0-9_-]{8,128}\.eyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{32,512}\b")
         .expect("regex")
 });
 static RE_STRIPE_KEY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{24,}\b").expect("regex"));
+static RE_STRIPE_WEBHOOK_SECRET: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bwhsec_[A-Za-z0-9]{20,}\b").expect("regex"));
 
 static RE_GCP_JSON_PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?s)(?P<prefix>"private_key"\s*:\s*)"-----BEGIN[^"]+-----END[^"]+""#)
         .expect("regex")
-});
-static RE_GCP_SERVICE_ACCOUNT_OBJECT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?s)\{[^{}]{0,500}"type"\s*:\s*"service_account"[^{}]{0,2500}\}"#).expect("regex")
 });
 static RE_GCP_PRIVATE_KEY_ID_FIELD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?P<prefix>"private_key_id"\s*:\s*)"[^"]+""#).expect("regex"));
@@ -78,9 +77,12 @@ static SECRET_LOOKUP_SET: LazyLock<RegexSet> = LazyLock::new(|| {
         r"\bAKIA[0-9A-Z]{16}\b",
         r"\bASIA[0-9A-Z]{16}\b",
         r"\bAIza[0-9A-Za-z_-]{35}\b",
-        r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+        r"\beyJ[A-Za-z0-9_-]{8,128}\.eyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{32,512}\b",
         r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{24,}\b",
+        r"\bwhsec_[A-Za-z0-9]{20,}\b",
         r#"(?s)"private_key"\s*:\s*"-----BEGIN[^"]+-----END[^"]+""#,
+        r#""private_key_id"\s*:\s*"[^"]+""#,
+        r#""client_email"\s*:\s*"[^"]+""#,
         r"(?i)\bAuthorization:\s*Bearer\s+\S+",
         r"(?i)\b(X-API-KEY|X-Auth-Token|Api-Key|Token)\s*:\s*([^\s]+)",
     ])
@@ -230,21 +232,26 @@ pub fn redact_secrets(text: &str) -> String {
     if let Cow::Owned(s) = RE_STRIPE_KEY.replace_all(&out, "[REDACTED_STRIPE_KEY]") {
         out = s;
     }
+    if let Cow::Owned(s) =
+        RE_STRIPE_WEBHOOK_SECRET.replace_all(&out, "[REDACTED_STRIPE_WEBHOOK_SECRET]")
+    {
+        out = s;
+    }
 
     out
 }
 
 fn redact_gcp_service_account_fields(text: &str) -> Cow<'_, str> {
-    RE_GCP_SERVICE_ACCOUNT_OBJECT.replace_all(text, |caps: &Captures| {
-        let object = caps.get(0).map(|m| m.as_str()).unwrap_or("");
-        let object = RE_GCP_PRIVATE_KEY_ID_FIELD.replace_all(object, |caps: &Captures| {
-            redact_json_string_field(caps, "[REDACTED_GCP_PRIVATE_KEY_ID]")
-        });
-        let object = RE_GCP_CLIENT_EMAIL_FIELD.replace_all(&object, |caps: &Captures| {
-            redact_json_string_field(caps, "[REDACTED_GCP_CLIENT_EMAIL]")
-        });
-        object.into_owned()
-    })
+    // `replace_all` returns `Cow::Borrowed` when no match — chain without redundant is_match probes.
+    let intermediate = RE_GCP_PRIVATE_KEY_ID_FIELD.replace_all(text, |caps: &Captures| {
+        redact_json_string_field(caps, "[REDACTED_GCP_PRIVATE_KEY_ID]")
+    });
+    match RE_GCP_CLIENT_EMAIL_FIELD.replace_all(intermediate.as_ref(), |caps: &Captures| {
+        redact_json_string_field(caps, "[REDACTED_GCP_CLIENT_EMAIL]")
+    }) {
+        Cow::Borrowed(_) => intermediate,
+        Cow::Owned(s) => Cow::Owned(s),
+    }
 }
 
 fn redact_json_string_field(caps: &Captures, replacement: &str) -> String {
@@ -350,9 +357,33 @@ mod tests {
             "eyJ{}.eyJ{}.{}",
             chars('J', 12),
             chars('K', 12),
-            chars('L', 16)
+            chars('L', 43)
         );
         assert_redacted(&token, "[REDACTED_JWT]");
+    }
+
+    #[test]
+    fn does_not_redact_jwt_like_strings_with_short_signature() {
+        let s = format!(
+            "trace eyJ{}.eyJ{}.{}",
+            chars('A', 12),
+            chars('B', 12),
+            chars('C', 16)
+        );
+        let r = redact_secrets(&s);
+        assert_eq!(r, s);
+    }
+
+    #[test]
+    fn does_not_redact_jwt_like_strings_with_oversized_header() {
+        let s = format!(
+            "fixture eyJ{}.eyJ{}.{}",
+            chars('A', 180),
+            chars('B', 12),
+            chars('C', 43)
+        );
+        let r = redact_secrets(&s);
+        assert_eq!(r, s);
     }
 
     #[test]
@@ -371,6 +402,12 @@ mod tests {
     fn redacts_stripe_restricted_key() {
         let token = format!("rk_live_{}", chars('O', 24));
         assert_redacted(&token, "[REDACTED_STRIPE_KEY]");
+    }
+
+    #[test]
+    fn redacts_stripe_webhook_secret() {
+        let token = format!("whsec_{}", chars('P', 24));
+        assert_redacted(&token, "[REDACTED_STRIPE_WEBHOOK_SECRET]");
     }
 
     #[test]
@@ -402,6 +439,24 @@ mod tests {
         assert!(!r.contains(client_email));
         assert!(r.contains(r#""private_key_id": "[REDACTED_GCP_PRIVATE_KEY_ID]""#));
         assert!(r.contains(r#""private_key": "[REDACTED_GCP_PRIVATE_KEY]""#));
+        assert!(r.contains(r#""client_email": "[REDACTED_GCP_CLIENT_EMAIL]""#));
+    }
+
+    #[test]
+    fn redacts_gcp_service_account_fields_without_private_key_trigger() {
+        let private_key_id = chars('2', 40);
+        let client_email = "field-only-redaction@aicx-test.iam.gserviceaccount.com";
+        let s = format!(
+            r#"{{
+  "private_key_id": "{private_key_id}",
+  "client_email": "{client_email}"
+}}"#
+        );
+
+        let r = redact_secrets(&s);
+        assert!(!r.contains(&private_key_id));
+        assert!(!r.contains(client_email));
+        assert!(r.contains(r#""private_key_id": "[REDACTED_GCP_PRIVATE_KEY_ID]""#));
         assert!(r.contains(r#""client_email": "[REDACTED_GCP_CLIENT_EMAIL]""#));
     }
 

@@ -12,6 +12,7 @@ fn test_conversation_first_excludes_reasoning() {
             message: "Fix the auth middleware".to_string(),
             branch: Some("main".to_string()),
             cwd: Some("/home/user/myrepo".to_string()),
+            timestamp_source: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -22,6 +23,7 @@ fn test_conversation_first_excludes_reasoning() {
             message: "I'll refactor the auth module to use JWT tokens.".to_string(),
             branch: Some("main".to_string()),
             cwd: Some("/home/user/myrepo".to_string()),
+            timestamp_source: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -32,6 +34,7 @@ fn test_conversation_first_excludes_reasoning() {
             message: "Thinking about the best approach...".to_string(),
             branch: None,
             cwd: Some("/home/user/myrepo".to_string()),
+            timestamp_source: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -42,6 +45,7 @@ fn test_conversation_first_excludes_reasoning() {
             message: "**Analysis**: Checking dependencies".to_string(),
             branch: None,
             cwd: Some("/home/user/myrepo".to_string()),
+            timestamp_source: None,
             frame_kind: None,
         },
     ];
@@ -69,6 +73,7 @@ fn test_conversation_first_preserves_full_messages() {
         message: long_msg.clone(),
         branch: None,
         cwd: None,
+        timestamp_source: None,
         frame_kind: None,
     }];
 
@@ -89,6 +94,7 @@ fn test_conversation_first_repo_project_identity() {
             message: "hello".to_string(),
             branch: None,
             cwd: Some("/Users/maciejgad/hosted/VetCoders/ai-contexters".to_string()),
+            timestamp_source: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -99,6 +105,7 @@ fn test_conversation_first_repo_project_identity() {
             message: "world".to_string(),
             branch: None,
             cwd: None,
+            timestamp_source: None,
             frame_kind: None,
         },
     ];
@@ -123,6 +130,7 @@ fn test_conversation_first_preserves_provenance() {
         message: "Deploy to production".to_string(),
         branch: Some("release/v2".to_string()),
         cwd: Some("/home/user/project".to_string()),
+        timestamp_source: None,
         frame_kind: None,
     }];
 
@@ -157,6 +165,7 @@ fn conversation_entry_agent(
         message: message.to_string(),
         branch: None,
         cwd: None,
+        timestamp_source: None,
         frame_kind: None,
     }
 }

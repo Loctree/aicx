@@ -1,7 +1,7 @@
 [package]
 name = "aicx"
 
-version = "0.8.1"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.91.1"
 description = "Operator CLI + MCP server: canonical corpus first, optional semantic index second (Claude Code, Codex, Gemini)"
@@ -64,21 +64,26 @@ anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
+getrandom = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 siphasher = "1.0"
 sha2 = "0.10"
+shlex = "1"
+hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1"
 indicatif = "0.18"
+inquire = "0.7"
 globset = "0.4"
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = "0.29"
 axum = "0.8"
 futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "signal", "process"] }
+tower_governor = { version = "0.8", default-features = false, features = ["axum"] }
 rmcp = { version = "1.2", features = ["server", "schemars", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 libc = "0.2.183"
 rmcp-memex = { package = "rust-memex", version = "0.6.5", default-features = false, optional = true }
@@ -115,3 +120,25 @@ path = "src/lib.rs"
 [profile.release]
 lto = true
 strip = true
+
+# Debian package metadata. Built via `cargo deb --no-build` after the normal
+# cargo release build on the linux runner. Used by the release.yml CI to ship
+# `aicx_<version>_<arch>.deb` alongside the tar.gz archive for apt-install UX.
+[package.metadata.deb]
+maintainer = "Loctree Release <release@loct.io>"
+copyright = "2024-2026 LibraxisAI"
+license-file = ["LICENSE", "0"]
+extended-description = """
+Operator CLI + MCP server for AI sessions: canonical corpus first, optional \
+semantic index second. Designed for Claude Code, Codex, and Gemini.\
+"""
+depends = "$auto"
+section = "utility"
+priority = "optional"
+assets = [
+    ["target/release/aicx", "usr/bin/", "755"],
+    ["target/release/aicx-mcp", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/aicx/README", "644"],
+    ["LICENSE", "usr/share/doc/aicx/LICENSE", "644"],
+    ["CHANGELOG.md", "usr/share/doc/aicx/CHANGELOG", "644"],
+]

@@ -31,6 +31,8 @@ pub struct Chunk {
     pub session_id: String,
     /// Working directory from the first message in the chunk window
     pub cwd: Option<String>,
+    /// Timestamp provenance when any source frame used an inferred timestamp.
+    pub timestamp_source: Option<String>,
     /// Classified kind for this chunk's content
     pub kind: Kind,
     /// Stable stream/channel classification for the chunk contents.
@@ -83,6 +85,8 @@ pub struct ChunkMetadataSidecar {
     pub session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_source: Option<String>,
     pub kind: Kind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_kind: Option<FrameKind>,
@@ -173,6 +177,7 @@ impl From<&Chunk> for ChunkMetadataSidecar {
             date: chunk.date.clone(),
             session_id: chunk.session_id.clone(),
             cwd: chunk.cwd.clone(),
+            timestamp_source: chunk.timestamp_source.clone(),
             kind: chunk.kind,
             frame_kind: chunk.frame_kind,
             speaker_hint: speaker_hint_from_chunk_text(&chunk.text),
@@ -412,6 +417,18 @@ fn frame_kind_for_window(entries: &[&TimelineEntry]) -> Option<FrameKind> {
         .then_some(first)
 }
 
+fn timestamp_source_for_window(entries: &[&TimelineEntry]) -> Option<String> {
+    let mut sources = entries
+        .iter()
+        .filter_map(|entry| entry.timestamp_source.as_deref());
+    let first = sources.next()?;
+    let mut source = first.to_string();
+    if sources.any(|candidate| candidate != first) {
+        source = "mixed".to_string();
+    }
+    Some(source)
+}
+
 // ============================================================================
 // Chunking logic
 // ============================================================================
@@ -514,6 +531,7 @@ fn chunk_day_entries(
         let highlights = extract_highlights(&window);
         let signals = extract_signals(&window);
         let frame_kind = frame_kind_for_window(&window);
+        let timestamp_source = timestamp_source_for_window(&window);
         let text = format_chunk_text_inner(
             &window,
             project,
@@ -544,6 +562,7 @@ fn chunk_day_entries(
             date: date.to_string(),
             session_id,
             cwd,
+            timestamp_source,
             kind,
             frame_kind,
             run_id: None,
@@ -1347,6 +1366,7 @@ mod tests {
             frame_kind: None,
             branch: None,
             cwd: None,
+            timestamp_source: None,
         }
     }
 
@@ -1439,6 +1459,7 @@ mod tests {
                 frame_kind: None,
                 branch: None,
                 cwd: None,
+                timestamp_source: None,
             },
             TimelineEntry {
                 timestamp: Utc.with_ymd_and_hms(2026, 1, 21, 10, 0, 0).unwrap(),
@@ -1449,6 +1470,7 @@ mod tests {
                 frame_kind: None,
                 branch: None,
                 cwd: None,
+                timestamp_source: None,
             },
         ];
 
@@ -1551,6 +1573,7 @@ mod tests {
                 date: "2026-01-22".to_string(),
                 session_id: "s1".to_string(),
                 cwd: Some("/Users/tester/workspaces/proj".to_string()),
+                timestamp_source: None,
                 kind: Kind::Conversations,
                 frame_kind: Some(FrameKind::UserMsg),
                 run_id: None,
@@ -1577,6 +1600,7 @@ mod tests {
                 date: "2026-01-22".to_string(),
                 session_id: "s1".to_string(),
                 cwd: None,
+                timestamp_source: None,
                 kind: Kind::Conversations,
                 frame_kind: None,
                 run_id: None,
@@ -1740,6 +1764,7 @@ mod tests {
                 date: "2026-01-20".to_string(),
                 session_id: "s".to_string(),
                 cwd: None,
+                timestamp_source: None,
                 kind: Kind::Conversations,
                 frame_kind: None,
                 run_id: None,
@@ -1766,6 +1791,7 @@ mod tests {
                 date: "2026-01-21".to_string(),
                 session_id: "s".to_string(),
                 cwd: None,
+                timestamp_source: None,
                 kind: Kind::Conversations,
                 frame_kind: None,
                 run_id: None,

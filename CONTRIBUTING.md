@@ -33,6 +33,12 @@ Run tests:
 cargo test
 ```
 
+Local development commands that read or write tempfile-backed `/tmp` paths now
+follow the same path-safety policy as release builds. Export
+`AICX_ALLOW_TMP=1` when you intentionally run dev/smoke commands against `/tmp`
+or macOS `/private/var/folders` paths. Cargo tests keep their `cfg(test)`
+tempfile allowance.
+
 Format code:
 
 ```bash

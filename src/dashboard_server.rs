@@ -31,6 +31,7 @@ use crate::auth::{self, AuthConfig};
 use crate::dashboard::{
     self, DashboardPayload, DashboardRecord, DashboardScope, DashboardStats, project_matches_filter,
 };
+use crate::sanitize;
 
 const REGENERATE_HEADER_NAME: &str = "x-ai-contexters-action";
 const REGENERATE_HEADER_VALUE: &str = "regenerate";
@@ -90,7 +91,11 @@ impl DashboardCorsPolicy {
 
     fn response_allow_origin(&self, origin: &str) -> Option<HeaderValue> {
         match self {
-            Self::All => HeaderValue::from_str(origin).ok(),
+            // CORS spec: `*` is incompatible with `Access-Control-Allow-Credentials: true`,
+            // and the browser refuses cross-origin credentialed requests when wildcard is
+            // returned. Reflecting the request origin here would defeat the protection
+            // by upgrading a wide-open allowlist into an attacker-controlled echo.
+            Self::All => Some(HeaderValue::from_static("*")),
             _ if self.allows_origin(origin) => HeaderValue::from_str(origin).ok(),
             _ => None,
         }
@@ -110,6 +115,7 @@ pub struct DashboardServerConfig {
     pub host: IpAddr,
     pub port: u16,
     pub auth: AuthConfig,
+    pub allow_no_origin: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -143,8 +149,6 @@ struct DashboardServerState {
     shell_html: String,
     snapshot: RwLock<DashboardSnapshot>,
     rebuilding: AtomicBool,
-    csrf_token: String,
-    memex_cli_path: Option<String>,
 }
 
 #[derive(Debug)]
@@ -199,15 +203,32 @@ fn default_search_limit() -> usize {
     20
 }
 
+fn forbidden_response(reason: &'static str, detail: impl std::fmt::Display) -> Response {
+    tracing::warn!(
+        reason,
+        detail = %detail,
+        "dashboard security check rejected request"
+    );
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorResponse {
+            ok: false,
+            error: "Forbidden".to_string(),
+        }),
+    )
+        .into_response()
+}
+
 #[derive(Debug, Deserialize)]
 struct SemanticSearchParams {
     q: String,
     #[serde(default = "default_search_limit")]
     limit: usize,
-    /// Optional project filter (case-insensitive substring match). Prefer
-    /// `projects` for cross-project search.
+    /// Optional project filter routed through the canonical
+    /// `aicx::store::project_filter_matches` helper. Strict semantics: no
+    /// substring matching. Prefer `projects` for cross-project search.
     project: Option<String>,
-    /// Optional project filters for cross-project search.
+    /// Optional project filters for cross-project search (strict).
     #[serde(default)]
     projects: Vec<String>,
     /// Optional minimum score threshold (0-100)
@@ -216,29 +237,6 @@ struct SemanticSearchParams {
     frame_kind: Option<crate::timeline::FrameKind>,
     /// Optional canonical corpus kind filter
     kind: Option<String>,
-}
-
-// default_namespace / default_search_mode removed 2026-05-10: the
-// `ns` + `mode` fields they backed lived on the old memex-CLI shim and
-// have no meaning for the in-process semantic dispatch. Cross-search
-// keeps `default_search_mode` inline via its own struct's default.
-fn default_search_mode() -> String {
-    "hybrid".to_string()
-}
-
-#[derive(Debug, Deserialize)]
-struct CrossSearchParams {
-    q: String,
-    #[serde(default = "default_search_limit")]
-    limit: usize,
-    #[serde(default = "default_search_mode")]
-    mode: String,
-    /// Optional project filter (case-insensitive substring match). Prefer
-    /// `projects` for cross-project search.
-    project: Option<String>,
-    /// Optional project filters for cross-project search.
-    #[serde(default)]
-    projects: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -265,14 +263,6 @@ struct FuzzySearchResponse {
     total_scanned: usize,
 }
 
-#[derive(Debug, Serialize)]
-struct MemexSearchResponse {
-    ok: bool,
-    query: String,
-    source: String,
-    results: serde_json::Value,
-}
-
 #[derive(Debug, Deserialize)]
 struct SteerSearchParams {
     /// Filter by run_id (exact)
@@ -285,9 +275,9 @@ struct SteerSearchParams {
     kind: Option<String>,
     /// Filter by frame/channel
     frame_kind: Option<crate::timeline::FrameKind>,
-    /// Filter by project (case-insensitive substring)
+    /// Filter by project (strict, via `aicx::store::project_filter_matches`)
     project: Option<String>,
-    /// Filter by multiple project substrings
+    /// Filter by multiple project filters (strict)
     #[serde(default)]
     projects: Vec<String>,
     /// Filter by date (YYYY-MM-DD or range)
@@ -345,31 +335,11 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
     let initial = rebuild_dashboard(&config).context("Initial dashboard build failed")?;
     let shell_html = dashboard::render_server_shell_html(&config.title);
 
-    let csrf_token = {
-        use std::collections::hash_map::RandomState;
-        use std::hash::{BuildHasher, Hasher};
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let pid = std::process::id();
-        let hash1 = RandomState::new().build_hasher().finish();
-        let hash2 = RandomState::new().build_hasher().finish();
-        format!("{:016x}{:016x}{:08x}{:016x}", hash1, hash2, pid, ts)
-    };
-
-    let memex_cli_path = which::which("rust-memex")
-        .or_else(|_| which::which("rmcp-memex"))
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned());
-
     let state = Arc::new(DashboardServerState {
         config: config.clone(),
         shell_html,
         snapshot: RwLock::new(DashboardSnapshot::from_build(initial)),
         rebuilding: AtomicBool::new(false),
-        csrf_token: csrf_token.clone(),
-        memex_cli_path,
     });
 
     let auth_source_label = config.auth.source.describe();
@@ -394,7 +364,7 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
         .route("/api/context", get(get_context))
         .route("/api/regenerate", post(regenerate_dashboard))
         .route("/api/search/semantic", get(semantic_search))
-        .route("/api/search/cross", get(cross_search))
+        .route("/api/search/cross", get(cross_search_gone))
         .route("/api/search/steer", get(steer_search));
 
     let api_router = auth::require_auth_layer(api_router, config.auth.clone());
@@ -423,26 +393,36 @@ pub async fn run_dashboard_server(config: DashboardServerConfig) -> Result<()> {
     eprintln!(
         "  Semantic:  GET  http://{addr}/api/search/semantic?q=<query>&project=<p>&score=<min>"
     );
-    eprintln!("  Cross:     GET  http://{addr}/api/search/cross?q=<query>");
     eprintln!("  Steer:     GET  http://{addr}/api/search/steer?run_id=<id>&project=<p>");
     eprintln!("  PWA:       GET  http://{addr}/manifest.webmanifest");
     eprintln!(
         "  Required header: {}: {}",
         REGENERATE_HEADER_NAME, REGENERATE_HEADER_VALUE
     );
+    if config.allow_no_origin {
+        eprintln!("  Mutation origin gate: allow no-Origin/no-Referer requests");
+    } else {
+        eprintln!("  Mutation origin gate: require Origin or Referer");
+    }
     eprintln!("  Store: {}", config.store_root.display());
     eprintln!("  CORS: {}", config.cors_policy.describe());
     if auth_enforced {
         eprintln!("  Auth: enabled on /api/* (source: {auth_source_label})");
+        if let Some(msg) = auth::proxy_rate_limit_warning(config.host) {
+            eprintln!("  ⚠ Rate-limit (proxy): {msg}");
+        }
     } else {
         eprintln!(
             "  Auth: DISABLED ({auth_source_label}) — /api/* surface is reachable by anyone who can hit {addr}"
         );
     }
 
-    axum::serve(listener, app)
-        .await
-        .context("Dashboard server runtime terminated unexpectedly")
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("Dashboard server runtime terminated unexpectedly")
 }
 
 pub fn validate_dashboard_host_policy(
@@ -493,18 +473,13 @@ async fn dashboard_cors_middleware(
                     apply_cors_headers(response.headers_mut(), allow_origin, true);
                     response
                 } else {
-                    (
-                        StatusCode::FORBIDDEN,
-                        Json(ErrorResponse {
-                            ok: false,
-                            error: format!(
-                                "Origin '{}' is not permitted by dashboard CORS policy '{}'.",
-                                origin,
-                                state.config.cors_policy.describe()
-                            ),
-                        }),
+                    forbidden_response(
+                        "cors_preflight_origin_rejected",
+                        format!(
+                            "origin={origin}; policy={}",
+                            state.config.cors_policy.describe()
+                        ),
                     )
-                        .into_response()
                 }
             }
             None => next.run(request).await,
@@ -644,47 +619,41 @@ async fn regenerate_dashboard(
     State(state): State<Arc<DashboardServerState>>,
     headers: HeaderMap,
 ) -> Response {
+    // Mutation gate: require the action header, Bearer auth, and by default an
+    // Origin/Referer that matches the configured dashboard origin policy.
     let header_ok = headers
         .get(REGENERATE_HEADER_NAME)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.eq_ignore_ascii_case(REGENERATE_HEADER_VALUE));
 
-    let csrf_ok = headers
-        .get("x-csrf-token")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v == state.csrf_token);
-
-    if !header_ok || !csrf_ok {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(ErrorResponse {
-                ok: false,
-                error: format!(
-                    "Missing or invalid required header: x-csrf-token or {}",
-                    REGENERATE_HEADER_NAME
-                ),
-            }),
-        )
-            .into_response();
+    if !header_ok {
+        return forbidden_response(
+            "missing_or_invalid_action_header",
+            format!("expected {REGENERATE_HEADER_NAME}: {REGENERATE_HEADER_VALUE}"),
+        );
     }
 
     let origin_str = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
     let referer_str = headers.get(header::REFERER).and_then(|v| v.to_str().ok());
+    let source_url = origin_str.or(referer_str);
 
-    // We mandate that if a browser sends an Origin or Referer (which it will for cross-origin POSTs),
-    // it must match the allowed origins for this dashboard instance to prevent CSRF.
-    if let Some(source_url) = origin_str.or(referer_str) {
-        let is_valid_source = state.config.cors_policy.allows_origin(source_url);
-        if !is_valid_source {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(ErrorResponse {
-                    ok: false,
-                    error: "Cross-origin regenerate request rejected by CORS policy".to_string(),
-                }),
-            )
-                .into_response();
-        }
+    if source_url.is_none() && !state.config.allow_no_origin {
+        return forbidden_response(
+            "missing_origin_or_referer",
+            "mutating dashboard request had neither Origin nor Referer",
+        );
+    }
+
+    if let Some(source_url) = source_url
+        && !state.config.cors_policy.allows_origin(source_url)
+    {
+        return forbidden_response(
+            "origin_or_referer_rejected",
+            format!(
+                "source={source_url}; policy={}",
+                state.config.cors_policy.describe()
+            ),
+        );
     }
 
     if state.rebuilding.swap(true, Ordering::SeqCst) {
@@ -840,9 +809,17 @@ fn parse_relative_time(s: &str) -> Option<i64> {
     } else {
         return None;
     };
+    // saturate on overflow rather than panic; user input may be adversarial
     Some(now.saturating_sub(num.saturating_mul(unit)))
 }
 
+/// Combine a startup `--project` scope with the request-level `project` /
+/// `projects` filters into a single list. The rollup is canonical-equality
+/// only: a request filter is kept when it matches the startup scope
+/// case-insensitively after trimming. The previous reverse-substring
+/// rollup (`request.contains(scope)`) silently collapsed `vista` +
+/// `vista-portal` into the same bucket — that's bug #28 and intentionally
+/// gone here.
 fn merge_project_scopes(
     scope: Option<&str>,
     request: Option<String>,
@@ -858,8 +835,8 @@ fn merge_project_scopes(
         if merged.is_empty() {
             merged.push(scope.to_string());
         } else {
-            let scope_lower = scope.to_ascii_lowercase();
-            merged.retain(|request| request.to_ascii_lowercase().contains(&scope_lower));
+            let scope_trimmed = scope.trim();
+            merged.retain(|request| request.trim().eq_ignore_ascii_case(scope_trimmed));
             if merged.is_empty() {
                 merged.push(scope.to_string());
             }
@@ -931,7 +908,7 @@ async fn get_browse(
         .iter()
         .filter(|r| {
             if let Some(ref p) = params.project
-                && !r.project.eq_ignore_ascii_case(p)
+                && !project_matches_filter(&r.project, Some(p))
             {
                 return false;
             }
@@ -1102,7 +1079,7 @@ async fn get_chunk(
         }
     };
 
-    let content = match std::fs::read_to_string(&file_path) {
+    let content = match sanitize::read_to_string_validated(&file_path) {
         Ok(c) => c,
         Err(err) => {
             return (
@@ -1406,150 +1383,21 @@ async fn semantic_search(
     }
 }
 
-// run_memex_search removed 2026-05-10: dashboard semantic search is
-// now in-process via `crate::search_engine::try_semantic_search`.
-// External `rust-memex` / `rmcp-memex` CLI spawn is no longer used for
-// the `/api/search/semantic` path. `run_memex_cli` + `run_memex_cross_search`
-// survive only for the cross-search endpoint (separate doctrine; lands
-// in its own cut when that surface migrates in-process).
-
-async fn run_memex_cli(
-    binary_path: Option<&str>,
-    args: &[&str],
-    action: &str,
-) -> Result<(String, std::process::Output)> {
-    let binary = binary_path.ok_or_else(|| {
-        anyhow::anyhow!("Semantic search (vector backend) is an optional capability. Failed to run memex {action}: missing compatible memex CLI (rust-memex or rmcp-memex). Please install the vector backend or fall back to default lexical search.")
-    })?;
-
-    let child = tokio::process::Command::new(binary)
-        .args(args)
-        .env_clear()
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context(format!("Failed to spawn {binary} {action}"))?;
-
-    let output = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
-        .await
-        .map_err(|_| anyhow::anyhow!("{binary} timed out after 30s"))?
-        .context(format!("Failed to collect output for {binary} {action}"))?;
-
-    Ok((binary.to_string(), output))
-}
-
-/// Cross-namespace semantic search via the configured memex CLI.
-///
-/// Searches all namespaces at once, merging and ranking results.
-async fn cross_search(
-    State(state): State<Arc<DashboardServerState>>,
-    params: Result<Query<CrossSearchParams>, QueryRejection>,
-) -> Response {
-    let Query(params) = match params {
-        Ok(q) => q,
-        Err(rejection) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    ok: false,
-                    error: format!("Invalid query parameters: {rejection}"),
-                }),
-            )
-                .into_response();
-        }
-    };
-    let query = params.q.trim().to_string();
-    if query.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                ok: false,
-                error: "Query parameter 'q' is required".to_string(),
-            }),
-        )
-            .into_response();
-    }
-
-    let limit = params.limit.min(200);
-    let mode = params.mode;
-    let projects = if params.projects.is_empty() {
-        params.project.into_iter().collect::<Vec<_>>()
-    } else {
-        params.projects
-    };
-
-    let result = run_memex_cross_search(
-        state.memex_cli_path.as_deref(),
-        &query,
-        limit,
-        &mode,
-        &projects,
+// Cross-namespace memex CLI fork removed: `aicx` no longer shells out to
+// `rust-memex` / `rmcp-memex`. AICX is the canonical corpus surface
+// (operator decision 2026-05-23). The `/api/search/cross` route is kept
+// so a client polling the endpoint gets a clean Gone surface instead of
+// a 404 that looks like a routing mistake — see `cross_search_gone`.
+async fn cross_search_gone() -> Response {
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": "cross_search_removed",
+            "reason": "The /api/search/cross endpoint backed by the rust-memex / rmcp-memex CLI fork has been removed. AICX is the canonical corpus; use /api/search/semantic instead.",
+        })),
     )
-    .await;
-
-    match result {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err(err) => {
-            if let Some(err) = err.downcast_ref::<std::io::Error>()
-                && err.kind() == std::io::ErrorKind::NotFound
-            {
-                let payload = serde_json::json!({
-                    "ok": false,
-                    "error": "semantic_search_unavailable",
-                    "reason": format!("{err}"),
-                });
-                return (StatusCode::UNPROCESSABLE_ENTITY, Json(payload)).into_response();
-            }
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    ok: false,
-                    error: format!("Search task failed: {err:#}"),
-                }),
-            )
-                .into_response()
-        }
-    }
-}
-
-async fn run_memex_cross_search(
-    memex_cli_path: Option<&str>,
-    query: &str,
-    limit: usize,
-    mode: &str,
-    projects: &[String],
-) -> Result<MemexSearchResponse> {
-    let mut args = vec![
-        "cross-search".to_string(),
-        query.to_string(),
-        "--limit".to_string(),
-        limit.to_string(),
-        "--mode".to_string(),
-        mode.to_string(),
-        "--json".to_string(),
-    ];
-    for project in projects {
-        args.push("--project".to_string());
-        args.push(project.clone());
-    }
-    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    let (binary, output) = run_memex_cli(memex_cli_path, &arg_refs, "cross-search").await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("{binary} cross-search failed: {}", stderr.trim());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let results: serde_json::Value =
-        serde_json::from_str(&stdout).unwrap_or(serde_json::Value::String(stdout.to_string()));
-
-    Ok(MemexSearchResponse {
-        ok: true,
-        query: query.to_string(),
-        source: format!("{binary} cross-search --mode {}", mode),
-        results,
-    })
+        .into_response()
 }
 
 /// Steering-metadata search across stored chunks.
@@ -1839,6 +1687,40 @@ fn write_dashboard_artifact(path: &Path, html: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
+    use std::io;
+    use std::sync::{Arc as StdArc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct CapturedLogWriter {
+        buffer: StdArc<Mutex<Vec<u8>>>,
+    }
+
+    struct CapturedLogGuard {
+        buffer: StdArc<Mutex<Vec<u8>>>,
+    }
+
+    impl io::Write for CapturedLogGuard {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buffer.lock().expect("log buffer poisoned").extend(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogWriter {
+        type Writer = CapturedLogGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogGuard {
+                buffer: self.buffer.clone(),
+            }
+        }
+    }
 
     fn mk_tmp_dir(name: &str) -> PathBuf {
         let dir = std::env::current_dir()
@@ -1860,7 +1742,52 @@ mod tests {
         .expect("seed file");
     }
 
+    async fn response_body_to_string(response: Response) -> String {
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect response body")
+            .to_bytes();
+        String::from_utf8(bytes.to_vec()).expect("utf8 body")
+    }
+
+    // Serialize all capture_logs callers. tracing's thread-local default
+    // subscriber loses races when multiple tests run in parallel against the
+    // same global state — one test's subscriber leaks across the scope of
+    // another, producing intermittent missing-log assertions. Holding this
+    // mutex for the duration of capture_logs makes the call deterministic.
+    static CAPTURE_LOGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
+        let _serial = CAPTURE_LOGS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let buffer = StdArc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CapturedLogWriter {
+                buffer: buffer.clone(),
+            })
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let logs = String::from_utf8(buffer.lock().expect("log buffer poisoned").clone())
+            .expect("utf8 logs");
+        (result, logs)
+    }
+
     fn mk_state(root: PathBuf, artifact_path: PathBuf) -> Arc<DashboardServerState> {
+        mk_state_with_origin_escape(root, artifact_path, false)
+    }
+
+    fn mk_state_with_origin_escape(
+        root: PathBuf,
+        artifact_path: PathBuf,
+        allow_no_origin: bool,
+    ) -> Arc<DashboardServerState> {
         Arc::new(DashboardServerState {
             config: DashboardServerConfig {
                 store_root: root,
@@ -1872,6 +1799,7 @@ mod tests {
                 host: "127.0.0.1".parse().expect("host"),
                 port: 8033,
                 auth: AuthConfig::disabled(),
+                allow_no_origin,
             },
             shell_html: "<html>shell</html>".to_string(),
             snapshot: RwLock::new(DashboardSnapshot {
@@ -1892,8 +1820,6 @@ mod tests {
                 last_error: None,
             }),
             rebuilding: AtomicBool::new(false),
-            csrf_token: "test".to_string(),
-            memex_cli_path: None,
         })
     }
 
@@ -2020,7 +1946,109 @@ mod tests {
         let response =
             runtime.block_on(regenerate_dashboard(State(state.clone()), HeaderMap::new()));
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = runtime.block_on(response_body_to_string(response));
+        assert_eq!(body, r#"{"ok":false,"error":"Forbidden"}"#);
         assert!(!state.rebuilding.load(Ordering::SeqCst));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regenerate_logs_detailed_reason_without_leaking_403_body() {
+        let root = mk_tmp_dir("dashboard_server_forbidden_log");
+        let artifact_path = root.join("dashboard.html");
+        seed_store(&root);
+        let state = mk_state(root.clone(), artifact_path);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let (response, logs) = capture_logs(|| {
+            runtime.block_on(regenerate_dashboard(State(state.clone()), HeaderMap::new()))
+        });
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = runtime.block_on(response_body_to_string(response));
+        assert_eq!(body, r#"{"ok":false,"error":"Forbidden"}"#);
+        assert!(logs.contains("missing_or_invalid_action_header"));
+        assert!(logs.contains(REGENERATE_HEADER_NAME));
+        assert!(!body.contains(REGENERATE_HEADER_NAME));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regenerate_rejects_missing_origin_and_referer() {
+        let root = mk_tmp_dir("dashboard_server_missing_origin");
+        let artifact_path = root.join("dashboard.html");
+        seed_store(&root);
+        let state = mk_state(root.clone(), artifact_path);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            REGENERATE_HEADER_NAME,
+            HeaderValue::from_static(REGENERATE_HEADER_VALUE),
+        );
+        let response = runtime.block_on(regenerate_dashboard(State(state.clone()), headers));
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = runtime.block_on(response_body_to_string(response));
+        assert_eq!(body, r#"{"ok":false,"error":"Forbidden"}"#);
+        assert!(!state.rebuilding.load(Ordering::SeqCst));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regenerate_accepts_no_origin_when_escape_hatch_enabled() {
+        let root = mk_tmp_dir("dashboard_server_no_origin_escape");
+        let artifact_path = root.join("dashboard.html");
+        seed_store(&root);
+        let state = mk_state_with_origin_escape(root.clone(), artifact_path, true);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            REGENERATE_HEADER_NAME,
+            HeaderValue::from_static(REGENERATE_HEADER_VALUE),
+        );
+        let response = runtime.block_on(regenerate_dashboard(State(state), headers));
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regenerate_rejects_cross_origin_referer() {
+        let root = mk_tmp_dir("dashboard_server_cross_origin_referer");
+        let artifact_path = root.join("dashboard.html");
+        seed_store(&root);
+        let state = mk_state(root.clone(), artifact_path);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            REGENERATE_HEADER_NAME,
+            HeaderValue::from_static(REGENERATE_HEADER_VALUE),
+        );
+        headers.insert(header::REFERER, "https://evil.example".parse().unwrap());
+        let response = runtime.block_on(regenerate_dashboard(State(state), headers));
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = runtime.block_on(response_body_to_string(response));
+        assert_eq!(body, r#"{"ok":false,"error":"Forbidden"}"#);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2043,7 +2071,6 @@ mod tests {
             REGENERATE_HEADER_NAME,
             HeaderValue::from_static(REGENERATE_HEADER_VALUE),
         );
-        headers.insert("x-csrf-token", "test".parse().unwrap());
         headers.insert(header::ORIGIN, "http://127.0.0.1:4000".parse().unwrap());
         let response = runtime.block_on(regenerate_dashboard(State(state.clone()), headers));
         assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -2069,7 +2096,6 @@ mod tests {
             REGENERATE_HEADER_NAME,
             HeaderValue::from_static(REGENERATE_HEADER_VALUE),
         );
-        headers.insert("x-csrf-token", "test".parse().unwrap());
         headers.insert(header::ORIGIN, "http://127.0.0.1:4000".parse().unwrap());
         let response = runtime.block_on(regenerate_dashboard(State(state), headers));
         assert_eq!(response.status(), StatusCode::OK);
@@ -2085,12 +2111,65 @@ mod tests {
         assert_eq!(err, "score must be between 0 and 100");
     }
 
+    // Bug #28 regression: `merge_project_scopes` must roll up by canonical
+    // case-insensitive equality, not by reverse substring. `vista` no longer
+    // collapses `vista-portal` into the same bucket.
     #[test]
-    fn test_cors_all_reflects_allowlisted_origin_not_wildcard() {
+    fn merge_project_scopes_rejects_substring_rollup() {
+        let merged = merge_project_scopes(
+            Some("vista"),
+            None,
+            vec!["vista-portal".to_string(), "vetcoders/vista".to_string()],
+        );
+        assert_eq!(
+            merged,
+            vec!["vista".to_string()],
+            "reverse-substring rollup leaked: vista-portal / vetcoders/vista must NOT be retained when scope is `vista`"
+        );
+    }
+
+    #[test]
+    fn merge_project_scopes_keeps_canonical_match_case_insensitive() {
+        let merged = merge_project_scopes(
+            Some("Vetcoders/Vista"),
+            None,
+            vec![
+                "vetcoders/vista".to_string(),
+                "vetcoders/vista-portal".to_string(),
+            ],
+        );
+        assert_eq!(
+            merged,
+            vec!["vetcoders/vista".to_string()],
+            "canonical-equality rollup must keep only the exact match (case-insensitive)"
+        );
+    }
+
+    #[test]
+    fn merge_project_scopes_falls_back_to_scope_when_no_overlap() {
+        let merged = merge_project_scopes(Some("vista"), None, vec!["vista-portal".to_string()]);
+        assert_eq!(
+            merged,
+            vec!["vista".to_string()],
+            "when no request matches the scope canonically, fall back to scope alone"
+        );
+    }
+
+    #[test]
+    fn test_cors_all_returns_wildcard_not_reflected_origin() {
         let policy = DashboardCorsPolicy::All;
+        // `Self::All` must return the literal wildcard so credentialed
+        // cross-origin requests are refused by the browser. Reflecting the
+        // request origin would let an attacker upgrade `All` into an echo
+        // server for cookies/credentials if the server ever set
+        // `Access-Control-Allow-Credentials: true`.
         assert_eq!(
             policy.response_allow_origin("https://example.com"),
-            Some(HeaderValue::from_str("https://example.com").unwrap())
+            Some(HeaderValue::from_static("*"))
+        );
+        assert_eq!(
+            policy.response_allow_origin("https://attacker.example.com"),
+            Some(HeaderValue::from_static("*"))
         );
     }
 

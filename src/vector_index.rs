@@ -23,7 +23,7 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-use std::io::Read;
+use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,75 @@ use sha2::{Digest, Sha256};
 /// conservative byte-level cap that keeps each embed call fast and within
 /// any reasonable model context.
 pub const DEFAULT_EMBED_PREFIX_BYTES: usize = 2048;
+
+fn strip_line_ending(mut line: String) -> String {
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+    line
+}
+
+fn oversized_line_error(path: &Path, line_no: usize, context: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "{context} line {line_no} exceeds {} bytes in {}",
+            crate::sanitize::MAX_VALIDATED_BYTES,
+            path.display()
+        ),
+    )
+}
+
+fn read_index_line_capped<R: BufRead>(
+    reader: &mut R,
+    path: &Path,
+    line_no: usize,
+    context: &str,
+) -> io::Result<Option<String>> {
+    let Some(line) =
+        crate::sanitize::read_line_capped(reader, crate::sanitize::MAX_VALIDATED_BYTES)?
+    else {
+        return Ok(None);
+    };
+    if line.exceeded {
+        return Err(oversized_line_error(path, line_no, context));
+    }
+    Ok(Some(strip_line_ending(line.line)))
+}
+
+struct CappedIndexLines<R> {
+    reader: R,
+    path: PathBuf,
+    line_no: usize,
+    context: &'static str,
+}
+
+fn capped_index_lines<R: BufRead>(
+    reader: R,
+    path: &Path,
+    first_line_no: usize,
+    context: &'static str,
+) -> CappedIndexLines<R> {
+    CappedIndexLines {
+        reader,
+        path: path.to_path_buf(),
+        line_no: first_line_no,
+        context,
+    }
+}
+
+impl<R: BufRead> Iterator for CappedIndexLines<R> {
+    type Item = io::Result<String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let line_no = self.line_no;
+        self.line_no += 1;
+        read_index_line_capped(&mut self.reader, &self.path, line_no, self.context).transpose()
+    }
+}
 
 /// Aggregate report emitted by [`dry_run_index`].
 ///
@@ -284,13 +353,17 @@ const CORRUPT_WARN_HEAD: usize = 5;
 /// `_all` bucket path so an operator can index every chunk in one file.
 pub fn index_path(project: Option<&str>) -> Result<PathBuf> {
     let base = crate::store::store_base_dir()?;
+    Ok(index_path_for(&base, project))
+}
+
+fn index_path_for(base: &Path, project: Option<&str>) -> PathBuf {
     // `store_base_dir()` resolves to the AICX home (`~/.aicx`), not the
     // corpus store (`~/.aicx/store`). Keep the vector index inside the
     // operator-owned AICX home so build, status, and search all agree.
     let index_root = base.join(INDEX_DIR_NAME);
-    Ok(index_root
+    index_root
         .join(index_bucket_name(project))
-        .join(INDEX_FILE_NAME))
+        .join(INDEX_FILE_NAME)
 }
 
 pub fn context_corpus_index_path(project: Option<&str>) -> Result<PathBuf> {
@@ -435,6 +508,38 @@ pub fn write_index(project: Option<&str>, sample: usize) -> Result<IndexStats> {
     write_index_with_progress(project, sample, &|_| {})
 }
 
+/// G-3 build-mode options for [`write_index_with_options`].
+///
+/// Default is incremental: only sidecars whose mtime is newer than the
+/// committed index `header.generated_at` are re-embedded, and their rows
+/// are appended to the existing `embeddings.ndjson`. `full_rescan: true`
+/// restores the pre-G-3 from-zero rebuild.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IndexBuildOptions {
+    /// `true` to embed every chunk from scratch. `false` (default) to walk
+    /// only chunks newer than the committed index header.
+    pub full_rescan: bool,
+}
+
+/// Short label for the currently-configured embedder backend
+/// (`"cloud"` / `"gguf"`). Returns `None` if no embedder can be loaded
+/// — caller is free to skip printing rather than surfacing a noisy error
+/// before the same backend init runs again inside [`write_index`].
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub fn probe_backend_label() -> Option<&'static str> {
+    let engine = crate::embedder::EmbeddingEngine::new().ok()?;
+    Some(backend_label_from_info(engine.info()))
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn backend_label_from_info(info: &crate::embedder::EmbeddingModelInfo) -> &'static str {
+    match info.source {
+        crate::embedder::NativeEmbeddingSource::CloudEndpoint(_) => "cloud",
+        crate::embedder::NativeEmbeddingSource::HfCache { .. }
+        | crate::embedder::NativeEmbeddingSource::ExplicitPath(_) => "gguf",
+    }
+}
+
 /// Same as [`write_index`] but emits [`IndexEvent`]s into the supplied sink
 /// for every embedded chunk plus a rate-limited [`IndexEvent::StatsTick`].
 ///
@@ -444,10 +549,29 @@ pub fn write_index(project: Option<&str>, sample: usize) -> Result<IndexStats> {
 /// at a 75-minute blank stdout. Internal rebuild paths (`aicx all`, library
 /// callers) still call the thin [`write_index`] wrapper above and pay zero
 /// observability cost.
+///
+/// Defaults to **incremental** since G-3 (only sidecars newer than the
+/// committed `header.generated_at` are re-embedded). Callers that need a
+/// from-zero rebuild use [`write_index_with_options`] with
+/// `full_rescan: true`.
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub fn write_index_with_progress(
     project: Option<&str>,
     sample: usize,
+    on_event: &dyn Fn(&IndexEvent),
+) -> Result<IndexStats> {
+    write_index_with_options(project, sample, IndexBuildOptions::default(), on_event)
+}
+
+/// Build (or incrementally update) the persistent NDJSON-backed index.
+///
+/// `options.full_rescan` controls the walk strategy — see
+/// [`IndexBuildOptions`].
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub fn write_index_with_options(
+    project: Option<&str>,
+    sample: usize,
+    options: IndexBuildOptions,
     on_event: &dyn Fn(&IndexEvent),
 ) -> Result<IndexStats> {
     use std::collections::HashSet;
@@ -483,10 +607,10 @@ pub fn write_index_with_progress(
     let _lock = crate::locks::acquire_exclusive(crate::locks::lance_lock_path()?)?;
 
     let root = crate::store::store_base_dir()?;
-    let files = live_index_files(&root, project)?;
-    stats.chunks_total = files.len();
+    let all_files = live_index_files(&root, project)?;
+    stats.chunks_total = all_files.len();
 
-    if files.is_empty() {
+    if all_files.is_empty() {
         stats.fallback_reason = Some("no chunks found in canonical store".to_string());
         stats.elapsed_ms = started.elapsed().as_millis();
         return Ok(stats);
@@ -512,12 +636,34 @@ pub fn write_index_with_progress(
             .with_context(|| format!("create index dir: {}", parent.display()))?;
     }
 
+    // G-3: decide build mode. `--full-rescan` always rebuilds from zero.
+    // `sample != 0` is a deterministic-subset diagnostic mode, also full.
+    // Otherwise look for a compatible committed index — if absent or
+    // incompatible (dim/model/profile drift), fall back to full so the
+    // operator does not silently mix model outputs.
+    let incremental_baseline = if options.full_rescan || sample != 0 {
+        None
+    } else {
+        load_incremental_baseline(&target_path, &info)?
+    };
+
+    // Files to walk through the embed loop. Incremental keeps only those
+    // newer than the baseline `generated_at` AND not already embedded
+    // (id-set diff covers crash-recovery cases where mtime ≤ generated_at
+    // but the row never made it into the committed index).
+    let files: Vec<crate::store::StoredContextFile> = match incremental_baseline.as_ref() {
+        Some(baseline) => partition_incremental_files(&all_files, baseline),
+        None => all_files.clone(),
+    };
     let cap = if sample == 0 {
         files.len()
     } else {
         sample.min(files.len())
     };
-    let resume = if sample == 0 {
+    // Resume-from-checkpoint only applies to a full rebuild; an
+    // incremental walk never writes to `ndjson.tmp` so there is nothing
+    // to resume from.
+    let resume = if sample == 0 && incremental_baseline.is_none() {
         load_resume_tmp_index(&tmp_path, &info)?
     } else {
         None
@@ -528,9 +674,12 @@ pub fn write_index_with_progress(
         .unwrap_or_default();
 
     // Atomic-ish: write to `.tmp` then rename so a partial build cannot
-    // poison subsequent queries. Full builds resume an existing compatible
-    // `.tmp` checkpoint; sample builds intentionally start clean so the
-    // operator gets exactly the requested sample size.
+    // poison subsequent queries. Three flows feed the same tmp file shape:
+    //   1. Resumed full build → append onto the surviving `.tmp` checkpoint.
+    //   2. Incremental walk (G-3) → seed tmp with the committed body so the
+    //      embed loop only writes the genuinely new rows.
+    //   3. Fresh full build → empty tmp + placeholder header, embed loop
+    //      writes every chunk.
     let mut writer = if let Some(state) = &resume {
         stats.resumed_embeddings = state.rows;
         stats.resume_tmp_path = Some(tmp_path.clone());
@@ -562,6 +711,21 @@ pub fn write_index_with_progress(
             entry_count: 0,
         };
         writeln!(writer, "{}", serde_json::to_string(&header)?)?;
+        // G-3: incremental seed — copy every data line from the committed
+        // index into tmp before the embed loop appends new rows. The
+        // truthful-header rewrite at commit time then sees existing-plus-new
+        // and renames atomically onto the target. `stats.resumed_embeddings`
+        // doubles as the "already in the file" count so the D-2 entry_count
+        // math below stays accurate.
+        if incremental_baseline.is_some() {
+            stats.resumed_embeddings = copy_committed_body_into(&mut writer, &target_path)
+                .with_context(|| {
+                    format!(
+                        "seed incremental tmp from committed index: {}",
+                        target_path.display()
+                    )
+                })?;
+        }
         writer
     };
 
@@ -920,16 +1084,14 @@ fn rewrite_index_with_truthful_header(
     final_tmp_path: &Path,
     header: &IndexHeader,
 ) -> Result<()> {
-    use std::io::{BufRead, BufReader, BufWriter, Write};
+    use std::io::{BufReader, BufWriter, Write};
 
     let src = crate::sanitize::open_file_validated(tmp_path)
         .with_context(|| format!("open tmp index for header rewrite: {}", tmp_path.display()))?;
     let mut src_reader = BufReader::new(src);
-    let mut placeholder = String::new();
-    src_reader
-        .read_line(&mut placeholder)
+    let placeholder = read_index_line_capped(&mut src_reader, tmp_path, 1, "tmp index header")
         .with_context(|| format!("read placeholder header: {}", tmp_path.display()))?;
-    if placeholder.is_empty() {
+    if placeholder.is_none() {
         anyhow::bail!("tmp index unexpectedly empty: {}", tmp_path.display());
     }
 
@@ -957,26 +1119,24 @@ fn rewrite_index_with_truthful_header(
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn read_committed_index_entries(path: &Path) -> Result<(IndexHeader, Vec<IndexEntry>)> {
-    use std::io::{BufRead, BufReader};
+    use std::io::BufReader;
 
     let file = crate::sanitize::open_file_validated(path)
         .with_context(|| format!("open committed semantic index: {}", path.display()))?;
-    let mut lines = BufReader::new(file).lines();
-    let header_line = lines
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("empty committed semantic index: {}", path.display()))?
-        .with_context(|| format!("read header in {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let header_line = read_index_line_capped(&mut reader, path, 1, "committed semantic header")
+        .with_context(|| format!("read header in {}", path.display()))?
+        .ok_or_else(|| anyhow::anyhow!("empty committed semantic index: {}", path.display()))?;
     let header = serde_json::from_str::<IndexHeader>(&header_line)
         .with_context(|| format!("parse header in {}", path.display()))?;
     let mut entries = Vec::new();
-    for (line_no, line) in lines.enumerate() {
-        let line =
-            line.with_context(|| format!("read line {} in {}", line_no + 2, path.display()))?;
+    for (idx, line) in capped_index_lines(reader, path, 2, "committed semantic data").enumerate() {
+        let line = line.with_context(|| format!("read line {} in {}", idx + 2, path.display()))?;
         if line.trim().is_empty() {
             continue;
         }
         let entry = serde_json::from_str::<IndexEntry>(&line)
-            .with_context(|| format!("parse line {} in {}", line_no + 2, path.display()))?;
+            .with_context(|| format!("parse line {} in {}", idx + 2, path.display()))?;
         entries.push(entry);
     }
     Ok((header, entries))
@@ -1034,7 +1194,7 @@ fn load_resume_tmp_index(
     info: &crate::embedder::EmbeddingModelInfo,
 ) -> Result<Option<ResumeTmpIndex>> {
     use std::collections::HashSet;
-    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+    use std::io::{BufReader, Read, Seek, SeekFrom};
 
     if !path.exists() {
         return Ok(None);
@@ -1042,11 +1202,14 @@ fn load_resume_tmp_index(
 
     let file = crate::sanitize::open_file_validated(path)
         .with_context(|| format!("open tmp index checkpoint: {}", path.display()))?;
-    let mut lines = BufReader::new(file).lines();
-    let header_line = match lines.next() {
-        Some(line) => line.with_context(|| format!("read tmp header: {}", path.display()))?,
-        None => return Ok(None),
-    };
+    let mut reader = BufReader::new(file);
+    let header_line =
+        match read_index_line_capped(&mut reader, path, 1, "tmp index checkpoint header")
+            .with_context(|| format!("read tmp header: {}", path.display()))?
+        {
+            Some(line) => line,
+            None => return Ok(None),
+        };
     let header: IndexHeader = serde_json::from_str(&header_line)
         .with_context(|| format!("parse tmp header: {}", path.display()))?;
     let profile = info.profile.to_string();
@@ -1082,11 +1245,12 @@ fn load_resume_tmp_index(
 
     let mut ids = HashSet::new();
     let mut rows = 0usize;
-    for (line_no, line) in lines.enumerate() {
+    for (idx, line) in capped_index_lines(reader, path, 2, "tmp index checkpoint data").enumerate()
+    {
         let line = line.with_context(|| {
             format!(
                 "read tmp index checkpoint line {}: {}",
-                line_no + 2,
+                idx + 2,
                 path.display()
             )
         })?;
@@ -1096,7 +1260,7 @@ fn load_resume_tmp_index(
         let entry: ResumeEntry = serde_json::from_str(&line).with_context(|| {
             format!(
                 "parse tmp index checkpoint line {}: {}",
-                line_no + 2,
+                idx + 2,
                 path.display()
             )
         })?;
@@ -1126,6 +1290,220 @@ fn load_resume_tmp_index(
         rows,
         needs_newline,
     }))
+}
+
+/// G-3 incremental baseline parsed from the existing committed index.
+///
+/// `embedded_ids` captures the row IDs that already live in the
+/// committed file. A chunk whose id is already in the committed body
+/// never re-embeds under the incremental walk (`--full-rescan` is the
+/// explicit refresh path).
+///
+/// `cutoff` is the `header.generated_at` lifted into a comparable
+/// [`std::time::SystemTime`]. It is retained as parsed-and-validated
+/// metadata so the loader can still reject a committed file with a
+/// malformed timestamp; the partition logic itself no longer consults
+/// mtime now that the missing-id rule is authoritative.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[derive(Debug, Clone)]
+pub(crate) struct IncrementalBaseline {
+    #[allow(dead_code)] // validated at parse time; kept for diagnostics & future reconcile mode
+    pub(crate) cutoff: std::time::SystemTime,
+    pub(crate) embedded_ids: std::collections::HashSet<String>,
+}
+
+/// Read the committed index at `path`, validate that its header matches
+/// the active embedder, and emit an [`IncrementalBaseline`] the caller
+/// can hand to [`partition_incremental_files`].
+///
+/// Returns `Ok(None)` when the committed index does not exist or has no
+/// data rows — both cases degrade to a full rebuild, since incremental
+/// math against "zero entries with stale generated_at" would silently
+/// skip every sidecar older than the cutoff and produce an empty result.
+///
+/// Header dim / model / profile mismatch returns an `Err` with a
+/// recovery hint pointing at `--full-rescan`. Embedder swaps must be
+/// explicit, never silent.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn load_incremental_baseline(
+    path: &Path,
+    info: &crate::embedder::EmbeddingModelInfo,
+) -> Result<Option<IncrementalBaseline>> {
+    use std::io::BufReader;
+
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let file = crate::sanitize::open_file_validated(path)
+        .with_context(|| format!("open committed index for incremental: {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let header_line =
+        match read_index_line_capped(&mut reader, path, 1, "committed incremental header")
+            .with_context(|| format!("read committed header: {}", path.display()))?
+        {
+            Some(line) => line,
+            None => return Ok(None),
+        };
+    let header: IndexHeader = serde_json::from_str(&header_line)
+        .with_context(|| format!("parse committed header: {}", path.display()))?;
+    let profile = info.profile.to_string();
+    if header.schema_version != INDEX_SCHEMA_VERSION
+        || header.model_id != info.model_id
+        || header.model_profile != profile
+        || header.dimension != info.dimension
+    {
+        return Err(anyhow::anyhow!(
+            "committed semantic index at {path} is incompatible with the active embedder.\n  \
+             committed: schema={cks} model={ckm} profile={ckp} dim={ckd}\n  \
+             current  : schema={cur_s} model={cur_m} profile={cur_p} dim={cur_d}\n  \
+             incremental walk requires a matching embedder. Rebuild from scratch:\n    \
+                 aicx index --full-rescan",
+            path = path.display(),
+            cks = header.schema_version,
+            ckm = header.model_id,
+            ckp = header.model_profile,
+            ckd = header.dimension,
+            cur_s = INDEX_SCHEMA_VERSION,
+            cur_m = info.model_id,
+            cur_p = profile,
+            cur_d = info.dimension,
+        ));
+    }
+
+    let cutoff = chrono::DateTime::parse_from_rfc3339(&header.generated_at)
+        .with_context(|| {
+            format!(
+                "parse header.generated_at ({}) in {}",
+                header.generated_at,
+                path.display()
+            )
+        })?
+        .with_timezone(&chrono::Utc);
+    let cutoff_st: std::time::SystemTime = cutoff.into();
+
+    #[derive(Deserialize)]
+    struct IdOnly {
+        id: String,
+    }
+
+    let mut embedded_ids = std::collections::HashSet::new();
+    let mut data_rows = 0usize;
+    for (idx, line) in capped_index_lines(reader, path, 2, "committed incremental data").enumerate()
+    {
+        let line =
+            line.with_context(|| format!("read committed line {}: {}", idx + 2, path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        data_rows += 1;
+        match serde_json::from_str::<IdOnly>(&line) {
+            Ok(row) => {
+                embedded_ids.insert(row.id);
+            }
+            Err(_) => {
+                // A corrupt row is rare here (writer commits whole rows or
+                // not at all). Tolerate it; query_index will surface the
+                // ratio at read time.
+            }
+        }
+    }
+
+    if data_rows == 0 {
+        // Header alone, no body — treat as never-built so the operator
+        // does not get a silent empty index after the first --full-rescan.
+        return Ok(None);
+    }
+
+    Ok(Some(IncrementalBaseline {
+        cutoff: cutoff_st,
+        embedded_ids,
+    }))
+}
+
+/// Return the subset of `files` that need to be embedded under the
+/// incremental walk.
+///
+/// **Rule: missing-id always wins.** A chunk whose id is not in the
+/// committed body is re-embedded regardless of mtime — this is the
+/// shape produced by backup / rsync / quarantine restore, where a real
+/// chunk may surface with an mtime older than `generated_at`. Without
+/// this rule incremental indexing would silently drop those chunks and
+/// only `--full-rescan` could recover them.
+///
+/// **Crash-recovery guard.** Any id already present in the committed
+/// body is skipped here. Refreshing an already-embedded chunk is the
+/// explicit job of `--full-rescan`; doing it silently under the
+/// incremental walk would risk crash-loop double writes after a
+/// partial rebuild.
+///
+/// Pure function so it can be exercised against a synthetic corpus in
+/// tests.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn partition_incremental_files(
+    files: &[crate::store::StoredContextFile],
+    baseline: &IncrementalBaseline,
+) -> Vec<crate::store::StoredContextFile> {
+    files
+        .iter()
+        .filter(|stored| {
+            let entry_id = chunk_id_from_path(&stored.path);
+            // Missing-id always wins. A chunk restored from backup /
+            // rsync / quarantine may carry an mtime older than the
+            // committed `header.generated_at`, but if its id is absent
+            // from the committed body we MUST re-embed it — otherwise
+            // Layer 2 semantic search silently drifts incomplete and
+            // operators are forced into `--full-rescan` to recover.
+            // Note: mtime is intentionally not consulted for this case;
+            // restored chunks may have any clock value.
+            if !baseline.embedded_ids.contains(&entry_id) {
+                return true;
+            }
+            // Crash-recovery guard: id is already in the committed body
+            // -> never re-embed under the incremental walk. Genuine
+            // refresh / reconcile of an already-embedded chunk is the
+            // job of `--full-rescan`, not silent drift here.
+            false
+        })
+        .cloned()
+        .collect()
+}
+
+/// G-3 incremental seed: copy every data row from the committed index at
+/// `target_path` into the open tmp writer. Skips the header line because
+/// the caller has already written its own placeholder header into tmp.
+/// Returns the number of rows copied so the caller can fold it into
+/// `stats.resumed_embeddings` (the D-2 entry_count math relies on it).
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn copy_committed_body_into(
+    writer: &mut std::io::BufWriter<std::fs::File>,
+    target_path: &Path,
+) -> Result<usize> {
+    use std::io::{BufReader, Write};
+
+    let src = crate::sanitize::open_file_validated(target_path)
+        .with_context(|| format!("open committed index for seed: {}", target_path.display()))?;
+    let mut reader = BufReader::new(src);
+    // Discard the header — caller has already emitted a new placeholder
+    // for the tmp file. Done by consuming one capped line.
+    let _ = read_index_line_capped(&mut reader, target_path, 1, "committed seed header")
+        .with_context(|| format!("read committed seed header: {}", target_path.display()))?;
+    let mut rows = 0usize;
+    for line in capped_index_lines(reader, target_path, 2, "committed seed data") {
+        let line =
+            line.with_context(|| format!("read committed body row: {}", target_path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        writeln!(writer, "{}", line).with_context(|| {
+            format!(
+                "seed incremental tmp with committed row: {}",
+                target_path.display()
+            )
+        })?;
+        rows += 1;
+    }
+    Ok(rows)
 }
 
 fn chunk_id_from_path(path: &std::path::Path) -> String {
@@ -1221,12 +1599,10 @@ fn first_metadata_field(path: &std::path::Path, key: &str) -> Option<String> {
 pub fn query_index(
     project: Option<&str>,
     query: &str,
-    _limit: usize,
+    limit: usize,
     kind_filter: Option<&str>,
     frame_kind_filter: Option<&str>,
 ) -> Result<Vec<QueryHit>> {
-    use std::io::{BufRead, BufReader};
-
     let path = index_path(project)?;
     if !path.exists() {
         return Ok(Vec::new());
@@ -1243,22 +1619,40 @@ pub fn query_index(
     let query_embedding = engine.embed(query).with_context(|| "embed query")?;
     drop(engine);
 
+    query_index_with_embedding(
+        &path,
+        &query_embedding,
+        limit,
+        kind_filter,
+        frame_kind_filter,
+    )
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn query_index_with_embedding(
+    path: &Path,
+    query_embedding: &[f32],
+    limit: usize,
+    kind_filter: Option<&str>,
+    frame_kind_filter: Option<&str>,
+) -> Result<Vec<QueryHit>> {
+    use std::io::BufReader;
+
     let _lock = crate::locks::acquire_shared(crate::locks::lance_lock_path()?)?;
 
     // `open_file_validated` validates the path against canonical roots
     // BEFORE opening — blocks any path-traversal attempt that an
     // operator-controlled `project` could inject into the lookup. Index
     // files must always live under the canonical `~/.aicx/indexed` tree.
-    let file = crate::sanitize::open_file_validated(&path)
+    let file = crate::sanitize::open_file_validated(path)
         .with_context(|| format!("open index: {}", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut lines = reader.lines();
+    let mut reader = BufReader::new(file);
 
     // First line is header
-    let header_line = match lines.next() {
-        Some(Ok(line)) => line,
-        Some(Err(err)) => return Err(err.into()),
-        None => return Ok(Vec::new()),
+    let header_line = match read_index_line_capped(&mut reader, path, 1, "query index header") {
+        Ok(Some(line)) => line,
+        Ok(None) => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
     };
     let header: IndexHeader = serde_json::from_str(&header_line)
         .with_context(|| format!("parse header in {}", path.display()))?;
@@ -1270,39 +1664,67 @@ pub fn query_index(
         ));
     }
 
-    let scan = scan_index_entries(lines, &query_embedding, kind_filter, frame_kind_filter)
-        .with_context(|| format!("scan index entries in {}", path.display()))?;
+    let scan = scan_index_entries(
+        capped_index_lines(reader, path, 2, "query index data"),
+        query_embedding,
+        kind_filter,
+        frame_kind_filter,
+    )
+    .with_context(|| format!("scan index entries in {}", path.display()))?;
 
-    if scan.corrupt_count > 0 {
-        let rate = scan.corrupt_count as f64 / scan.total_data_lines.max(1) as f64;
-        if scan.total_data_lines >= CORRUPT_MIN_SAMPLE && rate > CORRUPT_RATE_FAIL_FAST {
-            return Err(anyhow::anyhow!(
-                "index integrity failure in {}: {} of {} data lines ({:.1}%) failed to parse — exceeds {:.0}% threshold. Recovery: `aicx index --fresh --project <name>` to rebuild from canonical store.",
-                path.display(),
-                scan.corrupt_count,
-                scan.total_data_lines,
-                rate * 100.0,
-                CORRUPT_RATE_FAIL_FAST * 100.0,
-            ));
-        }
-        tracing::warn!(
-            target: "aicx::vector_index",
-            corrupt = scan.corrupt_count,
-            total = scan.total_data_lines,
-            rate_pct = rate * 100.0,
-            threshold_pct = CORRUPT_RATE_FAIL_FAST * 100.0,
-            index = %path.display(),
-            "index integrity: corrupt NDJSON lines tolerated below fail-fast threshold"
-        );
+    enforce_index_integrity(path, &scan)?;
+
+    Ok(finalize_query_hits(scan.hits, limit))
+}
+
+fn enforce_index_integrity(path: &Path, scan: &ScanResult) -> Result<()> {
+    if scan.corrupt_count == 0 {
+        return Ok(());
     }
 
-    let mut hits = scan.hits;
+    let rate = scan.corrupt_count as f64 / scan.total_data_lines.max(1) as f64;
+    if scan.total_data_lines >= CORRUPT_MIN_SAMPLE && rate > CORRUPT_RATE_FAIL_FAST {
+        return Err(anyhow::anyhow!(
+            "index integrity failure in {}: {} of {} data lines ({:.1}%) failed to parse — exceeds {:.0}% threshold. Recovery: `aicx index --full-rescan --project <name>` to rebuild from canonical store.",
+            path.display(),
+            scan.corrupt_count,
+            scan.total_data_lines,
+            rate * 100.0,
+            CORRUPT_RATE_FAIL_FAST * 100.0,
+        ));
+    }
+
+    tracing::warn!(
+        target: "aicx::vector_index",
+        corrupt = scan.corrupt_count,
+        total = scan.total_data_lines,
+        rate_pct = rate * 100.0,
+        threshold_pct = CORRUPT_RATE_FAIL_FAST * 100.0,
+        index = %path.display(),
+        "index integrity: corrupt NDJSON lines tolerated below fail-fast threshold"
+    );
+
+    Ok(())
+}
+
+/// Sort `hits` by cosine score descending and cap at `limit`.
+///
+/// Pure post-scan tail of [`query_index`]. Extracted so the limit contract
+/// (bug #32: caller-supplied `limit` is honored — never returns > `limit`
+/// rows) can be unit-tested without standing up an embedder.
+///
+/// Safe to truncate here because the scan filters (`kind` / `frame_kind`)
+/// are already pushed down into [`scan_index_entries`]: the pool fed in
+/// is filter-saturated, so the truncate cannot re-introduce bug #31's
+/// silent-empty pathology on the legacy path.
+pub fn finalize_query_hits(mut hits: Vec<QueryHit>, limit: usize) -> Vec<QueryHit> {
     hits.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    Ok(hits)
+    hits.truncate(limit);
+    hits
 }
 
 /// Result of scanning the data-line region of a persistent NDJSON index.
@@ -1410,6 +1832,9 @@ pub fn query_index(
 mod iter3_tests {
     use super::*;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn cosine_orthogonal_vectors_are_zero() {
@@ -1448,12 +1873,8 @@ mod iter3_tests {
 
     #[test]
     fn index_path_collapses_slashes_to_underscores() {
-        // Round-trip via env override so the test is hermetic.
         let dir = tempdir_for_test();
-        unsafe {
-            std::env::set_var("AICX_HOME", &dir);
-        }
-        let path = index_path(Some("vetcoders/aicx")).expect("path");
+        let path = index_path_for(&dir, Some("vetcoders/aicx"));
         let path_str = path.to_string_lossy();
         assert!(
             path_str.contains("vetcoders_aicx"),
@@ -1463,10 +1884,268 @@ mod iter3_tests {
             path_str.ends_with("embeddings.ndjson"),
             "expected NDJSON filename in {path_str}"
         );
-        unsafe {
-            std::env::remove_var("AICX_HOME");
-        }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn partition_incremental_files_keeps_only_unembedded_and_fresh() {
+        // G-3 partition logic on a synthetic corpus. The committed
+        // baseline knows about ids `a` and `b`; chunk `c` is brand new.
+        // `a` is older than cutoff AND committed -> skip; `b` is newer
+        // than cutoff but already committed -> skip (crash-recovery
+        // guard); `c` is the only survivor (new id wins regardless of
+        // mtime, plus its mtime is fresh here anyway).
+        use std::collections::HashSet;
+
+        let dir = tempdir_for_test();
+        let cutoff_dt = chrono::DateTime::parse_from_rfc3339("2026-05-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let chunks = [
+            ("a", "2026-05-14T00:00:00Z"), // older than cutoff
+            ("b", "2026-05-16T00:00:00Z"), // newer than cutoff
+            ("c", "2026-05-16T00:00:00Z"), // newer than cutoff
+        ];
+        let mut files: Vec<crate::store::StoredContextFile> = Vec::new();
+        for (id, mtime_rfc) in chunks {
+            let path = dir.join(format!("{id}.md"));
+            std::fs::write(&path, format!("# chunk {id}")).unwrap();
+            let ts: std::time::SystemTime = chrono::DateTime::parse_from_rfc3339(mtime_rfc)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+                .into();
+            filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(ts)).unwrap();
+            files.push(crate::store::StoredContextFile {
+                path,
+                project: "test".into(),
+                repo: None,
+                date_compact: "20260516".into(),
+                date_iso: "2026-05-16".into(),
+                kind: crate::timeline::Kind::Other,
+                agent: "claude".into(),
+                session_id: id.into(),
+                chunk: 0,
+            });
+        }
+
+        let mut embedded_ids = HashSet::new();
+        embedded_ids.insert("a".to_string());
+        embedded_ids.insert("b".to_string());
+        let baseline = IncrementalBaseline {
+            cutoff: cutoff_dt.into(),
+            embedded_ids,
+        };
+
+        let to_embed = partition_incremental_files(&files, &baseline);
+        let ids: Vec<String> = to_embed
+            .iter()
+            .map(|stored| chunk_id_from_path(&stored.path))
+            .collect();
+        assert_eq!(ids, vec!["c".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn partition_incremental_files_reembeds_missing_id_with_old_mtime() {
+        // Regression for PR #6 follow-up: a chunk restored from backup /
+        // rsync / quarantine restore may have an mtime OLDER than the
+        // committed `header.generated_at`, but if its id is not in the
+        // committed body the incremental walk MUST still pick it up.
+        // Otherwise Layer 2 semantic search silently drifts incomplete
+        // and operators are forced into `--full-rescan` to recover.
+        use std::collections::HashSet;
+
+        let dir = tempdir_for_test();
+        let cutoff_dt = chrono::DateTime::parse_from_rfc3339("2026-05-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        // Chunk `restored` has an old mtime (way before the cutoff) and
+        // no entry in the committed embedded_ids set — exactly the
+        // backup-restore shape we want to cover.
+        let restored_path = dir.join("restored.md");
+        std::fs::write(&restored_path, "# restored chunk").unwrap();
+        let old_ts: std::time::SystemTime =
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+                .into();
+        filetime::set_file_mtime(&restored_path, filetime::FileTime::from_system_time(old_ts))
+            .unwrap();
+
+        let files = vec![crate::store::StoredContextFile {
+            path: restored_path,
+            project: "test".into(),
+            repo: None,
+            date_compact: "20260101".into(),
+            date_iso: "2026-01-01".into(),
+            kind: crate::timeline::Kind::Other,
+            agent: "claude".into(),
+            session_id: "restored".into(),
+            chunk: 0,
+        }];
+
+        // Committed baseline mentions other ids, never `restored`.
+        let mut embedded_ids = HashSet::new();
+        embedded_ids.insert("a".to_string());
+        embedded_ids.insert("b".to_string());
+        let baseline = IncrementalBaseline {
+            cutoff: cutoff_dt.into(),
+            embedded_ids,
+        };
+
+        let to_embed = partition_incremental_files(&files, &baseline);
+        let ids: Vec<String> = to_embed
+            .iter()
+            .map(|stored| chunk_id_from_path(&stored.path))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["restored".to_string()],
+            "missing-id chunk with old mtime must be re-embedded"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn copy_committed_body_into_streams_data_rows_only() {
+        // G-3 incremental seed: existing committed index has 5 data rows
+        // plus a header. The seed helper must write exactly those 5 rows
+        // into the tmp writer (header dropped because the caller writes a
+        // fresh placeholder of its own).
+        let dir = tempdir_for_test();
+        let target = dir.join("embeddings.ndjson");
+        let tmp = dir.join("embeddings.ndjson.tmp");
+
+        let header = IndexHeader {
+            schema_version: "v0-test".into(),
+            model_id: "test-model".into(),
+            model_profile: "base".into(),
+            dimension: 4,
+            generated_at: "2026-05-15T12:00:00Z".into(),
+            entry_count: 5,
+        };
+        let mut body = serde_json::to_string(&header).unwrap();
+        body.push('\n');
+        for i in 0..5 {
+            body.push_str(&format!(
+                r#"{{"id":"row-{i}","embedding":[0.1,0.2,0.3,0.4]}}"#
+            ));
+            body.push('\n');
+        }
+        std::fs::write(&target, &body).unwrap();
+
+        {
+            let mut writer = std::io::BufWriter::new(std::fs::File::create(&tmp).unwrap());
+            use std::io::Write;
+            // Caller writes its own placeholder first.
+            writeln!(writer, "{{\"placeholder\":true}}").unwrap();
+            let rows = copy_committed_body_into(&mut writer, &target).unwrap();
+            assert_eq!(rows, 5, "seed must surface row count for D-2 math");
+        }
+
+        let content = std::fs::read_to_string(&tmp).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 6, "placeholder header + 5 data rows");
+        assert_eq!(lines[0], "{\"placeholder\":true}");
+        for (i, expected_id) in (0..5).map(|i| format!("row-{i}")).enumerate() {
+            assert!(
+                lines[i + 1].contains(&expected_id),
+                "row {} preserved verbatim",
+                i
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn incremental_round_trip_appends_only_new_rows() {
+        // End-to-end shape: first committed index has 3 rows. Operator
+        // adds 5 more chunks. Incremental walk + seed + rewrite produces
+        // a final file with exactly 8 rows and a truthful entry_count.
+        let dir = tempdir_for_test();
+        let target = dir.join("embeddings.ndjson");
+        let tmp = dir.join("embeddings.ndjson.tmp");
+        let commit_tmp = dir.join("embeddings.ndjson.commit-tmp");
+
+        // 1. Seed the canonical committed file with 3 rows.
+        let old_header = IndexHeader {
+            schema_version: INDEX_SCHEMA_VERSION.into(),
+            model_id: "test-model".into(),
+            model_profile: "base".into(),
+            dimension: 4,
+            generated_at: "2026-05-15T12:00:00Z".into(),
+            entry_count: 3,
+        };
+        let mut body = serde_json::to_string(&old_header).unwrap();
+        body.push('\n');
+        for i in 0..3 {
+            body.push_str(&format!(
+                r#"{{"id":"old-{i}","project":"test","agent":"claude","date":"20260515","path":"/tmp/old-{i}.md","kind":"other","session_id":"old-{i}","frame_kind":null,"cwd":null,"embedding":[0.1,0.2,0.3,0.4]}}"#
+            ));
+            body.push('\n');
+        }
+        std::fs::write(&target, &body).unwrap();
+
+        // 2. Simulate incremental write: tmp = placeholder + copy of old
+        //    body + 5 brand-new rows. Mirrors the production sequencing
+        //    inside `write_index_with_options` without invoking the
+        //    embedder (the unit-of-work the test is asserting is the
+        //    file-level math, not the embed step itself).
+        {
+            let mut writer = std::io::BufWriter::new(std::fs::File::create(&tmp).unwrap());
+            use std::io::Write;
+            let placeholder = IndexHeader {
+                entry_count: 0,
+                generated_at: "2026-05-16T12:00:00Z".into(),
+                ..old_header.clone()
+            };
+            writeln!(writer, "{}", serde_json::to_string(&placeholder).unwrap()).unwrap();
+            copy_committed_body_into(&mut writer, &target).unwrap();
+            for i in 0..5 {
+                writeln!(
+                    writer,
+                    r#"{{"id":"new-{i}","project":"test","agent":"claude","date":"20260516","path":"/tmp/new-{i}.md","kind":"other","session_id":"new-{i}","frame_kind":null,"cwd":null,"embedding":[0.5,0.6,0.7,0.8]}}"#
+                )
+                .unwrap();
+            }
+        }
+
+        // 3. Truthful header rewrite (D-2 contract) + atomic rename
+        //    onto the canonical target.
+        let truthful = IndexHeader {
+            entry_count: 8,
+            generated_at: "2026-05-16T12:00:00Z".into(),
+            ..old_header
+        };
+        rewrite_index_with_truthful_header(&tmp, &commit_tmp, &truthful).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::rename(&commit_tmp, &target).unwrap();
+
+        // 4. Assertions: header.entry_count == 8, body has 3 old + 5 new
+        //    rows, no full re-embed of the originals.
+        let final_content = std::fs::read_to_string(&target).unwrap();
+        let lines: Vec<&str> = final_content.lines().collect();
+        assert_eq!(lines.len(), 9, "header + 3 old + 5 new = 9 lines");
+        let final_header: IndexHeader = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(
+            final_header.entry_count, 8,
+            "D-2 entry_count truthful after incremental append"
+        );
+        let old_count = (1..=3).filter(|i| lines[*i].contains("old-")).count();
+        let new_count = (4..=8).filter(|i| lines[*i].contains("new-")).count();
+        assert_eq!(old_count, 3, "3 original rows preserved verbatim");
+        assert_eq!(new_count, 5, "exactly 5 new rows appended");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -1526,26 +2205,21 @@ mod iter3_tests {
     #[test]
     fn index_path_uses_all_bucket_for_no_project_filter() {
         let dir = tempdir_for_test();
-        unsafe {
-            std::env::set_var("AICX_HOME", &dir);
-        }
-        let path = index_path(None).expect("path");
+        let path = index_path_for(&dir, None);
         assert!(
             path.to_string_lossy().contains("_all"),
             "expected _all bucket in {}",
             path.display()
         );
         assert_eq!(path, dir.join("indexed").join("_all").join(INDEX_FILE_NAME));
-        unsafe {
-            std::env::remove_var("AICX_HOME");
-        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
     fn tempdir_for_test() -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
+        let n = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
         p.push(format!(
-            "aicx-vector-index-test-{}-{}",
+            "aicx-vector-index-test-{}-{}-{n}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1581,6 +2255,34 @@ mod iter3_tests {
     }
 
     #[test]
+    fn capped_index_lines_error_on_oversized_and_advance_to_next_line() {
+        let next = make_entry_line("after-oversized", vec![1.0]);
+        let mut input = "x".repeat(crate::sanitize::MAX_VALIDATED_BYTES + 1);
+        input.push('\n');
+        input.push_str(&next);
+        input.push('\n');
+
+        let reader = std::io::BufReader::new(std::io::Cursor::new(input.into_bytes()));
+        let mut lines = capped_index_lines(
+            reader,
+            Path::new("/tmp/aicx-vector-index-oversized.ndjson"),
+            2,
+            "test index data",
+        );
+        let err = lines
+            .next()
+            .expect("first oversized line is observed")
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds"));
+        let second = lines
+            .next()
+            .expect("reader advances to following line")
+            .expect("second line is valid");
+        assert_eq!(second, next);
+    }
+
+    #[test]
     fn scan_index_entries_no_corrupt_returns_all_hits() {
         let q = vec![1.0f32, 0.0, 0.0];
         let lines = vec![
@@ -1608,6 +2310,130 @@ mod iter3_tests {
         assert_eq!(scan.total_data_lines, 10);
         assert_eq!(scan.corrupt_count, 1);
         assert_eq!(scan.hits.len(), 9, "valid entries still parsed and scored");
+    }
+
+    fn make_hit(id: &str, score: f32) -> QueryHit {
+        QueryHit {
+            id: id.to_string(),
+            project: "test".to_string(),
+            agent: "claude".to_string(),
+            date: "20260524".to_string(),
+            path: std::path::PathBuf::from(format!("/tmp/aicx-test/{id}.md")),
+            kind: "session".to_string(),
+            session_id: id.to_string(),
+            frame_kind: None,
+            cwd: None,
+            score,
+        }
+    }
+
+    #[test]
+    fn finalize_query_hits_truncates_to_requested_limit() {
+        // Bug #32 regression. The legacy `query_index` accepted a `limit`
+        // arg but did not honor it — the parameter was prefixed `_limit`
+        // and the post-scan tail returned every hit. This locks the
+        // contract that the returned vec has `len() <= limit`.
+        let hits: Vec<QueryHit> = (0..50)
+            .map(|i| make_hit(&format!("h-{i}"), (50 - i) as f32 / 50.0))
+            .collect();
+        let out = finalize_query_hits(hits, 10);
+        assert_eq!(out.len(), 10, "limit honored: returns exactly 10 hits");
+        // Top score is the highest (1.0); confirm score-desc sort holds
+        // after truncate so the kept 10 are the BEST 10, not a random
+        // slice.
+        assert!(
+            out.windows(2).all(|w| w[0].score >= w[1].score),
+            "hits remain sorted score-desc after truncate"
+        );
+        assert_eq!(out[0].id, "h-0", "highest-scoring hit retained at head");
+    }
+
+    #[test]
+    fn finalize_query_hits_returns_full_pool_when_limit_exceeds_pool() {
+        // Pool shorter than limit ⇒ return everything (no padding, no
+        // panic). Documents the "fewer if pool exhausted" half of the
+        // bug #32 contract.
+        let hits: Vec<QueryHit> = (0..3)
+            .map(|i| make_hit(&format!("h-{i}"), i as f32 / 3.0))
+            .collect();
+        let out = finalize_query_hits(hits, 100);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn finalize_query_hits_zero_limit_returns_empty() {
+        // `limit == 0` is a legal request for "no hits, just confirm the
+        // scan ran". The legacy code ignored `_limit` entirely; the fix
+        // honors it strictly, including the degenerate case.
+        let hits: Vec<QueryHit> = (0..5)
+            .map(|i| make_hit(&format!("h-{i}"), i as f32))
+            .collect();
+        let out = finalize_query_hits(hits, 0);
+        assert!(out.is_empty(), "limit=0 returns empty vec");
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn query_index_recovery_hint_uses_full_rescan_not_fresh() {
+        // Bug #33 regression. Keep the fixture on-disk and exercise the same
+        // scan + integrity path that produces the operator-facing recovery
+        // hint, but avoid the shared global lance lock. The full query helper
+        // acquires `~/.aicx/locks/lance.lock`, which can legitimately block
+        // behind concurrent index tests on macOS and mask the recovery hint
+        // assertion with an unrelated timeout.
+        let root = tempdir_for_test();
+        let path = index_path_for(&root, Some("recovery-hint"));
+        std::fs::create_dir_all(path.parent().expect("index parent")).unwrap();
+
+        let header = IndexHeader {
+            schema_version: INDEX_SCHEMA_VERSION.to_string(),
+            model_id: "test-model".to_string(),
+            model_profile: "base".to_string(),
+            dimension: 2,
+            generated_at: "2026-05-24T18:13:11Z".to_string(),
+            entry_count: 20,
+        };
+        let mut body = serde_json::to_string(&header).expect("serialize header");
+        body.push('\n');
+        for i in 0..18 {
+            body.push_str(&make_entry_line(&format!("ok-{i}"), vec![1.0, 0.0]));
+            body.push('\n');
+        }
+        body.push_str("{not valid json\n");
+        body.push_str("{still not valid json\n");
+        std::fs::write(&path, body).expect("write corrupt fixture index");
+
+        let file = crate::sanitize::open_file_validated(&path).expect("open fixture index");
+        let mut reader = std::io::BufReader::new(file);
+        let header_line = read_index_line_capped(&mut reader, &path, 1, "query index header")
+            .expect("read header")
+            .expect("fixture header");
+        let header: IndexHeader = serde_json::from_str(&header_line).expect("parse header");
+        assert_eq!(
+            header.dimension, 2,
+            "fixture header should match query embedding"
+        );
+
+        let scan = scan_index_entries(
+            capped_index_lines(reader, &path, 2, "query index data"),
+            &[1.0, 0.0],
+            None,
+            None,
+        )
+        .expect("scan corrupt fixture");
+        let err =
+            enforce_index_integrity(&path, &scan).expect_err("corrupt fixture should fail-fast");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("--full-rescan"),
+            "query_index recovery hint must reference the canonical rescan flag"
+        );
+        let stale_flag = format!("--{}", "fresh");
+        assert!(
+            !message.contains(&stale_flag),
+            "stale rescan flag hint must not appear in the recovery message"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

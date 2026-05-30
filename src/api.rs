@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 use serde::Serialize;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -349,13 +349,17 @@ fn count_index_rows(path: &Path) -> Result<usize> {
     }
     let file = crate::sanitize::open_file_validated(path)
         .with_context(|| format!("open semantic index for status: {}", path.display()))?;
-    let mut lines = BufReader::new(file).lines();
-    if lines.next().transpose()?.is_none() {
+    let mut reader = BufReader::new(file);
+    if crate::sanitize::read_line_capped(&mut reader, crate::sanitize::MAX_VALIDATED_BYTES)?
+        .is_none()
+    {
         return Ok(0);
     }
     let mut rows = 0usize;
-    for line in lines {
-        if !line?.trim().is_empty() {
+    while let Some(line) =
+        crate::sanitize::read_line_capped(&mut reader, crate::sanitize::MAX_VALIDATED_BYTES)?
+    {
+        if !line.line.trim().is_empty() {
             rows += 1;
         }
     }
@@ -580,6 +584,7 @@ mod tests {
             frame_kind: Some(FrameKind::UserMsg),
             branch: None,
             cwd: None,
+            timestamp_source: None,
         }];
 
         let summary = client
