@@ -210,9 +210,10 @@ require_cmd shasum
 if [[ "${AICX_RELEASE_BUNDLE_ONLY_BINARIES:-0}" == "1" ]]; then
   echo "=== AICX GPG-signed bundle (binaries-only, no Apple codesign) ==="
   TARGET="${TARGET:-$(host_target)}"
-  case "$TARGET" in
-    *windows*) echo "Error: release-bundle-only-binaries does not support Windows targets yet: $TARGET" >&2; exit 1 ;;
-  esac
+  # Windows targets are handled below — binary suffix (.exe) + archive
+  # format (.zip via Python stdlib) are already target-aware. Real-release
+  # signing for Windows is operator-side; merge_queue_gate passes
+  # AICX_RELEASE_SKIP_SIGNING=1, release.yml carries the signing policy.
 
   VERSION="$(toml_value package.version)"
   if [[ -z "$PACKAGE_NAME" ]]; then
