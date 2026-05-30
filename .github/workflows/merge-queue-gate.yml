@@ -86,6 +86,10 @@ jobs:
         shell: bash
         env:
           AICX_RELEASE_BUNDLE_ONLY_BINARIES: "1"
+          # Merge queue gate runs without access to org secrets/vars. Skip
+          # GPG signing here — real signing happens in release.yml on tag push.
+          AICX_RELEASE_SKIP_SIGNING: "1"
+          LOCTREE_GPG_KEY_ID: ""
         run: bash tools/release_bundle.sh
 
       - name: npm publish --dry-run (wrapper package metadata)

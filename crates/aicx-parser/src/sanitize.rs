@@ -164,23 +164,28 @@ fn temp_allowlist_enabled_for_runtime(is_test_build: bool, is_cargo_test_harness
 }
 
 fn running_under_cargo_test_harness() -> bool {
-    std::env::current_exe().ok().is_some_and(|exe| {
-        let mut saw_target = false;
-        let mut saw_debug_or_release = false;
-        let mut saw_deps = false;
-        for component in exe.components() {
-            let text = component.as_os_str().to_string_lossy();
-            if text == "target" {
-                saw_target = true;
-            } else if saw_target && (text == "debug" || text == "release") {
-                saw_debug_or_release = true;
-            } else if saw_debug_or_release && text == "deps" {
-                saw_deps = true;
-                break;
-            }
-        }
-        saw_deps
-    })
+    std::env::current_exe()
+        .ok()
+        .is_some_and(|exe| is_cargo_test_exe_path(&exe))
+}
+
+fn is_cargo_test_exe_path(path: &Path) -> bool {
+    let has_deps_component = path.components().any(|component| {
+        matches!(
+            component,
+            Component::Normal(text) if text == std::ffi::OsStr::new("deps")
+        )
+    });
+    if !has_deps_component {
+        return false;
+    }
+
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.rsplit_once('-'))
+        .is_some_and(|(_, suffix)| {
+            suffix.len() >= 8 && suffix.chars().all(|ch| ch.is_ascii_hexdigit())
+        })
 }
 
 fn is_temp_allowlist_path(path: &Path) -> bool {
@@ -675,6 +680,19 @@ mod tests {
             let _env = EnvVarGuard::set(AICX_ALLOW_TMP_ENV, Some("true"));
             assert!(!temp_allowlist_enabled_for_runtime(false, false));
         }
+    }
+
+    #[test]
+    fn test_cargo_test_exe_detection_accepts_custom_target_dir_layout() {
+        let path =
+            Path::new("/Users/runner/work/cache/aicx-macos/debug/deps/aicx-0b1797b9ba8904ee");
+        assert!(is_cargo_test_exe_path(path));
+    }
+
+    #[test]
+    fn test_cargo_test_exe_detection_rejects_normal_binary_paths() {
+        let path = Path::new("/Users/runner/work/aicx/target/debug/aicx");
+        assert!(!is_cargo_test_exe_path(path));
     }
 
     #[test]

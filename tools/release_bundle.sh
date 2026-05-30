@@ -339,35 +339,45 @@ with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED) as zf:
   # never reaches `gh release upload` (which fails on directories).
   rm -rf "$BUNDLE_DIR"
 
-  # GPG detached signature is mandatory — Loctree releases never ship unsigned.
-  if [[ -z "${LOCTREE_GPG_KEY_ID:-}" ]]; then
-    echo "Error: LOCTREE_GPG_KEY_ID is not set — refusing to produce an unsigned release archive." >&2
-    echo "Export it in your shell (e.g. .zshrc) or pass LOCTREE_GPG_KEY_ID=... inline." >&2
-    exit 1
-  fi
-  PASSPHRASE_FILE="${LOCTREE_GPG_PASSPHRASE_FILE:-$HOME/.keys/.gpg.passphrase}"
-  if [[ ! -r "$PASSPHRASE_FILE" ]]; then
-    echo "Error: GPG passphrase file not readable at $PASSPHRASE_FILE." >&2
-    echo "Provide LOCTREE_GPG_PASSPHRASE_FILE=/path or place the passphrase at \$HOME/.keys/.gpg.passphrase (mode 600)." >&2
-    exit 1
-  fi
-  require_cmd gpg
-  if ! gpg --list-secret-keys "${LOCTREE_GPG_KEY_ID}" >/dev/null 2>&1; then
-    echo "Error: GPG secret key ${LOCTREE_GPG_KEY_ID} not imported on this host." >&2
-    exit 1
-  fi
-  echo "[2b/3] GPG detached-signing archive with ${LOCTREE_GPG_KEY_ID}..."
-  gpg --batch --yes --armor --pinentry-mode loopback \
-    --passphrase-file "$PASSPHRASE_FILE" \
-    --sig-notation "apple-developer-team-id@loctree.io=MW223P3NPX" \
-    --sig-notation "release-source@loctree.io=Loctree/aicx" \
-    --detach-sign --local-user "${LOCTREE_GPG_KEY_ID}" \
-    "$ARCHIVE_PATH"
+  # GPG detached signature: mandatory on real release (tag push, release.yml).
+  # In CI contexts that don't carry the signing key (e.g. merge_queue_gate),
+  # set AICX_RELEASE_SKIP_SIGNING=1 to produce an unsigned bundle for
+  # packaging-shape verification only. Loctree real releases never ship
+  # unsigned — release.yml asserts the key is present before this script runs.
+  if [[ "${AICX_RELEASE_SKIP_SIGNING:-0}" == "1" ]]; then
+    echo "[2b/3] AICX_RELEASE_SKIP_SIGNING=1 — bundling without GPG signature (CI gate context)"
+    echo "       This bundle MUST NOT be uploaded as a real release artifact."
+  else
+    if [[ -z "${LOCTREE_GPG_KEY_ID:-}" ]]; then
+      echo "Error: LOCTREE_GPG_KEY_ID is not set — refusing to produce an unsigned release archive." >&2
+      echo "Export it in your shell (e.g. .zshrc) or pass LOCTREE_GPG_KEY_ID=... inline." >&2
+      echo "Set AICX_RELEASE_SKIP_SIGNING=1 to bypass for non-release builds (e.g. merge queue gate)." >&2
+      exit 1
+    fi
+    PASSPHRASE_FILE="${LOCTREE_GPG_PASSPHRASE_FILE:-$HOME/.keys/.gpg.passphrase}"
+    if [[ ! -r "$PASSPHRASE_FILE" ]]; then
+      echo "Error: GPG passphrase file not readable at $PASSPHRASE_FILE." >&2
+      echo "Provide LOCTREE_GPG_PASSPHRASE_FILE=/path or place the passphrase at \$HOME/.keys/.gpg.passphrase (mode 600)." >&2
+      exit 1
+    fi
+    require_cmd gpg
+    if ! gpg --list-secret-keys "${LOCTREE_GPG_KEY_ID}" >/dev/null 2>&1; then
+      echo "Error: GPG secret key ${LOCTREE_GPG_KEY_ID} not imported on this host." >&2
+      exit 1
+    fi
+    echo "[2b/3] GPG detached-signing archive with ${LOCTREE_GPG_KEY_ID}..."
+    gpg --batch --yes --armor --pinentry-mode loopback \
+      --passphrase-file "$PASSPHRASE_FILE" \
+      --sig-notation "apple-developer-team-id@loctree.io=MW223P3NPX" \
+      --sig-notation "release-source@loctree.io=Loctree/aicx" \
+      --detach-sign --local-user "${LOCTREE_GPG_KEY_ID}" \
+      "$ARCHIVE_PATH"
 
-  # Export public key alongside artifacts so consumers can import + verify
-  # without keyserver lookup. ASCII armor, small, redistributable.
-  gpg --export --armor "${LOCTREE_GPG_KEY_ID}" \
-    > "${DIST_DIR}/loctree-release-pubkey.asc"
+    # Export public key alongside artifacts so consumers can import + verify
+    # without keyserver lookup. ASCII armor, small, redistributable.
+    gpg --export --armor "${LOCTREE_GPG_KEY_ID}" \
+      > "${DIST_DIR}/loctree-release-pubkey.asc"
+  fi
 
   echo "[3/3] Final artifact summary..."
   echo "Archive:         $ARCHIVE_PATH"
