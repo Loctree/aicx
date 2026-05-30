@@ -89,7 +89,20 @@ pub struct CorpusRepairManifest {
     pub scanned_markdown_files: usize,
     pub candidates: usize,
     pub repaired_files: usize,
+    /// Total files counted as skipped — equals
+    /// `skipped_charter_protected + skipped_other`. Kept for back-compat with
+    /// existing manifest consumers; new code should prefer the explicit
+    /// breakdown fields below.
     pub skipped_files: usize,
+    /// Files whose only detected noise is charter-protected (e.g.
+    /// `internal_thought_frame`). Repair leaves these untouched by design —
+    /// the charter forbids inventing/summarizing semantic content, so they
+    /// require human review rather than being a deterministic-repair target.
+    pub skipped_charter_protected: usize,
+    /// Files that had repair candidates but were not modified for reasons
+    /// other than charter protection (e.g. repair was already idempotent on
+    /// the detected noise classes).
+    pub skipped_other: usize,
     pub manifest_path: Option<PathBuf>,
     pub items: Vec<CorpusRepairItem>,
 }
@@ -125,6 +138,34 @@ impl NoiseClass {
             Self::InternalThoughtFrame => "internal_thought_frame",
             Self::MassiveToolJson => "massive_tool_json",
         }
+    }
+
+    /// Charter-protected classes carry semantic content the deterministic
+    /// repair must never invent, summarize, or strip. They are surfaced for
+    /// human review, not auto-repair.
+    fn is_charter_protected(&self) -> bool {
+        matches!(self, Self::InternalThoughtFrame)
+    }
+}
+
+/// Reason a candidate file ended up in the skipped bucket. Lets the manifest
+/// distinguish design-by-charter skips ("human review required") from generic
+/// no-op skips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipReason {
+    /// Every detected noise class is charter-protected. Repair must not touch
+    /// the file; the operator needs to review it manually.
+    CharterProtected,
+    /// File had at least one repairable noise class but the deterministic
+    /// repair produced identical content (already clean modulo detection).
+    NoChange,
+}
+
+fn classify_skip(noise: &BTreeSet<NoiseClass>) -> SkipReason {
+    if !noise.is_empty() && noise.iter().all(NoiseClass::is_charter_protected) {
+        SkipReason::CharterProtected
+    } else {
+        SkipReason::NoChange
     }
 }
 
@@ -199,6 +240,8 @@ pub fn repair(options: &CorpusRepairOptions) -> Result<CorpusRepairManifest> {
         candidates: 0,
         repaired_files: 0,
         skipped_files: 0,
+        skipped_charter_protected: 0,
+        skipped_other: 0,
         manifest_path: options.manifest_path.clone(),
         items: Vec::new(),
     };
@@ -219,6 +262,10 @@ pub fn repair(options: &CorpusRepairOptions) -> Result<CorpusRepairManifest> {
             let (repaired, removed) = repair_markdown_content(&content);
             if repaired == content {
                 manifest.skipped_files += 1;
+                match classify_skip(&noise) {
+                    SkipReason::CharterProtected => manifest.skipped_charter_protected += 1,
+                    SkipReason::NoChange => manifest.skipped_other += 1,
+                }
                 continue;
             }
 
@@ -319,12 +366,23 @@ pub fn format_repair_text(manifest: &CorpusRepairManifest) -> String {
         if manifest.apply { "apply" } else { "dry-run" }
     ));
     out.push_str(&format!(
-        "scanned_markdown_files: {}\ncandidates: {}\nrepaired_files: {}\nskipped_files: {}\n\n",
+        "scanned_markdown_files: {}\ncandidates: {}\nrepaired_files: {}\nskipped_files: {}\n",
         manifest.scanned_markdown_files,
         manifest.candidates,
         manifest.repaired_files,
         manifest.skipped_files
     ));
+    out.push_str(&format!(
+        "  skipped_charter_protected: {}\n  skipped_other: {}\n\n",
+        manifest.skipped_charter_protected, manifest.skipped_other
+    ));
+    if manifest.skipped_charter_protected > 0 {
+        out.push_str(&format!(
+            "note: {} files skipped because charter requires human review \
+             (internal_thought_frame and similar). This is by design, not an error.\n\n",
+            manifest.skipped_charter_protected
+        ));
+    }
     for item in &manifest.items {
         out.push_str(&format!(
             "- {} {} [{}]\n",
@@ -1059,6 +1117,81 @@ mod tests {
             json!(manifest.manifest_path)
         );
         assert!(fs::read_to_string(&file).unwrap().contains("signature"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repair_apply_buckets_internal_thought_frames_as_charter_protected() {
+        let root = tmp_root("charter-skip");
+        // Frame containing internal_thought_frame noise class only. Charter
+        // forbids touching these — they must be reported as "skipped because
+        // charter requires human review", NOT as a generic skip.
+        let charter_file = root
+            .join("store")
+            .join("Loctree")
+            .join("aicx")
+            .join("2026_0502")
+            .join("conversations")
+            .join("codex")
+            .join("2026_0502_codex_sess_thought.md");
+        fs::create_dir_all(charter_file.parent().unwrap()).unwrap();
+        fs::write(
+            &charter_file,
+            "header\nframe_kind: internal_thought\nbody line\n",
+        )
+        .unwrap();
+
+        // Repairable file with a signature line — should land in repaired_files.
+        let repairable_file = root
+            .join("store")
+            .join("Loctree")
+            .join("aicx")
+            .join("2026_0502")
+            .join("conversations")
+            .join("claude")
+            .join("2026_0502_claude_sess_sig.md");
+        fs::create_dir_all(repairable_file.parent().unwrap()).unwrap();
+        fs::write(
+            &repairable_file,
+            "ok\n{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"abc123\"}\n",
+        )
+        .unwrap();
+
+        let manifest = repair(&CorpusRepairOptions {
+            roots: vec![root.clone()],
+            dry_run: false,
+            apply: true,
+            backup: false,
+            manifest_path: None,
+        })
+        .unwrap();
+
+        // One repaired (signature), one skipped, and that skip must be
+        // bucketed as charter-protected — not a generic skip.
+        assert_eq!(manifest.repaired_files, 1, "signature file repaired");
+        assert_eq!(
+            manifest.skipped_files, 1,
+            "internal_thought frame counted as a skip"
+        );
+        assert_eq!(
+            manifest.skipped_charter_protected, 1,
+            "internal_thought_frame skip must be bucketed as charter-protected"
+        );
+        assert_eq!(
+            manifest.skipped_other, 0,
+            "no skips without a charter reason"
+        );
+
+        let rendered = format_repair_text(&manifest);
+        assert!(
+            rendered.contains("skipped_charter_protected: 1"),
+            "text output exposes charter bucket counter; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("charter requires human review"),
+            "text output explains charter skips as design, not error; got:\n{rendered}"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
