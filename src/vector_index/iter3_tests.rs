@@ -1,5 +1,8 @@
 use super::*;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
 fn cosine_orthogonal_vectors_are_zero() {
@@ -381,8 +384,9 @@ fn index_path_uses_all_bucket_for_no_project_filter() {
 
 fn tempdir_for_test() -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
+    let n = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
     p.push(format!(
-        "aicx-vector-index-test-{}-{}",
+        "aicx-vector-index-test-{}-{}-{n}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
