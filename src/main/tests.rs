@@ -2209,3 +2209,43 @@ fn test_watermark_advances_from_raw_extract_latest() {
         "new and legacy watermark semantics must differ — proves the fix is load-bearing"
     );
 }
+
+// =============================================================================
+// L36 (b): single source-of-truth gate for self-echo CLI patterns.
+//
+// `CLI_SUBCOMMAND_NAMES` in `aicx_parser::sanitize` materializes the list of
+// `aicx <subcommand>` patterns used by the self-echo filter. If a new variant
+// lands in `Commands` (here in `main.rs`) without a matching entry in that
+// constant, every routine operator invocation of the new subcommand will
+// leak into extracted chunks as substantive content. This test catches the
+// drift at build time instead of three weeks later in a noisy corpus audit.
+// =============================================================================
+#[test]
+fn cli_subcommand_names_match_commands_enum() {
+    use std::collections::BTreeSet;
+
+    // Live subcommand names as clap sees them — covers default kebab-case
+    // (e.g. `MigrateIntentSchema` → `migrate-intent-schema`) AND every
+    // explicit `#[command(name = "...")]` override (e.g.
+    // `DashboardServeLegacy` → `dashboard-serve`).
+    let cmd = Cli::command();
+    let live: BTreeSet<String> = cmd
+        .get_subcommands()
+        .map(|sub| sub.get_name().to_string())
+        .collect();
+
+    let registered: BTreeSet<String> = aicx_parser::sanitize::CLI_SUBCOMMAND_NAMES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+    let missing_in_constant: Vec<&String> = live.difference(&registered).collect();
+    let extra_in_constant: Vec<&String> = registered.difference(&live).collect();
+
+    assert!(
+        missing_in_constant.is_empty() && extra_in_constant.is_empty(),
+        "aicx_parser::sanitize::CLI_SUBCOMMAND_NAMES drift detected.\n\
+         missing from constant (add these): {missing_in_constant:?}\n\
+         extra in constant (remove or move to RETIRED_CLI_SUBCOMMANDS): {extra_in_constant:?}"
+    );
+}

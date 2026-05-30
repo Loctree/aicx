@@ -960,10 +960,14 @@ pub fn normalize_query(text: &str) -> String {
 // Self-echo filtering (prevents feedback loops)
 // ============================================================================
 
-/// Patterns in messages that indicate aicx's own operational traffic.
-/// These create feedback loops: search → log → extract → search matches own query.
+/// MCP tool names + dashboard HTTP routes that indicate aicx's own
+/// operational traffic. These are the "stable surface" patterns; CLI
+/// subcommand patterns are derived from [`CLI_SUBCOMMAND_NAMES`] and the
+/// JSON-RPC catch-all lives in its own constant so each axis stays
+/// auditable.
+///
 /// Retired MCP tool names stay here so historical traces remain filterable.
-const SELF_ECHO_PATTERNS: &[&str] = &[
+const STABLE_SELF_ECHO_PATTERNS: &[&str] = &[
     // MCP tool calls (current + retired names so historical traces remain filterable)
     "aicx_search",
     "aicx_read",
@@ -977,33 +981,173 @@ const SELF_ECHO_PATTERNS: &[&str] = &[
     "/api/health",
     "/api/regenerate",
     "/api/status",
-    // MCP JSON-RPC
-    "\"method\":\"tools/call\"",
-    "\"method\":\"tools/list\"",
-    "\"method\":\"initialize\"",
-    // CLI self-invocations
-    "aicx all -H",
-    "aicx all --hours",
-    "aicx claude -H",
-    "aicx claude --hours",
-    "aicx codex -H",
-    "aicx codex --hours",
-    "aicx gemini -H",
-    "aicx gemini --hours",
-    "aicx junie -H",
-    "aicx junie --hours",
-    "aicx store -H",
-    "aicx store --hours",
-    "aicx rank -p",
-    "aicx refs -H",
-    "aicx refs --hours",
-    "aicx serve",
-    "aicx dashboard --generate-html",
-    "aicx dashboard --serve",
-    "aicx dashboard-serve",
-    "aicx reports",
-    "aicx reports-extractor",
 ];
+
+/// Generic MCP JSON-RPC catch-all. Any line containing a raw JSON-RPC 2.0
+/// envelope is, by construction, aicx's own protocol traffic (or another
+/// MCP client's, which is still recycled context — not original signal).
+/// This subsumes the previous per-method patterns
+/// (`"method":"tools/call"`, `"method":"tools/list"`,
+/// `"method":"initialize"`) — any new method name lands here automatically
+/// without recompile. L36 (c).
+const MCP_JSONRPC_CATCH_ALL: &str = "\"jsonrpc\":\"2.0\"";
+
+/// Retired CLI subcommand names. Kept here so historical traces (operator
+/// shells, logged transcripts from older aicx versions) still classify as
+/// self-echo. Parallel to retired MCP tool names in
+/// `STABLE_SELF_ECHO_PATTERNS`.
+const RETIRED_CLI_SUBCOMMANDS: &[&str] = &[
+    // `aicx rank -p ...` predated the unified `intents`/`search` surface.
+    "rank",
+    // `aicx gemini` / `aicx junie` were single-source extractors before
+    // they were folded into `aicx all`/`aicx store --agent <name>`.
+    "gemini", "junie",
+];
+
+/// Canonical, kebab-case list of every `Commands::*` variant in `src/main.rs`.
+///
+/// **Single source of truth.** When a new subcommand is added (or renamed)
+/// in the binary's `Commands` enum, update this constant — drift is caught
+/// by `assert_cli_subcommand_names_match_clap` in `src/main/tests.rs`,
+/// which walks `Cli::command().get_subcommands()` and fails the test if
+/// the two lists disagree.
+///
+/// Entries match the names that clap emits at runtime (so `MigrateIntentSchema`
+/// → `"migrate-intent-schema"`, `DashboardServeLegacy` → `"dashboard-serve"`
+/// via the explicit `#[command(name = ...)]` override, etc.).
+///
+/// L36 (b): used to materialize `aicx <subcommand>` self-echo patterns
+/// for every variant, replacing the prior hand-curated subset.
+pub const CLI_SUBCOMMAND_NAMES: &[&str] = &[
+    "all",
+    "claude",
+    "codex",
+    "config",
+    "conversations",
+    "corpus",
+    "dashboard",
+    "dashboard-serve",
+    "doctor",
+    "extract",
+    "health",
+    "index",
+    "ingest",
+    "init",
+    "intents",
+    "list",
+    "migrate",
+    "migrate-intent-schema",
+    "read",
+    "refs",
+    "reports",
+    "reports-extractor",
+    "search",
+    "serve",
+    "sources",
+    "state",
+    "steer",
+    "store",
+    "tail",
+    "warmup",
+    "wizard",
+];
+
+/// Build the full self-echo pattern list (stable + JSON-RPC catch-all +
+/// CLI subcommand patterns + caller-supplied extras). Pure function; no
+/// I/O, no globals — keeps the public surface easy to unit-test.
+///
+/// L36 (b)+(c)+(d): consolidates every axis of self-echo detection
+/// (MCP tools, dashboard HTTP, JSON-RPC envelopes, CLI subcommands,
+/// operator config extras) into one materialized list.
+fn build_self_echo_patterns(extra: &[String]) -> Vec<String> {
+    let mut patterns: Vec<String> = Vec::with_capacity(
+        STABLE_SELF_ECHO_PATTERNS.len()
+            + CLI_SUBCOMMAND_NAMES.len()
+            + RETIRED_CLI_SUBCOMMANDS.len()
+            + extra.len()
+            + 1,
+    );
+    for pat in STABLE_SELF_ECHO_PATTERNS {
+        patterns.push((*pat).to_string());
+    }
+    patterns.push(MCP_JSONRPC_CATCH_ALL.to_string());
+    for name in CLI_SUBCOMMAND_NAMES.iter().chain(RETIRED_CLI_SUBCOMMANDS) {
+        patterns.push(format!("aicx {name}"));
+    }
+    for pat in extra {
+        let trimmed = pat.trim();
+        if !trimmed.is_empty() {
+            patterns.push(trimmed.to_string());
+        }
+    }
+    patterns
+}
+
+/// Process-cached lowercase pattern list. Hardcoded patterns plus
+/// `[extraction].extra_self_echo_patterns` from `~/.aicx/config.toml`
+/// (L36 (d)). Initialised on first call to [`is_self_echo`].
+static SELF_ECHO_PATTERNS_CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Returns the active self-echo pattern list, lower-cased for
+/// case-insensitive matching. First call reads config; subsequent calls
+/// return the cached vec.
+fn active_self_echo_patterns() -> &'static [String] {
+    SELF_ECHO_PATTERNS_CACHE.get_or_init(|| {
+        let extras = load_extra_self_echo_patterns_from_config();
+        build_self_echo_patterns(&extras)
+            .into_iter()
+            .map(|p| p.to_lowercase())
+            .collect()
+    })
+}
+
+/// Read `[extraction].extra_self_echo_patterns` from
+/// `$AICX_HOME/config.toml` (or `~/.aicx/config.toml`). Mirrors the
+/// AICX_HOME resolution used by `ProjectHashRegistry::load_default` so
+/// the parser crate stays self-contained (no embedder-crate coupling).
+///
+/// Returns an empty vec on any failure — missing file, parse error, or
+/// schema mismatch. Treating "no config" and "broken config" identically
+/// is intentional: a typo in the operator's TOML should never disable
+/// the hardcoded patterns that protect extraction from feedback loops.
+///
+/// L36 (d).
+fn load_extra_self_echo_patterns_from_config() -> Vec<String> {
+    #[derive(serde::Deserialize, Default)]
+    struct ExtractionFile {
+        #[serde(default)]
+        extraction: Option<ExtractionSection>,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct ExtractionSection {
+        #[serde(default)]
+        extra_self_echo_patterns: Vec<String>,
+    }
+
+    let base = std::env::var_os("AICX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".aicx")));
+    let Some(base) = base else {
+        return Vec::new();
+    };
+    let path = base.join("config.toml");
+    let raw = match read_to_string_validated(&path) {
+        Ok(raw) => raw,
+        Err(_) => return Vec::new(),
+    };
+    let parsed: ExtractionFile = match toml::from_str(&raw) {
+        Ok(parsed) => parsed,
+        Err(_) => return Vec::new(),
+    };
+    parsed
+        .extraction
+        .map(|section| section.extra_self_echo_patterns)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
 
 /// Sentinel brackets for aicx read blocks injected by vc-init / vc-agents.
 /// Content between these markers is recycled context, not original signal.
@@ -1046,9 +1190,9 @@ pub fn is_self_echo(message: &str) -> bool {
             continue;
         }
         let lower = line.to_lowercase();
-        if SELF_ECHO_PATTERNS
+        if active_self_echo_patterns()
             .iter()
-            .any(|pat| lower.contains(&pat.to_lowercase()))
+            .any(|pat| lower.contains(pat))
         {
             echo_lines += 1;
         }
@@ -1142,6 +1286,250 @@ mod echo_tests {
                    Root cause: threshold was too wide\n\
                    Follow-up: add focused coverage";
         assert!(!is_self_echo(msg));
+    }
+
+    // -----------------------------------------------------------------------
+    // L36 (b): CLI subcommand coverage — every Commands::* variant in the
+    // binary surfaces as an `aicx <subcommand>` pattern. Previously only a
+    // handful of subcommands (all/claude/codex/store/rank/refs/dashboard/...)
+    // were hardcoded; common operator invocations like `aicx state --info`,
+    // `aicx doctor`, `aicx index --dry-run`, etc. leaked through self-echo
+    // and re-contaminated extractions. These tests pin the regression so
+    // that whenever a new subcommand lands in `Commands`, the matching
+    // pattern is added to `CLI_SUBCOMMAND_NAMES`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_state_subcommand_is_echo() {
+        // `aicx state --info` is a routine operator probe; it must not leak
+        // into chunked extractions as substantive content.
+        let msg = "aicx state --info\n\
+                   aicx state --reset\n\
+                   aicx state -p vetcoders/Vista";
+        assert!(
+            is_self_echo(msg),
+            "`aicx state` invocations should be classified as self-echo"
+        );
+    }
+
+    #[test]
+    fn test_doctor_subcommand_is_echo() {
+        let msg = "aicx doctor --oracle\n\
+                   aicx doctor --rebuild-steer-index\n\
+                   aicx doctor --check-dedup";
+        assert!(
+            is_self_echo(msg),
+            "`aicx doctor` invocations should be classified as self-echo"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // L36 (d): config-driven `[extraction].extra_self_echo_patterns`.
+    //
+    // The pure builder (`build_self_echo_patterns`) is tested here because
+    // the cached top-level helper reads `~/.aicx/config.toml` via a process
+    // OnceLock that can't be safely re-initialised mid-test. The integration
+    // path is covered indirectly: the loader is a thin TOML read whose
+    // contract is "missing file or parse error → empty vec" (also asserted
+    // below by `build_self_echo_patterns` with an empty extras slice).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_self_echo_patterns_includes_config_extras() {
+        let extras = vec![
+            "custom-tool-name".to_string(),
+            "  /api/internal/foo  ".to_string(), // exercises trim
+            "".to_string(),                      // empty entries silently dropped
+        ];
+        let patterns = build_self_echo_patterns(&extras);
+
+        assert!(
+            patterns.iter().any(|p| p == "custom-tool-name"),
+            "non-empty extra pattern must appear verbatim in the materialized list"
+        );
+        assert!(
+            patterns.iter().any(|p| p == "/api/internal/foo"),
+            "extra patterns must be trimmed of surrounding whitespace"
+        );
+        assert!(
+            !patterns.iter().any(|p| p.is_empty()),
+            "empty extras must be filtered out"
+        );
+
+        // Baseline coverage: hardcoded + CLI + retired + catch-all all still present.
+        assert!(patterns.iter().any(|p| p == "aicx_search"));
+        assert!(patterns.iter().any(|p| p == "aicx doctor"));
+        assert!(patterns.iter().any(|p| p == "aicx rank"));
+        assert!(patterns.iter().any(|p| p == MCP_JSONRPC_CATCH_ALL));
+    }
+
+    #[test]
+    fn test_build_self_echo_patterns_empty_extras_matches_baseline() {
+        // L36 (d) safety property: a missing or empty `[extraction]`
+        // section must not subtract hardcoded patterns.
+        let baseline = build_self_echo_patterns(&[]);
+        assert!(
+            baseline.iter().any(|p| p == "aicx_search"),
+            "MCP tool names must survive an empty extras list"
+        );
+        assert!(
+            baseline.iter().any(|p| p == "aicx doctor"),
+            "CLI subcommand patterns must survive an empty extras list"
+        );
+    }
+
+    #[test]
+    fn test_load_extra_self_echo_patterns_from_config_reads_extraction_section() {
+        use std::fs;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static UNIQ: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "aicx-extraction-config-{}-{}",
+            std::process::id(),
+            UNIQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config.toml"),
+            r#"
+[extraction]
+extra_self_echo_patterns = [
+    "operator-marker-alpha",
+    "  /api/operator/beta  ",
+    "",
+]
+"#,
+        )
+        .unwrap();
+
+        // Drive the loader directly via $AICX_HOME so we don't touch the
+        // OnceLock-cached top-level helper. Set+restore the env var to keep
+        // other tests deterministic.
+        let prev = std::env::var_os("AICX_HOME");
+        // SAFETY: tests that touch the same env var must be serialized by
+        // the test runner; aicx test suite already documents this as a
+        // single-threaded constraint. See `crates/aicx-parser/tests/`.
+        // Marked unsafe because std::env::set_var is unsafe in Rust 2024.
+        unsafe {
+            std::env::set_var("AICX_HOME", &dir);
+        }
+        let loaded = load_extra_self_echo_patterns_from_config();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AICX_HOME", v),
+                None => std::env::remove_var("AICX_HOME"),
+            }
+        }
+
+        assert!(
+            loaded.iter().any(|p| p == "operator-marker-alpha"),
+            "loader must surface verbatim operator-supplied pattern; got {loaded:?}"
+        );
+        assert!(
+            loaded.iter().any(|p| p == "/api/operator/beta"),
+            "loader must trim whitespace; got {loaded:?}"
+        );
+        assert!(
+            !loaded.iter().any(|p| p.is_empty()),
+            "loader must drop empty entries; got {loaded:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_extra_self_echo_patterns_returns_empty_when_no_config() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static UNIQ: AtomicUsize = AtomicUsize::new(0);
+        let nonexistent = std::env::temp_dir().join(format!(
+            "aicx-extraction-config-nope-{}-{}",
+            std::process::id(),
+            UNIQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        // Do NOT create the directory — loader must tolerate the absent path.
+
+        let prev = std::env::var_os("AICX_HOME");
+        unsafe {
+            std::env::set_var("AICX_HOME", &nonexistent);
+        }
+        let loaded = load_extra_self_echo_patterns_from_config();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AICX_HOME", v),
+                None => std::env::remove_var("AICX_HOME"),
+            }
+        }
+
+        assert!(
+            loaded.is_empty(),
+            "missing config must yield empty extras, not panic; got {loaded:?}"
+        );
+    }
+
+    #[test]
+    fn test_mcp_jsonrpc_catch_all_matches_unknown_method() {
+        // L36 (c): previously only `"method":"tools/call"`,
+        // `"method":"tools/list"`, and `"method":"initialize"` matched.
+        // Any other JSON-RPC envelope (notifications, future methods,
+        // resource/prompt endpoints) leaked through. The generic
+        // `"jsonrpc":"2.0"` catch-all subsumes the entire surface so new
+        // MCP method names are filtered without recompile.
+        assert!(
+            is_self_echo(
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#
+            ),
+            "unknown JSON-RPC method should be caught by the generic catch-all"
+        );
+        assert!(
+            is_self_echo(r#"{"jsonrpc":"2.0","method":"resources/list","params":{}}"#),
+            "resources/list JSON-RPC must be filtered as self-echo"
+        );
+        assert!(
+            is_self_echo(
+                r#"{"jsonrpc":"2.0","id":42,"result":{"contents":[{"uri":"aicx://chunk/abc"}]}}"#
+            ),
+            "JSON-RPC result envelope (no method name at all) must still classify as self-echo"
+        );
+    }
+
+    #[test]
+    fn test_corpus_index_warmup_wizard_config_subcommands_are_echo() {
+        // Aggregate test — every subcommand below was historically missing
+        // from SELF_ECHO_PATTERNS. Auto-derivation from `Commands::*` closes
+        // the gap.
+        for line in [
+            "aicx corpus --audit",
+            "aicx index --dry-run",
+            "aicx warmup",
+            "aicx wizard",
+            "aicx config show",
+            "aicx steer --run-id abc",
+            "aicx tail --follow",
+            "aicx ingest --source loct-context-pack",
+            "aicx migrate --dry-run",
+            "aicx sources audit",
+            "aicx serve --transport stdio",
+            "aicx extract --session abc --agent claude",
+            "aicx read /some/path",
+            "aicx search hello",
+            "aicx refs -H 24",
+            "aicx reports --workflow marbles",
+            "aicx intents -H 720",
+            "aicx conversations --out-dir /tmp",
+            "aicx health",
+            "aicx list",
+            "aicx claude -H 24",
+            "aicx codex -H 24",
+            "aicx all -H 24",
+            "aicx store -H 24",
+        ] {
+            assert!(
+                is_self_echo(line),
+                "`{line}` should be classified as self-echo (Commands variant missing from pattern list?)"
+            );
+        }
     }
 }
 
