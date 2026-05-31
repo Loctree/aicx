@@ -1325,15 +1325,29 @@ pub async fn run_stdio() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run MCP server over streamable HTTP transport on given port with the given auth state.
-pub async fn run_http(port: u16, auth_config: AuthConfig) -> anyhow::Result<()> {
+/// Parse a bind host string into a [`std::net::IpAddr`].
+///
+/// Accepts any valid IPv4 or IPv6 address literal (e.g. `127.0.0.1`, `0.0.0.0`, `::1`).
+/// Hostnames are not resolved — bind addresses must be numeric.
+pub fn parse_bind_host(host: &str) -> anyhow::Result<std::net::IpAddr> {
+    host.parse::<std::net::IpAddr>().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid bind host {host:?}: expected a numeric IP address \
+             such as 127.0.0.1, 0.0.0.0, or ::1"
+        )
+    })
+}
+
+/// Run MCP server over streamable HTTP transport on the given host:port with the given auth state.
+pub async fn run_http(host: &str, port: u16, auth_config: AuthConfig) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .try_init()
         .ok();
 
-    let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
+    let ip = parse_bind_host(host)?;
+    let addr = std::net::SocketAddr::new(ip, port);
 
     let auth_source_label = auth_config.source.describe();
     let auth_enforced = auth_config.is_enforced();
@@ -1393,19 +1407,20 @@ pub async fn run_http(port: u16, auth_config: AuthConfig) -> anyhow::Result<()> 
 }
 
 /// Legacy compatibility wrapper for callers that still use the old `run_sse` name.
-pub async fn run_sse(port: u16, auth_config: AuthConfig) -> anyhow::Result<()> {
-    run_http(port, auth_config).await
+pub async fn run_sse(host: &str, port: u16, auth_config: AuthConfig) -> anyhow::Result<()> {
+    run_http(host, port, auth_config).await
 }
 
 /// Run the selected MCP transport. Stdio bypasses HTTP auth (no network surface).
 pub async fn run_transport(
     transport: McpTransport,
+    host: &str,
     port: u16,
     auth_config: AuthConfig,
 ) -> anyhow::Result<()> {
     match transport {
         McpTransport::Stdio => run_stdio().await,
-        McpTransport::Http => run_http(port, auth_config).await,
+        McpTransport::Http => run_http(host, port, auth_config).await,
     }
 }
 
@@ -1899,5 +1914,35 @@ mod tests {
         assert_eq!(possible, vec!["stdio".to_string(), "http".to_string()]);
         assert_eq!(McpTransport::from_str("http", true), Ok(McpTransport::Http));
         assert_eq!(McpTransport::from_str("sse", true), Ok(McpTransport::Http));
+    }
+
+    #[test]
+    fn parse_bind_host_accepts_valid_ipv4() {
+        assert!(super::parse_bind_host("127.0.0.1").is_ok());
+        assert!(super::parse_bind_host("0.0.0.0").is_ok());
+        assert!(super::parse_bind_host("192.168.1.1").is_ok());
+    }
+
+    #[test]
+    fn parse_bind_host_accepts_valid_ipv6() {
+        assert!(super::parse_bind_host("::1").is_ok());
+        assert!(super::parse_bind_host("::").is_ok());
+    }
+
+    #[test]
+    fn parse_bind_host_rejects_hostname() {
+        let err = super::parse_bind_host("localhost").unwrap_err();
+        assert!(err.to_string().contains("invalid bind host"));
+    }
+
+    #[test]
+    fn parse_bind_host_rejects_empty() {
+        assert!(super::parse_bind_host("").is_err());
+    }
+
+    #[test]
+    fn parse_bind_host_default_is_loopback() {
+        let ip = super::parse_bind_host("127.0.0.1").expect("loopback");
+        assert!(ip.is_loopback());
     }
 }

@@ -1087,6 +1087,10 @@ enum Commands {
         #[arg(long, default_value = "8044")]
         port: u16,
 
+        /// Bind address for HTTP transport (default: 127.0.0.1). Use 0.0.0.0 to bind all interfaces.
+        #[arg(long, default_value = "127.0.0.1", value_name = "HOST")]
+        host: String,
+
         /// Optional explicit auth token (overrides env / file / generated). HTTP transport only.
         #[arg(long, value_name = "TOKEN")]
         auth_token: Option<String>,
@@ -2105,6 +2109,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         Some(Commands::Serve {
             transport,
             port,
+            host,
             auth_token,
             require_auth,
         }) => {
@@ -2115,7 +2120,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 );
             }
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async { mcp::run_transport(transport, port, auth_config).await })?;
+            rt.block_on(async { mcp::run_transport(transport, &host, port, auth_config).await })?;
         }
         Some(Commands::Search {
             query,

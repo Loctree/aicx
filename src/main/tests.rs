@@ -1189,9 +1189,45 @@ fn serve_help_prefers_http_name_and_stays_compact() {
     assert!(!rendered.contains("Transport: stdio (default) or sse"));
     assert!(!rendered.contains("embedding mode"));
     assert!(
-        rendered.lines().count() < 30,
+        rendered.lines().count() < 35,
         "serve help should stay compact"
     );
+}
+
+#[test]
+fn serve_host_flag_defaults_to_loopback() {
+    let cli = Cli::try_parse_from(["aicx", "serve", "--transport", "http"])
+        .expect("parse with defaults");
+    match cli.command {
+        Some(Commands::Serve { host, .. }) => {
+            assert_eq!(host, "127.0.0.1");
+        }
+        _ => panic!("expected serve command"),
+    }
+}
+
+#[test]
+fn serve_host_flag_accepts_all_interfaces() {
+    let cli = Cli::try_parse_from(["aicx", "serve", "--transport", "http", "--host", "0.0.0.0"])
+        .expect("parse with --host 0.0.0.0");
+    match cli.command {
+        Some(Commands::Serve { host, .. }) => {
+            assert_eq!(host, "0.0.0.0");
+        }
+        _ => panic!("expected serve command"),
+    }
+}
+
+#[test]
+fn serve_host_flag_accepts_ipv6_loopback() {
+    let cli = Cli::try_parse_from(["aicx", "serve", "--transport", "http", "--host", "::1"])
+        .expect("parse --host ::1");
+    match cli.command {
+        Some(Commands::Serve { host, .. }) => {
+            assert_eq!(host, "::1");
+        }
+        _ => panic!("expected serve command"),
+    }
 }
 
 #[test]
