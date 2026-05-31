@@ -1,4 +1,48 @@
+//! Dashboard module regression tests.
+
+use super::scan::{
+    classify_extension_kind_ref, collect_json_strings, extract_latest_timestamp_from_json,
+    extract_latest_timestamp_from_text, scan_store,
+};
 use super::*;
+use chrono::{TimeZone, Utc};
+use regex::Regex;
+use serde_json::Value;
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+
+fn parse_session_filename(file_name: &str, re: &Regex) -> Option<(String, String, String)> {
+    let caps = re.captures(file_name)?;
+
+    let time = caps.name("time")?.as_str().to_string();
+    let agent = caps
+        .name("agent")
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let suffix = caps
+        .name("suffix")
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_default();
+    let ext = caps
+        .name("ext")
+        .map(|m| m.as_str().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let kind = if suffix == "context" && ext == "json" {
+        "context-json"
+    } else if suffix == "context" {
+        "context-note"
+    } else if suffix.chars().all(|c| c.is_ascii_digit()) {
+        "chunk"
+    } else {
+        classify_extension_kind_ref(&ext)
+    }
+    .to_string();
+
+    Some((time, agent, kind))
+}
 
 fn mk_tmp_dir(name: &str) -> PathBuf {
     let dir = std::env::current_dir()
@@ -21,7 +65,7 @@ fn inline_markdown_via_node(markdown: &str) -> Option<String> {
     let output = Command::new("node")
         .arg("-e")
         .arg(
-            "require(process.argv[1]); process.stdout.write(globalThis.AicxMarkdown.inlineMarkdown(process.argv[2]));",
+            "const md=require(process.argv[1]); process.stdout.write(md.inlineMarkdown(process.argv[2]));",
         )
         .arg(module_path)
         .arg(markdown)

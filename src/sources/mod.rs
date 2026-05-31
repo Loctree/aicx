@@ -36,7 +36,8 @@ pub use providers::{
 pub(crate) use shared::*;
 pub use shared::{
     ConversationProjection, decode_claude_project_path, detect_project_name,
-    repo_labels_from_entries, repo_name_from_cwd, to_conversation, to_conversation_with_stats,
+    infer_repo_name_from_current_dir, repo_labels_from_entries, repo_name_from_cwd, to_conversation,
+    to_conversation_with_stats,
 };
 
 const UNPROTECTED_SOURCE_WARNING: &str = "unprotected source material; run `aicx sources protect --root <path> --backend git-local --apply` to opt in";

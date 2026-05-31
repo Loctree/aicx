@@ -58,7 +58,7 @@ fn config_show_marker_covers_all_four_branches() {
 
     let env_path = PathBuf::from("/tmp/op-override.toml");
     let (path, branch, marker) =
-        describe_effective_config(&Some((env_path.clone(), ConfigSource::Env)));
+        crate::cli_config::describe_effective_config(&Some((env_path.clone(), ConfigSource::Env)));
     assert_eq!(branch, "env");
     assert_eq!(path, env_path.display().to_string());
     assert!(
@@ -69,14 +69,14 @@ fn config_show_marker_covers_all_four_branches() {
 
     let canonical = PathBuf::from("/tmp/.aicx/config.toml");
     let (path, branch, marker) =
-        describe_effective_config(&Some((canonical.clone(), ConfigSource::Canonical)));
+        crate::cli_config::describe_effective_config(&Some((canonical.clone(), ConfigSource::Canonical)));
     assert_eq!(branch, "canonical");
     assert_eq!(path, canonical.display().to_string());
     assert!(marker.contains("canonical"));
 
     let legacy = PathBuf::from("/tmp/.aicx/embedder.toml");
     let (path, branch, marker) =
-        describe_effective_config(&Some((legacy.clone(), ConfigSource::Legacy)));
+        crate::cli_config::describe_effective_config(&Some((legacy.clone(), ConfigSource::Legacy)));
     assert_eq!(branch, "legacy");
     assert_eq!(path, legacy.display().to_string());
     assert!(
@@ -84,7 +84,7 @@ fn config_show_marker_covers_all_four_branches() {
         "legacy marker must nudge migration: {marker}"
     );
 
-    let (path, branch, marker) = describe_effective_config(&None);
+    let (path, branch, marker) = crate::cli_config::describe_effective_config(&None);
     assert_eq!(branch, "defaults");
     assert_eq!(path, "<built-in defaults>");
     assert!(
@@ -2248,4 +2248,28 @@ fn cli_subcommand_names_match_commands_enum() {
          missing from constant (add these): {missing_in_constant:?}\n\
          extra in constant (remove or move to RETIRED_CLI_SUBCOMMANDS): {extra_in_constant:?}"
     );
+}
+
+#[test]
+fn config_subcommands_parse_after_module_split() {
+    let init = Cli::try_parse_from([
+        "aicx",
+        "config",
+        "init",
+        "--force",
+        "--path",
+        "/tmp/aicx-config.toml",
+    ])
+    .expect("config init command should parse");
+    let show = Cli::try_parse_from(["aicx", "config", "show", "--json"])
+        .expect("config show command should parse");
+
+    match init.command {
+        Some(Commands::Config { .. }) => {}
+        _ => panic!("expected config init command"),
+    }
+    match show.command {
+        Some(Commands::Config { .. }) => {}
+        _ => panic!("expected config show command"),
+    }
 }

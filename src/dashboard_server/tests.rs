@@ -1,4 +1,5 @@
 use super::*;
+use super::search::{MAX_SCORE_FILTER, merge_project_scopes, validate_score_filter};
 use crate::test_support::capture_logs;
 use http_body_util::BodyExt;
 

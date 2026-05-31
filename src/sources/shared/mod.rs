@@ -31,6 +31,7 @@ pub(crate) use files::{
 pub(crate) use json::*;
 pub(crate) use project::*;
 pub use project::{
-    decode_claude_project_path, detect_project_name, repo_labels_from_entries, repo_name_from_cwd,
+    decode_claude_project_path, detect_project_name, infer_repo_name_from_current_dir,
+    repo_labels_from_entries, repo_name_from_cwd,
 };
 pub(crate) use timeline::*;
