@@ -1142,6 +1142,41 @@ fn hybrid_manifest_matches_embedder(
     }
 }
 
+/// Rebuild the hybrid lexical + dense + manifest artifacts from the EXISTING
+/// committed semantic index, WITHOUT re-embedding (the `aicx repair` recovery
+/// path). The committed index already holds every chunk's embedding, so
+/// `materialize_hybrid_index` reconstructs the full retrieval surface from it
+/// — turning an unqueryable build (dense present, hybrid missing/stale) into a
+/// queryable one in seconds instead of a multi-hour re-embed.
+///
+/// The embedder is loaded only for its model/dimension fingerprint (recorded
+/// in the manifest and checked against the committed index); it never
+/// re-embeds chunk content.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub fn repair_hybrid_from_committed(project: Option<&str>) -> Result<aicx_retrieve::Manifest> {
+    let index_path = index_path(project)?;
+    if !index_path.exists() {
+        anyhow::bail!(
+            "no committed semantic index at {} — run `aicx index` first (repair only rebuilds \
+             hybrid artifacts from existing embeddings; it does not embed)",
+            index_path.display()
+        );
+    }
+    let engine = crate::embedder::EmbeddingEngine::new().context(
+        "repair needs the embedder for the model/dimension fingerprint (it does NOT re-embed chunks)",
+    )?;
+    let info = engine.info().clone();
+    materialize_hybrid_index(&index_path, project, &info)
+}
+
+/// Build-disabled stub for binaries compiled without any embedder feature.
+#[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+pub fn repair_hybrid_from_committed(_project: Option<&str>) -> Result<aicx_retrieve::Manifest> {
+    anyhow::bail!(
+        "repair requires an embedder feature — rebuild with `--features native-embedder` or `--features cloud-embedder`"
+    )
+}
+
 /// Rewrite the placeholder header in `tmp_path` with the truthful one and
 /// stream the remaining entries into `final_tmp_path`. Caller renames
 /// `final_tmp_path` onto the committed target after this succeeds.
