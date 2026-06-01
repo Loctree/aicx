@@ -659,8 +659,16 @@ fn atomic_swap_dir(staging: &Path, target: &Path) -> Result<()> {
         fs::rename(target, &backup)
             .with_context(|| format!("back up {} -> {}", target.display(), backup.display()))?;
     }
-    fs::rename(staging, target)
-        .with_context(|| format!("promote {} -> {}", staging.display(), target.display()))?;
+    if let Err(err) = fs::rename(staging, target) {
+        // Promotion failed AFTER the live index was moved to backup — roll the
+        // backup back so the last-good index stays queryable, instead of
+        // leaving an empty path at `target`.
+        if backup.exists() && !target.exists() {
+            let _ = fs::rename(&backup, target);
+        }
+        return Err(err)
+            .with_context(|| format!("promote {} -> {}", staging.display(), target.display()));
+    }
     if backup.exists() {
         // New index is live; a leftover backup is not fatal.
         let _ = fs::remove_dir_all(&backup);
