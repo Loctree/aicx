@@ -1260,6 +1260,26 @@ enum Commands {
         full_rescan: bool,
     },
 
+    /// Rebuild the hybrid lexical+manifest artifacts from the EXISTING
+    /// committed semantic index, WITHOUT re-embedding.
+    ///
+    /// Recovers a corpus whose dense embeddings are present
+    /// (`indexed/<bucket>/embeddings.ndjson`) but whose hybrid/lexical
+    /// retrieval surface is missing or stale — turning an unqueryable build
+    /// into a queryable one in seconds instead of a full re-index. Does NOT
+    /// touch the dense rows or call the embedder for content; it only reads
+    /// the committed embeddings and rematerializes lexical + dense + manifest.
+    #[command(display_order = 15)]
+    Repair {
+        /// Project filter (same forms as `index`). Omit to repair every project.
+        #[arg(short, long, value_delimiter = ',')]
+        project: Vec<String>,
+
+        /// Emit JSON stats instead of plain text
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
+
     /// Manage `$HOME/.aicx/config.toml` for embedders and endpoints.
     #[command(display_order = 4)]
     Config {
@@ -2161,6 +2181,10 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 run_index(&project, sample, json, dry_run, full_rescan)?
             }
         },
+        Some(Commands::Repair { project, json }) => {
+            warn_pending_mutation("repair");
+            run_repair(&project, json)?
+        }
         Some(Commands::Config { action }) => {
             run_config(action)?;
         }
@@ -5973,6 +5997,46 @@ fn write_index_for_current_build(
 /// embedder + samples chunks for ETA. `dry_run=false` writes a
 /// persistent NDJSON-backed index (Iter 3) that subsequent `aicx search`
 /// queries against via cosine similarity.
+fn run_repair(projects: &[String], json: bool) -> Result<()> {
+    let resolved_scopes = resolve_index_scopes(projects)?;
+    let scopes: Vec<Option<&str>> = resolved_scopes.iter().map(Option::as_deref).collect();
+
+    let mut reports = Vec::with_capacity(scopes.len());
+    for scope in scopes {
+        let manifest = aicx::vector_index::repair_hybrid_from_committed(scope)?;
+        reports.push((scope.map(ToString::to_string), manifest));
+    }
+
+    if json {
+        let payload = reports
+            .iter()
+            .map(|(project, manifest)| {
+                serde_json::json!({
+                    "project": project.as_deref().unwrap_or("_all"),
+                    "lexical_doc_count": manifest.lexical_doc_count,
+                    "dense_count": manifest.dense_count,
+                    "generation_id": manifest.generation_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!("{}", serde_json::to_string(&payload)?);
+    } else {
+        for (project, manifest) in &reports {
+            eprintln!(
+                "repaired hybrid for {}: lexical_doc_count={} dense_count={} generation_id={}",
+                project
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("_all"),
+                manifest.lexical_doc_count,
+                manifest.dense_count,
+                manifest.generation_id,
+            );
+        }
+    }
+    Ok(())
+}
+
 fn run_index(
     projects: &[String],
     sample: usize,
