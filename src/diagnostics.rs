@@ -432,13 +432,31 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn lock_test_init(verbose: bool, dir: Option<PathBuf>) {
+    // Serializes every test that resets/uses the process-global
+    // `DiagnosticsState`. The returned guard MUST be bound (`let _g = ...`) so
+    // it lives for the whole test body — otherwise parallel `cargo test` races
+    // the shared state via `record()` / `lock_state()` across sibling tests
+    // (the root cause of the intermittent diagnostics flakes).
+    static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // Bind for the whole test body. EVERY test touching the global
+    // `DiagnosticsState` must hold this, or a sibling that resets the state
+    // (e.g. `summary_skipped_when_no_records`) races those that read it.
+    fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
+        TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[must_use = "bind the guard (`let _g = lock_test_init(...)`) so it serializes the whole test"]
+    fn lock_test_init(verbose: bool, dir: Option<PathBuf>) -> std::sync::MutexGuard<'static, ()> {
+        let guard = serial_guard();
         reset_for_tests();
         init(verbose, dir).expect("init");
+        guard
     }
 
     #[test]
     fn summary_skipped_when_no_records() {
+        let _serial = serial_guard();
         // emit_summary only reads the global state and prints to stderr — it
         // must not panic regardless of what a parallel test has recorded. Call
         // it without holding the lock.
@@ -460,6 +478,7 @@ mod tests {
 
     #[test]
     fn summary_aggregates_per_extractor() {
+        let _serial = serial_guard();
         // G-4 stores diagnostics in a process-global `Mutex<DiagnosticsState>`.
         // Other tests can call production paths (extract_*_file) that record
         // into this same global. To make this test deterministic under
@@ -495,7 +514,7 @@ mod tests {
 
     #[test]
     fn run_id_is_set_after_init() {
-        lock_test_init(false, None);
+        let _serial = lock_test_init(false, None);
         let id = run_id().expect("run_id present after init");
         assert!(!id.is_empty());
         assert!(id.contains('Z') || id.contains('-'));
@@ -507,7 +526,7 @@ mod tests {
         // misattributed any unrecognized extractor name (e.g. a future
         // "qwen" or a typo) into the "claude" bucket because
         // `debug_assert!` is a no-op outside debug builds.
-        lock_test_init(false, None);
+        let _serial = lock_test_init(false, None);
         let p = PathBuf::from("/tmp/test.jsonl");
         record("qwen", DiagnosticKind::FallbackTimestamp, 1, &p);
         let state = lock_state();
@@ -538,7 +557,7 @@ mod tests {
         // not be silently dropped because it is absent from EXTRACTOR_ORDER.
         // Regression guard for the "recorded-but-invisible" gap surfaced in
         // pass-6 (AUD-2).
-        lock_test_init(false, None);
+        let _serial = lock_test_init(false, None);
         let p = PathBuf::from("/tmp/test.jsonl");
         record("qwen", DiagnosticKind::FallbackTimestamp, 1, &p); // routes to "unknown"
         record("claude", DiagnosticKind::FallbackTimestamp, 2, &p);
@@ -563,7 +582,7 @@ mod tests {
 
     #[test]
     fn sanitization_offsets_combined_under_single_phrase() {
-        lock_test_init(false, None);
+        let _serial = lock_test_init(false, None);
         let p = PathBuf::from("/tmp/claude/x.jsonl");
         record("claude", DiagnosticKind::BidiOverride, 10, &p);
         record("claude", DiagnosticKind::ZeroWidth, 30, &p);
