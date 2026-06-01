@@ -266,6 +266,10 @@ pub fn try_semantic_search(
         let mut scanned = 0usize;
         let mut model_id = None;
         let mut hybrid_statuses = Vec::new();
+        // Track whether any scope fell back to dense-only, so the merged
+        // outcome reports the degraded backend instead of silently claiming
+        // hybrid — the degraded status must reach the CLI/MCP boundary.
+        let mut any_dense_only = false;
         for scope in scopes {
             let mut outcome = try_semantic_search_native(
                 query,
@@ -274,6 +278,9 @@ pub fn try_semantic_search(
                 frame_kind_filter,
                 kind_filter,
             )?;
+            if outcome.backend_label == "semantic_dense_only" {
+                any_dense_only = true;
+            }
             scanned += outcome.scanned;
             model_id.get_or_insert(outcome.model_id.clone());
             if let Some(status) = outcome.retrieval_status.clone() {
@@ -286,7 +293,11 @@ pub fn try_semantic_search(
         Ok(SemanticOutcome {
             results: merged_results,
             scanned,
-            backend_label: "hybrid_rrf",
+            backend_label: if any_dense_only {
+                "semantic_dense_only"
+            } else {
+                "hybrid_rrf"
+            },
             model_id: model_id.unwrap_or_else(|| "unknown".to_string()),
             retrieval_status: merge_hybrid_statuses(&hybrid_statuses),
         })
