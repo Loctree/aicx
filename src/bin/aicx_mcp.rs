@@ -112,7 +112,9 @@ fn main() -> ExitCode {
             "[aicx-mcp] WARNING: HTTP transport bound without auth (--no-require-auth)",
         );
     }
-    match rt.block_on(async { mcp::run_transport(args.transport, &args.host, args.port, auth_config).await }) {
+    match rt.block_on(async {
+        mcp::run_transport(args.transport, &args.host, args.port, auth_config).await
+    }) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let err_str = format!("{e:?}");

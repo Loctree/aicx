@@ -1196,8 +1196,8 @@ fn serve_help_prefers_http_name_and_stays_compact() {
 
 #[test]
 fn serve_host_flag_defaults_to_loopback() {
-    let cli = Cli::try_parse_from(["aicx", "serve", "--transport", "http"])
-        .expect("parse with defaults");
+    let cli =
+        Cli::try_parse_from(["aicx", "serve", "--transport", "http"]).expect("parse with defaults");
     match cli.command {
         Some(Commands::Serve { host, .. }) => {
             assert_eq!(host, "127.0.0.1");
