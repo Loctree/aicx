@@ -641,3 +641,38 @@ fn scan_index_entries_kind_filter_excludes_non_matching() {
     let scan2 = scan_index_entries(ok_lines(lines), &q, Some("session"), None).expect("scan");
     assert_eq!(scan2.hits.len(), 2);
 }
+
+// Patch 3 / Bug A1: gate the (expensive, destructive) hybrid rebuild so a
+// no-op incremental run skips it — but a dimension/model migration never does.
+
+#[test]
+fn skip_hybrid_when_incremental_noop_and_manifest_matches() {
+    assert!(should_skip_hybrid_rebuild(true, 0, 0, true));
+}
+
+#[test]
+fn no_skip_when_full_rescan() {
+    // --full-rescan must always rebuild, even with zero "new" rows.
+    assert!(!should_skip_hybrid_rebuild(false, 0, 0, true));
+    assert!(!should_skip_hybrid_rebuild(false, 100, 0, true));
+}
+
+#[test]
+fn no_skip_when_new_chunks_indexed() {
+    assert!(!should_skip_hybrid_rebuild(true, 1, 0, true));
+    assert!(!should_skip_hybrid_rebuild(true, 100, 0, true));
+}
+
+#[test]
+fn no_skip_when_embed_failures_present() {
+    // Failures mean the dense layer is incomplete; the hybrid must reconcile.
+    assert!(!should_skip_hybrid_rebuild(true, 0, 3, true));
+}
+
+#[test]
+fn no_skip_when_manifest_embedder_mismatch() {
+    // F2LLM 2048 -> qwen3 4096 migration: the committed manifest no longer
+    // matches the current embedder, so even a no-op incremental MUST rebuild
+    // rather than leave search serving a stale-model hybrid.
+    assert!(!should_skip_hybrid_rebuild(true, 0, 0, false));
+}
