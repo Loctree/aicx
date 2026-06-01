@@ -269,14 +269,22 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tempdir() -> PathBuf {
+        // A process-wide atomic counter guarantees uniqueness even when two
+        // parallel tests call this within the same clock tick — `as_nanos()`
+        // alone can collide under `cargo test` concurrency, which let one
+        // test's `hydrate_profile_snapshot` pollute another's "empty base"
+        // and flake `detect_cached_profiles_in_returns_empty_for_empty_base`.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "aicx-hf-cache-test-{}-{}",
+            "aicx-hf-cache-test-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
