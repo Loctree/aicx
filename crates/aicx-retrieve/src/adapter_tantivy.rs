@@ -221,26 +221,60 @@ impl LexicalIndex for TantivyAdapter {
     }
 
     fn build(&mut self, chunks: &[ChunkRef]) -> Result<LexicalCommitId> {
+        // Bug B: build into a sibling staging dir and atomically swap it in,
+        // instead of `remove_dir_all`-ing the live index up front. The old
+        // index stays queryable until the swap, so search never hits an empty
+        // directory mid-rebuild.
+
+        // Drop the writer first so its lock on `self.dir` is released before we
+        // rename directories underneath it.
         self.writer = None;
-        if self.dir.exists() {
-            fs::remove_dir_all(&self.dir)
-                .with_context(|| format!("clear tantivy dir {}", self.dir.display()))?;
+
+        let staging = {
+            let name = self
+                .dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| TANTIVY_INDEX_DIR.to_string());
+            let mut p = self.dir.clone();
+            p.set_file_name(format!("{name}.building"));
+            p
+        };
+        if staging.exists() {
+            fs::remove_dir_all(&staging)
+                .with_context(|| format!("clear stale staging dir {}", staging.display()))?;
         }
-        fs::create_dir_all(&self.dir)
-            .with_context(|| format!("create tantivy dir {}", self.dir.display()))?;
+        fs::create_dir_all(&staging)
+            .with_context(|| format!("create staging tantivy dir {}", staging.display()))?;
 
         let (schema, fields) = build_schema();
-        let index = Index::create_in_dir(&self.dir, schema.clone())
-            .with_context(|| format!("create tantivy index {}", self.dir.display()))?;
-        register_tokenizers(&index);
-        let mut writer = index
-            .writer_with_num_threads(1, WRITER_HEAP_BYTES)
-            .context("create tantivy index writer")?;
+        {
+            let index = Index::create_in_dir(&staging, schema.clone())
+                .with_context(|| format!("create staging tantivy index {}", staging.display()))?;
+            register_tokenizers(&index);
+            let mut writer = index
+                .writer_with_num_threads(1, WRITER_HEAP_BYTES)
+                .context("create tantivy index writer")?;
 
-        for chunk in chunks {
-            Self::add_chunk_to_writer(&fields, &mut writer, chunk)?;
+            for chunk in chunks {
+                Self::add_chunk_to_writer(&fields, &mut writer, chunk)?;
+            }
+            writer.commit().context("commit tantivy build")?;
+            // writer + index dropped here → all handles on `staging` released
+            // before the rename swap below.
         }
-        writer.commit().context("commit tantivy build")?;
+
+        // Promote staging -> live, preserving the previous index until the
+        // final rename (last-good stays available throughout the build).
+        atomic_swap_dir(&staging, &self.dir)?;
+
+        // Reopen handles from the promoted final location.
+        let index = Index::open_in_dir(&self.dir)
+            .with_context(|| format!("open promoted tantivy index {}", self.dir.display()))?;
+        register_tokenizers(&index);
+        let writer = index
+            .writer_with_num_threads(1, WRITER_HEAP_BYTES)
+            .context("reopen tantivy index writer after swap")?;
 
         self.index = index;
         self.schema = schema;
@@ -592,5 +626,85 @@ impl<T: TokenStream> TokenStream for PolishParticipleTrimTokenStream<T> {
 
     fn token_mut(&mut self) -> &mut Token {
         self.tail.token_mut()
+    }
+}
+
+/// Atomically replace the `target` index directory with a fully-built
+/// `staging` directory on the same filesystem (Bug B).
+///
+/// `target` stays intact and queryable until the final rename, so a concurrent
+/// reader never sees a half-built index — only the sub-millisecond gap between
+/// two `rename(2)` calls (vs the multi-minute window left by the old
+/// `remove_dir_all` + rebuild-in-place). The previous index is moved to a
+/// `<name>.old` sibling and removed best-effort after promotion; a leftover
+/// backup is non-fatal because the new index is already live.
+///
+/// Caller MUST drop all open tantivy handles (writer + index) on both `target`
+/// and `staging` before calling this — an open handle blocks directory rename
+/// on Windows and risks stale inodes elsewhere.
+fn atomic_swap_dir(staging: &Path, target: &Path) -> Result<()> {
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| anyhow!("swap target has no file name: {}", target.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let mut backup = target.to_path_buf();
+    backup.set_file_name(format!("{file_name}.old"));
+
+    if backup.exists() {
+        fs::remove_dir_all(&backup)
+            .with_context(|| format!("clear stale backup {}", backup.display()))?;
+    }
+    if target.exists() {
+        fs::rename(target, &backup)
+            .with_context(|| format!("back up {} -> {}", target.display(), backup.display()))?;
+    }
+    fs::rename(staging, target)
+        .with_context(|| format!("promote {} -> {}", staging.display(), target.display()))?;
+    if backup.exists() {
+        // New index is live; a leftover backup is not fatal.
+        let _ = fs::remove_dir_all(&backup);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod swap_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn atomic_swap_replaces_target_with_staging() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("idx");
+        let staging = tmp.path().join("idx.building");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("marker"), "OLD").unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("marker"), "NEW").unwrap();
+
+        atomic_swap_dir(&staging, &target).unwrap();
+
+        assert_eq!(fs::read_to_string(target.join("marker")).unwrap(), "NEW");
+        assert!(!staging.exists(), "staging must be consumed by the rename");
+        assert!(
+            !tmp.path().join("idx.old").exists(),
+            "backup must be cleaned up after a successful swap"
+        );
+    }
+
+    #[test]
+    fn atomic_swap_when_target_absent() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("idx");
+        let staging = tmp.path().join("idx.building");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("marker"), "NEW").unwrap();
+
+        atomic_swap_dir(&staging, &target).unwrap();
+
+        assert_eq!(fs::read_to_string(target.join("marker")).unwrap(), "NEW");
+        assert!(!staging.exists());
     }
 }
