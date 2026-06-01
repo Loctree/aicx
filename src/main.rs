@@ -5420,6 +5420,10 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                     outcome,
                     diagnostic,
                 } = filtered;
+                // Bug B+ observability: dense-only degradation is never silent.
+                if outcome.backend_label == "semantic_dense_only" {
+                    eprintln!("[aicx][phase=search level=degraded reason=hybrid_unavailable]");
+                }
                 let status = (
                     outcome.backend_label,
                     outcome.model_id.clone(),

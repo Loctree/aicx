@@ -1169,9 +1169,24 @@ pub fn render_semantic_status_line(
             )
         })
         .unwrap_or_default();
+    // The dense-only degraded path (Bug B+) must not masquerade as a healthy
+    // hybrid query: tell the operator the lexical fusion leg is unavailable
+    // and that this is a fallback, not the full stack.
+    let (prefix, index_label, fallback_label) = if backend_label == "semantic_dense_only" {
+        ("[degraded] ", "dense_only", "hybrid_unavailable")
+    } else {
+        ("", "hybrid", "none")
+    };
     format!(
-        "{} result(s) from {} candidate chunks. oracle_status: backend={} index=hybrid fallback=none model={} loctree_scope_safe=true{}",
-        result_count, scanned, backend_label, model_id, manifest
+        "{}{} result(s) from {} candidate chunks. oracle_status: backend={} index={} fallback={} model={} loctree_scope_safe=true{}",
+        prefix,
+        result_count,
+        scanned,
+        backend_label,
+        index_label,
+        fallback_label,
+        model_id,
+        manifest
     )
 }
 
@@ -1251,6 +1266,33 @@ mod tests {
         assert!(line.contains("index=hybrid"));
         assert!(line.contains("model=F2LLM-v2-0.6B.Q4_K_M.gguf"));
         assert!(line.contains("loctree_scope_safe=true"));
+    }
+
+    /// Patch 3 / Bug B+ observability: the dense-only degraded path must NOT
+    /// render as a healthy hybrid query. It must say so out loud (operator
+    /// sees the quality drop), not silently claim `index=hybrid fallback=none`.
+    #[test]
+    fn semantic_status_line_flags_dense_only_as_degraded() {
+        let line = render_semantic_status_line(
+            "semantic_dense_only",
+            "qwen3-embedding-8b",
+            5,
+            227_290,
+            None,
+        );
+        assert!(line.contains("backend=semantic_dense_only"));
+        assert!(
+            !line.contains("index=hybrid"),
+            "dense-only must not claim index=hybrid: {line}"
+        );
+        assert!(
+            !line.contains("fallback=none"),
+            "dense-only is a fallback; must not claim fallback=none: {line}"
+        );
+        assert!(
+            line.contains("degraded") && line.contains("fallback=hybrid_unavailable"),
+            "dense-only must surface degraded status explicitly: {line}"
+        );
     }
 
     /// Patch 3 / Bug B+: when the hybrid stack is unavailable, semantic
