@@ -56,6 +56,63 @@ fn build_and_query_smoke() {
 }
 
 #[test]
+fn rebuild_swaps_content_atomically_and_leaves_no_temp_dirs() {
+    // Bug B: a rebuild must replace content via staging+swap, end with the
+    // live index dir present, and leave no `.building` / `.old` siblings.
+    let temp = TempDir::new().unwrap();
+    let mut adapter = TantivyAdapter::new(temp.path().to_path_buf()).unwrap();
+
+    adapter
+        .build(&[chunk(1, "alpha uniquevonetoken body", "codex")])
+        .unwrap();
+    assert!(
+        !adapter
+            .query(&query("uniquevonetoken", 5))
+            .unwrap()
+            .is_empty(),
+        "v1 content must be queryable after first build"
+    );
+
+    // Rebuild with entirely different content.
+    adapter
+        .build(&[chunk(2, "beta uniquevtwotoken body", "codex")])
+        .unwrap();
+    assert!(
+        !adapter
+            .query(&query("uniquevtwotoken", 5))
+            .unwrap()
+            .is_empty(),
+        "rebuilt index must contain v2 content"
+    );
+    assert!(
+        adapter
+            .query(&query("uniquevonetoken", 5))
+            .unwrap()
+            .is_empty(),
+        "v1 content must be gone after the swap"
+    );
+
+    assert!(
+        temp.path().join(TANTIVY_INDEX_DIR).exists(),
+        "live index dir must be present after rebuild"
+    );
+    assert!(
+        !temp
+            .path()
+            .join(format!("{TANTIVY_INDEX_DIR}.building"))
+            .exists(),
+        "no leftover staging dir"
+    );
+    assert!(
+        !temp
+            .path()
+            .join(format!("{TANTIVY_INDEX_DIR}.old"))
+            .exists(),
+        "no leftover backup dir"
+    );
+}
+
+#[test]
 fn filter_pre_pass_limits_hits_to_agent() {
     let temp = TempDir::new().unwrap();
     let mut adapter = TantivyAdapter::new(temp.path().to_path_buf()).unwrap();
