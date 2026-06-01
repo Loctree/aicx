@@ -991,7 +991,23 @@ pub fn write_index_with_options(
         }
     }
 
-    if let Err(err) = materialize_hybrid_index(&target_path, project, &info) {
+    // Bug A1: `materialize_hybrid_index` does a full, destructive tantivy
+    // rebuild on every call. Skip it when this incremental run added nothing
+    // and the committed manifest still matches the embedder — keeps the
+    // last-good hybrid index queryable and avoids the 98%-CPU / 12-min
+    // rebuild pathology. A dimension/model migration flips the manifest match
+    // to false and rebuilds regardless.
+    let skip_hybrid = should_skip_hybrid_rebuild(
+        incremental_baseline.is_some(),
+        indexed,
+        failed,
+        hybrid_manifest_matches_embedder(project, &info),
+    );
+    if skip_hybrid {
+        eprintln!(
+            "[aicx][phase=index event=hybrid_skip reason=no_op_incremental_manifest_match indexed=0 failed=0]"
+        );
+    } else if let Err(err) = materialize_hybrid_index(&target_path, project, &info) {
         on_event(&IndexEvent::RunFailed {
             error: format!("{err:#}"),
             processed_before_failure: processed,
@@ -1073,6 +1089,57 @@ fn materialize_hybrid_index(
     dense_persist.persist_ndjson(&hybrid_dense_path(project)?)?;
 
     Ok(manifest)
+}
+
+/// Pure decision: should `materialize_hybrid_index` be SKIPPED on this run?
+///
+/// Bug A1: `materialize_hybrid_index` triggers a full tantivy lexical rebuild
+/// (`remove_dir_all` + reindex of every doc) and is otherwise called
+/// unconditionally after each dense commit — so a no-op incremental run
+/// (zero new chunks) needlessly burns CPU and tears down the last-good
+/// lexical index. Skip it when nothing changed.
+///
+/// Skip ONLY when ALL hold:
+/// - `is_incremental` — not a `--full-rescan` (which must always rebuild),
+/// - `indexed == 0` — no new/changed rows materialized,
+/// - `failed == 0` — no embed failures to reconcile,
+/// - `manifest_matches_embedder` — the committed hybrid manifest still matches
+///   the current embedder. A dimension/model change (operator's F2LLM 2048 ->
+///   qwen3 4096 migration) flips this to false and FORCES a rebuild even on a
+///   no-op incremental, so search never keeps serving a stale-model hybrid.
+pub(crate) fn should_skip_hybrid_rebuild(
+    is_incremental: bool,
+    indexed: usize,
+    failed: usize,
+    manifest_matches_embedder: bool,
+) -> bool {
+    is_incremental && indexed == 0 && failed == 0 && manifest_matches_embedder
+}
+
+/// Does the committed hybrid manifest still match the CURRENT embedder?
+///
+/// Reads the on-disk manifest and compares its recorded dimension + model id
+/// against the live embedder. A missing/unreadable manifest, or a
+/// dimension/model change (F2LLM 2048 -> qwen3 4096 migration), returns
+/// `false` — which forces [`should_skip_hybrid_rebuild`] to rebuild rather
+/// than skip, so search never serves a stale-model hybrid.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn hybrid_manifest_matches_embedder(
+    project: Option<&str>,
+    info: &crate::embedder::EmbeddingModelInfo,
+) -> bool {
+    let Ok(manifest_path) = hybrid_manifest_path(project) else {
+        return false;
+    };
+    if !manifest_path.exists() {
+        return false;
+    }
+    match aicx_retrieve::Manifest::read_from_path(&manifest_path) {
+        Ok(manifest) => {
+            manifest.embedder_dim == info.dimension && manifest.embedder_model == info.model_id
+        }
+        Err(_) => false,
+    }
 }
 
 /// Rewrite the placeholder header in `tmp_path` with the truthful one and
