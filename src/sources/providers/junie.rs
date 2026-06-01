@@ -529,6 +529,11 @@ fn parse_compact_junie_timestamp(compact_date: &str, compact_time: &str) -> Opti
     if compact_date.len() != 6 || compact_time.len() != 6 {
         return None;
     }
+    // Byte-index slicing below is only UTF-8-safe for ASCII; a non-ASCII
+    // multibyte char in a malformed request id would otherwise panic.
+    if !compact_date.is_ascii() || !compact_time.is_ascii() {
+        return None;
+    }
 
     let year = 2000 + compact_date[0..2].parse::<i32>().ok()?;
     let month = compact_date[2..4].parse::<u32>().ok()?;
