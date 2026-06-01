@@ -1118,7 +1118,7 @@ fn rewrite_index_with_truthful_header(
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn read_committed_index_entries(path: &Path) -> Result<(IndexHeader, Vec<IndexEntry>)> {
+pub(crate) fn read_committed_index_entries(path: &Path) -> Result<(IndexHeader, Vec<IndexEntry>)> {
     use std::io::BufReader;
 
     let file = crate::sanitize::open_file_validated(path)
@@ -1143,7 +1143,7 @@ fn read_committed_index_entries(path: &Path) -> Result<(IndexHeader, Vec<IndexEn
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn index_entry_metadata_json(entry: &IndexEntry) -> serde_json::Value {
+pub(crate) fn index_entry_metadata_json(entry: &IndexEntry) -> serde_json::Value {
     serde_json::json!({
         "source_path": entry.path.to_string_lossy(),
         "project": entry.project,

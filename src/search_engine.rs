@@ -437,23 +437,8 @@ fn try_semantic_search_native(
                     .to_string(),
             }
         })?;
-    if !manifest_path.exists() {
-        let cmd = match project_filter {
-            Some(p) => format!("aicx index --project {p}"),
-            None => "aicx index".to_string(),
-        };
-        return Err(SemanticError::RetrievalManifestMissing {
-            path: manifest_path.clone(),
-            reason: format!(
-                "hybrid retrieval manifest is missing at {}",
-                manifest_path.display()
-            ),
-            recommendation: format!(
-                "run `{cmd}` with the current binary so lexical+dense hybrid artifacts are committed"
-            ),
-        });
-    }
-
+    // Embed the query once — both the hybrid path and the dense-only
+    // fallback need the query vector.
     let query_embedding = match engine.embed(query) {
         Ok(embedding) => embedding,
         Err(err) => {
@@ -467,7 +452,45 @@ fn try_semantic_search_native(
         }
     };
 
-    let hybrid = load_hybrid_index(project_filter, &path, &info, &manifest_path)?;
+    // Patch 3 / Bug B+: the hybrid (tantivy lexical + dense fusion) stack can
+    // be unavailable for manifest-side reasons — never committed
+    // (`RetrievalManifestMissing`) or mid-rebuild / mismatched
+    // (`RetrievalManifestStale`; e.g. `TantivyAdapter::build` wipes its dir
+    // before committing). The dense embeddings in the committed index stay a
+    // valid semantic artifact throughout, so degrade to dense-only ranking
+    // instead of hard-failing the whole query. Lexical is part of the
+    // ranking, not a precondition for semantic search.
+    let hybrid = if manifest_path.exists() {
+        match load_hybrid_index(project_filter, &path, &info, &manifest_path) {
+            Ok(hybrid) => hybrid,
+            Err(SemanticError::RetrievalManifestMissing { .. })
+            | Err(SemanticError::RetrievalManifestStale { .. }) => {
+                return query_dense_only_from_primary(
+                    &path,
+                    &query_embedding,
+                    embedder_dim,
+                    limit,
+                    kind_filter,
+                    frame_kind_filter,
+                    &info.model_id,
+                );
+            }
+            Err(other) => return Err(other),
+        }
+    } else {
+        // Manifest was never committed — serve dense-only directly from the
+        // primary committed index (already validated above: exists, correct
+        // dimension, non-empty).
+        return query_dense_only_from_primary(
+            &path,
+            &query_embedding,
+            embedder_dim,
+            limit,
+            kind_filter,
+            frame_kind_filter,
+            &info.model_id,
+        );
+    };
     let manifest = hybrid.manifest().cloned();
     let filters = hybrid_filters(kind_filter, frame_kind_filter);
     let hits = match hybrid.query_hybrid(aicx_retrieve::HybridQueryInput {
@@ -616,6 +639,159 @@ fn load_hybrid_index(
             "run `aicx index` to rebuild lexical+dense artifacts from the canonical corpus"
                 .to_string(),
     })
+}
+
+/// Dense-only semantic fallback that reads the PRIMARY committed index
+/// (`index_path` = `vector_index::index_path`, i.e. `indexed/<bucket>/embeddings.ndjson`)
+/// directly, bypassing the hybrid manifest + tantivy lexical layer entirely.
+///
+/// Engaged when the hybrid stack is unavailable for any manifest-side reason
+/// (`RetrievalManifestMissing` / `RetrievalManifestStale`) — e.g. the lexical
+/// index is mid-rebuild (`TantivyAdapter::build` wipes its dir) or the manifest
+/// was never committed. The dense embeddings in the committed index remain a
+/// valid semantic artifact throughout, so we degrade to dense-only cosine
+/// ranking instead of hard-failing the whole query.
+///
+/// This is NOT the doctrinal "silent fuzzy fallback" (see module docs): it is
+/// explicit semantic search over real embeddings, surfaced via
+/// `backend_label = "semantic_dense_only"`. Hard-fail only when there is no
+/// valid dense artifact to serve.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn query_dense_only_from_primary(
+    index_path: &std::path::Path,
+    query_embedding: &[f32],
+    dim: usize,
+    limit: usize,
+    kind_filter: Option<&str>,
+    frame_kind_filter: Option<FrameKind>,
+    model_id: &str,
+) -> std::result::Result<SemanticOutcome, SemanticError> {
+    use aicx_retrieve::{BruteForceAdapter, ChunkRef, DenseChunkRef, DenseIndex, Distance};
+
+    let (header, entries) =
+        crate::vector_index::read_committed_index_entries(index_path).map_err(|err| {
+            SemanticError::IndexCorrupt {
+                path: index_path.to_path_buf(),
+                reason: format!("dense-only fallback could not read committed index: {err:#}"),
+                recommendation: format!(
+                    "delete and rebuild: `rm -f {} && aicx index`",
+                    index_path.display()
+                ),
+            }
+        })?;
+
+    // Defensive dimension guard: a committed index built with a different
+    // embedder (operator's F2LLM 2048 -> qwen3 4096 migration) must NOT be
+    // scored against the current query vector. Surface DimensionMismatch
+    // rather than ranking meaningless cross-model cosine.
+    if header.dimension != dim {
+        return Err(SemanticError::DimensionMismatch {
+            path: index_path.to_path_buf(),
+            index_dim: header.dimension,
+            embedder_dim: dim,
+            reason: format!(
+                "dense-only fallback: committed index dimension={} (model {}), current embedder dimension={}",
+                header.dimension, header.model_id, dim
+            ),
+            recommendation: format!(
+                "rebuild with the current embedder: `rm -f {} && aicx index`",
+                index_path.display()
+            ),
+        });
+    }
+
+    if entries.is_empty() {
+        return Err(SemanticError::EmptyIndex {
+            path: index_path.to_path_buf(),
+            reason: format!(
+                "dense-only fallback: committed index at {} contains 0 entries",
+                index_path.display()
+            ),
+            recommendation: "run `aicx extract --all` to populate the corpus, then `aicx index`"
+                .to_string(),
+        });
+    }
+
+    let scanned = entries.len();
+    let dense_chunks: Vec<DenseChunkRef> = entries
+        .into_iter()
+        .map(|entry| {
+            let metadata = crate::vector_index::index_entry_metadata_json(&entry);
+            DenseChunkRef {
+                chunk: ChunkRef {
+                    id: entry.id,
+                    source_path: entry.path.to_string_lossy().to_string(),
+                    // Dense ranking scores embeddings, not text — keep the
+                    // body out of memory (227k chunks otherwise).
+                    text: String::new(),
+                    metadata,
+                },
+                embedding: entry.embedding,
+            }
+        })
+        .collect();
+
+    let mut dense = BruteForceAdapter::new(dim).with_distance(Distance::Cosine);
+    DenseIndex::build(&mut dense, &dense_chunks).map_err(|err| SemanticError::IndexCorrupt {
+        path: index_path.to_path_buf(),
+        reason: format!("dense-only fallback could not build in-memory dense index: {err:#}"),
+        recommendation: format!(
+            "delete and rebuild: `rm -f {} && aicx index`",
+            index_path.display()
+        ),
+    })?;
+
+    let filters = hybrid_filters(kind_filter, frame_kind_filter);
+    let hits = DenseIndex::query(&dense, query_embedding, limit, &filters).map_err(|err| {
+        SemanticError::IndexCorrupt {
+            path: index_path.to_path_buf(),
+            reason: format!("dense-only fallback query failed: {err:#}"),
+            recommendation: "retry; if it persists rebuild with `aicx index`".to_string(),
+        }
+    })?;
+
+    let results: Vec<FuzzyResult> = hits
+        .into_iter()
+        .map(|h| {
+            let path = hit_path(&h);
+            let score_pct = dense_score_pct(h.score);
+            let matched_lines = semantic_preview_lines(&path);
+            FuzzyResult {
+                file: path.to_string_lossy().to_string(),
+                path: path.to_string_lossy().to_string(),
+                project: hit_metadata_string(&h, "project"),
+                kind: hit_metadata_string(&h, "kind"),
+                frame_kind: hit_metadata_optional_string(&h, "frame_kind"),
+                agent: hit_metadata_string(&h, "agent"),
+                date: hit_metadata_string(&h, "date"),
+                timestamp: None,
+                score: score_pct,
+                label: format!("dense_only:{}", h.chunk_id),
+                density: h.score,
+                matched_lines,
+                session_id: hit_metadata_optional_string(&h, "session_id"),
+                cwd: hit_metadata_optional_string(&h, "cwd"),
+            }
+        })
+        .collect();
+
+    Ok(SemanticOutcome {
+        results,
+        scanned,
+        backend_label: "semantic_dense_only",
+        model_id: model_id.to_string(),
+        retrieval_status: None,
+    })
+}
+
+/// Map a brute-force Cosine **similarity** (`[-1.0, 1.0]`, higher = closer)
+/// to a `[0, 100]` percentage. Distinct from [`hybrid_score_pct`], which
+/// scales an RRF-fused score — the dense-only leg is not RRF-fused, so it
+/// must not borrow that scaling.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn dense_score_pct(cosine_similarity: f32) -> u8 {
+    let clamped = cosine_similarity.clamp(-1.0, 1.0);
+    (((clamped + 1.0) * 0.5 * 100.0).round() as i32).clamp(0, 100) as u8
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -1075,6 +1251,176 @@ mod tests {
         assert!(line.contains("index=hybrid"));
         assert!(line.contains("model=F2LLM-v2-0.6B.Q4_K_M.gguf"));
         assert!(line.contains("loctree_scope_safe=true"));
+    }
+
+    /// Patch 3 / Bug B+: when the hybrid stack is unavailable, semantic
+    /// search must degrade to dense-only ranking over the PRIMARY committed
+    /// index instead of hard-failing. This proves the dense leg reads the
+    /// committed `embeddings.ndjson` directly, ranks by cosine, labels itself
+    /// `semantic_dense_only`, and surfaces the closest embedding first.
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn dense_only_from_primary_ranks_by_cosine_without_hybrid() {
+        use crate::vector_index::{IndexEntry, IndexHeader};
+        use std::io::Write;
+
+        let dir =
+            std::env::temp_dir().join(format!("aicx-dense-only-ranks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let chunk_a = dir.join("a.md");
+        let chunk_b = dir.join("b.md");
+        std::fs::write(&chunk_a, "alpha chunk body about the noise filter").expect("write a");
+        std::fs::write(&chunk_b, "beta chunk body about something unrelated").expect("write b");
+
+        let header = IndexHeader {
+            schema_version: "1".to_string(),
+            model_id: "test-model".to_string(),
+            model_profile: "test".to_string(),
+            dimension: 3,
+            generated_at: "2026-06-01T00:00:00Z".to_string(),
+            entry_count: 2,
+        };
+        let mk_entry = |id: &str, path: &std::path::Path, emb: Vec<f32>| IndexEntry {
+            id: id.to_string(),
+            project: "test/repo".to_string(),
+            agent: "claude".to_string(),
+            date: "20260601".to_string(),
+            path: path.to_path_buf(),
+            kind: "conversations".to_string(),
+            session_id: format!("sess-{id}"),
+            frame_kind: Some("agent_reply".to_string()),
+            cwd: None,
+            embedding: emb,
+        };
+        let entry_a = mk_entry("chunk-a", &chunk_a, vec![1.0, 0.0, 0.0]);
+        let entry_b = mk_entry("chunk-b", &chunk_b, vec![0.0, 1.0, 0.0]);
+
+        let index_path = dir.join("embeddings.ndjson");
+        {
+            let mut f = std::fs::File::create(&index_path).expect("create index");
+            writeln!(f, "{}", serde_json::to_string(&header).unwrap()).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&entry_a).unwrap()).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&entry_b).unwrap()).unwrap();
+        }
+
+        // Query closest to entry_a's [1, 0, 0].
+        let query = vec![0.9_f32, 0.1, 0.0];
+        let outcome =
+            query_dense_only_from_primary(&index_path, &query, 3, 10, None, None, "test-model")
+                .expect("dense-only query should succeed on a valid primary index");
+
+        assert_eq!(
+            outcome.backend_label, "semantic_dense_only",
+            "dense-only path must label itself explicitly, not as hybrid"
+        );
+        assert!(
+            !outcome.results.is_empty(),
+            "a valid dense index must yield at least one hit"
+        );
+        assert!(
+            outcome.results[0].label.contains("chunk-a"),
+            "closest embedding (chunk-a) must rank first, got label: {}",
+            outcome.results[0].label
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Migration safety (operator's F2LLM 2048 -> qwen3 4096 case): a committed
+    /// index built at a different dimension must be REJECTED, never scored —
+    /// cross-model cosine is meaningless. The dense-only leg must surface
+    /// DimensionMismatch, not silently rank garbage.
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn dense_only_rejects_dimension_mismatch_instead_of_ranking_garbage() {
+        use crate::vector_index::{IndexEntry, IndexHeader};
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!(
+            "aicx-dense-only-dimmismatch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let chunk = dir.join("c.md");
+        std::fs::write(&chunk, "body").expect("write");
+
+        // Committed index was built at dimension 2 (older model)...
+        let header = IndexHeader {
+            schema_version: "1".to_string(),
+            model_id: "old-2d-model".to_string(),
+            model_profile: "test".to_string(),
+            dimension: 2,
+            generated_at: "2026-06-01T00:00:00Z".to_string(),
+            entry_count: 1,
+        };
+        let entry = IndexEntry {
+            id: "c".to_string(),
+            project: "test/repo".to_string(),
+            agent: "claude".to_string(),
+            date: "20260601".to_string(),
+            path: chunk.clone(),
+            kind: "conversations".to_string(),
+            session_id: "s".to_string(),
+            frame_kind: None,
+            cwd: None,
+            embedding: vec![1.0, 0.0],
+        };
+        let index_path = dir.join("embeddings.ndjson");
+        {
+            let mut f = std::fs::File::create(&index_path).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&header).unwrap()).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
+        }
+
+        // ...but the current embedder is dimension 3.
+        let query = vec![1.0_f32, 0.0, 0.0];
+        let err = query_dense_only_from_primary(&index_path, &query, 3, 10, None, None, "qwen3-3d")
+            .expect_err("dimension mismatch must error, not rank cross-model garbage");
+        assert_eq!(
+            err.kind(),
+            "dimension_mismatch",
+            "expected dimension_mismatch, got kind={} reason={}",
+            err.kind(),
+            err.reason()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A committed index with a header but zero data rows must surface
+    /// EmptyIndex (actionable), never panic or return an empty-but-Ok outcome.
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn dense_only_empty_index_is_typed_error_not_panic() {
+        use crate::vector_index::IndexHeader;
+        use std::io::Write;
+
+        let dir =
+            std::env::temp_dir().join(format!("aicx-dense-only-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let header = IndexHeader {
+            schema_version: "1".to_string(),
+            model_id: "m".to_string(),
+            model_profile: "test".to_string(),
+            dimension: 3,
+            generated_at: "2026-06-01T00:00:00Z".to_string(),
+            entry_count: 0,
+        };
+        let index_path = dir.join("embeddings.ndjson");
+        {
+            let mut f = std::fs::File::create(&index_path).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&header).unwrap()).unwrap();
+        }
+
+        let query = vec![1.0_f32, 0.0, 0.0];
+        let err = query_dense_only_from_primary(&index_path, &query, 3, 10, None, None, "m")
+            .expect_err("empty committed index must error");
+        assert_eq!(err.kind(), "empty_index");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn fake_hit(rank: usize, date: &str, agent: &str, score: u8) -> FuzzyResult {
