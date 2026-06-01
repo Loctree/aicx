@@ -16,6 +16,21 @@ pub use crate::timeline::{
     TimelineEntry,
 };
 
+/// Resolve the source-provider home directory from the environment.
+///
+/// Returns `$AICX_SOURCE_HOME` when set and non-empty, otherwise `$HOME`.
+/// Pure: no filesystem side effects. Use as the base for all provider-specific
+/// dot-directories (`.claude/`, `.codex/`, `.gemini/`, `.junie/`, `.codescribe/`)
+/// so an operator can point aicx at a synced mirror of another machine's
+/// agent sessions without symlinking $HOME.
+pub fn resolve_source_home() -> Result<PathBuf> {
+    let dir = match std::env::var_os("AICX_SOURCE_HOME") {
+        Some(value) if !value.is_empty() => PathBuf::from(value),
+        _ => dirs::home_dir().context("No home dir")?,
+    };
+    Ok(dir)
+}
+
 pub mod providers;
 pub mod shared;
 
@@ -197,7 +212,7 @@ fn source_info(
 
 /// List available sources with session counts, sizes, and read-only protection status.
 pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
-    let home = dirs::home_dir().context("No home dir")?;
+    let home = resolve_source_home()?;
     let mut sources: Vec<SourceInfo> = Vec::new();
 
     // Claude

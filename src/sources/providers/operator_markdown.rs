@@ -97,7 +97,7 @@ pub fn discover_operator_markdown_from(
 /// Extract operator-authored markdown from Downloads, the Vibecrafted inbox,
 /// and the current repo's `docs/operator` directory when present.
 pub fn extract_operator_markdown(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let home = dirs::home_dir().context("No home dir")?;
+    let home = resolve_source_home()?;
     let repo_root = std::env::current_dir()
         .ok()
         .and_then(|cwd| discover_git_root_from_path(&cwd));
