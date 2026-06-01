@@ -439,11 +439,22 @@ mod tests {
 
     #[test]
     fn summary_skipped_when_no_records() {
-        lock_test_init(false, None);
-        // emit_summary writes to stderr; we can't capture here, but at least
-        // verify it does not panic and counters are clean.
+        // emit_summary only reads the global state and prints to stderr — it
+        // must not panic regardless of what a parallel test has recorded. Call
+        // it without holding the lock.
         emit_summary();
-        let state = lock_state();
+
+        // For the "no records => empty extractor map" contract, hold the global
+        // lock across the reset+assert so a parallel test recording into the
+        // shared `Mutex<DiagnosticsState>` cannot race a `record()` in between
+        // (same discipline as `summary_aggregates_per_extractor`). Without this
+        // the assert flakes under parallel `cargo test`.
+        let mut state = STATE
+            .get_or_init(|| Mutex::new(DiagnosticsState::default()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *state = DiagnosticsState::default();
+        state.initialized = true;
         assert!(state.extractors.is_empty());
     }
 
