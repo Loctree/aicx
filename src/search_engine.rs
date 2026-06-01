@@ -301,34 +301,15 @@ fn try_semantic_search_native(
     frame_kind_filter: Option<FrameKind>,
     kind_filter: Option<&str>,
 ) -> std::result::Result<SemanticOutcome, SemanticError> {
-    // Probe the embedder first.
-    let mut engine = match crate::embedder::EmbeddingEngine::new() {
-        Ok(engine) => engine,
-        Err(err) => {
-            let msg = err.to_string();
-            let recommendation = if msg.contains("hydrated") || msg.contains("cache") {
-                "run `hf download mradermacher/F2LLM-v2-0.6B-GGUF F2LLM-v2-0.6B.Q4_K_M.gguf` \
-                 (or set `AICX_EMBEDDER_PATH=/path/to/your.gguf`), then retry"
-                    .to_string()
-            } else if msg.contains("cloud") || msg.contains("url") {
-                "verify `~/.aicx/config.toml` `[embedder.cloud]` url + api_key_env are set, \
-                 export the api key, retry"
-                    .to_string()
-            } else {
-                "check `aicx config show` for resolved backend; if unhealthy run `aicx doctor` \
-                 then retry"
-                    .to_string()
-            };
-            return Err(SemanticError::EmbedderUnavailable {
-                reason: format!("semantic embedder unavailable (optional): {msg}"),
-                recommendation,
-            });
-        }
-    };
-
-    let info = engine.info().clone();
-    let embedder_dim = info.dimension;
-
+    // Resolve + verify the committed index FIRST, BEFORE paying the
+    // (potentially heavy) embedder bootstrap. On a host with no local index
+    // (e.g. the silver mirror, which serves semantic from sztudio and keeps
+    // `indexed/` empty by design) this makes `aicx search` / the MCP
+    // `aicx_search` fail-fast with `IndexNotBuilt` WITHOUT loading the
+    // embedder — so a client retrying a deterministically-missing index does
+    // not pay a model/config bootstrap (the most expensive step) on every
+    // call. Functionally identical to checking after; the order is what saves
+    // the CPU.
     let path = crate::vector_index::index_path(project_filter).map_err(|err| {
         SemanticError::IndexNotBuilt {
             path: std::path::PathBuf::new(),
@@ -364,6 +345,34 @@ fn try_semantic_search_native(
             ),
         });
     }
+
+    // Index exists — NOW probe the embedder (the expensive bootstrap step).
+    let mut engine = match crate::embedder::EmbeddingEngine::new() {
+        Ok(engine) => engine,
+        Err(err) => {
+            let msg = err.to_string();
+            let recommendation = if msg.contains("hydrated") || msg.contains("cache") {
+                "run `hf download mradermacher/F2LLM-v2-0.6B-GGUF F2LLM-v2-0.6B.Q4_K_M.gguf` \
+                 (or set `AICX_EMBEDDER_PATH=/path/to/your.gguf`), then retry"
+                    .to_string()
+            } else if msg.contains("cloud") || msg.contains("url") {
+                "verify `~/.aicx/config.toml` `[embedder.cloud]` url + api_key_env are set, \
+                 export the api key, retry"
+                    .to_string()
+            } else {
+                "check `aicx config show` for resolved backend; if unhealthy run `aicx doctor` \
+                 then retry"
+                    .to_string()
+            };
+            return Err(SemanticError::EmbedderUnavailable {
+                reason: format!("semantic embedder unavailable (optional): {msg}"),
+                recommendation,
+            });
+        }
+    };
+
+    let info = engine.info().clone();
+    let embedder_dim = info.dimension;
 
     // Read header line first so we can detect dimension mismatch BEFORE
     // touching any vectors.
