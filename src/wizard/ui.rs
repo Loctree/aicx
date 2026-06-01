@@ -311,7 +311,9 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Line::from("1 corpus | 2 doctor | 3 intents | 4 store"),
         Line::from("hjkl / arrows navigate visible lists"),
         Line::from("/ filters corpus or intents"),
-        Line::from("doctor: r refresh, f runs aicx doctor --fix, b shows Plan B deferral"),
+        Line::from(
+            "doctor: r refresh, f runs aicx doctor --rebuild-steer-index, b shows Plan B deferral",
+        ),
         Line::from("store: t changes range, s runs aicx store -H <range> --emit none"),
         Line::from("store: Ctrl+C sends kill to the running subprocess"),
         Line::from("q quits when no long operation is in flight"),

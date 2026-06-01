@@ -1,0 +1,1627 @@
+use super::*;
+use std::fs;
+use std::path::PathBuf;
+
+fn chunk_path(root: &Path, project: &str, date: &str, name: &str) -> PathBuf {
+    let date_compact = crate::store::compact_date(date);
+    let agent = if name.contains("_claude") || name.contains("claude") {
+        "claude"
+    } else if name.contains("_gemini") || name.contains("gemini") {
+        "gemini"
+    } else {
+        "codex"
+    };
+    let sequence = name
+        .trim_end_matches(".md")
+        .rsplit_once('-')
+        .and_then(|(_, tail)| tail.parse::<u32>().ok())
+        .unwrap_or(1);
+    let basename = crate::store::session_basename(date, agent, "intentstest01", sequence);
+    let dir = root
+        .join("store")
+        .join("local")
+        .join(project)
+        .join(date_compact)
+        .join("conversations")
+        .join(agent);
+    fs::create_dir_all(&dir).expect("create chunk dir");
+    dir.join(basename)
+}
+
+fn write_chunk(root: &Path, project: &str, date: &str, name: &str, body: &str) {
+    let path = chunk_path(root, project, date, name);
+    fs::write(path, body).expect("write chunk");
+}
+
+fn migration_test_root(label: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("unix time")
+        .as_nanos();
+    std::env::temp_dir().join(format!("aicx-intents-{label}-{nanos}"))
+}
+
+#[test]
+fn migrate_intent_schema_dry_run_at_scans_all_projects_without_filter() {
+    let root = migration_test_root("intent-migration-all-projects");
+    write_chunk(
+        &root,
+        "alpha",
+        "2026-04-14",
+        "093000_claude-001.md",
+        "[09:30:00] assistant: result: alpha migration passed\n",
+    );
+    write_chunk(
+        &root,
+        "beta",
+        "2026-04-15",
+        "101500_codex-001.md",
+        "[10:15:00] user: question: should beta keep legacy links?\n",
+    );
+
+    let report = migrate_intent_schema_dry_run_at(&root.join("store"), None)
+        .expect("global migration dry run should work");
+
+    assert_eq!(report.total_chunks, 2);
+    assert_eq!(report.entries_found, 2);
+    assert_eq!(report.per_project.get("alpha"), Some(&1));
+    assert_eq!(report.per_project.get("beta"), Some(&1));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+fn write_chunk_with_sidecar(
+    root: &Path,
+    project: &str,
+    date: &str,
+    name: &str,
+    body: &str,
+    frame_kind: Option<FrameKind>,
+) {
+    let path = chunk_path(root, project, date, name);
+    fs::write(&path, body).expect("write chunk");
+    let sidecar = crate::chunker::ChunkMetadataSidecar {
+        id: path
+            .file_stem()
+            .expect("chunk file stem")
+            .to_string_lossy()
+            .to_string(),
+        project: format!("local/{project}"),
+        agent: if name.contains("_claude") || name.contains("claude") {
+            "claude".to_string()
+        } else if name.contains("_gemini") || name.contains("gemini") {
+            "gemini".to_string()
+        } else {
+            "codex".to_string()
+        },
+        date: date.to_string(),
+        session_id: "intentstest01".to_string(),
+        cwd: None,
+        timestamp_source: None,
+        kind: crate::store::Kind::Conversations,
+        run_id: None,
+        prompt_id: None,
+        frame_kind,
+        speaker_hint: None,
+        agent_model: None,
+        started_at: None,
+        completed_at: None,
+        token_usage: None,
+        findings_count: None,
+        workflow_phase: None,
+        mode: None,
+        skill_code: None,
+        framework_version: None,
+        intent_entries: Vec::new(),
+        tags: Vec::new(),
+        artifact_family: None,
+        schema_version: None,
+        truth_status: None,
+        learning_use: None,
+        keywords: None,
+        content_sha256: None,
+        noise_lines_dropped: 0,
+    };
+    fs::write(
+        path.with_extension("meta.json"),
+        serde_json::to_vec_pretty(&sidecar).expect("serialize sidecar"),
+    )
+    .expect("write sidecar");
+}
+
+#[test]
+fn extracts_and_dedups_signal_records() {
+    let tmp = std::env::temp_dir().join(format!(
+        "ai-contexters-intents-{}-signals",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+
+    let chunk_one = r#"[project: demo | agent: codex | date: 2026-03-15]
+
+[signals]
+Decision:
+- [decision] Reuse normalize_key from src/chunker.rs:508 for overlap dedup
+Intent:
+- Let's ship the intention engine this week
+Outcome:
+- [skill_outcome] p0=0 after cargo test
+RED LIGHT: checklist detected (open: 1, done: 0)
+- [ ] wire CLI
+[/signals]
+
+[12:00:00] user: Let's ship the intention engine this week
+[12:01:00] assistant: [decision] Reuse normalize_key from src/chunker.rs:508 for overlap dedup
+[12:02:00] assistant: [skill_outcome] p0=0 after cargo test
+"#;
+
+    let chunk_two = r#"[project: demo | agent: codex | date: 2026-03-15]
+
+[signals]
+Decision:
+- [decision] Reuse normalize_key from src/chunker.rs:508 for overlap dedup
+Outcome:
+- outcome: p0=0 after cargo test
+RED LIGHT: checklist detected (open: 0, done: 1)
+- [x] wire CLI
+[/signals]
+
+[12:05:00] assistant: outcome: p0=0 after cargo test
+"#;
+
+    write_chunk(&tmp, "demo", "2026-03-15", "120000_codex-001.md", chunk_one);
+    write_chunk(&tmp, "demo", "2026-03-15", "120500_codex-002.md", chunk_two);
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        kind_filter: None,
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+
+    assert_eq!(records.len(), 3);
+    assert!(records.iter().any(|record| {
+        record.kind == IntentKind::Decision
+            && record.summary.contains("Reuse normalize_key")
+            && record
+                .evidence
+                .iter()
+                .any(|item| item == "src/chunker.rs:508")
+    }));
+    assert!(records.iter().any(|record| {
+        record.kind == IntentKind::Intent
+            && record.summary == "Let's ship the intention engine this week"
+    }));
+    assert!(
+        records.iter().any(|record| {
+            record.kind == IntentKind::Outcome && record.summary.contains("p0=0")
+        })
+    );
+    assert!(!records.iter().any(|record| record.kind == IntentKind::Task));
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn extraction_stats_report_scanned_chunks_and_candidates_before_display_filters() {
+    let tmp = std::env::temp_dir().join(format!(
+        "ai-contexters-intents-{}-stats",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+
+    write_chunk(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "120000_codex-001.md",
+        "[signals]\nDecision:\n- [decision] Keep canonical corpus first\n[/signals]\n",
+    );
+    write_chunk(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "120500_codex-002.md",
+        "[signals]\nOutcome:\n- outcome: canonical oracle JSON verified\n[/signals]\n",
+    );
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        kind_filter: None,
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let extraction =
+        extract_intents_from_root_at_with_stats(&config, &tmp, now).expect("extract intents");
+
+    assert_eq!(extraction.stats.scanned_count, 2);
+    assert_eq!(extraction.stats.candidate_count, extraction.records.len());
+    assert!(extraction.stats.candidate_count >= 2);
+    assert!(extraction.stats.source_paths_verified);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn extracts_raw_lines_and_keeps_surviving_open_tasks() {
+    let tmp =
+        std::env::temp_dir().join(format!("ai-contexters-intents-{}-raw", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+
+    let chunk = r#"[project: demo | agent: claude | date: 2026-03-14]
+
+[11:00:00] user: Proponuję uprościć parser chunków
+Bo overlap robi bałagan.
+[11:01:00] assistant: decision: keep parser flat around src/intents.rs:1
+commit abcdef1 proves the old path was wrong.
+[11:02:00] assistant: validation: p1=0 and score=9 after checks
+[11:03:00] assistant: - [ ] add CLI polish
+"#;
+
+    write_chunk(&tmp, "demo", "2026-03-14", "110000_claude-001.md", chunk);
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 48,
+        strict: false,
+        kind_filter: None,
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(9, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+
+    assert!(records.iter().any(|record| {
+        record.kind == IntentKind::Intent
+            && record.summary == "Proponuję uprościć parser chunków"
+            && record
+                .context
+                .as_deref()
+                .is_some_and(|ctx| ctx.contains("Bo overlap robi bałagan"))
+    }));
+    assert!(records.iter().any(|record| {
+        record.kind == IntentKind::Decision
+            && record
+                .evidence
+                .iter()
+                .any(|item| item == "src/intents.rs:1")
+            && record.evidence.iter().any(|item| item == "abcdef1")
+    }));
+    assert!(records.iter().any(|record| {
+        record.kind == IntentKind::Outcome
+            && record.evidence.iter().any(|item| item == "p1=0")
+            && record.evidence.iter().any(|item| item == "score=9")
+    }));
+    assert!(
+        records.iter().any(|record| {
+            record.kind == IntentKind::Task && record.summary == "add CLI polish"
+        })
+    );
+}
+
+#[test]
+fn strict_mode_filters_heuristic_only_intents() {
+    let tmp = std::env::temp_dir().join(format!(
+        "ai-contexters-intents-{}-strict",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+
+    let chunk = r#"[project: demo | agent: codex | date: 2026-03-15]
+
+[12:00:00] user: Let's keep only the sharp path.
+"#;
+
+    write_chunk(&tmp, "demo", "2026-03-15", "120000_codex-001.md", chunk);
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: true,
+        kind_filter: None,
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+    assert!(records.is_empty());
+}
+
+#[test]
+fn frame_kind_filter_keeps_only_matching_chunks() {
+    let tmp = std::env::temp_dir().join(format!(
+        "ai-contexters-intents-{}-frame-kind",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+
+    write_chunk_with_sidecar(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "120000_codex-001.md",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:00:00] user: Let's keep only user intent truth.\n",
+        Some(FrameKind::UserMsg),
+    );
+    write_chunk_with_sidecar(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "120100_codex-002.md",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:01:00] assistant: decision: assistant-only steering\n",
+        Some(FrameKind::AgentReply),
+    );
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        kind_filter: None,
+        frame_kind: Some(FrameKind::UserMsg),
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, IntentKind::Intent);
+    assert_eq!(records[0].summary, "Let's keep only user intent truth.");
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn formats_markdown_with_required_sections() {
+    let records = vec![IntentRecord {
+        kind: IntentKind::Decision,
+        summary: "Keep the parser flat".to_string(),
+        context: Some("It removes overlap bugs.".to_string()),
+        evidence: vec!["src/intents.rs:42".to_string()],
+        project: "demo".to_string(),
+        agent: "codex".to_string(),
+        date: "2026-03-15".to_string(),
+        timestamp: None,
+        session_id: "test".to_string(),
+        count: None,
+        first_chunk: None,
+        last_chunk: None,
+        source_chunk: "/tmp/demo/2026-03-15/120000_codex-001.md".to_string(),
+    }];
+
+    let markdown = format_intents_markdown(&records);
+    assert!(markdown.contains("DECISION: Keep the parser flat"));
+    assert!(markdown.contains("WHY: It removes overlap bugs."));
+    assert!(markdown.contains("EVIDENCE:"));
+    assert!(markdown.contains("source_chunk: /tmp/demo/2026-03-15/120000_codex-001.md"));
+}
+
+#[test]
+fn formats_json_with_same_fields() {
+    let records = vec![IntentRecord {
+        kind: IntentKind::Outcome,
+        summary: "p0=0 after validation".to_string(),
+        context: None,
+        evidence: vec!["p0=0".to_string()],
+        project: "demo".to_string(),
+        agent: "claude".to_string(),
+        date: "2026-03-15".to_string(),
+        timestamp: None,
+        session_id: "test".to_string(),
+        count: None,
+        first_chunk: None,
+        last_chunk: None,
+        source_chunk: "/tmp/demo/2026-03-15/120500_claude-002.md".to_string(),
+    }];
+
+    let json = format_intents_json(&records).expect("serialize intents");
+    assert!(json.contains("\"kind\": \"outcome\""));
+    assert!(json.contains("\"summary\": \"p0=0 after validation\""));
+    assert!(json.contains("\"source_chunk\": \"/tmp/demo/2026-03-15/120500_claude-002.md\""));
+}
+
+#[test]
+fn formats_oracle_json_as_canonical_corpus_not_semantic_fallback() {
+    let records = vec![IntentRecord {
+        kind: IntentKind::Decision,
+        summary: "Canonical corpus stays source of truth".to_string(),
+        context: None,
+        evidence: vec!["decision: canonical first".to_string()],
+        project: "Loctree/aicx".to_string(),
+        agent: "codex".to_string(),
+        date: "2026-05-04".to_string(),
+        timestamp: None,
+        session_id: "sess-canonical".to_string(),
+        count: None,
+        first_chunk: None,
+        last_chunk: None,
+        source_chunk: "/tmp/aicx/chunk.md".to_string(),
+    }];
+
+    let status = OracleStatus::canonical_corpus_scan(Path::new("/tmp/aicx"), 1, 1, true);
+    let json = format_intents_oracle_json(&records, status).expect("serialize oracle intents");
+    let payload: serde_json::Value =
+        serde_json::from_str(&json).expect("oracle intents JSON should parse");
+
+    assert_eq!(payload["oracle_status"]["backend"], "canonical_corpus");
+    assert_eq!(payload["oracle_status"]["index_kind"], "canonical_chunks");
+    assert_eq!(
+        payload["oracle_status"]["fallback_reason"],
+        serde_json::Value::Null
+    );
+    assert_eq!(payload["oracle_status"]["loctree_scope_safe"], true);
+    assert!(
+        payload["oracle_status"]["loctree_scope_note"]
+            .as_str()
+            .unwrap()
+            .contains("not a semantic similarity oracle")
+    );
+}
+
+#[test]
+fn strip_case_prefix_is_utf8_safe() {
+    let text = "Działa pięknie — pełny artifact pack z Rust flow...";
+    assert_eq!(strip_case_insensitive_prefix(text, "validation:"), text);
+}
+
+// ── classifier tests ────────────────────────────────────────────
+
+mod classifier {
+    use super::*;
+    use crate::types::{EntryState, EntryType};
+
+    #[test]
+    fn classifies_decision_marker() {
+        let result = classify_line_entry_type("[decision] Use flat parser", false);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Decision));
+    }
+
+    #[test]
+    fn classifies_decision_prefix() {
+        let result = classify_line_entry_type("decision: keep normalize_key", false);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Decision));
+    }
+
+    #[test]
+    fn classifies_question_mark() {
+        let result =
+            classify_line_entry_type("How does the auth middleware handle sessions?", false);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Question));
+    }
+
+    #[test]
+    fn classifies_question_prefix() {
+        let result = classify_line_entry_type("question: can we reuse normalize_key?", false);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Question));
+    }
+
+    #[test]
+    fn classifies_assumption() {
+        let result =
+            classify_line_entry_type("assumption: the store root is always ~/.aicx", false);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Assumption));
+    }
+
+    #[test]
+    fn classifies_polish_assumption() {
+        let result = classify_line_entry_type("zakładam że ścieżka zawsze istnieje", false);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Assumption));
+    }
+
+    #[test]
+    fn classifies_insight_marker() {
+        let result = classify_line_entry_type(
+            "insight: aicx is an intention engine not a formatter",
+            false,
+        );
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Insight));
+    }
+
+    #[test]
+    fn classifies_result_marker() {
+        let result = classify_line_entry_type("result: latency 450ms p99", false);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Result));
+    }
+
+    #[test]
+    fn classifies_result_from_keywords() {
+        let result = classify_line_entry_type("tests 276/276 passed, 0 warnings", false);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Result));
+    }
+
+    #[test]
+    fn classifies_outcome_tag() {
+        let result = classify_line_entry_type("[skill_outcome] p0=0 after cargo test", false);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Outcome));
+    }
+
+    #[test]
+    fn classifies_why_marker() {
+        let result =
+            classify_line_entry_type("because the old auth middleware stores tokens wrong", false);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Why));
+    }
+
+    #[test]
+    fn classifies_argue_marker() {
+        let result = classify_line_entry_type(
+            "on the other hand, rewriting is cheaper than patching",
+            false,
+        );
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Argue));
+    }
+
+    #[test]
+    fn classifies_user_intent() {
+        let result = classify_line_entry_type("Let's ship the intention engine this week", true);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Intent));
+    }
+
+    #[test]
+    fn classifies_polish_user_intent() {
+        let result = classify_line_entry_type("Proponuję uprościć parser chunków", true);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Intent));
+    }
+
+    #[test]
+    fn classifies_polish_operator_decision() {
+        let result = classify_line_entry_type(
+            "Nie może być tak, że ostatnie słowo gubi kolor akcentu",
+            true,
+        );
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Decision));
+    }
+
+    #[test]
+    fn abstains_on_ambiguous_line() {
+        let result = classify_line_entry_type("some random code comment", false);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn abstains_on_short_question() {
+        let result = classify_line_entry_type("what?", false);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn classify_chunk_all_nine_types() {
+        let content = r#"[project: demo | agent: claude | date: 2026-04-15]
+
+[signals]
+Decision:
+- [decision] Use 9-type taxonomy
+Intent:
+- Let's ship intent engine
+Outcome:
+- outcome: migration completed successfully
+[/signals]
+
+[12:00:00] user: Proponuję dodać link graph
+[12:01:00] assistant: assumption: store root always at ~/.aicx
+[12:02:00] assistant: insight: aicx is an intention retrieval engine
+[12:03:00] assistant: result: tests 276/276 passed
+[12:04:00] user: How does the chunker handle overlap?
+[12:05:00] assistant: because the old approach created duplicates
+[12:06:00] assistant: on the other hand, flat parsing is simpler
+"#;
+
+        let entries = classify_chunk_entries(
+            content,
+            "/tmp/test/chunk-001.md",
+            Some("demo"),
+            Some("claude"),
+            Some("sess-01"),
+            "2026-04-15",
+        );
+
+        let types: HashSet<EntryType> = entries.iter().map(|e| e.entry_type).collect();
+        assert!(types.contains(&EntryType::Decision), "missing Decision");
+        assert!(types.contains(&EntryType::Outcome), "missing Outcome");
+        assert!(types.contains(&EntryType::Intent), "missing Intent");
+        assert!(types.contains(&EntryType::Assumption), "missing Assumption");
+        assert!(types.contains(&EntryType::Insight), "missing Insight");
+        assert!(types.contains(&EntryType::Result), "missing Result");
+        assert!(types.contains(&EntryType::Question), "missing Question");
+        assert!(types.contains(&EntryType::Why), "missing Why");
+        assert!(types.contains(&EntryType::Argue), "missing Argue");
+
+        for entry in &entries {
+            assert!(!entry.id.is_empty());
+            assert!(!entry.title.is_empty());
+            assert!(entry.confidence >= CLASSIFIER_ABSTAIN_THRESHOLD);
+            assert_eq!(entry.date, "2026-04-15");
+            assert_eq!(entry.source_chunk, "/tmp/test/chunk-001.md");
+        }
+    }
+
+    #[test]
+    fn stable_ids_are_deterministic() {
+        let content = "[12:00:00] user: Let's ship intent engine\n";
+        let a = classify_chunk_entries(content, "/chunk.md", None, None, None, "2026-04-15");
+        let b = classify_chunk_entries(content, "/chunk.md", None, None, None, "2026-04-15");
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.id, y.id);
+        }
+    }
+
+    #[test]
+    fn tags_are_inferred() {
+        let content = "[12:00:00] assistant: result: auth login tests passed\n";
+        let entries = classify_chunk_entries(content, "/c.md", None, None, None, "2026-04-15");
+        let result_entry = entries.iter().find(|e| e.entry_type == EntryType::Result);
+        assert!(result_entry.is_some());
+        let tags = &result_entry.unwrap().tags;
+        assert!(tags.contains(&"auth".to_string()) || tags.contains(&"testing".to_string()));
+    }
+
+    #[test]
+    fn initial_state_mapping() {
+        assert_eq!(initial_state(EntryType::Intent), EntryState::Proposed);
+        assert_eq!(initial_state(EntryType::Question), EntryState::Proposed);
+        assert_eq!(initial_state(EntryType::Assumption), EntryState::Proposed);
+        assert_eq!(initial_state(EntryType::Decision), EntryState::Active);
+        assert_eq!(initial_state(EntryType::Insight), EntryState::Active);
+        assert_eq!(initial_state(EntryType::Outcome), EntryState::Done);
+        assert_eq!(initial_state(EntryType::Result), EntryState::Done);
+        assert_eq!(initial_state(EntryType::Why), EntryState::Active);
+        assert_eq!(initial_state(EntryType::Argue), EntryState::Active);
+    }
+
+    // Area E.7: keyword classifier must respect word boundaries, negation,
+    // inline code spans, and fenced code blocks.
+
+    #[test]
+    fn test_intent_let_us_not_refactor_is_not_intent() {
+        let result = classify_line_entry_type("Let's not refactor the parser today", true);
+        assert!(
+            result.map(|r| r.0) != Some(EntryType::Intent),
+            "negation `let's not` must invert the keyword polarity"
+        );
+        assert!(!looks_like_intent_line(
+            "Let's not refactor the parser today"
+        ));
+    }
+
+    #[test]
+    fn test_intent_polish_nie_mam_pomyslu_is_not_intent() {
+        // Diacritic-aware word boundary: `pomysłu` should not match keyword
+        // `pomysł` because the following `u` is alphanumeric.
+        assert!(!looks_like_intent_line("nie mam pomysłu na ten task"));
+        let classified = classify_line_entry_type("nie mam pomysłu na ten task", true);
+        assert!(
+            classified.map(|r| r.0) != Some(EntryType::Intent),
+            "Polish negation `nie mam` + suffixed `pomysłu` must not classify as intent"
+        );
+    }
+
+    #[test]
+    fn test_intent_inline_code_let_us_encrypt_is_not_intent() {
+        let line = "We rotated certs via `let's encrypt` last Tuesday";
+        assert!(
+            !looks_like_intent_line(line),
+            "keyword inside backtick inline code must not classify"
+        );
+    }
+
+    #[test]
+    fn test_intent_in_fenced_code_block_is_not_intent() {
+        let chunk = "[project: demo | agent: codex | date: 2026-05-20]\n\n\
+            [12:00:00] user: see the snippet below\n\
+            ```\n\
+            let's encrypt --domain example.com\n\
+            ```\n\
+            [12:01:00] user: that's all\n";
+        let entries = classify_chunk_entries(
+            chunk,
+            "fake.md",
+            Some("demo"),
+            Some("codex"),
+            None,
+            "2026-05-20",
+        );
+        assert!(
+            entries.iter().all(|e| e.entry_type != EntryType::Intent),
+            "lines inside ``` fence must be excluded from classification, got: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn test_intent_real_let_us_refactor_still_classifies() {
+        let result = classify_line_entry_type("Let's refactor the parser today", true);
+        assert_eq!(
+            result.map(|r| r.0),
+            Some(EntryType::Intent),
+            "positive `let's refactor` must still classify as intent"
+        );
+        assert!(looks_like_intent_line("Let's refactor the parser today"));
+    }
+
+    #[test]
+    fn test_intent_polish_chce_zrobic_still_classifies() {
+        assert!(
+            looks_like_intent_line("chcę zrobić nowy parser"),
+            "positive Polish intent should still match keyword `chcę`"
+        );
+        let result = classify_line_entry_type("chcę zrobić nowy parser", true);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Intent));
+    }
+}
+
+mod session_level {
+    use super::*;
+    use crate::types::{EntryState, EntryType};
+
+    fn make_entry(
+        entry_type: EntryType,
+        title: &str,
+        date: &str,
+        session_id: &str,
+        project: &str,
+    ) -> IntentEntry {
+        IntentEntry {
+            id: IntentEntry::stable_id(title, 0, entry_type),
+            entry_type,
+            state: initial_state(entry_type),
+            title: title.to_string(),
+            body: None,
+            evidence: Vec::new(),
+            links: Vec::new(),
+            confidence: 0.9,
+            tags: Vec::new(),
+            project: Some(project.to_string()),
+            agent: Some("claude".to_string()),
+            session_id: Some(session_id.to_string()),
+            timestamp: None,
+            date: date.to_string(),
+            source_chunk: "/test/chunk.md".to_string(),
+        }
+    }
+
+    #[test]
+    fn supersedes_marks_older_entry() {
+        let mut entries = vec![
+            make_entry(
+                EntryType::Intent,
+                "ship the new intent engine soon with basic features",
+                "2026-04-10",
+                "s1",
+                "demo",
+            ),
+            make_entry(
+                EntryType::Intent,
+                "ship the new intent engine soon with full taxonomy",
+                "2026-04-15",
+                "s2",
+                "demo",
+            ),
+        ];
+
+        postprocess_session_entries(&mut entries, Some(30));
+
+        assert_eq!(entries[0].state, EntryState::Superseded);
+        assert_eq!(entries[1].state, EntryState::Proposed);
+        assert!(
+            entries[1]
+                .links
+                .iter()
+                .any(|l| l.relation == LinkType::Supersedes)
+        );
+    }
+
+    #[test]
+    fn contradicted_assumption() {
+        let mut entries = vec![
+            make_entry(
+                EntryType::Assumption,
+                "store root always exists",
+                "2026-04-10",
+                "s1",
+                "demo",
+            ),
+            make_entry(
+                EntryType::Result,
+                "store root failed validation error",
+                "2026-04-11",
+                "s1",
+                "demo",
+            ),
+        ];
+
+        postprocess_session_entries(&mut entries, Some(30));
+
+        assert_eq!(entries[0].state, EntryState::Contradicted);
+        assert!(
+            entries[0]
+                .links
+                .iter()
+                .any(|l| l.relation == LinkType::Contradicts)
+        );
+    }
+
+    #[test]
+    fn insight_links_to_sources() {
+        let mut entries = vec![
+            make_entry(
+                EntryType::Result,
+                "tests 276/276 passed",
+                "2026-04-15",
+                "s1",
+                "demo",
+            ),
+            make_entry(
+                EntryType::Outcome,
+                "migration complete",
+                "2026-04-15",
+                "s1",
+                "demo",
+            ),
+            make_entry(
+                EntryType::Insight,
+                "aicx is an intention engine",
+                "2026-04-15",
+                "s1",
+                "demo",
+            ),
+        ];
+
+        postprocess_session_entries(&mut entries, Some(30));
+
+        let insight = &entries[2];
+        assert!(!insight.links.is_empty());
+        assert!(
+            insight
+                .links
+                .iter()
+                .all(|l| l.relation == LinkType::DerivedFrom)
+        );
+    }
+
+    #[test]
+    fn unresolved_intent_tagged_after_threshold() {
+        let old_date = (chrono::Utc::now().date_naive() - chrono::Duration::days(10))
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut entries = vec![make_entry(
+            EntryType::Intent,
+            "implement dark mode",
+            &old_date,
+            "s-old",
+            "demo",
+        )];
+
+        postprocess_session_entries(&mut entries, Some(7));
+
+        assert!(entries[0].tags.contains(&"unresolved".to_string()));
+    }
+
+    #[test]
+    fn recent_intent_not_tagged_unresolved() {
+        let today = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut entries = vec![make_entry(
+            EntryType::Intent,
+            "implement dark mode",
+            &today,
+            "s-today",
+            "demo",
+        )];
+
+        postprocess_session_entries(&mut entries, Some(7));
+
+        assert!(!entries[0].tags.contains(&"unresolved".to_string()));
+    }
+}
+
+mod quality {
+    use super::*;
+
+    fn write_chunk_with_session(
+        root: &Path,
+        project: &str,
+        date: &str,
+        agent: &str,
+        session_id: &str,
+        sequence: u32,
+        body: &str,
+    ) -> PathBuf {
+        let date_compact = crate::store::compact_date(date);
+        let basename = crate::store::session_basename(date, agent, session_id, sequence);
+        let dir = root
+            .join("store")
+            .join("local")
+            .join(project)
+            .join(date_compact)
+            .join("conversations")
+            .join(agent);
+        fs::create_dir_all(&dir).expect("create chunk dir");
+        let path = dir.join(basename);
+        fs::write(&path, body).expect("write chunk");
+        path
+    }
+
+    // ── metadata-noise filter ───────────────────────────────────────
+
+    #[test]
+    fn metadata_only_summary_dropped() {
+        assert!(is_metadata_only_summary("1 Wierność źródłu"));
+        assert!(is_metadata_only_summary(
+            "4 Deterministyczność transformacji"
+        ));
+        assert!(is_metadata_only_summary("2."));
+        assert!(is_metadata_only_summary("3) Section heading"));
+        assert!(is_metadata_only_summary("..."));
+        assert!(is_metadata_only_summary("... ```"));
+        assert!(is_metadata_only_summary("```"));
+        assert!(is_metadata_only_summary("---"));
+    }
+
+    #[test]
+    fn real_decision_summary_kept() {
+        assert!(!is_metadata_only_summary(
+            "Materiał nie może dopowiadać, streszczać ani interpretować rozmowy",
+        ));
+        assert!(!is_metadata_only_summary(
+            "Keep canonical corpus as the source of truth",
+        ));
+        assert!(!is_metadata_only_summary(
+            "P1.2 — cache_scope_authority zawsze RepoVerified",
+        ));
+    }
+
+    #[test]
+    fn pipe_separated_numeric_headings_classified_as_noise() {
+        assert!(is_section_heading_noise(
+            "1 Wierność źródłu | 2 Retrieval quality",
+        ));
+        assert!(is_section_heading_noise("4 Deterministyczność | 5 Dedup"));
+        // Real prose with pipes is not noise:
+        assert!(!is_section_heading_noise(
+            "He said X and we agreed | She replied Y so we shipped Z",
+        ));
+        assert!(!is_section_heading_noise(
+            "Let's keep the parser flat | Avoid premature abstractions",
+        ));
+    }
+
+    // ── sentence-aware truncation ──────────────────────────────────
+
+    #[test]
+    fn short_summary_returned_unchanged() {
+        let text = "Keep the parser flat";
+        assert_eq!(truncate_summary_for_display(text), text);
+    }
+
+    #[test]
+    fn long_summary_ends_at_sentence_terminator_when_available() {
+        let mut text = String::new();
+        text.push_str("Pierwsza część decyzji o canonical corpus i jego znaczeniu dla całego stacku VetCoders w kontekście długoterminowej strategii AICX. ");
+        // Force length > 480 bytes; ensure a full sentence-terminator
+        // exists in the lookback window (last 80 bytes before cutoff).
+        text.push_str(
+            &"Druga część rozważań która dopisuje treść aż przekroczymy próg 480 bajtów. "
+                .repeat(5),
+        );
+        assert!(text.len() > 480);
+
+        let out = truncate_summary_for_display(&text);
+        assert!(out.len() <= 480 + 4);
+        // Output must end on a strong terminator or an ellipsis,
+        // never mid-word with "...[truncated]".
+        assert!(
+            out.ends_with('.') || out.ends_with('!') || out.ends_with('?') || out.ends_with('…')
+        );
+        assert!(!out.contains("...[truncated]"));
+    }
+
+    #[test]
+    fn long_summary_without_terminator_falls_back_to_word_boundary() {
+        // Long text with no sentence terminators at all.
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega ".repeat(5);
+        assert!(text.len() > 480);
+
+        let out = truncate_summary_for_display(&text);
+        assert!(out.ends_with('…'));
+        assert!(!out.contains("...[truncated]"));
+        // Ensure the cut landed on a word boundary (no partial word
+        // immediately before the ellipsis).
+        let stem = out.trim_end_matches(['…', ' ']);
+        assert!(
+            stem.chars().last().is_none_or(|c| !c.is_alphabetic())
+                || stem.ends_with(|c: char| c.is_alphabetic())
+        );
+    }
+
+    // ── session-scoped dedup ───────────────────────────────────────
+
+    #[test]
+    fn cross_session_identical_summary_kept_separate() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ai-contexters-intents-{}-cross-session",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+
+        let body = "[project: demo | agent: codex | date: 2026-05-02]\n\n\
+                    [11:00:00] user: Materiał ma być deterministyczny — musi mieć source_hash i być wygenerowany z raw JSONL.\n";
+
+        // Same operator-decision text appearing in two distinct sessions.
+        write_chunk_with_session(&tmp, "demo", "2026-05-02", "codex", "019dcceb-48c", 3, body);
+        write_chunk_with_session(
+            &tmp,
+            "demo",
+            "2026-05-04",
+            "codex",
+            "019df273-2c1",
+            27,
+            body,
+        );
+
+        let config = IntentsConfig {
+            project: "demo".to_string(),
+            hours: 240,
+            strict: false,
+            kind_filter: Some(IntentKind::Decision),
+            frame_kind: None,
+        };
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 5, 5)
+                .expect("date")
+                .and_hms_opt(0, 0, 0)
+                .expect("time"),
+            Utc,
+        );
+
+        let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+
+        // Two sessions, two records — identical summary text but distinct
+        // provenance must NOT collapse into one entry that lies about its
+        // session (older session_id paired with newer source_chunk).
+        let decisions: Vec<&IntentRecord> = records
+            .iter()
+            .filter(|r| r.kind == IntentKind::Decision)
+            .collect();
+        assert_eq!(
+            decisions.len(),
+            2,
+            "expected one decision per session, got {decisions:?}",
+        );
+
+        let session_ids: HashSet<String> = decisions.iter().map(|r| r.session_id.clone()).collect();
+        assert!(
+            session_ids.contains("019dcceb-48c"),
+            "missing session 019dcceb-48c in {session_ids:?}",
+        );
+        assert!(
+            session_ids.contains("019df273-2c1"),
+            "missing session 019df273-2c1 in {session_ids:?}",
+        );
+
+        // Provenance check: each record's session_id must match the
+        // session segment in its own source_chunk filename.
+        for record in &decisions {
+            let stem = std::path::Path::new(&record.source_chunk)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            assert!(
+                stem.contains(&record.session_id),
+                "session_id={} not found in source_chunk filename={}",
+                record.session_id,
+                stem,
+            );
+        }
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn metadata_only_decision_filtered_at_extraction() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ai-contexters-intents-{}-metadata-noise",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+
+        let body = "[project: demo | agent: codex | date: 2026-05-04]\n\n\
+                    [10:00:00] user: 4 Deterministyczność transformacji\n\
+                    [10:01:00] user: Materiał musi mieć source_hash i być deterministycznie wygenerowany z raw JSONL.\n";
+
+        write_chunk_with_session(
+            &tmp,
+            "demo",
+            "2026-05-04",
+            "codex",
+            "019df273-2c1",
+            27,
+            body,
+        );
+
+        let config = IntentsConfig {
+            project: "demo".to_string(),
+            hours: 240,
+            strict: false,
+            kind_filter: None,
+            frame_kind: None,
+        };
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 5, 5)
+                .expect("date")
+                .and_hms_opt(0, 0, 0)
+                .expect("time"),
+            Utc,
+        );
+
+        let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+
+        // Numeric-list heading "4 Deterministyczność transformacji" must
+        // not appear as the top decision/intent.
+        assert!(
+            !records
+                .iter()
+                .any(|r| r.summary.starts_with("4 Deterministyczność")),
+            "metadata-only heading leaked into records: {records:?}",
+        );
+
+        // The real operator-decision line still survives.
+        assert!(
+            records
+                .iter()
+                .any(|r| r.summary.starts_with("Materiał musi mieć source_hash")),
+            "real decision line dropped: records={records:?}",
+        );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    // ── path-derived session reconciliation ────────────────────────
+
+    #[test]
+    fn reconcile_session_id_uses_filename_when_record_disagrees() {
+        let mut records = vec![IntentRecord {
+            kind: IntentKind::Intent,
+            summary: "claim from session A but filename is from session B".to_string(),
+            context: None,
+            evidence: vec![],
+            project: "demo".to_string(),
+            agent: "codex".to_string(),
+            date: "2026-05-04".to_string(),
+            timestamp: None,
+            session_id: "019dcceb-48c".to_string(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk:
+                "/store/Loctree/aicx/2026_0504/conversations/codex/2026_0504_codex_019df273-2c1_027.md"
+                    .to_string(),
+        }];
+
+        reconcile_session_id_with_path(&mut records);
+
+        assert_eq!(
+            records[0].session_id, "019df273-2c1",
+            "session_id should reflect what the cited filename actually contains",
+        );
+    }
+
+    #[test]
+    fn reconcile_keeps_session_id_when_already_consistent() {
+        let mut records = vec![IntentRecord {
+            kind: IntentKind::Decision,
+            summary: "session_id matches filename".to_string(),
+            context: None,
+            evidence: vec![],
+            project: "demo".to_string(),
+            agent: "codex".to_string(),
+            date: "2026-05-04".to_string(),
+            timestamp: None,
+            session_id: "019df273-2c1".to_string(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk:
+                "/store/Loctree/aicx/2026_0504/conversations/codex/2026_0504_codex_019df273-2c1_027.md"
+                    .to_string(),
+        }];
+
+        reconcile_session_id_with_path(&mut records);
+
+        assert_eq!(records[0].session_id, "019df273-2c1");
+    }
+
+    #[test]
+    fn truncated_duplicate_record_is_dropped_when_full_source_twin_exists() {
+        let source_chunk = "/tmp/2026_0504_codex_019df273-2c1_067.md".to_string();
+        let mut records = vec![
+            IntentRecord {
+                kind: IntentKind::Decision,
+                summary: "nie mamy ani jednego użytkownika. Jesteśmy teraz w San Francisco i potrzebujemy strategii. Zrób sobie aicx search...[truncated]".to_string(),
+                evidence: Vec::new(),
+                project: "aicx".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-05-04".to_string(),
+                session_id: "019df273-2c1".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: source_chunk.clone(),
+                timestamp: None,
+                context: None,
+            },
+            IntentRecord {
+                kind: IntentKind::Decision,
+                summary: "nie mamy ani jednego użytkownika. Jesteśmy teraz w San Francisco i potrzebujemy strategii. Zrób sobie aicx search 'repozytoria libraxis loctree vetcoders' i pomóż.".to_string(),
+                evidence: Vec::new(),
+                project: "aicx".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-05-04".to_string(),
+                session_id: "019df273-2c1".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk,
+                timestamp: None,
+                context: None,
+            },
+        ];
+
+        drop_truncated_duplicate_records(&mut records);
+
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].summary.contains("...[truncated]"));
+    }
+
+    // Area E.3: dedup must scale linearly. The quadratic shape blew up on
+    // 10k-record sessions (100M comparisons); the indexed version stays
+    // O(N).
+
+    fn make_record(
+        kind: IntentKind,
+        summary: &str,
+        session_id: &str,
+        source_chunk: &str,
+    ) -> IntentRecord {
+        IntentRecord {
+            kind,
+            summary: summary.to_string(),
+            evidence: Vec::new(),
+            project: "demo".to_string(),
+            agent: "codex".to_string(),
+            date: "2026-05-04".to_string(),
+            session_id: session_id.to_string(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: source_chunk.to_string(),
+            timestamp: None,
+            context: None,
+        }
+    }
+
+    #[test]
+    fn test_drop_truncated_duplicate_is_linear() {
+        // Build 10k records: 5k full + 5k truncated prefix duplicates,
+        // distributed across many (session, chunk) buckets so the bucket
+        // index keeps each lookup O(1). The previous O(N²) shape on this
+        // input ran ~100M comparisons.
+        //
+        // The threshold guards against quadratic regression, not micro-
+        // benchmarks the runner's TSC. Run the dedup three times on
+        // independent clones and take the median elapsed; assert against
+        // a generous 500ms cap. Rationale:
+        //
+        //  * Linear (current) implementation lands well under 100ms on
+        //    every runner we've measured (M-series Mac, x86_64 Linux CI).
+        //  * Quadratic regression on N=10k explodes to multiple seconds,
+        //    so 500ms still catches it with ~5x safety margin.
+        //  * Median-of-3 smooths the one-in-a-while shared-runner load
+        //    spike (the prior `< 200ms` cap tripped on a 201.98ms outlier
+        //    on macos-self-hosted while linux passed the same test).
+        let mut records = Vec::with_capacity(10_000);
+        for i in 0..5_000 {
+            let session = format!("s{:04}", i % 250);
+            let chunk = format!("/tmp/s{:04}_c{:03}.md", i % 250, i % 50);
+            let full = format!(
+                "Decision number {i}: keep canonical store at ~/.aicx/store and rebuild semantic index nightly"
+            );
+            let truncated =
+                format!("Decision number {i}: keep canonical store at ~/.aicx/store...[truncated]");
+            records.push(make_record(IntentKind::Decision, &full, &session, &chunk));
+            records.push(make_record(
+                IntentKind::Decision,
+                &truncated,
+                &session,
+                &chunk,
+            ));
+        }
+        assert_eq!(records.len(), 10_000);
+
+        let mut samples: Vec<std::time::Duration> = Vec::with_capacity(3);
+        let mut last_result: Vec<IntentRecord> = Vec::new();
+        for _ in 0..3 {
+            let mut run = records.clone();
+            let start = std::time::Instant::now();
+            drop_truncated_duplicate_records(&mut run);
+            samples.push(start.elapsed());
+            last_result = run;
+        }
+        samples.sort();
+        let median = samples[1];
+
+        assert!(
+            median.as_millis() < 500,
+            "dedup must run in < 500ms (median of 3) on 10k records (got {median:?}; samples {samples:?}) — quadratic regression suspected"
+        );
+        assert_eq!(last_result.len(), 5_000);
+        assert!(
+            last_result
+                .iter()
+                .all(|r| !r.summary.contains("...[truncated]"))
+        );
+    }
+
+    #[test]
+    fn test_drop_truncated_dedup_keeps_fullest() {
+        // Two truncated and one full; the full survives even when ordered
+        // last in the input.
+        let session = "sess-fullest";
+        let chunk = "/tmp/fullest.md";
+        let mut records = vec![
+            make_record(
+                IntentKind::Decision,
+                "keep canonical store at ~/.aicx/store and...[truncated]",
+                session,
+                chunk,
+            ),
+            make_record(
+                IntentKind::Decision,
+                "keep canonical store at ~/.aicx/store and rebuild...[truncated]",
+                session,
+                chunk,
+            ),
+            make_record(
+                IntentKind::Decision,
+                "keep canonical store at ~/.aicx/store and rebuild semantic index nightly",
+                session,
+                chunk,
+            ),
+        ];
+
+        drop_truncated_duplicate_records(&mut records);
+
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].summary.contains("...[truncated]"));
+        assert!(records[0].summary.ends_with("nightly"));
+    }
+}
+
+// ── Area E.4 / E.9 / E.10 / E.11 regression coverage ────────────────
+
+#[cfg(test)]
+mod area_e_regressions {
+    use super::*;
+
+    fn make_record(kind: IntentKind, summary: &str) -> IntentRecord {
+        IntentRecord {
+            kind,
+            summary: summary.to_string(),
+            context: None,
+            evidence: Vec::new(),
+            project: "demo".to_string(),
+            agent: "claude".to_string(),
+            date: "2026-05-20".to_string(),
+            timestamp: None,
+            session_id: "sess".to_string(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: "chunk-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn dedup_intent_records_collapses_zero_width_variants() {
+        // "fix au\u{200B}th" must dedup against "fix auth" — E.11 + E.12.
+        let mut records = vec![
+            make_record(IntentKind::Intent, "fix auth"),
+            make_record(IntentKind::Intent, "fix au\u{200B}th"),
+            make_record(IntentKind::Intent, "FIX  AUTH"),
+        ];
+        dedup_intent_records(&mut records);
+        assert_eq!(
+            records.len(),
+            1,
+            "dedup should collapse all three variants of 'fix auth', got {:?}",
+            records
+                .iter()
+                .map(|r| r.summary.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dedup_intent_records_preserves_distinct_kinds() {
+        let mut records = vec![
+            make_record(IntentKind::Intent, "fix auth"),
+            make_record(IntentKind::Decision, "fix auth"),
+        ];
+        dedup_intent_records(&mut records);
+        // Different kinds → keep both even when summary normalizes equal.
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn merge_evidence_deduplicates_without_quadratic_rebuild() {
+        // E.4: merge of large additions must succeed without exploding;
+        // we cannot directly measure complexity but we can assert the
+        // logical behavior — final vector has no normalized duplicates.
+        let mut existing: Vec<String> = (0..200).map(|i| format!("evidence line {i}")).collect();
+        let additions: Vec<String> = (100..300)
+            .map(|i| format!("EVIDENCE LINE {i}")) // case-different overlap
+            .collect();
+        merge_evidence(&mut existing, additions);
+        // 0..200 already present, then 200..300 added → 300 unique.
+        assert_eq!(existing.len(), 300);
+        // No two entries share a normalized key.
+        let mut keys: Vec<String> = existing.iter().map(|s| normalize_key(s)).collect();
+        keys.sort();
+        let unique_before = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), unique_before, "merge_evidence left duplicates");
+    }
+
+    #[test]
+    fn classify_line_entry_type_rejects_tests_meta_discussion() {
+        // E.9: bare "we need to write tests for the auth flow" — no digits,
+        // no PASS/FAIL — must NOT classify as Result.
+        let result = classify_line_entry_type("we need to write tests for the auth flow", false);
+        assert!(
+            !matches!(result, Some((EntryType::Result, _))),
+            "soft 'tests' marker without shape must not classify as Result, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn classify_line_entry_type_accepts_tests_with_shape() {
+        // E.9: same soft marker but with digits → Result is acceptable.
+        let result = classify_line_entry_type("tests 276/276 passed", false);
+        assert!(
+            matches!(result, Some((EntryType::Result, _))),
+            "tests + digits should classify as Result, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn classify_line_entry_type_rejects_bare_error_meta() {
+        // "should we treat this as an error: ?" is meta-discussion.
+        let result = classify_line_entry_type("should we treat this as an error: ?", false);
+        assert!(
+            !matches!(result, Some((EntryType::Result, _))),
+            "bare 'error:' meta-discussion must not classify as Result, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn is_outcome_line_skips_bare_affirmation() {
+        // E.10: "Zrobione" alone is not an outcome.
+        assert!(!is_outcome_line("Zrobione"));
+        assert!(!is_outcome_line("- Done"));
+        assert!(!is_outcome_line("Gotowe."));
+        // But with detail (colon + content) it counts again.
+        assert!(is_outcome_line("Zrobione: build green"));
+    }
+
+    fn make_entry(id: &str, session: &str, entry_type: EntryType, title: &str) -> IntentEntry {
+        IntentEntry {
+            id: id.to_string(),
+            entry_type,
+            state: EntryState::Active,
+            title: title.to_string(),
+            body: None,
+            evidence: Vec::new(),
+            links: Vec::new(),
+            confidence: 0.9,
+            tags: Vec::new(),
+            project: Some("demo".to_string()),
+            agent: Some("claude".to_string()),
+            session_id: Some(session.to_string()),
+            timestamp: Some("2026-05-20T10:00:00Z".to_string()),
+            date: "2026-05-20".to_string(),
+            source_chunk: "chunk-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn detect_contradicted_assumptions_groups_by_session() {
+        // E.5: assumption + result in the SAME session should link;
+        // a result in a DIFFERENT session must not contradict.
+        let mut entries = vec![
+            make_entry(
+                "e1",
+                "sess-A",
+                EntryType::Assumption,
+                "auth tokens never expire in dev",
+            ),
+            make_entry(
+                "e2",
+                "sess-A",
+                EntryType::Result,
+                "auth tokens fail to refresh in dev",
+            ),
+            make_entry(
+                "e3",
+                "sess-B",
+                EntryType::Result,
+                "auth tokens broken in prod too",
+            ),
+        ];
+        detect_contradicted_assumptions(&mut entries);
+        assert_eq!(entries[0].state, EntryState::Contradicted);
+        assert!(
+            entries[0].links.iter().any(|l| l.target == "e2"),
+            "expected contradiction link to sess-A result e2, got {:?}",
+            entries[0].links
+        );
+        assert!(
+            !entries[0].links.iter().any(|l| l.target == "e3"),
+            "cross-session result e3 must not contradict, got {:?}",
+            entries[0].links
+        );
+    }
+
+    #[test]
+    fn detect_contradicted_assumptions_handles_no_overlap_cleanly() {
+        // Assumption + Result in same session but with <2 word overlap
+        // must NOT mark as contradicted.
+        let mut entries = vec![
+            make_entry("e1", "sess-A", EntryType::Assumption, "deployment is safe"),
+            make_entry(
+                "e2",
+                "sess-A",
+                EntryType::Result,
+                "auth tokens fail to refresh",
+            ),
+        ];
+        detect_contradicted_assumptions(&mut entries);
+        assert_eq!(entries[0].state, EntryState::Active);
+        assert!(entries[0].links.is_empty());
+    }
+}
