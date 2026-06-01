@@ -81,9 +81,17 @@ fn binary_does_not_contain_module_prefix_leak() {
     let bin = ensure_aicx_binary_exists();
     let bytes = fs::read(&bin).expect("read aicx binary");
 
-    // The exact regression: "aicx::intents:".
+    // The exact regression: a user-facing `aicx::intents: <message>` leak.
+    // The byte AFTER the colon must NOT be another `:` — `aicx::intents::foo`
+    // is a normal Rust path symbol that debug builds embed (visible as raw
+    // ASCII in ELF/Linux binaries, hidden in Mach-O/macOS). The old exact
+    // match ignored this, so it passed on macOS but false-positived on the
+    // Linux runner against the module's own debug symbols. This matches the
+    // `:`-not-`::` discipline the defensive scan below already uses.
     let needle = b"aicx::intents:";
-    let hit = bytes.windows(needle.len()).any(|w| w == needle);
+    let hit = bytes
+        .windows(needle.len() + 1)
+        .any(|w| &w[..needle.len()] == needle && w[needle.len()] != b':');
     assert!(
         !hit,
         "binary {} contains literal `aicx::intents:` — module-prefix \
