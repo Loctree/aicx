@@ -81,9 +81,12 @@ fn binary_does_not_contain_module_prefix_leak() {
     let bin = ensure_aicx_binary_exists();
     let bytes = fs::read(&bin).expect("read aicx binary");
 
-    // The exact regression: "aicx::intents:".
+    // The exact regression: "aicx::intents:" (single trailing `:`). Avoid
+    // matching debug/type paths like `aicx::intents::types::...`.
     let needle = b"aicx::intents:";
-    let hit = bytes.windows(needle.len()).any(|w| w == needle);
+    let hit = bytes
+        .windows(needle.len() + 1)
+        .any(|w| &w[..needle.len()] == needle && w[needle.len()] != b':');
     assert!(
         !hit,
         "binary {} contains literal `aicx::intents:` — module-prefix \
