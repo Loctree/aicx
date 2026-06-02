@@ -32,10 +32,6 @@ struct Args {
     #[arg(long, default_value = "8044")]
     port: u16,
 
-    /// Bind address for HTTP transport (default: 127.0.0.1). Use 0.0.0.0 to bind all interfaces.
-    #[arg(long, default_value = "127.0.0.1", value_name = "HOST")]
-    host: String,
-
     /// Optional explicit auth token (overrides env / file / generated). HTTP transport only.
     #[arg(long, value_name = "TOKEN")]
     auth_token: Option<String>,
@@ -112,9 +108,7 @@ fn main() -> ExitCode {
             "[aicx-mcp] WARNING: HTTP transport bound without auth (--no-require-auth)",
         );
     }
-    match rt.block_on(async {
-        mcp::run_transport(args.transport, &args.host, args.port, auth_config).await
-    }) {
+    match rt.block_on(async { mcp::run_transport(args.transport, args.port, auth_config).await }) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let err_str = format!("{e:?}");

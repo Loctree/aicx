@@ -347,7 +347,7 @@ pub fn parse_codescribe_transcript(
     date: NaiveDate,
     config: &ExtractionConfig,
 ) -> Result<Vec<TimelineEntry>> {
-    let home = resolve_source_home()?;
+    let home = dirs::home_dir().context("No home dir")?;
     let lexicon = load_codescribe_lexicon(&home);
     parse_codescribe_transcript_with_lexicon(path, date, config, &lexicon, &home)
 }
@@ -461,7 +461,7 @@ fn codescribe_path_fingerprint(path: &Path) -> String {
 
 /// Extract CodeScribe transcript entries from `$HOME/.codescribe/transcriptions`.
 pub fn extract_codescribe(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let home = resolve_source_home()?;
+    let home = dirs::home_dir().context("No home dir")?;
     extract_codescribe_from_home(&home, config)
 }
 

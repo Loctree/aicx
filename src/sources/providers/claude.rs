@@ -259,7 +259,10 @@ fn select_claude_session_id<'a>(
 /// Reads `~/.claude/projects/<project_dir>/<uuid>.jsonl` files.
 /// Uses filename stem (UUID) as session_id for consistency.
 pub fn extract_claude(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let claude_dir = resolve_source_home()?.join(".claude").join("projects");
+    let claude_dir = dirs::home_dir()
+        .context("No home dir")?
+        .join(".claude")
+        .join("projects");
 
     if !claude_dir.exists() {
         return Ok(vec![]);
@@ -491,7 +494,10 @@ struct ClaudeHistoryEntry {
 /// Contains user prompts with `project` (=cwd), `display` (text), `timestamp` (ms epoch).
 /// Skips slash commands (`/init`, `/status`, `/model`, etc.).
 pub fn extract_claude_history(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let history_path = resolve_source_home()?.join(".claude").join("history.jsonl");
+    let history_path = dirs::home_dir()
+        .context("No home dir")?
+        .join(".claude")
+        .join("history.jsonl");
 
     if !history_path.exists() {
         return Ok(vec![]);

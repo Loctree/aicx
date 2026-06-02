@@ -339,6 +339,37 @@ fn canonical_repo_label(value: &str) -> String {
         .join("/")
 }
 
+/// Infer the `--repo` label by walking up from the current directory to the
+/// nearest `.git` root, falling back to the cwd's own basename. Canonicalized
+/// through [`canonical_repo_label`] so the result matches stored slugs.
+pub fn infer_repo_name_from_current_dir() -> Result<String> {
+    let cwd = std::env::current_dir().context("Cannot determine current directory")?;
+    let mut probe = cwd.as_path();
+    loop {
+        if probe.join(".git").exists() {
+            let repo = probe
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.trim().is_empty())
+                .map(canonical_repo_label)
+                .ok_or_else(|| anyhow::anyhow!("Could not infer --repo from git root"))?;
+            return Ok(repo);
+        }
+        let Some(parent) = probe.parent() else {
+            break;
+        };
+        probe = parent;
+    }
+
+    let repo = cwd
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(canonical_repo_label)
+        .ok_or_else(|| anyhow::anyhow!("Could not infer --repo from the current directory"))?;
+    Ok(repo)
+}
+
 /// Derive canonical repo labels from extracted entries.
 pub fn repo_labels_from_entries(
     entries: &[TimelineEntry],

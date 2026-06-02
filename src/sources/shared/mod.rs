@@ -19,6 +19,7 @@ pub mod conversation;
 pub mod diagnostics;
 pub mod files;
 pub mod json;
+pub mod list;
 pub mod project;
 pub mod timeline;
 
@@ -29,8 +30,10 @@ pub(crate) use files::{
     walk_files, walk_jsonl_files,
 };
 pub(crate) use json::*;
+pub use list::list_available_sources;
 pub(crate) use project::*;
 pub use project::{
-    decode_claude_project_path, detect_project_name, repo_labels_from_entries, repo_name_from_cwd,
+    decode_claude_project_path, detect_project_name, infer_repo_name_from_current_dir,
+    repo_labels_from_entries, repo_name_from_cwd,
 };
 pub(crate) use timeline::*;

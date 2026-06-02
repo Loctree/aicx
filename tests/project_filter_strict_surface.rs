@@ -14,7 +14,7 @@
 //! 1. store path — `store::project_filter_matches` direct call.
 //! 2. dashboard — `dashboard::project_matches_filter` public wrapper.
 //! 3. steer-index — replicates the `metadata_matches` split-and-delegate
-//!    shape from `src/steer_index.rs`, plus a source-level invariant grep
+//!    shape from `src/steer_index/search.rs`, plus a source-level invariant grep
 //!    so the canonical helper stays wired in.
 //! 4. rank — replicates the `fuzzy_search_store_one` split-and-delegate
 //!    shape from `src/rank.rs`, plus a source-level invariant grep that
@@ -87,7 +87,7 @@ fn dashboard_path_rejects_substring_leak() {
 
 #[test]
 fn steer_index_path_rejects_substring_leak() {
-    // `metadata_matches` in `src/steer_index.rs` is crate-private. Replicate
+    // `metadata_matches` in `src/steer_index/search.rs` is crate-private. Replicate
     // its exact split-and-delegate shape against the canonical helper so the
     // contract this surface promises is locked in at the test boundary.
     let (organization, repository) = split_slug(LEAKY_CANDIDATE_SLUG);
@@ -105,7 +105,7 @@ fn steer_index_path_rejects_substring_leak() {
     // Source-level invariant: the canonical helper is invoked from the
     // steer-index candidate filter, and the old `lowercase().contains`
     // sibling is gone. Guards against silent regression in B-2's file.
-    let src = read_source("src/steer_index.rs");
+    let src = read_source("src/steer_index/search.rs");
     assert!(
         src.contains("crate::store::project_filter_matches"),
         "steer-index lost its routing to canonical `project_filter_matches`"

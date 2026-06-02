@@ -7,7 +7,6 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -15,11 +14,26 @@ use crate::chunker::{
     INTENT_KEYWORDS, is_decision_tag, is_outcome_tag, is_result_line, normalize_key,
     parse_checklist_task, truncate_signal_line,
 };
-use crate::oracle::{OracleEnvelope, OracleStatus};
 use crate::sanitize;
 use crate::store;
 use crate::timeline::FrameKind;
 use crate::types::{EntryState, EntryType, IntentEntry, Link, LinkType};
+
+mod display;
+mod types;
+
+pub use self::display::{
+    IntentDisplayFilters, IntentSortOrder, apply_display_filters, format_intents_json,
+    format_intents_markdown, format_intents_oracle_json,
+};
+use self::types::{
+    CandidateAccumulator, IntentCandidate, SignalSection, StoredChunkFile, TaskAccumulator,
+    TaskEvent, TranscriptEntry,
+};
+pub use self::types::{
+    IntentExtraction, IntentExtractionStats, IntentKind, IntentRecord, IntentsConfig,
+    MigrationReport,
+};
 
 const STRICT_CONFIDENCE: u8 = 3;
 
@@ -29,128 +43,6 @@ const STRICT_CONFIDENCE: u8 = 3;
 /// handful. Cap here so memory stays bounded; emit a diagnostic on stderr when
 /// the cap is hit so the operator notices truncated extraction.
 const MAX_CANDIDATES: usize = 5000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum IntentKind {
-    Decision,
-    Intent,
-    Outcome,
-    Task,
-}
-
-impl IntentKind {
-    pub fn heading(self) -> &'static str {
-        match self {
-            Self::Decision => "DECISION",
-            Self::Intent => "INTENT",
-            Self::Outcome => "OUTCOME",
-            Self::Task => "TASK",
-        }
-    }
-
-    fn sort_rank(self) -> u8 {
-        match self {
-            Self::Decision => 0,
-            Self::Intent => 1,
-            Self::Outcome => 2,
-            Self::Task => 3,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct IntentRecord {
-    pub kind: IntentKind,
-    pub summary: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context: Option<String>,
-    pub evidence: Vec<String>,
-    pub project: String,
-    pub agent: String,
-    pub date: String,
-    pub timestamp: Option<String>,
-    pub session_id: String,
-    pub count: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub first_chunk: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_chunk: Option<String>,
-    pub source_chunk: String,
-}
-#[derive(Debug, Clone)]
-pub struct IntentsConfig {
-    pub project: String,
-    pub hours: u64,
-    pub strict: bool,
-    pub kind_filter: Option<IntentKind>,
-    pub frame_kind: Option<FrameKind>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IntentExtractionStats {
-    pub scanned_count: usize,
-    pub candidate_count: usize,
-    pub source_paths_verified: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct IntentExtraction {
-    pub records: Vec<IntentRecord>,
-    pub stats: IntentExtractionStats,
-}
-
-#[derive(Debug, Clone)]
-struct StoredChunkFile {
-    agent: String,
-    date: String,
-    path: PathBuf,
-    project: String,
-    sequence: u32,
-    timestamp: DateTime<Utc>,
-    session_id: String,
-}
-
-#[derive(Debug, Clone)]
-struct TranscriptEntry {
-    role: String,
-    lines: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct IntentCandidate {
-    record: IntentRecord,
-    confidence: u8,
-    timestamp: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone)]
-struct TaskEvent {
-    key: String,
-    candidate: IntentCandidate,
-    is_open: bool,
-}
-
-#[derive(Debug, Clone)]
-struct CandidateAccumulator {
-    candidate: IntentCandidate,
-}
-
-#[derive(Debug, Clone)]
-struct TaskAccumulator {
-    candidate: IntentCandidate,
-    is_open: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SignalSection {
-    None,
-    Intent,
-    Decision,
-    Results,
-    Outcome,
-    Ignore,
-}
 
 pub fn extract_intents(config: &IntentsConfig) -> Result<Vec<IntentRecord>> {
     Ok(extract_intents_with_stats(config)?.records)
@@ -167,169 +59,6 @@ pub fn extract_intents_with_stats_for_projects(
 ) -> Result<IntentExtraction> {
     let store_root = store::store_base_dir()?;
     extract_intents_from_root_at_for_projects_with_stats(config, projects, &store_root, Utc::now())
-}
-
-/// Sort order for `apply_display_filters`. Mirrors the CLI's `SortOrder`
-/// without importing main.rs types into the library.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IntentSortOrder {
-    Newest,
-    Oldest,
-}
-
-/// Display-time filters applied AFTER `extract_intents`.
-///
-/// Promoted from `main.rs::run_intents` so that both the CLI and the MCP
-/// `aicx_intents` tool can reuse the same post-processing pipeline. Without
-/// this, MCP would silently lose `unresolved`/`collapse_session`/`agent`/
-/// date-range/sort/limit semantics.
-#[derive(Debug, Clone, Default)]
-pub struct IntentDisplayFilters {
-    pub unresolved: bool,
-    pub collapse_session: bool,
-    pub agent: Option<String>,
-    pub date_lo: Option<String>,
-    pub date_hi: Option<String>,
-    pub sort: Option<IntentSortOrder>,
-    pub limit: Option<usize>,
-}
-
-/// Apply display-time filters to intent records.
-///
-/// Order matters: `unresolved` and `collapse_session` are session-scoped
-/// transformations and must run before `agent`/date filters or the count
-/// aggregation in `collapse_session` becomes inconsistent with the
-/// downstream filters.
-pub fn apply_display_filters(
-    mut records: Vec<IntentRecord>,
-    filters: &IntentDisplayFilters,
-) -> Vec<IntentRecord> {
-    if filters.unresolved {
-        let mut resolved_sessions = HashSet::new();
-        for rec in &records {
-            if rec.kind == IntentKind::Outcome {
-                resolved_sessions.insert(rec.session_id.clone());
-            }
-        }
-        records
-            .retain(|r| r.kind != IntentKind::Intent || !resolved_sessions.contains(&r.session_id));
-    }
-
-    if filters.collapse_session {
-        let mut map: HashMap<String, IntentRecord> = HashMap::new();
-        let mut order = Vec::new();
-        for rec in records {
-            let key = rec.session_id.clone();
-            match map.entry(key.clone()) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    order.push(key);
-                    let mut clone = rec.clone();
-                    clone.count = Some(1);
-                    entry.insert(clone);
-                }
-                std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    let existing = entry.get_mut();
-                    *existing.count.as_mut().unwrap() += 1;
-                    if !existing.evidence.contains(&rec.summary) {
-                        existing.evidence.push(rec.summary);
-                    }
-                    if !existing.source_chunk.contains(&rec.source_chunk) {
-                        existing.source_chunk =
-                            format!("{}, {}", existing.source_chunk, rec.source_chunk);
-                    }
-                }
-            }
-        }
-        records = order.into_iter().filter_map(|k| map.remove(&k)).collect();
-    }
-
-    if let Some(agent_filter) = &filters.agent {
-        records.retain(|r| &r.agent == agent_filter);
-    }
-
-    if filters.date_lo.is_some() || filters.date_hi.is_some() {
-        records.retain(|r| {
-            filters
-                .date_lo
-                .as_ref()
-                .is_none_or(|lo| r.date.as_str() >= lo.as_str())
-                && filters
-                    .date_hi
-                    .as_ref()
-                    .is_none_or(|hi| r.date.as_str() <= hi.as_str())
-        });
-    }
-
-    if let Some(sort_order) = filters.sort {
-        records.sort_by(|a, b| {
-            let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
-            let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
-            match sort_order {
-                IntentSortOrder::Newest => t_b.cmp(t_a),
-                IntentSortOrder::Oldest => t_a.cmp(t_b),
-            }
-        });
-    }
-
-    if let Some(limit) = filters.limit {
-        records.truncate(limit);
-    }
-
-    records
-}
-
-pub fn format_intents_markdown(records: &[IntentRecord]) -> String {
-    if records.is_empty() {
-        return String::new();
-    }
-
-    let mut out = String::from("# Intent Timeline\n\n");
-    let mut last_date: Option<&str> = None;
-
-    for record in records {
-        if last_date != Some(record.date.as_str()) {
-            if last_date.is_some() {
-                out.push('\n');
-            }
-            out.push_str(&format!("## {}\n\n", record.date));
-            last_date = Some(record.date.as_str());
-        }
-
-        out.push_str(&format!(
-            "### {} | {}\n",
-            record.kind.heading(),
-            record.agent
-        ));
-        out.push_str(&format!("{}: {}\n", record.kind.heading(), record.summary));
-        out.push_str(&format!(
-            "WHY: {}\n",
-            record.context.as_deref().unwrap_or("not captured")
-        ));
-        out.push_str("EVIDENCE:\n");
-        out.push_str(&format!("- source_chunk: {}\n", record.source_chunk));
-        for evidence in &record.evidence {
-            out.push_str(&format!("- {}\n", evidence));
-        }
-        out.push('\n');
-    }
-
-    out
-}
-
-pub fn format_intents_json(records: &[IntentRecord]) -> Result<String> {
-    serde_json::to_string_pretty(records).context("Failed to serialize intents to JSON")
-}
-
-pub fn format_intents_oracle_json(
-    records: &[IntentRecord],
-    oracle_status: OracleStatus,
-) -> Result<String> {
-    serde_json::to_string_pretty(&OracleEnvelope {
-        oracle_status,
-        results: records.len(),
-        items: records,
-    })
-    .context("Failed to serialize intents oracle JSON")
 }
 
 #[cfg(test)]
@@ -2417,15 +2146,6 @@ fn link_insights_to_sources(entries: &mut [IntentEntry]) {
 }
 
 // ── Migration support ───────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize)]
-pub struct MigrationReport {
-    pub total_chunks: usize,
-    pub entries_found: usize,
-    pub per_type: HashMap<String, usize>,
-    pub per_project: HashMap<String, usize>,
-    pub unresolved_count: usize,
-}
 
 pub fn migrate_intent_schema_dry_run(project_filter: Option<&str>) -> Result<MigrationReport> {
     migrate_intent_schema_dry_run_at(&store::store_base_dir()?, project_filter)

@@ -420,7 +420,10 @@ fn project_junie_block(kind: &str, agent_event: &serde_json::Value) -> Option<Bl
 
 /// Extract timeline entries from all Junie session logs under `~/.junie/sessions/`.
 pub fn extract_junie(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let sessions_dir = resolve_source_home()?.join(".junie").join("sessions");
+    let sessions_dir = dirs::home_dir()
+        .context("No home dir")?
+        .join(".junie")
+        .join("sessions");
 
     if !sessions_dir.exists() || !sessions_dir.is_dir() {
         return Ok(vec![]);

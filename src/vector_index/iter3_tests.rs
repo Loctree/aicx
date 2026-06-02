@@ -397,6 +397,42 @@ fn tempdir_for_test() -> std::path::PathBuf {
     p
 }
 
+/// RAII guard that scopes `AICX_HOME` to a test tempdir so that paths
+/// derived from `store::store_base_dir()` (lock paths, store paths) stay
+/// isolated from any concurrently running aicx process on the host.
+///
+/// On drop, restores the previous value of `AICX_HOME` (or unsets it).
+/// Required for tests that exercise code paths inside
+/// `query_index_with_embedding` etc., which acquire the canonical
+/// `lance.lock` derived from `AICX_HOME`.
+struct ScopedAicxHome {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl ScopedAicxHome {
+    fn set(home: &std::path::Path) -> Self {
+        let previous = std::env::var_os("AICX_HOME");
+        // SAFETY: env mutation is single-threaded within this test scope;
+        // the RAII guard restores prior state on drop.
+        unsafe {
+            std::env::set_var("AICX_HOME", home);
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for ScopedAicxHome {
+    fn drop(&mut self) {
+        // SAFETY: env restore is single-threaded within the test scope.
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var("AICX_HOME", value),
+                None => std::env::remove_var("AICX_HOME"),
+            }
+        }
+    }
+}
+
 /// Build a synthetic NDJSON data-line for an `IndexEntry`. Mirrors the
 /// real `write_index` row shape without going through filesystem.
 fn make_entry_line(id: &str, embedding: Vec<f32>) -> String {
@@ -567,6 +603,13 @@ fn query_index_recovery_hint_uses_full_rescan_not_fresh() {
     body.push_str("{still not valid json\n");
     std::fs::write(&path, body).expect("write corrupt fixture index");
 
+    // Isolate lance.lock to the test tempdir so the assertion exercises the
+    // recovery-hint path even when a real `aicx index` is running on the
+    // host machine. Without this scope, the test contends on
+    // `~/.aicx/locks/lance.lock` against any active indexer and surfaces a
+    // lock-timeout error rather than the integrity-failure recovery hint
+    // that the regression guard cares about.
+    let _aicx_home_guard = ScopedAicxHome::set(&root);
     let err = query_index_with_embedding(&path, &[1.0, 0.0], 10, None, None)
         .expect_err("corrupt fixture should fail-fast");
     let message = format!("{err:#}");
@@ -640,39 +683,4 @@ fn scan_index_entries_kind_filter_excludes_non_matching() {
 
     let scan2 = scan_index_entries(ok_lines(lines), &q, Some("session"), None).expect("scan");
     assert_eq!(scan2.hits.len(), 2);
-}
-
-// Patch 3 / Bug A1: gate the (expensive, destructive) hybrid rebuild so a
-// no-op incremental run skips it — but a dimension/model migration never does.
-
-#[test]
-fn skip_hybrid_when_incremental_noop_and_manifest_matches() {
-    assert!(should_skip_hybrid_rebuild(true, 0, 0, true));
-}
-
-#[test]
-fn no_skip_when_full_rescan() {
-    // --full-rescan must always rebuild, even with zero "new" rows.
-    assert!(!should_skip_hybrid_rebuild(false, 0, 0, true));
-    assert!(!should_skip_hybrid_rebuild(false, 100, 0, true));
-}
-
-#[test]
-fn no_skip_when_new_chunks_indexed() {
-    assert!(!should_skip_hybrid_rebuild(true, 1, 0, true));
-    assert!(!should_skip_hybrid_rebuild(true, 100, 0, true));
-}
-
-#[test]
-fn no_skip_when_embed_failures_present() {
-    // Failures mean the dense layer is incomplete; the hybrid must reconcile.
-    assert!(!should_skip_hybrid_rebuild(true, 0, 3, true));
-}
-
-#[test]
-fn no_skip_when_manifest_embedder_mismatch() {
-    // F2LLM 2048 -> qwen3 4096 migration: the committed manifest no longer
-    // matches the current embedder, so even a no-op incremental MUST rebuild
-    // rather than leave search serving a stale-model hybrid.
-    assert!(!should_skip_hybrid_rebuild(true, 0, 0, false));
 }
