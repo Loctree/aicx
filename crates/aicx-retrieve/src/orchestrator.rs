@@ -127,6 +127,35 @@ impl HybridIndex {
     }
 
     pub fn commit(&mut self) -> Result<&Manifest> {
+        let prior = self
+            .manifest
+            .as_ref()
+            .ok_or_else(|| anyhow!("cannot commit hybrid index before build_hybrid"))?
+            .clone();
+        let completed = Manifest::now_utc();
+        let wall_seconds = completed
+            .signed_duration_since(prior.build_started_at)
+            .num_seconds()
+            .max(0) as u64;
+        self.manifest = Some(Manifest {
+            schema_version: prior.schema_version,
+            generation_id: Manifest::fresh_generation_id(),
+            source_chunk_count: prior.source_chunk_count,
+            source_hash_blake3: prior.source_hash_blake3,
+            embedder_model: self.embedder_fingerprint.model.clone(),
+            embedder_url_hash: self.embedder_fingerprint.url_hash.clone(),
+            embedder_dim: self.embedder_fingerprint.dim,
+            embedder_distance: self.embedder_fingerprint.distance.clone(),
+            dense_count: self.dense.count(),
+            dense_kind: self.dense.kind().to_string(),
+            lexical_commit_id: self.lexical.commit_id().0.clone(),
+            lexical_doc_count: self.lexical.doc_count(),
+            build_started_at: prior.build_started_at,
+            build_completed_at: completed,
+            build_wall_seconds: wall_seconds,
+            fusion_algorithm: self.fusion.name().to_string(),
+            fusion_k: fusion_k(self.fusion.name()),
+        });
         let manifest = self
             .manifest
             .as_ref()
@@ -152,7 +181,7 @@ impl HybridIndex {
             dense.as_ref(),
             fusion.as_ref(),
             &embedder_fingerprint,
-            observed_source_hash,
+            Some(observed_source_hash),
         )?;
         Ok(Self {
             lexical,
@@ -191,13 +220,23 @@ impl HybridIndex {
     }
 }
 
+pub fn validate_live_bindings_for_refresh(
+    manifest: &Manifest,
+    lexical: &dyn LexicalIndex,
+    dense: &dyn DenseIndex,
+    fusion: &dyn FusionStrategy,
+    fingerprint: &EmbedderFingerprint,
+) -> std::result::Result<(), RetrieveError> {
+    validate_bindings(manifest, lexical, dense, fusion, fingerprint, None)
+}
+
 fn validate_bindings(
     manifest: &Manifest,
     lexical: &dyn LexicalIndex,
     dense: &dyn DenseIndex,
     fusion: &dyn FusionStrategy,
     fingerprint: &EmbedderFingerprint,
-    observed_source_hash: &str,
+    observed_source_hash: Option<&str>,
 ) -> std::result::Result<(), RetrieveError> {
     if manifest.dense_kind != dense.kind() {
         return Err(RetrieveError::GenerationMismatch {
@@ -248,26 +287,30 @@ fn validate_bindings(
         });
     }
 
-    let observed = Manifest {
-        schema_version: manifest.schema_version.clone(),
-        generation_id: manifest.generation_id.clone(),
-        source_chunk_count: manifest.source_chunk_count,
-        source_hash_blake3: source_hash_blake3(observed_source_hash),
-        embedder_model: fingerprint.model.clone(),
-        embedder_url_hash: fingerprint.url_hash.clone(),
-        embedder_dim: fingerprint.dim,
-        embedder_distance: fingerprint.distance.clone(),
-        dense_count: dense.count(),
-        dense_kind: dense.kind().to_string(),
-        lexical_commit_id: lexical.commit_id().0.clone(),
-        lexical_doc_count: lexical.doc_count(),
-        build_started_at: manifest.build_started_at,
-        build_completed_at: manifest.build_completed_at,
-        build_wall_seconds: manifest.build_wall_seconds,
-        fusion_algorithm: fusion.name().to_string(),
-        fusion_k: manifest.fusion_k,
-    };
-    manifest.validate_against(&observed)
+    if let Some(observed_source_hash) = observed_source_hash {
+        let observed = Manifest {
+            schema_version: manifest.schema_version.clone(),
+            generation_id: manifest.generation_id.clone(),
+            source_chunk_count: manifest.source_chunk_count,
+            source_hash_blake3: source_hash_blake3(observed_source_hash),
+            embedder_model: fingerprint.model.clone(),
+            embedder_url_hash: fingerprint.url_hash.clone(),
+            embedder_dim: fingerprint.dim,
+            embedder_distance: fingerprint.distance.clone(),
+            dense_count: dense.count(),
+            dense_kind: dense.kind().to_string(),
+            lexical_commit_id: lexical.commit_id().0.clone(),
+            lexical_doc_count: lexical.doc_count(),
+            build_started_at: manifest.build_started_at,
+            build_completed_at: manifest.build_completed_at,
+            build_wall_seconds: manifest.build_wall_seconds,
+            fusion_algorithm: fusion.name().to_string(),
+            fusion_k: manifest.fusion_k,
+        };
+        manifest.validate_against(&observed)
+    } else {
+        Ok(())
+    }
 }
 
 pub fn hash_endpoint_url(endpoint_url: &str) -> String {
@@ -283,5 +326,80 @@ fn fusion_k(name: &str) -> u32 {
         crate::RRF_K_DEFAULT
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        BruteForceAdapter, ChunkRef, DenseChunkRef, Distance, ReciprocalRankFusion, TantivyAdapter,
+    };
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    fn chunk(id: &str, text: &str) -> ChunkRef {
+        ChunkRef {
+            id: id.to_string(),
+            source_path: format!("/tmp/{id}.md"),
+            text: text.to_string(),
+            metadata: json!({
+                "agent": "codex",
+                "date": "20260603",
+                "project": "vetcoders/Vista",
+            }),
+        }
+    }
+
+    fn dense(chunk: &ChunkRef, embedding: Vec<f32>) -> DenseChunkRef {
+        DenseChunkRef {
+            chunk: chunk.clone(),
+            embedding,
+        }
+    }
+
+    fn fingerprint() -> EmbedderFingerprint {
+        EmbedderFingerprint::new("test-model", "http://example.invalid/embed", 2, "cosine")
+    }
+
+    #[test]
+    fn commit_refreshes_manifest_after_delta_insert() {
+        let tmp = TempDir::new().expect("tempdir");
+        let manifest_dir = tmp.path().join("hybrid");
+
+        let chunk_a = chunk("a", "alpha");
+        let chunk_b = chunk("b", "bravo");
+        let chunk_c = chunk("c", "charlie");
+        let dense_a = dense(&chunk_a, vec![1.0, 0.0]);
+        let dense_b = dense(&chunk_b, vec![0.0, 1.0]);
+        let dense_c = dense(&chunk_c, vec![0.8, 0.2]);
+
+        let lexical = Box::new(TantivyAdapter::new(manifest_dir.clone()).expect("lexical"));
+        let dense = Box::new(BruteForceAdapter::new(2).with_distance(Distance::Cosine));
+        let fusion = Box::new(ReciprocalRankFusion::default());
+        let mut hybrid = HybridIndex::new(lexical, dense, fusion, &manifest_dir, fingerprint());
+
+        hybrid
+            .build_hybrid(
+                &[chunk_a.clone(), chunk_b.clone()],
+                &[dense_a.clone(), dense_b.clone()],
+                "source-v1",
+            )
+            .expect("build");
+        let initial = hybrid.commit().expect("initial commit").clone();
+
+        hybrid.lexical.insert(&chunk_c).expect("lexical insert");
+        hybrid.dense.insert(&dense_c).expect("dense insert");
+        {
+            let manifest = hybrid.manifest.as_mut().expect("manifest");
+            manifest.source_chunk_count = 3;
+            manifest.source_hash_blake3 = source_hash_blake3("source-v2");
+        }
+
+        let refreshed = hybrid.commit().expect("refresh commit").clone();
+        assert_eq!(refreshed.source_chunk_count, 3);
+        assert_eq!(refreshed.dense_count, 3);
+        assert_eq!(refreshed.lexical_doc_count, 3);
+        assert_ne!(refreshed.generation_id, initial.generation_id);
     }
 }

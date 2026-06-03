@@ -133,3 +133,35 @@ fn take_prefix_bytes_preserves_codepoints_under_cap() {
     // Cap of 4 must include exactly two codepoints (ą + ś).
     assert_eq!(out, "ąś");
 }
+
+#[test]
+fn hybrid_materialization_mode_skips_noop_incremental_when_manifest_matches() {
+    assert_eq!(
+        decide_hybrid_materialization(true, 0, 0, true, true),
+        HybridMaterializationMode::Skip
+    );
+}
+
+#[test]
+fn hybrid_materialization_mode_uses_incremental_insert_for_real_delta() {
+    assert_eq!(
+        decide_hybrid_materialization(true, 3, 0, true, true),
+        HybridMaterializationMode::IncrementalInsert
+    );
+}
+
+#[test]
+fn hybrid_materialization_mode_falls_back_to_full_when_manifest_mismatches() {
+    assert_eq!(
+        decide_hybrid_materialization(true, 3, 0, false, true),
+        HybridMaterializationMode::FullRebuild
+    );
+}
+
+#[test]
+fn hybrid_materialization_mode_falls_back_to_full_without_existing_hybrid() {
+    assert_eq!(
+        decide_hybrid_materialization(true, 3, 0, true, false),
+        HybridMaterializationMode::FullRebuild
+    );
+}

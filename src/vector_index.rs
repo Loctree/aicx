@@ -746,6 +746,7 @@ pub fn write_index_with_options(
     let mut skipped = 0usize;
     let mut failed = 0usize;
     let tick_interval = Duration::from_secs(1);
+    let mut hybrid_delta_chunks = Vec::new();
 
     for (item_index, stored) in files.iter().take(cap).enumerate() {
         let entry_id = chunk_id_from_path(&stored.path);
@@ -805,6 +806,22 @@ pub fn write_index_with_options(
         };
         let embedder_ms = embedder_started.elapsed().as_millis() as u64;
         let duration_ms = item_started.elapsed().as_millis() as u64;
+        let metadata = serde_json::json!({
+            "source_path": stored.path.to_string_lossy(),
+            "project": stored.project,
+            "agent": stored.agent,
+            "date": stored.date_iso,
+            "kind": stored.kind.dir_name(),
+            "session_id": stored.session_id,
+            "frame_kind": chunk_frame_kind(&stored.path),
+            "cwd": chunk_cwd(&stored.path),
+        });
+        let lexical_chunk = aicx_retrieve::ChunkRef {
+            id: entry_id.clone(),
+            source_path: stored.path.to_string_lossy().to_string(),
+            text: content.clone(),
+            metadata: metadata.clone(),
+        };
         let entry = IndexEntry {
             id: entry_id.clone(),
             project: stored.project.clone(),
@@ -817,6 +834,12 @@ pub fn write_index_with_options(
             cwd: chunk_cwd(&stored.path),
             embedding,
         };
+        if incremental_baseline.is_some() {
+            hybrid_delta_chunks.push(aicx_retrieve::DenseChunkRef {
+                chunk: lexical_chunk,
+                embedding: entry.embedding.clone(),
+            });
+        }
         writeln!(writer, "{}", serde_json::to_string(&entry)?)?;
         stats.embeddings_computed += 1;
         indexed += 1;
@@ -997,17 +1020,49 @@ pub fn write_index_with_options(
     // last-good hybrid index queryable and avoids the 98%-CPU / 12-min
     // rebuild pathology. A dimension/model migration flips the manifest match
     // to false and rebuilds regardless.
-    let skip_hybrid = should_skip_hybrid_rebuild(
+    let hybrid_mode = decide_hybrid_materialization(
         incremental_baseline.is_some(),
         indexed,
         failed,
         hybrid_manifest_matches_embedder(project, &info),
+        has_existing_hybrid_artifacts(project),
     );
-    if skip_hybrid {
-        eprintln!(
-            "[aicx][phase=index event=hybrid_skip reason=no_op_incremental_manifest_match indexed=0 failed=0]"
-        );
-    } else if let Err(err) = materialize_hybrid_index(&target_path, project, &info) {
+    let hybrid_result = match hybrid_mode {
+        HybridMaterializationMode::Skip => {
+            eprintln!(
+                "[aicx][phase=index event=hybrid_skip reason=no_op_incremental_manifest_match indexed=0 failed=0]"
+            );
+            Ok(None)
+        }
+        HybridMaterializationMode::IncrementalInsert => {
+            let source_hash = observed_source_hash_for_index_path(&target_path)?;
+            match incremental_materialize_hybrid(
+                project,
+                &info,
+                &hybrid_delta_chunks,
+                total_indexed,
+                &source_hash,
+            ) {
+                Ok(manifest) => {
+                    eprintln!(
+                        "[aicx][phase=index event=hybrid_incremental indexed={indexed} failed={failed} dense_count={}]",
+                        manifest.dense_count
+                    );
+                    Ok(Some(manifest))
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[aicx][phase=index event=hybrid_incremental_fallback reason=incremental_failed error={err:#}]"
+                    );
+                    materialize_hybrid_index(&target_path, project, &info).map(Some)
+                }
+            }
+        }
+        HybridMaterializationMode::FullRebuild => {
+            materialize_hybrid_index(&target_path, project, &info).map(Some)
+        }
+    };
+    if let Err(err) = hybrid_result {
         on_event(&IndexEvent::RunFailed {
             error: format!("{err:#}"),
             processed_before_failure: processed,
@@ -1091,6 +1146,96 @@ fn materialize_hybrid_index(
     Ok(manifest)
 }
 
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn incremental_materialize_hybrid(
+    project: Option<&str>,
+    info: &crate::embedder::EmbeddingModelInfo,
+    delta_chunks: &[aicx_retrieve::DenseChunkRef],
+    source_chunk_count: usize,
+    source_hash: &str,
+) -> Result<aicx_retrieve::Manifest> {
+    use aicx_retrieve::{
+        DenseIndex, Distance, FusionStrategy, LexicalIndex, Manifest, ReciprocalRankFusion,
+        TantivyAdapter, validate_live_bindings_for_refresh,
+    };
+
+    if delta_chunks.is_empty() {
+        anyhow::bail!("incremental hybrid materialize requires at least one delta chunk");
+    }
+
+    let manifest_dir = hybrid_index_dir(project)?;
+    let manifest_path = hybrid_manifest_path(project)?;
+    let dense_path = hybrid_dense_path(project)?;
+    let manifest = Manifest::read_from_path(&manifest_path)?;
+    let mut lexical = TantivyAdapter::new(manifest_dir)?;
+    let mut dense = aicx_retrieve::load_from_ndjson(&dense_path, info.dimension, Distance::Cosine)?;
+    let fusion = ReciprocalRankFusion::default();
+    let fingerprint = hybrid_embedder_fingerprint(info);
+
+    validate_live_bindings_for_refresh(&manifest, &lexical, &dense, &fusion, &fingerprint)
+        .map_err(|err| anyhow::anyhow!("incremental hybrid validate existing artifacts: {err}"))?;
+
+    let build_started_at = Manifest::now_utc();
+    for delta in delta_chunks {
+        lexical.insert(&delta.chunk)?;
+        dense.insert(delta)?;
+    }
+    dense.persist_ndjson(&dense_path)?;
+    let build_completed_at = Manifest::now_utc();
+    let refreshed = Manifest {
+        schema_version: manifest.schema_version,
+        generation_id: Manifest::fresh_generation_id(),
+        source_chunk_count,
+        source_hash_blake3: aicx_retrieve::source_hash_blake3(source_hash),
+        embedder_model: fingerprint.model,
+        embedder_url_hash: fingerprint.url_hash,
+        embedder_dim: fingerprint.dim,
+        embedder_distance: fingerprint.distance,
+        dense_count: dense.count(),
+        dense_kind: dense.kind().to_string(),
+        lexical_commit_id: lexical.commit_id().0.clone(),
+        lexical_doc_count: lexical.doc_count(),
+        build_started_at,
+        build_completed_at,
+        build_wall_seconds: build_completed_at
+            .signed_duration_since(build_started_at)
+            .num_seconds()
+            .max(0) as u64,
+        fusion_algorithm: fusion.name().to_string(),
+        fusion_k: aicx_retrieve::RRF_K_DEFAULT,
+    };
+    refreshed.write_to_path(&manifest_path)?;
+    Ok(refreshed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HybridMaterializationMode {
+    Skip,
+    IncrementalInsert,
+    FullRebuild,
+}
+
+pub(crate) fn decide_hybrid_materialization(
+    is_incremental: bool,
+    indexed: usize,
+    failed: usize,
+    manifest_matches_embedder: bool,
+    has_existing_hybrid: bool,
+) -> HybridMaterializationMode {
+    if is_incremental && indexed == 0 && failed == 0 && manifest_matches_embedder {
+        HybridMaterializationMode::Skip
+    } else if is_incremental
+        && indexed > 0
+        && failed == 0
+        && manifest_matches_embedder
+        && has_existing_hybrid
+    {
+        HybridMaterializationMode::IncrementalInsert
+    } else {
+        HybridMaterializationMode::FullRebuild
+    }
+}
+
 /// Pure decision: should `materialize_hybrid_index` be SKIPPED on this run?
 ///
 /// Bug A1: `materialize_hybrid_index` triggers a full tantivy lexical rebuild
@@ -1107,13 +1252,31 @@ fn materialize_hybrid_index(
 ///   the current embedder. A dimension/model change (operator's F2LLM 2048 ->
 ///   qwen3 4096 migration) flips this to false and FORCES a rebuild even on a
 ///   no-op incremental, so search never keeps serving a stale-model hybrid.
+#[allow(dead_code)]
 pub(crate) fn should_skip_hybrid_rebuild(
     is_incremental: bool,
     indexed: usize,
     failed: usize,
     manifest_matches_embedder: bool,
 ) -> bool {
-    is_incremental && indexed == 0 && failed == 0 && manifest_matches_embedder
+    decide_hybrid_materialization(
+        is_incremental,
+        indexed,
+        failed,
+        manifest_matches_embedder,
+        true,
+    ) == HybridMaterializationMode::Skip
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn has_existing_hybrid_artifacts(project: Option<&str>) -> bool {
+    let Ok(manifest_path) = hybrid_manifest_path(project) else {
+        return false;
+    };
+    let Ok(dense_path) = hybrid_dense_path(project) else {
+        return false;
+    };
+    manifest_path.exists() && dense_path.exists()
 }
 
 /// Does the committed hybrid manifest still match the CURRENT embedder?

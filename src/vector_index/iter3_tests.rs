@@ -625,6 +625,135 @@ fn query_index_recovery_hint_uses_full_rescan_not_fresh() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[test]
+fn incremental_materialize_hybrid_refreshes_persisted_artifacts() {
+    use aicx_retrieve::{Distance, HybridIndex, ReciprocalRankFusion, TantivyAdapter};
+
+    let root = tempdir_for_test();
+    let _aicx_home_guard = ScopedAicxHome::set(&root);
+    let project = "vetcoders/Vista";
+    let semantic_index = index_path_for(&root, Some(project));
+    std::fs::create_dir_all(semantic_index.parent().expect("semantic parent")).unwrap();
+
+    let chunks_dir = root.join("chunks");
+    std::fs::create_dir_all(&chunks_dir).unwrap();
+    let chunk_a_path = chunks_dir.join("a.md");
+    let chunk_b_path = chunks_dir.join("b.md");
+    let chunk_c_path = chunks_dir.join("c.md");
+    std::fs::write(&chunk_a_path, "alpha").unwrap();
+    std::fs::write(&chunk_b_path, "bravo").unwrap();
+    std::fs::write(&chunk_c_path, "charlie").unwrap();
+
+    let make_entry = |id: &str, path: &std::path::Path, embedding: Vec<f32>| IndexEntry {
+        id: id.to_string(),
+        project: "vetcoders/vista".to_string(),
+        agent: "claude".to_string(),
+        date: "20260603".to_string(),
+        path: path.to_path_buf(),
+        kind: "conversations".to_string(),
+        session_id: format!("session-{id}"),
+        frame_kind: Some("agent_reply".to_string()),
+        cwd: Some("/Users/silver/Git/Vista".to_string()),
+        embedding,
+    };
+    let write_semantic_index = |entries: &[IndexEntry], generated_at: &str| {
+        let header = IndexHeader {
+            schema_version: INDEX_SCHEMA_VERSION.to_string(),
+            model_id: "test-model".to_string(),
+            model_profile: "base".to_string(),
+            dimension: 2,
+            generated_at: generated_at.to_string(),
+            entry_count: entries.len(),
+        };
+        let mut body = serde_json::to_string(&header).expect("serialize header");
+        body.push('\n');
+        for entry in entries {
+            body.push_str(&serde_json::to_string(entry).expect("serialize entry"));
+            body.push('\n');
+        }
+        std::fs::write(&semantic_index, body).expect("write semantic fixture");
+    };
+
+    let entry_a = make_entry("a", &chunk_a_path, vec![1.0, 0.0]);
+    let entry_b = make_entry("b", &chunk_b_path, vec![0.0, 1.0]);
+    let entry_c = make_entry("c", &chunk_c_path, vec![0.6, 0.4]);
+    write_semantic_index(&[entry_a.clone(), entry_b.clone()], "2026-06-03T18:00:00Z");
+
+    let info = crate::embedder::EmbeddingModelInfo {
+        model_id: "test-model".to_string(),
+        dimension: 2,
+        backend: "gguf".to_string(),
+        profile: crate::embedder::EmbeddingProfile::Base,
+        source: crate::embedder::NativeEmbeddingSource::ExplicitPath(
+            root.join("fixtures").join("test-model.gguf"),
+        ),
+    };
+
+    let initial = materialize_hybrid_index(&semantic_index, Some(project), &info)
+        .expect("initial hybrid build");
+    assert_eq!(initial.dense_count, 2);
+    assert_eq!(initial.lexical_doc_count, 2);
+
+    write_semantic_index(
+        &[entry_a.clone(), entry_b.clone(), entry_c.clone()],
+        "2026-06-03T18:05:00Z",
+    );
+    let source_hash =
+        observed_source_hash_for_index_path(&semantic_index).expect("semantic source hash");
+    let delta = aicx_retrieve::DenseChunkRef {
+        chunk: aicx_retrieve::ChunkRef {
+            id: entry_c.id.clone(),
+            source_path: entry_c.path.to_string_lossy().to_string(),
+            text: std::fs::read_to_string(&entry_c.path).expect("read delta chunk"),
+            metadata: index_entry_metadata_json(&entry_c),
+        },
+        embedding: entry_c.embedding.clone(),
+    };
+
+    let refreshed = incremental_materialize_hybrid(Some(project), &info, &[delta], 3, &source_hash)
+        .expect("incremental hybrid refresh");
+    assert_eq!(refreshed.source_chunk_count, 3);
+    assert_eq!(refreshed.dense_count, 3);
+    assert_eq!(refreshed.lexical_doc_count, 3);
+    assert_ne!(refreshed.generation_id, initial.generation_id);
+
+    let persisted = aicx_retrieve::Manifest::read_from_path(
+        &hybrid_manifest_path(Some(project)).expect("manifest path"),
+    )
+    .expect("persisted manifest");
+    assert_eq!(persisted.source_chunk_count, 3);
+    assert_eq!(persisted.dense_count, 3);
+    assert_eq!(persisted.lexical_doc_count, 3);
+
+    let manifest_dir = hybrid_index_dir(Some(project)).expect("manifest dir");
+    let lexical = Box::new(TantivyAdapter::new(manifest_dir.clone()).expect("fresh lexical"));
+    let dense = Box::new(
+        aicx_retrieve::load_from_ndjson(
+            &hybrid_dense_path(Some(project)).expect("dense path"),
+            info.dimension,
+            Distance::Cosine,
+        )
+        .expect("fresh dense"),
+    );
+    let fusion = Box::new(ReciprocalRankFusion::default());
+    let reloaded = HybridIndex::load_from_manifest(
+        lexical,
+        dense,
+        fusion,
+        manifest_dir,
+        hybrid_embedder_fingerprint(&info),
+        &source_hash,
+    )
+    .expect("fresh reload after incremental refresh");
+    let manifest = reloaded.manifest().expect("reloaded manifest");
+    assert_eq!(manifest.source_chunk_count, 3);
+    assert_eq!(manifest.dense_count, 3);
+    assert_eq!(manifest.lexical_doc_count, 3);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn scan_index_entries_empty_lines_are_skipped_not_counted() {
     let q = vec![1.0f32, 0.0];
