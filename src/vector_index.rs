@@ -1221,6 +1221,14 @@ fn rewrite_index_with_truthful_header(
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub(crate) fn read_committed_index_entries(path: &Path) -> Result<(IndexHeader, Vec<IndexEntry>)> {
+    read_committed_index_entries_matching_project(path, None)
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub(crate) fn read_committed_index_entries_matching_project(
+    path: &Path,
+    project_filter: Option<&str>,
+) -> Result<(IndexHeader, Vec<IndexEntry>)> {
     use std::io::BufReader;
 
     let file = crate::sanitize::open_file_validated(path)
@@ -1232,10 +1240,25 @@ pub(crate) fn read_committed_index_entries(path: &Path) -> Result<(IndexHeader, 
     let header = serde_json::from_str::<IndexHeader>(&header_line)
         .with_context(|| format!("parse header in {}", path.display()))?;
     let mut entries = Vec::new();
+    let project_needle = project_filter
+        .map(|project| {
+            serde_json::to_string(project).map(|project_json| format!("\"project\":{project_json}"))
+        })
+        .transpose()?;
     for (idx, line) in capped_index_lines(reader, path, 2, "committed semantic data").enumerate() {
         let line = line.with_context(|| format!("read line {} in {}", idx + 2, path.display()))?;
         if line.trim().is_empty() {
             continue;
+        }
+        if let Some(needle) = project_needle.as_deref() {
+            // The persistent IndexEntry JSON is compact and includes a
+            // top-level `"project":"owner/repo"` field. For `_all` fallback
+            // queries this cheap textual guard avoids deserializing large
+            // 4096-float embeddings from unrelated projects before the dense
+            // leg can apply its exact FilterSet.
+            if !line.contains(needle) {
+                continue;
+            }
         }
         let entry = serde_json::from_str::<IndexEntry>(&line)
             .with_context(|| format!("parse line {} in {}", idx + 2, path.display()))?;
