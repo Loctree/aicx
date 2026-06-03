@@ -1,25 +1,13 @@
-//! Stub for steer_index when lance feature is disabled.
-
-use crate::timeline::FrameKind;
 use anyhow::Result;
 use std::path::PathBuf;
 
-pub struct SteerFilter<'a> {
-    pub run_id: Option<&'a str>,
-    pub prompt_id: Option<&'a str>,
-    pub agent: Option<&'a str>,
-    pub kind: Option<&'a str>,
-    pub frame_kind: Option<FrameKind>,
-    pub project: Option<&'a str>,
-    pub date_lo: Option<&'a str>,
-    pub date_hi: Option<&'a str>,
-}
+use crate::steer_index_contract::SteerFilter;
 
-pub async fn sync_steer_index(_new_files: &[&PathBuf]) -> Result<()> {
+pub(super) async fn sync_noop(_new_files: &[&PathBuf]) -> Result<()> {
     Ok(())
 }
 
-pub async fn sync_steer_index_with_progress(
+pub(super) async fn sync_with_progress_noop(
     _new_files: &[&PathBuf],
     _reporter: std::sync::Arc<dyn crate::progress::Reporter>,
     _failures: &crate::progress::FailureLog,
@@ -27,17 +15,17 @@ pub async fn sync_steer_index_with_progress(
     Ok(())
 }
 
-pub async fn query_steer_index_count() -> Result<usize> {
+pub(super) async fn query_count_disabled() -> Result<usize> {
     Ok(0)
 }
 
-pub async fn rebuild_steer_index_if_needed() -> Result<()> {
+pub(super) async fn rebuild_if_needed_noop() -> Result<()> {
     // We do not fail the sync/rebuild cycle because the index is strictly optional.
     // The operator will be informed only if they actively attempt to query it.
     Ok(())
 }
 
-pub async fn search_steer_index(
+pub(super) async fn search_disabled(
     _filter: &SteerFilter<'_>,
     _limit: usize,
 ) -> Result<Vec<serde_json::Value>> {

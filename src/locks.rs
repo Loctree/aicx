@@ -577,7 +577,7 @@ fn acquire_local(path: PathBuf, mode: LockMode, deadline: Instant) -> Result<Loc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex as StdMutex};
+    use crate::test_support::capture_logs;
     use std::thread;
 
     fn temp_lock(name: &str) -> PathBuf {
@@ -636,47 +636,6 @@ mod tests {
         fn drop(&mut self) {
             set_forced_would_block_path(None);
         }
-    }
-
-    #[derive(Clone)]
-    struct TestLogWriter(Arc<StdMutex<Vec<u8>>>);
-
-    struct TestLogGuard(Arc<StdMutex<Vec<u8>>>);
-
-    impl std::io::Write for TestLogGuard {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("log capture poisoned")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestLogWriter {
-        type Writer = TestLogGuard;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            TestLogGuard(Arc::clone(&self.0))
-        }
-    }
-
-    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
-        let output = Arc::new(StdMutex::new(Vec::new()));
-        let writer = TestLogWriter(Arc::clone(&output));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(writer)
-            .with_ansi(false)
-            .without_time()
-            .finish();
-        let result = tracing::subscriber::with_default(subscriber, f);
-        let logs = String::from_utf8(output.lock().expect("log capture poisoned").clone())
-            .expect("logs are utf8");
-        (result, logs)
     }
 
     #[test]

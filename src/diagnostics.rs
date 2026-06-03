@@ -346,7 +346,9 @@ pub fn log_describe(line: &str) {
 }
 
 /// Emit the per-extractor SUMMARY to stderr. Quiet when no diagnostics were
-/// recorded. Caps total output at ≤5 lines (≤4 extractors + 1 trailer hint).
+/// recorded. Caps total output at ≤5 lines: up to 5 extractor buckets (4
+/// known + the `unknown` catch-all), and the trailer hint is suppressed once
+/// 5 bucket lines are present so the cap holds.
 pub fn emit_summary() {
     let mut state = lock_state();
     if !state.initialized {
@@ -357,14 +359,7 @@ pub fn emit_summary() {
         let _ = writer.flush();
     }
 
-    let mut lines: Vec<String> = Vec::new();
-    for &extractor in EXTRACTOR_ORDER {
-        if let Some(counters) = state.extractors.get(extractor)
-            && let Some(line) = counters.line_for(extractor)
-        {
-            lines.push(line);
-        }
-    }
+    let lines = summary_lines(&state.extractors);
 
     if lines.is_empty() {
         return;
@@ -383,6 +378,30 @@ pub fn emit_summary() {
             path.display()
         );
     }
+}
+
+/// Build the per-extractor SUMMARY lines in canonical order. Pure over the
+/// recorded counters so the line set can be unit-tested without capturing
+/// stderr. Known extractors come first in `EXTRACTOR_ORDER`; the catch-all
+/// `unknown` bucket is appended last so a recorded unrecognized extractor is
+/// surfaced rather than silently dropped.
+fn summary_lines(extractors: &BTreeMap<&'static str, ExtractorCounters>) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for &extractor in EXTRACTOR_ORDER {
+        if let Some(counters) = extractors.get(extractor)
+            && let Some(line) = counters.line_for(extractor)
+        {
+            lines.push(line);
+        }
+    }
+    // Catch-all: surface the explicit `unknown` bucket last so a recorded
+    // unrecognized extractor is visible in the summary rather than dropped.
+    if let Some(counters) = extractors.get("unknown")
+        && let Some(line) = counters.line_for("unknown")
+    {
+        lines.push(line);
+    }
+    lines
 }
 
 fn canonical_extractor_key(extractor: &str) -> &'static str {
@@ -413,23 +432,53 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn lock_test_init(verbose: bool, dir: Option<PathBuf>) {
+    // Serializes every test that resets/uses the process-global
+    // `DiagnosticsState`. The returned guard MUST be bound (`let _g = ...`) so
+    // it lives for the whole test body — otherwise parallel `cargo test` races
+    // the shared state via `record()` / `lock_state()` across sibling tests
+    // (the root cause of the intermittent diagnostics flakes).
+    static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // Bind for the whole test body. EVERY test touching the global
+    // `DiagnosticsState` must hold this, or a sibling that resets the state
+    // (e.g. `summary_skipped_when_no_records`) races those that read it.
+    fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
+        TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[must_use = "bind the guard (`let _g = lock_test_init(...)`) so it serializes the whole test"]
+    fn lock_test_init(verbose: bool, dir: Option<PathBuf>) -> std::sync::MutexGuard<'static, ()> {
+        let guard = serial_guard();
         reset_for_tests();
         init(verbose, dir).expect("init");
+        guard
     }
 
     #[test]
     fn summary_skipped_when_no_records() {
-        lock_test_init(false, None);
-        // emit_summary writes to stderr; we can't capture here, but at least
-        // verify it does not panic and counters are clean.
+        let _serial = serial_guard();
+        // emit_summary only reads the global state and prints to stderr — it
+        // must not panic regardless of what a parallel test has recorded. Call
+        // it without holding the lock.
         emit_summary();
-        let state = lock_state();
+
+        // For the "no records => empty extractor map" contract, hold the global
+        // lock across the reset+assert so a parallel test recording into the
+        // shared `Mutex<DiagnosticsState>` cannot race a `record()` in between
+        // (same discipline as `summary_aggregates_per_extractor`). Without this
+        // the assert flakes under parallel `cargo test`.
+        let mut state = STATE
+            .get_or_init(|| Mutex::new(DiagnosticsState::default()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *state = DiagnosticsState::default();
+        state.initialized = true;
         assert!(state.extractors.is_empty());
     }
 
     #[test]
     fn summary_aggregates_per_extractor() {
+        let _serial = serial_guard();
         // G-4 stores diagnostics in a process-global `Mutex<DiagnosticsState>`.
         // Other tests can call production paths (extract_*_file) that record
         // into this same global. To make this test deterministic under
@@ -465,7 +514,7 @@ mod tests {
 
     #[test]
     fn run_id_is_set_after_init() {
-        lock_test_init(false, None);
+        let _serial = lock_test_init(false, None);
         let id = run_id().expect("run_id present after init");
         assert!(!id.is_empty());
         assert!(id.contains('Z') || id.contains('-'));
@@ -477,7 +526,7 @@ mod tests {
         // misattributed any unrecognized extractor name (e.g. a future
         // "qwen" or a typo) into the "claude" bucket because
         // `debug_assert!` is a no-op outside debug builds.
-        lock_test_init(false, None);
+        let _serial = lock_test_init(false, None);
         let p = PathBuf::from("/tmp/test.jsonl");
         record("qwen", DiagnosticKind::FallbackTimestamp, 1, &p);
         let state = lock_state();
@@ -503,8 +552,37 @@ mod tests {
     }
 
     #[test]
+    fn unknown_bucket_is_emitted_in_summary_lines() {
+        // The catch-all `unknown` bucket must appear in the emitted SUMMARY,
+        // not be silently dropped because it is absent from EXTRACTOR_ORDER.
+        // Regression guard for the "recorded-but-invisible" gap surfaced in
+        // pass-6 (AUD-2).
+        let _serial = lock_test_init(false, None);
+        let p = PathBuf::from("/tmp/test.jsonl");
+        record("qwen", DiagnosticKind::FallbackTimestamp, 1, &p); // routes to "unknown"
+        record("claude", DiagnosticKind::FallbackTimestamp, 2, &p);
+        let state = lock_state();
+        let lines = summary_lines(&state.extractors);
+        assert!(
+            lines.iter().any(|l| l.starts_with("Claude diagnostics:")),
+            "known extractor line must still be present, got: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("Unknown diagnostics:")),
+            "unknown bucket must surface in the summary, got: {lines:?}"
+        );
+        assert!(
+            lines
+                .last()
+                .map(|l| l.starts_with("Unknown diagnostics:"))
+                .unwrap_or(false),
+            "unknown line must sort last, after known extractors, got: {lines:?}"
+        );
+    }
+
+    #[test]
     fn sanitization_offsets_combined_under_single_phrase() {
-        lock_test_init(false, None);
+        let _serial = lock_test_init(false, None);
         let p = PathBuf::from("/tmp/claude/x.jsonl");
         record("claude", DiagnosticKind::BidiOverride, 10, &p);
         record("claude", DiagnosticKind::ZeroWidth, 30, &p);

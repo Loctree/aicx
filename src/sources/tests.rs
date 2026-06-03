@@ -1,6 +1,8 @@
 use super::*;
 use crate::chunker::{ChunkMetadataSidecar, ChunkerConfig, chunk_entries};
+use chrono::{Duration, TimeZone};
 use filetime::{FileTime, set_file_mtime};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -2219,7 +2221,7 @@ fn test_parse_claude_jsonl_preserves_missing_timestamp_with_fallback_metadata() 
     assert_eq!(warnings.len(), 1);
     match &warnings[0] {
         ClaudeSessionWarning::FallbackTimestamp { count, samples } => {
-            assert_eq!(*count, 1);
+            assert_eq!(count, &1);
             assert_eq!(
                 samples,
                 &vec!["line 2: <missing> -> fallback_previous".to_string()]

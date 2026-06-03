@@ -8,6 +8,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod cli;
 pub mod corpus;
 pub mod dashboard;
 pub mod dashboard_server;
@@ -28,15 +29,16 @@ pub mod reports_extractor;
 pub mod search_engine;
 pub mod sources;
 pub mod state;
-#[cfg(feature = "lance")]
 pub mod steer_index;
-#[cfg(not(feature = "lance"))]
-#[path = "steer_index_stub.rs"]
-pub mod steer_index;
+mod steer_index_contract;
 pub mod store;
 pub mod validation;
 pub mod vector_index;
 pub mod wizard;
+
+/// Test-only shared tracing capture (deterministic under parallel `cargo test`).
+#[cfg(test)]
+mod test_support;
 
 pub use aicx_parser as parser;
 pub use aicx_parser::{chunker, frontmatter, sanitize, segmentation, timeline, types};

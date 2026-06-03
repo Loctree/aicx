@@ -30,6 +30,8 @@ use std::io::{self, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
+mod cli_config;
+
 use aicx::corpus;
 use aicx::dashboard::{self, DashboardConfig, DashboardScope};
 use aicx::dashboard_server::{self, DashboardCorsPolicy, DashboardServerConfig};
@@ -72,16 +74,16 @@ fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
 
 /// aicx — operator front door for agent session logs.
 ///
-/// Two-layer pipeline, both operator-driven:
-///   Layer 1 (canonical corpus): extract, deduplicate, and chunk agent logs
-///     into steerable markdown at ~/.aicx/. This is ground truth.
+/// Operator-driven pipeline:
+///   Canonical corpus: extract, deduplicate, and chunk agent logs into
+///     steerable markdown at ~/.aicx/. This is ground truth.
 ///   Layer 2 (optional semantic index): local embedding-backed retrieval for native builds,
 ///     while the canonical corpus stays portable and useful without it.
 /// Quick start:
 ///   aicx all -H 4                      # build canonical corpus
 #[derive(Debug, Parser)]
 #[command(name = "aicx")]
-#[command(author = "M&K (c)2026 VetCoders")]
+#[command(author = "(c)2026 VetCoders")]
 #[command(version)]
 #[command(verbatim_doc_comment)]
 struct Cli {
@@ -231,21 +233,37 @@ enum SourcesCommands {
     },
 }
 
+/// Shared retrieval grammar (B-P1-11) used by `aicx search`,
+/// `aicx steer`, `aicx intents`, and `aicx tail`. One struct, one
+/// set of `help` bodies — so every retrieval command renders the same
+/// vocabulary in `--help` output.
 #[derive(Debug, Args, Clone)]
 struct RetrievalFilters {
     /// Maximum number of results to return.
     #[arg(long, default_value_t = 10)]
     limit: usize,
+
+    /// Sort order applied after filtering. Default: command-specific.
     #[arg(long, value_enum)]
     sort: Option<SortOrder>,
+
+    /// Minimum score threshold (0-100; semantic match confidence).
     #[arg(long)]
     score: Option<u8>,
+
+    /// Agent name filter: claude | codex | gemini | junie | codescribe.
     #[arg(long)]
     agent: Option<String>,
+
+    /// Lower date bound: YYYY-MM-DD or relative (e.g., 2026-04-23..).
     #[arg(long)]
     since: Option<String>,
+
+    /// Upper date bound: YYYY-MM-DD.
     #[arg(long)]
     until: Option<String>,
+
+    /// Frame channel filter: user_msg | agent_reply | internal_thought | tool_call.
     #[arg(long, value_enum)]
     frame_kind: Option<FrameKindArg>,
 }
@@ -461,30 +479,6 @@ struct DashboardServeLegacyArgs {
     preview_chars: usize,
 }
 
-/// Subcommands for `aicx config`.
-#[derive(Debug, Clone, Subcommand)]
-enum ConfigAction {
-    /// Write a default `~/.aicx/config.toml` with cloud-embedder
-    /// pre-selected. Bails if the file exists unless `--force`.
-    Init {
-        /// Overwrite the existing config file if present.
-        #[arg(long)]
-        force: bool,
-
-        /// Write to a custom path instead of `~/.aicx/config.toml`.
-        /// Useful for shared / repo-local config snapshots.
-        #[arg(long)]
-        path: Option<PathBuf>,
-    },
-    /// Display the resolved embedder configuration after merging env,
-    /// `embedder.toml`, `config.toml`, and built-in defaults.
-    Show {
-        /// Emit JSON instead of human-readable text.
-        #[arg(short = 'j', long)]
-        json: bool,
-    },
-}
-
 #[derive(Debug, Clone, Subcommand)]
 enum IndexAction {
     /// Show freshness and pending-corpus status for the semantic index.
@@ -511,10 +505,10 @@ enum IndexAction {
 #[derive(Debug, Subcommand)]
 enum Commands {
     // ── Layer 1: Canonical corpus ─────────────────────────────────────
-    /// Extract + store Claude Code sessions into the canonical corpus.
+    /// Extract and store Agents' sessions into the canonical corpus (canonical corpus extraction).
     ///
-    /// Reads ~/.claude/projects/ logs, deduplicates, chunks, and writes
-    /// steerable markdown to ~/.aicx/.
+    /// Reads claude-code session files, then
+    /// writes steerable Markdown files to a central store.
     #[command(display_order = 2)]
     Claude {
         #[command(flatten)]
@@ -581,10 +575,10 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract + store Codex sessions into the canonical corpus.
+    /// Extract and store Codex sessions into the canonical corpus.
     ///
-    /// Reads ~/.codex/history.jsonl, deduplicates, chunks, and writes
-    /// steerable markdown to ~/.aicx/.
+    /// Reads codex session files, then
+    /// writes steerable Markdown files to a central store.
     #[command(display_order = 3)]
     Codex {
         #[command(flatten)]
@@ -651,7 +645,7 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract + store from all agents (Claude + Codex + Gemini + Junie + CodeScribe) into the canonical corpus.
+    /// Extract and store from all agents (Claude + Codex + Gemini + Junie + CodeScribe) into the canonical corpus.
     ///
     /// The daily-driver command: runs each extractor, deduplicates, chunks, and
     /// writes steerable markdown to ~/.aicx/. By default, uses per-source
@@ -814,15 +808,20 @@ enum Commands {
         #[arg(long)]
         limit: Option<usize>,
 
-        /// Preview discovery/projection without writing JSON files.
+        /// Preview discovery without writing; emits a JSON envelope on
+        /// stdout (sessions_discovered, by_kind, by_agent, filters_applied)
+        /// and a human-readable summary banner on stderr.
+        ///
+        /// Pipe-friendly: `aicx conversations --dry-run --out-dir /tmp | jq .`
+        /// returns valid JSON; the operator banner still prints on stderr.
         #[arg(long)]
         dry_run: bool,
     },
 
-    /// Build the canonical corpus in ~/.aicx/ from agent logs.
+    /// Build the canonical corpus in from local agents' session files.
     ///
     /// Store-first corpus builder: extracts, deduplicates, chunks, and writes
-    /// steerable markdown. By default, this command uses per-source watermarks
+    /// steerable Markdown. By default, this command uses per-source watermarks
     /// to skip previously scanned history. Use --full-rescan for backfills
     /// and targeted re-extraction when you need to ignore the watermark.
     ///
@@ -970,7 +969,9 @@ enum Commands {
         #[arg(long)]
         reset: bool,
 
-        /// Project to reset (with --reset)
+        /// Project filter (applies to --info as well as --reset).
+        /// Supports the standard shapes: `-p owner/repo`, `-p owner/`,
+        /// `-p /repo`, or a bare `-p name` (cross-org).
         #[arg(short, long)]
         project: Option<String>,
 
@@ -1031,7 +1032,7 @@ enum Commands {
         kind: Option<String>,
     },
 
-    /// Stream newly-arriving intents/chunks in a follow-like mode.
+    /// Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals.
     Tail {
         /// Repo or store-bucket filters. Omit to scan all projects.
         /// Repeated `-p` flags or comma list (`-p a,b`) form a union.
@@ -1237,7 +1238,7 @@ enum Commands {
     #[command(display_order = 4)]
     Config {
         #[command(subcommand)]
-        action: ConfigAction,
+        action: cli_config::ConfigAction,
     },
 
     /// Read one canonical chunk by path, file name, or compact chunk reference.
@@ -1258,7 +1259,7 @@ enum Commands {
         json: bool,
     },
 
-    /// Retrieve chunks by steering metadata.
+    /// Retrieve chunks by steering metadata (requires --features lance).
     Steer {
         /// Filter by run_id (exact match)
         #[arg(long)]
@@ -1331,17 +1332,25 @@ enum Commands {
     /// Diagnose and optionally repair the canonical store and steer index.
     ///
     /// Runs integrity checks on the Lance steer DB, BM25 index, state.json,
-    /// sidecar coverage, and corpus bucket names. With --fix, applies safe corrective actions:
-    /// corrupted steer indexes are deleted and rebuilt from the canonical
-    /// store (which is treated as ground truth and never modified).
+    /// sidecar coverage, and corpus bucket names. With
+    /// `--rebuild-steer-index`, corrupted steer indexes are deleted and
+    /// rebuilt from the canonical store (which is treated as ground truth
+    /// and never modified). Other remediations live behind dedicated flags
+    /// (`--prune-empty-bodies`, `--fix-buckets`, `aicx store --full-rescan`).
     ///
-    /// Exit codes: 0 on green/warning or after successful --fix; 1 if
-    /// critical issues are detected without --fix.
+    /// Exit codes: 0 on green/warning or after successful rebuild; 1 if
+    /// critical issues are detected without remediation.
     #[command(display_order = 12)]
     Doctor {
-        /// Apply safe corrective actions for detected issues
-        #[arg(long)]
-        fix: bool,
+        /// Delete and rebuild the steer index from the canonical store
+        /// when corrupted or schema-incompatible. Narrower contract than
+        /// the legacy `--fix` (which was a no-op for sidecars/index
+        /// consistency/empty bodies — those have dedicated flags).
+        ///
+        /// Legacy alias: `--fix` is accepted with a deprecation warning
+        /// and will be removed in v1.0.
+        #[arg(long = "rebuild-steer-index", alias = "fix")]
+        rebuild_steer_index: bool,
 
         /// Move suspicious top-level corpus buckets to $HOME/.aicx/quarantine/.
         /// Buckets that are merely CamelCase (legitimate GitHub orgs like
@@ -1399,8 +1408,19 @@ enum Commands {
         #[arg(long, default_value = "text")]
         format: String,
 
-        /// Report AICX Oracle readiness: ready | degraded | unsafe_for_loctree_scope
-        #[arg(long)]
+        /// Report AICX Oracle readiness: ready | degraded | unsafe_for_loctree_scope.
+        ///
+        /// Severity vocabulary mapping (B-P1-06):
+        ///   ready                    ← all checks Green
+        ///   degraded                 ← any Warning, or non-Green dashboard route
+        ///   unsafe_for_loctree_scope ← any Critical in canonical / sidecars / content
+        ///
+        /// Doctor's per-check `severity` field uses TitleCase variants
+        /// (Green / Warning / Critical / NotConfigured / Skipped /
+        /// Unknown). The JSON serde renders them lowercase
+        /// (`"green"`/`"warning"`/...) so machine consumers can match
+        /// on stable tokens.
+        #[arg(long, verbatim_doc_comment)]
         oracle: bool,
     },
 
@@ -1417,6 +1437,142 @@ enum Commands {
     },
 }
 
+/// Detect `aicx <cmd>` invocations that clap would otherwise reject with
+/// a generic "the following required arguments were not provided" or
+/// "missing required subcommand" error. Returns a `(cmd_name,
+/// StructuredFailure)` pair when the canonical bad shape is present,
+/// `None` otherwise.
+///
+/// Covers (Wave C §3.2):
+/// - `aicx ingest` with no `--source <SOURCE>`
+/// - `aicx conversations` with no `--out-dir <DIR>`
+/// - `aicx sources` with no subcommand
+///
+/// Heuristic only: we exit early when we see `--help`/`-h`/`--version`
+/// so clap's own help rendering wins.
+fn detect_missing_required_boundary<I>(
+    args: I,
+) -> Option<(&'static str, aicx::cli::failure::StructuredFailure)>
+where
+    I: IntoIterator<Item = String>,
+{
+    let args: Vec<String> = args.into_iter().collect();
+    if args
+        .iter()
+        .any(|a| a == "--help" || a == "-h" || a == "--version" || a == "-V")
+    {
+        return None;
+    }
+
+    // Locate the leftmost top-level subcommand. We accept arbitrary
+    // top-level flags before it (e.g. `aicx --verbose ingest`).
+    let cmd_idx = args
+        .iter()
+        .position(|a| matches!(a.as_str(), "ingest" | "conversations" | "sources"))?;
+
+    let cmd = args[cmd_idx].as_str();
+    let tail = &args[cmd_idx + 1..];
+
+    match cmd {
+        "ingest" => {
+            // `--source` is required (no default).
+            if tail
+                .iter()
+                .any(|a| a == "--source" || a.starts_with("--source="))
+            {
+                return None;
+            }
+            Some((
+                "aicx ingest",
+                aicx::cli::failure::StructuredFailure::new(
+                    "missing_required_arg",
+                    "argument --source <SOURCE> is required",
+                    "rerun with --source <name>, e.g. aicx ingest --source loct-context-pack <PACK_DIR>",
+                )
+                .with_fallback("aicx ingest --source loct-context-pack <PACK_DIR>"),
+            ))
+        }
+        "conversations" => {
+            // `--out-dir` is required (no default).
+            if tail
+                .iter()
+                .any(|a| a == "--out-dir" || a.starts_with("--out-dir="))
+            {
+                return None;
+            }
+            Some((
+                "aicx conversations",
+                aicx::cli::failure::StructuredFailure::new(
+                    "missing_required_arg",
+                    "argument --out-dir <DIR> is required",
+                    "rerun with --out-dir <path>, e.g. aicx conversations --out-dir ~/.aicx/conversations",
+                )
+                .with_fallback("aicx conversations --out-dir ~/.aicx/conversations"),
+            ))
+        }
+        "sources" => {
+            // First positional after `sources` must be a known subcommand.
+            // `help` is clap's own — skip so it renders normally.
+            if let Some(next) = tail.iter().find(|a| !a.starts_with('-')) {
+                if matches!(next.as_str(), "protect" | "help") {
+                    return None;
+                }
+                None
+            } else {
+                // No further positional → subcommand missing.
+                Some((
+                    "aicx sources",
+                    aicx::cli::failure::StructuredFailure::new(
+                        "missing_subcommand",
+                        "aicx sources requires a subcommand (protect)",
+                        "pick the action you want, e.g. aicx sources protect --root <PATH>",
+                    )
+                    .with_fallback("aicx sources protect --root <PATH>"),
+                ))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Detect the `aicx config --show` mistake before clap rejects it with a
+/// generic "unexpected argument" error. Returns a [`StructuredFailure`]
+/// when the canonical bad shape is present, `None` otherwise.
+///
+/// Bad shape: a positional `config` followed (eventually) by `--show`,
+/// with no intervening `show`/`init` positional that would mean the user
+/// already picked a subcommand. We accept arbitrary top-level flags
+/// before `config` (e.g. `aicx --verbose config --show`) and arbitrary
+/// flags after `--show` (e.g. `aicx config --show --json`).
+fn detect_config_show_flag_mistake<I>(args: I) -> Option<aicx::cli::failure::StructuredFailure>
+where
+    I: IntoIterator<Item = String>,
+{
+    let args: Vec<String> = args.into_iter().collect();
+
+    // Step 1: locate the first positional that equals `config`.
+    let config_idx = args.iter().position(|a| a == "config")?;
+
+    // Step 2: walk forward; if we hit `show`/`init` first, the user is
+    // already on a valid subcommand path → no mistake.
+    for arg in &args[config_idx + 1..] {
+        if arg == "show" || arg == "init" {
+            return None;
+        }
+        if arg == "--show" {
+            return Some(
+                aicx::cli::failure::StructuredFailure::new(
+                    "flag_not_recognized",
+                    "'--show' is not a valid flag for 'aicx config'",
+                    "use the subcommand form: aicx config show",
+                )
+                .with_fallback("aicx config show"),
+            );
+        }
+    }
+    None
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1424,6 +1580,29 @@ fn main() -> Result<()> {
                 .add_directive("ai_contexters=info".parse().unwrap()),
         )
         .init();
+
+    // Pre-parse intercept (B-P1-12): `aicx config --show` is a common
+    // discoverability mistake — `--show` is a subcommand-positional, not
+    // a flag. Catch it before clap and emit the structured hint pointing
+    // at `aicx config show`. We only fire when the args follow the
+    // canonical bad shape so that legitimate parses are never affected.
+    if let Some(failure) = detect_config_show_flag_mistake(std::env::args().skip(1)) {
+        let json = aicx::cli::failure::want_json_envelope(false);
+        aicx::cli::failure::emit_and_error("aicx config", json, failure);
+        std::process::exit(2);
+    }
+
+    // Pre-parse intercept (B-P1-08): clap-default "missing required
+    // argument" rendering doesn't match the structured failure-as-state
+    // identity (Wave B §1.2). For the boundary cases where the surface
+    // is most likely to be hit by new operators — `aicx ingest`,
+    // `aicx conversations`, `aicx sources` — emit the structured
+    // envelope and exit 2 instead of letting clap own the output.
+    if let Some((cmd_name, failure)) = detect_missing_required_boundary(std::env::args().skip(1)) {
+        let json = aicx::cli::failure::want_json_envelope(false);
+        aicx::cli::failure::emit_and_error(cmd_name, json, failure);
+        std::process::exit(2);
+    }
 
     let cli = Cli::parse();
 
@@ -1457,6 +1636,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
             warn_incremental_legacy_flag(incremental);
+            warn_pending_mutation("claude");
             run_extraction(ExtractionParams {
                 agents: &["claude"],
                 project,
@@ -1495,6 +1675,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
             warn_incremental_legacy_flag(incremental);
+            warn_pending_mutation("codex");
             run_extraction(ExtractionParams {
                 agents: &["codex"],
                 project,
@@ -1532,6 +1713,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
             warn_incremental_legacy_flag(incremental);
+            warn_pending_mutation("all");
             run_extraction(ExtractionParams {
                 agents: &["claude", "codex", "gemini", "junie", "codescribe"],
                 project,
@@ -1566,11 +1748,26 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
 
+            let json = aicx::cli::failure::want_json_envelope(false);
+
             // Session mode: --session [+ --agent] -> scan sources, filter by session_id.
             if let Some(session_id) = session {
-                let agent = agent
-                    .or(format)
-                    .context("--session requires --agent {claude|codex|gemini|junie}")?;
+                let agent = match agent.or(format) {
+                    Some(a) => a,
+                    None => {
+                        aicx::cli::failure::emit_and_error(
+                            "aicx extract",
+                            json,
+                            aicx::cli::failure::StructuredFailure::new(
+                                "missing_required_arg",
+                                "--session requires --agent {claude|codex|gemini|junie}",
+                                "rerun with --agent <name>, e.g. aicx extract --session <id> --agent claude",
+                            )
+                            .with_fallback("aicx extract --session <ID> --agent claude"),
+                        );
+                        std::process::exit(2);
+                    }
+                };
                 run_extract_session(
                     &session_id,
                     agent,
@@ -1586,10 +1783,54 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 )?;
             } else {
                 // File mode (legacy): --format <agent> + positional input + -o.
-                let format = format
-                    .context("file-mode extract requires --format {claude|codex|gemini|gemini-antigravity|junie}")?;
-                let input = input.context("file-mode extract requires a positional INPUT path")?;
-                let output = output.context("file-mode extract requires -o/--output <FILE>")?;
+                let format = match format {
+                    Some(f) => f,
+                    None => {
+                        aicx::cli::failure::emit_and_error(
+                            "aicx extract",
+                            json,
+                            aicx::cli::failure::StructuredFailure::new(
+                                "mode_mismatch",
+                                "file-mode extract requires --format {claude|codex|gemini|gemini-antigravity|junie}",
+                                "pass --format <agent> with positional INPUT and -o <FILE>, or switch to session mode with --session <id> --agent <name>",
+                            )
+                            .with_fallback(
+                                "aicx extract --format claude path/to/session.jsonl -o /tmp/out.md",
+                            ),
+                        );
+                        std::process::exit(2);
+                    }
+                };
+                let input = match input {
+                    Some(i) => i,
+                    None => {
+                        aicx::cli::failure::emit_and_error(
+                            "aicx extract",
+                            json,
+                            aicx::cli::failure::StructuredFailure::new(
+                                "input_path_required",
+                                "file-mode extract requires a positional INPUT path",
+                                "append the agent log path, e.g. aicx extract --format claude ~/.claude/projects/<repo>/<session>.jsonl -o /tmp/out.md",
+                            ),
+                        );
+                        std::process::exit(2);
+                    }
+                };
+                let output = match output {
+                    Some(o) => o,
+                    None => {
+                        aicx::cli::failure::emit_and_error(
+                            "aicx extract",
+                            json,
+                            aicx::cli::failure::StructuredFailure::new(
+                                "output_path_required",
+                                "file-mode extract requires -o/--output <FILE>",
+                                "add -o /path/to/out.md to write the extracted markdown",
+                            ),
+                        );
+                        std::process::exit(2);
+                    }
+                };
                 run_extract_file(
                     format,
                     project,
@@ -1637,6 +1878,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }) => {
             let include_assistant = include_assistant_flag || !user_only;
             warn_incremental_legacy_flag(incremental);
+            warn_pending_mutation("store");
             run_store(StoreRunArgs {
                 project,
                 agent,
@@ -1661,9 +1903,23 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             input,
         }) => {
             if matches!(source, IngestSource::LoctContextPack) {
-                let input = input
-                    .as_deref()
-                    .context("aicx ingest --source loct-context-pack requires <PACK_DIR>")?;
+                let input = match input.as_deref() {
+                    Some(p) => p,
+                    None => {
+                        let json = aicx::cli::failure::want_json_envelope(false);
+                        aicx::cli::failure::emit_and_error(
+                            "aicx ingest",
+                            json,
+                            aicx::cli::failure::StructuredFailure::new(
+                                "input_path_required",
+                                "aicx ingest --source loct-context-pack requires <PACK_DIR>",
+                                "append the pack directory path, e.g. aicx ingest --source loct-context-pack ~/.vibecrafted/inbox/loct-context-pack-2026-05-25",
+                            )
+                            .with_fallback("aicx ingest --source loct-context-pack <PACK_DIR>"),
+                        );
+                        std::process::exit(2);
+                    }
+                };
                 let summary = store::ingest_loct_context_pack(input)?;
                 match emit {
                     StdoutEmit::Paths => println!("{}", summary.target_dir.display()),
@@ -1871,10 +2127,15 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             Some(IndexAction::Status { project, json }) => {
                 run_index_status(&project, json)?;
             }
-            None => run_index(&project, sample, json, dry_run, full_rescan)?,
+            None => {
+                if !dry_run {
+                    warn_pending_mutation("index");
+                }
+                run_index(&project, sample, json, dry_run, full_rescan)?
+            }
         },
         Some(Commands::Config { action }) => {
-            run_config(action)?;
+            cli_config::run_config(action)?;
         }
         Some(Commands::Read {
             reference,
@@ -1908,6 +2169,9 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             store_root,
             no_intent_schema,
         }) => {
+            if !dry_run {
+                warn_pending_mutation("migrate");
+            }
             let manifest =
                 aicx::store::run_migration_with_paths(dry_run, legacy_root, store_root.clone())?;
             if !no_intent_schema {
@@ -1923,6 +2187,9 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             store_root,
             dry_run,
         }) => {
+            if !dry_run {
+                warn_pending_mutation("migrate-intent-schema");
+            }
             let report = if let Some(store_root) = store_root {
                 intents::migrate_intent_schema_dry_run_at(
                     &store_root.join(store::CANONICAL_STORE_DIRNAME),
@@ -1938,7 +2205,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             println!("{json}");
         }
         Some(Commands::Doctor {
-            fix,
+            rebuild_steer_index,
             fix_buckets,
             dry_run,
             rebuild_sidecars,
@@ -1962,6 +2229,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 std::process::exit(if report.failures.is_empty() { 0 } else { 1 });
             }
 
+            let fix = rebuild_steer_index; // Assuming `fix` is an alias for `--rebuild-steer-index`.
             let legacy_or_readonly = fix
                 || fix_buckets
                 || dry_run
@@ -2016,8 +2284,17 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 );
             }
 
+            // Surface the legacy `--fix` form as deprecated so callers can
+            // migrate. We cannot tell from the parsed bool whether the
+            // operator typed `--fix` or `--rebuild-steer-index`; inspect
+            // the raw argv instead. The flag accepts both via Clap alias.
+            if rebuild_steer_index && std::env::args().any(|arg| arg == "--fix") {
+                eprintln!(
+                    "aicx doctor: warning: '--fix' is deprecated; use '--rebuild-steer-index'. The old flag will be removed in v1.0."
+                );
+            }
             let opts = aicx::doctor::DoctorOptions {
-                fix,
+                rebuild_steer_index,
                 fix_buckets,
                 dry_run,
                 rebuild_sidecars,
@@ -2029,7 +2306,34 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             };
             let rt = tokio::runtime::Runtime::new()
                 .context("Failed to start tokio runtime for doctor")?;
-            let report = rt.block_on(aicx::doctor::run(&opts))?;
+            let report = match rt.block_on(aicx::doctor::run(&opts)) {
+                Ok(report) => report,
+                Err(err) => {
+                    // CLI-boundary failure-as-state for doctor. Catch the
+                    // historical `--prune-empty-bodies` crash class (chunk
+                    // path outside aicx root) and any other run failure
+                    // here so the surface stays uniform with the rest of
+                    // the family (per Wave B §1.2 / Cut D2 contract).
+                    let json = aicx::cli::failure::want_json_envelope(format == "json");
+                    let message = format!("{err:#}");
+                    let kind = if message.contains("outside aicx canonical root")
+                        || message.contains("outside store root")
+                    {
+                        "path_outside_aicx_root"
+                    } else {
+                        "doctor_run_failed"
+                    };
+                    let failure = aicx::cli::failure::StructuredFailure::new(
+                        kind,
+                        message,
+                        "rerun with --verbose to see per-check details; \
+                         if the path is genuinely outside ~/.aicx report it \
+                         to the operator (possible store corruption or misconfigured roots)",
+                    );
+                    let wrapped = aicx::cli::failure::emit_and_error("aicx doctor", json, failure);
+                    return Err(wrapped);
+                }
+            };
 
             if oracle {
                 let status = aicx::doctor::oracle_readiness(&report);
@@ -2064,7 +2368,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }
         Some(Commands::Health) => {
             let opts = aicx::doctor::DoctorOptions {
-                fix: false,
+                rebuild_steer_index: false,
                 fix_buckets: false,
                 dry_run: false,
                 rebuild_sidecars: false,
@@ -2639,23 +2943,112 @@ fn run_conversations_batch(options: ConversationsBatchOptions) -> Result<()> {
     };
 
     let entries = sources::extract_claude(&config)?;
+
+    // Pre-compute discovery-aware histograms so dry-run can emit a
+    // pipe-friendly JSON envelope alongside the human banner (Wave D
+    // Cut D1 / B-P0-04 dual-channel parity with
+    // `migrate-intent-schema --dry-run`).
+    let by_kind = conversations_discovery_by_kind(&entries);
+    let by_agent = conversations_discovery_by_agent(&entries);
+
+    let dry_run = options.dry_run;
+    let hours = options.hours;
+    let limit = options.limit;
+    let project_filter_snapshot = options.project_filter.clone();
+    let agent_label = options.agent.clone();
+
     let summary = write_conversation_batch_outputs(ConversationBatchWriteOptions {
         agent_label: &options.agent,
         entries,
         project_filter: options.project_filter,
         out_dir: options.out_dir,
         limit: options.limit,
-        dry_run: options.dry_run,
+        dry_run,
         redaction_enabled: options.redact_secrets,
     })?;
 
-    eprintln!("sessions_discovered={}", summary.sessions_discovered);
-    eprintln!("sessions_written={}", summary.sessions_written);
-    eprintln!("messages_total={}", summary.messages_total);
-    eprintln!("output_dir={}", summary.output_dir.display());
-    eprintln!("failed_sessions={}", summary.failed_sessions);
+    if dry_run {
+        // Dual-channel emission (B-P0-04): JSON envelope on stdout for
+        // pipeline consumers (`aicx conversations --dry-run | jq .`),
+        // styled human banner on stderr for operators. Mirror the
+        // `migrate-intent-schema --dry-run` gold-pattern.
+        let envelope = serde_json::json!({
+            "dry_run": true,
+            "agent": agent_label,
+            "sessions_discovered": summary.sessions_discovered,
+            "messages_total": summary.messages_total,
+            "by_kind": by_kind,
+            "by_agent": by_agent,
+            "filters_applied": {
+                "project": project_filter_snapshot,
+                "hours": hours,
+                "limit": limit,
+            },
+            "output_dir": summary.output_dir.display().to_string(),
+        });
+        match serde_json::to_string_pretty(&envelope) {
+            Ok(rendered) => println!("{rendered}"),
+            Err(_) => println!("{envelope}"),
+        }
+
+        eprintln!("=== Conversations Dry-Run ===");
+        eprintln!("Agent:              {}", agent_label);
+        eprintln!("Sessions discovered: {}", summary.sessions_discovered);
+        eprintln!("Messages total:      {}", summary.messages_total);
+        eprintln!(
+            "Output dir (would write to): {}",
+            summary.output_dir.display()
+        );
+        if !by_kind.is_empty() {
+            eprintln!();
+            eprintln!("Per frame_kind:");
+            let mut kinds: Vec<(&String, &usize)> = by_kind.iter().collect();
+            kinds.sort_by(|a, b| b.1.cmp(a.1));
+            for (kind, count) in kinds {
+                eprintln!("  {:<24} {}", kind, count);
+            }
+        }
+    } else {
+        eprintln!("sessions_discovered={}", summary.sessions_discovered);
+        eprintln!("sessions_written={}", summary.sessions_written);
+        eprintln!("messages_total={}", summary.messages_total);
+        eprintln!("output_dir={}", summary.output_dir.display());
+        eprintln!("failed_sessions={}", summary.failed_sessions);
+    }
 
     Ok(())
+}
+
+/// Frame-kind histogram across the extracted timeline entries.
+///
+/// Used by the dry-run JSON envelope (B-P0-04). Entries without a
+/// `frame_kind` are bucketed under `"unknown"` so operators see the
+/// "noise floor" for sessions where the parser could not classify.
+fn conversations_discovery_by_kind(entries: &[timeline::TimelineEntry]) -> BTreeMap<String, usize> {
+    let mut by_kind: BTreeMap<String, usize> = BTreeMap::new();
+    for entry in entries {
+        let bucket = entry
+            .frame_kind
+            .map(|kind| kind.as_str().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        *by_kind.entry(bucket).or_insert(0) += 1;
+    }
+    by_kind
+}
+
+/// Agent histogram across the extracted timeline entries.
+///
+/// In conversations v1 the agent is always `"claude"` (the only
+/// supported source), but the field is emitted for forward-compat with
+/// future multi-agent exports.
+fn conversations_discovery_by_agent(
+    entries: &[timeline::TimelineEntry],
+) -> BTreeMap<String, usize> {
+    let mut by_agent: BTreeMap<String, usize> = BTreeMap::new();
+    for entry in entries {
+        *by_agent.entry(entry.agent.clone()).or_insert(0) += 1;
+    }
+    by_agent
 }
 
 fn write_conversation_batch_outputs(
@@ -3435,6 +3828,64 @@ fn warn_incremental_legacy_flag(flag_used: bool) {
     if flag_used {
         eprintln!("{INCREMENTAL_LEGACY_NOTE}");
     }
+}
+
+/// Default delay (seconds) after emitting a mutation warning, giving the
+/// operator a window to Ctrl-C before any filesystem writes start. The
+/// delay is configurable via the `AICX_MUTATION_WARN_DELAY_SECONDS` env
+/// var so CI / wrappers can shorten it. Set to `0` for no pause.
+const MUTATION_WARN_DELAY_SECONDS_DEFAULT: u64 = 3;
+
+/// Emit a non-blocking note before a subcommand starts mutating
+/// `~/.aicx/`, then sleep briefly so the operator can Ctrl-C if they
+/// invoked the command by accident.
+///
+/// Wave D Cut D1 (B-P0-03): seven subcommands (`all`, `claude`, `codex`,
+/// `store`, `migrate`, `migrate-intent-schema`, `index`) write to the
+/// canonical store on bare no-arg invocations. Operators occasionally
+/// trigger them by accident (typoed subcommand, muscle-memory from a
+/// different repo, etc.). This warning gives a 3-second confirmation
+/// window without changing the dry-run-default polarity (that lands in
+/// D4 if approved).
+///
+/// Suppressed entirely when `AICX_NO_MUTATION_WARN=1` is set so shipped
+/// scripts (`vc-init`, `vibecrafted-mcp`, `install.sh`, automation) can
+/// invoke `aicx` programmatically without the pause.
+///
+/// The delay (default 3s) is configurable via
+/// `AICX_MUTATION_WARN_DELAY_SECONDS`. A value of `0` keeps the warning
+/// but skips the sleep entirely.
+fn warn_pending_mutation(cmd: &str) {
+    if mutation_warn_suppressed() {
+        return;
+    }
+    let delay = mutation_warn_delay_seconds();
+    if delay == 0 {
+        eprintln!(
+            "aicx {cmd}: note: about to write to ~/.aicx/. Pass --dry-run to preview \
+             (where supported) or set AICX_NO_MUTATION_WARN=1 to silence this note."
+        );
+        return;
+    }
+    eprintln!(
+        "aicx {cmd}: note: about to write to ~/.aicx/. Pass --dry-run to preview \
+         (where supported) or Ctrl-C within {delay}s to abort. \
+         Set AICX_NO_MUTATION_WARN=1 to silence this note."
+    );
+    std::thread::sleep(std::time::Duration::from_secs(delay));
+}
+
+fn mutation_warn_suppressed() -> bool {
+    std::env::var("AICX_NO_MUTATION_WARN")
+        .map(|value| !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+}
+
+fn mutation_warn_delay_seconds() -> u64 {
+    std::env::var("AICX_MUTATION_WARN_DELAY_SECONDS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(MUTATION_WARN_DELAY_SECONDS_DEFAULT)
 }
 
 fn warn_legacy_subcommand(legacy: &str, replacement: &str) {
@@ -5098,288 +5549,6 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     Ok(())
 }
 
-// `inject_filter_pushdown_diagnostic` extracted to `aicx::search_engine`
-// to share one implementation between this CLI path and the MCP path
-// in `src/mcp.rs` (gemini-code-assist review on PR #9: DRY).
-
-/// Default canonical config template written by `aicx config init`.
-///
-/// Set up to advertise cloud-embedder as the recommended VetCoders
-/// production default with concrete provider examples; the native GGUF
-/// section ships fully-commented so operators can flip backends without
-/// hunting for the schema.
-const DEFAULT_CONFIG_TOML: &str = r#"# aicx — Vibecrafted with AI Agents (c)2026 VetCoders
-#
-# Canonical AICX configuration. Loaded by `aicx` (CLI), `aicx-mcp`,
-# and any in-process consumer of the embedder. Field precedence
-# (highest first):
-#   1. AICX_EMBEDDER_CONFIG env var  (explicit path override)
-#   2. ~/.aicx/embedder.toml          (legacy, native fields only)
-#   3. ~/.aicx/config.toml            (this file — canonical)
-#   4. AICX_EMBEDDER_*                (per-field env overrides)
-#
-# Edit and re-save. No restart needed; aicx reloads on every invocation.
-
-[embedder]
-# Recommended VetCoders default: cloud HTTP embedder, zero-install,
-# config-driven URL/model/API key. Switch to "gguf" for offline / dev
-# workstations with native llama.cpp inference. Use "auto" to let the
-# binary pick the strongest compiled-in backend.
-backend = "cloud"
-
-# Native GGUF profile (only consulted when backend = "gguf" or "auto"):
-#   "base"    — F2LLM 0.6B Q4_K_M  (~397 MB, 1024 dim)
-#   "dev"     — F2LLM 1.7B Q4_K_M  (~1.1 GB, 2048 dim)
-#   "premium" — F2LLM 1.7B Q6_K    (~1.4 GB, 2048 dim)
-profile = "base"
-
-[embedder.cloud]
-# OpenAI-compatible /v1/embeddings endpoint. Replace with your provider.
-#   OpenAI:           https://api.openai.com/v1/embeddings
-#   Voyage AI:        https://api.voyageai.com/v1/embeddings
-#   Together AI:      https://api.together.xyz/v1/embeddings
-#   OpenRouter:       https://openrouter.ai/api/v1/embeddings
-#   Ollama local:     http://localhost:11434/v1/embeddings
-#   Local LM Studio:  http://localhost:1234/v1/embeddings
-#
-# Local provider caveat: Ollama measured ~38s first-call coldstart
-# from idle on 2026-05-06, then warm calls are much faster. Local
-# providers are excellent for batched `aicx index` workflows where
-# startup amortizes over many chunks. For one-shot CLI search, remote
-# cloud providers usually feel faster. Run `aicx warmup` after idle to
-# pre-load local daemons before an interactive search session.
-url = "https://api.openai.com/v1/embeddings"
-
-# Model identifier as accepted by the provider:
-#   OpenAI:    text-embedding-3-small (1536 dim) | text-embedding-3-large (3072 dim)
-#   Voyage:    voyage-3 (1024 dim) | voyage-large-2 (1536 dim)
-#   Together:  BAAI/bge-large-en-v1.5 (1024 dim)
-model = "text-embedding-3-small"
-
-# Env var name holding the API key. Resolved at call time so secrets
-# never sit in config files. Set the env var before running aicx:
-#   export OPENAI_API_KEY=sk-...
-api_key_env = "OPENAI_API_KEY"
-
-# Output dimension (informational; some providers do not echo it).
-dimension = 1536
-
-# Request timeout in seconds.
-timeout_secs = 30
-
-# Optional extra headers (rarely needed; uncomment to use):
-# [embedder.cloud.headers]
-# "X-Trace-Id" = "vetcoders-aicx"
-"#;
-
-fn canonical_config_path() -> Result<PathBuf> {
-    Ok(aicx::store::resolve_aicx_home()
-        .context("cannot resolve AICX home for config.toml")?
-        .join("config.toml"))
-}
-
-/// Dispatch `aicx config <action>`.
-fn run_config(action: ConfigAction) -> Result<()> {
-    match action {
-        ConfigAction::Init { force, path } => run_config_init(force, path),
-        ConfigAction::Show { json } => run_config_show(json),
-    }
-}
-
-/// Write the canonical config.toml template, refusing to overwrite
-/// without `--force` so an operator never loses hand-tuned settings to
-/// a stray init.
-fn run_config_init(force: bool, path: Option<PathBuf>) -> Result<()> {
-    let target = match path {
-        Some(p) => p,
-        None => canonical_config_path()?,
-    };
-
-    if target.exists() && !force {
-        anyhow::bail!(
-            "config file already exists at {}; pass --force to overwrite, or edit it directly",
-            target.display()
-        );
-    }
-
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create config directory at {}", parent.display())
-        })?;
-    }
-
-    std::fs::write(&target, DEFAULT_CONFIG_TOML)
-        .with_context(|| format!("failed to write config to {}", target.display()))?;
-
-    eprintln!("aicx config init -> wrote {}", target.display());
-    eprintln!("Edit it to set your endpoint / model / API key env var, then:");
-    eprintln!("  export OPENAI_API_KEY=sk-...   # or your provider equivalent");
-    eprintln!("  aicx search 'your query'");
-
-    Ok(())
-}
-
-/// Print the resolved [`aicx_parser`]-compatible embedder config so the
-/// operator can verify what backend / model / dimension will actually
-/// run for the next `aicx search`.
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn run_config_show(json: bool) -> Result<()> {
-    let cfg = aicx::embedder::EmbeddingConfig::from_env();
-    let resolved = cfg.resolved_model();
-    let cloud_set = cfg.cloud.is_some();
-
-    let canonical_path = canonical_config_path().ok();
-    let effective = aicx::embedder::effective_config_source();
-    let (effective_path_display, effective_branch, marker_line) =
-        describe_effective_config(&effective);
-
-    // HF cache probing: surface whether the configured profile is hydrated
-    // and which other profiles (if any) have a usable snapshot already.
-    // Lets operators recover from the "runtime default base 0.6B missing,
-    // premium 1.7B already cached" situation without grep-debugging.
-    let current_cache_path = aicx::embedder::hf_cache::snapshot_path_for_profile(cfg.profile);
-    let cache_present = current_cache_path.is_some();
-    let cached_profiles = aicx::embedder::hf_cache::detect_cached_profiles();
-    let suggested_profile = if !cache_present {
-        cached_profiles.iter().find(|&&p| p != cfg.profile).copied()
-    } else {
-        None
-    };
-
-    if json {
-        let payload = serde_json::json!({
-            "backend": cfg.backend.as_str(),
-            "profile": cfg.profile.as_str(),
-            "resolved_native": {
-                "repo": resolved.repo,
-                "filename": resolved.filename,
-                "dimension_hint": resolved.dimension_hint,
-                "approx_size": resolved.approx_size,
-                "from_legacy_repo": resolved.from_legacy_repo,
-                "cache_present": cache_present,
-                "cache_path": current_cache_path.as_ref().map(|p| p.display().to_string()),
-            },
-            "cloud": cfg.cloud.as_ref().map(|c| serde_json::json!({
-                "url": c.url,
-                "model": c.model,
-                "api_key_env": c.api_key_env,
-                "dimension": c.effective_dimension(),
-                "timeout_secs": c.effective_timeout_secs(),
-            })),
-            "canonical_config_path": canonical_path.as_ref().map(|p| p.display().to_string()),
-            "effective_config_path": effective.as_ref().map(|(p, _)| p.display().to_string()),
-            "effective_branch": effective_branch,
-            "config_path": canonical_path.as_ref().map(|p| p.display().to_string()),
-            "cloud_section_present": cloud_set,
-            "available_cached_profiles": cached_profiles.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
-            "suggested_profile": suggested_profile.map(|p| p.as_str()),
-        });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-        return Ok(());
-    }
-
-    let canonical_display = canonical_path
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "<unresolved>".to_string());
-
-    eprintln!("aicx config show — resolved embedder configuration");
-    eprintln!("  canonical_config_path: {canonical_display}");
-    eprintln!("  effective_config_path: {effective_path_display}");
-    eprintln!("  effective_branch:      {effective_branch}");
-    eprintln!("  {marker_line}");
-    eprintln!("  backend:     {}", cfg.backend.as_str());
-    eprintln!("  profile:     {}", cfg.profile.as_str());
-    eprintln!("  native.repo:           {}", resolved.repo);
-    eprintln!("  native.filename:       {}", resolved.filename);
-    eprintln!("  native.dimension_hint: {}", resolved.dimension_hint);
-    eprintln!("  native.approx_size:    {}", resolved.approx_size);
-    if resolved.from_legacy_repo {
-        eprintln!("  native.from_legacy_repo: true (auto-mapped to F2LLM GGUF)");
-    }
-    eprintln!("  native.cache_present:  {cache_present}");
-    if let Some(path) = &current_cache_path {
-        eprintln!("  native.cache_path:     {}", path.display());
-    }
-    if !cached_profiles.is_empty() {
-        let names: Vec<&str> = cached_profiles.iter().map(|p| p.as_str()).collect();
-        eprintln!("  available_cached_profiles: {}", names.join(", "));
-    } else {
-        eprintln!("  available_cached_profiles: <none — run `hf download` first>");
-    }
-    if let Some(sug) = suggested_profile {
-        let sug_name = sug.as_str();
-        eprintln!(
-            "  suggested_profile:     {sug_name} (HF cache has it hydrated — set \
-             `AICX_EMBEDDER_PROFILE={sug_name}` or `profile = \"{sug_name}\"` in config.toml)"
-        );
-    }
-    if let Some(cloud) = &cfg.cloud {
-        eprintln!("  cloud.url:           {}", cloud.url);
-        eprintln!("  cloud.model:         {}", cloud.model);
-        eprintln!(
-            "  cloud.api_key_env:   {}",
-            cloud.api_key_env.as_deref().unwrap_or("<unset>")
-        );
-        eprintln!("  cloud.dimension:     {}", cloud.effective_dimension());
-        eprintln!("  cloud.timeout_secs:  {}", cloud.effective_timeout_secs());
-    } else {
-        eprintln!("  cloud:               <not configured> (run `aicx config init` to bootstrap)");
-    }
-    Ok(())
-}
-
-/// Render the human-readable `(effective_path, branch_name, marker_line)`
-/// triple used by both the plain-text and JSON paths of `aicx config show`.
-/// `None` means no config file was found and the embedder runs on built-in
-/// defaults — the marker then nudges `aicx config init`.
-#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn describe_effective_config(
-    effective: &Option<(PathBuf, aicx::embedder::ConfigSource)>,
-) -> (String, &'static str, String) {
-    use aicx::embedder::ConfigSource;
-    match effective {
-        Some((path, ConfigSource::Env)) => (
-            path.display().to_string(),
-            "env",
-            format!(
-                "(loaded from: env $AICX_EMBEDDER_CONFIG -> {})",
-                path.display()
-            ),
-        ),
-        Some((path, ConfigSource::Canonical)) => (
-            path.display().to_string(),
-            "canonical",
-            format!("(loaded from: canonical -> {})", path.display()),
-        ),
-        Some((path, ConfigSource::Legacy)) => (
-            path.display().to_string(),
-            "legacy",
-            format!(
-                "(loaded from: legacy embedder.toml -> {} — run `aicx config init` to migrate to canonical config.toml)",
-                path.display()
-            ),
-        ),
-        None => (
-            "<built-in defaults>".to_string(),
-            "defaults",
-            "(no config file found; using built-in defaults — run `aicx config init` to materialize one)"
-                .to_string(),
-        ),
-    }
-}
-
-#[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
-fn run_config_show(_json: bool) -> Result<()> {
-    eprintln!(
-        "aicx was built without any embedder feature. \
-         Install a pre-built release (e.g., `npm install -g @loctree/aicx`), \
-         or rebuild with `cargo install --features cloud-embedder` (recommended) \
-         or `--features native-embedder` (offline GGUF)."
-    );
-    Ok(())
-}
-
 /// Build the `IndexEvent` -> sink fanout used by `aicx index`. Always
 /// includes a tracing adapter (for log capture / non-TTY runs); adds an
 /// `IndicatifSink` with live ETA + rate when stderr is an interactive
@@ -6079,11 +6248,35 @@ fn run_state(reset: bool, project: Option<String>, info: bool) -> Result<()> {
     let mut state = StateManager::load()?;
 
     if info {
+        // B-P1-13: honor `--project` filter on --info as well as on --reset.
+        // When set, narrow the seen-hash listing (and totals) to buckets that
+        // match the filter via the canonical project_filter_matches resolver
+        // (`<owner>/<repo>` strict, `<owner>/` org wildcard, `/<repo>` repo
+        // wildcard, bare `name` cross-org). Watermarks and runs are global
+        // and remain unfiltered.
+        let filter = project.as_deref().map(str::trim).filter(|s| !s.is_empty());
         eprintln!("=== State Info ===");
-        eprintln!("  Total hashes: {}", state.total_hashes());
-        eprintln!("  Projects: {}", state.seen_hashes.len());
-        for (proj, set) in &state.seen_hashes {
-            eprintln!("    {}: {} hashes", proj, set.len());
+        if let Some(f) = filter {
+            eprintln!("Filtered by project: {}", f);
+        }
+        if let Some(f) = filter {
+            let matched: Vec<(&String, &aicx::state::SeenHashSet)> = state
+                .seen_hashes
+                .iter()
+                .filter(|(bucket, _)| state_bucket_matches_project_filter(bucket, f))
+                .collect();
+            let total: usize = matched.iter().map(|(_, set)| set.len()).sum();
+            eprintln!("  Total hashes (filtered): {}", total);
+            eprintln!("  Projects (filtered):     {}", matched.len());
+            for (proj, set) in &matched {
+                eprintln!("    {}: {} hashes", proj, set.len());
+            }
+        } else {
+            eprintln!("  Total hashes: {}", state.total_hashes());
+            eprintln!("  Projects: {}", state.seen_hashes.len());
+            for (proj, set) in &state.seen_hashes {
+                eprintln!("    {}: {} hashes", proj, set.len());
+            }
         }
         eprintln!("  Watermarks: {}", state.last_processed.len());
         for (src, ts) in &state.last_processed {
@@ -6108,6 +6301,26 @@ fn run_state(reset: bool, project: Option<String>, info: bool) -> Result<()> {
 
     eprintln!("Use --info to show state or --reset to clear. See --help.");
     Ok(())
+}
+
+/// Apply the canonical `project_filter_matches` resolver to a state-store
+/// bucket key. Buckets are stored as lowercase `<owner>/<repo>` (see
+/// `aicx::state::migration::canonical_state_bucket`); buckets that don't
+/// split into exactly two segments are matched against the bare filter
+/// only (cross-org name match) and never against the slug or org-wildcard
+/// shapes.
+fn state_bucket_matches_project_filter(bucket: &str, filter: &str) -> bool {
+    let mut parts = bucket.splitn(2, '/');
+    match (parts.next(), parts.next()) {
+        (Some(org), Some(repo)) if !org.is_empty() && !repo.is_empty() => {
+            store::project_filter_matches(org, repo, filter)
+        }
+        _ => {
+            // Legacy / non-slug bucket: treat the whole key as the repo
+            // side so a bare `-p <name>` still works.
+            store::project_filter_matches("", bucket, filter)
+        }
+    }
 }
 
 struct DashboardServerRunArgs {
@@ -6169,7 +6382,7 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
             "! Warning: dashboard server is binding beyond loopback on http://{}:{}",
             host, args.port
         );
-        eprintln!("  CORS policy: {}", cors_policy.describe());
+        eprintln!("  CORS policy: {}", cors_policy.label());
     }
 
     let config = DashboardServerConfig {
@@ -6497,7 +6710,7 @@ fn run_reports_extractor(args: ReportsExtractorRunArgs) -> Result<()> {
     let repo = if let Some(repo) = args.repo {
         repo
     } else {
-        infer_repo_name_from_cwd()?
+        sources::infer_repo_name_from_current_dir()?
     };
     let date_from = parse_cli_date(args.date_from.as_deref(), "--date-from")?;
     let date_to = parse_cli_date(args.date_to.as_deref(), "--date-to")?;
@@ -6562,32 +6775,6 @@ fn default_reports_bundle_path(output: &Path) -> PathBuf {
     parent.join(format!("{stem}.bundle.json"))
 }
 
-fn infer_repo_name_from_cwd() -> Result<String> {
-    let cwd = std::env::current_dir().context("Cannot determine current directory")?;
-    let mut probe = cwd.as_path();
-    loop {
-        if probe.join(".git").exists() {
-            let repo = probe
-                .file_name()
-                .and_then(|name| name.to_str())
-                .filter(|name| !name.trim().is_empty())
-                .ok_or_else(|| anyhow::anyhow!("Could not infer --repo from git root"))?;
-            return Ok(repo.to_string());
-        }
-        let Some(parent) = probe.parent() else {
-            break;
-        };
-        probe = parent;
-    }
-
-    let repo = cwd
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Could not infer --repo from the current directory"))?;
-    Ok(repo.to_string())
-}
-
 fn parse_cli_date(value: Option<&str>, flag_name: &str) -> Result<Option<NaiveDate>> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
@@ -6623,2102 +6810,5 @@ fn write_text_output(path: &Path, content: &str, label: &str, force: bool) -> Re
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use filetime::{FileTime, set_file_mtime};
-    use std::fs;
-
-    /// Bug #26 regression: the four branches of `aicx config show`
-    /// must each render a distinct marker so an operator can tell at
-    /// a glance which file the embedder actually loaded (env override,
-    /// legacy embedder.toml, canonical config.toml, or built-in
-    /// defaults). Tests the pure marker formatter; the resolver itself
-    /// is covered in `aicx_embeddings::config::tests`.
-    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-    #[test]
-    fn config_show_marker_covers_all_four_branches() {
-        use aicx::embedder::ConfigSource;
-
-        let env_path = PathBuf::from("/tmp/op-override.toml");
-        let (path, branch, marker) =
-            describe_effective_config(&Some((env_path.clone(), ConfigSource::Env)));
-        assert_eq!(branch, "env");
-        assert_eq!(path, env_path.display().to_string());
-        assert!(
-            marker.contains("$AICX_EMBEDDER_CONFIG"),
-            "env marker must name the override var: {marker}"
-        );
-        assert!(marker.contains(&env_path.display().to_string()));
-
-        let canonical = PathBuf::from("/tmp/.aicx/config.toml");
-        let (path, branch, marker) =
-            describe_effective_config(&Some((canonical.clone(), ConfigSource::Canonical)));
-        assert_eq!(branch, "canonical");
-        assert_eq!(path, canonical.display().to_string());
-        assert!(marker.contains("canonical"));
-
-        let legacy = PathBuf::from("/tmp/.aicx/embedder.toml");
-        let (path, branch, marker) =
-            describe_effective_config(&Some((legacy.clone(), ConfigSource::Legacy)));
-        assert_eq!(branch, "legacy");
-        assert_eq!(path, legacy.display().to_string());
-        assert!(
-            marker.contains("aicx config init"),
-            "legacy marker must nudge migration: {marker}"
-        );
-
-        let (path, branch, marker) = describe_effective_config(&None);
-        assert_eq!(branch, "defaults");
-        assert_eq!(path, "<built-in defaults>");
-        assert!(
-            marker.contains("aicx config init"),
-            "defaults marker must nudge `aicx config init`: {marker}"
-        );
-        assert!(
-            marker.contains("no config file found"),
-            "defaults marker must say no file was found: {marker}"
-        );
-    }
-
-    #[test]
-    fn lookback_cutoff_zero_returns_all_time() {
-        let cutoff = lookback_cutoff(0);
-        assert_eq!(
-            cutoff,
-            all_time_cutoff(),
-            "hours=0 must collapse to the Unix-epoch all-time sentinel"
-        );
-    }
-
-    #[test]
-    fn test_refs_cutoff_zero_returns_unix_epoch() {
-        let cutoff = crate::refs_cutoff(0);
-        assert_eq!(
-            cutoff,
-            std::time::UNIX_EPOCH,
-            "hours=0 must collapse to UNIX_EPOCH"
-        );
-    }
-
-    #[test]
-    fn test_extraction_source_key_is_order_insensitive() {
-        let project_a = vec!["a".to_string(), "b".to_string()];
-        let project_b = vec!["b".to_string(), "a".to_string()];
-
-        assert_eq!(
-            extraction_source_key(LEGACY_ALL_WATERMARK_AGENTS, &project_a),
-            extraction_source_key(LEGACY_ALL_WATERMARK_AGENTS, &project_b)
-        );
-        assert_eq!(
-            extraction_source_key_aliases(LEGACY_ALL_WATERMARK_AGENTS, &project_a),
-            extraction_source_key_aliases(LEGACY_ALL_WATERMARK_AGENTS, &project_b)
-        );
-    }
-
-    #[test]
-    fn test_extraction_source_key_is_case_insensitive() {
-        let project_a = vec!["Foo".to_string()];
-        let project_b = vec!["foo".to_string()];
-
-        assert_eq!(
-            extraction_source_key(LEGACY_ALL_WATERMARK_AGENTS, &project_a),
-            extraction_source_key(LEGACY_ALL_WATERMARK_AGENTS, &project_b)
-        );
-        assert_eq!(
-            extraction_source_key_aliases(LEGACY_ALL_WATERMARK_AGENTS, &project_a),
-            extraction_source_key_aliases(LEGACY_ALL_WATERMARK_AGENTS, &project_b)
-        );
-    }
-
-    /// Bug #36 regression: prove `aicx index status -p X` and
-    /// `aicx index -p X` produce the same bucket set for every canonical
-    /// filter shape. Both surfaces must canonicalize through
-    /// `aicx::store::resolve_filters_to_slugs` before computing bucket
-    /// paths, so any `-p X` that `index` would build IS the bucket set
-    /// that `index status` reports on (and vice versa).
-    #[test]
-    fn index_status_routes_through_index_canonical_resolver() {
-        use std::collections::BTreeSet;
-
-        let root = unique_test_dir("index-status-canonical");
-        let _ = fs::remove_dir_all(&root);
-        let canonical_root = root.join("store");
-
-        // Canonical on-disk store: 4 buckets across 2 orgs / 3 repo names.
-        // Mixed case mirrors real-world GitHub slugs (filesystem preserves it).
-        let bucket_slugs = [
-            "VetCoders/Loctree",
-            "VetCoders/aicx",
-            "Szowesgad/Loctree",
-            "Szowesgad/CodeScribe",
-        ];
-        for slug in bucket_slugs {
-            fs::create_dir_all(canonical_root.join(slug)).unwrap();
-        }
-
-        // Corresponding semantic index buckets (lowercase + `/` → `_`).
-        for bucket in [
-            "vetcoders_loctree",
-            "vetcoders_aicx",
-            "szowesgad_loctree",
-            "szowesgad_codescribe",
-        ] {
-            let dir = root.join("indexed").join(bucket);
-            fs::create_dir_all(&dir).unwrap();
-            // Header + one row so semantic_index_present flips to true.
-            write_file(
-                &dir.join("embeddings.ndjson"),
-                "{\"schema_version\":\"1.0\"}\n{\"id\":\"a\"}\n",
-            );
-        }
-
-        // The 4 canonical filter shapes from the bug brief.
-        let shapes: &[(&str, &[&str])] = &[
-            // strict slug
-            ("VetCoders/Loctree", &["vetcoders_loctree"]),
-            // org wildcard
-            ("VetCoders/", &["vetcoders_aicx", "vetcoders_loctree"]),
-            // cross-org repo
-            ("/Loctree", &["szowesgad_loctree", "vetcoders_loctree"]),
-            // bare name (matches as repo name across orgs)
-            ("Loctree", &["szowesgad_loctree", "vetcoders_loctree"]),
-        ];
-
-        for (filter, expected_buckets) in shapes {
-            // Step 1: canonical resolver (the shared chokepoint both
-            // `aicx index` and `aicx index status` route through after
-            // bug #36 is fixed).
-            let resolved =
-                aicx::store::resolve_filters_to_slugs_at(&canonical_root, &[(*filter).to_string()])
-                    .unwrap_or_else(|e| panic!("resolver failed for {filter:?}: {e}"));
-
-            assert!(
-                !resolved.is_empty(),
-                "filter {filter:?} must resolve to at least one slug"
-            );
-
-            // Step 2: for each canonical slug, ask the public status API
-            // (exactly what `run_index_status` calls). The bucket it
-            // reports IS the bucket `run_index` would have built.
-            let actual_buckets: BTreeSet<String> = resolved
-                .iter()
-                .map(|slug| {
-                    aicx::api::index_status_at(&root, Some(slug.as_str()))
-                        .unwrap_or_else(|e| panic!("index_status_at failed for slug {slug:?}: {e}"))
-                        .project_bucket
-                })
-                .collect();
-
-            let expected: BTreeSet<String> =
-                expected_buckets.iter().map(|s| (*s).to_string()).collect();
-
-            assert_eq!(
-                actual_buckets, expected,
-                "filter {filter:?}: `aicx index status` bucket set must equal `aicx index` bucket set"
-            );
-
-            // And every reported bucket must actually be Ready on disk
-            // — proves the canonical slug round-trips to an existing
-            // index file, not a phantom like `_codescribe`.
-            for bucket in &actual_buckets {
-                let path = root.join("indexed").join(bucket).join("embeddings.ndjson");
-                assert!(
-                    path.exists(),
-                    "filter {filter:?} resolved to bucket {bucket:?} but no index file exists at {}",
-                    path.display()
-                );
-            }
-        }
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    fn dummy_index_status(bucket: &str) -> aicx::IndexStatus {
-        aicx::IndexStatus {
-            canonical_chunks: 3,
-            semantic_index_present: true,
-            semantic_index_path: Some(format!("/tmp/{bucket}/embeddings.ndjson")),
-            semantic_index_rows: 3,
-            newest_chunk_mtime: Some("2026-05-24T00:00:00Z".to_string()),
-            semantic_index_mtime: Some("2026-05-24T00:01:00Z".to_string()),
-            semantic_lag_secs: Some(60),
-            pending_chunks: 0,
-            temp_index_present: false,
-            temp_index_path: None,
-            temp_index_rows: 0,
-            temp_index_mtime: None,
-            temp_index_bytes: None,
-            readiness: aicx::IndexReadiness::Ready,
-            backend: "ndjson".to_string(),
-            project_bucket: bucket.to_string(),
-            committed_at: Some("2026-05-24T00:01:00Z".to_string()),
-        }
-    }
-
-    #[test]
-    fn index_status_json_payload_is_always_array_for_single_scope() {
-        let reports = vec![(None, dummy_index_status("_all"))];
-        let payload = index_status_json_payload(&reports);
-        let items = payload
-            .as_array()
-            .expect("index status JSON must be a stable array envelope");
-
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["project"], "_all");
-        assert_eq!(items[0]["status"]["project_bucket"], "_all");
-    }
-
-    #[test]
-    fn index_status_json_payload_is_array_for_multiple_scopes() {
-        let reports = vec![
-            (
-                Some("VetCoders/aicx".to_string()),
-                dummy_index_status("vetcoders_aicx"),
-            ),
-            (
-                Some("Loctree/loctree-suite".to_string()),
-                dummy_index_status("loctree_loctree-suite"),
-            ),
-        ];
-        let payload = index_status_json_payload(&reports);
-        let items = payload
-            .as_array()
-            .expect("multi-scope index status JSON must use the same envelope");
-
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0]["project"], "VetCoders/aicx");
-        assert_eq!(items[1]["project"], "Loctree/loctree-suite");
-        assert_eq!(items[0]["status"]["project_bucket"], "vetcoders_aicx");
-        assert_eq!(
-            items[1]["status"]["project_bucket"],
-            "loctree_loctree-suite"
-        );
-    }
-
-    #[test]
-    fn run_search_rejects_limit_over_hard_cap_before_store_access() {
-        let filters = RetrievalFilters {
-            limit: MAX_CLI_SEARCH_LIMIT + 1,
-            sort: None,
-            score: None,
-            agent: None,
-            since: None,
-            until: None,
-            frame_kind: None,
-        };
-
-        let err = run_search(SearchRunArgs {
-            query: "dashboard",
-            projects: &[],
-            hours: 0,
-            date: None,
-            json: false,
-            filters,
-            kind: None,
-            no_semantic: true,
-        })
-        .expect_err("oversized search limit must fail before reading the store");
-
-        let rendered = err.to_string();
-        assert!(rendered.contains("search --limit"));
-        assert!(rendered.contains(&MAX_CLI_SEARCH_LIMIT.to_string()));
-    }
-
-    #[test]
-    fn fuzzy_fetch_limit_uses_semantic_filter_cap_constants() {
-        assert_eq!(
-            search_examined_fetch_limit(1, true),
-            aicx::search_engine::FILTER_EXAMINED_CAP_MIN
-        );
-        assert_eq!(
-            search_examined_fetch_limit(10, true),
-            10 * aicx::search_engine::FILTER_EXAMINED_CAP_RATIO
-        );
-        assert_eq!(search_examined_fetch_limit(1, false), 1);
-    }
-
-    #[test]
-    fn lookback_cutoff_handles_normal_range() {
-        let before = Utc::now();
-        let cutoff = lookback_cutoff(8);
-        let after = Utc::now();
-        let lower = before - chrono::Duration::hours(8) - chrono::Duration::seconds(5);
-        let upper = after - chrono::Duration::hours(8) + chrono::Duration::seconds(5);
-        assert!(
-            cutoff >= lower && cutoff <= upper,
-            "cutoff out of range: {cutoff}"
-        );
-    }
-
-    #[test]
-    fn lookback_cutoff_avoids_u64_to_i64_overflow() {
-        // Without the `i32::MAX` clamp, casting `u64::MAX as i64` wraps to -1 and
-        // places the cutoff one hour in the future. Verify the clamp keeps it
-        // strictly in the past for the entire `u64` domain.
-        let now = Utc::now();
-        let cutoff = lookback_cutoff(u64::MAX);
-        assert!(
-            cutoff < now,
-            "cutoff must not be in the future: {cutoff} vs now {now}"
-        );
-    }
-
-    fn unique_test_dir(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "aicx-main-{name}-{}-{}",
-            std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ))
-    }
-
-    fn write_file(path: &Path, content: &str) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(path, content).unwrap();
-    }
-
-    fn set_mtime(path: &Path, unix_seconds: i64) {
-        set_file_mtime(path, FileTime::from_unix_time(unix_seconds, 0)).unwrap();
-    }
-
-    #[test]
-    fn uuid_suffix_from_stem_extracts_rollout_uuid() {
-        assert_eq!(
-            uuid_suffix_from_stem(
-                "rollout-2026-05-14T00-47-35-019e2574-8a7f-7d33-a318-b365aa0ab970"
-            ),
-            Some("019e2574-8a7f-7d33-a318-b365aa0ab970")
-        );
-        assert_eq!(uuid_suffix_from_stem("rollout-2026-05-14"), None);
-    }
-
-    #[test]
-    fn session_reference_resolver_accepts_unique_prefix() {
-        let session_ids = BTreeSet::from([
-            "019e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
-            "119e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
-        ]);
-
-        let resolved = resolve_session_reference_from_candidates(
-            "019e2574",
-            &session_ids,
-            BTreeSet::new(),
-            "codex",
-        )
-        .unwrap();
-
-        assert_eq!(
-            resolved.canonical_id,
-            "019e2574-8a7f-7d33-a318-b365aa0ab970"
-        );
-        assert!(resolved.note.is_some());
-    }
-
-    #[test]
-    fn session_reference_resolver_rejects_ambiguous_prefix() {
-        let session_ids = BTreeSet::from([
-            "019e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
-            "019e2574-9999-7d33-a318-b365aa0ab970".to_string(),
-        ]);
-
-        let err = resolve_session_reference_from_candidates(
-            "019e2574",
-            &session_ids,
-            BTreeSet::new(),
-            "codex",
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(err.contains("Ambiguous session reference"));
-    }
-
-    #[test]
-    fn session_reference_resolver_accepts_unique_suffix() {
-        let session_ids = BTreeSet::from([
-            "019e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
-            "119e2574-8a7f-7d33-a318-000000000000".to_string(),
-        ]);
-
-        let resolved = resolve_session_reference_from_candidates(
-            "b365aa0ab970",
-            &session_ids,
-            BTreeSet::new(),
-            "codex",
-        )
-        .unwrap();
-
-        assert_eq!(
-            resolved.canonical_id,
-            "019e2574-8a7f-7d33-a318-b365aa0ab970"
-        );
-    }
-
-    #[test]
-    fn session_reference_resolver_accepts_codex_alias_match() {
-        let session_ids = BTreeSet::from(["019e2574-8a7f-7d33-a318-b365aa0ab970".to_string()]);
-        let aliases = BTreeSet::from(["019e2574-8a7f-7d33-a318-b365aa0ab970".to_string()]);
-
-        let resolved = resolve_session_reference_from_candidates(
-            "rollout-2026-05-14T00-47-35-019e2574-8a7f-7d33-a318-b365aa0ab970",
-            &session_ids,
-            aliases,
-            "codex",
-        )
-        .unwrap();
-
-        assert_eq!(
-            resolved.canonical_id,
-            "019e2574-8a7f-7d33-a318-b365aa0ab970"
-        );
-    }
-
-    #[test]
-    fn read_codex_session_meta_id_skips_malformed_lines() {
-        use std::io::Write;
-        let tmp_dir = unique_test_dir("read-meta-malformed");
-        std::fs::create_dir_all(&tmp_dir).unwrap();
-        let path = tmp_dir.join("partial.jsonl");
-        let mut file = std::fs::File::create(&path).unwrap();
-        // First candidate line contains the `"session_meta"` substring
-        // but is truncated mid-record (typical of a partially-flushed
-        // rollout). Before the fix this caused `read_codex_session_meta_id`
-        // to bail out and miss the valid record on the next line.
-        writeln!(
-            file,
-            r#"{{"timestamp":"2026-05-15T00:00:00Z","type":"session_meta","payload":{{"id":"truncated"#
-        )
-        .unwrap();
-        writeln!(
-            file,
-            r#"{{"timestamp":"2026-05-15T00:00:01Z","type":"session_meta","payload":{{"id":"019e0000-0000-0000-0000-000000000000","cwd":"/tmp"}}}}"#
-        )
-        .unwrap();
-        drop(file);
-
-        let id = read_codex_session_meta_id(&path);
-        assert_eq!(
-            id.as_deref(),
-            Some("019e0000-0000-0000-0000-000000000000"),
-            "malformed first line must not stop the scan"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-    }
-
-    #[test]
-    fn session_reference_resolver_ignores_out_of_window_alias() {
-        // Only one id is in the current `--hours`/`--project` window.
-        let session_ids = BTreeSet::from(["019e27c0-e492-7790-9c33-52b3dddd1067".to_string()]);
-        // The full sessions/ tree walk surfaced two aliases sharing the
-        // `019e2` prefix: one in-window, one historical/out-of-window.
-        let aliases = BTreeSet::from([
-            "019e27c0-e492-7790-9c33-52b3dddd1067".to_string(),
-            "019e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
-        ]);
-
-        let resolved =
-            resolve_session_reference_from_candidates("019e2", &session_ids, aliases, "codex")
-                .unwrap();
-
-        // Without the in-window filter the resolver would see two
-        // candidates and bail "ambiguous". After the fix it resolves
-        // uniquely to the in-window id.
-        assert_eq!(
-            resolved.canonical_id,
-            "019e27c0-e492-7790-9c33-52b3dddd1067"
-        );
-    }
-
-    fn default_session_extract_file_name(session_id: &str) -> String {
-        default_session_extract_path("claude", session_id)
-            .expect("default session extract path should resolve")
-            .file_name()
-            .expect("default session extract path should include a file name")
-            .to_string_lossy()
-            .into_owned()
-    }
-
-    #[test]
-    fn default_session_extract_path_empty_session_uses_safe_fallback() {
-        assert_eq!(default_session_extract_file_name(""), "session.md");
-    }
-
-    #[test]
-    fn default_session_extract_path_dot_session_gets_hashed_safe_name() {
-        let file_name = default_session_extract_file_name(".");
-
-        assert_ne!(file_name, "..md");
-        assert!(
-            file_name.starts_with("session-"),
-            "expected session-prefixed fallback, got {file_name}"
-        );
-        assert!(file_name.ends_with(".md"));
-    }
-
-    #[test]
-    fn default_session_extract_path_dotdot_session_gets_hashed_safe_name() {
-        let file_name = default_session_extract_file_name("..");
-
-        assert_ne!(file_name, "...md");
-        assert!(
-            file_name.starts_with("session-"),
-            "expected session-prefixed fallback, got {file_name}"
-        );
-        assert!(file_name.ends_with(".md"));
-    }
-
-    #[test]
-    fn default_session_extract_path_oversized_session_is_length_capped() {
-        let file_name = default_session_extract_file_name(&"a".repeat(500));
-        let stem = file_name
-            .strip_suffix(".md")
-            .expect("default extract filename should use markdown extension");
-        let (_, suffix) = stem
-            .rsplit_once('-')
-            .expect("oversized session id should carry hash suffix");
-
-        assert!(stem.len() <= DEFAULT_SESSION_EXTRACT_FILENAME_STEM_MAX_BYTES);
-        assert_eq!(suffix.len(), 16);
-        assert!(suffix.chars().all(|ch| ch.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn default_session_extract_path_normal_input_passthrough() {
-        // Closes Klaudiusz audit gap I-3 (P3): a UUID-like session id that
-        // uses only the safe charset (`[a-zA-Z0-9-_.]`) and fits under
-        // DEFAULT_SESSION_EXTRACT_FILENAME_STEM_MAX_BYTES must round-trip
-        // verbatim into the filename — no hash suffix, no sanitization
-        // collapse. Regression guard for the `is_already_safe` fast path.
-        let session_id = "019e27c0-e492-7790-9c33-52b3dddd1067";
-        let file_name = default_session_extract_file_name(session_id);
-        assert_eq!(
-            file_name,
-            format!("{session_id}.md"),
-            "normal UUID-like session id must pass through unchanged"
-        );
-    }
-
-    #[test]
-    fn conversation_batch_safe_session_filename_passes_through_safe_ids() {
-        let id = "019e27c0-e492-7790-9c33-52b3dddd1067";
-        assert_eq!(conversation_batch_safe_session_filename(id), id);
-    }
-
-    #[test]
-    fn conversation_batch_safe_session_filename_preserves_safe_underscore_runs() {
-        // Both ids only use safe characters. Earlier behavior collapsed
-        // `__` to `_` for every input, so "a__b" and "a_b" mapped to the
-        // same filename without a hash suffix and silently overwrote each
-        // other. Safe inputs must round-trip verbatim.
-        assert_eq!(conversation_batch_safe_session_filename("a__b"), "a__b");
-        assert_eq!(conversation_batch_safe_session_filename("a_b"), "a_b");
-    }
-
-    #[test]
-    fn conversation_batch_safe_session_filename_disambiguates_collisions() {
-        // Two distinct ids that collapse to the same sanitized base must
-        // produce different filenames so one export cannot overwrite the
-        // other.
-        let a = conversation_batch_safe_session_filename("a/b");
-        let b = conversation_batch_safe_session_filename("a:b");
-        assert_ne!(a, b, "distinct ids must not collide after sanitization");
-        assert!(
-            a.starts_with("a_b-"),
-            "expected sanitized base prefix, got {a}"
-        );
-        assert!(
-            b.starts_with("a_b-"),
-            "expected sanitized base prefix, got {b}"
-        );
-    }
-
-    #[test]
-    fn conversation_batch_safe_session_filename_falls_back_to_session() {
-        // All chars sanitized away — base becomes "session" plus a hash
-        // (still unique because the sanitization touched the id).
-        let safe = conversation_batch_safe_session_filename("///");
-        assert!(
-            safe.starts_with("session-"),
-            "expected session-prefixed name, got {safe}"
-        );
-    }
-
-    #[test]
-    fn claude_defaults_to_silent_stdout() {
-        let cli = Cli::try_parse_from(["aicx", "claude"]).expect("claude command should parse");
-
-        match cli.command {
-            Some(Commands::Claude { emit, .. }) => {
-                assert!(matches!(emit, StdoutEmit::None));
-            }
-            _ => panic!("expected claude command"),
-        }
-    }
-
-    #[test]
-    fn codex_defaults_to_silent_stdout() {
-        let cli = Cli::try_parse_from(["aicx", "codex"]).expect("codex command should parse");
-
-        match cli.command {
-            Some(Commands::Codex { emit, .. }) => {
-                assert!(matches!(emit, StdoutEmit::None));
-            }
-            _ => panic!("expected codex command"),
-        }
-    }
-
-    #[test]
-    fn all_defaults_to_silent_stdout() {
-        let cli = Cli::try_parse_from(["aicx", "all"]).expect("all command should parse");
-
-        match cli.command {
-            Some(Commands::All { emit, .. }) => {
-                assert!(matches!(emit, StdoutEmit::None));
-            }
-            _ => panic!("expected all command"),
-        }
-    }
-
-    #[test]
-    fn store_defaults_to_silent_stdout() {
-        let cli = Cli::try_parse_from(["aicx", "store"]).expect("store command should parse");
-
-        match cli.command {
-            Some(Commands::Store { emit, .. }) => {
-                assert!(matches!(emit, StdoutEmit::None));
-            }
-            other => panic!("expected store command, got {:?}", other.map(|_| "other")),
-        }
-    }
-
-    #[test]
-    fn store_accepts_explicit_paths_emit() {
-        let cli = Cli::try_parse_from(["aicx", "store", "--emit", "paths"])
-            .expect("store command with explicit emit should parse");
-
-        match cli.command {
-            Some(Commands::Store { emit, .. }) => {
-                assert!(matches!(emit, StdoutEmit::Paths));
-            }
-            other => panic!("expected store command, got {:?}", other.map(|_| "other")),
-        }
-    }
-
-    #[test]
-    fn ingest_accepts_operator_markdown_source_and_since() {
-        let cli = Cli::try_parse_from([
-            "aicx",
-            "ingest",
-            "--source",
-            "operator-md",
-            "--since",
-            "2026-05-01",
-            "--emit",
-            "json",
-        ])
-        .expect("operator markdown ingest command should parse");
-
-        match cli.command {
-            Some(Commands::Ingest {
-                source,
-                since,
-                emit,
-                ..
-            }) => {
-                assert!(matches!(source, IngestSource::OperatorMd));
-                assert_eq!(since.as_deref(), Some("2026-05-01"));
-                assert!(matches!(emit, StdoutEmit::Json));
-            }
-            other => panic!("expected ingest command, got {:?}", other.map(|_| "other")),
-        }
-    }
-
-    #[test]
-    fn refs_default_to_summary_stdout() {
-        let cli = Cli::try_parse_from(["aicx", "refs"]).expect("refs command should parse");
-
-        match cli.command {
-            Some(Commands::Refs { emit, .. }) => {
-                assert!(matches!(emit, RefsEmit::Summary));
-            }
-            _ => panic!("expected refs command"),
-        }
-    }
-
-    #[test]
-    fn refs_accept_explicit_paths_emit() {
-        let cli = Cli::try_parse_from(["aicx", "refs", "--emit", "paths"])
-            .expect("refs command with explicit emit should parse");
-
-        match cli.command {
-            Some(Commands::Refs { emit, .. }) => {
-                assert!(matches!(emit, RefsEmit::Paths));
-            }
-            _ => panic!("expected refs command"),
-        }
-    }
-
-    #[test]
-    fn search_accepts_score_and_json_flags() {
-        let cli = Cli::try_parse_from(["aicx", "search", "dashboard", "--score", "60", "--json"])
-            .expect("search command with score/json should parse");
-
-        match cli.command {
-            Some(Commands::Search {
-                filters,
-                json,
-                project,
-                ..
-            }) => {
-                assert_eq!(filters.score, Some(60));
-                assert!(json);
-                assert!(project.is_empty());
-            }
-            _ => panic!("expected search command"),
-        }
-    }
-
-    #[test]
-    fn search_accepts_no_semantic_escape_hatch() {
-        let cli = Cli::try_parse_from(["aicx", "search", "dashboard", "--no-semantic"])
-            .expect("search command with --no-semantic should parse");
-
-        match cli.command {
-            Some(Commands::Search { no_semantic, .. }) => {
-                assert!(no_semantic);
-            }
-            _ => panic!("expected search command"),
-        }
-    }
-
-    #[test]
-    fn search_accepts_frame_kind_filter() {
-        let cli = Cli::try_parse_from([
-            "aicx",
-            "search",
-            "dashboard",
-            "--frame-kind",
-            "internal_thought",
-        ])
-        .expect("search command with frame-kind should parse");
-
-        match cli.command {
-            Some(Commands::Search { filters, .. }) => {
-                assert_eq!(filters.frame_kind, Some(FrameKindArg::InternalThought));
-            }
-            _ => panic!("expected search command"),
-        }
-    }
-
-    #[test]
-    fn search_accepts_corpus_kind_filter() {
-        let cli = Cli::try_parse_from(["aicx", "search", "dashboard", "--kind", "conversations"])
-            .expect("search command with corpus kind should parse");
-
-        match cli.command {
-            Some(Commands::Search { kind, .. }) => {
-                assert_eq!(kind.as_deref(), Some("conversations"));
-            }
-            _ => panic!("expected search command"),
-        }
-    }
-
-    #[test]
-    fn search_accepts_multiple_project_filters() {
-        let cli = Cli::try_parse_from([
-            "aicx",
-            "search",
-            "rust-mux",
-            "-p",
-            "vc-operator",
-            "-p",
-            "vibecrafted",
-            "-p",
-            "loctree",
-        ])
-        .expect("search should accept repeated project filters");
-
-        match cli.command {
-            Some(Commands::Search { project, .. }) => {
-                assert_eq!(project, vec!["vc-operator", "vibecrafted", "loctree"]);
-            }
-            _ => panic!("expected search command"),
-        }
-    }
-
-    #[test]
-    fn index_accepts_explicit_dry_run_false_for_materialization() {
-        let cli = Cli::try_parse_from(["aicx", "index", "--dry-run=false"])
-            .expect("index --dry-run=false should parse");
-
-        match cli.command {
-            Some(Commands::Index {
-                dry_run,
-                project,
-                sample,
-                ..
-            }) => {
-                assert!(!dry_run);
-                assert!(project.is_empty());
-                assert_eq!(sample, 0, "default materialization should index all chunks");
-            }
-            _ => panic!("expected index command"),
-        }
-    }
-
-    #[test]
-    fn index_defaults_to_materialization() {
-        let cli = Cli::try_parse_from(["aicx", "index"]).expect("index command should parse");
-
-        match cli.command {
-            Some(Commands::Index {
-                dry_run, project, ..
-            }) => {
-                assert!(!dry_run);
-                assert!(project.is_empty());
-            }
-            _ => panic!("expected index command"),
-        }
-    }
-
-    #[test]
-    fn index_accepts_dry_run_preview() {
-        let cli =
-            Cli::try_parse_from(["aicx", "index", "--dry-run"]).expect("index --dry-run parses");
-
-        match cli.command {
-            Some(Commands::Index { dry_run, .. }) => {
-                assert!(dry_run);
-            }
-            _ => panic!("expected index command"),
-        }
-    }
-
-    #[test]
-    fn index_accepts_multiple_project_filters() {
-        let cli = Cli::try_parse_from([
-            "aicx",
-            "index",
-            "-p",
-            "vc-operator",
-            "-p",
-            "vibecrafted",
-            "-p",
-            "loctree",
-        ])
-        .expect("index should accept repeated project filters");
-
-        match cli.command {
-            Some(Commands::Index { project, .. }) => {
-                assert_eq!(project, vec!["vc-operator", "vibecrafted", "loctree"]);
-            }
-            _ => panic!("expected index command"),
-        }
-    }
-
-    #[test]
-    fn intents_accepts_multiple_project_filters() {
-        let cli = Cli::try_parse_from([
-            "aicx",
-            "intents",
-            "-p",
-            "vc-operator",
-            "-p",
-            "vibecrafted",
-            "-p",
-            "loctree",
-        ])
-        .expect("intents should accept repeated project filters");
-
-        match cli.command {
-            Some(Commands::Intents { project, .. }) => {
-                assert_eq!(project, vec!["vc-operator", "vibecrafted", "loctree"]);
-            }
-            _ => panic!("expected intents command"),
-        }
-    }
-
-    #[test]
-    fn steer_accepts_multiple_project_filters() {
-        let cli = Cli::try_parse_from([
-            "aicx",
-            "steer",
-            "-p",
-            "vc-operator",
-            "-p",
-            "vibecrafted",
-            "-p",
-            "loctree",
-        ])
-        .expect("steer should accept repeated project filters");
-
-        match cli.command {
-            Some(Commands::Steer { project, .. }) => {
-                assert_eq!(project, vec!["vc-operator", "vibecrafted", "loctree"]);
-            }
-            _ => panic!("expected steer command"),
-        }
-    }
-
-    #[test]
-    fn steer_accepts_frame_kind_filter() {
-        let cli = Cli::try_parse_from(["aicx", "steer", "--frame-kind", "user_msg"])
-            .expect("steer command with frame-kind should parse");
-
-        match cli.command {
-            Some(Commands::Steer { filters, .. }) => {
-                assert_eq!(filters.frame_kind, Some(FrameKindArg::UserMsg));
-            }
-            _ => panic!("expected steer command"),
-        }
-    }
-
-    #[test]
-    fn intents_accepts_frame_kind_filter() {
-        let cli = Cli::try_parse_from(["aicx", "intents", "--frame-kind", "tool_call"])
-            .expect("intents command with frame-kind should parse");
-
-        match cli.command {
-            Some(Commands::Intents { filters, .. }) => {
-                assert_eq!(filters.frame_kind, Some(FrameKindArg::ToolCall));
-            }
-            _ => panic!("expected intents command"),
-        }
-    }
-
-    #[test]
-    fn rank_subcommand_is_rejected() {
-        let err = Cli::try_parse_from(["aicx", "rank", "-p", "foo"])
-            .expect_err("rank subcommand should be rejected");
-        let rendered = err.to_string();
-        assert!(rendered.contains("unrecognized subcommand"));
-        assert!(rendered.contains("rank"));
-    }
-
-    #[test]
-    fn top_level_help_hides_retired_init_from_primary_surface() {
-        let mut cmd = Cli::command();
-        let rendered = cmd.render_help().to_string();
-
-        assert!(!rendered.contains("\n  init "));
-        assert!(!rendered.contains("Retired compatibility shim"));
-        assert!(!rendered.contains("Initialize repo context and run an agent"));
-    }
-
-    #[test]
-    fn top_level_help_does_not_advertise_dead_root_flags() {
-        let mut cmd = Cli::command();
-        let rendered = cmd.render_long_help().to_string();
-
-        assert!(!rendered.contains("used if no subcommand is provided"));
-        assert!(!rendered.contains("Project filter (used if no subcommand is provided)"));
-        assert!(!rendered.contains("Hours to look back (used if no subcommand is provided)"));
-    }
-
-    #[test]
-    fn primary_help_does_not_expose_layer_one_jargon() {
-        let mut cmd = Cli::command();
-        let mut rendered = cmd.render_long_help().to_string();
-
-        for subcommand in ["claude", "codex", "all", "store", "refs", "dashboard"] {
-            let mut subcmd = Cli::command();
-            let subcmd = subcmd
-                .find_subcommand_mut(subcommand)
-                .unwrap_or_else(|| panic!("{subcommand} subcommand should exist"));
-            rendered.push_str(&subcmd.render_long_help().to_string());
-        }
-
-        assert!(
-            !rendered.to_lowercase().contains("(layer 1"),
-            "primary help should describe the corpus directly, not leak layer-one jargon"
-        );
-    }
-
-    #[test]
-    fn top_level_help_uses_semantic_index_language() {
-        let mut cmd = Cli::command();
-        let rendered = cmd.render_long_help().to_string();
-
-        assert!(rendered.contains("Layer 2 (optional semantic index)"));
-        assert!(!rendered.contains("retrieval kernel"));
-    }
-
-    #[test]
-    fn init_help_explains_retirement_and_hides_legacy_flags() {
-        let mut cmd = Cli::command();
-        let init = cmd
-            .find_subcommand_mut("init")
-            .expect("init subcommand should exist for compatibility");
-        let rendered = init.render_long_help().to_string();
-
-        assert!(rendered.contains("aicx init has been retired."));
-        assert!(rendered.contains("/vc-init inside Claude Code."));
-        assert!(!rendered.contains("--agent"));
-        assert!(!rendered.contains("--action"));
-        assert!(!rendered.contains("--no-run"));
-        assert!(!rendered.contains("Initialize repo context and run an agent"));
-    }
-
-    #[test]
-    fn serve_accepts_http_and_legacy_sse_transport_names() {
-        let http = Cli::try_parse_from(["aicx", "serve", "--transport", "http"])
-            .expect("http transport should parse");
-        let legacy = Cli::try_parse_from(["aicx", "serve", "--transport", "sse"])
-            .expect("legacy sse alias should parse");
-
-        match http.command {
-            Some(Commands::Serve { transport, .. }) => {
-                assert_eq!(transport, McpTransport::Http);
-            }
-            _ => panic!("expected serve command for http transport"),
-        }
-
-        match legacy.command {
-            Some(Commands::Serve { transport, .. }) => {
-                assert_eq!(transport, McpTransport::Http);
-            }
-            _ => panic!("expected serve command for legacy sse transport"),
-        }
-    }
-
-    #[test]
-    fn serve_help_prefers_http_name_and_stays_compact() {
-        let mut cmd = Cli::command();
-        let serve = cmd
-            .find_subcommand_mut("serve")
-            .expect("serve subcommand should exist");
-        let rendered = serve.render_long_help().to_string();
-
-        assert!(rendered.contains("Transport: stdio (default) or http."));
-        assert!(!rendered.contains("Transport: stdio (default) or sse"));
-        assert!(!rendered.contains("embedding mode"));
-        assert!(
-            rendered.lines().count() < 30,
-            "serve help should stay compact"
-        );
-    }
-
-    #[test]
-    fn search_help_explains_semantic_first_with_fuzzy_fallback() {
-        // After the Iter 1 dispatch flip, `aicx search` is intentionally
-        // semantic-first with an explicit filesystem-fuzzy fallback. The
-        // help text must surface both legs of the contract so operators
-        // know which retrieval ran (and why) when reading `--help`.
-        let mut cmd = Cli::command();
-        let search = cmd
-            .find_subcommand_mut("search")
-            .expect("search subcommand should exist");
-        let rendered = search.render_long_help().to_string();
-
-        // Semantic leg must be visible — this is the new default.
-        assert!(
-            rendered.to_lowercase().contains("semantic"),
-            "search --help must mention semantic retrieval (the new default)"
-        );
-        // Fuzzy leg must be visible too — operators need to know it is
-        // the fallback, not a hidden behaviour.
-        assert!(
-            rendered.to_lowercase().contains("fuzzy"),
-            "search --help must mention fuzzy as the explicit fallback"
-        );
-        // Fallback contract must be named, not implied.
-        assert!(
-            rendered.to_lowercase().contains("fallback"),
-            "search --help must call out the fallback path explicitly"
-        );
-        // Old "filesystem-only" framing must be gone — it would mislead
-        // operators about what a build with `native-embedder` actually does.
-        assert!(
-            !rendered.contains("filesystem-only"),
-            "search --help must not advertise the legacy filesystem-only contract"
-        );
-    }
-
-    #[test]
-    fn read_command_parses_discover_path_and_json_mode() {
-        let cli = Cli::try_parse_from([
-            "aicx",
-            "read",
-            "store/VetCoders/aicx/2026_0502/reports/codex/chunk.md",
-            "--max-chars",
-            "400",
-            "--json",
-        ])
-        .expect("read command should parse");
-
-        match cli.command {
-            Some(Commands::Read {
-                reference,
-                max_chars,
-                json,
-            }) => {
-                assert_eq!(
-                    reference,
-                    "store/VetCoders/aicx/2026_0502/reports/codex/chunk.md"
-                );
-                assert_eq!(max_chars, Some(400));
-                assert!(json);
-            }
-            _ => panic!("expected read command"),
-        }
-    }
-
-    #[test]
-    fn steer_help_stays_short_and_scope_oriented() {
-        let mut cmd = Cli::command();
-        let steer = cmd
-            .find_subcommand_mut("steer")
-            .expect("steer subcommand should exist");
-        let rendered = steer.render_help().to_string();
-
-        assert!(rendered.contains("Retrieve chunks by steering metadata"));
-        assert!(rendered.contains("--project <PROJECT>"));
-        assert!(!rendered.contains("aicx steer --run-id mrbl-001"));
-        assert!(!rendered.contains("--no-redact-secrets"));
-        assert!(!rendered.contains("--hours <HOURS>"));
-        assert!(
-            rendered.lines().count() < 45,
-            "steer help should stay compact"
-        );
-    }
-
-    #[test]
-    fn top_level_help_hides_legacy_dashboard_and_reports_commands() {
-        let mut cmd = Cli::command();
-        let rendered = cmd.render_long_help().to_string();
-
-        assert!(!rendered.contains("dashboard-serve"));
-        assert!(!rendered.contains("reports-extractor"));
-        assert!(rendered.contains("\n  dashboard "));
-        assert!(rendered.contains("\n  reports "));
-    }
-
-    #[test]
-    fn dashboard_help_describes_generate_and_serve_modes() {
-        let mut cmd = Cli::command();
-        let dashboard = cmd
-            .find_subcommand_mut("dashboard")
-            .expect("dashboard subcommand should exist");
-        let rendered = dashboard.render_long_help().to_string();
-
-        assert!(rendered.contains("--serve"));
-        assert!(rendered.contains("--generate-html"));
-        assert!(rendered.contains("~/.aicx/aicx-dashboard.html"));
-        assert!(rendered.contains("--project <PROJECT>"));
-        assert!(rendered.contains("--hours <HOURS>"));
-        assert!(rendered.contains("--bg"));
-        assert!(rendered.contains("--allow-cors-origins"));
-        assert!(!rendered.contains("--artifact"));
-    }
-
-    #[test]
-    fn dashboard_server_only_flags_require_serve_mode() {
-        let err = Cli::try_parse_from(["aicx", "dashboard", "--host", "0.0.0.0"])
-            .expect_err("server-only host flag should require --serve");
-        let rendered = err.to_string();
-
-        assert!(rendered.contains("--serve"));
-    }
-
-    #[test]
-    fn dashboard_server_remote_flags_parse_with_explicit_cors_policy() {
-        let cli = Cli::try_parse_from([
-            "aicx",
-            "dashboard",
-            "--serve",
-            "--host",
-            "0.0.0.0",
-            "--allow-cors-origins",
-            "all",
-            "--allow-no-origin",
-            "--bg",
-        ])
-        .expect("remote dashboard serve flags should parse");
-
-        match cli.command {
-            Some(Commands::Dashboard(args)) => {
-                assert!(args.serve);
-                assert!(args.bg);
-                assert!(args.allow_no_origin);
-                assert_eq!(args.host.as_deref(), Some("0.0.0.0"));
-                assert_eq!(args.allow_cors_origins.as_deref(), Some("all"));
-            }
-            _ => panic!("expected dashboard command"),
-        }
-    }
-
-    #[test]
-    fn reports_help_describes_embedded_html_and_bundle() {
-        let mut cmd = Cli::command();
-        let reports = cmd
-            .find_subcommand_mut("reports")
-            .expect("reports subcommand should exist");
-        let rendered = reports.render_long_help().to_string();
-
-        assert!(rendered.contains("standalone HTML explorer"));
-        assert!(rendered.contains("~/.vibecrafted/artifacts"));
-        assert!(rendered.contains("~/.aicx/aicx-reports.html"));
-        assert!(rendered.contains("--bundle-output"));
-        assert!(rendered.contains("--date-from"));
-        assert!(rendered.contains("--date-to"));
-        assert!(!rendered.contains("canonical store"));
-    }
-
-    #[test]
-    fn corpus_audit_and_repair_commands_parse() {
-        let audit = Cli::try_parse_from(["aicx", "corpus", "audit", "--emit", "json"])
-            .expect("corpus audit should parse");
-        match audit.command {
-            Some(Commands::Corpus(CorpusArgs {
-                command: CorpusCommand::Audit(args),
-            })) => assert!(matches!(args.emit, CorpusEmit::Json)),
-            _ => panic!("expected corpus audit command"),
-        }
-
-        let repair = Cli::try_parse_from([
-            "aicx",
-            "corpus",
-            "repair",
-            "--root",
-            "/tmp/aicx-store",
-            "--dry-run",
-            "--backup",
-            "--manifest",
-            "/tmp/aicx-repair-preview.json",
-        ])
-        .expect("corpus repair should parse");
-        match repair.command {
-            Some(Commands::Corpus(CorpusArgs {
-                command: CorpusCommand::Repair(args),
-            })) => {
-                assert_eq!(args.roots.root, vec![PathBuf::from("/tmp/aicx-store")]);
-                assert!(args.dry_run);
-                assert!(!args.apply);
-                assert!(args.backup);
-                assert_eq!(
-                    args.manifest,
-                    Some(PathBuf::from("/tmp/aicx-repair-preview.json"))
-                );
-            }
-            _ => panic!("expected corpus repair command"),
-        }
-    }
-
-    #[test]
-    fn doctor_apply_requires_prune_empty_bodies() {
-        let cli = Cli::try_parse_from(["aicx", "doctor", "--prune-empty-bodies", "--apply"])
-            .expect("doctor prune apply should parse");
-        match cli.command {
-            Some(Commands::Doctor {
-                prune_empty_bodies,
-                apply,
-                ..
-            }) => {
-                assert!(prune_empty_bodies);
-                assert!(apply);
-            }
-            _ => panic!("expected doctor command"),
-        }
-
-        assert!(
-            Cli::try_parse_from(["aicx", "doctor", "--apply"]).is_err(),
-            "--apply is only valid as a --prune-empty-bodies modifier"
-        );
-    }
-
-    #[test]
-    fn store_agent_filter_is_explicit_and_includes_junie() {
-        let mut cmd = Cli::command();
-        let store = cmd
-            .find_subcommand_mut("store")
-            .expect("store subcommand should exist");
-        let rendered = store.render_long_help().to_string();
-
-        assert!(rendered.contains("claude, codex, gemini, junie"));
-        assert!(rendered.contains("codescribe"));
-        assert!(rendered.contains("operator-md"));
-
-        let cli = Cli::try_parse_from(["aicx", "store", "--agent", "junie"])
-            .expect("store should accept junie agent filter");
-        match cli.command {
-            Some(Commands::Store { agent, .. }) => {
-                assert_eq!(agent.as_deref(), Some("junie"));
-            }
-            _ => panic!("expected store command"),
-        }
-
-        let cli = Cli::try_parse_from(["aicx", "store", "--agent", "codescribe"])
-            .expect("store should accept codescribe agent filter");
-        match cli.command {
-            Some(Commands::Store { agent, .. }) => {
-                assert_eq!(agent.as_deref(), Some("codescribe"));
-            }
-            _ => panic!("expected store command"),
-        }
-
-        let cli = Cli::try_parse_from(["aicx", "store", "--agent", "operator-md"])
-            .expect("store should accept operator-md agent filter");
-        match cli.command {
-            Some(Commands::Store { agent, .. }) => {
-                assert_eq!(agent.as_deref(), Some("operator-md"));
-            }
-            _ => panic!("expected store command"),
-        }
-
-        let err = Cli::try_parse_from(["aicx", "store", "--agent", "oops"])
-            .expect_err("store should reject unknown agent filters");
-        assert!(err.to_string().contains("possible values"));
-    }
-
-    #[test]
-    fn list_help_names_all_discovered_agent_sources() {
-        let mut cmd = Cli::command();
-        let list = cmd
-            .find_subcommand_mut("list")
-            .expect("list subcommand should exist");
-        let rendered = list.render_long_help().to_string();
-
-        assert!(rendered.contains("Claude Code, Codex, Gemini, and Junie log paths"));
-    }
-
-    #[test]
-    fn legacy_dashboard_serve_subcommand_still_parses_hidden_compatibility_path() {
-        let cli = Cli::try_parse_from(["aicx", "dashboard-serve", "--port", "9480"])
-            .expect("legacy dashboard-serve alias should parse");
-
-        match cli.command {
-            Some(Commands::DashboardServeLegacy(args)) => {
-                assert_eq!(args.port, 9480);
-            }
-            _ => panic!("expected hidden dashboard-serve compatibility command"),
-        }
-    }
-
-    #[test]
-    fn legacy_reports_extractor_subcommand_still_parses_hidden_compatibility_path() {
-        let cli = Cli::try_parse_from(["aicx", "reports-extractor", "--repo", "demo"])
-            .expect("legacy reports-extractor alias should parse");
-
-        match cli.command {
-            Some(Commands::ReportsExtractorLegacy(args)) => {
-                assert_eq!(args.repo.as_deref(), Some("demo"));
-            }
-            _ => panic!("expected hidden reports-extractor compatibility command"),
-        }
-    }
-
-    #[test]
-    fn root_only_shortcuts_without_subcommand_are_rejected() {
-        let err = Cli::try_parse_from(["aicx", "-H", "24"])
-            .expect_err("root-only shortcut mode should not parse");
-        let rendered = err.to_string();
-
-        assert!(rendered.contains("unexpected argument '-H'"));
-    }
-
-    #[test]
-    fn non_corpus_commands_reject_redaction_flags() {
-        let err = Cli::try_parse_from(["aicx", "search", "dashboard", "--no-redact-secrets"])
-            .expect_err("search should not accept corpus-building-only redaction flags");
-        let rendered = err.to_string();
-
-        assert!(rendered.contains("--no-redact-secrets"));
-    }
-
-    #[test]
-    fn corpus_builders_accept_redaction_flags() {
-        let cli = Cli::try_parse_from(["aicx", "claude", "--no-redact-secrets"])
-            .expect("claude should accept corpus-building redaction flags");
-
-        match cli.command {
-            Some(Commands::Claude { redaction, .. }) => {
-                assert!(!redaction.redact_secrets);
-            }
-            _ => panic!("expected claude command"),
-        }
-    }
-
-    #[test]
-    fn extract_accepts_gemini_antigravity_format() {
-        let cli = Cli::try_parse_from([
-            "aicx",
-            "extract",
-            "--format",
-            "gemini-antigravity",
-            "/tmp/brain/uuid",
-            "-o",
-            "/tmp/report.md",
-        ])
-        .expect("extract command with gemini-antigravity should parse");
-
-        match cli.command {
-            Some(Commands::Extract { format, .. }) => {
-                assert!(matches!(
-                    format,
-                    Some(ExtractInputFormat::GeminiAntigravity)
-                ));
-            }
-            _ => panic!("expected extract command"),
-        }
-    }
-
-    #[test]
-    fn extract_accepts_junie_format() {
-        let cli = Cli::try_parse_from([
-            "aicx",
-            "extract",
-            "--format",
-            "junie",
-            "/tmp/session/events.jsonl",
-            "-o",
-            "/tmp/report.md",
-        ])
-        .expect("extract command with junie should parse");
-
-        match cli.command {
-            Some(Commands::Extract { format, .. }) => {
-                assert!(matches!(format, Some(ExtractInputFormat::Junie)));
-            }
-            _ => panic!("expected extract command"),
-        }
-    }
-
-    #[test]
-    fn extract_accepts_session_mode() {
-        let cli = Cli::try_parse_from([
-            "aicx",
-            "extract",
-            "--session",
-            "11111111-2222-3333-4444-555555555555",
-            "--agent",
-            "claude",
-        ])
-        .expect("extract --session should parse without positional input");
-
-        match cli.command {
-            Some(Commands::Extract {
-                session,
-                agent,
-                input,
-                output,
-                ..
-            }) => {
-                assert_eq!(
-                    session.as_deref(),
-                    Some("11111111-2222-3333-4444-555555555555")
-                );
-                assert!(matches!(agent, Some(ExtractInputFormat::Claude)));
-                assert!(input.is_none());
-                assert!(output.is_none());
-            }
-            _ => panic!("expected extract command"),
-        }
-    }
-
-    #[test]
-    fn extract_session_and_input_are_mutually_exclusive() {
-        let res = Cli::try_parse_from([
-            "aicx",
-            "extract",
-            "--session",
-            "abc",
-            "--agent",
-            "junie",
-            "/tmp/session/events.jsonl",
-        ]);
-        assert!(
-            res.is_err(),
-            "--session must conflict with positional INPUT path"
-        );
-    }
-
-    #[test]
-    fn conversations_accepts_claude_agent_and_out_dir() {
-        let cli = Cli::try_parse_from([
-            "aicx",
-            "conversations",
-            "--agent",
-            "claude",
-            "--hours",
-            "24",
-            "--limit",
-            "5",
-            "--out-dir",
-            "/tmp/aicx-conversations",
-        ])
-        .expect("conversations command should parse");
-
-        match cli.command {
-            Some(Commands::Conversations {
-                agent,
-                hours,
-                limit,
-                out_dir,
-                ..
-            }) => {
-                assert_eq!(agent, "claude");
-                assert_eq!(hours, 24);
-                assert_eq!(limit, Some(5));
-                assert_eq!(out_dir, PathBuf::from("/tmp/aicx-conversations"));
-            }
-            _ => panic!("expected conversations command"),
-        }
-    }
-
-    #[test]
-    fn conversations_rejects_non_claude_agent_for_v1() {
-        let err = Cli::try_parse_from([
-            "aicx",
-            "conversations",
-            "--agent",
-            "codex",
-            "--out-dir",
-            "/tmp/aicx-conversations",
-        ])
-        .expect_err("conversations v1 should reject non-claude agents");
-
-        assert!(err.to_string().contains("possible values"));
-    }
-
-    #[test]
-    fn conversations_sanitizes_session_filename() {
-        // Sanitized filenames append a SipHash suffix so distinct ids that
-        // collapse to the same base do not collide on disk. Assert the
-        // sanitized prefix is correct; the suffix is intentionally opaque.
-        let sanitized = conversation_batch_safe_session_filename("abc/def:ghi 123");
-        assert!(
-            sanitized.starts_with("abc_def_ghi_123-"),
-            "expected sanitized base prefix, got {sanitized}"
-        );
-        let empty_id = conversation_batch_safe_session_filename("");
-        // Empty input has no chars to sanitize → no suffix needed.
-        assert_eq!(empty_id, "session");
-    }
-
-    #[test]
-    fn conversations_output_path_is_deterministic() {
-        let path = conversation_batch_output_path(
-            Path::new("/tmp/aicx-conversations"),
-            "claude",
-            "abc/def",
-        );
-        // Path contains the sanitized base + SipHash suffix; assert the
-        // shape, not a fixed hash literal.
-        let path_str = path.to_string_lossy().to_string();
-        assert!(
-            path_str.starts_with("/tmp/aicx-conversations/claude/abc_def-"),
-            "unexpected path: {path_str}"
-        );
-        assert!(path_str.ends_with(".json"), "unexpected path: {path_str}");
-
-        // Determinism: same input must yield the same path.
-        let path2 = conversation_batch_output_path(
-            Path::new("/tmp/aicx-conversations"),
-            "claude",
-            "abc/def",
-        );
-        assert_eq!(path, path2, "sanitized path must be deterministic");
-    }
-
-    #[test]
-    fn conversations_batch_writes_synthetic_sessions_without_store_path() {
-        let root = unique_test_dir("conversations-batch");
-        let out_dir = root.join("out");
-        let ts = Utc.with_ymd_and_hms(2026, 5, 14, 12, 0, 0).unwrap();
-        let entries = vec![
-            timeline::TimelineEntry {
-                timestamp: ts,
-                agent: "claude".to_string(),
-                session_id: "session-one".to_string(),
-                role: "user".to_string(),
-                message: "hello one".to_string(),
-                frame_kind: None,
-                branch: Some("main".to_string()),
-                cwd: Some("/tmp/project-one".to_string()),
-                timestamp_source: None,
-            },
-            timeline::TimelineEntry {
-                timestamp: ts + chrono::Duration::seconds(1),
-                agent: "claude".to_string(),
-                session_id: "session-two/unsafe".to_string(),
-                role: "assistant".to_string(),
-                message: "hello two".to_string(),
-                frame_kind: None,
-                branch: None,
-                cwd: Some("/tmp/project-two".to_string()),
-                timestamp_source: None,
-            },
-        ];
-
-        let summary = write_conversation_batch_outputs(ConversationBatchWriteOptions {
-            agent_label: "claude",
-            entries,
-            project_filter: vec![],
-            out_dir: out_dir.clone(),
-            limit: None,
-            dry_run: false,
-            redaction_enabled: false,
-        })
-        .expect("synthetic batch should write conversation JSON files");
-
-        assert_eq!(summary.sessions_discovered, 2);
-        assert_eq!(summary.sessions_written, 2);
-        assert_eq!(summary.failed_sessions, 0);
-        assert_eq!(summary.messages_total, 2);
-        // session-one needed no sanitization — bare filename.
-        assert!(out_dir.join("claude/session-one.json").exists());
-        // session-two/unsafe contains an unsafe `/` → sanitized base is
-        // `session-two_unsafe`, with a SipHash suffix appended. Locate the
-        // file by walking the directory rather than hardcoding the hash.
-        let claude_dir = out_dir.join("claude");
-        let entries: Vec<String> = fs::read_dir(&claude_dir)
-            .expect("claude output dir must exist")
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().to_string())
-            .collect();
-        assert!(
-            entries
-                .iter()
-                .any(|name| name.starts_with("session-two_unsafe-") && name.ends_with(".json")),
-            "expected a session-two_unsafe-<hash>.json file, got {entries:?}"
-        );
-        assert!(!out_dir.starts_with(aicx::store::store_base_dir().unwrap()));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn migrate_accepts_custom_roots() {
-        let cli = Cli::try_parse_from([
-            "aicx",
-            "migrate",
-            "--dry-run",
-            "--no-intent-schema",
-            "--legacy-root",
-            "/tmp/legacy",
-            "--store-root",
-            "/tmp/aicx",
-        ])
-        .expect("migrate command with explicit roots should parse");
-
-        match cli.command {
-            Some(Commands::Migrate {
-                dry_run,
-                legacy_root,
-                store_root,
-                no_intent_schema,
-            }) => {
-                assert!(dry_run);
-                assert!(no_intent_schema);
-                assert_eq!(legacy_root, Some(PathBuf::from("/tmp/legacy")));
-                assert_eq!(store_root, Some(PathBuf::from("/tmp/aicx")));
-            }
-            _ => panic!("expected migrate command"),
-        }
-    }
-
-    #[test]
-    fn migrate_intent_schema_accepts_missing_project_and_defaults_to_dry_run() {
-        let cli = Cli::try_parse_from(["aicx", "migrate-intent-schema"])
-            .expect("migrate-intent-schema should parse without explicit project");
-
-        match cli.command {
-            Some(Commands::MigrateIntentSchema {
-                project,
-                store_root,
-                dry_run,
-            }) => {
-                assert_eq!(project, None);
-                assert_eq!(store_root, None);
-                assert!(dry_run);
-            }
-            _ => panic!("expected migrate-intent-schema command"),
-        }
-    }
-
-    #[test]
-    fn run_extract_file_uses_repo_identity_over_file_provenance() {
-        let root = unique_test_dir("extract-repo-identity");
-        let brain = root.join("brain").join("conv-9");
-        let step_output = brain
-            .join(".system_generated")
-            .join("steps")
-            .join("001")
-            .join("output.txt");
-        let report = root.join("report.md");
-
-        write_file(
-            &step_output,
-            r#"{"project":"/Users/tester/workspace/RepoDelta","decision":"Group by repo identity."}"#,
-        );
-        set_mtime(&step_output, 1_706_745_900);
-
-        run_extract_file(
-            ExtractInputFormat::GeminiAntigravity,
-            None,
-            brain,
-            report.clone(),
-            ExtractFileOptions {
-                include_assistant: true,
-                max_message_chars: 0,
-                redact_secrets: false,
-                conversation: false,
-            },
-        )
-        .unwrap();
-
-        let output = fs::read_to_string(&report).unwrap();
-        assert!(output.contains("| Filter | repodelta |"));
-        assert!(output.contains("Gemini Antigravity recovery report"));
-        assert!(!output.contains("| Filter | file:"));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn extractor_help_states_hours_zero_is_all_time() {
-        let mut cmd = Cli::command();
-        for subcommand in ["all", "claude", "codex", "store"] {
-            let command = cmd
-                .find_subcommand_mut(subcommand)
-                .expect("extractor subcommand should exist");
-            let rendered = command.render_long_help().to_string();
-            assert!(
-                rendered.contains("0 = all time"),
-                "{subcommand} --help must state the zero-hours contract"
-            );
-        }
-    }
-
-    // ====================================================================
-    // Pipeline-reorder cluster tests (#6, #8, #19)
-    // ====================================================================
-
-    fn mk_entry(
-        agent: &str,
-        session: &str,
-        ts_secs: i64,
-        message: &str,
-        cwd: Option<&str>,
-    ) -> timeline::TimelineEntry {
-        timeline::TimelineEntry {
-            timestamp: chrono::DateTime::<chrono::Utc>::from_timestamp(ts_secs, 0).unwrap(),
-            agent: agent.to_string(),
-            session_id: session.to_string(),
-            role: "user".to_string(),
-            message: message.to_string(),
-            frame_kind: None,
-            branch: None,
-            cwd: cwd.map(str::to_string),
-            timestamp_source: None,
-        }
-    }
-
-    fn mk_segment(
-        repo: Option<(&str, &str)>,
-        agent: &str,
-        session: &str,
-        entries: Vec<timeline::TimelineEntry>,
-    ) -> timeline::SemanticSegment {
-        timeline::SemanticSegment {
-            repo: repo.map(|(org, name)| timeline::RepoIdentity {
-                organization: org.to_string(),
-                repository: name.to_string(),
-            }),
-            source_tier: repo.map(|_| timeline::SourceTier::Primary),
-            kind: timeline::Kind::default(),
-            agent: agent.to_string(),
-            session_id: session.to_string(),
-            entries,
-        }
-    }
-
-    /// #6: redaction must run BEFORE dedup so seen_hashes accumulate the
-    /// post-redact form. If dedup hashed the pre-redact form, incremental
-    /// and full_rescan runs would diverge on the hash domain — the audit's
-    /// "two competing seen-sets" pathology.
-    #[test]
-    fn test_pipeline_redacts_once_before_dedup() {
-        let raw = "my key sk-abc1234567890abcdef1234567890abcdef1234";
-        let redacted = aicx::redact::redact_secrets(raw);
-        assert_ne!(raw, redacted, "redact_secrets must rewrite a known key");
-
-        // The pipeline mutates message in place pre-dedup. Simulate that
-        // and verify the helper hashes the redacted form, not the raw.
-        let entry_raw = mk_entry("claude", "s1", 1_700_000_000, raw, Some("/tmp/repo"));
-        let mut entry_redacted = entry_raw.clone();
-        entry_redacted.message = redacted.clone();
-
-        let hash_raw = StateManager::content_hash(
-            &entry_raw.agent,
-            entry_raw.timestamp.timestamp(),
-            &entry_raw.message,
-        );
-        let hash_redacted = StateManager::content_hash(
-            &entry_redacted.agent,
-            entry_redacted.timestamp.timestamp(),
-            &entry_redacted.message,
-        );
-        assert_ne!(
-            hash_raw, hash_redacted,
-            "pre-redact and post-redact hashes must differ — proves order matters"
-        );
-
-        // Now confirm dedup_segments_per_repo, given the redacted form,
-        // marks `seen_hashes` under the post-redact hash (not the raw).
-        let mut state = StateManager::default();
-        let seg = mk_segment(
-            Some(("VetCoders", "aicx")),
-            "claude",
-            "s1",
-            vec![entry_redacted],
-        );
-        let kept = dedup_segments_per_repo(vec![seg], &mut state, false, |_| {});
-        assert_eq!(kept.iter().map(|s| s.entries.len()).sum::<usize>(), 1);
-        assert!(
-            !state.is_new("VetCoders/aicx", &hash_redacted),
-            "post-redact hash must be in seen_hashes after dedup"
-        );
-        assert!(
-            state.is_new("VetCoders/aicx", &hash_raw),
-            "pre-redact hash must NOT appear in seen_hashes — proves redaction ran before dedup"
-        );
-    }
-
-    /// #8: dedup is keyed per canonical repo slug, not on `_global`. Two
-    /// segments with the SAME content hash but DIFFERENT canonical repos
-    /// must both survive — cross-repo collisions are real (e.g. shared
-    /// boilerplate, operator-md task-notification stubs).
-    #[test]
-    fn test_dedup_keyed_per_canonical_repo() {
-        let same_message = "echo of the same boilerplate operator-md stub";
-        let entry_a = mk_entry(
-            "claude",
-            "session-a",
-            1_700_000_000,
-            same_message,
-            Some("/tmp/a"),
-        );
-        let entry_b = mk_entry(
-            "claude",
-            "session-b",
-            1_700_000_001,
-            same_message,
-            Some("/tmp/b"),
-        );
-
-        // Two segments, two different canonical repos, identical content.
-        let seg_a = mk_segment(
-            Some(("VetCoders", "repo-a")),
-            "claude",
-            "session-a",
-            vec![entry_a.clone()],
-        );
-        let seg_b = mk_segment(
-            Some(("VetCoders", "repo-b")),
-            "claude",
-            "session-b",
-            vec![entry_b.clone()],
-        );
-
-        let mut state = StateManager::default();
-        let kept = dedup_segments_per_repo(vec![seg_a, seg_b], &mut state, false, |_| {});
-        let total: usize = kept.iter().map(|s| s.entries.len()).sum();
-        assert_eq!(
-            total, 2,
-            "cross-repo content collision must NOT dedup — both entries should survive"
-        );
-
-        // Verify the two hashes landed in DISTINCT seen_hashes buckets.
-        let hash = StateManager::content_hash(
-            &entry_a.agent,
-            entry_a.timestamp.timestamp(),
-            &entry_a.message,
-        );
-        assert!(
-            !state.is_new("VetCoders/repo-a", &hash),
-            "hash must be marked under repo-a's bucket"
-        );
-        // Different timestamps → different exact hashes. Just verify the
-        // repo-b bucket has its own entry under its own hash.
-        let hash_b = StateManager::content_hash(
-            &entry_b.agent,
-            entry_b.timestamp.timestamp(),
-            &entry_b.message,
-        );
-        assert!(
-            !state.is_new("VetCoders/repo-b", &hash_b),
-            "hash must be marked under repo-b's bucket"
-        );
-
-        // And critically: the legacy `_global` bucket stays empty — proof
-        // the new keying path doesn't pollute the cross-repo store.
-        assert!(
-            state.is_new("_global", &hash),
-            "_global bucket must remain untouched under per-canonical-repo keying"
-        );
-
-        // Re-running dedup with the same segments should now SKIP both,
-        // because each repo bucket already saw its own hash.
-        let seg_a2 = mk_segment(
-            Some(("VetCoders", "repo-a")),
-            "claude",
-            "session-a",
-            vec![entry_a],
-        );
-        let seg_b2 = mk_segment(
-            Some(("VetCoders", "repo-b")),
-            "claude",
-            "session-b",
-            vec![entry_b],
-        );
-        let kept2 = dedup_segments_per_repo(vec![seg_a2, seg_b2], &mut state, false, |_| {});
-        let total2: usize = kept2.iter().map(|s| s.entries.len()).sum();
-        assert_eq!(
-            total2, 0,
-            "second pass must dedup both — proves per-repo state persists"
-        );
-    }
-
-    /// PR #8 review regression guard (chatgpt-codex-connector P1):
-    /// under `--full-rescan` the in-memory dedup state must be shared
-    /// across all segments of the same canonical repo, not recreated
-    /// per segment. Before the fix in this commit, two segments of the
-    /// same repo carrying the same logical entry both survived dedup,
-    /// regressing full_rescan to segment-local behavior.
-    #[test]
-    fn test_full_rescan_dedups_across_segments_within_same_repo() {
-        // Same content, same timestamp, same agent — both entries
-        // produce identical `content_hash` and `overlap_hash`. The
-        // segments share a canonical repo (VetCoders/repo-a) but live
-        // in distinct sessions (the realistic shape: one repo touched
-        // by several Claude sessions over time).
-        let dup_message = "echo across sessions";
-        let dup_ts = 1_700_000_000;
-        let entry_a1 = mk_entry("claude", "s1", dup_ts, dup_message, Some("/tmp/a"));
-        let entry_a2 = mk_entry("claude", "s2", dup_ts, dup_message, Some("/tmp/a"));
-
-        let seg_s1 = mk_segment(
-            Some(("VetCoders", "repo-a")),
-            "claude",
-            "s1",
-            vec![entry_a1.clone()],
-        );
-        let seg_s2 = mk_segment(
-            Some(("VetCoders", "repo-a")),
-            "claude",
-            "s2",
-            vec![entry_a2.clone()],
-        );
-
-        let mut state = StateManager::default();
-        // full_rescan = true: incremental `state.is_new` is bypassed,
-        // dedup relies purely on the in-memory per-repo HashSets that
-        // this regression guard pins as run-wide (not segment-local).
-        let kept = dedup_segments_per_repo(vec![seg_s1, seg_s2], &mut state, true, |_| {});
-        let total: usize = kept.iter().map(|s| s.entries.len()).sum();
-        assert_eq!(
-            total, 1,
-            "full_rescan must dedup duplicates across segments of the \
-             same repo; got {total} kept (regressed before fix)"
-        );
-
-        // And the cross-repo invariant still holds — a second repo with
-        // the same content survives because each canonical repo owns
-        // its own dedup bucket.
-        let entry_b1 = mk_entry("claude", "s3", dup_ts, dup_message, Some("/tmp/b"));
-        let seg_b = mk_segment(
-            Some(("VetCoders", "repo-b")),
-            "claude",
-            "s3",
-            vec![entry_b1],
-        );
-        let entry_a3 = mk_entry("claude", "s4", dup_ts, dup_message, Some("/tmp/a"));
-        let seg_a3 = mk_segment(
-            Some(("VetCoders", "repo-a")),
-            "claude",
-            "s4",
-            vec![entry_a3],
-        );
-        let mut state2 = StateManager::default();
-        let kept2 = dedup_segments_per_repo(vec![seg_a3, seg_b], &mut state2, true, |_| {});
-        let total2: usize = kept2.iter().map(|s| s.entries.len()).sum();
-        assert_eq!(
-            total2, 2,
-            "cross-repo collision MUST survive full_rescan dedup — \
-             each canonical repo owns its own bucket; got {total2}"
-        );
-    }
-
-    /// #19: watermark advances from the raw-extract latest captured
-    /// BEFORE self-echo / dedup filters, not from `entries.last()` after
-    /// filtering. This closes the self-echo-tail re-extract loop.
-    #[test]
-    fn test_watermark_advances_from_raw_extract_latest() {
-        // Three entries [A (T-2), B (T-1), C (T)] where C is a self-echo
-        // candidate that filtering will drop.
-        let t_a = 1_700_000_000;
-        let t_b = 1_700_000_001;
-        let t_c = 1_700_000_002;
-        let entries = vec![
-            mk_entry("claude", "s1", t_a, "real signal A", Some("/tmp/repo")),
-            mk_entry("claude", "s1", t_b, "real signal B", Some("/tmp/repo")),
-            // A genuine self-echo marker recognized by aicx::sanitize::is_self_echo.
-            mk_entry(
-                "claude",
-                "s1",
-                t_c,
-                "【aicx:read】 store-read echo\n【/aicx:read】",
-                Some("/tmp/repo"),
-            ),
-        ];
-
-        // 1) The new pipeline captures raw_extract_latest BEFORE filters.
-        let raw_extract_latest = entries.last().map(|e| e.timestamp);
-        assert_eq!(raw_extract_latest.map(|ts| ts.timestamp()), Some(t_c));
-
-        // 2) Simulate the self-echo filter dropping the tail.
-        let filtered: Vec<_> = entries
-            .into_iter()
-            .filter(|e| !aicx::sanitize::is_self_echo(&e.message))
-            .collect();
-        assert_eq!(
-            filtered.last().map(|e| e.timestamp.timestamp()),
-            Some(t_b),
-            "self-echo filter must have dropped the tail entry — otherwise the test premise is broken"
-        );
-
-        // 3) Watermark must come from raw_extract_latest, NOT filtered.last()
-        let mut state = StateManager::default();
-        if let Some(latest) = raw_extract_latest {
-            state.update_watermark("source-key", latest);
-        }
-        assert_eq!(
-            state.get_watermark("source-key").map(|ts| ts.timestamp()),
-            Some(t_c),
-            "watermark must advance to the raw-extract tail (T), not the filtered survivor (T-1)"
-        );
-
-        // 4) Negative control: if we had written the legacy way, the
-        // watermark would lag at T-1 and the self-echo tail would be
-        // re-extracted on every subsequent run.
-        let mut legacy_state = StateManager::default();
-        if let Some(latest) = filtered.last() {
-            legacy_state.update_watermark("source-key", latest.timestamp);
-        }
-        assert_eq!(
-            legacy_state
-                .get_watermark("source-key")
-                .map(|ts| ts.timestamp()),
-            Some(t_b),
-            "legacy ordering would have produced this lagging watermark — verified for contrast"
-        );
-        assert_ne!(
-            state.get_watermark("source-key"),
-            legacy_state.get_watermark("source-key"),
-            "new and legacy watermark semantics must differ — proves the fix is load-bearing"
-        );
-    }
-}
+#[path = "main/tests.rs"]
+mod tests;

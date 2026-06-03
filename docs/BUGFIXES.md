@@ -2727,6 +2727,7 @@ warstwy wyboru akcji. Quarantine bylo filesystem move, lecz bez trwalego planu
 odwracania z hashami, wiec "recoverable" bylo bardziej obietnica niz kontrakt.
 
 **Fix.**
+
 - Dodano interactive doctor cleanup: TTY-only multi-select, dry-run preview,
   druga bramka apply i progress spinner per faza.
 - Dodano `--yes` / `--force`; `--force` pomija dry-run preview, a
@@ -2738,6 +2739,7 @@ odwracania z hashami, wiec "recoverable" bylo bardziej obietnica niz kontrakt.
   zostaja po starym torze bez promptow.
 
 **Touched.**
+
 - `src/doctor.rs` — cleanup planner/runtime, restore manifest, hash checks.
 - `src/main.rs` — `--yes`, `--force`, `--restore-quarantine` parser/runtime.
 - `tests/doctor_quarantine_apply.rs` — manifest + restore round-trip.
@@ -2768,6 +2770,7 @@ nie objely calego klastra doc-commentow Clap ani zsynchronizowanego
 `docs/COMMANDS.md`. Brakowalo tez testu pilnujacego primary help surface.
 
 **Fix.**
+
 - Usunieto parentetyczne `(layer 1)` z helpa `claude`, `codex`, `all`,
   `store`, `refs`, `dashboard` oraz quick-start comment.
 - Zsynchronizowano `docs/COMMANDS.md` dla tych samych command descriptions.
@@ -2777,6 +2780,7 @@ nie objely calego klastra doc-commentow Clap ani zsynchronizowanego
   `crates/aicx-embeddings/src/hf_cache.rs` bez suppressions.
 
 **Touched.**
+
 - `src/main.rs` — Clap doc-comment copy + help regression test.
 - `docs/COMMANDS.md` — user-facing command copy.
 - `crates/aicx-embeddings/src/hf_cache.rs` — `from_ref` cleanup w testach.

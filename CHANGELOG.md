@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+## [0.9.1] - 2026-05-26
+
+### Added
+
+- `aicx::cli::failure::StructuredFailure` module — canonical failure-as-state
+  pattern with `kind` / `reason` / `recommendation` / `fallback` fields,
+  rendered as a multi-line text block at the CLI boundary in text mode or as
+  a `{ok: false, error, kind, reason, recommendation, fallback}` JSON envelope
+  in `--json` mode. The pattern was already shipped in `aicx search`
+  semantic-down failures and `aicx steer` feature-gate errors; this release
+  promotes it into a shared module consumed by `aicx ingest`, `aicx
+  conversations`, `aicx extract`, `aicx sources`, `aicx doctor`, and
+  `aicx config`.
+- Non-blocking mutation warning on bare no-arg invocations of `aicx all`,
+  `aicx claude`, `aicx codex`, `aicx store`, `aicx migrate`,
+  `aicx migrate-intent-schema`, and `aicx index`. Emits a single-line note
+  to stderr, then waits 3 seconds before starting the mutation so an
+  operator who invoked accidentally can `Ctrl-C` to abort. Scripted callers
+  (`vc-init`, `vibecrafted-mcp`, `install.sh`) suppress the warning entirely
+  with `AICX_NO_MUTATION_WARN=1`. Delay is overridable via
+  `AICX_MUTATION_WARN_DELAY_SECONDS`.
+- `aicx conversations --dry-run` is now dual-channel: a JSON envelope is
+  emitted on stdout with `agent`, `by_agent`, `by_kind`, `dry_run`,
+  `filters_applied`, `messages_total`, `output_dir`, and
+  `sessions_discovered` keys, while the existing human-readable summary is
+  preserved under a `=== Conversations Dry-Run ===` banner on stderr.
+  Mirrors the `aicx migrate-intent-schema --dry-run` gold-standard pattern.
+  Pipe consumers can now `aicx conversations --dry-run | jq .` cleanly.
+- Help text bodies for the shared retrieval grammar flags `--score`,
+  `--agent`, `--since`, `--until`, and `--frame-kind` across `aicx search`,
+  `aicx steer`, `aicx intents`, and `aicx tail` — these previously had
+  empty help bodies because the shared filter struct was never decorated.
+- Structured-failure hint on `aicx config --show` flag mistake — emits the
+  canonical `kind: flag_not_recognized` block with a `recommendation: use
+  the subcommand form: aicx config show` and a `fallback: aicx config show`
+  suggestion.
+
 ### Changed
 
 - `aicx doctor` now has an operator cleanup flow: default TTY runs use an
@@ -17,6 +54,64 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `aicx search --limit` now fails above the explicit 10,000 result cap
   instead of allowing unbounded candidate-pool expansion, and the explicit
   fuzzy fallback uses the same filter examined-pool ratio as semantic search.
+- `aicx doctor --fix` renamed to `aicx doctor --rebuild-steer-index` so the
+  flag matches what it actually does (rebuild the steer index from the
+  canonical store — it does not orchestrate the broader remediations
+  recommended by the report). The old `--fix` flag is preserved as a
+  deprecation alias and emits `aicx doctor: warning: '--fix' is deprecated;
+  use '--rebuild-steer-index'. The old flag will be removed in v1.0.` Old
+  shell scripts continue to work unchanged.
+- CLI-boundary failure surfaces for `aicx ingest`, `aicx conversations`,
+  `aicx extract`, and `aicx sources` no-arg invocations are now wrapped in
+  the canonical `kind: missing_required_arg` block with a concrete
+  `recommendation` and a runnable `fallback` command, replacing the bare
+  Clap-default `error: the following required arguments...` and bare
+  anyhow chains.
+- `aicx config show` sentinel for missing optional values changed from
+  `<unset>` to canonical `<none>` so it aligns with the `aicx index status`
+  baseline. JSON output continues to emit `null`.
+- `aicx state --info` now honors the `--project` filter (previously only
+  honored when `--reset` was set). When the filter is applied, the output
+  carries a `Filtered by project: <owner>/<repo>` banner; totals show
+  `(filtered)` suffix. Filter supports the same four shapes as the rest of
+  the suite: `owner/repo`, `owner/`, `/repo`, and bare `name`.
+- `aicx tail --help` description now reads `"Print recent intents/chunks
+  (snapshot mode); add --follow to stream new arrivals"` instead of only
+  documenting the follow-mode behavior. Snapshot mode is the no-arg default.
+- `aicx steer --help` and `aicx steer` in the top-level help carry a
+  `(requires --features lance)` annotation so operators can see at a glance
+  that the subcommand is feature-gated and currently unavailable in slim
+  builds. Invocations still emit the existing structured fallback pointing
+  at `aicx search`.
+- `aicx all`, `aicx claude`, `aicx codex`, and `aicx store` description
+  strings no longer end with the internal architecture suffix `(layer 1)`.
+- `aicx doctor --oracle` output documents its verdict mapping in `--help`:
+  `ready` corresponds to `Green`, `degraded` to `Warning`, and
+  `unsafe_for_loctree_scope` to `Critical`. Output style remains distinct
+  from the standard severity-bracketed report and is suitable for
+  short-form readiness probes.
+
+### Fixed
+
+- `aicx doctor --prune-empty-bodies` no longer hard-crashes with a bare
+  anyhow chain when encountering the first empty-body chunk that lives in
+  `~/.aicx/non-repository-contexts/` or any other canonical root outside
+  `~/.aicx/store/`. The store-root prefix check was widened from
+  `<base>/store/` to all canonical roots under `~/.aicx/`. On the current
+  corpus (4418 empty-body candidates, many of which are non-repo) the
+  command now successfully emits the reviewable bash script described in
+  `--help` instead of failing on the first non-store-rooted candidate.
+- Duplicate `sidecars` / `sidecar_coverage` rows in `aicx doctor` text
+  output eliminated — the report now has a single canonical
+  sidecars-coverage row.
+- `aicx intents` stderr no longer leaks the Rust internal module prefix
+  `aicx::intents:` when the candidates cap is reached; the warning now
+  reads `aicx intents: warning: ...` in the operator-styled format. A
+  binary-string guard test walks the compiled rodata to catch future
+  regressions.
+- `aicx::cli::failure` clippy hygiene: an internal lowercase comparison
+  uses `eq_ignore_ascii_case` instead of a manual case-fold, restoring a
+  clean `cargo clippy -- -D warnings` build.
 
 ## [0.9.0] - 2026-05-23
 

@@ -341,7 +341,10 @@ fn failed_phase_records_recovery_hint_and_gates_lance_tail_rendering() {
         recovery_hint_for("steer_sync"),
     );
     assert_eq!(record.phase, "steer_sync");
-    assert_eq!(record.recovery_hint.as_deref(), Some("aicx doctor --fix"));
+    assert_eq!(
+        record.recovery_hint.as_deref(),
+        Some("aicx doctor --rebuild-steer-index")
+    );
     log.record(record);
 
     let records = log.snapshot();
