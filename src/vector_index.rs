@@ -806,22 +806,6 @@ pub fn write_index_with_options(
         };
         let embedder_ms = embedder_started.elapsed().as_millis() as u64;
         let duration_ms = item_started.elapsed().as_millis() as u64;
-        let metadata = serde_json::json!({
-            "source_path": stored.path.to_string_lossy(),
-            "project": stored.project,
-            "agent": stored.agent,
-            "date": stored.date_iso,
-            "kind": stored.kind.dir_name(),
-            "session_id": stored.session_id,
-            "frame_kind": chunk_frame_kind(&stored.path),
-            "cwd": chunk_cwd(&stored.path),
-        });
-        let lexical_chunk = aicx_retrieve::ChunkRef {
-            id: entry_id.clone(),
-            source_path: stored.path.to_string_lossy().to_string(),
-            text: content.clone(),
-            metadata: metadata.clone(),
-        };
         let entry = IndexEntry {
             id: entry_id.clone(),
             project: stored.project.clone(),
@@ -835,8 +819,23 @@ pub fn write_index_with_options(
             embedding,
         };
         if incremental_baseline.is_some() {
+            let metadata = serde_json::json!({
+                "source_path": stored.path.to_string_lossy(),
+                "project": stored.project,
+                "agent": stored.agent,
+                "date": stored.date_iso,
+                "kind": stored.kind.dir_name(),
+                "session_id": stored.session_id,
+                "frame_kind": chunk_frame_kind(&stored.path),
+                "cwd": chunk_cwd(&stored.path),
+            });
             hybrid_delta_chunks.push(aicx_retrieve::DenseChunkRef {
-                chunk: lexical_chunk,
+                chunk: aicx_retrieve::ChunkRef {
+                    id: entry_id.clone(),
+                    source_path: stored.path.to_string_lossy().to_string(),
+                    text: content,
+                    metadata,
+                },
                 embedding: entry.embedding.clone(),
             });
         }
@@ -1025,6 +1024,9 @@ pub fn write_index_with_options(
         indexed,
         failed,
         hybrid_manifest_matches_embedder(project, &info),
+        incremental_baseline.as_ref().is_some_and(|baseline| {
+            hybrid_manifest_matches_incremental_baseline(project, baseline)
+        }),
         has_existing_hybrid_artifacts(project),
     );
     let hybrid_result = match hybrid_mode {
@@ -1220,16 +1222,14 @@ pub(crate) fn decide_hybrid_materialization(
     indexed: usize,
     failed: usize,
     manifest_matches_embedder: bool,
+    manifest_matches_committed_source: bool,
     has_existing_hybrid: bool,
 ) -> HybridMaterializationMode {
-    if is_incremental && indexed == 0 && failed == 0 && manifest_matches_embedder {
+    let hybrid_is_current =
+        manifest_matches_embedder && manifest_matches_committed_source && has_existing_hybrid;
+    if is_incremental && indexed == 0 && failed == 0 && hybrid_is_current {
         HybridMaterializationMode::Skip
-    } else if is_incremental
-        && indexed > 0
-        && failed == 0
-        && manifest_matches_embedder
-        && has_existing_hybrid
-    {
+    } else if is_incremental && indexed > 0 && failed == 0 && hybrid_is_current {
         HybridMaterializationMode::IncrementalInsert
     } else {
         HybridMaterializationMode::FullRebuild
@@ -1252,19 +1252,25 @@ pub(crate) fn decide_hybrid_materialization(
 ///   the current embedder. A dimension/model change (operator's F2LLM 2048 ->
 ///   qwen3 4096 migration) flips this to false and FORCES a rebuild even on a
 ///   no-op incremental, so search never keeps serving a stale-model hybrid.
+/// - `manifest_matches_committed_source` — the existing hybrid still points at
+///   the same committed semantic corpus the incremental delta is based on.
+/// - `has_existing_hybrid` — both manifest + persisted dense artifacts exist.
 #[allow(dead_code)]
 pub(crate) fn should_skip_hybrid_rebuild(
     is_incremental: bool,
     indexed: usize,
     failed: usize,
     manifest_matches_embedder: bool,
+    manifest_matches_committed_source: bool,
+    has_existing_hybrid: bool,
 ) -> bool {
     decide_hybrid_materialization(
         is_incremental,
         indexed,
         failed,
         manifest_matches_embedder,
-        true,
+        manifest_matches_committed_source,
+        has_existing_hybrid,
     ) == HybridMaterializationMode::Skip
 }
 
@@ -1598,6 +1604,8 @@ pub(crate) struct IncrementalBaseline {
     #[allow(dead_code)] // validated at parse time; kept for diagnostics & future reconcile mode
     pub(crate) cutoff: std::time::SystemTime,
     pub(crate) embedded_ids: std::collections::HashSet<String>,
+    pub(crate) source_chunk_count: usize,
+    pub(crate) source_hash_blake3: String,
 }
 
 /// Read the committed index at `path`, validate that its header matches
@@ -1703,10 +1711,30 @@ fn load_incremental_baseline(
         return Ok(None);
     }
 
+    let source_hash = observed_source_hash_for_index_path(path)
+        .with_context(|| format!("hash committed incremental index: {}", path.display()))?;
+
     Ok(Some(IncrementalBaseline {
         cutoff: cutoff_st,
         embedded_ids,
+        source_chunk_count: data_rows,
+        source_hash_blake3: aicx_retrieve::source_hash_blake3(&source_hash),
     }))
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn hybrid_manifest_matches_incremental_baseline(
+    project: Option<&str>,
+    baseline: &IncrementalBaseline,
+) -> bool {
+    let Ok(path) = hybrid_manifest_path(project) else {
+        return false;
+    };
+    let Ok(manifest) = aicx_retrieve::Manifest::read_from_path(&path) else {
+        return false;
+    };
+    manifest.source_chunk_count == baseline.source_chunk_count
+        && manifest.source_hash_blake3 == baseline.source_hash_blake3
 }
 
 /// Return the subset of `files` that need to be embedded under the

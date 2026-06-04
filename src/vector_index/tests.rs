@@ -137,7 +137,7 @@ fn take_prefix_bytes_preserves_codepoints_under_cap() {
 #[test]
 fn hybrid_materialization_mode_skips_noop_incremental_when_manifest_matches() {
     assert_eq!(
-        decide_hybrid_materialization(true, 0, 0, true, true),
+        decide_hybrid_materialization(true, 0, 0, true, true, true),
         HybridMaterializationMode::Skip
     );
 }
@@ -145,7 +145,7 @@ fn hybrid_materialization_mode_skips_noop_incremental_when_manifest_matches() {
 #[test]
 fn hybrid_materialization_mode_uses_incremental_insert_for_real_delta() {
     assert_eq!(
-        decide_hybrid_materialization(true, 3, 0, true, true),
+        decide_hybrid_materialization(true, 3, 0, true, true, true),
         HybridMaterializationMode::IncrementalInsert
     );
 }
@@ -153,7 +153,7 @@ fn hybrid_materialization_mode_uses_incremental_insert_for_real_delta() {
 #[test]
 fn hybrid_materialization_mode_falls_back_to_full_when_manifest_mismatches() {
     assert_eq!(
-        decide_hybrid_materialization(true, 3, 0, false, true),
+        decide_hybrid_materialization(true, 3, 0, false, true, true),
         HybridMaterializationMode::FullRebuild
     );
 }
@@ -161,7 +161,23 @@ fn hybrid_materialization_mode_falls_back_to_full_when_manifest_mismatches() {
 #[test]
 fn hybrid_materialization_mode_falls_back_to_full_without_existing_hybrid() {
     assert_eq!(
-        decide_hybrid_materialization(true, 3, 0, true, false),
+        decide_hybrid_materialization(true, 3, 0, true, true, false),
+        HybridMaterializationMode::FullRebuild
+    );
+}
+
+#[test]
+fn hybrid_materialization_mode_falls_back_to_full_when_hybrid_source_is_stale() {
+    assert_eq!(
+        decide_hybrid_materialization(true, 3, 0, true, false, true),
+        HybridMaterializationMode::FullRebuild
+    );
+}
+
+#[test]
+fn hybrid_materialization_mode_falls_back_to_full_on_noop_without_existing_hybrid() {
+    assert_eq!(
+        decide_hybrid_materialization(true, 0, 0, true, true, false),
         HybridMaterializationMode::FullRebuild
     );
 }

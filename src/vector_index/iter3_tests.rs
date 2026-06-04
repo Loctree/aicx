@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static AICX_HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn cosine_orthogonal_vectors_are_zero() {
@@ -104,6 +105,8 @@ fn partition_incremental_files_keeps_only_unembedded_and_fresh() {
     let baseline = IncrementalBaseline {
         cutoff: cutoff_dt.into(),
         embedded_ids,
+        source_chunk_count: 2,
+        source_hash_blake3: "baseline".to_string(),
     };
 
     let to_embed = partition_incremental_files(&files, &baseline);
@@ -163,6 +166,8 @@ fn partition_incremental_files_reembeds_missing_id_with_old_mtime() {
     let baseline = IncrementalBaseline {
         cutoff: cutoff_dt.into(),
         embedded_ids,
+        source_chunk_count: 2,
+        source_hash_blake3: "baseline".to_string(),
     };
 
     let to_embed = partition_incremental_files(&files, &baseline);
@@ -407,17 +412,22 @@ fn tempdir_for_test() -> std::path::PathBuf {
 /// `lance.lock` derived from `AICX_HOME`.
 struct ScopedAicxHome {
     previous: Option<std::ffi::OsString>,
+    _guard: std::sync::MutexGuard<'static, ()>,
 }
 
 impl ScopedAicxHome {
     fn set(home: &std::path::Path) -> Self {
+        let guard = AICX_HOME_ENV_LOCK.lock().expect("AICX_HOME test lock");
         let previous = std::env::var_os("AICX_HOME");
         // SAFETY: env mutation is single-threaded within this test scope;
         // the RAII guard restores prior state on drop.
         unsafe {
             std::env::set_var("AICX_HOME", home);
         }
-        Self { previous }
+        Self {
+            previous,
+            _guard: guard,
+        }
     }
 }
 
@@ -750,6 +760,86 @@ fn incremental_materialize_hybrid_refreshes_persisted_artifacts() {
     assert_eq!(manifest.source_chunk_count, 3);
     assert_eq!(manifest.dense_count, 3);
     assert_eq!(manifest.lexical_doc_count, 3);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[test]
+fn incremental_baseline_detects_hybrid_manifest_stale_against_committed_source() {
+    let root = tempdir_for_test();
+    let _aicx_home_guard = ScopedAicxHome::set(&root);
+    let project = "vetcoders/Vista";
+    let semantic_index = index_path_for(&root, Some(project));
+    std::fs::create_dir_all(semantic_index.parent().expect("semantic parent")).unwrap();
+
+    let chunks_dir = root.join("chunks");
+    std::fs::create_dir_all(&chunks_dir).unwrap();
+    let chunk_a_path = chunks_dir.join("a.md");
+    let chunk_b_path = chunks_dir.join("b.md");
+    std::fs::write(&chunk_a_path, "alpha").unwrap();
+    std::fs::write(&chunk_b_path, "bravo").unwrap();
+
+    let make_entry = |id: &str, path: &std::path::Path, embedding: Vec<f32>| IndexEntry {
+        id: id.to_string(),
+        project: "vetcoders/vista".to_string(),
+        agent: "claude".to_string(),
+        date: "20260603".to_string(),
+        path: path.to_path_buf(),
+        kind: "conversations".to_string(),
+        session_id: format!("session-{id}"),
+        frame_kind: Some("agent_reply".to_string()),
+        cwd: Some("/Users/silver/Git/Vista".to_string()),
+        embedding,
+    };
+    let write_semantic_index = |entries: &[IndexEntry], generated_at: &str| {
+        let header = IndexHeader {
+            schema_version: INDEX_SCHEMA_VERSION.to_string(),
+            model_id: "test-model".to_string(),
+            model_profile: "base".to_string(),
+            dimension: 2,
+            generated_at: generated_at.to_string(),
+            entry_count: entries.len(),
+        };
+        let mut body = serde_json::to_string(&header).expect("serialize header");
+        body.push('\n');
+        for entry in entries {
+            body.push_str(&serde_json::to_string(entry).expect("serialize entry"));
+            body.push('\n');
+        }
+        std::fs::write(&semantic_index, body).expect("write semantic fixture");
+    };
+
+    let entry_a = make_entry("a", &chunk_a_path, vec![1.0, 0.0]);
+    let entry_b = make_entry("b", &chunk_b_path, vec![0.0, 1.0]);
+    write_semantic_index(std::slice::from_ref(&entry_a), "2026-06-03T18:00:00Z");
+
+    let info = crate::embedder::EmbeddingModelInfo {
+        model_id: "test-model".to_string(),
+        dimension: 2,
+        backend: "gguf".to_string(),
+        profile: crate::embedder::EmbeddingProfile::Base,
+        source: crate::embedder::NativeEmbeddingSource::ExplicitPath(
+            root.join("fixtures").join("test-model.gguf"),
+        ),
+    };
+
+    materialize_hybrid_index(&semantic_index, Some(project), &info).expect("initial hybrid build");
+    assert!(
+        hybrid_manifest_matches_embedder(Some(project), &info),
+        "control: stale-source check should be stricter than embedder-only match"
+    );
+
+    write_semantic_index(&[entry_a, entry_b], "2026-06-03T18:05:00Z");
+    let baseline = load_incremental_baseline(&semantic_index, &info)
+        .expect("load baseline")
+        .expect("baseline present");
+
+    assert_eq!(baseline.source_chunk_count, 2);
+    assert!(
+        !hybrid_manifest_matches_incremental_baseline(Some(project), &baseline),
+        "hybrid built from the older committed source must force a rebuild before incremental insert"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
