@@ -46,7 +46,6 @@ pub struct SemanticSearchOutcome {
 pub type SemanticOutcome = SemanticSearchOutcome;
 
 const BACKEND_HYBRID_RRF: &str = "hybrid_rrf";
-const BACKEND_HYBRID_RRF_ALL_FALLBACK: &str = "hybrid_rrf_all_fallback";
 const BACKEND_SEMANTIC_DENSE_ONLY: &str = "semantic_dense_only";
 const BACKEND_SEMANTIC_DENSE_ONLY_ALL_FALLBACK: &str = "semantic_dense_only_all_fallback";
 
@@ -309,8 +308,6 @@ pub fn try_semantic_search(
                 BACKEND_SEMANTIC_DENSE_ONLY_ALL_FALLBACK
             } else if any_dense_only {
                 BACKEND_SEMANTIC_DENSE_ONLY
-            } else if any_all_bucket_fallback {
-                BACKEND_HYBRID_RRF_ALL_FALLBACK
             } else {
                 BACKEND_HYBRID_RRF
             },
@@ -556,7 +553,7 @@ fn try_semantic_search_native(
         project: scope.retrieval_project_filter,
     };
 
-    if scope.used_all_bucket_fallback && scope.retrieval_project_filter.is_some() {
+    if scope.used_all_bucket_fallback {
         // `_all` is a cross-project bucket. Loading its manifest-managed dense
         // brute-force artifact materializes every vector in memory before the
         // adapter can apply FilterSet. For project-scoped fallback, use the
@@ -593,7 +590,7 @@ fn try_semantic_search_native(
                     limit,
                     retrieval_filters,
                     &info.model_id,
-                    scope.used_all_bucket_fallback,
+                    false,
                 );
             }
             Err(other) => return Err(other),
@@ -609,7 +606,7 @@ fn try_semantic_search_native(
             limit,
             retrieval_filters,
             &info.model_id,
-            scope.used_all_bucket_fallback,
+            false,
         );
     };
     let manifest = hybrid.manifest().cloned();
@@ -654,11 +651,7 @@ fn try_semantic_search_native(
             let path = hit_path(&h);
             let score_pct = hybrid_score_pct(h.score);
             let matched_lines = semantic_preview_lines(&path);
-            let label = if scope.used_all_bucket_fallback {
-                format!("hybrid_rrf_all_fallback:{}", h.chunk_id)
-            } else {
-                format!("hybrid_rrf:{}", h.chunk_id)
-            };
+            let label = format!("hybrid_rrf:{}", h.chunk_id);
             FuzzyResult {
                 file: path.to_string_lossy().to_string(),
                 path: path.to_string_lossy().to_string(),
@@ -681,11 +674,7 @@ fn try_semantic_search_native(
     Ok(SemanticOutcome {
         results,
         scanned,
-        backend_label: if scope.used_all_bucket_fallback {
-            BACKEND_HYBRID_RRF_ALL_FALLBACK
-        } else {
-            BACKEND_HYBRID_RRF
-        },
+        backend_label: BACKEND_HYBRID_RRF,
         model_id: info.model_id,
         retrieval_status,
     })
@@ -1656,6 +1645,73 @@ mod tests {
         assert!(
             outcome.results[0].label.contains("chunk-a"),
             "closest embedding (chunk-a) must rank first, got label: {}",
+            outcome.results[0].label
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn dense_only_all_bucket_fallback_labels_backend_explicitly() {
+        use crate::vector_index::{IndexEntry, IndexHeader};
+        use std::io::Write;
+
+        let dir =
+            std::env::temp_dir().join(format!("aicx-dense-only-all-label-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let chunk_path = dir.join("vista.md");
+        std::fs::write(&chunk_path, "vista fallback chunk").expect("write chunk");
+        let index_path = dir.join("embeddings.ndjson");
+
+        let header = IndexHeader {
+            schema_version: "1".to_string(),
+            model_id: "test-model".to_string(),
+            model_profile: "test".to_string(),
+            dimension: 3,
+            generated_at: "2026-06-04T00:00:00Z".to_string(),
+            entry_count: 1,
+        };
+        let entry = IndexEntry {
+            id: "vista-hit".to_string(),
+            project: "vetcoders/vista".to_string(),
+            agent: "claude".to_string(),
+            date: "20260604".to_string(),
+            path: chunk_path,
+            kind: "conversations".to_string(),
+            session_id: "sess-vista-hit".to_string(),
+            frame_kind: Some("agent_reply".to_string()),
+            cwd: None,
+            embedding: vec![1.0, 0.0, 0.0],
+        };
+
+        {
+            let mut f = std::fs::File::create(&index_path).expect("create index");
+            writeln!(f, "{}", serde_json::to_string(&header).unwrap()).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
+        }
+
+        let outcome = query_dense_only_from_primary(
+            &index_path,
+            &[1.0, 0.0, 0.0],
+            3,
+            10,
+            test_semantic_filters(Some("vetcoders/vista")),
+            "test-model",
+            true,
+        )
+        .expect("dense-only all-bucket fallback should succeed");
+
+        assert_eq!(
+            outcome.backend_label,
+            BACKEND_SEMANTIC_DENSE_ONLY_ALL_FALLBACK
+        );
+        assert!(
+            outcome.results[0]
+                .label
+                .starts_with("dense_only_all_fallback:"),
+            "all-bucket fallback hit label should be explicit, got {}",
             outcome.results[0].label
         );
 
