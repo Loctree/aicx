@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -1768,8 +1768,8 @@ pub fn resolve_filters_to_slugs_at_or_error(
     if resolved.is_empty() {
         anyhow::bail!(
             "no project matches filter(s): {}\n  \
-             accepted forms (case-insensitive): -p owner/repo (strict), \
-             -p owner/ (org wildcard), -p /repo (cross-org repo), -p name (cross-org)",
+             accepted forms (case-insensitive): owner/repo (strict), \
+             owner/ (org wildcard), /repo (cross-org repo), name (cross-org)",
             filters
                 .iter()
                 .map(|p| format!("{p:?}"))
@@ -1778,6 +1778,123 @@ pub fn resolve_filters_to_slugs_at_or_error(
         );
     }
     Ok(resolved)
+}
+
+pub fn resolve_filters_to_store_or_index_slugs_at_or_error(
+    store_root: &Path,
+    filters: &[String],
+) -> Result<Vec<String>> {
+    if filters.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let canonical_root = store_root.join(CANONICAL_STORE_DIRNAME);
+    let resolved = resolve_filters_to_slugs_at(&canonical_root, filters)?;
+    if !resolved.is_empty() {
+        return Ok(resolved);
+    }
+
+    let indexed_root = store_root.join("indexed");
+    let resolved = resolve_filters_to_index_slugs_at(&indexed_root, filters)?;
+    if resolved.is_empty() {
+        anyhow::bail!(
+            "no project matches filter(s): {}\n  \
+             accepted forms (case-insensitive): owner/repo (strict), \
+             owner/ (org wildcard), /repo (cross-org repo), name (cross-org)",
+            filters
+                .iter()
+                .map(|p| format!("{p:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(resolved)
+}
+
+fn resolve_filters_to_index_slugs_at(
+    indexed_root: &Path,
+    filters: &[String],
+) -> Result<Vec<String>> {
+    if !indexed_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut slugs = std::collections::BTreeSet::new();
+    let mut all_bucket: Option<PathBuf> = None;
+    for entry in fs::read_dir(indexed_root)
+        .with_context(|| format!("read indexed root {}", indexed_root.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("read indexed entry in {}", indexed_root.display()))?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let bucket = entry.file_name().to_string_lossy().to_string();
+        let index_path = path.join("embeddings.ndjson");
+        if bucket == "_all" {
+            all_bucket = Some(index_path);
+            continue;
+        }
+        for slug in project_slugs_from_index_file(&index_path, filters, true)? {
+            slugs.insert(slug);
+        }
+    }
+
+    if slugs.is_empty()
+        && let Some(index_path) = all_bucket
+    {
+        for slug in project_slugs_from_index_file(&index_path, filters, false)? {
+            slugs.insert(slug);
+        }
+    }
+
+    Ok(slugs.into_iter().collect())
+}
+
+fn project_slugs_from_index_file(
+    index_path: &Path,
+    filters: &[String],
+    stop_after_first_match: bool,
+) -> Result<Vec<String>> {
+    if !index_path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = sanitize::open_file_validated(index_path)
+        .with_context(|| format!("open indexed project resolver: {}", index_path.display()))?;
+    let reader = io::BufReader::new(file);
+    let mut slugs = Vec::new();
+    for (idx, line) in reader.lines().enumerate() {
+        let line =
+            line.with_context(|| format!("read line {} in {}", idx + 1, index_path.display()))?;
+        if idx == 0 || line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(project) = value.get("project").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if project_slug_matches_filters(project, filters)
+            && !slugs.iter().any(|existing| existing == project)
+        {
+            slugs.push(project.to_string());
+            if stop_after_first_match {
+                break;
+            }
+        }
+    }
+    Ok(slugs)
+}
+
+fn project_slug_matches_filters(project: &str, filters: &[String]) -> bool {
+    let Some((organization, repository)) = project.split_once('/') else {
+        return false;
+    };
+    filters
+        .iter()
+        .any(|filter| project_filter_matches(organization, repository, filter))
 }
 
 /// Detect the "bare-name" ambiguity case described in the `-p name` filter

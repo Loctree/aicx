@@ -1019,14 +1019,31 @@ pub fn write_index_with_options(
     // last-good hybrid index queryable and avoids the 98%-CPU / 12-min
     // rebuild pathology. A dimension/model migration flips the manifest match
     // to false and rebuilds regardless.
+    let committed_source_hash = observed_source_hash_for_index_path(&target_path)?;
+    let manifest_matches_pre_commit_source =
+        incremental_baseline.as_ref().is_some_and(|baseline| {
+            hybrid_manifest_matches_committed_source(
+                project,
+                baseline.source_chunk_count,
+                &baseline.source_hash_blake3,
+            )
+        });
+    let manifest_matches_post_commit_source = hybrid_manifest_matches_committed_source(
+        project,
+        total_indexed,
+        &aicx_retrieve::source_hash_blake3(&committed_source_hash),
+    );
+    let manifest_matches_source_for_mode = if indexed == 0 {
+        manifest_matches_post_commit_source
+    } else {
+        manifest_matches_pre_commit_source
+    };
     let hybrid_mode = decide_hybrid_materialization(
         incremental_baseline.is_some(),
         indexed,
         failed,
         hybrid_manifest_matches_embedder(project, &info),
-        incremental_baseline.as_ref().is_some_and(|baseline| {
-            hybrid_manifest_matches_incremental_baseline(project, baseline)
-        }),
+        manifest_matches_source_for_mode,
         has_existing_hybrid_artifacts(project),
     );
     let hybrid_result = match hybrid_mode {
@@ -1037,13 +1054,12 @@ pub fn write_index_with_options(
             Ok(None)
         }
         HybridMaterializationMode::IncrementalInsert => {
-            let source_hash = observed_source_hash_for_index_path(&target_path)?;
             match incremental_materialize_hybrid(
                 project,
                 &info,
                 &hybrid_delta_chunks,
                 total_indexed,
-                &source_hash,
+                &committed_source_hash,
             ) {
                 Ok(manifest) => {
                     eprintln!(
@@ -1723,9 +1739,10 @@ fn load_incremental_baseline(
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn hybrid_manifest_matches_incremental_baseline(
+fn hybrid_manifest_matches_committed_source(
     project: Option<&str>,
-    baseline: &IncrementalBaseline,
+    source_chunk_count: usize,
+    source_hash_blake3: &str,
 ) -> bool {
     let Ok(path) = hybrid_manifest_path(project) else {
         return false;
@@ -1733,8 +1750,8 @@ fn hybrid_manifest_matches_incremental_baseline(
     let Ok(manifest) = aicx_retrieve::Manifest::read_from_path(&path) else {
         return false;
     };
-    manifest.source_chunk_count == baseline.source_chunk_count
-        && manifest.source_hash_blake3 == baseline.source_hash_blake3
+    manifest.source_chunk_count == source_chunk_count
+        && manifest.source_hash_blake3 == source_hash_blake3
 }
 
 /// Return the subset of `files` that need to be embedded under the

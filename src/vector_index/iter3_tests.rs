@@ -837,8 +837,83 @@ fn incremental_baseline_detects_hybrid_manifest_stale_against_committed_source()
 
     assert_eq!(baseline.source_chunk_count, 2);
     assert!(
-        !hybrid_manifest_matches_incremental_baseline(Some(project), &baseline),
+        !hybrid_manifest_matches_committed_source(
+            Some(project),
+            baseline.source_chunk_count,
+            &baseline.source_hash_blake3,
+        ),
         "hybrid built from the older committed source must force a rebuild before incremental insert"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[test]
+fn no_op_incremental_revalidates_hybrid_against_post_commit_source() {
+    let root = tempdir_for_test();
+    let _aicx_home_guard = ScopedAicxHome::set(&root);
+    let project = "vetcoders/Vista";
+    let semantic_index = index_path_for(&root, Some(project));
+    std::fs::create_dir_all(semantic_index.parent().expect("semantic parent")).unwrap();
+
+    let chunks_dir = root.join("chunks");
+    std::fs::create_dir_all(&chunks_dir).unwrap();
+    let chunk_path = chunks_dir.join("a.md");
+    std::fs::write(&chunk_path, "alpha").unwrap();
+
+    let entry = IndexEntry {
+        id: "a".to_string(),
+        project: "vetcoders/vista".to_string(),
+        agent: "claude".to_string(),
+        date: "20260603".to_string(),
+        path: chunk_path,
+        kind: "conversations".to_string(),
+        session_id: "session-a".to_string(),
+        frame_kind: Some("agent_reply".to_string()),
+        cwd: Some("/Users/silver/Git/Vista".to_string()),
+        embedding: vec![1.0, 0.0],
+    };
+    let write_semantic_index = |generated_at: &str| {
+        let header = IndexHeader {
+            schema_version: INDEX_SCHEMA_VERSION.to_string(),
+            model_id: "test-model".to_string(),
+            model_profile: "base".to_string(),
+            dimension: 2,
+            generated_at: generated_at.to_string(),
+            entry_count: 1,
+        };
+        let mut body = serde_json::to_string(&header).expect("serialize header");
+        body.push('\n');
+        body.push_str(&serde_json::to_string(&entry).expect("serialize entry"));
+        body.push('\n');
+        std::fs::write(&semantic_index, body).expect("write semantic fixture");
+    };
+
+    let info = crate::embedder::EmbeddingModelInfo {
+        model_id: "test-model".to_string(),
+        dimension: 2,
+        backend: "gguf".to_string(),
+        profile: crate::embedder::EmbeddingProfile::Base,
+        source: crate::embedder::NativeEmbeddingSource::ExplicitPath(
+            root.join("fixtures").join("test-model.gguf"),
+        ),
+    };
+
+    write_semantic_index("2026-06-03T18:00:00Z");
+    materialize_hybrid_index(&semantic_index, Some(project), &info).expect("initial hybrid build");
+
+    write_semantic_index("2026-06-03T18:05:00Z");
+    let post_commit_source_hash =
+        observed_source_hash_for_index_path(&semantic_index).expect("hash rewritten index");
+
+    assert!(
+        !hybrid_manifest_matches_committed_source(
+            Some(project),
+            1,
+            &aicx_retrieve::source_hash_blake3(&post_commit_source_hash),
+        ),
+        "a no-op rewrite with a fresh committed header must not skip hybrid refresh against the old manifest"
     );
 
     let _ = std::fs::remove_dir_all(&root);

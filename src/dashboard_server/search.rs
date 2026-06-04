@@ -151,8 +151,8 @@ fn search_project_scopes(
     if projects.is_empty() {
         return Ok(vec![None]);
     }
-    let canonical_root = store_root.join(crate::store::CANONICAL_STORE_DIRNAME);
-    let resolved = crate::store::resolve_filters_to_slugs_at_or_error(&canonical_root, projects)?;
+    let resolved =
+        crate::store::resolve_filters_to_store_or_index_slugs_at_or_error(store_root, projects)?;
     Ok(resolved.into_iter().map(Some).collect())
 }
 
