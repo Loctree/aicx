@@ -1821,7 +1821,7 @@ fn resolve_filters_to_index_slugs_at(
 
     let mut slugs = std::collections::BTreeSet::new();
     let mut all_bucket: Option<PathBuf> = None;
-    for entry in fs::read_dir(indexed_root)
+    for entry in sanitize::read_dir_validated(indexed_root)
         .with_context(|| format!("read indexed root {}", indexed_root.display()))?
     {
         let entry =
