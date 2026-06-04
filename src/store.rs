@@ -1789,14 +1789,15 @@ pub fn resolve_filters_to_store_or_index_slugs_at_or_error(
     }
 
     let canonical_root = store_root.join(CANONICAL_STORE_DIRNAME);
-    let resolved = resolve_filters_to_slugs_at(&canonical_root, filters)?;
-    if !resolved.is_empty() {
-        return Ok(resolved);
+    let mut slugs = std::collections::BTreeSet::new();
+    for slug in resolve_filters_to_slugs_at(&canonical_root, filters)? {
+        slugs.insert(slug);
     }
-
     let indexed_root = store_root.join("indexed");
-    let resolved = resolve_filters_to_index_slugs_at(&indexed_root, filters)?;
-    if resolved.is_empty() {
+    for slug in resolve_filters_to_index_slugs_at(&indexed_root, filters)? {
+        slugs.insert(slug);
+    }
+    if slugs.is_empty() {
         anyhow::bail!(
             "no project matches filter(s): {}\n  \
              accepted forms (case-insensitive): owner/repo (strict), \
@@ -1808,7 +1809,7 @@ pub fn resolve_filters_to_store_or_index_slugs_at_or_error(
                 .join(", ")
         );
     }
-    Ok(resolved)
+    Ok(slugs.into_iter().collect())
 }
 
 fn resolve_filters_to_index_slugs_at(
@@ -1841,9 +1842,7 @@ fn resolve_filters_to_index_slugs_at(
         }
     }
 
-    if slugs.is_empty()
-        && let Some(index_path) = all_bucket
-    {
+    if let Some(index_path) = all_bucket {
         for slug in project_slugs_from_index_file(&index_path, filters, false)? {
             slugs.insert(slug);
         }

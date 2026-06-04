@@ -850,7 +850,7 @@ fn incremental_baseline_detects_hybrid_manifest_stale_against_committed_source()
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 #[test]
-fn no_op_incremental_revalidates_hybrid_against_post_commit_source() {
+fn no_op_incremental_preserves_skip_against_pre_commit_source() {
     let root = tempdir_for_test();
     let _aicx_home_guard = ScopedAicxHome::set(&root);
     let project = "vetcoders/Vista";
@@ -902,18 +902,33 @@ fn no_op_incremental_revalidates_hybrid_against_post_commit_source() {
 
     write_semantic_index("2026-06-03T18:00:00Z");
     materialize_hybrid_index(&semantic_index, Some(project), &info).expect("initial hybrid build");
+    let baseline = load_incremental_baseline(&semantic_index, &info)
+        .expect("load baseline")
+        .expect("baseline present");
+    assert!(
+        hybrid_manifest_matches_committed_source(
+            Some(project),
+            baseline.source_chunk_count,
+            &baseline.source_hash_blake3,
+        ),
+        "control: hybrid manifest should match the pre-commit no-op baseline"
+    );
 
     write_semantic_index("2026-06-03T18:05:00Z");
-    let post_commit_source_hash =
+    let post_commit_hash =
         observed_source_hash_for_index_path(&semantic_index).expect("hash rewritten index");
-
     assert!(
         !hybrid_manifest_matches_committed_source(
             Some(project),
             1,
-            &aicx_retrieve::source_hash_blake3(&post_commit_source_hash),
+            &aicx_retrieve::source_hash_blake3(&post_commit_hash),
         ),
-        "a no-op rewrite with a fresh committed header must not skip hybrid refresh against the old manifest"
+        "control: a generated_at-only rewrite changes the byte hash"
+    );
+
+    assert!(
+        should_skip_hybrid_rebuild(true, 0, 0, true, true, true),
+        "steady no-op incremental should keep the cheap skip path despite header-only rewrite"
     );
 
     let _ = std::fs::remove_dir_all(&root);

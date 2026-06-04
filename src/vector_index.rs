@@ -23,7 +23,7 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-use std::io::{self, BufRead, Read};
+use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -407,10 +407,9 @@ pub fn hybrid_dense_path(project: Option<&str>) -> Result<PathBuf> {
 pub fn observed_source_hash_for_index_path(path: &Path) -> Result<String> {
     let mut file = crate::sanitize::open_file_validated(path)
         .with_context(|| format!("open {}", path.display()))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .with_context(|| format!("read {}", path.display()))?;
-    Ok(format!("{:x}", Sha256::digest(&bytes)))
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).with_context(|| format!("read {}", path.display()))?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -1019,7 +1018,6 @@ pub fn write_index_with_options(
     // last-good hybrid index queryable and avoids the 98%-CPU / 12-min
     // rebuild pathology. A dimension/model migration flips the manifest match
     // to false and rebuilds regardless.
-    let committed_source_hash = observed_source_hash_for_index_path(&target_path)?;
     let manifest_matches_pre_commit_source =
         incremental_baseline.as_ref().is_some_and(|baseline| {
             hybrid_manifest_matches_committed_source(
@@ -1028,22 +1026,12 @@ pub fn write_index_with_options(
                 &baseline.source_hash_blake3,
             )
         });
-    let manifest_matches_post_commit_source = hybrid_manifest_matches_committed_source(
-        project,
-        total_indexed,
-        &aicx_retrieve::source_hash_blake3(&committed_source_hash),
-    );
-    let manifest_matches_source_for_mode = if indexed == 0 {
-        manifest_matches_post_commit_source
-    } else {
-        manifest_matches_pre_commit_source
-    };
     let hybrid_mode = decide_hybrid_materialization(
         incremental_baseline.is_some(),
         indexed,
         failed,
         hybrid_manifest_matches_embedder(project, &info),
-        manifest_matches_source_for_mode,
+        manifest_matches_pre_commit_source,
         has_existing_hybrid_artifacts(project),
     );
     let hybrid_result = match hybrid_mode {
@@ -1054,6 +1042,7 @@ pub fn write_index_with_options(
             Ok(None)
         }
         HybridMaterializationMode::IncrementalInsert => {
+            let committed_source_hash = observed_source_hash_for_index_path(&target_path)?;
             match incremental_materialize_hybrid(
                 project,
                 &info,

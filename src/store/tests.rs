@@ -2236,6 +2236,100 @@ fn resolve_filters_to_store_or_index_slugs_supports_index_only_all_bucket() {
 }
 
 #[test]
+fn resolve_filters_to_store_or_index_slugs_merges_store_and_index_only_matches() {
+    let root = migration_test_root("resolve-store-and-index");
+    fs::create_dir_all(root.join(CANONICAL_STORE_DIRNAME).join("foo").join("bar")).unwrap();
+    let indexed_all = root.join("indexed").join("_all");
+    fs::create_dir_all(&indexed_all).unwrap();
+    let header = serde_json::json!({
+        "schema_version": "aicx-vector-index/v1",
+        "model_id": "test-model",
+        "model_profile": "base",
+        "dimension": 2,
+        "generated_at": "2026-06-03T18:00:00Z",
+        "entry_count": 1
+    });
+    let entry = serde_json::json!({
+        "id": "chunk-a",
+        "project": "baz/qux",
+        "embedding": [1.0, 0.0]
+    });
+    fs::write(
+        indexed_all.join("embeddings.ndjson"),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            serde_json::to_string(&entry).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let got = resolve_filters_to_store_or_index_slugs_at_or_error(
+        &root,
+        &["foo/bar".to_string(), "baz/qux".to_string()],
+    )
+    .unwrap();
+    assert_eq!(got, vec!["baz/qux", "foo/bar"]);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_filters_to_index_slugs_scans_all_bucket_for_unmatched_filters() {
+    let root = migration_test_root("resolve-index-dedicated-and-all");
+    let indexed = root.join("indexed");
+    let dedicated = indexed.join("foo_bar");
+    let all = indexed.join("_all");
+    fs::create_dir_all(&dedicated).unwrap();
+    fs::create_dir_all(&all).unwrap();
+    let header = serde_json::json!({
+        "schema_version": "aicx-vector-index/v1",
+        "model_id": "test-model",
+        "model_profile": "base",
+        "dimension": 2,
+        "generated_at": "2026-06-03T18:00:00Z",
+        "entry_count": 1
+    });
+    let dedicated_entry = serde_json::json!({
+        "id": "chunk-a",
+        "project": "foo/bar",
+        "embedding": [1.0, 0.0]
+    });
+    let all_entry = serde_json::json!({
+        "id": "chunk-b",
+        "project": "baz/qux",
+        "embedding": [0.0, 1.0]
+    });
+    fs::write(
+        dedicated.join("embeddings.ndjson"),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            serde_json::to_string(&dedicated_entry).unwrap()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        all.join("embeddings.ndjson"),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            serde_json::to_string(&all_entry).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let got = resolve_filters_to_index_slugs_at(
+        &indexed,
+        &["foo/bar".to_string(), "baz/qux".to_string()],
+    )
+    .unwrap();
+    assert_eq!(got, vec!["baz/qux", "foo/bar"]);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn resolve_filters_to_index_slugs_reads_only_project_field() {
     let root = migration_test_root("resolve-index-project-only");
     let indexed_all = root.join("indexed").join("_all");

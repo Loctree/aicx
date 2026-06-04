@@ -287,30 +287,28 @@ fn validate_bindings(
         });
     }
 
-    if let Some(observed_source_hash) = observed_source_hash {
-        let observed = Manifest {
-            schema_version: manifest.schema_version.clone(),
-            generation_id: manifest.generation_id.clone(),
-            source_chunk_count: manifest.source_chunk_count,
-            source_hash_blake3: source_hash_blake3(observed_source_hash),
-            embedder_model: fingerprint.model.clone(),
-            embedder_url_hash: fingerprint.url_hash.clone(),
-            embedder_dim: fingerprint.dim,
-            embedder_distance: fingerprint.distance.clone(),
-            dense_count: dense.count(),
-            dense_kind: dense.kind().to_string(),
-            lexical_commit_id: lexical.commit_id().0.clone(),
-            lexical_doc_count: lexical.doc_count(),
-            build_started_at: manifest.build_started_at,
-            build_completed_at: manifest.build_completed_at,
-            build_wall_seconds: manifest.build_wall_seconds,
-            fusion_algorithm: fusion.name().to_string(),
-            fusion_k: manifest.fusion_k,
-        };
-        manifest.validate_against(&observed)
-    } else {
-        Ok(())
-    }
+    let observed = Manifest {
+        schema_version: manifest.schema_version.clone(),
+        generation_id: manifest.generation_id.clone(),
+        source_chunk_count: manifest.source_chunk_count,
+        source_hash_blake3: observed_source_hash
+            .map(source_hash_blake3)
+            .unwrap_or_else(|| manifest.source_hash_blake3.clone()),
+        embedder_model: fingerprint.model.clone(),
+        embedder_url_hash: fingerprint.url_hash.clone(),
+        embedder_dim: fingerprint.dim,
+        embedder_distance: fingerprint.distance.clone(),
+        dense_count: dense.count(),
+        dense_kind: dense.kind().to_string(),
+        lexical_commit_id: lexical.commit_id().0.clone(),
+        lexical_doc_count: lexical.doc_count(),
+        build_started_at: manifest.build_started_at,
+        build_completed_at: manifest.build_completed_at,
+        build_wall_seconds: manifest.build_wall_seconds,
+        fusion_algorithm: fusion.name().to_string(),
+        fusion_k: manifest.fusion_k,
+    };
+    manifest.validate_against(&observed)
 }
 
 pub fn hash_endpoint_url(endpoint_url: &str) -> String {
@@ -360,6 +358,79 @@ mod tests {
 
     fn fingerprint() -> EmbedderFingerprint {
         EmbedderFingerprint::new("test-model", "http://example.invalid/embed", 2, "cosine")
+    }
+
+    fn built_hybrid(
+        manifest_dir: &std::path::Path,
+    ) -> (
+        Manifest,
+        Box<dyn LexicalIndex>,
+        Box<dyn DenseIndex>,
+        Box<dyn FusionStrategy>,
+        EmbedderFingerprint,
+    ) {
+        let chunk_a = chunk("a", "alpha");
+        let chunk_b = chunk("b", "bravo");
+        let dense_a = dense(&chunk_a, vec![1.0, 0.0]);
+        let dense_b = dense(&chunk_b, vec![0.0, 1.0]);
+
+        let lexical = Box::new(TantivyAdapter::new(manifest_dir.to_path_buf()).expect("lexical"));
+        let dense = Box::new(BruteForceAdapter::new(2).with_distance(Distance::Cosine));
+        let fusion = Box::new(ReciprocalRankFusion::default());
+        let fingerprint = fingerprint();
+        let mut hybrid =
+            HybridIndex::new(lexical, dense, fusion, manifest_dir, fingerprint.clone());
+        hybrid
+            .build_hybrid(&[chunk_a, chunk_b], &[dense_a, dense_b], "source-v1")
+            .expect("build");
+        let manifest = hybrid.commit().expect("commit").clone();
+        let HybridIndex {
+            lexical,
+            dense,
+            fusion,
+            ..
+        } = hybrid;
+        (manifest, lexical, dense, fusion, fingerprint)
+    }
+
+    #[test]
+    fn refresh_validation_rejects_embedder_model_drift_without_source_hash() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (mut manifest, lexical, dense, fusion, fingerprint) = built_hybrid(tmp.path());
+        manifest.embedder_model = "old-model".to_string();
+
+        let err = validate_live_bindings_for_refresh(
+            &manifest,
+            lexical.as_ref(),
+            dense.as_ref(),
+            fusion.as_ref(),
+            &fingerprint,
+        )
+        .expect_err("model drift must fail refresh validation");
+        assert!(
+            matches!(err, RetrieveError::EmbedderModelDrift { .. }),
+            "expected model drift error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn refresh_validation_rejects_unsupported_schema_without_source_hash() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (mut manifest, lexical, dense, fusion, fingerprint) = built_hybrid(tmp.path());
+        manifest.schema_version = "1.0".to_string();
+
+        let err = validate_live_bindings_for_refresh(
+            &manifest,
+            lexical.as_ref(),
+            dense.as_ref(),
+            fusion.as_ref(),
+            &fingerprint,
+        )
+        .expect_err("unsupported schema must fail refresh validation");
+        assert!(
+            matches!(err, RetrieveError::SchemaVersionUnsupported(_)),
+            "expected unsupported schema error, got {err:?}"
+        );
     }
 
     #[test]
