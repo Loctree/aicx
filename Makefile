@@ -374,51 +374,57 @@ release-bundle-only-binaries:
 clean:
 	cargo clean
 
+# Help colors
+HELP_C_CYAN   := \033[36m
+HELP_C_GREEN  := \033[32m
+HELP_C_YELLOW := \033[33m
+HELP_C_RESET  := \033[0m
+
 help:
-	@echo "AICX Build System"
-	@echo ""
-	@echo "Core Commands:"
-	@echo "  make build           - Build release binaries (aicx + aicx-mcp)"
-	@echo "  make build-native    - Build release binaries with native GGUF embedder support"
-	@echo "  make install         - Install binaries + configure local MCP clients via install.sh"
-	@echo "  make install-bin     - Install only aicx + aicx-mcp from the current checkout"
-	@echo "  make install-config  - Configure local MCP clients without reinstalling binaries"
-	@echo "  make install-cargo   - Explain why crates.io install is not the active path"
-	@echo "  make git-hooks       - Install repo-local pre-commit + pre-push hooks"
-	@echo "  make precheck        - Quick default cargo check"
-	@echo "  make precheck-native - Quick native GGUF cargo check"
-	@echo "  make manifest-check  - Fail if Cargo.toml uses local path dependencies"
-	@echo "  make check           - Full local gate (fmt, check, clippy, test, build, semgrep)"
-	@echo "  make test            - Run all tests"
-	@echo "  make test-native     - Run native GGUF embedder tests"
-	@echo "  make fmt             - Format all Rust code"
-	@echo "  make clean           - Clean build artifacts"
-	@echo ""
-	@echo "Native Embeddings:"
-	@echo "  make embeddings-info EMBEDDER_PROFILE=base|dev|premium     - Show GGUF profile details"
-	@echo "  make embeddings-hydrate EMBEDDER_PROFILE=base|dev|premium  - Download selected GGUF into HF cache"
-	@echo "  make embeddings-check                                      - Check aicx-embeddings with GGUF backend"
-	@echo "  make embeddings-test                                       - Test aicx-embeddings with GGUF backend"
-	@echo "  make embeddings-clippy                                     - Clippy aicx-embeddings with GGUF backend"
-	@echo ""
-	@echo "Release / Version:"
-	@echo "  make version               - Alias for version-show"
-	@echo "  make version-show          - Show package version and tag state"
-	@echo "  make version-check         - Validate synced release surfaces (Cargo/docs/npm/changelog basics)"
-	@echo "  make version-bump VERSION=X - Bump version and sync docs/npm surfaces. X={patch|minor|major|x.y.z}"
-	@echo "  make version-patch         - Alias for version-bump VERSION=patch"
-	@echo "  make bump-patch            - Alias for version-bump VERSION=patch"
-	@echo "  make changelog-close       - Close CHANGELOG '## [Unreleased]' to current version + date"
-	@echo "  make release-notes         - Print release notes body derived from CHANGELOG current version section"
-	@echo "  make release-plan          - Print the full post-merge release flow"
-	@echo "  make release-prepare VERSION=X - version-bump + changelog-close + notes preview + precheck. X={patch|minor|major|x.y.z}"
-	@echo "  make release-check         - Strict release readiness gate"
-	@echo "  make release-tag           - Create annotated tag from Cargo.toml version"
-	@echo "  make release-push          - Push the current release tag to origin"
-	@echo "  make package-check         - Explain binary-release packaging track"
-	@echo "  make release-bundle        - Local macOS bundle + codesign + notarize using KEYS/NOTARY_PROFILE (NATIVE=1 for GGUF backend)"
-	@echo ""
-	@echo "Quick start:"
-	@echo "  make install         - Contributor/local operator setup"
-	@echo "  make check           - Full local verification"
-	@echo "  make release-plan    - Review release flow before tagging"
+	@printf '\n$(HELP_C_CYAN)%s$(HELP_C_RESET)\n' 'AICX Build System'
+	@printf '\n'
+	@printf '  $(HELP_C_YELLOW)%s$(HELP_C_RESET)\n' 'CORE COMMANDS'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'build' '- Build release binaries (aicx + aicx-mcp)'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'build-native' '- Build release binaries with native GGUF embedder support'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install' '- Install binaries + configure local MCP clients via install.sh'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-bin' '- Install only aicx + aicx-mcp from the current checkout'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-config' '- Configure local MCP clients without reinstalling binaries'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-cargo' '- Explain why crates.io install is not the active path'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'git-hooks' '- Install repo-local pre-commit + pre-push hooks'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'precheck' '- Quick default cargo check'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'precheck-native' 'Quick native GGUF cargo check'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'manifest-check' '- Fail if Cargo.toml uses local path dependencies'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'check' '- Full local gate (fmt, check, clippy, test, build, semgrep)'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test' '- Run all tests'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test-native' '- Run native GGUF embedder tests'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'fmt' '- Format all Rust code'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'clean' '- Clean build artifacts'
+	@printf '\n'
+	@printf '  $(HELP_C_YELLOW)%s$(HELP_C_RESET)\n' 'NATIVE EMBEDDINGS'
+	@printf '%s\n' '  make embeddings-info EMBEDDER_PROFILE=base|dev|premium     - Show GGUF profile details'
+	@printf '%s\n' '  make embeddings-hydrate EMBEDDER_PROFILE=base|dev|premium  - Download selected GGUF into HF cache'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'embeddings-check' '- Check aicx-embeddings with GGUF backend'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'embeddings-test' '- Test aicx-embeddings with GGUF backend'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'embeddings-clippy' '- Clippy aicx-embeddings with GGUF backend'
+	@printf '\n'
+	@printf '  $(HELP_C_YELLOW)%s$(HELP_C_RESET)\n' 'RELEASE / VERSION'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'version' '- Alias for version-show'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'version-show' '- Show package version and tag state'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'version-check' '- Validate synced release surfaces (Cargo/docs/npm/changelog basics)'
+	@printf '%s\n' '  make version-bump VERSION=X - Bump version and sync docs/npm surfaces. X={patch|minor|major|x.y.z}'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'version-patch' '- Alias for version-bump VERSION=patch'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'bump-patch' '- Alias for version-bump VERSION=patch'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'changelog-close' "- Close CHANGELOG '## [Unreleased]' to current version + date"
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'release-notes' '- Print release notes body derived from CHANGELOG current version section'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'release-plan' '- Print the full post-merge release flow'
+	@printf '%s\n' '  make release-prepare VERSION=X - version-bump + changelog-close + notes preview + precheck. X={patch|minor|major|x.y.z}'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'release-check' '- Strict release readiness gate'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'release-tag' '- Create annotated tag from Cargo.toml version'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'release-push' '- Push the current release tag to origin'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'package-check' '- Explain binary-release packaging track'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'release-bundle' '- Local macOS bundle + codesign + notarize using KEYS/NOTARY_PROFILE (NATIVE=1 for GGUF backend)'
+	@printf '\n'
+	@printf '  $(HELP_C_YELLOW)%s$(HELP_C_RESET)\n' 'QUICK START'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install' '- Contributor/local operator setup'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'check' '- Full local verification'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'release-plan' '- Review release flow before tagging'
