@@ -2155,6 +2155,11 @@ fn resolve_filters_to_slugs_supports_explicit_syntax() {
         resolve_filters_to_slugs_at(&canonical, &["vetcoders/CodeScribe".to_string()]).unwrap();
     assert_eq!(got, vec!["vetcoders/CodeScribe"]);
 
+    // strict slug match stays case-insensitive, but resolves to stored canonical casing
+    let got =
+        resolve_filters_to_slugs_at(&canonical, &["VETCODERS/codescribe".to_string()]).unwrap();
+    assert_eq!(got, vec!["vetcoders/CodeScribe"]);
+
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -2166,6 +2171,21 @@ fn resolve_filters_to_slugs_no_match_returns_empty_vec() {
 
     let got = resolve_filters_to_slugs_at(&canonical, &["nonexistent".to_string()]).unwrap();
     assert!(got.is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_filters_to_slugs_at_or_error_rejects_unknown_filters() {
+    let root = migration_test_root("resolve-error");
+    let canonical = root.join(CANONICAL_STORE_DIRNAME);
+    fs::create_dir_all(canonical.join("foo").join("bar")).unwrap();
+
+    let err = resolve_filters_to_slugs_at_or_error(&canonical, &["nonexistent".to_string()])
+        .expect_err("unknown filters should fail");
+    let msg = err.to_string();
+    assert!(msg.contains("no project matches filter(s): \"nonexistent\""));
+    assert!(msg.contains("accepted forms"));
 
     let _ = fs::remove_dir_all(&root);
 }

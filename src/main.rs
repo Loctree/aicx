@@ -5216,19 +5216,7 @@ fn resolve_project_filters_or_error(projects: &[String]) -> Result<Vec<String>> 
     if projects.is_empty() {
         return Ok(Vec::new());
     }
-    let resolved = aicx::store::resolve_filters_to_slugs(projects)?;
-    if resolved.is_empty() {
-        anyhow::bail!(
-            "no project matches filter(s): {}\n  \
-             accepted forms (case-insensitive): -p owner/repo (strict), \
-             -p owner/ (org wildcard), -p /repo (cross-org repo), -p name (cross-org)",
-            projects
-                .iter()
-                .map(|p| format!("{p:?}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
+    let resolved = aicx::store::resolve_filters_to_slugs_or_error(projects)?;
     // Warn (don't fail) when a bare-name filter matched both as an
     // organization AND as a repository — operator likely wanted one or the
     // other. Filter still resolves to the union; this is just a heads-up.

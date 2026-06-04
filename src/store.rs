@@ -1709,6 +1709,12 @@ pub fn resolve_filters_to_slugs(filters: &[String]) -> Result<Vec<String>> {
     resolve_filters_to_slugs_at(&canonical_root, filters)
 }
 
+pub fn resolve_filters_to_slugs_or_error(filters: &[String]) -> Result<Vec<String>> {
+    let base = store_base_dir()?;
+    let canonical_root = base.join(CANONICAL_STORE_DIRNAME);
+    resolve_filters_to_slugs_at_or_error(&canonical_root, filters)
+}
+
 pub fn resolve_filters_to_slugs_at(
     canonical_root: &Path,
     filters: &[String],
@@ -1749,6 +1755,29 @@ pub fn resolve_filters_to_slugs_at(
 
     slugs.sort();
     Ok(slugs)
+}
+
+pub fn resolve_filters_to_slugs_at_or_error(
+    canonical_root: &Path,
+    filters: &[String],
+) -> Result<Vec<String>> {
+    if filters.is_empty() {
+        return Ok(Vec::new());
+    }
+    let resolved = resolve_filters_to_slugs_at(canonical_root, filters)?;
+    if resolved.is_empty() {
+        anyhow::bail!(
+            "no project matches filter(s): {}\n  \
+             accepted forms (case-insensitive): -p owner/repo (strict), \
+             -p owner/ (org wildcard), -p /repo (cross-org repo), -p name (cross-org)",
+            filters
+                .iter()
+                .map(|p| format!("{p:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(resolved)
 }
 
 /// Detect the "bare-name" ambiguity case described in the `-p name` filter
