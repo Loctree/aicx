@@ -1270,7 +1270,8 @@ pub(crate) fn decide_hybrid_materialization(
 ///   no-op incremental, so search never keeps serving a stale-model hybrid.
 /// - `manifest_matches_committed_source` — the existing hybrid still points at
 ///   the same committed semantic corpus the incremental delta is based on.
-/// - `has_existing_hybrid` — both manifest + persisted dense artifacts exist.
+/// - `has_existing_hybrid` — manifest + persisted dense + Tantivy lexical
+///   artifacts exist.
 #[allow(dead_code)]
 pub(crate) fn should_skip_hybrid_rebuild(
     is_incremental: bool,
@@ -1298,7 +1299,13 @@ fn has_existing_hybrid_artifacts(project: Option<&str>) -> bool {
     let Ok(dense_path) = hybrid_dense_path(project) else {
         return false;
     };
-    manifest_path.exists() && dense_path.exists()
+    let Ok(hybrid_dir) = hybrid_index_dir(project) else {
+        return false;
+    };
+    let lexical_meta = hybrid_dir
+        .join(aicx_retrieve::TANTIVY_INDEX_DIR)
+        .join("meta.json");
+    manifest_path.exists() && dense_path.exists() && lexical_meta.exists()
 }
 
 /// Does the committed hybrid manifest still match the CURRENT embedder?

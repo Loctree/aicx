@@ -1870,10 +1870,10 @@ fn project_slugs_from_index_file(
         if idx == 0 || line.trim().is_empty() {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+        let Ok(row) = serde_json::from_str::<ProjectOnlyIndexRow>(&line) else {
             continue;
         };
-        let Some(project) = value.get("project").and_then(|v| v.as_str()) else {
+        let Some(project) = row.project else {
             continue;
         };
         if project_slug_matches_filters(project, filters)
@@ -1886,6 +1886,11 @@ fn project_slugs_from_index_file(
         }
     }
     Ok(slugs)
+}
+
+#[derive(Deserialize)]
+struct ProjectOnlyIndexRow<'a> {
+    project: Option<&'a str>,
 }
 
 fn project_slug_matches_filters(project: &str, filters: &[String]) -> bool {

@@ -2236,6 +2236,45 @@ fn resolve_filters_to_store_or_index_slugs_supports_index_only_all_bucket() {
 }
 
 #[test]
+fn resolve_filters_to_index_slugs_reads_only_project_field() {
+    let root = migration_test_root("resolve-index-project-only");
+    let indexed_all = root.join("indexed").join("_all");
+    fs::create_dir_all(&indexed_all).unwrap();
+    let header = serde_json::json!({
+        "schema_version": "aicx-vector-index/v1",
+        "model_id": "test-model",
+        "model_profile": "base",
+        "dimension": 2,
+        "generated_at": "2026-06-03T18:00:00Z",
+        "entry_count": 1
+    });
+    let entry = serde_json::json!({
+        "id": "chunk-a",
+        "project": "VetCoders/Vista",
+        "embedding": ["project resolver must not deserialize this as f32"]
+    });
+    fs::write(
+        indexed_all.join("embeddings.ndjson"),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            serde_json::to_string(&entry).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let got = project_slugs_from_index_file(
+        &indexed_all.join("embeddings.ndjson"),
+        &["vetcoders/vista".to_string()],
+        false,
+    )
+    .unwrap();
+    assert_eq!(got, vec!["VetCoders/Vista"]);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn resolve_filters_to_slugs_empty_input_returns_empty() {
     // Empty filters list means "all projects" by caller convention.
     let root = migration_test_root("resolve-no-filter");
