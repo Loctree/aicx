@@ -30,6 +30,7 @@ fn test_conversation_json_extract_stats_are_additive() {
         conversation_messages: messages.len(),
         conversation_projection: "user_assistant_only",
         exact_short_duplicates_dropped: 1,
+        harness_noise_dropped: 0,
     };
 
     write_conversation_json(&path, &messages, &metadata, &stats).unwrap();
@@ -92,6 +93,7 @@ fn test_conversation_json_extract_stats_can_report_redaction_disabled() {
         conversation_messages: messages.len(),
         conversation_projection: "user_assistant_only",
         exact_short_duplicates_dropped: 0,
+        harness_noise_dropped: 0,
     };
 
     write_conversation_json(&path, &messages, &metadata, &stats).unwrap();

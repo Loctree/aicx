@@ -3189,6 +3189,7 @@ fn write_conversation_batch_session(
         conversation_messages: projection.messages.len(),
         conversation_projection: "user_assistant_only",
         exact_short_duplicates_dropped: projection.exact_short_duplicates_dropped,
+        harness_noise_dropped: projection.harness_noise_dropped,
     };
 
     if !dry_run {
@@ -3517,6 +3518,7 @@ fn run_extract_session(
             conversation_messages: projection.messages.len(),
             conversation_projection: "user_assistant_only",
             exact_short_duplicates_dropped: projection.exact_short_duplicates_dropped,
+            harness_noise_dropped: projection.harness_noise_dropped,
         };
         let ext = output_path
             .extension()
@@ -3672,6 +3674,7 @@ fn run_extract_file(
             conversation_messages: projection.messages.len(),
             conversation_projection: "user_assistant_only",
             exact_short_duplicates_dropped: projection.exact_short_duplicates_dropped,
+            harness_noise_dropped: projection.harness_noise_dropped,
         };
 
         let ext = output_path
@@ -4532,6 +4535,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                 conversation_messages: projection.messages.len(),
                 conversation_projection: "user_assistant_only",
                 exact_short_duplicates_dropped: projection.exact_short_duplicates_dropped,
+                harness_noise_dropped: projection.harness_noise_dropped,
             };
             let date_str = metadata.generated_at.format("%Y%m%d_%H%M%S");
             let prefix = metadata.project_filter.as_deref().unwrap_or("all");

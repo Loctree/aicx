@@ -601,3 +601,126 @@ fn session_extract_conversation_flag_writes_distinct_denoised_default_file() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+fn write_claude_session_with_harness_noise(path: &Path, cwd: &Path) {
+    let now = Utc::now();
+    let skill_invocation = "<command-message>vc-init</command-message>\n<command-name>/vc-init</command-name>\n\nBase directory for this skill: /Users/x/.claude/skills/vc-init\n# vc-init — Technical Due Diligence\nThis whole skill body is harness-injected, not conversation.";
+    // A genuine user turn that PASTES a prior transcript containing the same
+    // markers mid-body. Must survive: it is real conversation, not an injection.
+    let pasted_transcript = "Please analyze the transcript I pasted below:\n\n> <command-name>/foo</command-name>\n> <local-command-caveat>noise</local-command-caveat>\nPASTED_TRANSCRIPT_SENTINEL — keep me.";
+    let lines = [
+        json!({
+            "type": "user",
+            "message": { "role": "user", "content": skill_invocation },
+            "timestamp": (now - chrono::Duration::seconds(6)).to_rfc3339_opts(SecondsFormat::Secs, true),
+            "sessionId": "claude-session-harness-noise",
+            "gitBranch": "main",
+            "cwd": cwd.display().to_string(),
+        })
+        .to_string(),
+        json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": "<local-command-caveat>Caveat: generated while running local commands.</local-command-caveat>\n<bash-input>git status</bash-input>",
+            },
+            "timestamp": (now - chrono::Duration::seconds(5)).to_rfc3339_opts(SecondsFormat::Secs, true),
+            "sessionId": "claude-session-harness-noise",
+            "gitBranch": "main",
+            "cwd": cwd.display().to_string(),
+        })
+        .to_string(),
+        json!({
+            "type": "assistant",
+            "message": { "role": "assistant", "content": [{ "type": "text", "text": "REAL_ASSISTANT_REPLY — kept." }] },
+            "timestamp": (now - chrono::Duration::seconds(4)).to_rfc3339_opts(SecondsFormat::Secs, true),
+            "sessionId": "claude-session-harness-noise",
+            "gitBranch": "main",
+            "cwd": cwd.display().to_string(),
+        })
+        .to_string(),
+        json!({
+            "type": "user",
+            "message": { "role": "user", "content": pasted_transcript },
+            "timestamp": (now - chrono::Duration::seconds(3)).to_rfc3339_opts(SecondsFormat::Secs, true),
+            "sessionId": "claude-session-harness-noise",
+            "gitBranch": "main",
+            "cwd": cwd.display().to_string(),
+        })
+        .to_string(),
+    ];
+
+    write_file(path, &lines.join("\n"));
+}
+
+#[test]
+fn session_conversation_extract_strips_harness_injected_noise_keeps_real_turns() {
+    let root = unique_test_dir("claude-session-harness-noise");
+    let home = root.join("home");
+    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let session_path = home
+        .join(".claude")
+        .join("projects")
+        .join("-Users-test-hosted-VetCoders-aicx")
+        .join("claude-session-harness-noise.jsonl");
+
+    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
+    write_claude_session_with_harness_noise(&session_path, &repo_root);
+
+    let full_output = run_aicx(
+        &home,
+        &[
+            "extract",
+            "--agent",
+            "claude",
+            "--session",
+            "claude-session-harness-noise",
+            "-H",
+            "24",
+        ],
+    );
+    assert_success(&full_output);
+
+    let conversation_output = run_aicx(
+        &home,
+        &[
+            "extract",
+            "--agent",
+            "claude",
+            "--session",
+            "claude-session-harness-noise",
+            "--conversation",
+            "-H",
+            "24",
+        ],
+    );
+    assert_success(&conversation_output);
+
+    let full_path = home
+        .join(".aicx")
+        .join("extracts")
+        .join("claude")
+        .join("claude-session-harness-noise.md");
+    let conversation_path = home
+        .join(".aicx")
+        .join("extracts")
+        .join("claude")
+        .join("claude-session-harness-noise_conversation.md");
+
+    let full = fs::read_to_string(&full_path).expect("read full extract");
+    let conversation = fs::read_to_string(&conversation_path).expect("read conversation extract");
+
+    // Full report keeps everything, including the harness-injected skill body.
+    assert!(full.contains("Base directory for this skill"));
+    assert!(full.contains("git status"));
+
+    // Conversation projection DROPS harness-injected turns ...
+    assert!(!conversation.contains("Base directory for this skill"));
+    assert!(!conversation.contains("This whole skill body is harness-injected"));
+    assert!(!conversation.contains("git status"));
+    // ... but PRESERVES real conversation: assistant reply + pasted transcript.
+    assert!(conversation.contains("REAL_ASSISTANT_REPLY"));
+    assert!(conversation.contains("PASTED_TRANSCRIPT_SENTINEL"));
+
+    let _ = fs::remove_dir_all(&root);
+}
