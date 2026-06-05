@@ -548,7 +548,7 @@ fn session_reference_resolver_ignores_out_of_window_alias() {
 }
 
 fn default_session_extract_file_name(session_id: &str) -> String {
-    default_session_extract_path("claude", session_id)
+    default_session_extract_path_for("claude", session_id, false, false)
         .expect("default session extract path should resolve")
         .file_name()
         .expect("default session extract path should include a file name")
@@ -557,7 +557,7 @@ fn default_session_extract_file_name(session_id: &str) -> String {
 }
 
 fn default_session_conversation_extract_file_name(session_id: &str) -> String {
-    default_session_conversation_extract_path("claude", session_id)
+    default_session_extract_path_for("claude", session_id, true, false)
         .expect("default conversation extract path should resolve")
         .file_name()
         .expect("default conversation extract path should include a file name")
@@ -580,6 +580,48 @@ fn default_session_conversation_extract_path_uses_distinct_suffix() {
         default_session_extract_file_name("abc-123"),
         default_session_conversation_extract_file_name("abc-123")
     );
+}
+
+#[test]
+fn default_session_extract_paths_never_collide_across_mode_axes() {
+    // The four (conversation, user_only) modes must each resolve to a distinct
+    // file so a user-only extract never overwrites the both-roles one.
+    let full = default_session_extract_path_for("claude", "abc-123", false, false)
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let full_user = default_session_extract_path_for("claude", "abc-123", false, true)
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let conv = default_session_extract_path_for("claude", "abc-123", true, false)
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let conv_user = default_session_extract_path_for("claude", "abc-123", true, true)
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    assert_eq!(full, "abc-123.md");
+    assert_eq!(full_user, "abc-123_user.md");
+    assert_eq!(conv, "abc-123_conversation.md");
+    assert_eq!(conv_user, "abc-123_conversation_user.md");
+
+    let all = [&full, &full_user, &conv, &conv_user];
+    for (i, a) in all.iter().enumerate() {
+        for b in &all[i + 1..] {
+            assert_ne!(a, b, "extract mode paths must be unique");
+        }
+    }
 }
 
 #[test]
@@ -659,7 +701,8 @@ fn default_session_extract_path_unicode_control_chars_are_stripped() {
 fn default_session_extract_path_backslash_is_not_a_path_separator() {
     // A backslash in the session id must sanitize to a safe char, never
     // leak as a Windows path separator that could split the component.
-    let path = default_session_extract_path("claude", "a\\b").expect("path resolves");
+    let path =
+        default_session_extract_path_for("claude", "a\\b", false, false).expect("path resolves");
     let file_name = path
         .file_name()
         .expect("file name")

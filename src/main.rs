@@ -2842,15 +2842,25 @@ fn default_session_extract_path_for_stem(agent_label: &str, stem: &str) -> Resul
         .join(format!("{stem}.md")))
 }
 
-fn default_session_extract_path(agent_label: &str, session_id: &str) -> Result<PathBuf> {
-    default_session_extract_path_for_stem(agent_label, &safe_session_extract_stem(session_id))
-}
-
-fn default_session_conversation_extract_path(
+/// Compose the default session-extract path for a given mode pair. The stem
+/// encodes BOTH axes so the four modes never collide on disk:
+///   * full, both roles            -> `<stem>.md`
+///   * full, user-only             -> `<stem>_user.md`
+///   * conversation, both roles    -> `<stem>_conversation.md`
+///   * conversation, user-only     -> `<stem>_conversation_user.md`
+fn default_session_extract_path_for(
     agent_label: &str,
     session_id: &str,
+    conversation: bool,
+    user_only: bool,
 ) -> Result<PathBuf> {
-    let stem = format!("{}_conversation", safe_session_extract_stem(session_id));
+    let mut stem = safe_session_extract_stem(session_id);
+    if conversation {
+        stem.push_str("_conversation");
+    }
+    if user_only {
+        stem.push_str("_user");
+    }
     default_session_extract_path_for_stem(agent_label, &stem)
 }
 
@@ -3404,10 +3414,15 @@ fn resolve_session_reference(
 }
 
 /// Run extraction filtered by `session_id` for a single agent and write either
-/// a full report or a denoised conversation transcript. Default output path is
-/// `~/.aicx/extracts/<agent>/<session_id>.md`, or
-/// `~/.aicx/extracts/<agent>/<session_id>_conversation.md` with
-/// `--conversation`; override via `output`.
+/// a full report or a denoised conversation transcript. The default output path
+/// encodes both the `--conversation` and `--user-only` axes so the four modes
+/// never collide:
+///   * `~/.aicx/extracts/<agent>/<session_id>.md`
+///   * `~/.aicx/extracts/<agent>/<session_id>_user.md` (`--user-only`)
+///   * `~/.aicx/extracts/<agent>/<session_id>_conversation.md` (`--conversation`)
+///   * `~/.aicx/extracts/<agent>/<session_id>_conversation_user.md` (both)
+///
+/// Override via `output`.
 fn run_extract_session(
     session_id: &str,
     agent: ExtractInputFormat,
@@ -3481,10 +3496,15 @@ fn run_extract_session(
 
     let output_path = match output {
         Some(p) => p,
-        None if conversation => {
-            default_session_conversation_extract_path(agent_label, &resolution.canonical_id)?
-        }
-        None => default_session_extract_path(agent_label, &resolution.canonical_id)?,
+        // `user_only` (== `!include_assistant`) is a distinct output axis: a
+        // user-only extract must not overwrite the both-roles extract of the
+        // same session/mode, so it earns its own `_user` suffix.
+        None => default_session_extract_path_for(
+            agent_label,
+            &resolution.canonical_id,
+            conversation,
+            !include_assistant,
+        )?,
     };
 
     let inferred_repos = sources::repo_labels_from_entries(&entries, &[]);
