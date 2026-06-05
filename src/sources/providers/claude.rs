@@ -21,6 +21,12 @@ struct ClaudeEntry {
     git_branch: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
+    /// Harness-injected/meta marker. When `true`, the row is synthetic context
+    /// (hook output, system reminder, injected card) rather than real
+    /// conversation, so every block it produces is reclassified to
+    /// `FrameKind::SystemNote`.
+    #[serde(rename = "isMeta", default)]
+    is_meta: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -155,6 +161,11 @@ fn extract_claude_line_entries(
     }
 
     let mut entries = Vec::new();
+    // A harness-injected/meta row is synthetic context, not real conversation:
+    // collapse every block it produces to SystemNote so the conversation
+    // projection and the user-only/intent lane (both keyed on frame_kind) drop
+    // it structurally, regardless of its surface role.
+    let force_system = entry.is_meta == Some(true);
     let fallback_role = if entry.entry_type == "tool_use" || entry.entry_type == "tool_result" {
         role_for_frame_kind(FrameKind::ToolCall)
     } else {
@@ -164,19 +175,29 @@ fn extract_claude_line_entries(
     let classified = extract_claude_classified_blocks(&entry.message, fallback_role);
     if !classified.is_empty() {
         for block in classified {
-            if !should_keep_entry(Some(block.frame_kind), config) {
+            let frame_kind = if force_system {
+                FrameKind::SystemNote
+            } else {
+                block.frame_kind
+            };
+            let role = if force_system {
+                role_for_frame_kind(FrameKind::SystemNote)
+            } else {
+                block.role.as_str()
+            };
+            if !should_keep_entry(Some(frame_kind), config) {
                 continue;
             }
             entries.push(build_timeline_entry_with_content_warnings(
                 timestamp,
                 "claude",
                 session_id,
-                &block.role,
+                role,
                 block.message,
                 TimelineEntryMeta {
                     branch: entry.git_branch.clone(),
                     cwd: entry.cwd.clone(),
-                    frame_kind: Some(block.frame_kind),
+                    frame_kind: Some(frame_kind),
                     timestamp_source: timestamp_source.map(str::to_string),
                 },
                 warnings,
@@ -190,17 +211,26 @@ fn extract_claude_line_entries(
         return Vec::new();
     }
 
-    let frame_kind = frame_kind_from_claude_type(&entry.entry_type)
-        .or_else(|| frame_kind_from_role(fallback_role));
+    let frame_kind = if force_system {
+        Some(FrameKind::SystemNote)
+    } else {
+        frame_kind_from_claude_type(&entry.entry_type)
+            .or_else(|| frame_kind_from_role(fallback_role))
+    };
     if !should_keep_entry(frame_kind, config) {
         return Vec::new();
     }
+    let role = if force_system {
+        role_for_frame_kind(FrameKind::SystemNote)
+    } else {
+        fallback_role
+    };
 
     entries.push(build_timeline_entry_with_content_warnings(
         timestamp,
         "claude",
         session_id,
-        fallback_role,
+        role,
         message,
         TimelineEntryMeta {
             branch: entry.git_branch,

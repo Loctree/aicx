@@ -389,6 +389,49 @@ fn test_extract_claude_file_classifies_frame_kinds_from_fixture() {
 }
 
 #[test]
+fn test_extract_claude_file_ismeta_user_entry_becomes_system_note() {
+    // A harness-injected user row (`isMeta: true` — e.g. a hook/system-reminder
+    // injection) must be classified as SystemNote, not UserMsg, so it is dropped
+    // by the conversation projection and excluded from the user-only/intent lane,
+    // while still surviving the full report (include_assistant = true).
+    let root = unique_test_dir("claude-ismeta-system-note");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"type":"user","message":{"role":"user","content":"real operator question"},"timestamp":"2026-04-14T10:00:00Z","sessionId":"sess-meta","gitBranch":"main","cwd":"/tmp/aicx"}
+{"type":"user","isMeta":true,"message":{"role":"user","content":"<system-reminder>injected hook context</system-reminder>"},"timestamp":"2026-04-14T10:00:01Z","sessionId":"sess-meta","gitBranch":"main","cwd":"/tmp/aicx"}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_claude_file(&tmp, &config).unwrap();
+    assert_eq!(
+        frame_kinds(&entries),
+        vec![Some(FrameKind::UserMsg), Some(FrameKind::SystemNote)]
+    );
+    assert_eq!(entries[0].message, "real operator question");
+    assert!(entries[1].message.contains("injected hook context"));
+
+    // user-only extraction (include_assistant = false) must drop the meta row.
+    let user_only = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: false,
+        watermark: None,
+    };
+    let user_entries = extract_claude_file(&tmp, &user_only).unwrap();
+    assert_eq!(frame_kinds(&user_entries), vec![Some(FrameKind::UserMsg)]);
+    assert_eq!(user_entries[0].message, "real operator question");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn test_extract_claude_file_drops_signature_only_thinking_killer_case() {
     let root = unique_test_dir("claude-empty-thinking-signature");
     let tmp = root.join("session.jsonl");
