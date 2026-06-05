@@ -128,6 +128,73 @@ fn write_claude_session_with_empty_signature(path: &Path, cwd: &Path) {
     write_file(path, &lines.join("\n"));
 }
 
+fn write_claude_session_with_extract_noise(path: &Path, cwd: &Path) {
+    let now = Utc::now();
+    let lines = [
+        json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": "Please inspect the repo",
+            },
+            "timestamp": (now - chrono::Duration::seconds(4)).to_rfc3339_opts(SecondsFormat::Secs, true),
+            "sessionId": "claude-session-extract-contract",
+            "gitBranch": "main",
+            "cwd": cwd.display().to_string(),
+        })
+        .to_string(),
+        json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "Hidden reasoning note that belongs only in full extract",
+                    },
+                    {
+                        "type": "text",
+                        "text": "Visible answer for the operator",
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_extract_contract",
+                        "name": "Bash",
+                        "input": {
+                            "command": "rg frame_kind",
+                        },
+                    }
+                ],
+            },
+            "timestamp": (now - chrono::Duration::seconds(3)).to_rfc3339_opts(SecondsFormat::Secs, true),
+            "sessionId": "claude-session-extract-contract",
+            "gitBranch": "main",
+            "cwd": cwd.display().to_string(),
+        })
+        .to_string(),
+        json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_extract_contract",
+                        "content": "tool output that belongs only in full extract",
+                    }
+                ],
+            },
+            "timestamp": (now - chrono::Duration::seconds(2)).to_rfc3339_opts(SecondsFormat::Secs, true),
+            "sessionId": "claude-session-extract-contract",
+            "gitBranch": "main",
+            "cwd": cwd.display().to_string(),
+        })
+        .to_string(),
+    ];
+
+    write_file(path, &lines.join("\n"));
+}
+
 fn current_profile_dir() -> PathBuf {
     let test_exe = std::env::current_exe().expect("resolve current test executable");
     test_exe
@@ -448,6 +515,89 @@ fn claude_store_does_not_emit_empty_thinking_signature() {
     assert!(conversation.contains("Visible Claude answer"));
     assert!(!conversation.contains(r#""signature""#));
     assert!(!conversation.contains("abc123"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn session_extract_conversation_flag_writes_distinct_denoised_default_file() {
+    let root = unique_test_dir("claude-session-conversation-default");
+    let home = root.join("home");
+    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let session_path = home
+        .join(".claude")
+        .join("projects")
+        .join("-Users-test-hosted-VetCoders-aicx")
+        .join("claude-session-extract-contract.jsonl");
+
+    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
+    write_claude_session_with_extract_noise(&session_path, &repo_root);
+
+    let full_output = run_aicx(
+        &home,
+        &[
+            "extract",
+            "--agent",
+            "claude",
+            "--session",
+            "claude-session-extract-contract",
+            "-H",
+            "24",
+        ],
+    );
+    assert_success(&full_output);
+
+    let conversation_output = run_aicx(
+        &home,
+        &[
+            "extract",
+            "--agent",
+            "claude",
+            "--session",
+            "claude-session-extract-contract",
+            "--conversation",
+            "-H",
+            "24",
+        ],
+    );
+    assert_success(&conversation_output);
+
+    let full_path = home
+        .join(".aicx")
+        .join("extracts")
+        .join("claude")
+        .join("claude-session-extract-contract.md");
+    let conversation_path = home
+        .join(".aicx")
+        .join("extracts")
+        .join("claude")
+        .join("claude-session-extract-contract_conversation.md");
+
+    assert!(
+        full_path.exists(),
+        "full extract missing at {}",
+        full_path.display()
+    );
+    assert!(
+        conversation_path.exists(),
+        "conversation extract missing at {}",
+        conversation_path.display()
+    );
+
+    let full = fs::read_to_string(&full_path).expect("read full extract");
+    let conversation = fs::read_to_string(&conversation_path).expect("read conversation extract");
+
+    assert!(full.contains("Hidden reasoning note that belongs only in full extract"));
+    assert!(full.contains("rg frame_kind"));
+    assert!(full.contains("toolu_extract_contract"));
+    assert!(full.contains("tool output that belongs only in full extract"));
+    assert!(full.contains("Visible answer for the operator"));
+    assert!(conversation.contains("Visible answer for the operator"));
+    assert!(!conversation.contains("Hidden reasoning note that belongs only in full extract"));
+    assert!(!conversation.contains("rg frame_kind"));
+    assert!(!conversation.contains("toolu_extract_contract"));
+    assert!(!conversation.contains("tool output that belongs only in full extract"));
+    assert_ne!(full, conversation);
 
     let _ = fs::remove_dir_all(&root);
 }

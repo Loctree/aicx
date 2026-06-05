@@ -556,9 +556,30 @@ fn default_session_extract_file_name(session_id: &str) -> String {
         .into_owned()
 }
 
+fn default_session_conversation_extract_file_name(session_id: &str) -> String {
+    default_session_conversation_extract_path("claude", session_id)
+        .expect("default conversation extract path should resolve")
+        .file_name()
+        .expect("default conversation extract path should include a file name")
+        .to_string_lossy()
+        .into_owned()
+}
+
 #[test]
 fn default_session_extract_path_empty_session_uses_safe_fallback() {
     assert_eq!(default_session_extract_file_name(""), "session.md");
+}
+
+#[test]
+fn default_session_conversation_extract_path_uses_distinct_suffix() {
+    assert_eq!(
+        default_session_conversation_extract_file_name("abc-123"),
+        "abc-123_conversation.md"
+    );
+    assert_ne!(
+        default_session_extract_file_name("abc-123"),
+        default_session_conversation_extract_file_name("abc-123")
+    );
 }
 
 #[test]

@@ -720,9 +720,10 @@ enum Commands {
     /// 2. Session mode: `aicx extract --session <uuid> --agent {claude,codex,gemini,junie} [-o FILE]`
     ///
     /// In session mode, the chosen agent's source store is scanned, all timeline
-    /// entries matching `--session` are filtered, and a denoised conversation
-    /// Markdown transcript is written. Default output path is
-    /// `~/.aicx/extracts/<agent>/<session_id>.md`.
+    /// entries matching `--session` are filtered, and either a full timeline
+    /// report or a denoised conversation Markdown transcript is written.
+    /// Default output paths are `~/.aicx/extracts/<agent>/<session_id>.md`
+    /// and `~/.aicx/extracts/<agent>/<session_id>_conversation.md`.
     #[command(display_order = 5)]
     Extract {
         #[command(flatten)]
@@ -1778,7 +1779,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                         include_assistant,
                         max_message_chars,
                         redact_secrets: redaction.redact_secrets,
-                        conversation: true, // session mode is conversation-first by default
+                        conversation,
                     },
                 )?;
             } else {
@@ -2780,60 +2781,77 @@ fn extract_input_format_label(format: ExtractInputFormat) -> &'static str {
 /// `~/.aicx/extracts/<agent>/<session_id>.md`.
 const DEFAULT_SESSION_EXTRACT_FILENAME_STEM_MAX_BYTES: usize = 180;
 
-fn default_session_extract_path(agent_label: &str, session_id: &str) -> Result<PathBuf> {
-    let base = aicx::store::store_base_dir()?;
+fn safe_session_extract_stem(session_id: &str) -> String {
     let is_already_safe = !session_id.is_empty()
         && session_id.len() <= DEFAULT_SESSION_EXTRACT_FILENAME_STEM_MAX_BYTES
         && !session_id.chars().all(|c| c == '.')
         && session_id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-    let safe_session = if is_already_safe {
-        session_id.to_string()
-    } else if session_id.is_empty() {
-        "session".to_string()
-    } else {
-        let mut safe = String::new();
-        let mut previous_was_separator = false;
+    if is_already_safe {
+        return session_id.to_string();
+    }
 
-        for ch in session_id.chars() {
-            let mapped = if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '_'
-            };
+    if session_id.is_empty() {
+        return "session".to_string();
+    }
 
-            if mapped == '_' {
-                if !previous_was_separator {
-                    safe.push(mapped);
-                }
-                previous_was_separator = true;
-            } else {
-                safe.push(mapped);
-                previous_was_separator = false;
-            }
-        }
+    let mut safe = String::new();
+    let mut previous_was_separator = false;
 
-        let safe = safe.trim_matches(|ch| ch == '_' || ch == '.');
-        let base = if safe.is_empty() { "session" } else { safe };
-        let base_max_len = DEFAULT_SESSION_EXTRACT_FILENAME_STEM_MAX_BYTES - 17;
-        let capped_base = if base.len() > base_max_len {
-            &base[..base_max_len]
+    for ch in session_id.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            ch
         } else {
-            base
+            '_'
         };
 
-        use siphasher::sip::SipHasher13;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = SipHasher13::new();
-        session_id.hash(&mut hasher);
-        let suffix = hasher.finish();
-        format!("{capped_base}-{suffix:016x}")
+        if mapped == '_' {
+            if !previous_was_separator {
+                safe.push(mapped);
+            }
+            previous_was_separator = true;
+        } else {
+            safe.push(mapped);
+            previous_was_separator = false;
+        }
+    }
+
+    let safe = safe.trim_matches(|ch| ch == '_' || ch == '.');
+    let base = if safe.is_empty() { "session" } else { safe };
+    let base_max_len = DEFAULT_SESSION_EXTRACT_FILENAME_STEM_MAX_BYTES - 17;
+    let capped_base = if base.len() > base_max_len {
+        &base[..base_max_len]
+    } else {
+        base
     };
+
+    use siphasher::sip::SipHasher13;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = SipHasher13::new();
+    session_id.hash(&mut hasher);
+    let suffix = hasher.finish();
+    format!("{capped_base}-{suffix:016x}")
+}
+
+fn default_session_extract_path_for_stem(agent_label: &str, stem: &str) -> Result<PathBuf> {
+    let base = aicx::store::store_base_dir()?;
     Ok(base
         .join("extracts")
         .join(agent_label)
-        .join(format!("{safe_session}.md")))
+        .join(format!("{stem}.md")))
+}
+
+fn default_session_extract_path(agent_label: &str, session_id: &str) -> Result<PathBuf> {
+    default_session_extract_path_for_stem(agent_label, &safe_session_extract_stem(session_id))
+}
+
+fn default_session_conversation_extract_path(
+    agent_label: &str,
+    session_id: &str,
+) -> Result<PathBuf> {
+    let stem = format!("{}_conversation", safe_session_extract_stem(session_id));
+    default_session_extract_path_for_stem(agent_label, &stem)
 }
 
 struct ConversationsBatchOptions {
@@ -3384,9 +3402,11 @@ fn resolve_session_reference(
     resolve_session_reference_from_candidates(requested, &session_ids, alias_matches, agent_label)
 }
 
-/// Run extraction filtered by `session_id` for a single agent and write a
-/// denoised conversation Markdown transcript. Default output path is
-/// `~/.aicx/extracts/<agent>/<session_id>.md`; override via `output`.
+/// Run extraction filtered by `session_id` for a single agent and write either
+/// a full report or a denoised conversation transcript. Default output path is
+/// `~/.aicx/extracts/<agent>/<session_id>.md`, or
+/// `~/.aicx/extracts/<agent>/<session_id>_conversation.md` with
+/// `--conversation`; override via `output`.
 fn run_extract_session(
     session_id: &str,
     agent: ExtractInputFormat,
@@ -3460,6 +3480,9 @@ fn run_extract_session(
 
     let output_path = match output {
         Some(p) => p,
+        None if conversation => {
+            default_session_conversation_extract_path(agent_label, &resolution.canonical_id)?
+        }
         None => default_session_extract_path(agent_label, &resolution.canonical_id)?,
     };
 
