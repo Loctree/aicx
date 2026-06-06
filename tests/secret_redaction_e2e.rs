@@ -143,6 +143,7 @@ fn extract_outputs_do_not_leak_modern_secret_families() {
         conversation_messages: messages.len(),
         conversation_projection: "user_assistant_only",
         exact_short_duplicates_dropped: 0,
+        harness_noise_dropped: 0,
     };
 
     write_conversation_markdown(&md_path, &messages, &metadata).expect("write markdown");

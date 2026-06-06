@@ -121,7 +121,8 @@ pub(crate) fn frame_kind_from_role(role: &str) -> Option<FrameKind> {
         "assistant" | "agent" => Some(FrameKind::AgentReply),
         "reasoning" | "thinking" => Some(FrameKind::InternalThought),
         "tool" | "tool_call" | "tool_result" | "function_call" => Some(FrameKind::ToolCall),
-        "system" | "info" | "error" | "notification" | "system_note" => Some(FrameKind::SystemNote),
+        "system" | "info" | "error" | "notification" | "system_note" | "developer"
+        | "instructions" => Some(FrameKind::SystemNote),
         _ => None,
     }
 }

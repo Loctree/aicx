@@ -708,6 +708,36 @@ fn test_extract_codex_file_classifies_frame_kinds_from_fixture() {
 }
 
 #[test]
+fn test_extract_codex_file_classifies_developer_response_item_as_system_note() {
+    let root = unique_test_dir("codex-developer-response-item");
+    let tmp = root.join("rollout.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"timestamp":"2026-06-05T10:00:00Z","type":"session_meta","payload":{"id":"codex-developer-role","cwd":"/tmp/aicx"}}
+{"timestamp":"2026-06-05T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"real user request"}]}}
+{"timestamp":"2026-06-05T10:00:02Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"injected developer instruction"}]}}"#;
+    write_file(&tmp, content);
+
+    let entries = extract_codex_file(&tmp, &default_config(true)).unwrap();
+    assert_eq!(
+        frame_kinds(&entries),
+        vec![Some(FrameKind::UserMsg), Some(FrameKind::SystemNote)]
+    );
+    assert_eq!(entries[0].role, "user");
+    assert_eq!(entries[0].message, "real user request");
+    assert_eq!(entries[1].role, "system");
+    assert_eq!(entries[1].message, "injected developer instruction");
+
+    let user_only_entries = extract_codex_file(&tmp, &default_config(false)).unwrap();
+    assert_eq!(
+        frame_kinds(&user_only_entries),
+        vec![Some(FrameKind::UserMsg)]
+    );
+    assert_eq!(user_only_entries[0].message, "real user request");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn test_parse_codex_session_missing_meta_warns_and_falls_back_to_stem() {
     let root = unique_test_dir("codex-missing-session-meta");
     let tmp = root.join("rollout-without-meta.jsonl");
