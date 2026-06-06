@@ -1331,7 +1331,63 @@ pub fn render_semantic_status_line(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SEARCH_TEST_AICX_HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct SearchTestAicxHomeGuard {
+        previous: Option<OsString>,
+        dir: PathBuf,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for SearchTestAicxHomeGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(previous) => {
+                    // SAFETY: tests that mutate AICX_HOME are serialized by
+                    // SEARCH_TEST_AICX_HOME_LOCK for the guard lifetime.
+                    unsafe { std::env::set_var("AICX_HOME", previous) };
+                }
+                None => {
+                    // SAFETY: tests that mutate AICX_HOME are serialized by
+                    // SEARCH_TEST_AICX_HOME_LOCK for the guard lifetime.
+                    unsafe { std::env::remove_var("AICX_HOME") };
+                }
+            }
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn set_search_test_aicx_home(label: &str) -> SearchTestAicxHomeGuard {
+        let guard = SEARCH_TEST_AICX_HOME_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("search AICX_HOME test lock");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "aicx-search-engine-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create isolated search AICX_HOME");
+        let previous = std::env::var_os("AICX_HOME");
+        // SAFETY: guarded by SEARCH_TEST_AICX_HOME_LOCK for the full
+        // lifetime of the returned guard.
+        unsafe { std::env::set_var("AICX_HOME", &dir) };
+        SearchTestAicxHomeGuard {
+            previous,
+            dir,
+            _guard: guard,
+        }
+    }
 
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     fn test_semantic_filters<'a>(project: Option<&'a str>) -> SemanticRetrievalFilters<'a> {
@@ -1344,19 +1400,13 @@ mod tests {
 
     #[test]
     fn fail_fast_carries_actionable_recommendation() {
+        let home = set_search_test_aicx_home("fail-fast");
         // In any test environment we either lack the feature flag, lack a
         // hydrated embedder, or lack a built index. The function must
         // never panic, and the typed error must carry both a non-empty
         // `reason` AND a non-empty `recommendation` so the operator
         // knows what to do next.
-        let result = try_semantic_search(
-            Path::new("/tmp/aicx-search-engine-test"),
-            "any query",
-            10,
-            &[None],
-            None,
-            None,
-        );
+        let result = try_semantic_search(&home.dir, "any query", 10, &[None], None, None);
 
         match result {
             Err(err) => {
