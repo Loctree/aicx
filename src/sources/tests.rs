@@ -1457,6 +1457,47 @@ fn test_extract_junie_file_honors_user_only_mode() {
 }
 
 #[test]
+fn test_extract_junie_file_plan_attachment_prompt_becomes_system_note() {
+    let root = unique_test_dir("junie-plan-attachment-system-note");
+    let session_dir = root.join("session-260605-183024-junie");
+    let tmp = session_dir.join("events.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"kind":"UserPromptEvent","requestId":"prompt-260605-183100-real1","prompt":"real operator question","presentablePrompt":"real operator question"}
+{"kind":"UserPromptEvent","requestId":"prompt-260605-183101-meta1","prompt":"Implement the suggested plan","presentablePrompt":"Implement the suggested plan","customAttachments":[{"kind":"PlanAttachment","plan":{"sections":[{"name":"Requirements","content":"Injected harness plan"}]}}]}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_junie_file(&tmp, &config).unwrap();
+    assert_eq!(
+        frame_kinds(&entries),
+        vec![Some(FrameKind::UserMsg), Some(FrameKind::SystemNote)]
+    );
+    assert_eq!(entries[0].role, "user");
+    assert_eq!(entries[0].message, "real operator question");
+    assert_eq!(entries[1].role, "system");
+    assert_eq!(entries[1].message, "Implement the suggested plan");
+
+    let user_only = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: false,
+        watermark: None,
+    };
+    let user_entries = extract_junie_file(&tmp, &user_only).unwrap();
+    assert_eq!(frame_kinds(&user_entries), vec![Some(FrameKind::UserMsg)]);
+    assert_eq!(user_entries[0].message, "real operator question");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn test_extract_gemini_antigravity_prefers_conversation_artifacts_for_brain_input() {
     let root = unique_test_dir("gemini-antigravity-brain");
     let brain = root.join("brain").join("conv-1");

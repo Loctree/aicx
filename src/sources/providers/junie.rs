@@ -74,17 +74,26 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                     .and_then(|value| value.as_str())
                     .and_then(parse_junie_request_timestamp);
                 let timestamp = next_junie_timestamp(&mut cursor, candidate);
+                let frame_kind = if junie_prompt_is_meta(&raw) {
+                    FrameKind::SystemNote
+                } else {
+                    FrameKind::UserMsg
+                };
+                let role = role_for_frame_kind(frame_kind);
                 if junie_timestamp_in_window(timestamp, config) {
+                    if !should_keep_entry(Some(frame_kind), config) {
+                        continue;
+                    }
                     entries.push(build_timeline_entry_with_content_warnings(
                         timestamp,
                         "junie",
                         &session_id,
-                        "user",
+                        role,
                         message,
                         TimelineEntryMeta {
                             branch: None,
                             cwd: current_cwd.clone(),
-                            frame_kind: Some(FrameKind::UserMsg),
+                            frame_kind: Some(frame_kind),
                             timestamp_source: None,
                         },
                         &mut warnings,
@@ -114,6 +123,34 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                             branch: None,
                             cwd: current_cwd.clone(),
                             frame_kind: Some(FrameKind::UserMsg),
+                            timestamp_source: None,
+                        },
+                        &mut warnings,
+                    ));
+                }
+            }
+            Some("SystemMessageEvent") => {
+                let message = render_junie_system_message(&raw);
+                let Some(message) = message else {
+                    continue;
+                };
+
+                let frame_kind = FrameKind::SystemNote;
+                let timestamp = next_junie_timestamp(&mut cursor, None);
+                if junie_timestamp_in_window(timestamp, config) {
+                    if !should_keep_entry(Some(frame_kind), config) {
+                        continue;
+                    }
+                    entries.push(build_timeline_entry_with_content_warnings(
+                        timestamp,
+                        "junie",
+                        &session_id,
+                        role_for_frame_kind(frame_kind),
+                        message,
+                        TimelineEntryMeta {
+                            branch: None,
+                            cwd: current_cwd.clone(),
+                            frame_kind: Some(frame_kind),
                             timestamp_source: None,
                         },
                         &mut warnings,
@@ -460,6 +497,7 @@ fn detect_junie_interesting_kind(line: &str) -> Option<&'static str> {
     const KINDS: &[&str] = &[
         "UserPromptEvent",
         "UserResponseEvent",
+        "SystemMessageEvent",
         "CurrentDirectoryUpdatedEvent",
         "ResultBlockUpdatedEvent",
         "AgentThoughtBlockUpdatedEvent",
@@ -482,6 +520,39 @@ fn detect_junie_interesting_kind(line: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+fn junie_prompt_is_meta(raw: &serde_json::Value) -> bool {
+    raw.get("customAttachments")
+        .and_then(|value| value.as_array())
+        .is_some_and(|attachments| {
+            attachments.iter().any(|attachment| {
+                matches!(
+                    attachment.get("kind").and_then(|value| value.as_str()),
+                    Some("PlanAttachment" | "ContinueTaskAttachment")
+                )
+            })
+        })
+}
+
+fn render_junie_system_message(raw: &serde_json::Value) -> Option<String> {
+    let text = raw
+        .get("text")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let details = raw
+        .get("details")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+
+    match (text, details) {
+        (Some(text), Some(details)) => Some(format!("{text}\n{details}")),
+        (Some(text), None) => Some(text.to_string()),
+        (None, Some(details)) => Some(details.to_string()),
+        (None, None) => None,
+    }
 }
 
 pub(crate) fn junie_session_id_from_path_with_warning(
