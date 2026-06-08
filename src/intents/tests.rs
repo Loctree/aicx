@@ -801,15 +801,15 @@ fn agent_chunk_still_yields_intents_drift_red() {
 }
 
 #[test]
-fn unresolved_filter_is_noop_without_outcomes_red() {
-    // F2 / dead `--unresolved`.
-    // RED: CURRENT behavior = with >=1 Intent and NO matching Outcome in the
-    // same session, `apply_display_filters` with unresolved:true removes
-    // nothing, so its output is byte-identical to the unfiltered output
-    // (unresolved_out == full_out → the filter is dead in the common case).
-    // DESIRED post-fix invariant = `--unresolved` actually narrows output, so
-    // the two results DIFFER. We assert the DESIRED invariant (assert_ne!), so
-    // this is RED now and flips GREEN when the filter delivers real narrowing.
+fn unresolved_filter_narrows_when_session_resolved() {
+    // F2 anchor (was `unresolved_filter_is_noop_without_outcomes_red`).
+    // `--unresolved` must drop Intents whose session is resolved by a matching
+    // Outcome and keep Intents whose session has none. With one resolved session
+    // (Intent + its Outcome) and one open Intent, the filtered output must DIFFER
+    // from the full output (real narrowing): the resolved Intent is dropped, the
+    // open Intent survives.
+    // (The CLI-level `--kind intent` interaction is fixed in `run_intents`, which
+    // defers the kind filter so Outcomes survive the resolution check.)
     let records = vec![
         IntentRecord {
             kind: IntentKind::Intent,
@@ -820,11 +820,26 @@ fn unresolved_filter_is_noop_without_outcomes_red() {
             agent: "codex".to_string(),
             date: "2026-03-15".to_string(),
             timestamp: None,
-            session_id: "sess-unresolved-a".to_string(),
+            session_id: "sess-resolved".to_string(),
             count: None,
             first_chunk: None,
             last_chunk: None,
-            source_chunk: "/tmp/demo/unresolved-a.md".to_string(),
+            source_chunk: "/tmp/demo/resolved-intent.md".to_string(),
+        },
+        IntentRecord {
+            kind: IntentKind::Outcome,
+            summary: "native intents audit shipped".to_string(),
+            context: None,
+            evidence: vec![],
+            project: "demo".to_string(),
+            agent: "codex".to_string(),
+            date: "2026-03-15".to_string(),
+            timestamp: None,
+            session_id: "sess-resolved".to_string(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: "/tmp/demo/resolved-outcome.md".to_string(),
         },
         IntentRecord {
             kind: IntentKind::Intent,
@@ -835,11 +850,11 @@ fn unresolved_filter_is_noop_without_outcomes_red() {
             agent: "codex".to_string(),
             date: "2026-03-15".to_string(),
             timestamp: None,
-            session_id: "sess-unresolved-b".to_string(),
+            session_id: "sess-open".to_string(),
             count: None,
             first_chunk: None,
             last_chunk: None,
-            source_chunk: "/tmp/demo/unresolved-b.md".to_string(),
+            source_chunk: "/tmp/demo/open-intent.md".to_string(),
         },
     ];
 
@@ -854,20 +869,27 @@ fn unresolved_filter_is_noop_without_outcomes_red() {
 
     assert_ne!(
         unresolved_out, full_out,
-        "--unresolved removed nothing (dead filter): output is byte-identical to full output; desired post-fix = it narrows",
+        "--unresolved removed nothing (dead filter): output is byte-identical to full output",
+    );
+    assert!(
+        !unresolved_out
+            .iter()
+            .any(|r| r.kind == IntentKind::Intent && r.session_id == "sess-resolved"),
+        "resolved Intent (session has an Outcome) must be filtered out by --unresolved",
+    );
+    assert!(
+        unresolved_out.iter().any(|r| r.session_id == "sess-open"),
+        "open Intent (no Outcome in session) must survive --unresolved",
     );
 }
 
 #[test]
-fn default_limit_clips_below_explicit_limit_red() {
-    // F3 / default-limit clip.
-    // RED: CURRENT behavior = with >= 11 records, the CLI default `limit: 10`
-    // truncates to 10 while `--limit 200` returns the full set, so the default
-    // run silently clips the roadmap (default_out.len() < limit200_out.len()).
-    // DESIRED post-fix invariant = the default should NOT silently clip below
-    // an explicit large limit, i.e. the counts are equal. We assert the DESIRED
-    // invariant (assert_eq! on the lengths), so this is RED now and flips GREEN
-    // when the default stops clipping the roadmap.
+fn none_limit_does_not_clip_roadmap() {
+    // F3 anchor (was `default_limit_clips_below_explicit_limit_red`).
+    // `apply_display_filters` must treat `limit: None` as unlimited so the intents
+    // CLI can map its `--limit` default to None and stop silently clipping a 12+
+    // item roadmap; an explicit `Some(n)` still truncates to n.
+    // (The CLI default override lives in `run_intents`: default sentinel -> None.)
     let records: Vec<IntentRecord> = (0..12)
         .map(|i| IntentRecord {
             kind: IntentKind::Intent,
@@ -886,27 +908,33 @@ fn default_limit_clips_below_explicit_limit_red() {
         })
         .collect();
 
-    let default_out = apply_display_filters(
+    let no_limit = apply_display_filters(
+        records.clone(),
+        &IntentDisplayFilters {
+            limit: None,
+            ..Default::default()
+        },
+    );
+    let explicit_10 = apply_display_filters(
         records.clone(),
         &IntentDisplayFilters {
             limit: Some(10),
             ..Default::default()
         },
     );
-    let limit200_out = apply_display_filters(
-        records.clone(),
-        &IntentDisplayFilters {
-            limit: Some(200),
-            ..Default::default()
-        },
-    );
 
     assert_eq!(
-        default_out.len(),
-        limit200_out.len(),
-        "default limit clipped the roadmap: default={} vs --limit 200={}; desired post-fix = no silent clip",
-        default_out.len(),
-        limit200_out.len(),
+        no_limit.len(),
+        records.len(),
+        "limit: None must not clip the roadmap (got {} of {})",
+        no_limit.len(),
+        records.len(),
+    );
+    assert_eq!(
+        explicit_10.len(),
+        10,
+        "explicit limit must still truncate (got {})",
+        explicit_10.len(),
     );
 }
 

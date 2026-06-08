@@ -2577,11 +2577,18 @@ fn run_intents(
         _ => unreachable!("clap validates this"),
     });
 
+    // F2 / dead `--unresolved`: the unresolved filter marks a session "resolved"
+    // when it contains an Outcome. If a `--kind` filter strips Outcomes at
+    // extraction time, the filter sees none and silently no-ops (output is
+    // byte-identical to unfiltered). When `--unresolved` is active we defer the
+    // kind filter: extract WITHOUT it so Outcomes survive the resolution check,
+    // then re-apply it after the unresolved narrowing.
+    let post_kind = if unresolved { kind_filter } else { None };
     let config = intents::IntentsConfig {
         project: projects.first().cloned().unwrap_or_default(),
         hours,
         strict,
-        kind_filter,
+        kind_filter: if unresolved { None } else { kind_filter },
         frame_kind: filters.frame_kind.map(Into::into),
     };
 
@@ -2607,10 +2614,24 @@ fn run_intents(
             // Score sort isn't meaningful for intents (no score field); fall back to newest.
             SortOrder::Score => intents::IntentSortOrder::Newest,
         }),
-        limit: Some(filters.limit),
+        // F3 / default-limit clip: the shared `--limit` default of 10 silently
+        // truncates an intents roadmap (often 20-30 planned items). Treat the
+        // default sentinel as "no limit" so the full roadmap survives; an
+        // explicit larger `--limit` still trims. (Mirrors the tail one-shot's
+        // existing `== 10` default override.)
+        limit: if filters.limit == 10 {
+            None
+        } else {
+            Some(filters.limit)
+        },
     };
 
-    let records = intents::apply_display_filters(records, &display_filters);
+    let mut records = intents::apply_display_filters(records, &display_filters);
+
+    // F2: re-apply the kind filter we deferred so `--unresolved` could see Outcomes.
+    if let Some(k) = post_kind {
+        records.retain(|r| r.kind == k);
+    }
 
     if records.is_empty() && emit != "json" {
         eprintln!(
