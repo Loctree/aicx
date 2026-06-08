@@ -81,7 +81,12 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         let cutoff_hours = config.hours.min(i64::MAX as u64) as i64;
         now - Duration::hours(cutoff_hours)
     };
-    let files = collect_chunk_files(store_root, &config.project, cutoff, config.frame_kind)?;
+    let files = collect_chunk_files(
+        store_root,
+        &config.project,
+        cutoff,
+        config.effective_frame_kind(),
+    )?;
     let scanned_count = files.len();
     let source_paths_verified = verify_stored_chunk_paths(&files);
 
@@ -241,7 +246,7 @@ fn collect_chunk_files(
     store_root: &Path,
     project: &str,
     cutoff: DateTime<Utc>,
-    frame_kind: Option<FrameKind>,
+    frame_kind: FrameKind,
 ) -> Result<Vec<StoredChunkFile>> {
     let mut files = Vec::new();
     let scan_root = normalize_scan_root(store_root);
@@ -266,13 +271,11 @@ fn collect_chunk_files(
         }) {
             continue;
         }
-        if let Some(expected) = frame_kind {
-            let matches_frame = store::load_sidecar(&file.path)
-                .and_then(|sidecar| sidecar.frame_kind)
-                .is_some_and(|kind| kind == expected);
-            if !matches_frame {
-                continue;
-            }
+        let matches_frame = store::load_sidecar(&file.path)
+            .and_then(|sidecar| sidecar.frame_kind)
+            .is_some_and(|kind| kind == frame_kind);
+        if !matches_frame {
+            continue;
         }
 
         let timestamp = file
@@ -2166,7 +2169,7 @@ pub fn migrate_intent_schema_dry_run_at(
                 .unwrap(),
             Utc,
         ),
-        None,
+        IntentsConfig::default_frame_kind(),
     )?;
 
     let mut all_entries = Vec::new();

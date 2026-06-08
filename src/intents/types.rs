@@ -62,6 +62,16 @@ pub struct IntentsConfig {
     pub frame_kind: Option<FrameKind>,
 }
 
+impl IntentsConfig {
+    pub fn default_frame_kind() -> FrameKind {
+        FrameKind::UserMsg
+    }
+
+    pub fn effective_frame_kind(&self) -> FrameKind {
+        self.frame_kind.unwrap_or_else(Self::default_frame_kind)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IntentExtractionStats {
     pub scanned_count: usize,

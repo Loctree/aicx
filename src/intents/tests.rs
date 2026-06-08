@@ -30,8 +30,7 @@ fn chunk_path(root: &Path, project: &str, date: &str, name: &str) -> PathBuf {
 }
 
 fn write_chunk(root: &Path, project: &str, date: &str, name: &str, body: &str) {
-    let path = chunk_path(root, project, date, name);
-    fs::write(path, body).expect("write chunk");
+    write_chunk_with_sidecar(root, project, date, name, body, Some(FrameKind::UserMsg));
 }
 
 fn migration_test_root(label: &str) -> PathBuf {
@@ -81,6 +80,24 @@ fn write_chunk_with_sidecar(
 ) {
     let path = chunk_path(root, project, date, name);
     fs::write(&path, body).expect("write chunk");
+    let agent = if name.contains("_claude") || name.contains("claude") {
+        "claude"
+    } else if name.contains("_gemini") || name.contains("gemini") {
+        "gemini"
+    } else {
+        "codex"
+    };
+    write_sidecar(&path, project, agent, date, "intentstest01", frame_kind);
+}
+
+fn write_sidecar(
+    path: &Path,
+    project: &str,
+    agent: &str,
+    date: &str,
+    session_id: &str,
+    frame_kind: Option<FrameKind>,
+) {
     let sidecar = crate::chunker::ChunkMetadataSidecar {
         id: path
             .file_stem()
@@ -88,15 +105,9 @@ fn write_chunk_with_sidecar(
             .to_string_lossy()
             .to_string(),
         project: format!("local/{project}"),
-        agent: if name.contains("_claude") || name.contains("claude") {
-            "claude".to_string()
-        } else if name.contains("_gemini") || name.contains("gemini") {
-            "gemini".to_string()
-        } else {
-            "codex".to_string()
-        },
+        agent: agent.to_string(),
         date: date.to_string(),
-        session_id: "intentstest01".to_string(),
+        session_id: session_id.to_string(),
         cwd: None,
         timestamp_source: None,
         kind: crate::store::Kind::Conversations,
@@ -403,6 +414,117 @@ fn frame_kind_filter_keeps_only_matching_chunks() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].kind, IntentKind::Intent);
     assert_eq!(records[0].summary, "Let's keep only user intent truth.");
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn default_frame_kind_is_user_msg() {
+    assert_eq!(IntentsConfig::default_frame_kind(), FrameKind::UserMsg);
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        kind_filter: None,
+        frame_kind: None,
+    };
+
+    assert_eq!(config.effective_frame_kind(), FrameKind::UserMsg);
+}
+
+#[test]
+fn default_frame_kind_admits_user_chunk_and_rejects_agent_chunk() {
+    let tmp = std::env::temp_dir().join(format!(
+        "ai-contexters-intents-{}-default-frame-kind",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+
+    write_chunk_with_sidecar(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "120000_codex-001.md",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:00:00] user: Let's keep only user intent truth.\n",
+        Some(FrameKind::UserMsg),
+    );
+    write_chunk_with_sidecar(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "120100_codex-002.md",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:01:00] assistant: decision: assistant-only steering\n",
+        Some(FrameKind::AgentReply),
+    );
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        kind_filter: None,
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, IntentKind::Intent);
+    assert_eq!(records[0].summary, "Let's keep only user intent truth.");
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn explicit_agent_frame_kind_override_still_admits_agent_chunk() {
+    let tmp = std::env::temp_dir().join(format!(
+        "ai-contexters-intents-{}-agent-frame-kind-override",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+
+    write_chunk_with_sidecar(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "120000_codex-001.md",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:00:00] user: Let's keep only user intent truth.\n",
+        Some(FrameKind::UserMsg),
+    );
+    write_chunk_with_sidecar(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "120100_codex-002.md",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:01:00] assistant: decision: assistant-only steering\n",
+        Some(FrameKind::AgentReply),
+    );
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        kind_filter: None,
+        frame_kind: Some(FrameKind::AgentReply),
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, IntentKind::Decision);
+    assert_eq!(records[0].summary, "assistant-only steering");
 
     let _ = fs::remove_dir_all(&tmp);
 }
@@ -1146,6 +1268,14 @@ mod quality {
         fs::create_dir_all(&dir).expect("create chunk dir");
         let path = dir.join(basename);
         fs::write(&path, body).expect("write chunk");
+        write_sidecar(
+            &path,
+            project,
+            agent,
+            date,
+            session_id,
+            Some(FrameKind::UserMsg),
+        );
         path
     }
 
