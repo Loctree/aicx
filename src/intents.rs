@@ -21,6 +21,7 @@ use crate::timeline::FrameKind;
 use crate::types::{EntryState, EntryType, IntentEntry, Link, LinkType};
 
 mod display;
+mod schema;
 mod types;
 
 pub use self::display::{
@@ -34,6 +35,12 @@ use self::types::{
 pub use self::types::{
     IntentExtraction, IntentExtractionStats, IntentKind, IntentRecord, IntentsConfig,
     MigrationReport,
+};
+// Lane 2-5 schema anchor (MASTER Phase 2 §3). Stages land incrementally; these
+// types are the convergence point every lane stage must agree on.
+pub use self::schema::{
+    ClaimRecord, ClaimType, ClarifyQuestion, ContractFracture, FractureSeverity, ResultRecord,
+    ResultStatus, VerificationStatus,
 };
 
 const STRICT_CONFIDENCE: u8 = 3;
