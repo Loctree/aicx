@@ -40,7 +40,7 @@ pub use self::types::{
 // types are the convergence point every lane stage must agree on.
 pub use self::schema::{
     ClaimRecord, ClaimType, ClarifyQuestion, ContractFracture, FractureSeverity, ResultRecord,
-    ResultStatus, VerificationStatus,
+    ResultStatus, VerificationStatus, classify_claim,
 };
 
 const STRICT_CONFIDENCE: u8 = 3;

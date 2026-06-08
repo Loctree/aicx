@@ -169,6 +169,57 @@ pub struct ClarifyQuestion {
     pub linked_results: Vec<String>,
 }
 
+// ── Lane 2 classification primitive ──────────────────────────────
+
+/// Classify a claim sentence into its [`ClaimType`] by surface claim-language.
+///
+/// Case-insensitive substring match in priority order (most specific first):
+/// "no blockers" must not be misread as `Blocked`, and "ready to ship" must not
+/// be swallowed by a generic ship/done marker. Returns `None` when no claim
+/// marker is present — absence is NOT `Implemented` by default; a claim must
+/// actually claim something.
+///
+/// `ReadyToPush` / `Shippable` / `NoBlockers` are the highest-risk claims (the
+/// "production ready" applause verdict); classification only labels them — Lane 3
+/// must still demand evidence before any of them becomes a Result.
+pub fn classify_claim(text: &str) -> Option<ClaimType> {
+    let t = text.to_lowercase();
+    // (needle, type) — list order IS precedence; first contained needle wins.
+    const RULES: &[(&str, ClaimType)] = &[
+        ("no blocker", ClaimType::NoBlockers),
+        ("zero blocker", ClaimType::NoBlockers),
+        ("blocked", ClaimType::Blocked),
+        ("blocker", ClaimType::Blocked),
+        ("production ready", ClaimType::ReadyToPush),
+        ("ready to push", ClaimType::ReadyToPush),
+        ("ready to ship", ClaimType::ReadyToPush),
+        ("ready to merge", ClaimType::ReadyToPush),
+        ("shippable", ClaimType::Shippable),
+        ("ship it", ClaimType::Shippable),
+        ("migration complete", ClaimType::Migrated),
+        ("migrated", ClaimType::Migrated),
+        ("installed", ClaimType::Installed),
+        ("docs updated", ClaimType::Documented),
+        ("documented", ClaimType::Documented),
+        ("verified", ClaimType::Verified),
+        ("all green", ClaimType::Green),
+        ("tests green", ClaimType::Green),
+        ("green", ClaimType::Green),
+        ("tests pass", ClaimType::Tested),
+        ("passing", ClaimType::Tested),
+        ("tested", ClaimType::Tested),
+        ("fixed", ClaimType::Fixed),
+        ("implemented", ClaimType::Implemented),
+        ("shipped", ClaimType::Implemented),
+        ("complete", ClaimType::Implemented),
+        ("done", ClaimType::Implemented),
+    ];
+    RULES
+        .iter()
+        .find(|(needle, _)| t.contains(needle))
+        .map(|(_, kind)| *kind)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +293,42 @@ mod tests {
         ] {
             assert!(!json.is_empty());
         }
+    }
+
+    #[test]
+    fn classify_claim_maps_taxonomy_and_respects_precedence() {
+        use ClaimType::*;
+        // straight taxonomy hits
+        assert_eq!(classify_claim("this is done"), Some(Implemented));
+        assert_eq!(classify_claim("shipped the adapter"), Some(Implemented));
+        assert_eq!(classify_claim("fixed the dead filter"), Some(Fixed));
+        assert_eq!(classify_claim("all tests pass now"), Some(Tested));
+        assert_eq!(classify_claim("verified against the repo"), Some(Verified));
+        assert_eq!(classify_claim("migration complete"), Some(Migrated));
+        assert_eq!(classify_claim("installed via pipx"), Some(Installed));
+        assert_eq!(classify_claim("docs updated"), Some(Documented));
+        assert_eq!(classify_claim("the suite is green"), Some(Green));
+        assert_eq!(
+            classify_claim("this is production ready"),
+            Some(ReadyToPush)
+        );
+        assert_eq!(classify_claim("shippable as-is"), Some(Shippable));
+
+        // precedence edges
+        assert_eq!(
+            classify_claim("no blockers remain"),
+            Some(NoBlockers),
+            "'no blockers' must not be misread as Blocked",
+        );
+        assert_eq!(classify_claim("blocked on review"), Some(Blocked));
+        assert_eq!(
+            classify_claim("it is ready to ship"),
+            Some(ReadyToPush),
+            "'ready to ship' must not be swallowed by Shippable/ship-it",
+        );
+
+        // no claim marker -> None (absence is not Implemented)
+        assert_eq!(classify_claim("just exploring some options"), None);
+        assert_eq!(classify_claim(""), None);
     }
 }
