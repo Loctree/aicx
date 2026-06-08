@@ -1,5 +1,6 @@
 use super::*;
 use crate::oracle::OracleStatus;
+use crate::sources::shared::{IntentLineModality, intent_line_modality};
 use std::fs;
 use std::path::PathBuf;
 
@@ -41,6 +42,32 @@ fn migration_test_root(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("aicx-intents-{label}-{nanos}"))
 }
 
+fn extract_demo_records(label: &str, body: &str) -> Vec<IntentRecord> {
+    let root = migration_test_root(label);
+    let _ = fs::remove_dir_all(&root);
+
+    write_chunk(&root, "demo", "2026-03-15", "120000_codex-001.md", body);
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        kind_filter: None,
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &root, now).expect("extract intents");
+    let _ = fs::remove_dir_all(root);
+    records
+}
+
 #[test]
 fn migrate_intent_schema_dry_run_at_scans_all_projects_without_filter() {
     let root = migration_test_root("intent-migration-all-projects");
@@ -68,6 +95,97 @@ fn migrate_intent_schema_dry_run_at_scans_all_projects_without_filter() {
     assert_eq!(report.per_project.get("beta"), Some(&1));
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn head_blockquote_reference_is_pasted_reference_not_intent() {
+    let line = "> intent: Let's ship the mirrored roadmap";
+    assert_eq!(
+        intent_line_modality("user", line),
+        IntentLineModality::PastedReference
+    );
+
+    let records = extract_demo_records(
+        "blockquote-reference-modality",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:00:00] user: > intent: Let's ship the mirrored roadmap\n",
+    );
+
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.kind == IntentKind::Intent),
+        "head blockquote reference leaked intent records: {records:?}"
+    );
+}
+
+#[test]
+fn pasted_text_placeholder_reference_is_pasted_reference_not_intent() {
+    let line = "[Pasted text #1 +9 lines] Let's ship the mirrored roadmap";
+    assert_eq!(
+        intent_line_modality("user", line),
+        IntentLineModality::PastedReference
+    );
+
+    let records = extract_demo_records(
+        "placeholder-reference-modality",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:00:00] user: [Pasted text #1 +9 lines] Let's ship the mirrored roadmap\n",
+    );
+
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.kind == IntentKind::Intent),
+        "pasted-text placeholder leaked intent records: {records:?}"
+    );
+}
+
+#[test]
+fn zadanie_head_is_typed_directive_and_remains_intent() {
+    let line = "Zadanie: dopnij pasted-vs-typed modality gate";
+    assert_eq!(
+        intent_line_modality("user", line),
+        IntentLineModality::TypedDirective
+    );
+
+    let records = extract_demo_records(
+        "zadanie-typed-directive-modality",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:00:00] user: Zadanie: dopnij pasted-vs-typed modality gate\n",
+    );
+
+    assert!(
+        records.iter().any(|record| {
+            record.kind == IntentKind::Intent
+                && record
+                    .summary
+                    .contains("Zadanie: dopnij pasted-vs-typed modality gate")
+        }),
+        "typed Zadanie directive did not produce an intent record: {records:?}"
+    );
+}
+
+#[test]
+fn typed_directive_with_reference_marker_mid_body_remains_intent() {
+    let line =
+        "Zadanie: analyze this pasted reference > intent: old plan [Pasted text #2 +4 lines]";
+    assert_eq!(
+        intent_line_modality("user", line),
+        IntentLineModality::TypedDirective
+    );
+
+    let records = extract_demo_records(
+        "mid-body-reference-marker-modality",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:00:00] user: Zadanie: analyze this pasted reference > intent: old plan [Pasted text #2 +4 lines]\n",
+    );
+
+    assert!(
+        records.iter().any(|record| {
+            record.kind == IntentKind::Intent
+                && record
+                    .summary
+                    .contains("Zadanie: analyze this pasted reference")
+        }),
+        "typed directive with mid-body reference markers was not preserved: {records:?}"
+    );
 }
 
 fn write_chunk_with_sidecar(

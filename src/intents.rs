@@ -15,6 +15,7 @@ use crate::chunker::{
     parse_checklist_task, truncate_signal_line,
 };
 use crate::sanitize;
+use crate::sources::shared::{IntentLineModality, intent_line_modality};
 use crate::store;
 use crate::timeline::FrameKind;
 use crate::types::{EntryState, EntryType, IntentEntry, Link, LinkType};
@@ -603,6 +604,15 @@ fn extract_transcript_candidates(
 }
 
 fn infer_kind_from_line(line: &str, is_user_line: bool) -> Option<IntentKind> {
+    let modality = if is_user_line {
+        intent_line_modality("user", line)
+    } else {
+        IntentLineModality::Other
+    };
+    if modality == IntentLineModality::PastedReference {
+        return None;
+    }
+
     if is_decision_tag(line) {
         return Some(IntentKind::Decision);
     }
@@ -611,6 +621,9 @@ fn infer_kind_from_line(line: &str, is_user_line: bool) -> Option<IntentKind> {
     }
     if is_outcome_line(line) {
         return Some(IntentKind::Outcome);
+    }
+    if modality == IntentLineModality::TypedDirective {
+        return Some(IntentKind::Intent);
     }
     if is_user_line && looks_like_intent_line(line) {
         return Some(IntentKind::Intent);
@@ -1617,6 +1630,15 @@ fn line_has_result_shape(lower_line: &str) -> bool {
 pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType, f32)> {
     let lower = line.to_lowercase();
     let trimmed = lower.trim();
+    let modality = if is_user {
+        intent_line_modality("user", line)
+    } else {
+        IntentLineModality::Other
+    };
+
+    if modality == IntentLineModality::PastedReference {
+        return None;
+    }
 
     if trimmed.starts_with("decision:") || trimmed.contains("[decision]") {
         return Some((EntryType::Decision, 0.95));
@@ -1682,6 +1704,9 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
         return Some((EntryType::Why, 0.7));
     }
 
+    if modality == IntentLineModality::TypedDirective {
+        return Some((EntryType::Intent, 0.8));
+    }
     if is_user
         && INTENT_KEYWORDS
             .iter()

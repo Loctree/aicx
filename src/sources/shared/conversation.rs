@@ -35,6 +35,53 @@ const HARNESS_HEAD_MARKERS: [&str; 8] = [
     "Base directory for this skill:", // injected skill body preamble
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntentLineModality {
+    TypedDirective,
+    PastedReference,
+    Other,
+}
+
+const PASTED_REFERENCE_HEAD_MARKERS: [&str; 2] = [
+    ">",              // Markdown blockquote pasted as reference material
+    "[Pasted text #", // Claude clipboard placeholder for pasted content
+];
+
+const TYPED_DIRECTIVE_HEAD_MARKERS: [&str; 4] = [
+    "zadanie:", // Polish "Task:" directive head
+    "task:", "intent:", "[intent]",
+];
+
+/// Classify whether a user-authored line is a typed directive or pasted
+/// reference material.
+///
+/// Like [`is_harness_injected_noise`], detection is role-disciplined and
+/// head-anchored on the raw left-trimmed line. Markers that appear deeper in a
+/// line are ordinary quoted content and do not change the modality.
+pub(crate) fn intent_line_modality(role: &str, line: &str) -> IntentLineModality {
+    if !role.eq_ignore_ascii_case("user") {
+        return IntentLineModality::Other;
+    }
+
+    let head = line.trim_start();
+    if PASTED_REFERENCE_HEAD_MARKERS
+        .iter()
+        .any(|marker| head.starts_with(marker))
+    {
+        return IntentLineModality::PastedReference;
+    }
+
+    let head_lower = head.to_lowercase();
+    if TYPED_DIRECTIVE_HEAD_MARKERS
+        .iter()
+        .any(|marker| head_lower.starts_with(marker))
+    {
+        return IntentLineModality::TypedDirective;
+    }
+
+    IntentLineModality::Other
+}
+
 /// True when `message` is a harness-injected synthetic user turn rather than
 /// real conversation: a slash-command / skill invocation (with its injected
 /// skill body), inline `! command` local execution I/O, or a system/hook
@@ -282,6 +329,39 @@ mod harness_noise_tests {
         let projection = to_conversation_with_stats(&entries, &[]);
         assert_eq!(projection.messages.len(), 1);
         assert_eq!(projection.messages[0].message, pasted);
+    }
+
+    #[test]
+    fn classifies_head_blockquote_as_pasted_reference() {
+        assert_eq!(
+            intent_line_modality("user", "> intent: ship the mirrored plan"),
+            IntentLineModality::PastedReference
+        );
+    }
+
+    #[test]
+    fn classifies_head_pasted_text_placeholder_as_pasted_reference() {
+        assert_eq!(
+            intent_line_modality("user", "[Pasted text #1 +12 lines] Let's ship it"),
+            IntentLineModality::PastedReference
+        );
+    }
+
+    #[test]
+    fn classifies_zadanie_head_as_typed_directive() {
+        assert_eq!(
+            intent_line_modality("user", "Zadanie: dopnij modality gate"),
+            IntentLineModality::TypedDirective
+        );
+    }
+
+    #[test]
+    fn preserves_typed_directive_with_reference_markers_mid_body() {
+        let line = "Zadanie: analyze quoted material, not as command\n\n> intent: old plan\n[Pasted text #2 +4 lines]";
+        assert_eq!(
+            intent_line_modality("user", line),
+            IntentLineModality::TypedDirective
+        );
     }
 
     #[test]

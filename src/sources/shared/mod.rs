@@ -24,6 +24,7 @@ pub mod project;
 pub mod timeline;
 
 pub use conversation::{ConversationProjection, to_conversation, to_conversation_with_stats};
+pub(crate) use conversation::{IntentLineModality, intent_line_modality};
 pub(crate) use diagnostics::*;
 pub(crate) use files::{
     MAX_LINE_BYTES, observe_oversized_line, parse_rfc3339_or_naive_utc, short_path_hash,
