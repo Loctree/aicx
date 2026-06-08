@@ -500,6 +500,176 @@ fn strip_case_prefix_is_utf8_safe() {
     assert_eq!(strip_case_insensitive_prefix(text, "validation:"), text);
 }
 
+// ── C0.1 native regression anchor (RED) ─────────────────────────
+//
+// Three falsifying tests that LOCK the current broken behavior of the native
+// intent stream. Each asserts the *desired post-fix invariant*, so all three
+// are RED today and flip GREEN only when the underlying bug is deliberately
+// fixed downstream. RED here is the deliverable — do NOT patch production code
+// to make them pass. See plan C0.1 and `.loctree/context-scope-intents.md`
+// (A/B/C drift finding: "native intent stream jest częściowo lustrem własnego
+// szumu").
+
+#[test]
+fn agent_chunk_still_yields_intents_drift_red() {
+    // F1 / role-drift.
+    // RED: CURRENT behavior = a pure agent-authored chunk (assistant role,
+    // FrameKind::AgentReply) still produces intent records — agent meta-chatter
+    // drifts into operator intents (records.len() > 0).
+    // DESIRED post-fix invariant = a pure agent chunk yields ZERO operator
+    // intents (records.is_empty()). We assert the DESIRED invariant, so this is
+    // RED now and flips GREEN when role-drift is fixed.
+    let tmp = std::env::temp_dir().join(format!(
+        "ai-contexters-intents-{}-agent-drift",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+
+    write_chunk_with_sidecar(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "120100_codex-002.md",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:01:00] assistant: decision: assistant-only steering\n",
+        Some(FrameKind::AgentReply),
+    );
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        kind_filter: None,
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+
+    let leaked = records.len();
+    let _ = fs::remove_dir_all(&tmp);
+
+    assert!(
+        records.is_empty(),
+        "agent-authored chunk leaked {leaked} intent(s) (role-drift); desired post-fix = zero: {records:?}",
+    );
+}
+
+#[test]
+fn unresolved_filter_is_noop_without_outcomes_red() {
+    // F2 / dead `--unresolved`.
+    // RED: CURRENT behavior = with >=1 Intent and NO matching Outcome in the
+    // same session, `apply_display_filters` with unresolved:true removes
+    // nothing, so its output is byte-identical to the unfiltered output
+    // (unresolved_out == full_out → the filter is dead in the common case).
+    // DESIRED post-fix invariant = `--unresolved` actually narrows output, so
+    // the two results DIFFER. We assert the DESIRED invariant (assert_ne!), so
+    // this is RED now and flips GREEN when the filter delivers real narrowing.
+    let records = vec![
+        IntentRecord {
+            kind: IntentKind::Intent,
+            summary: "ship native intents audit".to_string(),
+            context: None,
+            evidence: vec![],
+            project: "demo".to_string(),
+            agent: "codex".to_string(),
+            date: "2026-03-15".to_string(),
+            timestamp: None,
+            session_id: "sess-unresolved-a".to_string(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: "/tmp/demo/unresolved-a.md".to_string(),
+        },
+        IntentRecord {
+            kind: IntentKind::Intent,
+            summary: "lock regression anchor".to_string(),
+            context: None,
+            evidence: vec![],
+            project: "demo".to_string(),
+            agent: "codex".to_string(),
+            date: "2026-03-15".to_string(),
+            timestamp: None,
+            session_id: "sess-unresolved-b".to_string(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: "/tmp/demo/unresolved-b.md".to_string(),
+        },
+    ];
+
+    let unresolved_out = apply_display_filters(
+        records.clone(),
+        &IntentDisplayFilters {
+            unresolved: true,
+            ..Default::default()
+        },
+    );
+    let full_out = apply_display_filters(records.clone(), &IntentDisplayFilters::default());
+
+    assert_ne!(
+        unresolved_out, full_out,
+        "--unresolved removed nothing (dead filter): output is byte-identical to full output; desired post-fix = it narrows",
+    );
+}
+
+#[test]
+fn default_limit_clips_below_explicit_limit_red() {
+    // F3 / default-limit clip.
+    // RED: CURRENT behavior = with >= 11 records, the CLI default `limit: 10`
+    // truncates to 10 while `--limit 200` returns the full set, so the default
+    // run silently clips the roadmap (default_out.len() < limit200_out.len()).
+    // DESIRED post-fix invariant = the default should NOT silently clip below
+    // an explicit large limit, i.e. the counts are equal. We assert the DESIRED
+    // invariant (assert_eq! on the lengths), so this is RED now and flips GREEN
+    // when the default stops clipping the roadmap.
+    let records: Vec<IntentRecord> = (0..12)
+        .map(|i| IntentRecord {
+            kind: IntentKind::Intent,
+            summary: format!("planned roadmap item {i}"),
+            context: None,
+            evidence: vec![],
+            project: "demo".to_string(),
+            agent: "codex".to_string(),
+            date: "2026-03-15".to_string(),
+            timestamp: None,
+            session_id: format!("sess-limit-{i}"),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: format!("/tmp/demo/limit-{i}.md"),
+        })
+        .collect();
+
+    let default_out = apply_display_filters(
+        records.clone(),
+        &IntentDisplayFilters {
+            limit: Some(10),
+            ..Default::default()
+        },
+    );
+    let limit200_out = apply_display_filters(
+        records.clone(),
+        &IntentDisplayFilters {
+            limit: Some(200),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(
+        default_out.len(),
+        limit200_out.len(),
+        "default limit clipped the roadmap: default={} vs --limit 200={}; desired post-fix = no silent clip",
+        default_out.len(),
+        limit200_out.len(),
+    );
+}
+
 // ── classifier tests ────────────────────────────────────────────
 
 mod classifier {
