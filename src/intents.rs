@@ -1762,6 +1762,7 @@ pub fn classify_chunk_entries(
                     body: None,
                     evidence,
                     links: Vec::new(),
+                    superseded_by: None,
                     confidence: conf,
                     tags,
                     project: project.map(String::from),
@@ -1801,6 +1802,7 @@ pub fn classify_chunk_entries(
                         body: None,
                         evidence,
                         links: Vec::new(),
+                        superseded_by: None,
                         confidence: conf,
                         tags,
                         project: project.map(String::from),
@@ -2003,6 +2005,7 @@ fn detect_supersedes(entries: &mut [IntentEntry]) {
         superseded_idx: usize,
         newer_idx: usize,
         superseded_id: String,
+        newer_id: String,
     }
 
     let mut topic_latest: HashMap<String, (usize, String, String)> = HashMap::new();
@@ -2036,6 +2039,7 @@ fn detect_supersedes(entries: &mut [IntentEntry]) {
                     superseded_idx: old_idx,
                     newer_idx: idx,
                     superseded_id: old_id,
+                    newer_id: entry.id.clone(),
                 });
                 topic_latest.insert(topic_key, (idx, entry.id.clone(), entry.date.clone()));
             } else {
@@ -2043,6 +2047,7 @@ fn detect_supersedes(entries: &mut [IntentEntry]) {
                     superseded_idx: idx,
                     newer_idx: *prev_idx,
                     superseded_id: entry.id.clone(),
+                    newer_id: prev_id.clone(),
                 });
             }
         } else {
@@ -2052,10 +2057,12 @@ fn detect_supersedes(entries: &mut [IntentEntry]) {
 
     for action in actions {
         entries[action.superseded_idx].state = EntryState::Superseded;
+        entries[action.superseded_idx].superseded_by = Some(action.newer_id.clone());
+        entries[action.newer_idx].state = EntryState::Active;
         let already = entries[action.newer_idx]
             .links
             .iter()
-            .any(|l| l.target == action.superseded_id);
+            .any(|l| l.relation == LinkType::Supersedes && l.target == action.superseded_id);
         if !already {
             entries[action.newer_idx].links.push(Link {
                 relation: LinkType::Supersedes,

@@ -1214,6 +1214,7 @@ mod session_level {
             body: None,
             evidence: Vec::new(),
             links: Vec::new(),
+            superseded_by: None,
             confidence: 0.9,
             tags: Vec::new(),
             project: Some(project.to_string()),
@@ -1246,14 +1247,70 @@ mod session_level {
 
         postprocess_session_entries(&mut entries, Some(30));
 
+        let older_id = entries[0].id.clone();
+        let newer_id = entries[1].id.clone();
+
         assert_eq!(entries[0].state, EntryState::Superseded);
-        assert_eq!(entries[1].state, EntryState::Proposed);
+        assert_eq!(entries[0].superseded_by, Some(newer_id.clone()));
+        assert_eq!(entries[1].state, EntryState::Active);
         assert!(
             entries[1]
                 .links
                 .iter()
-                .any(|l| l.relation == LinkType::Supersedes)
+                .any(|l| l.relation == LinkType::Supersedes && l.target == older_id)
         );
+    }
+
+    #[test]
+    fn supersession_promotes_winner_and_stamps_superseded_by() {
+        let mut entries = vec![
+            make_entry(
+                EntryType::Intent,
+                "add flag X parser fallback mode",
+                "2026-04-10",
+                "s1",
+                "demo",
+            ),
+            make_entry(
+                EntryType::Intent,
+                "add flag X parser fallback mode; no, the real fix is Y",
+                "2026-04-15",
+                "s2",
+                "demo",
+            ),
+            make_entry(
+                EntryType::Intent,
+                "ship unrelated docs cleanup",
+                "2026-04-15",
+                "s3",
+                "demo",
+            ),
+        ];
+
+        postprocess_session_entries(&mut entries, Some(7));
+        postprocess_session_entries(&mut entries, Some(7));
+
+        let loser_id = entries[0].id.clone();
+        let winner_id = entries[1].id.clone();
+        let json = serde_json::to_value(&entries).expect("serialize entries");
+
+        assert_eq!(entries[0].state, EntryState::Superseded);
+        assert_eq!(entries[0].superseded_by, Some(winner_id.clone()));
+        assert_eq!(entries[1].state, EntryState::Active);
+        assert!(entries[2].superseded_by.is_none());
+        assert!(
+            entries[1]
+                .links
+                .iter()
+                .any(|l| l.relation == LinkType::Supersedes && l.target == loser_id)
+        );
+
+        assert_eq!(json[0]["status"], "superseded");
+        assert_eq!(json[0]["superseded_by"], winner_id);
+        assert_eq!(json[1]["status"], "active");
+        assert_eq!(json[1]["links"][0]["relation"], "supersedes");
+        assert_eq!(json[1]["links"][0]["target"], entries[0].id);
+        assert!(json[2].get("superseded_by").is_none());
     }
 
     #[test]
@@ -1977,6 +2034,7 @@ mod area_e_regressions {
             body: None,
             evidence: Vec::new(),
             links: Vec::new(),
+            superseded_by: None,
             confidence: 0.9,
             tags: Vec::new(),
             project: Some("demo".to_string()),

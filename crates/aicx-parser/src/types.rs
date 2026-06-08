@@ -116,6 +116,7 @@ impl Eq for Link {}
 pub struct IntentEntry {
     pub id: String,
     pub entry_type: EntryType,
+    #[serde(rename = "status", alias = "state")]
     pub state: EntryState,
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -124,6 +125,8 @@ pub struct IntentEntry {
     pub evidence: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<Link>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
     pub confidence: f32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,

@@ -27,3 +27,4 @@ CLAUDE.md
 /*.txt
 /*.py
 /tools/__pycache__
+/reports/agent-runs
