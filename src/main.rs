@@ -2447,11 +2447,11 @@ fn run_sessions_list(
     limit: usize,
     format: &str,
 ) -> Result<()> {
-    let projects_root = dirs::home_dir()
-        .context("No home dir")?
-        .join(".claude")
-        .join("projects");
-    let discovered = sessions::discover_claude_sessions(&projects_root);
+    let home = dirs::home_dir().context("No home dir")?;
+    let mut discovered = sessions::discover_claude_sessions(&home.join(".claude").join("projects"));
+    discovered.extend(sessions::discover_codex_sessions(
+        &home.join(".codex").join("sessions"),
+    ));
 
     let here = if cwd_only {
         Some(std::env::current_dir()?.to_string_lossy().into_owned())

@@ -230,6 +230,148 @@ fn scan_claude_session_file(path: &Path, decoded_cwd: Option<&str>) -> Option<Se
     })
 }
 
+/// Discover Codex CLI sessions under a sessions root (`~/.codex/sessions`),
+/// which nests rollouts by date (`YYYY/MM/DD/rollout-*.jsonl`). Walks the tree.
+pub fn discover_codex_sessions(sessions_root: &Path) -> Vec<SessionInfo> {
+    let mut out = Vec::new();
+    let mut stack = vec![sessions_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(read) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                && let Some(info) = scan_codex_session_file(&path)
+            {
+                out.push(info);
+            }
+        }
+    }
+    out
+}
+
+/// Parse a single Codex rollout `.jsonl` into a [`SessionInfo`]. Canonical id +
+/// cwd come from the `session_meta` line; the conversation count uses only the
+/// `response_item` message stream by role (developer/system/tool rows are not
+/// conversation — consistent with the meta->SystemNote classification).
+fn scan_codex_session_file(path: &Path) -> Option<SessionInfo> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut session_id: Option<String> = None;
+    let mut cwd: Option<String> = None;
+    let mut started_at: Option<DateTime<Utc>> = None;
+    let mut updated_at: Option<DateTime<Utc>> = None;
+    let mut user_message_count = 0usize;
+    let mut agent_message_count = 0usize;
+    let mut title: Option<String> = None;
+    let mut saw_any_line = false;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        saw_any_line = true;
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+
+        if let Some(ts) = v
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc))
+        {
+            started_at = Some(started_at.map_or(ts, |c| c.min(ts)));
+            updated_at = Some(updated_at.map_or(ts, |c| c.max(ts)));
+        }
+
+        let typ = v.get("type").and_then(|t| t.as_str());
+        let payload = v.get("payload");
+        if typ == Some("session_meta") {
+            if session_id.is_none() {
+                session_id = payload
+                    .and_then(|p| p.get("id"))
+                    .and_then(|i| i.as_str())
+                    .map(String::from);
+            }
+            if cwd.is_none() {
+                cwd = payload
+                    .and_then(|p| p.get("cwd"))
+                    .and_then(|c| c.as_str())
+                    .map(String::from);
+            }
+            continue;
+        }
+        if typ == Some("response_item")
+            && payload.and_then(|p| p.get("type")).and_then(|t| t.as_str()) == Some("message")
+        {
+            match payload.and_then(|p| p.get("role")).and_then(|r| r.as_str()) {
+                Some("user") => {
+                    user_message_count += 1;
+                    if title.is_none() {
+                        title = codex_message_text(payload).map(|t| short_title(&t));
+                    }
+                }
+                Some("assistant") => agent_message_count += 1,
+                _ => {}
+            }
+        }
+    }
+
+    let session_id = session_id.unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string()
+    });
+    let project = cwd.as_deref().and_then(project_label_from_cwd);
+    let (repo_path, association) = match cwd {
+        Some(c) => (Some(c), Association::Exact),
+        None => (None, Association::Unknown),
+    };
+    let temporal_confidence = if started_at.is_some() {
+        TemporalConfidence::Full
+    } else if saw_any_line {
+        TemporalConfidence::Partial
+    } else {
+        TemporalConfidence::None
+    };
+
+    Some(SessionInfo {
+        session_id,
+        agent: "codex".to_string(),
+        project,
+        repo_path,
+        started_at,
+        updated_at,
+        message_count: user_message_count + agent_message_count,
+        user_message_count,
+        agent_message_count,
+        title,
+        source_path: path.to_path_buf(),
+        association,
+        temporal_confidence,
+    })
+}
+
+/// Best-effort text of a codex message payload (`content` can be a string or an
+/// array of `{text}` / `{input_text}` parts).
+fn codex_message_text(payload: Option<&serde_json::Value>) -> Option<String> {
+    let content = payload?.get("content")?;
+    if let Some(s) = content.as_str() {
+        return Some(s.to_string());
+    }
+    content.as_array()?.iter().find_map(|part| {
+        part.get("text")
+            .and_then(|t| t.as_str())
+            .filter(|t| !t.trim().is_empty())
+            .map(String::from)
+    })
+}
+
 fn short_title(text: &str) -> String {
     let first_line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     let trimmed = first_line.trim();
@@ -376,6 +518,43 @@ mod tests {
         assert!(sessions[0].started_at.is_none());
         // partial repo association inferred from the directory encoding
         assert_eq!(sessions[0].association, Association::Inferred);
+    }
+
+    #[test]
+    fn discovers_codex_session_from_meta_and_message_stream() {
+        let root = temp_root("codex");
+        let day = root.join("2026").join("01").join("29");
+        fs::create_dir_all(&day).unwrap();
+        write_session(
+            &day,
+            "rollout-2026-01-29T13-58-09-019c09d5.jsonl",
+            &[
+                r#"{"timestamp":"2026-01-29T12:58:09.421Z","type":"session_meta","payload":{"id":"019c09d5-codex","cwd":"/Users/me/hosted/VetCoders"}}"#,
+                r#"{"timestamp":"2026-01-29T12:58:10.000Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"text":"bootstrap"}]}}"#,
+                r#"{"timestamp":"2026-01-29T12:59:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"zrób to"}]}}"#,
+                r#"{"timestamp":"2026-01-29T13:00:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"robię"}]}}"#,
+            ],
+        );
+        let sessions = discover_codex_sessions(&root);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!(s.agent, "codex");
+        // canonical id from session_meta.payload.id, not the filename
+        assert_eq!(s.session_id, "019c09d5-codex");
+        assert_eq!(s.project.as_deref(), Some("VetCoders"));
+        assert_eq!(s.association, Association::Exact);
+        // developer row is NOT conversation — only user + assistant counted
+        assert_eq!(s.user_message_count, 1);
+        assert_eq!(s.agent_message_count, 1);
+        assert_eq!(s.message_count, 2);
+        assert_eq!(s.title.as_deref(), Some("zrób to"));
+        assert_eq!(s.temporal_confidence, TemporalConfidence::Full);
+        assert_eq!(
+            s.started_at.unwrap().to_rfc3339(),
+            "2026-01-29T12:58:09.421+00:00"
+        );
     }
 
     fn mk_info(id: &str, repo: Option<&str>, updated: &str) -> SessionInfo {
