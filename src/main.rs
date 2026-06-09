@@ -251,6 +251,29 @@ enum SessionsCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ClaimsCommand {
+    /// Extract Unverified claims (Lane 2) from a session's conversation.
+    Extract {
+        /// Session id (or unique prefix).
+        #[arg(long)]
+        session: String,
+
+        /// Agent: claude | codex | gemini | junie. Inferred from the session id
+        /// when omitted.
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Hours to look back when locating the session (default 720).
+        #[arg(long, default_value = "720")]
+        hours: u64,
+
+        /// Output format: json | summary.
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum SourcesCommands {
     /// Opt in to local source-root protection.
     Protect {
@@ -975,6 +998,13 @@ enum Commands {
     Sessions {
         #[command(subcommand)]
         command: SessionsCommand,
+    },
+
+    /// Lane 2: extract agent claims (audit targets) from a session.
+    #[command(display_order = 6)]
+    Claims {
+        #[command(subcommand)]
+        command: ClaimsCommand,
     },
 
     /// Interactive daily-driver entrypoint for corpus, doctor, intents, and store.
@@ -2040,6 +2070,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }
         Some(Commands::Sources { command }) => run_sources_command(command)?,
         Some(Commands::Sessions { command }) => run_sessions_command(command)?,
+        Some(Commands::Claims { command }) => run_claims_command(command)?,
         Some(Commands::Wizard { smoke_test }) => {
             if smoke_test {
                 aicx::wizard::smoke_test()?;
@@ -2447,6 +2478,118 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn extract_input_format_from_str(s: &str) -> Option<ExtractInputFormat> {
+    match s.to_lowercase().as_str() {
+        "claude" => Some(ExtractInputFormat::Claude),
+        "codex" => Some(ExtractInputFormat::Codex),
+        "gemini" => Some(ExtractInputFormat::Gemini),
+        "junie" => Some(ExtractInputFormat::Junie),
+        _ => None,
+    }
+}
+
+fn run_claims_command(command: ClaimsCommand) -> Result<()> {
+    match command {
+        ClaimsCommand::Extract {
+            session,
+            agent,
+            hours,
+            format,
+        } => run_claims_extract(&session, agent, hours, &format),
+    }
+}
+
+fn run_claims_extract(
+    session: &str,
+    agent: Option<String>,
+    hours: u64,
+    format: &str,
+) -> Result<()> {
+    let agent_str = match agent {
+        Some(a) => a,
+        None => {
+            let home = dirs::home_dir().context("No home dir")?;
+            sessions::find_session_by_id(&home, session)
+                .map(|s| s.agent)
+                .context("could not infer agent from session id; pass --agent")?
+        }
+    };
+    let fmt = extract_input_format_from_str(&agent_str)
+        .with_context(|| format!("unknown agent '{agent_str}' (claude|codex|gemini|junie)"))?;
+
+    let config = ExtractionConfig {
+        project_filter: Vec::new(),
+        cutoff: lookback_cutoff(hours),
+        include_assistant: true,
+        watermark: None,
+    };
+    let mut entries = match fmt {
+        ExtractInputFormat::Claude => sources::extract_claude(&config)?,
+        ExtractInputFormat::Codex => sources::extract_codex(&config)?,
+        ExtractInputFormat::Gemini | ExtractInputFormat::GeminiAntigravity => {
+            sources::extract_gemini(&config)?
+        }
+        ExtractInputFormat::Junie => sources::extract_junie(&config)?,
+    };
+    let label = extract_input_format_label(fmt);
+    let resolution = resolve_session_reference(session, fmt, label, &entries)?;
+    entries.retain(|e| e.session_id == resolution.canonical_id);
+    if entries.is_empty() {
+        anyhow::bail!(
+            "no entries for session '{session}' (agent {agent_str}); try a larger --hours"
+        );
+    }
+
+    // Project = last path segment of the recorded cwd, else agent/id.
+    let project = entries
+        .iter()
+        .find_map(|e| e.cwd.as_deref())
+        .and_then(|c| c.trim_end_matches('/').rsplit('/').find(|s| !s.is_empty()))
+        .map(String::from)
+        .unwrap_or_else(|| format!("{agent_str}/{}", resolution.canonical_id));
+
+    let claim_sources: Vec<intents::ClaimSource> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| intents::ClaimSource {
+            role: e.role.clone(),
+            text: e.message.clone(),
+            project: project.clone(),
+            session_id: resolution.canonical_id.clone(),
+            agent: Some(e.agent.clone()),
+            source_ref: format!("{}#{i}", e.timestamp.to_rfc3339()),
+        })
+        .collect();
+
+    let claims = intents::extract_claims(&claim_sources);
+
+    match format {
+        "summary" => {
+            println!(
+                "{} claim(s) from session {} ({})",
+                claims.len(),
+                resolution.canonical_id,
+                agent_str
+            );
+            for c in &claims {
+                let flag = if c.risk_flags.is_empty() {
+                    ""
+                } else {
+                    " [HIGH-RISK]"
+                };
+                println!(
+                    "- {} (unverified){}: {}",
+                    c.claim_type.label(),
+                    flag,
+                    truncate_table_cell(&c.claim_text, 90)
+                );
+            }
+        }
+        _ => println!("{}", serde_json::to_string_pretty(&claims)?),
+    }
     Ok(())
 }
 

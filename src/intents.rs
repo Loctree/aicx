@@ -39,8 +39,8 @@ pub use self::types::{
 // Lane 2-5 schema anchor (MASTER Phase 2 §3). Stages land incrementally; these
 // types are the convergence point every lane stage must agree on.
 pub use self::schema::{
-    ClaimRecord, ClaimType, ClarifyQuestion, ContractFracture, FractureSeverity, ResultRecord,
-    ResultStatus, VerificationStatus, classify_claim,
+    ClaimRecord, ClaimSource, ClaimType, ClarifyQuestion, ContractFracture, FractureSeverity,
+    ResultRecord, ResultStatus, VerificationStatus, classify_claim, extract_claims,
 };
 
 const STRICT_CONFIDENCE: u8 = 3;

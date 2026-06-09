@@ -65,6 +65,32 @@ pub enum ClaimType {
     Blocked,
 }
 
+impl ClaimType {
+    /// snake_case label, matching the serde representation.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Implemented => "implemented",
+            Self::Fixed => "fixed",
+            Self::Tested => "tested",
+            Self::Verified => "verified",
+            Self::Migrated => "migrated",
+            Self::Installed => "installed",
+            Self::Documented => "documented",
+            Self::Green => "green",
+            Self::ReadyToPush => "ready_to_push",
+            Self::Shippable => "shippable",
+            Self::NoBlockers => "no_blockers",
+            Self::Blocked => "blocked",
+        }
+    }
+
+    /// The "production ready" applause claims that must never be promoted to a
+    /// Result without Lane 3 evidence.
+    pub fn is_high_risk(self) -> bool {
+        matches!(self, Self::ReadyToPush | Self::Shippable | Self::NoBlockers)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationStatus {
@@ -220,6 +246,78 @@ pub fn classify_claim(text: &str) -> Option<ClaimType> {
         .map(|(_, kind)| *kind)
 }
 
+/// A minimal source row for Lane 2 claim extraction: one message with its role
+/// and provenance. Decoupled from any store/session reader so the pure transform
+/// is testable without a corpus.
+#[derive(Debug, Clone)]
+pub struct ClaimSource {
+    pub role: String,
+    pub text: String,
+    pub project: String,
+    pub session_id: String,
+    pub agent: Option<String>,
+    pub source_ref: String,
+}
+
+fn is_agent_role(role: &str) -> bool {
+    matches!(
+        role.to_lowercase().as_str(),
+        "assistant" | "agent" | "model" | "gemini"
+    )
+}
+
+/// Lane 2 stage (pure): turn agent/assistant source rows into Unverified
+/// [`ClaimRecord`]s. Doctrine enforced here:
+/// - claims are agent-originated — user rows never produce a claim;
+/// - a row whose text carries no claim marker is skipped — no manufactured
+///   claims (absence of a marker is not a claim);
+/// - every claim is `Unverified` until Lane 3 supplies evidence;
+/// - the applause claims (ready/shippable/no-blockers) are flagged high-risk.
+pub fn extract_claims(sources: &[ClaimSource]) -> Vec<ClaimRecord> {
+    sources
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| {
+            if !is_agent_role(&s.role) {
+                return None;
+            }
+            // Classify the leading non-empty line, not the whole message: a long
+            // reply incidentally contains markers ("fixed"/"ready"/"green") deep
+            // in prose that are not the claim. Status claims lead their message.
+            let claim_line = s
+                .text
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("");
+            let claim_type = classify_claim(claim_line)?;
+            let risk_flags = if claim_type.is_high_risk() {
+                vec!["high_risk_unverified_claim".to_string()]
+            } else {
+                Vec::new()
+            };
+            Some(ClaimRecord {
+                id: format!("claim-{}-{i}", s.session_id),
+                project: s.project.clone(),
+                source_session: s.session_id.clone(),
+                source_agent: s.agent.clone(),
+                source_role: s.role.clone(),
+                source_span: Some(s.source_ref.clone()),
+                claim_text: claim_line.to_string(),
+                claim_type,
+                claimed_status: claim_type.label().to_string(),
+                claimed_files: Vec::new(),
+                claimed_commands: Vec::new(),
+                claimed_artifacts: Vec::new(),
+                related_intents: Vec::new(),
+                evidence_refs: Vec::new(),
+                verification_status: VerificationStatus::Unverified,
+                risk_flags,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +428,43 @@ mod tests {
         // no claim marker -> None (absence is not Implemented)
         assert_eq!(classify_claim("just exploring some options"), None);
         assert_eq!(classify_claim(""), None);
+    }
+
+    #[test]
+    fn extract_claims_keeps_agent_claims_drops_user_and_unmarked() {
+        let mk = |role: &str, text: &str, refr: &str| ClaimSource {
+            role: role.to_string(),
+            text: text.to_string(),
+            project: "aicx".to_string(),
+            session_id: "s1".to_string(),
+            agent: Some("codex".to_string()),
+            source_ref: refr.to_string(),
+        };
+        let sources = vec![
+            // user row has a marker ("fixed") but claims are agent-originated -> dropped
+            mk("user", "fixed the bug please", "u1"),
+            mk("assistant", "fixed the dead filter", "a1"),
+            // no claim marker -> dropped (absence is not a claim)
+            mk("assistant", "just thinking out loud", "a2"),
+            mk("assistant", "this is production ready", "a3"),
+        ];
+
+        let claims = extract_claims(&sources);
+        assert_eq!(claims.len(), 2, "only marked agent rows survive");
+
+        let fixed = &claims[0];
+        assert_eq!(fixed.claim_type, ClaimType::Fixed);
+        assert_eq!(fixed.source_role, "assistant");
+        assert_eq!(fixed.claimed_status, "fixed");
+        assert_eq!(fixed.verification_status, VerificationStatus::Unverified);
+        assert!(fixed.risk_flags.is_empty());
+
+        let ready = &claims[1];
+        assert_eq!(ready.claim_type, ClaimType::ReadyToPush);
+        // the applause verdict is flagged so Lane 3 must demand evidence
+        assert_eq!(
+            ready.risk_flags,
+            vec!["high_risk_unverified_claim".to_string()]
+        );
     }
 }
