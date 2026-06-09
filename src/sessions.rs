@@ -16,9 +16,33 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+
+/// True if `path`'s mtime is older than `after` — a cheap metadata-only
+/// pre-filter (no file read) so a scan can skip ancient session files before
+/// the expensive full parse. A missing/unreadable mtime is treated as "keep".
+fn older_than(path: &Path, after: Option<SystemTime>) -> bool {
+    let Some(after) = after else {
+        return false;
+    };
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|mtime| mtime < after)
+        .unwrap_or(false)
+}
+
+/// True when `here` and `repo` are the same path or one nests inside the other —
+/// the "is this session relevant to my cwd?" test, shared by the pre-read dir
+/// prune and the post-discovery [`select_sessions`] filter.
+fn cwd_nests(here: &str, repo: &str) -> bool {
+    // Case-insensitive: macOS filesystems are case-insensitive, and the same repo
+    // is recorded under mixed casing (e.g. `vetcoders` vs `VetCoders`).
+    let (here, repo) = (here.to_lowercase(), repo.to_lowercase());
+    here == repo || here.starts_with(&repo) || repo.starts_with(&here)
+}
 
 /// How a session was associated with a project/repo: directly read from the
 /// session's own `cwd`, or inferred from the on-disk directory encoding.
@@ -96,7 +120,11 @@ fn project_label_from_cwd(cwd: &str) -> Option<String> {
 /// (`~/.claude/projects`). Each `<encoded-cwd>/<session-id>.jsonl` becomes one
 /// [`SessionInfo`]. Tolerant: unparseable lines are skipped, unreadable files
 /// are omitted rather than aborting the scan.
-pub fn discover_claude_sessions(projects_root: &Path) -> Vec<SessionInfo> {
+pub fn discover_claude_sessions(
+    projects_root: &Path,
+    modified_after: Option<SystemTime>,
+    cwd_filter: Option<&str>,
+) -> Vec<SessionInfo> {
     let mut out = Vec::new();
     let Ok(dirs) = fs::read_dir(projects_root) else {
         return out;
@@ -113,12 +141,34 @@ pub fn discover_claude_sessions(projects_root: &Path) -> Vec<SessionInfo> {
             .to_string();
         let decoded_cwd = decode_claude_project_dir(&dir_name);
 
+        // Claude encodes the cwd in the project dir name, so a `--cwd` filter can
+        // prune entire non-matching project dirs BEFORE reading any session file
+        // — the key to a fast `--cwd` list over a large history. Match by
+        // ENCODING the target ('/' -> '-') and comparing against the raw dir name,
+        // NOT by decoding: the decode is lossy (a real hyphen like `vc-workspace`
+        // is indistinguishable from a separator) and would mis-prune those paths.
+        if let Some(want) = cwd_filter {
+            // Lowercase: macOS is case-insensitive and the same repo appears under
+            // mixed casing (`vetcoders` vs `VetCoders`).
+            let want_enc = want.replace('/', "-").to_lowercase();
+            let dir_lc = dir_name.to_lowercase();
+            if dir_lc != want_enc
+                && !dir_lc.starts_with(&want_enc)
+                && !want_enc.starts_with(&dir_lc)
+            {
+                continue;
+            }
+        }
+
         let Ok(files) = fs::read_dir(&dir_path) else {
             continue;
         };
         for file_entry in files.flatten() {
             let path = file_entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if older_than(&path, modified_after) {
                 continue;
             }
             if let Some(info) = scan_claude_session_file(&path, decoded_cwd.as_deref()) {
@@ -232,7 +282,10 @@ fn scan_claude_session_file(path: &Path, decoded_cwd: Option<&str>) -> Option<Se
 
 /// Discover Codex CLI sessions under a sessions root (`~/.codex/sessions`),
 /// which nests rollouts by date (`YYYY/MM/DD/rollout-*.jsonl`). Walks the tree.
-pub fn discover_codex_sessions(sessions_root: &Path) -> Vec<SessionInfo> {
+pub fn discover_codex_sessions(
+    sessions_root: &Path,
+    modified_after: Option<SystemTime>,
+) -> Vec<SessionInfo> {
     let mut out = Vec::new();
     let mut stack = vec![sessions_root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -244,6 +297,7 @@ pub fn discover_codex_sessions(sessions_root: &Path) -> Vec<SessionInfo> {
             if path.is_dir() {
                 stack.push(path);
             } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                && !older_than(&path, modified_after)
                 && let Some(info) = scan_codex_session_file(&path)
             {
                 out.push(info);
@@ -392,17 +446,17 @@ pub fn select_sessions(
     mut sessions: Vec<SessionInfo>,
     here: Option<&str>,
     agent: Option<&str>,
+    since: Option<DateTime<Utc>>,
     limit: usize,
 ) -> Vec<SessionInfo> {
     if let Some(agent) = agent {
         sessions.retain(|s| s.agent == agent);
     }
+    if let Some(since) = since {
+        sessions.retain(|s| s.updated_at.or(s.started_at).is_some_and(|t| t >= since));
+    }
     if let Some(here) = here {
-        sessions.retain(|s| {
-            s.repo_path
-                .as_deref()
-                .is_some_and(|p| here == p || here.starts_with(p) || p.starts_with(here))
-        });
+        sessions.retain(|s| s.repo_path.as_deref().is_some_and(|p| cwd_nests(here, p)));
     }
     sessions.sort_by(|a, b| {
         let ta = a.updated_at.or(a.started_at);
@@ -451,7 +505,7 @@ mod tests {
             ],
         );
 
-        let sessions = discover_claude_sessions(&root);
+        let sessions = discover_claude_sessions(&root, None, None);
         let _ = fs::remove_dir_all(&root);
 
         assert_eq!(sessions.len(), 1);
@@ -494,7 +548,7 @@ mod tests {
                 r#"{"type":"user","message":{"role":"user","content":"x"},"timestamp":"2026-01-23T09:00:00.000Z"}"#,
             ],
         );
-        let sessions = discover_claude_sessions(&root);
+        let sessions = discover_claude_sessions(&root, None, None);
         let _ = fs::remove_dir_all(&root);
         let json = serde_json::to_string(&sessions[0]).unwrap();
         // year + full ISO date present in machine output (RFC3339, UTC as `Z`),
@@ -512,12 +566,37 @@ mod tests {
             "s2.jsonl",
             &[r#"{"type":"user","message":{"role":"user","content":"no time here"}}"#],
         );
-        let sessions = discover_claude_sessions(&root);
+        let sessions = discover_claude_sessions(&root, None, None);
         let _ = fs::remove_dir_all(&root);
         assert_eq!(sessions[0].temporal_confidence, TemporalConfidence::Partial);
         assert!(sessions[0].started_at.is_none());
         // partial repo association inferred from the directory encoding
         assert_eq!(sessions[0].association, Association::Inferred);
+    }
+
+    #[test]
+    fn cwd_prune_keeps_hyphenated_path_dirs() {
+        // The project dir encodes cwd with '/'->'-'; a real hyphen (vc-workspace)
+        // must NOT be mis-pruned by a lossy decode when matching --cwd.
+        let root = temp_root("cwdprune");
+        let proj = root.join("-Users-me-vc-workspace-aicx");
+        fs::create_dir_all(&proj).unwrap();
+        write_session(
+            &proj,
+            "h1.jsonl",
+            &[
+                r#"{"type":"user","cwd":"/Users/me/vc-workspace/aicx","message":{"role":"user","content":"x"},"timestamp":"2026-06-08T10:00:00.000Z"}"#,
+            ],
+        );
+
+        // matching cwd (with the hyphen) keeps the session
+        let kept = discover_claude_sessions(&root, None, Some("/Users/me/vc-workspace/aicx"));
+        assert_eq!(kept.len(), 1, "hyphenated cwd must not be mis-pruned");
+
+        // a different repo prunes the dir without reading
+        let pruned = discover_claude_sessions(&root, None, Some("/Users/me/other-repo"));
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(pruned.len(), 0);
     }
 
     #[test]
@@ -535,7 +614,7 @@ mod tests {
                 r#"{"timestamp":"2026-01-29T13:00:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"robię"}]}}"#,
             ],
         );
-        let sessions = discover_codex_sessions(&root);
+        let sessions = discover_codex_sessions(&root, None);
         let _ = fs::remove_dir_all(&root);
 
         assert_eq!(sessions.len(), 1);
@@ -589,19 +668,34 @@ mod tests {
         ];
 
         // cwd filter keeps only repo-a, newest first
-        let got = select_sessions(sessions.clone(), Some(here), None, 0);
+        let got = select_sessions(sessions.clone(), Some(here), None, None, 0);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].session_id, "bbb", "newest first");
         assert_eq!(got[1].session_id, "aaa");
 
         // limit clips after sort
-        let limited = select_sessions(sessions.clone(), Some(here), None, 1);
+        let limited = select_sessions(sessions.clone(), Some(here), None, None, 1);
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].session_id, "bbb");
 
         // no cwd filter -> all three, ccc (2026-06-09) newest
-        let all = select_sessions(sessions, None, None, 0);
+        let all = select_sessions(sessions.clone(), None, None, None, 0);
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].session_id, "ccc");
+
+        // since filter drops anything updated before the bound
+        let recent = select_sessions(
+            sessions,
+            None,
+            None,
+            Some(
+                DateTime::parse_from_rfc3339("2026-06-08T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            0,
+        );
+        assert_eq!(recent.len(), 2, "only bbb (06-08) and ccc (06-09) survive");
+        assert!(recent.iter().all(|s| s.session_id != "aaa"));
     }
 }

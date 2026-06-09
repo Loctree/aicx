@@ -216,9 +216,19 @@ enum SessionsCommand {
         #[arg(long)]
         cwd: bool,
 
-        /// Filter by agent (currently: claude).
+        /// Filter by agent (claude | codex).
         #[arg(long)]
         agent: Option<String>,
+
+        /// Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the
+        /// last 30 days; pass --all to scan the full history.
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Scan the full session history (slower) instead of the default
+        /// last-30-days window.
+        #[arg(long)]
+        all: bool,
 
         /// Max sessions to show (0 = all).
         #[arg(long, default_value_t = 20)]
@@ -2435,30 +2445,74 @@ fn run_sessions_command(command: SessionsCommand) -> Result<()> {
         SessionsCommand::List {
             cwd,
             agent,
+            since,
+            all,
             limit,
             format,
-        } => run_sessions_list(cwd, agent, limit, &format),
+        } => run_sessions_list(cwd, agent, since, all, limit, &format),
     }
+}
+
+fn parse_since_date(s: &str) -> Result<DateTime<Utc>> {
+    let nd = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .with_context(|| format!("invalid --since date '{s}' (expected YYYY-MM-DD)"))?;
+    Ok(nd
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is valid")
+        .and_utc())
 }
 
 fn run_sessions_list(
     cwd_only: bool,
     agent: Option<String>,
+    since: Option<String>,
+    all: bool,
     limit: usize,
     format: &str,
 ) -> Result<()> {
-    let home = dirs::home_dir().context("No home dir")?;
-    let mut discovered = sessions::discover_claude_sessions(&home.join(".claude").join("projects"));
-    discovered.extend(sessions::discover_codex_sessions(
-        &home.join(".codex").join("sessions"),
-    ));
+    // Recency window: default to the last 30 days so the scan stays fast on
+    // large histories; --since sets it explicitly, --all scans everything.
+    let since_dt: Option<DateTime<Utc>> = if all {
+        None
+    } else if let Some(s) = &since {
+        Some(parse_since_date(s)?)
+    } else {
+        Some(Utc::now() - chrono::Duration::days(30))
+    };
+    // Cheap mtime pre-filter mirrors the window so old files are skipped before
+    // the expensive full parse.
+    let modified_after: Option<std::time::SystemTime> = since_dt.map(|dt| {
+        let secs = dt.timestamp().max(0) as u64;
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    });
 
+    // Resolve cwd BEFORE discovery: Claude encodes the cwd in its project dir
+    // name, so passing it down lets discovery prune non-matching dirs without
+    // reading a single file — the fast path for `--cwd`.
     let here = if cwd_only {
         Some(std::env::current_dir()?.to_string_lossy().into_owned())
     } else {
         None
     };
-    let selected = sessions::select_sessions(discovered, here.as_deref(), agent.as_deref(), limit);
+
+    let home = dirs::home_dir().context("No home dir")?;
+    let mut discovered = sessions::discover_claude_sessions(
+        &home.join(".claude").join("projects"),
+        modified_after,
+        here.as_deref(),
+    );
+    discovered.extend(sessions::discover_codex_sessions(
+        &home.join(".codex").join("sessions"),
+        modified_after,
+    ));
+
+    let selected = sessions::select_sessions(
+        discovered,
+        here.as_deref(),
+        agent.as_deref(),
+        since_dt,
+        limit,
+    );
 
     match format {
         "json" => println!("{}", serde_json::to_string_pretty(&selected)?),
