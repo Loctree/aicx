@@ -238,6 +238,16 @@ enum SessionsCommand {
         #[arg(long, default_value = "table")]
         format: String,
     },
+
+    /// Show one session's metadata, located by id (or a unique prefix).
+    Show {
+        /// Session id (or a unique prefix).
+        session_id: String,
+
+        /// Output format: markdown | json.
+        #[arg(long, default_value = "markdown")]
+        format: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -961,7 +971,7 @@ enum Commands {
     },
 
     /// Discover and list agent sessions on disk (session surface).
-    #[command(display_order = 6)]
+    #[command(display_order = 6, alias = "session")]
     Sessions {
         #[command(subcommand)]
         command: SessionsCommand,
@@ -2450,7 +2460,45 @@ fn run_sessions_command(command: SessionsCommand) -> Result<()> {
             limit,
             format,
         } => run_sessions_list(cwd, agent, since, all, limit, &format),
+        SessionsCommand::Show { session_id, format } => run_session_show(session_id, &format),
     }
+}
+
+fn run_session_show(session_id: String, format: &str) -> Result<()> {
+    let home = dirs::home_dir().context("No home dir")?;
+    let Some(info) = sessions::find_session_by_id(&home, &session_id) else {
+        anyhow::bail!("no session found matching id '{session_id}'");
+    };
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(&info)?),
+        _ => {
+            let ts = |t: Option<chrono::DateTime<Utc>>| {
+                t.map(|t| t.to_rfc3339())
+                    .unwrap_or_else(|| "(unknown)".to_string())
+            };
+            println!("# Session {}\n", info.session_id);
+            println!("- agent: {}", info.agent);
+            println!("- project: {}", info.project.as_deref().unwrap_or("-"));
+            println!("- repo: {}", info.repo_path.as_deref().unwrap_or("-"));
+            println!("- started: {}", ts(info.started_at));
+            println!("- updated: {}", ts(info.updated_at));
+            println!(
+                "- messages: {} ({} user / {} agent)",
+                info.message_count, info.user_message_count, info.agent_message_count
+            );
+            println!("- association: {:?}", info.association);
+            println!("- temporal_confidence: {:?}", info.temporal_confidence);
+            println!("- source: {}", info.source_path.display());
+            if let Some(t) = &info.title {
+                println!("- title: {t}");
+            }
+            println!(
+                "\n## extract\n\n    aicx extract --agent {} --session {} --conversation",
+                info.agent, info.session_id
+            );
+        }
+    }
+    Ok(())
 }
 
 fn parse_since_date(s: &str) -> Result<DateTime<Utc>> {

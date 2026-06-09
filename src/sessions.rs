@@ -560,6 +560,95 @@ fn scan_gemini_session_file(path: &Path, dir_name: &str) -> Option<SessionInfo> 
     })
 }
 
+/// Locate a single session by id (or unique prefix) for `aicx session show`.
+/// Fast for claude/codex (the id is in the filename, so no file is read until a
+/// name matches); gemini falls back to a header scan (its id lives inside the
+/// file). Returns the first match, trying claude -> codex -> gemini.
+pub fn find_session_by_id(home: &Path, id: &str) -> Option<SessionInfo> {
+    // Claude: file stem IS the session id.
+    let claude_root = home.join(".claude").join("projects");
+    if let Ok(dirs) = fs::read_dir(&claude_root) {
+        for d in dirs.flatten() {
+            let dp = d.path();
+            if !dp.is_dir() {
+                continue;
+            }
+            let decoded = decode_claude_project_dir(
+                dp.file_name().and_then(|n| n.to_str()).unwrap_or_default(),
+            );
+            let Ok(files) = fs::read_dir(&dp) else {
+                continue;
+            };
+            for f in files.flatten() {
+                let p = f.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+                if stem.starts_with(id)
+                    && let Some(info) = scan_claude_session_file(&p, decoded.as_deref())
+                {
+                    return Some(info);
+                }
+            }
+        }
+    }
+
+    // Codex: the filename embeds the uuid.
+    let mut stack = vec![home.join(".codex").join("sessions")];
+    while let Some(dir) = stack.pop() {
+        let Ok(read) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in read.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+            if stem.contains(id)
+                && let Some(info) = scan_codex_session_file(&p)
+            {
+                return Some(info);
+            }
+        }
+    }
+
+    // Gemini: id lives in the header; scan (few files).
+    let gemini_root = home.join(".gemini").join("tmp");
+    if let Ok(dirs) = fs::read_dir(&gemini_root) {
+        for d in dirs.flatten() {
+            let dir_name = d
+                .path()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let Ok(files) = fs::read_dir(d.path().join("chats")) else {
+                continue;
+            };
+            for f in files.flatten() {
+                let p = f.path();
+                let ext = p.extension().and_then(|x| x.to_str());
+                if ext != Some("json") && ext != Some("jsonl") {
+                    continue;
+                }
+                if let Some(info) = scan_gemini_session_file(&p, &dir_name)
+                    && info.session_id.starts_with(id)
+                {
+                    return Some(info);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn short_title(text: &str) -> String {
     let first_line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     let trimmed = first_line.trim();
@@ -731,6 +820,34 @@ mod tests {
         let pruned = discover_claude_sessions(&root, None, Some("/Users/me/other-repo"));
         let _ = fs::remove_dir_all(&root);
         assert_eq!(pruned.len(), 0);
+    }
+
+    #[test]
+    fn find_session_by_id_locates_claude_by_filename() {
+        let home = temp_root("findsession");
+        let proj = home.join(".claude").join("projects").join("-tmp-proj");
+        fs::create_dir_all(&proj).unwrap();
+        write_session(
+            &proj,
+            "abc12345-dead-beef.jsonl",
+            &[
+                r#"{"type":"user","cwd":"/tmp/proj","message":{"role":"user","content":"hi"},"timestamp":"2026-06-08T10:00:00.000Z"}"#,
+            ],
+        );
+
+        // located by a prefix, no other agent roots present (tolerated)
+        let found = find_session_by_id(&home, "abc12345");
+        let _ = fs::remove_dir_all(&home);
+        let s = found.expect("session found by id prefix");
+        assert_eq!(s.session_id, "abc12345-dead-beef");
+        assert_eq!(s.agent, "claude");
+
+        // unknown id -> None
+        let home2 = temp_root("findsession2");
+        fs::create_dir_all(&home2).unwrap();
+        let none = find_session_by_id(&home2, "nope");
+        let _ = fs::remove_dir_all(&home2);
+        assert!(none.is_none());
     }
 
     #[test]
