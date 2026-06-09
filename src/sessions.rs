@@ -426,6 +426,140 @@ fn codex_message_text(payload: Option<&serde_json::Value>) -> Option<String> {
     })
 }
 
+/// Discover Gemini CLI sessions under a tmp root (`~/.gemini/tmp`). Each project
+/// lives in `<tmp>/<project-or-hash>/chats/session-*.json` as a single whole-file
+/// JSON document with `sessionId`, `startTime`, `lastUpdated`, and `messages[]`.
+/// Gemini records no cwd — only a project hash — so the repo association is the
+/// directory name (the project basename) when it is not an opaque hash.
+pub fn discover_gemini_sessions(
+    tmp_root: &Path,
+    modified_after: Option<SystemTime>,
+    cwd_filter: Option<&str>,
+) -> Vec<SessionInfo> {
+    let mut out = Vec::new();
+    let Ok(dirs) = fs::read_dir(tmp_root) else {
+        return out;
+    };
+    // Gemini has no cwd, only the project basename == the dir name; match --cwd
+    // against the current dir's last path segment.
+    let want_base = cwd_filter
+        .and_then(project_label_from_cwd)
+        .map(|s| s.to_lowercase());
+    for dir_entry in dirs.flatten() {
+        let proj_dir = dir_entry.path();
+        if !proj_dir.is_dir() {
+            continue;
+        }
+        let dir_name = proj_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if let Some(want) = &want_base
+            && dir_name.to_lowercase() != *want
+        {
+            continue;
+        }
+        let chats = proj_dir.join("chats");
+        let Ok(files) = fs::read_dir(&chats) else {
+            continue;
+        };
+        for file_entry in files.flatten() {
+            let path = file_entry.path();
+            let ext = path.extension().and_then(|e| e.to_str());
+            if (ext != Some("json") && ext != Some("jsonl")) || older_than(&path, modified_after) {
+                continue;
+            }
+            if let Some(info) = scan_gemini_session_file(&path, &dir_name) {
+                out.push(info);
+            }
+        }
+    }
+    out
+}
+
+/// Parse a single Gemini whole-file session JSON into a [`SessionInfo`].
+fn scan_gemini_session_file(path: &Path, dir_name: &str) -> Option<SessionInfo> {
+    let content = fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    let session_id = v
+        .get("sessionId")
+        .and_then(|s| s.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string()
+        });
+    let parse_ts = |key: &str| {
+        v.get(key)
+            .and_then(|s| s.as_str())
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&Utc))
+    };
+    let started_at = parse_ts("startTime");
+    let updated_at = parse_ts("lastUpdated").or(started_at);
+
+    let mut user_message_count = 0usize;
+    let mut agent_message_count = 0usize;
+    let mut title = None;
+    if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
+        for m in msgs {
+            match m.get("type").and_then(|t| t.as_str()) {
+                Some("user") => {
+                    user_message_count += 1;
+                    if title.is_none()
+                        && let Some(t) = m
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .filter(|t| !t.trim().is_empty())
+                    {
+                        title = Some(short_title(t));
+                    }
+                }
+                Some("gemini") | Some("model") | Some("assistant") => agent_message_count += 1,
+                _ => {}
+            }
+        }
+    }
+
+    let is_hash = dir_name.len() == 64 && dir_name.chars().all(|c| c.is_ascii_hexdigit());
+    let project = if is_hash || dir_name.is_empty() {
+        None
+    } else {
+        Some(dir_name.to_string())
+    };
+    let association = if project.is_some() {
+        Association::Inferred
+    } else {
+        Association::Unknown
+    };
+    let temporal_confidence = if started_at.is_some() {
+        TemporalConfidence::Full
+    } else {
+        TemporalConfidence::Partial
+    };
+
+    Some(SessionInfo {
+        session_id,
+        agent: "gemini".to_string(),
+        project,
+        // Gemini records only a project hash, never the cwd.
+        repo_path: None,
+        started_at,
+        updated_at,
+        message_count: user_message_count + agent_message_count,
+        user_message_count,
+        agent_message_count,
+        title,
+        source_path: path.to_path_buf(),
+        association,
+        temporal_confidence,
+    })
+}
+
 fn short_title(text: &str) -> String {
     let first_line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     let trimmed = first_line.trim();
@@ -597,6 +731,46 @@ mod tests {
         let pruned = discover_claude_sessions(&root, None, Some("/Users/me/other-repo"));
         let _ = fs::remove_dir_all(&root);
         assert_eq!(pruned.len(), 0);
+    }
+
+    #[test]
+    fn discovers_gemini_session_from_whole_file_json() {
+        let root = temp_root("gemini");
+        let chats = root.join("myproj").join("chats");
+        fs::create_dir_all(&chats).unwrap();
+        let doc = r#"{
+          "sessionId":"116b0791-gemini",
+          "projectHash":"abc",
+          "startTime":"2026-03-22T20:43:32.318Z",
+          "lastUpdated":"2026-03-22T20:43:53.023Z",
+          "messages":[
+            {"id":"1","type":"user","content":"zrób raport"},
+            {"id":"2","type":"gemini","content":"ok"},
+            {"id":"3","type":"gemini","content":"gotowe"}
+          ]
+        }"#;
+        fs::write(chats.join("session-2026-03-22T20-43.json"), doc).unwrap();
+
+        let sessions = discover_gemini_sessions(&root, None, None);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!(s.agent, "gemini");
+        assert_eq!(s.session_id, "116b0791-gemini");
+        assert_eq!(s.project.as_deref(), Some("myproj"));
+        // type=user vs type=gemini split
+        assert_eq!(s.user_message_count, 1);
+        assert_eq!(s.agent_message_count, 2);
+        assert_eq!(s.message_count, 3);
+        assert_eq!(s.title.as_deref(), Some("zrób raport"));
+        assert_eq!(s.temporal_confidence, TemporalConfidence::Full);
+        assert_eq!(
+            s.started_at.unwrap().to_rfc3339(),
+            "2026-03-22T20:43:32.318+00:00"
+        );
+        // gemini records only a project hash, never the cwd
+        assert!(s.repo_path.is_none());
     }
 
     #[test]

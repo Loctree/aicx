@@ -2496,15 +2496,30 @@ fn run_sessions_list(
     };
 
     let home = dirs::home_dir().context("No home dir")?;
-    let mut discovered = sessions::discover_claude_sessions(
-        &home.join(".claude").join("projects"),
-        modified_after,
-        here.as_deref(),
-    );
-    discovered.extend(sessions::discover_codex_sessions(
-        &home.join(".codex").join("sessions"),
-        modified_after,
-    ));
+    // Gate discovery by --agent so e.g. `--agent gemini` scans only gemini
+    // instead of reading every claude+codex file and filtering afterwards.
+    let want_agent = agent.as_deref();
+    let mut discovered = Vec::new();
+    if want_agent.is_none_or(|a| a == "claude") {
+        discovered.extend(sessions::discover_claude_sessions(
+            &home.join(".claude").join("projects"),
+            modified_after,
+            here.as_deref(),
+        ));
+    }
+    if want_agent.is_none_or(|a| a == "codex") {
+        discovered.extend(sessions::discover_codex_sessions(
+            &home.join(".codex").join("sessions"),
+            modified_after,
+        ));
+    }
+    if want_agent.is_none_or(|a| a == "gemini") {
+        discovered.extend(sessions::discover_gemini_sessions(
+            &home.join(".gemini").join("tmp"),
+            modified_after,
+            here.as_deref(),
+        ));
+    }
 
     let selected = sessions::select_sessions(
         discovered,
