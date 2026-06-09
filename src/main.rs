@@ -40,6 +40,7 @@ use aicx::mcp::{self, McpTransport};
 use aicx::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
 use aicx::rank;
 use aicx::reports_extractor::{self, ReportsExtractorConfig};
+use aicx::sessions;
 use aicx::sources::{self, ExtractionConfig};
 use aicx::state::StateManager;
 use aicx::store;
@@ -205,6 +206,28 @@ impl SourceProtectionBackend {
             Self::GitLocal => "git-local",
         }
     }
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionsCommand {
+    /// List discovered agent sessions, newest first.
+    List {
+        /// Restrict to sessions whose repo/cwd matches the current directory.
+        #[arg(long)]
+        cwd: bool,
+
+        /// Filter by agent (currently: claude).
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Max sessions to show (0 = all).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+
+        /// Output format: table | json.
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -925,6 +948,13 @@ enum Commands {
     Sources {
         #[command(subcommand)]
         command: SourcesCommands,
+    },
+
+    /// Discover and list agent sessions on disk (session surface).
+    #[command(display_order = 6)]
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommand,
     },
 
     /// Interactive daily-driver entrypoint for corpus, doctor, intents, and store.
@@ -1989,6 +2019,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             }
         }
         Some(Commands::Sources { command }) => run_sources_command(command)?,
+        Some(Commands::Sessions { command }) => run_sessions_command(command)?,
         Some(Commands::Wizard { smoke_test }) => {
             if smoke_test {
                 aicx::wizard::smoke_test()?;
@@ -2397,6 +2428,83 @@ fn run_command(command: Option<Commands>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_sessions_command(command: SessionsCommand) -> Result<()> {
+    match command {
+        SessionsCommand::List {
+            cwd,
+            agent,
+            limit,
+            format,
+        } => run_sessions_list(cwd, agent, limit, &format),
+    }
+}
+
+fn run_sessions_list(
+    cwd_only: bool,
+    agent: Option<String>,
+    limit: usize,
+    format: &str,
+) -> Result<()> {
+    let projects_root = dirs::home_dir()
+        .context("No home dir")?
+        .join(".claude")
+        .join("projects");
+    let discovered = sessions::discover_claude_sessions(&projects_root);
+
+    let here = if cwd_only {
+        Some(std::env::current_dir()?.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+    let selected = sessions::select_sessions(discovered, here.as_deref(), agent.as_deref(), limit);
+
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(&selected)?),
+        _ => {
+            if selected.is_empty() {
+                eprintln!("No sessions found.");
+                return Ok(());
+            }
+            println!(
+                "{:<10}  {:<6}  {:<22}  {:<25}  {:>5}  {:>4}  {:<8}  TITLE",
+                "SESSION", "AGENT", "PROJECT", "UPDATED (UTC)", "MSGS", "USR", "ASSOC"
+            );
+            for s in &selected {
+                let sid = &s.session_id[..8.min(s.session_id.len())];
+                let project = s.project.as_deref().unwrap_or("-");
+                let updated = s
+                    .updated_at
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_else(|| "(no timestamp)".to_string());
+                let assoc = format!("{:?}", s.association).to_lowercase();
+                println!(
+                    "{:<10}  {:<6}  {:<22}  {:<25}  {:>5}  {:>4}  {:<8}  {}",
+                    sid,
+                    s.agent,
+                    truncate_table_cell(project, 22),
+                    updated,
+                    s.message_count,
+                    s.user_message_count,
+                    assoc,
+                    truncate_table_cell(s.title.as_deref().unwrap_or(""), 60),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Char-boundary-safe cell truncation for table output (never byte-slices a
+/// multibyte char — that path panics, cf. the thread-index UTF-8 crash).
+fn truncate_table_cell(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let clipped: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{clipped}…")
+    }
 }
 
 fn run_sources_command(command: SourcesCommands) -> Result<()> {

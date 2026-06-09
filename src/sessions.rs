@@ -241,6 +241,38 @@ fn short_title(text: &str) -> String {
     }
 }
 
+/// Select sessions for `aicx sessions list`: optional agent filter, optional
+/// cwd-association filter (keep sessions whose repo_path nests with `here`),
+/// newest-first sort (by `updated_at`, falling back to `started_at`), then an
+/// optional `limit` (0 = all). Pure so the list policy is testable without the
+/// filesystem.
+pub fn select_sessions(
+    mut sessions: Vec<SessionInfo>,
+    here: Option<&str>,
+    agent: Option<&str>,
+    limit: usize,
+) -> Vec<SessionInfo> {
+    if let Some(agent) = agent {
+        sessions.retain(|s| s.agent == agent);
+    }
+    if let Some(here) = here {
+        sessions.retain(|s| {
+            s.repo_path
+                .as_deref()
+                .is_some_and(|p| here == p || here.starts_with(p) || p.starts_with(here))
+        });
+    }
+    sessions.sort_by(|a, b| {
+        let ta = a.updated_at.or(a.started_at);
+        let tb = b.updated_at.or(b.started_at);
+        tb.cmp(&ta)
+    });
+    if limit > 0 {
+        sessions.truncate(limit);
+    }
+    sessions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +376,53 @@ mod tests {
         assert!(sessions[0].started_at.is_none());
         // partial repo association inferred from the directory encoding
         assert_eq!(sessions[0].association, Association::Inferred);
+    }
+
+    fn mk_info(id: &str, repo: Option<&str>, updated: &str) -> SessionInfo {
+        SessionInfo {
+            session_id: id.to_string(),
+            agent: "claude".to_string(),
+            project: repo.and_then(project_label_from_cwd),
+            repo_path: repo.map(str::to_string),
+            started_at: None,
+            updated_at: Some(
+                DateTime::parse_from_rfc3339(updated)
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            message_count: 1,
+            user_message_count: 1,
+            agent_message_count: 0,
+            title: None,
+            source_path: PathBuf::from(format!("/x/{id}.jsonl")),
+            association: Association::Exact,
+            temporal_confidence: TemporalConfidence::Full,
+        }
+    }
+
+    #[test]
+    fn select_sessions_filters_by_cwd_and_sorts_newest_first() {
+        let here = "/Users/me/repo-a";
+        let sessions = vec![
+            mk_info("aaa", Some("/Users/me/repo-a"), "2026-06-01T10:00:00Z"),
+            mk_info("bbb", Some("/Users/me/repo-a"), "2026-06-08T10:00:00Z"),
+            mk_info("ccc", Some("/Users/me/repo-b"), "2026-06-09T10:00:00Z"),
+        ];
+
+        // cwd filter keeps only repo-a, newest first
+        let got = select_sessions(sessions.clone(), Some(here), None, 0);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].session_id, "bbb", "newest first");
+        assert_eq!(got[1].session_id, "aaa");
+
+        // limit clips after sort
+        let limited = select_sessions(sessions.clone(), Some(here), None, 1);
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].session_id, "bbb");
+
+        // no cwd filter -> all three, ccc (2026-06-09) newest
+        let all = select_sessions(sessions, None, None, 0);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].session_id, "ccc");
     }
 }
