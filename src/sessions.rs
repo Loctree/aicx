@@ -640,6 +640,254 @@ fn scan_gemini_session_file(path: &Path, dir_name: &str) -> Option<SessionInfo> 
     })
 }
 
+/// Junie session directory prefix (`~/.junie/sessions/session-*`). Mirrors
+/// `JUNIE_SESSION_DIR_PREFIX` in `sources/providers/junie.rs` (private to the
+/// extractor) — keep the two in sync.
+const JUNIE_SESSION_DIR_PREFIX: &str = "session-";
+
+/// Junie events log filename inside a session directory.
+const JUNIE_EVENTS_FILENAME: &str = "events.jsonl";
+
+/// Parse Junie's compact `YYMMDD` + `HHMMSS` timestamp pair (used in session
+/// dir names `session-260408-214715-abcd` and request ids
+/// `prompt-260408-214823-br8l`). Mirrors `parse_compact_junie_timestamp` in
+/// `sources/providers/junie.rs` (private to the extractor) — keep in sync.
+/// Junie writes these as UTC wall-clock, consistent with the extractor.
+fn parse_compact_junie_timestamp(compact_date: &str, compact_time: &str) -> Option<DateTime<Utc>> {
+    if compact_date.len() != 6 || compact_time.len() != 6 {
+        return None;
+    }
+    // Byte-index slicing below is only UTF-8-safe for ASCII.
+    if !compact_date.is_ascii() || !compact_time.is_ascii() {
+        return None;
+    }
+    let year = 2000 + compact_date[0..2].parse::<i32>().ok()?;
+    let month = compact_date[2..4].parse::<u32>().ok()?;
+    let day = compact_date[4..6].parse::<u32>().ok()?;
+    let hour = compact_time[0..2].parse::<u32>().ok()?;
+    let minute = compact_time[2..4].parse::<u32>().ok()?;
+    let second = compact_time[4..6].parse::<u32>().ok()?;
+    let naive =
+        chrono::NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, minute, second)?;
+    Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+}
+
+/// Parse a compact timestamp out of a `<prefix>-YYMMDD-HHMMSS[-suffix]` string
+/// (Junie session-dir suffix or `prompt-*` request id).
+fn parse_junie_compact_pair(s: &str) -> Option<DateTime<Utc>> {
+    let mut parts = s.split('-');
+    let compact_date = parts.next()?;
+    let compact_time = parts.next()?;
+    parse_compact_junie_timestamp(compact_date, compact_time)
+}
+
+/// Discover Junie sessions under a sessions root (`~/.junie/sessions`). Each
+/// session is `session-<YYMMDD>-<HHMMSS>-<suffix>/events.jsonl`; the session
+/// id is the directory name minus the `session-` prefix — the same id
+/// `aicx extract --agent junie` reports. Absolute time comes from the compact
+/// timestamps Junie embeds in the dir name and in `prompt-*` request ids
+/// (events carry no per-line RFC3339 stamp). Tolerant: unreadable files are
+/// counted and skipped, never abort the scan.
+pub fn discover_junie_sessions(
+    sessions_root: &Path,
+    modified_after: Option<SystemTime>,
+) -> Vec<SessionInfo> {
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    let Ok(dirs) = fs::read_dir(sessions_root) else {
+        return out;
+    };
+    for dir_entry in dirs.flatten() {
+        let dir_path = dir_entry.path();
+        if !dir_path.is_dir() {
+            continue;
+        }
+        let Some(session_id) = dir_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix(JUNIE_SESSION_DIR_PREFIX))
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let events = dir_path.join(JUNIE_EVENTS_FILENAME);
+        if !events.is_file() || older_than(&events, modified_after) {
+            continue;
+        }
+        match scan_junie_session_file(&events, session_id) {
+            Some(info) => out.push(info),
+            None => skipped += 1,
+        }
+    }
+    if skipped > 0 {
+        eprintln!("aicx: sessions: skipped {skipped} unreadable file(s) (junie)");
+    }
+    out
+}
+
+/// Parse a single Junie `events.jsonl` into a [`SessionInfo`].
+///
+/// Event shapes (same contract the extractor in
+/// `sources/providers/junie.rs` consumes):
+/// - `{"kind":"UserPromptEvent","requestId":"prompt-YYMMDD-HHMMSS-..","prompt":..}`
+///   — a user message; prompts carrying `PlanAttachment` /
+///   `ContinueTaskAttachment` are harness meta, not operator messages.
+/// - `{"kind":"UserResponseEvent","prompt":..}` — a user choice/reply.
+/// - `{"kind":"SessionA2uxEvent","event":{"agentEvent":{"kind":..}}}` —
+///   nested agent events; `ResultBlockUpdatedEvent` is the agent reply
+///   surface (deduped per stepId like the extractor),
+///   `CurrentDirectoryUpdatedEvent` carries the recorded cwd.
+fn scan_junie_session_file(path: &Path, session_id: &str) -> Option<SessionInfo> {
+    let content = fs::read_to_string(path).ok()?;
+
+    // Anchor: the session dir name embeds the start time.
+    let anchor = parse_junie_compact_pair(session_id);
+    let mut started_at: Option<DateTime<Utc>> = anchor;
+    let mut updated_at: Option<DateTime<Utc>> = anchor;
+    let mut user_message_count = 0usize;
+    let mut agent_message_count = 0usize;
+    let mut title: Option<String> = None;
+    let mut recorded_cwd: Option<String> = None;
+    // Garbage-only files report TemporalConfidence::None (consistent with
+    // claude/codex) — unless the dir-name anchor already gave absolute time.
+    let mut saw_parsable_line = false;
+    // Junie streams ResultBlockUpdatedEvent snapshots (repeats per stepId);
+    // count a reply only when the rendered text changes, like the extractor.
+    let mut last_result_render: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        saw_parsable_line = true;
+
+        match v.get("kind").and_then(|k| k.as_str()) {
+            Some("UserPromptEvent") => {
+                let prompt = v
+                    .get("prompt")
+                    .and_then(|p| p.as_str())
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty());
+                if let Some(ts) = v
+                    .get("requestId")
+                    .and_then(|r| r.as_str())
+                    .and_then(|r| r.strip_prefix("prompt-"))
+                    .and_then(parse_junie_compact_pair)
+                {
+                    started_at = Some(started_at.map_or(ts, |c| c.min(ts)));
+                    updated_at = Some(updated_at.map_or(ts, |c| c.max(ts)));
+                }
+                // Plan/continue attachments are injected harness meta, not an
+                // operator message — same rule as the extractor's SystemNote.
+                let is_meta = v
+                    .get("customAttachments")
+                    .and_then(|a| a.as_array())
+                    .is_some_and(|attachments| {
+                        attachments.iter().any(|attachment| {
+                            matches!(
+                                attachment.get("kind").and_then(|k| k.as_str()),
+                                Some("PlanAttachment" | "ContinueTaskAttachment")
+                            )
+                        })
+                    });
+                if !is_meta && let Some(text) = prompt {
+                    user_message_count += 1;
+                    if title.is_none() {
+                        title = Some(short_title(text));
+                    }
+                }
+            }
+            Some("UserResponseEvent") => {
+                if v.get("prompt")
+                    .and_then(|p| p.as_str())
+                    .is_some_and(|t| !t.trim().is_empty())
+                {
+                    user_message_count += 1;
+                }
+            }
+            _ => {
+                let Some(agent_event) = v.get("event").and_then(|e| e.get("agentEvent")) else {
+                    continue;
+                };
+                match agent_event.get("kind").and_then(|k| k.as_str()) {
+                    Some("CurrentDirectoryUpdatedEvent") => {
+                        if recorded_cwd.is_none()
+                            && let Some(cwd) = agent_event
+                                .get("currentDirectory")
+                                .and_then(|c| c.as_str())
+                                .map(str::trim)
+                                .filter(|c| !c.is_empty())
+                        {
+                            recorded_cwd = Some(cwd.to_string());
+                        }
+                    }
+                    Some("ResultBlockUpdatedEvent") => {
+                        let Some(result) = agent_event
+                            .get("result")
+                            .and_then(|r| r.as_str())
+                            .map(str::trim)
+                            .filter(|r| !r.is_empty())
+                        else {
+                            continue;
+                        };
+                        let step_id = agent_event
+                            .get("stepId")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("(no-step)")
+                            .to_string();
+                        if last_result_render
+                            .get(&step_id)
+                            .is_some_and(|prev| prev == result)
+                        {
+                            continue;
+                        }
+                        last_result_render.insert(step_id, result.to_string());
+                        agent_message_count += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let project = recorded_cwd.as_deref().and_then(project_label_from_cwd);
+    let (repo_path, association) = match recorded_cwd {
+        Some(c) => (Some(c), Association::Exact),
+        None => (None, Association::Unknown),
+    };
+    // Full when the dir name or a request id yielded an absolute stamp;
+    // Partial when the file parsed but exposed no time signal; None for
+    // garbage-only content (consistent with claude/codex/gemini).
+    let temporal_confidence = if started_at.is_some() {
+        TemporalConfidence::Full
+    } else if saw_parsable_line {
+        TemporalConfidence::Partial
+    } else {
+        TemporalConfidence::None
+    };
+
+    Some(SessionInfo {
+        session_id: session_id.to_string(),
+        agent: "junie".to_string(),
+        project,
+        repo_path,
+        started_at,
+        updated_at,
+        message_count: user_message_count + agent_message_count,
+        user_message_count,
+        agent_message_count,
+        title,
+        source_path: path.to_path_buf(),
+        association,
+        temporal_confidence,
+    })
+}
+
 /// Extract the trailing session-id segment from a codex rollout filename stem,
 /// shaped `rollout-<YYYY-MM-DDThh-mm-ss>-<id>`. Returns `None` when the stem
 /// does not follow that shape (callers then fall back to whole-stem matching).
@@ -658,9 +906,10 @@ fn codex_rollout_id_segment(stem: &str) -> Option<&str> {
 }
 
 /// Locate a single session by id (or unique prefix) for `aicx session show`.
-/// Fast for claude/codex (the id is in the filename, so no file is read until a
-/// name matches); gemini falls back to a header scan (its id lives inside the
-/// file). Returns the first match, trying claude -> codex -> gemini.
+/// Fast for claude/codex/junie (the id is in the file/dir name, so no file is
+/// read until a name matches); gemini falls back to a header scan (its id
+/// lives inside the file). Returns the first match, trying
+/// claude -> codex -> gemini -> junie.
 pub fn find_session_by_id(home: &Path, id: &str) -> Option<SessionInfo> {
     // Claude: file stem IS the session id.
     let claude_root = home.join(".claude").join("projects");
@@ -762,6 +1011,47 @@ pub fn find_session_by_id(home: &Path, id: &str) -> Option<SessionInfo> {
                 {
                     return Some(info);
                 }
+            }
+        }
+    }
+
+    // Junie: the session id is the dir name minus the `session-` prefix; match
+    // a prefix of that segment, no file read until a name matches. Sorted for
+    // a deterministic pick on ambiguous prefixes (mirrors the codex branch).
+    let junie_root = home.join(".junie").join("sessions");
+    if let Ok(dirs) = fs::read_dir(&junie_root) {
+        let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+        for d in dirs.flatten() {
+            let dp = d.path();
+            if !dp.is_dir() {
+                continue;
+            }
+            let Some(sid) = dp
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix(JUNIE_SESSION_DIR_PREFIX))
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            if !sid.starts_with(id) {
+                continue;
+            }
+            let events = dp.join(JUNIE_EVENTS_FILENAME);
+            if events.is_file() {
+                candidates.push((sid.to_string(), events));
+            }
+        }
+        candidates.sort();
+        if candidates.len() > 1 {
+            eprintln!(
+                "aicx: session: id '{id}' matches {} junie sessions; using the first (sorted)",
+                candidates.len()
+            );
+        }
+        for (sid, events) in candidates {
+            if let Some(info) = scan_junie_session_file(&events, &sid) {
+                return Some(info);
             }
         }
     }
@@ -1328,6 +1618,110 @@ mod tests {
             "019c1111-aaaa"
         );
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn discovers_junie_session_with_compact_timestamps_and_counts() {
+        let root = temp_root("junie");
+        let session_dir = root.join("session-260408-214715-abcd");
+        fs::create_dir_all(&session_dir).unwrap();
+        write_session(
+            &session_dir,
+            "events.jsonl",
+            &[
+                r#"{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"CurrentDirectoryUpdatedEvent","currentDirectory":"/tmp/repo"}}}"#,
+                r#"{"kind":"UserPromptEvent","requestId":"prompt-260408-214823-br8l","prompt":"vc-init","presentablePrompt":"vc-init"}"#,
+                r#"{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"step-1","result":"Initial plan"}}}"#,
+                r#"{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"step-1","result":"Initial plan"}}}"#,
+                r#"{"kind":"UserResponseEvent","prompt":"jedziemy","isChoice":true}"#,
+                r#"{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"step-1","result":"Refined plan"}}}"#,
+            ],
+        );
+
+        let sessions = discover_junie_sessions(&root, None);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!(s.agent, "junie");
+        // id = dir name minus the `session-` prefix (extractor contract)
+        assert_eq!(s.session_id, "260408-214715-abcd");
+        // absolute time from dir-name anchor + prompt request id
+        assert_eq!(s.temporal_confidence, TemporalConfidence::Full);
+        assert_eq!(
+            s.started_at.unwrap().to_rfc3339(),
+            "2026-04-08T21:47:15+00:00"
+        );
+        assert_eq!(
+            s.updated_at.unwrap().to_rfc3339(),
+            "2026-04-08T21:48:23+00:00"
+        );
+        // cwd from CurrentDirectoryUpdatedEvent
+        assert_eq!(s.repo_path.as_deref(), Some("/tmp/repo"));
+        assert_eq!(s.project.as_deref(), Some("repo"));
+        assert_eq!(s.association, Association::Exact);
+        // duplicate streaming Result snapshot deduped; changed text counted
+        assert_eq!(s.user_message_count, 2);
+        assert_eq!(s.agent_message_count, 2);
+        assert_eq!(s.message_count, 4);
+        assert_eq!(s.title.as_deref(), Some("vc-init"));
+    }
+
+    #[test]
+    fn junie_meta_prompt_is_not_an_operator_message_or_title() {
+        let root = temp_root("junie_meta");
+        let session_dir = root.join("session-260605-183024-junie");
+        fs::create_dir_all(&session_dir).unwrap();
+        write_session(
+            &session_dir,
+            "events.jsonl",
+            &[
+                r#"{"kind":"UserPromptEvent","requestId":"prompt-260605-183101-meta1","prompt":"Implement the suggested plan","customAttachments":[{"kind":"PlanAttachment"}]}"#,
+                r#"{"kind":"UserPromptEvent","requestId":"prompt-260605-183102-real1","prompt":"real operator question"}"#,
+            ],
+        );
+        let sessions = discover_junie_sessions(&root, None);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!(s.user_message_count, 1, "meta prompt not counted");
+        assert_eq!(s.title.as_deref(), Some("real operator question"));
+    }
+
+    #[test]
+    fn junie_garbage_only_file_reports_temporal_none_without_anchor() {
+        let root = temp_root("junie_garbage");
+        // No parseable compact timestamp in the dir suffix, garbage content.
+        let session_dir = root.join("session-opaque");
+        fs::create_dir_all(&session_dir).unwrap();
+        write_session(&session_dir, "events.jsonl", &["{{{ not json"]);
+        let sessions = discover_junie_sessions(&root, None);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].temporal_confidence, TemporalConfidence::None);
+        assert!(sessions[0].started_at.is_none());
+    }
+
+    #[test]
+    fn find_session_by_id_locates_junie_by_dir_name() {
+        let home = temp_root("junie_find");
+        let session_dir = home
+            .join(".junie")
+            .join("sessions")
+            .join("session-260408-214715-abcd");
+        fs::create_dir_all(&session_dir).unwrap();
+        write_session(
+            &session_dir,
+            "events.jsonl",
+            &[
+                r#"{"kind":"UserPromptEvent","requestId":"prompt-260408-214823-br8l","prompt":"hej"}"#,
+            ],
+        );
+        let found = find_session_by_id(&home, "260408-214715");
+        let _ = fs::remove_dir_all(&home);
+        let s = found.expect("junie session found by id prefix");
+        assert_eq!(s.agent, "junie");
+        assert_eq!(s.session_id, "260408-214715-abcd");
     }
 
     #[test]
