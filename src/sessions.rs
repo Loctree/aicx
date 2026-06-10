@@ -1815,6 +1815,111 @@ mod tests {
         assert_eq!(s.session_id, "g-abc1-aaa", "smallest session id wins");
     }
 
+    /// Make `path` unreadable (mode 000). Returns false when permissions are
+    /// not enforced (e.g. running as root) — callers then skip the assertion.
+    #[cfg(unix)]
+    fn make_unreadable(path: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::read_to_string(path).is_err()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_unreadable_file_is_skipped_not_fatal() {
+        let root = temp_root("unreadable_claude");
+        let proj = root.join("-tmp-proj");
+        fs::create_dir_all(&proj).unwrap();
+        write_session(
+            &proj,
+            "good.jsonl",
+            &[
+                r#"{"type":"user","message":{"role":"user","content":"ok"},"timestamp":"2026-06-08T10:00:00.000Z"}"#,
+            ],
+        );
+        write_session(&proj, "locked.jsonl", &["{}"]);
+        if !make_unreadable(&proj.join("locked.jsonl")) {
+            let _ = fs::remove_dir_all(&root);
+            return; // root: permissions not enforced, nothing to verify
+        }
+        let sessions = discover_claude_sessions(&root, None, None);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(sessions.len(), 1, "unreadable file skipped, scan survives");
+        assert_eq!(sessions[0].session_id, "good");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_unreadable_file_is_skipped_not_fatal() {
+        let root = temp_root("unreadable_codex");
+        let day = root.join("2026").join("01").join("29");
+        fs::create_dir_all(&day).unwrap();
+        write_session(
+            &day,
+            "rollout-good.jsonl",
+            &[
+                r#"{"timestamp":"2026-01-29T12:58:09.421Z","type":"session_meta","payload":{"id":"good-codex","cwd":"/tmp/a"}}"#,
+            ],
+        );
+        write_session(&day, "rollout-locked.jsonl", &["{}"]);
+        if !make_unreadable(&day.join("rollout-locked.jsonl")) {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        let sessions = discover_codex_sessions(&root, None);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(sessions.len(), 1, "unreadable file skipped, scan survives");
+        assert_eq!(sessions[0].session_id, "good-codex");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gemini_unreadable_file_is_skipped_not_fatal() {
+        let root = temp_root("unreadable_gemini");
+        let chats = root.join("proj").join("chats");
+        fs::create_dir_all(&chats).unwrap();
+        fs::write(
+            chats.join("session-good.json"),
+            r#"{"sessionId":"g-good","messages":[{"id":"1","type":"user","content":"hej"}]}"#,
+        )
+        .unwrap();
+        fs::write(chats.join("session-locked.json"), "{}").unwrap();
+        if !make_unreadable(&chats.join("session-locked.json")) {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        let sessions = discover_gemini_sessions(&root, None, None);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(sessions.len(), 1, "unreadable file skipped, scan survives");
+        assert_eq!(sessions[0].session_id, "g-good");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn junie_unreadable_events_file_is_skipped_not_fatal() {
+        let root = temp_root("unreadable_junie");
+        let good = root.join("session-260408-214715-good");
+        fs::create_dir_all(&good).unwrap();
+        write_session(
+            &good,
+            "events.jsonl",
+            &[
+                r#"{"kind":"UserPromptEvent","requestId":"prompt-260408-214823-br8l","prompt":"hej"}"#,
+            ],
+        );
+        let locked = root.join("session-260408-220000-lock");
+        fs::create_dir_all(&locked).unwrap();
+        write_session(&locked, "events.jsonl", &["{}"]);
+        if !make_unreadable(&locked.join("events.jsonl")) {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        let sessions = discover_junie_sessions(&root, None);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(sessions.len(), 1, "unreadable file skipped, scan survives");
+        assert_eq!(sessions[0].session_id, "260408-214715-good");
+    }
+
     #[test]
     fn codex_rollout_id_segment_parses_rollout_shape() {
         assert_eq!(
