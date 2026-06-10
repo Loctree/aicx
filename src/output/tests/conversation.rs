@@ -98,12 +98,12 @@ fn write_conversation_markdown_emits_date_heading_for_recency() {
 
     let content = fs::read_to_string(&path).unwrap();
     assert!(
-        content.contains("#### 2026-01-23"),
-        "missing first-day date heading (with year):\n{content}"
+        content.contains("#### 2026-01-23 (UTC)"),
+        "missing first-day date heading (with year and UTC marker):\n{content}"
     );
     assert!(
-        content.contains("#### 2026-01-24"),
-        "day boundary must emit a second date heading:\n{content}"
+        content.contains("#### 2026-01-24 (UTC)"),
+        "day boundary must emit a second date heading (with UTC marker):\n{content}"
     );
 
     cleanup(&dir);
