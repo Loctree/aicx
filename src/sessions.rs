@@ -909,11 +909,17 @@ fn codex_rollout_id_segment(stem: &str) -> Option<&str> {
 /// Fast for claude/codex/junie (the id is in the file/dir name, so no file is
 /// read until a name matches); gemini falls back to a header scan (its id
 /// lives inside the file). Returns the first match, trying
-/// claude -> codex -> gemini -> junie.
+/// claude -> codex -> gemini -> junie. Within every branch an ambiguous
+/// prefix resolves deterministically: candidates are sorted and a warning
+/// names the match count before the first one wins.
 pub fn find_session_by_id(home: &Path, id: &str) -> Option<SessionInfo> {
-    // Claude: file stem IS the session id.
+    // Claude: file stem IS the session id. Candidates are collected and
+    // sorted so an ambiguous prefix resolves deterministically (warn + first
+    // by path) instead of in fs::read_dir order — mirrors the codex/junie
+    // branches.
     let claude_root = home.join(".claude").join("projects");
     if let Ok(dirs) = fs::read_dir(&claude_root) {
+        let mut candidates: Vec<(PathBuf, Option<String>)> = Vec::new();
         for d in dirs.flatten() {
             let dp = d.path();
             if !dp.is_dir() {
@@ -931,11 +937,21 @@ pub fn find_session_by_id(home: &Path, id: &str) -> Option<SessionInfo> {
                     continue;
                 }
                 let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-                if stem.starts_with(id)
-                    && let Some(info) = scan_claude_session_file(&p, decoded.as_deref())
-                {
-                    return Some(info);
+                if stem.starts_with(id) {
+                    candidates.push((p, decoded.clone()));
                 }
+            }
+        }
+        candidates.sort();
+        if candidates.len() > 1 {
+            eprintln!(
+                "aicx: session: id '{id}' matches {} claude sessions; using the first (sorted)",
+                candidates.len()
+            );
+        }
+        for (p, decoded) in candidates {
+            if let Some(info) = scan_claude_session_file(&p, decoded.as_deref()) {
+                return Some(info);
             }
         }
     }
@@ -987,9 +1003,12 @@ pub fn find_session_by_id(home: &Path, id: &str) -> Option<SessionInfo> {
         }
     }
 
-    // Gemini: id lives in the header; scan (few files).
+    // Gemini: id lives in the header; scan (few files). Matches are collected
+    // and sorted (session id, then path) so an ambiguous prefix resolves
+    // deterministically with a warning — mirrors the codex/junie branches.
     let gemini_root = home.join(".gemini").join("tmp");
     if let Ok(dirs) = fs::read_dir(&gemini_root) {
+        let mut candidates: Vec<SessionInfo> = Vec::new();
         for d in dirs.flatten() {
             let dir_name = d
                 .path()
@@ -1009,9 +1028,23 @@ pub fn find_session_by_id(home: &Path, id: &str) -> Option<SessionInfo> {
                 if let Some(info) = scan_gemini_session_file(&p, &dir_name)
                     && info.session_id.starts_with(id)
                 {
-                    return Some(info);
+                    candidates.push(info);
                 }
             }
+        }
+        candidates.sort_by(|a, b| {
+            a.session_id
+                .cmp(&b.session_id)
+                .then_with(|| a.source_path.cmp(&b.source_path))
+        });
+        if candidates.len() > 1 {
+            eprintln!(
+                "aicx: session: id '{id}' matches {} gemini sessions; using the first (sorted)",
+                candidates.len()
+            );
+        }
+        if let Some(info) = candidates.into_iter().next() {
+            return Some(info);
         }
     }
 
@@ -1722,6 +1755,64 @@ mod tests {
         let s = found.expect("junie session found by id prefix");
         assert_eq!(s.agent, "junie");
         assert_eq!(s.session_id, "260408-214715-abcd");
+    }
+
+    #[test]
+    fn find_session_by_id_claude_ambiguous_prefix_resolves_deterministically() {
+        let home = temp_root("claude_ambiguous");
+        // Two sessions sharing the `abc1` prefix in DIFFERENT project dirs:
+        // fs::read_dir order is unspecified, so without sorting the winner
+        // would be arbitrary. Sorted by path, `-proj-a` wins.
+        let proj_a = home.join(".claude").join("projects").join("-proj-a");
+        let proj_b = home.join(".claude").join("projects").join("-proj-b");
+        fs::create_dir_all(&proj_a).unwrap();
+        fs::create_dir_all(&proj_b).unwrap();
+        write_session(
+            &proj_a,
+            "abc1zzzz-in-a.jsonl",
+            &[
+                r#"{"type":"user","cwd":"/proj/a","message":{"role":"user","content":"a"},"timestamp":"2026-06-08T10:00:00.000Z"}"#,
+            ],
+        );
+        write_session(
+            &proj_b,
+            "abc1aaaa-in-b.jsonl",
+            &[
+                r#"{"type":"user","cwd":"/proj/b","message":{"role":"user","content":"b"},"timestamp":"2026-06-08T11:00:00.000Z"}"#,
+            ],
+        );
+
+        let found = find_session_by_id(&home, "abc1");
+        let _ = fs::remove_dir_all(&home);
+        let s = found.expect("ambiguous prefix still resolves");
+        // Lexicographically first PATH wins (-proj-a sorts before -proj-b),
+        // independent of read_dir enumeration order.
+        assert_eq!(s.session_id, "abc1zzzz-in-a");
+        assert_eq!(s.repo_path.as_deref(), Some("/proj/a"));
+    }
+
+    #[test]
+    fn find_session_by_id_gemini_ambiguous_prefix_resolves_deterministically() {
+        let home = temp_root("gemini_ambiguous");
+        let chats = home.join(".gemini").join("tmp").join("proj").join("chats");
+        fs::create_dir_all(&chats).unwrap();
+        // Same `g-abc1` prefix; sorted by session id, `g-abc1-aaa` must win
+        // even though its file name sorts AFTER the other one.
+        fs::write(
+            chats.join("session-1.json"),
+            r#"{"sessionId":"g-abc1-zzz","messages":[{"id":"1","type":"user","content":"z"}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            chats.join("session-2.json"),
+            r#"{"sessionId":"g-abc1-aaa","messages":[{"id":"1","type":"user","content":"a"}]}"#,
+        )
+        .unwrap();
+
+        let found = find_session_by_id(&home, "g-abc1");
+        let _ = fs::remove_dir_all(&home);
+        let s = found.expect("ambiguous prefix still resolves");
+        assert_eq!(s.session_id, "g-abc1-aaa", "smallest session id wins");
     }
 
     #[test]
