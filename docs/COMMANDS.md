@@ -274,8 +274,8 @@ Options:
 - `-p, --project <PROJECT>...` repo or store-bucket filter(s); omit to search all projects
 - `-H, --hours <HOURS>` lookback window (`0` = all time)
 - `-d, --date <DATE>` filter by date (single day, range, or open-ended)
-- `-l, --limit <N>` max results (default: `10`)
-- `-s, --score <SCORE>` minimum quality threshold (`0..=100`)
+- `--limit <N>` max results (default: `10`)
+- `--score <SCORE>` minimum quality threshold (`0..=100`)
 - `--no-semantic` run explicit filesystem-fuzzy search instead of semantic search
 - `-j, --json` emit compact JSON instead of plain text
 
@@ -332,11 +332,11 @@ aicx steer [OPTIONS]
 Options:
 - `--run-id <RUN_ID>` filter by run_id (exact match)
 - `--prompt-id <PROMPT_ID>` filter by prompt_id (exact match)
-- `-a, --agent <AGENT>` filter by agent: claude, codex, gemini
+- `--agent <AGENT>` filter by agent: claude, codex, gemini, junie, codescribe
 - `-k, --kind <KIND>` filter by kind: conversations, plans, reports, other
 - `-p, --project <PROJECT>...` repo or store-bucket filter(s); omit to search all projects
 - `-d, --date <DATE>` filter by date: single day, range, or open-ended
-- `-l, --limit <N>` max results (default: `20`)
+- `--limit <N>` max results (default: `10`)
 - `-j, --json` emit JSON with `oracle_status`
 
 Examples:
@@ -493,6 +493,7 @@ aicx intents [OPTIONS]
 Options:
 - `-p, --project <PROJECT>...` repo or store-bucket filter(s); omit to scan all projects
 - `-H, --hours <HOURS>` lookback window (default: `720`)
+- `--limit <N>` max results (default: unlimited, so a full roadmap is never silently clipped; an explicit `--limit 10` means 10)
 - `--emit <markdown|json>` output format (default: `markdown`; `json` includes `oracle_status`)
 - `--strict` only show high-confidence intents
 - `--kind <decision|intent|outcome|task>` filter by kind
@@ -520,21 +521,29 @@ Every machine-readable lane export is wrapped in the `aicx.lanes.v1` envelope:
 `timezone_assumptions`, and `warnings` (non-empty whenever any timestamp is
 partial or inferred — partial time is never silently presented as full).
 
+Privacy note: lane exports embed raw text fragments of agent messages — each
+`claim_text` is the leading line of the source message verbatim. Paths under
+the user's home directory in artifact-evidence excerpts are redacted to `~`.
+
 ## `aicx sessions`
 
-Discover and list agent sessions on disk (claude + codex + gemini), newest
-first, with absolute RFC3339 timestamps.
+Discover and list agent sessions on disk (claude + codex + gemini + junie),
+newest first, with absolute RFC3339 timestamps.
 
 ```bash
-aicx sessions list [--cwd] [--agent <claude|codex|gemini>] [--since YYYY-MM-DD]
+aicx sessions list [--cwd] [--agent <claude|codex|gemini|junie>] [--since YYYY-MM-DD]
                    [--all] [--limit <N>] [--format table|json]
 aicx sessions show <session_id> [--format markdown|json]   # alias: aicx session show
 ```
 
 - `--cwd` infers the repo from the current directory and lists only its sessions.
+- `--agent` accepts exactly `claude`, `codex`, `gemini`, or `junie`; anything
+  else is a CLI error, never a silently empty list.
 - Association confidence is explicit: `exact` (from session cwd) vs `inferred`
   (decoded from the project dir name).
-- Sessions with no parseable timestamp are marked, never silently dated.
+- Sessions without a parseable timestamp are still listed — the table shows
+  them with an explicit `(no timestamp)` marker (and they survive the
+  `--since` window) instead of being silently dated out.
 
 ## `aicx claims`
 
@@ -555,7 +564,8 @@ Lane 3: collect repo evidence for a session's claims and fold it into
 verification statuses. Read-only — nothing is executed.
 
 ```bash
-aicx results collect --session <id> [--repo <path>] [--format json|summary]
+aicx results collect --session <id-or-prefix> [--agent <a>] [--hours <H>]
+                     [--repo <path>] [--format json|summary]
 ```
 
 For every checkable file path a claim names, artifact existence yields a
@@ -569,7 +579,8 @@ Lane 5: turn verified gaps into at most 5 A/B/C **decision** questions —
 never fact questions the system can answer itself.
 
 ```bash
-aicx clarify --session <id> [--repo <path>] [--max <1-5>] [--format markdown|json]
+aicx clarify --session <id-or-prefix> [--agent <a>] [--hours <H>] [--repo <path>]
+             [--max <1-5>] [--format markdown|json]
 ```
 
 Questions come from contract fractures (Lane 4): contradicted claims and
