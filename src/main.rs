@@ -248,6 +248,35 @@ enum SessionsCommand {
         #[arg(long, default_value = "markdown")]
         format: String,
     },
+
+    /// Unified truth report for one session: human intents (Lane 1), agent
+    /// claims + evidence verification (Lanes 2-3), contract fractures (Lane 4)
+    /// and clarify decisions (Lane 5) in a single rendering.
+    Report {
+        /// Session id (or a unique prefix).
+        session_id: String,
+
+        /// Agent: claude | codex | gemini | junie. Inferred from the session
+        /// id when omitted.
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Hours to look back when locating the session (default 720).
+        #[arg(long, default_value_t = 720)]
+        hours: u64,
+
+        /// Repo root evidence is checked against (default: current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Max clarify questions (hard-capped at 5).
+        #[arg(long, default_value_t = 5)]
+        max: usize,
+
+        /// Output format: markdown | json.
+        #[arg(long, default_value = "markdown")]
+        format: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2593,12 +2622,20 @@ struct LaneSessionContext {
     warnings: Vec<String>,
     extracted_at: String,
     claims: Vec<intents::ClaimRecord>,
+    user_intents: Vec<intents::UserIntentLine>,
 }
 
 impl LaneSessionContext {
     /// Wrap a lane payload in the machine-export envelope (schema_version,
     /// absolute generated_at, time coverage, timezone assumptions, warnings).
-    fn envelope<T: serde::Serialize>(&self, mode: &str, payload: T) -> intents::LaneExport<T> {
+    /// `role_filter` declares which roles fed the payload: the claim-only
+    /// lanes pass `agent_only`, the unified report passes `all`.
+    fn envelope<T: serde::Serialize>(
+        &self,
+        mode: &str,
+        role_filter: &str,
+        payload: T,
+    ) -> intents::LaneExport<T> {
         intents::LaneExport {
             schema_version: intents::LANE_SCHEMA_VERSION.to_string(),
             generated_at: self.extracted_at.clone(),
@@ -2608,7 +2645,7 @@ impl LaneSessionContext {
             source_time_coverage: self.coverage.clone(),
             source_files: self.source_files.clone(),
             extraction_mode: mode.to_string(),
-            role_filter: "agent_only".to_string(),
+            role_filter: role_filter.to_string(),
             timezone_assumptions: intents::UTC_TIMEZONE_ASSUMPTION.to_string(),
             warnings: self.warnings.clone(),
             payload,
@@ -2698,28 +2735,43 @@ fn load_session_claims(
         .map(|s| vec![s.source_path.display().to_string()])
         .unwrap_or_default();
 
-    // role_filter="agent_only" in the envelope means the filter happens HERE,
-    // at the source build — not only inside `extract_claims` (which re-guards
-    // as defense in depth, using the SAME shared predicate). enumerate() runs
-    // BEFORE the filter so `source_ref` indices keep pointing at positions in
-    // the full entry stream.
+    // Role filtering happens HERE, at the source build — not only inside the
+    // lane stages (which re-guard as defense in depth, using the SAME shared
+    // predicates). enumerate() runs BEFORE the filter so `source_ref` indices
+    // keep pointing at positions in the full entry stream. Lane 1 takes the
+    // strict user allowlist, Lane 2 the agent predicate — system/tool rows
+    // enter neither lane.
+    let to_source = |i: usize, e: &timeline::TimelineEntry| intents::ClaimSource {
+        role: e.role.clone(),
+        text: e.message.clone(),
+        project: project.clone(),
+        session_id: resolution.canonical_id.clone(),
+        agent: Some(e.agent.clone()),
+        source_ref: format!("{}#{i}", e.timestamp.to_rfc3339()),
+        timestamp: Some(e.timestamp.to_rfc3339()),
+        timestamp_partial: e.timestamp_source.is_some(),
+    };
     let claim_sources: Vec<intents::ClaimSource> = entries
         .iter()
         .enumerate()
         .filter(|(_, e)| intents::is_agent_role(&e.role))
-        .map(|(i, e)| intents::ClaimSource {
-            role: e.role.clone(),
-            text: e.message.clone(),
-            project: project.clone(),
-            session_id: resolution.canonical_id.clone(),
-            agent: Some(e.agent.clone()),
-            source_ref: format!("{}#{i}", e.timestamp.to_rfc3339()),
-            timestamp: Some(e.timestamp.to_rfc3339()),
-            timestamp_partial: e.timestamp_source.is_some(),
+        .map(|(i, e)| to_source(i, e))
+        .collect();
+    // Lane 1 reuses the SAME harness-noise gate as `--conversation` denoising:
+    // a "user"-role row that is really an injected skill body, `! command`
+    // stdout, or a hook reminder must never feed the human-intent lane.
+    let user_sources: Vec<intents::ClaimSource> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            intents::is_user_role(&e.role)
+                && !sources::is_harness_injected_noise(&e.role, &e.message)
         })
+        .map(|(i, e)| to_source(i, e))
         .collect();
 
     let claims = intents::extract_claims(&claim_sources, &extracted_at);
+    let user_intents = intents::extract_user_intent_lines(&user_sources, &extracted_at);
 
     let mut warnings = Vec::new();
     let partial = claims.iter().filter(|c| c.timestamp_partial).count();
@@ -2742,6 +2794,7 @@ fn load_session_claims(
         warnings,
         extracted_at,
         claims,
+        user_intents,
     })
 }
 
@@ -2775,7 +2828,7 @@ fn run_claims_extract(
             }
         }
         _ => {
-            let export = ctx.envelope("claims", &ctx.claims);
+            let export = ctx.envelope("claims", "agent_only", &ctx.claims);
             println!("{}", serde_json::to_string_pretty(&export)?);
         }
     }
@@ -2846,6 +2899,7 @@ fn run_results_collect(
         _ => {
             let export = ctx.envelope(
                 "results",
+                "agent_only",
                 ResultsPayload {
                     claims: ctx.claims.clone(),
                     results,
@@ -2878,6 +2932,7 @@ fn run_clarify(
         "json" => {
             let export = ctx.envelope(
                 "clarify",
+                "agent_only",
                 ClarifyPayload {
                     fractures,
                     questions,
@@ -2922,7 +2977,149 @@ fn run_sessions_command(command: SessionsCommand) -> Result<()> {
             format,
         } => run_sessions_list(cwd, agent, since, all, limit, &format),
         SessionsCommand::Show { session_id, format } => run_session_show(session_id, &format),
+        SessionsCommand::Report {
+            session_id,
+            agent,
+            hours,
+            repo,
+            max,
+            format,
+        } => run_session_report(&session_id, agent, hours, repo, max, &format),
     }
+}
+
+#[derive(serde::Serialize)]
+struct SessionReportPayload {
+    user_intents: Vec<intents::UserIntentLine>,
+    claims: Vec<intents::ClaimRecord>,
+    results: Vec<intents::ResultRecord>,
+    fractures: Vec<intents::ContractFracture>,
+    questions: Vec<intents::ClarifyQuestion>,
+}
+
+/// Unified per-session truth report: all five lanes in one rendering, so an
+/// agent (or operator) entering a repo can answer in one pass — what the human
+/// wanted, what the agent claimed, what evidence verified, what is
+/// fake-complete, and what decision is still open.
+fn run_session_report(
+    session: &str,
+    agent: Option<String>,
+    hours: u64,
+    repo: Option<PathBuf>,
+    max: usize,
+    format: &str,
+) -> Result<()> {
+    let (ctx, repo_root, results) = collect_and_verify(session, agent, hours, repo)?;
+    let fractures = intents::detect_fractures(&ctx.claims);
+    let questions = intents::generate_clarify(&fractures, max);
+    if format == "json" {
+        let export = ctx.envelope(
+            "report",
+            "all",
+            SessionReportPayload {
+                user_intents: ctx.user_intents.clone(),
+                claims: ctx.claims.clone(),
+                results,
+                fractures,
+                questions,
+            },
+        );
+        println!("{}", serde_json::to_string_pretty(&export)?);
+        return Ok(());
+    }
+
+    println!(
+        "# Session truth report — {} ({})\n",
+        ctx.canonical_id, ctx.agent
+    );
+    println!("- project: {}", ctx.project);
+    println!("- repo evidence root: {}", repo_root.display());
+    println!("- generated_at: {} (UTC)", ctx.extracted_at);
+    if let Some(c) = &ctx.coverage {
+        println!("- source time coverage: {} .. {}", c.earliest, c.latest);
+    }
+    for w in &ctx.warnings {
+        println!("- warning: {w}");
+    }
+
+    println!("\n## Lane 1 — human intent ({})\n", ctx.user_intents.len());
+    if ctx.user_intents.is_empty() {
+        println!(
+            "(no classified user intent lines; raw user text may still carry direction — see `aicx extract --conversation --user-only`)"
+        );
+    }
+    for ui in &ctx.user_intents {
+        println!(
+            "- [{}] {} — {}",
+            ui.entry_type,
+            ui.timestamp.as_deref().unwrap_or("(no timestamp)"),
+            truncate_table_cell(&ui.raw_text, 100)
+        );
+    }
+
+    println!(
+        "\n## Lanes 2-3 — agent claims vs evidence ({})\n",
+        ctx.claims.len()
+    );
+    for c in &ctx.claims {
+        let status = format!("{:?}", c.verification_status).to_lowercase();
+        let flag = if c.risk_flags.is_empty() {
+            ""
+        } else {
+            " [HIGH-RISK]"
+        };
+        println!(
+            "- [{status}]{flag} {}: {}",
+            c.claim_type.label(),
+            truncate_table_cell(&c.claim_text, 90)
+        );
+    }
+    let fake_complete: Vec<_> = ctx
+        .claims
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.verification_status,
+                intents::VerificationStatus::Contradicted
+            ) || (!c.risk_flags.is_empty()
+                && !matches!(c.verification_status, intents::VerificationStatus::Verified))
+        })
+        .collect();
+    println!("\n### Fake-complete candidates ({})\n", fake_complete.len());
+    for c in &fake_complete {
+        println!(
+            "- {}: {}",
+            c.claim_type.label(),
+            truncate_table_cell(&c.claim_text, 90)
+        );
+    }
+
+    println!("\n## Lane 4 — contract fractures ({})\n", fractures.len());
+    for f in &fractures {
+        println!(
+            "- [{:?}] {} — promised: {} | runtime: {}",
+            f.severity,
+            f.claim_id,
+            truncate_table_cell(&f.promised_surface, 60),
+            truncate_table_cell(&f.runtime_surface, 60)
+        );
+    }
+
+    println!(
+        "\n## Lane 5 — clarify ({} question(s), cap 5)\n",
+        questions.len()
+    );
+    if questions.is_empty() {
+        println!("No unresolved human decisions detected from this session's claims.");
+    }
+    for (i, q) in questions.iter().enumerate() {
+        println!("{}. {}", i + 1, q.question);
+        for opt in &q.options {
+            println!("   {opt}");
+        }
+        println!("   default: {}", q.default_recommendation);
+    }
+    Ok(())
 }
 
 fn run_session_show(session_id: String, format: &str) -> Result<()> {

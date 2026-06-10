@@ -400,6 +400,94 @@ pub fn is_agent_role(role: &str) -> bool {
     )
 }
 
+/// True when `role` names a human/operator-originated row. Lane 1 doctrine:
+/// intents belong to humans — a strict allowlist (not merely "not an agent"),
+/// so tool/system/unknown rows never enter the intent lane.
+pub fn is_user_role(role: &str) -> bool {
+    matches!(role.to_lowercase().as_str(), "user" | "human" | "operator")
+}
+
+// ── Lane 1 — Human Intent (per-session view) ─────────────────────
+
+/// One classified user-originated line from a session, for the per-session
+/// truth report. Corpus-level Lane 1 stays `aicx intents` (user frames by
+/// default); this is the same-classifier per-session view.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UserIntentLine {
+    pub id: String,
+    pub session_id: String,
+    pub source_role: String,
+    /// Classified kind: intent | decision | question | assumption | …
+    pub entry_type: String,
+    pub confidence: f32,
+    pub raw_text: String,
+    pub source_ref: String,
+    /// Absolute source-message timestamp (RFC3339), when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    pub timestamp_partial: bool,
+    pub extracted_at: String,
+}
+
+/// Lane 1 stage (pure, per-session): classify user-originated lines into
+/// intent-bearing entries. Doctrine enforced here:
+/// - intents are user-originated — agent/tool/system rows never produce one
+///   ([`is_user_role`] allowlist, re-guarded in-lane like [`extract_claims`]);
+/// - no manufactured intents — a line that classifies to nothing is skipped,
+///   and pasted-reference material is rejected by the shared classifier;
+/// - result/outcome-shaped lines belong to the evidence lane even when a user
+///   pasted them — they never become human intent;
+/// - identical lines are deduplicated (earliest occurrence wins), since agent
+///   logs frequently double-record the same user turn.
+pub fn extract_user_intent_lines(
+    sources: &[ClaimSource],
+    extracted_at: &str,
+) -> Vec<UserIntentLine> {
+    let mut out: Vec<UserIntentLine> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (idx, src) in sources.iter().enumerate() {
+        if !is_user_role(&src.role) {
+            continue;
+        }
+        for line in src.text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((entry_type, confidence)) = super::classify_line_entry_type(line, true) else {
+                continue;
+            };
+            if matches!(
+                entry_type,
+                crate::types::EntryType::Result | crate::types::EntryType::Outcome
+            ) {
+                continue;
+            }
+            if !seen.insert(line.to_string()) {
+                continue;
+            }
+            out.push(UserIntentLine {
+                id: format!(
+                    "intent-{}-{}-{}",
+                    src.session_id,
+                    idx,
+                    claim_hash8(line, &src.source_ref)
+                ),
+                session_id: src.session_id.clone(),
+                source_role: src.role.clone(),
+                entry_type: entry_type.as_str().to_string(),
+                confidence,
+                raw_text: line.to_string(),
+                source_ref: src.source_ref.clone(),
+                timestamp: src.timestamp.clone(),
+                timestamp_partial: src.timestamp_partial,
+                extracted_at: extracted_at.to_string(),
+            });
+        }
+    }
+    out
+}
+
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -924,6 +1012,62 @@ mod tests {
         assert_eq!(
             ready.risk_flags,
             vec!["high_risk_unverified_claim".to_string()]
+        );
+    }
+
+    #[test]
+    fn user_intent_lines_keep_user_rows_and_drop_agent_and_tool_text() {
+        let sources = vec![
+            mk_source("user", "Decision: ship the lanes envelope first", "u1"),
+            // agent text with an intent-shaped marker must NEVER enter Lane 1
+            mk_source(
+                "assistant",
+                "Decision: I delivered everything already",
+                "a1",
+            ),
+            // tool/system rows are outside the strict user allowlist
+            mk_source("tool", "decision: noise from a tool row", "t1"),
+            // unclassified user chatter is skipped — no manufactured intents
+            mk_source("user", "hello there team", "u2"),
+        ];
+
+        let lines = extract_user_intent_lines(&sources, "2026-06-09T21:00:00Z");
+        assert_eq!(lines.len(), 1, "only classified USER lines survive");
+        let line = &lines[0];
+        assert_eq!(line.source_role, "user");
+        assert_eq!(line.entry_type, "decision");
+        assert_eq!(line.session_id, "s1");
+        // P0 temporal: absolute source timestamp + extraction stamp, explicit
+        // partial marker
+        assert_eq!(line.timestamp.as_deref(), Some("2026-06-09T20:41:00Z"));
+        assert!(!line.timestamp_partial);
+        assert_eq!(line.extracted_at, "2026-06-09T21:00:00Z");
+    }
+
+    #[test]
+    fn assistant_completion_text_becomes_claim_never_intent() {
+        // Lane separation: the same assistant row feeds Lane 2 and is invisible
+        // to Lane 1.
+        let sources = vec![mk_source(
+            "assistant",
+            "implemented the report command, suite is green",
+            "a1",
+        )];
+        let claims = extract_claims(&sources, "2026-06-09T21:00:00Z");
+        let lines = extract_user_intent_lines(&sources, "2026-06-09T21:00:00Z");
+        assert_eq!(claims.len(), 1, "completion text is an audit target");
+        assert!(lines.is_empty(), "agent text must never enter Lane 1");
+    }
+
+    #[test]
+    fn user_intent_lines_propagate_partial_timestamp_marker() {
+        let mut src = mk_source("user", "decision: keep UTC everywhere", "u1");
+        src.timestamp_partial = true;
+        let lines = extract_user_intent_lines(&[src], "2026-06-09T21:00:00Z");
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].timestamp_partial,
+            "partial time is never silently presented as full"
         );
     }
 

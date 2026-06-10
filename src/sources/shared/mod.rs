@@ -23,7 +23,9 @@ pub mod list;
 pub mod project;
 pub mod timeline;
 
-pub use conversation::{ConversationProjection, to_conversation, to_conversation_with_stats};
+pub use conversation::{
+    ConversationProjection, is_harness_injected_noise, to_conversation, to_conversation_with_stats,
+};
 pub(crate) use conversation::{IntentLineModality, intent_line_modality};
 pub(crate) use diagnostics::*;
 pub(crate) use files::{

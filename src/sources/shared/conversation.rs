@@ -94,7 +94,7 @@ pub(crate) fn intent_line_modality(role: &str, line: &str) -> IntentLineModality
 ///     markers are not at the head, so the turn is treated as real input.
 ///   * **Assistant-authored content** (skill-creation bodies, hook-development
 ///     output) is never matched, because only user-role turns are considered.
-fn is_harness_injected_noise(role: &str, message: &str) -> bool {
+pub fn is_harness_injected_noise(role: &str, message: &str) -> bool {
     if role != "user" {
         return false;
     }

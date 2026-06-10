@@ -534,6 +534,8 @@ newest first, with absolute RFC3339 timestamps.
 aicx sessions list [--cwd] [--agent <claude|codex|gemini|junie>] [--since YYYY-MM-DD]
                    [--all] [--limit <N>] [--format table|json]
 aicx sessions show <session_id> [--format markdown|json]   # alias: aicx session show
+aicx sessions report <session_id> [--agent <a>] [--hours <H>] [--repo <path>]
+                     [--max <N>] [--format markdown|json]
 ```
 
 - `--cwd` infers the repo from the current directory and lists only its sessions.
@@ -544,6 +546,15 @@ aicx sessions show <session_id> [--format markdown|json]   # alias: aicx session
 - Sessions without a parseable timestamp are still listed — the table shows
   them with an explicit `(no timestamp)` marker (and they survive the
   `--since` window) instead of being silently dated out.
+
+`aicx sessions report` is the unified per-session truth surface: all five
+lanes in one rendering — classified human-intent lines (Lane 1, strict user
+allowlist), agent claims with their evidence-folded verification statuses
+(Lanes 2-3), contract fractures (Lane 4), and at most 5 clarify decision
+questions (Lane 5) — plus an explicit "fake-complete candidates" list
+(contradicted or high-risk-unverified claims). JSON output wraps the payload
+in the `aicx.lanes.v1` envelope with `role_filter: all` (the report reads both
+user and agent rows; the claim-only lanes stay `agent_only`).
 
 ## `aicx claims`
 
