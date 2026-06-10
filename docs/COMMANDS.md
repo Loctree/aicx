@@ -503,6 +503,79 @@ Example:
 aicx intents -p CodeScribe loctree-suite --strict --kind decision
 ```
 
+## Truth-pipeline lanes (sessions / claims / results / clarify)
+
+`aicx` separates five epistemic lanes so agent self-report can never become
+truth by repetition:
+
+1. **Intents belong to humans** — `aicx intents` (user-only frames by default).
+2. **Claims belong to agents** — `aicx claims extract`; always `unverified` at birth.
+3. **Results belong to evidence** — `aicx results collect`; no evidence, no result.
+4. **Fractures are promise-vs-runtime gaps** — surfaced by `aicx clarify`.
+5. **Clarify belongs to unresolved human decisions** — at most 5 A/B/C questions.
+
+Every machine-readable lane export is wrapped in the `aicx.lanes.v1` envelope:
+`schema_version`, absolute `generated_at` (RFC3339, full date+year),
+`source_time_coverage`, `source_files`, `extraction_mode`, `role_filter`,
+`timezone_assumptions`, and `warnings` (non-empty whenever any timestamp is
+partial or inferred — partial time is never silently presented as full).
+
+## `aicx sessions`
+
+Discover and list agent sessions on disk (claude + codex + gemini), newest
+first, with absolute RFC3339 timestamps.
+
+```bash
+aicx sessions list [--cwd] [--agent <claude|codex|gemini>] [--since YYYY-MM-DD]
+                   [--all] [--limit <N>] [--format table|json]
+aicx sessions show <session_id> [--format markdown|json]   # alias: aicx session show
+```
+
+- `--cwd` infers the repo from the current directory and lists only its sessions.
+- Association confidence is explicit: `exact` (from session cwd) vs `inferred`
+  (decoded from the project dir name).
+- Sessions with no parseable timestamp are marked, never silently dated.
+
+## `aicx claims`
+
+Lane 2: extract agent claims (audit targets, never truth) from one session.
+
+```bash
+aicx claims extract --session <id-or-prefix> [--agent <a>] [--hours <H>] [--format json|summary]
+```
+
+Every claim carries the absolute source-message timestamp, a
+`timestamp_partial` marker, an `extracted_at` stamp, and is born
+`unverified`. Applause verdicts (`ready_to_push` / `shippable` /
+`no_blockers`) are flagged `high_risk_unverified_claim`.
+
+## `aicx results`
+
+Lane 3: collect repo evidence for a session's claims and fold it into
+verification statuses. Read-only — nothing is executed.
+
+```bash
+aicx results collect --session <id> [--repo <path>] [--format json|summary]
+```
+
+For every checkable file path a claim names, artifact existence yields a
+`pass` result and absence a `fail`; `verify_claims` then promotes/demotes:
+pass → `verified`, fail → `contradicted`, mixed → `partial`, no evidence →
+stays `unverified` (never promoted).
+
+## `aicx clarify`
+
+Lane 5: turn verified gaps into at most 5 A/B/C **decision** questions —
+never fact questions the system can answer itself.
+
+```bash
+aicx clarify --session <id> [--repo <path>] [--max <1-5>] [--format markdown|json]
+```
+
+Questions come from contract fractures (Lane 4): contradicted claims and
+unbacked applause verdicts, severest first, each with a default
+recommendation and the cost of not deciding.
+
 ## `aicx dashboard`
 
 Generate a searchable HTML dashboard from the canonical store, or serve it locally.

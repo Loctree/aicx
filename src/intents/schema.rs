@@ -17,6 +17,51 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use serde::Serialize;
+use std::path::Path;
+
+// ── Export envelope (P0 temporal contract) ───────────────────────
+
+/// Earliest/latest source-message timestamps covered by an export, RFC3339.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TimeCoverage {
+    pub earliest: String,
+    pub latest: String,
+}
+
+/// Machine-readable export envelope every lane export is wrapped in (MASTER
+/// "Required Output Contracts"). Carries the full temporal contract so a
+/// downstream agent can always answer "when is this from?" — absolute
+/// `generated_at` (with year), source time coverage, explicit timezone
+/// assumptions, and warnings whenever any timestamp is partial or inferred.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LaneExport<T: Serialize> {
+    /// Schema identifier+version for this envelope, e.g. `aicx.lanes.v1`.
+    pub schema_version: String,
+    /// Absolute extraction timestamp, RFC3339 with year.
+    pub generated_at: String,
+    pub project: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_time_coverage: Option<TimeCoverage>,
+    pub source_files: Vec<String>,
+    /// Which lane produced this export: `claims` | `results` | `clarify`.
+    pub extraction_mode: String,
+    /// Role filter applied at the source: `agent_only` | `user_only` | `all`.
+    pub role_filter: String,
+    /// e.g. "all timestamps normalized to UTC (RFC3339) at source".
+    pub timezone_assumptions: String,
+    /// Non-empty whenever temporal truth is degraded (partial/inferred times,
+    /// missing years, inferred session order). Never silently full.
+    pub warnings: Vec<String>,
+    pub payload: T,
+}
+
+pub const LANE_SCHEMA_VERSION: &str = "aicx.lanes.v1";
+pub const UTC_TIMEZONE_ASSUMPTION: &str =
+    "all timestamps normalized to UTC (RFC3339, full date+year) at source";
 
 // ── Lane 2 — Agent Claim ─────────────────────────────────────────
 
@@ -36,6 +81,14 @@ pub struct ClaimRecord {
     pub claim_text: String,
     pub claim_type: ClaimType,
     pub claimed_status: String,
+    /// Absolute source-message timestamp (RFC3339, full date+year), when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    /// True when the source timestamp was inferred (fallback) or absent —
+    /// partial temporal truth is marked, never silently presented as full.
+    pub timestamp_partial: bool,
+    /// Absolute extraction timestamp (RFC3339).
+    pub extracted_at: String,
     pub claimed_files: Vec<String>,
     pub claimed_commands: Vec<String>,
     pub claimed_artifacts: Vec<String>,
@@ -184,6 +237,8 @@ pub enum FractureSeverity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ClarifyQuestion {
     pub decision_id: String,
+    /// The decision question itself — asks what to decide, never what to look up.
+    pub question: String,
     pub why_now: String,
     pub known_facts: Vec<String>,
     /// Decision options, preferably A/B/C.
@@ -257,6 +312,11 @@ pub struct ClaimSource {
     pub session_id: String,
     pub agent: Option<String>,
     pub source_ref: String,
+    /// Absolute source-message timestamp (RFC3339), when known.
+    pub timestamp: Option<String>,
+    /// True when the timestamp came from a fallback (previous line, file
+    /// mtime, extraction time) rather than the message itself.
+    pub timestamp_partial: bool,
 }
 
 fn is_agent_role(role: &str) -> bool {
@@ -273,7 +333,7 @@ fn is_agent_role(role: &str) -> bool {
 ///   claims (absence of a marker is not a claim);
 /// - every claim is `Unverified` until Lane 3 supplies evidence;
 /// - the applause claims (ready/shippable/no-blockers) are flagged high-risk.
-pub fn extract_claims(sources: &[ClaimSource]) -> Vec<ClaimRecord> {
+pub fn extract_claims(sources: &[ClaimSource], extracted_at: &str) -> Vec<ClaimRecord> {
     sources
         .iter()
         .enumerate()
@@ -306,6 +366,9 @@ pub fn extract_claims(sources: &[ClaimSource]) -> Vec<ClaimRecord> {
                 claim_text: claim_line.to_string(),
                 claim_type,
                 claimed_status: claim_type.label().to_string(),
+                timestamp: s.timestamp.clone(),
+                timestamp_partial: s.timestamp_partial || s.timestamp.is_none(),
+                extracted_at: extracted_at.to_string(),
                 claimed_files: Vec::new(),
                 claimed_commands: Vec::new(),
                 claimed_artifacts: Vec::new(),
@@ -314,6 +377,247 @@ pub fn extract_claims(sources: &[ClaimSource]) -> Vec<ClaimRecord> {
                 verification_status: VerificationStatus::Unverified,
                 risk_flags,
             })
+        })
+        .collect()
+}
+
+// ── Lane 3 stages — evidence collection + claim verification ─────
+
+/// Pull path-looking tokens out of a claim sentence: backtick-quoted spans and
+/// bare tokens containing `/` that look like repo-relative file paths. These are
+/// the artifacts the claim implicitly stakes its truth on.
+/// A token is only checkable evidence when it can be resolved against the repo
+/// root (or absolutely). `~`-prefixed paths and glob patterns name surfaces we
+/// cannot honestly test here — skipping them avoids manufacturing false
+/// contradictions (absence of checkable evidence is NOT a Fail).
+fn is_checkable_path(token: &str) -> bool {
+    token.contains('/') && !token.contains("://") && !token.starts_with('~') && !token.contains('*')
+}
+
+fn path_tokens(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    // backtick-quoted spans first — the explicit form
+    let mut rest = text;
+    while let Some(start) = rest.find('`') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('`') else { break };
+        let token = after[..end].trim();
+        if !token.contains(' ') && is_checkable_path(token) {
+            out.push(token.to_string());
+        }
+        rest = &after[end + 1..];
+    }
+    // bare path-like tokens (contain '/', no URL scheme, end in a file-ish name)
+    for word in text.split_whitespace() {
+        let w = word.trim_matches(|c: char| ",.;:()[]\"'".contains(c));
+        if is_checkable_path(w)
+            && !w.starts_with('`')
+            && w.rsplit('/').next().is_some_and(|f| f.contains('.'))
+        {
+            out.push(w.to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Lane 3 stage (deterministic, read-only): for every file path a claim names,
+/// check whether the artifact actually exists under `repo_root` (or absolutely).
+/// Existence yields a `Pass` result, absence a `Fail` — both are evidence; a
+/// claim that names no artifact gets no result here and stays unverified.
+/// Nothing is executed — this collects repo-state evidence only.
+pub fn collect_artifact_evidence(
+    claims: &[ClaimRecord],
+    repo_root: &Path,
+    collected_at: &str,
+) -> Vec<ResultRecord> {
+    let mut results = Vec::new();
+    for claim in claims {
+        for token in path_tokens(&claim.claim_text) {
+            let candidate = Path::new(&token);
+            let exists = if candidate.is_absolute() {
+                candidate.exists()
+            } else {
+                repo_root.join(candidate).exists()
+            };
+            let status = if exists {
+                ResultStatus::Pass
+            } else {
+                ResultStatus::Fail
+            };
+            results.push(ResultRecord {
+                id: format!("result-{}-{}", claim.id, results.len()),
+                project: claim.project.clone(),
+                evidence_type: "artifact_existence".to_string(),
+                command: None,
+                exit_status: None,
+                artifact_path: Some(token.clone()),
+                observed_output_excerpt: Some(if exists {
+                    format!("{token}: exists in {}", repo_root.display())
+                } else {
+                    format!("{token}: NOT FOUND in {}", repo_root.display())
+                }),
+                timestamp: Some(collected_at.to_string()),
+                related_claims: vec![claim.id.clone()],
+                related_intents: Vec::new(),
+                result_status: status,
+                confidence: 8,
+                reproducibility_notes: Some("ls-level filesystem check, re-runnable".to_string()),
+            });
+        }
+    }
+    results
+}
+
+/// Lane 3 verification (pure): fold evidence into claims. Pass evidence
+/// verifies, Fail evidence contradicts, mixed evidence is Partial; a claim
+/// nothing points at stays exactly as it was (Unverified by default — no
+/// evidence means no result, and no result means no promotion).
+pub fn verify_claims(claims: &mut [ClaimRecord], results: &[ResultRecord]) {
+    for claim in claims.iter_mut() {
+        let mut pass = 0usize;
+        let mut fail = 0usize;
+        for r in results
+            .iter()
+            .filter(|r| r.related_claims.contains(&claim.id))
+        {
+            claim.evidence_refs.push(r.id.clone());
+            match r.result_status {
+                ResultStatus::Pass => pass += 1,
+                ResultStatus::Fail => fail += 1,
+                ResultStatus::Partial | ResultStatus::Unknown => {}
+            }
+        }
+        claim.verification_status = match (pass, fail) {
+            (0, 0) => claim.verification_status, // untouched — stays Unverified
+            (_, 0) => VerificationStatus::Verified,
+            (0, _) => VerificationStatus::Contradicted,
+            (_, _) => VerificationStatus::Partial,
+        };
+    }
+}
+
+// ── Lane 4 stage — contract fracture detection ───────────────────
+
+/// Lane 4 stage (pure): surface promise-vs-runtime fractures from verified
+/// claims. A contradicted claim IS a fracture (the agent said X, the repo says
+/// not-X); an applause claim (ready/shippable/no-blockers) with no evidence is
+/// a fracture-in-waiting and gets surfaced at Medium so it cannot pass as truth.
+pub fn detect_fractures(claims: &[ClaimRecord]) -> Vec<ContractFracture> {
+    let mut fractures = Vec::new();
+    for claim in claims {
+        match claim.verification_status {
+            VerificationStatus::Contradicted => {
+                let severity = if claim.claim_type.is_high_risk() {
+                    FractureSeverity::Critical
+                } else {
+                    FractureSeverity::High
+                };
+                fractures.push(ContractFracture {
+                    contract_source: format!(
+                        "agent claim {} (session {})",
+                        claim.id, claim.source_session
+                    ),
+                    promised_surface: claim.claim_text.clone(),
+                    runtime_surface: "evidence contradicts the claim (named artifact missing)"
+                        .to_string(),
+                    evidence: claim.evidence_refs.clone(),
+                    severity,
+                    options: vec![
+                        "A: implement/repair so the claim becomes true".to_string(),
+                        "B: retract the claim and reopen the task".to_string(),
+                        "C: accept the gap and record it as known debt".to_string(),
+                    ],
+                    recommended_clarify_question: Some(format!("clarify-{}", claim.id)),
+                });
+            }
+            VerificationStatus::Unverified if claim.claim_type.is_high_risk() => {
+                fractures.push(ContractFracture {
+                    contract_source: format!(
+                        "agent claim {} (session {})",
+                        claim.id, claim.source_session
+                    ),
+                    promised_surface: claim.claim_text.clone(),
+                    runtime_surface: "no evidence collected — applause verdict unbacked"
+                        .to_string(),
+                    evidence: Vec::new(),
+                    severity: FractureSeverity::Medium,
+                    options: vec![
+                        "A: demand evidence (run gates) before trusting the verdict".to_string(),
+                        "B: treat as unverified and keep hardening".to_string(),
+                        "C: accept the verdict on trust and ship".to_string(),
+                    ],
+                    recommended_clarify_question: Some(format!("clarify-{}", claim.id)),
+                });
+            }
+            _ => {}
+        }
+    }
+    fractures
+}
+
+// ── Lane 5 stage — clarify generation ────────────────────────────
+
+/// Hard ceiling on clarify questions per run — clarify is a decision-gathering
+/// mechanism, not a questionnaire.
+pub const CLARIFY_MAX_QUESTIONS: usize = 5;
+
+/// Lane 5 stage (pure): turn the sharpest fractures into bounded A/B/C
+/// decision questions. Questions ask what the human must DECIDE (keep the
+/// promise, retract it, or ship with the gap) — never facts the system already
+/// determined (the known facts ride along in `known_facts`). At most
+/// `min(max, CLARIFY_MAX_QUESTIONS)` questions, severest fractures first.
+pub fn generate_clarify(fractures: &[ContractFracture], max: usize) -> Vec<ClarifyQuestion> {
+    let cap = max.min(CLARIFY_MAX_QUESTIONS);
+    let mut ordered: Vec<&ContractFracture> = fractures.iter().collect();
+    // severest first; FractureSeverity derives Low..Critical in declaration
+    // order, so sort by reverse discriminant via a manual rank.
+    let rank = |s: FractureSeverity| match s {
+        FractureSeverity::Critical => 0,
+        FractureSeverity::High => 1,
+        FractureSeverity::Medium => 2,
+        FractureSeverity::Low => 3,
+    };
+    ordered.sort_by_key(|f| rank(f.severity));
+    ordered
+        .into_iter()
+        .take(cap)
+        .enumerate()
+        .map(|(i, f)| ClarifyQuestion {
+            decision_id: f
+                .recommended_clarify_question
+                .clone()
+                .unwrap_or_else(|| format!("clarify-{i}")),
+            question: format!(
+                "The promise \"{}\" does not match runtime ({}). Repair it, retract it, or ship with the gap?",
+                f.promised_surface, f.runtime_surface
+            ),
+            why_now: format!(
+                "{:?}-severity fracture between a recorded promise and the live repo; \
+                 leaving it undecided lets a false claim harden into assumed truth",
+                f.severity
+            ),
+            known_facts: {
+                let mut facts = vec![
+                    format!("promised: {}", f.promised_surface),
+                    format!("observed: {}", f.runtime_surface),
+                ];
+                facts.extend(f.evidence.iter().map(|e| format!("evidence: {e}")));
+                facts
+            },
+            options: f.options.clone(),
+            default_recommendation: f
+                .options
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "A: repair to match the promise".to_string()),
+            cost_of_not_deciding: "the gap survives as invisible debt and every future agent \
+                                   plans on top of a promise the runtime does not keep"
+                .to_string(),
+            linked_intents: Vec::new(),
+            linked_claims: vec![f.contract_source.clone()],
+            linked_results: f.evidence.clone(),
         })
         .collect()
 }
@@ -335,6 +639,9 @@ mod tests {
             claim_text: "fixed F2 dead --unresolved".into(),
             claim_type: ClaimType::Fixed,
             claimed_status: "done".into(),
+            timestamp: Some("2026-06-08T18:06:26Z".into()),
+            timestamp_partial: false,
+            extracted_at: "2026-06-09T20:41:00Z".into(),
             claimed_files: vec!["src/main.rs".into()],
             claimed_commands: vec!["cargo test -p aicx --lib".into()],
             claimed_artifacts: vec![],
@@ -373,6 +680,7 @@ mod tests {
 
         let clarify = ClarifyQuestion {
             decision_id: "clarify-1".into(),
+            question: "Build the promised renderer or drop the promise?".into(),
             why_now: "contract promises an artifact runtime never emits".into(),
             known_facts: vec!["spotlight.md has 0 renderers".into()],
             options: vec!["A build it".into(), "B drop promise".into()],
@@ -430,26 +738,31 @@ mod tests {
         assert_eq!(classify_claim(""), None);
     }
 
-    #[test]
-    fn extract_claims_keeps_agent_claims_drops_user_and_unmarked() {
-        let mk = |role: &str, text: &str, refr: &str| ClaimSource {
+    fn mk_source(role: &str, text: &str, refr: &str) -> ClaimSource {
+        ClaimSource {
             role: role.to_string(),
             text: text.to_string(),
             project: "aicx".to_string(),
             session_id: "s1".to_string(),
             agent: Some("codex".to_string()),
             source_ref: refr.to_string(),
-        };
+            timestamp: Some("2026-06-09T20:41:00Z".to_string()),
+            timestamp_partial: false,
+        }
+    }
+
+    #[test]
+    fn extract_claims_keeps_agent_claims_drops_user_and_unmarked() {
         let sources = vec![
             // user row has a marker ("fixed") but claims are agent-originated -> dropped
-            mk("user", "fixed the bug please", "u1"),
-            mk("assistant", "fixed the dead filter", "a1"),
+            mk_source("user", "fixed the bug please", "u1"),
+            mk_source("assistant", "fixed the dead filter", "a1"),
             // no claim marker -> dropped (absence is not a claim)
-            mk("assistant", "just thinking out loud", "a2"),
-            mk("assistant", "this is production ready", "a3"),
+            mk_source("assistant", "just thinking out loud", "a2"),
+            mk_source("assistant", "this is production ready", "a3"),
         ];
 
-        let claims = extract_claims(&sources);
+        let claims = extract_claims(&sources, "2026-06-09T20:45:00Z");
         assert_eq!(claims.len(), 2, "only marked agent rows survive");
 
         let fixed = &claims[0];
@@ -466,5 +779,181 @@ mod tests {
             ready.risk_flags,
             vec!["high_risk_unverified_claim".to_string()]
         );
+    }
+
+    #[test]
+    fn claims_carry_absolute_time_and_mark_partial_explicitly() {
+        // P0 temporal: a claim must carry the absolute source timestamp (with
+        // year) AND the extraction timestamp; a missing source time is marked
+        // partial — never silently presented as full temporal truth.
+        let mut with_time = mk_source("assistant", "fixed the parser", "a1");
+        with_time.timestamp = Some("2026-06-09T20:41:00Z".to_string());
+        let mut no_time = mk_source("assistant", "tests pass on the suite", "a2");
+        no_time.timestamp = None;
+
+        let claims = extract_claims(&[with_time, no_time], "2026-06-09T21:00:00Z");
+        assert_eq!(claims.len(), 2);
+
+        assert_eq!(claims[0].timestamp.as_deref(), Some("2026-06-09T20:41:00Z"));
+        assert!(claims[0].timestamp.as_deref().unwrap().starts_with("2026-"));
+        assert!(!claims[0].timestamp_partial);
+        assert_eq!(claims[0].extracted_at, "2026-06-09T21:00:00Z");
+
+        assert!(claims[1].timestamp.is_none());
+        assert!(
+            claims[1].timestamp_partial,
+            "missing source time must be marked partial"
+        );
+    }
+
+    #[test]
+    fn lane_export_envelope_carries_temporal_contract() {
+        let export = LaneExport {
+            schema_version: LANE_SCHEMA_VERSION.to_string(),
+            generated_at: "2026-06-09T21:00:00Z".to_string(),
+            project: "aicx".to_string(),
+            repo: Some("/repo".to_string()),
+            session_id: Some("s1".to_string()),
+            source_time_coverage: Some(TimeCoverage {
+                earliest: "2026-06-09T20:00:00Z".to_string(),
+                latest: "2026-06-09T20:59:00Z".to_string(),
+            }),
+            source_files: vec!["~/.claude/projects/x/s1.jsonl".to_string()],
+            extraction_mode: "claims".to_string(),
+            role_filter: "agent_only".to_string(),
+            timezone_assumptions: UTC_TIMEZONE_ASSUMPTION.to_string(),
+            warnings: vec!["1 claim has a partial timestamp".to_string()],
+            payload: Vec::<ClaimRecord>::new(),
+        };
+        let json = serde_json::to_string(&export).unwrap();
+        for key in [
+            "schema_version",
+            "generated_at",
+            "source_time_coverage",
+            "timezone_assumptions",
+            "warnings",
+            "2026-06-09T21:00:00Z",
+        ] {
+            assert!(json.contains(key), "envelope must expose {key}");
+        }
+    }
+
+    #[test]
+    fn evidence_verifies_and_contradiction_marks_contradicted() {
+        let sources = vec![
+            mk_source("assistant", "fixed `src/intents/schema.rs` for good", "a1"),
+            mk_source(
+                "assistant",
+                "implemented `src/does_not_exist.rs` fully",
+                "a2",
+            ),
+            mk_source("assistant", "verified the run end to end", "a3"),
+        ];
+        let mut claims = extract_claims(&sources, "2026-06-09T21:00:00Z");
+        assert_eq!(claims.len(), 3);
+
+        // repo root = this crate's source tree; schema.rs exists, the other not
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let results = collect_artifact_evidence(&claims, repo, "2026-06-09T21:01:00Z");
+        assert_eq!(results.len(), 2, "only path-naming claims yield evidence");
+
+        verify_claims(&mut claims, &results);
+        assert_eq!(
+            claims[0].verification_status,
+            VerificationStatus::Verified,
+            "existing artifact verifies the claim"
+        );
+        assert!(!claims[0].evidence_refs.is_empty());
+        assert_eq!(
+            claims[1].verification_status,
+            VerificationStatus::Contradicted,
+            "missing artifact contradicts the claim"
+        );
+        assert_eq!(
+            claims[2].verification_status,
+            VerificationStatus::Unverified,
+            "claim without evidence stays unverified — never promoted"
+        );
+        assert!(claims[2].evidence_refs.is_empty());
+    }
+
+    #[test]
+    fn fractures_surface_contradictions_and_unbacked_applause() {
+        let sources = vec![
+            mk_source("assistant", "implemented `src/nope.rs` end to end", "a1"),
+            mk_source("assistant", "this is production ready", "a2"),
+            mk_source("assistant", "fixed `src/intents/schema.rs`", "a3"),
+        ];
+        let mut claims = extract_claims(&sources, "2026-06-09T21:00:00Z");
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let results = collect_artifact_evidence(&claims, repo, "2026-06-09T21:01:00Z");
+        verify_claims(&mut claims, &results);
+
+        let fractures = detect_fractures(&claims);
+        assert_eq!(
+            fractures.len(),
+            2,
+            "contradicted claim + unbacked applause fracture; verified claim does not"
+        );
+        assert_eq!(fractures[0].severity, FractureSeverity::High);
+        assert_eq!(fractures[1].severity, FractureSeverity::Medium);
+        assert!(fractures.iter().all(|f| !f.options.is_empty()));
+    }
+
+    #[test]
+    fn clarify_caps_at_five_and_asks_decisions_not_facts() {
+        // 7 fractures in -> at most 5 questions out, severest first.
+        let mk_fracture = |i: usize, severity| ContractFracture {
+            contract_source: format!("agent claim claim-s1-{i}"),
+            promised_surface: format!("promise {i}"),
+            runtime_surface: "absent".to_string(),
+            evidence: vec![format!("result-{i}")],
+            severity,
+            options: vec![
+                "A: repair".to_string(),
+                "B: retract".to_string(),
+                "C: ship with gap".to_string(),
+            ],
+            recommended_clarify_question: Some(format!("clarify-{i}")),
+        };
+        let fractures: Vec<ContractFracture> = (0..7)
+            .map(|i| {
+                mk_fracture(
+                    i,
+                    if i == 6 {
+                        FractureSeverity::Critical
+                    } else {
+                        FractureSeverity::Medium
+                    },
+                )
+            })
+            .collect();
+
+        let questions = generate_clarify(&fractures, 10);
+        assert_eq!(questions.len(), CLARIFY_MAX_QUESTIONS, "hard cap at 5");
+        assert_eq!(
+            questions[0].decision_id, "clarify-6",
+            "severest fracture first"
+        );
+
+        for q in &questions {
+            // decision-shaped: a real question with >=2 actionable options,
+            // a default, and a named cost — not a fact lookup.
+            assert!(q.question.ends_with('?'));
+            assert!(
+                q.question.contains("Repair it, retract it, or ship"),
+                "question asks for a decision"
+            );
+            assert!(q.options.len() >= 2);
+            assert!(!q.default_recommendation.is_empty());
+            assert!(!q.cost_of_not_deciding.is_empty());
+            assert!(
+                !q.known_facts.is_empty(),
+                "facts ride along instead of being asked"
+            );
+        }
+
+        // an explicit lower max narrows further
+        assert_eq!(generate_clarify(&fractures, 2).len(), 2);
     }
 }

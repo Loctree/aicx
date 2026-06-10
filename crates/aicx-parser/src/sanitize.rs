@@ -1021,6 +1021,7 @@ const RETIRED_CLI_SUBCOMMANDS: &[&str] = &[
 pub const CLI_SUBCOMMAND_NAMES: &[&str] = &[
     "all",
     "claims",
+    "clarify",
     "claude",
     "codex",
     "config",
@@ -1042,6 +1043,7 @@ pub const CLI_SUBCOMMAND_NAMES: &[&str] = &[
     "refs",
     "reports",
     "reports-extractor",
+    "results",
     "search",
     "serve",
     "sessions",

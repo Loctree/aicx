@@ -274,6 +274,34 @@ enum ClaimsCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ResultsCommand {
+    /// Collect repo evidence (artifact existence) for a session's claims and
+    /// fold it into verification statuses (Lane 3).
+    Collect {
+        /// Session id (or unique prefix).
+        #[arg(long)]
+        session: String,
+
+        /// Agent: claude | codex | gemini | junie. Inferred from the session id
+        /// when omitted.
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Hours to look back when locating the session (default 720).
+        #[arg(long, default_value = "720")]
+        hours: u64,
+
+        /// Repo root evidence is checked against (default: current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Output format: json | summary.
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum SourcesCommands {
     /// Opt in to local source-root protection.
     Protect {
@@ -1005,6 +1033,42 @@ enum Commands {
     Claims {
         #[command(subcommand)]
         command: ClaimsCommand,
+    },
+
+    /// Lane 3: collect repo evidence for a session's claims and verify them.
+    #[command(display_order = 6)]
+    Results {
+        #[command(subcommand)]
+        command: ResultsCommand,
+    },
+
+    /// Lane 5: generate at most 5 A/B/C decision questions from verified gaps.
+    #[command(display_order = 6)]
+    Clarify {
+        /// Session id (or unique prefix).
+        #[arg(long)]
+        session: String,
+
+        /// Agent: claude | codex | gemini | junie. Inferred from the session id
+        /// when omitted.
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Hours to look back when locating the session (default 720).
+        #[arg(long, default_value = "720")]
+        hours: u64,
+
+        /// Repo root evidence is checked against (default: current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Max questions (hard-capped at 5).
+        #[arg(long, default_value_t = 5)]
+        max: usize,
+
+        /// Output format: markdown | json.
+        #[arg(long, default_value = "markdown")]
+        format: String,
     },
 
     /// Interactive daily-driver entrypoint for corpus, doctor, intents, and store.
@@ -2071,6 +2135,15 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         Some(Commands::Sources { command }) => run_sources_command(command)?,
         Some(Commands::Sessions { command }) => run_sessions_command(command)?,
         Some(Commands::Claims { command }) => run_claims_command(command)?,
+        Some(Commands::Results { command }) => run_results_command(command)?,
+        Some(Commands::Clarify {
+            session,
+            agent,
+            hours,
+            repo,
+            max,
+            format,
+        }) => run_clarify(&session, agent, hours, repo, max, &format)?,
         Some(Commands::Wizard { smoke_test }) => {
             if smoke_test {
                 aicx::wizard::smoke_test()?;
@@ -2502,20 +2575,56 @@ fn run_claims_command(command: ClaimsCommand) -> Result<()> {
     }
 }
 
-fn run_claims_extract(
+/// Everything the lane CLIs (claims / results / clarify) share: the session's
+/// claims plus the temporal export-envelope context (P0 contract).
+struct LaneSessionContext {
+    canonical_id: String,
+    agent: String,
+    project: String,
+    repo: Option<String>,
+    source_files: Vec<String>,
+    coverage: Option<intents::TimeCoverage>,
+    warnings: Vec<String>,
+    extracted_at: String,
+    claims: Vec<intents::ClaimRecord>,
+}
+
+impl LaneSessionContext {
+    /// Wrap a lane payload in the machine-export envelope (schema_version,
+    /// absolute generated_at, time coverage, timezone assumptions, warnings).
+    fn envelope<T: serde::Serialize>(&self, mode: &str, payload: T) -> intents::LaneExport<T> {
+        intents::LaneExport {
+            schema_version: intents::LANE_SCHEMA_VERSION.to_string(),
+            generated_at: self.extracted_at.clone(),
+            project: self.project.clone(),
+            repo: self.repo.clone(),
+            session_id: Some(self.canonical_id.clone()),
+            source_time_coverage: self.coverage.clone(),
+            source_files: self.source_files.clone(),
+            extraction_mode: mode.to_string(),
+            role_filter: "agent_only".to_string(),
+            timezone_assumptions: intents::UTC_TIMEZONE_ASSUMPTION.to_string(),
+            warnings: self.warnings.clone(),
+            payload,
+        }
+    }
+}
+
+/// Locate a session, extract its conversation, and run Lane 2 claim
+/// extraction with full temporal metadata. Shared by claims/results/clarify.
+fn load_session_claims(
     session: &str,
     agent: Option<String>,
     hours: u64,
-    format: &str,
-) -> Result<()> {
+) -> Result<LaneSessionContext> {
+    let home = dirs::home_dir().context("No home dir")?;
+    let session_info = sessions::find_session_by_id(&home, session);
     let agent_str = match agent {
         Some(a) => a,
-        None => {
-            let home = dirs::home_dir().context("No home dir")?;
-            sessions::find_session_by_id(&home, session)
-                .map(|s| s.agent)
-                .context("could not infer agent from session id; pass --agent")?
-        }
+        None => session_info
+            .as_ref()
+            .map(|s| s.agent.clone())
+            .context("could not infer agent from session id; pass --agent")?,
     };
     let fmt = extract_input_format_from_str(&agent_str)
         .with_context(|| format!("unknown agent '{agent_str}' (claude|codex|gemini|junie)"))?;
@@ -2544,12 +2653,29 @@ fn run_claims_extract(
     }
 
     // Project = last path segment of the recorded cwd, else agent/id.
-    let project = entries
+    let repo = entries
         .iter()
         .find_map(|e| e.cwd.as_deref())
+        .map(String::from);
+    let project = repo
+        .as_deref()
         .and_then(|c| c.trim_end_matches('/').rsplit('/').find(|s| !s.is_empty()))
         .map(String::from)
         .unwrap_or_else(|| format!("{agent_str}/{}", resolution.canonical_id));
+
+    let extracted_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let coverage = {
+        let earliest = entries.iter().map(|e| e.timestamp).min();
+        let latest = entries.iter().map(|e| e.timestamp).max();
+        earliest.zip(latest).map(|(a, b)| intents::TimeCoverage {
+            earliest: a.to_rfc3339(),
+            latest: b.to_rfc3339(),
+        })
+    };
+    let source_files = session_info
+        .as_ref()
+        .map(|s| vec![s.source_path.display().to_string()])
+        .unwrap_or_default();
 
     let claim_sources: Vec<intents::ClaimSource> = entries
         .iter()
@@ -2561,20 +2687,53 @@ fn run_claims_extract(
             session_id: resolution.canonical_id.clone(),
             agent: Some(e.agent.clone()),
             source_ref: format!("{}#{i}", e.timestamp.to_rfc3339()),
+            timestamp: Some(e.timestamp.to_rfc3339()),
+            timestamp_partial: e.timestamp_source.is_some(),
         })
         .collect();
 
-    let claims = intents::extract_claims(&claim_sources);
+    let claims = intents::extract_claims(&claim_sources, &extracted_at);
 
+    let mut warnings = Vec::new();
+    let partial = claims.iter().filter(|c| c.timestamp_partial).count();
+    if partial > 0 {
+        warnings.push(format!(
+            "{partial} claim(s) carry a partial/inferred source timestamp"
+        ));
+    }
+    if source_files.is_empty() {
+        warnings.push("source session file not resolved; provenance is session-id only".into());
+    }
+
+    Ok(LaneSessionContext {
+        canonical_id: resolution.canonical_id,
+        agent: agent_str,
+        project,
+        repo,
+        source_files,
+        coverage,
+        warnings,
+        extracted_at,
+        claims,
+    })
+}
+
+fn run_claims_extract(
+    session: &str,
+    agent: Option<String>,
+    hours: u64,
+    format: &str,
+) -> Result<()> {
+    let ctx = load_session_claims(session, agent, hours)?;
     match format {
         "summary" => {
             println!(
                 "{} claim(s) from session {} ({})",
-                claims.len(),
-                resolution.canonical_id,
-                agent_str
+                ctx.claims.len(),
+                ctx.canonical_id,
+                ctx.agent
             );
-            for c in &claims {
+            for c in &ctx.claims {
                 let flag = if c.risk_flags.is_empty() {
                     ""
                 } else {
@@ -2588,7 +2747,139 @@ fn run_claims_extract(
                 );
             }
         }
-        _ => println!("{}", serde_json::to_string_pretty(&claims)?),
+        _ => {
+            let export = ctx.envelope("claims", &ctx.claims);
+            println!("{}", serde_json::to_string_pretty(&export)?);
+        }
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct ResultsPayload {
+    claims: Vec<intents::ClaimRecord>,
+    results: Vec<intents::ResultRecord>,
+}
+
+fn run_results_command(command: ResultsCommand) -> Result<()> {
+    match command {
+        ResultsCommand::Collect {
+            session,
+            agent,
+            hours,
+            repo,
+            format,
+        } => run_results_collect(&session, agent, hours, repo, &format),
+    }
+}
+
+/// Lane 3 chain shared by `results collect` and `clarify`: extract claims,
+/// collect artifact evidence against the repo, fold it into verification.
+fn collect_and_verify(
+    session: &str,
+    agent: Option<String>,
+    hours: u64,
+    repo: Option<PathBuf>,
+) -> Result<(LaneSessionContext, PathBuf, Vec<intents::ResultRecord>)> {
+    let mut ctx = load_session_claims(session, agent, hours)?;
+    let repo_root = match repo {
+        Some(p) => p,
+        None => std::env::current_dir().context("cannot resolve current dir; pass --repo")?,
+    };
+    let results = intents::collect_artifact_evidence(&ctx.claims, &repo_root, &ctx.extracted_at);
+    intents::verify_claims(&mut ctx.claims, &results);
+    Ok((ctx, repo_root, results))
+}
+
+fn run_results_collect(
+    session: &str,
+    agent: Option<String>,
+    hours: u64,
+    repo: Option<PathBuf>,
+    format: &str,
+) -> Result<()> {
+    let (ctx, repo_root, results) = collect_and_verify(session, agent, hours, repo)?;
+    match format {
+        "summary" => {
+            println!(
+                "{} claim(s), {} evidence result(s) against {}",
+                ctx.claims.len(),
+                results.len(),
+                repo_root.display()
+            );
+            for c in &ctx.claims {
+                println!(
+                    "- [{}] {}: {}",
+                    format!("{:?}", c.verification_status).to_lowercase(),
+                    c.claim_type.label(),
+                    truncate_table_cell(&c.claim_text, 80)
+                );
+            }
+        }
+        _ => {
+            let export = ctx.envelope(
+                "results",
+                ResultsPayload {
+                    claims: ctx.claims.clone(),
+                    results,
+                },
+            );
+            println!("{}", serde_json::to_string_pretty(&export)?);
+        }
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct ClarifyPayload {
+    fractures: Vec<intents::ContractFracture>,
+    questions: Vec<intents::ClarifyQuestion>,
+}
+
+fn run_clarify(
+    session: &str,
+    agent: Option<String>,
+    hours: u64,
+    repo: Option<PathBuf>,
+    max: usize,
+    format: &str,
+) -> Result<()> {
+    let (ctx, _repo_root, _results) = collect_and_verify(session, agent, hours, repo)?;
+    let fractures = intents::detect_fractures(&ctx.claims);
+    let questions = intents::generate_clarify(&fractures, max);
+    match format {
+        "json" => {
+            let export = ctx.envelope(
+                "clarify",
+                ClarifyPayload {
+                    fractures,
+                    questions,
+                },
+            );
+            println!("{}", serde_json::to_string_pretty(&export)?);
+        }
+        _ => {
+            println!("# Clarify — session {}\n", ctx.canonical_id);
+            println!("- generated_at: {}", ctx.extracted_at);
+            println!("- fractures: {}", fractures.len());
+            println!("- questions: {} (cap 5)\n", questions.len());
+            if questions.is_empty() {
+                println!("No unresolved decisions — no contradicted or unbacked claims found.");
+            }
+            for (i, q) in questions.iter().enumerate() {
+                println!("## {}. {}\n", i + 1, q.question);
+                println!("why now: {}\n", q.why_now);
+                for fact in &q.known_facts {
+                    println!("- {fact}");
+                }
+                println!();
+                for opt in &q.options {
+                    println!("  {opt}");
+                }
+                println!("\n  default: {}", q.default_recommendation);
+                println!("  cost of not deciding: {}\n", q.cost_of_not_deciding);
+            }
+        }
     }
     Ok(())
 }
