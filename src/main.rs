@@ -216,8 +216,8 @@ enum SessionsCommand {
         #[arg(long)]
         cwd: bool,
 
-        /// Filter by agent (claude | codex).
-        #[arg(long)]
+        /// Filter by agent (claude | codex | gemini | junie).
+        #[arg(long, value_parser = ["claude", "codex", "gemini", "junie"])]
         agent: Option<String>,
 
         /// Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the
@@ -333,9 +333,10 @@ enum SourcesCommands {
 /// vocabulary in `--help` output.
 #[derive(Debug, Args, Clone)]
 struct RetrievalFilters {
-    /// Maximum number of results to return.
-    #[arg(long, default_value_t = 10)]
-    limit: usize,
+    /// Maximum number of results to return. Default is command-specific:
+    /// search/steer 10, tail 20, intents unlimited (full roadmap).
+    #[arg(long)]
+    limit: Option<usize>,
 
     /// Sort order applied after filtering. Default: command-specific.
     #[arg(long, value_enum)]
@@ -363,6 +364,11 @@ struct RetrievalFilters {
 }
 
 const MAX_CLI_SEARCH_LIMIT: usize = 10_000;
+
+/// Default `--limit` for bounded retrieval commands (`search`, `steer`) when
+/// the operator passes none. `tail` defaults to 20 and `intents` to unlimited
+/// — see [`RetrievalFilters::limit`].
+const DEFAULT_RETRIEVAL_LIMIT: usize = 10;
 
 #[derive(Debug, Clone, Args)]
 struct DashboardArgs {
@@ -1063,7 +1069,7 @@ enum Commands {
         repo: Option<PathBuf>,
 
         /// Max questions (hard-capped at 5).
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_t = 5, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=5))]
         max: usize,
 
         /// Output format: markdown | json.
@@ -2610,6 +2616,17 @@ impl LaneSessionContext {
     }
 }
 
+/// Agent-role test for lane source rows. Mirrors the (private)
+/// `is_agent_role` in `intents/schema.rs` — keep the two in sync: Lane 2
+/// claims are agent-originated, so user/system/tool rows never become
+/// claim sources.
+fn is_lane_agent_role(role: &str) -> bool {
+    matches!(
+        role.to_lowercase().as_str(),
+        "assistant" | "agent" | "model" | "gemini"
+    )
+}
+
 /// Locate a session, extract its conversation, and run Lane 2 claim
 /// extraction with full temporal metadata. Shared by claims/results/clarify.
 fn load_session_claims(
@@ -2667,9 +2684,15 @@ fn load_session_claims(
     let coverage = {
         let earliest = entries.iter().map(|e| e.timestamp).min();
         let latest = entries.iter().map(|e| e.timestamp).max();
+        // The envelope declares UTC (`timezone_assumptions`), so the coverage
+        // bounds render as UTC with a literal `Z` — never a local offset.
         earliest.zip(latest).map(|(a, b)| intents::TimeCoverage {
-            earliest: a.to_rfc3339(),
-            latest: b.to_rfc3339(),
+            earliest: a
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            latest: b
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         })
     };
     let source_files = session_info
@@ -2677,9 +2700,14 @@ fn load_session_claims(
         .map(|s| vec![s.source_path.display().to_string()])
         .unwrap_or_default();
 
+    // role_filter="agent_only" in the envelope means the filter happens HERE,
+    // at the source build — not only inside `extract_claims` (which re-guards
+    // as defense in depth). enumerate() runs BEFORE the filter so `source_ref`
+    // indices keep pointing at positions in the full entry stream.
     let claim_sources: Vec<intents::ClaimSource> = entries
         .iter()
         .enumerate()
+        .filter(|(_, e)| is_lane_agent_role(&e.role))
         .map(|(i, e)| intents::ClaimSource {
             role: e.role.clone(),
             text: e.message.clone(),
@@ -2938,10 +2966,8 @@ fn run_session_show(session_id: String, format: &str) -> Result<()> {
 fn parse_since_date(s: &str) -> Result<DateTime<Utc>> {
     let nd = NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .with_context(|| format!("invalid --since date '{s}' (expected YYYY-MM-DD)"))?;
-    Ok(nd
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is valid")
-        .and_utc())
+    // NaiveTime::MIN is midnight — no panicking unwrap path.
+    Ok(nd.and_time(chrono::NaiveTime::MIN).and_utc())
 }
 
 fn run_sessions_list(
@@ -3002,6 +3028,15 @@ fn run_sessions_list(
             here.as_deref(),
         ));
     }
+    if want_agent.is_none_or(|a| a == "junie") {
+        // Junie has no cwd in its dir layout (the dir name is a timestamp), so
+        // there is no pre-read prune; select_sessions applies the --cwd filter
+        // against the recorded CurrentDirectoryUpdatedEvent cwd afterwards.
+        discovered.extend(sessions::discover_junie_sessions(
+            &home.join(".junie").join("sessions"),
+            modified_after,
+        ));
+    }
 
     let selected = sessions::select_sessions(
         discovered,
@@ -3023,7 +3058,7 @@ fn run_sessions_list(
                 "SESSION", "AGENT", "PROJECT", "UPDATED (UTC)", "MSGS", "USR", "ASSOC"
             );
             for s in &selected {
-                let sid = &s.session_id[..8.min(s.session_id.len())];
+                let sid = session_id_table_prefix(&s.session_id);
                 let project = s.project.as_deref().unwrap_or("-");
                 let updated = s
                     .updated_at
@@ -3045,6 +3080,13 @@ fn run_sessions_list(
         }
     }
     Ok(())
+}
+
+/// First 8 chars of a session id for the sessions table — char-safe. Ids
+/// normally are ASCII uuids, but the file-stem fallback can carry non-ASCII;
+/// a byte slice would panic on a multibyte boundary.
+fn session_id_table_prefix(id: &str) -> String {
+    id.chars().take(8).collect()
 }
 
 /// Char-boundary-safe cell truncation for table output (never byte-slices a
@@ -3273,16 +3315,11 @@ fn run_intents(
             // Score sort isn't meaningful for intents (no score field); fall back to newest.
             SortOrder::Score => intents::IntentSortOrder::Newest,
         }),
-        // F3 / default-limit clip: the shared `--limit` default of 10 silently
-        // truncates an intents roadmap (often 20-30 planned items). Treat the
-        // default sentinel as "no limit" so the full roadmap survives; an
-        // explicit larger `--limit` still trims. (Mirrors the tail one-shot's
-        // existing `== 10` default override.)
-        limit: if filters.limit == 10 {
-            None
-        } else {
-            Some(filters.limit)
-        },
+        // F3 / default-limit clip (P2-11): `--limit` is a true Option now.
+        // None means "no limit" so a full intents roadmap (often 20-30
+        // planned items) survives by default, while an explicit `--limit 10`
+        // is honored instead of being mistaken for a default sentinel.
+        limit: filters.limit,
     };
 
     let mut records = intents::apply_display_filters(records, &display_filters);
@@ -3330,9 +3367,10 @@ fn run_tail(
     mut filters: RetrievalFilters,
 ) -> Result<()> {
     if !follow {
-        // One-shot mode
-        if filters.limit == 10 {
-            filters.limit = 20; // default 20 for tail
+        // One-shot mode: default to 20 when no explicit --limit was passed
+        // (an explicit `--limit 10` now means 10 — P2-11).
+        if filters.limit.is_none() {
+            filters.limit = Some(20);
         }
         filters.sort = Some(SortOrder::Newest);
         return run_intents(
@@ -6017,7 +6055,8 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         kind,
         no_semantic,
     } = args;
-    validate_cli_search_limit(filters.limit)?;
+    let limit = filters.limit.unwrap_or(DEFAULT_RETRIEVAL_LIMIT);
+    validate_cli_search_limit(limit)?;
     let kind_filter = kind.and_then(aicx::timeline::Kind::parse);
     // Extract inline date hints from query if no explicit --date given
     let (effective_query, inline_date) = if date.is_none() {
@@ -6066,8 +6105,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         // `rank::fuzzy_search_store` is not on the hybrid retrieval
         // primitive and is operator-requested explicitly via
         // `--no-semantic`, so we leave it alone.
-        let fuzzy_fetch_limit =
-            search_examined_fetch_limit(filters.limit, post_filters.is_active());
+        let fuzzy_fetch_limit = search_examined_fetch_limit(limit, post_filters.is_active());
         let (mut results, scanned) = rank::fuzzy_search_store(
             &root,
             &search_query,
@@ -6097,7 +6135,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         match aicx::search_engine::try_semantic_search_filtered(
             &root,
             &search_query,
-            filters.limit,
+            limit,
             &scopes,
             filters.frame_kind.map(Into::into),
             kind_filter.map(|kind| kind.dir_name()),
@@ -6165,7 +6203,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     }
 
     // Truncate to requested limit after date filtering
-    let results: Vec<_> = results.into_iter().take(filters.limit).collect();
+    let results: Vec<_> = results.into_iter().take(limit).collect();
 
     if json {
         let oracle_status = match semantic_status {
@@ -6667,6 +6705,7 @@ fn run_steer(
     filters: RetrievalFilters,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
+    let limit = filters.limit.unwrap_or(DEFAULT_RETRIEVAL_LIMIT);
 
     let effective_date = date;
     let (date_lo, date_hi) = if let Some(d) = effective_date {
@@ -6690,10 +6729,7 @@ fn run_steer(
             date_lo: date_lo.as_deref(),
             date_hi: date_hi.as_deref(),
         };
-        let mut batch = rt.block_on(aicx::steer_index::search_steer_index(
-            &filter,
-            filters.limit,
-        ))?;
+        let mut batch = rt.block_on(aicx::steer_index::search_steer_index(&filter, limit))?;
         metadatas.append(&mut batch);
     }
     dedup_steer_metadata(&mut metadatas);
@@ -6717,7 +6753,7 @@ fn run_steer(
             }
         });
     }
-    metadatas.truncate(filters.limit);
+    metadatas.truncate(limit);
 
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());

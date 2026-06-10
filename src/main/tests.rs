@@ -317,7 +317,7 @@ fn index_status_json_payload_is_array_for_multiple_scopes() {
 #[test]
 fn run_search_rejects_limit_over_hard_cap_before_store_access() {
     let filters = RetrievalFilters {
-        limit: MAX_CLI_SEARCH_LIMIT + 1,
+        limit: Some(MAX_CLI_SEARCH_LIMIT + 1),
         sort: None,
         score: None,
         agent: None,
@@ -354,6 +354,64 @@ fn fuzzy_fetch_limit_uses_semantic_filter_cap_constants() {
         10 * aicx::search_engine::FILTER_EXAMINED_CAP_RATIO
     );
     assert_eq!(search_examined_fetch_limit(1, false), 1);
+}
+
+#[test]
+fn session_id_table_prefix_is_char_safe_for_non_ascii_ids() {
+    // P2-09: file-stem fallback ids can carry non-ASCII; a byte slice
+    // `&id[..8]` panics on a multibyte boundary. The helper must not.
+    assert_eq!(session_id_table_prefix("zażółć-gęśla-jaźń"), "zażółć-g");
+    assert_eq!(session_id_table_prefix("séance"), "séance");
+    assert_eq!(session_id_table_prefix(""), "");
+    assert_eq!(session_id_table_prefix("0eb1a73c-1234"), "0eb1a73c");
+}
+
+#[test]
+fn retrieval_limit_is_a_true_option_so_explicit_ten_is_honored() {
+    // P2-11: `--limit 10` used to collide with the default sentinel and
+    // silently meant "no limit" for intents. Now omission is None and an
+    // explicit 10 is Some(10).
+    let cli = Cli::try_parse_from(["aicx", "intents", "--limit", "10"])
+        .expect("intents accepts --limit 10");
+    match cli.command {
+        Some(Commands::Intents { filters, .. }) => assert_eq!(filters.limit, Some(10)),
+        other => panic!("expected intents, got {other:?}"),
+    }
+
+    let cli = Cli::try_parse_from(["aicx", "intents"]).expect("intents parses without --limit");
+    match cli.command {
+        Some(Commands::Intents { filters, .. }) => assert_eq!(filters.limit, None),
+        other => panic!("expected intents, got {other:?}"),
+    }
+}
+
+#[test]
+fn sessions_list_agent_filter_rejects_typos_at_parse_time() {
+    // P2-07: a typo'd --agent must be a clap error, not a silent empty list.
+    let err = Cli::try_parse_from(["aicx", "sessions", "list", "--agent", "claud"])
+        .expect_err("unknown agent must fail parsing");
+    assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+
+    for agent in ["claude", "codex", "gemini", "junie"] {
+        Cli::try_parse_from(["aicx", "sessions", "list", "--agent", agent])
+            .unwrap_or_else(|e| panic!("agent '{agent}' must parse: {e}"));
+    }
+}
+
+#[test]
+fn clarify_max_enforces_documented_one_to_five_range() {
+    // P3-11: the doc promises <1-5>; out-of-range values are clap errors.
+    for bad in ["0", "6"] {
+        let err = Cli::try_parse_from(["aicx", "clarify", "--session", "s", "--max", bad])
+            .expect_err("out-of-range --max must fail parsing");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+    let cli = Cli::try_parse_from(["aicx", "clarify", "--session", "s", "--max", "3"])
+        .expect("--max 3 parses");
+    match cli.command {
+        Some(Commands::Clarify { max, .. }) => assert_eq!(max, 3),
+        other => panic!("expected clarify, got {other:?}"),
+    }
 }
 
 #[test]
