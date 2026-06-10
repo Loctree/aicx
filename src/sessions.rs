@@ -34,14 +34,38 @@ fn older_than(path: &Path, after: Option<SystemTime>) -> bool {
         .unwrap_or(false)
 }
 
+/// True when `child` equals `parent` or sits strictly under it with `sep` as
+/// the segment boundary right after the prefix. The boundary check is what
+/// prevents `/a/repo-backup` from matching `/a/repo` (and the `-`-encoded
+/// equivalent in the Claude project-dir space).
+fn nests_under(child: &str, parent: &str, sep: char) -> bool {
+    child
+        .strip_prefix(parent)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(sep))
+}
+
 /// True when `here` and `repo` are the same path or one nests inside the other —
 /// the "is this session relevant to my cwd?" test, shared by the pre-read dir
-/// prune and the post-discovery [`select_sessions`] filter.
+/// prune and the post-discovery [`select_sessions`] filter. Matching is on
+/// whole path segments: after a shared prefix the next char must be `/` (or
+/// the end), so `repo` never matches `repo-backup`.
 fn cwd_nests(here: &str, repo: &str) -> bool {
     // Case-insensitive: macOS filesystems are case-insensitive, and the same repo
     // is recorded under mixed casing (e.g. `vetcoders` vs `VetCoders`).
     let (here, repo) = (here.to_lowercase(), repo.to_lowercase());
-    here == repo || here.starts_with(&repo) || repo.starts_with(&here)
+    let (here, repo) = (here.trim_end_matches('/'), repo.trim_end_matches('/'));
+    nests_under(here, repo, '/') || nests_under(repo, here, '/')
+}
+
+/// ENCODED-space variant of [`cwd_nests`] for [`Association::Inferred`]
+/// sessions: the repo path was decoded from a Claude project dir name (every
+/// `-` became `/`, lossy), so comparing decoded strings would mis-match real
+/// hyphenated paths. Instead encode `here` the same way (`/` -> `-`) and nest
+/// with `-` as the boundary, mirroring the pre-read dir prune.
+fn cwd_nests_encoded(here: &str, repo: &str) -> bool {
+    let here = here.trim_end_matches('/').replace('/', "-").to_lowercase();
+    let repo = repo.trim_end_matches('/').replace('/', "-").to_lowercase();
+    nests_under(&here, &repo, '-') || nests_under(&repo, &here, '-')
 }
 
 /// How a session was associated with a project/repo: directly read from the
@@ -99,8 +123,11 @@ pub struct SessionInfo {
 /// Claude encodes the cwd by replacing `/` with `-`, e.g.
 /// `-Users-silver-Git-transcript-builder`. The encoding is lossy (real hyphens
 /// are indistinguishable from separators), so this is a best-effort INFERENCE,
-/// not exact truth — callers mark the association accordingly. The session's own
-/// `cwd` field, when present, is always preferred over this decode.
+/// not exact truth — callers mark the association as [`Association::Inferred`]
+/// and any path comparison against such a decoded value must happen in the
+/// ENCODED space (see [`cwd_nests_encoded`]), never on the decoded string. The
+/// session's own `cwd` field, when present, is always preferred over this
+/// decode.
 fn decode_claude_project_dir(dir_name: &str) -> Option<String> {
     if !dir_name.starts_with('-') {
         return None;
@@ -126,6 +153,7 @@ pub fn discover_claude_sessions(
     cwd_filter: Option<&str>,
 ) -> Vec<SessionInfo> {
     let mut out = Vec::new();
+    let mut skipped = 0usize;
     let Ok(dirs) = fs::read_dir(projects_root) else {
         return out;
     };
@@ -149,13 +177,14 @@ pub fn discover_claude_sessions(
         // is indistinguishable from a separator) and would mis-prune those paths.
         if let Some(want) = cwd_filter {
             // Lowercase: macOS is case-insensitive and the same repo appears under
-            // mixed casing (`vetcoders` vs `VetCoders`).
+            // mixed casing (`vetcoders` vs `VetCoders`). The prefix match enforces
+            // a `-` segment boundary (encoded separator) so `-a-repo` does not
+            // keep `-a-repository`; an encoded subdir like `-a-repo-backup` stays
+            // (it could be `/a/repo/backup` — conservative keep, the post-discovery
+            // filter on the recorded cwd settles it).
             let want_enc = want.replace('/', "-").to_lowercase();
             let dir_lc = dir_name.to_lowercase();
-            if dir_lc != want_enc
-                && !dir_lc.starts_with(&want_enc)
-                && !want_enc.starts_with(&dir_lc)
-            {
+            if !nests_under(&dir_lc, &want_enc, '-') && !nests_under(&want_enc, &dir_lc, '-') {
                 continue;
             }
         }
@@ -171,10 +200,14 @@ pub fn discover_claude_sessions(
             if older_than(&path, modified_after) {
                 continue;
             }
-            if let Some(info) = scan_claude_session_file(&path, decoded_cwd.as_deref()) {
-                out.push(info);
+            match scan_claude_session_file(&path, decoded_cwd.as_deref()) {
+                Some(info) => out.push(info),
+                None => skipped += 1,
             }
         }
+    }
+    if skipped > 0 {
+        eprintln!("aicx: sessions: skipped {skipped} unreadable file(s) (claude)");
     }
     out
 }
@@ -191,17 +224,20 @@ fn scan_claude_session_file(path: &Path, decoded_cwd: Option<&str>) -> Option<Se
     let mut agent_message_count = 0usize;
     let mut recorded_cwd: Option<String> = None;
     let mut title: Option<String> = None;
-    let mut saw_any_line = false;
+    // Set only after a line actually parses: a file holding nothing but garbage
+    // has no time signal at all and must report TemporalConfidence::None, not
+    // Partial.
+    let mut saw_parsable_line = false;
 
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        saw_any_line = true;
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+        saw_parsable_line = true;
 
         if recorded_cwd.is_none()
             && let Some(cwd) = value.get("cwd").and_then(|v| v.as_str())
@@ -257,7 +293,7 @@ fn scan_claude_session_file(path: &Path, decoded_cwd: Option<&str>) -> Option<Se
 
     let temporal_confidence = if started_at.is_some() {
         TemporalConfidence::Full
-    } else if saw_any_line {
+    } else if saw_parsable_line {
         TemporalConfidence::Partial
     } else {
         TemporalConfidence::None
@@ -280,29 +316,51 @@ fn scan_claude_session_file(path: &Path, decoded_cwd: Option<&str>) -> Option<Se
     })
 }
 
+/// Depth cap for the codex `YYYY/MM/DD` rollout walk: the real layout is 3
+/// levels, 16 leaves generous headroom while still terminating on pathological
+/// (e.g. cyclic-looking) trees.
+const MAX_CODEX_SCAN_DEPTH: usize = 16;
+
 /// Discover Codex CLI sessions under a sessions root (`~/.codex/sessions`),
-/// which nests rollouts by date (`YYYY/MM/DD/rollout-*.jsonl`). Walks the tree.
+/// which nests rollouts by date (`YYYY/MM/DD/rollout-*.jsonl`). Walks the tree
+/// without following symlinks (the entry's own file type decides) and with a
+/// [`MAX_CODEX_SCAN_DEPTH`] cap.
 pub fn discover_codex_sessions(
     sessions_root: &Path,
     modified_after: Option<SystemTime>,
 ) -> Vec<SessionInfo> {
     let mut out = Vec::new();
-    let mut stack = vec![sessions_root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
+    let mut skipped = 0usize;
+    let mut stack = vec![(sessions_root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
         let Ok(read) = fs::read_dir(&dir) else {
             continue;
         };
         for entry in read.flatten() {
+            // entry.file_type() reports the symlink itself (no follow), unlike
+            // path.is_dir() which would traverse it.
+            let Ok(file_type) = entry.file_type() else {
+                skipped += 1;
+                continue;
+            };
             let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+            if file_type.is_dir() {
+                if depth < MAX_CODEX_SCAN_DEPTH {
+                    stack.push((path, depth + 1));
+                }
+            } else if file_type.is_file()
+                && path.extension().and_then(|e| e.to_str()) == Some("jsonl")
                 && !older_than(&path, modified_after)
-                && let Some(info) = scan_codex_session_file(&path)
             {
-                out.push(info);
+                match scan_codex_session_file(&path) {
+                    Some(info) => out.push(info),
+                    None => skipped += 1,
+                }
             }
         }
+    }
+    if skipped > 0 {
+        eprintln!("aicx: sessions: skipped {skipped} unreadable file(s) (codex)");
     }
     out
 }
@@ -320,17 +378,19 @@ fn scan_codex_session_file(path: &Path) -> Option<SessionInfo> {
     let mut user_message_count = 0usize;
     let mut agent_message_count = 0usize;
     let mut title: Option<String> = None;
-    let mut saw_any_line = false;
+    // Set only after a line actually parses (see scan_claude_session_file): a
+    // garbage-only file reports TemporalConfidence::None, not Partial.
+    let mut saw_parsable_line = false;
 
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        saw_any_line = true;
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+        saw_parsable_line = true;
 
         if let Some(ts) = v
             .get("timestamp")
@@ -388,7 +448,7 @@ fn scan_codex_session_file(path: &Path) -> Option<SessionInfo> {
     };
     let temporal_confidence = if started_at.is_some() {
         TemporalConfidence::Full
-    } else if saw_any_line {
+    } else if saw_parsable_line {
         TemporalConfidence::Partial
     } else {
         TemporalConfidence::None
@@ -437,6 +497,7 @@ pub fn discover_gemini_sessions(
     cwd_filter: Option<&str>,
 ) -> Vec<SessionInfo> {
     let mut out = Vec::new();
+    let mut skipped = 0usize;
     let Ok(dirs) = fs::read_dir(tmp_root) else {
         return out;
     };
@@ -470,10 +531,14 @@ pub fn discover_gemini_sessions(
             if (ext != Some("json") && ext != Some("jsonl")) || older_than(&path, modified_after) {
                 continue;
             }
-            if let Some(info) = scan_gemini_session_file(&path, &dir_name) {
-                out.push(info);
+            match scan_gemini_session_file(&path, &dir_name) {
+                Some(info) => out.push(info),
+                None => skipped += 1,
             }
         }
+    }
+    if skipped > 0 {
+        eprintln!("aicx: sessions: skipped {skipped} unreadable file(s) (gemini)");
     }
     out
 }
@@ -505,8 +570,19 @@ fn scan_gemini_session_file(path: &Path, dir_name: &str) -> Option<SessionInfo> 
     let mut user_message_count = 0usize;
     let mut agent_message_count = 0usize;
     let mut title = None;
+    // Partial-time signal: a per-message timestamp exists even though the
+    // header times are missing.
+    let mut messages_have_time = false;
     if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
         for m in msgs {
+            if !messages_have_time
+                && m.get("timestamp")
+                    .and_then(|t| t.as_str())
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .is_some()
+            {
+                messages_have_time = true;
+            }
             match m.get("type").and_then(|t| t.as_str()) {
                 Some("user") => {
                     user_message_count += 1;
@@ -536,10 +612,14 @@ fn scan_gemini_session_file(path: &Path, dir_name: &str) -> Option<SessionInfo> 
     } else {
         Association::Unknown
     };
+    // Consistent with claude/codex: no startTime, no lastUpdated and no
+    // per-message time means NO time signal at all -> None, never Partial.
     let temporal_confidence = if started_at.is_some() {
         TemporalConfidence::Full
-    } else {
+    } else if updated_at.is_some() || messages_have_time {
         TemporalConfidence::Partial
+    } else {
+        TemporalConfidence::None
     };
 
     Some(SessionInfo {
@@ -558,6 +638,23 @@ fn scan_gemini_session_file(path: &Path, dir_name: &str) -> Option<SessionInfo> 
         association,
         temporal_confidence,
     })
+}
+
+/// Extract the trailing session-id segment from a codex rollout filename stem,
+/// shaped `rollout-<YYYY-MM-DDThh-mm-ss>-<id>`. Returns `None` when the stem
+/// does not follow that shape (callers then fall back to whole-stem matching).
+fn codex_rollout_id_segment(stem: &str) -> Option<&str> {
+    let rest = stem.strip_prefix("rollout-")?;
+    // The timestamp block is a fixed 19-char `YYYY-MM-DDThh-mm-ss`.
+    let ts = rest.get(..19)?;
+    if rest.as_bytes().get(19) != Some(&b'-')
+        || !ts
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '-' || c == 'T')
+    {
+        return None;
+    }
+    rest.get(20..).filter(|id| !id.is_empty())
 }
 
 /// Locate a single session by id (or unique prefix) for `aicx session show`.
@@ -594,27 +691,50 @@ pub fn find_session_by_id(home: &Path, id: &str) -> Option<SessionInfo> {
         }
     }
 
-    // Codex: the filename embeds the uuid.
-    let mut stack = vec![home.join(".codex").join("sessions")];
-    while let Some(dir) = stack.pop() {
+    // Codex: the filename embeds the uuid as the trailing segment of
+    // `rollout-<timestamp>-<id>`; match a prefix of that segment (so an id
+    // prefix never collides with the timestamp block), falling back to a
+    // whole-stem prefix match for non-rollout-shaped names. Walk without
+    // following symlinks and with the same depth cap as discovery.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut stack = vec![(home.join(".codex").join("sessions"), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
         let Ok(read) = fs::read_dir(&dir) else {
             continue;
         };
         for e in read.flatten() {
+            let Ok(file_type) = e.file_type() else {
+                continue;
+            };
             let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
+            if file_type.is_dir() {
+                if depth < MAX_CODEX_SCAN_DEPTH {
+                    stack.push((p, depth + 1));
+                }
                 continue;
             }
-            if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+            if !file_type.is_file() || p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
                 continue;
             }
             let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-            if stem.contains(id)
-                && let Some(info) = scan_codex_session_file(&p)
-            {
-                return Some(info);
+            let matched = codex_rollout_id_segment(stem)
+                .map_or_else(|| stem.starts_with(id), |seg| seg.starts_with(id));
+            if matched {
+                candidates.push(p);
             }
+        }
+    }
+    // Deterministic on ambiguity: warn, then take the lexicographically first.
+    candidates.sort();
+    if candidates.len() > 1 {
+        eprintln!(
+            "aicx: session: id '{id}' matches {} codex rollouts; using the first (sorted)",
+            candidates.len()
+        );
+    }
+    for p in candidates {
+        if let Some(info) = scan_codex_session_file(&p) {
+            return Some(info);
         }
     }
 
@@ -676,15 +796,31 @@ pub fn select_sessions(
         sessions.retain(|s| s.agent == agent);
     }
     if let Some(since) = since {
-        sessions.retain(|s| s.updated_at.or(s.started_at).is_some_and(|t| t >= since));
+        // A session with NO timestamp survives the since-window: it is marked
+        // "(no timestamp)" in the table (main.rs), never silently dated out —
+        // aligns with COMMANDS.md "marked, never silently dated".
+        sessions.retain(|s| s.updated_at.or(s.started_at).is_none_or(|t| t >= since));
     }
     if let Some(here) = here {
-        sessions.retain(|s| s.repo_path.as_deref().is_some_and(|p| cwd_nests(here, p)));
+        sessions.retain(|s| {
+            s.repo_path.as_deref().is_some_and(|p| {
+                // Inferred repo paths were decoded from a lossy dir encoding
+                // ('-' -> '/'), so compare those in the ENCODED space; exact
+                // recorded cwds compare as real paths.
+                if s.association == Association::Inferred {
+                    cwd_nests_encoded(here, p)
+                } else {
+                    cwd_nests(here, p)
+                }
+            })
+        });
     }
     sessions.sort_by(|a, b| {
         let ta = a.updated_at.or(a.started_at);
         let tb = b.updated_at.or(b.started_at);
-        tb.cmp(&ta)
+        // Tie-break on session_id so equal timestamps order deterministically
+        // (a stable result under `limit`).
+        tb.cmp(&ta).then_with(|| a.session_id.cmp(&b.session_id))
     });
     if limit > 0 {
         sessions.truncate(limit);
@@ -988,5 +1124,224 @@ mod tests {
         );
         assert_eq!(recent.len(), 2, "only bbb (06-08) and ccc (06-09) survive");
         assert!(recent.iter().all(|s| s.session_id != "aaa"));
+    }
+
+    #[test]
+    fn cwd_nests_requires_segment_boundary() {
+        // sibling with a shared prefix must NOT nest (both directions)
+        assert!(!cwd_nests("/a/repo", "/a/repo-backup"));
+        assert!(!cwd_nests("/a/repo-backup", "/a/repo"));
+        assert!(!cwd_nests("/a/repository", "/a/repo"));
+        // genuine nesting still works (both directions)
+        assert!(cwd_nests("/a/repo/sub", "/a/repo"));
+        assert!(cwd_nests("/a/repo", "/a/repo/sub"));
+        // equality, case-insensitivity, trailing slash
+        assert!(cwd_nests("/a/Repo", "/a/repo"));
+        assert!(cwd_nests("/a/repo/", "/a/repo"));
+    }
+
+    #[test]
+    fn cwd_prune_requires_encoded_segment_boundary() {
+        // A dir whose encoded name merely shares a string prefix with the
+        // encoded --cwd must be pruned: `repo` is not `repository`.
+        let root = temp_root("cwdprune_boundary");
+        let sibling = root.join("-Users-me-repository");
+        fs::create_dir_all(&sibling).unwrap();
+        write_session(
+            &sibling,
+            "x1.jsonl",
+            &[
+                r#"{"type":"user","cwd":"/Users/me/repository","message":{"role":"user","content":"x"},"timestamp":"2026-06-08T10:00:00.000Z"}"#,
+            ],
+        );
+        let nested = root.join("-Users-me-repo-sub");
+        fs::create_dir_all(&nested).unwrap();
+        write_session(
+            &nested,
+            "x2.jsonl",
+            &[
+                r#"{"type":"user","cwd":"/Users/me/repo/sub","message":{"role":"user","content":"y"},"timestamp":"2026-06-08T11:00:00.000Z"}"#,
+            ],
+        );
+
+        let got = discover_claude_sessions(&root, None, Some("/Users/me/repo"));
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(got.len(), 1, "repository pruned, repo/sub kept");
+        assert_eq!(got[0].session_id, "x2");
+    }
+
+    #[test]
+    fn select_sessions_keeps_sessions_without_timestamp_in_since_window() {
+        // "marked, never silently dated": a no-timestamp session survives
+        // --since (main.rs renders it as "(no timestamp)").
+        let mut no_time = mk_info("notime", Some("/Users/me/repo-a"), "2026-06-01T10:00:00Z");
+        no_time.updated_at = None;
+        no_time.started_at = None;
+        no_time.temporal_confidence = TemporalConfidence::None;
+        let sessions = vec![
+            no_time,
+            mk_info("old", Some("/Users/me/repo-a"), "2026-06-01T10:00:00Z"),
+            mk_info("new", Some("/Users/me/repo-a"), "2026-06-08T10:00:00Z"),
+        ];
+        let got = select_sessions(
+            sessions,
+            None,
+            None,
+            Some(
+                DateTime::parse_from_rfc3339("2026-06-07T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            0,
+        );
+        let ids: Vec<&str> = got.iter().map(|s| s.session_id.as_str()).collect();
+        assert!(ids.contains(&"notime"), "no-timestamp session survives");
+        assert!(ids.contains(&"new"));
+        assert!(!ids.contains(&"old"), "dated-out session is dropped");
+        // no-timestamp sorts after dated sessions (None < Some, newest first)
+        assert_eq!(ids.last(), Some(&"notime"));
+    }
+
+    #[test]
+    fn select_sessions_sort_is_deterministic_on_equal_timestamps() {
+        let sessions = vec![
+            mk_info("zzz", None, "2026-06-08T10:00:00Z"),
+            mk_info("aaa", None, "2026-06-08T10:00:00Z"),
+            mk_info("mmm", None, "2026-06-08T10:00:00Z"),
+        ];
+        let got = select_sessions(sessions, None, None, None, 0);
+        let ids: Vec<&str> = got.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["aaa", "mmm", "zzz"], "session_id tie-break");
+        // limit now clips a stable head
+        let sessions = vec![
+            mk_info("zzz", None, "2026-06-08T10:00:00Z"),
+            mk_info("aaa", None, "2026-06-08T10:00:00Z"),
+        ];
+        let one = select_sessions(sessions, None, None, None, 1);
+        assert_eq!(one[0].session_id, "aaa");
+    }
+
+    #[test]
+    fn select_sessions_matches_inferred_repo_in_encoded_space() {
+        // Inferred repo_path comes from the lossy dir decode: the real cwd
+        // /Users/me/vc-workspace/aicx decodes to /Users/me/vc/workspace/aicx.
+        // Encoded-space matching must still associate it with --cwd.
+        let mut inferred = mk_info(
+            "inf",
+            Some("/Users/me/vc/workspace/aicx"),
+            "2026-06-08T10:00:00Z",
+        );
+        inferred.association = Association::Inferred;
+        let got = select_sessions(
+            vec![inferred.clone()],
+            Some("/Users/me/vc-workspace/aicx"),
+            None,
+            None,
+            0,
+        );
+        assert_eq!(got.len(), 1, "inferred match happens in encoded space");
+        // and a non-matching cwd still drops it
+        let none = select_sessions(vec![inferred], Some("/Users/me/other"), None, None, 0);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn garbage_only_file_reports_temporal_confidence_none() {
+        // claude: no parsable record + no timestamp -> None, not Partial
+        let root = temp_root("garbage_claude");
+        let proj = root.join("-tmp-garbage");
+        fs::create_dir_all(&proj).unwrap();
+        write_session(&proj, "g1.jsonl", &["this is not json", "neither is this"]);
+        let sessions = discover_claude_sessions(&root, None, None);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].temporal_confidence, TemporalConfidence::None);
+
+        // codex: same rule
+        let root = temp_root("garbage_codex");
+        let day = root.join("2026").join("01").join("29");
+        fs::create_dir_all(&day).unwrap();
+        write_session(&day, "rollout-garbage.jsonl", &["{{{ not json"]);
+        let sessions = discover_codex_sessions(&root, None);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].temporal_confidence, TemporalConfidence::None);
+    }
+
+    #[test]
+    fn gemini_session_without_any_time_signal_reports_none() {
+        let root = temp_root("gemini_notime");
+        let chats = root.join("proj").join("chats");
+        fs::create_dir_all(&chats).unwrap();
+        // no startTime, no lastUpdated, no per-message timestamps -> None
+        let no_time =
+            r#"{"sessionId":"g-1","messages":[{"id":"1","type":"user","content":"hej"}]}"#;
+        fs::write(chats.join("session-a.json"), no_time).unwrap();
+        // only a per-message timestamp -> Partial (some signal, not absolute header time)
+        let msg_time = r#"{"sessionId":"g-2","messages":[{"id":"1","type":"user","content":"hej","timestamp":"2026-06-08T10:00:00.000Z"}]}"#;
+        fs::write(chats.join("session-b.json"), msg_time).unwrap();
+
+        let mut sessions = discover_gemini_sessions(&root, None, None);
+        let _ = fs::remove_dir_all(&root);
+        sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session_id, "g-1");
+        assert_eq!(sessions[0].temporal_confidence, TemporalConfidence::None);
+        assert_eq!(sessions[1].session_id, "g-2");
+        assert_eq!(sessions[1].temporal_confidence, TemporalConfidence::Partial);
+    }
+
+    #[test]
+    fn find_session_by_id_codex_matches_id_segment_not_timestamp() {
+        let home = temp_root("codexfind");
+        let day = home.join(".codex").join("sessions").join("2026").join("01");
+        fs::create_dir_all(&day).unwrap();
+        write_session(
+            &day,
+            "rollout-2026-01-29T13-58-09-019c1111-aaaa.jsonl",
+            &[
+                r#"{"timestamp":"2026-01-29T12:58:09.421Z","type":"session_meta","payload":{"id":"019c1111-aaaa","cwd":"/tmp/a"}}"#,
+            ],
+        );
+        write_session(
+            &day,
+            "rollout-2026-01-29T14-00-00-019c2222-bbbb.jsonl",
+            &[
+                r#"{"timestamp":"2026-01-29T13:00:00.000Z","type":"session_meta","payload":{"id":"019c2222-bbbb","cwd":"/tmp/b"}}"#,
+            ],
+        );
+
+        // exact id-segment prefix resolves the right rollout
+        let found = find_session_by_id(&home, "019c2222");
+        assert_eq!(
+            found.expect("found by id segment").session_id,
+            "019c2222-bbbb"
+        );
+        // a timestamp-shaped prefix must NOT match (old `contains` would have)
+        assert!(find_session_by_id(&home, "2026").is_none());
+        // ambiguous prefix resolves deterministically (sorted, first wins)
+        let ambiguous = find_session_by_id(&home, "019c");
+        assert_eq!(
+            ambiguous
+                .expect("ambiguous prefix still resolves")
+                .session_id,
+            "019c1111-aaaa"
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn codex_rollout_id_segment_parses_rollout_shape() {
+        assert_eq!(
+            codex_rollout_id_segment("rollout-2026-01-29T13-58-09-019c09d5-aaaa"),
+            Some("019c09d5-aaaa")
+        );
+        // non-rollout shapes fall back to None (whole-stem match applies)
+        assert_eq!(codex_rollout_id_segment("rollout-garbage"), None);
+        assert_eq!(codex_rollout_id_segment("some-other-file"), None);
+        assert_eq!(
+            codex_rollout_id_segment("rollout-2026-01-29T13-58-09-"),
+            None
+        );
     }
 }
