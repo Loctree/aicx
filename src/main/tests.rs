@@ -2428,3 +2428,20 @@ fn lane_time_coverage_normalizes_offsets_to_utc_z() {
     // No timestamps -> no coverage (the envelope omits it, never fabricates).
     assert!(lane_time_coverage(Vec::<DateTime<Utc>>::new()).is_none());
 }
+
+#[test]
+fn lane_claim_source_filter_uses_shared_agent_role_predicate() {
+    // P2-04: load_session_claims filters claim sources with
+    // intents::is_agent_role — the SAME predicate extract_claims re-guards
+    // with. Assert the re-exported predicate (the one the binary links)
+    // upholds the role_filter="agent_only" contract.
+    for role in ["assistant", "agent", "model", "gemini", "Assistant"] {
+        assert!(intents::is_agent_role(role), "{role} rows become sources");
+    }
+    for role in ["user", "system", "tool", "developer"] {
+        assert!(
+            !intents::is_agent_role(role),
+            "{role} rows never become claim sources"
+        );
+    }
+}

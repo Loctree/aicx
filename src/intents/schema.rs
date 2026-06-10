@@ -388,7 +388,12 @@ pub struct ClaimSource {
     pub timestamp_partial: bool,
 }
 
-fn is_agent_role(role: &str) -> bool {
+/// True when `role` names an agent-originated row. Lane 2 doctrine: claims
+/// are agent-originated, so user/system/tool/developer rows never become
+/// claim sources. Public as THE single role predicate shared by the source
+/// build in the CLI (`load_session_claims`) and the in-lane re-guard in
+/// [`extract_claims`] — no hand-synced duplicates.
+pub fn is_agent_role(role: &str) -> bool {
     matches!(
         role.to_lowercase().as_str(),
         "assistant" | "agent" | "model" | "gemini"
@@ -1280,5 +1285,20 @@ mod tests {
         // records.
         assert!(extract_claims(&[], "2026-06-09T21:00:00Z").is_empty());
         assert!(generate_clarify(&[], 5).is_empty());
+    }
+
+    #[test]
+    fn is_agent_role_accepts_agent_rows_and_rejects_the_rest() {
+        // The single shared predicate behind role_filter="agent_only": both
+        // the CLI source build and the extract_claims re-guard call THIS.
+        for role in ["assistant", "agent", "model", "gemini"] {
+            assert!(is_agent_role(role), "{role} is agent-originated");
+        }
+        // case-insensitive
+        assert!(is_agent_role("Assistant"));
+        assert!(is_agent_role("MODEL"));
+        for role in ["user", "system", "tool", "developer", "operator", ""] {
+            assert!(!is_agent_role(role), "{role:?} must never source a claim");
+        }
     }
 }

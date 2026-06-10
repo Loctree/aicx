@@ -2616,17 +2616,6 @@ impl LaneSessionContext {
     }
 }
 
-/// Agent-role test for lane source rows. Mirrors the (private)
-/// `is_agent_role` in `intents/schema.rs` — keep the two in sync: Lane 2
-/// claims are agent-originated, so user/system/tool rows never become
-/// claim sources.
-fn is_lane_agent_role(role: &str) -> bool {
-    matches!(
-        role.to_lowercase().as_str(),
-        "assistant" | "agent" | "model" | "gemini"
-    )
-}
-
 /// Build the lane-export [`intents::TimeCoverage`] from source timestamps:
 /// earliest..latest, normalized to UTC and rendered RFC3339 with a literal
 /// `Z` suffix. The envelope declares UTC (`timezone_assumptions`), so the
@@ -2711,12 +2700,13 @@ fn load_session_claims(
 
     // role_filter="agent_only" in the envelope means the filter happens HERE,
     // at the source build — not only inside `extract_claims` (which re-guards
-    // as defense in depth). enumerate() runs BEFORE the filter so `source_ref`
-    // indices keep pointing at positions in the full entry stream.
+    // as defense in depth, using the SAME shared predicate). enumerate() runs
+    // BEFORE the filter so `source_ref` indices keep pointing at positions in
+    // the full entry stream.
     let claim_sources: Vec<intents::ClaimSource> = entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| is_lane_agent_role(&e.role))
+        .filter(|(_, e)| intents::is_agent_role(&e.role))
         .map(|(i, e)| intents::ClaimSource {
             role: e.role.clone(),
             text: e.message.clone(),

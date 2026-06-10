@@ -42,7 +42,7 @@ pub use self::schema::{
     CLARIFY_MAX_QUESTIONS, ClaimRecord, ClaimSource, ClaimType, ClarifyQuestion, ContractFracture,
     FractureSeverity, LANE_SCHEMA_VERSION, LaneExport, ResultRecord, ResultStatus, TimeCoverage,
     UTC_TIMEZONE_ASSUMPTION, VerificationStatus, classify_claim, collect_artifact_evidence,
-    detect_fractures, extract_claims, generate_clarify, verify_claims,
+    detect_fractures, extract_claims, generate_clarify, is_agent_role, verify_claims,
 };
 
 const STRICT_CONFIDENCE: u8 = 3;
