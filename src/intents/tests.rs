@@ -1342,6 +1342,100 @@ mod session_level {
     }
 
     #[test]
+    fn supersedes_chain_final_state_is_input_order_independent() {
+        // P2-01: in a 3-link chain A <- B <- C, B both supersedes A and is
+        // superseded by C. The final state must be A=Superseded(by B),
+        // B=Superseded(by C), C=Active — regardless of input order. The old
+        // pairwise action loop got this right only by accident of ascending
+        // push order.
+        let chain_entries = || {
+            (
+                make_entry(
+                    EntryType::Intent,
+                    "ship the new intent engine basic skeleton",
+                    "2026-04-10",
+                    "s1",
+                    "demo",
+                ),
+                make_entry(
+                    EntryType::Intent,
+                    "ship the new intent engine with retries",
+                    "2026-04-12",
+                    "s2",
+                    "demo",
+                ),
+                make_entry(
+                    EntryType::Intent,
+                    "ship the new intent engine final form",
+                    "2026-04-15",
+                    "s3",
+                    "demo",
+                ),
+            )
+        };
+
+        let (a, b, c) = chain_entries();
+        let (a_id, b_id, c_id) = (a.id.clone(), b.id.clone(), c.id.clone());
+        let forward = vec![a, b, c];
+        let (a2, b2, c2) = chain_entries();
+        let reversed = vec![c2, b2, a2];
+
+        for (label, mut entries) in [("forward", forward), ("reversed", reversed)] {
+            detect_supersedes(&mut entries);
+
+            let by_id = |id: &str| {
+                entries
+                    .iter()
+                    .find(|e| e.id == id)
+                    .unwrap_or_else(|| panic!("entry {id} missing in {label} run"))
+            };
+            let (a, b, c) = (by_id(&a_id), by_id(&b_id), by_id(&c_id));
+
+            assert_eq!(
+                a.state,
+                EntryState::Superseded,
+                "{label}: A must be superseded"
+            );
+            assert_eq!(
+                a.superseded_by,
+                Some(b_id.clone()),
+                "{label}: A must be superseded by B (chain link, not by C)"
+            );
+            assert_eq!(
+                b.state,
+                EntryState::Superseded,
+                "{label}: B must be superseded"
+            );
+            assert_eq!(
+                b.superseded_by,
+                Some(c_id.clone()),
+                "{label}: B must be superseded by C"
+            );
+            assert_eq!(
+                c.state,
+                EntryState::Active,
+                "{label}: C is the chain head and must stay Active"
+            );
+            assert!(
+                c.superseded_by.is_none(),
+                "{label}: C must not be superseded"
+            );
+            assert!(
+                b.links
+                    .iter()
+                    .any(|l| l.relation == LinkType::Supersedes && l.target == a_id),
+                "{label}: B must carry a supersedes link to A"
+            );
+            assert!(
+                c.links
+                    .iter()
+                    .any(|l| l.relation == LinkType::Supersedes && l.target == b_id),
+                "{label}: C must carry a supersedes link to B"
+            );
+        }
+    }
+
+    #[test]
     fn contradicted_assumption() {
         let mut entries = vec![
             make_entry(
@@ -2128,5 +2222,116 @@ mod area_e_regressions {
         detect_contradicted_assumptions(&mut entries);
         assert_eq!(entries[0].state, EntryState::Active);
         assert!(entries[0].links.is_empty());
+    }
+}
+
+// ── P3-09: flexible UTC date parsing for mixed-format comparisons ────
+
+mod flexible_dates {
+    use super::*;
+
+    fn make_record(summary: &str, date: &str, timestamp: Option<&str>) -> IntentRecord {
+        IntentRecord {
+            kind: IntentKind::Intent,
+            summary: summary.to_string(),
+            context: None,
+            evidence: Vec::new(),
+            project: "demo".to_string(),
+            agent: "codex".to_string(),
+            date: date.to_string(),
+            timestamp: timestamp.map(|t| t.to_string()),
+            session_id: format!("sess-{summary}"),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: format!("/tmp/demo/{summary}.md"),
+        }
+    }
+
+    #[test]
+    fn parse_flexible_utc_normalizes_bare_dates_and_offsets() {
+        let day = parse_flexible_utc("2026-05-04").expect("bare date must parse");
+        assert_eq!(day.to_rfc3339(), "2026-05-04T00:00:00+00:00");
+
+        // +02:00 offset normalizes to 21:30Z, which is BEFORE 22:00Z even
+        // though the raw strings compare the other way lexicographically.
+        let offset = parse_flexible_utc("2026-05-04T23:30:00+02:00").expect("offset must parse");
+        let zulu = parse_flexible_utc("2026-05-04T22:00:00Z").expect("zulu must parse");
+        assert!("2026-05-04T23:30:00+02:00" > "2026-05-04T22:00:00Z");
+        assert!(offset < zulu, "typed comparison must use the UTC axis");
+
+        assert_eq!(parse_flexible_utc("not-a-date"), None);
+        assert_eq!(parse_flexible_utc("2026-13-99"), None);
+    }
+
+    #[test]
+    fn sort_mixes_date_only_and_timestamped_records_consistently() {
+        // Oldest-first expectation on the UTC axis:
+        //   date-only (midnight UTC) < 21:30Z (23:30+02:00) < 22:00Z.
+        // The old lexicographic sort produced date-only < 22:00Z < 23:30+02:00.
+        let records = vec![
+            make_record(
+                "late-offset",
+                "2026-05-04",
+                Some("2026-05-04T23:30:00+02:00"),
+            ),
+            make_record("zulu", "2026-05-04", Some("2026-05-04T22:00:00Z")),
+            make_record("date-only", "2026-05-04", None),
+        ];
+
+        let oldest = apply_display_filters(
+            records.clone(),
+            &IntentDisplayFilters {
+                sort: Some(IntentSortOrder::Oldest),
+                ..Default::default()
+            },
+        );
+        let oldest_order: Vec<&str> = oldest.iter().map(|r| r.summary.as_str()).collect();
+        assert_eq!(
+            oldest_order,
+            vec!["date-only", "late-offset", "zulu"],
+            "Oldest sort must order date-only (midnight) before 21:30Z before 22:00Z"
+        );
+
+        let newest = apply_display_filters(
+            records,
+            &IntentDisplayFilters {
+                sort: Some(IntentSortOrder::Newest),
+                ..Default::default()
+            },
+        );
+        let newest_order: Vec<&str> = newest.iter().map(|r| r.summary.as_str()).collect();
+        assert_eq!(
+            newest_order,
+            vec!["zulu", "late-offset", "date-only"],
+            "Newest sort must be the exact reverse of Oldest"
+        );
+    }
+
+    #[test]
+    fn date_range_filter_compares_on_utc_axis() {
+        // 01:00+03:00 on 2026-05-04 is 22:00Z on 2026-05-03, so a
+        // lo=2026-05-04 bound must EXCLUDE it. The old lexicographic
+        // comparison kept it ("2026-05-04T..." >= "2026-05-04").
+        let records = vec![
+            make_record("pre-window", "2026-05-04T01:00:00+03:00", None),
+            make_record("in-window", "2026-05-04", None),
+            make_record("garbage-date", "someday", None),
+        ];
+
+        let filtered = apply_display_filters(
+            records,
+            &IntentDisplayFilters {
+                date_lo: Some("2026-05-04".to_string()),
+                date_hi: Some("2026-05-05".to_string()),
+                ..Default::default()
+            },
+        );
+        let kept: Vec<&str> = filtered.iter().map(|r| r.summary.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec!["in-window"],
+            "offset timestamp before the UTC window and unparsable dates must be dropped"
+        );
     }
 }

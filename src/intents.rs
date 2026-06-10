@@ -2009,16 +2009,37 @@ fn detect_unresolved(entries: &mut [IntentEntry], threshold_days: i64) {
     }
 }
 
-fn detect_supersedes(entries: &mut [IntentEntry]) {
-    struct SupersedesAction {
-        superseded_idx: usize,
-        newer_idx: usize,
-        superseded_id: String,
-        newer_id: String,
+/// Parse a date string that may be either a bare `YYYY-MM-DD` day or a full
+/// RFC3339 timestamp with any offset. Full timestamps are normalized to UTC;
+/// bare dates map to midnight UTC so day-only and timestamped values compare
+/// on a single typed axis instead of lexicographically (P3-09).
+pub(crate) fn parse_flexible_utc(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
     }
+    NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .ok()
+        .map(|d| DateTime::<Utc>::from_naive_utc_and_offset(d.and_time(NaiveTime::MIN), Utc))
+}
 
-    let mut topic_latest: HashMap<String, (usize, String, String)> = HashMap::new();
-    let mut actions: Vec<SupersedesAction> = Vec::new();
+/// Compare two flexible date strings on the typed UTC axis when both parse;
+/// fall back to the legacy lexicographic comparison for unparsable input so
+/// garbage keeps its historical ordering.
+pub(crate) fn cmp_dates_flexible(a: &str, b: &str) -> std::cmp::Ordering {
+    match (parse_flexible_utc(a), parse_flexible_utc(b)) {
+        (Some(da), Some(db)) => da.cmp(&db),
+        _ => a.cmp(b),
+    }
+}
+
+fn detect_supersedes(entries: &mut [IntentEntry]) {
+    // Group supersession candidates by topic, then resolve each topic as a
+    // date-ordered chain. Recomputing the whole chain (instead of applying
+    // pairwise actions against a running "latest") makes the final states
+    // independent of input order: an entry that supersedes an older sibling
+    // while itself being superseded by a newer one always ends Superseded,
+    // never Active (P2-01).
+    let mut topics: HashMap<String, Vec<usize>> = HashMap::new();
 
     for (idx, entry) in entries.iter().enumerate() {
         if !matches!(
@@ -2037,48 +2058,50 @@ fn detect_supersedes(entries: &mut [IntentEntry]) {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-
-        if let Some((prev_idx, prev_id, prev_date)) = topic_latest.get(&topic_key) {
-            if entry.date > *prev_date
-                || (entry.date == *prev_date && entry.confidence > entries[*prev_idx].confidence)
-            {
-                let old_idx = *prev_idx;
-                let old_id = prev_id.clone();
-                actions.push(SupersedesAction {
-                    superseded_idx: old_idx,
-                    newer_idx: idx,
-                    superseded_id: old_id,
-                    newer_id: entry.id.clone(),
-                });
-                topic_latest.insert(topic_key, (idx, entry.id.clone(), entry.date.clone()));
-            } else {
-                actions.push(SupersedesAction {
-                    superseded_idx: idx,
-                    newer_idx: *prev_idx,
-                    superseded_id: entry.id.clone(),
-                    newer_id: prev_id.clone(),
-                });
-            }
-        } else {
-            topic_latest.insert(topic_key, (idx, entry.id.clone(), entry.date.clone()));
-        }
+        topics.entry(topic_key).or_default().push(idx);
     }
 
-    for action in actions {
-        entries[action.superseded_idx].state = EntryState::Superseded;
-        entries[action.superseded_idx].superseded_by = Some(action.newer_id.clone());
-        entries[action.newer_idx].state = EntryState::Active;
-        let already = entries[action.newer_idx]
-            .links
-            .iter()
-            .any(|l| l.relation == LinkType::Supersedes && l.target == action.superseded_id);
-        if !already {
-            entries[action.newer_idx].links.push(Link {
-                relation: LinkType::Supersedes,
-                target: action.superseded_id,
-                confidence: Some(0.7),
-            });
+    for mut chain in topics.into_values() {
+        if chain.len() < 2 {
+            continue;
         }
+        // Oldest first. Ties on date are broken by confidence (higher wins,
+        // so it sorts later in the chain), then by input order (first-seen
+        // wins), mirroring the previous pairwise rules.
+        chain.sort_by(|&a, &b| {
+            cmp_dates_flexible(&entries[a].date, &entries[b].date)
+                .then_with(|| {
+                    entries[a]
+                        .confidence
+                        .partial_cmp(&entries[b].confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| b.cmp(&a))
+        });
+
+        for pair in chain.windows(2) {
+            let (older_idx, newer_idx) = (pair[0], pair[1]);
+            let older_id = entries[older_idx].id.clone();
+            let newer_id = entries[newer_idx].id.clone();
+            entries[older_idx].state = EntryState::Superseded;
+            entries[older_idx].superseded_by = Some(newer_id);
+            let already = entries[newer_idx]
+                .links
+                .iter()
+                .any(|l| l.relation == LinkType::Supersedes && l.target == older_id);
+            if !already {
+                entries[newer_idx].links.push(Link {
+                    relation: LinkType::Supersedes,
+                    target: older_id,
+                    confidence: Some(0.7),
+                });
+            }
+        }
+
+        // Only the chain head is promoted; every other member was just
+        // marked Superseded above and must stay that way.
+        let winner_idx = *chain.last().expect("chain has at least two members");
+        entries[winner_idx].state = EntryState::Active;
     }
 }
 

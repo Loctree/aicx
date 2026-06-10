@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::oracle::{OracleEnvelope, OracleStatus};
 
-use super::{IntentKind, IntentRecord};
+use super::{IntentKind, IntentRecord, cmp_dates_flexible, parse_flexible_utc};
 
 /// Sort order for `apply_display_filters`. Mirrors the CLI's `SortOrder`
 /// without importing main.rs types into the library.
@@ -84,15 +84,36 @@ pub fn apply_display_filters(
     }
 
     if filters.date_lo.is_some() || filters.date_hi.is_some() {
+        // Compare on the typed UTC axis when both sides parse (bare dates
+        // are midnight UTC, RFC3339 offsets are normalized); fall back to
+        // the legacy lexicographic comparison for unparsable input.
+        let within_bound = |date: &str, bound: &str, keep_low: bool| -> bool {
+            match (parse_flexible_utc(date), parse_flexible_utc(bound)) {
+                (Some(d), Some(b)) => {
+                    if keep_low {
+                        d >= b
+                    } else {
+                        d <= b
+                    }
+                }
+                _ => {
+                    if keep_low {
+                        date >= bound
+                    } else {
+                        date <= bound
+                    }
+                }
+            }
+        };
         records.retain(|r| {
             filters
                 .date_lo
                 .as_ref()
-                .is_none_or(|lo| r.date.as_str() >= lo.as_str())
+                .is_none_or(|lo| within_bound(&r.date, lo, true))
                 && filters
                     .date_hi
                     .as_ref()
-                    .is_none_or(|hi| r.date.as_str() <= hi.as_str())
+                    .is_none_or(|hi| within_bound(&r.date, hi, false))
         });
     }
 
@@ -100,9 +121,10 @@ pub fn apply_display_filters(
         records.sort_by(|a, b| {
             let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
             let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
+            let ord = cmp_dates_flexible(t_a, t_b);
             match sort_order {
-                IntentSortOrder::Newest => t_b.cmp(t_a),
-                IntentSortOrder::Oldest => t_a.cmp(t_b),
+                IntentSortOrder::Newest => ord.reverse(),
+                IntentSortOrder::Oldest => ord,
             }
         });
     }
