@@ -1020,6 +1020,7 @@ const RETIRED_CLI_SUBCOMMANDS: &[&str] = &[
 /// for every variant, replacing the prior hand-curated subset.
 pub const CLI_SUBCOMMAND_NAMES: &[&str] = &[
     "all",
+    "claims",
     "claude",
     "codex",
     "config",
@@ -1043,6 +1044,7 @@ pub const CLI_SUBCOMMAND_NAMES: &[&str] = &[
     "reports-extractor",
     "search",
     "serve",
+    "sessions",
     "sources",
     "state",
     "steer",
