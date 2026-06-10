@@ -1920,6 +1920,85 @@ mod tests {
         assert_eq!(sessions[0].session_id, "260408-214715-good");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn codex_walk_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+        let home = temp_root("codex_symlink_home");
+        let root = home.join(".codex").join("sessions");
+        fs::create_dir_all(&root).unwrap();
+        // A real rollout OUTSIDE the scan root, reachable only via symlinks.
+        let outside = temp_root("codex_symlink_outside");
+        write_session(
+            &outside,
+            "rollout-2026-01-29T13-58-09-019c09d5.jsonl",
+            &[
+                r#"{"timestamp":"2026-01-29T12:58:09.421Z","type":"session_meta","payload":{"id":"019c09d5-ext","cwd":"/tmp/x"}}"#,
+            ],
+        );
+        // Cyclic dir symlink: following it would loop until the depth cap.
+        symlink(&root, root.join("loop")).unwrap();
+        // Dir symlink escaping the root + direct file symlink to a .jsonl.
+        symlink(&outside, root.join("ext")).unwrap();
+        symlink(
+            outside.join("rollout-2026-01-29T13-58-09-019c09d5.jsonl"),
+            root.join("rollout-2026-01-29T13-58-09-019c09d5.jsonl"),
+        )
+        .unwrap();
+
+        // Discovery terminates and collects NOTHING through a symlink.
+        let sessions = discover_codex_sessions(&root, None);
+        assert!(
+            sessions.is_empty(),
+            "no session may arrive through a symlink: {sessions:?}"
+        );
+        // The find-by-id walk obeys the same rule.
+        assert!(find_session_by_id(&home, "019c09d5").is_none());
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn codex_walk_caps_depth() {
+        let home = temp_root("codex_depth_home");
+        let root = home.join(".codex").join("sessions");
+        // A rollout at the deepest scanned level (MAX_CODEX_SCAN_DEPTH dirs
+        // below the root) is still found...
+        let mut in_cap = root.clone();
+        for i in 0..MAX_CODEX_SCAN_DEPTH {
+            in_cap = in_cap.join(format!("d{i}"));
+        }
+        fs::create_dir_all(&in_cap).unwrap();
+        write_session(
+            &in_cap,
+            "rollout-2026-01-29T13-58-09-incap1111.jsonl",
+            &[
+                r#"{"timestamp":"2026-01-29T12:58:09.421Z","type":"session_meta","payload":{"id":"incap1111","cwd":"/tmp/a"}}"#,
+            ],
+        );
+        // ...one level deeper is beyond the cap and must NOT be found.
+        let mut beyond = root.clone();
+        for i in 0..(MAX_CODEX_SCAN_DEPTH + 1) {
+            beyond = beyond.join(format!("e{i}"));
+        }
+        fs::create_dir_all(&beyond).unwrap();
+        write_session(
+            &beyond,
+            "rollout-2026-01-29T14-00-00-beyond2222.jsonl",
+            &[
+                r#"{"timestamp":"2026-01-29T13:00:00.000Z","type":"session_meta","payload":{"id":"beyond2222","cwd":"/tmp/b"}}"#,
+            ],
+        );
+
+        let sessions = discover_codex_sessions(&root, None);
+        assert_eq!(sessions.len(), 1, "only the in-cap rollout is discovered");
+        assert_eq!(sessions[0].session_id, "incap1111");
+        // The find-by-id walk applies the same cap.
+        assert!(find_session_by_id(&home, "incap1111").is_some());
+        assert!(find_session_by_id(&home, "beyond2222").is_none());
+        let _ = fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn codex_rollout_id_segment_parses_rollout_shape() {
         assert_eq!(
