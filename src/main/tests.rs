@@ -2403,3 +2403,28 @@ fn config_subcommands_parse_after_module_split() {
         _ => panic!("expected config show command"),
     }
 }
+
+#[test]
+fn lane_time_coverage_normalizes_offsets_to_utc_z() {
+    // P2-06: the envelope declares UTC, so offset-bearing source stamps must
+    // come out shifted to UTC with a literal `Z` suffix — never `+02:00`.
+    let a = DateTime::parse_from_rfc3339("2026-06-08T10:30:00+02:00").unwrap();
+    let b = DateTime::parse_from_rfc3339("2026-06-08T12:00:00+02:00").unwrap();
+    let cov = lane_time_coverage([b, a]).expect("two stamps yield coverage");
+    assert_eq!(
+        cov.earliest, "2026-06-08T08:30:00Z",
+        "hour shifted, Z suffix"
+    );
+    assert_eq!(cov.latest, "2026-06-08T10:00:00Z");
+
+    // Already-UTC stamps pass through unchanged (and min/max order holds).
+    let u = DateTime::parse_from_rfc3339("2026-06-08T08:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let cov = lane_time_coverage([u]).expect("single stamp is its own bounds");
+    assert_eq!(cov.earliest, "2026-06-08T08:00:00Z");
+    assert_eq!(cov.latest, "2026-06-08T08:00:00Z");
+
+    // No timestamps -> no coverage (the envelope omits it, never fabricates).
+    assert!(lane_time_coverage(Vec::<DateTime<Utc>>::new()).is_none());
+}

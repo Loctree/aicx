@@ -2627,6 +2627,28 @@ fn is_lane_agent_role(role: &str) -> bool {
     )
 }
 
+/// Build the lane-export [`intents::TimeCoverage`] from source timestamps:
+/// earliest..latest, normalized to UTC and rendered RFC3339 with a literal
+/// `Z` suffix. The envelope declares UTC (`timezone_assumptions`), so the
+/// coverage bounds must never carry a local offset. Generic over the input
+/// zone so the normalization itself is exercisable in tests.
+fn lane_time_coverage<Tz: TimeZone>(
+    timestamps: impl IntoIterator<Item = DateTime<Tz>>,
+) -> Option<intents::TimeCoverage> {
+    let mut earliest: Option<DateTime<Utc>> = None;
+    let mut latest: Option<DateTime<Utc>> = None;
+    for ts in timestamps {
+        let ts = ts.with_timezone(&Utc);
+        earliest = Some(earliest.map_or(ts, |cur| cur.min(ts)));
+        latest = Some(latest.map_or(ts, |cur| cur.max(ts)));
+    }
+    let render = |t: DateTime<Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    earliest.zip(latest).map(|(a, b)| intents::TimeCoverage {
+        earliest: render(a),
+        latest: render(b),
+    })
+}
+
 /// Locate a session, extract its conversation, and run Lane 2 claim
 /// extraction with full temporal metadata. Shared by claims/results/clarify.
 fn load_session_claims(
@@ -2681,20 +2703,7 @@ fn load_session_claims(
         .unwrap_or_else(|| format!("{agent_str}/{}", resolution.canonical_id));
 
     let extracted_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let coverage = {
-        let earliest = entries.iter().map(|e| e.timestamp).min();
-        let latest = entries.iter().map(|e| e.timestamp).max();
-        // The envelope declares UTC (`timezone_assumptions`), so the coverage
-        // bounds render as UTC with a literal `Z` — never a local offset.
-        earliest.zip(latest).map(|(a, b)| intents::TimeCoverage {
-            earliest: a
-                .with_timezone(&Utc)
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            latest: b
-                .with_timezone(&Utc)
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        })
-    };
+    let coverage = lane_time_coverage(entries.iter().map(|e| e.timestamp));
     let source_files = session_info
         .as_ref()
         .map(|s| vec![s.source_path.display().to_string()])
