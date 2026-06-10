@@ -1014,7 +1014,10 @@ const RETIRED_CLI_SUBCOMMANDS: &[&str] = &[
 ///
 /// Entries match the names that clap emits at runtime (so `MigrateIntentSchema`
 /// → `"migrate-intent-schema"`, `DashboardServeLegacy` → `"dashboard-serve"`
-/// via the explicit `#[command(name = ...)]` override, etc.).
+/// via the explicit `#[command(name = ...)]` override, etc.) plus every
+/// subcommand alias (so `Sessions` alias `"session"` is listed too —
+/// operators type aliases at the shell, and those invocations must be
+/// filtered just like the canonical names).
 ///
 /// L36 (b): used to materialize `aicx <subcommand>` self-echo patterns
 /// for every variant, replacing the prior hand-curated subset.
@@ -1046,6 +1049,7 @@ pub const CLI_SUBCOMMAND_NAMES: &[&str] = &[
     "results",
     "search",
     "serve",
+    "session",
     "sessions",
     "sources",
     "state",

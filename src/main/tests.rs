@@ -2291,13 +2291,19 @@ fn cli_subcommand_names_match_commands_enum() {
     use std::collections::BTreeSet;
 
     // Live subcommand names as clap sees them — covers default kebab-case
-    // (e.g. `MigrateIntentSchema` → `migrate-intent-schema`) AND every
+    // (e.g. `MigrateIntentSchema` → `migrate-intent-schema`), every
     // explicit `#[command(name = "...")]` override (e.g.
-    // `DashboardServeLegacy` → `dashboard-serve`).
+    // `DashboardServeLegacy` → `dashboard-serve`), AND every alias
+    // (e.g. `Sessions` alias `session`). Aliases matter because operators
+    // type them at the shell, so `aicx session show ...` lines would leak
+    // into extracts if the alias is missing from the self-echo constant.
     let cmd = Cli::command();
     let live: BTreeSet<String> = cmd
         .get_subcommands()
-        .map(|sub| sub.get_name().to_string())
+        .flat_map(|sub| {
+            std::iter::once(sub.get_name().to_string())
+                .chain(sub.get_all_aliases().map(str::to_string))
+        })
         .collect();
 
     let registered: BTreeSet<String> = aicx_parser::sanitize::CLI_SUBCOMMAND_NAMES
