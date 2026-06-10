@@ -98,9 +98,10 @@ pub struct ClaimRecord {
     pub risk_flags: Vec<String>,
 }
 
-/// Claim taxonomy (MASTER §305). Note `ReadyToPush`/`Shippable`/`NoBlockers` are
-/// the highest-risk claims — the "production ready" applause verdict — and must
-/// never be promoted to a Result without Lane 3 evidence.
+/// Claim taxonomy (MASTER §305). Note `Green`/`ReadyToPush`/`Shippable`/
+/// `NoBlockers` are the highest-risk claims — the "all green" / "production
+/// ready" applause verdict — and must never be promoted to a Result without
+/// Lane 3 evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimType {
@@ -137,10 +138,14 @@ impl ClaimType {
         }
     }
 
-    /// The "production ready" applause claims that must never be promoted to a
-    /// Result without Lane 3 evidence.
+    /// The applause claims ("production ready", "all green") that must never
+    /// be promoted to a Result without Lane 3 evidence. `Green` is included:
+    /// "all green" is the classic evidence-free applause verdict.
     pub fn is_high_risk(self) -> bool {
-        matches!(self, Self::ReadyToPush | Self::Shippable | Self::NoBlockers)
+        matches!(
+            self,
+            Self::Green | Self::ReadyToPush | Self::Shippable | Self::NoBlockers
+        )
     }
 }
 
@@ -206,6 +211,11 @@ pub enum ResultStatus {
 /// absent. A fracture carries the decision it forces, not just the gap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContractFracture {
+    /// Stable id of the [`ClaimRecord`] this fracture was detected on — the
+    /// machine-readable link Lane 5 uses for `linked_claims`.
+    pub claim_id: String,
+    /// Human-readable provenance ("agent claim ... (session ...)"); display
+    /// only, never used as a join key.
     pub contract_source: String,
     pub promised_surface: String,
     pub runtime_surface: String,
@@ -252,52 +262,111 @@ pub struct ClarifyQuestion {
 
 // ── Lane 2 classification primitive ──────────────────────────────
 
+/// Lowercased word tokens, split on non-alphanumeric boundaries. Unicode
+/// letters (Polish diacritics included) count as word characters, so
+/// "naprawiłem" survives as one token.
+fn claim_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// True when `phrase` (space-separated lowercase words) appears in `tokens`
+/// as a contiguous token sequence. Token-boundary matching, never substring:
+/// "incomplete" does not contain the token "complete".
+fn contains_phrase(tokens: &[String], phrase: &str) -> bool {
+    let needle: Vec<&str> = phrase.split_whitespace().collect();
+    if needle.is_empty() || needle.len() > tokens.len() {
+        return false;
+    }
+    tokens
+        .windows(needle.len())
+        .any(|w| w.iter().zip(needle.iter()).all(|(t, n)| t == n))
+}
+
 /// Classify a claim sentence into its [`ClaimType`] by surface claim-language.
 ///
-/// Case-insensitive substring match in priority order (most specific first):
-/// "no blockers" must not be misread as `Blocked`, and "ready to ship" must not
-/// be swallowed by a generic ship/done marker. Returns `None` when no claim
-/// marker is present — absence is NOT `Implemented` by default; a claim must
-/// actually claim something.
+/// Case-insensitive token-boundary phrase match in priority order (most
+/// specific first): "no blockers" must not be misread as `Blocked`, and
+/// "ready to ship" must not be swallowed by a generic ship/done marker.
+/// Matching is on word boundaries, never raw substrings — "incomplete" is not
+/// `complete`, "abandoned" is not `done`, "greenfield" is not `green`.
+/// Returns `None` when no claim marker is present — absence is NOT
+/// `Implemented` by default; a claim must actually claim something.
 ///
-/// `ReadyToPush` / `Shippable` / `NoBlockers` are the highest-risk claims (the
-/// "production ready" applause verdict); classification only labels them — Lane 3
-/// must still demand evidence before any of them becomes a Result.
+/// Markers cover English and Polish (the repo deliberately supports PL claim
+/// language, mirroring `TYPED_DIRECTIVE_HEAD_MARKERS`); Polish needles are
+/// listed both with and without diacritics ("naprawiłem"/"naprawilem").
+///
+/// `Green` / `ReadyToPush` / `Shippable` / `NoBlockers` are the highest-risk
+/// claims (the "production ready" / "all green" applause verdict);
+/// classification only labels them — Lane 3 must still demand evidence before
+/// any of them becomes a Result.
 pub fn classify_claim(text: &str) -> Option<ClaimType> {
-    let t = text.to_lowercase();
-    // (needle, type) — list order IS precedence; first contained needle wins.
+    let tokens = claim_tokens(text);
+    if tokens.is_empty() {
+        return None;
+    }
+    // (needle, type) — list order IS precedence; first matching phrase wins.
     const RULES: &[(&str, ClaimType)] = &[
         ("no blocker", ClaimType::NoBlockers),
+        ("no blockers", ClaimType::NoBlockers),
         ("zero blocker", ClaimType::NoBlockers),
+        ("zero blockers", ClaimType::NoBlockers),
+        ("bez blokerów", ClaimType::NoBlockers),
+        ("bez blokerow", ClaimType::NoBlockers),
         ("blocked", ClaimType::Blocked),
         ("blocker", ClaimType::Blocked),
+        ("blockers", ClaimType::Blocked),
+        ("zablokowane", ClaimType::Blocked),
         ("production ready", ClaimType::ReadyToPush),
         ("ready to push", ClaimType::ReadyToPush),
         ("ready to ship", ClaimType::ReadyToPush),
         ("ready to merge", ClaimType::ReadyToPush),
+        ("gotowe do push", ClaimType::ReadyToPush),
+        ("gotowe do pusha", ClaimType::ReadyToPush),
+        ("można pushować", ClaimType::ReadyToPush),
+        ("mozna pushowac", ClaimType::ReadyToPush),
         ("shippable", ClaimType::Shippable),
         ("ship it", ClaimType::Shippable),
         ("migration complete", ClaimType::Migrated),
         ("migrated", ClaimType::Migrated),
         ("installed", ClaimType::Installed),
+        ("wdrożone", ClaimType::Implemented),
+        ("wdrozone", ClaimType::Implemented),
         ("docs updated", ClaimType::Documented),
         ("documented", ClaimType::Documented),
         ("verified", ClaimType::Verified),
+        ("działa", ClaimType::Verified),
+        ("dziala", ClaimType::Verified),
         ("all green", ClaimType::Green),
         ("tests green", ClaimType::Green),
         ("green", ClaimType::Green),
+        ("wszystko zielone", ClaimType::Green),
+        ("testy zielone", ClaimType::Green),
+        ("zielone", ClaimType::Green),
         ("tests pass", ClaimType::Tested),
         ("passing", ClaimType::Tested),
         ("tested", ClaimType::Tested),
+        ("przetestowane", ClaimType::Tested),
+        ("testy przechodzą", ClaimType::Tested),
+        ("testy przechodza", ClaimType::Tested),
         ("fixed", ClaimType::Fixed),
+        ("naprawione", ClaimType::Fixed),
+        ("naprawiłem", ClaimType::Fixed),
+        ("naprawilem", ClaimType::Fixed),
         ("implemented", ClaimType::Implemented),
         ("shipped", ClaimType::Implemented),
         ("complete", ClaimType::Implemented),
+        ("completed", ClaimType::Implemented),
         ("done", ClaimType::Implemented),
+        ("zrobione", ClaimType::Implemented),
+        ("gotowe", ClaimType::Implemented),
     ];
     RULES
         .iter()
-        .find(|(needle, _)| t.contains(needle))
+        .find(|(needle, _)| contains_phrase(&tokens, needle))
         .map(|(_, kind)| *kind)
 }
 
@@ -326,13 +395,43 @@ fn is_agent_role(role: &str) -> bool {
     )
 }
 
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// FNV-1a 64-bit fold step — inline, dependency-free, deterministic.
+fn fnv1a64(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// 8-hex deterministic content hash over `(claim_text, source_ref)`, used to
+/// disambiguate claim ids across separate `extract_claims` calls. A NUL
+/// separator keeps the pair unambiguous ("ab"+"c" vs "a"+"bc").
+fn claim_hash8(claim_text: &str, source_ref: &str) -> String {
+    let h = fnv1a64(FNV_OFFSET, claim_text.as_bytes());
+    let h = fnv1a64(h, &[0]);
+    let h = fnv1a64(h, source_ref.as_bytes());
+    format!("{:08x}", (h ^ (h >> 32)) as u32)
+}
+
 /// Lane 2 stage (pure): turn agent/assistant source rows into Unverified
 /// [`ClaimRecord`]s. Doctrine enforced here:
 /// - claims are agent-originated — user rows never produce a claim;
 /// - a row whose text carries no claim marker is skipped — no manufactured
 ///   claims (absence of a marker is not a claim);
 /// - every claim is `Unverified` until Lane 3 supplies evidence;
-/// - the applause claims (ready/shippable/no-blockers) are flagged high-risk.
+/// - the applause claims (green/ready/shippable/no-blockers) are flagged
+///   high-risk.
+///
+/// Claim id shape: `claim-<session_id>-<row_index>-<hash8>` where `hash8` is a
+/// deterministic FNV-1a content hash of `(claim_text, source_ref)`. Uniqueness
+/// scope: ids are unique within one call per source row, and the content hash
+/// disambiguates rows that share `(session_id, index)` across separate calls
+/// over different sources. Identical input rows deliberately produce identical
+/// ids (deterministic, re-runnable extraction — not globally unique).
 pub fn extract_claims(sources: &[ClaimSource], extracted_at: &str) -> Vec<ClaimRecord> {
     sources
         .iter()
@@ -357,7 +456,11 @@ pub fn extract_claims(sources: &[ClaimSource], extracted_at: &str) -> Vec<ClaimR
                 Vec::new()
             };
             Some(ClaimRecord {
-                id: format!("claim-{}-{i}", s.session_id),
+                id: format!(
+                    "claim-{}-{i}-{}",
+                    s.session_id,
+                    claim_hash8(claim_line, &s.source_ref)
+                ),
                 project: s.project.clone(),
                 source_session: s.session_id.clone(),
                 source_agent: s.agent.clone(),
@@ -422,11 +525,35 @@ fn path_tokens(text: &str) -> Vec<String> {
     out
 }
 
+/// Redact the user's home prefix in an absolute path to `~` so excerpts do
+/// not leak the local username into exported lane records. Home is resolved
+/// the same way as everywhere else in the repo (`dirs::home_dir()`, which
+/// honors `$HOME` on Unix). Only whole-component prefixes are redacted —
+/// `/Users/silverton` is not touched when home is `/Users/silver`.
+fn redact_home(path: &str) -> String {
+    let Some(home) = dirs::home_dir() else {
+        return path.to_string();
+    };
+    let home = home.to_string_lossy();
+    let home = home.trim_end_matches('/');
+    if home.is_empty() || !path.starts_with(home) {
+        return path.to_string();
+    }
+    let rest = &path[home.len()..];
+    match rest.chars().next() {
+        None => "~".to_string(),
+        Some('/') => format!("~{rest}"),
+        Some(_) => path.to_string(),
+    }
+}
+
 /// Lane 3 stage (deterministic, read-only): for every file path a claim names,
 /// check whether the artifact actually exists under `repo_root` (or absolutely).
 /// Existence yields a `Pass` result, absence a `Fail` — both are evidence; a
 /// claim that names no artifact gets no result here and stays unverified.
-/// Nothing is executed — this collects repo-state evidence only.
+/// Nothing is executed — this collects repo-state evidence only. Absolute
+/// paths under the user's home are redacted to `~` in
+/// `observed_output_excerpt` (the raw `artifact_path` stays checkable).
 pub fn collect_artifact_evidence(
     claims: &[ClaimRecord],
     repo_root: &Path,
@@ -453,10 +580,14 @@ pub fn collect_artifact_evidence(
                 command: None,
                 exit_status: None,
                 artifact_path: Some(token.clone()),
-                observed_output_excerpt: Some(if exists {
-                    format!("{token}: exists in {}", repo_root.display())
-                } else {
-                    format!("{token}: NOT FOUND in {}", repo_root.display())
+                observed_output_excerpt: Some({
+                    let shown_token = redact_home(&token);
+                    let shown_root = redact_home(&repo_root.display().to_string());
+                    if exists {
+                        format!("{shown_token}: exists in {shown_root}")
+                    } else {
+                        format!("{shown_token}: NOT FOUND in {shown_root}")
+                    }
                 }),
                 timestamp: Some(collected_at.to_string()),
                 related_claims: vec![claim.id.clone()],
@@ -502,7 +633,7 @@ pub fn verify_claims(claims: &mut [ClaimRecord], results: &[ResultRecord]) {
 
 /// Lane 4 stage (pure): surface promise-vs-runtime fractures from verified
 /// claims. A contradicted claim IS a fracture (the agent said X, the repo says
-/// not-X); an applause claim (ready/shippable/no-blockers) with no evidence is
+/// not-X); an applause claim (green/ready/shippable/no-blockers) with no evidence is
 /// a fracture-in-waiting and gets surfaced at Medium so it cannot pass as truth.
 pub fn detect_fractures(claims: &[ClaimRecord]) -> Vec<ContractFracture> {
     let mut fractures = Vec::new();
@@ -515,6 +646,7 @@ pub fn detect_fractures(claims: &[ClaimRecord]) -> Vec<ContractFracture> {
                     FractureSeverity::High
                 };
                 fractures.push(ContractFracture {
+                    claim_id: claim.id.clone(),
                     contract_source: format!(
                         "agent claim {} (session {})",
                         claim.id, claim.source_session
@@ -534,6 +666,7 @@ pub fn detect_fractures(claims: &[ClaimRecord]) -> Vec<ContractFracture> {
             }
             VerificationStatus::Unverified if claim.claim_type.is_high_risk() => {
                 fractures.push(ContractFracture {
+                    claim_id: claim.id.clone(),
                     contract_source: format!(
                         "agent claim {} (session {})",
                         claim.id, claim.source_session
@@ -567,19 +700,26 @@ pub const CLARIFY_MAX_QUESTIONS: usize = 5;
 /// decision questions. Questions ask what the human must DECIDE (keep the
 /// promise, retract it, or ship with the gap) — never facts the system already
 /// determined (the known facts ride along in `known_facts`). At most
-/// `min(max, CLARIFY_MAX_QUESTIONS)` questions, severest fractures first.
+/// `min(max, CLARIFY_MAX_QUESTIONS)` questions, severest fractures first;
+/// severity ties break on `claim_id` so the selection under the cap is
+/// deterministic regardless of input order.
 pub fn generate_clarify(fractures: &[ContractFracture], max: usize) -> Vec<ClarifyQuestion> {
     let cap = max.min(CLARIFY_MAX_QUESTIONS);
     let mut ordered: Vec<&ContractFracture> = fractures.iter().collect();
     // severest first; FractureSeverity derives Low..Critical in declaration
-    // order, so sort by reverse discriminant via a manual rank.
+    // order, so sort by reverse discriminant via a manual rank. Secondary key
+    // claim_id keeps tie-breaking (and thus the cap cutoff) deterministic.
     let rank = |s: FractureSeverity| match s {
         FractureSeverity::Critical => 0,
         FractureSeverity::High => 1,
         FractureSeverity::Medium => 2,
         FractureSeverity::Low => 3,
     };
-    ordered.sort_by_key(|f| rank(f.severity));
+    ordered.sort_by(|a, b| {
+        rank(a.severity)
+            .cmp(&rank(b.severity))
+            .then_with(|| a.claim_id.cmp(&b.claim_id))
+    });
     ordered
         .into_iter()
         .take(cap)
@@ -616,7 +756,7 @@ pub fn generate_clarify(fractures: &[ContractFracture], max: usize) -> Vec<Clari
                                    plans on top of a promise the runtime does not keep"
                 .to_string(),
             linked_intents: Vec::new(),
-            linked_claims: vec![f.contract_source.clone()],
+            linked_claims: vec![f.claim_id.clone()],
             linked_results: f.evidence.clone(),
         })
         .collect()
@@ -669,6 +809,7 @@ mod tests {
         };
 
         let fracture = ContractFracture {
+            claim_id: "claim-1".into(),
             contract_source: "docs/TB_ARTIFACT_CONTRACT.md".into(),
             promised_surface: "spotlight.md renderer".into(),
             runtime_surface: "absent (0 renderers in tb_core/)".into(),
@@ -898,12 +1039,23 @@ mod tests {
         assert_eq!(fractures[0].severity, FractureSeverity::High);
         assert_eq!(fractures[1].severity, FractureSeverity::Medium);
         assert!(fractures.iter().all(|f| !f.options.is_empty()));
+
+        // machine-readable link: fracture carries the originating claim id,
+        // while contract_source stays human-readable provenance
+        assert_eq!(fractures[0].claim_id, claims[0].id);
+        assert_eq!(fractures[1].claim_id, claims[1].id);
+        assert!(fractures[0].contract_source.contains(&claims[0].id));
+
+        // Lane 5 links questions to claims via claim_id, not contract_source
+        let questions = generate_clarify(&fractures, 5);
+        assert_eq!(questions[0].linked_claims, vec![claims[0].id.clone()]);
     }
 
     #[test]
     fn clarify_caps_at_five_and_asks_decisions_not_facts() {
         // 7 fractures in -> at most 5 questions out, severest first.
         let mk_fracture = |i: usize, severity| ContractFracture {
+            claim_id: format!("claim-s1-{i}"),
             contract_source: format!("agent claim claim-s1-{i}"),
             promised_surface: format!("promise {i}"),
             runtime_surface: "absent".to_string(),
@@ -955,5 +1107,178 @@ mod tests {
 
         // an explicit lower max narrows further
         assert_eq!(generate_clarify(&fractures, 2).len(), 2);
+    }
+
+    #[test]
+    fn classify_claim_matches_word_boundaries_not_substrings() {
+        // P2-12: substring matching produced false positives; token-boundary
+        // matching must not see a marker inside a larger word.
+        assert_eq!(classify_claim("the spec is incomplete"), None);
+        assert_eq!(classify_claim("abandoned the approach"), None);
+        assert_eq!(classify_claim("greenfield rewrite plan"), None);
+        assert_eq!(classify_claim("no trespassing rules apply"), None);
+
+        // the real markers still hit on their own word boundaries
+        assert_eq!(
+            classify_claim("the migration is complete"),
+            Some(ClaimType::Implemented)
+        );
+        assert_eq!(classify_claim("it is green"), Some(ClaimType::Green));
+    }
+
+    #[test]
+    fn classify_claim_supports_polish_markers() {
+        use ClaimType::*;
+        // with and without diacritics — both spellings occur in the wild
+        assert_eq!(classify_claim("naprawione w parserze"), Some(Fixed));
+        assert_eq!(classify_claim("naprawiłem ten bug"), Some(Fixed));
+        assert_eq!(classify_claim("naprawilem ten bug"), Some(Fixed));
+        assert_eq!(classify_claim("zrobione"), Some(Implemented));
+        assert_eq!(classify_claim("gotowe"), Some(Implemented));
+        assert_eq!(classify_claim("wdrożone na staging"), Some(Implemented));
+        assert_eq!(classify_claim("wdrozone na staging"), Some(Implemented));
+        assert_eq!(classify_claim("przetestowane lokalnie"), Some(Tested));
+        assert_eq!(classify_claim("testy przechodzą"), Some(Tested));
+        assert_eq!(classify_claim("testy przechodza"), Some(Tested));
+        assert_eq!(classify_claim("działa na produkcji"), Some(Verified));
+        assert_eq!(classify_claim("dziala end to end"), Some(Verified));
+        assert_eq!(classify_claim("wszystko zielone"), Some(Green));
+        assert_eq!(classify_claim("testy zielone"), Some(Green));
+        assert_eq!(classify_claim("bez blokerów"), Some(NoBlockers));
+        assert_eq!(classify_claim("bez blokerow"), Some(NoBlockers));
+        assert_eq!(classify_claim("gotowe do push"), Some(ReadyToPush));
+        assert_eq!(classify_claim("gotowe do pusha"), Some(ReadyToPush));
+        assert_eq!(classify_claim("można pushować"), Some(ReadyToPush));
+        assert_eq!(classify_claim("mozna pushowac"), Some(ReadyToPush));
+
+        // precedence: the ReadyToPush phrase outranks the generic "gotowe"
+        assert_eq!(
+            classify_claim("gotowe do push po review"),
+            Some(ReadyToPush)
+        );
+    }
+
+    #[test]
+    fn green_claim_is_high_risk_applause() {
+        // P2-14: "all green" is the classic applause verdict without evidence.
+        assert!(ClaimType::Green.is_high_risk());
+        assert!(ClaimType::ReadyToPush.is_high_risk());
+        assert!(!ClaimType::Fixed.is_high_risk());
+
+        let claims = extract_claims(
+            &[mk_source("assistant", "all green", "a1")],
+            "2026-06-09T21:00:00Z",
+        );
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].claim_type, ClaimType::Green);
+        assert_eq!(
+            claims[0].risk_flags,
+            vec!["high_risk_unverified_claim".to_string()]
+        );
+
+        // an unverified green claim surfaces as a Medium fracture
+        let fractures = detect_fractures(&claims);
+        assert_eq!(fractures.len(), 1);
+        assert_eq!(fractures[0].severity, FractureSeverity::Medium);
+        assert_eq!(fractures[0].claim_id, claims[0].id);
+    }
+
+    #[test]
+    fn claim_ids_are_deterministic_and_content_scoped() {
+        // P2-02: claim-<sid>-<i> collided across separate extract_claims calls;
+        // the content hash disambiguates while staying deterministic.
+        let a = vec![mk_source("assistant", "fixed the parser", "a1")];
+        let b = vec![mk_source("assistant", "fixed the linter", "a1")];
+
+        let first = extract_claims(&a, "2026-06-09T21:00:00Z");
+        let again = extract_claims(&a, "2026-06-09T22:00:00Z");
+        let other = extract_claims(&b, "2026-06-09T21:00:00Z");
+
+        assert_eq!(first[0].id, again[0].id, "same input -> same id");
+        assert_ne!(
+            first[0].id, other[0].id,
+            "same (session, index), different claim text -> different id"
+        );
+        assert!(first[0].id.starts_with("claim-s1-0-"));
+        let suffix = first[0].id.rsplit('-').next().unwrap();
+        assert_eq!(suffix.len(), 8, "8-hex content hash suffix");
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // same text, different source_ref -> different id too
+        let c = vec![mk_source("assistant", "fixed the parser", "a2")];
+        let other_ref = extract_claims(&c, "2026-06-09T21:00:00Z");
+        assert_ne!(first[0].id, other_ref[0].id);
+    }
+
+    #[test]
+    fn clarify_breaks_severity_ties_deterministically_by_claim_id() {
+        // P3-10: >cap fractures of the same severity must yield a stable,
+        // input-order-independent selection (secondary sort key: claim_id).
+        let mk = |id: &str| ContractFracture {
+            claim_id: id.to_string(),
+            contract_source: format!("agent claim {id}"),
+            promised_surface: format!("promise {id}"),
+            runtime_surface: "absent".to_string(),
+            evidence: Vec::new(),
+            severity: FractureSeverity::Medium,
+            options: vec!["A: repair".to_string(), "B: retract".to_string()],
+            recommended_clarify_question: None,
+        };
+        let shuffled = ["c-9", "c-3", "c-7", "c-1", "c-5", "c-8", "c-2"];
+        let fractures: Vec<ContractFracture> = shuffled.iter().map(|id| mk(id)).collect();
+
+        let picked: Vec<String> = generate_clarify(&fractures, 5)
+            .into_iter()
+            .map(|q| q.linked_claims[0].clone())
+            .collect();
+        assert_eq!(picked, vec!["c-1", "c-2", "c-3", "c-5", "c-7"]);
+
+        // reversed input order picks the exact same set in the same order
+        let reversed: Vec<ContractFracture> = shuffled.iter().rev().map(|id| mk(id)).collect();
+        let picked_rev: Vec<String> = generate_clarify(&reversed, 5)
+            .into_iter()
+            .map(|q| q.linked_claims[0].clone())
+            .collect();
+        assert_eq!(picked, picked_rev);
+    }
+
+    #[test]
+    fn artifact_evidence_redacts_home_prefix_in_excerpt() {
+        // P2-03: absolute paths under the user's home must not leak the local
+        // username into exported excerpts. Uses the real home dir (read-only,
+        // no env mutation) with a path that is guaranteed not to exist.
+        let home = dirs::home_dir().expect("home dir resolvable in tests");
+        let missing = home.join("aicx-schema-redaction-test-does-not-exist.rs");
+        let text = format!("implemented {} fully", missing.display());
+
+        let claims = extract_claims(
+            &[mk_source("assistant", &text, "a1")],
+            "2026-06-09T21:00:00Z",
+        );
+        let results = collect_artifact_evidence(&claims, Path::new("/tmp"), "2026-06-09T21:01:00Z");
+        assert_eq!(results.len(), 1);
+
+        let excerpt = results[0].observed_output_excerpt.as_deref().unwrap();
+        assert!(
+            excerpt.starts_with("~/aicx-schema-redaction-test-does-not-exist.rs"),
+            "home prefix redacted to ~ in excerpt: {excerpt}"
+        );
+        assert!(
+            !excerpt.contains(home.to_string_lossy().as_ref()),
+            "raw home path must not leak into excerpt: {excerpt}"
+        );
+        // the raw artifact_path stays checkable (unredacted)
+        assert_eq!(
+            results[0].artifact_path.as_deref(),
+            Some(missing.display().to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn empty_inputs_yield_empty_outputs() {
+        // P3-14 edge: empty pipelines stay empty, no panics, no manufactured
+        // records.
+        assert!(extract_claims(&[], "2026-06-09T21:00:00Z").is_empty());
+        assert!(generate_clarify(&[], 5).is_empty());
     }
 }
