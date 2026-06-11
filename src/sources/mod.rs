@@ -37,8 +37,8 @@ pub use providers::{
 pub(crate) use shared::*;
 pub use shared::{
     ConversationProjection, decode_claude_project_path, detect_project_name,
-    infer_repo_name_from_current_dir, list_available_sources, repo_labels_from_entries,
-    repo_name_from_cwd, to_conversation, to_conversation_with_stats,
+    infer_repo_name_from_current_dir, is_harness_injected_noise, list_available_sources,
+    repo_labels_from_entries, repo_name_from_cwd, to_conversation, to_conversation_with_stats,
 };
 
 pub fn extract_all(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {

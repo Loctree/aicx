@@ -98,7 +98,20 @@ pub fn write_conversation_markdown_with_redaction(
                 writeln!(file, "CWD: `{}`\n", sp)?;
             }
 
+            // P0 cognitive: per-message stamps below are time-only. Emit a date
+            // heading whenever the day changes so a reader can tell "yesterday"
+            // from "8 months ago" — the year/date was previously absent from the
+            // extract, leaving bare `[HH:MM:SS]` stamps with no anchor.
+            // P3-12: timestamps are UTC; say so on the heading (the per-message
+            // `[HH:MM:SS]` stamps inherit the timezone from their day heading),
+            // matching the explicit "UPDATED (UTC)" label in `sessions list`.
+            let mut last_date: Option<String> = None;
             for msg in session_msgs {
+                let date = msg.timestamp.format("%Y-%m-%d").to_string();
+                if last_date.as_deref() != Some(date.as_str()) {
+                    writeln!(file, "#### {} (UTC)\n", date)?;
+                    last_date = Some(date);
+                }
                 let time = msg.timestamp.format("%H:%M:%S");
                 let role_label = if msg.role == "user" {
                     "user"

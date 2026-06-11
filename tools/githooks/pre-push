@@ -21,23 +21,28 @@ except ModuleNotFoundError:
 with open("Cargo.toml", "rb") as fh:
     data = tomllib.load(fh)
 
+# Path deps are portable as long as they carry a registry `version` —
+# cargo strips the path on publish and consumers resolve the version.
+# The unportable (and publish-breaking) form is a path dep WITHOUT a
+# version: it cannot be uploaded and silently pins the build to this
+# checkout. Flag only that form.
 bad = [
     (section, name, spec["path"])
     for section in ("dependencies", "dev-dependencies", "build-dependencies")
     for name, spec in data.get(section, {}).items()
-    if isinstance(spec, dict) and "path" in spec
+    if isinstance(spec, dict) and "path" in spec and "version" not in spec
 ]
 
 if bad:
     raise SystemExit(
         "Manifest portability check failed:\n"
         + "\n".join(
-            f"  - {section}.{name} uses unexpected local path dependency {path}"
+            f"  - {section}.{name} is a local path dependency without a registry version: {path}"
             for section, name, path in bad
         )
     )
 
-print("Manifest portability: ok (root dependencies use registry versions)")
+print("Manifest portability: ok (path dependencies carry registry versions)")
 PY
 
 echo ""

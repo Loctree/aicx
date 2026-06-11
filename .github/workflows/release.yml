@@ -192,6 +192,12 @@ jobs:
 
       - name: Install protoc
         # Manual install — see ci.yml for rationale (arduino/setup-protoc#108).
+        # Skipped on windows-pc: the slim Windows bundle builds default
+        # features only (no `lance`), so rust-memex/grpc — the sole protoc
+        # consumer — is never compiled. Running it on Windows previously hit
+        # the `else` branch and exited 1, blocking the Windows leg before the
+        # build even started.
+        if: matrix.runner_name != 'windows-pc'
         shell: bash
         run: |
           if command -v protoc >/dev/null 2>&1; then
@@ -245,7 +251,12 @@ jobs:
 
       - name: Build binaries-only release (windows-pc, GPG-detached .zip)
         if: matrix.runner_name == 'windows-pc'
-        shell: bash
+        # Force Git Bash explicitly. A bare `shell: bash` on a self-hosted
+        # Windows runner whose service runs as LOCAL SYSTEM resolves to the
+        # WSL `bash.exe` stub (WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED) and the step
+        # dies before running anything. Pinning the Git for Windows bash
+        # sidesteps WSL entirely.
+        shell: 'C:\Program Files\Git\bin\bash.exe -eo pipefail {0}'
         working-directory: aicx
         env:
           TARGET: ${{ matrix.target }}
@@ -255,10 +266,12 @@ jobs:
           AICX_CLEAN_AFTER_BUILD: "0"
           PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
           LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}
-          # Strawberry Perl ships mingw-w64 gcc — required for windows-gnu target.
-          # Add it to PATH so cargo's linker finds it.
-          PATH: "C:\\Strawberry\\c\\bin;C:\\Program Files (x86)\\GnuPG\\bin;C:\\Program Files\\Git\\usr\\bin;${{ env.PATH }}"
         run: |
+          # Prepend the mingw-w64 gcc (Strawberry Perl) linker and GnuPG to
+          # PATH without clobbering the runner's real PATH — the old
+          # `env: PATH: ...${{ env.PATH }}` form expanded `env.PATH` to empty
+          # and wiped cargo/git off PATH. Git Bash uses POSIX-style paths.
+          export PATH="/c/Strawberry/c/bin:/c/Program Files (x86)/GnuPG/bin:$PATH"
           ./tools/release_bundle.sh
 
       - name: Build .deb (linux only)

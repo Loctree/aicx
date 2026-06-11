@@ -1,5 +1,6 @@
 use super::*;
 use crate::oracle::OracleStatus;
+use crate::sources::shared::{IntentLineModality, intent_line_modality};
 use std::fs;
 use std::path::PathBuf;
 
@@ -30,8 +31,7 @@ fn chunk_path(root: &Path, project: &str, date: &str, name: &str) -> PathBuf {
 }
 
 fn write_chunk(root: &Path, project: &str, date: &str, name: &str, body: &str) {
-    let path = chunk_path(root, project, date, name);
-    fs::write(path, body).expect("write chunk");
+    write_chunk_with_sidecar(root, project, date, name, body, Some(FrameKind::UserMsg));
 }
 
 fn migration_test_root(label: &str) -> PathBuf {
@@ -40,6 +40,32 @@ fn migration_test_root(label: &str) -> PathBuf {
         .expect("unix time")
         .as_nanos();
     std::env::temp_dir().join(format!("aicx-intents-{label}-{nanos}"))
+}
+
+fn extract_demo_records(label: &str, body: &str) -> Vec<IntentRecord> {
+    let root = migration_test_root(label);
+    let _ = fs::remove_dir_all(&root);
+
+    write_chunk(&root, "demo", "2026-03-15", "120000_codex-001.md", body);
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        kind_filter: None,
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &root, now).expect("extract intents");
+    let _ = fs::remove_dir_all(root);
+    records
 }
 
 #[test]
@@ -71,6 +97,97 @@ fn migrate_intent_schema_dry_run_at_scans_all_projects_without_filter() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn head_blockquote_reference_is_pasted_reference_not_intent() {
+    let line = "> intent: Let's ship the mirrored roadmap";
+    assert_eq!(
+        intent_line_modality("user", line),
+        IntentLineModality::PastedReference
+    );
+
+    let records = extract_demo_records(
+        "blockquote-reference-modality",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:00:00] user: > intent: Let's ship the mirrored roadmap\n",
+    );
+
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.kind == IntentKind::Intent),
+        "head blockquote reference leaked intent records: {records:?}"
+    );
+}
+
+#[test]
+fn pasted_text_placeholder_reference_is_pasted_reference_not_intent() {
+    let line = "[Pasted text #1 +9 lines] Let's ship the mirrored roadmap";
+    assert_eq!(
+        intent_line_modality("user", line),
+        IntentLineModality::PastedReference
+    );
+
+    let records = extract_demo_records(
+        "placeholder-reference-modality",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:00:00] user: [Pasted text #1 +9 lines] Let's ship the mirrored roadmap\n",
+    );
+
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.kind == IntentKind::Intent),
+        "pasted-text placeholder leaked intent records: {records:?}"
+    );
+}
+
+#[test]
+fn zadanie_head_is_typed_directive_and_remains_intent() {
+    let line = "Zadanie: dopnij pasted-vs-typed modality gate";
+    assert_eq!(
+        intent_line_modality("user", line),
+        IntentLineModality::TypedDirective
+    );
+
+    let records = extract_demo_records(
+        "zadanie-typed-directive-modality",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:00:00] user: Zadanie: dopnij pasted-vs-typed modality gate\n",
+    );
+
+    assert!(
+        records.iter().any(|record| {
+            record.kind == IntentKind::Intent
+                && record
+                    .summary
+                    .contains("Zadanie: dopnij pasted-vs-typed modality gate")
+        }),
+        "typed Zadanie directive did not produce an intent record: {records:?}"
+    );
+}
+
+#[test]
+fn typed_directive_with_reference_marker_mid_body_remains_intent() {
+    let line =
+        "Zadanie: analyze this pasted reference > intent: old plan [Pasted text #2 +4 lines]";
+    assert_eq!(
+        intent_line_modality("user", line),
+        IntentLineModality::TypedDirective
+    );
+
+    let records = extract_demo_records(
+        "mid-body-reference-marker-modality",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:00:00] user: Zadanie: analyze this pasted reference > intent: old plan [Pasted text #2 +4 lines]\n",
+    );
+
+    assert!(
+        records.iter().any(|record| {
+            record.kind == IntentKind::Intent
+                && record
+                    .summary
+                    .contains("Zadanie: analyze this pasted reference")
+        }),
+        "typed directive with mid-body reference markers was not preserved: {records:?}"
+    );
+}
+
 fn write_chunk_with_sidecar(
     root: &Path,
     project: &str,
@@ -81,6 +198,24 @@ fn write_chunk_with_sidecar(
 ) {
     let path = chunk_path(root, project, date, name);
     fs::write(&path, body).expect("write chunk");
+    let agent = if name.contains("_claude") || name.contains("claude") {
+        "claude"
+    } else if name.contains("_gemini") || name.contains("gemini") {
+        "gemini"
+    } else {
+        "codex"
+    };
+    write_sidecar(&path, project, agent, date, "intentstest01", frame_kind);
+}
+
+fn write_sidecar(
+    path: &Path,
+    project: &str,
+    agent: &str,
+    date: &str,
+    session_id: &str,
+    frame_kind: Option<FrameKind>,
+) {
     let sidecar = crate::chunker::ChunkMetadataSidecar {
         id: path
             .file_stem()
@@ -88,15 +223,9 @@ fn write_chunk_with_sidecar(
             .to_string_lossy()
             .to_string(),
         project: format!("local/{project}"),
-        agent: if name.contains("_claude") || name.contains("claude") {
-            "claude".to_string()
-        } else if name.contains("_gemini") || name.contains("gemini") {
-            "gemini".to_string()
-        } else {
-            "codex".to_string()
-        },
+        agent: agent.to_string(),
         date: date.to_string(),
-        session_id: "intentstest01".to_string(),
+        session_id: session_id.to_string(),
         cwd: None,
         timestamp_source: None,
         kind: crate::store::Kind::Conversations,
@@ -408,6 +537,117 @@ fn frame_kind_filter_keeps_only_matching_chunks() {
 }
 
 #[test]
+fn default_frame_kind_is_user_msg() {
+    assert_eq!(IntentsConfig::default_frame_kind(), FrameKind::UserMsg);
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        kind_filter: None,
+        frame_kind: None,
+    };
+
+    assert_eq!(config.effective_frame_kind(), FrameKind::UserMsg);
+}
+
+#[test]
+fn default_frame_kind_admits_user_chunk_and_rejects_agent_chunk() {
+    let tmp = std::env::temp_dir().join(format!(
+        "ai-contexters-intents-{}-default-frame-kind",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+
+    write_chunk_with_sidecar(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "120000_codex-001.md",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:00:00] user: Let's keep only user intent truth.\n",
+        Some(FrameKind::UserMsg),
+    );
+    write_chunk_with_sidecar(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "120100_codex-002.md",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:01:00] assistant: decision: assistant-only steering\n",
+        Some(FrameKind::AgentReply),
+    );
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        kind_filter: None,
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, IntentKind::Intent);
+    assert_eq!(records[0].summary, "Let's keep only user intent truth.");
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn explicit_agent_frame_kind_override_still_admits_agent_chunk() {
+    let tmp = std::env::temp_dir().join(format!(
+        "ai-contexters-intents-{}-agent-frame-kind-override",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+
+    write_chunk_with_sidecar(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "120000_codex-001.md",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:00:00] user: Let's keep only user intent truth.\n",
+        Some(FrameKind::UserMsg),
+    );
+    write_chunk_with_sidecar(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "120100_codex-002.md",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:01:00] assistant: decision: assistant-only steering\n",
+        Some(FrameKind::AgentReply),
+    );
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        kind_filter: None,
+        frame_kind: Some(FrameKind::AgentReply),
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, IntentKind::Decision);
+    assert_eq!(records[0].summary, "assistant-only steering");
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn formats_markdown_with_required_sections() {
     let records = vec![IntentRecord {
         kind: IntentKind::Decision,
@@ -498,6 +738,204 @@ fn formats_oracle_json_as_canonical_corpus_not_semantic_fallback() {
 fn strip_case_prefix_is_utf8_safe() {
     let text = "Działa pięknie — pełny artifact pack z Rust flow...";
     assert_eq!(strip_case_insensitive_prefix(text, "validation:"), text);
+}
+
+// ── C0.1 native regression anchors ───────────────────────────────
+//
+// Born as falsifying RED tests that locked the then-broken behavior of the
+// native intent stream (plan C0.1, A/B/C drift finding: "native intent
+// stream jest częściowo lustrem własnego szumu"). The underlying fixes have
+// since landed on this branch, so these now run GREEN as permanent
+// regression guards for the post-fix invariants: agent chunks yield no
+// operator intents, frame_kind filtering defaults sanely, and limit
+// semantics stay honest. The `_drift_red` names are kept for history.
+
+#[test]
+fn agent_chunk_still_yields_intents_drift_red() {
+    // F1 / role-drift.
+    // RED: CURRENT behavior = a pure agent-authored chunk (assistant role,
+    // FrameKind::AgentReply) still produces intent records — agent meta-chatter
+    // drifts into operator intents (records.len() > 0).
+    // DESIRED post-fix invariant = a pure agent chunk yields ZERO operator
+    // intents (records.is_empty()). We assert the DESIRED invariant, so this is
+    // RED now and flips GREEN when role-drift is fixed.
+    let tmp = std::env::temp_dir().join(format!(
+        "ai-contexters-intents-{}-agent-drift",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+
+    write_chunk_with_sidecar(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "120100_codex-002.md",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:01:00] assistant: decision: assistant-only steering\n",
+        Some(FrameKind::AgentReply),
+    );
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        kind_filter: None,
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+
+    let leaked = records.len();
+    let _ = fs::remove_dir_all(&tmp);
+
+    assert!(
+        records.is_empty(),
+        "agent-authored chunk leaked {leaked} intent(s) (role-drift); desired post-fix = zero: {records:?}",
+    );
+}
+
+#[test]
+fn unresolved_filter_narrows_when_session_resolved() {
+    // F2 anchor (was `unresolved_filter_is_noop_without_outcomes_red`).
+    // `--unresolved` must drop Intents whose session is resolved by a matching
+    // Outcome and keep Intents whose session has none. With one resolved session
+    // (Intent + its Outcome) and one open Intent, the filtered output must DIFFER
+    // from the full output (real narrowing): the resolved Intent is dropped, the
+    // open Intent survives.
+    // (The CLI-level `--kind intent` interaction is fixed in `run_intents`, which
+    // defers the kind filter so Outcomes survive the resolution check.)
+    let records = vec![
+        IntentRecord {
+            kind: IntentKind::Intent,
+            summary: "ship native intents audit".to_string(),
+            context: None,
+            evidence: vec![],
+            project: "demo".to_string(),
+            agent: "codex".to_string(),
+            date: "2026-03-15".to_string(),
+            timestamp: None,
+            session_id: "sess-resolved".to_string(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: "/tmp/demo/resolved-intent.md".to_string(),
+        },
+        IntentRecord {
+            kind: IntentKind::Outcome,
+            summary: "native intents audit shipped".to_string(),
+            context: None,
+            evidence: vec![],
+            project: "demo".to_string(),
+            agent: "codex".to_string(),
+            date: "2026-03-15".to_string(),
+            timestamp: None,
+            session_id: "sess-resolved".to_string(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: "/tmp/demo/resolved-outcome.md".to_string(),
+        },
+        IntentRecord {
+            kind: IntentKind::Intent,
+            summary: "lock regression anchor".to_string(),
+            context: None,
+            evidence: vec![],
+            project: "demo".to_string(),
+            agent: "codex".to_string(),
+            date: "2026-03-15".to_string(),
+            timestamp: None,
+            session_id: "sess-open".to_string(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: "/tmp/demo/open-intent.md".to_string(),
+        },
+    ];
+
+    let unresolved_out = apply_display_filters(
+        records.clone(),
+        &IntentDisplayFilters {
+            unresolved: true,
+            ..Default::default()
+        },
+    );
+    let full_out = apply_display_filters(records.clone(), &IntentDisplayFilters::default());
+
+    assert_ne!(
+        unresolved_out, full_out,
+        "--unresolved removed nothing (dead filter): output is byte-identical to full output",
+    );
+    assert!(
+        !unresolved_out
+            .iter()
+            .any(|r| r.kind == IntentKind::Intent && r.session_id == "sess-resolved"),
+        "resolved Intent (session has an Outcome) must be filtered out by --unresolved",
+    );
+    assert!(
+        unresolved_out.iter().any(|r| r.session_id == "sess-open"),
+        "open Intent (no Outcome in session) must survive --unresolved",
+    );
+}
+
+#[test]
+fn none_limit_does_not_clip_roadmap() {
+    // F3 anchor (was `default_limit_clips_below_explicit_limit_red`).
+    // `apply_display_filters` must treat `limit: None` as unlimited so the intents
+    // CLI can map its `--limit` default to None and stop silently clipping a 12+
+    // item roadmap; an explicit `Some(n)` still truncates to n.
+    // (The CLI default override lives in `run_intents`: default sentinel -> None.)
+    let records: Vec<IntentRecord> = (0..12)
+        .map(|i| IntentRecord {
+            kind: IntentKind::Intent,
+            summary: format!("planned roadmap item {i}"),
+            context: None,
+            evidence: vec![],
+            project: "demo".to_string(),
+            agent: "codex".to_string(),
+            date: "2026-03-15".to_string(),
+            timestamp: None,
+            session_id: format!("sess-limit-{i}"),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: format!("/tmp/demo/limit-{i}.md"),
+        })
+        .collect();
+
+    let no_limit = apply_display_filters(
+        records.clone(),
+        &IntentDisplayFilters {
+            limit: None,
+            ..Default::default()
+        },
+    );
+    let explicit_10 = apply_display_filters(
+        records.clone(),
+        &IntentDisplayFilters {
+            limit: Some(10),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(
+        no_limit.len(),
+        records.len(),
+        "limit: None must not clip the roadmap (got {} of {})",
+        no_limit.len(),
+        records.len(),
+    );
+    assert_eq!(
+        explicit_10.len(),
+        10,
+        "explicit limit must still truncate (got {})",
+        explicit_10.len(),
+    );
 }
 
 // ── classifier tests ────────────────────────────────────────────
@@ -804,6 +1242,7 @@ mod session_level {
             body: None,
             evidence: Vec::new(),
             links: Vec::new(),
+            superseded_by: None,
             confidence: 0.9,
             tags: Vec::new(),
             project: Some(project.to_string()),
@@ -836,14 +1275,164 @@ mod session_level {
 
         postprocess_session_entries(&mut entries, Some(30));
 
+        let older_id = entries[0].id.clone();
+        let newer_id = entries[1].id.clone();
+
         assert_eq!(entries[0].state, EntryState::Superseded);
-        assert_eq!(entries[1].state, EntryState::Proposed);
+        assert_eq!(entries[0].superseded_by, Some(newer_id.clone()));
+        assert_eq!(entries[1].state, EntryState::Active);
         assert!(
             entries[1]
                 .links
                 .iter()
-                .any(|l| l.relation == LinkType::Supersedes)
+                .any(|l| l.relation == LinkType::Supersedes && l.target == older_id)
         );
+    }
+
+    #[test]
+    fn supersession_promotes_winner_and_stamps_superseded_by() {
+        let mut entries = vec![
+            make_entry(
+                EntryType::Intent,
+                "add flag X parser fallback mode",
+                "2026-04-10",
+                "s1",
+                "demo",
+            ),
+            make_entry(
+                EntryType::Intent,
+                "add flag X parser fallback mode; no, the real fix is Y",
+                "2026-04-15",
+                "s2",
+                "demo",
+            ),
+            make_entry(
+                EntryType::Intent,
+                "ship unrelated docs cleanup",
+                "2026-04-15",
+                "s3",
+                "demo",
+            ),
+        ];
+
+        postprocess_session_entries(&mut entries, Some(7));
+        postprocess_session_entries(&mut entries, Some(7));
+
+        let loser_id = entries[0].id.clone();
+        let winner_id = entries[1].id.clone();
+        let json = serde_json::to_value(&entries).expect("serialize entries");
+
+        assert_eq!(entries[0].state, EntryState::Superseded);
+        assert_eq!(entries[0].superseded_by, Some(winner_id.clone()));
+        assert_eq!(entries[1].state, EntryState::Active);
+        assert!(entries[2].superseded_by.is_none());
+        assert!(
+            entries[1]
+                .links
+                .iter()
+                .any(|l| l.relation == LinkType::Supersedes && l.target == loser_id)
+        );
+
+        assert_eq!(json[0]["status"], "superseded");
+        assert_eq!(json[0]["superseded_by"], winner_id);
+        assert_eq!(json[1]["status"], "active");
+        assert_eq!(json[1]["links"][0]["relation"], "supersedes");
+        assert_eq!(json[1]["links"][0]["target"], entries[0].id);
+        assert!(json[2].get("superseded_by").is_none());
+    }
+
+    #[test]
+    fn supersedes_chain_final_state_is_input_order_independent() {
+        // P2-01: in a 3-link chain A <- B <- C, B both supersedes A and is
+        // superseded by C. The final state must be A=Superseded(by B),
+        // B=Superseded(by C), C=Active — regardless of input order. The old
+        // pairwise action loop got this right only by accident of ascending
+        // push order.
+        let chain_entries = || {
+            (
+                make_entry(
+                    EntryType::Intent,
+                    "ship the new intent engine basic skeleton",
+                    "2026-04-10",
+                    "s1",
+                    "demo",
+                ),
+                make_entry(
+                    EntryType::Intent,
+                    "ship the new intent engine with retries",
+                    "2026-04-12",
+                    "s2",
+                    "demo",
+                ),
+                make_entry(
+                    EntryType::Intent,
+                    "ship the new intent engine final form",
+                    "2026-04-15",
+                    "s3",
+                    "demo",
+                ),
+            )
+        };
+
+        let (a, b, c) = chain_entries();
+        let (a_id, b_id, c_id) = (a.id.clone(), b.id.clone(), c.id.clone());
+        let forward = vec![a, b, c];
+        let (a2, b2, c2) = chain_entries();
+        let reversed = vec![c2, b2, a2];
+
+        for (label, mut entries) in [("forward", forward), ("reversed", reversed)] {
+            detect_supersedes(&mut entries);
+
+            let by_id = |id: &str| {
+                entries
+                    .iter()
+                    .find(|e| e.id == id)
+                    .unwrap_or_else(|| panic!("entry {id} missing in {label} run"))
+            };
+            let (a, b, c) = (by_id(&a_id), by_id(&b_id), by_id(&c_id));
+
+            assert_eq!(
+                a.state,
+                EntryState::Superseded,
+                "{label}: A must be superseded"
+            );
+            assert_eq!(
+                a.superseded_by,
+                Some(b_id.clone()),
+                "{label}: A must be superseded by B (chain link, not by C)"
+            );
+            assert_eq!(
+                b.state,
+                EntryState::Superseded,
+                "{label}: B must be superseded"
+            );
+            assert_eq!(
+                b.superseded_by,
+                Some(c_id.clone()),
+                "{label}: B must be superseded by C"
+            );
+            assert_eq!(
+                c.state,
+                EntryState::Active,
+                "{label}: C is the chain head and must stay Active"
+            );
+            assert!(
+                c.superseded_by.is_none(),
+                "{label}: C must not be superseded"
+            );
+            assert!(
+                b.links
+                    .iter()
+                    .any(|l| l.relation == LinkType::Supersedes && l.target == a_id),
+                "{label}: B must carry a supersedes link to A"
+            );
+            assert!(
+                c.links
+                    .iter()
+                    .any(|l| l.relation == LinkType::Supersedes && l.target == b_id),
+                "{label}: C must carry a supersedes link to B"
+            );
+        }
     }
 
     #[test]
@@ -976,6 +1565,14 @@ mod quality {
         fs::create_dir_all(&dir).expect("create chunk dir");
         let path = dir.join(basename);
         fs::write(&path, body).expect("write chunk");
+        write_sidecar(
+            &path,
+            project,
+            agent,
+            date,
+            session_id,
+            Some(FrameKind::UserMsg),
+        );
         path
     }
 
@@ -1559,6 +2156,7 @@ mod area_e_regressions {
             body: None,
             evidence: Vec::new(),
             links: Vec::new(),
+            superseded_by: None,
             confidence: 0.9,
             tags: Vec::new(),
             project: Some("demo".to_string()),
@@ -1624,5 +2222,116 @@ mod area_e_regressions {
         detect_contradicted_assumptions(&mut entries);
         assert_eq!(entries[0].state, EntryState::Active);
         assert!(entries[0].links.is_empty());
+    }
+}
+
+// ── P3-09: flexible UTC date parsing for mixed-format comparisons ────
+
+mod flexible_dates {
+    use super::*;
+
+    fn make_record(summary: &str, date: &str, timestamp: Option<&str>) -> IntentRecord {
+        IntentRecord {
+            kind: IntentKind::Intent,
+            summary: summary.to_string(),
+            context: None,
+            evidence: Vec::new(),
+            project: "demo".to_string(),
+            agent: "codex".to_string(),
+            date: date.to_string(),
+            timestamp: timestamp.map(|t| t.to_string()),
+            session_id: format!("sess-{summary}"),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: format!("/tmp/demo/{summary}.md"),
+        }
+    }
+
+    #[test]
+    fn parse_flexible_utc_normalizes_bare_dates_and_offsets() {
+        let day = parse_flexible_utc("2026-05-04").expect("bare date must parse");
+        assert_eq!(day.to_rfc3339(), "2026-05-04T00:00:00+00:00");
+
+        // +02:00 offset normalizes to 21:30Z, which is BEFORE 22:00Z even
+        // though the raw strings compare the other way lexicographically.
+        let offset = parse_flexible_utc("2026-05-04T23:30:00+02:00").expect("offset must parse");
+        let zulu = parse_flexible_utc("2026-05-04T22:00:00Z").expect("zulu must parse");
+        assert!("2026-05-04T23:30:00+02:00" > "2026-05-04T22:00:00Z");
+        assert!(offset < zulu, "typed comparison must use the UTC axis");
+
+        assert_eq!(parse_flexible_utc("not-a-date"), None);
+        assert_eq!(parse_flexible_utc("2026-13-99"), None);
+    }
+
+    #[test]
+    fn sort_mixes_date_only_and_timestamped_records_consistently() {
+        // Oldest-first expectation on the UTC axis:
+        //   date-only (midnight UTC) < 21:30Z (23:30+02:00) < 22:00Z.
+        // The old lexicographic sort produced date-only < 22:00Z < 23:30+02:00.
+        let records = vec![
+            make_record(
+                "late-offset",
+                "2026-05-04",
+                Some("2026-05-04T23:30:00+02:00"),
+            ),
+            make_record("zulu", "2026-05-04", Some("2026-05-04T22:00:00Z")),
+            make_record("date-only", "2026-05-04", None),
+        ];
+
+        let oldest = apply_display_filters(
+            records.clone(),
+            &IntentDisplayFilters {
+                sort: Some(IntentSortOrder::Oldest),
+                ..Default::default()
+            },
+        );
+        let oldest_order: Vec<&str> = oldest.iter().map(|r| r.summary.as_str()).collect();
+        assert_eq!(
+            oldest_order,
+            vec!["date-only", "late-offset", "zulu"],
+            "Oldest sort must order date-only (midnight) before 21:30Z before 22:00Z"
+        );
+
+        let newest = apply_display_filters(
+            records,
+            &IntentDisplayFilters {
+                sort: Some(IntentSortOrder::Newest),
+                ..Default::default()
+            },
+        );
+        let newest_order: Vec<&str> = newest.iter().map(|r| r.summary.as_str()).collect();
+        assert_eq!(
+            newest_order,
+            vec!["zulu", "late-offset", "date-only"],
+            "Newest sort must be the exact reverse of Oldest"
+        );
+    }
+
+    #[test]
+    fn date_range_filter_compares_on_utc_axis() {
+        // 01:00+03:00 on 2026-05-04 is 22:00Z on 2026-05-03, so a
+        // lo=2026-05-04 bound must EXCLUDE it. The old lexicographic
+        // comparison kept it ("2026-05-04T..." >= "2026-05-04").
+        let records = vec![
+            make_record("pre-window", "2026-05-04T01:00:00+03:00", None),
+            make_record("in-window", "2026-05-04", None),
+            make_record("garbage-date", "someday", None),
+        ];
+
+        let filtered = apply_display_filters(
+            records,
+            &IntentDisplayFilters {
+                date_lo: Some("2026-05-04".to_string()),
+                date_hi: Some("2026-05-05".to_string()),
+                ..Default::default()
+            },
+        );
+        let kept: Vec<&str> = filtered.iter().map(|r| r.summary.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec!["in-window"],
+            "offset timestamp before the UTC window and unparsable dates must be dropped"
+        );
     }
 }

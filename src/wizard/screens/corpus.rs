@@ -136,7 +136,7 @@ impl CorpusScreen {
     }
 
     pub fn move_selection(&mut self, delta: isize) {
-        self.selected = move_index(self.selected, self.entries.len(), delta);
+        self.selected = super::move_index(self.selected, self.entries.len(), delta);
     }
 
     pub fn move_column(&mut self, delta: isize) {
@@ -181,17 +181,6 @@ fn entry_from_file(file: &StoredContextFile) -> CorpusEntry {
         label: label.clone(),
         path: file.path.clone(),
         haystack: format!("{} {}", label, file.path.display()).to_ascii_lowercase(),
-    }
-}
-
-fn move_index(current: usize, len: usize, delta: isize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    if delta < 0 {
-        current.saturating_sub(delta.unsigned_abs()).min(len - 1)
-    } else {
-        current.saturating_add(delta as usize).min(len - 1)
     }
 }
 

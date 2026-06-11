@@ -39,17 +39,7 @@ impl DoctorScreen {
     }
 
     pub fn move_selection(&mut self, delta: isize) {
-        if self.cards.is_empty() {
-            return;
-        }
-        if delta < 0 {
-            self.selected = self.selected.saturating_sub(delta.unsigned_abs());
-        } else {
-            self.selected = self
-                .selected
-                .saturating_add(delta as usize)
-                .min(self.cards.len() - 1);
-        }
+        self.selected = super::move_index(self.selected, self.cards.len(), delta);
     }
 
     fn run_command(&mut self, args: &[&str]) {

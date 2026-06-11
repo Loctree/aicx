@@ -130,9 +130,38 @@ Resolution order:
 1. `AICX_EMBEDDER_PATH`
 2. `AICX_EMBEDDER_REPO` + `AICX_EMBEDDER_FILENAME`
 3. `AICX_EMBEDDER_CONFIG`
-4. `~/.aicx/embedder.toml`
-5. `~/.aicx/config.toml`
-6. profile defaults
+4. `$AICX_HOME/config.toml` or `[storage].home`/`config.toml`
+5. `$AICX_HOME/embedder.toml` or `[storage].home`/`embedder.toml`
+6. bootstrap `~/.aicx/config.toml`
+7. bootstrap `~/.aicx/embedder.toml`
+8. profile defaults
+
+Persistent AICX root relocation:
+
+```toml
+[storage]
+# `AICX_HOME` env still wins for one-shot commands.
+# Use an absolute path or ~/...
+home = "~/aicx"
+```
+
+When `AICX_HOME` is unset, AICX reads bootstrap `~/.aicx/config.toml` first
+only to discover `[storage].home`. The runtime root then becomes
+`$home/store`, `$home/indexed`, `$home/state`, and `$home/embeddings`.
+This avoids typing `AICX_HOME=...` for every command while keeping env as the
+explicit override.
+
+Installer UX:
+
+```bash
+bash install.sh --pick-home
+# or non-interactive:
+bash install.sh --aicx-home="$HOME/.aicx"
+```
+
+The default root remains `~/.aicx`, so the default semantic index remains
+`~/.aicx/indexed/_all/embeddings.ndjson`. Picking a custom AICX home moves the
+same layout under that root: `<AICX_HOME>/indexed/_all/embeddings.ndjson`.
 
 Useful env vars:
 

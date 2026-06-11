@@ -353,12 +353,12 @@ fn codex_store_round_trips_frame_kind_filters() {
         ]
     );
 
-    // `aicx search` is semantic-only since v0.7. In this hermetic test env
-    // there's no hydrated embedder or built index, so the CLI must fail
-    // fast with a typed error payload (exit code 2) rather than silently
-    // returning empty results. End-to-end frame_kind round-trip with a
-    // real index lives in `tests/e2e_pipeline.rs` (feature-gated against
-    // the operator's canonical ~/.aicx config).
+    // `aicx search` is semantic-first. In this hermetic test env there's no
+    // hydrated embedder or built index, so the CLI must automatically degrade
+    // to filesystem-fuzzy while surfacing the typed semantic failure in JSON.
+    // End-to-end semantic frame_kind round-trip with a real index lives in
+    // `tests/e2e_pipeline.rs` (feature-gated against the operator's canonical
+    // ~/.aicx config).
     let search_output = run_aicx(
         &home,
         &[
@@ -371,23 +371,16 @@ fn codex_store_round_trips_frame_kind_filters() {
             "ai-contexters",
         ],
     );
-    assert_eq!(
-        search_output.status.code(),
-        Some(2),
-        "semantic-only search must fail fast with exit 2 when preconditions are missing\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&search_output.stdout),
-        String::from_utf8_lossy(&search_output.stderr)
-    );
+    assert_success(&search_output);
     let search_payload: Value =
-        serde_json::from_slice(&search_output.stdout).expect("fail-fast emits JSON payload");
-    assert_eq!(search_payload["ok"].as_bool(), Some(false));
-    assert_eq!(
-        search_payload["error"].as_str(),
-        Some("semantic_search_unavailable")
-    );
-    let kind = search_payload["kind"]
+        serde_json::from_slice(&search_output.stdout).expect("fallback emits JSON payload");
+    assert_eq!(search_payload["results"].as_u64(), Some(1));
+    let fallback = &search_payload["semantic_fallback"];
+    assert_eq!(fallback["used"].as_bool(), Some(true));
+    assert_eq!(fallback["backend"].as_str(), Some("filesystem_fuzzy"));
+    let kind = fallback["kind"]
         .as_str()
-        .expect("fail-fast payload carries kind label");
+        .expect("fallback payload carries semantic failure kind label");
     assert!(
         matches!(
             kind,
@@ -396,18 +389,15 @@ fn codex_store_round_trips_frame_kind_filters() {
         "unexpected fail-fast kind: {kind}"
     );
     assert!(
-        !search_payload["reason"]
-            .as_str()
-            .unwrap_or_default()
-            .is_empty(),
-        "fail-fast reason must not be empty"
+        !fallback["reason"].as_str().unwrap_or_default().is_empty(),
+        "fallback reason must not be empty"
     );
     assert!(
-        !search_payload["recommendation"]
+        !fallback["recommendation"]
             .as_str()
             .unwrap_or_default()
             .is_empty(),
-        "fail-fast recommendation must not be empty"
+        "fallback recommendation must not be empty"
     );
 
     #[cfg(feature = "lance")]

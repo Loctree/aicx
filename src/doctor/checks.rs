@@ -1,21 +1,219 @@
-//! Diagnostic checks for aicx doctor.
+//! Diagnostic checks and the doctor run orchestrator.
+//!
+//! `run` / `run_at` execute every integrity check, apply requested
+//! remediations (steer rebuild, bucket quarantine, empty-body
+//! quarantine), then re-check and aggregate an overall severity.
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::oracle::OracleReadiness;
 use crate::sanitize;
 use crate::steer_index;
 use crate::store;
 use crate::validation::{is_valid_repo_bucket_name, is_valid_repo_project_slug};
 
-use super::{Severity, CheckResult, DoctorOptions, doctor_home_label};
-use super::quarantine::empty_body_report;
+use super::quarantine::{
+    apply_empty_body_quarantine, empty_body_report, quarantine_bucket,
+    quarantine_bucket_with_timestamp, render_prune_empty_bodies_script,
+    render_rebuild_sidecars_script,
+};
+use super::report::max_severity;
+use super::types::{CheckResult, DoctorOptions, DoctorReport, Severity, doctor_home_label};
 
-pub fn check_context_corpus(base: &Path) -> CheckResult {
+pub async fn run(opts: &DoctorOptions) -> Result<DoctorReport> {
+    let base = store::store_base_dir().context("Failed to resolve aicx store base directory")?;
+    run_at(&base, opts).await
+}
+
+pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
+    let mut canonical_store = check_canonical_store(base);
+    let mut steer_lance = check_steer_lance(base).await;
+    let mut steer_bm25 = check_steer_bm25(base);
+    let mut state = check_state(base);
+    let mut sidecars = check_sidecar_coverage(base);
+    let mut corpus_buckets = check_corpus_buckets(base);
+    let mut noise_health = check_noise_health(base);
+    let mut semantic_health = check_semantic_health(opts);
+    let mut index_freshness = check_index_freshness(base);
+    let mut index_consistency = check_index_consistency(base);
+    let mut embedder_warmth = check_embedder_warmth(opts);
+    let mut empty_body_chunks = check_empty_body_chunks(base);
+    let mut content_dedup = if opts.check_dedup {
+        check_content_dedup(base)
+    } else {
+        CheckResult {
+            name: "content_dedup".to_string(),
+            severity: Severity::Green,
+            detail: "not requested".to_string(),
+            recommendation: None,
+        }
+    };
+    let mut context_corpus = check_context_corpus(base);
+
+    let mut fixes_applied = Vec::new();
+    let rebuild_sidecars_script = if opts.rebuild_sidecars {
+        Some(render_rebuild_sidecars_script(base)?)
+    } else {
+        None
+    };
+    let prune_empty_bodies_script = if opts.prune_empty_bodies && !opts.apply_prune_empty_bodies {
+        Some(render_prune_empty_bodies_script(base)?)
+    } else {
+        None
+    };
+    let apply_empty_bodies = opts.prune_empty_bodies && opts.apply_prune_empty_bodies;
+
+    if opts.rebuild_steer_index
+        && (steer_lance.severity == Severity::Critical || steer_bm25.severity == Severity::Critical)
+    {
+        match attempt_steer_rebuild(base).await {
+            Ok(msg) => fixes_applied.push(msg),
+            Err(e) => fixes_applied.push(format!("rebuild attempted but failed: {e}")),
+        }
+    }
+
+    if opts.fix_buckets {
+        let store_root = base.join("store");
+        let dry = opts.dry_run;
+        let prefix = if dry { "[dry-run] " } else { "" };
+        match scan_corpus_buckets(&store_root) {
+            Ok(suspicious) if suspicious.is_empty() => {
+                fixes_applied.push("no suspicious corpus buckets to quarantine".to_string());
+            }
+            Ok(suspicious) => {
+                let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+                let single_bucket = suspicious.len() == 1;
+                for bucket_name in &suspicious {
+                    if dry {
+                        fixes_applied.push(format!(
+                            "{prefix}would quarantine corpus bucket `{bucket_name}`"
+                        ));
+                        continue;
+                    }
+                    let result = if single_bucket {
+                        quarantine_bucket(&store_root, bucket_name)
+                    } else {
+                        quarantine_bucket_with_timestamp(&store_root, bucket_name, &timestamp)
+                    };
+                    match result {
+                        Ok(dst) => fixes_applied.push(format!(
+                            "quarantined corpus bucket `{bucket_name}` to {}",
+                            dst.display()
+                        )),
+                        Err(e) => fixes_applied.push(format!(
+                            "failed to quarantine corpus bucket `{bucket_name}`: {e}"
+                        )),
+                    }
+                }
+            }
+            Err(e) => fixes_applied.push(format!("{prefix}bucket scan skipped: {e}")),
+        }
+    }
+
+    if apply_empty_bodies {
+        match apply_empty_body_quarantine(base) {
+            Ok(report) if report.moved_chunks == 0 && report.failures.is_empty() => {
+                fixes_applied.push("no empty-body chunks to quarantine".to_string());
+            }
+            Ok(report) => {
+                if report.moved_chunks > 0 {
+                    let quarantine_root = report
+                        .quarantine_root
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "unknown quarantine root".to_string());
+                    fixes_applied.push(format!(
+                        "quarantined {} empty-body chunk(s) and {} sidecar(s) to {}",
+                        report.moved_chunks, report.moved_sidecars, quarantine_root
+                    ));
+                    if let Some(manifest_path) = report.manifest_path {
+                        fixes_applied.push(format!(
+                            "wrote quarantine manifest {}",
+                            manifest_path.display()
+                        ));
+                    }
+                }
+                for failure in report.failures.iter().take(10) {
+                    fixes_applied.push(format!("failed to quarantine empty-body chunk: {failure}"));
+                }
+                if report.failures.len() > 10 {
+                    fixes_applied.push(format!(
+                        "additional empty-body quarantine failures omitted: {}",
+                        report.failures.len() - 10
+                    ));
+                }
+            }
+            Err(e) => fixes_applied.push(format!("empty-body quarantine skipped: {e}")),
+        }
+    }
+
+    if opts.rebuild_steer_index || opts.fix_buckets || apply_empty_bodies {
+        canonical_store = check_canonical_store(base);
+        steer_lance = check_steer_lance(base).await;
+        steer_bm25 = check_steer_bm25(base);
+        state = check_state(base);
+        sidecars = check_sidecar_coverage(base);
+        corpus_buckets = check_corpus_buckets(base);
+        noise_health = check_noise_health(base);
+        semantic_health = check_semantic_health(opts);
+        index_freshness = check_index_freshness(base);
+        index_consistency = check_index_consistency(base);
+        embedder_warmth = check_embedder_warmth(opts);
+        empty_body_chunks = check_empty_body_chunks(base);
+        content_dedup = if opts.check_dedup {
+            check_content_dedup(base)
+        } else {
+            content_dedup
+        };
+        context_corpus = check_context_corpus(base);
+    }
+
+    let sidecar_coverage = sidecars.clone();
+
+    let overall = max_severity(&[
+        canonical_store.severity,
+        steer_lance.severity,
+        steer_bm25.severity,
+        state.severity,
+        sidecars.severity,
+        corpus_buckets.severity,
+        noise_health.severity,
+        semantic_health.severity,
+        index_freshness.severity,
+        index_consistency.severity,
+        embedder_warmth.severity,
+        empty_body_chunks.severity,
+        content_dedup.severity,
+        context_corpus.severity,
+    ]);
+
+    Ok(DoctorReport {
+        schema_version: 2,
+        canonical_store,
+        steer_lance,
+        steer_bm25,
+        state,
+        sidecars,
+        corpus_buckets,
+        noise_health,
+        semantic_health,
+        index_freshness,
+        index_consistency,
+        sidecar_coverage,
+        embedder_warmth,
+        empty_body_chunks,
+        content_dedup,
+        context_corpus,
+        rebuild_sidecars_script,
+        prune_empty_bodies_script,
+        fixes_applied,
+        overall,
+    })
+}
+
+pub(crate) fn check_context_corpus(base: &Path) -> CheckResult {
     let corpus_root = base.join(store::CONTEXT_CORPUS_DIRNAME);
     if !corpus_root.exists() {
         return CheckResult {
@@ -86,7 +284,7 @@ pub fn check_context_corpus(base: &Path) -> CheckResult {
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-pub fn check_semantic_health(opts: &DoctorOptions) -> CheckResult {
+pub(crate) fn check_semantic_health(opts: &DoctorOptions) -> CheckResult {
     let cfg = crate::embedder::EmbeddingConfig::from_env();
     match cfg.backend {
         crate::embedder::BackendPreference::Cloud => {
@@ -189,8 +387,7 @@ pub fn check_semantic_health(opts: &DoctorOptions) -> CheckResult {
                     recommendation: Some(
                         "Hydrate the model cache or switch [embedder].backend = \"cloud\". Semantic features will be skipped until available."
                             .to_string(),
-                    ),
-                }
+                    ),                }
             }
         }
         crate::embedder::BackendPreference::Candle => CheckResult {
@@ -203,19 +400,19 @@ pub fn check_semantic_health(opts: &DoctorOptions) -> CheckResult {
 }
 
 #[cfg(feature = "native-embedder")]
-fn native_embedder_ping() -> std::result::Result<String, String> {
+pub(crate) fn native_embedder_ping() -> std::result::Result<String, String> {
     crate::embedder::EmbeddingEngine::new()
         .map(|engine| format!("native engine info responded: {}", engine.info().model_id))
         .map_err(|err| err.to_string())
 }
 
 #[cfg(not(feature = "native-embedder"))]
-fn native_embedder_ping() -> std::result::Result<String, String> {
+pub(crate) fn native_embedder_ping() -> std::result::Result<String, String> {
     Ok("native engine info probe skipped; native-embedder feature is disabled".to_string())
 }
 
 #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
-pub fn check_semantic_health(_opts: &DoctorOptions) -> CheckResult {
+pub(crate) fn check_semantic_health(_opts: &DoctorOptions) -> CheckResult {
     CheckResult {
         name: "semantic_health".to_string(),
         severity: Severity::Critical,
@@ -224,7 +421,13 @@ pub fn check_semantic_health(_opts: &DoctorOptions) -> CheckResult {
     }
 }
 
-pub fn list_indexed_buckets(indexed_root: &Path) -> Vec<String> {
+/// Enumerate per-bucket subdirectories under `<aicx_home>/indexed/`.
+///
+/// Each bucket holds a `embeddings.ndjson` (atomically committed) and
+/// optionally a `embeddings.ndjson.tmp` checkpoint. Buckets are either
+/// `_all` (cross-project query target) or a `canonical_bucket_name`
+/// derived from `<owner>/<repo>` per `api::semantic_index_path_for_bucket`.
+pub(crate) fn list_indexed_buckets(indexed_root: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(indexed_root) else {
         return Vec::new();
     };
@@ -237,7 +440,17 @@ pub fn list_indexed_buckets(indexed_root: &Path) -> Vec<String> {
     buckets
 }
 
-pub fn check_index_freshness(base: &Path) -> CheckResult {
+/// Bug #37: doctor freshness must inspect the SEMANTIC index that
+/// `aicx index` actually writes — `<aicx_home>/indexed/<bucket>/embeddings.ndjson`
+/// (see `api::semantic_index_path_for_bucket`). The legacy check used
+/// `steer_db` / `steer_bm25` mtimes (metadata steer indexes), so it
+/// reported "fresh" while the real semantic corpus was missing or stale.
+///
+/// Recovery hint uses the post-A-1 canonical flag set: `aicx index` for
+/// incremental refresh, `aicx index --full-rescan` for a from-zero
+/// rebuild. Path interpolation flows through `doctor_home_label` so the
+/// recommendation tracks `$AICX_HOME` like the other 8 doctor strings.
+pub(crate) fn check_index_freshness(base: &Path) -> CheckResult {
     let indexed_root = base.join("indexed");
     let newest_chunk = newest_mtime(&base.join("store"))
         .into_iter()
@@ -341,7 +554,7 @@ pub fn check_index_freshness(base: &Path) -> CheckResult {
     }
 }
 
-pub fn check_index_consistency(base: &Path) -> CheckResult {
+pub(crate) fn check_index_consistency(base: &Path) -> CheckResult {
     let files = store::scan_context_files_at(base).unwrap_or_default();
     let chunk_keys = files
         .iter()
@@ -469,7 +682,7 @@ pub fn check_index_consistency(base: &Path) -> CheckResult {
     }
 }
 
-pub fn newest_mtime(root: &Path) -> Option<SystemTime> {
+pub(crate) fn newest_mtime(root: &Path) -> Option<SystemTime> {
     let entries = std::fs::read_dir(root).ok()?;
     let mut newest = root.metadata().ok().and_then(|meta| meta.modified().ok());
     for entry in entries.flatten() {
@@ -485,7 +698,7 @@ pub fn newest_mtime(root: &Path) -> Option<SystemTime> {
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-pub fn check_embedder_warmth(opts: &DoctorOptions) -> CheckResult {
+pub(crate) fn check_embedder_warmth(opts: &DoctorOptions) -> CheckResult {
     let cfg = crate::embedder::EmbeddingConfig::from_env();
     if cfg.backend == crate::embedder::BackendPreference::Cloud {
         let local = cfg
@@ -585,7 +798,7 @@ pub fn check_embedder_warmth(opts: &DoctorOptions) -> CheckResult {
 }
 
 #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
-pub fn check_embedder_warmth(_opts: &DoctorOptions) -> CheckResult {
+pub(crate) fn check_embedder_warmth(_opts: &DoctorOptions) -> CheckResult {
     CheckResult {
         name: "embedder_warmth".to_string(),
         severity: Severity::NotConfigured,
@@ -595,14 +808,14 @@ pub fn check_embedder_warmth(_opts: &DoctorOptions) -> CheckResult {
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn is_local_embedder_url(url: &str) -> bool {
+pub(crate) fn is_local_embedder_url(url: &str) -> bool {
     url.contains("localhost:")
         || url.contains("127.0.0.1:")
         || url.contains("0.0.0.0:")
         || url.contains("[::1]:")
 }
 
-pub fn check_canonical_store(base: &Path) -> CheckResult {
+pub(crate) fn check_canonical_store(base: &Path) -> CheckResult {
     let store_root = base.join("store");
     if !store_root.exists() {
         return CheckResult {
@@ -622,7 +835,7 @@ pub fn check_canonical_store(base: &Path) -> CheckResult {
 }
 
 #[cfg(not(feature = "lance"))]
-pub async fn check_steer_lance(_base: &Path) -> CheckResult {
+pub(crate) async fn check_steer_lance(_base: &Path) -> CheckResult {
     CheckResult {
         name: "steer_lance".to_string(),
         severity: Severity::NotConfigured,
@@ -632,7 +845,7 @@ pub async fn check_steer_lance(_base: &Path) -> CheckResult {
 }
 
 #[cfg(feature = "lance")]
-pub async fn check_steer_lance(base: &Path) -> CheckResult {
+pub(crate) async fn check_steer_lance(base: &Path) -> CheckResult {
     let lance_dir = base.join("steer_db").join("mcp_documents.lance");
     if !lance_dir.exists() {
         return CheckResult {
@@ -680,7 +893,7 @@ pub async fn check_steer_lance(base: &Path) -> CheckResult {
 }
 
 #[cfg(not(feature = "lance"))]
-pub fn check_steer_bm25(_base: &Path) -> CheckResult {
+pub(crate) fn check_steer_bm25(_base: &Path) -> CheckResult {
     CheckResult {
         name: "steer_bm25".to_string(),
         severity: Severity::NotConfigured,
@@ -690,7 +903,7 @@ pub fn check_steer_bm25(_base: &Path) -> CheckResult {
 }
 
 #[cfg(feature = "lance")]
-pub fn check_steer_bm25(base: &Path) -> CheckResult {
+pub(crate) fn check_steer_bm25(base: &Path) -> CheckResult {
     let bm25_dir = base.join("steer_bm25");
     if !bm25_dir.exists() {
         return CheckResult {
@@ -722,7 +935,7 @@ pub fn check_steer_bm25(base: &Path) -> CheckResult {
     }
 }
 
-pub fn check_state(base: &Path) -> CheckResult {
+pub(crate) fn check_state(base: &Path) -> CheckResult {
     let state_path = base.join("state.json");
     if !state_path.exists() {
         return CheckResult {
@@ -734,7 +947,7 @@ pub fn check_state(base: &Path) -> CheckResult {
     }
     // state.json has a dedicated 128 MiB cap (see sanitize::MAX_STATE_JSON_BYTES);
     // the generic 8 MiB validated reader rejects realistic dedup histories
-    // (200k+ chunks -> state.json ~25 MB). Use the state-specific reader.
+    // (200k+ chunks → state.json ~25 MB). Use the state-specific reader.
     let raw = match sanitize::read_state_json_validated(&state_path) {
         Ok(s) => s,
         Err(e) => {
@@ -768,7 +981,7 @@ pub fn check_state(base: &Path) -> CheckResult {
     }
 }
 
-pub fn check_sidecar_coverage(base: &Path) -> CheckResult {
+pub(crate) fn check_sidecar_coverage(base: &Path) -> CheckResult {
     let files = store::scan_context_files_at(base).unwrap_or_default();
     let context_corpus_files = store::scan_context_corpus_files_at(base).unwrap_or_default();
     let total = files.len() + context_corpus_files.len();
@@ -820,7 +1033,7 @@ pub fn check_sidecar_coverage(base: &Path) -> CheckResult {
     }
 }
 
-pub fn check_content_dedup(base: &Path) -> CheckResult {
+pub(crate) fn check_content_dedup(base: &Path) -> CheckResult {
     let mut seen: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for file in store::scan_context_files_at(base).unwrap_or_default() {
         if let Some(sidecar) = store::load_sidecar(&file.path)
@@ -857,7 +1070,7 @@ pub fn check_content_dedup(base: &Path) -> CheckResult {
     }
 }
 
-pub fn check_empty_body_chunks(base: &Path) -> CheckResult {
+pub(crate) fn check_empty_body_chunks(base: &Path) -> CheckResult {
     let report = empty_body_report(base);
     let total = report.total;
     if total == 0 {
@@ -917,7 +1130,19 @@ pub fn check_empty_body_chunks(base: &Path) -> CheckResult {
     }
 }
 
-pub fn check_noise_health(base: &Path) -> CheckResult {
+/// Aggregate noise filter activity across all sidecars in the canonical
+/// store. Surfaces upstream emitters that produce excessive structural
+/// scaffolding. Sidecars without `noise_lines_dropped` (older than commit
+/// `ffe288a`) contribute `0` and are counted under `pre_filter_chunks`.
+///
+/// Severity policy:
+/// - `Green` when no chunks have any dropped noise (clean corpus or
+///   pre-filter-only).
+/// - `Warning` when >50% of post-filter chunks recorded >10 dropped noise
+///   lines — operator should investigate which agents/runs produced the
+///   scaffolding.
+/// - `Green` for any milder signal (filter doing its job invisibly).
+pub(crate) fn check_noise_health(base: &Path) -> CheckResult {
     let files = store::scan_context_files_at(base).unwrap_or_default();
     let total = files.len();
     if total == 0 {
@@ -946,7 +1171,7 @@ pub fn check_noise_health(base: &Path) -> CheckResult {
             continue;
         };
         if sidecar.noise_lines_dropped == 0 {
-            // Either pre-filter-era sidecar (field absent -> 0) or genuinely
+            // Either pre-filter-era sidecar (field absent → 0) or genuinely
             // clean chunk. Indistinguishable here without a probe; surface
             // as informational.
             sidecars_pre_filter += 1;
@@ -992,7 +1217,7 @@ pub fn check_noise_health(base: &Path) -> CheckResult {
     }
 }
 
-pub fn check_corpus_buckets(base: &Path) -> CheckResult {
+pub(crate) fn check_corpus_buckets(base: &Path) -> CheckResult {
     let store_root = base.join("store");
     if !store_root.exists() {
         return CheckResult {
@@ -1057,7 +1282,7 @@ pub fn check_corpus_buckets(base: &Path) -> CheckResult {
     }
 }
 
-pub fn count_corpus_buckets(store_root: &Path) -> Result<usize> {
+pub(crate) fn count_corpus_buckets(store_root: &Path) -> Result<usize> {
     let mut count = 0usize;
     for entry in
         crate::sanitize::read_dir_validated(store_root).context("read corpus store root")?
@@ -1070,7 +1295,23 @@ pub fn count_corpus_buckets(store_root: &Path) -> Result<usize> {
     Ok(count)
 }
 
-pub fn scan_corpus_buckets(store_root: &Path) -> Result<Vec<String>> {
+/// Scan top-level corpus buckets and return only the **suspicious** ones —
+/// folder names that fail [`is_valid_repo_bucket_name`] / [`is_valid_repo_project_slug`].
+///
+/// The validator is intentionally permissive (case-preserving CamelCase,
+/// dot-prefix `.aicx`/`.github`/`.scripts`, underscore-prefix `_internal`)
+/// after the 2026-05-12 relax. What remains "suspicious" is real
+/// extractor-bug evidence: template-placeholder leaks (`${RELEASE_REPO}`,
+/// `<owner>`, `{target_owner}`), and mid-segment shell-metacharacter /
+/// newline / quote garbage (`loctree.git\ncd`,
+/// `vc-skills.git\"><span`).
+///
+/// Pre-2026-05-12 the validator also rejected CamelCase orgs and
+/// dot-prefixed names, which on 2026-05-09 mass-quarantined ~89k
+/// legitimate chunks across `LibraxisAI/`, `VetCoders/`, `Loctree/`,
+/// `Szowesgad/`. Relaxing the validator (not adding canonicalization
+/// magic) was the correct response.
+pub(crate) fn scan_corpus_buckets(store_root: &Path) -> Result<Vec<String>> {
     let mut suspicious = Vec::new();
     if !store_root.exists() {
         return Ok(suspicious);
@@ -1092,7 +1333,7 @@ pub fn scan_corpus_buckets(store_root: &Path) -> Result<Vec<String>> {
             continue;
         }
 
-        // Org folder is valid -> check each repo subfolder.
+        // Org folder is valid → check each repo subfolder.
         for repo_entry in crate::sanitize::read_dir_validated(&org_entry.path())
             .with_context(|| format!("read corpus org bucket `{org}`"))?
         {
@@ -1116,4 +1357,37 @@ pub fn scan_corpus_buckets(store_root: &Path) -> Result<Vec<String>> {
 
     suspicious.sort();
     Ok(suspicious)
+}
+
+pub(crate) async fn attempt_steer_rebuild(base: &Path) -> Result<String> {
+    let steer_db = base.join("steer_db");
+    let steer_bm25 = base.join("steer_bm25");
+    let steer_meta = base.join("steer_index_meta.json");
+
+    let mut removed = Vec::new();
+    if steer_db.exists() {
+        std::fs::remove_dir_all(&steer_db).context("remove steer_db")?;
+        removed.push("steer_db");
+    }
+    if steer_bm25.exists() {
+        std::fs::remove_dir_all(&steer_bm25).context("remove steer_bm25")?;
+        removed.push("steer_bm25");
+    }
+    if steer_meta.exists() {
+        std::fs::remove_file(&steer_meta).context("remove steer_index_meta.json")?;
+        removed.push("steer_index_meta.json");
+    }
+
+    steer_index::rebuild_steer_index_if_needed()
+        .await
+        .context("rebuild after corruption removal")?;
+
+    Ok(format!(
+        "removed {} and rebuilt steer index from canonical store",
+        if removed.is_empty() {
+            "nothing".to_string()
+        } else {
+            removed.join(", ")
+        }
+    ))
 }

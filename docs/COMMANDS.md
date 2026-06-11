@@ -260,10 +260,10 @@ aicx corpus repair --root "$HOME/.aicx/store/Loctree/aicx/2026_0502" --apply --b
 Semantic search across the canonical corpus.
 
 Search uses the materialized semantic index by default. When the embedder or
-index is unavailable, it fails fast with `kind`, `reason`, and
-`recommendation`; it does not silently pretend fuzzy results are semantic
-oracle truth. Use `--no-semantic` only when you intentionally want the explicit
-filesystem-fuzzy escape hatch.
+index is unavailable, it automatically falls back to filesystem-fuzzy and
+surfaces the typed semantic failure as `semantic_fallback` in JSON or as a
+stderr note in text mode. Use `--no-semantic` only when you intentionally want
+to skip the semantic attempt.
 
 ```bash
 aicx search [OPTIONS] <QUERY>
@@ -274,9 +274,9 @@ Options:
 - `-p, --project <PROJECT>...` repo or store-bucket filter(s); omit to search all projects
 - `-H, --hours <HOURS>` lookback window (`0` = all time)
 - `-d, --date <DATE>` filter by date (single day, range, or open-ended)
-- `-l, --limit <N>` max results (default: `10`)
-- `-s, --score <SCORE>` minimum quality threshold (`0..=100`)
-- `--no-semantic` run explicit filesystem-fuzzy search instead of semantic search
+- `--limit <N>` max results (default: `10`)
+- `--score <SCORE>` minimum quality threshold (`0..=100`)
+- `--no-semantic` skip semantic search and run filesystem-fuzzy directly
 - `-j, --json` emit compact JSON instead of plain text
 
 Examples:
@@ -332,11 +332,11 @@ aicx steer [OPTIONS]
 Options:
 - `--run-id <RUN_ID>` filter by run_id (exact match)
 - `--prompt-id <PROMPT_ID>` filter by prompt_id (exact match)
-- `-a, --agent <AGENT>` filter by agent: claude, codex, gemini
+- `--agent <AGENT>` filter by agent: claude, codex, gemini, junie, codescribe
 - `-k, --kind <KIND>` filter by kind: conversations, plans, reports, other
 - `-p, --project <PROJECT>...` repo or store-bucket filter(s); omit to search all projects
 - `-d, --date <DATE>` filter by date: single day, range, or open-ended
-- `-l, --limit <N>` max results (default: `20`)
+- `--limit <N>` max results (default: `10`)
 - `-j, --json` emit JSON with `oracle_status`
 
 Examples:
@@ -493,6 +493,7 @@ aicx intents [OPTIONS]
 Options:
 - `-p, --project <PROJECT>...` repo or store-bucket filter(s); omit to scan all projects
 - `-H, --hours <HOURS>` lookback window (default: `720`)
+- `--limit <N>` max results (default: unlimited, so a full roadmap is never silently clipped; an explicit `--limit 10` means 10)
 - `--emit <markdown|json>` output format (default: `markdown`; `json` includes `oracle_status`)
 - `--strict` only show high-confidence intents
 - `--kind <decision|intent|outcome|task>` filter by kind
@@ -502,6 +503,100 @@ Example:
 ```bash
 aicx intents -p CodeScribe loctree-suite --strict --kind decision
 ```
+
+## Truth-pipeline lanes (sessions / claims / results / clarify)
+
+`aicx` separates five epistemic lanes so agent self-report can never become
+truth by repetition:
+
+1. **Intents belong to humans** — `aicx intents` (user-only frames by default).
+2. **Claims belong to agents** — `aicx claims extract`; always `unverified` at birth.
+3. **Results belong to evidence** — `aicx results collect`; no evidence, no result.
+4. **Fractures are promise-vs-runtime gaps** — surfaced by `aicx clarify`.
+5. **Clarify belongs to unresolved human decisions** — at most 5 A/B/C questions.
+
+Every machine-readable lane export is wrapped in the `aicx.lanes.v1` envelope:
+`schema_version`, absolute `generated_at` (RFC3339, full date+year),
+`source_time_coverage`, `source_files`, `extraction_mode`, `role_filter`,
+`timezone_assumptions`, and `warnings` (non-empty whenever any timestamp is
+partial or inferred — partial time is never silently presented as full).
+
+Privacy note: lane exports embed raw text fragments of agent messages — each
+`claim_text` is the leading line of the source message verbatim. Paths under
+the user's home directory in artifact-evidence excerpts are redacted to `~`.
+
+## `aicx sessions`
+
+Discover and list agent sessions on disk (claude + codex + gemini + junie),
+newest first, with absolute RFC3339 timestamps.
+
+```bash
+aicx sessions list [--cwd] [--agent <claude|codex|gemini|junie>] [--since YYYY-MM-DD]
+                   [--all] [--limit <N>] [--format table|json]
+aicx sessions show <session_id> [--format markdown|json]   # alias: aicx session show
+aicx sessions report <session_id> [--agent <a>] [--hours <H>] [--repo <path>]
+                     [--max <N>] [--format markdown|json]
+```
+
+- `--cwd` infers the repo from the current directory and lists only its sessions.
+- `--agent` accepts exactly `claude`, `codex`, `gemini`, or `junie`; anything
+  else is a CLI error, never a silently empty list.
+- Association confidence is explicit: `exact` (from session cwd) vs `inferred`
+  (decoded from the project dir name).
+- Sessions without a parseable timestamp are still listed — the table shows
+  them with an explicit `(no timestamp)` marker (and they survive the
+  `--since` window) instead of being silently dated out.
+
+`aicx sessions report` is the unified per-session truth surface: all five
+lanes in one rendering — classified human-intent lines (Lane 1, strict user
+allowlist), agent claims with their evidence-folded verification statuses
+(Lanes 2-3), contract fractures (Lane 4), and at most 5 clarify decision
+questions (Lane 5) — plus an explicit "fake-complete candidates" list
+(contradicted or high-risk-unverified claims). JSON output wraps the payload
+in the `aicx.lanes.v1` envelope with `role_filter: all` (the report reads both
+user and agent rows; the claim-only lanes stay `agent_only`).
+
+## `aicx claims`
+
+Lane 2: extract agent claims (audit targets, never truth) from one session.
+
+```bash
+aicx claims extract --session <id-or-prefix> [--agent <a>] [--hours <H>] [--format json|summary]
+```
+
+Every claim carries the absolute source-message timestamp, a
+`timestamp_partial` marker, an `extracted_at` stamp, and is born
+`unverified`. Applause verdicts (`ready_to_push` / `shippable` /
+`no_blockers`) are flagged `high_risk_unverified_claim`.
+
+## `aicx results`
+
+Lane 3: collect repo evidence for a session's claims and fold it into
+verification statuses. Read-only — nothing is executed.
+
+```bash
+aicx results collect --session <id-or-prefix> [--agent <a>] [--hours <H>]
+                     [--repo <path>] [--format json|summary]
+```
+
+For every checkable file path a claim names, artifact existence yields a
+`pass` result and absence a `fail`; `verify_claims` then promotes/demotes:
+pass → `verified`, fail → `contradicted`, mixed → `partial`, no evidence →
+stays `unverified` (never promoted).
+
+## `aicx clarify`
+
+Lane 5: turn verified gaps into at most 5 A/B/C **decision** questions —
+never fact questions the system can answer itself.
+
+```bash
+aicx clarify --session <id-or-prefix> [--agent <a>] [--hours <H>] [--repo <path>]
+             [--max <1-5>] [--format markdown|json]
+```
+
+Questions come from contract fractures (Lane 4): contradicted claims and
+unbacked applause verdicts, severest first, each with a default
+recommendation and the cost of not deciding.
 
 ## `aicx dashboard`
 

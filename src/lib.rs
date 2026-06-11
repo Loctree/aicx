@@ -27,6 +27,7 @@ pub mod rank;
 pub mod redact;
 pub mod reports_extractor;
 pub mod search_engine;
+pub mod sessions;
 pub mod sources;
 pub mod state;
 pub mod steer_index;

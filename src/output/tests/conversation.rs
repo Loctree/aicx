@@ -64,6 +64,52 @@ fn test_conversation_json_extract_stats_are_additive() {
 }
 
 #[test]
+fn write_conversation_markdown_emits_date_heading_for_recency() {
+    // P0 cognitive: extracts carried time-only stamps; a reader could not tell a
+    // session from yesterday apart from one 8 months old. The markdown must carry
+    // the full date (with year) once per session day, including day boundaries.
+    let dir = unique_test_dir("conversation_md_date_heading");
+    let path = dir.join("conversation.md");
+    let mk = |y, mo, d, h, role: &str, body: &str| ConversationMessage {
+        timestamp: Utc.with_ymd_and_hms(y, mo, d, h, 0, 0).unwrap(),
+        agent: "claude".to_string(),
+        session_id: "sess-date".to_string(),
+        role: role.to_string(),
+        message: body.to_string(),
+        repo_project: "test".to_string(),
+        source_path: None,
+        branch: None,
+        message_kind: crate::timeline::MessageKind::Conversation,
+        collapse_stub_kind: None,
+    };
+    let messages = vec![
+        mk(2026, 1, 23, 9, "user", "first day"),
+        mk(2026, 1, 24, 10, "assistant", "next day"),
+    ];
+    let metadata = ReportMetadata {
+        generated_at: Utc.with_ymd_and_hms(2026, 1, 24, 13, 0, 0).unwrap(),
+        project_filter: Some("test".to_string()),
+        hours_back: 48,
+        total_entries: 2,
+        sessions: vec!["sess-date".to_string()],
+    };
+
+    write_conversation_markdown(&path, &messages, &metadata).unwrap();
+
+    let content = fs::read_to_string(&path).unwrap();
+    assert!(
+        content.contains("#### 2026-01-23 (UTC)"),
+        "missing first-day date heading (with year and UTC marker):\n{content}"
+    );
+    assert!(
+        content.contains("#### 2026-01-24 (UTC)"),
+        "day boundary must emit a second date heading (with UTC marker):\n{content}"
+    );
+
+    cleanup(&dir);
+}
+
+#[test]
 fn test_conversation_json_extract_stats_can_report_redaction_disabled() {
     let dir = unique_test_dir("conversation_extract_stats_redaction_disabled");
     let path = dir.join("conversation.json");

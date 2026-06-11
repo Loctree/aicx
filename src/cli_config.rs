@@ -35,14 +35,20 @@ pub(crate) enum ConfigAction {
 const DEFAULT_CONFIG_TOML: &str = r#"# aicx — Vibecrafted with AI Agents (c)2026 VetCoders
 #
 # Canonical AICX configuration. Loaded by `aicx` (CLI), `aicx-mcp`,
-# and any in-process consumer of the embedder. Field precedence
-# (highest first):
+# and any in-process consumer of the embedder. Config file search order:
 #   1. AICX_EMBEDDER_CONFIG env var  (explicit path override)
-#   2. ~/.aicx/embedder.toml          (legacy, native fields only)
-#   3. ~/.aicx/config.toml            (this file — canonical)
-#   4. AICX_EMBEDDER_*                (per-field env overrides)
+#   2. <effective-aicx-home>/config.toml   (canonical)
+#   3. <effective-aicx-home>/embedder.toml (legacy, native fields only)
+# Per-field AICX_EMBEDDER_* env vars override values loaded from the file.
 #
 # Edit and re-save. No restart needed; aicx reloads on every invocation.
+
+[storage]
+# Optional persistent AICX root override. `AICX_HOME` env still wins for
+# one-shot commands; when env is unset this value moves the whole runtime
+# root (`store/`, `indexed/`, `state/`, `embeddings/`) away from ~/.aicx.
+# Use an absolute path or ~/...
+# home = "~/aicx"
 
 [embedder]
 # Recommended VetCoders default: cloud HTTP embedder, zero-install,
@@ -153,6 +159,7 @@ fn run_config_show(json: bool) -> Result<()> {
     let cloud_set = cfg.cloud.is_some();
 
     let canonical_path = canonical_config_path().ok();
+    let resolved_aicx_home = aicx::store::resolve_aicx_home().ok();
     let effective = aicx::embedder::effective_config_source();
     let (effective_path_display, effective_branch, marker_line) =
         describe_effective_config(&effective);
@@ -191,6 +198,7 @@ fn run_config_show(json: bool) -> Result<()> {
                 "timeout_secs": c.effective_timeout_secs(),
             })),
             "canonical_config_path": canonical_path.as_ref().map(|p| p.display().to_string()),
+            "resolved_aicx_home": resolved_aicx_home.as_ref().map(|p| p.display().to_string()),
             "effective_config_path": effective.as_ref().map(|(p, _)| p.display().to_string()),
             "effective_branch": effective_branch,
             "config_path": canonical_path.as_ref().map(|p| p.display().to_string()),
@@ -208,6 +216,9 @@ fn run_config_show(json: bool) -> Result<()> {
         .unwrap_or_else(|| "<unresolved>".to_string());
 
     eprintln!("aicx config show — resolved embedder configuration");
+    if let Some(path) = &resolved_aicx_home {
+        eprintln!("  resolved_aicx_home:    {}", path.display());
+    }
     eprintln!("  canonical_config_path: {canonical_display}");
     eprintln!("  effective_config_path: {effective_path_display}");
     eprintln!("  effective_branch:      {effective_branch}");
@@ -281,6 +292,14 @@ pub(crate) fn describe_effective_config(
             "legacy",
             format!(
                 "(loaded from: legacy embedder.toml -> {} — run `aicx config init` to migrate to canonical config.toml)",
+                path.display()
+            ),
+        ),
+        Some((path, ConfigSource::Bootstrap)) => (
+            path.display().to_string(),
+            "bootstrap",
+            format!(
+                "(loaded from: bootstrap ~/.aicx/config.toml -> {}; use [storage].home to relocate the runtime root)",
                 path.display()
             ),
         ),

@@ -15,11 +15,13 @@ use crate::chunker::{
     parse_checklist_task, truncate_signal_line,
 };
 use crate::sanitize;
+use crate::sources::shared::{IntentLineModality, intent_line_modality};
 use crate::store;
 use crate::timeline::FrameKind;
 use crate::types::{EntryState, EntryType, IntentEntry, Link, LinkType};
 
 mod display;
+mod schema;
 mod types;
 
 pub use self::display::{
@@ -33,6 +35,15 @@ use self::types::{
 pub use self::types::{
     IntentExtraction, IntentExtractionStats, IntentKind, IntentRecord, IntentsConfig,
     MigrationReport,
+};
+// Lane 2-5 schema anchor (MASTER Phase 2 §3). Stages land incrementally; these
+// types are the convergence point every lane stage must agree on.
+pub use self::schema::{
+    CLARIFY_MAX_QUESTIONS, ClaimRecord, ClaimSource, ClaimType, ClarifyQuestion, ContractFracture,
+    FractureSeverity, LANE_SCHEMA_VERSION, LaneExport, ResultRecord, ResultStatus, TimeCoverage,
+    UTC_TIMEZONE_ASSUMPTION, UserIntentLine, VerificationStatus, classify_claim,
+    collect_artifact_evidence, detect_fractures, extract_claims, extract_user_intent_lines,
+    generate_clarify, is_agent_role, is_user_role, verify_claims,
 };
 
 const STRICT_CONFIDENCE: u8 = 3;
@@ -81,7 +92,12 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         let cutoff_hours = config.hours.min(i64::MAX as u64) as i64;
         now - Duration::hours(cutoff_hours)
     };
-    let files = collect_chunk_files(store_root, &config.project, cutoff, config.frame_kind)?;
+    let files = collect_chunk_files(
+        store_root,
+        &config.project,
+        cutoff,
+        config.effective_frame_kind(),
+    )?;
     let scanned_count = files.len();
     let source_paths_verified = verify_stored_chunk_paths(&files);
 
@@ -241,7 +257,7 @@ fn collect_chunk_files(
     store_root: &Path,
     project: &str,
     cutoff: DateTime<Utc>,
-    frame_kind: Option<FrameKind>,
+    frame_kind: FrameKind,
 ) -> Result<Vec<StoredChunkFile>> {
     let mut files = Vec::new();
     let scan_root = normalize_scan_root(store_root);
@@ -257,7 +273,8 @@ fn collect_chunk_files(
         {
             continue;
         }
-        if store::load_sidecar(&file.path).is_some_and(|sidecar| {
+        let sidecar = store::load_sidecar(&file.path);
+        if sidecar.as_ref().is_some_and(|sidecar| {
             sidecar.artifact_family.as_deref() == Some(store::LOCT_CONTEXT_PACK_FAMILY)
                 || sidecar
                     .truth_status
@@ -266,13 +283,14 @@ fn collect_chunk_files(
         }) {
             continue;
         }
-        if let Some(expected) = frame_kind {
-            let matches_frame = store::load_sidecar(&file.path)
-                .and_then(|sidecar| sidecar.frame_kind)
-                .is_some_and(|kind| kind == expected);
-            if !matches_frame {
-                continue;
-            }
+        // Legacy chunks (no sidecar yet, or a pre-frame_kind sidecar) belong
+        // to the default user_msg lane; requiring an explicit frame_kind here
+        // silently emptied intents on stores written before the field existed.
+        let chunk_frame = sidecar
+            .and_then(|sidecar| sidecar.frame_kind)
+            .unwrap_or_else(IntentsConfig::default_frame_kind);
+        if chunk_frame != frame_kind {
+            continue;
         }
 
         let timestamp = file
@@ -600,6 +618,15 @@ fn extract_transcript_candidates(
 }
 
 fn infer_kind_from_line(line: &str, is_user_line: bool) -> Option<IntentKind> {
+    let modality = if is_user_line {
+        intent_line_modality("user", line)
+    } else {
+        IntentLineModality::Other
+    };
+    if modality == IntentLineModality::PastedReference {
+        return None;
+    }
+
     if is_decision_tag(line) {
         return Some(IntentKind::Decision);
     }
@@ -608,6 +635,9 @@ fn infer_kind_from_line(line: &str, is_user_line: bool) -> Option<IntentKind> {
     }
     if is_outcome_line(line) {
         return Some(IntentKind::Outcome);
+    }
+    if modality == IntentLineModality::TypedDirective {
+        return Some(IntentKind::Intent);
     }
     if is_user_line && looks_like_intent_line(line) {
         return Some(IntentKind::Intent);
@@ -1614,6 +1644,15 @@ fn line_has_result_shape(lower_line: &str) -> bool {
 pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType, f32)> {
     let lower = line.to_lowercase();
     let trimmed = lower.trim();
+    let modality = if is_user {
+        intent_line_modality("user", line)
+    } else {
+        IntentLineModality::Other
+    };
+
+    if modality == IntentLineModality::PastedReference {
+        return None;
+    }
 
     if trimmed.starts_with("decision:") || trimmed.contains("[decision]") {
         return Some((EntryType::Decision, 0.95));
@@ -1679,6 +1718,9 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
         return Some((EntryType::Why, 0.7));
     }
 
+    if modality == IntentLineModality::TypedDirective {
+        return Some((EntryType::Intent, 0.8));
+    }
     if is_user
         && INTENT_KEYWORDS
             .iter()
@@ -1734,6 +1776,7 @@ pub fn classify_chunk_entries(
                     body: None,
                     evidence,
                     links: Vec::new(),
+                    superseded_by: None,
                     confidence: conf,
                     tags,
                     project: project.map(String::from),
@@ -1773,6 +1816,7 @@ pub fn classify_chunk_entries(
                         body: None,
                         evidence,
                         links: Vec::new(),
+                        superseded_by: None,
                         confidence: conf,
                         tags,
                         project: project.map(String::from),
@@ -1970,15 +2014,37 @@ fn detect_unresolved(entries: &mut [IntentEntry], threshold_days: i64) {
     }
 }
 
-fn detect_supersedes(entries: &mut [IntentEntry]) {
-    struct SupersedesAction {
-        superseded_idx: usize,
-        newer_idx: usize,
-        superseded_id: String,
+/// Parse a date string that may be either a bare `YYYY-MM-DD` day or a full
+/// RFC3339 timestamp with any offset. Full timestamps are normalized to UTC;
+/// bare dates map to midnight UTC so day-only and timestamped values compare
+/// on a single typed axis instead of lexicographically (P3-09).
+pub(crate) fn parse_flexible_utc(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
     }
+    NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .ok()
+        .map(|d| DateTime::<Utc>::from_naive_utc_and_offset(d.and_time(NaiveTime::MIN), Utc))
+}
 
-    let mut topic_latest: HashMap<String, (usize, String, String)> = HashMap::new();
-    let mut actions: Vec<SupersedesAction> = Vec::new();
+/// Compare two flexible date strings on the typed UTC axis when both parse;
+/// fall back to the legacy lexicographic comparison for unparsable input so
+/// garbage keeps its historical ordering.
+pub(crate) fn cmp_dates_flexible(a: &str, b: &str) -> std::cmp::Ordering {
+    match (parse_flexible_utc(a), parse_flexible_utc(b)) {
+        (Some(da), Some(db)) => da.cmp(&db),
+        _ => a.cmp(b),
+    }
+}
+
+fn detect_supersedes(entries: &mut [IntentEntry]) {
+    // Group supersession candidates by topic, then resolve each topic as a
+    // date-ordered chain. Recomputing the whole chain (instead of applying
+    // pairwise actions against a running "latest") makes the final states
+    // independent of input order: an entry that supersedes an older sibling
+    // while itself being superseded by a newer one always ends Superseded,
+    // never Active (P2-01).
+    let mut topics: HashMap<String, Vec<usize>> = HashMap::new();
 
     for (idx, entry) in entries.iter().enumerate() {
         if !matches!(
@@ -1997,44 +2063,50 @@ fn detect_supersedes(entries: &mut [IntentEntry]) {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-
-        if let Some((prev_idx, prev_id, prev_date)) = topic_latest.get(&topic_key) {
-            if entry.date > *prev_date
-                || (entry.date == *prev_date && entry.confidence > entries[*prev_idx].confidence)
-            {
-                let old_idx = *prev_idx;
-                let old_id = prev_id.clone();
-                actions.push(SupersedesAction {
-                    superseded_idx: old_idx,
-                    newer_idx: idx,
-                    superseded_id: old_id,
-                });
-                topic_latest.insert(topic_key, (idx, entry.id.clone(), entry.date.clone()));
-            } else {
-                actions.push(SupersedesAction {
-                    superseded_idx: idx,
-                    newer_idx: *prev_idx,
-                    superseded_id: entry.id.clone(),
-                });
-            }
-        } else {
-            topic_latest.insert(topic_key, (idx, entry.id.clone(), entry.date.clone()));
-        }
+        topics.entry(topic_key).or_default().push(idx);
     }
 
-    for action in actions {
-        entries[action.superseded_idx].state = EntryState::Superseded;
-        let already = entries[action.newer_idx]
-            .links
-            .iter()
-            .any(|l| l.target == action.superseded_id);
-        if !already {
-            entries[action.newer_idx].links.push(Link {
-                relation: LinkType::Supersedes,
-                target: action.superseded_id,
-                confidence: Some(0.7),
-            });
+    for mut chain in topics.into_values() {
+        if chain.len() < 2 {
+            continue;
         }
+        // Oldest first. Ties on date are broken by confidence (higher wins,
+        // so it sorts later in the chain), then by input order (first-seen
+        // wins), mirroring the previous pairwise rules.
+        chain.sort_by(|&a, &b| {
+            cmp_dates_flexible(&entries[a].date, &entries[b].date)
+                .then_with(|| {
+                    entries[a]
+                        .confidence
+                        .partial_cmp(&entries[b].confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| b.cmp(&a))
+        });
+
+        for pair in chain.windows(2) {
+            let (older_idx, newer_idx) = (pair[0], pair[1]);
+            let older_id = entries[older_idx].id.clone();
+            let newer_id = entries[newer_idx].id.clone();
+            entries[older_idx].state = EntryState::Superseded;
+            entries[older_idx].superseded_by = Some(newer_id);
+            let already = entries[newer_idx]
+                .links
+                .iter()
+                .any(|l| l.relation == LinkType::Supersedes && l.target == older_id);
+            if !already {
+                entries[newer_idx].links.push(Link {
+                    relation: LinkType::Supersedes,
+                    target: older_id,
+                    confidence: Some(0.7),
+                });
+            }
+        }
+
+        // Only the chain head is promoted; every other member was just
+        // marked Superseded above and must stay that way.
+        let winner_idx = *chain.last().expect("chain has at least two members");
+        entries[winner_idx].state = EntryState::Active;
     }
 }
 
@@ -2166,7 +2238,7 @@ pub fn migrate_intent_schema_dry_run_at(
                 .unwrap(),
             Utc,
         ),
-        None,
+        IntentsConfig::default_frame_kind(),
     )?;
 
     let mut all_entries = Vec::new();

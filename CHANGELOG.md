@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+## [0.9.2] - 2026-06-11
+
+### Added
+
+- `[storage].home` bootstrap config: `$HOME/.aicx/config.toml` can pin the
+  AICX home directory (`AICX_HOME` env still wins). Value is validated:
+  absolute path or `~/...` only, no `..` traversal, no control characters;
+  the config read goes through the size-capped validated reader.
+- `aicx intents`: supersession winner is promoted to active state and the
+  loser stamped with `superseded_by` (chain-based `detect_supersedes`).
+- `aicx search`: automatic filesystem-fuzzy fallback when semantic search
+  is unavailable; `--no-semantic` still forces the fuzzy path explicitly.
+
+### Changed
+
+- Workspace version sync: all internal crates (`aicx-parser`,
+  `aicx-embeddings`, `aicx-retrieve`, `aicx-progress-contracts`,
+  `aicx-monitor`) now version-track the main `aicx` crate and are published
+  to crates.io alongside it, so `aicx` is consumable as a library
+  dependency (Loctree consumer path).
+- `src/doctor.rs` decomposed from a 2602-line monolith into
+  `doctor/{types,checks,cleanup,quarantine,report}` behind a re-exporting
+  facade; public API unchanged. Stale never-compiled orphan modules
+  (`doctor/checks.rs` old copy, `sources/shared` Faza-1 placeholders)
+  removed.
+- `toml` promoted from dev-dependency to runtime dependency (bootstrap
+  config parsing).
+
+
 ## [0.9.1] - 2026-05-26
 
 ### Added

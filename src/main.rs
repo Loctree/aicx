@@ -40,6 +40,7 @@ use aicx::mcp::{self, McpTransport};
 use aicx::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
 use aicx::rank;
 use aicx::reports_extractor::{self, ReportsExtractorConfig};
+use aicx::sessions;
 use aicx::sources::{self, ExtractionConfig};
 use aicx::state::StateManager;
 use aicx::store;
@@ -208,6 +209,128 @@ impl SourceProtectionBackend {
 }
 
 #[derive(Debug, Subcommand)]
+enum SessionsCommand {
+    /// List discovered agent sessions, newest first.
+    List {
+        /// Restrict to sessions whose repo/cwd matches the current directory.
+        #[arg(long)]
+        cwd: bool,
+
+        /// Filter by agent (claude | codex | gemini | junie).
+        #[arg(long, value_parser = ["claude", "codex", "gemini", "junie"])]
+        agent: Option<String>,
+
+        /// Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the
+        /// last 30 days; pass --all to scan the full history.
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Scan the full session history (slower) instead of the default
+        /// last-30-days window.
+        #[arg(long)]
+        all: bool,
+
+        /// Max sessions to show (0 = all).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+
+        /// Output format: table | json.
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+
+    /// Show one session's metadata, located by id (or a unique prefix).
+    Show {
+        /// Session id (or a unique prefix).
+        session_id: String,
+
+        /// Output format: markdown | json.
+        #[arg(long, default_value = "markdown")]
+        format: String,
+    },
+
+    /// Unified truth report for one session: human intents (Lane 1), agent
+    /// claims + evidence verification (Lanes 2-3), contract fractures (Lane 4)
+    /// and clarify decisions (Lane 5) in a single rendering.
+    Report {
+        /// Session id (or a unique prefix).
+        session_id: String,
+
+        /// Agent: claude | codex | gemini | junie. Inferred from the session
+        /// id when omitted.
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Hours to look back when locating the session (default 720).
+        #[arg(long, default_value_t = 720)]
+        hours: u64,
+
+        /// Repo root evidence is checked against (default: current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Max clarify questions (hard-capped at 5).
+        #[arg(long, default_value_t = 5)]
+        max: usize,
+
+        /// Output format: markdown | json.
+        #[arg(long, default_value = "markdown")]
+        format: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ClaimsCommand {
+    /// Extract Unverified claims (Lane 2) from a session's conversation.
+    Extract {
+        /// Session id (or unique prefix).
+        #[arg(long)]
+        session: String,
+
+        /// Agent: claude | codex | gemini | junie. Inferred from the session id
+        /// when omitted.
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Hours to look back when locating the session (default 720).
+        #[arg(long, default_value = "720")]
+        hours: u64,
+
+        /// Output format: json | summary.
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ResultsCommand {
+    /// Collect repo evidence (artifact existence) for a session's claims and
+    /// fold it into verification statuses (Lane 3).
+    Collect {
+        /// Session id (or unique prefix).
+        #[arg(long)]
+        session: String,
+
+        /// Agent: claude | codex | gemini | junie. Inferred from the session id
+        /// when omitted.
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Hours to look back when locating the session (default 720).
+        #[arg(long, default_value = "720")]
+        hours: u64,
+
+        /// Repo root evidence is checked against (default: current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Output format: json | summary.
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum SourcesCommands {
     /// Opt in to local source-root protection.
     Protect {
@@ -239,9 +362,10 @@ enum SourcesCommands {
 /// vocabulary in `--help` output.
 #[derive(Debug, Args, Clone)]
 struct RetrievalFilters {
-    /// Maximum number of results to return.
-    #[arg(long, default_value_t = 10)]
-    limit: usize,
+    /// Maximum number of results to return. Default is command-specific:
+    /// search/steer 10, tail 20, intents unlimited (full roadmap).
+    #[arg(long)]
+    limit: Option<usize>,
 
     /// Sort order applied after filtering. Default: command-specific.
     #[arg(long, value_enum)]
@@ -269,6 +393,11 @@ struct RetrievalFilters {
 }
 
 const MAX_CLI_SEARCH_LIMIT: usize = 10_000;
+
+/// Default `--limit` for bounded retrieval commands (`search`, `steer`) when
+/// the operator passes none. `tail` defaults to 20 and `intents` to unlimited
+/// — see [`RetrievalFilters::limit`].
+const DEFAULT_RETRIEVAL_LIMIT: usize = 10;
 
 #[derive(Debug, Clone, Args)]
 struct DashboardArgs {
@@ -927,6 +1056,56 @@ enum Commands {
         command: SourcesCommands,
     },
 
+    /// Discover and list agent sessions on disk (session surface).
+    #[command(display_order = 6, alias = "session")]
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommand,
+    },
+
+    /// Lane 2: extract agent claims (audit targets) from a session.
+    #[command(display_order = 6)]
+    Claims {
+        #[command(subcommand)]
+        command: ClaimsCommand,
+    },
+
+    /// Lane 3: collect repo evidence for a session's claims and verify them.
+    #[command(display_order = 6)]
+    Results {
+        #[command(subcommand)]
+        command: ResultsCommand,
+    },
+
+    /// Lane 5: generate at most 5 A/B/C decision questions from verified gaps.
+    #[command(display_order = 6)]
+    Clarify {
+        /// Session id (or unique prefix).
+        #[arg(long)]
+        session: String,
+
+        /// Agent: claude | codex | gemini | junie. Inferred from the session id
+        /// when omitted.
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Hours to look back when locating the session (default 720).
+        #[arg(long, default_value = "720")]
+        hours: u64,
+
+        /// Repo root evidence is checked against (default: current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Max questions (hard-capped at 5).
+        #[arg(long, default_value_t = 5, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=5))]
+        max: usize,
+
+        /// Output format: markdown | json.
+        #[arg(long, default_value = "markdown")]
+        format: String,
+    },
+
     /// Interactive daily-driver entrypoint for corpus, doctor, intents, and store.
     #[command(display_order = 9)]
     Wizard {
@@ -1134,8 +1313,8 @@ enum Commands {
         no_gitignore: bool,
     },
 
-    /// Search the canonical corpus. Semantic by default; `--no-semantic`
-    /// runs the explicit filesystem-fuzzy fallback.
+    /// Search the canonical corpus. Semantic by default; automatic
+    /// filesystem-fuzzy fallback when semantic search is unavailable.
     #[command(display_order = 12)]
     Search {
         /// Search query string
@@ -1989,6 +2168,17 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             }
         }
         Some(Commands::Sources { command }) => run_sources_command(command)?,
+        Some(Commands::Sessions { command }) => run_sessions_command(command)?,
+        Some(Commands::Claims { command }) => run_claims_command(command)?,
+        Some(Commands::Results { command }) => run_results_command(command)?,
+        Some(Commands::Clarify {
+            session,
+            agent,
+            hours,
+            repo,
+            max,
+            format,
+        }) => run_clarify(&session, agent, hours, repo, max, &format)?,
         Some(Commands::Wizard { smoke_test }) => {
             if smoke_test {
                 aicx::wizard::smoke_test()?;
@@ -2399,6 +2589,713 @@ fn run_command(command: Option<Commands>) -> Result<()> {
     Ok(())
 }
 
+fn extract_input_format_from_str(s: &str) -> Option<ExtractInputFormat> {
+    match s.to_lowercase().as_str() {
+        "claude" => Some(ExtractInputFormat::Claude),
+        "codex" => Some(ExtractInputFormat::Codex),
+        "gemini" => Some(ExtractInputFormat::Gemini),
+        "junie" => Some(ExtractInputFormat::Junie),
+        _ => None,
+    }
+}
+
+fn run_claims_command(command: ClaimsCommand) -> Result<()> {
+    match command {
+        ClaimsCommand::Extract {
+            session,
+            agent,
+            hours,
+            format,
+        } => run_claims_extract(&session, agent, hours, &format),
+    }
+}
+
+/// Everything the lane CLIs (claims / results / clarify) share: the session's
+/// claims plus the temporal export-envelope context (P0 contract).
+struct LaneSessionContext {
+    canonical_id: String,
+    agent: String,
+    project: String,
+    repo: Option<String>,
+    source_files: Vec<String>,
+    coverage: Option<intents::TimeCoverage>,
+    warnings: Vec<String>,
+    extracted_at: String,
+    claims: Vec<intents::ClaimRecord>,
+    user_intents: Vec<intents::UserIntentLine>,
+}
+
+impl LaneSessionContext {
+    /// Wrap a lane payload in the machine-export envelope (schema_version,
+    /// absolute generated_at, time coverage, timezone assumptions, warnings).
+    /// `role_filter` declares which roles fed the payload: the claim-only
+    /// lanes pass `agent_only`, the unified report passes `all`.
+    fn envelope<T: serde::Serialize>(
+        &self,
+        mode: &str,
+        role_filter: &str,
+        payload: T,
+    ) -> intents::LaneExport<T> {
+        intents::LaneExport {
+            schema_version: intents::LANE_SCHEMA_VERSION.to_string(),
+            generated_at: self.extracted_at.clone(),
+            project: self.project.clone(),
+            repo: self.repo.clone(),
+            session_id: Some(self.canonical_id.clone()),
+            source_time_coverage: self.coverage.clone(),
+            source_files: self.source_files.clone(),
+            extraction_mode: mode.to_string(),
+            role_filter: role_filter.to_string(),
+            timezone_assumptions: intents::UTC_TIMEZONE_ASSUMPTION.to_string(),
+            warnings: self.warnings.clone(),
+            payload,
+        }
+    }
+}
+
+/// Build the lane-export [`intents::TimeCoverage`] from source timestamps:
+/// earliest..latest, normalized to UTC and rendered RFC3339 with a literal
+/// `Z` suffix. The envelope declares UTC (`timezone_assumptions`), so the
+/// coverage bounds must never carry a local offset. Generic over the input
+/// zone so the normalization itself is exercisable in tests.
+fn lane_time_coverage<Tz: TimeZone>(
+    timestamps: impl IntoIterator<Item = DateTime<Tz>>,
+) -> Option<intents::TimeCoverage> {
+    let mut earliest: Option<DateTime<Utc>> = None;
+    let mut latest: Option<DateTime<Utc>> = None;
+    for ts in timestamps {
+        let ts = ts.with_timezone(&Utc);
+        earliest = Some(earliest.map_or(ts, |cur| cur.min(ts)));
+        latest = Some(latest.map_or(ts, |cur| cur.max(ts)));
+    }
+    let render = |t: DateTime<Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    earliest.zip(latest).map(|(a, b)| intents::TimeCoverage {
+        earliest: render(a),
+        latest: render(b),
+    })
+}
+
+/// Locate a session, extract its conversation, and run Lane 2 claim
+/// extraction with full temporal metadata. Shared by claims/results/clarify.
+fn load_session_claims(
+    session: &str,
+    agent: Option<String>,
+    hours: u64,
+) -> Result<LaneSessionContext> {
+    let home = dirs::home_dir().context("No home dir")?;
+    let session_info = sessions::find_session_by_id(&home, session);
+    let agent_str = match agent {
+        Some(a) => a,
+        None => session_info
+            .as_ref()
+            .map(|s| s.agent.clone())
+            .context("could not infer agent from session id; pass --agent")?,
+    };
+    let fmt = extract_input_format_from_str(&agent_str)
+        .with_context(|| format!("unknown agent '{agent_str}' (claude|codex|gemini|junie)"))?;
+
+    let config = ExtractionConfig {
+        project_filter: Vec::new(),
+        cutoff: lookback_cutoff(hours),
+        include_assistant: true,
+        watermark: None,
+    };
+    let mut entries = match fmt {
+        ExtractInputFormat::Claude => sources::extract_claude(&config)?,
+        ExtractInputFormat::Codex => sources::extract_codex(&config)?,
+        ExtractInputFormat::Gemini | ExtractInputFormat::GeminiAntigravity => {
+            sources::extract_gemini(&config)?
+        }
+        ExtractInputFormat::Junie => sources::extract_junie(&config)?,
+    };
+    let label = extract_input_format_label(fmt);
+    let resolution = resolve_session_reference(session, fmt, label, &entries)?;
+    entries.retain(|e| e.session_id == resolution.canonical_id);
+    if entries.is_empty() {
+        anyhow::bail!(
+            "no entries for session '{session}' (agent {agent_str}); try a larger --hours"
+        );
+    }
+
+    // Project = last path segment of the recorded cwd, else agent/id.
+    let repo = entries
+        .iter()
+        .find_map(|e| e.cwd.as_deref())
+        .map(String::from);
+    let project = repo
+        .as_deref()
+        .and_then(|c| c.trim_end_matches('/').rsplit('/').find(|s| !s.is_empty()))
+        .map(String::from)
+        .unwrap_or_else(|| format!("{agent_str}/{}", resolution.canonical_id));
+
+    let extracted_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let coverage = lane_time_coverage(entries.iter().map(|e| e.timestamp));
+    let source_files = session_info
+        .as_ref()
+        .map(|s| vec![s.source_path.display().to_string()])
+        .unwrap_or_default();
+
+    // Role filtering happens HERE, at the source build — not only inside the
+    // lane stages (which re-guard as defense in depth, using the SAME shared
+    // predicates). enumerate() runs BEFORE the filter so `source_ref` indices
+    // keep pointing at positions in the full entry stream. Lane 1 takes the
+    // strict user allowlist, Lane 2 the agent predicate — system/tool rows
+    // enter neither lane.
+    let to_source = |i: usize, e: &timeline::TimelineEntry| intents::ClaimSource {
+        role: e.role.clone(),
+        text: e.message.clone(),
+        project: project.clone(),
+        session_id: resolution.canonical_id.clone(),
+        agent: Some(e.agent.clone()),
+        source_ref: format!("{}#{i}", e.timestamp.to_rfc3339()),
+        timestamp: Some(e.timestamp.to_rfc3339()),
+        timestamp_partial: e.timestamp_source.is_some(),
+    };
+    let claim_sources: Vec<intents::ClaimSource> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| intents::is_agent_role(&e.role))
+        .map(|(i, e)| to_source(i, e))
+        .collect();
+    // Lane 1 reuses the SAME harness-noise gate as `--conversation` denoising:
+    // a "user"-role row that is really an injected skill body, `! command`
+    // stdout, or a hook reminder must never feed the human-intent lane.
+    let user_sources: Vec<intents::ClaimSource> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            intents::is_user_role(&e.role)
+                && !sources::is_harness_injected_noise(&e.role, &e.message)
+        })
+        .map(|(i, e)| to_source(i, e))
+        .collect();
+
+    let claims = intents::extract_claims(&claim_sources, &extracted_at);
+    let user_intents = intents::extract_user_intent_lines(&user_sources, &extracted_at);
+
+    let mut warnings = Vec::new();
+    let partial = claims.iter().filter(|c| c.timestamp_partial).count();
+    if partial > 0 {
+        warnings.push(format!(
+            "{partial} claim(s) carry a partial/inferred source timestamp"
+        ));
+    }
+    if source_files.is_empty() {
+        warnings.push("source session file not resolved; provenance is session-id only".into());
+    }
+
+    Ok(LaneSessionContext {
+        canonical_id: resolution.canonical_id,
+        agent: agent_str,
+        project,
+        repo,
+        source_files,
+        coverage,
+        warnings,
+        extracted_at,
+        claims,
+        user_intents,
+    })
+}
+
+fn run_claims_extract(
+    session: &str,
+    agent: Option<String>,
+    hours: u64,
+    format: &str,
+) -> Result<()> {
+    let ctx = load_session_claims(session, agent, hours)?;
+    match format {
+        "summary" => {
+            println!(
+                "{} claim(s) from session {} ({})",
+                ctx.claims.len(),
+                ctx.canonical_id,
+                ctx.agent
+            );
+            for c in &ctx.claims {
+                let flag = if c.risk_flags.is_empty() {
+                    ""
+                } else {
+                    " [HIGH-RISK]"
+                };
+                println!(
+                    "- {} (unverified){}: {}",
+                    c.claim_type.label(),
+                    flag,
+                    truncate_table_cell(&c.claim_text, 90)
+                );
+            }
+        }
+        _ => {
+            let export = ctx.envelope("claims", "agent_only", &ctx.claims);
+            println!("{}", serde_json::to_string_pretty(&export)?);
+        }
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct ResultsPayload {
+    claims: Vec<intents::ClaimRecord>,
+    results: Vec<intents::ResultRecord>,
+}
+
+fn run_results_command(command: ResultsCommand) -> Result<()> {
+    match command {
+        ResultsCommand::Collect {
+            session,
+            agent,
+            hours,
+            repo,
+            format,
+        } => run_results_collect(&session, agent, hours, repo, &format),
+    }
+}
+
+/// Lane 3 chain shared by `results collect` and `clarify`: extract claims,
+/// collect artifact evidence against the repo, fold it into verification.
+fn collect_and_verify(
+    session: &str,
+    agent: Option<String>,
+    hours: u64,
+    repo: Option<PathBuf>,
+) -> Result<(LaneSessionContext, PathBuf, Vec<intents::ResultRecord>)> {
+    let mut ctx = load_session_claims(session, agent, hours)?;
+    let repo_root = match repo {
+        Some(p) => p,
+        None => std::env::current_dir().context("cannot resolve current dir; pass --repo")?,
+    };
+    let results = intents::collect_artifact_evidence(&ctx.claims, &repo_root, &ctx.extracted_at);
+    intents::verify_claims(&mut ctx.claims, &results);
+    Ok((ctx, repo_root, results))
+}
+
+fn run_results_collect(
+    session: &str,
+    agent: Option<String>,
+    hours: u64,
+    repo: Option<PathBuf>,
+    format: &str,
+) -> Result<()> {
+    let (ctx, repo_root, results) = collect_and_verify(session, agent, hours, repo)?;
+    match format {
+        "summary" => {
+            println!(
+                "{} claim(s), {} evidence result(s) against {}",
+                ctx.claims.len(),
+                results.len(),
+                repo_root.display()
+            );
+            for c in &ctx.claims {
+                println!(
+                    "- [{}] {}: {}",
+                    format!("{:?}", c.verification_status).to_lowercase(),
+                    c.claim_type.label(),
+                    truncate_table_cell(&c.claim_text, 80)
+                );
+            }
+        }
+        _ => {
+            let export = ctx.envelope(
+                "results",
+                "agent_only",
+                ResultsPayload {
+                    claims: ctx.claims.clone(),
+                    results,
+                },
+            );
+            println!("{}", serde_json::to_string_pretty(&export)?);
+        }
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct ClarifyPayload {
+    fractures: Vec<intents::ContractFracture>,
+    questions: Vec<intents::ClarifyQuestion>,
+}
+
+fn run_clarify(
+    session: &str,
+    agent: Option<String>,
+    hours: u64,
+    repo: Option<PathBuf>,
+    max: usize,
+    format: &str,
+) -> Result<()> {
+    let (ctx, _repo_root, _results) = collect_and_verify(session, agent, hours, repo)?;
+    let fractures = intents::detect_fractures(&ctx.claims);
+    let questions = intents::generate_clarify(&fractures, max);
+    match format {
+        "json" => {
+            let export = ctx.envelope(
+                "clarify",
+                "agent_only",
+                ClarifyPayload {
+                    fractures,
+                    questions,
+                },
+            );
+            println!("{}", serde_json::to_string_pretty(&export)?);
+        }
+        _ => {
+            println!("# Clarify — session {}\n", ctx.canonical_id);
+            println!("- generated_at: {}", ctx.extracted_at);
+            println!("- fractures: {}", fractures.len());
+            println!("- questions: {} (cap 5)\n", questions.len());
+            if questions.is_empty() {
+                println!("No unresolved decisions — no contradicted or unbacked claims found.");
+            }
+            for (i, q) in questions.iter().enumerate() {
+                println!("## {}. {}\n", i + 1, q.question);
+                println!("why now: {}\n", q.why_now);
+                for fact in &q.known_facts {
+                    println!("- {fact}");
+                }
+                println!();
+                for opt in &q.options {
+                    println!("  {opt}");
+                }
+                println!("\n  default: {}", q.default_recommendation);
+                println!("  cost of not deciding: {}\n", q.cost_of_not_deciding);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_sessions_command(command: SessionsCommand) -> Result<()> {
+    match command {
+        SessionsCommand::List {
+            cwd,
+            agent,
+            since,
+            all,
+            limit,
+            format,
+        } => run_sessions_list(cwd, agent, since, all, limit, &format),
+        SessionsCommand::Show { session_id, format } => run_session_show(session_id, &format),
+        SessionsCommand::Report {
+            session_id,
+            agent,
+            hours,
+            repo,
+            max,
+            format,
+        } => run_session_report(&session_id, agent, hours, repo, max, &format),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct SessionReportPayload {
+    user_intents: Vec<intents::UserIntentLine>,
+    claims: Vec<intents::ClaimRecord>,
+    results: Vec<intents::ResultRecord>,
+    fractures: Vec<intents::ContractFracture>,
+    questions: Vec<intents::ClarifyQuestion>,
+}
+
+/// Unified per-session truth report: all five lanes in one rendering, so an
+/// agent (or operator) entering a repo can answer in one pass — what the human
+/// wanted, what the agent claimed, what evidence verified, what is
+/// fake-complete, and what decision is still open.
+fn run_session_report(
+    session: &str,
+    agent: Option<String>,
+    hours: u64,
+    repo: Option<PathBuf>,
+    max: usize,
+    format: &str,
+) -> Result<()> {
+    let (ctx, repo_root, results) = collect_and_verify(session, agent, hours, repo)?;
+    let fractures = intents::detect_fractures(&ctx.claims);
+    let questions = intents::generate_clarify(&fractures, max);
+    if format == "json" {
+        let export = ctx.envelope(
+            "report",
+            "all",
+            SessionReportPayload {
+                user_intents: ctx.user_intents.clone(),
+                claims: ctx.claims.clone(),
+                results,
+                fractures,
+                questions,
+            },
+        );
+        println!("{}", serde_json::to_string_pretty(&export)?);
+        return Ok(());
+    }
+
+    println!(
+        "# Session truth report — {} ({})\n",
+        ctx.canonical_id, ctx.agent
+    );
+    println!("- project: {}", ctx.project);
+    println!("- repo evidence root: {}", repo_root.display());
+    println!("- generated_at: {} (UTC)", ctx.extracted_at);
+    if let Some(c) = &ctx.coverage {
+        println!("- source time coverage: {} .. {}", c.earliest, c.latest);
+    }
+    for w in &ctx.warnings {
+        println!("- warning: {w}");
+    }
+
+    println!("\n## Lane 1 — human intent ({})\n", ctx.user_intents.len());
+    if ctx.user_intents.is_empty() {
+        println!(
+            "(no classified user intent lines; raw user text may still carry direction — see `aicx extract --conversation --user-only`)"
+        );
+    }
+    for ui in &ctx.user_intents {
+        println!(
+            "- [{}] {} — {}",
+            ui.entry_type,
+            ui.timestamp.as_deref().unwrap_or("(no timestamp)"),
+            truncate_table_cell(&ui.raw_text, 100)
+        );
+    }
+
+    println!(
+        "\n## Lanes 2-3 — agent claims vs evidence ({})\n",
+        ctx.claims.len()
+    );
+    for c in &ctx.claims {
+        let status = format!("{:?}", c.verification_status).to_lowercase();
+        let flag = if c.risk_flags.is_empty() {
+            ""
+        } else {
+            " [HIGH-RISK]"
+        };
+        println!(
+            "- [{status}]{flag} {}: {}",
+            c.claim_type.label(),
+            truncate_table_cell(&c.claim_text, 90)
+        );
+    }
+    let fake_complete: Vec<_> = ctx
+        .claims
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.verification_status,
+                intents::VerificationStatus::Contradicted
+            ) || (!c.risk_flags.is_empty()
+                && !matches!(c.verification_status, intents::VerificationStatus::Verified))
+        })
+        .collect();
+    println!("\n### Fake-complete candidates ({})\n", fake_complete.len());
+    for c in &fake_complete {
+        println!(
+            "- {}: {}",
+            c.claim_type.label(),
+            truncate_table_cell(&c.claim_text, 90)
+        );
+    }
+
+    println!("\n## Lane 4 — contract fractures ({})\n", fractures.len());
+    for f in &fractures {
+        println!(
+            "- [{:?}] {} — promised: {} | runtime: {}",
+            f.severity,
+            f.claim_id,
+            truncate_table_cell(&f.promised_surface, 60),
+            truncate_table_cell(&f.runtime_surface, 60)
+        );
+    }
+
+    println!(
+        "\n## Lane 5 — clarify ({} question(s), cap 5)\n",
+        questions.len()
+    );
+    if questions.is_empty() {
+        println!("No unresolved human decisions detected from this session's claims.");
+    }
+    for (i, q) in questions.iter().enumerate() {
+        println!("{}. {}", i + 1, q.question);
+        for opt in &q.options {
+            println!("   {opt}");
+        }
+        println!("   default: {}", q.default_recommendation);
+    }
+    Ok(())
+}
+
+fn run_session_show(session_id: String, format: &str) -> Result<()> {
+    let home = dirs::home_dir().context("No home dir")?;
+    let Some(info) = sessions::find_session_by_id(&home, &session_id) else {
+        anyhow::bail!("no session found matching id '{session_id}'");
+    };
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(&info)?),
+        _ => {
+            let ts = |t: Option<chrono::DateTime<Utc>>| {
+                t.map(|t| t.to_rfc3339())
+                    .unwrap_or_else(|| "(unknown)".to_string())
+            };
+            println!("# Session {}\n", info.session_id);
+            println!("- agent: {}", info.agent);
+            println!("- project: {}", info.project.as_deref().unwrap_or("-"));
+            println!("- repo: {}", info.repo_path.as_deref().unwrap_or("-"));
+            println!("- started: {}", ts(info.started_at));
+            println!("- updated: {}", ts(info.updated_at));
+            println!(
+                "- messages: {} ({} user / {} agent)",
+                info.message_count, info.user_message_count, info.agent_message_count
+            );
+            println!("- association: {:?}", info.association);
+            println!("- temporal_confidence: {:?}", info.temporal_confidence);
+            println!("- source: {}", info.source_path.display());
+            if let Some(t) = &info.title {
+                println!("- title: {t}");
+            }
+            println!(
+                "\n## extract\n\n    aicx extract --agent {} --session {} --conversation",
+                info.agent, info.session_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_since_date(s: &str) -> Result<DateTime<Utc>> {
+    let nd = NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .with_context(|| format!("invalid --since date '{s}' (expected YYYY-MM-DD)"))?;
+    // NaiveTime::MIN is midnight — no panicking unwrap path.
+    Ok(nd.and_time(chrono::NaiveTime::MIN).and_utc())
+}
+
+fn run_sessions_list(
+    cwd_only: bool,
+    agent: Option<String>,
+    since: Option<String>,
+    all: bool,
+    limit: usize,
+    format: &str,
+) -> Result<()> {
+    // Recency window: default to the last 30 days so the scan stays fast on
+    // large histories; --since sets it explicitly, --all scans everything.
+    let since_dt: Option<DateTime<Utc>> = if all {
+        None
+    } else if let Some(s) = &since {
+        Some(parse_since_date(s)?)
+    } else {
+        Some(Utc::now() - chrono::Duration::days(30))
+    };
+    // Cheap mtime pre-filter mirrors the window so old files are skipped before
+    // the expensive full parse.
+    let modified_after: Option<std::time::SystemTime> = since_dt.map(|dt| {
+        let secs = dt.timestamp().max(0) as u64;
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    });
+
+    // Resolve cwd BEFORE discovery: Claude encodes the cwd in its project dir
+    // name, so passing it down lets discovery prune non-matching dirs without
+    // reading a single file — the fast path for `--cwd`.
+    let here = if cwd_only {
+        Some(std::env::current_dir()?.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+
+    let home = dirs::home_dir().context("No home dir")?;
+    // Gate discovery by --agent so e.g. `--agent gemini` scans only gemini
+    // instead of reading every claude+codex file and filtering afterwards.
+    let want_agent = agent.as_deref();
+    let mut discovered = Vec::new();
+    if want_agent.is_none_or(|a| a == "claude") {
+        discovered.extend(sessions::discover_claude_sessions(
+            &home.join(".claude").join("projects"),
+            modified_after,
+            here.as_deref(),
+        ));
+    }
+    if want_agent.is_none_or(|a| a == "codex") {
+        discovered.extend(sessions::discover_codex_sessions(
+            &home.join(".codex").join("sessions"),
+            modified_after,
+        ));
+    }
+    if want_agent.is_none_or(|a| a == "gemini") {
+        discovered.extend(sessions::discover_gemini_sessions(
+            &home.join(".gemini").join("tmp"),
+            modified_after,
+            here.as_deref(),
+        ));
+    }
+    if want_agent.is_none_or(|a| a == "junie") {
+        // Junie has no cwd in its dir layout (the dir name is a timestamp), so
+        // there is no pre-read prune; select_sessions applies the --cwd filter
+        // against the recorded CurrentDirectoryUpdatedEvent cwd afterwards.
+        discovered.extend(sessions::discover_junie_sessions(
+            &home.join(".junie").join("sessions"),
+            modified_after,
+        ));
+    }
+
+    let selected = sessions::select_sessions(
+        discovered,
+        here.as_deref(),
+        agent.as_deref(),
+        since_dt,
+        limit,
+    );
+
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(&selected)?),
+        _ => {
+            if selected.is_empty() {
+                eprintln!("No sessions found.");
+                return Ok(());
+            }
+            println!(
+                "{:<10}  {:<6}  {:<22}  {:<25}  {:>5}  {:>4}  {:<8}  TITLE",
+                "SESSION", "AGENT", "PROJECT", "UPDATED (UTC)", "MSGS", "USR", "ASSOC"
+            );
+            for s in &selected {
+                let sid = session_id_table_prefix(&s.session_id);
+                let project = s.project.as_deref().unwrap_or("-");
+                let updated = s
+                    .updated_at
+                    .map(|t| t.to_rfc3339())
+                    .unwrap_or_else(|| "(no timestamp)".to_string());
+                let assoc = format!("{:?}", s.association).to_lowercase();
+                println!(
+                    "{:<10}  {:<6}  {:<22}  {:<25}  {:>5}  {:>4}  {:<8}  {}",
+                    sid,
+                    s.agent,
+                    truncate_table_cell(project, 22),
+                    updated,
+                    s.message_count,
+                    s.user_message_count,
+                    assoc,
+                    truncate_table_cell(s.title.as_deref().unwrap_or(""), 60),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// First 8 chars of a session id for the sessions table — char-safe. Ids
+/// normally are ASCII uuids, but the file-stem fallback can carry non-ASCII;
+/// a byte slice would panic on a multibyte boundary.
+fn session_id_table_prefix(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// Char-boundary-safe cell truncation for table output (never byte-slices a
+/// multibyte char — that path panics, cf. the thread-index UTF-8 crash).
+fn truncate_table_cell(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let clipped: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{clipped}…")
+    }
+}
+
 fn run_sources_command(command: SourcesCommands) -> Result<()> {
     match command {
         SourcesCommands::Protect {
@@ -2577,11 +3474,18 @@ fn run_intents(
         _ => unreachable!("clap validates this"),
     });
 
+    // F2 / dead `--unresolved`: the unresolved filter marks a session "resolved"
+    // when it contains an Outcome. If a `--kind` filter strips Outcomes at
+    // extraction time, the filter sees none and silently no-ops (output is
+    // byte-identical to unfiltered). When `--unresolved` is active we defer the
+    // kind filter: extract WITHOUT it so Outcomes survive the resolution check,
+    // then re-apply it after the unresolved narrowing.
+    let post_kind = if unresolved { kind_filter } else { None };
     let config = intents::IntentsConfig {
         project: projects.first().cloned().unwrap_or_default(),
         hours,
         strict,
-        kind_filter,
+        kind_filter: if unresolved { None } else { kind_filter },
         frame_kind: filters.frame_kind.map(Into::into),
     };
 
@@ -2607,10 +3511,19 @@ fn run_intents(
             // Score sort isn't meaningful for intents (no score field); fall back to newest.
             SortOrder::Score => intents::IntentSortOrder::Newest,
         }),
-        limit: Some(filters.limit),
+        // F3 / default-limit clip (P2-11): `--limit` is a true Option now.
+        // None means "no limit" so a full intents roadmap (often 20-30
+        // planned items) survives by default, while an explicit `--limit 10`
+        // is honored instead of being mistaken for a default sentinel.
+        limit: filters.limit,
     };
 
-    let records = intents::apply_display_filters(records, &display_filters);
+    let mut records = intents::apply_display_filters(records, &display_filters);
+
+    // F2: re-apply the kind filter we deferred so `--unresolved` could see Outcomes.
+    if let Some(k) = post_kind {
+        records.retain(|r| r.kind == k);
+    }
 
     if records.is_empty() && emit != "json" {
         eprintln!(
@@ -2650,9 +3563,10 @@ fn run_tail(
     mut filters: RetrievalFilters,
 ) -> Result<()> {
     if !follow {
-        // One-shot mode
-        if filters.limit == 10 {
-            filters.limit = 20; // default 20 for tail
+        // One-shot mode: default to 20 when no explicit --limit was passed
+        // (an explicit `--limit 10` now means 10 — P2-11).
+        if filters.limit.is_none() {
+            filters.limit = Some(20);
         }
         filters.sort = Some(SortOrder::Newest);
         return run_intents(
@@ -5293,8 +6207,9 @@ fn project_scope_label(projects: &[String]) -> String {
     }
 }
 
-/// Semantic-first retrieval across the canonical store. Fails fast when
-/// semantic preconditions are missing unless `--no-semantic` is explicit.
+/// Semantic-first retrieval across the canonical store. Missing semantic
+/// preconditions degrade to filesystem-fuzzy; `--no-semantic` skips the
+/// semantic attempt entirely.
 struct SearchRunArgs<'a> {
     query: &'a str,
     projects: &'a [String],
@@ -5337,7 +6252,8 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         kind,
         no_semantic,
     } = args;
-    validate_cli_search_limit(filters.limit)?;
+    let limit = filters.limit.unwrap_or(DEFAULT_RETRIEVAL_LIMIT);
+    validate_cli_search_limit(limit)?;
     let kind_filter = kind.and_then(aicx::timeline::Kind::parse);
     // Extract inline date hints from query if no explicit --date given
     let (effective_query, inline_date) = if date.is_none() {
@@ -5381,86 +6297,68 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     let resolved_projects = resolve_project_filters_or_error(projects)?;
     let scopes = project_scopes(&resolved_projects);
 
-    let (mut results, scanned, semantic_status, pushdown_diagnostic) = if no_semantic {
-        // Fuzzy path keeps the legacy "fetch then post-filter" shape —
-        // `rank::fuzzy_search_store` is not on the hybrid retrieval
-        // primitive and is operator-requested explicitly via
-        // `--no-semantic`, so we leave it alone.
-        let fuzzy_fetch_limit =
-            search_examined_fetch_limit(filters.limit, post_filters.is_active());
-        let (mut results, scanned) = rank::fuzzy_search_store(
-            &root,
-            &search_query,
-            fuzzy_fetch_limit,
-            &scopes,
-            filters.frame_kind.map(Into::into),
-        )?;
-        if let Some(min_score) = post_filters.score_min {
-            results.retain(|r| r.score >= min_score);
-        }
-        if let Some(ref agent_filter) = post_filters.agent {
-            results.retain(|r| r.agent == *agent_filter);
-        }
-        if post_filters.date_lo.is_some() || post_filters.date_hi.is_some() {
-            let lo = post_filters.date_lo.as_deref();
-            let hi = post_filters.date_hi.as_deref();
-            results.retain(|r| {
-                lo.is_none_or(|lo| r.date.as_str() >= lo)
-                    && hi.is_none_or(|hi| r.date.as_str() <= hi)
-            });
-        } else if let Some(ref cutoff) = post_filters.hours_cutoff {
-            let cutoff = cutoff.as_str();
-            results.retain(|r| r.date.as_str() >= cutoff);
-        }
-        (results, scanned, None, None)
-    } else {
-        match aicx::search_engine::try_semantic_search_filtered(
-            &root,
-            &search_query,
-            filters.limit,
-            &scopes,
-            filters.frame_kind.map(Into::into),
-            kind_filter.map(|kind| kind.dir_name()),
-            &post_filters,
-        ) {
-            Ok(filtered) => {
-                let aicx::search_engine::FilteredSemanticOutcome {
-                    outcome,
-                    diagnostic,
-                } = filtered;
-                let status = (
-                    outcome.backend_label,
-                    outcome.model_id.clone(),
-                    outcome.scanned,
-                    outcome.retrieval_status.clone(),
-                );
-                (outcome.results, outcome.scanned, Some(status), diagnostic)
-            }
-            Err(err) => {
-                let payload = serde_json::json!({
-                    "ok": false,
-                    "error": "semantic_search_unavailable",
-                    "kind": err.kind(),
-                    "reason": err.reason(),
-                    "recommendation": err.recommendation(),
-                    "fallback": {
-                        "available": true,
-                        "command": format!("aicx search --no-semantic {:?}", query),
-                    },
-                });
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&payload)?);
-                } else {
-                    eprintln!("aicx search: semantic search unavailable.");
-                    eprintln!("  kind:           {}", err.kind());
-                    eprintln!("  reason:         {}", err.reason());
-                    eprintln!("  recommendation: {}", err.recommendation());
-                    eprintln!("  fallback:       aicx search --no-semantic {:?}", query);
+    let (mut results, scanned, semantic_status, pushdown_diagnostic, semantic_fallback) =
+        if no_semantic {
+            let (results, scanned) = run_fuzzy_search_with_filters(
+                &root,
+                &search_query,
+                limit,
+                &scopes,
+                filters.frame_kind.map(Into::into),
+                &post_filters,
+            )?;
+            (results, scanned, None, None, None)
+        } else {
+            match aicx::search_engine::try_semantic_search_filtered(
+                &root,
+                &search_query,
+                limit,
+                &scopes,
+                filters.frame_kind.map(Into::into),
+                kind_filter.map(|kind| kind.dir_name()),
+                &post_filters,
+            ) {
+                Ok(filtered) => {
+                    let aicx::search_engine::FilteredSemanticOutcome {
+                        outcome,
+                        diagnostic,
+                    } = filtered;
+                    let status = (
+                        outcome.backend_label,
+                        outcome.model_id.clone(),
+                        outcome.scanned,
+                        outcome.retrieval_status.clone(),
+                    );
+                    (
+                        outcome.results,
+                        outcome.scanned,
+                        Some(status),
+                        diagnostic,
+                        None,
+                    )
                 }
-                std::process::exit(2);
+                Err(err) => {
+                    let fallback = SemanticFallbackNotice::from_error(&err);
+                    let (results, scanned) = run_fuzzy_search_with_filters(
+                        &root,
+                        &search_query,
+                        limit,
+                        &scopes,
+                        filters.frame_kind.map(Into::into),
+                        &post_filters,
+                    )?;
+                    if !json {
+                        eprintln!(
+                            "aicx search: semantic search unavailable; falling back to filesystem fuzzy."
+                        );
+                        eprintln!("  kind:           {}", err.kind());
+                        eprintln!("  reason:         {}", err.reason());
+                        eprintln!("  recommendation: {}", err.recommendation());
+                    }
+                    (results, scanned, None, None, Some(fallback))
+                }
             }
-        }
-    };
+        };
 
     // Defensive kind retain: the semantic path pushes `kind_filter`
     // into the hybrid query, but we keep the explicit check so a future
@@ -5485,7 +6383,7 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     }
 
     // Truncate to requested limit after date filtering
-    let results: Vec<_> = results.into_iter().take(filters.limit).collect();
+    let results: Vec<_> = results.into_iter().take(limit).collect();
 
     if json {
         let oracle_status = match semantic_status {
@@ -5520,10 +6418,26 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         };
         let rendered =
             rank::render_search_json_with_oracle(&root, &results, scanned, oracle_status)?;
-        let payload = aicx::search_engine::inject_filter_pushdown_diagnostic(
+        let mut payload = aicx::search_engine::inject_filter_pushdown_diagnostic(
             &rendered,
             pushdown_diagnostic.as_ref(),
         )?;
+        if let Some(ref fallback) = semantic_fallback {
+            let mut value: serde_json::Value = serde_json::from_str(&payload)?;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "semantic_fallback".to_string(),
+                    serde_json::json!({
+                        "used": true,
+                        "backend": "filesystem_fuzzy",
+                        "kind": fallback.kind,
+                        "reason": fallback.reason,
+                        "recommendation": fallback.recommendation,
+                    }),
+                );
+            }
+            payload = serde_json::to_string(&value)?;
+        }
         println!("{}", payload);
         return Ok(());
     }
@@ -5564,11 +6478,18 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                     retrieval_status.as_ref(),
                 )
             }
-            None => format!(
-                "{} result(s) from {} scanned chunks. oracle_status: backend=filesystem_fuzzy index=none fallback=operator_requested loctree_scope_safe=false",
-                results.len(),
-                scanned
-            ),
+            None => {
+                let fallback = semantic_fallback
+                    .as_ref()
+                    .map(|notice| format!("semantic_unavailable kind={}", notice.kind))
+                    .unwrap_or_else(|| "operator_requested".to_string());
+                format!(
+                    "{} result(s) from {} scanned chunks. oracle_status: backend=filesystem_fuzzy index=none fallback={} loctree_scope_safe=false",
+                    results.len(),
+                    scanned,
+                    fallback
+                )
+            }
         };
         let suffix = pushdown_diagnostic
             .as_ref()
@@ -5582,6 +6503,56 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         eprintln!("\n{}{}", base_line, suffix);
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct SemanticFallbackNotice {
+    kind: String,
+    reason: String,
+    recommendation: String,
+}
+
+impl SemanticFallbackNotice {
+    fn from_error(err: &aicx::search_engine::SemanticError) -> Self {
+        Self {
+            kind: err.kind().to_string(),
+            reason: err.reason().to_string(),
+            recommendation: err.recommendation().to_string(),
+        }
+    }
+}
+
+fn run_fuzzy_search_with_filters(
+    root: &Path,
+    search_query: &str,
+    limit: usize,
+    scopes: &[Option<&str>],
+    frame_kind: Option<timeline::FrameKind>,
+    post_filters: &aicx::search_engine::SemanticSearchFilters,
+) -> Result<(Vec<rank::FuzzyResult>, usize)> {
+    // Fuzzy path keeps the legacy "fetch then post-filter" shape. It is
+    // reached either by operator request (`--no-semantic`) or by explicit
+    // semantic degradation when the committed index cannot be served.
+    let fuzzy_fetch_limit = search_examined_fetch_limit(limit, post_filters.is_active());
+    let (mut results, scanned) =
+        rank::fuzzy_search_store(root, search_query, fuzzy_fetch_limit, scopes, frame_kind)?;
+    if let Some(min_score) = post_filters.score_min {
+        results.retain(|r| r.score >= min_score);
+    }
+    if let Some(ref agent_filter) = post_filters.agent {
+        results.retain(|r| r.agent == *agent_filter);
+    }
+    if post_filters.date_lo.is_some() || post_filters.date_hi.is_some() {
+        let lo = post_filters.date_lo.as_deref();
+        let hi = post_filters.date_hi.as_deref();
+        results.retain(|r| {
+            lo.is_none_or(|lo| r.date.as_str() >= lo) && hi.is_none_or(|hi| r.date.as_str() <= hi)
+        });
+    } else if let Some(ref cutoff) = post_filters.hours_cutoff {
+        let cutoff = cutoff.as_str();
+        results.retain(|r| r.date.as_str() >= cutoff);
+    }
+    Ok((results, scanned))
 }
 
 /// Build the `IndexEvent` -> sink fanout used by `aicx index`. Always
@@ -5987,6 +6958,7 @@ fn run_steer(
     filters: RetrievalFilters,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
+    let limit = filters.limit.unwrap_or(DEFAULT_RETRIEVAL_LIMIT);
 
     let effective_date = date;
     let (date_lo, date_hi) = if let Some(d) = effective_date {
@@ -6010,10 +6982,7 @@ fn run_steer(
             date_lo: date_lo.as_deref(),
             date_hi: date_hi.as_deref(),
         };
-        let mut batch = rt.block_on(aicx::steer_index::search_steer_index(
-            &filter,
-            filters.limit,
-        ))?;
+        let mut batch = rt.block_on(aicx::steer_index::search_steer_index(&filter, limit))?;
         metadatas.append(&mut batch);
     }
     dedup_steer_metadata(&mut metadatas);
@@ -6037,7 +7006,7 @@ fn run_steer(
             }
         });
     }
-    metadatas.truncate(filters.limit);
+    metadatas.truncate(limit);
 
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
