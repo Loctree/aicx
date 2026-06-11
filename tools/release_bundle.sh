@@ -559,7 +559,11 @@ security list-keychains -d user -s "$TEMP_KEYCHAIN_PATH" $EXISTING_KEYCHAINS >/d
 # the default keychain only — the search-list set above is not consulted, so
 # without this codesign reports "no identity found" even though the import
 # succeeded. `cleanup` restores the original default on exit.
-ORIGINAL_DEFAULT_KEYCHAIN="$(security default-keychain -d user | tr -d ' "')"
+# A non-interactive runner session may have no default keychain at all
+# (`SecKeychainCopyDomainDefault user: A default keychain could not be found`),
+# which would abort under `set -e`. Tolerate the empty case; cleanup only
+# restores when a previous default actually existed.
+ORIGINAL_DEFAULT_KEYCHAIN="$(security default-keychain -d user 2>/dev/null | tr -d ' "' || true)"
 security default-keychain -d user -s "$TEMP_KEYCHAIN_PATH"
 security import "$CERT_P12" \
   -k "$TEMP_KEYCHAIN_PATH" \
