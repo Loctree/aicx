@@ -92,8 +92,9 @@ aicx-retrieve = { version = "0.2.0" }
 blake3 = "1.8.5"
 which = "8.0.2"
 
-[dev-dependencies]
 toml = "0.8"
+
+[dev-dependencies]
 filetime = "0.2"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
