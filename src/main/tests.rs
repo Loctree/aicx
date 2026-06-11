@@ -45,15 +45,15 @@ fn detect_config_show_flag_accepts_global_flags_before_config() {
     assert!(detect_config_show_flag_mistake(args).is_some());
 }
 
-/// Bug #26 regression: the four branches of `aicx config show`
+/// Bug #26 regression: the branches of `aicx config show`
 /// must each render a distinct marker so an operator can tell at
 /// a glance which file the embedder actually loaded (env override,
-/// legacy embedder.toml, canonical config.toml, or built-in
+/// legacy embedder.toml, canonical config.toml, bootstrap config, or built-in
 /// defaults). Tests the pure marker formatter; the resolver itself
 /// is covered in `aicx_embeddings::config::tests`.
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 #[test]
-fn config_show_marker_covers_all_four_branches() {
+fn config_show_marker_covers_all_branches() {
     use aicx::embedder::ConfigSource;
 
     let env_path = PathBuf::from("/tmp/op-override.toml");
@@ -84,6 +84,18 @@ fn config_show_marker_covers_all_four_branches() {
     assert!(
         marker.contains("aicx config init"),
         "legacy marker must nudge migration: {marker}"
+    );
+
+    let bootstrap = PathBuf::from("/tmp/.aicx/config.toml");
+    let (path, branch, marker) = crate::cli_config::describe_effective_config(&Some((
+        bootstrap.clone(),
+        ConfigSource::Bootstrap,
+    )));
+    assert_eq!(branch, "bootstrap");
+    assert_eq!(path, bootstrap.display().to_string());
+    assert!(
+        marker.contains("[storage].home"),
+        "bootstrap marker must name storage relocation: {marker}"
     );
 
     let (path, branch, marker) = crate::cli_config::describe_effective_config(&None);

@@ -30,6 +30,9 @@ AICX_GIT_URL="${AICX_GIT_URL:-https://github.com/Loctree/aicx}"
 AICX_BIN_DIR="${AICX_BIN_DIR:-$HOME/.local/bin}"
 AICX_RELEASE_REPO="${AICX_RELEASE_REPO:-Loctree/aicx}"
 AICX_RELEASE_TAG="${AICX_RELEASE_TAG:-latest}"
+AICX_CONFIG_PATH="${AICX_CONFIG_PATH:-$HOME/.aicx/config.toml}"
+AICX_HOME_PICKER="${AICX_HOME_PICKER:-auto}"
+AICX_STORAGE_HOME="${AICX_STORAGE_HOME:-}"
 AICX_EMBEDDER_PICKER="${AICX_EMBEDDER_PICKER:-auto}"
 AICX_EMBEDDER_PROFILE="${AICX_EMBEDDER_PROFILE:-}"
 AICX_EMBEDDER_FILENAME="${AICX_EMBEDDER_FILENAME:-${AICX_EMBEDDER_FILE:-}}"
@@ -53,6 +56,9 @@ for arg in "$@"; do
     --verify-path-only) VERIFY_PATH_ONLY=1 ;;
     --release) AICX_INSTALL_MODE="release" ;;
     --release-tag=*) AICX_RELEASE_TAG="${arg#*=}" ;;
+    --pick-home) AICX_HOME_PICKER="1" ;;
+    --no-home-prompt) AICX_HOME_PICKER="0" ;;
+    --aicx-home=*) AICX_STORAGE_HOME="${arg#*=}" ;;
     --pick-embedder) AICX_EMBEDDER_PICKER="1" ;;
     --no-embedder-prompt) AICX_EMBEDDER_PICKER="0" ;;
     --embedder-profile=*) AICX_EMBEDDER_PROFILE="${arg#*=}" ;;
@@ -89,6 +95,12 @@ for arg in "$@"; do
       echo "  --embedder-profile=base|dev|premium"
       echo "  --no-embedder-prompt               # suppress interactive picker"
       echo "  note: this writes AICX local embedder preferences; Roost/rust-memex remains the heavy retrieval plane"
+      echo ""
+      echo "AICX storage root picker:"
+      echo "  --pick-home                        # ask where AICX_HOME should live"
+      echo "  --aicx-home=/absolute/path         # persist [storage].home in ~/.aicx/config.toml"
+      echo "  --no-home-prompt                   # suppress interactive AICX_HOME picker"
+      echo "  default: ~/.aicx                   # semantic index remains ~/.aicx/indexed/"
       exit 0
       ;;
   esac
@@ -186,6 +198,95 @@ embedder_file_for_profile() {
     premium) echo "F2LLM-v2-1.7B.Q6_K.gguf" ;;
     *) return 1 ;;
   esac
+}
+
+write_storage_home_config() {
+  local configured_home="$1"
+  local config_path="$AICX_CONFIG_PATH"
+
+  mkdir -p "$(dirname "$config_path")"
+  AICX_CONFIG_PATH_FOR_WRITE="$config_path" \
+  AICX_STORAGE_HOME_FOR_WRITE="$configured_home" \
+  python3 - <<'PY'
+from pathlib import Path
+import json
+import os
+import re
+
+config_path = Path(os.environ["AICX_CONFIG_PATH_FOR_WRITE"]).expanduser()
+storage_home = os.environ["AICX_STORAGE_HOME_FOR_WRITE"].strip()
+expanded = Path(storage_home).expanduser()
+if not storage_home:
+    raise SystemExit("empty AICX storage home")
+if not (storage_home == "~" or storage_home.startswith("~/") or expanded.is_absolute()):
+    raise SystemExit(
+        f"invalid AICX home {storage_home!r}: use an absolute path or ~/..."
+    )
+
+home_line = f"home = {json.dumps(storage_home)}"
+lines = config_path.read_text(encoding="utf-8").splitlines() if config_path.exists() else []
+out = []
+in_storage = False
+storage_seen = False
+home_written = False
+
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith("[") and stripped.endswith("]") and not stripped.startswith("[["):
+        if in_storage and not home_written:
+            out.append(home_line)
+            home_written = True
+        in_storage = stripped == "[storage]"
+        storage_seen = storage_seen or in_storage
+        out.append(line)
+        continue
+
+    if in_storage and re.match(r"^\s*home\s*=", line):
+        if not home_written:
+            out.append(home_line)
+            home_written = True
+        continue
+
+    out.append(line)
+
+if in_storage and not home_written:
+    out.append(home_line)
+elif not storage_seen:
+    if out and out[-1].strip():
+        out.append("")
+    out.append("[storage]")
+    out.append(home_line)
+
+config_path.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+print(config_path)
+PY
+}
+
+maybe_configure_aicx_home() {
+  local picker selected_home config_written default_home
+  picker=$(normalise_bool "$AICX_HOME_PICKER")
+  default_home="$HOME/.aicx"
+  selected_home="${AICX_STORAGE_HOME:-}"
+
+  if [ -z "$selected_home" ] && { [ "$picker" = "1" ] || { [ "$picker" = "auto" ] && [ -t 0 ] && [ -t 1 ] && [ -z "${CI:-}" ]; }; }; then
+    echo ""
+    echo "AICX storage root setup"
+    echo "  Default root: $default_home"
+    echo "  Semantic index path: <AICX_HOME>/indexed/_all/embeddings.ndjson"
+    echo "  Press Enter for the default, or enter an absolute path / ~/... for a persistent custom root."
+    printf "AICX_HOME [%s]: " "$default_home"
+    read -r selected_home || true
+    selected_home="${selected_home:-}"
+  fi
+
+  if [ -z "$selected_home" ]; then
+    echo "  AICX_HOME default kept: $default_home"
+    return 0
+  fi
+
+  config_written=$(write_storage_home_config "$selected_home")
+  echo "  persistent AICX_HOME saved to $config_written"
+  echo "  semantic index will live under: $selected_home/indexed/"
 }
 
 write_embedder_config() {
@@ -766,6 +867,11 @@ PY
   AICX_BIN_DIR="$AICX_BIN_DIR" \
   AICX_INSTALL_FORCE="$AICX_INSTALL_FORCE" \
   AICX_INSTALL_DRY_RUN="$AICX_INSTALL_DRY_RUN" \
+  AICX_CONFIG_PATH="$AICX_CONFIG_PATH" \
+  AICX_HOME_PICKER="$AICX_HOME_PICKER" \
+  AICX_STORAGE_HOME="$AICX_STORAGE_HOME" \
+  AICX_EMBEDDER_PICKER="$AICX_EMBEDDER_PICKER" \
+  AICX_EMBEDDER_PROFILE="$AICX_EMBEDDER_PROFILE" \
   bash "$bundle_dir/install.sh"
   exit 0
 }
@@ -898,8 +1004,9 @@ else
   echo "  Warning: aicx-mcp not found. MCP config will be skipped."
 fi
 
-# --- Step 3: Configure MCP ---
-echo "[3/4] Configuring MCP servers..."
+# --- Step 3: Configure storage + MCP ---
+echo "[3/4] Configuring storage + MCP servers..."
+maybe_configure_aicx_home
 
 configure_mcp() {
   local tool_name="$1"

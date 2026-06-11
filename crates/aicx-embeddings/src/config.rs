@@ -138,6 +138,8 @@ pub enum ConfigSource {
     Canonical,
     /// Legacy `<aicx_home>/embedder.toml`.
     Legacy,
+    /// Bootstrap `$HOME/.aicx/config.toml` used to discover `[storage].home`.
+    Bootstrap,
 }
 
 impl ConfigSource {
@@ -146,6 +148,7 @@ impl ConfigSource {
             ConfigSource::Env => "env",
             ConfigSource::Canonical => "canonical",
             ConfigSource::Legacy => "legacy",
+            ConfigSource::Bootstrap => "bootstrap",
         }
     }
 }
@@ -162,14 +165,20 @@ pub fn config_search_paths() -> Vec<PathBuf> {
 /// existing file wins.
 ///
 /// Root resolution mirrors `aicx::store::resolve_aicx_home`: `$AICX_HOME`
-/// wins when set+non-empty, otherwise `~/.aicx`. Duplicated locally
+/// wins when set+non-empty, otherwise bootstrap `$HOME/.aicx/config.toml`
+/// may provide `[storage].home`, otherwise `~/.aicx`. Duplicated locally
 /// because aicx-embeddings is a leaf crate (the main `aicx` crate
-/// depends on it, not the other way around) and we deliberately avoid
-/// pulling the full crate just to share one 4-line resolver.
+/// depends on it, not the other way around).
 pub fn config_search_paths_with_source() -> Vec<(PathBuf, ConfigSource)> {
+    let env_home = std::env::var_os("AICX_HOME");
+    let default_home = dirs::home_dir().map(|home| home.join(".aicx"));
+    let effective_home = aicx_home_root_from(env_home.clone(), default_home.as_deref());
     build_search_paths(
         env_string("AICX_EMBEDDER_CONFIG").as_deref(),
-        aicx_home_root().as_deref(),
+        effective_home.as_deref(),
+        default_home
+            .as_deref()
+            .filter(|_| should_include_bootstrap_home(&env_home)),
     )
 }
 
@@ -188,6 +197,7 @@ pub fn effective_config_source() -> Option<(PathBuf, ConfigSource)> {
 fn build_search_paths(
     env_override: Option<&str>,
     aicx_home: Option<&Path>,
+    bootstrap_home: Option<&Path>,
 ) -> Vec<(PathBuf, ConfigSource)> {
     let mut out = Vec::new();
     if let Some(path) = env_override
@@ -200,16 +210,85 @@ fn build_search_paths(
         out.push((root.join("config.toml"), ConfigSource::Canonical));
         out.push((root.join("embedder.toml"), ConfigSource::Legacy));
     }
+    if let Some(root) = bootstrap_home {
+        let bootstrap = root.join("config.toml");
+        if !out.iter().any(|(path, _)| path == &bootstrap) {
+            out.push((bootstrap, ConfigSource::Bootstrap));
+        }
+        let legacy = root.join("embedder.toml");
+        if !out.iter().any(|(path, _)| path == &legacy) {
+            out.push((legacy, ConfigSource::Legacy));
+        }
+    }
     out
 }
 
-/// Local mirror of `aicx::store::resolve_aicx_home`. Returns the resolved
-/// AICX home: `$AICX_HOME` when set + non-empty, otherwise `~/.aicx`.
-fn aicx_home_root() -> Option<PathBuf> {
-    match std::env::var_os("AICX_HOME") {
+fn should_include_bootstrap_home(env_home: &Option<std::ffi::OsString>) -> bool {
+    env_home.as_ref().is_none_or(|value| value.is_empty())
+}
+
+/// Local mirror of `aicx::store::resolve_aicx_home`.
+pub(crate) fn aicx_home_root() -> Option<PathBuf> {
+    let default_home = dirs::home_dir().map(|home| home.join(".aicx"));
+    aicx_home_root_from(std::env::var_os("AICX_HOME"), default_home.as_deref())
+}
+
+fn aicx_home_root_from(
+    env_value: Option<std::ffi::OsString>,
+    default_home: Option<&Path>,
+) -> Option<PathBuf> {
+    match env_value {
         Some(value) if !value.is_empty() => Some(PathBuf::from(value)),
-        _ => dirs::home_dir().map(|home| home.join(".aicx")),
+        _ => {
+            let default_home = default_home?;
+            configured_home_from_bootstrap_config(default_home)
+                .or_else(|| Some(default_home.to_path_buf()))
+        }
     }
+}
+
+fn configured_home_from_bootstrap_config(default_home: &Path) -> Option<PathBuf> {
+    let config_path = default_home.join("config.toml");
+    if !config_path.exists() {
+        return None;
+    }
+    let raw = match read_config_file_capped(&config_path, CONFIG_FILE_MAX_BYTES) {
+        Ok(raw) => raw,
+        Err(err) => {
+            debug!(
+                target: "aicx_embeddings::config",
+                "failed to read bootstrap config {} for [storage].home: {}",
+                config_path.display(),
+                err
+            );
+            return None;
+        }
+    };
+    let parsed: toml::Value = match toml::from_str(&raw) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            debug!(
+                target: "aicx_embeddings::config",
+                "failed to parse bootstrap config {} for [storage].home: {}",
+                config_path.display(),
+                err
+            );
+            return None;
+        }
+    };
+    let value = parsed.get("storage")?.get("home")?.as_str()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let home_dir = default_home.parent()?;
+    let path = if value == "~" {
+        home_dir.to_path_buf()
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        home_dir.join(rest)
+    } else {
+        PathBuf::from(value)
+    };
+    path.is_absolute().then_some(path)
 }
 
 /// Hard upper bound for the embedder config file size. Realistic
@@ -226,9 +305,9 @@ pub(crate) const CONFIG_FILE_MAX_BYTES: u64 = 1024 * 1024;
 /// than generic IO errors. Bug #39.
 ///
 /// `path` comes from `config_search_paths()` — an internal resolver that
-/// returns canonical `$AICX_HOME/config.toml`, `$AICX_HOME/embedder.toml`,
-/// or `$AICX_EMBEDDER_CONFIG` (operator-controlled env). It is not user
-/// input in the path-traversal sense, but we still open via explicit
+/// returns `$AICX_EMBEDDER_CONFIG`, effective-root config files, and the
+/// bootstrap `~/.aicx/config.toml` fallback. It is not user input in the
+/// path-traversal sense, but we still open via explicit
 /// `OpenOptions::new().read(true)` to match the codebase's
 /// pass-3 hardening pattern (see commits `9682007` and `095c988`).
 pub(crate) fn read_config_file_capped(path: &Path, max_bytes: u64) -> io::Result<String> {
@@ -436,7 +515,7 @@ mod tests {
         let override_file = home.join("override.toml");
         fs::write(&override_file, "").unwrap();
 
-        let paths = build_search_paths(Some(override_file.to_str().unwrap()), Some(&home));
+        let paths = build_search_paths(Some(override_file.to_str().unwrap()), Some(&home), None);
         let effective = first_existing(paths).expect("env override should win");
         assert_eq!(effective.1, ConfigSource::Env);
         assert_eq!(effective.0, override_file);
@@ -449,7 +528,7 @@ mod tests {
         let canonical = home.join("config.toml");
         fs::write(&canonical, "").unwrap();
 
-        let paths = build_search_paths(None, Some(&home));
+        let paths = build_search_paths(None, Some(&home), None);
         let effective = first_existing(paths).expect("canonical should win");
         assert_eq!(effective.1, ConfigSource::Canonical);
         assert_eq!(effective.0, canonical);
@@ -462,7 +541,7 @@ mod tests {
         let legacy = home.join("embedder.toml");
         fs::write(&legacy, "").unwrap();
 
-        let paths = build_search_paths(None, Some(&home));
+        let paths = build_search_paths(None, Some(&home), None);
         let effective = first_existing(paths).expect("legacy should win");
         assert_eq!(effective.1, ConfigSource::Legacy);
         assert_eq!(effective.0, legacy);
@@ -473,7 +552,7 @@ mod tests {
     fn defaults_branch_when_no_file_present() {
         let home = tmp_dir("defaults-branch-home");
 
-        let paths = build_search_paths(None, Some(&home));
+        let paths = build_search_paths(None, Some(&home), None);
         assert!(
             first_existing(paths).is_none(),
             "no file should match — embedder must fall back to built-in defaults"
@@ -485,7 +564,7 @@ mod tests {
         let home = tmp_dir("empty-env-home");
         fs::write(home.join("config.toml"), "").unwrap();
 
-        let paths = build_search_paths(Some("   "), Some(&home));
+        let paths = build_search_paths(Some("   "), Some(&home), None);
         let effective = first_existing(paths).expect("canonical should still win");
         assert_eq!(effective.1, ConfigSource::Canonical);
     }
@@ -498,7 +577,7 @@ mod tests {
         fs::write(&canonical, "").unwrap();
         fs::write(&legacy, "").unwrap();
 
-        let paths = build_search_paths(None, Some(&home));
+        let paths = build_search_paths(None, Some(&home), None);
         let effective = first_existing(paths).expect("canonical should win");
         assert_eq!(effective.1, ConfigSource::Canonical);
         assert_eq!(effective.0, canonical);
@@ -557,11 +636,75 @@ mod tests {
     #[test]
     fn config_search_paths_back_compat_drops_source() {
         let home = tmp_dir("backcompat-home");
-        let paths = build_search_paths(Some("/tmp/x.toml"), Some(&home));
+        let paths = build_search_paths(Some("/tmp/x.toml"), Some(&home), None);
         let plain: Vec<PathBuf> = paths.into_iter().map(|(p, _)| p).collect();
         assert_eq!(plain.len(), 3);
         assert_eq!(plain[0], PathBuf::from("/tmp/x.toml"));
         assert_eq!(plain[1], home.join("config.toml"));
         assert_eq!(plain[2], home.join("embedder.toml"));
+    }
+
+    #[test]
+    fn bootstrap_config_can_relocate_aicx_home_and_remain_embedder_fallback() {
+        let user_home = tmp_dir("bootstrap-user-home");
+        let bootstrap_home = user_home.join(".aicx");
+        let relocated = user_home.join("relocated-aicx");
+        fs::create_dir_all(&bootstrap_home).unwrap();
+        fs::write(
+            bootstrap_home.join("config.toml"),
+            format!(
+                "[storage]\nhome = \"{}\"\n\n[embedder]\nbackend = \"cloud\"\n",
+                relocated.display()
+            ),
+        )
+        .unwrap();
+
+        let effective = aicx_home_root_from(None, Some(&bootstrap_home))
+            .expect("bootstrap storage.home should resolve");
+        assert_eq!(effective, relocated);
+
+        let paths = build_search_paths(None, Some(&effective), Some(&bootstrap_home));
+        assert_eq!(
+            paths[0],
+            (relocated.join("config.toml"), ConfigSource::Canonical)
+        );
+        assert_eq!(
+            paths[1],
+            (relocated.join("embedder.toml"), ConfigSource::Legacy)
+        );
+        assert_eq!(
+            paths[2],
+            (bootstrap_home.join("config.toml"), ConfigSource::Bootstrap)
+        );
+    }
+
+    #[test]
+    fn explicit_aicx_home_env_wins_over_bootstrap_storage_home() {
+        let user_home = tmp_dir("bootstrap-env-wins");
+        let bootstrap_home = user_home.join(".aicx");
+        let relocated = user_home.join("relocated-aicx");
+        let pinned = user_home.join("env-pinned");
+        fs::create_dir_all(&bootstrap_home).unwrap();
+        fs::write(
+            bootstrap_home.join("config.toml"),
+            format!("[storage]\nhome = \"{}\"\n", relocated.display()),
+        )
+        .unwrap();
+
+        let effective =
+            aicx_home_root_from(Some(pinned.clone().into_os_string()), Some(&bootstrap_home))
+                .expect("env-pinned root should resolve");
+        assert_eq!(effective, pinned);
+    }
+
+    #[test]
+    fn empty_aicx_home_env_still_allows_bootstrap_config() {
+        assert!(should_include_bootstrap_home(&None));
+        assert!(should_include_bootstrap_home(&Some(
+            std::ffi::OsString::new()
+        )));
+        assert!(!should_include_bootstrap_home(&Some(
+            std::ffi::OsString::from("/tmp/aicx")
+        )));
     }
 }

@@ -1,7 +1,7 @@
 use super::*;
 use chrono::TimeZone;
 use filetime::{FileTime, set_file_mtime};
-use std::env;
+use std::{env, fs};
 
 // ──────────────────────────────────────────────────────────────────
 // AICX-home / store-base / chunks-dir contract tests.
@@ -121,6 +121,65 @@ fn test_resolve_aicx_home_treats_empty_env_var_as_unset() {
         resolved.ends_with(".aicx"),
         "empty AICX_HOME should fall back to ~/.aicx; got {resolved:?}"
     );
+}
+
+#[test]
+fn test_resolve_aicx_home_uses_bootstrap_storage_home_when_env_unset() {
+    let home = std::env::temp_dir().join(format!("aicx-storage-home-test-{}", std::process::id()));
+    let default_home = home.join(".aicx");
+    let configured = home.join("configured-aicx");
+    fs::create_dir_all(&default_home).unwrap();
+    fs::write(
+        default_home.join("config.toml"),
+        format!("[storage]\nhome = \"{}\"\n", configured.display()),
+    )
+    .unwrap();
+
+    let resolved = paths::resolve_aicx_home_from(None, &home)
+        .expect("bootstrap [storage].home should resolve");
+    assert_eq!(resolved, configured);
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn test_resolve_aicx_home_env_wins_over_bootstrap_storage_home() {
+    let home =
+        std::env::temp_dir().join(format!("aicx-storage-env-wins-test-{}", std::process::id()));
+    let default_home = home.join(".aicx");
+    let configured = home.join("configured-aicx");
+    let pinned = home.join("env-pinned");
+    fs::create_dir_all(&default_home).unwrap();
+    fs::write(
+        default_home.join("config.toml"),
+        format!("[storage]\nhome = \"{}\"\n", configured.display()),
+    )
+    .unwrap();
+
+    let resolved = paths::resolve_aicx_home_from(Some(pinned.clone().into_os_string()), &home)
+        .expect("env-pinned home should resolve");
+    assert_eq!(resolved, pinned);
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn test_resolve_aicx_home_rejects_relative_bootstrap_storage_home() {
+    let home =
+        std::env::temp_dir().join(format!("aicx-storage-relative-test-{}", std::process::id()));
+    let default_home = home.join(".aicx");
+    fs::create_dir_all(&default_home).unwrap();
+    fs::write(
+        default_home.join("config.toml"),
+        "[storage]\nhome = \"relative\"\n",
+    )
+    .unwrap();
+
+    let err = paths::resolve_aicx_home_from(None, &home)
+        .expect_err("relative [storage].home should fail");
+    assert!(
+        err.to_string().contains("expected an absolute path"),
+        "unexpected error: {err:#}"
+    );
+    let _ = fs::remove_dir_all(home);
 }
 
 /// Integration guard: every canonical-root resolver in the workspace
