@@ -25,14 +25,22 @@ REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 
 # Pick the newest Python ≥ 3.11 available. tomllib is stdlib only from 3.11,
 # and bash scripts don't inherit .zshrc PATH ordering, so we detect explicitly
-# instead of trusting `python3`. Caller can override with PYTHON=...
-PYTHON="${PYTHON:-$(command -v python3.14 2>/dev/null \
-  || command -v python3.13 2>/dev/null \
-  || command -v python3.12 2>/dev/null \
-  || command -v python3.11 2>/dev/null \
-  || command -v python3 2>/dev/null)}"
-if [[ -z "$PYTHON" ]]; then
-  echo "Error: no Python interpreter found (need 3.11+ for stdlib tomllib)." >&2
+# instead of trusting `python3`. Candidates that resolve but can't import
+# tomllib are skipped, not fatal — on Windows `python3` is the WindowsApps
+# Store stub while the real interpreter is plain `python`. Caller can
+# override with PYTHON=...
+if [[ -z "${PYTHON:-}" ]]; then
+  for _py_candidate in python3.14 python3.13 python3.12 python3.11 python3 python; do
+    _py_path="$(command -v "$_py_candidate" 2>/dev/null)" || continue
+    if "$_py_path" -c 'import tomllib' >/dev/null 2>&1; then
+      PYTHON="$_py_path"
+      break
+    fi
+  done
+  unset _py_candidate _py_path
+fi
+if [[ -z "${PYTHON:-}" ]]; then
+  echo "Error: no Python 3.11+ with stdlib tomllib found (set PYTHON=... to override)." >&2
   exit 1
 fi
 if ! "$PYTHON" -c 'import tomllib' >/dev/null 2>&1; then
