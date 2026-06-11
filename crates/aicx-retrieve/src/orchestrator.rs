@@ -360,15 +360,15 @@ mod tests {
         EmbedderFingerprint::new("test-model", "http://example.invalid/embed", 2, "cosine")
     }
 
-    fn built_hybrid(
-        manifest_dir: &std::path::Path,
-    ) -> (
+    type BuiltHybrid = (
         Manifest,
         Box<dyn LexicalIndex>,
         Box<dyn DenseIndex>,
         Box<dyn FusionStrategy>,
         EmbedderFingerprint,
-    ) {
+    );
+
+    fn built_hybrid(manifest_dir: &std::path::Path) -> BuiltHybrid {
         let chunk_a = chunk("a", "alpha");
         let chunk_b = chunk("b", "bravo");
         let dense_a = dense(&chunk_a, vec![1.0, 0.0]);
