@@ -33,6 +33,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `toml` promoted from dev-dependency to runtime dependency (bootstrap
   config parsing).
 
+### Fixed
+
+- `aicx intents`: legacy chunks without a sidecar (or with a sidecar written
+  before `frame_kind` existed) are classified into the default `user_msg`
+  lane instead of being silently dropped, so intent extraction no longer
+  returns empty on stores created before the field was introduced.
+- Bootstrap `[storage].home` validation is consistent across every consumer
+  (runtime resolver, the `aicx-embeddings` config mirror, and `install.sh`):
+  control characters and parent-directory (`..`) traversal are rejected
+  wherever the value is read, so one component cannot resolve a home another
+  refuses to start on.
+- Tainted-path hardening on the bootstrap config read (size-capped, validated
+  reader instead of a raw read).
+- macOS release signing: the temporary signing keychain is set as the default
+  before `codesign`, so a non-interactive CI runner session resolves the
+  signing identity by name (previously failed with "no identity found"
+  despite a successful certificate import).
+- Windows release bundle: build the gnu target under Git Bash with the
+  mingw-w64 linker, skip the protoc step the slim bundle does not need, and
+  stop overwriting `PATH`; the binaries-only bundler no longer refuses Windows
+  targets.
+
+### Internal
+
+- Release tooling (`tools/release_sync.py`, `make release-prepare`) syncs and
+  validates every workspace crate manifest and internal dependency
+  requirement, so a version bump cannot silently desync the workspace.
+- The pre-push gate delegates to the Makefile gate targets and only runs the
+  full Rust suite (clippy + tests) when Rust or Cargo files actually change;
+  Semgrep is a required, non-optional gate (semgrep / `uvx` / `pipx`).
+
 
 ## [0.9.1] - 2026-05-26
 
