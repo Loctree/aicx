@@ -51,12 +51,18 @@ jobs:
           - platform: darwin-arm64
             runs_on: [ self-hosted, dragon-macos ]
             npm_package_dir: distribution/npm/aicx/platform-packages/darwin-arm64
+            bash: bash
           - platform: linux-x64-gnu
             runs_on: [ self-hosted, ops-linux ]
             npm_package_dir: distribution/npm/aicx/platform-packages/linux-x64-gnu
+            bash: bash
+          # Runner label unified with release.yml (`windows-pc`, not the bare
+          # `windows`). `bash` is pinned to Git for Windows so a LOCAL SYSTEM
+          # runner service does not resolve it to the WSL stub.
           - platform: win32-x64-gnu
-            runs_on: [ self-hosted, windows ]
+            runs_on: [ self-hosted, windows-pc ]
             npm_package_dir: distribution/npm/aicx/platform-packages/win32-x64-gnu
+            bash: 'C:\Program Files\Git\bin\bash.exe -eo pipefail {0}'
     steps:
       - uses: actions/checkout@v6
         with:
@@ -69,28 +75,38 @@ jobs:
 
       - name: Resolve workspace version
         id: meta
-        shell: bash
+        shell: ${{ matrix.bash }}
         run: |
           version=$(grep '^version' Cargo.toml | head -1 | cut -d '"' -f 2)
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
 
       - name: Release channel version consistency
-        shell: bash
+        shell: ${{ matrix.bash }}
         run: bash tools/release-channel-check.sh
 
       - name: Sync npm package versions
-        shell: bash
+        shell: ${{ matrix.bash }}
         run: node distribution/npm/sync-version.mjs "${{ steps.meta.outputs.version }}"
 
       - name: Build release bundle (real, per platform)
-        shell: bash
+        shell: ${{ matrix.bash }}
         env:
           AICX_RELEASE_BUNDLE_ONLY_BINARIES: "1"
           # Merge queue gate runs without access to org secrets/vars. Skip
           # GPG signing here — real signing happens in release.yml on tag push.
           AICX_RELEASE_SKIP_SIGNING: "1"
           LOCTREE_GPG_KEY_ID: ""
-        run: bash tools/release_bundle.sh
+        run: |
+          # Windows: pin the gnu target (the runner default may be msvc, which
+          # would yield the wrong asset name and break npm verification),
+          # ensure it is installed, and prepend the mingw-w64 gcc linker
+          # without clobbering PATH.
+          if [[ "${{ matrix.platform }}" == win32-* ]]; then
+            export TARGET=x86_64-pc-windows-gnu
+            export PATH="/c/Strawberry/c/bin:$PATH"
+            rustup target add x86_64-pc-windows-gnu
+          fi
+          bash tools/release_bundle.sh
 
       - name: npm publish --dry-run (wrapper package metadata)
         if: matrix.platform == 'linux-x64-gnu'
@@ -100,11 +116,11 @@ jobs:
 
       - name: npm publish --dry-run (platform package ${{ matrix.platform }})
         working-directory: ${{ matrix.npm_package_dir }}
-        shell: bash
+        shell: ${{ matrix.bash }}
         run: npm publish --dry-run --access public
 
       - name: Summary
-        shell: bash
+        shell: ${{ matrix.bash }}
         run: |
           echo "Merge queue gate passed for ${{ matrix.platform }}:"
           echo "  - cargo workspace check ✓ (linux job)"

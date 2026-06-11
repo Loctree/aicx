@@ -210,9 +210,10 @@ require_cmd shasum
 if [[ "${AICX_RELEASE_BUNDLE_ONLY_BINARIES:-0}" == "1" ]]; then
   echo "=== AICX GPG-signed bundle (binaries-only, no Apple codesign) ==="
   TARGET="${TARGET:-$(host_target)}"
-  case "$TARGET" in
-    *windows*) echo "Error: release-bundle-only-binaries does not support Windows targets yet: $TARGET" >&2; exit 1 ;;
-  esac
+  # Windows targets ARE supported on this path: the staging/zip/sign logic
+  # below branches on `*windows*` (.exe suffix, portable zip, no install.sh).
+  # The earlier blanket `exit 1` guard was a stale leftover from before that
+  # branching landed and is intentionally gone.
 
   VERSION="$(toml_value package.version)"
   if [[ -z "$PACKAGE_NAME" ]]; then
