@@ -2155,6 +2155,11 @@ fn resolve_filters_to_slugs_supports_explicit_syntax() {
         resolve_filters_to_slugs_at(&canonical, &["vetcoders/CodeScribe".to_string()]).unwrap();
     assert_eq!(got, vec!["vetcoders/CodeScribe"]);
 
+    // strict slug match stays case-insensitive, but resolves to stored canonical casing
+    let got =
+        resolve_filters_to_slugs_at(&canonical, &["VETCODERS/codescribe".to_string()]).unwrap();
+    assert_eq!(got, vec!["vetcoders/CodeScribe"]);
+
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -2166,6 +2171,199 @@ fn resolve_filters_to_slugs_no_match_returns_empty_vec() {
 
     let got = resolve_filters_to_slugs_at(&canonical, &["nonexistent".to_string()]).unwrap();
     assert!(got.is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_filters_to_slugs_at_or_error_rejects_unknown_filters() {
+    let root = migration_test_root("resolve-error");
+    let canonical = root.join(CANONICAL_STORE_DIRNAME);
+    fs::create_dir_all(canonical.join("foo").join("bar")).unwrap();
+
+    let err = resolve_filters_to_slugs_at_or_error(&canonical, &["nonexistent".to_string()])
+        .expect_err("unknown filters should fail");
+    let msg = err.to_string();
+    assert!(msg.contains("no project matches filter(s): \"nonexistent\""));
+    assert!(msg.contains("accepted forms"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_filters_to_store_or_index_slugs_supports_index_only_all_bucket() {
+    let root = migration_test_root("resolve-index-only");
+    let indexed_all = root.join("indexed").join("_all");
+    fs::create_dir_all(&indexed_all).unwrap();
+    let header = serde_json::json!({
+        "schema_version": "aicx-vector-index/v1",
+        "model_id": "test-model",
+        "model_profile": "base",
+        "dimension": 2,
+        "generated_at": "2026-06-03T18:00:00Z",
+        "entry_count": 1
+    });
+    let entry = serde_json::json!({
+        "id": "chunk-a",
+        "project": "VetCoders/Vista",
+        "agent": "claude",
+        "date": "20260603",
+        "path": "/tmp/chunk-a.md",
+        "kind": "conversations",
+        "session_id": "session-a",
+        "frame_kind": "agent_reply",
+        "cwd": "/Users/silver/Git/Vista",
+        "embedding": [1.0, 0.0]
+    });
+    fs::write(
+        indexed_all.join("embeddings.ndjson"),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            serde_json::to_string(&entry).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let got = resolve_filters_to_store_or_index_slugs_at_or_error(
+        &root,
+        &["vetcoders/vista".to_string()],
+    )
+    .unwrap();
+    assert_eq!(got, vec!["VetCoders/Vista"]);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_filters_to_store_or_index_slugs_merges_store_and_index_only_matches() {
+    let root = migration_test_root("resolve-store-and-index");
+    fs::create_dir_all(root.join(CANONICAL_STORE_DIRNAME).join("foo").join("bar")).unwrap();
+    let indexed_all = root.join("indexed").join("_all");
+    fs::create_dir_all(&indexed_all).unwrap();
+    let header = serde_json::json!({
+        "schema_version": "aicx-vector-index/v1",
+        "model_id": "test-model",
+        "model_profile": "base",
+        "dimension": 2,
+        "generated_at": "2026-06-03T18:00:00Z",
+        "entry_count": 1
+    });
+    let entry = serde_json::json!({
+        "id": "chunk-a",
+        "project": "baz/qux",
+        "embedding": [1.0, 0.0]
+    });
+    fs::write(
+        indexed_all.join("embeddings.ndjson"),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            serde_json::to_string(&entry).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let got = resolve_filters_to_store_or_index_slugs_at_or_error(
+        &root,
+        &["foo/bar".to_string(), "baz/qux".to_string()],
+    )
+    .unwrap();
+    assert_eq!(got, vec!["baz/qux", "foo/bar"]);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_filters_to_index_slugs_scans_all_bucket_for_unmatched_filters() {
+    let root = migration_test_root("resolve-index-dedicated-and-all");
+    let indexed = root.join("indexed");
+    let dedicated = indexed.join("foo_bar");
+    let all = indexed.join("_all");
+    fs::create_dir_all(&dedicated).unwrap();
+    fs::create_dir_all(&all).unwrap();
+    let header = serde_json::json!({
+        "schema_version": "aicx-vector-index/v1",
+        "model_id": "test-model",
+        "model_profile": "base",
+        "dimension": 2,
+        "generated_at": "2026-06-03T18:00:00Z",
+        "entry_count": 1
+    });
+    let dedicated_entry = serde_json::json!({
+        "id": "chunk-a",
+        "project": "foo/bar",
+        "embedding": [1.0, 0.0]
+    });
+    let all_entry = serde_json::json!({
+        "id": "chunk-b",
+        "project": "baz/qux",
+        "embedding": [0.0, 1.0]
+    });
+    fs::write(
+        dedicated.join("embeddings.ndjson"),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            serde_json::to_string(&dedicated_entry).unwrap()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        all.join("embeddings.ndjson"),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            serde_json::to_string(&all_entry).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let got = resolve_filters_to_index_slugs_at(
+        &indexed,
+        &["foo/bar".to_string(), "baz/qux".to_string()],
+    )
+    .unwrap();
+    assert_eq!(got, vec!["baz/qux", "foo/bar"]);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resolve_filters_to_index_slugs_reads_only_project_field() {
+    let root = migration_test_root("resolve-index-project-only");
+    let indexed_all = root.join("indexed").join("_all");
+    fs::create_dir_all(&indexed_all).unwrap();
+    let header = serde_json::json!({
+        "schema_version": "aicx-vector-index/v1",
+        "model_id": "test-model",
+        "model_profile": "base",
+        "dimension": 2,
+        "generated_at": "2026-06-03T18:00:00Z",
+        "entry_count": 1
+    });
+    let entry = serde_json::json!({
+        "id": "chunk-a",
+        "project": "VetCoders/Vista",
+        "embedding": ["project resolver must not deserialize this as f32"]
+    });
+    fs::write(
+        indexed_all.join("embeddings.ndjson"),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            serde_json::to_string(&entry).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let got = project_slugs_from_index_file(
+        &indexed_all.join("embeddings.ndjson"),
+        &["vetcoders/vista".to_string()],
+        false,
+    )
+    .unwrap();
+    assert_eq!(got, vec!["VetCoders/Vista"]);
 
     let _ = fs::remove_dir_all(&root);
 }

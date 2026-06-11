@@ -71,4 +71,8 @@ pub struct ConversationExtractStats {
     pub conversation_messages: usize,
     pub conversation_projection: &'static str,
     pub exact_short_duplicates_dropped: usize,
+    /// Harness-injected synthetic user turns dropped from the conversation
+    /// projection (slash-command / skill bodies, inline `! command` I/O,
+    /// system/hook reminders).
+    pub harness_noise_dropped: usize,
 }

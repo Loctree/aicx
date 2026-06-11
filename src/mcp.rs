@@ -337,12 +337,16 @@ fn default_true() -> bool {
     true
 }
 
-fn search_project_scopes(projects: &[String]) -> Vec<Option<&str>> {
+fn search_project_scopes(
+    store_root: &std::path::Path,
+    projects: &[String],
+) -> anyhow::Result<Vec<Option<String>>> {
     if projects.is_empty() {
-        vec![None]
-    } else {
-        projects.iter().map(String::as_str).map(Some).collect()
+        return Ok(vec![None]);
     }
+    let resolved =
+        store::resolve_filters_to_store_or_index_slugs_at_or_error(store_root, projects)?;
+    Ok(resolved.into_iter().map(Some).collect())
 }
 
 fn dedup_metadata_by_path(items: &mut Vec<serde_json::Value>) {
@@ -750,9 +754,14 @@ impl AicxMcpServer {
             .clone()
             .filter(|projects| !projects.is_empty())
             .unwrap_or_else(|| project.clone().into_iter().collect());
-        let project_scopes = search_project_scopes(&owned_projects);
         let store_root = store::store_base_dir()
             .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+        let project_scopes_owned = search_project_scopes(&store_root, &owned_projects)
+            .map_err(|e| McpError::invalid_params(format!("Project filter: {e}"), None))?;
+        let project_scopes: Vec<Option<&str>> = project_scopes_owned
+            .iter()
+            .map(|scope| scope.as_deref())
+            .collect();
 
         let post_filters = filter_build.post_filters;
 
@@ -1048,7 +1057,10 @@ impl AicxMcpServer {
             .clone()
             .filter(|projects| !projects.is_empty())
             .unwrap_or_else(|| params.project.clone().into_iter().collect());
-        let project_scopes = search_project_scopes(&owned_projects);
+        let store_root = store::store_base_dir()
+            .map_err(|e| McpError::internal_error(format!("Store error: {e}"), None))?;
+        let project_scopes = search_project_scopes(&store_root, &owned_projects)
+            .map_err(|e| McpError::invalid_params(format!("Project filter: {e}"), None))?;
         let mut metadatas = Vec::new();
 
         for project in project_scopes {
@@ -1058,7 +1070,7 @@ impl AicxMcpServer {
                 agent: params.agent.as_deref(),
                 kind: params.kind.as_deref(),
                 frame_kind: params.frame_kind,
-                project,
+                project: project.as_deref(),
                 date_lo: date_lo.as_deref(),
                 date_hi: date_hi.as_deref(),
             };

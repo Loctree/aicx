@@ -45,6 +45,10 @@ pub struct SemanticSearchOutcome {
 /// Result of a semantic search call.
 pub type SemanticOutcome = SemanticSearchOutcome;
 
+const BACKEND_HYBRID_RRF: &str = "hybrid_rrf";
+const BACKEND_SEMANTIC_DENSE_ONLY: &str = "semantic_dense_only";
+const BACKEND_SEMANTIC_DENSE_ONLY_ALL_FALLBACK: &str = "semantic_dense_only_all_fallback";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HybridRetrievalStatus {
     pub generation_id: String,
@@ -270,6 +274,7 @@ pub fn try_semantic_search(
         // outcome reports the degraded backend instead of silently claiming
         // hybrid — the degraded status must reach the CLI/MCP boundary.
         let mut any_dense_only = false;
+        let mut any_all_bucket_fallback = false;
         for scope in scopes {
             let mut outcome = try_semantic_search_native(
                 query,
@@ -278,8 +283,14 @@ pub fn try_semantic_search(
                 frame_kind_filter,
                 kind_filter,
             )?;
-            if outcome.backend_label == "semantic_dense_only" {
+            if outcome
+                .backend_label
+                .starts_with(BACKEND_SEMANTIC_DENSE_ONLY)
+            {
                 any_dense_only = true;
+            }
+            if outcome.backend_label.ends_with("_all_fallback") {
+                any_all_bucket_fallback = true;
             }
             scanned += outcome.scanned;
             model_id.get_or_insert(outcome.model_id.clone());
@@ -293,15 +304,81 @@ pub fn try_semantic_search(
         Ok(SemanticOutcome {
             results: merged_results,
             scanned,
-            backend_label: if any_dense_only {
-                "semantic_dense_only"
+            backend_label: if any_dense_only && any_all_bucket_fallback {
+                BACKEND_SEMANTIC_DENSE_ONLY_ALL_FALLBACK
+            } else if any_dense_only {
+                BACKEND_SEMANTIC_DENSE_ONLY
             } else {
-                "hybrid_rrf"
+                BACKEND_HYBRID_RRF
             },
             model_id: model_id.unwrap_or_else(|| "unknown".to_string()),
             retrieval_status: merge_hybrid_statuses(&hybrid_statuses),
         })
     }
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[derive(Debug)]
+struct SemanticBucketScope<'a> {
+    index_project: Option<&'a str>,
+    retrieval_project_filter: Option<&'a str>,
+    index_path: std::path::PathBuf,
+    used_all_bucket_fallback: bool,
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[derive(Clone, Copy)]
+struct SemanticRetrievalFilters<'a> {
+    kind: Option<&'a str>,
+    frame_kind: Option<FrameKind>,
+    project: Option<&'a str>,
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn index_not_built_error(path: std::path::PathBuf, project_filter: Option<&str>) -> SemanticError {
+    let cmd = match project_filter {
+        Some(p) => format!("aicx index --project {p}"),
+        None => "aicx index".to_string(),
+    };
+    SemanticError::IndexNotBuilt {
+        path: path.clone(),
+        reason: format!("vector index not yet materialized at {}", path.display()),
+        recommendation: format!(
+            "run `{cmd}` (one-off; subsequent runs query the index in-process)"
+        ),
+    }
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn select_semantic_bucket_scope<'a>(
+    project_filter: Option<&'a str>,
+    project_index_path: std::path::PathBuf,
+    all_index_path: std::path::PathBuf,
+) -> std::result::Result<SemanticBucketScope<'a>, SemanticError> {
+    if project_index_path.exists() {
+        return Ok(SemanticBucketScope {
+            index_project: project_filter,
+            // Keep project pushdown even inside a project-specific bucket as
+            // a defensive guard against stale or mixed-project artifacts.
+            retrieval_project_filter: project_filter,
+            index_path: project_index_path,
+            used_all_bucket_fallback: false,
+        });
+    }
+
+    if let Some(project) = project_filter {
+        if all_index_path.exists() {
+            return Ok(SemanticBucketScope {
+                index_project: None,
+                retrieval_project_filter: Some(project),
+                index_path: all_index_path,
+                used_all_bucket_fallback: true,
+            });
+        }
+        return Err(index_not_built_error(project_index_path, project_filter));
+    }
+
+    Err(index_not_built_error(project_index_path, project_filter))
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -321,7 +398,7 @@ fn try_semantic_search_native(
     // not pay a model/config bootstrap (the most expensive step) on every
     // call. Functionally identical to checking after; the order is what saves
     // the CPU.
-    let path = crate::vector_index::index_path(project_filter).map_err(|err| {
+    let project_index_path = crate::vector_index::index_path(project_filter).map_err(|err| {
         SemanticError::IndexNotBuilt {
             path: std::path::PathBuf::new(),
             reason: format!("could not resolve index path: {err}"),
@@ -329,20 +406,18 @@ fn try_semantic_search_native(
                 .to_string(),
         }
     })?;
-
-    if !path.exists() {
-        let cmd = match project_filter {
-            Some(p) => format!("aicx index --project {p}"),
-            None => "aicx index".to_string(),
-        };
-        return Err(SemanticError::IndexNotBuilt {
-            path: path.clone(),
-            reason: format!("vector index not yet materialized at {}", path.display()),
-            recommendation: format!(
-                "run `{cmd}` (one-off; subsequent runs query the index in-process)"
-            ),
-        });
-    }
+    let all_index_path = if project_filter.is_some() {
+        crate::vector_index::index_path(None).map_err(|err| SemanticError::IndexNotBuilt {
+            path: std::path::PathBuf::new(),
+            reason: format!("could not resolve _all index path: {err}"),
+            recommendation: "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index`"
+                .to_string(),
+        })?
+    } else {
+        project_index_path.clone()
+    };
+    let scope = select_semantic_bucket_scope(project_filter, project_index_path, all_index_path)?;
+    let path = scope.index_path.clone();
 
     // Touch the file once to surface IO errors early with a readable
     // recommendation.
@@ -449,7 +524,7 @@ fn try_semantic_search_native(
     }
 
     let manifest_path =
-        crate::vector_index::hybrid_manifest_path(project_filter).map_err(|err| {
+        crate::vector_index::hybrid_manifest_path(scope.index_project).map_err(|err| {
             SemanticError::IndexCorrupt {
                 path: path.clone(),
                 reason: format!("could not resolve hybrid manifest path: {err}"),
@@ -472,6 +547,29 @@ fn try_semantic_search_native(
         }
     };
 
+    let retrieval_filters = SemanticRetrievalFilters {
+        kind: kind_filter,
+        frame_kind: frame_kind_filter,
+        project: scope.retrieval_project_filter,
+    };
+
+    if scope.used_all_bucket_fallback {
+        // `_all` is a cross-project bucket. Loading its manifest-managed dense
+        // brute-force artifact materializes every vector in memory before the
+        // adapter can apply FilterSet. For project-scoped fallback, use the
+        // primary committed index with a pre-deserialize project guard so the
+        // operator does not pay an 11GB dense load for one repo query.
+        return query_dense_only_from_primary(
+            &path,
+            &query_embedding,
+            embedder_dim,
+            limit,
+            retrieval_filters,
+            &info.model_id,
+            true,
+        );
+    }
+
     // Patch 3 / Bug B+: the hybrid (tantivy lexical + dense fusion) stack can
     // be unavailable for manifest-side reasons — never committed
     // (`RetrievalManifestMissing`) or mid-rebuild / mismatched
@@ -481,7 +579,7 @@ fn try_semantic_search_native(
     // instead of hard-failing the whole query. Lexical is part of the
     // ranking, not a precondition for semantic search.
     let hybrid = if manifest_path.exists() {
-        match load_hybrid_index(project_filter, &path, &info, &manifest_path) {
+        match load_hybrid_index(scope.index_project, &path, &info, &manifest_path) {
             Ok(hybrid) => hybrid,
             Err(SemanticError::RetrievalManifestMissing { .. })
             | Err(SemanticError::RetrievalManifestStale { .. }) => {
@@ -490,9 +588,9 @@ fn try_semantic_search_native(
                     &query_embedding,
                     embedder_dim,
                     limit,
-                    kind_filter,
-                    frame_kind_filter,
+                    retrieval_filters,
                     &info.model_id,
+                    false,
                 );
             }
             Err(other) => return Err(other),
@@ -506,13 +604,13 @@ fn try_semantic_search_native(
             &query_embedding,
             embedder_dim,
             limit,
-            kind_filter,
-            frame_kind_filter,
+            retrieval_filters,
             &info.model_id,
+            false,
         );
     };
     let manifest = hybrid.manifest().cloned();
-    let filters = hybrid_filters(kind_filter, frame_kind_filter);
+    let filters = hybrid_filters(retrieval_filters);
     let hits = match hybrid.query_hybrid(aicx_retrieve::HybridQueryInput {
         query_text: query,
         query_embedding: &query_embedding,
@@ -553,6 +651,7 @@ fn try_semantic_search_native(
             let path = hit_path(&h);
             let score_pct = hybrid_score_pct(h.score);
             let matched_lines = semantic_preview_lines(&path);
+            let label = format!("hybrid_rrf:{}", h.chunk_id);
             FuzzyResult {
                 file: path.to_string_lossy().to_string(),
                 path: path.to_string_lossy().to_string(),
@@ -563,7 +662,7 @@ fn try_semantic_search_native(
                 date: hit_metadata_string(&h, "date"),
                 timestamp: None,
                 score: score_pct,
-                label: format!("hybrid_rrf:{}", h.chunk_id),
+                label,
                 density: h.score,
                 matched_lines,
                 session_id: hit_metadata_optional_string(&h, "session_id"),
@@ -575,7 +674,7 @@ fn try_semantic_search_native(
     Ok(SemanticOutcome {
         results,
         scanned,
-        backend_label: "hybrid_rrf",
+        backend_label: BACKEND_HYBRID_RRF,
         model_id: info.model_id,
         retrieval_status,
     })
@@ -682,23 +781,24 @@ fn query_dense_only_from_primary(
     query_embedding: &[f32],
     dim: usize,
     limit: usize,
-    kind_filter: Option<&str>,
-    frame_kind_filter: Option<FrameKind>,
+    filters: SemanticRetrievalFilters<'_>,
     model_id: &str,
+    used_all_bucket_fallback: bool,
 ) -> std::result::Result<SemanticOutcome, SemanticError> {
     use aicx_retrieve::{BruteForceAdapter, ChunkRef, DenseChunkRef, DenseIndex, Distance};
 
-    let (header, entries) =
-        crate::vector_index::read_committed_index_entries(index_path).map_err(|err| {
-            SemanticError::IndexCorrupt {
-                path: index_path.to_path_buf(),
-                reason: format!("dense-only fallback could not read committed index: {err:#}"),
-                recommendation: format!(
-                    "delete and rebuild: `rm -f {} && aicx index`",
-                    index_path.display()
-                ),
-            }
-        })?;
+    let (header, entries) = crate::vector_index::read_committed_index_entries_matching_project(
+        index_path,
+        filters.project,
+    )
+    .map_err(|err| SemanticError::IndexCorrupt {
+        path: index_path.to_path_buf(),
+        reason: format!("dense-only fallback could not read committed index: {err:#}"),
+        recommendation: format!(
+            "delete and rebuild: `rm -f {} && aicx index`",
+            index_path.display()
+        ),
+    })?;
 
     // Defensive dimension guard: a committed index built with a different
     // embedder (operator's F2LLM 2048 -> qwen3 4096 migration) must NOT be
@@ -761,8 +861,8 @@ fn query_dense_only_from_primary(
         ),
     })?;
 
-    let filters = hybrid_filters(kind_filter, frame_kind_filter);
-    let hits = DenseIndex::query(&dense, query_embedding, limit, &filters).map_err(|err| {
+    let filter_set = hybrid_filters(filters);
+    let hits = DenseIndex::query(&dense, query_embedding, limit, &filter_set).map_err(|err| {
         SemanticError::IndexCorrupt {
             path: index_path.to_path_buf(),
             reason: format!("dense-only fallback query failed: {err:#}"),
@@ -776,6 +876,11 @@ fn query_dense_only_from_primary(
             let path = hit_path(&h);
             let score_pct = dense_score_pct(h.score);
             let matched_lines = semantic_preview_lines(&path);
+            let label = if used_all_bucket_fallback {
+                format!("dense_only_all_fallback:{}", h.chunk_id)
+            } else {
+                format!("dense_only:{}", h.chunk_id)
+            };
             FuzzyResult {
                 file: path.to_string_lossy().to_string(),
                 path: path.to_string_lossy().to_string(),
@@ -786,7 +891,7 @@ fn query_dense_only_from_primary(
                 date: hit_metadata_string(&h, "date"),
                 timestamp: None,
                 score: score_pct,
-                label: format!("dense_only:{}", h.chunk_id),
+                label,
                 density: h.score,
                 matched_lines,
                 session_id: hit_metadata_optional_string(&h, "session_id"),
@@ -798,7 +903,11 @@ fn query_dense_only_from_primary(
     Ok(SemanticOutcome {
         results,
         scanned,
-        backend_label: "semantic_dense_only",
+        backend_label: if used_all_bucket_fallback {
+            BACKEND_SEMANTIC_DENSE_ONLY_ALL_FALLBACK
+        } else {
+            BACKEND_SEMANTIC_DENSE_ONLY
+        },
         model_id: model_id.to_string(),
         retrieval_status: None,
     })
@@ -815,24 +924,27 @@ fn dense_score_pct(cosine_similarity: f32) -> u8 {
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn hybrid_filters(
-    kind_filter: Option<&str>,
-    frame_kind_filter: Option<FrameKind>,
-) -> aicx_retrieve::FilterSet {
-    let mut filters = aicx_retrieve::FilterSet::default();
-    if let Some(kind) = kind_filter {
-        filters.values.insert(
+fn hybrid_filters(filters: SemanticRetrievalFilters<'_>) -> aicx_retrieve::FilterSet {
+    let mut set = aicx_retrieve::FilterSet::default();
+    if let Some(project) = filters.project {
+        set.values.insert(
+            "project".to_string(),
+            serde_json::Value::String(project.to_string()),
+        );
+    }
+    if let Some(kind) = filters.kind {
+        set.values.insert(
             "kind".to_string(),
             serde_json::Value::String(kind.to_string()),
         );
     }
-    if let Some(frame_kind) = frame_kind_filter {
-        filters.values.insert(
+    if let Some(frame_kind) = filters.frame_kind {
+        set.values.insert(
             "frame_kind".to_string(),
             serde_json::Value::String(frame_kind.as_str().to_string()),
         );
     }
-    filters
+    set
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -1192,8 +1304,14 @@ pub fn render_semantic_status_line(
     // The dense-only degraded path (Bug B+) must not masquerade as a healthy
     // hybrid query: tell the operator the lexical fusion leg is unavailable
     // and that this is a fallback, not the full stack.
-    let (prefix, index_label, fallback_label) = if backend_label == "semantic_dense_only" {
+    let dense_only = backend_label.starts_with(BACKEND_SEMANTIC_DENSE_ONLY);
+    let all_bucket_fallback = backend_label.ends_with("_all_fallback");
+    let (prefix, index_label, fallback_label) = if dense_only && all_bucket_fallback {
+        ("[degraded] ", "dense_only", "hybrid_unavailable,all_bucket")
+    } else if dense_only {
         ("[degraded] ", "dense_only", "hybrid_unavailable")
+    } else if all_bucket_fallback {
+        ("", "hybrid", "all_bucket")
     } else {
         ("", "hybrid", "none")
     };
@@ -1213,23 +1331,82 @@ pub fn render_semantic_status_line(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SEARCH_TEST_AICX_HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct SearchTestAicxHomeGuard {
+        previous: Option<OsString>,
+        dir: PathBuf,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for SearchTestAicxHomeGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(previous) => {
+                    // SAFETY: tests that mutate AICX_HOME are serialized by
+                    // SEARCH_TEST_AICX_HOME_LOCK for the guard lifetime.
+                    unsafe { std::env::set_var("AICX_HOME", previous) };
+                }
+                None => {
+                    // SAFETY: tests that mutate AICX_HOME are serialized by
+                    // SEARCH_TEST_AICX_HOME_LOCK for the guard lifetime.
+                    unsafe { std::env::remove_var("AICX_HOME") };
+                }
+            }
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn set_search_test_aicx_home(label: &str) -> SearchTestAicxHomeGuard {
+        let guard = SEARCH_TEST_AICX_HOME_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("search AICX_HOME test lock");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "aicx-search-engine-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create isolated search AICX_HOME");
+        let previous = std::env::var_os("AICX_HOME");
+        // SAFETY: guarded by SEARCH_TEST_AICX_HOME_LOCK for the full
+        // lifetime of the returned guard.
+        unsafe { std::env::set_var("AICX_HOME", &dir) };
+        SearchTestAicxHomeGuard {
+            previous,
+            dir,
+            _guard: guard,
+        }
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    fn test_semantic_filters<'a>(project: Option<&'a str>) -> SemanticRetrievalFilters<'a> {
+        SemanticRetrievalFilters {
+            kind: None,
+            frame_kind: None,
+            project,
+        }
+    }
 
     #[test]
     fn fail_fast_carries_actionable_recommendation() {
+        let home = set_search_test_aicx_home("fail-fast");
         // In any test environment we either lack the feature flag, lack a
         // hydrated embedder, or lack a built index. The function must
         // never panic, and the typed error must carry both a non-empty
         // `reason` AND a non-empty `recommendation` so the operator
         // knows what to do next.
-        let result = try_semantic_search(
-            Path::new("/tmp/aicx-search-engine-test"),
-            "any query",
-            10,
-            &[None],
-            None,
-            None,
-        );
+        let result = try_semantic_search(&home.dir, "any query", 10, &[None], None, None);
 
         match result {
             Err(err) => {
@@ -1315,6 +1492,134 @@ mod tests {
         );
     }
 
+    /// F1 regression: project-scoped semantic search may run on a host where
+    /// only the cross-project `_all` bucket is materialized. In that case the
+    /// search path should fall back to `_all`, while keeping the requested
+    /// project as a strict retrieval filter.
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn project_bucket_missing_falls_back_to_all_with_project_filter() {
+        let dir = std::env::temp_dir().join(format!(
+            "aicx-semantic-scope-fallback-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let project_index_path = dir.join("vetcoders_vista").join("embeddings.ndjson");
+        let all_index_path = dir.join("_all").join("embeddings.ndjson");
+        std::fs::create_dir_all(all_index_path.parent().unwrap()).expect("create all bucket");
+        std::fs::write(&all_index_path, "{}\n").expect("touch all index");
+
+        let scope = select_semantic_bucket_scope(
+            Some("vetcoders/vista"),
+            project_index_path.clone(),
+            all_index_path.clone(),
+        )
+        .expect("missing project bucket should use existing _all bucket");
+
+        assert_eq!(scope.index_path, all_index_path);
+        assert_eq!(scope.index_project, None);
+        assert_eq!(scope.retrieval_project_filter, Some("vetcoders/vista"));
+        assert!(
+            scope.used_all_bucket_fallback,
+            "scope should explicitly mark the _all fallback"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F1 regression: when dense-only fallback queries `_all`, project
+    /// filtering must happen inside retrieval before top-N selection. A very
+    /// close hit from another project must not crowd out the requested project.
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn dense_only_all_bucket_project_filter_is_strict_before_limit() {
+        use crate::vector_index::{IndexEntry, IndexHeader};
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!(
+            "aicx-dense-only-project-filter-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let vista_chunk = dir.join("vista.md");
+        let other_chunk = dir.join("other.md");
+        std::fs::write(&vista_chunk, "vista transcription duplication note").expect("write vista");
+        std::fs::write(&other_chunk, "other project with near identical embedding")
+            .expect("write other");
+
+        let header = IndexHeader {
+            schema_version: "1".to_string(),
+            model_id: "test-model".to_string(),
+            model_profile: "test".to_string(),
+            dimension: 3,
+            generated_at: "2026-06-03T00:00:00Z".to_string(),
+            entry_count: 2,
+        };
+        let mk_entry =
+            |id: &str, project: &str, path: &std::path::Path, emb: Vec<f32>| IndexEntry {
+                id: id.to_string(),
+                project: project.to_string(),
+                agent: "claude".to_string(),
+                date: "20260603".to_string(),
+                path: path.to_path_buf(),
+                kind: "conversations".to_string(),
+                session_id: format!("sess-{id}"),
+                frame_kind: Some("agent_reply".to_string()),
+                cwd: None,
+                embedding: emb,
+            };
+        let other = mk_entry(
+            "other-hit",
+            "vetcoders/other",
+            &other_chunk,
+            vec![1.0, 0.0, 0.0],
+        );
+        let other_bad_dim = mk_entry(
+            "other-bad-dim",
+            "vetcoders/other",
+            &other_chunk,
+            vec![1.0, 0.0],
+        );
+        let vista = mk_entry(
+            "vista-hit",
+            "vetcoders/vista",
+            &vista_chunk,
+            vec![0.8, 0.2, 0.0],
+        );
+        let index_path = dir.join("embeddings.ndjson");
+        {
+            let mut f = std::fs::File::create(&index_path).expect("create index");
+            writeln!(f, "{}", serde_json::to_string(&header).unwrap()).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&other).unwrap()).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&other_bad_dim).unwrap()).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&vista).unwrap()).unwrap();
+        }
+
+        let query = vec![1.0_f32, 0.0, 0.0];
+        let outcome = query_dense_only_from_primary(
+            &index_path,
+            &query,
+            3,
+            1,
+            test_semantic_filters(Some("vetcoders/vista")),
+            "test-model",
+            false,
+        )
+        .expect("dense-only _all query should retain requested project hits");
+
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].project, "vetcoders/vista");
+        assert!(
+            outcome.results[0].label.contains("vista-hit"),
+            "expected requested project hit, got {}",
+            outcome.results[0].label
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Patch 3 / Bug B+: when the hybrid stack is unavailable, semantic
     /// search must degrade to dense-only ranking over the PRIMARY committed
     /// index instead of hard-failing. This proves the dense leg reads the
@@ -1368,9 +1673,16 @@ mod tests {
 
         // Query closest to entry_a's [1, 0, 0].
         let query = vec![0.9_f32, 0.1, 0.0];
-        let outcome =
-            query_dense_only_from_primary(&index_path, &query, 3, 10, None, None, "test-model")
-                .expect("dense-only query should succeed on a valid primary index");
+        let outcome = query_dense_only_from_primary(
+            &index_path,
+            &query,
+            3,
+            10,
+            test_semantic_filters(None),
+            "test-model",
+            false,
+        )
+        .expect("dense-only query should succeed on a valid primary index");
 
         assert_eq!(
             outcome.backend_label, "semantic_dense_only",
@@ -1383,6 +1695,73 @@ mod tests {
         assert!(
             outcome.results[0].label.contains("chunk-a"),
             "closest embedding (chunk-a) must rank first, got label: {}",
+            outcome.results[0].label
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn dense_only_all_bucket_fallback_labels_backend_explicitly() {
+        use crate::vector_index::{IndexEntry, IndexHeader};
+        use std::io::Write;
+
+        let dir =
+            std::env::temp_dir().join(format!("aicx-dense-only-all-label-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let chunk_path = dir.join("vista.md");
+        std::fs::write(&chunk_path, "vista fallback chunk").expect("write chunk");
+        let index_path = dir.join("embeddings.ndjson");
+
+        let header = IndexHeader {
+            schema_version: "1".to_string(),
+            model_id: "test-model".to_string(),
+            model_profile: "test".to_string(),
+            dimension: 3,
+            generated_at: "2026-06-04T00:00:00Z".to_string(),
+            entry_count: 1,
+        };
+        let entry = IndexEntry {
+            id: "vista-hit".to_string(),
+            project: "vetcoders/vista".to_string(),
+            agent: "claude".to_string(),
+            date: "20260604".to_string(),
+            path: chunk_path,
+            kind: "conversations".to_string(),
+            session_id: "sess-vista-hit".to_string(),
+            frame_kind: Some("agent_reply".to_string()),
+            cwd: None,
+            embedding: vec![1.0, 0.0, 0.0],
+        };
+
+        {
+            let mut f = std::fs::File::create(&index_path).expect("create index");
+            writeln!(f, "{}", serde_json::to_string(&header).unwrap()).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
+        }
+
+        let outcome = query_dense_only_from_primary(
+            &index_path,
+            &[1.0, 0.0, 0.0],
+            3,
+            10,
+            test_semantic_filters(Some("vetcoders/vista")),
+            "test-model",
+            true,
+        )
+        .expect("dense-only all-bucket fallback should succeed");
+
+        assert_eq!(
+            outcome.backend_label,
+            BACKEND_SEMANTIC_DENSE_ONLY_ALL_FALLBACK
+        );
+        assert!(
+            outcome.results[0]
+                .label
+                .starts_with("dense_only_all_fallback:"),
+            "all-bucket fallback hit label should be explicit, got {}",
             outcome.results[0].label
         );
 
@@ -1438,8 +1817,16 @@ mod tests {
 
         // ...but the current embedder is dimension 3.
         let query = vec![1.0_f32, 0.0, 0.0];
-        let err = query_dense_only_from_primary(&index_path, &query, 3, 10, None, None, "qwen3-3d")
-            .expect_err("dimension mismatch must error, not rank cross-model garbage");
+        let err = query_dense_only_from_primary(
+            &index_path,
+            &query,
+            3,
+            10,
+            test_semantic_filters(None),
+            "qwen3-3d",
+            false,
+        )
+        .expect_err("dimension mismatch must error, not rank cross-model garbage");
         assert_eq!(
             err.kind(),
             "dimension_mismatch",
@@ -1478,8 +1865,16 @@ mod tests {
         }
 
         let query = vec![1.0_f32, 0.0, 0.0];
-        let err = query_dense_only_from_primary(&index_path, &query, 3, 10, None, None, "m")
-            .expect_err("empty committed index must error");
+        let err = query_dense_only_from_primary(
+            &index_path,
+            &query,
+            3,
+            10,
+            test_semantic_filters(None),
+            "m",
+            false,
+        )
+        .expect_err("empty committed index must error");
         assert_eq!(err.kind(), "empty_index");
 
         let _ = std::fs::remove_dir_all(&dir);

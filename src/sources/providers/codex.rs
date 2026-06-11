@@ -458,6 +458,46 @@ fn codex_payload_message(payload: &serde_json::Value) -> String {
     render_json_inline(payload)
 }
 
+fn codex_response_item_message(payload: &serde_json::Value) -> String {
+    payload
+        .get("content")
+        .map(codex_content_message)
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| codex_payload_message(payload))
+}
+
+fn codex_content_message(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(codex_content_part_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        serde_json::Value::Object(_) => {
+            codex_content_part_text(value).unwrap_or_else(|| render_json_inline(value))
+        }
+        _ => render_json_inline(value),
+    }
+}
+
+fn codex_content_part_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+
+    let obj = value.as_object()?;
+    for key in ["text", "content", "message"] {
+        if let Some(text) = obj.get(key).and_then(|v| v.as_str())
+            && !text.trim().is_empty()
+        {
+            return Some(text.to_string());
+        }
+    }
+
+    None
+}
+
 fn codex_timestamp_from_epoch_seconds(raw: i64) -> Option<DateTime<Utc>> {
     Utc.timestamp_opt(raw, 0).single()
 }
@@ -723,7 +763,7 @@ fn parse_codex_session_events_with_diagnostics(
             continue;
         }
 
-        if ev.event_type != "event_msg" {
+        if ev.event_type != "event_msg" && ev.event_type != "response_item" {
             continue;
         }
 
@@ -737,84 +777,107 @@ fn parse_codex_session_events_with_diagnostics(
             }
         }
 
-        let msg_type = ev
-            .payload
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let (role, message, frame_kind) = if ev.event_type == "response_item" {
+            let item_type = ev
+                .payload
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if item_type != "message" {
+                continue;
+            }
 
-        let (role, message, frame_kind) = match msg_type {
-            "user_message" => (
-                "user",
-                ev.payload
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                Some(FrameKind::UserMsg),
-            ),
-            "agent_message" => (
-                "assistant",
-                ev.payload
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                Some(FrameKind::AgentReply),
-            ),
-            "agent_reasoning" | "thinking" | "thinking_delta" => (
-                "reasoning",
-                ev.payload
-                    .get("text")
-                    .or_else(|| ev.payload.get("message"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                Some(FrameKind::InternalThought),
-            ),
-            "function_call"
-            | "tool_call"
-            | "tool_result"
-            | "mcp_tool_call"
-            | "mcp_tool_call_response" => (
-                "tool",
-                ev.payload
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| render_json_inline(&ev.payload)),
-                Some(FrameKind::ToolCall),
-            ),
-            "task_started"
-            | "task_complete"
-            | "error"
-            | "notification"
-            | "web_search"
-            | "web_search_complete" => (
-                "system",
-                codex_payload_message(&ev.payload),
-                Some(FrameKind::SystemNote),
-            ),
-            other => {
-                let sample = if other.is_empty() {
-                    "<missing>".to_string()
-                } else {
-                    other.to_string()
-                };
-                unknown_msg_type_count += 1;
-                push_unique_sample(&mut unknown_msg_type_samples, sample, 5);
+            let raw_role = ev
+                .payload
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("system");
+            let frame_kind = frame_kind_from_role(raw_role);
+            let role = match frame_kind {
+                Some(kind) => role_for_frame_kind(kind).to_string(),
+                None => raw_role.to_string(),
+            };
+            (role, codex_response_item_message(&ev.payload), frame_kind)
+        } else {
+            let msg_type = ev
+                .payload
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
 
-                let role = ev
-                    .payload
-                    .get("role")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("system");
-                let frame_kind = frame_kind_from_role(role).unwrap_or(FrameKind::SystemNote);
-                (
-                    role_for_frame_kind(frame_kind),
+            match msg_type {
+                "user_message" => (
+                    "user".to_string(),
+                    ev.payload
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    Some(FrameKind::UserMsg),
+                ),
+                "agent_message" => (
+                    "assistant".to_string(),
+                    ev.payload
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    Some(FrameKind::AgentReply),
+                ),
+                "agent_reasoning" | "thinking" | "thinking_delta" => (
+                    "reasoning".to_string(),
+                    ev.payload
+                        .get("text")
+                        .or_else(|| ev.payload.get("message"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    Some(FrameKind::InternalThought),
+                ),
+                "function_call"
+                | "tool_call"
+                | "tool_result"
+                | "mcp_tool_call"
+                | "mcp_tool_call_response" => (
+                    "tool".to_string(),
+                    ev.payload
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| render_json_inline(&ev.payload)),
+                    Some(FrameKind::ToolCall),
+                ),
+                "task_started"
+                | "task_complete"
+                | "error"
+                | "notification"
+                | "web_search"
+                | "web_search_complete" => (
+                    "system".to_string(),
                     codex_payload_message(&ev.payload),
-                    Some(frame_kind),
-                )
+                    Some(FrameKind::SystemNote),
+                ),
+                other => {
+                    let sample = if other.is_empty() {
+                        "<missing>".to_string()
+                    } else {
+                        other.to_string()
+                    };
+                    unknown_msg_type_count += 1;
+                    push_unique_sample(&mut unknown_msg_type_samples, sample, 5);
+
+                    let role = ev
+                        .payload
+                        .get("role")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("system");
+                    let frame_kind = frame_kind_from_role(role).unwrap_or(FrameKind::SystemNote);
+                    (
+                        role_for_frame_kind(frame_kind).to_string(),
+                        codex_payload_message(&ev.payload),
+                        Some(frame_kind),
+                    )
+                }
             }
         };
 
@@ -850,7 +913,7 @@ fn parse_codex_session_events_with_diagnostics(
             timestamp,
             "codex",
             &session_id,
-            role,
+            &role,
             message,
             TimelineEntryMeta {
                 branch: None,

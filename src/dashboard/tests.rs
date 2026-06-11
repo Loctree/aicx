@@ -65,7 +65,7 @@ fn inline_markdown_via_node(markdown: &str) -> Option<String> {
     let output = Command::new("node")
         .arg("-e")
         .arg(
-            "const md=require(process.argv[1]); process.stdout.write(md.inlineMarkdown(process.argv[2]));",
+            "const { pathToFileURL } = require('url'); (async () => { await import(pathToFileURL(process.argv[1])); const md = globalThis.AicxMarkdown; process.stdout.write(md.inlineMarkdown(process.argv[2])); })().catch((err) => { console.error(err); process.exit(1); });",
         )
         .arg(module_path)
         .arg(markdown)

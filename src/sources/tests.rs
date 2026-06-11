@@ -389,6 +389,49 @@ fn test_extract_claude_file_classifies_frame_kinds_from_fixture() {
 }
 
 #[test]
+fn test_extract_claude_file_ismeta_user_entry_becomes_system_note() {
+    // A harness-injected user row (`isMeta: true` — e.g. a hook/system-reminder
+    // injection) must be classified as SystemNote, not UserMsg, so it is dropped
+    // by the conversation projection and excluded from the user-only/intent lane,
+    // while still surviving the full report (include_assistant = true).
+    let root = unique_test_dir("claude-ismeta-system-note");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"type":"user","message":{"role":"user","content":"real operator question"},"timestamp":"2026-04-14T10:00:00Z","sessionId":"sess-meta","gitBranch":"main","cwd":"/tmp/aicx"}
+{"type":"user","isMeta":true,"message":{"role":"user","content":"<system-reminder>injected hook context</system-reminder>"},"timestamp":"2026-04-14T10:00:01Z","sessionId":"sess-meta","gitBranch":"main","cwd":"/tmp/aicx"}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_claude_file(&tmp, &config).unwrap();
+    assert_eq!(
+        frame_kinds(&entries),
+        vec![Some(FrameKind::UserMsg), Some(FrameKind::SystemNote)]
+    );
+    assert_eq!(entries[0].message, "real operator question");
+    assert!(entries[1].message.contains("injected hook context"));
+
+    // user-only extraction (include_assistant = false) must drop the meta row.
+    let user_only = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: false,
+        watermark: None,
+    };
+    let user_entries = extract_claude_file(&tmp, &user_only).unwrap();
+    assert_eq!(frame_kinds(&user_entries), vec![Some(FrameKind::UserMsg)]);
+    assert_eq!(user_entries[0].message, "real operator question");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn test_extract_claude_file_drops_signature_only_thinking_killer_case() {
     let root = unique_test_dir("claude-empty-thinking-signature");
     let tmp = root.join("session.jsonl");
@@ -660,6 +703,36 @@ fn test_extract_codex_file_classifies_frame_kinds_from_fixture() {
     assert_eq!(entries[1].message, "Visible assistant reply");
     assert_eq!(entries[2].message, "Hidden chain of thought");
     assert!(entries[3].message.contains("searchDocs"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_extract_codex_file_classifies_developer_response_item_as_system_note() {
+    let root = unique_test_dir("codex-developer-response-item");
+    let tmp = root.join("rollout.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"timestamp":"2026-06-05T10:00:00Z","type":"session_meta","payload":{"id":"codex-developer-role","cwd":"/tmp/aicx"}}
+{"timestamp":"2026-06-05T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"real user request"}]}}
+{"timestamp":"2026-06-05T10:00:02Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"injected developer instruction"}]}}"#;
+    write_file(&tmp, content);
+
+    let entries = extract_codex_file(&tmp, &default_config(true)).unwrap();
+    assert_eq!(
+        frame_kinds(&entries),
+        vec![Some(FrameKind::UserMsg), Some(FrameKind::SystemNote)]
+    );
+    assert_eq!(entries[0].role, "user");
+    assert_eq!(entries[0].message, "real user request");
+    assert_eq!(entries[1].role, "system");
+    assert_eq!(entries[1].message, "injected developer instruction");
+
+    let user_only_entries = extract_codex_file(&tmp, &default_config(false)).unwrap();
+    assert_eq!(
+        frame_kinds(&user_only_entries),
+        vec![Some(FrameKind::UserMsg)]
+    );
+    assert_eq!(user_only_entries[0].message, "real user request");
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -1379,6 +1452,47 @@ fn test_extract_junie_file_honors_user_only_mode() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].role, "user");
     assert_eq!(entries[0].message, "hello");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_extract_junie_file_plan_attachment_prompt_becomes_system_note() {
+    let root = unique_test_dir("junie-plan-attachment-system-note");
+    let session_dir = root.join("session-260605-183024-junie");
+    let tmp = session_dir.join("events.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"kind":"UserPromptEvent","requestId":"prompt-260605-183100-real1","prompt":"real operator question","presentablePrompt":"real operator question"}
+{"kind":"UserPromptEvent","requestId":"prompt-260605-183101-meta1","prompt":"Implement the suggested plan","presentablePrompt":"Implement the suggested plan","customAttachments":[{"kind":"PlanAttachment","plan":{"sections":[{"name":"Requirements","content":"Injected harness plan"}]}}]}"#;
+    write_file(&tmp, content);
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries = extract_junie_file(&tmp, &config).unwrap();
+    assert_eq!(
+        frame_kinds(&entries),
+        vec![Some(FrameKind::UserMsg), Some(FrameKind::SystemNote)]
+    );
+    assert_eq!(entries[0].role, "user");
+    assert_eq!(entries[0].message, "real operator question");
+    assert_eq!(entries[1].role, "system");
+    assert_eq!(entries[1].message, "Implement the suggested plan");
+
+    let user_only = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.timestamp_opt(0, 0).single().unwrap(),
+        include_assistant: false,
+        watermark: None,
+    };
+    let user_entries = extract_junie_file(&tmp, &user_only).unwrap();
+    assert_eq!(frame_kinds(&user_entries), vec![Some(FrameKind::UserMsg)]);
+    assert_eq!(user_entries[0].message, "real operator question");
 
     let _ = fs::remove_dir_all(&root);
 }

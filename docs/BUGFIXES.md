@@ -2793,3 +2793,45 @@ Gate: `cargo fmt --all --check`; `cargo test help`;
 primary CLI discovery powinno nazywac rzecz po funkcji: corpus, store,
 dashboard. Gdy czyscisz help text, renderuj help w tescie zamiast zakladac, ze
 doc-comment grep pokrywa realny output.
+
+---
+
+## 2026-06-05 — search fail-fast test no longer loads operator runtime · `this workflow`
+
+**Symptom.** Full `cargo test` byl blokowany przez
+`search_engine::tests::fail_fast_carries_actionable_recommendation`; targeted
+repro potwierdzil, ze sam test po buildzie wisial ponad 30s. Wczesniejszy wpis
+w tym pliku traktowal to jako znany pre-existing hang, wiec suite nie mogl
+uczciwie domknac pelnego green gate.
+
+**Root cause.** Test podawal `/tmp/aicx-search-engine-test` jako `store_root`,
+ale semantic index resolver bierze runtime path z `$AICX_HOME` / operator home.
+Na maszynie z lokalnym indeksem i embedderem test wchodzil w prawdziwa semantic
+query/bootstrap zamiast deterministycznie sprawdzic fail-fast contract.
+
+**Fix.**
+
+- `fail_fast_carries_actionable_recommendation` ustawia izolowany pusty
+  `AICX_HOME` przez RAII guard i restore w `Drop`.
+- Guard serializuje lokalne mutacje env lockiem, tworzy unikalny katalog w
+  `std::env::temp_dir()` i usuwa go po tescie.
+- Test dalej akceptuje kazdy typed fail-fast/success wariant, ale juz nie moze
+  przypadkowo uzyc operatorowego indeksu ani odpalic kosztownego embeddera
+  przed brakiem indeksu.
+
+**Touched.**
+
+- `src/search_engine.rs` — test-only isolated `AICX_HOME` guard.
+- `docs/BUGFIXES.md` — zamkniety wpis dla dawnego hanging gate.
+
+**Tests.** Targeted reprodukcja przed fixem:
+`cargo test --lib search_engine::tests::fail_fast_carries_actionable_recommendation -- --nocapture`
+wisiala ponad 30s i zostala przerwana. Po fixie zielone:
+`cargo test --lib search_engine::tests::fail_fast_carries_actionable_recommendation -- --nocapture`
+(test body 0.00s), `cargo fmt --check`,
+`cargo clippy --workspace -- -D warnings`,
+`cargo test -- --test-threads=2` bez skipow.
+
+**Lessons.** Test fail-fast nie moze zalezec od hostowego runtime. Jesli code path
+czyta `$AICX_HOME`, test musi ten home jawnie izolowac albo testuje operatorowy
+stan maszyny, nie kontrakt kodu.

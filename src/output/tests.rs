@@ -61,6 +61,7 @@ fn conversation_stats(redaction_enabled: bool, messages: usize) -> ConversationE
         conversation_messages: messages,
         conversation_projection: "user_assistant_only",
         exact_short_duplicates_dropped: 0,
+        harness_noise_dropped: 0,
     }
 }
 

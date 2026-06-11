@@ -144,12 +144,16 @@ pub(super) fn merge_project_scopes(
     merged
 }
 
-fn search_project_scopes(projects: &[String]) -> Vec<Option<&str>> {
+fn search_project_scopes(
+    store_root: &std::path::Path,
+    projects: &[String],
+) -> Result<Vec<Option<String>>> {
     if projects.is_empty() {
-        vec![None]
-    } else {
-        projects.iter().map(String::as_str).map(Some).collect()
+        return Ok(vec![None]);
     }
+    let resolved =
+        crate::store::resolve_filters_to_store_or_index_slugs_at_or_error(store_root, projects)?;
+    Ok(resolved.into_iter().map(Some).collect())
 }
 
 fn project_matches_any_filter(project: &str, filters: &[String]) -> bool {
@@ -247,9 +251,25 @@ pub(super) async fn get_semantic_search(
     let query_clone = query.clone();
     let project_owned = request_projects.clone();
     let kind_filter_owned = kind_filter;
+    let project_scopes_owned = match search_project_scopes(&store_root, &project_owned) {
+        Ok(scopes) => scopes,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    ok: false,
+                    error: error.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
 
     let result = tokio::task::spawn_blocking(move || {
-        let project_scopes = search_project_scopes(&project_owned);
+        let project_scopes: Vec<Option<&str>> = project_scopes_owned
+            .iter()
+            .map(|scope| scope.as_deref())
+            .collect();
         crate::search_engine::try_semantic_search(
             &store_root,
             &query_clone,
@@ -415,15 +435,16 @@ fn run_steer_search(params: SteerSearchParams, limit: usize) -> Result<SteerSear
     };
 
     let project_filters = merge_project_scopes(None, params.project.clone(), params.projects);
+    let store_root = crate::store::store_base_dir()?;
     let mut metadatas = Vec::new();
-    for project in search_project_scopes(&project_filters) {
+    for project in search_project_scopes(&store_root, &project_filters)? {
         let filter = crate::steer_index::SteerFilter {
             run_id: params.run_id.as_deref(),
             prompt_id: params.prompt_id.as_deref(),
             agent: params.agent.as_deref(),
             kind: params.kind.as_deref(),
             frame_kind: params.frame_kind,
-            project,
+            project: project.as_deref(),
             date_lo: date_lo.as_deref(),
             date_hi: date_hi.as_deref(),
         };

@@ -115,7 +115,11 @@ impl Aicx {
         } else {
             opts.projects
         };
-        let project_scopes = search_project_scopes(&owned_projects);
+        let project_scopes_owned = search_project_scopes(&self.config.store_root, &owned_projects)?;
+        let project_scopes: Vec<Option<&str>> = project_scopes_owned
+            .iter()
+            .map(|scope| scope.as_deref())
+            .collect();
 
         let kind_filter = match opts.kind.as_deref() {
             Some(kind) => Some(
@@ -198,12 +202,13 @@ impl Default for SearchOptions {
     }
 }
 
-fn search_project_scopes(projects: &[String]) -> Vec<Option<&str>> {
+fn search_project_scopes(store_root: &Path, projects: &[String]) -> Result<Vec<Option<String>>> {
     if projects.is_empty() {
-        vec![None]
-    } else {
-        projects.iter().map(String::as_str).map(Some).collect()
+        return Ok(vec![None]);
     }
+    let resolved =
+        crate::store::resolve_filters_to_store_or_index_slugs_at_or_error(store_root, projects)?;
+    Ok(resolved.into_iter().map(Some).collect())
 }
 
 #[derive(Debug, Clone, Serialize)]
