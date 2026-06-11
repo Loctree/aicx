@@ -163,13 +163,8 @@ check:
 	@$(MAKE) test-native
 	@echo "[9/10] Building slim release binaries..."
 	@cargo build --locked --release --bin aicx --bin aicx-mcp
-	@echo "[10/10] Running Semgrep (if available)..."
-	@if command -v semgrep >/dev/null 2>&1 || command -v pipx >/dev/null 2>&1; then \
-		SEMGREP=$$(command -v semgrep || echo "pipx run semgrep"); \
-		$$SEMGREP --config auto --error --quiet . --exclude target; \
-	else \
-		echo "[!] Semgrep not available, skipping (install: pipx install semgrep)"; \
-	fi
+	@echo "[10/10] Running Semgrep (required)..."
+	@$(MAKE) semgrep
 	@echo "=== All checks passed ==="
 
 fmt:
@@ -219,12 +214,11 @@ embeddings-clippy:
 	cargo clippy --locked -p aicx-embeddings --features gguf -- -D warnings
 
 semgrep:
-	@if command -v semgrep >/dev/null 2>&1 || command -v pipx >/dev/null 2>&1; then \
-		SEMGREP=$$(command -v semgrep || echo "pipx run semgrep"); \
-		$$SEMGREP --config auto --error --quiet . --exclude target; \
-	else \
-		echo "[!] Semgrep not available, skipping (install: pipx install semgrep)"; \
-	fi
+	@if command -v semgrep >/dev/null 2>&1; then SEMGREP="semgrep"; \
+	elif command -v uvx >/dev/null 2>&1; then SEMGREP="uvx semgrep"; \
+	elif command -v pipx >/dev/null 2>&1; then SEMGREP="pipx run semgrep"; \
+	else echo "[x] Semgrep is REQUIRED — no runner found. Install semgrep, or use 'uvx semgrep' / 'pipx run semgrep'." >&2; exit 1; fi; \
+	$$SEMGREP --config auto --error --quiet . --exclude target
 
 ci: check
 	@echo "CI-equivalent local checks passed."
