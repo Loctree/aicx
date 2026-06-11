@@ -30,36 +30,24 @@ resolver = "3"
 
 [features]
 loctree-consumer = []
-# aicx is semantic-by-default with two compiled-in backends: cloud HTTP
-# embedder (the recommended VetCoders production default — zero-install,
-# config-driven) and native GGUF (offline / dev workstations). Filesystem
-# fuzzy stays the graceful fallback when neither backend can serve a query.
 default = ["native-embedder", "cloud-embedder"]
-# Lance semantic steer index and local BM25 ranking (optional).
-# Opting out drops the lancedb C++ build requirements.
+# Lance steer index + local BM25; opting out drops the lancedb C++ build deps.
 lance = ["dep:rmcp-memex"]
-# Native embedder — first-choice in-process local embeddings through the
-# reusable aicx-embeddings crate. The installed binary stays slim: models are
-# hydrated into the HF cache or pinned by path, not silently bundled.
+# In-process GGUF embeddings (offline / dev workstations).
 native-embedder = ["dep:aicx-embeddings", "aicx-embeddings/gguf"]
 native-embedder-metal = ["native-embedder", "aicx-embeddings/metal"]
 native-embedder-openmp = ["native-embedder", "aicx-embeddings/openmp"]
-# Cloud embedder — HTTP POST against an OpenAI-compatible /v1/embeddings
-# endpoint. Recommended VetCoders default for production: no GGUF download
-# required; URL + model + api_key_env live in ~/.aicx/config.toml.
+# HTTP embedder against an OpenAI-compatible /v1/embeddings endpoint
+# (production default; config in ~/.aicx/config.toml).
 cloud-embedder = ["dep:aicx-embeddings", "aicx-embeddings/cloud"]
-# Opt-in end-to-end pipeline test (`tests/e2e_pipeline.rs`). Requires the
-# canonical `~/.aicx/config.toml` (cloud cascade) or a hydrated GGUF model.
-# Fail-fast on missing preconditions per operator doctrine — no silent skip.
-# Run with `cargo test --features e2e-aicx --test e2e_pipeline` (or
-# `make test-e2e`). CI without these preconditions does not run it.
+# Opt-in e2e pipeline test: cargo test --features e2e-aicx --test e2e_pipeline
 e2e-aicx = ["native-embedder", "cloud-embedder"]
 
 [dependencies]
-aicx-embeddings = { version = "0.8.0", optional = true, default-features = false }
-aicx-monitor = { version = "0.1.0" }
-aicx-parser = { version = "0.8.0", features = ["json-schema"] }
-aicx-progress-contracts = { version = "0.1.0" }
+aicx-embeddings = { version = "0.9.2", optional = true, default-features = false }
+aicx-monitor = { version = "0.9.2" }
+aicx-parser = { version = "0.9.2", features = ["json-schema"] }
+aicx-progress-contracts = { version = "0.9.2" }
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
@@ -88,7 +76,7 @@ rmcp = { version = "1.2", features = ["server", "schemars", "transport-io", "tra
 libc = "0.2.183"
 rmcp-memex = { package = "rust-memex", version = "0.6.5", default-features = false, optional = true }
 schemars = "1.2.1"
-aicx-retrieve = { version = "0.2.0" }
+aicx-retrieve = { version = "0.9.2" }
 blake3 = "1.8.5"
 which = "8.0.2"
 

@@ -249,10 +249,10 @@ version-bump:
 ifeq ($(origin VERSION),command line)
 	@$(PYTHON) tools/release_sync.py bump "$(VERSION)"
 	@echo ""
-	@echo "Versioned release surfaces synced from Cargo.toml into docs + distribution/npm."
+	@echo "Versioned release surfaces synced from Cargo.toml into workspace crates + docs + distribution/npm."
 	@echo "Cargo.lock is intentionally not touched by version-bump."
-	@echo "To sync the lockfile for this package only (no network):"
-	@echo "  cargo update --package $(PACKAGE_NAME) --offline"
+	@echo "To sync the lockfile for all workspace packages (no network):"
+	@echo "  cargo update --workspace --offline"
 	@echo "Or rely on 'make release-prepare' to sync it for you."
 else
 	@echo "VERSION is required. Usage: make version-bump VERSION={patch|minor|major|x.y.z}" >&2 && exit 1
@@ -300,7 +300,7 @@ release-prepare:
 ifeq ($(origin VERSION),command line)
 	@$(MAKE) version-bump VERSION=$(VERSION)
 	@$(MAKE) changelog-close CHANGELOG_GENERATE=1
-	@cargo update --package $(PACKAGE_NAME) --offline
+	@cargo update --workspace --offline
 	@$(MAKE) version-check
 	@$(PYTHON) tools/release_sync.py notes --output dist/release-notes.md
 	@$(MAKE) precheck
