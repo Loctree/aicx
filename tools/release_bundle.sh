@@ -193,6 +193,11 @@ PY
 
 cleanup() {
   local status=$?
+  # Restore the operator's original default keychain before tearing the
+  # temporary one down (see the default-keychain switch in the signing path).
+  if [[ -n "${ORIGINAL_DEFAULT_KEYCHAIN:-}" ]]; then
+    security default-keychain -s "${ORIGINAL_DEFAULT_KEYCHAIN}" >/dev/null 2>&1 || true
+  fi
   if [[ -n "${TEMP_KEYCHAIN_PATH:-}" && -f "${TEMP_KEYCHAIN_PATH}" ]]; then
     security delete-keychain "${TEMP_KEYCHAIN_PATH}" >/dev/null 2>&1 || true
   fi
@@ -549,6 +554,13 @@ security create-keychain -p "$TEMP_KEYCHAIN_PASSWORD" "$TEMP_KEYCHAIN_PATH"
 security set-keychain-settings -lut 21600 "$TEMP_KEYCHAIN_PATH"
 security unlock-keychain -p "$TEMP_KEYCHAIN_PASSWORD" "$TEMP_KEYCHAIN_PATH"
 security list-keychains -d user -s "$TEMP_KEYCHAIN_PATH" $EXISTING_KEYCHAINS >/dev/null
+# Make the temp keychain the default. Under a launchd runner session
+# (`SessionCreate=true`), codesign resolves a signing identity BY NAME from
+# the default keychain only — the search-list set above is not consulted, so
+# without this codesign reports "no identity found" even though the import
+# succeeded. `cleanup` restores the original default on exit.
+ORIGINAL_DEFAULT_KEYCHAIN="$(security default-keychain -d user | tr -d ' "')"
+security default-keychain -d user -s "$TEMP_KEYCHAIN_PATH"
 security import "$CERT_P12" \
   -k "$TEMP_KEYCHAIN_PATH" \
   -P "$CERT_PASSWORD" \
