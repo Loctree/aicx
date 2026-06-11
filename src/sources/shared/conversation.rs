@@ -71,11 +71,12 @@ pub(crate) fn intent_line_modality(role: &str, line: &str) -> IntentLineModality
         return IntentLineModality::PastedReference;
     }
 
-    let head_lower = head.to_lowercase();
-    if TYPED_DIRECTIVE_HEAD_MARKERS
-        .iter()
-        .any(|marker| head_lower.starts_with(marker))
-    {
+    // Allocation-free case-insensitive prefix check: this runs for every
+    // transcript line, and the markers are ASCII.
+    if TYPED_DIRECTIVE_HEAD_MARKERS.iter().any(|marker| {
+        head.get(..marker.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(marker))
+    }) {
         return IntentLineModality::TypedDirective;
     }
 

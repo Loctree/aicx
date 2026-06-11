@@ -273,7 +273,8 @@ fn collect_chunk_files(
         {
             continue;
         }
-        if store::load_sidecar(&file.path).is_some_and(|sidecar| {
+        let sidecar = store::load_sidecar(&file.path);
+        if sidecar.as_ref().is_some_and(|sidecar| {
             sidecar.artifact_family.as_deref() == Some(store::LOCT_CONTEXT_PACK_FAMILY)
                 || sidecar
                     .truth_status
@@ -282,10 +283,13 @@ fn collect_chunk_files(
         }) {
             continue;
         }
-        let matches_frame = store::load_sidecar(&file.path)
+        // Legacy chunks (no sidecar yet, or a pre-frame_kind sidecar) belong
+        // to the default user_msg lane; requiring an explicit frame_kind here
+        // silently emptied intents on stores written before the field existed.
+        let chunk_frame = sidecar
             .and_then(|sidecar| sidecar.frame_kind)
-            .is_some_and(|kind| kind == frame_kind);
-        if !matches_frame {
+            .unwrap_or_else(IntentsConfig::default_frame_kind);
+        if chunk_frame != frame_kind {
             continue;
         }
 

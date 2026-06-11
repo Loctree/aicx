@@ -218,6 +218,12 @@ storage_home = os.environ["AICX_STORAGE_HOME_FOR_WRITE"].strip()
 expanded = Path(storage_home).expanduser()
 if not storage_home:
     raise SystemExit("empty AICX storage home")
+if any(ord(ch) < 32 for ch in storage_home):
+    raise SystemExit("invalid AICX home: control characters are not allowed")
+if ".." in expanded.parts:
+    raise SystemExit(
+        "invalid AICX home: parent-directory traversal (`..`) is not allowed"
+    )
 if not (storage_home == "~" or storage_home.startswith("~/") or expanded.is_absolute()):
     raise SystemExit(
         f"invalid AICX home {storage_home!r}: use an absolute path or ~/..."

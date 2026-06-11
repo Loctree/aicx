@@ -740,15 +740,15 @@ fn strip_case_prefix_is_utf8_safe() {
     assert_eq!(strip_case_insensitive_prefix(text, "validation:"), text);
 }
 
-// ── C0.1 native regression anchor (RED) ─────────────────────────
+// ── C0.1 native regression anchors ───────────────────────────────
 //
-// Three falsifying tests that LOCK the current broken behavior of the native
-// intent stream. Each asserts the *desired post-fix invariant*, so all three
-// are RED today and flip GREEN only when the underlying bug is deliberately
-// fixed downstream. RED here is the deliverable — do NOT patch production code
-// to make them pass. See plan C0.1 and `.loctree/context-scope-intents.md`
-// (A/B/C drift finding: "native intent stream jest częściowo lustrem własnego
-// szumu").
+// Born as falsifying RED tests that locked the then-broken behavior of the
+// native intent stream (plan C0.1, A/B/C drift finding: "native intent
+// stream jest częściowo lustrem własnego szumu"). The underlying fixes have
+// since landed on this branch, so these now run GREEN as permanent
+// regression guards for the post-fix invariants: agent chunks yield no
+// operator intents, frame_kind filtering defaults sanely, and limit
+// semantics stay honest. The `_drift_red` names are kept for history.
 
 #[test]
 fn agent_chunk_still_yields_intents_drift_red() {

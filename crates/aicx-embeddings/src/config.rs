@@ -280,6 +280,12 @@ fn configured_home_from_bootstrap_config(default_home: &Path) -> Option<PathBuf>
     if value.is_empty() {
         return None;
     }
+    // Mirror the validation in aicx::store::paths: reject control characters
+    // and `..` traversal so this crate never resolves a relocated root that
+    // the main crate will refuse.
+    if value.chars().any(char::is_control) {
+        return None;
+    }
     let home_dir = default_home.parent()?;
     let path = if value == "~" {
         home_dir.to_path_buf()
@@ -288,6 +294,12 @@ fn configured_home_from_bootstrap_config(default_home: &Path) -> Option<PathBuf>
     } else {
         PathBuf::from(value)
     };
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
     path.is_absolute().then_some(path)
 }
 
