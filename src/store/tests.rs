@@ -182,6 +182,52 @@ fn test_resolve_aicx_home_rejects_relative_bootstrap_storage_home() {
     let _ = fs::remove_dir_all(home);
 }
 
+#[test]
+fn test_resolve_aicx_home_rejects_traversal_in_bootstrap_storage_home() {
+    let home = std::env::temp_dir().join(format!(
+        "aicx-storage-traversal-test-{}",
+        std::process::id()
+    ));
+    let default_home = home.join(".aicx");
+    fs::create_dir_all(&default_home).unwrap();
+    fs::write(
+        default_home.join("config.toml"),
+        "[storage]\nhome = \"/tmp/storage/../../etc/aicx\"\n",
+    )
+    .unwrap();
+
+    let err = paths::resolve_aicx_home_from(None, &home)
+        .expect_err("[storage].home with `..` traversal should fail");
+    assert!(
+        err.to_string().contains("parent-directory traversal"),
+        "unexpected error: {err:#}"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn test_resolve_aicx_home_rejects_control_chars_in_bootstrap_storage_home() {
+    let home = std::env::temp_dir().join(format!(
+        "aicx-storage-control-char-test-{}",
+        std::process::id()
+    ));
+    let default_home = home.join(".aicx");
+    fs::create_dir_all(&default_home).unwrap();
+    fs::write(
+        default_home.join("config.toml"),
+        "[storage]\nhome = \"/tmp/storage\\nhome\"\n",
+    )
+    .unwrap();
+
+    let err = paths::resolve_aicx_home_from(None, &home)
+        .expect_err("[storage].home with control characters should fail");
+    assert!(
+        err.to_string().contains("control characters"),
+        "unexpected error: {err:#}"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
 /// Integration guard: every canonical-root resolver in the workspace
 /// must agree on `$AICX_HOME` when it is pinned. Covers the split-brain
 /// regression (bugs #25 + #40) where seven sites still hard-coded

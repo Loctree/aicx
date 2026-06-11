@@ -92,7 +92,10 @@ fn configured_home_from_bootstrap_config(
     if !config_path.exists() {
         return Ok(None);
     }
-    let raw = fs::read_to_string(&config_path)
+    // Size-capped, traversal-checked, allowlist-enforced read (semgrep:
+    // tainted-path). The bootstrap config sits at a fixed location under
+    // `$HOME/.aicx/`, but it is still operator-writable input.
+    let raw = crate::sanitize::read_to_string_validated(&config_path)
         .with_context(|| format!("failed to read bootstrap config {}", config_path.display()))?;
     let parsed: toml::Value = toml::from_str(&raw)
         .with_context(|| format!("failed to parse bootstrap config {}", config_path.display()))?;
@@ -103,17 +106,18 @@ fn configured_home_from_bootstrap_config(
     else {
         return Ok(None);
     };
-    normalize_configured_home(value, home_dir, &config_path)
-}
-
-fn normalize_configured_home(
-    value: &str,
-    home_dir: &Path,
-    config_path: &Path,
-) -> Result<Option<PathBuf>> {
+    // Operator-writable input: reject control characters and `..`
+    // traversal before trusting the value as the AICX home, and accept
+    // only absolute paths (or `~`/`~/...` expanded against $HOME).
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Ok(None);
+    }
+    if trimmed.chars().any(char::is_control) {
+        anyhow::bail!(
+            "invalid [storage].home in {}: control characters are not allowed",
+            config_path.display()
+        );
     }
     let path = if trimmed == "~" {
         home_dir.to_path_buf()
@@ -122,6 +126,16 @@ fn normalize_configured_home(
     } else {
         PathBuf::from(trimmed)
     };
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        anyhow::bail!(
+            "invalid [storage].home in {}: parent-directory traversal (`..`) is not allowed, got {:?}",
+            config_path.display(),
+            value
+        );
+    }
     if !path.is_absolute() {
         anyhow::bail!(
             "invalid [storage].home in {}: expected an absolute path or ~/..., got {:?}",
