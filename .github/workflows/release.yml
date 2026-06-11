@@ -332,6 +332,7 @@ jobs:
 
       - name: Clean local build artifacts
         if: always()
+        shell: bash
         working-directory: aicx
         run: |
           cargo clean --target "${{ matrix.target }}" || true
