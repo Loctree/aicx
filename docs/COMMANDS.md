@@ -260,10 +260,10 @@ aicx corpus repair --root "$HOME/.aicx/store/Loctree/aicx/2026_0502" --apply --b
 Semantic search across the canonical corpus.
 
 Search uses the materialized semantic index by default. When the embedder or
-index is unavailable, it fails fast with `kind`, `reason`, and
-`recommendation`; it does not silently pretend fuzzy results are semantic
-oracle truth. Use `--no-semantic` only when you intentionally want the explicit
-filesystem-fuzzy escape hatch.
+index is unavailable, it automatically falls back to filesystem-fuzzy and
+surfaces the typed semantic failure as `semantic_fallback` in JSON or as a
+stderr note in text mode. Use `--no-semantic` only when you intentionally want
+to skip the semantic attempt.
 
 ```bash
 aicx search [OPTIONS] <QUERY>
@@ -276,7 +276,7 @@ Options:
 - `-d, --date <DATE>` filter by date (single day, range, or open-ended)
 - `--limit <N>` max results (default: `10`)
 - `--score <SCORE>` minimum quality threshold (`0..=100`)
-- `--no-semantic` run explicit filesystem-fuzzy search instead of semantic search
+- `--no-semantic` skip semantic search and run filesystem-fuzzy directly
 - `-j, --json` emit compact JSON instead of plain text
 
 Examples:

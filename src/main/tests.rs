@@ -1320,10 +1320,9 @@ fn serve_help_prefers_http_name_and_stays_compact() {
 
 #[test]
 fn search_help_explains_semantic_first_with_fuzzy_fallback() {
-    // After the Iter 1 dispatch flip, `aicx search` is intentionally
-    // semantic-first with an explicit filesystem-fuzzy fallback. The
-    // help text must surface both legs of the contract so operators
-    // know which retrieval ran (and why) when reading `--help`.
+    // `aicx search` is semantic-first and automatically degrades to
+    // filesystem-fuzzy when semantic cannot be served. The help text must
+    // surface both legs of the contract so operators know which retrieval ran.
     let mut cmd = Cli::command();
     let search = cmd
         .find_subcommand_mut("search")
@@ -1339,7 +1338,7 @@ fn search_help_explains_semantic_first_with_fuzzy_fallback() {
     // the fallback, not a hidden behaviour.
     assert!(
         rendered.to_lowercase().contains("fuzzy"),
-        "search --help must mention fuzzy as the explicit fallback"
+        "search --help must mention fuzzy as the fallback"
     );
     // Fallback contract must be named, not implied.
     assert!(

@@ -1,17 +1,16 @@
-//! Semantic-only search dispatch with fail-fast diagnostics.
+//! Semantic search dispatch with typed diagnostics.
 //!
-//! `aicx search` is **semantic-by-contract** since v0.7: a query is encoded
+//! The library primitive is **semantic-by-contract**: a query is encoded
 //! through the in-process embedder ([`crate::embedder`], which re-exports
 //! the local [`aicx_embeddings`] crate's GGUF + cloud HTTP stack) and
 //! matched against a materialized vector index of the canonical store.
 //!
-//! There is no silent fuzzy fallback. When a precondition is missing
+//! The primitive never pretends fuzzy results are semantic. When a precondition is missing
 //! (embedder unhydrated, index not built, empty/low-signal corpus,
 //! dimension mismatch between query and index), [`try_semantic_search`]
 //! returns a typed [`SemanticError`] with a human-readable `reason` AND
-//! an actionable `recommendation`. The caller renders the error and
-//! exits non-zero so operators see exactly what to do, instead of
-//! receiving "0 results" without a story.
+//! an actionable `recommendation`. The CLI may then explicitly degrade to
+//! filesystem-fuzzy while surfacing the semantic failure in its rendered output.
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
@@ -340,12 +339,36 @@ fn index_not_built_error(path: std::path::PathBuf, project_filter: Option<&str>)
         Some(p) => format!("aicx index --project {p}"),
         None => "aicx index".to_string(),
     };
+    let legacy_hint = legacy_index_hint(project_filter, &path)
+        .map(|hint| format!(" {hint}"))
+        .unwrap_or_default();
     SemanticError::IndexNotBuilt {
         path: path.clone(),
-        reason: format!("vector index not yet materialized at {}", path.display()),
+        reason: format!(
+            "vector index not yet materialized at {}{}",
+            path.display(),
+            legacy_hint
+        ),
         recommendation: format!(
             "run `{cmd}` (one-off; subsequent runs query the index in-process)"
         ),
+    }
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn legacy_index_hint(project_filter: Option<&str>, canonical_path: &Path) -> Option<String> {
+    let legacy_path = dirs::home_dir()?
+        .join("index")
+        .join(crate::vector_index::index_bucket_name(project_filter))
+        .join("embeddings.ndjson");
+    if legacy_path.exists() && legacy_path != canonical_path {
+        Some(format!(
+            "Found legacy index at {}; current AICX uses {}.",
+            legacy_path.display(),
+            canonical_path.display()
+        ))
+    } else {
+        None
     }
 }
 

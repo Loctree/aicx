@@ -1313,8 +1313,8 @@ enum Commands {
         no_gitignore: bool,
     },
 
-    /// Search the canonical corpus. Semantic by default; `--no-semantic`
-    /// runs the explicit filesystem-fuzzy fallback.
+    /// Search the canonical corpus. Semantic by default; automatic
+    /// filesystem-fuzzy fallback when semantic search is unavailable.
     #[command(display_order = 12)]
     Search {
         /// Search query string
@@ -6207,8 +6207,9 @@ fn project_scope_label(projects: &[String]) -> String {
     }
 }
 
-/// Semantic-first retrieval across the canonical store. Fails fast when
-/// semantic preconditions are missing unless `--no-semantic` is explicit.
+/// Semantic-first retrieval across the canonical store. Missing semantic
+/// preconditions degrade to filesystem-fuzzy; `--no-semantic` skips the
+/// semantic attempt entirely.
 struct SearchRunArgs<'a> {
     query: &'a str,
     projects: &'a [String],
@@ -6296,85 +6297,68 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     let resolved_projects = resolve_project_filters_or_error(projects)?;
     let scopes = project_scopes(&resolved_projects);
 
-    let (mut results, scanned, semantic_status, pushdown_diagnostic) = if no_semantic {
-        // Fuzzy path keeps the legacy "fetch then post-filter" shape —
-        // `rank::fuzzy_search_store` is not on the hybrid retrieval
-        // primitive and is operator-requested explicitly via
-        // `--no-semantic`, so we leave it alone.
-        let fuzzy_fetch_limit = search_examined_fetch_limit(limit, post_filters.is_active());
-        let (mut results, scanned) = rank::fuzzy_search_store(
-            &root,
-            &search_query,
-            fuzzy_fetch_limit,
-            &scopes,
-            filters.frame_kind.map(Into::into),
-        )?;
-        if let Some(min_score) = post_filters.score_min {
-            results.retain(|r| r.score >= min_score);
-        }
-        if let Some(ref agent_filter) = post_filters.agent {
-            results.retain(|r| r.agent == *agent_filter);
-        }
-        if post_filters.date_lo.is_some() || post_filters.date_hi.is_some() {
-            let lo = post_filters.date_lo.as_deref();
-            let hi = post_filters.date_hi.as_deref();
-            results.retain(|r| {
-                lo.is_none_or(|lo| r.date.as_str() >= lo)
-                    && hi.is_none_or(|hi| r.date.as_str() <= hi)
-            });
-        } else if let Some(ref cutoff) = post_filters.hours_cutoff {
-            let cutoff = cutoff.as_str();
-            results.retain(|r| r.date.as_str() >= cutoff);
-        }
-        (results, scanned, None, None)
-    } else {
-        match aicx::search_engine::try_semantic_search_filtered(
-            &root,
-            &search_query,
-            limit,
-            &scopes,
-            filters.frame_kind.map(Into::into),
-            kind_filter.map(|kind| kind.dir_name()),
-            &post_filters,
-        ) {
-            Ok(filtered) => {
-                let aicx::search_engine::FilteredSemanticOutcome {
-                    outcome,
-                    diagnostic,
-                } = filtered;
-                let status = (
-                    outcome.backend_label,
-                    outcome.model_id.clone(),
-                    outcome.scanned,
-                    outcome.retrieval_status.clone(),
-                );
-                (outcome.results, outcome.scanned, Some(status), diagnostic)
-            }
-            Err(err) => {
-                let payload = serde_json::json!({
-                    "ok": false,
-                    "error": "semantic_search_unavailable",
-                    "kind": err.kind(),
-                    "reason": err.reason(),
-                    "recommendation": err.recommendation(),
-                    "fallback": {
-                        "available": true,
-                        "command": format!("aicx search --no-semantic {:?}", query),
-                    },
-                });
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&payload)?);
-                } else {
-                    eprintln!("aicx search: semantic search unavailable.");
-                    eprintln!("  kind:           {}", err.kind());
-                    eprintln!("  reason:         {}", err.reason());
-                    eprintln!("  recommendation: {}", err.recommendation());
-                    eprintln!("  fallback:       aicx search --no-semantic {:?}", query);
+    let (mut results, scanned, semantic_status, pushdown_diagnostic, semantic_fallback) =
+        if no_semantic {
+            let (results, scanned) = run_fuzzy_search_with_filters(
+                &root,
+                &search_query,
+                limit,
+                &scopes,
+                filters.frame_kind.map(Into::into),
+                &post_filters,
+            )?;
+            (results, scanned, None, None, None)
+        } else {
+            match aicx::search_engine::try_semantic_search_filtered(
+                &root,
+                &search_query,
+                limit,
+                &scopes,
+                filters.frame_kind.map(Into::into),
+                kind_filter.map(|kind| kind.dir_name()),
+                &post_filters,
+            ) {
+                Ok(filtered) => {
+                    let aicx::search_engine::FilteredSemanticOutcome {
+                        outcome,
+                        diagnostic,
+                    } = filtered;
+                    let status = (
+                        outcome.backend_label,
+                        outcome.model_id.clone(),
+                        outcome.scanned,
+                        outcome.retrieval_status.clone(),
+                    );
+                    (
+                        outcome.results,
+                        outcome.scanned,
+                        Some(status),
+                        diagnostic,
+                        None,
+                    )
                 }
-                std::process::exit(2);
+                Err(err) => {
+                    let fallback = SemanticFallbackNotice::from_error(&err);
+                    let (results, scanned) = run_fuzzy_search_with_filters(
+                        &root,
+                        &search_query,
+                        limit,
+                        &scopes,
+                        filters.frame_kind.map(Into::into),
+                        &post_filters,
+                    )?;
+                    if !json {
+                        eprintln!(
+                            "aicx search: semantic search unavailable; falling back to filesystem fuzzy."
+                        );
+                        eprintln!("  kind:           {}", err.kind());
+                        eprintln!("  reason:         {}", err.reason());
+                        eprintln!("  recommendation: {}", err.recommendation());
+                    }
+                    (results, scanned, None, None, Some(fallback))
+                }
             }
-        }
-    };
+        };
 
     // Defensive kind retain: the semantic path pushes `kind_filter`
     // into the hybrid query, but we keep the explicit check so a future
@@ -6434,10 +6418,26 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         };
         let rendered =
             rank::render_search_json_with_oracle(&root, &results, scanned, oracle_status)?;
-        let payload = aicx::search_engine::inject_filter_pushdown_diagnostic(
+        let mut payload = aicx::search_engine::inject_filter_pushdown_diagnostic(
             &rendered,
             pushdown_diagnostic.as_ref(),
         )?;
+        if let Some(ref fallback) = semantic_fallback {
+            let mut value: serde_json::Value = serde_json::from_str(&payload)?;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "semantic_fallback".to_string(),
+                    serde_json::json!({
+                        "used": true,
+                        "backend": "filesystem_fuzzy",
+                        "kind": fallback.kind,
+                        "reason": fallback.reason,
+                        "recommendation": fallback.recommendation,
+                    }),
+                );
+            }
+            payload = serde_json::to_string(&value)?;
+        }
         println!("{}", payload);
         return Ok(());
     }
@@ -6478,11 +6478,18 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
                     retrieval_status.as_ref(),
                 )
             }
-            None => format!(
-                "{} result(s) from {} scanned chunks. oracle_status: backend=filesystem_fuzzy index=none fallback=operator_requested loctree_scope_safe=false",
-                results.len(),
-                scanned
-            ),
+            None => {
+                let fallback = semantic_fallback
+                    .as_ref()
+                    .map(|notice| format!("semantic_unavailable kind={}", notice.kind))
+                    .unwrap_or_else(|| "operator_requested".to_string());
+                format!(
+                    "{} result(s) from {} scanned chunks. oracle_status: backend=filesystem_fuzzy index=none fallback={} loctree_scope_safe=false",
+                    results.len(),
+                    scanned,
+                    fallback
+                )
+            }
         };
         let suffix = pushdown_diagnostic
             .as_ref()
@@ -6496,6 +6503,56 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         eprintln!("\n{}{}", base_line, suffix);
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct SemanticFallbackNotice {
+    kind: String,
+    reason: String,
+    recommendation: String,
+}
+
+impl SemanticFallbackNotice {
+    fn from_error(err: &aicx::search_engine::SemanticError) -> Self {
+        Self {
+            kind: err.kind().to_string(),
+            reason: err.reason().to_string(),
+            recommendation: err.recommendation().to_string(),
+        }
+    }
+}
+
+fn run_fuzzy_search_with_filters(
+    root: &Path,
+    search_query: &str,
+    limit: usize,
+    scopes: &[Option<&str>],
+    frame_kind: Option<timeline::FrameKind>,
+    post_filters: &aicx::search_engine::SemanticSearchFilters,
+) -> Result<(Vec<rank::FuzzyResult>, usize)> {
+    // Fuzzy path keeps the legacy "fetch then post-filter" shape. It is
+    // reached either by operator request (`--no-semantic`) or by explicit
+    // semantic degradation when the committed index cannot be served.
+    let fuzzy_fetch_limit = search_examined_fetch_limit(limit, post_filters.is_active());
+    let (mut results, scanned) =
+        rank::fuzzy_search_store(root, search_query, fuzzy_fetch_limit, scopes, frame_kind)?;
+    if let Some(min_score) = post_filters.score_min {
+        results.retain(|r| r.score >= min_score);
+    }
+    if let Some(ref agent_filter) = post_filters.agent {
+        results.retain(|r| r.agent == *agent_filter);
+    }
+    if post_filters.date_lo.is_some() || post_filters.date_hi.is_some() {
+        let lo = post_filters.date_lo.as_deref();
+        let hi = post_filters.date_hi.as_deref();
+        results.retain(|r| {
+            lo.is_none_or(|lo| r.date.as_str() >= lo) && hi.is_none_or(|hi| r.date.as_str() <= hi)
+        });
+    } else if let Some(ref cutoff) = post_filters.hours_cutoff {
+        let cutoff = cutoff.as_str();
+        results.retain(|r| r.date.as_str() >= cutoff);
+    }
+    Ok((results, scanned))
 }
 
 /// Build the `IndexEvent` -> sink fanout used by `aicx index`. Always
