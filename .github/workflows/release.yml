@@ -257,7 +257,12 @@ jobs:
         # dies before running anything. Pinning the Git for Windows bash
         # sidesteps WSL entirely.
         shell: 'C:\Program Files\Git\bin\bash.exe -eo pipefail {0}'
-        working-directory: aicx
+        # NOTE: no `working-directory:` here. On this self-hosted Windows
+        # runner, a relative working-directory combined with a custom absolute
+        # `shell` path makes the runner throw "Second path fragment must not be
+        # a drive or UNC name" before the script runs. `cd` inside the script
+        # instead. (The linux/mac legs keep working-directory: the default bash
+        # shell does not trip this.)
         env:
           TARGET: ${{ matrix.target }}
           DIST_DIR: ${{ github.workspace }}/aicx/dist
@@ -267,6 +272,7 @@ jobs:
           PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
           LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}
         run: |
+          cd "$GITHUB_WORKSPACE/aicx"
           # Prepend the mingw-w64 gcc (Strawberry Perl) linker and GnuPG to
           # PATH without clobbering the runner's real PATH — the old
           # `env: PATH: ...${{ env.PATH }}` form expanded `env.PATH` to empty
