@@ -61,17 +61,7 @@ impl IntentsScreen {
     }
 
     pub fn move_selection(&mut self, delta: isize) {
-        if self.visible.is_empty() {
-            return;
-        }
-        if delta < 0 {
-            self.selected = self.selected.saturating_sub(delta.unsigned_abs());
-        } else {
-            self.selected = self
-                .selected
-                .saturating_add(delta as usize)
-                .min(self.visible.len() - 1);
-        }
+        self.selected = super::move_index(self.selected, self.visible.len(), delta);
     }
 
     pub fn apply_query(&mut self, query: String) {
