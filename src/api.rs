@@ -1,8 +1,11 @@
 //! Stable in-process API for consumers that want AICX as a library.
 //!
 //! The CLI remains the product shell, but this facade is the supported crate
-//! boundary: callers get corpus, retrieval, intent, and health operations
-//! without importing CLI-private glue from `main.rs`.
+//! boundary. With default features callers get corpus, retrieval, intent, and
+//! health operations without importing CLI-private glue from `main.rs`.
+//! With `default-features = false, features = ["loctree-consumer"]`, callers get
+//! the stable read core: chunk listing/reading, typed chunk references, session
+//! types, and pure intent extraction stages without embedding or app surfaces.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -11,12 +14,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::chunker::ChunkerConfig;
+#[cfg(feature = "app")]
 use crate::doctor::{DoctorOptions, DoctorReport};
 use crate::intents::{IntentExtraction, IntentsConfig};
+#[cfg(feature = "app")]
 use crate::rank::FuzzyResult;
 use crate::sessions::{self, SessionInfo};
 use crate::store::{ReadContextChunk, StoreWriteSummary, StoredContextFile};
-use crate::timeline::{FrameKind, TimelineEntry};
+#[cfg(feature = "app")]
+use crate::timeline::FrameKind;
+use crate::timeline::TimelineEntry;
 
 /// Configuration for an [`Aicx`] library handle.
 #[derive(Debug, Clone)]
@@ -106,6 +113,7 @@ impl Aicx {
     /// Run a semantic search against the canonical store's persistent vector
     /// index. Fails fast with a descriptive error when any precondition is
     /// missing (embedder unhydrated, index not built, dimension mismatch).
+    #[cfg(feature = "app")]
     pub fn semantic_search(
         &self,
         query: impl AsRef<str>,
@@ -168,6 +176,7 @@ impl Aicx {
         )
     }
 
+    #[cfg(feature = "app")]
     pub async fn doctor(&self, opts: &DoctorOptions) -> Result<DoctorReport> {
         crate::doctor::run_at(&self.config.store_root, opts).await
     }
@@ -183,6 +192,7 @@ pub struct StoreOptions {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "app")]
 pub struct SearchOptions {
     pub limit: usize,
     pub projects: Vec<String>,
@@ -191,6 +201,7 @@ pub struct SearchOptions {
     pub kind: Option<String>,
 }
 
+#[cfg(feature = "app")]
 impl Default for SearchOptions {
     fn default() -> Self {
         Self {
@@ -203,6 +214,7 @@ impl Default for SearchOptions {
     }
 }
 
+#[cfg(feature = "app")]
 fn search_project_scopes(store_root: &Path, projects: &[String]) -> Result<Vec<Option<String>>> {
     if projects.is_empty() {
         return Ok(vec![None]);
@@ -213,6 +225,7 @@ fn search_project_scopes(store_root: &Path, projects: &[String]) -> Result<Vec<O
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg(feature = "app")]
 pub struct SearchResults {
     pub results: Vec<FuzzyResult>,
     pub scanned: usize,
@@ -516,7 +529,7 @@ fn system_time_to_rfc3339(value: SystemTime) -> String {
     datetime.to_rfc3339()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "app"))]
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};

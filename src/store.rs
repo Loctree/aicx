@@ -519,7 +519,7 @@ pub fn write_context_session_first(
     .written_paths)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "app"))]
 fn write_context_session_first_at(
     root: &Path,
     spec: SessionWriteSpec<'_>,
@@ -2261,12 +2261,12 @@ pub use migration::{
     LegacyItemKind, MigrationAction, MigrationExecution, MigrationItem, MigrationManifest,
     MigrationTotals, run_migration, run_migration_with_paths,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "app"))]
 pub(crate) use migration::{SourceLocator, run_migration_at};
 
 // ============================================================================
 // Tests
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "app"))]
 mod tests;

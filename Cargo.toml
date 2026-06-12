@@ -29,10 +29,30 @@ members = [
 resolver = "3"
 
 [features]
+# Stable, slim library profile for in-process consumers such as Loctree.
+# Use with `default-features = false` to expose the store/read/session/intent core
+# without CLI, dashboard, MCP, retrieval, embedder, or Lance surfaces.
 loctree-consumer = []
-default = ["native-embedder", "cloud-embedder"]
+default = ["app", "native-embedder", "cloud-embedder"]
+app = [
+    "dep:aicx-monitor",
+    "dep:aicx-progress-contracts",
+    "dep:aicx-retrieve",
+    "dep:axum",
+    "dep:clap",
+    "dep:crossterm",
+    "dep:futures",
+    "dep:indicatif",
+    "dep:inquire",
+    "dep:ratatui",
+    "dep:rmcp",
+    "dep:tokio",
+    "dep:tower_governor",
+    "dep:tracing-subscriber",
+    "dep:which",
+]
 # Lance steer index + local BM25; opting out drops the lancedb C++ build deps.
-lance = ["dep:rmcp-memex"]
+lance = ["app", "dep:rmcp-memex"]
 # In-process GGUF embeddings (offline / dev workstations).
 native-embedder = ["dep:aicx-embeddings", "aicx-embeddings/gguf"]
 native-embedder-metal = ["native-embedder", "aicx-embeddings/metal"]
@@ -45,12 +65,12 @@ e2e-aicx = ["native-embedder", "cloud-embedder"]
 
 [dependencies]
 aicx-embeddings = { path = "crates/aicx-embeddings", version = "0.9.3", optional = true, default-features = false }
-aicx-monitor = { path = "crates/aicx-monitor", version = "0.9.3" }
+aicx-monitor = { path = "crates/aicx-monitor", version = "0.9.3", optional = true }
 aicx-parser = { path = "crates/aicx-parser", version = "0.9.3", features = ["json-schema"] }
-aicx-progress-contracts = { path = "crates/aicx-progress-contracts", version = "0.9.3" }
+aicx-progress-contracts = { path = "crates/aicx-progress-contracts", version = "0.9.3", optional = true }
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 dirs = "6"
 getrandom = "0.3"
 serde = { version = "1.0", features = ["derive"] }
@@ -61,24 +81,24 @@ sha2 = "0.10"
 shlex = "1"
 hex = "0.4"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 regex = "1"
-indicatif = "0.18"
-inquire = "0.7"
+indicatif = { version = "0.18", optional = true }
+inquire = { version = "0.7", optional = true }
 globset = "0.4"
-ratatui = "0.30"
-crossterm = "0.29"
-axum = "0.8"
-futures = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "signal", "process"] }
-tower_governor = { version = "0.8", default-features = false, features = ["axum"] }
-rmcp = { version = "1.2", features = ["server", "schemars", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
+ratatui = { version = "0.30", optional = true }
+crossterm = { version = "0.29", optional = true }
+axum = { version = "0.8", optional = true }
+futures = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "signal", "process"], optional = true }
+tower_governor = { version = "0.8", default-features = false, features = ["axum"], optional = true }
+rmcp = { version = "1.2", features = ["server", "schemars", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"], optional = true }
 libc = "0.2.183"
 rmcp-memex = { package = "rust-memex", version = "0.6.5", default-features = false, optional = true }
 schemars = "1.2.1"
-aicx-retrieve = { path = "crates/aicx-retrieve", version = "0.9.3" }
+aicx-retrieve = { path = "crates/aicx-retrieve", version = "0.9.3", optional = true }
 blake3 = "1.8.5"
-which = "8.0.2"
+which = { version = "8.0.2", optional = true }
 
 toml = "0.8"
 
@@ -90,10 +110,12 @@ http-body-util = "0.1"
 [[bin]]
 name = "aicx"
 path = "src/main.rs"
+required-features = ["app"]
 
 [[bin]]
 name = "aicx-mcp"
 path = "src/bin/aicx_mcp.rs"
+required-features = ["app"]
 
 [lib]
 name = "aicx"

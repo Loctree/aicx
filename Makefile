@@ -12,7 +12,7 @@ ifeq (,$(shell command -v cargo 2>/dev/null))
 endif
 
 .PHONY: all build build-native release-binaries install install-bin install-config install-cargo git-hooks
-.PHONY: precheck precheck-native test test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
+.PHONY: precheck precheck-native loctree-consumer-check test test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
 .PHONY: embeddings-check embeddings-test embeddings-clippy embeddings-hydrate embeddings-info
 .PHONY: version version-show version-check version-bump version-patch bump-patch changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle release-bundle-only-binaries test-e2e
 
@@ -115,6 +115,15 @@ precheck-native:
 	cargo check --locked -p aicx-embeddings --features gguf
 	cargo check --locked -p aicx --features native-embedder --all-targets
 
+loctree-consumer-check:
+	cargo check --locked -p aicx --no-default-features --features loctree-consumer
+	cargo test --locked -p aicx --lib --no-default-features --features loctree-consumer slim_profile_exposes_read_core_contract
+	@hits=$$(cargo tree --locked --no-default-features --features loctree-consumer -p aicx | grep -ciE 'lancedb|llama' || true); \
+	if [ "$$hits" != "0" ]; then \
+		echo "loctree-consumer pulled forbidden lancedb/llama dependencies ($$hits hits)" >&2; \
+		exit 1; \
+	fi
+
 manifest-check:
 	@$(PYTHON) -c 'import sys, re; text = open("Cargo.toml", "r").read(); bad = [m.group(1) for m in re.finditer(r"^([\w-]+)\s*=.*path\s*=", text, re.MULTILINE) if m.group(1) not in ("rmcp-memex", "aicx-embeddings", "aicx-retrieve", "aicx-parser", "aicx-monitor", "aicx-progress-contracts", "path")]; sys.exit("Manifest policy check failed:\n  - Unexpected local path dependency: " + ", ".join(bad)) if bad else print("Manifest policy: ok (approved local product deps only)")'
 
@@ -145,25 +154,27 @@ test-retrieval-eval-rebaseline:
 
 check:
 	@echo "=== AICX Quality Gate ==="
-	@echo "[1/10] Checking manifest portability..."
+	@echo "[1/11] Checking manifest portability..."
 	@$(MAKE) manifest-check
-	@echo "[2/10] Checking formatting..."
+	@echo "[2/11] Checking formatting..."
 	@cargo fmt --all --check || (echo "Run 'make fmt' to fix formatting." && exit 1)
-	@echo "[3/10] Running default cargo check..."
+	@echo "[3/11] Running default cargo check..."
 	@$(MAKE) precheck
-	@echo "[4/10] Running native GGUF cargo check..."
+	@echo "[4/11] Running loctree consumer profile check..."
+	@$(MAKE) loctree-consumer-check
+	@echo "[5/11] Running native GGUF cargo check..."
 	@$(MAKE) precheck-native
-	@echo "[5/10] Running default clippy..."
+	@echo "[6/11] Running default clippy..."
 	@$(MAKE) clippy
-	@echo "[6/10] Running native GGUF clippy..."
+	@echo "[7/11] Running native GGUF clippy..."
 	@$(MAKE) clippy-native
-	@echo "[7/10] Running default tests..."
+	@echo "[8/11] Running default tests..."
 	@$(MAKE) test
-	@echo "[8/10] Running native GGUF tests..."
+	@echo "[9/11] Running native GGUF tests..."
 	@$(MAKE) test-native
-	@echo "[9/10] Building slim release binaries..."
+	@echo "[10/11] Building slim release binaries..."
 	@cargo build --locked --release --bin aicx --bin aicx-mcp
-	@echo "[10/10] Running Semgrep (required)..."
+	@echo "[11/11] Running Semgrep (required)..."
 	@$(MAKE) semgrep
 	@echo "=== All checks passed ==="
 
