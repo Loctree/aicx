@@ -2151,8 +2151,11 @@ mod tests {
             files_touched: None,
         };
 
-        let results =
-            audit_claims_against_evidence(&[claim.clone()], &[ev], "2026-06-12T02:54:00Z");
+        let results = audit_claims_against_evidence(
+            std::slice::from_ref(&claim),
+            &[ev],
+            "2026-06-12T02:54:00Z",
+        );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].result_status, ResultStatus::Fail);
         assert_eq!(results[0].related_claims, vec!["claim-green".to_string()]);
@@ -2232,8 +2235,11 @@ mod tests {
         };
 
         // It should NOT be verified
-        let results =
-            audit_claims_against_evidence(&[claim.clone()], &[ev.clone()], "2026-06-12T02:54:00Z");
+        let results = audit_claims_against_evidence(
+            std::slice::from_ref(&claim),
+            std::slice::from_ref(&ev),
+            "2026-06-12T02:54:00Z",
+        );
         assert!(
             results.is_empty(),
             "High-risk claim with only circumstantial evidence is not verified (no pass result generated)"
