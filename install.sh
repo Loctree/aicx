@@ -40,6 +40,7 @@ AICX_EMBEDDER_CONFIG_PATH="${AICX_EMBEDDER_CONFIG_PATH:-$HOME/.aicx/embedder.tom
 AICX_INSTALL_FORCE="${AICX_INSTALL_FORCE:-0}"
 AICX_INSTALL_DRY_RUN="${AICX_INSTALL_DRY_RUN:-0}"
 AICX_CARGO_BIN_DIR="${AICX_CARGO_BIN_DIR:-${CARGO_INSTALL_ROOT:+$CARGO_INSTALL_ROOT/bin}}"
+AICX_EMBEDDER_SETUP_DETAIL="No local embedder profile was configured in this run."
 if [ -z "$AICX_CARGO_BIN_DIR" ]; then
   AICX_CARGO_BIN_DIR="$HOME/.cargo/bin"
 fi
@@ -94,7 +95,7 @@ for arg in "$@"; do
       echo "  --pick-embedder                    # interactive config for ~/.aicx/embedder.toml"
       echo "  --embedder-profile=base|dev|premium"
       echo "  --no-embedder-prompt               # suppress interactive picker"
-      echo "  note: this writes AICX local embedder preferences; Roost/rust-memex remains the heavy retrieval plane"
+      echo "  note: writes only AICX local embedder preferences"
       echo ""
       echo "AICX storage root picker:"
       echo "  --pick-home                        # ask where AICX_HOME should live"
@@ -397,12 +398,14 @@ maybe_configure_native_embedder() {
   if [ -n "${AICX_EMBEDDER_PATH:-}" ]; then
     config_written=$(write_embedder_config "" "" "" "$AICX_EMBEDDER_PATH")
     echo "  native embedder path pinned in $config_written"
+    AICX_EMBEDDER_SETUP_DETAIL="Saved explicit local embedder path in $config_written."
     return 0
   fi
 
   if [ -n "$selected_repo" ]; then
     config_written=$(write_embedder_config "" "$selected_repo" "$selected_filename" "")
     echo "  native embedder repo pinned in $config_written"
+    AICX_EMBEDDER_SETUP_DETAIL="Saved local embedder repo preference in $config_written."
     maybe_prime_embedder_cache "$selected_repo" "$selected_filename"
     return 0
   fi
@@ -411,6 +414,7 @@ maybe_configure_native_embedder() {
     case "$explicit_profile" in
       none|off|skip)
         echo "  native embedder picker: skipped by explicit profile"
+        AICX_EMBEDDER_SETUP_DETAIL="You skipped native embedder setup."
         return 0
         ;;
       base|dev|premium)
@@ -424,19 +428,33 @@ maybe_configure_native_embedder() {
   elif [ "$picker" = "1" ] || { [ "$picker" = "auto" ] && [ -t 0 ] && [ -t 1 ] && [ -z "${CI:-}" ]; }; then
     echo ""
     echo "Native embedder setup"
-    echo "  This does not bloat the installed bundle."
-    echo "  It writes ~/.aicx/embedder.toml and can prime exactly one GGUF file in the HF cache."
-    echo "  This is AICX's first-choice local embedding path; Roost/rust-memex remains the heavy retrieval plane."
+    echo "  This optional step writes $AICX_EMBEDDER_CONFIG_PATH."
+    echo "  Model download is explicit and opt-in."
     echo ""
-    echo "  1) skip"
-    echo "  2) base    - F2LLM 0.6B Q4_K_M GGUF (~397 MB, portable default)"
-    echo "  3) dev     - F2LLM 1.7B Q4_K_M GGUF (~1.1 GB, workstation tier)"
-    echo "  4) premium - F2LLM 1.7B Q6_K GGUF (~1.4 GB, stronger local tier)"
-    printf "Choose native embedder profile [1-4]: "
+    echo "  1) Skip"
+    echo "     Do not configure local embeddings now."
+    echo ""
+    echo "  2) Base"
+    echo "     F2LLM 0.6B Q4_K_M GGUF"
+    echo "     Approx. 397 MB"
+    echo "     Recommended default."
+    echo ""
+    echo "  3) Dev"
+    echo "     F2LLM 1.7B Q4_K_M GGUF"
+    echo "     Approx. 1.1 GB"
+    echo "     Better quality, requires more resources."
+    echo ""
+    echo "  4) Premium"
+    echo "     F2LLM 1.7B Q6_K GGUF"
+    echo "     Approx. 1.4 GB"
+    echo "     Highest local quality, largest download."
+    echo ""
+    printf "Select profile [1-4]: "
     read -r reply || true
     case "${reply:-1}" in
       1|"")
         echo "  native embedder picker: skipped"
+        AICX_EMBEDDER_SETUP_DETAIL="You skipped native embedder setup."
         return 0
         ;;
       2) selected_profile="base" ;;
@@ -444,6 +462,7 @@ maybe_configure_native_embedder() {
       4) selected_profile="premium" ;;
       *)
         echo "  native embedder picker: invalid choice, skipping"
+        AICX_EMBEDDER_SETUP_DETAIL="No local embedder profile was configured; invalid picker choice was ignored."
         return 0
         ;;
     esac
@@ -455,6 +474,7 @@ maybe_configure_native_embedder() {
   selected_filename=$(embedder_file_for_profile "$selected_profile")
   config_written=$(write_embedder_config "$selected_profile" "$selected_repo" "$selected_filename" "")
   echo "  native embedder preference saved to $config_written"
+  AICX_EMBEDDER_SETUP_DETAIL="Saved the '$selected_profile' local embedder profile in $config_written."
   maybe_prime_embedder_cache "$selected_repo" "$selected_filename"
 }
 
@@ -1091,41 +1111,51 @@ maybe_configure_native_embedder
 echo ""
 
 # --- Done ---
-echo "=== Setup complete ==="
+echo "=== AICX setup complete ==="
 echo ""
-if path_has_dir "$AICX_BIN_DIR"; then
-  echo "Install path:"
-  echo "  $AICX_BIN_DIR is already on PATH"
-else
-  echo "PATH note:"
-  echo "  Add $AICX_BIN_DIR to PATH so new shells pick up the bundled install first."
-  echo "  Example: export PATH=\"$AICX_BIN_DIR:\$PATH\""
-  echo ""
-fi
-if [ -d "$HOME/.ai-contexters" ]; then
-  echo "Legacy store detected at ~/.ai-contexters/"
-  echo "Run 'aicx migrate' to move your history to the new canonical ~/.aicx/ store."
-  echo ""
-fi
 echo "Installed:"
-echo "  aicx      — CLI for extraction, search, steer, dashboard"
-echo "  aicx-mcp  — MCP server (4 tools: search, read, rank, steer)"
+echo "  aicx      - command-line tool for indexing and searching agent history"
+echo "  aicx-mcp  - MCP server for Claude Code, Codex and Gemini"
 echo ""
-echo "MCP tools available in Claude Code / Codex / Gemini:"
-echo "  aicx_search  — fuzzy search across session history"
-echo "  aicx_read    — read one canonical chunk by path or ref"
-echo "  aicx_rank    — quality-score stored chunks"
-echo "  aicx_steer   — retrieve chunks by run/prompt/project/agent/date metadata"
+echo "Install path:"
+echo "  $AICX_BIN_DIR"
+if path_has_dir "$AICX_BIN_DIR"; then
+  echo "  This path is already available in PATH."
+else
+  echo "  Add this path to PATH so new shells pick up the bundled install first."
+  echo "  Example: export PATH=\"$AICX_BIN_DIR:\$PATH\""
+fi
+echo ""
+if [ -d "$HOME/.ai-contexters" ]; then
+  echo "Legacy store:"
+  echo "  Found ~/.ai-contexters/"
+  echo "  Run 'aicx migrate' to move your history to the canonical ~/.aicx/ store."
+  echo ""
+fi
+echo "MCP tools:"
+echo "  aicx_search  - search session history"
+echo "  aicx_read    - read a stored chunk"
+echo "  aicx_rank    - score stored chunks"
+echo "  aicx_steer   - search by project, agent, date or run metadata"
 echo ""
 echo "Quick start:"
-echo "  aicx all -H 24                     # rescan last 24h from all agents"
-echo "  aicx search 'query terms'          # fuzzy search across session history"
-echo "  aicx refs -H 24                    # compact summary of recent files"
-echo "  aicx steer --project aicx          # metadata-aware retrieval"
+echo "  aicx all -H 24"
+echo "      Index the last 24 hours from supported agents."
 echo ""
-echo "Native local embeddings:"
-echo "  bash install.sh --pick-embedder    # choose and optionally hydrate one GGUF model"
-echo "  config: ~/.aicx/embedder.toml      # backend/profile/repo/filename/path"
+echo "  aicx search \"query terms\""
+echo "      Search indexed session history."
 echo ""
-echo "Heavy retrieval:"
-echo "  Use Roost/rust-memex for the advanced operator retrieval plane; AICX stays the portable corpus + local embedding foundation."
+echo "  aicx refs -H 24"
+echo "      Show compact references from the last 24 hours."
+echo ""
+echo "  aicx steer --project aicx"
+echo "      Search using project metadata."
+echo ""
+echo "Local embeddings:"
+echo "  $AICX_EMBEDDER_SETUP_DETAIL"
+echo ""
+echo "  To configure or change local embeddings later, run:"
+echo "    bash install.sh --pick-embedder"
+echo ""
+echo "  Config file:"
+echo "    $AICX_EMBEDDER_CONFIG_PATH"
