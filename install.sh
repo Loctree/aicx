@@ -291,8 +291,9 @@ maybe_configure_aicx_home() {
   fi
 
   config_written=$(write_storage_home_config "$selected_home")
-  echo "  persistent AICX_HOME saved to $config_written"
-  echo "  semantic index will live under: $selected_home/indexed/"
+  echo "  config: $config_written"
+  echo "  storage root: $selected_home"
+  echo "  semantic index path: $selected_home/indexed/_all/embeddings.ndjson"
 }
 
 write_embedder_config() {

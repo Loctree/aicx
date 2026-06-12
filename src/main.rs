@@ -1421,13 +1421,13 @@ enum Commands {
         action: cli_config::ConfigAction,
     },
 
-    /// Read one canonical chunk by path, file name, or compact chunk reference.
+    /// Read one canonical chunk by path, file name, or `chunk:<id>` reference.
     ///
     /// This closes the discover -> read loop: pass a path from `aicx search`,
     /// `aicx refs --emit paths`, dashboard `/api/chunk`, or MCP search results.
     #[command(display_order = 14)]
     Read {
-        /// Absolute path, store-relative path, file name, or compact chunk reference
+        /// Absolute path, store-relative path, file name, legacy compact ref, or `chunk:<id>`
         reference: String,
 
         /// Truncate chunk content to this many UTF-8 characters
@@ -4808,8 +4808,8 @@ fn warn_incremental_legacy_flag(flag_used: bool) {
 /// var so CI / wrappers can shorten it. Set to `0` for no pause.
 const MUTATION_WARN_DELAY_SECONDS_DEFAULT: u64 = 3;
 
-/// Emit a non-blocking note before a subcommand starts mutating
-/// `~/.aicx/`, then sleep briefly so the operator can Ctrl-C if they
+/// Emit a non-blocking note before a subcommand starts mutating the
+/// resolved AICX home, then sleep briefly so the operator can Ctrl-C if they
 /// invoked the command by accident.
 ///
 /// Wave D Cut D1 (B-P0-03): seven subcommands (`all`, `claude`, `codex`,
@@ -4832,19 +4832,26 @@ fn warn_pending_mutation(cmd: &str) {
         return;
     }
     let delay = mutation_warn_delay_seconds();
+    let root = mutation_warn_root_display();
     if delay == 0 {
         eprintln!(
-            "aicx {cmd}: note: about to write to ~/.aicx/. Pass --dry-run to preview \
+            "aicx {cmd}: note: about to write to {root}. Pass --dry-run to preview \
              (where supported) or set AICX_NO_MUTATION_WARN=1 to silence this note."
         );
         return;
     }
     eprintln!(
-        "aicx {cmd}: note: about to write to ~/.aicx/. Pass --dry-run to preview \
+        "aicx {cmd}: note: about to write to {root}. Pass --dry-run to preview \
          (where supported) or Ctrl-C within {delay}s to abort. \
          Set AICX_NO_MUTATION_WARN=1 to silence this note."
     );
     std::thread::sleep(std::time::Duration::from_secs(delay));
+}
+
+fn mutation_warn_root_display() -> String {
+    aicx::store::resolve_aicx_home()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|err| format!("<unresolved AICX_HOME: {err:#}>"))
 }
 
 fn mutation_warn_suppressed() -> bool {
