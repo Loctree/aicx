@@ -52,6 +52,7 @@ fn extract_demo_records(label: &str, body: &str) -> Vec<IntentRecord> {
         project: "demo".to_string(),
         hours: 24,
         strict: false,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: None,
     };
@@ -306,6 +307,7 @@ RED LIGHT: checklist detected (open: 0, done: 1)
         project: "demo".to_string(),
         hours: 24,
         strict: false,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: None,
     };
@@ -369,6 +371,7 @@ fn extraction_stats_report_scanned_chunks_and_candidates_before_display_filters(
         project: "demo".to_string(),
         hours: 24,
         strict: false,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: None,
     };
@@ -413,6 +416,7 @@ commit abcdef1 proves the old path was wrong.
         project: "demo".to_string(),
         hours: 48,
         strict: false,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: None,
     };
@@ -473,6 +477,7 @@ fn strict_mode_filters_heuristic_only_intents() {
         project: "demo".to_string(),
         hours: 24,
         strict: true,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: None,
     };
@@ -517,6 +522,7 @@ fn frame_kind_filter_keeps_only_matching_chunks() {
         project: "demo".to_string(),
         hours: 24,
         strict: false,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: Some(FrameKind::UserMsg),
     };
@@ -544,6 +550,7 @@ fn default_frame_kind_is_user_msg() {
         project: "demo".to_string(),
         hours: 24,
         strict: false,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: None,
     };
@@ -572,6 +579,7 @@ fn default_frame_kind_admits_user_chunk() {
         project: "demo".to_string(),
         hours: 24,
         strict: false,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: None,
     };
@@ -620,6 +628,7 @@ fn default_frame_kind_admits_user_chunk_and_rejects_agent_chunk() {
         project: "demo".to_string(),
         hours: 24,
         strict: false,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: None,
     };
@@ -668,6 +677,7 @@ fn explicit_agent_frame_kind_override_still_admits_agent_chunk() {
         project: "demo".to_string(),
         hours: 24,
         strict: false,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: Some(FrameKind::AgentReply),
     };
@@ -821,6 +831,7 @@ fn agent_chunk_still_yields_intents_drift_red() {
         project: "demo".to_string(),
         hours: 24,
         strict: false,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: None,
     };
@@ -1744,6 +1755,7 @@ mod quality {
             project: "demo".to_string(),
             hours: 240,
             strict: false,
+            min_confidence: None,
             kind_filter: Some(IntentKind::Decision),
             frame_kind: None,
         };
@@ -1824,6 +1836,7 @@ mod quality {
             project: "demo".to_string(),
             hours: 240,
             strict: false,
+            min_confidence: None,
             kind_filter: None,
             frame_kind: None,
         };
@@ -2444,7 +2457,7 @@ mod flexible_dates {
             &chunk_file,
             "aicx",
             "chunk.md",
-            2,
+            false,
             Some("voice_transcript".to_string()),
         );
         assert!(
@@ -2460,7 +2473,7 @@ mod flexible_dates {
             &chunk_file,
             "aicx",
             "chunk.md",
-            2,
+            false,
             Some("voice_transcript".to_string()),
         );
         assert!(
@@ -2484,5 +2497,238 @@ mod flexible_dates {
         // Written should come first
         assert_eq!(records[0].summary, "Intent written");
         assert_eq!(records[1].summary, "Intent voice");
+    }
+
+    #[test]
+    fn test_unresolved_mode_intent_vs_session() {
+        let records = vec![
+            IntentRecord {
+                kind: IntentKind::Intent,
+                summary: "implement search".to_string(),
+                context: None,
+                evidence: vec![],
+                project: "demo".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-06-12".to_string(),
+                timestamp: None,
+                session_id: "sess-1".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "chunk1.md".to_string(),
+                source: None,
+            },
+            IntentRecord {
+                kind: IntentKind::Intent,
+                summary: "fix login".to_string(),
+                context: None,
+                evidence: vec![],
+                project: "demo".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-06-12".to_string(),
+                timestamp: None,
+                session_id: "sess-1".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "chunk1.md".to_string(),
+                source: None,
+            },
+            IntentRecord {
+                kind: IntentKind::Outcome,
+                summary: "search was implemented successfully".to_string(),
+                context: None,
+                evidence: vec![],
+                project: "demo".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-06-12".to_string(),
+                timestamp: None,
+                session_id: "sess-1".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "chunk2.md".to_string(),
+                source: None,
+            },
+        ];
+
+        // 1. Session Mode: session contains Outcome, so all intents are filtered out
+        let session_filtered = apply_display_filters(
+            records.clone(),
+            &IntentDisplayFilters {
+                unresolved: true,
+                unresolved_mode: UnresolvedMode::Session,
+                ..Default::default()
+            },
+        );
+        let has_intents = session_filtered
+            .iter()
+            .any(|r| r.kind == IntentKind::Intent);
+        assert!(
+            !has_intents,
+            "Session mode should filter out all intents for resolved session"
+        );
+
+        // 2. Intent Mode: only "implement search" has a matching outcome, "fix login" should survive!
+        let intent_filtered = apply_display_filters(
+            records,
+            &IntentDisplayFilters {
+                unresolved: true,
+                unresolved_mode: UnresolvedMode::Intent,
+                ..Default::default()
+            },
+        );
+        let remaining_intents: Vec<_> = intent_filtered
+            .iter()
+            .filter(|r| r.kind == IntentKind::Intent)
+            .map(|r| r.summary.as_str())
+            .collect();
+        assert_eq!(remaining_intents, vec!["fix login"]);
+    }
+
+    #[test]
+    fn test_kind_plus_unresolved_combination() {
+        let records = vec![
+            IntentRecord {
+                kind: IntentKind::Intent,
+                summary: "implement search".to_string(),
+                context: None,
+                evidence: vec![],
+                project: "demo".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-06-12".to_string(),
+                timestamp: None,
+                session_id: "sess-1".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "chunk1.md".to_string(),
+                source: None,
+            },
+            IntentRecord {
+                kind: IntentKind::Intent,
+                summary: "fix login".to_string(),
+                context: None,
+                evidence: vec![],
+                project: "demo".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-06-12".to_string(),
+                timestamp: None,
+                session_id: "sess-1".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "chunk1.md".to_string(),
+                source: None,
+            },
+            IntentRecord {
+                kind: IntentKind::Outcome,
+                summary: "search was implemented successfully".to_string(),
+                context: None,
+                evidence: vec![],
+                project: "demo".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-06-12".to_string(),
+                timestamp: None,
+                session_id: "sess-1".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "chunk2.md".to_string(),
+                source: None,
+            },
+        ];
+
+        // Apply unresolved (intent mode) and then kind filter (Intents only).
+        // It must NOT return empty because "fix login" remains unresolved.
+        let mut filtered = apply_display_filters(
+            records,
+            &IntentDisplayFilters {
+                unresolved: true,
+                unresolved_mode: UnresolvedMode::Intent,
+                ..Default::default()
+            },
+        );
+        // Defer kind filter simulation
+        filtered.retain(|r| r.kind == IntentKind::Intent);
+
+        let summaries: Vec<_> = filtered.iter().map(|r| r.summary.as_str()).collect();
+        assert_eq!(summaries, vec!["fix login"]);
+    }
+
+    #[test]
+    fn test_strict_confidence_threshold() {
+        use super::dedup_candidates;
+        use super::types::IntentCandidate;
+
+        let chunk_file = StoredChunkFile {
+            agent: "agy".to_string(),
+            date: "2026-06-12".to_string(),
+            path: PathBuf::from("chunk.md"),
+            project: "aicx".to_string(),
+            sequence: 1,
+            timestamp: Utc::now(),
+            session_id: "sess-1".to_string(),
+        };
+
+        // 1. Voice transcript intent without context/evidence (confidence 2)
+        let c1 = IntentCandidate {
+            record: IntentRecord {
+                kind: IntentKind::Intent,
+                summary: "low confidence intent".to_string(),
+                context: None,
+                evidence: vec![],
+                project: "aicx".to_string(),
+                agent: "agy".to_string(),
+                date: "2026-06-12".to_string(),
+                timestamp: None,
+                session_id: "sess-1".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "chunk.md".to_string(),
+                source: Some("voice_transcript".to_string()),
+            },
+            confidence: 2,
+            timestamp: chunk_file.timestamp,
+        };
+
+        // 2. High confidence intent (confidence 4)
+        let c2 = IntentCandidate {
+            record: IntentRecord {
+                kind: IntentKind::Intent,
+                summary: "high confidence intent".to_string(),
+                context: Some("explicit instruction".to_string()),
+                evidence: vec![],
+                project: "aicx".to_string(),
+                agent: "agy".to_string(),
+                date: "2026-06-12".to_string(),
+                timestamp: None,
+                session_id: "sess-1".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "chunk.md".to_string(),
+                source: None,
+            },
+            confidence: 4,
+            timestamp: chunk_file.timestamp,
+        };
+
+        let candidates = vec![c1, c2];
+
+        // With strict = false, both kept
+        let all = dedup_candidates(candidates.clone(), false, None, None);
+        assert_eq!(all.len(), 2);
+
+        // With strict = true (requires confidence >= 4), only high confidence kept
+        let strict_records = dedup_candidates(candidates.clone(), true, None, None);
+        assert_eq!(strict_records.len(), 1);
+        assert_eq!(strict_records[0].summary, "high confidence intent");
+
+        // With min_confidence = Some(3), only high confidence kept (confidence 4 >= 3)
+        let min_conf_records = dedup_candidates(candidates, false, Some(3), None);
+        assert_eq!(min_conf_records.len(), 1);
+        assert_eq!(min_conf_records[0].summary, "high confidence intent");
     }
 }

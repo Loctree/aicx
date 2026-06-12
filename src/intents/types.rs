@@ -60,6 +60,7 @@ pub struct IntentsConfig {
     pub project: String,
     pub hours: u64,
     pub strict: bool,
+    pub min_confidence: Option<u8>,
     pub kind_filter: Option<IntentKind>,
     pub frame_kind: Option<FrameKind>,
 }

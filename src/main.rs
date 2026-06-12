@@ -176,6 +176,22 @@ impl From<FrameKindArg> for timeline::FrameKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+#[value(rename_all = "snake_case")]
+enum UnresolvedModeArg {
+    Session,
+    Intent,
+}
+
+impl From<UnresolvedModeArg> for aicx::intents::UnresolvedMode {
+    fn from(value: UnresolvedModeArg) -> Self {
+        match value {
+            UnresolvedModeArg::Session => Self::Session,
+            UnresolvedModeArg::Intent => Self::Intent,
+        }
+    }
+}
+
 const DEFAULT_DASHBOARD_TITLE: &str = "AICX Dashboard";
 const DEFAULT_REPORTS_TITLE: &str = "AICX Report Explorer";
 
@@ -1191,9 +1207,19 @@ enum Commands {
         #[command(flatten)]
         filters: RetrievalFilters,
 
-        /// Return only intent entries without a matching outcome within the same session
+        /// Return only intent entries without a matching outcome.
+        ///
+        /// The unresolved filter can operate at session level or intent level,
+        /// configured via `--unresolved-mode`.
         #[arg(long)]
         unresolved: bool,
+
+        /// Mode for filtering unresolved entries: session (default) or intent.
+        ///
+        /// session: Keep entries from sessions that do not contain an outcome. This is session-level closure.
+        /// intent: Keep intent entries where no matching outcome closes that intent. This is per-intent roadmap closure.
+        #[arg(long, value_enum, default_value_t = UnresolvedModeArg::Session)]
+        unresolved_mode: UnresolvedModeArg,
 
         /// Collapse multiple intents from the same session into one entry
         #[arg(long)]
@@ -1206,6 +1232,10 @@ enum Commands {
         /// Only show high-confidence intents
         #[arg(long)]
         strict: bool,
+
+        /// Minimum confidence threshold (1..5) to keep (overrides --strict if both specified)
+        #[arg(long)]
+        min_confidence: Option<u8>,
 
         /// Filter by kind: decision, intent, outcome, task
         #[arg(long, value_parser = ["decision", "intent", "outcome", "task"])]
@@ -1360,11 +1390,13 @@ enum Commands {
         json: bool,
     },
 
-    /// Build the semantic index. Use `--dry-run` to preview without writing.
+    /// Catch up the canonical corpus, then build the semantic index. Use
+    /// `--dry-run` to preview without writing.
     ///
-    /// Default behaviour is INCREMENTAL: only sidecars whose mtime is newer
-    /// than the existing index `header.generated_at` are embedded, and the
-    /// new rows are appended to the committed index file. Pass
+    /// Default behaviour is INCREMENTAL: first materialize missing canonical
+    /// chunks from source sessions, then embed only sidecars whose mtime is
+    /// newer than the existing index `header.generated_at`; new rows are
+    /// appended to the committed index file. Pass
     /// `--full-rescan` to re-embed every chunk from scratch — useful when
     /// the embedder model changes, the index file is corrupt, or an
     /// operator wants a deterministic from-zero rebuild.
@@ -2256,9 +2288,11 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             hours,
             filters,
             unresolved,
+            unresolved_mode,
             collapse_session,
             emit,
             strict,
+            min_confidence,
             kind,
         }) => {
             run_intents(
@@ -2268,8 +2302,10 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 IntentsDisplayOptions {
                     emit: &emit,
                     strict,
+                    min_confidence,
                     kind: kind.as_deref(),
                     unresolved,
+                    unresolved_mode: unresolved_mode.into(),
                     collapse_session,
                 },
             )?;
@@ -3460,8 +3496,10 @@ fn create_initial_source_snapshot(root: &Path) -> Result<()> {
 struct IntentsDisplayOptions<'a> {
     emit: &'a str,
     strict: bool,
+    min_confidence: Option<u8>,
     kind: Option<&'a str>,
     unresolved: bool,
+    unresolved_mode: aicx::intents::UnresolvedMode,
     collapse_session: bool,
 }
 
@@ -3474,8 +3512,10 @@ fn run_intents(
     let IntentsDisplayOptions {
         emit,
         strict,
+        min_confidence,
         kind,
         unresolved,
+        unresolved_mode,
         collapse_session,
     } = display;
     let kind_filter = kind.map(|k| match k {
@@ -3497,6 +3537,7 @@ fn run_intents(
         project: projects.first().cloned().unwrap_or_default(),
         hours,
         strict,
+        min_confidence,
         kind_filter: if unresolved { None } else { kind_filter },
         frame_kind: filters.frame_kind.map(Into::into),
     };
@@ -3513,6 +3554,7 @@ fn run_intents(
 
     let display_filters = intents::IntentDisplayFilters {
         unresolved,
+        unresolved_mode,
         collapse_session,
         agent: filters.agent.clone(),
         date_lo,
@@ -3538,11 +3580,22 @@ fn run_intents(
     }
 
     if records.is_empty() && emit != "json" {
-        eprintln!(
-            "No intents found for {} in last {} hours.",
-            project_scope_label(projects),
-            hours
-        );
+        if unresolved
+            && unresolved_mode == aicx::intents::UnresolvedMode::Session
+            && post_kind == Some(intents::IntentKind::Intent)
+        {
+            eprintln!(
+                "No intents found for {} in last {} hours. Note: --unresolved defaults to session-level mode. If you want to find unresolved intents at the intent level (matching intent to outcome by content), try: --unresolved-mode intent",
+                project_scope_label(projects),
+                hours
+            );
+        } else {
+            eprintln!(
+                "No intents found for {} in last {} hours.",
+                project_scope_label(projects),
+                hours
+            );
+        }
         return Ok(());
     }
 
@@ -3588,8 +3641,10 @@ fn run_tail(
             IntentsDisplayOptions {
                 emit: "markdown",
                 strict: false,
+                min_confidence: None,
                 kind,
                 unresolved: false,
+                unresolved_mode: aicx::intents::UnresolvedMode::Session,
                 collapse_session: false,
             },
         );
@@ -3607,6 +3662,7 @@ fn run_tail(
         project: projects.first().cloned().unwrap_or_default(),
         hours,
         strict: false,
+        min_confidence: None,
         kind_filter,
         frame_kind: filters.frame_kind.map(Into::into),
     };
@@ -5037,16 +5093,26 @@ struct StoreRunArgs {
 fn resolve_store_agents(agent: Option<&str>) -> Result<Vec<&'static str>> {
     match agent {
         Some("claude") => Ok(vec!["claude"]),
+        Some("claude-history") => Ok(vec!["claude-history"]),
         Some("codex") => Ok(vec!["codex"]),
+        Some("codex-sessions") => Ok(vec!["codex-sessions"]),
         Some("gemini") => Ok(vec!["gemini"]),
         Some("junie") => Ok(vec!["junie"]),
         Some("codescribe") => Ok(vec!["codescribe"]),
         Some("operator-md") => Ok(vec!["operator-md"]),
         Some(other) => Err(anyhow::anyhow!(
-            "Unsupported --agent '{}'. Expected one of: claude, codex, gemini, junie, codescribe, operator-md.",
+            "Unsupported --agent '{}'. Expected one of: claude, claude-history, codex, codex-sessions, gemini, junie, codescribe, operator-md.",
             other
         )),
-        None => Ok(vec!["claude", "codex", "gemini", "junie", "codescribe"]),
+        None => Ok(vec![
+            "claude",
+            "claude-history",
+            "codex",
+            "codex-sessions",
+            "gemini",
+            "junie",
+            "codescribe",
+        ]),
     }
 }
 
@@ -5683,7 +5749,9 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         );
         let agent_entries_result = match ag {
             "claude" => sources::extract_claude(&config),
+            "claude-history" => sources::extract_claude_history(&config),
             "codex" => sources::extract_codex(&config),
+            "codex-sessions" => sources::extract_codex_sessions(&config),
             "gemini" => sources::extract_gemini(&config),
             "junie" => sources::extract_junie(&config),
             "codescribe" => sources::extract_codescribe(&config),
@@ -6697,6 +6765,21 @@ fn run_index(
 
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr()) && !json;
 
+    if !dry_run {
+        eprintln!("Canonical catch-up: materializing source sessions before embedding");
+        run_store(StoreRunArgs {
+            project: projects.to_vec(),
+            agent: None,
+            hours: 0,
+            cutoff: None,
+            full_rescan: false,
+            include_assistant: true,
+            emit: StdoutEmit::None,
+            redact_secrets: true,
+            noise_filter_enabled: true,
+        })?;
+    }
+
     // G-3: announce embedder backend class so the operator can predict perf.
     // Cloud HTTP (~2.5s/req) vs native GGUF (~50ms/req on M-series) matter
     // for ETA expectations; suppressed in --json mode so machine readers
@@ -6816,6 +6899,8 @@ fn print_index_status_text(status: &aicx::IndexStatus) {
         "  readiness:              {}",
         match status.readiness {
             aicx::IndexReadiness::Ready => "ready",
+            aicx::IndexReadiness::StaleChunks => "stale_chunks (sessions newer than chunks)",
+            aicx::IndexReadiness::StaleIndex => "stale_index (chunks pending embedding)",
             aicx::IndexReadiness::Pending => "pending (only temp checkpoint)",
             aicx::IndexReadiness::Missing => "missing",
         }
@@ -6839,6 +6924,29 @@ fn print_index_status_text(status: &aicx::IndexStatus) {
     eprintln!(
         "  newest_chunk_mtime:     {}",
         status.newest_chunk_mtime.as_deref().unwrap_or("<none>")
+    );
+    eprintln!("  source_sessions:        {}", status.source_sessions);
+    eprintln!(
+        "  newest_session_updated: {}",
+        status
+            .newest_session_updated_at
+            .as_deref()
+            .unwrap_or("<none>")
+    );
+    eprintln!(
+        "  sessions_newer_than_chunks: {}",
+        status.sessions_newer_than_chunks
+    );
+    eprintln!(
+        "  sessions_without_timestamps: {}",
+        status.sessions_without_timestamps
+    );
+    eprintln!(
+        "  chunking_lag_secs:      {}",
+        status
+            .chunking_lag_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string())
     );
     eprintln!(
         "  semantic_index_mtime:   {}",

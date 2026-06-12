@@ -13,6 +13,24 @@ pub enum IntentSortOrder {
     Oldest,
 }
 
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+    Default,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum UnresolvedMode {
+    #[default]
+    Session,
+    Intent,
+}
+
 /// Display-time filters applied AFTER `extract_intents`.
 ///
 /// Promoted from `main.rs::run_intents` so that both the CLI and the MCP
@@ -22,12 +40,165 @@ pub enum IntentSortOrder {
 #[derive(Debug, Clone, Default)]
 pub struct IntentDisplayFilters {
     pub unresolved: bool,
+    pub unresolved_mode: UnresolvedMode,
     pub collapse_session: bool,
     pub agent: Option<String>,
     pub date_lo: Option<String>,
     pub date_hi: Option<String>,
     pub sort: Option<IntentSortOrder>,
     pub limit: Option<usize>,
+}
+
+fn clean_to_significant_words(text: &str) -> HashSet<String> {
+    const STOP_WORDS: &[&str] = &[
+        // English verbs/helpers
+        "fix",
+        "fixed",
+        "fixing",
+        "ship",
+        "shipped",
+        "shipping",
+        "implement",
+        "implemented",
+        "implementing",
+        "add",
+        "added",
+        "adding",
+        "test",
+        "tests",
+        "tested",
+        "testing",
+        "run",
+        "running",
+        "done",
+        "completed",
+        "complete",
+        "finished",
+        "finish",
+        "working",
+        "works",
+        "success",
+        "successfully",
+        "fail",
+        "failed",
+        "with",
+        "for",
+        "and",
+        "the",
+        "a",
+        "an",
+        "in",
+        "on",
+        "at",
+        "to",
+        "of",
+        "from",
+        "by",
+        "that",
+        "this",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "as",
+        "or",
+        // Polish verbs/helpers
+        "napraw",
+        "naprawione",
+        "naprawiłem",
+        "wdrożone",
+        "wdrozone",
+        "wdrożyłem",
+        "dodaj",
+        "dodane",
+        "dodałem",
+        "zrobione",
+        "zrobiłem",
+        "gotowe",
+        "dziala",
+        "działa",
+        "test",
+        "testy",
+        "przetestowane",
+        "uruchom",
+        "uruchomione",
+        "sukces",
+        "porażka",
+        "błąd",
+        "bledu",
+        "bledy",
+        "błędy",
+        "z",
+        "do",
+        "na",
+        "w",
+        "o",
+        "i",
+        "a",
+        "lub",
+        "dla",
+        "przez",
+        "pod",
+        "po",
+        "działające",
+    ];
+
+    let mut words = HashSet::new();
+    let cleaned = text.to_lowercase();
+    for token in cleaned.split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_') {
+        let trimmed = token.trim();
+        if trimmed.len() > 1 && !STOP_WORDS.contains(&trimmed) {
+            words.insert(trimmed.to_string());
+        }
+    }
+    words
+}
+
+fn normalize_alphanumeric(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect()
+}
+
+fn outcome_matches_intent(outcome: &IntentRecord, intent: &IntentRecord) -> bool {
+    if outcome.project != intent.project {
+        return false;
+    }
+
+    let outcome_words = clean_to_significant_words(&outcome.summary);
+    let intent_words = clean_to_significant_words(&intent.summary);
+
+    if outcome_words.is_empty() || intent_words.is_empty() {
+        let norm_outcome = normalize_alphanumeric(&outcome.summary);
+        let norm_intent = normalize_alphanumeric(&intent.summary);
+        if norm_outcome.is_empty() || norm_intent.is_empty() {
+            return false;
+        }
+        return norm_outcome.contains(&norm_intent) || norm_intent.contains(&norm_outcome);
+    }
+
+    let intersection: HashSet<_> = outcome_words.intersection(&intent_words).collect();
+    if intersection.is_empty() {
+        return false;
+    }
+
+    let min_len = outcome_words.len().min(intent_words.len());
+    let overlap_ratio = intersection.len() as f32 / min_len as f32;
+
+    if min_len <= 2 {
+        overlap_ratio >= 0.99
+    } else {
+        overlap_ratio >= 0.5
+    }
 }
 
 /// Apply display-time filters to intent records.
@@ -41,14 +212,33 @@ pub fn apply_display_filters(
     filters: &IntentDisplayFilters,
 ) -> Vec<IntentRecord> {
     if filters.unresolved {
-        let mut resolved_sessions = HashSet::new();
-        for rec in &records {
-            if rec.kind == IntentKind::Outcome {
-                resolved_sessions.insert(rec.session_id.clone());
+        match filters.unresolved_mode {
+            UnresolvedMode::Session => {
+                let mut resolved_sessions = HashSet::new();
+                for rec in &records {
+                    if rec.kind == IntentKind::Outcome {
+                        resolved_sessions.insert(rec.session_id.clone());
+                    }
+                }
+                records.retain(|r| {
+                    r.kind != IntentKind::Intent || !resolved_sessions.contains(&r.session_id)
+                });
+            }
+            UnresolvedMode::Intent => {
+                let outcomes: Vec<IntentRecord> = records
+                    .iter()
+                    .filter(|r| r.kind == IntentKind::Outcome)
+                    .cloned()
+                    .collect();
+                records.retain(|r| {
+                    if r.kind != IntentKind::Intent {
+                        return true;
+                    }
+                    let has_match = outcomes.iter().any(|o| outcome_matches_intent(o, r));
+                    !has_match
+                });
             }
         }
-        records
-            .retain(|r| r.kind != IntentKind::Intent || !resolved_sessions.contains(&r.session_id));
     }
 
     if filters.collapse_session {

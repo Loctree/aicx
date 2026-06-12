@@ -25,8 +25,8 @@ mod schema;
 mod types;
 
 pub use self::display::{
-    IntentDisplayFilters, IntentSortOrder, apply_display_filters, format_intents_json,
-    format_intents_markdown, format_intents_oracle_json,
+    IntentDisplayFilters, IntentSortOrder, UnresolvedMode, apply_display_filters,
+    format_intents_json, format_intents_markdown, format_intents_oracle_json,
 };
 use self::types::{
     CandidateAccumulator, IntentCandidate, SignalSection, StoredChunkFile, TaskAccumulator,
@@ -46,8 +46,6 @@ pub use self::schema::{
     detect_contract_fractures, detect_fractures, extract_claims, extract_user_intent_lines,
     generate_clarify, is_agent_role, is_user_role, verify_claims,
 };
-
-const STRICT_CONFIDENCE: u8 = 3;
 
 /// E.6: hard upper bound on per-extraction candidate vectors. A pathological
 /// input (huge transcript with many bullet lines) used to drag the whole
@@ -148,9 +146,19 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         }
     }
 
-    let mut records = dedup_candidates(candidates, config.strict, config.kind_filter);
+    let mut records = dedup_candidates(
+        candidates,
+        config.strict,
+        config.min_confidence,
+        config.kind_filter,
+    );
     drop_truncated_duplicate_records(&mut records);
-    let mut task_records = finalize_tasks(task_events, config.strict, config.kind_filter);
+    let mut task_records = finalize_tasks(
+        task_events,
+        config.strict,
+        config.min_confidence,
+        config.kind_filter,
+    );
     records.append(&mut task_records);
 
     reconcile_session_id_with_path(&mut records);
@@ -525,7 +533,7 @@ fn extract_signal_candidates(
                 project,
                 source_chunk,
                 !is_done,
-                STRICT_CONFIDENCE,
+                true,
                 None,
             ) {
                 task_events.push(event);
@@ -550,16 +558,8 @@ fn extract_signal_candidates(
         };
 
         if let Some(kind) = kind
-            && let Some(candidate) = build_candidate(
-                kind,
-                payload,
-                None,
-                file,
-                project,
-                source_chunk,
-                STRICT_CONFIDENCE,
-                None,
-            )
+            && let Some(candidate) =
+                build_candidate(kind, payload, None, file, project, source_chunk, true, None)
         {
             candidates.push(candidate);
         }
@@ -606,7 +606,7 @@ fn extract_transcript_candidates(
                     project,
                     source_chunk,
                     !is_done,
-                    STRICT_CONFIDENCE,
+                    false,
                     source_provenance,
                 ) {
                     task_events.push(event);
@@ -617,10 +617,6 @@ fn extract_transcript_candidates(
             let Some(kind) = infer_kind_from_line(line, is_user) else {
                 continue;
             };
-            let confidence = match kind {
-                IntentKind::Intent => 2,
-                _ => STRICT_CONFIDENCE,
-            };
 
             if let Some(candidate) = build_candidate(
                 kind,
@@ -629,7 +625,7 @@ fn extract_transcript_candidates(
                 file,
                 project,
                 source_chunk,
-                confidence,
+                false,
                 source_provenance,
             ) {
                 candidates.push(candidate);
@@ -923,6 +919,35 @@ fn is_garbled_transcription(summary: &str) -> bool {
     false
 }
 
+fn calculate_confidence(
+    kind: IntentKind,
+    summary: &str,
+    has_context: bool,
+    has_evidence: bool,
+    is_signal: bool,
+) -> u8 {
+    let mut confidence = if is_signal {
+        4
+    } else {
+        match kind {
+            IntentKind::Intent => 2,
+            _ => 3,
+        }
+    };
+
+    if has_context {
+        confidence += 1;
+    }
+    if has_evidence {
+        confidence += 1;
+    }
+    if kind == IntentKind::Intent && severity_marker(summary).is_some() {
+        confidence += 1;
+    }
+
+    confidence.min(5)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_candidate(
     kind: IntentKind,
@@ -931,7 +956,7 @@ fn build_candidate(
     file: &StoredChunkFile,
     project: &str,
     source_chunk: &str,
-    confidence: u8,
+    is_signal: bool,
     source_provenance: Option<String>,
 ) -> Option<IntentCandidate> {
     let summary = normalize_display_text(&clean_summary(kind, raw_summary));
@@ -958,6 +983,14 @@ fn build_candidate(
     {
         return None; // Degrade to candidate (exclude from final intents)
     }
+
+    let confidence = calculate_confidence(
+        kind,
+        &summary,
+        context.is_some(),
+        !evidence.is_empty(),
+        is_signal,
+    );
 
     Some(IntentCandidate {
         record: IntentRecord {
@@ -989,7 +1022,7 @@ fn build_task_event(
     project: &str,
     source_chunk: &str,
     is_open: bool,
-    confidence: u8,
+    is_signal: bool,
     source_provenance: Option<String>,
 ) -> Option<TaskEvent> {
     let candidate = build_candidate(
@@ -999,7 +1032,7 @@ fn build_task_event(
         file,
         project,
         source_chunk,
-        confidence,
+        is_signal,
         source_provenance,
     )?;
 
@@ -1362,15 +1395,24 @@ fn drop_truncated_duplicate_records(records: &mut Vec<IntentRecord>) {
 fn dedup_candidates(
     candidates: Vec<IntentCandidate>,
     strict: bool,
+    min_confidence: Option<u8>,
     kind_filter: Option<IntentKind>,
 ) -> Vec<IntentRecord> {
     let mut map: HashMap<(IntentKind, String, String), CandidateAccumulator> = HashMap::new();
+
+    let target_confidence = if let Some(mc) = min_confidence {
+        mc
+    } else if strict {
+        4
+    } else {
+        1
+    };
 
     for candidate in candidates {
         if kind_filter.is_some() && kind_filter != Some(candidate.record.kind) {
             continue;
         }
-        if strict && candidate.confidence < STRICT_CONFIDENCE {
+        if candidate.confidence < target_confidence {
             continue;
         }
 
@@ -1421,6 +1463,7 @@ fn dedup_candidates(
 fn finalize_tasks(
     task_events: Vec<TaskEvent>,
     strict: bool,
+    min_confidence: Option<u8>,
     kind_filter: Option<IntentKind>,
 ) -> Vec<IntentRecord> {
     if kind_filter.is_some() && kind_filter != Some(IntentKind::Task) {
@@ -1441,8 +1484,16 @@ fn finalize_tasks(
             })
     });
 
+    let target_confidence = if let Some(mc) = min_confidence {
+        mc
+    } else if strict {
+        4
+    } else {
+        1
+    };
+
     for event in events {
-        if strict && event.candidate.confidence < STRICT_CONFIDENCE {
+        if event.candidate.confidence < target_confidence {
             continue;
         }
 

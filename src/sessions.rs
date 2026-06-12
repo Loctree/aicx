@@ -888,6 +888,48 @@ fn scan_junie_session_file(path: &Path, session_id: &str) -> Option<SessionInfo>
     })
 }
 
+/// Discover every first-class session source under `home`.
+///
+/// This is the shared discovery core for status surfaces that need to reason
+/// about source-session freshness without duplicating provider walks. `cwd_filter`
+/// is passed into providers that can cheaply prune by cwd before reading files;
+/// [`select_sessions`] still applies the authoritative post-discovery filter.
+pub fn discover_sessions_at(
+    home: &Path,
+    modified_after: Option<SystemTime>,
+    cwd_filter: Option<&str>,
+    agent: Option<&str>,
+) -> Vec<SessionInfo> {
+    let mut discovered = Vec::new();
+    if agent.is_none_or(|a| a == "claude") {
+        discovered.extend(discover_claude_sessions(
+            &home.join(".claude").join("projects"),
+            modified_after,
+            cwd_filter,
+        ));
+    }
+    if agent.is_none_or(|a| a == "codex") {
+        discovered.extend(discover_codex_sessions(
+            &home.join(".codex").join("sessions"),
+            modified_after,
+        ));
+    }
+    if agent.is_none_or(|a| a == "gemini") {
+        discovered.extend(discover_gemini_sessions(
+            &home.join(".gemini").join("tmp"),
+            modified_after,
+            cwd_filter,
+        ));
+    }
+    if agent.is_none_or(|a| a == "junie") {
+        discovered.extend(discover_junie_sessions(
+            &home.join(".junie").join("sessions"),
+            modified_after,
+        ));
+    }
+    discovered
+}
+
 /// Extract the trailing session-id segment from a codex rollout filename stem,
 /// shaped `rollout-<YYYY-MM-DDThh-mm-ss>-<id>`. Returns `None` when the stem
 /// does not follow that shape (callers then fall back to whole-stem matching).

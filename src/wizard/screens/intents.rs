@@ -21,6 +21,7 @@ impl IntentsScreen {
             project: project_filter.clone(),
             hours,
             strict: false,
+            min_confidence: None,
             kind_filter: None,
             frame_kind: None,
         };
