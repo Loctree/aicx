@@ -218,7 +218,16 @@ fi
 
 require_cmd cargo
 
-require_cmd shasum
+# Portable SHA-256: macOS/Linux ship perl `shasum`, Git Bash on Windows only
+# ships coreutils `sha256sum`. Both emit the same "HASH  filename" format.
+if command -v shasum >/dev/null 2>&1; then
+  sha256_file() { shasum -a 256 "$1"; }
+elif command -v sha256sum >/dev/null 2>&1; then
+  sha256_file() { sha256sum "$1"; }
+else
+  echo "Error: missing required command: shasum or sha256sum" >&2
+  exit 1
+fi
 
 if [[ "${AICX_RELEASE_BUNDLE_ONLY_BINARIES:-0}" == "1" ]]; then
   echo "=== AICX GPG-signed bundle (binaries-only, no Apple codesign) ==="
@@ -296,7 +305,7 @@ EOF
     fi
     echo "  2. compose $BUNDLE_DIR layout (bin + LICENSE + README + install.sh + docs)"
     echo "  3. tar -czf $ARCHIVE_PATH"
-    echo "  4. shasum -a 256 -> $CHECKSUM_PATH"
+    echo "  4. sha256 checksum -> $CHECKSUM_PATH"
     exit 0
   fi
 
@@ -347,7 +356,7 @@ with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED) as zf:
   else
     (cd "$DIST_DIR" && tar -czf "$ARCHIVE_PATH" "$BUNDLE_BASENAME")
   fi
-  (cd "$DIST_DIR" && shasum -a 256 "$(basename "$ARCHIVE_PATH")") > "$CHECKSUM_PATH"
+  (cd "$DIST_DIR" && sha256_file "$(basename "$ARCHIVE_PATH")") > "$CHECKSUM_PATH"
 
   # Bundle staging directory only matters for inspection; remove it so it
   # never reaches `gh release upload` (which fails on directories).
@@ -599,7 +608,7 @@ done
 echo "[4/6] Packaging notarization archive..."
 rm -f "$ARCHIVE_PATH" "$CHECKSUM_PATH" "$NOTARY_LOG_PATH" "${ARCHIVE_PATH}.asc"
 ditto -c -k --keepParent "$BUNDLE_DIR" "$ARCHIVE_PATH"
-shasum -a 256 "$ARCHIVE_PATH" > "$CHECKSUM_PATH"
+sha256_file "$ARCHIVE_PATH" > "$CHECKSUM_PATH"
 
 # GPG detached signature is mandatory — Loctree releases never ship unsigned.
 if [[ -z "${LOCTREE_GPG_KEY_ID:-}" ]]; then

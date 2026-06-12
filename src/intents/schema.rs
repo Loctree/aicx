@@ -16,7 +16,7 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 // ── Export envelope (P0 temporal contract) ───────────────────────
@@ -201,6 +201,28 @@ pub enum ResultStatus {
     Fail,
     Partial,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    Commit,
+    TestRun,
+    RuntimeProbe,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceRecord {
+    pub id: String,
+    pub kind: EvidenceKind,
+    pub excerpt: String,
+    pub observed_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_touched: Option<Vec<String>>,
 }
 
 // ── Lane 4 — Contract Fracture ───────────────────────────────────
@@ -691,6 +713,241 @@ pub fn collect_artifact_evidence(
             });
         }
     }
+    results
+}
+
+/// Helper to identify if a line is a failing cargo test line.
+fn is_failing_test_line(line: &str) -> bool {
+    if !line.contains("test result:") {
+        return false;
+    }
+    let lower = line.to_lowercase();
+    if !lower.contains("failed") {
+        return false;
+    }
+    if line.to_uppercase().contains("FAILED") {
+        return true;
+    }
+    if let Some(idx) = lower.find("failed") {
+        let prefix = &lower[..idx];
+        let last_word = prefix.split_whitespace().next_back();
+        let num = last_word.and_then(|w| w.parse::<usize>().ok());
+        if let Some(n) = num {
+            return n > 0;
+        }
+    }
+    false
+}
+
+/// Helper to determine if an evidence record unambiguously overlaps with a claim.
+fn is_unambiguous_overlap(claim: &ClaimRecord, ev: &EvidenceRecord) -> bool {
+    match ev.kind {
+        EvidenceKind::Commit => {
+            // Check if commit SHA (anchor) is mentioned in claim text
+            if ev.anchor.as_ref().is_some_and(|sha| {
+                sha.len() >= 7
+                    && claim
+                        .claim_text
+                        .to_lowercase()
+                        .contains(&sha.to_lowercase())
+            }) {
+                return true;
+            }
+            // Check if any touched file is mentioned in claim text or claim's claimed_files
+            let claim_files = path_tokens(&claim.claim_text);
+            if let Some(ref files) = ev.files_touched {
+                for f in files {
+                    if claim_files.contains(f) || claim.claimed_files.contains(f) {
+                        return true;
+                    }
+                }
+            }
+            // Check if the excerpt mentions any claim files
+            for f in &claim_files {
+                if ev.excerpt.contains(f) {
+                    return true;
+                }
+            }
+        }
+        EvidenceKind::TestRun => {
+            // A test run overlaps with a claim if the claim mentions tests or test commands
+            let text = claim.claim_text.to_lowercase();
+            let is_test_claim = text.contains("test")
+                || text.contains("testy")
+                || text.contains("przetestowane")
+                || text.contains("green")
+                || text.contains("zielon");
+
+            if is_test_claim {
+                return true;
+            }
+
+            if ev
+                .anchor
+                .as_ref()
+                .is_some_and(|cmd| text.contains(&cmd.to_lowercase()))
+            {
+                return true;
+            }
+        }
+        EvidenceKind::RuntimeProbe => {
+            // A runtime probe overlaps if the claim mentions the command
+            if ev.anchor.as_ref().is_some_and(|cmd| {
+                claim
+                    .claim_text
+                    .to_lowercase()
+                    .contains(&cmd.to_lowercase())
+            }) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Lane 3 verification stage: audit claims against evidence records.
+/// Turns agent claims (Lane 2 output) into evidence-backed ResultRecords.
+/// Pure function.
+pub fn audit_claims_against_evidence(
+    claims: &[ClaimRecord],
+    evidence: &[EvidenceRecord],
+    audited_at: &str,
+) -> Vec<ResultRecord> {
+    let mut results = Vec::new();
+
+    for claim in claims {
+        // Find matching evidence records
+        let mut matched_ev: Vec<&EvidenceRecord> = Vec::new();
+        for ev in evidence {
+            let is_direct = ev.claim_id.as_deref() == Some(&claim.id);
+            let is_overlap = is_unambiguous_overlap(claim, ev);
+            if is_direct || is_overlap {
+                matched_ev.push(ev);
+            }
+        }
+
+        if matched_ev.is_empty() {
+            continue;
+        }
+
+        // Check if any matched evidence contains a failure
+        let mut has_failure = false;
+
+        for ev in &matched_ev {
+            if ev.kind == EvidenceKind::TestRun && ev.excerpt.lines().any(is_failing_test_line) {
+                has_failure = true;
+            }
+        }
+
+        if has_failure {
+            // Generate Fail ResultRecord
+            let first_fail_ev = matched_ev
+                .iter()
+                .find(|ev| {
+                    ev.kind == EvidenceKind::TestRun && ev.excerpt.lines().any(is_failing_test_line)
+                })
+                .unwrap();
+
+            let evidence_type = match first_fail_ev.kind {
+                EvidenceKind::Commit => "commit",
+                EvidenceKind::TestRun => "test_run",
+                EvidenceKind::RuntimeProbe => "runtime_probe",
+            }
+            .to_string();
+
+            let (command, exit_status) = if first_fail_ev.kind == EvidenceKind::RuntimeProbe
+                || first_fail_ev.kind == EvidenceKind::TestRun
+            {
+                (first_fail_ev.anchor.clone(), Some(1))
+            } else {
+                (None, None)
+            };
+
+            results.push(ResultRecord {
+                id: format!("result-audit-{}-{}", claim.id, results.len()),
+                project: claim.project.clone(),
+                evidence_type,
+                command,
+                exit_status,
+                artifact_path: None,
+                observed_output_excerpt: Some(first_fail_ev.excerpt.clone()),
+                timestamp: Some(audited_at.to_string()),
+                related_claims: vec![claim.id.clone()],
+                related_intents: Vec::new(),
+                result_status: ResultStatus::Fail,
+                confidence: 9,
+                reproducibility_notes: Some(
+                    "Audited against test run output (failing)".to_string(),
+                ),
+            });
+        } else {
+            // All matched evidence is passing/supporting.
+            // Check the high-risk gate
+            let has_direct = matched_ev
+                .iter()
+                .any(|ev| ev.claim_id.as_deref() == Some(&claim.id));
+            let can_verify = !claim.claim_type.is_high_risk() || has_direct;
+
+            if can_verify {
+                // Find primary evidence (prefer direct link if available)
+                let primary_ev = matched_ev
+                    .iter()
+                    .find(|ev| ev.claim_id.as_deref() == Some(&claim.id))
+                    .cloned()
+                    .unwrap_or(matched_ev[0]);
+
+                let evidence_type = match primary_ev.kind {
+                    EvidenceKind::Commit => "commit",
+                    EvidenceKind::TestRun => "test_run",
+                    EvidenceKind::RuntimeProbe => "runtime_probe",
+                }
+                .to_string();
+
+                let command = if primary_ev.kind == EvidenceKind::RuntimeProbe
+                    || primary_ev.kind == EvidenceKind::TestRun
+                {
+                    primary_ev.anchor.clone()
+                } else {
+                    None
+                };
+
+                let artifact_path = if primary_ev.kind == EvidenceKind::Commit {
+                    primary_ev
+                        .files_touched
+                        .as_ref()
+                        .and_then(|files| files.first().cloned())
+                } else {
+                    None
+                };
+
+                results.push(ResultRecord {
+                    id: format!("result-audit-{}-{}", claim.id, results.len()),
+                    project: claim.project.clone(),
+                    evidence_type,
+                    command,
+                    exit_status: Some(0),
+                    artifact_path,
+                    observed_output_excerpt: Some(primary_ev.excerpt.clone()),
+                    timestamp: Some(audited_at.to_string()),
+                    related_claims: vec![claim.id.clone()],
+                    related_intents: Vec::new(),
+                    result_status: ResultStatus::Pass,
+                    confidence: 9,
+                    reproducibility_notes: Some(format!(
+                        "Audited and verified via matching {} evidence record",
+                        if has_direct {
+                            "direct"
+                        } else {
+                            "circumstantial"
+                        }
+                    )),
+                });
+            } else {
+                // High-risk claim with only circumstantial evidence is NOT verified
+            }
+        }
+    }
+
     results
 }
 
@@ -1444,5 +1701,208 @@ mod tests {
         for role in ["user", "system", "tool", "developer", "operator", ""] {
             assert!(!is_agent_role(role), "{role:?} must never source a claim");
         }
+    }
+
+    #[test]
+    fn test_evidence_serialization() {
+        let ev = EvidenceRecord {
+            id: "ev-1".to_string(),
+            kind: EvidenceKind::TestRun,
+            excerpt: "test result: ok. 5 passed; 0 failed".to_string(),
+            observed_at: "2026-06-12T02:53:00Z".to_string(),
+            anchor: Some("cargo test".to_string()),
+            claim_id: Some("claim-123".to_string()),
+            files_touched: None,
+        };
+        let serialized = serde_json::to_string(&ev).unwrap();
+        let deserialized: EvidenceRecord = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(ev, deserialized);
+
+        let serialized_kind = serde_json::to_string(&EvidenceKind::Commit).unwrap();
+        assert_eq!(serialized_kind, "\"commit\"");
+        let deserialized_kind: EvidenceKind = serde_json::from_str(&serialized_kind).unwrap();
+        assert_eq!(deserialized_kind, EvidenceKind::Commit);
+    }
+
+    #[test]
+    fn test_audit_claims_against_evidence_verified_path() {
+        // non-high-risk claim with direct linked evidence
+        let claim = ClaimRecord {
+            id: "claim-1".into(),
+            project: "aicx".into(),
+            source_session: "sess-a".into(),
+            source_agent: Some("codex".into()),
+            source_role: "assistant".into(),
+            source_span: None,
+            claim_text: "fixed the database schema".into(),
+            claim_type: ClaimType::Fixed,
+            claimed_status: "fixed".into(),
+            timestamp: Some("2026-06-08T18:06:26Z".into()),
+            timestamp_partial: false,
+            extracted_at: "2026-06-09T20:41:00Z".into(),
+            claimed_files: vec![],
+            claimed_commands: vec![],
+            claimed_artifacts: vec![],
+            related_intents: vec![],
+            evidence_refs: vec![],
+            verification_status: VerificationStatus::default(),
+            risk_flags: vec![],
+        };
+
+        let ev = EvidenceRecord {
+            id: "ev-1".to_string(),
+            kind: EvidenceKind::RuntimeProbe,
+            excerpt: "database migration executed successfully".to_string(),
+            observed_at: "2026-06-12T02:53:00Z".to_string(),
+            anchor: Some("migration command".to_string()),
+            claim_id: Some("claim-1".to_string()),
+            files_touched: None,
+        };
+
+        let results = audit_claims_against_evidence(&[claim], &[ev], "2026-06-12T02:54:00Z");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].result_status, ResultStatus::Pass);
+        assert_eq!(results[0].related_claims, vec!["claim-1".to_string()]);
+        assert_eq!(results[0].command, Some("migration command".to_string()));
+    }
+
+    #[test]
+    fn test_audit_claims_against_evidence_contradicted_path() {
+        // Claim: "tests green"
+        let claim = ClaimRecord {
+            id: "claim-green".into(),
+            project: "aicx".into(),
+            source_session: "sess-a".into(),
+            source_agent: Some("codex".into()),
+            source_role: "assistant".into(),
+            source_span: None,
+            claim_text: "tests green".into(),
+            claim_type: ClaimType::Green,
+            claimed_status: "green".into(),
+            timestamp: Some("2026-06-08T18:06:26Z".into()),
+            timestamp_partial: false,
+            extracted_at: "2026-06-09T20:41:00Z".into(),
+            claimed_files: vec![],
+            claimed_commands: vec![],
+            claimed_artifacts: vec![],
+            related_intents: vec![],
+            evidence_refs: vec![],
+            verification_status: VerificationStatus::default(),
+            risk_flags: vec![],
+        };
+
+        // Evidence contains a failing test result
+        let ev = EvidenceRecord {
+            id: "ev-fail".to_string(),
+            kind: EvidenceKind::TestRun,
+            excerpt:
+                "running 10 tests\ntest result: FAILED. 9 passed; 1 failed; 0 ignored; 0 measured"
+                    .to_string(),
+            observed_at: "2026-06-12T02:53:00Z".to_string(),
+            anchor: Some("cargo test".to_string()),
+            claim_id: None, // circumstantial/unlinked
+            files_touched: None,
+        };
+
+        let results =
+            audit_claims_against_evidence(&[claim.clone()], &[ev], "2026-06-12T02:54:00Z");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].result_status, ResultStatus::Fail);
+        assert_eq!(results[0].related_claims, vec!["claim-green".to_string()]);
+
+        // Also test verify_claims updates the claim status to Contradicted
+        let mut claims = vec![claim];
+        verify_claims(&mut claims, &results);
+        assert_eq!(
+            claims[0].verification_status,
+            VerificationStatus::Contradicted
+        );
+    }
+
+    #[test]
+    fn test_audit_claims_against_evidence_unsupported_path() {
+        let claim = ClaimRecord {
+            id: "claim-unsupported".into(),
+            project: "aicx".into(),
+            source_session: "sess-a".into(),
+            source_agent: Some("codex".into()),
+            source_role: "assistant".into(),
+            source_span: None,
+            claim_text: "fixed a minor spelling mistake".into(),
+            claim_type: ClaimType::Fixed,
+            claimed_status: "fixed".into(),
+            timestamp: Some("2026-06-08T18:06:26Z".into()),
+            timestamp_partial: false,
+            extracted_at: "2026-06-09T20:41:00Z".into(),
+            claimed_files: vec![],
+            claimed_commands: vec![],
+            claimed_artifacts: vec![],
+            related_intents: vec![],
+            evidence_refs: vec![],
+            verification_status: VerificationStatus::default(),
+            risk_flags: vec![],
+        };
+
+        // No evidence matching this claim
+        let results = audit_claims_against_evidence(&[claim], &[], "2026-06-12T02:54:00Z");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_audit_claims_against_evidence_high_risk_gate() {
+        // High-risk claim
+        let claim = ClaimRecord {
+            id: "claim-highrisk".into(),
+            project: "aicx".into(),
+            source_session: "sess-a".into(),
+            source_agent: Some("codex".into()),
+            source_role: "assistant".into(),
+            source_span: None,
+            claim_text: "this is production ready".into(),
+            claim_type: ClaimType::ReadyToPush,
+            claimed_status: "ready_to_push".into(),
+            timestamp: Some("2026-06-08T18:06:26Z".into()),
+            timestamp_partial: false,
+            extracted_at: "2026-06-09T20:41:00Z".into(),
+            claimed_files: vec![],
+            claimed_commands: vec![],
+            claimed_artifacts: vec![],
+            related_intents: vec![],
+            evidence_refs: vec![],
+            verification_status: VerificationStatus::default(),
+            risk_flags: vec!["high_risk_unverified_claim".to_string()],
+        };
+
+        // Circumstantial evidence that is passing
+        let ev = EvidenceRecord {
+            id: "ev-circumstantial".to_string(),
+            kind: EvidenceKind::RuntimeProbe,
+            excerpt: "production-ready checklist looks good".to_string(),
+            observed_at: "2026-06-12T02:53:00Z".to_string(),
+            anchor: Some("checklist check".to_string()),
+            claim_id: None, // unlinked
+            files_touched: None,
+        };
+
+        // It should NOT be verified
+        let results =
+            audit_claims_against_evidence(&[claim.clone()], &[ev.clone()], "2026-06-12T02:54:00Z");
+        assert!(
+            results.is_empty(),
+            "High-risk claim with only circumstantial evidence is not verified (no pass result generated)"
+        );
+
+        // Now link it directly
+        let mut ev_linked = ev;
+        ev_linked.claim_id = Some("claim-highrisk".to_string());
+
+        let results_linked =
+            audit_claims_against_evidence(&[claim], &[ev_linked], "2026-06-12T02:54:00Z");
+        assert_eq!(results_linked.len(), 1);
+        assert_eq!(
+            results_linked[0].result_status,
+            ResultStatus::Pass,
+            "Verified with direct linked evidence"
+        );
     }
 }

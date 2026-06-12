@@ -40,10 +40,11 @@ pub use self::types::{
 // types are the convergence point every lane stage must agree on.
 pub use self::schema::{
     CLARIFY_MAX_QUESTIONS, ClaimRecord, ClaimSource, ClaimType, ClarifyQuestion, ContractFracture,
-    FractureSeverity, LANE_SCHEMA_VERSION, LaneExport, ResultRecord, ResultStatus, TimeCoverage,
-    UTC_TIMEZONE_ASSUMPTION, UserIntentLine, VerificationStatus, classify_claim,
-    collect_artifact_evidence, detect_fractures, extract_claims, extract_user_intent_lines,
-    generate_clarify, is_agent_role, is_user_role, verify_claims,
+    EvidenceKind, EvidenceRecord, FractureSeverity, LANE_SCHEMA_VERSION, LaneExport, ResultRecord,
+    ResultStatus, TimeCoverage, UTC_TIMEZONE_ASSUMPTION, UserIntentLine, VerificationStatus,
+    audit_claims_against_evidence, classify_claim, collect_artifact_evidence, detect_fractures,
+    extract_claims, extract_user_intent_lines, generate_clarify, is_agent_role, is_user_role,
+    verify_claims,
 };
 
 const STRICT_CONFIDENCE: u8 = 3;
