@@ -3503,6 +3503,398 @@ struct IntentsDisplayOptions<'a> {
     collapse_session: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IntentsProjectResolution {
+    projects: Vec<String>,
+    unresolved_filters: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BucketHint {
+    slug: String,
+    chunks: usize,
+}
+
+fn resolve_intents_project_filters(projects: &[String]) -> Result<IntentsProjectResolution> {
+    let store_root = store::store_base_dir()?;
+    let cwd = std::env::current_dir().ok();
+    resolve_intents_project_filters_at(projects, &store_root, &[], cwd.as_deref())
+}
+
+fn resolve_intents_project_filters_at(
+    projects: &[String],
+    store_root: &Path,
+    sessions: &[sessions::SessionInfo],
+    cwd: Option<&Path>,
+) -> Result<IntentsProjectResolution> {
+    if projects.is_empty() {
+        return Ok(IntentsProjectResolution {
+            projects: Vec::new(),
+            unresolved_filters: Vec::new(),
+        });
+    }
+
+    let mut slugs: Vec<String> = store::scan_context_files_at(store_root)?
+        .into_iter()
+        .map(|file| file.project)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    slugs.sort();
+
+    let mut resolved = BTreeSet::new();
+    let mut unresolved = Vec::new();
+    for filter in projects {
+        let matches = resolve_single_intents_project_filter(filter, &slugs, sessions, cwd)?;
+        if matches.is_empty() {
+            unresolved.push(filter.clone());
+        } else {
+            resolved.extend(matches);
+        }
+    }
+
+    Ok(IntentsProjectResolution {
+        projects: resolved.into_iter().collect(),
+        unresolved_filters: unresolved,
+    })
+}
+
+fn resolve_single_intents_project_filter(
+    filter: &str,
+    slugs: &[String],
+    sessions: &[sessions::SessionInfo],
+    cwd: Option<&Path>,
+) -> Result<Vec<String>> {
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if let Some(matches) = unique_resolution_stage(
+        filter,
+        "exact bucket",
+        slugs.iter().filter(|slug| slug.as_str() == filter).cloned(),
+    )? {
+        return Ok(matches);
+    }
+    if let Some(matches) = unique_resolution_stage(
+        filter,
+        "case-insensitive bucket",
+        slugs
+            .iter()
+            .filter(|slug| slug.eq_ignore_ascii_case(filter))
+            .cloned(),
+    )? {
+        return Ok(matches);
+    }
+
+    let session_matches = sessions
+        .iter()
+        .filter(|session| {
+            session
+                .project
+                .as_deref()
+                .is_some_and(|project| project.eq_ignore_ascii_case(filter))
+        })
+        .filter_map(|session| session.repo_path.as_deref())
+        .flat_map(|repo_path| slug_candidates_from_cwd_like(repo_path, filter, slugs));
+    if let Some(matches) =
+        unique_resolution_stage(filter, "sessions display-name", session_matches)?
+    {
+        return Ok(matches);
+    }
+
+    if let Some(cwd) = cwd.and_then(Path::to_str) {
+        let cwd_basename_matches = Path::new(cwd)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(filter));
+        if cwd_basename_matches
+            && let Some(matches) = unique_resolution_stage(
+                filter,
+                "cwd basename",
+                slug_candidates_from_cwd_like(cwd, filter, slugs),
+            )?
+        {
+            return Ok(matches);
+        }
+    }
+
+    if let Some(remote_slug) = inferred_slug_from_cwd_like(filter)
+        && let Some(slug) = canonical_stored_slug(slugs, &remote_slug)
+    {
+        return Ok(vec![slug]);
+    }
+
+    if filter.starts_with('/') || filter.ends_with('/') {
+        let matches: Vec<String> = slugs
+            .iter()
+            .filter(|slug| {
+                split_slug(slug)
+                    .is_some_and(|(org, repo)| store::project_filter_matches(org, repo, filter))
+            })
+            .cloned()
+            .collect();
+        if !matches.is_empty() {
+            return Ok(matches);
+        }
+    }
+
+    if let Some(matches) = unique_resolution_stage(
+        filter,
+        "alias",
+        slugs
+            .iter()
+            .filter(|slug| slug_matches_project_alias(slug, filter))
+            .cloned(),
+    )? {
+        return Ok(matches);
+    }
+
+    Ok(Vec::new())
+}
+
+fn unique_resolution_stage<I>(
+    filter: &str,
+    stage: &str,
+    candidates: I,
+) -> Result<Option<Vec<String>>>
+where
+    I: IntoIterator<Item = String>,
+{
+    let matches: Vec<String> = candidates
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if matches.is_empty() {
+        return Ok(None);
+    }
+    if matches.len() > 1 {
+        anyhow::bail!(
+            "project filter {filter:?} is ambiguous at {stage} resolution; matched buckets:\n  - {}\nUse one exact bucket with -p owner/repo.",
+            matches.join("\n  - ")
+        );
+    }
+    Ok(Some(matches))
+}
+
+fn slug_candidates_from_cwd_like(cwd_like: &str, filter: &str, slugs: &[String]) -> Vec<String> {
+    if let Some(remote_slug) = inferred_slug_from_cwd_like(cwd_like)
+        && let Some(slug) = canonical_stored_slug(slugs, &remote_slug)
+    {
+        return vec![slug];
+    }
+
+    let mut matches = BTreeSet::new();
+    let basename = Path::new(cwd_like)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| name.eq_ignore_ascii_case(filter));
+    if let Some(basename) = basename {
+        matches.extend(
+            slugs
+                .iter()
+                .filter(|slug| {
+                    split_slug(slug).is_some_and(|(_, repo)| repo.eq_ignore_ascii_case(basename))
+                })
+                .cloned(),
+        );
+    }
+
+    matches.into_iter().collect()
+}
+
+fn inferred_slug_from_cwd_like(value: &str) -> Option<String> {
+    if !is_resolvable_cwd_like(value) {
+        return None;
+    }
+    let identity = aicx_parser::segmentation::infer_tiered_identity_from_cwd(Some(value))?.identity;
+    Some(identity.slug())
+}
+
+fn is_resolvable_cwd_like(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with('/')
+        || value.starts_with('~')
+        || value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.starts_with("git@")
+        || value.starts_with("ssh://")
+        || value.starts_with("git://")
+        || (cfg!(windows) && is_windows_absolute_path(value))
+}
+
+fn is_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/'))
+        || value.starts_with("\\\\")
+}
+
+fn canonical_stored_slug(slugs: &[String], candidate: &str) -> Option<String> {
+    slugs
+        .iter()
+        .find(|slug| slug.eq_ignore_ascii_case(candidate))
+        .cloned()
+}
+
+fn split_slug(slug: &str) -> Option<(&str, &str)> {
+    let (org, repo) = slug.split_once('/')?;
+    if org.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((org, repo))
+}
+
+fn slug_matches_project_alias(slug: &str, filter: &str) -> bool {
+    let filter_alias = project_alias_key(filter);
+    if filter_alias.is_empty() {
+        return false;
+    }
+    let Some((org, repo)) = split_slug(slug) else {
+        return false;
+    };
+    [slug, org, repo]
+        .into_iter()
+        .any(|candidate| project_alias_key(candidate) == filter_alias)
+}
+
+fn project_alias_key(value: &str) -> String {
+    let mut value = value.trim().to_ascii_lowercase();
+    for suffix in [
+        "_deprecated",
+        "-deprecated",
+        ".deprecated",
+        " deprecated",
+        "_depr",
+        "-depr",
+        ".depr",
+        " depr",
+    ] {
+        if let Some(stripped) = value.strip_suffix(suffix) {
+            value = stripped.to_string();
+            break;
+        }
+    }
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn collect_recent_bucket_counts(store_root: &Path, hours: u64) -> Result<BTreeMap<String, usize>> {
+    let cutoff = if hours == 0 {
+        DateTime::<Utc>::from_timestamp(0, 0).expect("Unix epoch timestamp is valid")
+    } else {
+        let cutoff_hours = hours.min(i64::MAX as u64) as i64;
+        Utc::now() - chrono::Duration::hours(cutoff_hours)
+    };
+    let mut counts = BTreeMap::new();
+    for file in store::scan_context_files_at(store_root)? {
+        if file.path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let timestamp = file
+            .path
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .map(DateTime::<Utc>::from)
+            .or_else(|| {
+                NaiveDate::parse_from_str(&file.date_iso, "%Y-%m-%d")
+                    .ok()
+                    .and_then(|date| date.and_hms_opt(0, 0, 0))
+                    .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
+            });
+        if timestamp.is_some_and(|ts| ts >= cutoff) {
+            *counts.entry(file.project).or_insert(0) += 1;
+        }
+    }
+    Ok(counts)
+}
+
+fn nearby_bucket_hints(filters: &[String], counts: &BTreeMap<String, usize>) -> Vec<BucketHint> {
+    let filter_aliases: Vec<String> = filters
+        .iter()
+        .map(|filter| project_alias_key(filter))
+        .filter(|filter| !filter.is_empty())
+        .collect();
+    let mut hints: Vec<BucketHint> = counts
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .filter(|(slug, _)| {
+            if filters
+                .iter()
+                .any(|filter| slug.eq_ignore_ascii_case(filter.trim()))
+            {
+                return false;
+            }
+            let slug_alias = project_alias_key(slug);
+            let repo_alias = split_slug(slug).map(|(_, repo)| project_alias_key(repo));
+            filter_aliases.iter().any(|filter| {
+                slug_alias.contains(filter)
+                    || filter.contains(&slug_alias)
+                    || repo_alias
+                        .as_ref()
+                        .is_some_and(|repo| repo.contains(filter) || filter.contains(repo))
+            })
+        })
+        .map(|(slug, count)| BucketHint {
+            slug: slug.clone(),
+            chunks: *count,
+        })
+        .collect();
+    hints.sort_by(|left, right| {
+        right
+            .chunks
+            .cmp(&left.chunks)
+            .then_with(|| left.slug.cmp(&right.slug))
+    });
+    hints.truncate(5);
+    hints
+}
+
+fn print_no_intents_message(
+    projects: &[String],
+    hours: u64,
+    unresolved_note: Option<&str>,
+) -> Result<()> {
+    if projects.is_empty() {
+        eprintln!("No intents found for all projects in last {hours} hours.");
+        if let Some(note) = unresolved_note {
+            eprintln!("{note}");
+        }
+        return Ok(());
+    }
+
+    eprintln!(
+        "No intents found for project filter: {} in last {} hours.",
+        project_scope_label(projects),
+        hours
+    );
+    if let Some(note) = unresolved_note {
+        eprintln!("{note}");
+    }
+
+    let store_root = store::store_base_dir()?;
+    let hints = nearby_bucket_hints(projects, &collect_recent_bucket_counts(&store_root, hours)?);
+    if !hints.is_empty() {
+        eprintln!("Did you mean a nearby bucket with recent data?");
+        for hint in &hints {
+            eprintln!(
+                "- {} ({} chunks in last {}h)",
+                hint.slug, hint.chunks, hours
+            );
+        }
+        eprintln!("Try:");
+        eprintln!("  aicx intents -p {} --hours {}", hints[0].slug, hours);
+    }
+    Ok(())
+}
+
 fn run_intents(
     projects: &[String],
     hours: u64,
@@ -3533,8 +3925,21 @@ fn run_intents(
     // kind filter: extract WITHOUT it so Outcomes survive the resolution check,
     // then re-apply it after the unresolved narrowing.
     let post_kind = if unresolved { kind_filter } else { None };
+    let project_resolution = resolve_intents_project_filters(projects)?;
+    let mut effective_projects = if project_resolution.projects.is_empty() {
+        projects.to_vec()
+    } else {
+        project_resolution.projects.clone()
+    };
+    effective_projects.extend(project_resolution.unresolved_filters.iter().cloned());
+    effective_projects = effective_projects
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
     let config = intents::IntentsConfig {
-        project: projects.first().cloned().unwrap_or_default(),
+        project: effective_projects.first().cloned().unwrap_or_default(),
         hours,
         strict,
         min_confidence,
@@ -3542,7 +3947,8 @@ fn run_intents(
         frame_kind: filters.frame_kind.map(Into::into),
     };
 
-    let extraction = intents::extract_intents_with_stats_for_projects(&config, projects)?;
+    let extraction =
+        intents::extract_intents_with_stats_for_projects(&config, &effective_projects)?;
     let records = extraction.records;
 
     let (date_lo, date_hi) = if let Some(ref d) = filters.since {
@@ -3580,21 +3986,17 @@ fn run_intents(
     }
 
     if records.is_empty() && emit != "json" {
+        let unresolved_note = (unresolved
+            && unresolved_mode == aicx::intents::UnresolvedMode::Session
+            && post_kind == Some(intents::IntentKind::Intent))
+        .then_some("Note: --unresolved defaults to session-level mode. If you want to find unresolved intents at the intent level (matching intent to outcome by content), try: --unresolved-mode intent");
         if unresolved
             && unresolved_mode == aicx::intents::UnresolvedMode::Session
             && post_kind == Some(intents::IntentKind::Intent)
         {
-            eprintln!(
-                "No intents found for {} in last {} hours. Note: --unresolved defaults to session-level mode. If you want to find unresolved intents at the intent level (matching intent to outcome by content), try: --unresolved-mode intent",
-                project_scope_label(projects),
-                hours
-            );
+            print_no_intents_message(projects, hours, unresolved_note)?;
         } else {
-            eprintln!(
-                "No intents found for {} in last {} hours.",
-                project_scope_label(projects),
-                hours
-            );
+            print_no_intents_message(projects, hours, None)?;
         }
         return Ok(());
     }

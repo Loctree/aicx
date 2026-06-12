@@ -521,6 +521,116 @@ fn set_mtime(path: &Path, unix_seconds: i64) {
     set_file_mtime(path, FileTime::from_unix_time(unix_seconds, 0)).unwrap();
 }
 
+fn write_store_chunk(root: &Path, slug: &str, date: &str, session: &str) -> PathBuf {
+    let path = root
+        .join("store")
+        .join(slug)
+        .join(date)
+        .join("conversations")
+        .join("claude")
+        .join(format!("{date}_claude_{session}_001.md"));
+    write_file(&path, "[signals]\n- intent: test\n");
+    path
+}
+
+fn session_info(project: &str, repo_path: &str) -> sessions::SessionInfo {
+    sessions::SessionInfo {
+        session_id: "session-1".to_string(),
+        agent: "claude".to_string(),
+        project: Some(project.to_string()),
+        repo_path: Some(repo_path.to_string()),
+        started_at: None,
+        updated_at: None,
+        message_count: 1,
+        user_message_count: 1,
+        agent_message_count: 0,
+        title: None,
+        source_path: PathBuf::from("/tmp/session.jsonl"),
+        association: sessions::Association::Exact,
+        temporal_confidence: sessions::TemporalConfidence::None,
+    }
+}
+
+#[test]
+fn intents_project_resolver_prefers_session_display_before_alias() {
+    let root = unique_test_dir("intents-project-display");
+    let _ = fs::remove_dir_all(&root);
+    write_store_chunk(&root, "legacy/ScreenScribe", "2026_0612", "legacy");
+    write_store_chunk(
+        &root,
+        "vetcoders/screen_scribe_depr",
+        "2026_0612",
+        "canonical",
+    );
+    let sessions = vec![session_info(
+        "ScreenScribe",
+        "git@github.com:vetcoders/screen_scribe_depr.git",
+    )];
+
+    let got =
+        resolve_intents_project_filters_at(&["ScreenScribe".to_string()], &root, &sessions, None)
+            .unwrap();
+    let _ = fs::remove_dir_all(&root);
+
+    assert_eq!(got.projects, vec!["vetcoders/screen_scribe_depr"]);
+    assert!(got.unresolved_filters.is_empty());
+}
+
+#[test]
+fn intents_project_resolver_errors_on_ambiguous_alias() {
+    let root = unique_test_dir("intents-project-ambiguous");
+    let _ = fs::remove_dir_all(&root);
+    write_store_chunk(&root, "one/screen_scribe_depr", "2026_0612", "one");
+    write_store_chunk(&root, "two/ScreenScribe", "2026_0612", "two");
+
+    let err = resolve_intents_project_filters_at(&["ScreenScribe".to_string()], &root, &[], None)
+        .expect_err("alias collision should force explicit bucket");
+    let msg = err.to_string();
+    let _ = fs::remove_dir_all(&root);
+
+    assert!(msg.contains("ambiguous"));
+    assert!(msg.contains("one/screen_scribe_depr"));
+    assert!(msg.contains("two/ScreenScribe"));
+}
+
+#[test]
+fn intents_project_resolver_does_not_resolve_bare_unknown_to_current_repo() {
+    let root = unique_test_dir("intents-project-bare-unknown");
+    let _ = fs::remove_dir_all(&root);
+    write_store_chunk(&root, "Loctree/aicx", "2026_0612", "aicx");
+
+    let got =
+        resolve_intents_project_filters_at(&["ScreenScrib".to_string()], &root, &[], None).unwrap();
+    let _ = fs::remove_dir_all(&root);
+
+    assert!(got.projects.is_empty());
+    assert_eq!(got.unresolved_filters, vec!["ScreenScrib"]);
+}
+
+#[test]
+fn intents_empty_result_hint_ranks_nearby_recent_buckets() {
+    let mut counts = BTreeMap::new();
+    counts.insert("vetcoders/screen_scribe_depr".to_string(), 12);
+    counts.insert("vetcoders/other".to_string(), 99);
+    counts.insert("local/ScreenScribe".to_string(), 3);
+
+    let hints = nearby_bucket_hints(&["ScreenScribe".to_string()], &counts);
+
+    assert_eq!(
+        hints,
+        vec![
+            BucketHint {
+                slug: "vetcoders/screen_scribe_depr".to_string(),
+                chunks: 12,
+            },
+            BucketHint {
+                slug: "local/ScreenScribe".to_string(),
+                chunks: 3,
+            },
+        ]
+    );
+}
+
 #[test]
 fn uuid_suffix_from_stem_extracts_rollout_uuid() {
     assert_eq!(
