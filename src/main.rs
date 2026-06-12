@@ -6749,6 +6749,45 @@ fn write_index_for_current_build(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IndexCatchUpPlan {
+    needed: bool,
+    cutoff: Option<DateTime<Utc>>,
+}
+
+fn index_catch_up_plan_from_statuses(statuses: &[aicx::IndexStatus]) -> Result<IndexCatchUpPlan> {
+    let mut needed = false;
+    let mut cutoff: Option<DateTime<Utc>> = None;
+
+    for status in statuses {
+        if status.sessions_newer_than_chunks == 0 {
+            continue;
+        }
+        needed = true;
+        let Some(newest_chunk_mtime) = status.newest_chunk_mtime.as_deref() else {
+            return Ok(IndexCatchUpPlan {
+                needed: true,
+                cutoff: None,
+            });
+        };
+        let parsed = DateTime::parse_from_rfc3339(newest_chunk_mtime)
+            .with_context(|| format!("parse newest_chunk_mtime `{newest_chunk_mtime}`"))?
+            .with_timezone(&Utc);
+        cutoff = Some(cutoff.map_or(parsed, |current| current.min(parsed)));
+    }
+
+    Ok(IndexCatchUpPlan { needed, cutoff })
+}
+
+fn index_catch_up_plan(scopes: &[Option<&str>]) -> Result<IndexCatchUpPlan> {
+    let store_root = store::store_base_dir()?;
+    let statuses = scopes
+        .iter()
+        .map(|scope| aicx::api::index_status_at(&store_root, *scope))
+        .collect::<Result<Vec<_>>>()?;
+    index_catch_up_plan_from_statuses(&statuses)
+}
+
 /// Build (or preview) the vector index. `dry_run=true` probes the
 /// embedder + samples chunks for ETA. `dry_run=false` writes a
 /// persistent NDJSON-backed index (Iter 3) that subsequent `aicx search`
@@ -6766,18 +6805,28 @@ fn run_index(
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr()) && !json;
 
     if !dry_run {
-        eprintln!("Canonical catch-up: materializing source sessions before embedding");
-        run_store(StoreRunArgs {
-            project: projects.to_vec(),
-            agent: None,
-            hours: 0,
-            cutoff: None,
-            full_rescan: false,
-            include_assistant: true,
-            emit: StdoutEmit::None,
-            redact_secrets: true,
-            noise_filter_enabled: true,
-        })?;
+        let catch_up = index_catch_up_plan(&scopes)?;
+        if catch_up.needed {
+            eprintln!("Canonical catch-up: materializing source sessions before embedding");
+            if let Some(cutoff) = catch_up.cutoff {
+                eprintln!("  Catch-up cutoff: {}", cutoff.to_rfc3339());
+            } else {
+                eprintln!("  Catch-up cutoff: <all time>");
+            }
+            run_store(StoreRunArgs {
+                project: projects.to_vec(),
+                agent: None,
+                hours: 0,
+                cutoff: catch_up.cutoff,
+                full_rescan: true,
+                include_assistant: true,
+                emit: StdoutEmit::None,
+                redact_secrets: true,
+                noise_filter_enabled: true,
+            })?;
+        } else {
+            eprintln!("Canonical catch-up: no source sessions newer than chunks");
+        }
     }
 
     // G-3: announce embedder backend class so the operator can predict perf.

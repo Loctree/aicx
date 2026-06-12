@@ -292,6 +292,51 @@ fn dummy_index_status(bucket: &str) -> aicx::IndexStatus {
 }
 
 #[test]
+fn index_catch_up_plan_uses_oldest_lagging_chunk_timestamp() {
+    let mut current = dummy_index_status("current");
+    current.sessions_newer_than_chunks = 0;
+    current.newest_chunk_mtime = Some("2026-06-12T10:00:00Z".to_string());
+
+    let mut lagging_newer = dummy_index_status("lagging-newer");
+    lagging_newer.sessions_newer_than_chunks = 3;
+    lagging_newer.newest_chunk_mtime = Some("2026-06-12T09:00:00Z".to_string());
+
+    let mut lagging_older = dummy_index_status("lagging-older");
+    lagging_older.sessions_newer_than_chunks = 1;
+    lagging_older.newest_chunk_mtime = Some("2026-06-11T12:33:26Z".to_string());
+
+    let plan = index_catch_up_plan_from_statuses(&[current, lagging_newer, lagging_older]).unwrap();
+
+    assert!(plan.needed);
+    assert_eq!(
+        plan.cutoff.unwrap().to_rfc3339(),
+        "2026-06-11T12:33:26+00:00"
+    );
+}
+
+#[test]
+fn index_catch_up_plan_skips_store_when_no_chunking_lag_exists() {
+    let status = dummy_index_status("ready");
+
+    let plan = index_catch_up_plan_from_statuses(&[status]).unwrap();
+
+    assert!(!plan.needed);
+    assert!(plan.cutoff.is_none());
+}
+
+#[test]
+fn index_catch_up_plan_uses_all_time_when_lagging_status_has_no_chunks() {
+    let mut missing_chunks = dummy_index_status("missing-chunks");
+    missing_chunks.sessions_newer_than_chunks = 5;
+    missing_chunks.newest_chunk_mtime = None;
+
+    let plan = index_catch_up_plan_from_statuses(&[missing_chunks]).unwrap();
+
+    assert!(plan.needed);
+    assert!(plan.cutoff.is_none());
+}
+
+#[test]
 fn index_status_json_payload_is_always_array_for_single_scope() {
     let reports = vec![(None, dummy_index_status("_all"))];
     let payload = index_status_json_payload(&reports);
