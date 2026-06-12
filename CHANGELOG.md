@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+## [0.9.3] - 2026-06-12
+
+### Added
+
+- `aicx index status`: truthful sessions→chunks freshness — new fields
+  `source_sessions`, `newest_session_updated_at`, `sessions_newer_than_chunks`,
+  `sessions_without_timestamps`, `chunking_lag_secs`; readiness now reports
+  `stale_chunks`/`stale_index` instead of a false clean `ready` when source
+  sessions are newer than canonical chunks. MCP `IndexStatus` carries the
+  same fields.
+- `aicx index`: canonical catch-up stage — when chunking lag exists, source
+  sessions are materialized into the canonical store (cutoff derived from the
+  oldest lagging `newest_chunk_mtime`) before semantic indexing; skipped
+  entirely when no lag exists.
+- `aicx intents`: voice-transcript provenance — `<codescribe>`-tagged
+  transcriptions get `source: voice_transcript`, a `[voice]` timeline marker,
+  and sort below typed intents; deterministic garble gate drops incoherent
+  voice-only intents that carry neither WHY nor EVIDENCE.
+- `aicx intents`: `--unresolved-mode <session|intent>` — intent-level
+  closure matching (keyword-overlap join) in addition to the session-level
+  default; empty results under the default mode now print a hint instead of
+  a bare false-empty.
+- `aicx intents`: `--min-confidence <1..5>` exposes the structural confidence
+  threshold; `--strict` now maps to confidence ≥4 and measurably cuts
+  low-confidence noise.
+- Intents epistemic spine (lanes 3–5): `audit_claims_against_evidence`
+  (EvidenceRecord/EvidenceKind), `detect_contract_fractures` (contradicted /
+  unsupported-high-risk / orphaned-intent taxonomy), and `generate_clarify`
+  (deterministic, capped, priority-ordered clarify questions).
+- Typed `ChunkRefSpec` resolver in the store: `aicx read` accepts
+  `chunk:<hex-id>` (8-hex SHA-256 prefix of the canonical chunk path), bare
+  hex ids, absolute/store-relative paths, and legacy compact refs through one
+  shared resolver (CLI + MCP); unknown ids fail with a query-bearing error,
+  ambiguous prefixes list candidates.
+
+### Fixed
+
+- CLI no longer panics with `failed printing to stdout: Broken pipe` when
+  output is piped into `head`/`less` on Unix — SIGPIPE default disposition is
+  restored at process start (regression-tested).
+- Mutation warning and installer messages print the *resolved* AICX home
+  (bootstrap `[storage].home` / `AICX_HOME`) instead of a hardcoded
+  `~/.aicx`; installer output distinguishes `config:` from `storage root:`
+  when the two diverge.
+- `aicx-parser`: segment-kind scoring no longer overflows on report-heavy
+  sessions (score accumulation widened u8→u16; regression covered with a
+  300-entry fixture).
+
 ## [0.9.2] - 2026-06-11
 
 ### Added
