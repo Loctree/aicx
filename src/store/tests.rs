@@ -1342,7 +1342,10 @@ fn test_dir_sha_cache_does_not_cross_dirs() {
 // ================================================================
 
 fn retrieval_test_root(name: &str) -> PathBuf {
-    env::temp_dir().join(format!(
+    let temp = env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| env::temp_dir());
+    temp.join(format!(
         "aicx-retrieval-{name}-{}-{}",
         std::process::id(),
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -1354,6 +1357,16 @@ fn write_chunk_file(path: &Path, content: &str) {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(path, content).unwrap();
+}
+
+fn repo_chunk_path(root: &Path, session_id: &str, chunk: u32) -> PathBuf {
+    root.join("store")
+        .join("VetCoders")
+        .join("ai-contexters")
+        .join("2026_0321")
+        .join("conversations")
+        .join("claude")
+        .join(format!("2026_0321_claude_{session_id}_{chunk:03}.md"))
 }
 
 fn set_mtime(path: &Path, unix_seconds: i64) {
@@ -1587,6 +1600,108 @@ fn read_context_chunk_accepts_relative_path_file_name_and_compact_ref() {
     )
     .expect("read by compact ref");
     assert_eq!(by_compact.relative_path, by_relative.relative_path);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn chunk_ref_spec_parse_accepts_paths_and_chunk_ids() {
+    assert_eq!(
+        ChunkRefSpec::parse("/tmp/aicx/chunk.md").unwrap(),
+        ChunkRefSpec::Path(PathBuf::from("/tmp/aicx/chunk.md"))
+    );
+    assert_eq!(
+        ChunkRefSpec::parse(
+            "store/VetCoders/ai-contexters/2026_0321/conversations/claude/chunk.md"
+        )
+        .unwrap(),
+        ChunkRefSpec::Path(PathBuf::from(
+            "store/VetCoders/ai-contexters/2026_0321/conversations/claude/chunk.md"
+        ))
+    );
+    assert_eq!(
+        ChunkRefSpec::parse("chunk:10B84A3F").unwrap(),
+        ChunkRefSpec::Id("10b84a3f".to_string())
+    );
+    assert_eq!(
+        ChunkRefSpec::parse("10b84a3f").unwrap(),
+        ChunkRefSpec::Id("10b84a3f".to_string())
+    );
+}
+
+#[test]
+fn read_context_chunk_resolves_chunk_id_from_absolute_path_hash() {
+    let root = retrieval_test_root("read-chunk-id");
+    let _ = fs::remove_dir_all(&root);
+
+    let chunk_path = repo_chunk_path(&root, "sess-pathhash", 1);
+    write_chunk_file(&chunk_path, "Decision: path hash ids are compact handles");
+
+    let scanned = scan_context_files_at(&root).expect("scan fixture");
+    assert_eq!(scanned.len(), 1);
+    let id = chunk_path_ref_id(&scanned[0]);
+
+    let by_chunk_ref =
+        read_context_chunk_at(&root, &format!("chunk:{id}"), Some(16)).expect("read by chunk id");
+    assert_eq!(by_chunk_ref.path, scanned[0].path);
+    assert_eq!(by_chunk_ref.content, "Decision: path h");
+    assert!(by_chunk_ref.truncated);
+
+    let by_bare_id = read_context_chunk_at(&root, &id, None).expect("read by bare id");
+    assert_eq!(by_bare_id.path, by_chunk_ref.path);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn read_context_chunk_reports_unknown_chunk_id() {
+    let root = retrieval_test_root("read-chunk-id-miss");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+
+    let err = read_context_chunk_at(&root, "chunk:deadbeef", None).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("chunk:deadbeef"));
+    assert!(message.contains("not found"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn read_context_chunk_rejects_ambiguous_chunk_id_prefix_with_candidates() {
+    let root = retrieval_test_root("read-chunk-id-ambiguous");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let canonical_root = sanitize::validate_dir_path(&root).unwrap();
+
+    let mut by_prefix = std::collections::HashMap::<String, (PathBuf, String)>::new();
+    let (left_path, right_path, prefix, left_id, right_id) = (0..70_000)
+        .find_map(|idx| {
+            let session_id = format!("ambig-{idx}");
+            let path = repo_chunk_path(&canonical_root, &session_id, 1);
+            let id = content_sha256(path.to_string_lossy().as_ref())
+                .chars()
+                .take(8)
+                .collect::<String>();
+            let prefix = id.chars().take(4).collect::<String>();
+            if let Some((prev_path, prev_id)) = by_prefix.get(&prefix) {
+                Some((prev_path.clone(), path, prefix, prev_id.clone(), id))
+            } else {
+                by_prefix.insert(prefix, (path, id));
+                None
+            }
+        })
+        .expect("find deterministic 4-hex prefix collision");
+
+    write_chunk_file(&left_path, "first ambiguous chunk");
+    write_chunk_file(&right_path, "second ambiguous chunk");
+
+    let err = read_context_chunk_at(&root, &format!("chunk:{prefix}"), None).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("ambiguous chunk id"));
+    assert!(message.contains("candidates:"));
+    assert!(message.contains(&format!("chunk:{left_id}")));
+    assert!(message.contains(&format!("chunk:{right_id}")));
 
     let _ = fs::remove_dir_all(&root);
 }

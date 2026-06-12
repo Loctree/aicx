@@ -1040,6 +1040,194 @@ pub fn detect_fractures(claims: &[ClaimRecord]) -> Vec<ContractFracture> {
     fractures
 }
 
+/// Lane 4 stage (pure): detect contract fractures by analyzing user intents,
+/// agent claims, and verified result records. Surfaces:
+/// 1. Contradicted claims (evidence failure).
+/// 2. Unsupported high-risk claims (unverified status but high risk claim type).
+/// 3. Orphaned intents (user intents with no addressing claim and no addressing result).
+pub fn detect_contract_fractures(
+    intents: &[super::IntentRecord],
+    claims: &[ClaimRecord],
+    results: &[ResultRecord],
+) -> Vec<ContractFracture> {
+    let mut local_claims = claims.to_vec();
+    verify_claims(&mut local_claims, results);
+
+    let mut fractures = Vec::new();
+
+    // 1. Contradicted claims & 2. Unsupported high-risk claims
+    for claim in &local_claims {
+        match claim.verification_status {
+            VerificationStatus::Contradicted => {
+                let severity = if claim.claim_type.is_high_risk() {
+                    FractureSeverity::Critical
+                } else {
+                    FractureSeverity::High
+                };
+                fractures.push(ContractFracture {
+                    claim_id: claim.id.clone(),
+                    contract_source: format!(
+                        "agent claim {} (session {})",
+                        claim.id, claim.source_session
+                    ),
+                    promised_surface: claim.claim_text.clone(),
+                    runtime_surface: "evidence contradicts the claim (named artifact missing)"
+                        .to_string(),
+                    evidence: claim.evidence_refs.clone(),
+                    severity,
+                    options: vec![
+                        "A: implement/repair so the claim becomes true".to_string(),
+                        "B: retract the claim and reopen the task".to_string(),
+                        "C: accept the gap and record it as known debt".to_string(),
+                    ],
+                    recommended_clarify_question: Some(format!("clarify-{}", claim.id)),
+                });
+            }
+            VerificationStatus::Unverified if claim.claim_type.is_high_risk() => {
+                fractures.push(ContractFracture {
+                    claim_id: claim.id.clone(),
+                    contract_source: format!(
+                        "agent claim {} (session {})",
+                        claim.id, claim.source_session
+                    ),
+                    promised_surface: claim.claim_text.clone(),
+                    runtime_surface: "no evidence collected — applause verdict unbacked"
+                        .to_string(),
+                    evidence: Vec::new(),
+                    severity: FractureSeverity::Medium,
+                    options: vec![
+                        "A: demand evidence (run gates) before trusting the verdict".to_string(),
+                        "B: treat as unverified and keep hardening".to_string(),
+                        "C: accept the verdict on trust and ship".to_string(),
+                    ],
+                    recommended_clarify_question: Some(format!("clarify-{}", claim.id)),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // 3. Orphaned intents
+    for intent in intents {
+        if intent.kind != super::IntentKind::Intent {
+            continue;
+        }
+
+        // Check if there is any claim addressing this intent
+        let has_addressing_claim = local_claims.iter().any(|claim| {
+            if claim.project != intent.project {
+                return false;
+            }
+            if claim.related_intents.contains(&intent.summary) {
+                return true;
+            }
+            let claim_lower = claim.claim_text.to_lowercase();
+            let intent_lower = intent.summary.to_lowercase();
+            if claim_lower.contains(&intent_lower) || intent_lower.contains(&claim_lower) {
+                return true;
+            }
+
+            let intent_words: Vec<&str> = intent_lower
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| w.len() >= 3)
+                .collect();
+            let claim_words: Vec<&str> = claim_lower
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| w.len() >= 3)
+                .collect();
+
+            intent_words.iter().any(|iw| {
+                claim_words
+                    .iter()
+                    .any(|cw| cw.contains(iw) || iw.contains(cw))
+            })
+        });
+
+        // Check if there is any result addressing this intent
+        let has_addressing_result = results.iter().any(|result| {
+            if result.project != intent.project {
+                return false;
+            }
+            if result.related_intents.contains(&intent.summary) {
+                return true;
+            }
+            let intent_lower = intent.summary.to_lowercase();
+            if let Some(cmd) = &result.command {
+                let cmd_lower = cmd.to_lowercase();
+                if cmd_lower.contains(&intent_lower) {
+                    return true;
+                }
+            }
+            if let Some(excerpt) = &result.observed_output_excerpt {
+                let excerpt_lower = excerpt.to_lowercase();
+                if excerpt_lower.contains(&intent_lower) {
+                    return true;
+                }
+            }
+            if let Some(notes) = &result.reproducibility_notes {
+                let notes_lower = notes.to_lowercase();
+                if notes_lower.contains(&intent_lower) {
+                    return true;
+                }
+            }
+
+            let intent_words: Vec<&str> = intent_lower
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| w.len() >= 3)
+                .collect();
+
+            let mut result_text = String::new();
+            if let Some(cmd) = &result.command {
+                result_text.push_str(cmd);
+                result_text.push(' ');
+            }
+            if let Some(excerpt) = &result.observed_output_excerpt {
+                result_text.push_str(excerpt);
+                result_text.push(' ');
+            }
+            if let Some(notes) = &result.reproducibility_notes {
+                result_text.push_str(notes);
+            }
+            let result_lower = result_text.to_lowercase();
+            let result_words: Vec<&str> = result_lower
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| w.len() >= 3)
+                .collect();
+
+            intent_words.iter().any(|iw| {
+                result_words
+                    .iter()
+                    .any(|rw| rw.contains(iw) || iw.contains(rw))
+            })
+        });
+
+        if !has_addressing_claim && !has_addressing_result {
+            let summary_hash = claim_hash8(&intent.summary, &intent.source_chunk);
+            let claim_id = format!("intent-orphan-{}-{}", intent.session_id, summary_hash);
+
+            fractures.push(ContractFracture {
+                claim_id: claim_id.clone(),
+                contract_source: format!(
+                    "user intent \"{}\" (session {})",
+                    intent.summary, intent.session_id
+                ),
+                promised_surface: intent.summary.clone(),
+                runtime_surface: "no agent claim and no result addresses this user intent (silently dropped work)".to_string(),
+                evidence: Vec::new(),
+                severity: FractureSeverity::Low,
+                options: vec![
+                    "A: implement/repair the codebase to satisfy the user intent".to_string(),
+                    "B: document the dropped intent as out of scope or deferred".to_string(),
+                    "C: ignore and accept the gap".to_string(),
+                ],
+                recommended_clarify_question: Some(format!("clarify-{}", claim_id)),
+            });
+        }
+    }
+
+    fractures
+}
+
 // ── Lane 5 stage — clarify generation ────────────────────────────
 
 /// Hard ceiling on clarify questions per run — clarify is a decision-gathering
@@ -1904,5 +2092,184 @@ mod tests {
             ResultStatus::Pass,
             "Verified with direct linked evidence"
         );
+    }
+
+    #[test]
+    fn test_detect_contract_fractures_contradicted() {
+        let claim = ClaimRecord {
+            id: "claim-test-1".into(),
+            project: "aicx".into(),
+            source_session: "sess-123".into(),
+            source_agent: Some("codex".into()),
+            source_role: "assistant".into(),
+            source_span: None,
+            claim_text: "fixed broken connection".into(),
+            claim_type: ClaimType::Fixed,
+            claimed_status: "fixed".into(),
+            timestamp: None,
+            timestamp_partial: false,
+            extracted_at: "2026-06-12T02:54:00Z".into(),
+            claimed_files: vec![],
+            claimed_commands: vec![],
+            claimed_artifacts: vec![],
+            related_intents: vec![],
+            evidence_refs: vec![],
+            verification_status: VerificationStatus::Unverified,
+            risk_flags: vec![],
+        };
+
+        let result = ResultRecord {
+            id: "result-test-1".into(),
+            project: "aicx".into(),
+            evidence_type: "test_run".into(),
+            command: Some("cargo test".into()),
+            exit_status: Some(1),
+            artifact_path: None,
+            observed_output_excerpt: Some("test failed".into()),
+            timestamp: None,
+            related_claims: vec!["claim-test-1".into()],
+            related_intents: vec![],
+            result_status: ResultStatus::Fail,
+            confidence: 9,
+            reproducibility_notes: None,
+        };
+
+        let fractures = detect_contract_fractures(&[], &[claim], &[result]);
+        assert_eq!(fractures.len(), 1);
+        let f = &fractures[0];
+        assert_eq!(f.claim_id, "claim-test-1");
+        assert_eq!(f.severity, FractureSeverity::High);
+        assert!(f.contract_source.contains("claim-test-1"));
+        assert!(f.contract_source.contains("sess-123"));
+        assert_eq!(f.promised_surface, "fixed broken connection");
+        assert!(f.runtime_surface.contains("contradicts"));
+        assert_eq!(f.evidence, vec!["result-test-1".to_string()]);
+    }
+
+    #[test]
+    fn test_detect_contract_fractures_unsupported_high_risk() {
+        let claim = ClaimRecord {
+            id: "claim-test-2".into(),
+            project: "aicx".into(),
+            source_session: "sess-123".into(),
+            source_agent: Some("codex".into()),
+            source_role: "assistant".into(),
+            source_span: None,
+            claim_text: "everything is production ready".into(),
+            claim_type: ClaimType::ReadyToPush,
+            claimed_status: "ready_to_push".into(),
+            timestamp: None,
+            timestamp_partial: false,
+            extracted_at: "2026-06-12T02:54:00Z".into(),
+            claimed_files: vec![],
+            claimed_commands: vec![],
+            claimed_artifacts: vec![],
+            related_intents: vec![],
+            evidence_refs: vec![],
+            verification_status: VerificationStatus::Unverified,
+            risk_flags: vec![],
+        };
+
+        let fractures = detect_contract_fractures(&[], &[claim], &[]);
+        assert_eq!(fractures.len(), 1);
+        let f = &fractures[0];
+        assert_eq!(f.claim_id, "claim-test-2");
+        assert_eq!(f.severity, FractureSeverity::Medium);
+        assert_eq!(f.promised_surface, "everything is production ready");
+        assert!(f.runtime_surface.contains("no evidence"));
+        assert!(f.evidence.is_empty());
+    }
+
+    #[test]
+    fn test_detect_contract_fractures_orphaned_intent() {
+        use super::super::{IntentKind, IntentRecord};
+
+        let intent = IntentRecord {
+            kind: IntentKind::Intent,
+            summary: "add zero-width character support".to_string(),
+            context: None,
+            evidence: vec![],
+            project: "aicx".to_string(),
+            agent: "operator".to_string(),
+            date: "2026-06-12".to_string(),
+            timestamp: None,
+            session_id: "sess-123".to_string(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: "chunk-1".to_string(),
+        };
+
+        let fractures = detect_contract_fractures(&[intent], &[], &[]);
+        assert_eq!(fractures.len(), 1);
+        let f = &fractures[0];
+        assert!(f.claim_id.starts_with("intent-orphan-"));
+        assert_eq!(f.severity, FractureSeverity::Low);
+        assert_eq!(f.promised_surface, "add zero-width character support");
+        assert!(f.runtime_surface.contains("no agent claim"));
+        assert!(f.evidence.is_empty());
+    }
+
+    #[test]
+    fn test_detect_contract_fractures_clean_session() {
+        use super::super::{IntentKind, IntentRecord};
+
+        let intent = IntentRecord {
+            kind: IntentKind::Intent,
+            summary: "fix database migration".to_string(),
+            context: None,
+            evidence: vec![],
+            project: "aicx".to_string(),
+            agent: "operator".to_string(),
+            date: "2026-06-12".to_string(),
+            timestamp: None,
+            session_id: "sess-123".to_string(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: "chunk-1".to_string(),
+        };
+
+        let claim = ClaimRecord {
+            id: "claim-test-3".into(),
+            project: "aicx".into(),
+            source_session: "sess-123".into(),
+            source_agent: Some("codex".into()),
+            source_role: "assistant".into(),
+            source_span: None,
+            claim_text: "fixed database migration".into(),
+            claim_type: ClaimType::Fixed,
+            claimed_status: "fixed".into(),
+            timestamp: None,
+            timestamp_partial: false,
+            extracted_at: "2026-06-12T02:54:00Z".into(),
+            claimed_files: vec![],
+            claimed_commands: vec![],
+            claimed_artifacts: vec![],
+            related_intents: vec![],
+            evidence_refs: vec![],
+            verification_status: VerificationStatus::Unverified,
+            risk_flags: vec![],
+        };
+
+        let result = ResultRecord {
+            id: "result-test-3".into(),
+            project: "aicx".into(),
+            evidence_type: "runtime_probe".into(),
+            command: Some("cargo run".into()),
+            exit_status: Some(0),
+            artifact_path: None,
+            observed_output_excerpt: Some("fixed database migration".into()),
+            timestamp: None,
+            related_claims: vec!["claim-test-3".into()],
+            related_intents: vec![],
+            result_status: ResultStatus::Pass,
+            confidence: 9,
+            reproducibility_notes: None,
+        };
+
+        // All matched and verified -> ZERO fractures!
+        let fractures = detect_contract_fractures(&[intent], &[claim], &[result]);
+        assert_eq!(fractures.len(), 0);
     }
 }
