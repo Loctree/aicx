@@ -552,6 +552,46 @@ fn default_frame_kind_is_user_msg() {
 }
 
 #[test]
+fn default_frame_kind_admits_user_chunk() {
+    let tmp = std::env::temp_dir().join(format!(
+        "ai-contexters-intents-{}-default-user-frame-kind",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+
+    write_chunk_with_sidecar(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "120000_codex-001.md",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:00:00] user: Let's keep only user intent truth.\n",
+        Some(FrameKind::UserMsg),
+    );
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        kind_filter: None,
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, IntentKind::Intent);
+    assert_eq!(records[0].summary, "Let's keep only user intent truth.");
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn default_frame_kind_admits_user_chunk_and_rejects_agent_chunk() {
     let tmp = std::env::temp_dir().join(format!(
         "ai-contexters-intents-{}-default-frame-kind",
