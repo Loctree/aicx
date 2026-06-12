@@ -52,6 +52,8 @@ pub struct IntentRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_chunk: Option<String>,
     pub source_chunk: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 #[derive(Debug, Clone)]
 pub struct IntentsConfig {

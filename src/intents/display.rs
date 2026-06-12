@@ -153,9 +153,15 @@ pub fn format_intents_markdown(records: &[IntentRecord]) -> String {
             last_date = Some(record.date.as_str());
         }
 
+        let voice_marker = if record.source.as_deref() == Some("voice_transcript") {
+            " [voice]"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "### {} | {}\n",
+            "### {}{} | {}\n",
             record.kind.heading(),
+            voice_marker,
             record.agent
         ));
         out.push_str(&format!("{}: {}\n", record.kind.heading(), record.summary));

@@ -457,6 +457,62 @@ pub struct UserIntentLine {
     pub timestamp: Option<String>,
     pub timestamp_partial: bool,
     pub extracted_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CodescribeParser {
+    in_codescribe: bool,
+}
+
+impl Default for CodescribeParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CodescribeParser {
+    pub fn new() -> Self {
+        Self {
+            in_codescribe: false,
+        }
+    }
+
+    pub fn process(&mut self, line: &str) -> (String, bool) {
+        let mut cleaned = String::new();
+        let mut is_voice = self.in_codescribe;
+
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '<' {
+                let mut tag_buf = String::new();
+                while let Some(&next_c) = chars.peek() {
+                    if next_c == '>' {
+                        chars.next();
+                        break;
+                    }
+                    tag_buf.push(chars.next().unwrap());
+                }
+
+                let tag_trimmed = tag_buf.trim();
+                if tag_trimmed.starts_with("codescribe") {
+                    self.in_codescribe = true;
+                    is_voice = true;
+                } else if tag_trimmed == "/codescribe" {
+                    self.in_codescribe = false;
+                } else {
+                    cleaned.push('<');
+                    cleaned.push_str(&tag_buf);
+                    cleaned.push('>');
+                }
+            } else {
+                cleaned.push(c);
+            }
+        }
+
+        (cleaned.trim().to_string(), is_voice)
+    }
 }
 
 /// Lane 1 stage (pure, per-session): classify user-originated lines into
@@ -479,8 +535,10 @@ pub fn extract_user_intent_lines(
         if !is_user_role(&src.role) {
             continue;
         }
+        let mut codescribe_parser = CodescribeParser::new();
         for line in src.text.lines() {
-            let line = line.trim();
+            let (cleaned, is_voice) = codescribe_parser.process(line);
+            let line = cleaned.trim();
             if line.is_empty() {
                 continue;
             }
@@ -496,6 +554,11 @@ pub fn extract_user_intent_lines(
             if !seen.insert(line.to_string()) {
                 continue;
             }
+            let source_val = if is_voice {
+                Some("voice_transcript".to_string())
+            } else {
+                None
+            };
             out.push(UserIntentLine {
                 id: format!(
                     "intent-{}-{}-{}",
@@ -512,6 +575,7 @@ pub fn extract_user_intent_lines(
                 timestamp: src.timestamp.clone(),
                 timestamp_partial: src.timestamp_partial,
                 extracted_at: extracted_at.to_string(),
+                source: source_val,
             });
         }
     }
@@ -2293,6 +2357,7 @@ mod tests {
             first_chunk: None,
             last_chunk: None,
             source_chunk: "chunk-1".to_string(),
+            source: None,
         };
 
         let fractures = detect_contract_fractures(&[intent], &[], &[]);
@@ -2323,6 +2388,7 @@ mod tests {
             first_chunk: None,
             last_chunk: None,
             source_chunk: "chunk-1".to_string(),
+            source: None,
         };
 
         let claim = ClaimRecord {

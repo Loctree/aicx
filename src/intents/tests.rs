@@ -703,6 +703,7 @@ fn formats_markdown_with_required_sections() {
         first_chunk: None,
         last_chunk: None,
         source_chunk: "/tmp/demo/2026-03-15/120000_codex-001.md".to_string(),
+        source: None,
     }];
 
     let markdown = format_intents_markdown(&records);
@@ -728,6 +729,7 @@ fn formats_json_with_same_fields() {
         first_chunk: None,
         last_chunk: None,
         source_chunk: "/tmp/demo/2026-03-15/120500_claude-002.md".to_string(),
+        source: None,
     }];
 
     let json = format_intents_json(&records).expect("serialize intents");
@@ -752,6 +754,7 @@ fn formats_oracle_json_as_canonical_corpus_not_semantic_fallback() {
         first_chunk: None,
         last_chunk: None,
         source_chunk: "/tmp/aicx/chunk.md".to_string(),
+        source: None,
     }];
 
     let status = OracleStatus::canonical_corpus_scan(Path::new("/tmp/aicx"), 1, 1, true);
@@ -865,6 +868,7 @@ fn unresolved_filter_narrows_when_session_resolved() {
             first_chunk: None,
             last_chunk: None,
             source_chunk: "/tmp/demo/resolved-intent.md".to_string(),
+            source: None,
         },
         IntentRecord {
             kind: IntentKind::Outcome,
@@ -880,6 +884,7 @@ fn unresolved_filter_narrows_when_session_resolved() {
             first_chunk: None,
             last_chunk: None,
             source_chunk: "/tmp/demo/resolved-outcome.md".to_string(),
+            source: None,
         },
         IntentRecord {
             kind: IntentKind::Intent,
@@ -895,6 +900,7 @@ fn unresolved_filter_narrows_when_session_resolved() {
             first_chunk: None,
             last_chunk: None,
             source_chunk: "/tmp/demo/open-intent.md".to_string(),
+            source: None,
         },
     ];
 
@@ -945,6 +951,7 @@ fn none_limit_does_not_clip_roadmap() {
             first_chunk: None,
             last_chunk: None,
             source_chunk: format!("/tmp/demo/limit-{i}.md"),
+            source: None,
         })
         .collect();
 
@@ -1870,6 +1877,7 @@ mod quality {
             source_chunk:
                 "/store/Loctree/aicx/2026_0504/conversations/codex/2026_0504_codex_019df273-2c1_027.md"
                     .to_string(),
+            source: None,
         }];
 
         reconcile_session_id_with_path(&mut records);
@@ -1898,6 +1906,7 @@ mod quality {
             source_chunk:
                 "/store/Loctree/aicx/2026_0504/conversations/codex/2026_0504_codex_019df273-2c1_027.md"
                     .to_string(),
+            source: None,
         }];
 
         reconcile_session_id_with_path(&mut records);
@@ -1923,6 +1932,7 @@ mod quality {
                 source_chunk: source_chunk.clone(),
                 timestamp: None,
                 context: None,
+                source: None,
             },
             IntentRecord {
                 kind: IntentKind::Decision,
@@ -1938,6 +1948,7 @@ mod quality {
                 source_chunk,
                 timestamp: None,
                 context: None,
+                source: None,
             },
         ];
 
@@ -1971,6 +1982,7 @@ mod quality {
             source_chunk: source_chunk.to_string(),
             timestamp: None,
             context: None,
+            source: None,
         }
     }
 
@@ -2092,6 +2104,7 @@ mod area_e_regressions {
             first_chunk: None,
             last_chunk: None,
             source_chunk: "chunk-1".to_string(),
+            source: None,
         }
     }
 
@@ -2285,6 +2298,7 @@ mod flexible_dates {
             first_chunk: None,
             last_chunk: None,
             source_chunk: format!("/tmp/demo/{summary}.md"),
+            source: None,
         }
     }
 
@@ -2373,5 +2387,102 @@ mod flexible_dates {
             vec!["in-window"],
             "offset timestamp before the UTC window and unparsable dates must be dropped"
         );
+    }
+
+    #[test]
+    fn test_codescribe_parser_voice_provenance() {
+        use super::CodescribeParser;
+        let mut parser = CodescribeParser::new();
+
+        // Single line tag
+        let (cleaned, is_voice) =
+            parser.process("<codescribe mode=\"voice\" lang=\"pl\">Pamiętaj o tym</codescribe>");
+        assert_eq!(cleaned, "Pamiętaj o tym");
+        assert!(is_voice);
+
+        // Multi-line tag
+        let mut parser_multi = CodescribeParser::new();
+        let (cleaned1, is_voice1) = parser_multi.process("<codescribe mode=\"voice\">");
+        assert_eq!(cleaned1, "");
+        assert!(is_voice1);
+
+        let (cleaned2, is_voice2) = parser_multi.process("Pojedyncza linia");
+        assert_eq!(cleaned2, "Pojedyncza linia");
+        assert!(is_voice2);
+
+        let (cleaned3, is_voice3) = parser_multi.process("</codescribe>");
+        assert_eq!(cleaned3, "");
+        assert!(is_voice3);
+
+        let (cleaned4, is_voice4) = parser_multi.process("zwykły tekst");
+        assert_eq!(cleaned4, "zwykły tekst");
+        assert!(!is_voice4);
+    }
+
+    #[test]
+    fn test_garble_gate_repro_degradation() {
+        use super::{IntentKind, StoredChunkFile, build_candidate};
+        use chrono::Utc;
+        use std::path::PathBuf;
+
+        let text_repro = "Pamiętaj, że chcę to wrzucić w Injust mechanizm launchera VC-Ship, który zgodnie z moim specem dowiezie to od Arozet w całej intencjonalnej read/write kadensy. Zabezpieczam.";
+        let chunk_file = StoredChunkFile {
+            agent: "agy".to_string(),
+            date: "2026-06-12".to_string(),
+            path: PathBuf::from("chunk.md"),
+            project: "aicx".to_string(),
+            sequence: 1,
+            timestamp: Utc::now(),
+            session_id: "sess-1".to_string(),
+        };
+
+        // Repro case: no context, no evidence -> degraded (returns None)
+        let candidate = build_candidate(
+            IntentKind::Intent,
+            text_repro,
+            None,
+            &chunk_file,
+            "aicx",
+            "chunk.md",
+            2,
+            Some("voice_transcript".to_string()),
+        );
+        assert!(
+            candidate.is_none(),
+            "Garbled transcription without context or evidence must be degraded/dropped"
+        );
+
+        // If it has evidence or context, it is preserved (just in case there's real intent)
+        let candidate_with_context = build_candidate(
+            IntentKind::Intent,
+            text_repro,
+            Some("Why: user explicitly requested SF strategy".to_string()),
+            &chunk_file,
+            "aicx",
+            "chunk.md",
+            2,
+            Some("voice_transcript".to_string()),
+        );
+        assert!(
+            candidate_with_context.is_some(),
+            "Intent with context should not be blindly degraded"
+        );
+    }
+
+    #[test]
+    fn test_voice_intent_sorts_lower() {
+        use super::sort_intent_records;
+        let mut r1 = make_record("Intent voice", "2026-06-12", None);
+        r1.source = Some("voice_transcript".to_string());
+
+        let mut r2 = make_record("Intent written", "2026-06-12", None);
+        r2.source = None;
+
+        let mut records = vec![r1.clone(), r2.clone()];
+        sort_intent_records(&mut records);
+
+        // Written should come first
+        assert_eq!(records[0].summary, "Intent written");
+        assert_eq!(records[1].summary, "Intent voice");
     }
 }

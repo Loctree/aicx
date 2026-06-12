@@ -39,10 +39,10 @@ pub use self::types::{
 // Lane 2-5 schema anchor (MASTER Phase 2 §3). Stages land incrementally; these
 // types are the convergence point every lane stage must agree on.
 pub use self::schema::{
-    CLARIFY_MAX_QUESTIONS, ClaimRecord, ClaimSource, ClaimType, ClarifyQuestion, ContractFracture,
-    EvidenceKind, EvidenceRecord, FractureSeverity, LANE_SCHEMA_VERSION, LaneExport, ResultRecord,
-    ResultStatus, TimeCoverage, UTC_TIMEZONE_ASSUMPTION, UserIntentLine, VerificationStatus,
-    audit_claims_against_evidence, classify_claim, collect_artifact_evidence,
+    CLARIFY_MAX_QUESTIONS, ClaimRecord, ClaimSource, ClaimType, ClarifyQuestion, CodescribeParser,
+    ContractFracture, EvidenceKind, EvidenceRecord, FractureSeverity, LANE_SCHEMA_VERSION,
+    LaneExport, ResultRecord, ResultStatus, TimeCoverage, UTC_TIMEZONE_ASSUMPTION, UserIntentLine,
+    VerificationStatus, audit_claims_against_evidence, classify_claim, collect_artifact_evidence,
     detect_contract_fractures, detect_fractures, extract_claims, extract_user_intent_lines,
     generate_clarify, is_agent_role, is_user_role, verify_claims,
 };
@@ -207,6 +207,11 @@ fn sort_intent_records(records: &mut [IntentRecord]) {
             .date
             .cmp(&left.date)
             .then_with(|| left.kind.sort_rank().cmp(&right.kind.sort_rank()))
+            .then_with(|| {
+                let left_is_voice = left.source.as_deref() == Some("voice_transcript");
+                let right_is_voice = right.source.as_deref() == Some("voice_transcript");
+                left_is_voice.cmp(&right_is_voice)
+            })
             .then_with(|| right.source_chunk.cmp(&left.source_chunk))
             .then_with(|| left.summary.cmp(&right.summary))
     });
@@ -521,6 +526,7 @@ fn extract_signal_candidates(
                 source_chunk,
                 !is_done,
                 STRICT_CONFIDENCE,
+                None,
             ) {
                 task_events.push(event);
             }
@@ -552,6 +558,7 @@ fn extract_signal_candidates(
                 project,
                 source_chunk,
                 STRICT_CONFIDENCE,
+                None,
             )
         {
             candidates.push(candidate);
@@ -572,9 +579,11 @@ fn extract_transcript_candidates(
 
     for entry in transcript_entries {
         let is_user = entry.role.eq_ignore_ascii_case("user");
+        let mut codescribe_parser = CodescribeParser::new();
 
         for (index, raw_line) in entry.lines.iter().enumerate() {
-            let line = raw_line.trim();
+            let (cleaned, is_voice) = codescribe_parser.process(raw_line);
+            let line = cleaned.trim();
             if line.is_empty() {
                 continue;
             }
@@ -583,6 +592,11 @@ fn extract_transcript_candidates(
             }
 
             let context = surrounding_context(&entry.lines, index);
+            let source_provenance = if is_voice {
+                Some("voice_transcript".to_string())
+            } else {
+                None
+            };
 
             if let Some((is_done, task)) = parse_checklist_task(line) {
                 if let Some(event) = build_task_event(
@@ -593,6 +607,7 @@ fn extract_transcript_candidates(
                     source_chunk,
                     !is_done,
                     STRICT_CONFIDENCE,
+                    source_provenance,
                 ) {
                     task_events.push(event);
                 }
@@ -607,9 +622,16 @@ fn extract_transcript_candidates(
                 _ => STRICT_CONFIDENCE,
             };
 
-            if let Some(candidate) =
-                build_candidate(kind, line, context, file, project, source_chunk, confidence)
-            {
+            if let Some(candidate) = build_candidate(
+                kind,
+                line,
+                context,
+                file,
+                project,
+                source_chunk,
+                confidence,
+                source_provenance,
+            ) {
                 candidates.push(candidate);
             }
         }
@@ -878,6 +900,30 @@ fn looks_like_operator_decision_line(line: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
+fn is_garbled_transcription(summary: &str) -> bool {
+    let lower = summary.to_lowercase();
+    if lower.contains("arozet") || lower.contains("injust") {
+        return true;
+    }
+    let fillers = &["yym", "ehem", "ten tego", "yyy", "eee", "hmmm"];
+    for &f in fillers {
+        if lower.contains(f) {
+            return true;
+        }
+    }
+    let word_count = summary.split_whitespace().count();
+    let has_structure = summary.contains(',')
+        || summary.contains('.')
+        || summary.contains(';')
+        || summary.contains('?')
+        || summary.contains('!');
+    if word_count > 15 && !has_structure {
+        return true;
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_candidate(
     kind: IntentKind,
     raw_summary: &str,
@@ -886,6 +932,7 @@ fn build_candidate(
     project: &str,
     source_chunk: &str,
     confidence: u8,
+    source_provenance: Option<String>,
 ) -> Option<IntentCandidate> {
     let summary = normalize_display_text(&clean_summary(kind, raw_summary));
     if summary.is_empty() || is_metadata_only_summary(&summary) {
@@ -903,6 +950,15 @@ fn build_candidate(
         merge_evidence(&mut evidence, extract_evidence(extra));
     }
 
+    // Anti-bełkot sanity gate:
+    if kind == IntentKind::Intent
+        && context.is_none()
+        && evidence.is_empty()
+        && is_garbled_transcription(&summary)
+    {
+        return None; // Degrade to candidate (exclude from final intents)
+    }
+
     Some(IntentCandidate {
         record: IntentRecord {
             kind,
@@ -918,12 +974,14 @@ fn build_candidate(
             last_chunk: None,
             source_chunk: source_chunk.to_string(),
             timestamp: Some(file.timestamp.to_rfc3339()),
+            source: source_provenance,
         },
         confidence,
         timestamp: file.timestamp,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_task_event(
     task: &str,
     context: Option<String>,
@@ -932,6 +990,7 @@ fn build_task_event(
     source_chunk: &str,
     is_open: bool,
     confidence: u8,
+    source_provenance: Option<String>,
 ) -> Option<TaskEvent> {
     let candidate = build_candidate(
         IntentKind::Task,
@@ -941,6 +1000,7 @@ fn build_task_event(
         project,
         source_chunk,
         confidence,
+        source_provenance,
     )?;
 
     Some(TaskEvent {
