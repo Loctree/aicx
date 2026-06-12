@@ -335,6 +335,40 @@ pub struct ReadContextChunk {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkRefSpec {
+    Path(PathBuf),
+    Id(String),
+    LegacyCompact(String),
+}
+
+impl ChunkRefSpec {
+    pub fn parse(reference: &str) -> Result<Self> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return Err(anyhow!("chunk reference is required"));
+        }
+
+        if let Some(id) = reference.strip_prefix("chunk:") {
+            let id = id.trim();
+            if !is_chunk_id_prefix(id) {
+                return Err(anyhow!("invalid chunk reference id: {reference}"));
+            }
+            return Ok(Self::Id(id.to_ascii_lowercase()));
+        }
+
+        if is_chunk_id_prefix(reference) {
+            return Ok(Self::Id(reference.to_ascii_lowercase()));
+        }
+
+        if reference.contains('|') {
+            return Ok(Self::LegacyCompact(reference.to_string()));
+        }
+
+        Ok(Self::Path(PathBuf::from(reference)))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StoreWriteSummary {
     pub total_entries: usize,
@@ -1084,18 +1118,10 @@ pub fn read_context_chunk_at(
     max_chars: Option<usize>,
 ) -> Result<ReadContextChunk> {
     let base = sanitize::validate_dir_path(base)?;
-    let reference = reference.trim();
-    if reference.is_empty() {
-        return Err(anyhow!("chunk reference is required"));
-    }
+    let spec = ChunkRefSpec::parse(reference)?;
 
     let files = scan_context_files_at(&base)?;
-    let Some(file) = files
-        .into_iter()
-        .find(|file| stored_file_matches_reference(&base, file, reference))
-    else {
-        return Err(anyhow!("chunk not found: {reference}"));
-    };
+    let file = resolve_context_chunk_file(&base, files, &spec)?;
 
     let relative_path = file
         .path
@@ -1121,6 +1147,62 @@ pub fn read_context_chunk_at(
         content,
         truncated,
     })
+}
+
+fn resolve_context_chunk_file(
+    base: &Path,
+    files: Vec<StoredContextFile>,
+    spec: &ChunkRefSpec,
+) -> Result<StoredContextFile> {
+    match spec {
+        ChunkRefSpec::Id(id) => resolve_context_chunk_id(files, id),
+        ChunkRefSpec::Path(path) => {
+            let reference = path.to_string_lossy();
+            files
+                .into_iter()
+                .find(|file| stored_file_matches_reference(base, file, &reference))
+                .ok_or_else(|| anyhow!("chunk not found: {reference}"))
+        }
+        ChunkRefSpec::LegacyCompact(reference) => files
+            .into_iter()
+            .find(|file| stored_file_matches_reference(base, file, reference))
+            .ok_or_else(|| anyhow!("chunk not found: {reference}")),
+    }
+}
+
+fn resolve_context_chunk_id(files: Vec<StoredContextFile>, id: &str) -> Result<StoredContextFile> {
+    let mut matches = Vec::new();
+    for file in files {
+        let path_id = chunk_path_ref_id(&file);
+        if path_id.starts_with(id) {
+            matches.push((path_id, file));
+        }
+    }
+
+    match matches.len() {
+        0 => Err(anyhow!("chunk not found for id: chunk:{id}")),
+        1 => Ok(matches.remove(0).1),
+        _ => {
+            let candidates = matches
+                .iter()
+                .map(|(candidate_id, file)| format!("chunk:{candidate_id} {}", file.path.display()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(anyhow!(
+                "ambiguous chunk id chunk:{id}; candidates: {candidates}"
+            ))
+        }
+    }
+}
+
+fn chunk_path_ref_id(file: &StoredContextFile) -> String {
+    let path = file.path.to_string_lossy();
+    let hash = content_sha256(path.as_ref());
+    hash.chars().take(8).collect()
+}
+
+fn is_chunk_id_prefix(value: &str) -> bool {
+    (4..=64).contains(&value.len()) && value.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 fn stored_file_matches_reference(base: &Path, file: &StoredContextFile, reference: &str) -> bool {

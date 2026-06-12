@@ -55,6 +55,6 @@ pub mod prelude {
     pub use crate::doctor::{DoctorOptions, DoctorReport};
     pub use crate::intents::{IntentExtraction, IntentRecord, IntentsConfig};
     pub use crate::rank::FuzzyResult;
-    pub use crate::store::{ReadContextChunk, StoreWriteSummary, StoredContextFile};
+    pub use crate::store::{ChunkRefSpec, ReadContextChunk, StoreWriteSummary, StoredContextFile};
     pub use crate::timeline::TimelineEntry;
 }

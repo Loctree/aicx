@@ -231,7 +231,7 @@ pub struct EvidenceRecord {
 /// surface: docs promise `spotlight.md` but runtime never emits it; a canonical
 /// contract exists only untracked; tests are green but the promised behavior is
 /// absent. A fracture carries the decision it forces, not just the gap.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContractFracture {
     /// Stable id of the [`ClaimRecord`] this fracture was detected on — the
     /// machine-readable link Lane 5 uses for `linked_claims`.
@@ -248,9 +248,17 @@ pub struct ContractFracture {
     pub options: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recommended_clarify_question: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub linked_intents: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub linked_claims: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub linked_results: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FractureSeverity {
     Low,
@@ -266,7 +274,7 @@ pub enum FractureSeverity {
 /// with known gap or keep hardening?), never discoverable facts (where is the
 /// file? did the test pass?). Always carries a default recommendation so a
 /// non-dev operator can answer "I trust you" instead of guessing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClarifyQuestion {
     pub decision_id: String,
     /// The decision question itself — asks what to decide, never what to look up.
@@ -1012,6 +1020,10 @@ pub fn detect_fractures(claims: &[ClaimRecord]) -> Vec<ContractFracture> {
                         "C: accept the gap and record it as known debt".to_string(),
                     ],
                     recommended_clarify_question: Some(format!("clarify-{}", claim.id)),
+                    linked_intents: claim.related_intents.clone(),
+                    linked_claims: vec![claim.id.clone()],
+                    linked_results: claim.evidence_refs.clone(),
+                    timestamp: claim.timestamp.clone(),
                 });
             }
             VerificationStatus::Unverified if claim.claim_type.is_high_risk() => {
@@ -1032,6 +1044,10 @@ pub fn detect_fractures(claims: &[ClaimRecord]) -> Vec<ContractFracture> {
                         "C: accept the verdict on trust and ship".to_string(),
                     ],
                     recommended_clarify_question: Some(format!("clarify-{}", claim.id)),
+                    linked_intents: claim.related_intents.clone(),
+                    linked_claims: vec![claim.id.clone()],
+                    linked_results: Vec::new(),
+                    timestamp: claim.timestamp.clone(),
                 });
             }
             _ => {}
@@ -1081,6 +1097,10 @@ pub fn detect_contract_fractures(
                         "C: accept the gap and record it as known debt".to_string(),
                     ],
                     recommended_clarify_question: Some(format!("clarify-{}", claim.id)),
+                    linked_intents: claim.related_intents.clone(),
+                    linked_claims: vec![claim.id.clone()],
+                    linked_results: claim.evidence_refs.clone(),
+                    timestamp: claim.timestamp.clone(),
                 });
             }
             VerificationStatus::Unverified if claim.claim_type.is_high_risk() => {
@@ -1101,6 +1121,10 @@ pub fn detect_contract_fractures(
                         "C: accept the verdict on trust and ship".to_string(),
                     ],
                     recommended_clarify_question: Some(format!("clarify-{}", claim.id)),
+                    linked_intents: claim.related_intents.clone(),
+                    linked_claims: vec![claim.id.clone()],
+                    linked_results: Vec::new(),
+                    timestamp: claim.timestamp.clone(),
                 });
             }
             _ => {}
@@ -1221,6 +1245,10 @@ pub fn detect_contract_fractures(
                     "C: ignore and accept the gap".to_string(),
                 ],
                 recommended_clarify_question: Some(format!("clarify-{}", claim_id)),
+                linked_intents: vec![intent.summary.clone()],
+                linked_claims: Vec::new(),
+                linked_results: Vec::new(),
+                timestamp: intent.timestamp.clone(),
             });
         }
     }
@@ -1234,6 +1262,45 @@ pub fn detect_contract_fractures(
 /// mechanism, not a questionnaire.
 pub const CLARIFY_MAX_QUESTIONS: usize = 5;
 
+fn validate_and_sanitize_options(options: &[String]) -> Vec<String> {
+    // Check if options are degenerate or less than 2
+    let is_degenerate = options.len() < 2
+        || options.iter().any(|o| {
+            let o_lower = o.to_lowercase();
+            let clean = if o_lower.starts_with("a:")
+                || o_lower.starts_with("b:")
+                || o_lower.starts_with("c:")
+            {
+                o_lower[2..].trim().to_string()
+            } else if o_lower.starts_with("a. ")
+                || o_lower.starts_with("b. ")
+                || o_lower.starts_with("c. ")
+                || o_lower.starts_with("a: ")
+                || o_lower.starts_with("b: ")
+                || o_lower.starts_with("c: ")
+            {
+                o_lower[3..].trim().to_string()
+            } else {
+                o_lower.trim().to_string()
+            };
+            clean == "yes"
+                || clean == "no"
+                || clean == "maybe"
+                || clean == "true"
+                || clean == "false"
+        });
+
+    if is_degenerate {
+        vec![
+            "A: implement/repair to match the promise".to_string(),
+            "B: retract or descope the promise".to_string(),
+            "C: accept the gap and document it".to_string(),
+        ]
+    } else {
+        options.to_vec()
+    }
+}
+
 /// Lane 5 stage (pure): turn the sharpest fractures into bounded A/B/C
 /// decision questions. Questions ask what the human must DECIDE (keep the
 /// promise, retract it, or ship with the gap) — never facts the system already
@@ -1244,58 +1311,74 @@ pub const CLARIFY_MAX_QUESTIONS: usize = 5;
 pub fn generate_clarify(fractures: &[ContractFracture], max: usize) -> Vec<ClarifyQuestion> {
     let cap = max.min(CLARIFY_MAX_QUESTIONS);
     let mut ordered: Vec<&ContractFracture> = fractures.iter().collect();
-    // severest first; FractureSeverity derives Low..Critical in declaration
-    // order, so sort by reverse discriminant via a manual rank. Secondary key
-    // claim_id keeps tie-breaking (and thus the cap cutoff) deterministic.
+
+    // Sort logic:
+    // Category 1: Critical & High (contradicted claims)
+    // Category 2: Medium (unverified high-risk claims)
+    // Category 3: Low (orphaned intents)
+    // within each: sorted by recency (newest first, i.e., tb.cmp(ta))
+    // tie-breaker: claim_id ascending
     let rank = |s: FractureSeverity| match s {
         FractureSeverity::Critical => 0,
         FractureSeverity::High => 1,
         FractureSeverity::Medium => 2,
         FractureSeverity::Low => 3,
     };
+
     ordered.sort_by(|a, b| {
-        rank(a.severity)
-            .cmp(&rank(b.severity))
+        let rank_a = rank(a.severity);
+        let rank_b = rank(b.severity);
+        rank_a
+            .cmp(&rank_b)
+            .then_with(|| match (&a.timestamp, &b.timestamp) {
+                (Some(ta), Some(tb)) => tb.cmp(ta),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
             .then_with(|| a.claim_id.cmp(&b.claim_id))
     });
+
     ordered
         .into_iter()
         .take(cap)
-        .enumerate()
-        .map(|(i, f)| ClarifyQuestion {
-            decision_id: f
-                .recommended_clarify_question
-                .clone()
-                .unwrap_or_else(|| format!("clarify-{i}")),
-            question: format!(
-                "The promise \"{}\" does not match runtime ({}). Repair it, retract it, or ship with the gap?",
-                f.promised_surface, f.runtime_surface
-            ),
-            why_now: format!(
-                "{:?}-severity fracture between a recorded promise and the live repo; \
-                 leaving it undecided lets a false claim harden into assumed truth",
-                f.severity
-            ),
-            known_facts: {
-                let mut facts = vec![
-                    format!("promised: {}", f.promised_surface),
-                    format!("observed: {}", f.runtime_surface),
-                ];
-                facts.extend(f.evidence.iter().map(|e| format!("evidence: {e}")));
-                facts
-            },
-            options: f.options.clone(),
-            default_recommendation: f
-                .options
+        .map(|f| {
+            let opts = validate_and_sanitize_options(&f.options);
+            let default_recommendation = opts
                 .first()
                 .cloned()
-                .unwrap_or_else(|| "A: repair to match the promise".to_string()),
-            cost_of_not_deciding: "the gap survives as invisible debt and every future agent \
-                                   plans on top of a promise the runtime does not keep"
-                .to_string(),
-            linked_intents: Vec::new(),
-            linked_claims: vec![f.claim_id.clone()],
-            linked_results: f.evidence.clone(),
+                .unwrap_or_else(|| "A: implement/repair to match the promise".to_string());
+            ClarifyQuestion {
+                decision_id: f
+                    .recommended_clarify_question
+                    .clone()
+                    .unwrap_or_else(|| format!("clarify-{}", f.claim_id)),
+                question: format!(
+                    "The promise \"{}\" does not match runtime ({}). Repair it, retract it, or ship with the gap?",
+                    f.promised_surface, f.runtime_surface
+                ),
+                why_now: format!(
+                    "{:?}-severity fracture between a recorded promise and the live repo; \
+                     leaving it undecided lets a false claim harden into assumed truth",
+                    f.severity
+                ),
+                known_facts: {
+                    let mut facts = vec![
+                        format!("promised: {}", f.promised_surface),
+                        format!("observed: {}", f.runtime_surface),
+                    ];
+                    facts.extend(f.evidence.iter().map(|e| format!("evidence: {e}")));
+                    facts
+                },
+                options: opts,
+                default_recommendation,
+                cost_of_not_deciding: "the gap survives as invisible debt and every future agent \
+                                       plans on top of a promise the runtime does not keep"
+                    .to_string(),
+                linked_intents: f.linked_intents.clone(),
+                linked_claims: f.linked_claims.clone(),
+                linked_results: f.linked_results.clone(),
+            }
         })
         .collect()
 }
@@ -1355,6 +1438,10 @@ mod tests {
             severity: FractureSeverity::High,
             options: vec!["build renderer".into(), "downgrade contract".into()],
             recommended_clarify_question: Some("clarify-1".into()),
+            linked_intents: vec![],
+            linked_claims: vec!["claim-1".into()],
+            linked_results: vec![],
+            timestamp: None,
         };
 
         let clarify = ClarifyQuestion {
@@ -1661,6 +1748,10 @@ mod tests {
                 "C: ship with gap".to_string(),
             ],
             recommended_clarify_question: Some(format!("clarify-{i}")),
+            linked_intents: vec![],
+            linked_claims: vec![format!("claim-s1-{i}")],
+            linked_results: vec![format!("result-{i}")],
+            timestamp: None,
         };
         let fractures: Vec<ContractFracture> = (0..7)
             .map(|i| {
@@ -1817,6 +1908,10 @@ mod tests {
             severity: FractureSeverity::Medium,
             options: vec!["A: repair".to_string(), "B: retract".to_string()],
             recommended_clarify_question: None,
+            linked_intents: vec![],
+            linked_claims: vec![id.to_string()],
+            linked_results: vec![],
+            timestamp: None,
         };
         let shuffled = ["c-9", "c-3", "c-7", "c-1", "c-5", "c-8", "c-2"];
         let fractures: Vec<ContractFracture> = shuffled.iter().map(|id| mk(id)).collect();
@@ -2271,5 +2366,254 @@ mod tests {
         // All matched and verified -> ZERO fractures!
         let fractures = detect_contract_fractures(&[intent], &[claim], &[result]);
         assert_eq!(fractures.len(), 0);
+    }
+
+    #[test]
+    fn test_generate_clarify_hard_cap_and_priority_order() {
+        // Construct 12 candidate fractures of various severities and timestamps,
+        // and verify exactly 5 questions come out, sorted by priority first (Critical > High > Medium > Low).
+        let mk_frac =
+            |id: &str, severity: FractureSeverity, timestamp: Option<&str>| ContractFracture {
+                claim_id: id.to_string(),
+                contract_source: format!("agent claim {id}"),
+                promised_surface: format!("promise {id}"),
+                runtime_surface: "absent".to_string(),
+                evidence: Vec::new(),
+                severity,
+                options: vec!["A: repair".to_string(), "B: retract".to_string()],
+                recommended_clarify_question: None,
+                linked_intents: vec![],
+                linked_claims: vec![id.to_string()],
+                linked_results: vec![],
+                timestamp: timestamp.map(String::from),
+            };
+
+        let candidates = vec![
+            mk_frac(
+                "c-low-1",
+                FractureSeverity::Low,
+                Some("2026-06-10T12:00:00Z"),
+            ),
+            mk_frac(
+                "c-crit-1",
+                FractureSeverity::Critical,
+                Some("2026-06-01T12:00:00Z"),
+            ),
+            mk_frac(
+                "c-high-1",
+                FractureSeverity::High,
+                Some("2026-06-05T12:00:00Z"),
+            ),
+            mk_frac(
+                "c-med-1",
+                FractureSeverity::Medium,
+                Some("2026-06-03T12:00:00Z"),
+            ),
+            mk_frac(
+                "c-low-2",
+                FractureSeverity::Low,
+                Some("2026-06-11T12:00:00Z"),
+            ),
+            mk_frac(
+                "c-crit-2",
+                FractureSeverity::Critical,
+                Some("2026-06-02T12:00:00Z"),
+            ),
+            mk_frac(
+                "c-high-2",
+                FractureSeverity::High,
+                Some("2026-06-06T12:00:00Z"),
+            ),
+            mk_frac(
+                "c-med-2",
+                FractureSeverity::Medium,
+                Some("2026-06-04T12:00:00Z"),
+            ),
+            mk_frac(
+                "c-low-3",
+                FractureSeverity::Low,
+                Some("2026-06-12T12:00:00Z"),
+            ),
+            mk_frac(
+                "c-crit-3",
+                FractureSeverity::Critical,
+                Some("2026-06-03T12:00:00Z"),
+            ),
+            mk_frac(
+                "c-high-3",
+                FractureSeverity::High,
+                Some("2026-06-07T12:00:00Z"),
+            ),
+            mk_frac(
+                "c-med-3",
+                FractureSeverity::Medium,
+                Some("2026-06-05T12:00:00Z"),
+            ),
+        ];
+
+        let questions = generate_clarify(&candidates, 12);
+        assert_eq!(questions.len(), 5);
+
+        // Priority order: Category 1 (Critical > High) > Category 2 (Medium) > Category 3 (Low)
+        // Within same priority, sorted by recency (newest first).
+        // Criticals:
+        // - c-crit-3 (2026-06-03)
+        // - c-crit-2 (2026-06-02)
+        // - c-crit-1 (2026-06-01)
+        // Highs:
+        // - c-high-3 (2026-06-07)
+        // - c-high-2 (2026-06-06)
+        // So the top 5 questions should be:
+        // 1. c-crit-3
+        // 2. c-crit-2
+        // 3. c-crit-1
+        // 4. c-high-3
+        // 5. c-high-2
+        assert_eq!(questions[0].linked_claims[0], "c-crit-3");
+        assert_eq!(questions[1].linked_claims[0], "c-crit-2");
+        assert_eq!(questions[2].linked_claims[0], "c-crit-1");
+        assert_eq!(questions[3].linked_claims[0], "c-high-3");
+        assert_eq!(questions[4].linked_claims[0], "c-high-2");
+    }
+
+    #[test]
+    fn test_generate_clarify_recency_sorting_under_same_priority() {
+        let mk_frac = |id: &str, timestamp: Option<&str>| ContractFracture {
+            claim_id: id.to_string(),
+            contract_source: format!("agent claim {id}"),
+            promised_surface: format!("promise {id}"),
+            runtime_surface: "absent".to_string(),
+            evidence: Vec::new(),
+            severity: FractureSeverity::Medium,
+            options: vec!["A: repair".to_string(), "B: retract".to_string()],
+            recommended_clarify_question: None,
+            linked_intents: vec![],
+            linked_claims: vec![id.to_string()],
+            linked_results: vec![],
+            timestamp: timestamp.map(String::from),
+        };
+
+        let candidates = vec![
+            mk_frac("c-1", Some("2026-06-08T18:00:00Z")),
+            mk_frac("c-2", None),
+            mk_frac("c-3", Some("2026-06-09T18:00:00Z")),
+            mk_frac("c-4", Some("2026-06-07T18:00:00Z")),
+            mk_frac("c-5", None),
+        ];
+
+        let questions = generate_clarify(&candidates, 5);
+        assert_eq!(questions.len(), 5);
+
+        // Sorted by recency (newest first, Nones last)
+        // 1. c-3 (2026-06-09)
+        // 2. c-1 (2026-06-08)
+        // 3. c-4 (2026-06-07)
+        // 4. c-2 (None, claim_id tie-break)
+        // 5. c-5 (None, claim_id tie-break)
+        assert_eq!(questions[0].linked_claims[0], "c-3");
+        assert_eq!(questions[1].linked_claims[0], "c-1");
+        assert_eq!(questions[2].linked_claims[0], "c-4");
+        assert_eq!(questions[3].linked_claims[0], "c-2");
+        assert_eq!(questions[4].linked_claims[0], "c-5");
+    }
+
+    #[test]
+    fn test_generate_clarify_option_quality_gate() {
+        let mk_frac = |id: &str, options: Vec<String>| ContractFracture {
+            claim_id: id.to_string(),
+            contract_source: format!("agent claim {id}"),
+            promised_surface: format!("promise {id}"),
+            runtime_surface: "absent".to_string(),
+            evidence: Vec::new(),
+            severity: FractureSeverity::Medium,
+            options,
+            recommended_clarify_question: None,
+            linked_intents: vec![],
+            linked_claims: vec![id.to_string()],
+            linked_results: vec![],
+            timestamp: None,
+        };
+
+        let candidates = vec![
+            mk_frac("c-degenerate-1", vec!["yes".to_string(), "no".to_string()]),
+            mk_frac(
+                "c-degenerate-2",
+                vec![
+                    "A: true".to_string(),
+                    "B: false".to_string(),
+                    "C: maybe".to_string(),
+                ],
+            ),
+            mk_frac("c-too-few", vec!["only one option".to_string()]),
+            mk_frac(
+                "c-good",
+                vec!["A: keep the promise".to_string(), "B: drop it".to_string()],
+            ),
+        ];
+
+        let questions = generate_clarify(&candidates, 4);
+        assert_eq!(questions.len(), 4);
+
+        // Index 0: degenerate yes/no -> replaced with default options
+        assert_eq!(questions[0].linked_claims[0], "c-degenerate-1");
+        assert_eq!(
+            questions[0].options[0],
+            "A: implement/repair to match the promise"
+        );
+        assert_eq!(questions[0].options[1], "B: retract or descope the promise");
+
+        // Index 1: degenerate true/false/maybe -> replaced with default options
+        assert_eq!(questions[1].linked_claims[0], "c-degenerate-2");
+        assert_eq!(
+            questions[1].options[0],
+            "A: implement/repair to match the promise"
+        );
+        assert_eq!(questions[1].options[1], "B: retract or descope the promise");
+
+        // Index 2: good options -> preserved!
+        assert_eq!(questions[2].linked_claims[0], "c-good");
+        assert_eq!(questions[2].options[0], "A: keep the promise");
+        assert_eq!(questions[2].options[1], "B: drop it");
+
+        // Index 3: too few options -> replaced with default options
+        assert_eq!(questions[3].linked_claims[0], "c-too-few");
+        assert_eq!(
+            questions[3].options[0],
+            "A: implement/repair to match the promise"
+        );
+        assert_eq!(questions[3].options[1], "B: retract or descope the promise");
+    }
+
+    #[test]
+    fn test_generate_clarify_anchor_linkage_and_serde_roundtrip() {
+        let fracture = ContractFracture {
+            claim_id: "claim-test-123".to_string(),
+            contract_source: "agent claim claim-test-123".to_string(),
+            promised_surface: "some promise".to_string(),
+            runtime_surface: "some runtime".to_string(),
+            evidence: vec!["result-evidence-1".to_string()],
+            severity: FractureSeverity::High,
+            options: vec!["A: opt1".to_string(), "B: opt2".to_string()],
+            recommended_clarify_question: Some("clarify-question-123".to_string()),
+            linked_intents: vec!["intent-abc".to_string()],
+            linked_claims: vec!["claim-test-123".to_string()],
+            linked_results: vec!["result-evidence-1".to_string()],
+            timestamp: Some("2026-06-12T03:00:00Z".to_string()),
+        };
+
+        let questions = generate_clarify(&[fracture], 1);
+        assert_eq!(questions.len(), 1);
+        let q = &questions[0];
+
+        // Verify anchor linkage fields are set correctly
+        assert_eq!(q.linked_intents, vec!["intent-abc".to_string()]);
+        assert_eq!(q.linked_claims, vec!["claim-test-123".to_string()]);
+        assert_eq!(q.linked_results, vec!["result-evidence-1".to_string()]);
+
+        // Serde roundtrip check
+        let json_str = serde_json::to_string(&q).expect("Should serialize successfully");
+        let deserialized: ClarifyQuestion =
+            serde_json::from_str(&json_str).expect("Should deserialize successfully");
+        assert_eq!(q, &deserialized);
     }
 }
