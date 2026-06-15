@@ -172,6 +172,120 @@ Notes:
 }
 
 #[test]
+fn charter_block_does_not_become_intent_or_outcome() {
+    let records = extract_demo_records(
+        "charter-block-filter",
+        r#"[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]
+
+[12:00:00] user: # AGENTS.md instructions for /Users/maciejgad/vc-workspace/vetcoders/aicx
+<INSTRUCTIONS>
+<!-- loctree-doctrine: v1 -->
+## **LOCTREE + AICX + VIBECRAFTED — ZŁOTE RUNO**
+Done Is A Market Condition
+Code is not done because a narrow check turned green
+Product truth beats local elegance.
+</INSTRUCTIONS>
+[12:01:00] user: Task: keep the real user directive visible after charter
+"#,
+    );
+
+    assert!(
+        records.iter().any(|record| {
+            record.kind == IntentKind::Intent
+                && record
+                    .summary
+                    .contains("keep the real user directive visible after charter")
+        }),
+        "real user directive after charter was not preserved: {records:?}",
+    );
+    assert!(
+        !records.iter().any(|record| {
+            record.summary.contains("Done Is A Market Condition")
+                || record
+                    .summary
+                    .contains("Code is not done because a narrow check turned green")
+                || record
+                    .summary
+                    .contains("Product truth beats local elegance")
+        }),
+        "charter block leaked intent/outcome records: {records:?}",
+    );
+}
+
+#[test]
+fn repeated_charter_signal_lines_do_not_multiply_across_sessions() {
+    let tmp = migration_test_root("charter-signal-dedup");
+    let _ = fs::remove_dir_all(&tmp);
+
+    let body = r#"[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]
+
+[signals]
+Intent:
+- Done Is A Market Condition
+- Code is not done because a narrow check turned green
+[/signals]
+
+[12:00:00] user: Done Is A Market Condition
+"#;
+
+    write_chunk_with_session(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "codex",
+        "charter-session-a",
+        1,
+        body,
+    );
+    write_chunk_with_session(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "codex",
+        "charter-session-b",
+        2,
+        body,
+    );
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+    let charter_count = records
+        .iter()
+        .filter(|record| {
+            record.summary.contains("Done Is A Market Condition")
+                || record
+                    .summary
+                    .contains("Code is not done because a narrow check turned green")
+        })
+        .count();
+    assert!(
+        charter_count <= 1,
+        "charter line multiplied across sessions: {records:?}",
+    );
+    assert_eq!(
+        charter_count, 0,
+        "charter doctrine should be filtered before candidate promotion: {records:?}",
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn collapse_session_merges_exact_daily_duplicates_across_session_forks() {
     let make_record = |session_id: &str, source_chunk: &str| IntentRecord {
         kind: IntentKind::Intent,
@@ -439,6 +553,38 @@ fn write_chunk_with_sidecar(
         "codex"
     };
     write_sidecar(&path, project, agent, date, "intentstest01", frame_kind);
+}
+
+fn write_chunk_with_session(
+    root: &Path,
+    project: &str,
+    date: &str,
+    agent: &str,
+    session_id: &str,
+    sequence: u32,
+    body: &str,
+) -> PathBuf {
+    let date_compact = crate::store::compact_date(date);
+    let basename = crate::store::session_basename(date, agent, session_id, sequence);
+    let dir = root
+        .join("store")
+        .join("local")
+        .join(project)
+        .join(date_compact)
+        .join("conversations")
+        .join(agent);
+    fs::create_dir_all(&dir).expect("create chunk dir");
+    let path = dir.join(basename);
+    fs::write(&path, body).expect("write chunk");
+    write_sidecar(
+        &path,
+        project,
+        agent,
+        date,
+        session_id,
+        Some(FrameKind::UserMsg),
+    );
+    path
 }
 
 fn write_sidecar(
@@ -1893,38 +2039,6 @@ mod session_level {
 mod quality {
     use super::*;
 
-    fn write_chunk_with_session(
-        root: &Path,
-        project: &str,
-        date: &str,
-        agent: &str,
-        session_id: &str,
-        sequence: u32,
-        body: &str,
-    ) -> PathBuf {
-        let date_compact = crate::store::compact_date(date);
-        let basename = crate::store::session_basename(date, agent, session_id, sequence);
-        let dir = root
-            .join("store")
-            .join("local")
-            .join(project)
-            .join(date_compact)
-            .join("conversations")
-            .join(agent);
-        fs::create_dir_all(&dir).expect("create chunk dir");
-        let path = dir.join(basename);
-        fs::write(&path, body).expect("write chunk");
-        write_sidecar(
-            &path,
-            project,
-            agent,
-            date,
-            session_id,
-            Some(FrameKind::UserMsg),
-        );
-        path
-    }
-
     // ── metadata-noise filter ───────────────────────────────────────
 
     #[test]
@@ -2017,10 +2131,10 @@ mod quality {
         );
     }
 
-    // ── session-scoped dedup ───────────────────────────────────────
+    // ── content-scoped dedup ───────────────────────────────────────
 
     #[test]
-    fn cross_session_identical_summary_kept_separate() {
+    fn cross_session_identical_summary_collapses_with_consistent_provenance() {
         let tmp = std::env::temp_dir().join(format!(
             "ai-contexters-intents-{}-cross-session",
             std::process::id()
@@ -2060,9 +2174,83 @@ mod quality {
 
         let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
 
-        // Two sessions, two records — identical summary text but distinct
-        // provenance must NOT collapse into one entry that lies about its
-        // session (older session_id paired with newer source_chunk).
+        // Same normalized fact across sessions surfaces once, with the
+        // selected source_chunk and session_id kept in sync.
+        let decisions: Vec<&IntentRecord> = records
+            .iter()
+            .filter(|r| r.kind == IntentKind::Decision)
+            .collect();
+        assert_eq!(
+            decisions.len(),
+            1,
+            "expected one collapsed decision for repeated text, got {decisions:?}",
+        );
+
+        let record = decisions[0];
+        let stem = std::path::Path::new(&record.source_chunk)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        assert!(
+            stem.contains(&record.session_id),
+            "session_id={} not found in source_chunk filename={}",
+            record.session_id,
+            stem,
+        );
+        assert_eq!(record.session_id, "019df273-2c1");
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn cross_session_distinct_human_intents_do_not_collapse() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ai-contexters-intents-{}-cross-session-distinct",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+
+        let body_a = "[project: demo | agent: codex | date: 2026-05-02]\n\n\
+                    [11:00:00] user: Materiał ma być deterministyczny — musi mieć source_hash.\n";
+        let body_b = "[project: demo | agent: codex | date: 2026-05-04]\n\n\
+                    [11:00:00] user: Materiał ma być audytowalny — musi mieć source_manifest.\n";
+
+        write_chunk_with_session(
+            &tmp,
+            "demo",
+            "2026-05-02",
+            "codex",
+            "019dcceb-48c",
+            3,
+            body_a,
+        );
+        write_chunk_with_session(
+            &tmp,
+            "demo",
+            "2026-05-04",
+            "codex",
+            "019df273-2c1",
+            27,
+            body_b,
+        );
+
+        let config = IntentsConfig {
+            project: "demo".to_string(),
+            hours: 240,
+            strict: false,
+            min_confidence: None,
+            kind_filter: Some(IntentKind::Decision),
+            frame_kind: None,
+        };
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 5, 5)
+                .expect("date")
+                .and_hms_opt(0, 0, 0)
+                .expect("time"),
+            Utc,
+        );
+
+        let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
         let decisions: Vec<&IntentRecord> = records
             .iter()
             .filter(|r| r.kind == IntentKind::Decision)
@@ -2070,33 +2258,14 @@ mod quality {
         assert_eq!(
             decisions.len(),
             2,
-            "expected one decision per session, got {decisions:?}",
+            "distinct human decisions collapsed too aggressively: {decisions:?}",
         );
-
-        let session_ids: HashSet<String> = decisions.iter().map(|r| r.session_id.clone()).collect();
+        assert!(decisions.iter().any(|r| r.summary.contains("source_hash")));
         assert!(
-            session_ids.contains("019dcceb-48c"),
-            "missing session 019dcceb-48c in {session_ids:?}",
+            decisions
+                .iter()
+                .any(|r| r.summary.contains("source_manifest"))
         );
-        assert!(
-            session_ids.contains("019df273-2c1"),
-            "missing session 019df273-2c1 in {session_ids:?}",
-        );
-
-        // Provenance check: each record's session_id must match the
-        // session segment in its own source_chunk filename.
-        for record in &decisions {
-            let stem = std::path::Path::new(&record.source_chunk)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            assert!(
-                stem.contains(&record.session_id),
-                "session_id={} not found in source_chunk filename={}",
-                record.session_id,
-                stem,
-            );
-        }
 
         let _ = fs::remove_dir_all(tmp);
     }

@@ -15,7 +15,7 @@ use crate::chunker::{
     parse_checklist_task, truncate_signal_line,
 };
 use crate::sanitize;
-use crate::sources::shared::{IntentLineModality, intent_line_modality};
+use crate::sources::shared::{IntentLineModality, intent_line_modality, is_harness_injected_noise};
 use crate::store;
 use crate::timeline::FrameKind;
 use crate::types::{EntryState, EntryType, IntentEntry, Link, LinkType};
@@ -231,11 +231,12 @@ fn dedup_intent_records(records: &mut Vec<IntentRecord>) {
         // Normalize the summary so dedup catches near-duplicates that differ
         // only in whitespace, case, or invisible chars (zero-width / bidi).
         // Without this, "fix au\u{200B}th" sneaks past as a "new" record.
+        // Session/chunk are provenance, not identity: identical normalized
+        // facts re-ingested across sessions should surface once per project.
         seen.insert((
             record.kind,
+            record.project.clone(),
             normalize_key(&record.summary),
-            record.session_id.clone(),
-            record.source_chunk.clone(),
         ))
     });
 }
@@ -551,12 +552,16 @@ fn extract_signal_candidates(
             || line.starts_with("Checklist detected")
             || line.starts_with("... (+")
             || is_source_metadata_line(line)
+            || is_reingested_charter_line(line)
         {
             continue;
         }
 
         let payload = strip_signal_bullet(line);
-        if is_source_metadata_line(payload) || is_local_command_artifact_line(payload) {
+        if is_source_metadata_line(payload)
+            || is_local_command_artifact_line(payload)
+            || is_reingested_charter_line(payload)
+        {
             continue;
         }
         let kind = match section {
@@ -588,6 +593,15 @@ fn extract_transcript_candidates(
 
     for entry in transcript_entries {
         let is_user = entry.role.eq_ignore_ascii_case("user");
+        if is_user {
+            let message = entry.lines.join("\n");
+            if (is_harness_injected_noise(&entry.role, &message)
+                && !is_local_command_artifact_line(message.lines().next().unwrap_or_default()))
+                || is_reingested_charter_block(&message)
+            {
+                continue;
+            }
+        }
         let mut codescribe_parser = CodescribeParser::new();
 
         for (index, raw_line) in entry.lines.iter().enumerate() {
@@ -600,6 +614,9 @@ fn extract_transcript_candidates(
                 continue;
             }
             if is_local_command_artifact_line(line) {
+                continue;
+            }
+            if is_reingested_charter_line(line) {
                 continue;
             }
 
@@ -677,6 +694,65 @@ fn is_local_command_artifact_line(line: &str) -> bool {
         || shell_lower.starts_with("content-security-policy:")
         || shell_lower.starts_with("referrer-policy:")
         || shell_lower.starts_with("permissions-policy:")
+}
+
+fn is_reingested_charter_block(message: &str) -> bool {
+    let head = message.trim_start();
+    charter_head_markers()
+        .iter()
+        .any(|marker| starts_with_marker(head, marker))
+}
+
+fn is_reingested_charter_line(line: &str) -> bool {
+    let trimmed = strip_signal_bullet(line)
+        .trim_start_matches('>')
+        .trim_start();
+    if charter_head_markers()
+        .iter()
+        .any(|marker| starts_with_marker(trimmed, marker))
+    {
+        return true;
+    }
+
+    let lower = trimmed.to_lowercase();
+    [
+        "done is a market condition",
+        "code is not done because a narrow check turned green",
+        "\"done\" means repo health",
+        "runtime truth beats theoretical correctness",
+        "product truth beats local elegance",
+        "loctree gives **sight**",
+        "aicx gives **insight**",
+        "vibecrafted gives **hands**",
+        "move fast, but with taste",
+        "be radical when radical is cleaner",
+        "finish the whole thing, not just the code",
+        "we craft.",
+        "we converge.",
+        "we ship.",
+    ]
+    .iter()
+    .any(|marker| lower.starts_with(marker))
+}
+
+fn starts_with_marker(text: &str, marker: &str) -> bool {
+    text.get(..marker.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(marker))
+}
+
+fn charter_head_markers() -> &'static [&'static str] {
+    &[
+        "# AGENTS.md instructions",
+        "# CLAUDE.md instructions",
+        "<INSTRUCTIONS>",
+        "<!-- loctree-doctrine",
+        "<!-- loctree-advise",
+        "# VetCoders Global Agent Charter",
+        "# VetCoders Agent Operating Guide",
+        "# Loctree + AICX + Vibecrafted Agent Operating Guide",
+        "# The Vibecrafted Manifesto",
+        "## **LOCTREE + AICX + VIBECRAFTED",
+    ]
 }
 
 fn infer_kind_from_line(line: &str, is_user_line: bool) -> Option<IntentKind> {
@@ -1510,13 +1586,13 @@ fn dedup_candidates(
             continue;
         }
 
-        // Session-scoped key. Cross-session merges silently swap source_chunk
-        // while keeping the wrong session_id, lying about provenance. Keep
-        // identical text in different sessions as separate records.
+        // Same normalized fact, same project, same kind: surface once. The
+        // merge path below carries the winning provenance together, so the
+        // selected source_chunk and session_id stay consistent.
         let key = (
             candidate.record.kind,
+            candidate.record.project.clone(),
             normalize_key(&candidate.record.summary),
-            candidate.record.session_id.clone(),
         );
 
         if let Some(existing) = map.get_mut(&key) {
@@ -1652,6 +1728,7 @@ fn merge_candidate(existing: &mut CandidateAccumulator, incoming: IntentCandidat
         existing.candidate.record.project = incoming.record.project.clone();
         existing.candidate.record.agent = incoming.record.agent.clone();
         existing.candidate.record.date = incoming.record.date.clone();
+        existing.candidate.record.session_id = incoming.record.session_id.clone();
         existing.candidate.record.source_chunk = incoming.record.source_chunk.clone();
     }
 }
