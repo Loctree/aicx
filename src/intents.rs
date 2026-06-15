@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::chunker::{
-    INTENT_KEYWORDS, is_decision_tag, is_outcome_tag, is_result_line, normalize_key,
-    parse_checklist_task, truncate_signal_line,
+    INTENT_KEYWORDS, is_decision_tag, is_local_command_artifact_line, is_outcome_tag,
+    is_result_line, normalize_key, parse_checklist_task, truncate_signal_line,
 };
 use crate::sanitize;
 use crate::sources::shared::{IntentLineModality, intent_line_modality, is_harness_injected_noise};
@@ -646,6 +646,9 @@ fn extract_transcript_candidates(
             let Some(kind) = infer_kind_from_line(line, is_user) else {
                 continue;
             };
+            if role_suppresses_outcome_promotion(&entry.role) && kind == IntentKind::Outcome {
+                continue;
+            }
 
             if let Some(candidate) = build_candidate(
                 kind,
@@ -665,42 +668,16 @@ fn extract_transcript_candidates(
     (candidates, task_events)
 }
 
-fn is_local_command_artifact_line(line: &str) -> bool {
-    let trimmed = strip_signal_bullet(line).trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.starts_with("<local-command-caveat")
-        || lower.starts_with("</local-command-caveat")
-        || lower.starts_with("<bash-stdout")
-        || lower.starts_with("</bash-stdout")
-        || lower.starts_with("<bash-stderr")
-        || lower.starts_with("</bash-stderr")
-    {
-        return true;
-    }
-
-    let shell_line = trimmed.trim_start_matches(['*', '>', '<']).trim_start();
-    let shell_lower = shell_line.to_ascii_lowercase();
-    shell_lower.starts_with("issuer:")
-        || shell_lower.starts_with("subject:")
-        || shell_lower.starts_with("subjectaltname:")
-        || shell_lower.starts_with("ssl certificate")
-        || shell_lower.starts_with("alpn:")
-        || shell_lower.starts_with("http/")
-        || shell_lower.starts_with("server:")
-        || shell_lower.starts_with("content-type:")
-        || shell_lower.starts_with("x-ratelimit-")
-        || shell_lower.starts_with("x-request-id:")
-        || shell_lower.starts_with("strict-transport-security:")
-        || shell_lower.starts_with("content-security-policy:")
-        || shell_lower.starts_with("referrer-policy:")
-        || shell_lower.starts_with("permissions-policy:")
-}
-
 fn is_reingested_charter_block(message: &str) -> bool {
     let head = message.trim_start();
     charter_head_markers()
         .iter()
         .any(|marker| starts_with_marker(head, marker))
+}
+
+fn role_suppresses_outcome_promotion(role: &str) -> bool {
+    let role = role.trim().to_ascii_lowercase();
+    role == "agent_reply" || role.starts_with("tool_") || role == "tool"
 }
 
 fn is_reingested_charter_line(line: &str) -> bool {
@@ -2087,6 +2064,11 @@ pub fn classify_chunk_entries(
             if let Some((entry_type, conf)) = classify_line_entry_type(trimmed, is_user)
                 && conf >= CLASSIFIER_ABSTAIN_THRESHOLD
             {
+                if role_suppresses_outcome_promotion(&entry.role)
+                    && matches!(entry_type, EntryType::Outcome | EntryType::Result)
+                {
+                    continue;
+                }
                 let title = clean_entry_title(entry_type, trimmed);
                 if !title.is_empty() {
                     let id = IntentEntry::stable_id(source_chunk, byte_offset, entry_type);

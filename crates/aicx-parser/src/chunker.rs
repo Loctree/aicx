@@ -977,8 +977,8 @@ fn is_local_command_artifact_entry(entry: &TimelineEntry) -> bool {
         .any(is_local_command_artifact_line)
 }
 
-fn is_local_command_artifact_line(line: &str) -> bool {
-    let trimmed = line.trim();
+pub fn is_local_command_artifact_line(line: &str) -> bool {
+    let trimmed = strip_signal_bullet(line).trim();
     let lower = trimmed.to_ascii_lowercase();
     if lower.starts_with("<local-command-caveat")
         || lower.starts_with("</local-command-caveat")
@@ -1006,6 +1006,17 @@ fn is_local_command_artifact_line(line: &str) -> bool {
         || shell_lower.starts_with("content-security-policy:")
         || shell_lower.starts_with("referrer-policy:")
         || shell_lower.starts_with("permissions-policy:")
+}
+
+fn strip_signal_bullet(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        return rest.trim_start();
+    }
+    if let Some(rest) = trimmed.strip_prefix("* ") {
+        return rest.trim_start();
+    }
+    trimmed
 }
 
 pub(crate) fn is_intent_line(line: &str) -> bool {

@@ -896,6 +896,54 @@ commit abcdef1 proves the old path was wrong.
 }
 
 #[test]
+fn tool_call_and_agent_reply_do_not_become_outcomes() {
+    let tmp = migration_test_root("tool-agent-outcome-source-role");
+    let _ = fs::remove_dir_all(&tmp);
+
+    let chunk = r#"[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]
+
+[12:00:00] tool_call: (mcp__aicx__aicx_intents completed with no output)
+[12:01:00] agent_reply: validation: p0=0 and cargo test passed
+[12:02:00] user: Why keep the canonical index path for first users?
+"#;
+
+    write_chunk(&tmp, "demo", "2026-03-15", "120000_codex-001.md", chunk);
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.kind == IntentKind::Outcome),
+        "tool_call/agent_reply diagnostics must not promote to outcome: {records:?}"
+    );
+    assert!(
+        records.iter().any(|record| {
+            record.kind == IntentKind::Intent
+                && record.summary.contains("Why keep the canonical index path")
+        }),
+        "human why/question should remain visible as intent truth: {records:?}"
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn strict_mode_filters_heuristic_only_intents() {
     let tmp = std::env::temp_dir().join(format!(
         "ai-contexters-intents-{}-strict",
