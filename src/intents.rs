@@ -588,9 +588,6 @@ fn extract_transcript_candidates(
 
     for entry in transcript_entries {
         let is_user = entry.role.eq_ignore_ascii_case("user");
-        if is_user && is_local_command_artifact_entry(entry) {
-            continue;
-        }
         let mut codescribe_parser = CodescribeParser::new();
 
         for (index, raw_line) in entry.lines.iter().enumerate() {
@@ -649,14 +646,6 @@ fn extract_transcript_candidates(
     }
 
     (candidates, task_events)
-}
-
-fn is_local_command_artifact_entry(entry: &TranscriptEntry) -> bool {
-    entry
-        .lines
-        .iter()
-        .take(3)
-        .any(|line| is_local_command_artifact_line(line))
 }
 
 fn is_local_command_artifact_line(line: &str) -> bool {
@@ -1175,19 +1164,23 @@ fn normalize_display_text(text: &str) -> String {
 
 fn surrounding_context(lines: &[String], index: usize) -> Option<String> {
     let mut parts = Vec::new();
+    let mut push_part = |line: &str| {
+        let line = line.trim();
+        if is_source_metadata_line(line) || is_local_command_artifact_line(line) {
+            return;
+        }
+        let part = normalize_display_text(line);
+        if !part.is_empty() {
+            parts.push(part);
+        }
+    };
 
     if let Some(prev) = index.checked_sub(1).and_then(|idx| lines.get(idx)) {
-        let prev = normalize_display_text(prev);
-        if !prev.is_empty() {
-            parts.push(prev);
-        }
+        push_part(prev);
     }
 
     if let Some(next) = lines.get(index + 1) {
-        let next = normalize_display_text(next);
-        if !next.is_empty() {
-            parts.push(next);
-        }
+        push_part(next);
     }
 
     if parts.is_empty() {

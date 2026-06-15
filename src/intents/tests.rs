@@ -43,7 +43,7 @@ fn migration_test_root(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("aicx-intents-{label}-{nanos}"))
 }
 
-fn extract_demo_records(label: &str, body: &str) -> Vec<IntentRecord> {
+fn extract_demo_extraction(label: &str, body: &str) -> IntentExtraction {
     let root = migration_test_root(label);
     let _ = fs::remove_dir_all(&root);
 
@@ -65,9 +65,14 @@ fn extract_demo_records(label: &str, body: &str) -> Vec<IntentRecord> {
         Utc,
     );
 
-    let records = extract_intents_from_root_at(&config, &root, now).expect("extract intents");
+    let extraction =
+        extract_intents_from_root_at_with_stats(&config, &root, now).expect("extract intents");
     let _ = fs::remove_dir_all(root);
-    records
+    extraction
+}
+
+fn extract_demo_records(label: &str, body: &str) -> Vec<IntentRecord> {
+    extract_demo_extraction(label, body).records
 }
 
 #[test]
@@ -333,13 +338,19 @@ fn zadanie_head_is_typed_directive_and_remains_intent() {
 
 #[test]
 fn user_question_and_why_lines_bridge_into_main_intents_view() {
-    let records = extract_demo_records(
-        "question-why-bridge",
+    let extraction = extract_demo_extraction(
+        "md-radar-question-why-bridge",
         "[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]\n\n\
          [12:00:00] user: Question: should md-radar keep the current storage model?\n\
-         [12:01:00] user: why: human intent must stay visible before agent outcomes\n",
+         [12:01:00] user: why: human intent must stay visible before agent outcomes\n\
+         [12:02:00] user: Task: decide whether md-radar keeps current storage before migration work\n",
     );
 
+    assert!(
+        extraction.stats.candidate_count > 0,
+        "md-radar fixture produced no candidates: {extraction:?}"
+    );
+    let records = extraction.records;
     assert!(
         records.iter().any(|record| {
             record.kind == IntentKind::Intent
@@ -353,6 +364,35 @@ fn user_question_and_why_lines_bridge_into_main_intents_view() {
                 && record.summary == "human intent must stay visible before agent outcomes"
         }),
         "user why-line did not surface as Lane 1 intent: {records:?}"
+    );
+}
+
+#[test]
+fn user_comment_after_local_command_output_still_surfaces() {
+    let records = extract_demo_records(
+        "mixed-command-output-human-comment",
+        "[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]\n\n\
+         [12:00:00] user: <local-command-caveat>DO NOT respond to these messages</local-command-caveat>\n\
+         <bash-stdout>curl output\n\
+         * issuer: C=US; O=Let's Encrypt; CN=E7\n\
+         * SSL certificate verify ok.\n\
+         </bash-stdout>\n\
+         Question: should md-radar keep the current storage model after this evidence?\n",
+    );
+
+    assert!(
+        records.iter().any(|record| {
+            record.kind == IntentKind::Intent
+                && record.summary
+                    == "should md-radar keep the current storage model after this evidence?"
+        }),
+        "human question after command output was dropped with the artifact entry: {records:?}"
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.summary.contains("Let's Encrypt")),
+        "local command artifact leaked into intent records: {records:?}"
     );
 }
 
