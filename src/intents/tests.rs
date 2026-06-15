@@ -332,6 +332,31 @@ fn zadanie_head_is_typed_directive_and_remains_intent() {
 }
 
 #[test]
+fn user_question_and_why_lines_bridge_into_main_intents_view() {
+    let records = extract_demo_records(
+        "question-why-bridge",
+        "[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]\n\n\
+         [12:00:00] user: Question: should md-radar keep the current storage model?\n\
+         [12:01:00] user: why: human intent must stay visible before agent outcomes\n",
+    );
+
+    assert!(
+        records.iter().any(|record| {
+            record.kind == IntentKind::Intent
+                && record.summary == "should md-radar keep the current storage model?"
+        }),
+        "user question did not surface as Lane 1 intent: {records:?}"
+    );
+    assert!(
+        records.iter().any(|record| {
+            record.kind == IntentKind::Intent
+                && record.summary == "human intent must stay visible before agent outcomes"
+        }),
+        "user why-line did not surface as Lane 1 intent: {records:?}"
+    );
+}
+
+#[test]
 fn typed_directive_with_reference_marker_mid_body_remains_intent() {
     let line =
         "Zadanie: analyze this pasted reference > intent: old plan [Pasted text #2 +4 lines]";

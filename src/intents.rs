@@ -700,6 +700,14 @@ fn infer_kind_from_line(line: &str, is_user_line: bool) -> Option<IntentKind> {
         return None;
     }
 
+    if is_user_line
+        && let Some((entry_type, confidence)) = classify_line_entry_type(line, true)
+        && confidence >= CLASSIFIER_ABSTAIN_THRESHOLD
+        && let Some(kind) = entry_type_to_timeline_kind(entry_type)
+    {
+        return Some(kind);
+    }
+
     if is_decision_tag(line) {
         return Some(IntentKind::Decision);
     }
@@ -716,6 +724,15 @@ fn infer_kind_from_line(line: &str, is_user_line: bool) -> Option<IntentKind> {
         return Some(IntentKind::Intent);
     }
     None
+}
+
+fn entry_type_to_timeline_kind(entry_type: EntryType) -> Option<IntentKind> {
+    match entry_type {
+        EntryType::Decision => Some(IntentKind::Decision),
+        EntryType::Intent | EntryType::Question | EntryType::Why => Some(IntentKind::Intent),
+        EntryType::Outcome | EntryType::Result => Some(IntentKind::Outcome),
+        EntryType::Argue | EntryType::Assumption | EntryType::Insight => None,
+    }
 }
 
 fn is_outcome_line(line: &str) -> bool {
@@ -1120,6 +1137,8 @@ fn clean_summary(kind: IntentKind, raw: &str) -> String {
         IntentKind::Intent => {
             text = strip_case_insensitive_prefix(text, "[intent]");
             text = strip_case_insensitive_prefix(text, "intent:");
+            text = strip_case_insensitive_prefix(text, "question:");
+            text = strip_case_insensitive_prefix(text, "why:");
         }
         IntentKind::Task => {}
     }
@@ -1753,6 +1772,7 @@ const ASSUMPTION_MARKERS: &[&str] = &[
 ];
 
 const WHY_MARKERS: &[&str] = &[
+    "why:",
     "because",
     "the reason",
     "this is needed",

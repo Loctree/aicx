@@ -711,6 +711,10 @@ fn write_store_chunk(root: &Path, slug: &str, date: &str, session: &str) -> Path
     path
 }
 
+fn encode_claude_project_dir(path: &Path) -> String {
+    path.display().to_string().replace('/', "-")
+}
+
 fn session_info(project: &str, repo_path: &str) -> sessions::SessionInfo {
     sessions::SessionInfo {
         session_id: "session-1".to_string(),
@@ -727,6 +731,66 @@ fn session_info(project: &str, repo_path: &str) -> sessions::SessionInfo {
         association: sessions::Association::Exact,
         temporal_confidence: sessions::TemporalConfidence::None,
     }
+}
+
+#[test]
+fn intents_project_resolver_discovers_session_display_bridge_in_production_path() {
+    let root = unique_test_dir("intents-project-discovered-display-store");
+    let home = unique_test_dir("intents-project-discovered-display-home");
+    let repo_parent = unique_test_dir("intents-project-discovered-display-repo");
+    let repo = repo_parent.join("Compass");
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&repo_parent);
+
+    write_store_chunk(&root, "vetcoders/field_ops", "2026_0612", "canonical");
+    fs::create_dir_all(&repo).unwrap();
+    let git_init = std::process::Command::new("git")
+        .arg("init")
+        .arg(&repo)
+        .output()
+        .expect("git init should run");
+    assert!(git_init.status.success());
+    let git_remote = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:vetcoders/field_ops.git",
+        ])
+        .output()
+        .expect("git remote add should run");
+    assert!(git_remote.status.success());
+    let encoded = encode_claude_project_dir(&repo);
+    let session_path = home
+        .join(".claude")
+        .join("projects")
+        .join(encoded)
+        .join("session-1.jsonl");
+    write_file(
+        &session_path,
+        &format!(
+            "{{\"type\":\"user\",\"timestamp\":\"2026-06-14T00:00:00Z\",\"cwd\":{:?},\"message\":{{\"role\":\"user\",\"content\":\"remember this\"}}}}\n",
+            repo.display().to_string()
+        ),
+    );
+
+    let got = resolve_intents_project_filters_with_session_home_at(
+        &["Compass".to_string()],
+        &root,
+        Some(&home),
+        None,
+    )
+    .unwrap();
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&repo_parent);
+
+    assert_eq!(got.projects, vec!["vetcoders/field_ops"]);
+    assert!(got.unresolved_filters.is_empty());
 }
 
 #[test]

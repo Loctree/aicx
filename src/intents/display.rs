@@ -256,7 +256,7 @@ pub fn apply_display_filters(
                 }
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                     let existing = entry.get_mut();
-                    *existing.count.as_mut().unwrap() += rec.count.unwrap_or(1);
+                    *existing.count.get_or_insert(0) += rec.count.unwrap_or(1);
                     if !existing.evidence.contains(&rec.summary) {
                         existing.evidence.push(rec.summary);
                     }

@@ -3722,7 +3722,36 @@ struct BucketHint {
 fn resolve_intents_project_filters(projects: &[String]) -> Result<IntentsProjectResolution> {
     let store_root = store::store_base_dir()?;
     let cwd = std::env::current_dir().ok();
-    resolve_intents_project_filters_at(projects, &store_root, &[], cwd.as_deref())
+    let session_home = dirs::home_dir();
+    resolve_intents_project_filters_with_session_home_at(
+        projects,
+        &store_root,
+        session_home.as_deref(),
+        cwd.as_deref(),
+    )
+}
+
+fn resolve_intents_project_filters_with_session_home_at(
+    projects: &[String],
+    store_root: &Path,
+    session_home: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Result<IntentsProjectResolution> {
+    let sessions = discover_intents_resolution_sessions(projects, session_home);
+    resolve_intents_project_filters_at(projects, store_root, &sessions, cwd)
+}
+
+fn discover_intents_resolution_sessions(
+    projects: &[String],
+    session_home: Option<&Path>,
+) -> Vec<sessions::SessionInfo> {
+    if projects.is_empty() {
+        return Vec::new();
+    }
+    let Some(home) = session_home else {
+        return Vec::new();
+    };
+    sessions::discover_sessions_at(home, None, None, None)
 }
 
 fn resolve_intents_project_filters_at(
