@@ -638,6 +638,23 @@ fn clarify_max_enforces_documented_one_to_five_range() {
 }
 
 #[test]
+fn sessions_report_max_enforces_documented_one_to_five_range() {
+    for bad in ["0", "6"] {
+        let err = Cli::try_parse_from(["aicx", "sessions", "report", "s", "--max", bad])
+            .expect_err("out-of-range sessions report --max must fail parsing");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+    let cli = Cli::try_parse_from(["aicx", "sessions", "report", "s", "--max", "3"])
+        .expect("--max 3 parses");
+    match cli.command {
+        Some(Commands::Sessions {
+            command: SessionsCommand::Report { max, .. },
+        }) => assert_eq!(max, 3),
+        other => panic!("expected sessions report, got {other:?}"),
+    }
+}
+
+#[test]
 fn lookback_cutoff_handles_normal_range() {
     let before = Utc::now();
     let cutoff = lookback_cutoff(8);

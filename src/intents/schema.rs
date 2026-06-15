@@ -492,7 +492,8 @@ impl CodescribeParser {
                         chars.next();
                         break;
                     }
-                    tag_buf.push(chars.next().unwrap());
+                    tag_buf.push(next_c);
+                    chars.next();
                 }
 
                 let tag_trimmed = tag_buf.trim();
@@ -902,24 +903,12 @@ pub fn audit_claims_against_evidence(
             continue;
         }
 
-        // Check if any matched evidence contains a failure
-        let mut has_failure = false;
+        let first_fail_ev = matched_ev.iter().copied().find(|ev| {
+            ev.kind == EvidenceKind::TestRun && ev.excerpt.lines().any(is_failing_test_line)
+        });
 
-        for ev in &matched_ev {
-            if ev.kind == EvidenceKind::TestRun && ev.excerpt.lines().any(is_failing_test_line) {
-                has_failure = true;
-            }
-        }
-
-        if has_failure {
+        if let Some(first_fail_ev) = first_fail_ev {
             // Generate Fail ResultRecord
-            let first_fail_ev = matched_ev
-                .iter()
-                .find(|ev| {
-                    ev.kind == EvidenceKind::TestRun && ev.excerpt.lines().any(is_failing_test_line)
-                })
-                .unwrap();
-
             let evidence_type = match first_fail_ev.kind {
                 EvidenceKind::Commit => "commit",
                 EvidenceKind::TestRun => "test_run",

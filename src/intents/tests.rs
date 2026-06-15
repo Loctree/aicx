@@ -206,6 +206,37 @@ fn collapse_session_merges_exact_daily_duplicates_across_session_forks() {
 }
 
 #[test]
+fn collapse_session_tolerates_existing_none_count() {
+    let make_record = |summary: &str, count| IntentRecord {
+        kind: IntentKind::Intent,
+        summary: summary.to_string(),
+        context: None,
+        evidence: vec![],
+        project: "VetCoders/ScreenScribe".to_string(),
+        agent: "codex".to_string(),
+        date: "2026-05-31".to_string(),
+        timestamp: None,
+        session_id: "same-session".to_string(),
+        count,
+        first_chunk: None,
+        last_chunk: None,
+        source_chunk: format!("{summary}.md"),
+        source: None,
+    };
+
+    let collapsed = apply_display_filters(
+        vec![make_record("first", None), make_record("second", Some(2))],
+        &IntentDisplayFilters {
+            collapse_session: true,
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(collapsed.len(), 1);
+    assert_eq!(collapsed[0].count, Some(3));
+}
+
+#[test]
 fn migrate_intent_schema_dry_run_at_scans_all_projects_without_filter() {
     let root = migration_test_root("intent-migration-all-projects");
     write_chunk(

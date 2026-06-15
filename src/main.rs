@@ -293,7 +293,7 @@ enum SessionsCommand {
         repo: Option<PathBuf>,
 
         /// Max clarify questions (hard-capped at 5).
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_t = 5, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=5))]
         max: usize,
 
         /// Output format: markdown | json.
@@ -1795,6 +1795,8 @@ where
 #[cfg(unix)]
 fn restore_default_sigpipe() {
     unsafe {
+        // SAFETY: restore the process SIGPIPE disposition to the platform default
+        // before the CLI starts worker threads or installs custom handlers.
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }

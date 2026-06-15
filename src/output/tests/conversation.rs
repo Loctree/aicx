@@ -110,6 +110,41 @@ fn write_conversation_markdown_emits_date_heading_for_recency() {
 }
 
 #[test]
+fn write_conversation_markdown_handles_non_ascii_session_ids() {
+    let dir = unique_test_dir("conversation_md_non_ascii_session_id");
+    let path = dir.join("conversation.md");
+    let messages = vec![ConversationMessage {
+        timestamp: Utc.with_ymd_and_hms(2026, 1, 24, 13, 0, 0).unwrap(),
+        agent: "claude".to_string(),
+        session_id: "abcdef😀tail".to_string(),
+        role: "user".to_string(),
+        message: "non-ascii session id should not panic".to_string(),
+        repo_project: "test".to_string(),
+        source_path: None,
+        branch: None,
+        message_kind: crate::timeline::MessageKind::Conversation,
+        collapse_stub_kind: None,
+    }];
+    let metadata = ReportMetadata {
+        generated_at: Utc.with_ymd_and_hms(2026, 1, 24, 13, 0, 0).unwrap(),
+        project_filter: Some("test".to_string()),
+        hours_back: 24,
+        total_entries: 1,
+        sessions: vec!["abcdef😀tail".to_string()],
+    };
+
+    write_conversation_markdown(&path, &messages, &metadata).unwrap();
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert!(
+        content.contains("### Session `abcdef😀t` [claude]"),
+        "session heading should truncate by characters, not bytes:\n{content}"
+    );
+
+    cleanup(&dir);
+}
+
+#[test]
 fn test_conversation_json_extract_stats_can_report_redaction_disabled() {
     let dir = unique_test_dir("conversation_extract_stats_redaction_disabled");
     let path = dir.join("conversation.json");
