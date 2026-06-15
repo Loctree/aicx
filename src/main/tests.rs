@@ -2,6 +2,108 @@ use super::*;
 use filetime::{FileTime, set_file_mtime};
 use std::fs;
 
+#[test]
+fn default_intents_markdown_uses_pack_report() {
+    let sections = vec![
+        IntentPackSection {
+            title: "Decisions",
+            records: vec![intents::IntentRecord {
+                kind: intents::IntentKind::Decision,
+                summary: "ship public seed only after privacy scrub".to_string(),
+                context: None,
+                evidence: vec!["P0 privacy gate".to_string()],
+                project: "Loctree/aicx".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-06-14".to_string(),
+                timestamp: None,
+                session_id: "s1".to_string(),
+                count: Some(2),
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "chunk-a.md".to_string(),
+                source: None,
+            }],
+        },
+        IntentPackSection {
+            title: "Tasks",
+            records: Vec::new(),
+        },
+        IntentPackSection {
+            title: "Human Intent",
+            records: Vec::new(),
+        },
+        IntentPackSection {
+            title: "Agent Claims / Self-Reports",
+            records: Vec::new(),
+        },
+        IntentPackSection {
+            title: "Unresolved Human Intent",
+            records: Vec::new(),
+        },
+    ];
+
+    let markdown = format_intents_pack_markdown("Loctree/aicx", 168, Some(20), &sections);
+
+    assert!(markdown.starts_with("# Intent Report"));
+    assert!(markdown.contains("- per_section_limit: 20"));
+    assert!(markdown.contains("## Decisions"));
+    assert!(markdown.contains("## Tasks"));
+    assert!(markdown.contains("## Human Intent"));
+    assert!(markdown.contains("## Agent Claims / Self-Reports"));
+    assert!(markdown.contains("## Unresolved Human Intent"));
+    assert!(markdown.contains("## Mission Keyword Hits"));
+    assert!(markdown.contains("`privacy`"));
+    assert!(markdown.contains("`public seed`"));
+}
+
+#[test]
+fn pack_record_dedupes_joined_source_chunks() {
+    assert_eq!(
+        unique_source_chunks("a.md, b.md, a.md,  b.md, c.md"),
+        vec!["a.md", "b.md", "c.md"]
+    );
+}
+
+#[test]
+fn default_pack_trigger_preserves_scoped_timeline_modes() {
+    let filters = RetrievalFilters {
+        limit: None,
+        sort: None,
+        score: None,
+        agent: None,
+        since: None,
+        until: None,
+        frame_kind: None,
+    };
+    assert!(should_render_intents_pack(
+        &filters, "markdown", None, false, false
+    ));
+    assert!(!should_render_intents_pack(
+        &filters, "json", None, false, false
+    ));
+    assert!(!should_render_intents_pack(
+        &filters,
+        "markdown",
+        Some("decision"),
+        false,
+        false
+    ));
+    assert!(!should_render_intents_pack(
+        &filters, "markdown", None, true, false
+    ));
+    assert!(!should_render_intents_pack(
+        &filters, "markdown", None, false, true
+    ));
+
+    let scoped = RetrievalFilters {
+        frame_kind: Some(FrameKindArg::UserMsg),
+        ..filters
+    };
+    assert!(!should_render_intents_pack(
+        &scoped, "markdown", None, false, false
+    ));
+}
+
 /// Regression: B-P1-12 — detector must fire on the canonical bad shape.
 #[test]
 fn detect_config_show_flag_fires_on_canonical_mistake() {
@@ -419,13 +521,72 @@ fn fuzzy_fetch_limit_uses_semantic_filter_cap_constants() {
 }
 
 #[test]
-fn session_id_table_prefix_is_char_safe_for_non_ascii_ids() {
-    // P2-09: file-stem fallback ids can carry non-ASCII; a byte slice
-    // `&id[..8]` panics on a multibyte boundary. The helper must not.
-    assert_eq!(session_id_table_prefix("zażółć-gęśla-jaźń"), "zażółć-g");
-    assert_eq!(session_id_table_prefix("séance"), "séance");
-    assert_eq!(session_id_table_prefix(""), "");
-    assert_eq!(session_id_table_prefix("0eb1a73c-1234"), "0eb1a73c");
+fn session_id_table_value_preserves_full_id() {
+    assert_eq!(
+        session_id_table_value("zażółć-gęśla-jaźń"),
+        "zażółć-gęśla-jaźń"
+    );
+    assert_eq!(session_id_table_value("séance"), "séance");
+    assert_eq!(session_id_table_value(""), "");
+    assert_eq!(session_id_table_value("0eb1a73c-1234"), "0eb1a73c-1234");
+}
+
+#[test]
+fn sessions_table_project_uses_canonical_repo_identity() {
+    let info = session_info("aicx", "/Users/me/hosted/Loctree/aicx");
+
+    assert_eq!(session_project_label(&info), "Loctree/aicx");
+}
+
+#[test]
+fn sessions_table_compacts_home_repo_path_for_scanning() {
+    let Some(home) = dirs::home_dir().and_then(|path| path.into_os_string().into_string().ok())
+    else {
+        return;
+    };
+
+    let path = format!("{home}/Loctree/vetcoders/aicx");
+    assert_eq!(compact_repo_path(&path), "~/L/v/aicx");
+}
+
+#[test]
+fn sessions_table_user_comes_from_source_users_path() {
+    let info = session_info("aicx", "/Users/dragon/Loctree/aicx");
+
+    assert_eq!(session_user_label(&info), "dragon");
+}
+
+#[test]
+fn sessions_table_time_is_minute_precision_with_explicit_utc_offset() {
+    let time = Utc.with_ymd_and_hms(2026, 6, 14, 4, 49, 22).unwrap();
+
+    assert_eq!(format_session_table_time(time), "2026-06-14T04:49(+0)");
+}
+
+#[test]
+fn current_session_prefers_codex_thread_id_env() {
+    let current = current_session_from_env_lookup(|key| match key {
+        "CODEX_THREAD_ID" => Some("019eba52-81db-7d31-bb28-6343f05c4b79".to_string()),
+        _ => None,
+    })
+    .expect("current session from env");
+
+    assert_eq!(current.session_id, "019eba52-81db-7d31-bb28-6343f05c4b79");
+    assert_eq!(current.source, "env:CODEX_THREAD_ID");
+    assert_eq!(current.agent.as_deref(), Some("codex"));
+}
+
+#[test]
+fn sessions_current_command_parses_json_flag() {
+    let cli = Cli::try_parse_from(["aicx", "sessions", "current", "--json"])
+        .expect("sessions current should parse");
+
+    match cli.command {
+        Some(Commands::Sessions {
+            command: SessionsCommand::Current { json },
+        }) => assert!(json),
+        _ => panic!("expected sessions current command"),
+    }
 }
 
 #[test]
@@ -1551,6 +1712,25 @@ fn read_command_parses_discover_path_and_json_mode() {
             assert!(json);
         }
         _ => panic!("expected read command"),
+    }
+}
+
+#[test]
+fn open_alias_parses_as_read_for_loctree_chunk_refs() {
+    let cli = Cli::try_parse_from(["aicx", "open", "chunk:590b30cd", "--max-chars", "240"])
+        .expect("open alias should parse as read");
+
+    match cli.command {
+        Some(Commands::Read {
+            reference,
+            max_chars,
+            json,
+        }) => {
+            assert_eq!(reference, "chunk:590b30cd");
+            assert_eq!(max_chars, Some(240));
+            assert!(!json);
+        }
+        _ => panic!("expected open alias to parse as read command"),
     }
 }
 

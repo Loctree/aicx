@@ -937,11 +937,17 @@ fn extract_intent_lines(entries: &[&TimelineEntry]) -> Vec<String> {
         if entry.role.to_lowercase() != "user" {
             continue;
         }
+        if is_local_command_artifact_entry(entry) {
+            continue;
+        }
         for line in entry.message.lines().map(str::trim) {
             if line.is_empty() {
                 continue;
             }
             if is_source_metadata_line(line) {
+                continue;
+            }
+            if is_local_command_artifact_line(line) {
                 continue;
             }
             if !is_intent_line(line) {
@@ -961,6 +967,45 @@ fn extract_intent_lines(entries: &[&TimelineEntry]) -> Vec<String> {
     }
 
     out
+}
+
+fn is_local_command_artifact_entry(entry: &TimelineEntry) -> bool {
+    entry
+        .message
+        .lines()
+        .take(3)
+        .any(is_local_command_artifact_line)
+}
+
+fn is_local_command_artifact_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("<local-command-caveat")
+        || lower.starts_with("</local-command-caveat")
+        || lower.starts_with("<bash-stdout")
+        || lower.starts_with("</bash-stdout")
+        || lower.starts_with("<bash-stderr")
+        || lower.starts_with("</bash-stderr")
+    {
+        return true;
+    }
+
+    let shell_line = trimmed.trim_start_matches(['*', '>', '<']).trim_start();
+    let shell_lower = shell_line.to_ascii_lowercase();
+    shell_lower.starts_with("issuer:")
+        || shell_lower.starts_with("subject:")
+        || shell_lower.starts_with("subjectaltname:")
+        || shell_lower.starts_with("ssl certificate")
+        || shell_lower.starts_with("alpn:")
+        || shell_lower.starts_with("http/")
+        || shell_lower.starts_with("server:")
+        || shell_lower.starts_with("content-type:")
+        || shell_lower.starts_with("x-ratelimit-")
+        || shell_lower.starts_with("x-request-id:")
+        || shell_lower.starts_with("strict-transport-security:")
+        || shell_lower.starts_with("content-security-policy:")
+        || shell_lower.starts_with("referrer-policy:")
+        || shell_lower.starts_with("permissions-policy:")
 }
 
 pub(crate) fn is_intent_line(line: &str) -> bool {
@@ -993,6 +1038,13 @@ fn is_source_metadata_line(line: &str) -> bool {
         "project:",
         "author:",
         "heading:",
+        "input:",
+        "output:",
+        "\"output\":",
+        "current topic:",
+        "topic summary:",
+        "successfully created and wrote to new file:",
+        "base directory for this skill:",
     ]
     .iter()
     .any(|prefix| lower.starts_with(prefix))
@@ -1866,6 +1918,29 @@ mod tests {
         assert!(text.contains("Intent:"));
         assert!(text.contains("No i tutaj mam taki pomysł, żeby to zrobić"));
         assert!(text.contains("[/signals]"));
+    }
+
+    #[test]
+    fn test_format_chunk_text_skips_local_command_artifact_intents() {
+        let entries = [
+            make_entry(
+                14,
+                31,
+                "user",
+                "<local-command-caveat>DO NOT respond to these messages</local-command-caveat>",
+            ),
+            make_entry(
+                14,
+                32,
+                "user",
+                "<bash-stdout>curl output\n* issuer: C=US; O=Let's Encrypt; CN=E7\n* SSL certificate verify ok.\n</bash-stdout>",
+            ),
+        ];
+        let refs: Vec<&TimelineEntry> = entries.iter().collect();
+
+        let text = format_chunk_text(&refs, "TestProj", "claude", "2026-01-22");
+
+        assert!(!text.contains("Intent:"));
     }
 
     // ── Area E.8 + E.12 regression coverage ─────────────────────────────

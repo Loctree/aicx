@@ -1,6 +1,7 @@
 use super::*;
 use crate::oracle::OracleStatus;
 use crate::sources::shared::{IntentLineModality, intent_line_modality};
+use filetime::{FileTime, set_file_mtime};
 use std::fs;
 use std::path::PathBuf;
 
@@ -67,6 +68,141 @@ fn extract_demo_records(label: &str, body: &str) -> Vec<IntentRecord> {
     let records = extract_intents_from_root_at(&config, &root, now).expect("extract intents");
     let _ = fs::remove_dir_all(root);
     records
+}
+
+#[test]
+fn local_command_artifacts_do_not_become_intents() {
+    let root = migration_test_root("local-command-artifact-intent");
+    let _ = fs::remove_dir_all(&root);
+    write_chunk(
+        &root,
+        "demo",
+        "2026-03-15",
+        "120000_codex-001.md",
+        r#"[project: demo | agent: claude | date: 2026-03-15 | frame_kind: user_msg]
+
+[signals]
+Intent:
+- Next steps:
+- *  issuer: C=US; O=Let's Encrypt; CN=E7
+[/signals]
+
+[12:00:00] user: <local-command-caveat>DO NOT respond to these messages</local-command-caveat>
+[12:00:00] user: <bash-stdout>curl output
+* subjectAltName: host "api.libraxis.cloud" matched cert's "api.libraxis.cloud"
+* issuer: C=US; O=Let's Encrypt; CN=E7
+* SSL certificate verify ok.
+</bash-stdout>
+"#,
+    );
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        min_confidence: None,
+        kind_filter: Some(IntentKind::Intent),
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+    let records = extract_intents_from_root_at(&config, &root, now).expect("extract intents");
+    assert!(
+        records.is_empty(),
+        "local command artifacts leaked: {records:?}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn pasted_skill_doc_outline_does_not_become_intent() {
+    let root = migration_test_root("pasted-skill-doc-outline");
+    let _ = fs::remove_dir_all(&root);
+    write_chunk(
+        &root,
+        "demo",
+        "2026-03-15",
+        "120000_claude-001.md",
+        r#"[project: demo | agent: claude | date: 2026-03-15 | frame_kind: user_msg]
+
+[signals]
+Intent:
+- 10. Use `cron` to keep heartbeat and schedule the next step when the session
+- Input: "You drive. I want this local AI stack to feel production-ready."
+Notes:
+- Base directory for this skill: /Users/maciejgad/.claude/skills/vc-ownership
+[/signals]
+
+[12:00:00] user: Base directory for this skill: /Users/maciejgad/.claude/skills/vc-ownership
+
+# vc-ownership
+
+10. Use `cron` to keep heartbeat and schedule the next step when the session
+"#,
+    );
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        min_confidence: None,
+        kind_filter: Some(IntentKind::Intent),
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+    let records = extract_intents_from_root_at(&config, &root, now).expect("extract intents");
+    assert!(records.is_empty(), "skill doc outline leaked: {records:?}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn collapse_session_merges_exact_daily_duplicates_across_session_forks() {
+    let make_record = |session_id: &str, source_chunk: &str| IntentRecord {
+        kind: IntentKind::Intent,
+        summary: "przerobimy ScreenScribe na portal".to_string(),
+        context: None,
+        evidence: vec![],
+        project: "VetCoders/ScreenScribe".to_string(),
+        agent: "codex".to_string(),
+        date: "2026-05-31".to_string(),
+        timestamp: None,
+        session_id: session_id.to_string(),
+        count: None,
+        first_chunk: None,
+        last_chunk: None,
+        source_chunk: source_chunk.to_string(),
+        source: None,
+    };
+
+    let records = vec![
+        make_record("fork-a", "a.md"),
+        make_record("fork-b", "b.md"),
+        make_record("fork-c", "c.md"),
+    ];
+    let collapsed = apply_display_filters(
+        records,
+        &IntentDisplayFilters {
+            collapse_session: true,
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(collapsed.len(), 1);
+    assert_eq!(collapsed[0].count, Some(3));
+    assert!(collapsed[0].source_chunk.contains("a.md"));
+    assert!(collapsed[0].source_chunk.contains("b.md"));
+    assert!(collapsed[0].source_chunk.contains("c.md"));
 }
 
 #[test]
@@ -390,6 +526,65 @@ fn extraction_stats_report_scanned_chunks_and_candidates_before_display_filters(
     assert_eq!(extraction.stats.candidate_count, extraction.records.len());
     assert!(extraction.stats.candidate_count >= 2);
     assert!(extraction.stats.source_paths_verified);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn hours_filter_uses_canonical_chunk_date_not_mtime() {
+    let tmp = std::env::temp_dir().join(format!(
+        "ai-contexters-intents-{}-canonical-date",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+
+    write_chunk(
+        &tmp,
+        "demo",
+        "2026-03-01",
+        "120000_codex-001.md",
+        "[signals]\nIntent:\n- stale synced intent\n[/signals]\n",
+    );
+    write_chunk(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "120500_codex-002.md",
+        "[signals]\nIntent:\n- fresh canonical intent\n[/signals]\n",
+    );
+    let stale_path = chunk_path(&tmp, "demo", "2026-03-01", "120000_codex-001.md");
+    let fresh_mtime = FileTime::from_unix_time(1_773_580_800, 0); // 2026-03-15T12:00:00Z
+    set_file_mtime(&stale_path, fresh_mtime).expect("set stale mtime");
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+
+    assert!(
+        records
+            .iter()
+            .any(|record| record.summary == "fresh canonical intent")
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.summary == "stale synced intent"),
+        "mtime drift must not make stale canonical chunks fresh: {records:?}"
+    );
 
     let _ = fs::remove_dir_all(tmp);
 }

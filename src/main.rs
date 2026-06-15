@@ -226,6 +226,13 @@ impl SourceProtectionBackend {
 
 #[derive(Debug, Subcommand)]
 enum SessionsCommand {
+    /// Print the current agent session id for commit trailers and handoffs.
+    Current {
+        /// Emit JSON with source metadata instead of the bare session id
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
+
     /// List discovered agent sessions, newest first.
     List {
         /// Restrict to sessions whose repo/cwd matches the current directory.
@@ -1457,7 +1464,7 @@ enum Commands {
     ///
     /// This closes the discover -> read loop: pass a path from `aicx search`,
     /// `aicx refs --emit paths`, dashboard `/api/chunk`, or MCP search results.
-    #[command(display_order = 14)]
+    #[command(display_order = 14, visible_alias = "open")]
     Read {
         /// Absolute path, store-relative path, file name, legacy compact ref, or `chunk:<id>`
         reference: String,
@@ -3016,6 +3023,7 @@ fn run_clarify(
 
 fn run_sessions_command(command: SessionsCommand) -> Result<()> {
     match command {
+        SessionsCommand::Current { json } => run_sessions_current(json),
         SessionsCommand::List {
             cwd,
             agent,
@@ -3034,6 +3042,16 @@ fn run_sessions_command(command: SessionsCommand) -> Result<()> {
             format,
         } => run_session_report(&session_id, agent, hours, repo, max, &format),
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CurrentSessionPayload {
+    session_id: String,
+    source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_path: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -3207,6 +3225,95 @@ fn run_session_show(session_id: String, format: &str) -> Result<()> {
     Ok(())
 }
 
+const CURRENT_SESSION_ENV_KEYS: &[(&str, Option<&str>)] = &[
+    ("AICX_SESSION_ID", None),
+    ("CODEX_THREAD_ID", Some("codex")),
+    ("CODEX_SESSION_ID", Some("codex")),
+    ("CLAUDE_SESSION_ID", Some("claude")),
+    ("CLAUDE_CODE_SESSION_ID", Some("claude")),
+    ("GEMINI_SESSION_ID", Some("gemini")),
+    ("JUNIE_SESSION_ID", Some("junie")),
+];
+
+fn run_sessions_current(json: bool) -> Result<()> {
+    let current = current_session_from_env().or_else(|| current_session_from_disk().ok().flatten());
+    let Some(current) = current else {
+        anyhow::bail!(
+            "could not resolve current session id from env or recent sessions for this cwd"
+        );
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&current)?);
+    } else {
+        println!("{}", current.session_id);
+    }
+    Ok(())
+}
+
+fn current_session_from_env() -> Option<CurrentSessionPayload> {
+    current_session_from_env_lookup(|key| std::env::var(key).ok())
+}
+
+fn current_session_from_env_lookup(
+    mut get: impl FnMut(&str) -> Option<String>,
+) -> Option<CurrentSessionPayload> {
+    for (key, agent) in CURRENT_SESSION_ENV_KEYS {
+        let Some(value) = get(key).map(|value| value.trim().to_string()) else {
+            continue;
+        };
+        if value.is_empty() {
+            continue;
+        }
+        return Some(CurrentSessionPayload {
+            session_id: value,
+            source: format!("env:{key}"),
+            agent: agent.map(str::to_string),
+            repo_path: None,
+        });
+    }
+    None
+}
+
+fn current_session_from_disk() -> Result<Option<CurrentSessionPayload>> {
+    let home = dirs::home_dir().context("No home dir")?;
+    let here = std::env::current_dir()?.to_string_lossy().into_owned();
+    let since_dt = Utc::now() - chrono::Duration::days(7);
+    let modified_after = std::time::SystemTime::UNIX_EPOCH
+        + std::time::Duration::from_secs(since_dt.timestamp().max(0) as u64);
+
+    let mut discovered = Vec::new();
+    discovered.extend(sessions::discover_claude_sessions(
+        &home.join(".claude").join("projects"),
+        Some(modified_after),
+        Some(&here),
+    ));
+    discovered.extend(sessions::discover_codex_sessions(
+        &home.join(".codex").join("sessions"),
+        Some(modified_after),
+    ));
+    discovered.extend(sessions::discover_gemini_sessions(
+        &home.join(".gemini").join("tmp"),
+        Some(modified_after),
+        Some(&here),
+    ));
+    discovered.extend(sessions::discover_junie_sessions(
+        &home.join(".junie").join("sessions"),
+        Some(modified_after),
+    ));
+
+    let mut selected = sessions::select_sessions(discovered, Some(&here), None, Some(since_dt), 1);
+    let Some(info) = selected.pop() else {
+        return Ok(None);
+    };
+    Ok(Some(CurrentSessionPayload {
+        session_id: info.session_id,
+        source: "disk:newest-cwd".to_string(),
+        agent: Some(info.agent),
+        repo_path: info.repo_path,
+    }))
+}
+
 fn parse_since_date(s: &str) -> Result<DateTime<Utc>> {
     let nd = NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .with_context(|| format!("invalid --since date '{s}' (expected YYYY-MM-DD)"))?;
@@ -3297,28 +3404,39 @@ fn run_sessions_list(
                 eprintln!("No sessions found.");
                 return Ok(());
             }
+            let session_width = selected
+                .iter()
+                .map(|s| s.session_id.chars().count())
+                .max()
+                .unwrap_or(0)
+                .max("SESSION".len());
             println!(
-                "{:<10}  {:<6}  {:<22}  {:<25}  {:>5}  {:>4}  {:<8}  TITLE",
-                "SESSION", "AGENT", "PROJECT", "UPDATED (UTC)", "MSGS", "USR", "ASSOC"
+                "{:<session_width$}  {:<6}  {:<18}  {:<18}  {:<20}  {:>8}  USR",
+                "SESSION", "AGENT", "PROJECT", "PATH", "UPDATED (TZ)", "MSGS"
             );
             for s in &selected {
-                let sid = session_id_table_prefix(&s.session_id);
-                let project = s.project.as_deref().unwrap_or("-");
+                let sid = session_id_table_value(&s.session_id);
+                let project = session_project_label(s);
+                let user = session_user_label(s);
+                let path = s
+                    .repo_path
+                    .as_deref()
+                    .map(compact_repo_path)
+                    .unwrap_or_else(|| "-".to_string());
                 let updated = s
                     .updated_at
-                    .map(|t| t.to_rfc3339())
+                    .map(format_session_table_time)
                     .unwrap_or_else(|| "(no timestamp)".to_string());
-                let assoc = format!("{:?}", s.association).to_lowercase();
+                let messages = format!("{}({}u)", s.message_count, s.user_message_count);
                 println!(
-                    "{:<10}  {:<6}  {:<22}  {:<25}  {:>5}  {:>4}  {:<8}  {}",
+                    "{:<session_width$}  {:<6}  {:<18}  {:<18}  {:<20}  {:>8}  {}",
                     sid,
                     s.agent,
-                    truncate_table_cell(project, 22),
+                    truncate_table_cell(&project, 18),
+                    truncate_table_cell(&path, 18),
                     updated,
-                    s.message_count,
-                    s.user_message_count,
-                    assoc,
-                    truncate_table_cell(s.title.as_deref().unwrap_or(""), 60),
+                    messages,
+                    user,
                 );
             }
         }
@@ -3326,11 +3444,77 @@ fn run_sessions_list(
     Ok(())
 }
 
-/// First 8 chars of a session id for the sessions table — char-safe. Ids
-/// normally are ASCII uuids, but the file-stem fallback can carry non-ASCII;
-/// a byte slice would panic on a multibyte boundary.
-fn session_id_table_prefix(id: &str) -> String {
-    id.chars().take(8).collect()
+/// Full session id for the sessions table. This command is the operator's
+/// discovery surface for copy/pasting ids into `show`, `report`, and `extract`.
+fn session_id_table_value(id: &str) -> String {
+    id.to_string()
+}
+
+fn session_project_label(session: &sessions::SessionInfo) -> String {
+    session
+        .repo_path
+        .as_deref()
+        .and_then(|path| aicx::parser::segmentation::infer_tiered_identity_from_cwd(Some(path)))
+        .map(|tiered| tiered.identity.slug())
+        .or_else(|| session.project.clone())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn compact_repo_path(path: &str) -> String {
+    let normalized = if let Some(home) =
+        dirs::home_dir().and_then(|path| path.into_os_string().into_string().ok())
+        && let Some(stripped) = path.strip_prefix(&format!("{home}/"))
+    {
+        format!("~/{stripped}")
+    } else {
+        path.to_string()
+    };
+
+    let Some(stripped) = normalized.strip_prefix("~/") else {
+        return normalized;
+    };
+    let parts = stripped
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() < 3 {
+        return normalized;
+    }
+    let mut compact = String::from("~");
+    for part in &parts[..parts.len() - 1] {
+        compact.push('/');
+        compact.push(part.chars().next().unwrap_or('-'));
+    }
+    compact.push('/');
+    compact.push_str(parts.last().copied().unwrap_or("-"));
+    compact
+}
+
+fn session_user_label(session: &sessions::SessionInfo) -> String {
+    session
+        .repo_path
+        .as_deref()
+        .and_then(user_from_users_path)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn user_from_users_path(path: &str) -> Option<String> {
+    let mut parts = Path::new(path).components().peekable();
+    while let Some(component) = parts.next() {
+        if component.as_os_str().to_string_lossy() == "Users"
+            && let Some(user) = parts.next()
+        {
+            let user = user.as_os_str().to_string_lossy();
+            if !user.is_empty() {
+                return Some(user.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn format_session_table_time(time: DateTime<Utc>) -> String {
+    format!("{}(+0)", time.format("%Y-%m-%dT%H:%M"))
 }
 
 /// Char-boundary-safe cell truncation for table output (never byte-slices a
@@ -3502,6 +3686,24 @@ struct IntentsDisplayOptions<'a> {
     unresolved_mode: aicx::intents::UnresolvedMode,
     collapse_session: bool,
 }
+
+#[derive(Debug)]
+struct IntentPackSection {
+    title: &'static str,
+    records: Vec<intents::IntentRecord>,
+}
+
+#[derive(Debug)]
+struct IntentPackKeywordHit {
+    section: &'static str,
+    keyword: &'static str,
+    date: String,
+    agent: String,
+    summary: String,
+    source_chunk: String,
+}
+
+const DEFAULT_INTENTS_PACK_LIMIT: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IntentsProjectResolution {
@@ -3938,6 +4140,11 @@ fn run_intents(
         .into_iter()
         .collect();
 
+    if should_render_intents_pack(&filters, emit, kind, unresolved, collapse_session) {
+        run_intents_pack(&effective_projects, hours, &filters, strict, min_confidence)?;
+        return Ok(());
+    }
+
     let config = intents::IntentsConfig {
         project: effective_projects.first().cloned().unwrap_or_default(),
         hours,
@@ -4020,6 +4227,331 @@ fn run_intents(
     }
 
     Ok(())
+}
+
+fn should_render_intents_pack(
+    filters: &RetrievalFilters,
+    emit: &str,
+    kind: Option<&str>,
+    unresolved: bool,
+    collapse_session: bool,
+) -> bool {
+    emit == "markdown"
+        && kind.is_none()
+        && !unresolved
+        && !collapse_session
+        && filters.frame_kind.is_none()
+}
+
+fn run_intents_pack(
+    projects: &[String],
+    hours: u64,
+    filters: &RetrievalFilters,
+    strict: bool,
+    min_confidence: Option<u8>,
+) -> Result<()> {
+    let lane_sort = filters.sort.unwrap_or(SortOrder::Newest);
+    let lane_limit = filters.limit.or(Some(DEFAULT_INTENTS_PACK_LIMIT));
+    let decisions = extract_intents_pack_lane(
+        projects,
+        hours,
+        filters,
+        strict,
+        min_confidence,
+        Some(intents::IntentKind::Decision),
+        None,
+        false,
+        false,
+        lane_sort,
+        lane_limit,
+    )?;
+    let tasks = extract_intents_pack_lane(
+        projects,
+        hours,
+        filters,
+        strict,
+        min_confidence,
+        Some(intents::IntentKind::Task),
+        None,
+        true,
+        false,
+        lane_sort,
+        lane_limit,
+    )?;
+    let user_msg = extract_intents_pack_lane(
+        projects,
+        hours,
+        filters,
+        strict,
+        min_confidence,
+        Some(intents::IntentKind::Intent),
+        Some(timeline::FrameKind::UserMsg),
+        true,
+        false,
+        lane_sort,
+        lane_limit,
+    )?;
+    let agent_reply = extract_intents_pack_lane(
+        projects,
+        hours,
+        filters,
+        strict,
+        min_confidence,
+        Some(intents::IntentKind::Outcome),
+        Some(timeline::FrameKind::AgentReply),
+        true,
+        false,
+        lane_sort,
+        lane_limit,
+    )?;
+    let unresolved = extract_intents_pack_lane(
+        projects,
+        hours,
+        filters,
+        strict,
+        min_confidence,
+        Some(intents::IntentKind::Intent),
+        None,
+        false,
+        true,
+        lane_sort,
+        lane_limit,
+    )?;
+
+    let sections = vec![
+        IntentPackSection {
+            title: "Decisions",
+            records: decisions,
+        },
+        IntentPackSection {
+            title: "Tasks",
+            records: tasks,
+        },
+        IntentPackSection {
+            title: "Human Intent",
+            records: user_msg,
+        },
+        IntentPackSection {
+            title: "Agent Claims / Self-Reports",
+            records: agent_reply,
+        },
+        IntentPackSection {
+            title: "Unresolved Human Intent",
+            records: unresolved,
+        },
+    ];
+    let project_label = if projects.is_empty() {
+        "(all projects)".to_string()
+    } else {
+        projects.join(", ")
+    };
+    print!(
+        "{}",
+        format_intents_pack_markdown(&project_label, hours, lane_limit, &sections)
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_intents_pack_lane(
+    projects: &[String],
+    hours: u64,
+    filters: &RetrievalFilters,
+    strict: bool,
+    min_confidence: Option<u8>,
+    kind_filter: Option<intents::IntentKind>,
+    frame_kind: Option<timeline::FrameKind>,
+    collapse_session: bool,
+    unresolved: bool,
+    sort: SortOrder,
+    limit: Option<usize>,
+) -> Result<Vec<intents::IntentRecord>> {
+    let config = intents::IntentsConfig {
+        project: projects.first().cloned().unwrap_or_default(),
+        hours,
+        strict,
+        min_confidence,
+        kind_filter: if unresolved { None } else { kind_filter },
+        frame_kind,
+    };
+    let extraction = intents::extract_intents_with_stats_for_projects(&config, projects)?;
+    let (date_lo, date_hi) = intent_date_bounds(filters)?;
+    let mut records = intents::apply_display_filters(
+        extraction.records,
+        &intents::IntentDisplayFilters {
+            unresolved,
+            unresolved_mode: intents::UnresolvedMode::Session,
+            collapse_session,
+            agent: filters.agent.clone(),
+            date_lo,
+            date_hi,
+            sort: Some(match sort {
+                SortOrder::Newest | SortOrder::Score => intents::IntentSortOrder::Newest,
+                SortOrder::Oldest => intents::IntentSortOrder::Oldest,
+            }),
+            limit,
+        },
+    );
+    if unresolved && let Some(kind) = kind_filter {
+        records.retain(|record| record.kind == kind);
+    }
+    Ok(records)
+}
+
+fn intent_date_bounds(filters: &RetrievalFilters) -> Result<(Option<String>, Option<String>)> {
+    if let Some(ref d) = filters.since {
+        let bounds = parse_date_filter(d)?;
+        Ok((bounds.0, bounds.1))
+    } else {
+        Ok((None, filters.until.clone()))
+    }
+}
+
+fn format_intents_pack_markdown(
+    project_label: &str,
+    hours: u64,
+    per_section_limit: Option<usize>,
+    sections: &[IntentPackSection],
+) -> String {
+    let mut out = String::new();
+    out.push_str("# Intent Report\n\n");
+    out.push_str(&format!("- project: {project_label}\n"));
+    out.push_str(&format!("- window_hours: {hours}\n"));
+    if let Some(limit) = per_section_limit {
+        out.push_str(&format!("- per_section_limit: {limit}\n"));
+    }
+    out.push_str("- source: canonical corpus\n\n");
+
+    for section in sections {
+        out.push_str(&format!("## {}\n\n", section.title));
+        if section.records.is_empty() {
+            out.push_str("_No records._\n\n");
+            continue;
+        }
+        for record in &section.records {
+            format_pack_record(&mut out, record);
+        }
+    }
+
+    let hits = collect_intents_pack_keyword_hits(sections);
+    out.push_str("## Mission Keyword Hits\n\n");
+    if hits.is_empty() {
+        out.push_str("_No mission keyword hits._\n");
+    } else {
+        for hit in hits {
+            out.push_str(&format!(
+                "- `{}` in {} | {} | {}: {}\n",
+                hit.keyword, hit.section, hit.date, hit.agent, hit.summary
+            ));
+            for source_chunk in unique_source_chunks(&hit.source_chunk) {
+                out.push_str(&format!("  source_chunk: {source_chunk}\n"));
+            }
+        }
+    }
+
+    out
+}
+
+fn format_pack_record(out: &mut String, record: &intents::IntentRecord) {
+    let count = record
+        .count
+        .filter(|count| *count > 1)
+        .map(|count| format!(" ({count}x)"))
+        .unwrap_or_default();
+    out.push_str(&format!(
+        "### {}{} | {} | {}\n",
+        record.kind.heading(),
+        count,
+        record.agent,
+        record.date
+    ));
+    out.push_str(&format!("{}: {}\n", record.kind.heading(), record.summary));
+    out.push_str(&format!(
+        "WHY: {}\n",
+        record.context.as_deref().unwrap_or("not captured")
+    ));
+    out.push_str("EVIDENCE:\n");
+    for source_chunk in unique_source_chunks(&record.source_chunk) {
+        out.push_str(&format!("- source_chunk: {source_chunk}\n"));
+    }
+    for evidence in &record.evidence {
+        out.push_str(&format!("- {}\n", evidence));
+    }
+    out.push('\n');
+}
+
+fn unique_source_chunks(source_chunk: &str) -> Vec<&str> {
+    let mut seen = BTreeSet::new();
+    source_chunk
+        .split(", ")
+        .filter_map(|chunk| {
+            let chunk = chunk.trim();
+            if chunk.is_empty() || !seen.insert(chunk) {
+                None
+            } else {
+                Some(chunk)
+            }
+        })
+        .collect()
+}
+
+fn collect_intents_pack_keyword_hits(sections: &[IntentPackSection]) -> Vec<IntentPackKeywordHit> {
+    const KEYWORDS: &[&str] = &[
+        "clean repo",
+        "public seed",
+        "fresh history",
+        "vista-leak",
+        "privacy",
+        "secret",
+        "depr",
+        "push",
+        "public flip",
+        "fresh-clone",
+        "p0",
+        "p1",
+        "p2",
+        "p3",
+        "p4",
+    ];
+
+    let mut hits = Vec::new();
+    let mut seen = BTreeSet::new();
+    for section in sections {
+        for record in &section.records {
+            let haystack = format!(
+                "{}\n{}\n{}\n{}",
+                record.summary,
+                record.context.as_deref().unwrap_or(""),
+                record.evidence.join("\n"),
+                record.source_chunk
+            )
+            .to_lowercase();
+            for keyword in KEYWORDS {
+                if !haystack.contains(keyword) {
+                    continue;
+                }
+                let seen_key = (
+                    section.title,
+                    *keyword,
+                    record.date.as_str(),
+                    record.agent.as_str(),
+                    record.summary.as_str(),
+                );
+                if !seen.insert(seen_key) {
+                    continue;
+                }
+                hits.push(IntentPackKeywordHit {
+                    section: section.title,
+                    keyword,
+                    date: record.date.clone(),
+                    agent: record.agent.clone(),
+                    summary: record.summary.clone(),
+                    source_chunk: record.source_chunk.clone(),
+                });
+            }
+        }
+    }
+    hits
 }
 
 fn run_tail(

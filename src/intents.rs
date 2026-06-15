@@ -307,21 +307,27 @@ fn collect_chunk_files(
             continue;
         }
 
-        let timestamp = file
-            .path
-            .metadata()
-            .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .map(DateTime::<Utc>::from)
+        // Recency is anchored to the canonical chunk date encoded in the store
+        // layout. Filesystem mtime drifts during daily sync/migration and must
+        // not make stale sessions look fresh.
+        let canonical_date = NaiveDate::parse_from_str(&file.date_iso, "%Y-%m-%d").ok();
+        let timestamp = canonical_date
+            .and_then(|date| combine_date_time(date, "000000"))
             .or_else(|| {
-                NaiveDate::parse_from_str(&file.date_iso, "%Y-%m-%d")
+                file.path
+                    .metadata()
                     .ok()
-                    .and_then(|date| combine_date_time(date, "000000"))
+                    .and_then(|metadata| metadata.modified().ok())
+                    .map(DateTime::<Utc>::from)
             });
         let Some(timestamp) = timestamp else {
             continue;
         };
-        if timestamp < cutoff {
+        if let Some(date) = canonical_date {
+            if date < cutoff.date_naive() {
+                continue;
+            }
+        } else if timestamp < cutoff {
             continue;
         }
 
@@ -550,6 +556,9 @@ fn extract_signal_candidates(
         }
 
         let payload = strip_signal_bullet(line);
+        if is_source_metadata_line(payload) || is_local_command_artifact_line(payload) {
+            continue;
+        }
         let kind = match section {
             SignalSection::Intent => Some(IntentKind::Intent),
             SignalSection::Decision => Some(IntentKind::Decision),
@@ -579,6 +588,9 @@ fn extract_transcript_candidates(
 
     for entry in transcript_entries {
         let is_user = entry.role.eq_ignore_ascii_case("user");
+        if is_user && is_local_command_artifact_entry(entry) {
+            continue;
+        }
         let mut codescribe_parser = CodescribeParser::new();
 
         for (index, raw_line) in entry.lines.iter().enumerate() {
@@ -588,6 +600,9 @@ fn extract_transcript_candidates(
                 continue;
             }
             if is_source_metadata_line(line) {
+                continue;
+            }
+            if is_local_command_artifact_line(line) {
                 continue;
             }
 
@@ -634,6 +649,45 @@ fn extract_transcript_candidates(
     }
 
     (candidates, task_events)
+}
+
+fn is_local_command_artifact_entry(entry: &TranscriptEntry) -> bool {
+    entry
+        .lines
+        .iter()
+        .take(3)
+        .any(|line| is_local_command_artifact_line(line))
+}
+
+fn is_local_command_artifact_line(line: &str) -> bool {
+    let trimmed = strip_signal_bullet(line).trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("<local-command-caveat")
+        || lower.starts_with("</local-command-caveat")
+        || lower.starts_with("<bash-stdout")
+        || lower.starts_with("</bash-stdout")
+        || lower.starts_with("<bash-stderr")
+        || lower.starts_with("</bash-stderr")
+    {
+        return true;
+    }
+
+    let shell_line = trimmed.trim_start_matches(['*', '>', '<']).trim_start();
+    let shell_lower = shell_line.to_ascii_lowercase();
+    shell_lower.starts_with("issuer:")
+        || shell_lower.starts_with("subject:")
+        || shell_lower.starts_with("subjectaltname:")
+        || shell_lower.starts_with("ssl certificate")
+        || shell_lower.starts_with("alpn:")
+        || shell_lower.starts_with("http/")
+        || shell_lower.starts_with("server:")
+        || shell_lower.starts_with("content-type:")
+        || shell_lower.starts_with("x-ratelimit-")
+        || shell_lower.starts_with("x-request-id:")
+        || shell_lower.starts_with("strict-transport-security:")
+        || shell_lower.starts_with("content-security-policy:")
+        || shell_lower.starts_with("referrer-policy:")
+        || shell_lower.starts_with("permissions-policy:")
 }
 
 fn infer_kind_from_line(line: &str, is_user_line: bool) -> Option<IntentKind> {
@@ -871,6 +925,13 @@ fn is_source_metadata_line(line: &str) -> bool {
         "project:",
         "author:",
         "heading:",
+        "input:",
+        "output:",
+        "\"output\":",
+        "current topic:",
+        "topic summary:",
+        "successfully created and wrote to new file:",
+        "base directory for this skill:",
     ]
     .iter()
     .any(|prefix| lower.starts_with(prefix))
@@ -1198,7 +1259,28 @@ fn is_metadata_only_summary(text: &str) -> bool {
     {
         return true;
     }
+    if trimmed.ends_with(':') && words.len() <= 4 && !trimmed.contains("://") {
+        return true;
+    }
+    if is_numbered_reference_item(trimmed) {
+        return true;
+    }
     false
+}
+
+fn is_numbered_reference_item(text: &str) -> bool {
+    let Some(first) = text.split_whitespace().next() else {
+        return false;
+    };
+    let marker = first.trim_end_matches(['.', ')']);
+    if marker.is_empty() || !marker.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    text.contains('`')
+        || lower.contains(" when the ")
+        || lower.contains("must ")
+        || lower.contains("should ")
 }
 
 /// Detects the "1 Foo | 2 Bar" pattern that appears as `context` when the

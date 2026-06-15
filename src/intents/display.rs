@@ -242,6 +242,7 @@ pub fn apply_display_filters(
     }
 
     if filters.collapse_session {
+        records = collapse_exact_daily_duplicates(records);
         let mut map: HashMap<String, IntentRecord> = HashMap::new();
         let mut order = Vec::new();
         for rec in records {
@@ -250,19 +251,16 @@ pub fn apply_display_filters(
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     order.push(key);
                     let mut clone = rec.clone();
-                    clone.count = Some(1);
+                    clone.count = Some(rec.count.unwrap_or(1));
                     entry.insert(clone);
                 }
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                     let existing = entry.get_mut();
-                    *existing.count.as_mut().unwrap() += 1;
+                    *existing.count.as_mut().unwrap() += rec.count.unwrap_or(1);
                     if !existing.evidence.contains(&rec.summary) {
                         existing.evidence.push(rec.summary);
                     }
-                    if !existing.source_chunk.contains(&rec.source_chunk) {
-                        existing.source_chunk =
-                            format!("{}, {}", existing.source_chunk, rec.source_chunk);
-                    }
+                    append_unique_source_chunk(&mut existing.source_chunk, &rec.source_chunk);
                 }
             }
         }
@@ -324,6 +322,62 @@ pub fn apply_display_filters(
     }
 
     records
+}
+
+fn collapse_exact_daily_duplicates(records: Vec<IntentRecord>) -> Vec<IntentRecord> {
+    let mut map: HashMap<(IntentKind, String, String, String), IntentRecord> = HashMap::new();
+    let mut order = Vec::new();
+
+    for rec in records {
+        let key = (
+            rec.kind,
+            rec.agent.clone(),
+            rec.date.clone(),
+            normalize_display_key(&rec.summary),
+        );
+        match map.entry(key.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                order.push(key);
+                entry.insert(rec);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                let incoming_count = rec.count.unwrap_or(1);
+                let existing_count = existing.count.get_or_insert(1);
+                *existing_count += incoming_count;
+                append_unique_source_chunk(&mut existing.source_chunk, &rec.source_chunk);
+                for evidence in rec.evidence {
+                    if !existing.evidence.contains(&evidence) {
+                        existing.evidence.push(evidence);
+                    }
+                }
+            }
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|key| map.remove(&key))
+        .collect()
+}
+
+fn normalize_display_key(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn append_unique_source_chunk(target: &mut String, source_chunk: &str) {
+    if target.split(", ").any(|existing| existing == source_chunk) {
+        return;
+    }
+    if target.is_empty() {
+        target.push_str(source_chunk);
+    } else {
+        target.push_str(", ");
+        target.push_str(source_chunk);
+    }
 }
 
 pub fn format_intents_markdown(records: &[IntentRecord]) -> String {
