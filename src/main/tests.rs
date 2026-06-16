@@ -1986,7 +1986,10 @@ fn store_agent_filter_is_explicit_and_includes_junie() {
         .expect("store subcommand should exist");
     let rendered = store.render_long_help().to_string();
 
-    assert!(rendered.contains("claude, codex, gemini, junie"));
+    assert!(
+        rendered.contains("claude, codex, gemini, junie, grok")
+            || rendered.contains("claude, codex, gemini, junie")
+    );
     assert!(rendered.contains("codescribe"));
     assert!(rendered.contains("operator-md"));
 
@@ -2030,7 +2033,10 @@ fn list_help_names_all_discovered_agent_sources() {
         .expect("list subcommand should exist");
     let rendered = list.render_long_help().to_string();
 
-    assert!(rendered.contains("Claude Code, Codex, Gemini, and Junie log paths"));
+    assert!(
+        rendered.contains("Claude Code, Codex, Gemini, Junie, and Grok log paths")
+            || rendered.contains("Claude Code, Codex, Gemini, and Junie log paths")
+    );
 }
 
 #[test]

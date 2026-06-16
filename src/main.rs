@@ -240,8 +240,8 @@ enum SessionsCommand {
         #[arg(long)]
         cwd: bool,
 
-        /// Filter by agent (claude | codex | gemini | junie).
-        #[arg(long, value_parser = ["claude", "codex", "gemini", "junie"])]
+        /// Filter by agent (claude | codex | gemini | junie | grok).
+        #[arg(long, value_parser = ["claude", "codex", "gemini", "junie", "grok"])]
         agent: Option<String>,
 
         /// Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the
@@ -280,7 +280,7 @@ enum SessionsCommand {
         /// Session id (or a unique prefix).
         session_id: String,
 
-        /// Agent: claude | codex | gemini | junie. Inferred from the session
+        /// Agent: claude | codex | gemini | junie | grok. Inferred from the session
         /// id when omitted.
         #[arg(long)]
         agent: Option<String>,
@@ -311,7 +311,7 @@ enum ClaimsCommand {
         #[arg(long)]
         session: String,
 
-        /// Agent: claude | codex | gemini | junie. Inferred from the session id
+        /// Agent: claude | codex | gemini | junie | grok. Inferred from the session id
         /// when omitted.
         #[arg(long)]
         agent: Option<String>,
@@ -335,7 +335,7 @@ enum ResultsCommand {
         #[arg(long)]
         session: String,
 
-        /// Agent: claude | codex | gemini | junie. Inferred from the session id
+        /// Agent: claude | codex | gemini | junie | grok. Inferred from the session id
         /// when omitted.
         #[arg(long)]
         agent: Option<String>,
@@ -988,10 +988,10 @@ enum Commands {
         #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
 
-        /// Agent filter: one of claude, codex, gemini, junie, codescribe, operator-md.
-        /// Default: claude+codex+gemini+junie+codescribe (operator-md is opt-in
+        /// Agent filter: one of claude, codex, gemini, junie, grok, codescribe, operator-md.
+        /// Default: claude+codex+gemini+junie+grok+codescribe (operator-md is opt-in
         /// via `--agent operator-md`).
-        #[arg(short, long, value_parser = ["claude", "codex", "gemini", "junie", "codescribe", "operator-md"])]
+        #[arg(short, long, value_parser = ["claude", "codex", "gemini", "junie", "grok", "codescribe", "operator-md"])]
         agent: Option<String>,
 
         /// Hours to look back (default: 48, 0 = all time)
@@ -1108,7 +1108,7 @@ enum Commands {
         #[arg(long)]
         session: String,
 
-        /// Agent: claude | codex | gemini | junie. Inferred from the session id
+        /// Agent: claude | codex | gemini | junie | grok. Inferred from the session id
         /// when omitted.
         #[arg(long)]
         agent: Option<String>,
@@ -1994,7 +1994,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                             json,
                             aicx::cli::failure::StructuredFailure::new(
                                 "missing_required_arg",
-                                "--session requires --agent {claude|codex|gemini|junie}",
+                                "--session requires --agent {claude|codex|gemini|junie|grok}",
                                 "rerun with --agent <name>, e.g. aicx extract --session <id> --agent claude",
                             )
                             .with_fallback("aicx extract --session <ID> --agent claude"),
@@ -3238,10 +3238,14 @@ const CURRENT_SESSION_ENV_KEYS: &[(&str, Option<&str>)] = &[
     ("CLAUDE_CODE_SESSION_ID", Some("claude")),
     ("GEMINI_SESSION_ID", Some("gemini")),
     ("JUNIE_SESSION_ID", Some("junie")),
+    ("GROK_SESSION_ID", Some("grok")),
+    ("GROK_THREAD_ID", Some("grok")),
 ];
 
 fn run_sessions_current(json: bool) -> Result<()> {
-    let current = current_session_from_env().or_else(|| current_session_from_disk().ok().flatten());
+    let current = current_session_from_env()
+        .or_else(current_session_from_grok_active)
+        .or_else(|| current_session_from_disk().ok().flatten());
     let Some(current) = current else {
         anyhow::bail!(
             "could not resolve current session id from env or recent sessions for this cwd"
@@ -3258,6 +3262,34 @@ fn run_sessions_current(json: bool) -> Result<()> {
 
 fn current_session_from_env() -> Option<CurrentSessionPayload> {
     current_session_from_env_lookup(|key| std::env::var(key).ok())
+}
+
+/// Grok explicitly tracks the live session (with cwd) in ~/.grok/active_sessions.json.
+/// This gives a reliable "current" even if the transcript jsonl files use a different
+/// shape than codex rollouts (chat_history etc. don't always have session_meta).
+fn current_session_from_grok_active() -> Option<CurrentSessionPayload> {
+    let home = dirs::home_dir()?;
+    let active_path = home.join(".grok").join("active_sessions.json");
+    let content = std::fs::read_to_string(&active_path).ok()?;
+    let active: Vec<serde_json::Value> = serde_json::from_str(&content).ok()?;
+    let here = std::env::current_dir().ok()?.to_string_lossy().into_owned();
+    for entry in active {
+        if let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str()) {
+            if cwd == here {
+                if let Some(id) = entry.get("session_id").and_then(|v| v.as_str()) {
+                    if !id.trim().is_empty() {
+                        return Some(CurrentSessionPayload {
+                            session_id: id.trim().to_string(),
+                            source: "grok:active_sessions.json".to_string(),
+                            agent: Some("grok".to_string()),
+                            repo_path: Some(cwd.to_string()),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn current_session_from_env_lookup(
@@ -3304,6 +3336,10 @@ fn current_session_from_disk() -> Result<Option<CurrentSessionPayload>> {
     ));
     discovered.extend(sessions::discover_junie_sessions(
         &home.join(".junie").join("sessions"),
+        Some(modified_after),
+    ));
+    discovered.extend(sessions::discover_grok_sessions(
+        &home.join(".grok").join("sessions"),
         Some(modified_after),
     ));
 
@@ -5772,7 +5808,8 @@ fn render_resolved_store_buckets(scope: &StoreScopeSurface) -> String {
 
 const INCREMENTAL_LEGACY_NOTE: &str =
     "# Note: --incremental is now the default and will be removed in 0.8.0";
-const LEGACY_ALL_WATERMARK_AGENTS: &[&str] = &["claude", "codex", "gemini", "junie", "codescribe"];
+const LEGACY_ALL_WATERMARK_AGENTS: &[&str] =
+    &["claude", "codex", "gemini", "junie", "grok", "codescribe"];
 const LEGACY_ALL_WATERMARK_KEY: &str = "claude+codex+gemini+junie";
 
 fn normalized_source_key_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
@@ -6072,7 +6109,7 @@ fn resolve_store_agents(agent: Option<&str>) -> Result<Vec<&'static str>> {
         Some("codescribe") => Ok(vec!["codescribe"]),
         Some("operator-md") => Ok(vec!["operator-md"]),
         Some(other) => Err(anyhow::anyhow!(
-            "Unsupported --agent '{}'. Expected one of: claude, claude-history, codex, codex-sessions, gemini, junie, codescribe, operator-md.",
+            "Unsupported --agent '{}'. Expected one of: claude, claude-history, codex, codex-sessions, gemini, junie, grok, codescribe, operator-md.",
             other
         )),
         None => Ok(vec![
