@@ -40,8 +40,8 @@ const BINARY_MAPPINGS = {
     exeSuffix: "",
   },
   "@loctree/aicx-win32-x64-gnu": {
-    file: `aicx-v${VERSION}-x86_64-pc-windows-gnu-slim.zip`,
-    bundleDir: `aicx-v${VERSION}-x86_64-pc-windows-gnu-slim`,
+    file: `aicx-v${VERSION}-x86_64-pc-windows-msvc-slim.zip`,
+    bundleDir: `aicx-v${VERSION}-x86_64-pc-windows-msvc-slim`,
     archiveType: "zip",
     exeSuffix: ".exe",
   },

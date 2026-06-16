@@ -1949,7 +1949,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             warn_incremental_legacy_flag(incremental);
             warn_pending_mutation("all");
             run_extraction(ExtractionParams {
-                agents: &["claude", "codex", "gemini", "junie", "codescribe"],
+                agents: &["claude", "codex", "gemini", "junie", "grok", "codescribe"],
                 project,
                 hours,
                 output_dir: output.as_deref(),
@@ -3274,19 +3274,17 @@ fn current_session_from_grok_active() -> Option<CurrentSessionPayload> {
     let active: Vec<serde_json::Value> = serde_json::from_str(&content).ok()?;
     let here = std::env::current_dir().ok()?.to_string_lossy().into_owned();
     for entry in active {
-        if let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str()) {
-            if cwd == here {
-                if let Some(id) = entry.get("session_id").and_then(|v| v.as_str()) {
-                    if !id.trim().is_empty() {
-                        return Some(CurrentSessionPayload {
-                            session_id: id.trim().to_string(),
-                            source: "grok:active_sessions.json".to_string(),
-                            agent: Some("grok".to_string()),
-                            repo_path: Some(cwd.to_string()),
-                        });
-                    }
-                }
-            }
+        if let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str())
+            && cwd == here
+            && let Some(id) = entry.get("session_id").and_then(|v| v.as_str())
+            && !id.trim().is_empty()
+        {
+            return Some(CurrentSessionPayload {
+                session_id: id.trim().to_string(),
+                source: "grok:active_sessions.json".to_string(),
+                agent: Some("grok".to_string()),
+                repo_path: Some(cwd.to_string()),
+            });
         }
     }
     None
@@ -5810,7 +5808,7 @@ const INCREMENTAL_LEGACY_NOTE: &str =
     "# Note: --incremental is now the default and will be removed in 0.8.0";
 const LEGACY_ALL_WATERMARK_AGENTS: &[&str] =
     &["claude", "codex", "gemini", "junie", "grok", "codescribe"];
-const LEGACY_ALL_WATERMARK_KEY: &str = "claude+codex+gemini+junie";
+const LEGACY_ALL_WATERMARK_KEY: &str = "claude+codex+gemini+junie+grok+codescribe";
 
 fn normalized_source_key_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let mut normalized = parts
@@ -5855,7 +5853,11 @@ fn extraction_source_key_aliases(agents: &[&str], project: &[String]) -> Vec<Str
         aliases.push(format!(
             "claude+codex+gemini+junie+codescribe:{project_key}"
         ));
+        aliases.push(format!(
+            "claude+codex+gemini+junie+grok+codescribe:{project_key}"
+        ));
         aliases.push(format!("claude+codex+gemini:{project_key}"));
+        aliases.push(format!("claude+codex+gemini+junie:{project_key}"));
     }
     aliases
 }

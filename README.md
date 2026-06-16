@@ -1,474 +1,168 @@
-# AI Contexters
+# aicx
 
-Operator front door for agent session logs.
+**Operator front door for agent session logs.**
 
-`aicx` is store-first:
+`aicx` turns raw transcripts from Claude Code, Codex, Gemini, Grok and other agents into a clean, deduplicated, steerable **canonical corpus** at `~/.aicx/`. This corpus is ground truth.
 
-1. **Canonical corpus** (`~/.aicx/`) — extract, deduplicate, chunk, and store
-   agent session logs as steerable markdown with frontmatter metadata. This is
-   ground truth. Built by extractors (`claude`, `codex`, `all`) and `store`.
+It is store-first and operator-driven: nothing mutates your corpus unless you run a command.
 
-2. **Retrieval surfaces** — filesystem search, steering metadata, MCP tools, and
-   a reusable native embedding library. AICX stays portable; heavy retrieval
-   belongs to Roost/rust-memex.
+## The Model
 
-`aicx` owns the canonical corpus and the portable local embedding foundation.
-Roost/rust-memex owns the advanced retrieval/operator plane.
-The operator-facing oracle contract is in `docs/ORACLE_CORPUS.md`: raw source
-logs and the canonical corpus are truth; indexes are derived, rebuildable views
-that must disclose fallback and Loctree scope safety.
+### Layer 1 — Canonical corpus (the truth)
+Read local agent session logs, normalise into a single timeline schema, deduplicate, chunk into steerable markdown with rich frontmatter (agent, run_id, prompt_id, timestamps, cwd, source refs, etc.).
 
-Supported sources:
+This is the portable, human-auditable record of:
+1. what the human wanted
+2. what the agent claimed
+3. what reality proves
+4. what still requires a human decision
 
-- Claude Code: `~/.claude/projects/*/*.jsonl`
-- Codex: `~/.codex/history.jsonl`
-- Gemini CLI: `~/.gemini/tmp/<hash>/chats/session-*.json`
-- Gemini Antigravity direct extract: `~/.gemini/antigravity/conversations/<uuid>.pb` or
-  `~/.gemini/antigravity/brain/<uuid>/`
-- `loct-context-pack` (immutable structural-evidence packs from Loctree prism / polarize):
-  `aicx ingest --source loct-context-pack <PACK_DIR>` writes into the parallel **Context Corpus** at
-  `~/.aicx/context-corpus/`. See [`docs/CONTEXT_CORPUS.md`](./docs/CONTEXT_CORPUS.md).
+There is also **Layer 1b — Context corpus** for `loct` context packs (prism artifacts). These live under `~/.aicx/context-corpus/`, are excluded from normal `intents` and live-truth retrieval, and materialise into their own embeddings namespace.
 
-## Context Corpus
+### The Intents Engine ("silnik intencji")
 
-Alongside the canonical session-log store, `aicx` maintains an **immutable
-context corpus** at `~/.aicx/context-corpus/` that retains `loct-context-pack`
-prism artifacts (structural evidence consumed by `vc-polarize` gating and
-doctrine drafting). The corpus is governed by a different contract:
-append-only, operator-driven (only `aicx ingest --source loct-context-pack`
-writes to it), excluded from `aicx intents` and live-truth retrieval, and
-materialized into a separate `context-corpus.embeddings.ndjson` namespace so
-example evidence never poisons live-session truth.
+This is the real payload.
+
+**The 5-lane verification system** (the original operator flow, still visible in the command surface and in the corpus itself):
+
+1. what the human wanted
+2. what the agent claimed
+3. what reality proves
+4. what still requires a human decision
+
+**Current structured form** (via `intents` + `migrate-intent-schema`):
+
+Stored chunks are classified into a 9-type intent taxonomy. The `intents` command extracts `IntentRecord`s with `kind` (`decision`, `intent`, `outcome`, `task`, ...), confidence, state, and unresolved tracking (at session level or per-intent).
 
 ```bash
-aicx ingest --source loct-context-pack /path/to/prism-pack
-aicx doctor --check-dedup   # cross-namespace duplicate report
+aicx intents --agent grok --kind decision --unresolved --unresolved-mode intent
+aicx claims --session <id>
+aicx results --session <id> --repo .
+aicx clarify --session <id> --max 5
+aicx migrate-intent-schema --dry-run
 ```
 
-Sidecars carry `artifact_family=loct-context-pack`,
-`schema_version=context_corpus.v1`, `truth_status.role=Example`, and
-`content_sha256`. Every ingest batch produces an `index.jsonl` manifest. Full
-contract, retention path layout, and immutability filter behavior in
-[`docs/CONTEXT_CORPUS.md`](./docs/CONTEXT_CORPUS.md).
+The corpus carries the signal. `intents` is the extractor. The lane commands (`claims`, `results`, `clarify`) are the operator verification surface. `migrate-intent-schema` upgrades the corpus to the full 9-type model.
 
-## Install
+See `docs/ORACLE_CORPUS.md` for the contract: raw/canonical corpus = truth; indexes are derived, rebuildable views that must disclose `oracle_status` (freshness, scope, fallback, Loctree scope safety).
 
-Public install from GitHub Releases:
+### Layer 2 — Retrieval surfaces (optional, powerful)
+
+- `search` — semantic by default (when embedder is available); automatic filesystem-fuzzy fallback. Always returns `oracle_status`.
+- `steer` — retrieve by steering metadata (`run_id`, `prompt_id`, `agent`, `kind`, project, date, frame_kind) using sidecar data. Safe for precise, scope-narrowed re-entry.
+- `serve` (MCP server) — `aicx_search`, `aicx_steer`, `aicx_intents`, `aicx_read`, `aicx_rank`, etc.
+- `dashboard`, `reports`, `tail`, `read`.
+
+`aicx` owns the canonical corpus and the reusable local embedding foundation. Advanced retrieval lives in the companion `rust-memex` project.
+
+## Command Surface (current, from the live binary)
+
+```
+aicx — operator front door for agent session logs.
+
+Operator-driven pipeline:
+  Canonical corpus: extract, deduplicate, and chunk agent logs into
+    steerable markdown at ~/.aicx/. This is ground truth.
+  Layer 2 (optional semantic index): local embedding-backed retrieval for native builds,
+    while the canonical corpus stays portable and useful without it.
+
+Quick start:
+  aicx all -H 4                      # build canonical corpus
+```
+
+### Corpus building (Layer 1)
+- `all` — extract + store from all agents (Claude + Codex + Gemini + Junie + CodeScribe) into the canonical corpus.
+- `claude`, `codex`, `extract` (with `--format`), `store`, `ingest`.
+- `conversations` — batch-export clean conversation JSONs without writing to the store.
+
+Common powerful flags: `-H/--hours`, `--full-rescan`, `--user-only`, `--no-redact-secrets`, `--emit paths|json`, `-o` for local reports, `--loctree`.
+
+### Session surface
+- `sessions current` — the live session id (perfect for commit trailers and handoffs).
+- `sessions list`, `sessions show`, `sessions report`.
+- `list`, `sources` — raw agent logs on disk + protection status.
+
+### Intents & verification (the lanes + taxonomy)
+- `intents` — structured extraction from the corpus (`--kind decision,intent,outcome,task`, `--unresolved`, `--unresolved-mode session|intent`, `--agent`, `--frame-kind`, `--strict`, `--min-confidence`, `--collapse-session`, etc.).
+- `claims`, `results`, `clarify` — the classic 5-lane tools for a single session.
+- `migrate-intent-schema` — classify/upgrade stored chunks into the 9-type model.
+
+### Retrieval & inspection
+- `search` — semantic + fuzzy with quality scoring and `oracle_status`.
+- `steer` — metadata-driven retrieval (requires the steer index).
+- `read` (alias `open`), `tail`, `dashboard`, `reports`.
+
+### Maintenance & truth
+- `doctor` — diagnose + (optionally) repair the store and steer index.
+- `health`, `refs`, `state`, `corpus`, `sources protect`.
+
+### Integration
+- `serve` — run as MCP server.
+- `wizard` — interactive daily-driver that wires corpus, doctor, intents and store.
+- `config`.
+
+See `docs/COMMANDS.md` for the full map and every flag.
+
+## Supported Agents
+
+Claude Code, Codex (history + rollouts), Gemini (classic + Antigravity), **Grok** (full layout under `~/.grok/sessions/<encoded-cwd>/<session-uuid>/` — `chat_history.jsonl`, `events.jsonl`, `active_sessions.json`, etc.; first-class support via the same v1/responses parser + explicit current-session handling), Junie, CodeScribe, and raw operator markdown via `ingest`.
+
+## Quick Start (realistic operator flow)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Loctree/aicx/main/install.sh | AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.9.3 bash
+# 1. Build / refresh the corpus (incremental by default)
+aicx all -H 48
+
+# 2. Check what’s actually live right now
+aicx sessions current
+
+# 3. Pull structured intents (the silnik intencji)
+aicx intents --agent grok --kind decision --unresolved --limit 20
+
+# 4. Deep dive on one session with the lane tools
+aicx claims --session 019ecde7-9780-7ca0-b73b-dc931325b9d4 --agent grok
+aicx results --session 019ecde7-9780-7ca0-b73b-dc931325b9d4 --agent grok --repo .
+aicx clarify --session 019ecde7-9780-7ca0-b73b-dc931325b9d4 --agent grok --max 5
+
+# 5. Health + repair
+aicx doctor
 ```
 
-The installer downloads the matching release archive, verifies its adjacent
-`.sha256` sidecar, and installs both shipped commands:
+## Philosophy (in the project’s own words)
+
+- The canonical corpus **is** ground truth. Indexes, embeddings and dashboards are derived, rebuildable views that must always be able to tell you their `oracle_status` (freshness, scope, fallback, Loctree scope safety).
+- Store-first and operator-driven. Nothing happens behind your back.
+- Perception over memory. The raw + canonical record must remain usable even if the semantic layer is unavailable or stale.
+- No silencers. Prefer loud, actionable diagnostics over silent degradation.
+- High verification bar. Real runtime testing on the actual binary. Structural work starts with loctree before raw grep. `make check` is non-negotiable.
+
+This is not “yet another RAG over chat logs”. It is an attempt to keep the *intention record* of agent work usable and provable over time — especially when the agents are running complex, multi-day workflows with their own internal state.
+
+## Installation
 
 ```bash
-aicx --help
-aicx-mcp --version
+cargo install --locked aicx
+# with native GGUF embedder (Apple Silicon / Linux)
+cargo install --locked aicx --features native-embedder
 ```
 
-Before it writes binaries, `install.sh` scans the active install surface with
-`which -a aicx`, prints every version it can resolve, and warns if `PATH` might
-keep using another channel. After install it compares the installed binary with
-the `PATH`-resolved binary. Use `bash install.sh --dry-run` to preview shadow
-cleanup, or `AICX_INSTALL_FORCE=1` for non-interactive installs you have already
-checked.
+Prebuilt releases + the smart `install.sh` that ships with them are the recommended path for non-Rust users. See `docs/install-paths.md`.
 
-Direct release download with checksum and GPG verification:
+npm wrapper (`@loctree/aicx`) also exists.
 
-```bash
-version=0.9.0
-case "$(uname -s)-$(uname -m)" in
-  Darwin-arm64) target=aarch64-apple-darwin; ext=zip ;;
-  Linux-x86_64) target=x86_64-linux-gnu; ext=tar.gz ;;
-  *) echo "unsupported platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
-esac
+## Development
 
-asset="aicx-v${version}-${target}-slim.${ext}"
-base="https://github.com/Loctree/aicx/releases/download/v${version}"
+See `AGENTS.md`. In short: `make check` always, loctree semantic first, verify on the real built binary, no new silencers without an extremely good recorded reason.
 
-curl -fLO "${base}/${asset}"
-curl -fLO "${base}/${asset}.sha256"
-curl -fLO "${base}/${asset}.asc"
+## Links
 
-shasum -a 256 -c "${asset}.sha256"
-gpg --verify "${asset}.asc" "${asset}"
-tar -xzf "${asset}"
-```
-
-From a local checkout:
-
-```bash
-./install.sh
-```
-
-`install.sh` installs `aicx` + `aicx-mcp` from the current checkout and configures Claude Code, Codex, and Gemini when
-their MCP settings directories already exist.
-
-From a release bundle:
-
-```bash
-bash install.sh
-```
-
-Bundle install copies prebuilt `aicx` + `aicx-mcp` into `~/.local/bin`, removes stale user-local / cargo-installed
-copies, then refreshes MCP configuration.
-No Rust toolchain and no local memex compilation are required on the target machine.
-
-From an existing checkout, you can force the same release path:
-
-```bash
-AICX_INSTALL_MODE=release bash install.sh
-AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.9.0 bash install.sh
-```
-
-Current release assets are slim bundles for macOS arm64, Linux x64 GNU, and
-Windows x64 GNU. The `.sha256` sidecar is mandatory; detached `.asc` signatures
-are published with release archives.
-
-The npm wrapper track exists under `distribution/npm/` and ships platform
-packages for macOS arm64, Linux x64 GNU, and Windows x64 GNU. npm postinstall
-warns about `~/.local/bin` or cargo-bin shadows by default. Set
-`AICX_NPM_REPLACE_LOCAL=1` if npm should remove older or equal local shadows
-during install.
-
-From an accessible GitHub repo when you want unreleased source:
-
-```bash
-cargo install --git https://github.com/Loctree/aicx --locked aicx
-```
-
-Already installed the binaries?
-
-```bash
-./install.sh --skip-install
-```
-
-Manual fallback:
-
-```bash
-cargo install --path . --locked --bin aicx --bin aicx-mcp
-./install.sh --skip-install
-```
-
-`install.sh` prefers a colocated release bundle first, then a local checkout, and otherwise falls back to the published
-install path.
-
-See [`docs/install-paths.md`](./docs/install-paths.md) for the full channel map
-and shadow cleanup model.
-
-Maintainer-local signed bundle path on macOS:
-
-```bash
-make release-bundle KEYS=~/.keys
-make release-bundle KEYS=~/.keys NOTARY_PROFILE=vc-notary
-```
-
-Store a local Apple notary profile from operator-owned credentials:
-
-```bash
-set -a
-source "$HOME/.keys/.notary.env"
-set +a
-
-xcrun notarytool store-credentials "${NOTARY_PROFILE:-vc-notary}" \
-  --apple-id "$NOTARY_APPLE_ID" \
-  --team-id "$NOTARY_TEAM_ID" \
-  --password "$NOTARY_PASSWORD"
-```
-
-That release path cleans `target/<triple>` after the bundle is safely written so
-the self-hosted box does not keep hauling old release artifacts. Use `CLEAN=0`
-when you explicitly want to keep the local build outputs.
-
-Native embedder profiles:
-
-- `base` — F2LLM-v2 0.6B `Q4_K_M` GGUF, 1024 dims, about 397 MB
-- `dev` — F2LLM-v2 1.7B `Q4_K_M` GGUF, 2048 dims, about 1.1 GB
-- `premium` — F2LLM-v2 1.7B `Q6_K` GGUF, 2048 dims, about 1.4 GB
-- Picker during install: `bash install.sh --pick-embedder`
-
-Config truth:
-
-- AICX native embedder preferences live in `~/.aicx/embedder.toml` or `AICX_EMBEDDER_CONFIG`.
-- The picker writes `backend = "gguf"`, `profile`, `repo`, and exact `filename`; model hydration is explicit.
-- Roost/rust-memex retrieval config remains separate, usually `~/.rmcp-servers/rust-memex/config.toml` or
-  `RUST_MEMEX_CONFIG`.
-- Current public release bundles stay slim; they do not auto-bundle model weights.
-
-## Quickstart
-
-`aicx wizard` opens the interactive entrypoint for browsing the corpus,
-running doctor, watching store progress, and viewing the intents timeline.
-Press `?` inside the wizard for the keymap.
-
-### Library API
-
-`aicx` is also a Rust library. The supported facade is `aicx::Aicx`;
-callers do not need to import command-line internals from `main.rs`.
-
-```rust
-use aicx::prelude::*;
-
-let client = Aicx::from_env() ?;
-let status = client.index_status(None) ?;
-let chunks = client.list_chunks() ?;
-```
-
-For embedding AICX into another service, construct a handle with an explicit
-store root and write timeline entries directly:
-
-```rust
-use aicx::prelude::*;
-
-let client = Aicx::with_store_root("/tmp/aicx");
-let summary = client.store_entries( & entries, & StoreOptions::default ()) ?;
-```
-
-### Layer 1 — build the canonical corpus
-
-Extract the last 4 hours into `~/.aicx/`. Extractors are quiet on stdout by default (`--emit none`).
-
-```bash
-aicx all -H 4                      # daily driver: watermark-tracked, skips already-processed entries
-aicx all -H 0                      # all time: no lookback cutoff
-aicx store -p MyProject -H 720     # store-first: watermark-tracked refresh into the canonical corpus
-aicx store -p MyProject -H 720 --full-rescan  # explicit backfill / recovery pass
-```
-
-`-p/--project` on extractors and `store` narrows source session discovery before
-repo segmentation. One run can still resolve into multiple canonical repo buckets
-or `non-repository-contexts`; `--emit json` makes that explicit through
-`requested_source_filters` and `resolved_store_buckets`.
-
-See what landed:
-
-```bash
-aicx refs -H 4
-aicx refs -H 4 --emit paths
-aicx read store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md
-```
-
-Surface contract:
-
-- `aicx refs` is the active CLI inventory command for canonical chunks.
-- `aicx read` is the direct re-entry command for paths returned by `refs`,
-  `search`, dashboard chunk APIs, or MCP retrieval tools.
-- There is currently no `aicx rank` CLI subcommand; ranking stays on the MCP surface as `aicx_rank`.
-- `aicx init` is retired; framework bootstrap now lives in `/vc-init`.
-
-### Native local embeddings
-
-AICX ships the reusable `aicx-embeddings` library behind the
-`native-embedder` feature. The installed bundle does not carry model weights;
-the picker can write config and optionally hydrate exactly one GGUF file:
-
-```bash
-bash install.sh --pick-embedder
-hf download mradermacher/F2LLM-v2-0.6B-GGUF F2LLM-v2-0.6B.Q4_K_M.gguf
-```
-
-The config file is plain TOML:
-
-```toml
-[native_embedder]
-backend = "gguf"
-profile = "base"
-repo = "mradermacher/F2LLM-v2-0.6B-GGUF"
-filename = "F2LLM-v2-0.6B.Q4_K_M.gguf"
-prefer_embedded = false
-max_length = 512
-```
-
-Pipe one JSON payload (handy for automation):
-
-```bash
-aicx all -H 4 --emit json | jq '.store_paths'
-aicx all -H 4 --emit json | jq '.resolved_store_buckets'
-```
-
-## What Gets Written Where
-
-### Layer 1 — canonical store (extractors, `store`)
-
-- `~/.aicx/store/<organization>/<repository>/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
-- `~/.aicx/non-repository-contexts/<YYYY_MMDD>/<kind>/<agent>/<YYYY_MMDD>_<agent>_<session-id>_<chunk>.md`
-- `~/.aicx/index.json`
-
-### Native embedder config
-
-- `~/.aicx/embedder.toml` — local GGUF backend/profile/repo/filename/path preference
-- HuggingFace cache snapshots under `~/.cache/huggingface/hub/`
-
-Framework-owned repo-local context artifacts (not written by the `aicx` CLI itself):
-
-- `.ai-context/share/artifacts/SUMMARY.md`
-- `.ai-context/share/artifacts/TIMELINE.md`
-- `.ai-context/share/artifacts/TRIAGE.md`
-
-Store ignore contract:
-
-- Optional `~/.aicx/.aicxignore` excludes matching canonical chunk paths from steer indexing and downstream retrieval
-  materialization.
-- Patterns are matched relative to `~/.aicx/` using glob syntax, for example:
-
-```gitignore
-store/VetCoders/ai-contexters/**/reports/**
-!store/VetCoders/ai-contexters/**/reports/2026_0406_codex_important_001.md
-```
-
-## Common Workflows
-
-Daily “what changed?” with incremental refresh plus compact summary:
-
-```bash
-aicx all -H 24 --emit none
-aicx refs -H 24
-```
-
-Full-window backfill (ignore the stored watermark explicitly):
-
-```bash
-aicx all -H 168 --full-rescan
-```
-
-User-only mode (smaller output; excludes assistant + reasoning):
-
-```bash
-aicx claude -p CodeScribe -H 48 --user-only
-```
-
-Steering retrieval (filter chunks by frontmatter metadata):
-
-```bash
-aicx steer --run-id mrbl-001
-aicx steer --project ai-contexters --kind reports --date 2026-03-28
-aicx steer --agent claude --date 2026-03-20..2026-03-28
-```
-
-Direct chunk re-entry:
-
-```bash
-aicx search "doctor sidecars" --json
-aicx read /Users/polyversai/.aicx/store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md --max-chars 4000
-```
-
-`aicx search --json`, `aicx steer --json`, `aicx intents --emit json`, and the
-matching MCP tools include `oracle_status`. Fuzzy search is visibly marked as a
-filesystem fallback, not semantic oracle readiness.
-
-Native embedder hydration — picking the local model without bloating the bundle:
-
-```bash
-bash install.sh --pick-embedder
-cat ~/.aicx/embedder.toml
-```
-
-Heavy retrieval lives outside this CLI surface:
-
-- Use Roost/rust-memex for advanced retrieval pipelines, provider routing, and operator-scale indexing.
-- Keep Roost/rust-memex settings in its own config plane (`RUST_MEMEX_CONFIG`, usually
-  `~/.rmcp-servers/rust-memex/config.toml`).
-- Do not put the heavy retrieval provider config into `~/.aicx/embedder.toml`; that file governs only AICX local
-  embeddings.
-
-Example Roost/rust-memex provider config:
-
-```toml
-[embeddings]
-required_dimension = 2560
-
-[[embeddings.providers]]
-name = "mlx-local"
-base_url = "http://127.0.0.1:1234"
-model = "qwen3-embedding-4b"
-priority = 1
-```
-
-Single-session Gemini Antigravity extract (conversation artifacts first, explicit step-output fallback):
-
-```bash
-aicx extract --format gemini-antigravity \
-  ~/.gemini/antigravity/conversations/<uuid>.pb \
-  -o /tmp/antigravity-report.md
-```
-
-Review Vibecrafted workflow and marbles artifacts as a standalone dossier:
-
-```bash
-aicx reports \
-  --repo ai-contexters \
-  --workflow marbles \
-  --date-from 2026-04-10 \
-  --date-to 2026-04-12 \
-  -o ~/.aicx/aicx-reports.html \
-  --bundle-output ~/.aicx/aicx-reports.bundle.json
-```
-
-The generated HTML embeds the selected slice directly and can also import/export
-compatible JSON bundles client-side, so you can merge multiple workflow slices
-without standing up a server.
-
-Local browsing now shares one surface:
-
-```bash
-# Static HTML artifact (default output: ~/.aicx/aicx-dashboard.html)
-aicx dashboard --generate-html -p ai-contexters -H 24
-
-# Live local server
-aicx dashboard --serve -p ai-contexters -H 24
-
-# Remote / Tailscale server with explicit CORS policy
-aicx dashboard --serve --host 0.0.0.0 --allow-cors-origins tailscale --bg
-```
-
-The `tailscale` CORS preset accepts both tailnet IP origins and MagicDNS browser origins (`*.ts.net`).
-
-## Intent Taxonomy
-
-The intent engine classifies stored chunks into 9 semantic types with typed link relations:
-
-| Type         | What it captures                          | Initial state |
-|--------------|-------------------------------------------|---------------|
-| `intent`     | User-expressed goal or proposal           | proposed      |
-| `why`        | Motivation behind a decision              | active        |
-| `argue`      | Multi-voice disagreement or trade-off     | active        |
-| `decision`   | Crystallized choice from discussion       | active        |
-| `assumption` | Hypothesis treated as true until verified | proposed      |
-| `outcome`    | Broad result of an action                 | done          |
-| `result`     | Concrete measurable data point            | done          |
-| `question`   | Open knowledge gap                        | proposed      |
-| `insight`    | Reframe backed by research evidence       | active        |
-
-Link types: `derived_from`, `supersedes`, `verifies`, `contradicts`, `supports`, `results_in`, `answers`, `links_to`.
-
-State transitions: Proposed → Active → Done/Superseded/Contradicted. Session-level post-processing detects unresolved
-intents (no outcome after 7 days), supersedes chains (newer entry on same topic), contradicted assumptions (result +
-failure signal), and insight sourcing (DerivedFrom links to research chunks).
-
-```bash
-aicx migrate
-aicx migrate-intent-schema
-aicx migrate-intent-schema --project MyProject --dry-run
-```
-
-## Docs
-
-- `docs/ARCHITECTURE.md` (module map + data flows)
-- `docs/COMMANDS.md` (exact CLI reference + examples)
-- `docs/STORE_LAYOUT.md` (store + framework-owned `.ai-context/` layouts)
-- `docs/REDACTION.md` (secret redaction, regex engine notes)
-- `docs/SOURCE_PROTECTION.md` (opt-in local source protection and sharing policy)
-- `docs/DISTILLATION.md` (chunking/distillation model + tuning ideas)
-- `docs/RELEASES.md` (release/distribution workflow + maintainer checklist)
-
-## Notes
-
-- Secrets are redacted by default on corpus-building commands (`claude`, `codex`, `all`, `extract`, `store`). Disable
-  only if you know what you’re doing: `--no-redact-secrets`.
-- Framework integration expects `aicx` or `aicx-mcp` in `PATH`.
-- Native embedding models are never downloaded silently by package install or MCP startup.
+- Architecture & mental model: `docs/ARCHITECTURE.md`
+- Exhaustive command reference: `docs/COMMANDS.md`
+- Oracle / truth contract: `docs/ORACLE_CORPUS.md`
+- Store layout, protection, redaction: `docs/STORE_LAYOUT.md`, `docs/SOURCE_PROTECTION.md`, `docs/REDACTION.md`
+- Releases: `docs/RELEASES.md`
+- Embeddings: `docs/EMBEDDINGS.md`
 
 ---
 
-Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+Built with excessive care. The goal is not to be the best AI context tool. The goal is that six months from now you can still understand what the agents were actually doing — and prove it.
