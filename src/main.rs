@@ -147,6 +147,7 @@ enum ExtractInputFormat {
     Gemini,
     GeminiAntigravity,
     Junie,
+    Grok,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -881,7 +882,7 @@ enum Commands {
         #[command(flatten)]
         redaction: RedactionArgs,
 
-        /// Input format (agent), required in file mode: claude | codex | gemini | gemini-antigravity | junie
+        /// Input format (agent), required in file mode: claude | codex | gemini | gemini-antigravity | junie | grok
         #[arg(long, value_enum, alias = "input-format")]
         format: Option<ExtractInputFormat>,
 
@@ -2652,6 +2653,7 @@ fn extract_input_format_from_str(s: &str) -> Option<ExtractInputFormat> {
         "codex" => Some(ExtractInputFormat::Codex),
         "gemini" => Some(ExtractInputFormat::Gemini),
         "junie" => Some(ExtractInputFormat::Junie),
+        "grok" => Some(ExtractInputFormat::Grok),
         _ => None,
     }
 }
@@ -2749,7 +2751,7 @@ fn load_session_claims(
             .context("could not infer agent from session id; pass --agent")?,
     };
     let fmt = extract_input_format_from_str(&agent_str)
-        .with_context(|| format!("unknown agent '{agent_str}' (claude|codex|gemini|junie)"))?;
+        .with_context(|| format!("unknown agent '{agent_str}' (claude|codex|gemini|junie|grok)"))?;
 
     let config = ExtractionConfig {
         project_filter: Vec::new(),
@@ -2764,6 +2766,7 @@ fn load_session_claims(
             sources::extract_gemini(&config)?
         }
         ExtractInputFormat::Junie => sources::extract_junie(&config)?,
+        ExtractInputFormat::Grok => sources::extract_grok(&config)?,
     };
     let label = extract_input_format_label(fmt);
     let resolution = resolve_session_reference(session, fmt, label, &entries)?;
@@ -4721,6 +4724,7 @@ fn extract_input_format_label(format: ExtractInputFormat) -> &'static str {
         ExtractInputFormat::Gemini => "gemini",
         ExtractInputFormat::GeminiAntigravity => "gemini",
         ExtractInputFormat::Junie => "junie",
+        ExtractInputFormat::Grok => "grok",
     }
 }
 
@@ -5404,6 +5408,7 @@ fn run_extract_session(
             sources::extract_gemini(&config)?
         }
         ExtractInputFormat::Junie => sources::extract_junie(&config)?,
+        ExtractInputFormat::Grok => sources::extract_grok(&config)?,
     };
 
     let resolution = resolve_session_reference(session_id, agent, agent_label, &entries)?;
@@ -5568,6 +5573,7 @@ fn run_extract_file(
             sources::extract_gemini_antigravity_file(&input, &config)?
         }
         ExtractInputFormat::Junie => sources::extract_junie_file(&input, &config)?,
+        ExtractInputFormat::Grok => sources::extract_grok_file(&input, &config)?,
     };
 
     // Sort by timestamp (extractors should already do this).
@@ -6201,6 +6207,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             "codex" => sources::extract_codex(&config),
             "gemini" => sources::extract_gemini(&config),
             "junie" => sources::extract_junie(&config),
+            "grok" => sources::extract_grok(&config),
             "codescribe" => sources::extract_codescribe(&config),
             "operator-md" => sources::extract_operator_markdown(&config),
             _ => Ok(Vec::new()),
@@ -6719,6 +6726,8 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
             "codex-sessions" => sources::extract_codex_sessions(&config),
             "gemini" => sources::extract_gemini(&config),
             "junie" => sources::extract_junie(&config),
+            "grok" => sources::extract_grok(&config),
+            "grok-sessions" => sources::extract_grok_sessions(&config),
             "codescribe" => sources::extract_codescribe(&config),
             "operator-md" => sources::extract_operator_markdown(&config),
             _ => Ok(Vec::new()),

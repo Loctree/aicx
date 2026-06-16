@@ -405,7 +405,7 @@ pub struct SteerParams {
     pub run_id: Option<String>,
     /// Filter by prompt_id (exact match against sidecar metadata)
     pub prompt_id: Option<String>,
-    /// Filter by agent name: claude, codex, gemini (case-insensitive)
+    /// Filter by agent name: claude, codex, gemini, junie, grok (case-insensitive)
     pub agent: Option<String>,
     /// Filter by kind: conversations, plans, reports, other
     pub kind: Option<String>,
@@ -473,7 +473,7 @@ pub struct IntentsParams {
     /// Collapse multiple intents from the same session into one entry with count
     #[serde(default)]
     pub collapse_session: bool,
-    /// Optional agent filter (claude, codex, gemini, junie)
+    /// Optional agent filter (claude, codex, gemini, junie, grok)
     pub agent: Option<String>,
     /// Optional lower date bound (YYYY-MM-DD or single-day shorthand like 2026-04-23..)
     pub since: Option<String>,

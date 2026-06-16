@@ -30,9 +30,9 @@ pub use providers::{
     discover_operator_markdown_from, extract_claude, extract_claude_file, extract_claude_history,
     extract_codescribe, extract_codescribe_from_home, extract_codex, extract_codex_file,
     extract_codex_sessions, extract_gemini, extract_gemini_antigravity_file, extract_gemini_file,
-    extract_junie, extract_junie_file, extract_operator_markdown,
-    extract_operator_markdown_from_home, extract_operator_markdown_from_home_and_repo,
-    parse_codescribe_transcript,
+    extract_grok, extract_grok_file, extract_grok_sessions, extract_junie, extract_junie_file,
+    extract_operator_markdown, extract_operator_markdown_from_home,
+    extract_operator_markdown_from_home_and_repo, parse_codescribe_transcript,
 };
 pub(crate) use shared::*;
 pub use shared::{
@@ -54,6 +54,12 @@ pub fn extract_all(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     match extract_codex(config) {
         Ok(entries) => all.extend(entries),
         Err(e) => eprintln!("Codex extraction warning: {}", e),
+    }
+
+    // Grok (Codex v1/responses format under ~/.grok)
+    match extract_grok(config) {
+        Ok(entries) => all.extend(entries),
+        Err(e) => eprintln!("Grok extraction warning: {}", e),
     }
 
     // Gemini
@@ -90,6 +96,12 @@ pub fn extract_all(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     match extract_codex_sessions(config) {
         Ok(entries) => all.extend(entries),
         Err(e) => eprintln!("Codex sessions extraction warning: {}", e),
+    }
+
+    // Grok sessions (separate for parity with codex; extract_grok already includes them too)
+    match extract_grok_sessions(config) {
+        Ok(entries) => all.extend(entries),
+        Err(e) => eprintln!("Grok sessions extraction warning: {}", e),
     }
 
     // Sort by timestamp

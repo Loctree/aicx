@@ -31,6 +31,14 @@ impl SourceLocator {
             path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
         });
         locator.index_file(home.join(".codex").join("history.jsonl"));
+
+        // Grok (same rollout v1/responses jsonl format as codex, under .grok/sessions and .grok/projects)
+        locator.index_recursive(home.join(".grok").join("sessions"), |path| {
+            path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+        });
+        locator.index_recursive(home.join(".grok").join("projects"), |path| {
+            path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+        });
         locator.index_recursive(home.join(".gemini").join("tmp"), |path| {
             path.extension().and_then(|ext| ext.to_str()) == Some("json")
                 && path

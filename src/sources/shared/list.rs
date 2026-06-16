@@ -170,6 +170,46 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
         }
     }
 
+    // Grok (Codex v1/responses format): ~/.grok/sessions/<project>/<session-uuid>/*.jsonl
+    // and also check projects/ for any additional transcripts
+    let grok_sessions_dir = home.join(".grok").join("sessions");
+    if grok_sessions_dir.exists() && grok_sessions_dir.is_dir() {
+        let files = walk_jsonl_files(&grok_sessions_dir);
+        let total_size: u64 = files
+            .iter()
+            .filter_map(|f| fs::metadata(f).ok())
+            .map(|m| m.len())
+            .sum();
+        if !files.is_empty() {
+            sources.push(source_info(
+                &home,
+                "grok-sessions",
+                grok_sessions_dir,
+                files.len(),
+                total_size,
+            ));
+        }
+    }
+    // Also surface the projects dir if it has data (Grok stores per-project session dirs under it too)
+    let grok_projects_dir = home.join(".grok").join("projects");
+    if grok_projects_dir.exists() && grok_projects_dir.is_dir() {
+        let files = walk_jsonl_files(&grok_projects_dir);
+        let total_size: u64 = files
+            .iter()
+            .filter_map(|f| fs::metadata(f).ok())
+            .map(|m| m.len())
+            .sum();
+        if !files.is_empty() {
+            sources.push(source_info(
+                &home,
+                "grok-projects",
+                grok_projects_dir,
+                files.len(),
+                total_size,
+            ));
+        }
+    }
+
     // Gemini CLI: ~/.gemini/tmp/<projectHash>/chats/session-*.json[l]
     let gemini_tmp = home.join(".gemini").join("tmp");
     if gemini_tmp.exists() && gemini_tmp.is_dir() {

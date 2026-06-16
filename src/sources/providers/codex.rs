@@ -3,7 +3,7 @@ use crate::sources::*;
 use chrono::TimeZone;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::io::BufReader;
+use std::io::{BufRead, BufReader};
 
 use crate::timeline::FrameKind;
 
@@ -26,13 +26,14 @@ pub(crate) struct CodexEntry {
 /// - Codex history format (`~/.codex/history.jsonl`) — `CodexEntry` per line.
 /// - Codex session format (`~/.codex/sessions/**/**/*.jsonl`) — `CodexSessionEvent` per line.
 pub fn extract_codex_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let (entries, warnings) = parse_codex_file_with_diagnostics(path, config)?;
+    let (entries, warnings) = parse_codex_file_with_diagnostics(path, "codex", config)?;
     emit_codex_session_warnings(path, &warnings);
     Ok(entries)
 }
 
 pub(crate) fn parse_codex_file_with_diagnostics(
     path: &Path,
+    agent_label: &str,
     config: &ExtractionConfig,
 ) -> Result<(Vec<TimelineEntry>, Vec<CodexSessionWarning>)> {
     let file = sanitize::open_file_validated(path)?;
@@ -102,7 +103,12 @@ pub(crate) fn parse_codex_file_with_diagnostics(
         let mut entries = build_codex_history_entries(&history_records, config, &mut warnings);
         if !session_events.is_empty() {
             let (mut session_entries, session_warnings) =
-                parse_codex_session_events_with_diagnostics(path, &session_events, config);
+                parse_codex_session_events_with_diagnostics(
+                    path,
+                    agent_label,
+                    &session_events,
+                    config,
+                );
             warnings.extend(session_warnings);
             entries.append(&mut session_entries);
         }
@@ -607,16 +613,26 @@ pub fn extract_codex_sessions(config: &ExtractionConfig) -> Result<Vec<TimelineE
         .context("No home dir")?
         .join(".codex")
         .join("sessions");
+    extract_codex_like_sessions_at(&sessions_dir, "codex", config)
+}
 
-    if !sessions_dir.exists() || !sessions_dir.is_dir() {
+/// Internal: walk a sessions root (date-nested or Grok-style <project>/<uuid> nested) for *.jsonl,
+/// parse using the v1/responses session event format, and label everything with the given agent_label.
+/// This is the reusable "clone" implementation.
+pub(crate) fn extract_codex_like_sessions_at(
+    sessions_root: &Path,
+    agent_label: &str,
+    config: &ExtractionConfig,
+) -> Result<Vec<TimelineEntry>> {
+    if !sessions_root.exists() || !sessions_root.is_dir() {
         return Ok(vec![]);
     }
 
     let mut entries = Vec::new();
-    let files = walk_jsonl_files(&sessions_dir);
+    let files = walk_jsonl_files(sessions_root);
 
     for path in &files {
-        match parse_codex_session_file_with_diagnostics(path, config) {
+        match parse_codex_session_file_with_diagnostics(path, agent_label, config) {
             Ok((se, warnings)) => {
                 emit_codex_session_warnings(path, &warnings);
                 entries.extend(se);
@@ -631,6 +647,7 @@ pub fn extract_codex_sessions(config: &ExtractionConfig) -> Result<Vec<TimelineE
 
 pub(crate) fn parse_codex_session_file_with_diagnostics(
     path: &Path,
+    agent_label: &str,
     config: &ExtractionConfig,
 ) -> Result<(Vec<TimelineEntry>, Vec<CodexSessionWarning>)> {
     let file = sanitize::open_file_validated(path)?;
@@ -665,7 +682,7 @@ pub(crate) fn parse_codex_session_file_with_diagnostics(
     }
 
     let (entries, event_warnings) =
-        parse_codex_session_events_with_diagnostics(path, &events, config);
+        parse_codex_session_events_with_diagnostics(path, agent_label, &events, config);
     warnings.extend(event_warnings);
     Ok((entries, warnings))
 }
@@ -679,6 +696,7 @@ fn codex_line_parse_error(line_number: usize, line: &str) -> CodexSessionWarning
 
 fn parse_codex_session_events_with_diagnostics(
     path: &Path,
+    agent_label: &str,
     events: &[CodexSessionEvent],
     config: &ExtractionConfig,
 ) -> (Vec<TimelineEntry>, Vec<CodexSessionWarning>) {
@@ -911,7 +929,7 @@ fn parse_codex_session_events_with_diagnostics(
 
         entries.push(build_timeline_entry_with_content_warnings(
             timestamp,
-            "codex",
+            agent_label,
             &session_id,
             &role,
             message,
@@ -992,4 +1010,293 @@ pub(crate) fn count_codex_sessions(path: &std::path::Path) -> Result<usize> {
     }
 
     Ok(sessions.len())
+}
+
+// ============================================================================
+// Grok support (Codex v1/responses format 1:1 under ~/.grok/projects and ~/.grok/sessions)
+// ============================================================================
+
+/// Extract from a single Grok transcript file (e.g. chat_history.jsonl or events.jsonl
+/// inside a ~/.grok/sessions/<project>/<session-uuid>/ dir).
+///
+/// The line format for conversation turns is 1:1 with Codex rollout JSONL (CodexSessionEvent).
+/// We delegate to the codex parser; warnings/diagnostics are currently tagged "codex".
+pub fn extract_grok_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name == "chat_history.jsonl" {
+        // Grok stores its main conversation transcript in this file (different envelope than pure codex rollouts).
+        let (entries, warnings) = parse_grok_chat_history(path, config)?;
+        emit_codex_session_warnings(path, &warnings);
+        return Ok(entries);
+    }
+    // Delegate everything else (including any v1/responses rollout jsonl) to the codex parser.
+    // The caller is responsible for passing a grok-flavored path.
+    extract_codex_file(path, config)
+}
+
+/// Walk `~/.grok/sessions/` (and nested project-slug / uuid dirs) for *.jsonl and
+/// parse using the Codex v1/responses session event parser.
+pub fn extract_grok_sessions(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
+    let sessions_root = dirs::home_dir()
+        .context("No home dir")?
+        .join(".grok")
+        .join("sessions");
+
+    // Use the shared "codex format" walker (now parameterized) for any pure v1 jsonl files.
+    let mut entries = extract_codex_like_sessions_at(&sessions_root, "grok", config)?;
+
+    // Additionally walk for Grok-specific chat_history.jsonl (the main readable transcript log).
+    // These use a different top-level shape than pure Codex rollout events, so we need a mapper.
+    // We still reuse the same sessions_root so only one place "points" at the raw location.
+    let chat_files = walk_jsonl_files(&sessions_root)
+        .into_iter()
+        .filter(|p| p.file_name().and_then(|n| n.to_str()) == Some("chat_history.jsonl"))
+        .collect::<Vec<_>>();
+
+    for p in &chat_files {
+        if let Ok((mut chat_entries, warnings)) = parse_grok_chat_history(p, config) {
+            emit_codex_session_warnings(p, &warnings);
+            if let Some(dir_id) = grok_session_id_from_path(p) {
+                for e in &mut chat_entries {
+                    if e.session_id.is_empty() || e.session_id == "chat_history" {
+                        e.session_id = dir_id.clone();
+                    }
+                }
+            }
+            entries.extend(chat_entries);
+        }
+    }
+
+    entries.sort_by_key(|a| a.timestamp);
+    Ok(entries)
+}
+
+/// Extract Grok transcripts.
+///
+/// Prefers the session/rollout layout under ~/.grok/sessions (v1/responses).
+/// If a top-level ~/.grok/history.jsonl in legacy CodexEntry format exists, it is also included.
+pub fn extract_grok(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
+    let grok_root = dirs::home_dir().context("No home dir")?.join(".grok");
+
+    let mut entries = Vec::new();
+
+    // Optional legacy-style history.jsonl at ~/.grok/history.jsonl (CodexEntry lines)
+    let history_path = grok_root.join("history.jsonl");
+    if history_path.exists()
+        && let Ok(file) = sanitize::open_file_validated(&history_path)
+    {
+        let mut reader = BufReader::new(file);
+        let mut records = Vec::new();
+        let mut warnings = Vec::new();
+        let mut oversized_count = 0usize;
+        let mut oversized_samples = Vec::new();
+        let mut line_number = 0usize;
+
+        while let Some(limited) = sanitize::read_line_capped(&mut reader, MAX_LINE_BYTES)? {
+            line_number += 1;
+            if limited.exceeded {
+                observe_oversized_line(&mut oversized_count, &mut oversized_samples, line_number);
+                continue;
+            }
+            let line = limited.line;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(entry) = serde_json::from_str::<CodexEntry>(&line) {
+                records.push(entry);
+            }
+        }
+        if oversized_count > 0 {
+            warnings.push(CodexSessionWarning::OversizedLine {
+                count: oversized_count,
+                samples: oversized_samples,
+            });
+        }
+        let mut hist = build_codex_history_entries(&records, config, &mut warnings);
+        emit_codex_session_warnings(&history_path, &warnings);
+        entries.append(&mut hist);
+    }
+
+    // Main source: session rollouts under ~/.grok/sessions (and projects layout may surface more via the walk)
+    match extract_grok_sessions(config) {
+        Ok(sess) => entries.extend(sess),
+        Err(e) => eprintln!("Grok sessions extraction warning: {}", e),
+    }
+
+    entries.sort_by_key(|a| a.timestamp);
+    Ok(entries)
+}
+
+/// Try to derive a session id from a Grok layout path.
+/// Grok stores per-session data under ~/.grok/sessions/<encoded-project>/<uuid>/...
+/// The <uuid> dir name (e.g. 019ecde7-...) is the canonical session identifier.
+fn grok_session_id_from_path(path: &Path) -> Option<String> {
+    // Walk up a few parents looking for a dir that looks like a Grok session id (the one passed to --session).
+    let mut cur = path.parent();
+    for _ in 0..4 {
+        if let Some(dir) = cur {
+            if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+                // Common Grok/this-harness ids start with 01 or are long hex/ULID-like with dashes.
+                if name.len() >= 20
+                    && (name.starts_with("01")
+                        || name.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+                {
+                    return Some(name.to_string());
+                }
+            }
+            cur = dir.parent();
+        } else {
+            break;
+        }
+    }
+    None
+}
+
+/// Minimal parser for Grok's chat_history.jsonl (the primary human-visible transcript).
+/// Lines are not CodexSessionEvent shaped, but carry "type": "user" | "assistant" | "reasoning" | "tool_result" etc.
+/// We force the session_id from the parent directory name when present.
+/// Returns entries + content sanitization warnings so caller can emit them (no silencing).
+fn parse_grok_chat_history(
+    path: &Path,
+    config: &ExtractionConfig,
+) -> Result<(Vec<TimelineEntry>, Vec<CodexSessionWarning>)> {
+    let file = sanitize::open_file_validated(path)?;
+    let reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    let mut warnings: Vec<CodexSessionWarning> = Vec::new();
+    let mut line_no = 0usize;
+
+    let forced_session_id =
+        grok_session_id_from_path(path).unwrap_or_else(|| file_stem_string(path));
+
+    // Base timestamp: mtime of the file, or now.
+    let base_ts = fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|st| {
+            use std::time::SystemTime;
+            let dur = st.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+            Some(
+                chrono::Utc
+                    .timestamp_opt(dur.as_secs() as i64, dur.subsec_nanos())
+                    .single()
+                    .unwrap_or_else(Utc::now),
+            )
+        })
+        .unwrap_or_else(Utc::now);
+
+    for line_res in reader.lines() {
+        line_no += 1;
+        let line = match line_res {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let typ = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+
+        let (role, message, frame_kind) = match typ {
+            "user" => {
+                let text = v
+                    .get("content")
+                    .and_then(|c| c.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                ("user".to_string(), text, Some(FrameKind::UserMsg))
+            }
+            "assistant" => {
+                let mut text = v
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if text.is_empty()
+                    && let Some(calls) = v.get("tool_calls").and_then(|c| c.as_array())
+                {
+                    let names: Vec<String> = calls
+                        .iter()
+                        .filter_map(|c| c.get("name").and_then(|n| n.as_str()))
+                        .map(|s| s.to_string())
+                        .collect();
+                    if !names.is_empty() {
+                        text = format!("[tool calls: {}]", names.join(", "));
+                    }
+                }
+                ("assistant".to_string(), text, Some(FrameKind::AgentReply))
+            }
+            "reasoning" => {
+                let text = v
+                    .get("summary")
+                    .and_then(|s| s.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|p| p.get("text").and_then(|t| t.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+                (
+                    "reasoning".to_string(),
+                    text,
+                    Some(FrameKind::InternalThought),
+                )
+            }
+            "tool_result" => {
+                let text = v
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                ("tool".to_string(), text, Some(FrameKind::ToolCall))
+            }
+            "text" | "summary_text" => {
+                let text = v
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                ("assistant".to_string(), text, Some(FrameKind::AgentReply))
+            }
+            _ => continue,
+        };
+
+        if !should_keep_entry(frame_kind, config) {
+            continue;
+        }
+        if message.trim().is_empty() {
+            continue;
+        }
+
+        // Assign slightly offset timestamps to preserve order within the file.
+        let ts = base_ts + chrono::Duration::milliseconds(line_no as i64);
+
+        if ts < config.cutoff {
+            continue;
+        }
+
+        entries.push(build_timeline_entry_with_content_warnings(
+            ts,
+            "grok",
+            &forced_session_id,
+            &role,
+            message,
+            TimelineEntryMeta {
+                branch: None,
+                cwd: None,
+                frame_kind,
+                timestamp_source: None,
+            },
+            &mut warnings,
+        ));
+    }
+
+    Ok((entries, warnings))
 }

@@ -919,6 +919,12 @@ pub fn discover_sessions_at(
             modified_after,
         ));
     }
+    if agent.is_none_or(|a| a == "grok") {
+        discovered.extend(discover_codex_sessions(
+            &home.join(".grok").join("sessions"),
+            modified_after,
+        ));
+    }
     if agent.is_none_or(|a| a == "gemini") {
         discovered.extend(discover_gemini_sessions(
             &home.join(".gemini").join("tmp"),

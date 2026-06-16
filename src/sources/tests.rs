@@ -753,7 +753,8 @@ fn test_parse_codex_session_missing_meta_warns_and_falls_back_to_stem() {
         watermark: None,
     };
 
-    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    let (entries, warnings) =
+        parse_codex_session_file_with_diagnostics(&tmp, "codex", &config).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].session_id, "rollout-without-meta");
     assert_eq!(
@@ -784,7 +785,8 @@ fn test_parse_codex_session_duplicate_meta_warns_first_wins() {
         watermark: None,
     };
 
-    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    let (entries, warnings) =
+        parse_codex_session_file_with_diagnostics(&tmp, "codex", &config).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].session_id, "session-a");
     assert_eq!(
@@ -820,7 +822,8 @@ fn test_parse_codex_session_filename_mismatch_warns() {
         watermark: None,
     };
 
-    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    let (entries, warnings) =
+        parse_codex_session_file_with_diagnostics(&tmp, "codex", &config).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].session_id, meta_id);
     assert_eq!(
@@ -854,7 +857,8 @@ fn test_parse_codex_session_non_rollout_filename_does_not_mismatch_warn() {
         watermark: None,
     };
 
-    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    let (entries, warnings) =
+        parse_codex_session_file_with_diagnostics(&tmp, "codex", &config).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].session_id, meta_id);
     assert!(warnings.is_empty());
@@ -924,7 +928,7 @@ fn test_codex_history_silent_skip_emits_warning() {
     write_file(&tmp, &content);
 
     let (entries, warnings) =
-        parse_codex_file_with_diagnostics(&tmp, &default_config(true)).unwrap();
+        parse_codex_file_with_diagnostics(&tmp, "codex", &default_config(true)).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].message, "hello history");
 
@@ -957,7 +961,7 @@ fn test_codex_session_event_silent_skip_emits_warning() {
     write_file(&tmp, content);
 
     let (entries, warnings) =
-        parse_codex_session_file_with_diagnostics(&tmp, &default_config(true)).unwrap();
+        parse_codex_session_file_with_diagnostics(&tmp, "codex", &default_config(true)).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].message, "hello session");
     assert!(warnings.iter().any(|warning| {
@@ -997,7 +1001,8 @@ fn test_parse_codex_session_duplicate_and_mismatch_warn_together() {
         watermark: None,
     };
 
-    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    let (entries, warnings) =
+        parse_codex_session_file_with_diagnostics(&tmp, "codex", &config).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].session_id, meta_id);
     assert_eq!(
@@ -1038,7 +1043,8 @@ fn test_parse_codex_session_unparsable_timestamps_warn_and_drop() {
         watermark: None,
     };
 
-    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    let (entries, warnings) =
+        parse_codex_session_file_with_diagnostics(&tmp, "codex", &config).unwrap();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].message, "naive ts dropped");
     assert_eq!(
@@ -1083,7 +1089,8 @@ fn test_parse_codex_session_mcp_tool_call_is_kept_in_timeline() {
         watermark: None,
     };
 
-    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    let (entries, warnings) =
+        parse_codex_session_file_with_diagnostics(&tmp, "codex", &config).unwrap();
     assert_eq!(entries.len(), 2);
     assert!(entries.iter().all(|e| e.role == "tool"));
     assert!(
@@ -1122,7 +1129,8 @@ fn test_parse_codex_session_unknown_msg_type_warns_and_counts() {
         watermark: None,
     };
 
-    let (entries, warnings) = parse_codex_session_file_with_diagnostics(&tmp, &config).unwrap();
+    let (entries, warnings) =
+        parse_codex_session_file_with_diagnostics(&tmp, "codex", &config).unwrap();
     assert_eq!(entries.len(), 7);
     assert_eq!(entries[0].role, "user");
     assert_eq!(entries[1].role, "system");
@@ -2373,7 +2381,7 @@ fn test_codex_session_meta_empty_then_valid_wins() {
     write_file(&tmp, content);
 
     let (entries, warnings) =
-        parse_codex_session_file_with_diagnostics(&tmp, &default_config(true)).unwrap();
+        parse_codex_session_file_with_diagnostics(&tmp, "codex", &default_config(true)).unwrap();
     assert_eq!(entries[0].session_id, "session-a");
     assert!(warnings.is_empty());
 
@@ -2392,7 +2400,7 @@ fn test_codex_session_meta_empty_then_valid_duplicate_warns() {
     write_file(&tmp, content);
 
     let (entries, warnings) =
-        parse_codex_session_file_with_diagnostics(&tmp, &default_config(true)).unwrap();
+        parse_codex_session_file_with_diagnostics(&tmp, "codex", &default_config(true)).unwrap();
     assert_eq!(entries[0].session_id, "session-a");
     assert_eq!(
         warnings,
@@ -2415,7 +2423,7 @@ fn test_codex_session_meta_empty_only_falls_back() {
     write_file(&tmp, content);
 
     let (entries, warnings) =
-        parse_codex_session_file_with_diagnostics(&tmp, &default_config(true)).unwrap();
+        parse_codex_session_file_with_diagnostics(&tmp, "codex", &default_config(true)).unwrap();
     assert_eq!(entries[0].session_id, "rollout-empty-only");
     assert_eq!(
         warnings,
@@ -2437,7 +2445,7 @@ fn test_parse_codex_session_role_only_tool_frame_is_preserved() {
     write_file(&tmp, content);
 
     let (entries, warnings) =
-        parse_codex_session_file_with_diagnostics(&tmp, &default_config(true)).unwrap();
+        parse_codex_session_file_with_diagnostics(&tmp, "codex", &default_config(true)).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].role, "tool");
     assert_eq!(entries[0].frame_kind, Some(FrameKind::ToolCall));
@@ -2457,7 +2465,7 @@ fn test_parse_codex_session_unknown_payload_preserved_as_system_note() {
     write_file(&tmp, content);
 
     let (entries, warnings) =
-        parse_codex_session_file_with_diagnostics(&tmp, &default_config(true)).unwrap();
+        parse_codex_session_file_with_diagnostics(&tmp, "codex", &default_config(true)).unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].role, "system");
     assert_eq!(entries[0].frame_kind, Some(FrameKind::SystemNote));
