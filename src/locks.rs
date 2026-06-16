@@ -574,7 +574,7 @@ fn acquire_local(path: PathBuf, mode: LockMode, deadline: Instant) -> Result<Loc
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "app"))]
 mod tests {
     use super::*;
     use crate::test_support::capture_logs;

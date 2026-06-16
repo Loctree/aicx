@@ -1119,10 +1119,25 @@ fn materialize_hybrid_index(
     let source_hash = observed_source_hash_for_index_path(index_path)?;
     let mut lexical_chunks = Vec::with_capacity(entries.len());
     let mut dense_chunks = Vec::with_capacity(entries.len());
+    let mut skipped_missing_source_count = 0usize;
+    let mut skipped_missing_source_examples: Vec<PathBuf> = Vec::new();
 
     for entry in entries {
-        let text = crate::sanitize::read_to_string_validated(&entry.path)
-            .with_context(|| format!("read chunk for hybrid index: {}", entry.path.display()))?;
+        let text = match crate::sanitize::read_to_string_validated(&entry.path) {
+            Ok(text) => text,
+            Err(_err) if !entry.path.exists() => {
+                skipped_missing_source_count += 1;
+                if skipped_missing_source_examples.len() < 5 {
+                    skipped_missing_source_examples.push(entry.path.clone());
+                }
+                continue;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("read chunk for hybrid index: {}", entry.path.display())
+                });
+            }
+        };
         let metadata = index_entry_metadata_json(&entry);
         let chunk = ChunkRef {
             id: entry.id.clone(),
@@ -1135,6 +1150,23 @@ fn materialize_hybrid_index(
             chunk,
             embedding: entry.embedding,
         });
+    }
+    if skipped_missing_source_count > 0 {
+        let examples = skipped_missing_source_examples
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        eprintln!(
+            "[aicx][phase=index event=hybrid_skip_missing_sources skipped={} examples={}]",
+            skipped_missing_source_count, examples
+        );
+    }
+    if dense_chunks.is_empty() && skipped_missing_source_count > 0 {
+        anyhow::bail!(
+            "hybrid build has no live source chunks after skipping {} stale semantic row(s)",
+            skipped_missing_source_count
+        );
     }
 
     let lexical = Box::new(TantivyAdapter::new(manifest_dir.clone())?);

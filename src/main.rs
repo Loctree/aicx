@@ -147,6 +147,7 @@ enum ExtractInputFormat {
     Gemini,
     GeminiAntigravity,
     Junie,
+    Grok,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -172,6 +173,22 @@ impl From<FrameKindArg> for timeline::FrameKind {
             FrameKindArg::AgentReply => Self::AgentReply,
             FrameKindArg::InternalThought => Self::InternalThought,
             FrameKindArg::ToolCall => Self::ToolCall,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+#[value(rename_all = "snake_case")]
+enum UnresolvedModeArg {
+    Session,
+    Intent,
+}
+
+impl From<UnresolvedModeArg> for aicx::intents::UnresolvedMode {
+    fn from(value: UnresolvedModeArg) -> Self {
+        match value {
+            UnresolvedModeArg::Session => Self::Session,
+            UnresolvedModeArg::Intent => Self::Intent,
         }
     }
 }
@@ -210,6 +227,13 @@ impl SourceProtectionBackend {
 
 #[derive(Debug, Subcommand)]
 enum SessionsCommand {
+    /// Print the current agent session id for commit trailers and handoffs.
+    Current {
+        /// Emit JSON with source metadata instead of the bare session id
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
+
     /// List discovered agent sessions, newest first.
     List {
         /// Restrict to sessions whose repo/cwd matches the current directory.
@@ -270,7 +294,7 @@ enum SessionsCommand {
         repo: Option<PathBuf>,
 
         /// Max clarify questions (hard-capped at 5).
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_t = 5, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=5))]
         max: usize,
 
         /// Output format: markdown | json.
@@ -858,7 +882,7 @@ enum Commands {
         #[command(flatten)]
         redaction: RedactionArgs,
 
-        /// Input format (agent), required in file mode: claude | codex | gemini | gemini-antigravity | junie
+        /// Input format (agent), required in file mode: claude | codex | gemini | gemini-antigravity | junie | grok
         #[arg(long, value_enum, alias = "input-format")]
         format: Option<ExtractInputFormat>,
 
@@ -1191,9 +1215,19 @@ enum Commands {
         #[command(flatten)]
         filters: RetrievalFilters,
 
-        /// Return only intent entries without a matching outcome within the same session
+        /// Return only intent entries without a matching outcome.
+        ///
+        /// The unresolved filter can operate at session level or intent level,
+        /// configured via `--unresolved-mode`.
         #[arg(long)]
         unresolved: bool,
+
+        /// Mode for filtering unresolved entries: session (default) or intent.
+        ///
+        /// session: Keep entries from sessions that do not contain an outcome. This is session-level closure.
+        /// intent: Keep intent entries where no matching outcome closes that intent. This is per-intent roadmap closure.
+        #[arg(long, value_enum, default_value_t = UnresolvedModeArg::Session)]
+        unresolved_mode: UnresolvedModeArg,
 
         /// Collapse multiple intents from the same session into one entry
         #[arg(long)]
@@ -1206,6 +1240,10 @@ enum Commands {
         /// Only show high-confidence intents
         #[arg(long)]
         strict: bool,
+
+        /// Minimum confidence threshold (1..5) to keep (overrides --strict if both specified)
+        #[arg(long)]
+        min_confidence: Option<u8>,
 
         /// Filter by kind: decision, intent, outcome, task
         #[arg(long, value_parser = ["decision", "intent", "outcome", "task"])]
@@ -1360,11 +1398,13 @@ enum Commands {
         json: bool,
     },
 
-    /// Build the semantic index. Use `--dry-run` to preview without writing.
+    /// Catch up the canonical corpus, then build the semantic index. Use
+    /// `--dry-run` to preview without writing.
     ///
-    /// Default behaviour is INCREMENTAL: only sidecars whose mtime is newer
-    /// than the existing index `header.generated_at` are embedded, and the
-    /// new rows are appended to the committed index file. Pass
+    /// Default behaviour is INCREMENTAL: first materialize missing canonical
+    /// chunks from source sessions, then embed only sidecars whose mtime is
+    /// newer than the existing index `header.generated_at`; new rows are
+    /// appended to the committed index file. Pass
     /// `--full-rescan` to re-embed every chunk from scratch — useful when
     /// the embedder model changes, the index file is corrupt, or an
     /// operator wants a deterministic from-zero rebuild.
@@ -1421,13 +1461,13 @@ enum Commands {
         action: cli_config::ConfigAction,
     },
 
-    /// Read one canonical chunk by path, file name, or compact chunk reference.
+    /// Read one canonical chunk by path, file name, or `chunk:<id>` reference.
     ///
     /// This closes the discover -> read loop: pass a path from `aicx search`,
     /// `aicx refs --emit paths`, dashboard `/api/chunk`, or MCP search results.
-    #[command(display_order = 14)]
+    #[command(display_order = 14, visible_alias = "open")]
     Read {
-        /// Absolute path, store-relative path, file name, or compact chunk reference
+        /// Absolute path, store-relative path, file name, legacy compact ref, or `chunk:<id>`
         reference: String,
 
         /// Truncate chunk content to this many UTF-8 characters
@@ -1753,7 +1793,21 @@ where
     None
 }
 
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    unsafe {
+        // SAFETY: restore the process SIGPIPE disposition to the platform default
+        // before the CLI starts worker threads or installs custom handlers.
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
+
 fn main() -> Result<()> {
+    restore_default_sigpipe();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -2244,9 +2298,11 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             hours,
             filters,
             unresolved,
+            unresolved_mode,
             collapse_session,
             emit,
             strict,
+            min_confidence,
             kind,
         }) => {
             run_intents(
@@ -2256,8 +2312,10 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 IntentsDisplayOptions {
                     emit: &emit,
                     strict,
+                    min_confidence,
                     kind: kind.as_deref(),
                     unresolved,
+                    unresolved_mode: unresolved_mode.into(),
                     collapse_session,
                 },
             )?;
@@ -2595,6 +2653,7 @@ fn extract_input_format_from_str(s: &str) -> Option<ExtractInputFormat> {
         "codex" => Some(ExtractInputFormat::Codex),
         "gemini" => Some(ExtractInputFormat::Gemini),
         "junie" => Some(ExtractInputFormat::Junie),
+        "grok" => Some(ExtractInputFormat::Grok),
         _ => None,
     }
 }
@@ -2692,7 +2751,7 @@ fn load_session_claims(
             .context("could not infer agent from session id; pass --agent")?,
     };
     let fmt = extract_input_format_from_str(&agent_str)
-        .with_context(|| format!("unknown agent '{agent_str}' (claude|codex|gemini|junie)"))?;
+        .with_context(|| format!("unknown agent '{agent_str}' (claude|codex|gemini|junie|grok)"))?;
 
     let config = ExtractionConfig {
         project_filter: Vec::new(),
@@ -2707,6 +2766,7 @@ fn load_session_claims(
             sources::extract_gemini(&config)?
         }
         ExtractInputFormat::Junie => sources::extract_junie(&config)?,
+        ExtractInputFormat::Grok => sources::extract_grok(&config)?,
     };
     let label = extract_input_format_label(fmt);
     let resolution = resolve_session_reference(session, fmt, label, &entries)?;
@@ -2968,6 +3028,7 @@ fn run_clarify(
 
 fn run_sessions_command(command: SessionsCommand) -> Result<()> {
     match command {
+        SessionsCommand::Current { json } => run_sessions_current(json),
         SessionsCommand::List {
             cwd,
             agent,
@@ -2986,6 +3047,16 @@ fn run_sessions_command(command: SessionsCommand) -> Result<()> {
             format,
         } => run_session_report(&session_id, agent, hours, repo, max, &format),
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CurrentSessionPayload {
+    session_id: String,
+    source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_path: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -3159,6 +3230,95 @@ fn run_session_show(session_id: String, format: &str) -> Result<()> {
     Ok(())
 }
 
+const CURRENT_SESSION_ENV_KEYS: &[(&str, Option<&str>)] = &[
+    ("AICX_SESSION_ID", None),
+    ("CODEX_THREAD_ID", Some("codex")),
+    ("CODEX_SESSION_ID", Some("codex")),
+    ("CLAUDE_SESSION_ID", Some("claude")),
+    ("CLAUDE_CODE_SESSION_ID", Some("claude")),
+    ("GEMINI_SESSION_ID", Some("gemini")),
+    ("JUNIE_SESSION_ID", Some("junie")),
+];
+
+fn run_sessions_current(json: bool) -> Result<()> {
+    let current = current_session_from_env().or_else(|| current_session_from_disk().ok().flatten());
+    let Some(current) = current else {
+        anyhow::bail!(
+            "could not resolve current session id from env or recent sessions for this cwd"
+        );
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&current)?);
+    } else {
+        println!("{}", current.session_id);
+    }
+    Ok(())
+}
+
+fn current_session_from_env() -> Option<CurrentSessionPayload> {
+    current_session_from_env_lookup(|key| std::env::var(key).ok())
+}
+
+fn current_session_from_env_lookup(
+    mut get: impl FnMut(&str) -> Option<String>,
+) -> Option<CurrentSessionPayload> {
+    for (key, agent) in CURRENT_SESSION_ENV_KEYS {
+        let Some(value) = get(key).map(|value| value.trim().to_string()) else {
+            continue;
+        };
+        if value.is_empty() {
+            continue;
+        }
+        return Some(CurrentSessionPayload {
+            session_id: value,
+            source: format!("env:{key}"),
+            agent: agent.map(str::to_string),
+            repo_path: None,
+        });
+    }
+    None
+}
+
+fn current_session_from_disk() -> Result<Option<CurrentSessionPayload>> {
+    let home = dirs::home_dir().context("No home dir")?;
+    let here = std::env::current_dir()?.to_string_lossy().into_owned();
+    let since_dt = Utc::now() - chrono::Duration::days(7);
+    let modified_after = std::time::SystemTime::UNIX_EPOCH
+        + std::time::Duration::from_secs(since_dt.timestamp().max(0) as u64);
+
+    let mut discovered = Vec::new();
+    discovered.extend(sessions::discover_claude_sessions(
+        &home.join(".claude").join("projects"),
+        Some(modified_after),
+        Some(&here),
+    ));
+    discovered.extend(sessions::discover_codex_sessions(
+        &home.join(".codex").join("sessions"),
+        Some(modified_after),
+    ));
+    discovered.extend(sessions::discover_gemini_sessions(
+        &home.join(".gemini").join("tmp"),
+        Some(modified_after),
+        Some(&here),
+    ));
+    discovered.extend(sessions::discover_junie_sessions(
+        &home.join(".junie").join("sessions"),
+        Some(modified_after),
+    ));
+
+    let mut selected = sessions::select_sessions(discovered, Some(&here), None, Some(since_dt), 1);
+    let Some(info) = selected.pop() else {
+        return Ok(None);
+    };
+    Ok(Some(CurrentSessionPayload {
+        session_id: info.session_id,
+        source: "disk:newest-cwd".to_string(),
+        agent: Some(info.agent),
+        repo_path: info.repo_path,
+    }))
+}
+
 fn parse_since_date(s: &str) -> Result<DateTime<Utc>> {
     let nd = NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .with_context(|| format!("invalid --since date '{s}' (expected YYYY-MM-DD)"))?;
@@ -3249,28 +3409,39 @@ fn run_sessions_list(
                 eprintln!("No sessions found.");
                 return Ok(());
             }
+            let session_width = selected
+                .iter()
+                .map(|s| s.session_id.chars().count())
+                .max()
+                .unwrap_or(0)
+                .max("SESSION".len());
             println!(
-                "{:<10}  {:<6}  {:<22}  {:<25}  {:>5}  {:>4}  {:<8}  TITLE",
-                "SESSION", "AGENT", "PROJECT", "UPDATED (UTC)", "MSGS", "USR", "ASSOC"
+                "{:<session_width$}  {:<6}  {:<18}  {:<18}  {:<20}  {:>8}  USR",
+                "SESSION", "AGENT", "PROJECT", "PATH", "UPDATED (TZ)", "MSGS"
             );
             for s in &selected {
-                let sid = session_id_table_prefix(&s.session_id);
-                let project = s.project.as_deref().unwrap_or("-");
+                let sid = session_id_table_value(&s.session_id);
+                let project = session_project_label(s);
+                let user = session_user_label(s);
+                let path = s
+                    .repo_path
+                    .as_deref()
+                    .map(compact_repo_path)
+                    .unwrap_or_else(|| "-".to_string());
                 let updated = s
                     .updated_at
-                    .map(|t| t.to_rfc3339())
+                    .map(format_session_table_time)
                     .unwrap_or_else(|| "(no timestamp)".to_string());
-                let assoc = format!("{:?}", s.association).to_lowercase();
+                let messages = format!("{}({}u)", s.message_count, s.user_message_count);
                 println!(
-                    "{:<10}  {:<6}  {:<22}  {:<25}  {:>5}  {:>4}  {:<8}  {}",
+                    "{:<session_width$}  {:<6}  {:<18}  {:<18}  {:<20}  {:>8}  {}",
                     sid,
                     s.agent,
-                    truncate_table_cell(project, 22),
+                    truncate_table_cell(&project, 18),
+                    truncate_table_cell(&path, 18),
                     updated,
-                    s.message_count,
-                    s.user_message_count,
-                    assoc,
-                    truncate_table_cell(s.title.as_deref().unwrap_or(""), 60),
+                    messages,
+                    user,
                 );
             }
         }
@@ -3278,11 +3449,77 @@ fn run_sessions_list(
     Ok(())
 }
 
-/// First 8 chars of a session id for the sessions table — char-safe. Ids
-/// normally are ASCII uuids, but the file-stem fallback can carry non-ASCII;
-/// a byte slice would panic on a multibyte boundary.
-fn session_id_table_prefix(id: &str) -> String {
-    id.chars().take(8).collect()
+/// Full session id for the sessions table. This command is the operator's
+/// discovery surface for copy/pasting ids into `show`, `report`, and `extract`.
+fn session_id_table_value(id: &str) -> String {
+    id.to_string()
+}
+
+fn session_project_label(session: &sessions::SessionInfo) -> String {
+    session
+        .repo_path
+        .as_deref()
+        .and_then(|path| aicx::parser::segmentation::infer_tiered_identity_from_cwd(Some(path)))
+        .map(|tiered| tiered.identity.slug())
+        .or_else(|| session.project.clone())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn compact_repo_path(path: &str) -> String {
+    let normalized = if let Some(home) =
+        dirs::home_dir().and_then(|path| path.into_os_string().into_string().ok())
+        && let Some(stripped) = path.strip_prefix(&format!("{home}/"))
+    {
+        format!("~/{stripped}")
+    } else {
+        path.to_string()
+    };
+
+    let Some(stripped) = normalized.strip_prefix("~/") else {
+        return normalized;
+    };
+    let parts = stripped
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() < 3 {
+        return normalized;
+    }
+    let mut compact = String::from("~");
+    for part in &parts[..parts.len() - 1] {
+        compact.push('/');
+        compact.push(part.chars().next().unwrap_or('-'));
+    }
+    compact.push('/');
+    compact.push_str(parts.last().copied().unwrap_or("-"));
+    compact
+}
+
+fn session_user_label(session: &sessions::SessionInfo) -> String {
+    session
+        .repo_path
+        .as_deref()
+        .and_then(user_from_users_path)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn user_from_users_path(path: &str) -> Option<String> {
+    let mut parts = Path::new(path).components().peekable();
+    while let Some(component) = parts.next() {
+        if component.as_os_str().to_string_lossy() == "Users"
+            && let Some(user) = parts.next()
+        {
+            let user = user.as_os_str().to_string_lossy();
+            if !user.is_empty() {
+                return Some(user.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn format_session_table_time(time: DateTime<Utc>) -> String {
+    format!("{}(+0)", time.format("%Y-%m-%dT%H:%M"))
 }
 
 /// Char-boundary-safe cell truncation for table output (never byte-slices a
@@ -3448,9 +3685,450 @@ fn create_initial_source_snapshot(root: &Path) -> Result<()> {
 struct IntentsDisplayOptions<'a> {
     emit: &'a str,
     strict: bool,
+    min_confidence: Option<u8>,
     kind: Option<&'a str>,
     unresolved: bool,
+    unresolved_mode: aicx::intents::UnresolvedMode,
     collapse_session: bool,
+}
+
+#[derive(Debug)]
+struct IntentPackSection {
+    title: &'static str,
+    records: Vec<intents::IntentRecord>,
+}
+
+#[derive(Debug)]
+struct IntentPackKeywordHit {
+    section: &'static str,
+    keyword: &'static str,
+    date: String,
+    agent: String,
+    summary: String,
+    source_chunk: String,
+}
+
+const DEFAULT_INTENTS_PACK_LIMIT: usize = 20;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IntentsProjectResolution {
+    projects: Vec<String>,
+    unresolved_filters: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BucketHint {
+    slug: String,
+    chunks: usize,
+}
+
+fn resolve_intents_project_filters(projects: &[String]) -> Result<IntentsProjectResolution> {
+    let store_root = store::store_base_dir()?;
+    let cwd = std::env::current_dir().ok();
+    let session_home = dirs::home_dir();
+    resolve_intents_project_filters_with_session_home_at(
+        projects,
+        &store_root,
+        session_home.as_deref(),
+        cwd.as_deref(),
+    )
+}
+
+fn resolve_intents_project_filters_with_session_home_at(
+    projects: &[String],
+    store_root: &Path,
+    session_home: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Result<IntentsProjectResolution> {
+    let sessions = discover_intents_resolution_sessions(projects, session_home);
+    resolve_intents_project_filters_at(projects, store_root, &sessions, cwd)
+}
+
+fn discover_intents_resolution_sessions(
+    projects: &[String],
+    session_home: Option<&Path>,
+) -> Vec<sessions::SessionInfo> {
+    if projects.is_empty() {
+        return Vec::new();
+    }
+    let Some(home) = session_home else {
+        return Vec::new();
+    };
+    sessions::discover_sessions_at(home, None, None, None)
+}
+
+fn resolve_intents_project_filters_at(
+    projects: &[String],
+    store_root: &Path,
+    sessions: &[sessions::SessionInfo],
+    cwd: Option<&Path>,
+) -> Result<IntentsProjectResolution> {
+    if projects.is_empty() {
+        return Ok(IntentsProjectResolution {
+            projects: Vec::new(),
+            unresolved_filters: Vec::new(),
+        });
+    }
+
+    let mut slugs: Vec<String> = store::scan_context_files_at(store_root)?
+        .into_iter()
+        .map(|file| file.project)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    slugs.sort();
+
+    let mut resolved = BTreeSet::new();
+    let mut unresolved = Vec::new();
+    for filter in projects {
+        let matches = resolve_single_intents_project_filter(filter, &slugs, sessions, cwd)?;
+        if matches.is_empty() {
+            unresolved.push(filter.clone());
+        } else {
+            resolved.extend(matches);
+        }
+    }
+
+    Ok(IntentsProjectResolution {
+        projects: resolved.into_iter().collect(),
+        unresolved_filters: unresolved,
+    })
+}
+
+fn resolve_single_intents_project_filter(
+    filter: &str,
+    slugs: &[String],
+    sessions: &[sessions::SessionInfo],
+    cwd: Option<&Path>,
+) -> Result<Vec<String>> {
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if let Some(matches) = unique_resolution_stage(
+        filter,
+        "exact bucket",
+        slugs.iter().filter(|slug| slug.as_str() == filter).cloned(),
+    )? {
+        return Ok(matches);
+    }
+    if let Some(matches) = unique_resolution_stage(
+        filter,
+        "case-insensitive bucket",
+        slugs
+            .iter()
+            .filter(|slug| slug.eq_ignore_ascii_case(filter))
+            .cloned(),
+    )? {
+        return Ok(matches);
+    }
+
+    let session_matches = sessions
+        .iter()
+        .filter(|session| {
+            session
+                .project
+                .as_deref()
+                .is_some_and(|project| project.eq_ignore_ascii_case(filter))
+        })
+        .filter_map(|session| session.repo_path.as_deref())
+        .flat_map(|repo_path| slug_candidates_from_cwd_like(repo_path, filter, slugs));
+    if let Some(matches) =
+        unique_resolution_stage(filter, "sessions display-name", session_matches)?
+    {
+        return Ok(matches);
+    }
+
+    if let Some(cwd) = cwd.and_then(Path::to_str) {
+        let cwd_basename_matches = Path::new(cwd)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(filter));
+        if cwd_basename_matches
+            && let Some(matches) = unique_resolution_stage(
+                filter,
+                "cwd basename",
+                slug_candidates_from_cwd_like(cwd, filter, slugs),
+            )?
+        {
+            return Ok(matches);
+        }
+    }
+
+    if let Some(remote_slug) = inferred_slug_from_cwd_like(filter)
+        && let Some(slug) = canonical_stored_slug(slugs, &remote_slug)
+    {
+        return Ok(vec![slug]);
+    }
+
+    if filter.starts_with('/') || filter.ends_with('/') {
+        let matches: Vec<String> = slugs
+            .iter()
+            .filter(|slug| {
+                split_slug(slug)
+                    .is_some_and(|(org, repo)| store::project_filter_matches(org, repo, filter))
+            })
+            .cloned()
+            .collect();
+        if !matches.is_empty() {
+            return Ok(matches);
+        }
+    }
+
+    if let Some(matches) = unique_resolution_stage(
+        filter,
+        "alias",
+        slugs
+            .iter()
+            .filter(|slug| slug_matches_project_alias(slug, filter))
+            .cloned(),
+    )? {
+        return Ok(matches);
+    }
+
+    Ok(Vec::new())
+}
+
+fn unique_resolution_stage<I>(
+    filter: &str,
+    stage: &str,
+    candidates: I,
+) -> Result<Option<Vec<String>>>
+where
+    I: IntoIterator<Item = String>,
+{
+    let matches: Vec<String> = candidates
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if matches.is_empty() {
+        return Ok(None);
+    }
+    if matches.len() > 1 {
+        anyhow::bail!(
+            "project filter {filter:?} is ambiguous at {stage} resolution; matched buckets:\n  - {}\nUse one exact bucket with -p owner/repo.",
+            matches.join("\n  - ")
+        );
+    }
+    Ok(Some(matches))
+}
+
+fn slug_candidates_from_cwd_like(cwd_like: &str, filter: &str, slugs: &[String]) -> Vec<String> {
+    if let Some(remote_slug) = inferred_slug_from_cwd_like(cwd_like)
+        && let Some(slug) = canonical_stored_slug(slugs, &remote_slug)
+    {
+        return vec![slug];
+    }
+
+    let mut matches = BTreeSet::new();
+    let basename = Path::new(cwd_like)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| name.eq_ignore_ascii_case(filter));
+    if let Some(basename) = basename {
+        matches.extend(
+            slugs
+                .iter()
+                .filter(|slug| {
+                    split_slug(slug).is_some_and(|(_, repo)| repo.eq_ignore_ascii_case(basename))
+                })
+                .cloned(),
+        );
+    }
+
+    matches.into_iter().collect()
+}
+
+fn inferred_slug_from_cwd_like(value: &str) -> Option<String> {
+    if !is_resolvable_cwd_like(value) {
+        return None;
+    }
+    let identity = aicx_parser::segmentation::infer_tiered_identity_from_cwd(Some(value))?.identity;
+    Some(identity.slug())
+}
+
+fn is_resolvable_cwd_like(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with('/')
+        || value.starts_with('~')
+        || value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.starts_with("git@")
+        || value.starts_with("ssh://")
+        || value.starts_with("git://")
+        || (cfg!(windows) && is_windows_absolute_path(value))
+}
+
+fn is_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/'))
+        || value.starts_with("\\\\")
+}
+
+fn canonical_stored_slug(slugs: &[String], candidate: &str) -> Option<String> {
+    slugs
+        .iter()
+        .find(|slug| slug.eq_ignore_ascii_case(candidate))
+        .cloned()
+}
+
+fn split_slug(slug: &str) -> Option<(&str, &str)> {
+    let (org, repo) = slug.split_once('/')?;
+    if org.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((org, repo))
+}
+
+fn slug_matches_project_alias(slug: &str, filter: &str) -> bool {
+    let filter_alias = project_alias_key(filter);
+    if filter_alias.is_empty() {
+        return false;
+    }
+    let Some((org, repo)) = split_slug(slug) else {
+        return false;
+    };
+    [slug, org, repo]
+        .into_iter()
+        .any(|candidate| project_alias_key(candidate) == filter_alias)
+}
+
+fn project_alias_key(value: &str) -> String {
+    let mut value = value.trim().to_ascii_lowercase();
+    for suffix in [
+        "_deprecated",
+        "-deprecated",
+        ".deprecated",
+        " deprecated",
+        "_depr",
+        "-depr",
+        ".depr",
+        " depr",
+    ] {
+        if let Some(stripped) = value.strip_suffix(suffix) {
+            value = stripped.to_string();
+            break;
+        }
+    }
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn collect_recent_bucket_counts(store_root: &Path, hours: u64) -> Result<BTreeMap<String, usize>> {
+    let cutoff = if hours == 0 {
+        DateTime::<Utc>::from_timestamp(0, 0).expect("Unix epoch timestamp is valid")
+    } else {
+        let cutoff_hours = hours.min(i64::MAX as u64) as i64;
+        Utc::now() - chrono::Duration::hours(cutoff_hours)
+    };
+    let mut counts = BTreeMap::new();
+    for file in store::scan_context_files_at(store_root)? {
+        if file.path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let timestamp = file
+            .path
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .map(DateTime::<Utc>::from)
+            .or_else(|| {
+                NaiveDate::parse_from_str(&file.date_iso, "%Y-%m-%d")
+                    .ok()
+                    .and_then(|date| date.and_hms_opt(0, 0, 0))
+                    .map(|dt| DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc))
+            });
+        if timestamp.is_some_and(|ts| ts >= cutoff) {
+            *counts.entry(file.project).or_insert(0) += 1;
+        }
+    }
+    Ok(counts)
+}
+
+fn nearby_bucket_hints(filters: &[String], counts: &BTreeMap<String, usize>) -> Vec<BucketHint> {
+    let filter_aliases: Vec<String> = filters
+        .iter()
+        .map(|filter| project_alias_key(filter))
+        .filter(|filter| !filter.is_empty())
+        .collect();
+    let mut hints: Vec<BucketHint> = counts
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .filter(|(slug, _)| {
+            if filters
+                .iter()
+                .any(|filter| slug.eq_ignore_ascii_case(filter.trim()))
+            {
+                return false;
+            }
+            let slug_alias = project_alias_key(slug);
+            let repo_alias = split_slug(slug).map(|(_, repo)| project_alias_key(repo));
+            filter_aliases.iter().any(|filter| {
+                slug_alias.contains(filter)
+                    || filter.contains(&slug_alias)
+                    || repo_alias
+                        .as_ref()
+                        .is_some_and(|repo| repo.contains(filter) || filter.contains(repo))
+            })
+        })
+        .map(|(slug, count)| BucketHint {
+            slug: slug.clone(),
+            chunks: *count,
+        })
+        .collect();
+    hints.sort_by(|left, right| {
+        right
+            .chunks
+            .cmp(&left.chunks)
+            .then_with(|| left.slug.cmp(&right.slug))
+    });
+    hints.truncate(5);
+    hints
+}
+
+fn print_no_intents_message(
+    projects: &[String],
+    hours: u64,
+    unresolved_note: Option<&str>,
+) -> Result<()> {
+    if projects.is_empty() {
+        eprintln!("No intents found for all projects in last {hours} hours.");
+        if let Some(note) = unresolved_note {
+            eprintln!("{note}");
+        }
+        return Ok(());
+    }
+
+    eprintln!(
+        "No intents found for project filter: {} in last {} hours.",
+        project_scope_label(projects),
+        hours
+    );
+    if let Some(note) = unresolved_note {
+        eprintln!("{note}");
+    }
+
+    let store_root = store::store_base_dir()?;
+    let hints = nearby_bucket_hints(projects, &collect_recent_bucket_counts(&store_root, hours)?);
+    if !hints.is_empty() {
+        eprintln!("Did you mean a nearby bucket with recent data?");
+        for hint in &hints {
+            eprintln!(
+                "- {} ({} chunks in last {}h)",
+                hint.slug, hint.chunks, hours
+            );
+        }
+        eprintln!("Try:");
+        eprintln!("  aicx intents -p {} --hours {}", hints[0].slug, hours);
+    }
+    Ok(())
 }
 
 fn run_intents(
@@ -3462,8 +4140,10 @@ fn run_intents(
     let IntentsDisplayOptions {
         emit,
         strict,
+        min_confidence,
         kind,
         unresolved,
+        unresolved_mode,
         collapse_session,
     } = display;
     let kind_filter = kind.map(|k| match k {
@@ -3481,15 +4161,35 @@ fn run_intents(
     // kind filter: extract WITHOUT it so Outcomes survive the resolution check,
     // then re-apply it after the unresolved narrowing.
     let post_kind = if unresolved { kind_filter } else { None };
+    let project_resolution = resolve_intents_project_filters(projects)?;
+    let mut effective_projects = if project_resolution.projects.is_empty() {
+        projects.to_vec()
+    } else {
+        project_resolution.projects.clone()
+    };
+    effective_projects.extend(project_resolution.unresolved_filters.iter().cloned());
+    effective_projects = effective_projects
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    if should_render_intents_pack(&filters, emit, kind, unresolved, collapse_session) {
+        run_intents_pack(&effective_projects, hours, &filters, strict, min_confidence)?;
+        return Ok(());
+    }
+
     let config = intents::IntentsConfig {
-        project: projects.first().cloned().unwrap_or_default(),
+        project: effective_projects.first().cloned().unwrap_or_default(),
         hours,
         strict,
+        min_confidence,
         kind_filter: if unresolved { None } else { kind_filter },
         frame_kind: filters.frame_kind.map(Into::into),
     };
 
-    let extraction = intents::extract_intents_with_stats_for_projects(&config, projects)?;
+    let extraction =
+        intents::extract_intents_with_stats_for_projects(&config, &effective_projects)?;
     let records = extraction.records;
 
     let (date_lo, date_hi) = if let Some(ref d) = filters.since {
@@ -3501,6 +4201,7 @@ fn run_intents(
 
     let display_filters = intents::IntentDisplayFilters {
         unresolved,
+        unresolved_mode,
         collapse_session,
         agent: filters.agent.clone(),
         date_lo,
@@ -3526,11 +4227,18 @@ fn run_intents(
     }
 
     if records.is_empty() && emit != "json" {
-        eprintln!(
-            "No intents found for {} in last {} hours.",
-            project_scope_label(projects),
-            hours
-        );
+        let unresolved_note = (unresolved
+            && unresolved_mode == aicx::intents::UnresolvedMode::Session
+            && post_kind == Some(intents::IntentKind::Intent))
+        .then_some("Note: --unresolved defaults to session-level mode. If you want to find unresolved intents at the intent level (matching intent to outcome by content), try: --unresolved-mode intent");
+        if unresolved
+            && unresolved_mode == aicx::intents::UnresolvedMode::Session
+            && post_kind == Some(intents::IntentKind::Intent)
+        {
+            print_no_intents_message(projects, hours, unresolved_note)?;
+        } else {
+            print_no_intents_message(projects, hours, None)?;
+        }
         return Ok(());
     }
 
@@ -3555,6 +4263,331 @@ fn run_intents(
     Ok(())
 }
 
+fn should_render_intents_pack(
+    filters: &RetrievalFilters,
+    emit: &str,
+    kind: Option<&str>,
+    unresolved: bool,
+    collapse_session: bool,
+) -> bool {
+    emit == "markdown"
+        && kind.is_none()
+        && !unresolved
+        && !collapse_session
+        && filters.frame_kind.is_none()
+}
+
+fn run_intents_pack(
+    projects: &[String],
+    hours: u64,
+    filters: &RetrievalFilters,
+    strict: bool,
+    min_confidence: Option<u8>,
+) -> Result<()> {
+    let lane_sort = filters.sort.unwrap_or(SortOrder::Newest);
+    let lane_limit = filters.limit.or(Some(DEFAULT_INTENTS_PACK_LIMIT));
+    let decisions = extract_intents_pack_lane(
+        projects,
+        hours,
+        filters,
+        strict,
+        min_confidence,
+        Some(intents::IntentKind::Decision),
+        None,
+        false,
+        false,
+        lane_sort,
+        lane_limit,
+    )?;
+    let tasks = extract_intents_pack_lane(
+        projects,
+        hours,
+        filters,
+        strict,
+        min_confidence,
+        Some(intents::IntentKind::Task),
+        None,
+        true,
+        false,
+        lane_sort,
+        lane_limit,
+    )?;
+    let user_msg = extract_intents_pack_lane(
+        projects,
+        hours,
+        filters,
+        strict,
+        min_confidence,
+        Some(intents::IntentKind::Intent),
+        Some(timeline::FrameKind::UserMsg),
+        true,
+        false,
+        lane_sort,
+        lane_limit,
+    )?;
+    let agent_reply = extract_intents_pack_lane(
+        projects,
+        hours,
+        filters,
+        strict,
+        min_confidence,
+        Some(intents::IntentKind::Outcome),
+        Some(timeline::FrameKind::AgentReply),
+        true,
+        false,
+        lane_sort,
+        lane_limit,
+    )?;
+    let unresolved = extract_intents_pack_lane(
+        projects,
+        hours,
+        filters,
+        strict,
+        min_confidence,
+        Some(intents::IntentKind::Intent),
+        None,
+        false,
+        true,
+        lane_sort,
+        lane_limit,
+    )?;
+
+    let sections = vec![
+        IntentPackSection {
+            title: "Decisions",
+            records: decisions,
+        },
+        IntentPackSection {
+            title: "Tasks",
+            records: tasks,
+        },
+        IntentPackSection {
+            title: "Human Intent",
+            records: user_msg,
+        },
+        IntentPackSection {
+            title: "Agent Claims / Self-Reports",
+            records: agent_reply,
+        },
+        IntentPackSection {
+            title: "Unresolved Human Intent",
+            records: unresolved,
+        },
+    ];
+    let project_label = if projects.is_empty() {
+        "(all projects)".to_string()
+    } else {
+        projects.join(", ")
+    };
+    print!(
+        "{}",
+        format_intents_pack_markdown(&project_label, hours, lane_limit, &sections)
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_intents_pack_lane(
+    projects: &[String],
+    hours: u64,
+    filters: &RetrievalFilters,
+    strict: bool,
+    min_confidence: Option<u8>,
+    kind_filter: Option<intents::IntentKind>,
+    frame_kind: Option<timeline::FrameKind>,
+    collapse_session: bool,
+    unresolved: bool,
+    sort: SortOrder,
+    limit: Option<usize>,
+) -> Result<Vec<intents::IntentRecord>> {
+    let config = intents::IntentsConfig {
+        project: projects.first().cloned().unwrap_or_default(),
+        hours,
+        strict,
+        min_confidence,
+        kind_filter: if unresolved { None } else { kind_filter },
+        frame_kind,
+    };
+    let extraction = intents::extract_intents_with_stats_for_projects(&config, projects)?;
+    let (date_lo, date_hi) = intent_date_bounds(filters)?;
+    let mut records = intents::apply_display_filters(
+        extraction.records,
+        &intents::IntentDisplayFilters {
+            unresolved,
+            unresolved_mode: intents::UnresolvedMode::Session,
+            collapse_session,
+            agent: filters.agent.clone(),
+            date_lo,
+            date_hi,
+            sort: Some(match sort {
+                SortOrder::Newest | SortOrder::Score => intents::IntentSortOrder::Newest,
+                SortOrder::Oldest => intents::IntentSortOrder::Oldest,
+            }),
+            limit,
+        },
+    );
+    if unresolved && let Some(kind) = kind_filter {
+        records.retain(|record| record.kind == kind);
+    }
+    Ok(records)
+}
+
+fn intent_date_bounds(filters: &RetrievalFilters) -> Result<(Option<String>, Option<String>)> {
+    if let Some(ref d) = filters.since {
+        let bounds = parse_date_filter(d)?;
+        Ok((bounds.0, bounds.1))
+    } else {
+        Ok((None, filters.until.clone()))
+    }
+}
+
+fn format_intents_pack_markdown(
+    project_label: &str,
+    hours: u64,
+    per_section_limit: Option<usize>,
+    sections: &[IntentPackSection],
+) -> String {
+    let mut out = String::new();
+    out.push_str("# Intent Report\n\n");
+    out.push_str(&format!("- project: {project_label}\n"));
+    out.push_str(&format!("- window_hours: {hours}\n"));
+    if let Some(limit) = per_section_limit {
+        out.push_str(&format!("- per_section_limit: {limit}\n"));
+    }
+    out.push_str("- source: canonical corpus\n\n");
+
+    for section in sections {
+        out.push_str(&format!("## {}\n\n", section.title));
+        if section.records.is_empty() {
+            out.push_str("_No records._\n\n");
+            continue;
+        }
+        for record in &section.records {
+            format_pack_record(&mut out, record);
+        }
+    }
+
+    let hits = collect_intents_pack_keyword_hits(sections);
+    out.push_str("## Mission Keyword Hits\n\n");
+    if hits.is_empty() {
+        out.push_str("_No mission keyword hits._\n");
+    } else {
+        for hit in hits {
+            out.push_str(&format!(
+                "- `{}` in {} | {} | {}: {}\n",
+                hit.keyword, hit.section, hit.date, hit.agent, hit.summary
+            ));
+            for source_chunk in unique_source_chunks(&hit.source_chunk) {
+                out.push_str(&format!("  source_chunk: {source_chunk}\n"));
+            }
+        }
+    }
+
+    out
+}
+
+fn format_pack_record(out: &mut String, record: &intents::IntentRecord) {
+    let count = record
+        .count
+        .filter(|count| *count > 1)
+        .map(|count| format!(" ({count}x)"))
+        .unwrap_or_default();
+    out.push_str(&format!(
+        "### {}{} | {} | {}\n",
+        record.kind.heading(),
+        count,
+        record.agent,
+        record.date
+    ));
+    out.push_str(&format!("{}: {}\n", record.kind.heading(), record.summary));
+    out.push_str(&format!(
+        "WHY: {}\n",
+        record.context.as_deref().unwrap_or("not captured")
+    ));
+    out.push_str("EVIDENCE:\n");
+    for source_chunk in unique_source_chunks(&record.source_chunk) {
+        out.push_str(&format!("- source_chunk: {source_chunk}\n"));
+    }
+    for evidence in &record.evidence {
+        out.push_str(&format!("- {}\n", evidence));
+    }
+    out.push('\n');
+}
+
+fn unique_source_chunks(source_chunk: &str) -> Vec<&str> {
+    let mut seen = BTreeSet::new();
+    source_chunk
+        .split(", ")
+        .filter_map(|chunk| {
+            let chunk = chunk.trim();
+            if chunk.is_empty() || !seen.insert(chunk) {
+                None
+            } else {
+                Some(chunk)
+            }
+        })
+        .collect()
+}
+
+fn collect_intents_pack_keyword_hits(sections: &[IntentPackSection]) -> Vec<IntentPackKeywordHit> {
+    const KEYWORDS: &[&str] = &[
+        "clean repo",
+        "public seed",
+        "fresh history",
+        "vista-leak",
+        "privacy",
+        "secret",
+        "depr",
+        "push",
+        "public flip",
+        "fresh-clone",
+        "p0",
+        "p1",
+        "p2",
+        "p3",
+        "p4",
+    ];
+
+    let mut hits = Vec::new();
+    let mut seen = BTreeSet::new();
+    for section in sections {
+        for record in &section.records {
+            let haystack = format!(
+                "{}\n{}\n{}\n{}",
+                record.summary,
+                record.context.as_deref().unwrap_or(""),
+                record.evidence.join("\n"),
+                record.source_chunk
+            )
+            .to_lowercase();
+            for keyword in KEYWORDS {
+                if !haystack.contains(keyword) {
+                    continue;
+                }
+                let seen_key = (
+                    section.title,
+                    *keyword,
+                    record.date.as_str(),
+                    record.agent.as_str(),
+                    record.summary.as_str(),
+                );
+                if !seen.insert(seen_key) {
+                    continue;
+                }
+                hits.push(IntentPackKeywordHit {
+                    section: section.title,
+                    keyword,
+                    date: record.date.clone(),
+                    agent: record.agent.clone(),
+                    summary: record.summary.clone(),
+                    source_chunk: record.source_chunk.clone(),
+                });
+            }
+        }
+    }
+    hits
+}
+
 fn run_tail(
     projects: &[String],
     hours: u64,
@@ -3576,8 +4609,10 @@ fn run_tail(
             IntentsDisplayOptions {
                 emit: "markdown",
                 strict: false,
+                min_confidence: None,
                 kind,
                 unresolved: false,
+                unresolved_mode: aicx::intents::UnresolvedMode::Session,
                 collapse_session: false,
             },
         );
@@ -3595,6 +4630,7 @@ fn run_tail(
         project: projects.first().cloned().unwrap_or_default(),
         hours,
         strict: false,
+        min_confidence: None,
         kind_filter,
         frame_kind: filters.frame_kind.map(Into::into),
     };
@@ -3688,6 +4724,7 @@ fn extract_input_format_label(format: ExtractInputFormat) -> &'static str {
         ExtractInputFormat::Gemini => "gemini",
         ExtractInputFormat::GeminiAntigravity => "gemini",
         ExtractInputFormat::Junie => "junie",
+        ExtractInputFormat::Grok => "grok",
     }
 }
 
@@ -4371,6 +5408,7 @@ fn run_extract_session(
             sources::extract_gemini(&config)?
         }
         ExtractInputFormat::Junie => sources::extract_junie(&config)?,
+        ExtractInputFormat::Grok => sources::extract_grok(&config)?,
     };
 
     let resolution = resolve_session_reference(session_id, agent, agent_label, &entries)?;
@@ -4535,6 +5573,7 @@ fn run_extract_file(
             sources::extract_gemini_antigravity_file(&input, &config)?
         }
         ExtractInputFormat::Junie => sources::extract_junie_file(&input, &config)?,
+        ExtractInputFormat::Grok => sources::extract_grok_file(&input, &config)?,
     };
 
     // Sort by timestamp (extractors should already do this).
@@ -4796,8 +5835,8 @@ fn warn_incremental_legacy_flag(flag_used: bool) {
 /// var so CI / wrappers can shorten it. Set to `0` for no pause.
 const MUTATION_WARN_DELAY_SECONDS_DEFAULT: u64 = 3;
 
-/// Emit a non-blocking note before a subcommand starts mutating
-/// `~/.aicx/`, then sleep briefly so the operator can Ctrl-C if they
+/// Emit a non-blocking note before a subcommand starts mutating the
+/// resolved AICX home, then sleep briefly so the operator can Ctrl-C if they
 /// invoked the command by accident.
 ///
 /// Wave D Cut D1 (B-P0-03): seven subcommands (`all`, `claude`, `codex`,
@@ -4820,19 +5859,26 @@ fn warn_pending_mutation(cmd: &str) {
         return;
     }
     let delay = mutation_warn_delay_seconds();
+    let root = mutation_warn_root_display();
     if delay == 0 {
         eprintln!(
-            "aicx {cmd}: note: about to write to ~/.aicx/. Pass --dry-run to preview \
+            "aicx {cmd}: note: about to write to {root}. Pass --dry-run to preview \
              (where supported) or set AICX_NO_MUTATION_WARN=1 to silence this note."
         );
         return;
     }
     eprintln!(
-        "aicx {cmd}: note: about to write to ~/.aicx/. Pass --dry-run to preview \
+        "aicx {cmd}: note: about to write to {root}. Pass --dry-run to preview \
          (where supported) or Ctrl-C within {delay}s to abort. \
          Set AICX_NO_MUTATION_WARN=1 to silence this note."
     );
     std::thread::sleep(std::time::Duration::from_secs(delay));
+}
+
+fn mutation_warn_root_display() -> String {
+    aicx::store::resolve_aicx_home()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|err| format!("<unresolved AICX_HOME: {err:#}>"))
 }
 
 fn mutation_warn_suppressed() -> bool {
@@ -5018,16 +6064,26 @@ struct StoreRunArgs {
 fn resolve_store_agents(agent: Option<&str>) -> Result<Vec<&'static str>> {
     match agent {
         Some("claude") => Ok(vec!["claude"]),
+        Some("claude-history") => Ok(vec!["claude-history"]),
         Some("codex") => Ok(vec!["codex"]),
+        Some("codex-sessions") => Ok(vec!["codex-sessions"]),
         Some("gemini") => Ok(vec!["gemini"]),
         Some("junie") => Ok(vec!["junie"]),
         Some("codescribe") => Ok(vec!["codescribe"]),
         Some("operator-md") => Ok(vec!["operator-md"]),
         Some(other) => Err(anyhow::anyhow!(
-            "Unsupported --agent '{}'. Expected one of: claude, codex, gemini, junie, codescribe, operator-md.",
+            "Unsupported --agent '{}'. Expected one of: claude, claude-history, codex, codex-sessions, gemini, junie, codescribe, operator-md.",
             other
         )),
-        None => Ok(vec!["claude", "codex", "gemini", "junie", "codescribe"]),
+        None => Ok(vec![
+            "claude",
+            "claude-history",
+            "codex",
+            "codex-sessions",
+            "gemini",
+            "junie",
+            "codescribe",
+        ]),
     }
 }
 
@@ -5151,6 +6207,7 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             "codex" => sources::extract_codex(&config),
             "gemini" => sources::extract_gemini(&config),
             "junie" => sources::extract_junie(&config),
+            "grok" => sources::extract_grok(&config),
             "codescribe" => sources::extract_codescribe(&config),
             "operator-md" => sources::extract_operator_markdown(&config),
             _ => Ok(Vec::new()),
@@ -5664,9 +6721,13 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         );
         let agent_entries_result = match ag {
             "claude" => sources::extract_claude(&config),
+            "claude-history" => sources::extract_claude_history(&config),
             "codex" => sources::extract_codex(&config),
+            "codex-sessions" => sources::extract_codex_sessions(&config),
             "gemini" => sources::extract_gemini(&config),
             "junie" => sources::extract_junie(&config),
+            "grok" => sources::extract_grok(&config),
+            "grok-sessions" => sources::extract_grok_sessions(&config),
             "codescribe" => sources::extract_codescribe(&config),
             "operator-md" => sources::extract_operator_markdown(&config),
             _ => Ok(Vec::new()),
@@ -6662,6 +7723,45 @@ fn write_index_for_current_build(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IndexCatchUpPlan {
+    needed: bool,
+    cutoff: Option<DateTime<Utc>>,
+}
+
+fn index_catch_up_plan_from_statuses(statuses: &[aicx::IndexStatus]) -> Result<IndexCatchUpPlan> {
+    let mut needed = false;
+    let mut cutoff: Option<DateTime<Utc>> = None;
+
+    for status in statuses {
+        if status.sessions_newer_than_chunks == 0 {
+            continue;
+        }
+        needed = true;
+        let Some(newest_chunk_mtime) = status.newest_chunk_mtime.as_deref() else {
+            return Ok(IndexCatchUpPlan {
+                needed: true,
+                cutoff: None,
+            });
+        };
+        let parsed = DateTime::parse_from_rfc3339(newest_chunk_mtime)
+            .with_context(|| format!("parse newest_chunk_mtime `{newest_chunk_mtime}`"))?
+            .with_timezone(&Utc);
+        cutoff = Some(cutoff.map_or(parsed, |current| current.min(parsed)));
+    }
+
+    Ok(IndexCatchUpPlan { needed, cutoff })
+}
+
+fn index_catch_up_plan(scopes: &[Option<&str>]) -> Result<IndexCatchUpPlan> {
+    let store_root = store::store_base_dir()?;
+    let statuses = scopes
+        .iter()
+        .map(|scope| aicx::api::index_status_at(&store_root, *scope))
+        .collect::<Result<Vec<_>>>()?;
+    index_catch_up_plan_from_statuses(&statuses)
+}
+
 /// Build (or preview) the vector index. `dry_run=true` probes the
 /// embedder + samples chunks for ETA. `dry_run=false` writes a
 /// persistent NDJSON-backed index (Iter 3) that subsequent `aicx search`
@@ -6677,6 +7777,31 @@ fn run_index(
     let scopes: Vec<Option<&str>> = resolved_scopes.iter().map(Option::as_deref).collect();
 
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr()) && !json;
+
+    if !dry_run {
+        let catch_up = index_catch_up_plan(&scopes)?;
+        if catch_up.needed {
+            eprintln!("Canonical catch-up: materializing source sessions before embedding");
+            if let Some(cutoff) = catch_up.cutoff {
+                eprintln!("  Catch-up cutoff: {}", cutoff.to_rfc3339());
+            } else {
+                eprintln!("  Catch-up cutoff: <all time>");
+            }
+            run_store(StoreRunArgs {
+                project: projects.to_vec(),
+                agent: None,
+                hours: 0,
+                cutoff: catch_up.cutoff,
+                full_rescan: true,
+                include_assistant: true,
+                emit: StdoutEmit::None,
+                redact_secrets: true,
+                noise_filter_enabled: true,
+            })?;
+        } else {
+            eprintln!("Canonical catch-up: no source sessions newer than chunks");
+        }
+    }
 
     // G-3: announce embedder backend class so the operator can predict perf.
     // Cloud HTTP (~2.5s/req) vs native GGUF (~50ms/req on M-series) matter
@@ -6797,6 +7922,8 @@ fn print_index_status_text(status: &aicx::IndexStatus) {
         "  readiness:              {}",
         match status.readiness {
             aicx::IndexReadiness::Ready => "ready",
+            aicx::IndexReadiness::StaleChunks => "stale_chunks (sessions newer than chunks)",
+            aicx::IndexReadiness::StaleIndex => "stale_index (chunks pending embedding)",
             aicx::IndexReadiness::Pending => "pending (only temp checkpoint)",
             aicx::IndexReadiness::Missing => "missing",
         }
@@ -6820,6 +7947,29 @@ fn print_index_status_text(status: &aicx::IndexStatus) {
     eprintln!(
         "  newest_chunk_mtime:     {}",
         status.newest_chunk_mtime.as_deref().unwrap_or("<none>")
+    );
+    eprintln!("  source_sessions:        {}", status.source_sessions);
+    eprintln!(
+        "  newest_session_updated: {}",
+        status
+            .newest_session_updated_at
+            .as_deref()
+            .unwrap_or("<none>")
+    );
+    eprintln!(
+        "  sessions_newer_than_chunks: {}",
+        status.sessions_newer_than_chunks
+    );
+    eprintln!(
+        "  sessions_without_timestamps: {}",
+        status.sessions_without_timestamps
+    );
+    eprintln!(
+        "  chunking_lag_secs:      {}",
+        status
+            .chunking_lag_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string())
     );
     eprintln!(
         "  semantic_index_mtime:   {}",

@@ -1,8 +1,11 @@
 //! Stable in-process API for consumers that want AICX as a library.
 //!
 //! The CLI remains the product shell, but this facade is the supported crate
-//! boundary: callers get corpus, retrieval, intent, and health operations
-//! without importing CLI-private glue from `main.rs`.
+//! boundary. With default features callers get corpus, retrieval, intent, and
+//! health operations without importing CLI-private glue from `main.rs`.
+//! With `default-features = false, features = ["loctree-consumer"]`, callers get
+//! the stable read core: chunk listing/reading, typed chunk references, session
+//! types, and pure intent extraction stages without embedding or app surfaces.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -11,11 +14,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::chunker::ChunkerConfig;
+#[cfg(feature = "app")]
 use crate::doctor::{DoctorOptions, DoctorReport};
 use crate::intents::{IntentExtraction, IntentsConfig};
+#[cfg(feature = "app")]
 use crate::rank::FuzzyResult;
+use crate::sessions::{self, SessionInfo};
 use crate::store::{ReadContextChunk, StoreWriteSummary, StoredContextFile};
-use crate::timeline::{FrameKind, TimelineEntry};
+#[cfg(feature = "app")]
+use crate::timeline::FrameKind;
+use crate::timeline::TimelineEntry;
 
 /// Configuration for an [`Aicx`] library handle.
 #[derive(Debug, Clone)]
@@ -105,6 +113,7 @@ impl Aicx {
     /// Run a semantic search against the canonical store's persistent vector
     /// index. Fails fast with a descriptive error when any precondition is
     /// missing (embedder unhydrated, index not built, dimension mismatch).
+    #[cfg(feature = "app")]
     pub fn semantic_search(
         &self,
         query: impl AsRef<str>,
@@ -167,6 +176,7 @@ impl Aicx {
         )
     }
 
+    #[cfg(feature = "app")]
     pub async fn doctor(&self, opts: &DoctorOptions) -> Result<DoctorReport> {
         crate::doctor::run_at(&self.config.store_root, opts).await
     }
@@ -182,6 +192,7 @@ pub struct StoreOptions {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "app")]
 pub struct SearchOptions {
     pub limit: usize,
     pub projects: Vec<String>,
@@ -190,6 +201,7 @@ pub struct SearchOptions {
     pub kind: Option<String>,
 }
 
+#[cfg(feature = "app")]
 impl Default for SearchOptions {
     fn default() -> Self {
         Self {
@@ -202,6 +214,7 @@ impl Default for SearchOptions {
     }
 }
 
+#[cfg(feature = "app")]
 fn search_project_scopes(store_root: &Path, projects: &[String]) -> Result<Vec<Option<String>>> {
     if projects.is_empty() {
         return Ok(vec![None]);
@@ -212,6 +225,7 @@ fn search_project_scopes(store_root: &Path, projects: &[String]) -> Result<Vec<O
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg(feature = "app")]
 pub struct SearchResults {
     pub results: Vec<FuzzyResult>,
     pub scanned: usize,
@@ -237,6 +251,12 @@ pub enum IndexReadiness {
     /// to query. A temp checkpoint may coexist when a rebuild is in
     /// flight over a previously committed index.
     Ready,
+    /// Source sessions are newer than the newest canonical chunk, so the
+    /// sessions -> chunks stage has not caught up yet.
+    StaleChunks,
+    /// Canonical chunks exist that have not been represented in the committed
+    /// semantic index yet.
+    StaleIndex,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -246,6 +266,11 @@ pub struct IndexStatus {
     pub semantic_index_path: Option<String>,
     pub semantic_index_rows: usize,
     pub newest_chunk_mtime: Option<String>,
+    pub source_sessions: usize,
+    pub newest_session_updated_at: Option<String>,
+    pub sessions_newer_than_chunks: usize,
+    pub sessions_without_timestamps: usize,
+    pub chunking_lag_secs: Option<u64>,
     pub semantic_index_mtime: Option<String>,
     pub semantic_lag_secs: Option<u64>,
     pub pending_chunks: usize,
@@ -271,6 +296,14 @@ pub struct IndexStatus {
 }
 
 pub fn index_status_at(base: &Path, project: Option<&str>) -> Result<IndexStatus> {
+    index_status_at_with_sessions(base, project, None)
+}
+
+fn index_status_at_with_sessions(
+    base: &Path,
+    project: Option<&str>,
+    source_sessions_override: Option<&[SessionInfo]>,
+) -> Result<IndexStatus> {
     let chunks = crate::store::scan_context_files_project_at(base, project)?;
     let newest_chunk = chunks
         .iter()
@@ -291,6 +324,15 @@ pub fn index_status_at(base: &Path, project: Option<&str>) -> Result<IndexStatus
     let temp_index_bytes = temp_metadata.as_ref().map(|metadata| metadata.len());
     let semantic_index_present = semantic_index_mtime.is_some();
     let temp_index_present = temp_index_mtime.is_some();
+    let discovered_sessions;
+    let source_sessions = match source_sessions_override {
+        Some(sessions) => sessions,
+        None => {
+            discovered_sessions = discover_source_sessions_for_status(base, project, newest_chunk);
+            &discovered_sessions
+        }
+    };
+    let chunking = calculate_chunking_lag(source_sessions, newest_chunk);
     let semantic_index_rows = count_index_rows(&semantic_index_path)?;
     let temp_index_rows = count_index_rows(&temp_index_path)?;
     let semantic_lag_secs = match (newest_chunk, semantic_index_mtime) {
@@ -306,9 +348,13 @@ pub fn index_status_at(base: &Path, project: Option<&str>) -> Result<IndexStatus
     let pending_chunks = chunks.len().saturating_sub(semantic_index_rows);
 
     let readiness = match (semantic_index_present, temp_index_present) {
-        (true, _) => IndexReadiness::Ready,
         (false, true) => IndexReadiness::Pending,
         (false, false) => IndexReadiness::Missing,
+        (true, _) if chunking.sessions_newer_than_chunks > 0 => IndexReadiness::StaleChunks,
+        (true, _) if pending_chunks > 0 || semantic_lag_secs.unwrap_or(0) > 0 => {
+            IndexReadiness::StaleIndex
+        }
+        (true, _) => IndexReadiness::Ready,
     };
     let committed_at = semantic_index_mtime.map(system_time_to_rfc3339);
 
@@ -318,6 +364,13 @@ pub fn index_status_at(base: &Path, project: Option<&str>) -> Result<IndexStatus
         semantic_index_path: semantic_index_present.then(|| path_for_json(&semantic_index_path)),
         semantic_index_rows,
         newest_chunk_mtime: newest_chunk.map(system_time_to_rfc3339),
+        source_sessions: chunking.source_sessions,
+        newest_session_updated_at: chunking
+            .newest_session_updated_at
+            .map(|value| value.to_rfc3339()),
+        sessions_newer_than_chunks: chunking.sessions_newer_than_chunks,
+        sessions_without_timestamps: chunking.sessions_without_timestamps,
+        chunking_lag_secs: chunking.chunking_lag_secs,
         semantic_index_mtime: committed_at.clone(),
         semantic_lag_secs,
         pending_chunks,
@@ -331,6 +384,102 @@ pub fn index_status_at(base: &Path, project: Option<&str>) -> Result<IndexStatus
         project_bucket,
         committed_at,
     })
+}
+
+#[derive(Debug, Clone)]
+struct ChunkingLag {
+    source_sessions: usize,
+    newest_session_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    sessions_newer_than_chunks: usize,
+    sessions_without_timestamps: usize,
+    chunking_lag_secs: Option<u64>,
+}
+
+fn discover_source_sessions_for_status(
+    base: &Path,
+    project: Option<&str>,
+    newest_chunk: Option<SystemTime>,
+) -> Vec<SessionInfo> {
+    let Ok(active_store_root) = crate::store::store_base_dir() else {
+        return Vec::new();
+    };
+    if active_store_root != base {
+        return Vec::new();
+    }
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+
+    sessions::discover_sessions_at(&home, newest_chunk, None, None)
+        .into_iter()
+        .filter(|session| status_session_matches_project(project, session))
+        .collect()
+}
+
+fn status_session_matches_project(project: Option<&str>, session: &SessionInfo) -> bool {
+    let Some(project) = project.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    if project == "_all" {
+        return true;
+    }
+
+    let needle = project.to_ascii_lowercase();
+    let slash_needle = needle.replace('_', "/");
+    let repo_name = slash_needle
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(&slash_needle);
+
+    if session.project.as_deref().is_some_and(|value| {
+        value.eq_ignore_ascii_case(project) || value.eq_ignore_ascii_case(repo_name)
+    }) {
+        return true;
+    }
+
+    session.repo_path.as_deref().is_some_and(|repo_path| {
+        let normalized = repo_path.replace('\\', "/").to_ascii_lowercase();
+        normalized == slash_needle
+            || normalized.ends_with(&format!("/{repo_name}"))
+            || normalized.contains(&format!("/{slash_needle}"))
+    })
+}
+
+fn calculate_chunking_lag(
+    source_sessions: &[SessionInfo],
+    newest_chunk: Option<SystemTime>,
+) -> ChunkingLag {
+    let newest_chunk_at = newest_chunk.map(chrono::DateTime::<chrono::Utc>::from);
+    let mut newest_session_updated_at: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut sessions_newer_than_chunks = 0usize;
+    let mut sessions_without_timestamps = 0usize;
+
+    for session in source_sessions {
+        let Some(session_time) = session.updated_at.or(session.started_at) else {
+            sessions_without_timestamps += 1;
+            continue;
+        };
+        newest_session_updated_at =
+            Some(newest_session_updated_at.map_or(session_time, |cur| cur.max(session_time)));
+        if newest_chunk_at.is_none_or(|chunk_time| session_time > chunk_time) {
+            sessions_newer_than_chunks += 1;
+        }
+    }
+
+    let chunking_lag_secs = match (newest_session_updated_at, newest_chunk_at) {
+        (Some(session_time), Some(chunk_time)) if session_time > chunk_time => {
+            Some((session_time - chunk_time).num_seconds().max(0) as u64)
+        }
+        _ => None,
+    };
+
+    ChunkingLag {
+        source_sessions: source_sessions.len(),
+        newest_session_updated_at,
+        sessions_newer_than_chunks,
+        sessions_without_timestamps,
+        chunking_lag_secs,
+    }
 }
 
 fn canonical_bucket_name(project: Option<&str>) -> String {
@@ -380,7 +529,7 @@ fn system_time_to_rfc3339(value: SystemTime) -> String {
     datetime.to_rfc3339()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "app"))]
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
@@ -430,7 +579,7 @@ mod tests {
         )
         .expect("write sibling index");
 
-        let status = index_status_at(&root, None).expect("index status");
+        let status = index_status_at_with_sessions(&root, None, Some(&[])).expect("index status");
 
         assert!(status.semantic_index_present);
         assert_eq!(status.semantic_index_rows, 2);
@@ -482,7 +631,7 @@ mod tests {
         )
         .expect("write temp index");
 
-        let status = index_status_at(&root, None).expect("index status");
+        let status = index_status_at_with_sessions(&root, None, Some(&[])).expect("index status");
 
         assert!(!status.semantic_index_present);
         assert!(status.temp_index_present);
@@ -510,7 +659,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create root");
 
-        let status = index_status_at(&root, None).expect("index status");
+        let status = index_status_at_with_sessions(&root, None, Some(&[])).expect("index status");
 
         assert!(!status.semantic_index_present);
         assert!(!status.temp_index_present);
@@ -532,8 +681,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create root");
 
-        let status =
-            index_status_at(&root, Some("VetCoders/Loctree")).expect("index status with project");
+        let status = index_status_at_with_sessions(&root, Some("VetCoders/Loctree"), Some(&[]))
+            .expect("index status with project");
 
         // Mirrors the on-disk bucket: lowercase + path separators replaced.
         assert_eq!(status.project_bucket, "vetcoders_loctree");
@@ -550,6 +699,11 @@ mod tests {
             semantic_index_path: None,
             semantic_index_rows: 0,
             newest_chunk_mtime: None,
+            source_sessions: 0,
+            newest_session_updated_at: None,
+            sessions_newer_than_chunks: 0,
+            sessions_without_timestamps: 0,
+            chunking_lag_secs: None,
             semantic_index_mtime: None,
             semantic_lag_secs: None,
             pending_chunks: 0,
@@ -571,6 +725,80 @@ mod tests {
         assert_eq!(payload["project_bucket"], "_all");
         assert!(payload["committed_at"].is_null());
         assert_eq!(payload["temp_index_rows"], 1);
+    }
+
+    #[test]
+    fn index_status_marks_stale_chunks_when_sessions_are_newer_than_chunks() {
+        let root = std::env::temp_dir().join(format!(
+            "aicx-api-index-status-stale-chunks-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+
+        let older = Utc.with_ymd_and_hms(2026, 6, 11, 12, 33, 0).unwrap();
+        let newer = Utc.with_ymd_and_hms(2026, 6, 12, 9, 28, 0).unwrap();
+        let entry = TimelineEntry {
+            timestamp: older,
+            agent: "claude".to_string(),
+            session_id: "old-session".to_string(),
+            role: "user".to_string(),
+            message: "old chunk".to_string(),
+            frame_kind: Some(FrameKind::UserMsg),
+            branch: None,
+            cwd: Some("/Users/me/vc-workspace/vetcoders/aicx".to_string()),
+            timestamp_source: None,
+        };
+        let summary = crate::store::store_semantic_segments_at(
+            &root,
+            &[entry],
+            &ChunkerConfig::default(),
+            |_, _| {},
+        )
+        .expect("store chunk");
+        let index_dir = root.join("indexed").join("_all");
+        std::fs::create_dir_all(&index_dir).expect("create index dir");
+        let index_path = index_dir.join("embeddings.ndjson");
+        std::fs::write(
+            &index_path,
+            "{\"schema_version\":\"1.0\"}\n{\"id\":\"old\"}\n",
+        )
+        .expect("write index");
+
+        let older_file_time = filetime::FileTime::from_unix_time(older.timestamp(), 0);
+        for path in &summary.written_paths {
+            filetime::set_file_mtime(path, older_file_time).expect("set chunk mtime");
+        }
+        filetime::set_file_mtime(&index_path, older_file_time).expect("set index mtime");
+
+        let session = SessionInfo {
+            session_id: "fresh".to_string(),
+            agent: "claude".to_string(),
+            project: Some("aicx".to_string()),
+            repo_path: Some("/Users/me/vc-workspace/vetcoders/aicx".to_string()),
+            started_at: Some(newer),
+            updated_at: Some(newer),
+            message_count: 1,
+            user_message_count: 1,
+            agent_message_count: 0,
+            title: Some("fresh work".to_string()),
+            source_path: root.join("fresh.jsonl"),
+            association: crate::sessions::Association::Exact,
+            temporal_confidence: crate::sessions::TemporalConfidence::Full,
+        };
+
+        let status =
+            index_status_at_with_sessions(&root, None, Some(&[session])).expect("index status");
+
+        assert_eq!(status.source_sessions, 1);
+        assert_eq!(status.sessions_newer_than_chunks, 1);
+        assert_eq!(status.sessions_without_timestamps, 0);
+        assert_eq!(status.newest_session_updated_at, Some(newer.to_rfc3339()));
+        assert_eq!(status.readiness, IndexReadiness::StaleChunks);
+        assert!(status.chunking_lag_secs.unwrap() > 0);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

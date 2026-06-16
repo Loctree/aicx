@@ -1,6 +1,7 @@
 use super::*;
 use crate::oracle::OracleStatus;
 use crate::sources::shared::{IntentLineModality, intent_line_modality};
+use filetime::{FileTime, set_file_mtime};
 use std::fs;
 use std::path::PathBuf;
 
@@ -42,7 +43,7 @@ fn migration_test_root(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("aicx-intents-{label}-{nanos}"))
 }
 
-fn extract_demo_records(label: &str, body: &str) -> Vec<IntentRecord> {
+fn extract_demo_extraction(label: &str, body: &str) -> IntentExtraction {
     let root = migration_test_root(label);
     let _ = fs::remove_dir_all(&root);
 
@@ -52,6 +53,7 @@ fn extract_demo_records(label: &str, body: &str) -> Vec<IntentRecord> {
         project: "demo".to_string(),
         hours: 24,
         strict: false,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: None,
     };
@@ -63,9 +65,294 @@ fn extract_demo_records(label: &str, body: &str) -> Vec<IntentRecord> {
         Utc,
     );
 
-    let records = extract_intents_from_root_at(&config, &root, now).expect("extract intents");
+    let extraction =
+        extract_intents_from_root_at_with_stats(&config, &root, now).expect("extract intents");
     let _ = fs::remove_dir_all(root);
-    records
+    extraction
+}
+
+fn extract_demo_records(label: &str, body: &str) -> Vec<IntentRecord> {
+    extract_demo_extraction(label, body).records
+}
+
+#[test]
+fn local_command_artifacts_do_not_become_intents() {
+    let root = migration_test_root("local-command-artifact-intent");
+    let _ = fs::remove_dir_all(&root);
+    write_chunk(
+        &root,
+        "demo",
+        "2026-03-15",
+        "120000_codex-001.md",
+        r#"[project: demo | agent: claude | date: 2026-03-15 | frame_kind: user_msg]
+
+[signals]
+Intent:
+- Next steps:
+- *  issuer: C=US; O=Let's Encrypt; CN=E7
+[/signals]
+
+[12:00:00] user: <local-command-caveat>DO NOT respond to these messages</local-command-caveat>
+[12:00:00] user: <bash-stdout>curl output
+* subjectAltName: host "api.libraxis.cloud" matched cert's "api.libraxis.cloud"
+* issuer: C=US; O=Let's Encrypt; CN=E7
+* SSL certificate verify ok.
+</bash-stdout>
+"#,
+    );
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        min_confidence: None,
+        kind_filter: Some(IntentKind::Intent),
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+    let records = extract_intents_from_root_at(&config, &root, now).expect("extract intents");
+    assert!(
+        records.is_empty(),
+        "local command artifacts leaked: {records:?}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn pasted_skill_doc_outline_does_not_become_intent() {
+    let root = migration_test_root("pasted-skill-doc-outline");
+    let _ = fs::remove_dir_all(&root);
+    write_chunk(
+        &root,
+        "demo",
+        "2026-03-15",
+        "120000_claude-001.md",
+        r#"[project: demo | agent: claude | date: 2026-03-15 | frame_kind: user_msg]
+
+[signals]
+Intent:
+- 10. Use `cron` to keep heartbeat and schedule the next step when the session
+- Input: "You drive. I want this local AI stack to feel production-ready."
+Notes:
+- Base directory for this skill: /Users/maciejgad/.claude/skills/vc-ownership
+[/signals]
+
+[12:00:00] user: Base directory for this skill: /Users/maciejgad/.claude/skills/vc-ownership
+
+# vc-ownership
+
+10. Use `cron` to keep heartbeat and schedule the next step when the session
+"#,
+    );
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        min_confidence: None,
+        kind_filter: Some(IntentKind::Intent),
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+    let records = extract_intents_from_root_at(&config, &root, now).expect("extract intents");
+    assert!(records.is_empty(), "skill doc outline leaked: {records:?}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn charter_block_does_not_become_intent_or_outcome() {
+    let records = extract_demo_records(
+        "charter-block-filter",
+        r#"[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]
+
+[12:00:00] user: # AGENTS.md instructions for /Users/maciejgad/vc-workspace/vetcoders/aicx
+<INSTRUCTIONS>
+<!-- loctree-doctrine: v1 -->
+## **LOCTREE + AICX + VIBECRAFTED — ZŁOTE RUNO**
+Done Is A Market Condition
+Code is not done because a narrow check turned green
+Product truth beats local elegance.
+</INSTRUCTIONS>
+[12:01:00] user: Task: keep the real user directive visible after charter
+"#,
+    );
+
+    assert!(
+        records.iter().any(|record| {
+            record.kind == IntentKind::Intent
+                && record
+                    .summary
+                    .contains("keep the real user directive visible after charter")
+        }),
+        "real user directive after charter was not preserved: {records:?}",
+    );
+    assert!(
+        !records.iter().any(|record| {
+            record.summary.contains("Done Is A Market Condition")
+                || record
+                    .summary
+                    .contains("Code is not done because a narrow check turned green")
+                || record
+                    .summary
+                    .contains("Product truth beats local elegance")
+        }),
+        "charter block leaked intent/outcome records: {records:?}",
+    );
+}
+
+#[test]
+fn repeated_charter_signal_lines_do_not_multiply_across_sessions() {
+    let tmp = migration_test_root("charter-signal-dedup");
+    let _ = fs::remove_dir_all(&tmp);
+
+    let body = r#"[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]
+
+[signals]
+Intent:
+- Done Is A Market Condition
+- Code is not done because a narrow check turned green
+[/signals]
+
+[12:00:00] user: Done Is A Market Condition
+"#;
+
+    write_chunk_with_session(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "codex",
+        "charter-session-a",
+        1,
+        body,
+    );
+    write_chunk_with_session(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "codex",
+        "charter-session-b",
+        2,
+        body,
+    );
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+    let charter_count = records
+        .iter()
+        .filter(|record| {
+            record.summary.contains("Done Is A Market Condition")
+                || record
+                    .summary
+                    .contains("Code is not done because a narrow check turned green")
+        })
+        .count();
+    assert!(
+        charter_count <= 1,
+        "charter line multiplied across sessions: {records:?}",
+    );
+    assert_eq!(
+        charter_count, 0,
+        "charter doctrine should be filtered before candidate promotion: {records:?}",
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn collapse_session_merges_exact_daily_duplicates_across_session_forks() {
+    let make_record = |session_id: &str, source_chunk: &str| IntentRecord {
+        kind: IntentKind::Intent,
+        summary: "przerobimy ScreenScribe na portal".to_string(),
+        context: None,
+        evidence: vec![],
+        project: "VetCoders/ScreenScribe".to_string(),
+        agent: "codex".to_string(),
+        date: "2026-05-31".to_string(),
+        timestamp: None,
+        session_id: session_id.to_string(),
+        count: None,
+        first_chunk: None,
+        last_chunk: None,
+        source_chunk: source_chunk.to_string(),
+        source: None,
+    };
+
+    let records = vec![
+        make_record("fork-a", "a.md"),
+        make_record("fork-b", "b.md"),
+        make_record("fork-c", "c.md"),
+    ];
+    let collapsed = apply_display_filters(
+        records,
+        &IntentDisplayFilters {
+            collapse_session: true,
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(collapsed.len(), 1);
+    assert_eq!(collapsed[0].count, Some(3));
+    assert!(collapsed[0].source_chunk.contains("a.md"));
+    assert!(collapsed[0].source_chunk.contains("b.md"));
+    assert!(collapsed[0].source_chunk.contains("c.md"));
+}
+
+#[test]
+fn collapse_session_tolerates_existing_none_count() {
+    let make_record = |summary: &str, count| IntentRecord {
+        kind: IntentKind::Intent,
+        summary: summary.to_string(),
+        context: None,
+        evidence: vec![],
+        project: "VetCoders/ScreenScribe".to_string(),
+        agent: "codex".to_string(),
+        date: "2026-05-31".to_string(),
+        timestamp: None,
+        session_id: "same-session".to_string(),
+        count,
+        first_chunk: None,
+        last_chunk: None,
+        source_chunk: format!("{summary}.md"),
+        source: None,
+    };
+
+    let collapsed = apply_display_filters(
+        vec![make_record("first", None), make_record("second", Some(2))],
+        &IntentDisplayFilters {
+            collapse_session: true,
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(collapsed.len(), 1);
+    assert_eq!(collapsed[0].count, Some(3));
 }
 
 #[test]
@@ -164,6 +451,111 @@ fn zadanie_head_is_typed_directive_and_remains_intent() {
 }
 
 #[test]
+fn user_question_and_why_lines_bridge_into_main_intents_view() {
+    let extraction = extract_demo_extraction(
+        "md-radar-question-why-bridge",
+        "[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]\n\n\
+         [12:00:00] user: Question: should md-radar keep the current storage model?\n\
+         [12:01:00] user: why: human intent must stay visible before agent outcomes\n\
+         [12:02:00] user: Task: decide whether md-radar keeps current storage before migration work\n",
+    );
+
+    assert!(
+        extraction.stats.candidate_count > 0,
+        "md-radar fixture produced no candidates: {extraction:?}"
+    );
+    let records = extraction.records;
+    assert!(
+        records.iter().any(|record| {
+            record.kind == IntentKind::Intent
+                && record.summary == "should md-radar keep the current storage model?"
+        }),
+        "user question did not surface as Lane 1 intent: {records:?}"
+    );
+    assert!(
+        records.iter().any(|record| {
+            record.kind == IntentKind::Intent
+                && record.summary == "human intent must stay visible before agent outcomes"
+        }),
+        "user why-line did not surface as Lane 1 intent: {records:?}"
+    );
+}
+
+#[test]
+fn md_radar_style_user_messages_surface_in_main_intents_view() {
+    let extraction = extract_demo_extraction(
+        "md-radar-natural-human-lines",
+        "[project: m-szymanska/md-radar | agent: codex | date: 2026-06-15 | frame_kind: user_msg]\n\n\
+         [12:00:00] user: Proszę odpal /vc-init na tym repo i ustal, gdzie zaczęła się wcześniejsza sesja.\n\
+         [12:01:00] user: Czy AICX umie wyciągać intents z JSONL?\n\
+         [12:02:00] user: Usuń hardkody i ścieżki z README, bo to ma być gotowe dla świeżego repo.\n",
+    );
+
+    assert!(
+        extraction.stats.scanned_count == 1,
+        "md-radar fixture should scan one user_msg chunk: {extraction:?}"
+    );
+    assert!(
+        extraction.stats.candidate_count >= 3,
+        "md-radar-style user messages produced no candidates: {extraction:?}"
+    );
+
+    let records = extraction.records;
+    assert!(
+        records.iter().any(|record| {
+            record.kind == IntentKind::Intent
+                && record.summary.contains("Proszę odpal /vc-init na tym repo")
+        }),
+        "human /vc-init request disappeared from Lane 1: {records:?}"
+    );
+    assert!(
+        records.iter().any(|record| {
+            record.kind == IntentKind::Intent
+                && record
+                    .summary
+                    .contains("Czy AICX umie wyciągać intents z JSONL?")
+        }),
+        "human question disappeared from Lane 1: {records:?}"
+    );
+    assert!(
+        records.iter().any(|record| {
+            matches!(record.kind, IntentKind::Intent | IntentKind::Decision)
+                && record.summary.contains("Usuń hardkody i ścieżki z README")
+        }),
+        "human cleanup request disappeared from Lane 1: {records:?}"
+    );
+}
+
+#[test]
+fn user_comment_after_local_command_output_still_surfaces() {
+    let records = extract_demo_records(
+        "mixed-command-output-human-comment",
+        "[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]\n\n\
+         [12:00:00] user: <local-command-caveat>DO NOT respond to these messages</local-command-caveat>\n\
+         <bash-stdout>curl output\n\
+         * issuer: C=US; O=Let's Encrypt; CN=E7\n\
+         * SSL certificate verify ok.\n\
+         </bash-stdout>\n\
+         Question: should md-radar keep the current storage model after this evidence?\n",
+    );
+
+    assert!(
+        records.iter().any(|record| {
+            record.kind == IntentKind::Intent
+                && record.summary
+                    == "should md-radar keep the current storage model after this evidence?"
+        }),
+        "human question after command output was dropped with the artifact entry: {records:?}"
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.summary.contains("Let's Encrypt")),
+        "local command artifact leaked into intent records: {records:?}"
+    );
+}
+
+#[test]
 fn typed_directive_with_reference_marker_mid_body_remains_intent() {
     let line =
         "Zadanie: analyze this pasted reference > intent: old plan [Pasted text #2 +4 lines]";
@@ -206,6 +598,38 @@ fn write_chunk_with_sidecar(
         "codex"
     };
     write_sidecar(&path, project, agent, date, "intentstest01", frame_kind);
+}
+
+fn write_chunk_with_session(
+    root: &Path,
+    project: &str,
+    date: &str,
+    agent: &str,
+    session_id: &str,
+    sequence: u32,
+    body: &str,
+) -> PathBuf {
+    let date_compact = crate::store::compact_date(date);
+    let basename = crate::store::session_basename(date, agent, session_id, sequence);
+    let dir = root
+        .join("store")
+        .join("local")
+        .join(project)
+        .join(date_compact)
+        .join("conversations")
+        .join(agent);
+    fs::create_dir_all(&dir).expect("create chunk dir");
+    let path = dir.join(basename);
+    fs::write(&path, body).expect("write chunk");
+    write_sidecar(
+        &path,
+        project,
+        agent,
+        date,
+        session_id,
+        Some(FrameKind::UserMsg),
+    );
+    path
 }
 
 fn write_sidecar(
@@ -306,6 +730,7 @@ RED LIGHT: checklist detected (open: 0, done: 1)
         project: "demo".to_string(),
         hours: 24,
         strict: false,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: None,
     };
@@ -369,6 +794,7 @@ fn extraction_stats_report_scanned_chunks_and_candidates_before_display_filters(
         project: "demo".to_string(),
         hours: 24,
         strict: false,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: None,
     };
@@ -387,6 +813,65 @@ fn extraction_stats_report_scanned_chunks_and_candidates_before_display_filters(
     assert_eq!(extraction.stats.candidate_count, extraction.records.len());
     assert!(extraction.stats.candidate_count >= 2);
     assert!(extraction.stats.source_paths_verified);
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn hours_filter_uses_canonical_chunk_date_not_mtime() {
+    let tmp = std::env::temp_dir().join(format!(
+        "ai-contexters-intents-{}-canonical-date",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+
+    write_chunk(
+        &tmp,
+        "demo",
+        "2026-03-01",
+        "120000_codex-001.md",
+        "[signals]\nIntent:\n- stale synced intent\n[/signals]\n",
+    );
+    write_chunk(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "120500_codex-002.md",
+        "[signals]\nIntent:\n- fresh canonical intent\n[/signals]\n",
+    );
+    let stale_path = chunk_path(&tmp, "demo", "2026-03-01", "120000_codex-001.md");
+    let fresh_mtime = FileTime::from_unix_time(1_773_580_800, 0); // 2026-03-15T12:00:00Z
+    set_file_mtime(&stale_path, fresh_mtime).expect("set stale mtime");
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+
+    assert!(
+        records
+            .iter()
+            .any(|record| record.summary == "fresh canonical intent")
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.summary == "stale synced intent"),
+        "mtime drift must not make stale canonical chunks fresh: {records:?}"
+    );
 
     let _ = fs::remove_dir_all(tmp);
 }
@@ -413,6 +898,7 @@ commit abcdef1 proves the old path was wrong.
         project: "demo".to_string(),
         hours: 48,
         strict: false,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: None,
     };
@@ -455,6 +941,54 @@ commit abcdef1 proves the old path was wrong.
 }
 
 #[test]
+fn tool_call_and_agent_reply_do_not_become_outcomes() {
+    let tmp = migration_test_root("tool-agent-outcome-source-role");
+    let _ = fs::remove_dir_all(&tmp);
+
+    let chunk = r#"[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]
+
+[12:00:00] tool_call: (mcp__aicx__aicx_intents completed with no output)
+[12:01:00] agent_reply: validation: p0=0 and cargo test passed
+[12:02:00] user: Why keep the canonical index path for first users?
+"#;
+
+    write_chunk(&tmp, "demo", "2026-03-15", "120000_codex-001.md", chunk);
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.kind == IntentKind::Outcome),
+        "tool_call/agent_reply diagnostics must not promote to outcome: {records:?}"
+    );
+    assert!(
+        records.iter().any(|record| {
+            record.kind == IntentKind::Intent
+                && record.summary.contains("Why keep the canonical index path")
+        }),
+        "human why/question should remain visible as intent truth: {records:?}"
+    );
+
+    let _ = fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn strict_mode_filters_heuristic_only_intents() {
     let tmp = std::env::temp_dir().join(format!(
         "ai-contexters-intents-{}-strict",
@@ -473,6 +1007,7 @@ fn strict_mode_filters_heuristic_only_intents() {
         project: "demo".to_string(),
         hours: 24,
         strict: true,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: None,
     };
@@ -517,6 +1052,7 @@ fn frame_kind_filter_keeps_only_matching_chunks() {
         project: "demo".to_string(),
         hours: 24,
         strict: false,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: Some(FrameKind::UserMsg),
     };
@@ -544,11 +1080,53 @@ fn default_frame_kind_is_user_msg() {
         project: "demo".to_string(),
         hours: 24,
         strict: false,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: None,
     };
 
     assert_eq!(config.effective_frame_kind(), FrameKind::UserMsg);
+}
+
+#[test]
+fn default_frame_kind_admits_user_chunk() {
+    let tmp = std::env::temp_dir().join(format!(
+        "ai-contexters-intents-{}-default-user-frame-kind",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&tmp);
+
+    write_chunk_with_sidecar(
+        &tmp,
+        "demo",
+        "2026-03-15",
+        "120000_codex-001.md",
+        "[project: demo | agent: codex | date: 2026-03-15]\n\n[12:00:00] user: Let's keep only user intent truth.\n",
+        Some(FrameKind::UserMsg),
+    );
+
+    let config = IntentsConfig {
+        project: "demo".to_string(),
+        hours: 24,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: None,
+    };
+    let now = DateTime::<Utc>::from_naive_utc_and_offset(
+        NaiveDate::from_ymd_opt(2026, 3, 15)
+            .expect("date")
+            .and_hms_opt(13, 0, 0)
+            .expect("time"),
+        Utc,
+    );
+
+    let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].kind, IntentKind::Intent);
+    assert_eq!(records[0].summary, "Let's keep only user intent truth.");
+
+    let _ = fs::remove_dir_all(&tmp);
 }
 
 #[test]
@@ -580,6 +1158,7 @@ fn default_frame_kind_admits_user_chunk_and_rejects_agent_chunk() {
         project: "demo".to_string(),
         hours: 24,
         strict: false,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: None,
     };
@@ -628,6 +1207,7 @@ fn explicit_agent_frame_kind_override_still_admits_agent_chunk() {
         project: "demo".to_string(),
         hours: 24,
         strict: false,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: Some(FrameKind::AgentReply),
     };
@@ -663,6 +1243,7 @@ fn formats_markdown_with_required_sections() {
         first_chunk: None,
         last_chunk: None,
         source_chunk: "/tmp/demo/2026-03-15/120000_codex-001.md".to_string(),
+        source: None,
     }];
 
     let markdown = format_intents_markdown(&records);
@@ -688,6 +1269,7 @@ fn formats_json_with_same_fields() {
         first_chunk: None,
         last_chunk: None,
         source_chunk: "/tmp/demo/2026-03-15/120500_claude-002.md".to_string(),
+        source: None,
     }];
 
     let json = format_intents_json(&records).expect("serialize intents");
@@ -712,6 +1294,7 @@ fn formats_oracle_json_as_canonical_corpus_not_semantic_fallback() {
         first_chunk: None,
         last_chunk: None,
         source_chunk: "/tmp/aicx/chunk.md".to_string(),
+        source: None,
     }];
 
     let status = OracleStatus::canonical_corpus_scan(Path::new("/tmp/aicx"), 1, 1, true);
@@ -778,6 +1361,7 @@ fn agent_chunk_still_yields_intents_drift_red() {
         project: "demo".to_string(),
         hours: 24,
         strict: false,
+        min_confidence: None,
         kind_filter: None,
         frame_kind: None,
     };
@@ -825,6 +1409,7 @@ fn unresolved_filter_narrows_when_session_resolved() {
             first_chunk: None,
             last_chunk: None,
             source_chunk: "/tmp/demo/resolved-intent.md".to_string(),
+            source: None,
         },
         IntentRecord {
             kind: IntentKind::Outcome,
@@ -840,6 +1425,7 @@ fn unresolved_filter_narrows_when_session_resolved() {
             first_chunk: None,
             last_chunk: None,
             source_chunk: "/tmp/demo/resolved-outcome.md".to_string(),
+            source: None,
         },
         IntentRecord {
             kind: IntentKind::Intent,
@@ -855,6 +1441,7 @@ fn unresolved_filter_narrows_when_session_resolved() {
             first_chunk: None,
             last_chunk: None,
             source_chunk: "/tmp/demo/open-intent.md".to_string(),
+            source: None,
         },
     ];
 
@@ -905,6 +1492,7 @@ fn none_limit_does_not_clip_roadmap() {
             first_chunk: None,
             last_chunk: None,
             source_chunk: format!("/tmp/demo/limit-{i}.md"),
+            source: None,
         })
         .collect();
 
@@ -1544,38 +2132,6 @@ mod session_level {
 mod quality {
     use super::*;
 
-    fn write_chunk_with_session(
-        root: &Path,
-        project: &str,
-        date: &str,
-        agent: &str,
-        session_id: &str,
-        sequence: u32,
-        body: &str,
-    ) -> PathBuf {
-        let date_compact = crate::store::compact_date(date);
-        let basename = crate::store::session_basename(date, agent, session_id, sequence);
-        let dir = root
-            .join("store")
-            .join("local")
-            .join(project)
-            .join(date_compact)
-            .join("conversations")
-            .join(agent);
-        fs::create_dir_all(&dir).expect("create chunk dir");
-        let path = dir.join(basename);
-        fs::write(&path, body).expect("write chunk");
-        write_sidecar(
-            &path,
-            project,
-            agent,
-            date,
-            session_id,
-            Some(FrameKind::UserMsg),
-        );
-        path
-    }
-
     // ── metadata-noise filter ───────────────────────────────────────
 
     #[test]
@@ -1668,10 +2224,10 @@ mod quality {
         );
     }
 
-    // ── session-scoped dedup ───────────────────────────────────────
+    // ── content-scoped dedup ───────────────────────────────────────
 
     #[test]
-    fn cross_session_identical_summary_kept_separate() {
+    fn cross_session_identical_summary_collapses_with_consistent_provenance() {
         let tmp = std::env::temp_dir().join(format!(
             "ai-contexters-intents-{}-cross-session",
             std::process::id()
@@ -1697,6 +2253,7 @@ mod quality {
             project: "demo".to_string(),
             hours: 240,
             strict: false,
+            min_confidence: None,
             kind_filter: Some(IntentKind::Decision),
             frame_kind: None,
         };
@@ -1710,9 +2267,83 @@ mod quality {
 
         let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
 
-        // Two sessions, two records — identical summary text but distinct
-        // provenance must NOT collapse into one entry that lies about its
-        // session (older session_id paired with newer source_chunk).
+        // Same normalized fact across sessions surfaces once, with the
+        // selected source_chunk and session_id kept in sync.
+        let decisions: Vec<&IntentRecord> = records
+            .iter()
+            .filter(|r| r.kind == IntentKind::Decision)
+            .collect();
+        assert_eq!(
+            decisions.len(),
+            1,
+            "expected one collapsed decision for repeated text, got {decisions:?}",
+        );
+
+        let record = decisions[0];
+        let stem = std::path::Path::new(&record.source_chunk)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        assert!(
+            stem.contains(&record.session_id),
+            "session_id={} not found in source_chunk filename={}",
+            record.session_id,
+            stem,
+        );
+        assert_eq!(record.session_id, "019df273-2c1");
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn cross_session_distinct_human_intents_do_not_collapse() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ai-contexters-intents-{}-cross-session-distinct",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+
+        let body_a = "[project: demo | agent: codex | date: 2026-05-02]\n\n\
+                    [11:00:00] user: Materiał ma być deterministyczny — musi mieć source_hash.\n";
+        let body_b = "[project: demo | agent: codex | date: 2026-05-04]\n\n\
+                    [11:00:00] user: Materiał ma być audytowalny — musi mieć source_manifest.\n";
+
+        write_chunk_with_session(
+            &tmp,
+            "demo",
+            "2026-05-02",
+            "codex",
+            "019dcceb-48c",
+            3,
+            body_a,
+        );
+        write_chunk_with_session(
+            &tmp,
+            "demo",
+            "2026-05-04",
+            "codex",
+            "019df273-2c1",
+            27,
+            body_b,
+        );
+
+        let config = IntentsConfig {
+            project: "demo".to_string(),
+            hours: 240,
+            strict: false,
+            min_confidence: None,
+            kind_filter: Some(IntentKind::Decision),
+            frame_kind: None,
+        };
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 5, 5)
+                .expect("date")
+                .and_hms_opt(0, 0, 0)
+                .expect("time"),
+            Utc,
+        );
+
+        let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
         let decisions: Vec<&IntentRecord> = records
             .iter()
             .filter(|r| r.kind == IntentKind::Decision)
@@ -1720,33 +2351,14 @@ mod quality {
         assert_eq!(
             decisions.len(),
             2,
-            "expected one decision per session, got {decisions:?}",
+            "distinct human decisions collapsed too aggressively: {decisions:?}",
         );
-
-        let session_ids: HashSet<String> = decisions.iter().map(|r| r.session_id.clone()).collect();
+        assert!(decisions.iter().any(|r| r.summary.contains("source_hash")));
         assert!(
-            session_ids.contains("019dcceb-48c"),
-            "missing session 019dcceb-48c in {session_ids:?}",
+            decisions
+                .iter()
+                .any(|r| r.summary.contains("source_manifest"))
         );
-        assert!(
-            session_ids.contains("019df273-2c1"),
-            "missing session 019df273-2c1 in {session_ids:?}",
-        );
-
-        // Provenance check: each record's session_id must match the
-        // session segment in its own source_chunk filename.
-        for record in &decisions {
-            let stem = std::path::Path::new(&record.source_chunk)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            assert!(
-                stem.contains(&record.session_id),
-                "session_id={} not found in source_chunk filename={}",
-                record.session_id,
-                stem,
-            );
-        }
 
         let _ = fs::remove_dir_all(tmp);
     }
@@ -1777,6 +2389,7 @@ mod quality {
             project: "demo".to_string(),
             hours: 240,
             strict: false,
+            min_confidence: None,
             kind_filter: None,
             frame_kind: None,
         };
@@ -1830,6 +2443,7 @@ mod quality {
             source_chunk:
                 "/store/Loctree/aicx/2026_0504/conversations/codex/2026_0504_codex_019df273-2c1_027.md"
                     .to_string(),
+            source: None,
         }];
 
         reconcile_session_id_with_path(&mut records);
@@ -1858,6 +2472,7 @@ mod quality {
             source_chunk:
                 "/store/Loctree/aicx/2026_0504/conversations/codex/2026_0504_codex_019df273-2c1_027.md"
                     .to_string(),
+            source: None,
         }];
 
         reconcile_session_id_with_path(&mut records);
@@ -1883,6 +2498,7 @@ mod quality {
                 source_chunk: source_chunk.clone(),
                 timestamp: None,
                 context: None,
+                source: None,
             },
             IntentRecord {
                 kind: IntentKind::Decision,
@@ -1898,6 +2514,7 @@ mod quality {
                 source_chunk,
                 timestamp: None,
                 context: None,
+                source: None,
             },
         ];
 
@@ -1931,6 +2548,7 @@ mod quality {
             source_chunk: source_chunk.to_string(),
             timestamp: None,
             context: None,
+            source: None,
         }
     }
 
@@ -2052,6 +2670,7 @@ mod area_e_regressions {
             first_chunk: None,
             last_chunk: None,
             source_chunk: "chunk-1".to_string(),
+            source: None,
         }
     }
 
@@ -2245,6 +2864,7 @@ mod flexible_dates {
             first_chunk: None,
             last_chunk: None,
             source_chunk: format!("/tmp/demo/{summary}.md"),
+            source: None,
         }
     }
 
@@ -2333,5 +2953,335 @@ mod flexible_dates {
             vec!["in-window"],
             "offset timestamp before the UTC window and unparsable dates must be dropped"
         );
+    }
+
+    #[test]
+    fn test_codescribe_parser_voice_provenance() {
+        use super::CodescribeParser;
+        let mut parser = CodescribeParser::new();
+
+        // Single line tag
+        let (cleaned, is_voice) =
+            parser.process("<codescribe mode=\"voice\" lang=\"pl\">Pamiętaj o tym</codescribe>");
+        assert_eq!(cleaned, "Pamiętaj o tym");
+        assert!(is_voice);
+
+        // Multi-line tag
+        let mut parser_multi = CodescribeParser::new();
+        let (cleaned1, is_voice1) = parser_multi.process("<codescribe mode=\"voice\">");
+        assert_eq!(cleaned1, "");
+        assert!(is_voice1);
+
+        let (cleaned2, is_voice2) = parser_multi.process("Pojedyncza linia");
+        assert_eq!(cleaned2, "Pojedyncza linia");
+        assert!(is_voice2);
+
+        let (cleaned3, is_voice3) = parser_multi.process("</codescribe>");
+        assert_eq!(cleaned3, "");
+        assert!(is_voice3);
+
+        let (cleaned4, is_voice4) = parser_multi.process("zwykły tekst");
+        assert_eq!(cleaned4, "zwykły tekst");
+        assert!(!is_voice4);
+    }
+
+    #[test]
+    fn test_garble_gate_repro_degradation() {
+        use super::{IntentKind, StoredChunkFile, build_candidate};
+        use chrono::Utc;
+        use std::path::PathBuf;
+
+        let text_repro = "Pamiętaj, że chcę to wrzucić w Injust mechanizm launchera VC-Ship, który zgodnie z moim specem dowiezie to od Arozet w całej intencjonalnej read/write kadensy. Zabezpieczam.";
+        let chunk_file = StoredChunkFile {
+            agent: "agy".to_string(),
+            date: "2026-06-12".to_string(),
+            path: PathBuf::from("chunk.md"),
+            project: "aicx".to_string(),
+            sequence: 1,
+            timestamp: Utc::now(),
+            session_id: "sess-1".to_string(),
+        };
+
+        // Repro case: no context, no evidence -> degraded (returns None)
+        let candidate = build_candidate(
+            IntentKind::Intent,
+            text_repro,
+            None,
+            &chunk_file,
+            "aicx",
+            "chunk.md",
+            false,
+            Some("voice_transcript".to_string()),
+        );
+        assert!(
+            candidate.is_none(),
+            "Garbled transcription without context or evidence must be degraded/dropped"
+        );
+
+        // If it has evidence or context, it is preserved (just in case there's real intent)
+        let candidate_with_context = build_candidate(
+            IntentKind::Intent,
+            text_repro,
+            Some("Why: user explicitly requested SF strategy".to_string()),
+            &chunk_file,
+            "aicx",
+            "chunk.md",
+            false,
+            Some("voice_transcript".to_string()),
+        );
+        assert!(
+            candidate_with_context.is_some(),
+            "Intent with context should not be blindly degraded"
+        );
+    }
+
+    #[test]
+    fn test_voice_intent_sorts_lower() {
+        use super::sort_intent_records;
+        let mut r1 = make_record("Intent voice", "2026-06-12", None);
+        r1.source = Some("voice_transcript".to_string());
+
+        let mut r2 = make_record("Intent written", "2026-06-12", None);
+        r2.source = None;
+
+        let mut records = vec![r1.clone(), r2.clone()];
+        sort_intent_records(&mut records);
+
+        // Written should come first
+        assert_eq!(records[0].summary, "Intent written");
+        assert_eq!(records[1].summary, "Intent voice");
+    }
+
+    #[test]
+    fn test_unresolved_mode_intent_vs_session() {
+        let records = vec![
+            IntentRecord {
+                kind: IntentKind::Intent,
+                summary: "implement search".to_string(),
+                context: None,
+                evidence: vec![],
+                project: "demo".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-06-12".to_string(),
+                timestamp: None,
+                session_id: "sess-1".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "chunk1.md".to_string(),
+                source: None,
+            },
+            IntentRecord {
+                kind: IntentKind::Intent,
+                summary: "fix login".to_string(),
+                context: None,
+                evidence: vec![],
+                project: "demo".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-06-12".to_string(),
+                timestamp: None,
+                session_id: "sess-1".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "chunk1.md".to_string(),
+                source: None,
+            },
+            IntentRecord {
+                kind: IntentKind::Outcome,
+                summary: "search was implemented successfully".to_string(),
+                context: None,
+                evidence: vec![],
+                project: "demo".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-06-12".to_string(),
+                timestamp: None,
+                session_id: "sess-1".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "chunk2.md".to_string(),
+                source: None,
+            },
+        ];
+
+        // 1. Session Mode: session contains Outcome, so all intents are filtered out
+        let session_filtered = apply_display_filters(
+            records.clone(),
+            &IntentDisplayFilters {
+                unresolved: true,
+                unresolved_mode: UnresolvedMode::Session,
+                ..Default::default()
+            },
+        );
+        let has_intents = session_filtered
+            .iter()
+            .any(|r| r.kind == IntentKind::Intent);
+        assert!(
+            !has_intents,
+            "Session mode should filter out all intents for resolved session"
+        );
+
+        // 2. Intent Mode: only "implement search" has a matching outcome, "fix login" should survive!
+        let intent_filtered = apply_display_filters(
+            records,
+            &IntentDisplayFilters {
+                unresolved: true,
+                unresolved_mode: UnresolvedMode::Intent,
+                ..Default::default()
+            },
+        );
+        let remaining_intents: Vec<_> = intent_filtered
+            .iter()
+            .filter(|r| r.kind == IntentKind::Intent)
+            .map(|r| r.summary.as_str())
+            .collect();
+        assert_eq!(remaining_intents, vec!["fix login"]);
+    }
+
+    #[test]
+    fn test_kind_plus_unresolved_combination() {
+        let records = vec![
+            IntentRecord {
+                kind: IntentKind::Intent,
+                summary: "implement search".to_string(),
+                context: None,
+                evidence: vec![],
+                project: "demo".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-06-12".to_string(),
+                timestamp: None,
+                session_id: "sess-1".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "chunk1.md".to_string(),
+                source: None,
+            },
+            IntentRecord {
+                kind: IntentKind::Intent,
+                summary: "fix login".to_string(),
+                context: None,
+                evidence: vec![],
+                project: "demo".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-06-12".to_string(),
+                timestamp: None,
+                session_id: "sess-1".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "chunk1.md".to_string(),
+                source: None,
+            },
+            IntentRecord {
+                kind: IntentKind::Outcome,
+                summary: "search was implemented successfully".to_string(),
+                context: None,
+                evidence: vec![],
+                project: "demo".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-06-12".to_string(),
+                timestamp: None,
+                session_id: "sess-1".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "chunk2.md".to_string(),
+                source: None,
+            },
+        ];
+
+        // Apply unresolved (intent mode) and then kind filter (Intents only).
+        // It must NOT return empty because "fix login" remains unresolved.
+        let mut filtered = apply_display_filters(
+            records,
+            &IntentDisplayFilters {
+                unresolved: true,
+                unresolved_mode: UnresolvedMode::Intent,
+                ..Default::default()
+            },
+        );
+        // Defer kind filter simulation
+        filtered.retain(|r| r.kind == IntentKind::Intent);
+
+        let summaries: Vec<_> = filtered.iter().map(|r| r.summary.as_str()).collect();
+        assert_eq!(summaries, vec!["fix login"]);
+    }
+
+    #[test]
+    fn test_strict_confidence_threshold() {
+        use super::dedup_candidates;
+        use super::types::IntentCandidate;
+
+        let chunk_file = StoredChunkFile {
+            agent: "agy".to_string(),
+            date: "2026-06-12".to_string(),
+            path: PathBuf::from("chunk.md"),
+            project: "aicx".to_string(),
+            sequence: 1,
+            timestamp: Utc::now(),
+            session_id: "sess-1".to_string(),
+        };
+
+        // 1. Voice transcript intent without context/evidence (confidence 2)
+        let c1 = IntentCandidate {
+            record: IntentRecord {
+                kind: IntentKind::Intent,
+                summary: "low confidence intent".to_string(),
+                context: None,
+                evidence: vec![],
+                project: "aicx".to_string(),
+                agent: "agy".to_string(),
+                date: "2026-06-12".to_string(),
+                timestamp: None,
+                session_id: "sess-1".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "chunk.md".to_string(),
+                source: Some("voice_transcript".to_string()),
+            },
+            confidence: 2,
+            timestamp: chunk_file.timestamp,
+        };
+
+        // 2. High confidence intent (confidence 4)
+        let c2 = IntentCandidate {
+            record: IntentRecord {
+                kind: IntentKind::Intent,
+                summary: "high confidence intent".to_string(),
+                context: Some("explicit instruction".to_string()),
+                evidence: vec![],
+                project: "aicx".to_string(),
+                agent: "agy".to_string(),
+                date: "2026-06-12".to_string(),
+                timestamp: None,
+                session_id: "sess-1".to_string(),
+                count: None,
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "chunk.md".to_string(),
+                source: None,
+            },
+            confidence: 4,
+            timestamp: chunk_file.timestamp,
+        };
+
+        let candidates = vec![c1, c2];
+
+        // With strict = false, both kept
+        let all = dedup_candidates(candidates.clone(), false, None, None);
+        assert_eq!(all.len(), 2);
+
+        // With strict = true (requires confidence >= 4), only high confidence kept
+        let strict_records = dedup_candidates(candidates.clone(), true, None, None);
+        assert_eq!(strict_records.len(), 1);
+        assert_eq!(strict_records[0].summary, "high confidence intent");
+
+        // With min_confidence = Some(3), only high confidence kept (confidence 4 >= 3)
+        let min_conf_records = dedup_candidates(candidates, false, Some(3), None);
+        assert_eq!(min_conf_records.len(), 1);
+        assert_eq!(min_conf_records[0].summary, "high confidence intent");
     }
 }

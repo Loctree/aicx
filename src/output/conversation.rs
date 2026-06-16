@@ -87,7 +87,7 @@ pub fn write_conversation_markdown_with_redaction(
 
         for session_id in &session_order {
             let session_msgs = &by_session[session_id];
-            let session_short = &session_id[..8.min(session_id.len())];
+            let session_short: String = session_id.chars().take(8).collect();
             let agent = session_msgs
                 .first()
                 .map(|m| m.agent.as_str())
@@ -104,7 +104,7 @@ pub fn write_conversation_markdown_with_redaction(
             // extract, leaving bare `[HH:MM:SS]` stamps with no anchor.
             // P3-12: timestamps are UTC; say so on the heading (the per-message
             // `[HH:MM:SS]` stamps inherit the timezone from their day heading),
-            // matching the explicit "UPDATED (UTC)" label in `sessions list`.
+            // matching the explicit "UPDATED (TZ)" label in `sessions list`.
             let mut last_date: Option<String> = None;
             for msg in session_msgs {
                 let date = msg.timestamp.format("%Y-%m-%d").to_string();

@@ -52,12 +52,15 @@ pub struct IntentRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_chunk: Option<String>,
     pub source_chunk: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 #[derive(Debug, Clone)]
 pub struct IntentsConfig {
     pub project: String,
     pub hours: u64,
     pub strict: bool,
+    pub min_confidence: Option<u8>,
     pub kind_filter: Option<IntentKind>,
     pub frame_kind: Option<FrameKind>,
 }

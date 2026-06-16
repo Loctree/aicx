@@ -168,6 +168,7 @@ impl OracleStatus {
         }
     }
 
+    #[cfg(feature = "app")]
     pub fn hybrid_rrf(
         store_root: &Path,
         status: &crate::search_engine::HybridRetrievalStatus,

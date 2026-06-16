@@ -2,6 +2,108 @@ use super::*;
 use filetime::{FileTime, set_file_mtime};
 use std::fs;
 
+#[test]
+fn default_intents_markdown_uses_pack_report() {
+    let sections = vec![
+        IntentPackSection {
+            title: "Decisions",
+            records: vec![intents::IntentRecord {
+                kind: intents::IntentKind::Decision,
+                summary: "ship public seed only after privacy scrub".to_string(),
+                context: None,
+                evidence: vec!["P0 privacy gate".to_string()],
+                project: "Loctree/aicx".to_string(),
+                agent: "codex".to_string(),
+                date: "2026-06-14".to_string(),
+                timestamp: None,
+                session_id: "s1".to_string(),
+                count: Some(2),
+                first_chunk: None,
+                last_chunk: None,
+                source_chunk: "chunk-a.md".to_string(),
+                source: None,
+            }],
+        },
+        IntentPackSection {
+            title: "Tasks",
+            records: Vec::new(),
+        },
+        IntentPackSection {
+            title: "Human Intent",
+            records: Vec::new(),
+        },
+        IntentPackSection {
+            title: "Agent Claims / Self-Reports",
+            records: Vec::new(),
+        },
+        IntentPackSection {
+            title: "Unresolved Human Intent",
+            records: Vec::new(),
+        },
+    ];
+
+    let markdown = format_intents_pack_markdown("Loctree/aicx", 168, Some(20), &sections);
+
+    assert!(markdown.starts_with("# Intent Report"));
+    assert!(markdown.contains("- per_section_limit: 20"));
+    assert!(markdown.contains("## Decisions"));
+    assert!(markdown.contains("## Tasks"));
+    assert!(markdown.contains("## Human Intent"));
+    assert!(markdown.contains("## Agent Claims / Self-Reports"));
+    assert!(markdown.contains("## Unresolved Human Intent"));
+    assert!(markdown.contains("## Mission Keyword Hits"));
+    assert!(markdown.contains("`privacy`"));
+    assert!(markdown.contains("`public seed`"));
+}
+
+#[test]
+fn pack_record_dedupes_joined_source_chunks() {
+    assert_eq!(
+        unique_source_chunks("a.md, b.md, a.md,  b.md, c.md"),
+        vec!["a.md", "b.md", "c.md"]
+    );
+}
+
+#[test]
+fn default_pack_trigger_preserves_scoped_timeline_modes() {
+    let filters = RetrievalFilters {
+        limit: None,
+        sort: None,
+        score: None,
+        agent: None,
+        since: None,
+        until: None,
+        frame_kind: None,
+    };
+    assert!(should_render_intents_pack(
+        &filters, "markdown", None, false, false
+    ));
+    assert!(!should_render_intents_pack(
+        &filters, "json", None, false, false
+    ));
+    assert!(!should_render_intents_pack(
+        &filters,
+        "markdown",
+        Some("decision"),
+        false,
+        false
+    ));
+    assert!(!should_render_intents_pack(
+        &filters, "markdown", None, true, false
+    ));
+    assert!(!should_render_intents_pack(
+        &filters, "markdown", None, false, true
+    ));
+
+    let scoped = RetrievalFilters {
+        frame_kind: Some(FrameKindArg::UserMsg),
+        ..filters
+    };
+    assert!(!should_render_intents_pack(
+        &scoped, "markdown", None, false, false
+    ));
+}
+
 /// Regression: B-P1-12 — detector must fire on the canonical bad shape.
 #[test]
 fn detect_config_show_flag_fires_on_canonical_mistake() {
@@ -271,6 +373,11 @@ fn dummy_index_status(bucket: &str) -> aicx::IndexStatus {
         semantic_index_path: Some(format!("/tmp/{bucket}/embeddings.ndjson")),
         semantic_index_rows: 3,
         newest_chunk_mtime: Some("2026-05-24T00:00:00Z".to_string()),
+        source_sessions: 0,
+        newest_session_updated_at: None,
+        sessions_newer_than_chunks: 0,
+        sessions_without_timestamps: 0,
+        chunking_lag_secs: None,
         semantic_index_mtime: Some("2026-05-24T00:01:00Z".to_string()),
         semantic_lag_secs: Some(60),
         pending_chunks: 0,
@@ -284,6 +391,51 @@ fn dummy_index_status(bucket: &str) -> aicx::IndexStatus {
         project_bucket: bucket.to_string(),
         committed_at: Some("2026-05-24T00:01:00Z".to_string()),
     }
+}
+
+#[test]
+fn index_catch_up_plan_uses_oldest_lagging_chunk_timestamp() {
+    let mut current = dummy_index_status("current");
+    current.sessions_newer_than_chunks = 0;
+    current.newest_chunk_mtime = Some("2026-06-12T10:00:00Z".to_string());
+
+    let mut lagging_newer = dummy_index_status("lagging-newer");
+    lagging_newer.sessions_newer_than_chunks = 3;
+    lagging_newer.newest_chunk_mtime = Some("2026-06-12T09:00:00Z".to_string());
+
+    let mut lagging_older = dummy_index_status("lagging-older");
+    lagging_older.sessions_newer_than_chunks = 1;
+    lagging_older.newest_chunk_mtime = Some("2026-06-11T12:33:26Z".to_string());
+
+    let plan = index_catch_up_plan_from_statuses(&[current, lagging_newer, lagging_older]).unwrap();
+
+    assert!(plan.needed);
+    assert_eq!(
+        plan.cutoff.unwrap().to_rfc3339(),
+        "2026-06-11T12:33:26+00:00"
+    );
+}
+
+#[test]
+fn index_catch_up_plan_skips_store_when_no_chunking_lag_exists() {
+    let status = dummy_index_status("ready");
+
+    let plan = index_catch_up_plan_from_statuses(&[status]).unwrap();
+
+    assert!(!plan.needed);
+    assert!(plan.cutoff.is_none());
+}
+
+#[test]
+fn index_catch_up_plan_uses_all_time_when_lagging_status_has_no_chunks() {
+    let mut missing_chunks = dummy_index_status("missing-chunks");
+    missing_chunks.sessions_newer_than_chunks = 5;
+    missing_chunks.newest_chunk_mtime = None;
+
+    let plan = index_catch_up_plan_from_statuses(&[missing_chunks]).unwrap();
+
+    assert!(plan.needed);
+    assert!(plan.cutoff.is_none());
 }
 
 #[test]
@@ -369,13 +521,72 @@ fn fuzzy_fetch_limit_uses_semantic_filter_cap_constants() {
 }
 
 #[test]
-fn session_id_table_prefix_is_char_safe_for_non_ascii_ids() {
-    // P2-09: file-stem fallback ids can carry non-ASCII; a byte slice
-    // `&id[..8]` panics on a multibyte boundary. The helper must not.
-    assert_eq!(session_id_table_prefix("zażółć-gęśla-jaźń"), "zażółć-g");
-    assert_eq!(session_id_table_prefix("séance"), "séance");
-    assert_eq!(session_id_table_prefix(""), "");
-    assert_eq!(session_id_table_prefix("0eb1a73c-1234"), "0eb1a73c");
+fn session_id_table_value_preserves_full_id() {
+    assert_eq!(
+        session_id_table_value("zażółć-gęśla-jaźń"),
+        "zażółć-gęśla-jaźń"
+    );
+    assert_eq!(session_id_table_value("séance"), "séance");
+    assert_eq!(session_id_table_value(""), "");
+    assert_eq!(session_id_table_value("0eb1a73c-1234"), "0eb1a73c-1234");
+}
+
+#[test]
+fn sessions_table_project_uses_canonical_repo_identity() {
+    let info = session_info("aicx", "/Users/me/hosted/Loctree/aicx");
+
+    assert_eq!(session_project_label(&info), "Loctree/aicx");
+}
+
+#[test]
+fn sessions_table_compacts_home_repo_path_for_scanning() {
+    let Some(home) = dirs::home_dir().and_then(|path| path.into_os_string().into_string().ok())
+    else {
+        return;
+    };
+
+    let path = format!("{home}/Loctree/vetcoders/aicx");
+    assert_eq!(compact_repo_path(&path), "~/L/v/aicx");
+}
+
+#[test]
+fn sessions_table_user_comes_from_source_users_path() {
+    let info = session_info("aicx", "/Users/dragon/Loctree/aicx");
+
+    assert_eq!(session_user_label(&info), "dragon");
+}
+
+#[test]
+fn sessions_table_time_is_minute_precision_with_explicit_utc_offset() {
+    let time = Utc.with_ymd_and_hms(2026, 6, 14, 4, 49, 22).unwrap();
+
+    assert_eq!(format_session_table_time(time), "2026-06-14T04:49(+0)");
+}
+
+#[test]
+fn current_session_prefers_codex_thread_id_env() {
+    let current = current_session_from_env_lookup(|key| match key {
+        "CODEX_THREAD_ID" => Some("019eba52-81db-7d31-bb28-6343f05c4b79".to_string()),
+        _ => None,
+    })
+    .expect("current session from env");
+
+    assert_eq!(current.session_id, "019eba52-81db-7d31-bb28-6343f05c4b79");
+    assert_eq!(current.source, "env:CODEX_THREAD_ID");
+    assert_eq!(current.agent.as_deref(), Some("codex"));
+}
+
+#[test]
+fn sessions_current_command_parses_json_flag() {
+    let cli = Cli::try_parse_from(["aicx", "sessions", "current", "--json"])
+        .expect("sessions current should parse");
+
+    match cli.command {
+        Some(Commands::Sessions {
+            command: SessionsCommand::Current { json },
+        }) => assert!(json),
+        _ => panic!("expected sessions current command"),
+    }
 }
 
 #[test]
@@ -427,6 +638,23 @@ fn clarify_max_enforces_documented_one_to_five_range() {
 }
 
 #[test]
+fn sessions_report_max_enforces_documented_one_to_five_range() {
+    for bad in ["0", "6"] {
+        let err = Cli::try_parse_from(["aicx", "sessions", "report", "s", "--max", bad])
+            .expect_err("out-of-range sessions report --max must fail parsing");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+    let cli = Cli::try_parse_from(["aicx", "sessions", "report", "s", "--max", "3"])
+        .expect("--max 3 parses");
+    match cli.command {
+        Some(Commands::Sessions {
+            command: SessionsCommand::Report { max, .. },
+        }) => assert_eq!(max, 3),
+        other => panic!("expected sessions report, got {other:?}"),
+    }
+}
+
+#[test]
 fn lookback_cutoff_handles_normal_range() {
     let before = Utc::now();
     let cutoff = lookback_cutoff(8);
@@ -469,6 +697,180 @@ fn write_file(path: &Path, content: &str) {
 
 fn set_mtime(path: &Path, unix_seconds: i64) {
     set_file_mtime(path, FileTime::from_unix_time(unix_seconds, 0)).unwrap();
+}
+
+fn write_store_chunk(root: &Path, slug: &str, date: &str, session: &str) -> PathBuf {
+    let path = root
+        .join("store")
+        .join(slug)
+        .join(date)
+        .join("conversations")
+        .join("claude")
+        .join(format!("{date}_claude_{session}_001.md"));
+    write_file(&path, "[signals]\n- intent: test\n");
+    path
+}
+
+fn encode_claude_project_dir(path: &Path) -> String {
+    path.display().to_string().replace('/', "-")
+}
+
+fn session_info(project: &str, repo_path: &str) -> sessions::SessionInfo {
+    sessions::SessionInfo {
+        session_id: "session-1".to_string(),
+        agent: "claude".to_string(),
+        project: Some(project.to_string()),
+        repo_path: Some(repo_path.to_string()),
+        started_at: None,
+        updated_at: None,
+        message_count: 1,
+        user_message_count: 1,
+        agent_message_count: 0,
+        title: None,
+        source_path: PathBuf::from("/tmp/session.jsonl"),
+        association: sessions::Association::Exact,
+        temporal_confidence: sessions::TemporalConfidence::None,
+    }
+}
+
+#[test]
+fn intents_project_resolver_discovers_session_display_bridge_in_production_path() {
+    let root = unique_test_dir("intents-project-discovered-display-store");
+    let home = unique_test_dir("intents-project-discovered-display-home");
+    let repo_parent = unique_test_dir("intents-project-discovered-display-repo");
+    let repo = repo_parent.join("Compass");
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&repo_parent);
+
+    write_store_chunk(&root, "vetcoders/field_ops", "2026_0612", "canonical");
+    fs::create_dir_all(&repo).unwrap();
+    let git_init = std::process::Command::new("git")
+        .arg("init")
+        .arg(&repo)
+        .output()
+        .expect("git init should run");
+    assert!(git_init.status.success());
+    let git_remote = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:vetcoders/field_ops.git",
+        ])
+        .output()
+        .expect("git remote add should run");
+    assert!(git_remote.status.success());
+    let encoded = encode_claude_project_dir(&repo);
+    let session_path = home
+        .join(".claude")
+        .join("projects")
+        .join(encoded)
+        .join("session-1.jsonl");
+    write_file(
+        &session_path,
+        &format!(
+            "{{\"type\":\"user\",\"timestamp\":\"2026-06-14T00:00:00Z\",\"cwd\":{:?},\"message\":{{\"role\":\"user\",\"content\":\"remember this\"}}}}\n",
+            repo.display().to_string()
+        ),
+    );
+
+    let got = resolve_intents_project_filters_with_session_home_at(
+        &["Compass".to_string()],
+        &root,
+        Some(&home),
+        None,
+    )
+    .unwrap();
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&repo_parent);
+
+    assert_eq!(got.projects, vec!["vetcoders/field_ops"]);
+    assert!(got.unresolved_filters.is_empty());
+}
+
+#[test]
+fn intents_project_resolver_prefers_session_display_before_alias() {
+    let root = unique_test_dir("intents-project-display");
+    let _ = fs::remove_dir_all(&root);
+    write_store_chunk(&root, "legacy/ScreenScribe", "2026_0612", "legacy");
+    write_store_chunk(
+        &root,
+        "vetcoders/screen_scribe_depr",
+        "2026_0612",
+        "canonical",
+    );
+    let sessions = vec![session_info(
+        "ScreenScribe",
+        "git@github.com:vetcoders/screen_scribe_depr.git",
+    )];
+
+    let got =
+        resolve_intents_project_filters_at(&["ScreenScribe".to_string()], &root, &sessions, None)
+            .unwrap();
+    let _ = fs::remove_dir_all(&root);
+
+    assert_eq!(got.projects, vec!["vetcoders/screen_scribe_depr"]);
+    assert!(got.unresolved_filters.is_empty());
+}
+
+#[test]
+fn intents_project_resolver_errors_on_ambiguous_alias() {
+    let root = unique_test_dir("intents-project-ambiguous");
+    let _ = fs::remove_dir_all(&root);
+    write_store_chunk(&root, "one/screen_scribe_depr", "2026_0612", "one");
+    write_store_chunk(&root, "two/ScreenScribe", "2026_0612", "two");
+
+    let err = resolve_intents_project_filters_at(&["ScreenScribe".to_string()], &root, &[], None)
+        .expect_err("alias collision should force explicit bucket");
+    let msg = err.to_string();
+    let _ = fs::remove_dir_all(&root);
+
+    assert!(msg.contains("ambiguous"));
+    assert!(msg.contains("one/screen_scribe_depr"));
+    assert!(msg.contains("two/ScreenScribe"));
+}
+
+#[test]
+fn intents_project_resolver_does_not_resolve_bare_unknown_to_current_repo() {
+    let root = unique_test_dir("intents-project-bare-unknown");
+    let _ = fs::remove_dir_all(&root);
+    write_store_chunk(&root, "Loctree/aicx", "2026_0612", "aicx");
+
+    let got =
+        resolve_intents_project_filters_at(&["ScreenScrib".to_string()], &root, &[], None).unwrap();
+    let _ = fs::remove_dir_all(&root);
+
+    assert!(got.projects.is_empty());
+    assert_eq!(got.unresolved_filters, vec!["ScreenScrib"]);
+}
+
+#[test]
+fn intents_empty_result_hint_ranks_nearby_recent_buckets() {
+    let mut counts = BTreeMap::new();
+    counts.insert("vetcoders/screen_scribe_depr".to_string(), 12);
+    counts.insert("vetcoders/other".to_string(), 99);
+    counts.insert("local/ScreenScribe".to_string(), 3);
+
+    let hints = nearby_bucket_hints(&["ScreenScribe".to_string()], &counts);
+
+    assert_eq!(
+        hints,
+        vec![
+            BucketHint {
+                slug: "vetcoders/screen_scribe_depr".to_string(),
+                chunks: 12,
+            },
+            BucketHint {
+                slug: "local/ScreenScribe".to_string(),
+                chunks: 3,
+            },
+        ]
+    );
 }
 
 #[test]
@@ -1391,6 +1793,25 @@ fn read_command_parses_discover_path_and_json_mode() {
             assert!(json);
         }
         _ => panic!("expected read command"),
+    }
+}
+
+#[test]
+fn open_alias_parses_as_read_for_loctree_chunk_refs() {
+    let cli = Cli::try_parse_from(["aicx", "open", "chunk:590b30cd", "--max-chars", "240"])
+        .expect("open alias should parse as read");
+
+    match cli.command {
+        Some(Commands::Read {
+            reference,
+            max_chars,
+            json,
+        }) => {
+            assert_eq!(reference, "chunk:590b30cd");
+            assert_eq!(max_chars, Some(240));
+            assert!(!json);
+        }
+        _ => panic!("expected open alias to parse as read command"),
     }
 }
 

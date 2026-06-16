@@ -533,16 +533,22 @@ newest first, with absolute RFC3339 timestamps.
 ```bash
 aicx sessions list [--cwd] [--agent <claude|codex|gemini|junie>] [--since YYYY-MM-DD]
                    [--all] [--limit <N>] [--format table|json]
+aicx sessions current [--json]
 aicx sessions show <session_id> [--format markdown|json]   # alias: aicx session show
 aicx sessions report <session_id> [--agent <a>] [--hours <H>] [--repo <path>]
                      [--max <N>] [--format markdown|json]
 ```
 
+- `current` prints the current agent session id for commit trailers and handoffs.
+  It prefers runtime env such as `CODEX_THREAD_ID`, then falls back to the newest
+  recent session associated with the current cwd.
 - `--cwd` infers the repo from the current directory and lists only its sessions.
 - `--agent` accepts exactly `claude`, `codex`, `gemini`, or `junie`; anything
   else is a CLI error, never a silently empty list.
-- Association confidence is explicit: `exact` (from session cwd) vs `inferred`
-  (decoded from the project dir name).
+- Table output is the operator copy/paste surface: full `SESSION`, canonical
+  repo `PROJECT`, compact source `PATH`, minute-precision `UPDATED (TZ)`,
+  combined `MSGS`/user count, and source-path `USR` derived from
+  `/Users/<user>/...`.
 - Sessions without a parseable timestamp are still listed — the table shows
   them with an explicit `(no timestamp)` marker (and they survive the
   `--since` window) instead of being silently dated out.

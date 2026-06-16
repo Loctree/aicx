@@ -405,7 +405,7 @@ pub struct SteerParams {
     pub run_id: Option<String>,
     /// Filter by prompt_id (exact match against sidecar metadata)
     pub prompt_id: Option<String>,
-    /// Filter by agent name: claude, codex, gemini (case-insensitive)
+    /// Filter by agent name: claude, codex, gemini, junie, grok (case-insensitive)
     pub agent: Option<String>,
     /// Filter by kind: conversations, plans, reports, other
     pub kind: Option<String>,
@@ -465,10 +465,15 @@ pub struct IntentsParams {
     /// Filter to intent entries lacking a matching outcome in the same session
     #[serde(default)]
     pub unresolved: bool,
+    /// Mode for filtering unresolved entries: session (default) or intent
+    #[serde(default)]
+    pub unresolved_mode: Option<intents::UnresolvedMode>,
+    /// Minimum confidence threshold (1..5)
+    pub min_confidence: Option<u8>,
     /// Collapse multiple intents from the same session into one entry with count
     #[serde(default)]
     pub collapse_session: bool,
-    /// Optional agent filter (claude, codex, gemini, junie)
+    /// Optional agent filter (claude, codex, gemini, junie, grok)
     pub agent: Option<String>,
     /// Optional lower date bound (YYYY-MM-DD or single-day shorthand like 2026-04-23..)
     pub since: Option<String>,
@@ -1208,6 +1213,7 @@ impl AicxMcpServer {
             project: owned_projects.first().cloned().unwrap_or_default(),
             hours: params.hours,
             strict: params.strict,
+            min_confidence: params.min_confidence,
             kind_filter,
             frame_kind: params.frame_kind,
         };
@@ -1220,6 +1226,7 @@ impl AicxMcpServer {
 
         let display_filters = intents::IntentDisplayFilters {
             unresolved: params.unresolved,
+            unresolved_mode: params.unresolved_mode.unwrap_or_default(),
             collapse_session: params.collapse_session,
             agent: params.agent,
             date_lo: params.since,
@@ -1252,7 +1259,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_index_status",
-        description = "Report the truthful state of the AICX semantic vector index for a project bucket. Returns `readiness` (ready/pending/missing), backend, project_bucket, committed_at, pending_chunks, and the final + temp checkpoint paths. `ready` is set only when the atomically committed `embeddings.ndjson` is present; a lone `.ndjson.tmp` checkpoint surfaces as `pending` so Loctree and other oracles can refuse to trust semantic retrieval before commit."
+        description = "Report the truthful state of the AICX sessions -> chunks -> semantic-index pipeline for a project bucket. Returns `readiness` (ready/stale_chunks/stale_index/pending/missing), source session freshness, pending_chunks, backend, project_bucket, committed_at, and final + temp checkpoint paths. `ready` is set only when source sessions are not newer than chunks and the atomically committed `embeddings.ndjson` is current."
     )]
     async fn index_status(
         &self,

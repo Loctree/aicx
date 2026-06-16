@@ -15,6 +15,7 @@
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -214,7 +215,8 @@ pub fn discover_claude_sessions(
 
 /// Parse a single Claude session `.jsonl` into a [`SessionInfo`].
 fn scan_claude_session_file(path: &Path, decoded_cwd: Option<&str>) -> Option<SessionInfo> {
-    let content = fs::read_to_string(path).ok()?;
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
     let session_id = path.file_stem().and_then(|s| s.to_str())?.to_string();
 
     let mut started_at: Option<DateTime<Utc>> = None;
@@ -229,7 +231,7 @@ fn scan_claude_session_file(path: &Path, decoded_cwd: Option<&str>) -> Option<Se
     // Partial.
     let mut saw_parsable_line = false;
 
-    for line in content.lines() {
+    for line in reader.lines().map_while(Result::ok) {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -370,7 +372,8 @@ pub fn discover_codex_sessions(
 /// `response_item` message stream by role (developer/system/tool rows are not
 /// conversation — consistent with the meta->SystemNote classification).
 fn scan_codex_session_file(path: &Path) -> Option<SessionInfo> {
-    let content = fs::read_to_string(path).ok()?;
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
     let mut session_id: Option<String> = None;
     let mut cwd: Option<String> = None;
     let mut started_at: Option<DateTime<Utc>> = None;
@@ -382,7 +385,7 @@ fn scan_codex_session_file(path: &Path) -> Option<SessionInfo> {
     // garbage-only file reports TemporalConfidence::None, not Partial.
     let mut saw_parsable_line = false;
 
-    for line in content.lines() {
+    for line in reader.lines().map_while(Result::ok) {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -545,8 +548,9 @@ pub fn discover_gemini_sessions(
 
 /// Parse a single Gemini whole-file session JSON into a [`SessionInfo`].
 fn scan_gemini_session_file(path: &Path, dir_name: &str) -> Option<SessionInfo> {
-    let content = fs::read_to_string(path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let v: serde_json::Value = serde_json::from_reader(reader).ok()?;
 
     let session_id = v
         .get("sessionId")
@@ -738,7 +742,8 @@ pub fn discover_junie_sessions(
 ///   surface (deduped per stepId like the extractor),
 ///   `CurrentDirectoryUpdatedEvent` carries the recorded cwd.
 fn scan_junie_session_file(path: &Path, session_id: &str) -> Option<SessionInfo> {
-    let content = fs::read_to_string(path).ok()?;
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
 
     // Anchor: the session dir name embeds the start time.
     let anchor = parse_junie_compact_pair(session_id);
@@ -756,7 +761,7 @@ fn scan_junie_session_file(path: &Path, session_id: &str) -> Option<SessionInfo>
     let mut last_result_render: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
 
-    for line in content.lines() {
+    for line in reader.lines().map_while(Result::ok) {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -886,6 +891,54 @@ fn scan_junie_session_file(path: &Path, session_id: &str) -> Option<SessionInfo>
         association,
         temporal_confidence,
     })
+}
+
+/// Discover every first-class session source under `home`.
+///
+/// This is the shared discovery core for status surfaces that need to reason
+/// about source-session freshness without duplicating provider walks. `cwd_filter`
+/// is passed into providers that can cheaply prune by cwd before reading files;
+/// [`select_sessions`] still applies the authoritative post-discovery filter.
+pub fn discover_sessions_at(
+    home: &Path,
+    modified_after: Option<SystemTime>,
+    cwd_filter: Option<&str>,
+    agent: Option<&str>,
+) -> Vec<SessionInfo> {
+    let mut discovered = Vec::new();
+    if agent.is_none_or(|a| a == "claude") {
+        discovered.extend(discover_claude_sessions(
+            &home.join(".claude").join("projects"),
+            modified_after,
+            cwd_filter,
+        ));
+    }
+    if agent.is_none_or(|a| a == "codex") {
+        discovered.extend(discover_codex_sessions(
+            &home.join(".codex").join("sessions"),
+            modified_after,
+        ));
+    }
+    if agent.is_none_or(|a| a == "grok") {
+        discovered.extend(discover_codex_sessions(
+            &home.join(".grok").join("sessions"),
+            modified_after,
+        ));
+    }
+    if agent.is_none_or(|a| a == "gemini") {
+        discovered.extend(discover_gemini_sessions(
+            &home.join(".gemini").join("tmp"),
+            modified_after,
+            cwd_filter,
+        ));
+    }
+    if agent.is_none_or(|a| a == "junie") {
+        discovered.extend(discover_junie_sessions(
+            &home.join(".junie").join("sessions"),
+            modified_after,
+        ));
+    }
+    discovered
 }
 
 /// Extract the trailing session-id segment from a codex rollout filename stem,

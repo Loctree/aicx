@@ -766,6 +766,72 @@ fn incremental_materialize_hybrid_refreshes_persisted_artifacts() {
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 #[test]
+fn materialize_hybrid_index_skips_missing_source_rows() {
+    let root = tempdir_for_test();
+    let _aicx_home_guard = ScopedAicxHome::set(&root);
+    let project = "vetcoders/Vista";
+    let semantic_index = index_path_for(&root, Some(project));
+    std::fs::create_dir_all(semantic_index.parent().expect("semantic parent")).unwrap();
+
+    let chunks_dir = root.join("chunks");
+    std::fs::create_dir_all(&chunks_dir).unwrap();
+    let live_chunk_path = chunks_dir.join("live.md");
+    let missing_chunk_path = chunks_dir.join("missing.md");
+    std::fs::write(&live_chunk_path, "live chunk").unwrap();
+
+    let make_entry = |id: &str, path: &std::path::Path, embedding: Vec<f32>| IndexEntry {
+        id: id.to_string(),
+        project: "vetcoders/vista".to_string(),
+        agent: "codex".to_string(),
+        date: "20260614".to_string(),
+        path: path.to_path_buf(),
+        kind: "conversations".to_string(),
+        session_id: format!("session-{id}"),
+        frame_kind: Some("agent_reply".to_string()),
+        cwd: Some("/Users/maciejgad/vc-workspace/vetcoders/aicx".to_string()),
+        embedding,
+    };
+    let header = IndexHeader {
+        schema_version: INDEX_SCHEMA_VERSION.to_string(),
+        model_id: "test-model".to_string(),
+        model_profile: "base".to_string(),
+        dimension: 2,
+        generated_at: "2026-06-14T05:32:00Z".to_string(),
+        entry_count: 2,
+    };
+    let entries = [
+        make_entry("live", &live_chunk_path, vec![1.0, 0.0]),
+        make_entry("missing", &missing_chunk_path, vec![0.0, 1.0]),
+    ];
+    let mut body = serde_json::to_string(&header).expect("serialize header");
+    body.push('\n');
+    for entry in &entries {
+        body.push_str(&serde_json::to_string(entry).expect("serialize entry"));
+        body.push('\n');
+    }
+    std::fs::write(&semantic_index, body).expect("write semantic fixture");
+
+    let info = crate::embedder::EmbeddingModelInfo {
+        model_id: "test-model".to_string(),
+        dimension: 2,
+        backend: "gguf".to_string(),
+        profile: crate::embedder::EmbeddingProfile::Base,
+        source: crate::embedder::NativeEmbeddingSource::ExplicitPath(
+            root.join("fixtures").join("test-model.gguf"),
+        ),
+    };
+
+    let manifest = materialize_hybrid_index(&semantic_index, Some(project), &info)
+        .expect("hybrid build should tolerate stale source rows");
+    assert_eq!(manifest.source_chunk_count, 1);
+    assert_eq!(manifest.dense_count, 1);
+    assert_eq!(manifest.lexical_doc_count, 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[test]
 fn incremental_baseline_detects_hybrid_manifest_stale_against_committed_source() {
     let root = tempdir_for_test();
     let _aicx_home_guard = ScopedAicxHome::set(&root);

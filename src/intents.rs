@@ -11,11 +11,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::chunker::{
-    INTENT_KEYWORDS, is_decision_tag, is_outcome_tag, is_result_line, normalize_key,
-    parse_checklist_task, truncate_signal_line,
+    INTENT_KEYWORDS, is_decision_tag, is_local_command_artifact_line, is_outcome_tag,
+    is_result_line, normalize_key, parse_checklist_task, truncate_signal_line,
 };
 use crate::sanitize;
-use crate::sources::shared::{IntentLineModality, intent_line_modality};
+use crate::sources::shared::{IntentLineModality, intent_line_modality, is_harness_injected_noise};
 use crate::store;
 use crate::timeline::FrameKind;
 use crate::types::{EntryState, EntryType, IntentEntry, Link, LinkType};
@@ -25,8 +25,8 @@ mod schema;
 mod types;
 
 pub use self::display::{
-    IntentDisplayFilters, IntentSortOrder, apply_display_filters, format_intents_json,
-    format_intents_markdown, format_intents_oracle_json,
+    IntentDisplayFilters, IntentSortOrder, UnresolvedMode, apply_display_filters,
+    format_intents_json, format_intents_markdown, format_intents_oracle_json,
 };
 use self::types::{
     CandidateAccumulator, IntentCandidate, SignalSection, StoredChunkFile, TaskAccumulator,
@@ -39,14 +39,13 @@ pub use self::types::{
 // Lane 2-5 schema anchor (MASTER Phase 2 §3). Stages land incrementally; these
 // types are the convergence point every lane stage must agree on.
 pub use self::schema::{
-    CLARIFY_MAX_QUESTIONS, ClaimRecord, ClaimSource, ClaimType, ClarifyQuestion, ContractFracture,
-    FractureSeverity, LANE_SCHEMA_VERSION, LaneExport, ResultRecord, ResultStatus, TimeCoverage,
-    UTC_TIMEZONE_ASSUMPTION, UserIntentLine, VerificationStatus, classify_claim,
-    collect_artifact_evidence, detect_fractures, extract_claims, extract_user_intent_lines,
+    CLARIFY_MAX_QUESTIONS, ClaimRecord, ClaimSource, ClaimType, ClarifyQuestion, CodescribeParser,
+    ContractFracture, EvidenceKind, EvidenceRecord, FractureSeverity, LANE_SCHEMA_VERSION,
+    LaneExport, ResultRecord, ResultStatus, TimeCoverage, UTC_TIMEZONE_ASSUMPTION, UserIntentLine,
+    VerificationStatus, audit_claims_against_evidence, classify_claim, collect_artifact_evidence,
+    detect_contract_fractures, detect_fractures, extract_claims, extract_user_intent_lines,
     generate_clarify, is_agent_role, is_user_role, verify_claims,
 };
-
-const STRICT_CONFIDENCE: u8 = 3;
 
 /// E.6: hard upper bound on per-extraction candidate vectors. A pathological
 /// input (huge transcript with many bullet lines) used to drag the whole
@@ -147,9 +146,19 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         }
     }
 
-    let mut records = dedup_candidates(candidates, config.strict, config.kind_filter);
+    let mut records = dedup_candidates(
+        candidates,
+        config.strict,
+        config.min_confidence,
+        config.kind_filter,
+    );
     drop_truncated_duplicate_records(&mut records);
-    let mut task_records = finalize_tasks(task_events, config.strict, config.kind_filter);
+    let mut task_records = finalize_tasks(
+        task_events,
+        config.strict,
+        config.min_confidence,
+        config.kind_filter,
+    );
     records.append(&mut task_records);
 
     reconcile_session_id_with_path(&mut records);
@@ -206,6 +215,11 @@ fn sort_intent_records(records: &mut [IntentRecord]) {
             .date
             .cmp(&left.date)
             .then_with(|| left.kind.sort_rank().cmp(&right.kind.sort_rank()))
+            .then_with(|| {
+                let left_is_voice = left.source.as_deref() == Some("voice_transcript");
+                let right_is_voice = right.source.as_deref() == Some("voice_transcript");
+                left_is_voice.cmp(&right_is_voice)
+            })
             .then_with(|| right.source_chunk.cmp(&left.source_chunk))
             .then_with(|| left.summary.cmp(&right.summary))
     });
@@ -217,11 +231,12 @@ fn dedup_intent_records(records: &mut Vec<IntentRecord>) {
         // Normalize the summary so dedup catches near-duplicates that differ
         // only in whitespace, case, or invisible chars (zero-width / bidi).
         // Without this, "fix au\u{200B}th" sneaks past as a "new" record.
+        // Session/chunk are provenance, not identity: identical normalized
+        // facts re-ingested across sessions should surface once per project.
         seen.insert((
             record.kind,
+            record.project.clone(),
             normalize_key(&record.summary),
-            record.session_id.clone(),
-            record.source_chunk.clone(),
         ))
     });
 }
@@ -293,21 +308,27 @@ fn collect_chunk_files(
             continue;
         }
 
-        let timestamp = file
-            .path
-            .metadata()
-            .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .map(DateTime::<Utc>::from)
+        // Recency is anchored to the canonical chunk date encoded in the store
+        // layout. Filesystem mtime drifts during daily sync/migration and must
+        // not make stale sessions look fresh.
+        let canonical_date = NaiveDate::parse_from_str(&file.date_iso, "%Y-%m-%d").ok();
+        let timestamp = canonical_date
+            .and_then(|date| combine_date_time(date, "000000"))
             .or_else(|| {
-                NaiveDate::parse_from_str(&file.date_iso, "%Y-%m-%d")
+                file.path
+                    .metadata()
                     .ok()
-                    .and_then(|date| combine_date_time(date, "000000"))
+                    .and_then(|metadata| metadata.modified().ok())
+                    .map(DateTime::<Utc>::from)
             });
         let Some(timestamp) = timestamp else {
             continue;
         };
-        if timestamp < cutoff {
+        if let Some(date) = canonical_date {
+            if date < cutoff.date_naive() {
+                continue;
+            }
+        } else if timestamp < cutoff {
             continue;
         }
 
@@ -519,7 +540,8 @@ fn extract_signal_candidates(
                 project,
                 source_chunk,
                 !is_done,
-                STRICT_CONFIDENCE,
+                true,
+                None,
             ) {
                 task_events.push(event);
             }
@@ -530,11 +552,18 @@ fn extract_signal_candidates(
             || line.starts_with("Checklist detected")
             || line.starts_with("... (+")
             || is_source_metadata_line(line)
+            || is_reingested_charter_line(line)
         {
             continue;
         }
 
         let payload = strip_signal_bullet(line);
+        if is_source_metadata_line(payload)
+            || is_local_command_artifact_line(payload)
+            || is_reingested_charter_line(payload)
+        {
+            continue;
+        }
         let kind = match section {
             SignalSection::Intent => Some(IntentKind::Intent),
             SignalSection::Decision => Some(IntentKind::Decision),
@@ -543,15 +572,8 @@ fn extract_signal_candidates(
         };
 
         if let Some(kind) = kind
-            && let Some(candidate) = build_candidate(
-                kind,
-                payload,
-                None,
-                file,
-                project,
-                source_chunk,
-                STRICT_CONFIDENCE,
-            )
+            && let Some(candidate) =
+                build_candidate(kind, payload, None, file, project, source_chunk, true, None)
         {
             candidates.push(candidate);
         }
@@ -571,17 +593,39 @@ fn extract_transcript_candidates(
 
     for entry in transcript_entries {
         let is_user = entry.role.eq_ignore_ascii_case("user");
+        if is_user {
+            let message = entry.lines.join("\n");
+            if (is_harness_injected_noise(&entry.role, &message)
+                && !is_local_command_artifact_line(message.lines().next().unwrap_or_default()))
+                || is_reingested_charter_block(&message)
+            {
+                continue;
+            }
+        }
+        let mut codescribe_parser = CodescribeParser::new();
 
         for (index, raw_line) in entry.lines.iter().enumerate() {
-            let line = raw_line.trim();
+            let (cleaned, is_voice) = codescribe_parser.process(raw_line);
+            let line = cleaned.trim();
             if line.is_empty() {
                 continue;
             }
             if is_source_metadata_line(line) {
                 continue;
             }
+            if is_local_command_artifact_line(line) {
+                continue;
+            }
+            if is_reingested_charter_line(line) {
+                continue;
+            }
 
             let context = surrounding_context(&entry.lines, index);
+            let source_provenance = if is_voice {
+                Some("voice_transcript".to_string())
+            } else {
+                None
+            };
 
             if let Some((is_done, task)) = parse_checklist_task(line) {
                 if let Some(event) = build_task_event(
@@ -591,7 +635,8 @@ fn extract_transcript_candidates(
                     project,
                     source_chunk,
                     !is_done,
-                    STRICT_CONFIDENCE,
+                    false,
+                    source_provenance,
                 ) {
                     task_events.push(event);
                 }
@@ -601,20 +646,90 @@ fn extract_transcript_candidates(
             let Some(kind) = infer_kind_from_line(line, is_user) else {
                 continue;
             };
-            let confidence = match kind {
-                IntentKind::Intent => 2,
-                _ => STRICT_CONFIDENCE,
-            };
+            if role_suppresses_outcome_promotion(&entry.role) && kind == IntentKind::Outcome {
+                continue;
+            }
 
-            if let Some(candidate) =
-                build_candidate(kind, line, context, file, project, source_chunk, confidence)
-            {
+            if let Some(candidate) = build_candidate(
+                kind,
+                line,
+                context,
+                file,
+                project,
+                source_chunk,
+                false,
+                source_provenance,
+            ) {
                 candidates.push(candidate);
             }
         }
     }
 
     (candidates, task_events)
+}
+
+fn is_reingested_charter_block(message: &str) -> bool {
+    let head = message.trim_start();
+    charter_head_markers()
+        .iter()
+        .any(|marker| starts_with_marker(head, marker))
+}
+
+fn role_suppresses_outcome_promotion(role: &str) -> bool {
+    let role = role.trim().to_ascii_lowercase();
+    role == "agent_reply" || role.starts_with("tool_") || role == "tool"
+}
+
+fn is_reingested_charter_line(line: &str) -> bool {
+    let trimmed = strip_signal_bullet(line)
+        .trim_start_matches('>')
+        .trim_start();
+    if charter_head_markers()
+        .iter()
+        .any(|marker| starts_with_marker(trimmed, marker))
+    {
+        return true;
+    }
+
+    let lower = trimmed.to_lowercase();
+    [
+        "done is a market condition",
+        "code is not done because a narrow check turned green",
+        "\"done\" means repo health",
+        "runtime truth beats theoretical correctness",
+        "product truth beats local elegance",
+        "loctree gives **sight**",
+        "aicx gives **insight**",
+        "vibecrafted gives **hands**",
+        "move fast, but with taste",
+        "be radical when radical is cleaner",
+        "finish the whole thing, not just the code",
+        "we craft.",
+        "we converge.",
+        "we ship.",
+    ]
+    .iter()
+    .any(|marker| lower.starts_with(marker))
+}
+
+fn starts_with_marker(text: &str, marker: &str) -> bool {
+    text.get(..marker.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(marker))
+}
+
+fn charter_head_markers() -> &'static [&'static str] {
+    &[
+        "# AGENTS.md instructions",
+        "# CLAUDE.md instructions",
+        "<INSTRUCTIONS>",
+        "<!-- loctree-doctrine",
+        "<!-- loctree-advise",
+        "# VetCoders Global Agent Charter",
+        "# VetCoders Agent Operating Guide",
+        "# Loctree + AICX + Vibecrafted Agent Operating Guide",
+        "# The Vibecrafted Manifesto",
+        "## **LOCTREE + AICX + VIBECRAFTED",
+    ]
 }
 
 fn infer_kind_from_line(line: &str, is_user_line: bool) -> Option<IntentKind> {
@@ -625,6 +740,14 @@ fn infer_kind_from_line(line: &str, is_user_line: bool) -> Option<IntentKind> {
     };
     if modality == IntentLineModality::PastedReference {
         return None;
+    }
+
+    if is_user_line
+        && let Some((entry_type, confidence)) = classify_line_entry_type(line, true)
+        && confidence >= CLASSIFIER_ABSTAIN_THRESHOLD
+        && let Some(kind) = entry_type_to_timeline_kind(entry_type)
+    {
+        return Some(kind);
     }
 
     if is_decision_tag(line) {
@@ -643,6 +766,15 @@ fn infer_kind_from_line(line: &str, is_user_line: bool) -> Option<IntentKind> {
         return Some(IntentKind::Intent);
     }
     None
+}
+
+fn entry_type_to_timeline_kind(entry_type: EntryType) -> Option<IntentKind> {
+    match entry_type {
+        EntryType::Decision => Some(IntentKind::Decision),
+        EntryType::Intent | EntryType::Question | EntryType::Why => Some(IntentKind::Intent),
+        EntryType::Outcome | EntryType::Result => Some(IntentKind::Outcome),
+        EntryType::Argue | EntryType::Assumption | EntryType::Insight => None,
+    }
 }
 
 fn is_outcome_line(line: &str) -> bool {
@@ -852,6 +984,13 @@ fn is_source_metadata_line(line: &str) -> bool {
         "project:",
         "author:",
         "heading:",
+        "input:",
+        "output:",
+        "\"output\":",
+        "current topic:",
+        "topic summary:",
+        "successfully created and wrote to new file:",
+        "base directory for this skill:",
     ]
     .iter()
     .any(|prefix| lower.starts_with(prefix))
@@ -877,6 +1016,59 @@ fn looks_like_operator_decision_line(line: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
+fn is_garbled_transcription(summary: &str) -> bool {
+    let lower = summary.to_lowercase();
+    if lower.contains("arozet") || lower.contains("injust") {
+        return true;
+    }
+    let fillers = &["yym", "ehem", "ten tego", "yyy", "eee", "hmmm"];
+    for &f in fillers {
+        if lower.contains(f) {
+            return true;
+        }
+    }
+    let word_count = summary.split_whitespace().count();
+    let has_structure = summary.contains(',')
+        || summary.contains('.')
+        || summary.contains(';')
+        || summary.contains('?')
+        || summary.contains('!');
+    if word_count > 15 && !has_structure {
+        return true;
+    }
+    false
+}
+
+fn calculate_confidence(
+    kind: IntentKind,
+    summary: &str,
+    has_context: bool,
+    has_evidence: bool,
+    is_signal: bool,
+) -> u8 {
+    let mut confidence = if is_signal {
+        4
+    } else {
+        match kind {
+            IntentKind::Intent => 2,
+            _ => 3,
+        }
+    };
+
+    if has_context {
+        confidence += 1;
+    }
+    if has_evidence {
+        confidence += 1;
+    }
+    if kind == IntentKind::Intent && severity_marker(summary).is_some() {
+        confidence += 1;
+    }
+
+    confidence.min(5)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_candidate(
     kind: IntentKind,
     raw_summary: &str,
@@ -884,7 +1076,8 @@ fn build_candidate(
     file: &StoredChunkFile,
     project: &str,
     source_chunk: &str,
-    confidence: u8,
+    is_signal: bool,
+    source_provenance: Option<String>,
 ) -> Option<IntentCandidate> {
     let summary = normalize_display_text(&clean_summary(kind, raw_summary));
     if summary.is_empty() || is_metadata_only_summary(&summary) {
@@ -902,6 +1095,23 @@ fn build_candidate(
         merge_evidence(&mut evidence, extract_evidence(extra));
     }
 
+    // Anti-bełkot sanity gate:
+    if kind == IntentKind::Intent
+        && context.is_none()
+        && evidence.is_empty()
+        && is_garbled_transcription(&summary)
+    {
+        return None; // Degrade to candidate (exclude from final intents)
+    }
+
+    let confidence = calculate_confidence(
+        kind,
+        &summary,
+        context.is_some(),
+        !evidence.is_empty(),
+        is_signal,
+    );
+
     Some(IntentCandidate {
         record: IntentRecord {
             kind,
@@ -917,12 +1127,14 @@ fn build_candidate(
             last_chunk: None,
             source_chunk: source_chunk.to_string(),
             timestamp: Some(file.timestamp.to_rfc3339()),
+            source: source_provenance,
         },
         confidence,
         timestamp: file.timestamp,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_task_event(
     task: &str,
     context: Option<String>,
@@ -930,7 +1142,8 @@ fn build_task_event(
     project: &str,
     source_chunk: &str,
     is_open: bool,
-    confidence: u8,
+    is_signal: bool,
+    source_provenance: Option<String>,
 ) -> Option<TaskEvent> {
     let candidate = build_candidate(
         IntentKind::Task,
@@ -939,7 +1152,8 @@ fn build_task_event(
         file,
         project,
         source_chunk,
-        confidence,
+        is_signal,
+        source_provenance,
     )?;
 
     Some(TaskEvent {
@@ -965,6 +1179,8 @@ fn clean_summary(kind: IntentKind, raw: &str) -> String {
         IntentKind::Intent => {
             text = strip_case_insensitive_prefix(text, "[intent]");
             text = strip_case_insensitive_prefix(text, "intent:");
+            text = strip_case_insensitive_prefix(text, "question:");
+            text = strip_case_insensitive_prefix(text, "why:");
         }
         IntentKind::Task => {}
     }
@@ -1001,19 +1217,23 @@ fn normalize_display_text(text: &str) -> String {
 
 fn surrounding_context(lines: &[String], index: usize) -> Option<String> {
     let mut parts = Vec::new();
+    let mut push_part = |line: &str| {
+        let line = line.trim();
+        if is_source_metadata_line(line) || is_local_command_artifact_line(line) {
+            return;
+        }
+        let part = normalize_display_text(line);
+        if !part.is_empty() {
+            parts.push(part);
+        }
+    };
 
     if let Some(prev) = index.checked_sub(1).and_then(|idx| lines.get(idx)) {
-        let prev = normalize_display_text(prev);
-        if !prev.is_empty() {
-            parts.push(prev);
-        }
+        push_part(prev);
     }
 
     if let Some(next) = lines.get(index + 1) {
-        let next = normalize_display_text(next);
-        if !next.is_empty() {
-            parts.push(next);
-        }
+        push_part(next);
     }
 
     if parts.is_empty() {
@@ -1104,7 +1324,28 @@ fn is_metadata_only_summary(text: &str) -> bool {
     {
         return true;
     }
+    if trimmed.ends_with(':') && words.len() <= 4 && !trimmed.contains("://") {
+        return true;
+    }
+    if is_numbered_reference_item(trimmed) {
+        return true;
+    }
     false
+}
+
+fn is_numbered_reference_item(text: &str) -> bool {
+    let Some(first) = text.split_whitespace().next() else {
+        return false;
+    };
+    let marker = first.trim_end_matches(['.', ')']);
+    if marker.is_empty() || !marker.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    text.contains('`')
+        || lower.contains(" when the ")
+        || lower.contains("must ")
+        || lower.contains("should ")
 }
 
 /// Detects the "1 Foo | 2 Bar" pattern that appears as `context` when the
@@ -1301,25 +1542,34 @@ fn drop_truncated_duplicate_records(records: &mut Vec<IntentRecord>) {
 fn dedup_candidates(
     candidates: Vec<IntentCandidate>,
     strict: bool,
+    min_confidence: Option<u8>,
     kind_filter: Option<IntentKind>,
 ) -> Vec<IntentRecord> {
     let mut map: HashMap<(IntentKind, String, String), CandidateAccumulator> = HashMap::new();
+
+    let target_confidence = if let Some(mc) = min_confidence {
+        mc
+    } else if strict {
+        4
+    } else {
+        1
+    };
 
     for candidate in candidates {
         if kind_filter.is_some() && kind_filter != Some(candidate.record.kind) {
             continue;
         }
-        if strict && candidate.confidence < STRICT_CONFIDENCE {
+        if candidate.confidence < target_confidence {
             continue;
         }
 
-        // Session-scoped key. Cross-session merges silently swap source_chunk
-        // while keeping the wrong session_id, lying about provenance. Keep
-        // identical text in different sessions as separate records.
+        // Same normalized fact, same project, same kind: surface once. The
+        // merge path below carries the winning provenance together, so the
+        // selected source_chunk and session_id stay consistent.
         let key = (
             candidate.record.kind,
+            candidate.record.project.clone(),
             normalize_key(&candidate.record.summary),
-            candidate.record.session_id.clone(),
         );
 
         if let Some(existing) = map.get_mut(&key) {
@@ -1360,6 +1610,7 @@ fn dedup_candidates(
 fn finalize_tasks(
     task_events: Vec<TaskEvent>,
     strict: bool,
+    min_confidence: Option<u8>,
     kind_filter: Option<IntentKind>,
 ) -> Vec<IntentRecord> {
     if kind_filter.is_some() && kind_filter != Some(IntentKind::Task) {
@@ -1380,8 +1631,16 @@ fn finalize_tasks(
             })
     });
 
+    let target_confidence = if let Some(mc) = min_confidence {
+        mc
+    } else if strict {
+        4
+    } else {
+        1
+    };
+
     for event in events {
-        if strict && event.candidate.confidence < STRICT_CONFIDENCE {
+        if event.candidate.confidence < target_confidence {
             continue;
         }
 
@@ -1446,6 +1705,7 @@ fn merge_candidate(existing: &mut CandidateAccumulator, incoming: IntentCandidat
         existing.candidate.record.project = incoming.record.project.clone();
         existing.candidate.record.agent = incoming.record.agent.clone();
         existing.candidate.record.date = incoming.record.date.clone();
+        existing.candidate.record.session_id = incoming.record.session_id.clone();
         existing.candidate.record.source_chunk = incoming.record.source_chunk.clone();
     }
 }
@@ -1559,6 +1819,7 @@ const ASSUMPTION_MARKERS: &[&str] = &[
 ];
 
 const WHY_MARKERS: &[&str] = &[
+    "why:",
     "because",
     "the reason",
     "this is needed",
@@ -1803,6 +2064,11 @@ pub fn classify_chunk_entries(
             if let Some((entry_type, conf)) = classify_line_entry_type(trimmed, is_user)
                 && conf >= CLASSIFIER_ABSTAIN_THRESHOLD
             {
+                if role_suppresses_outcome_promotion(&entry.role)
+                    && matches!(entry_type, EntryType::Outcome | EntryType::Result)
+                {
+                    continue;
+                }
                 let title = clean_entry_title(entry_type, trimmed);
                 if !title.is_empty() {
                     let id = IntentEntry::stable_id(source_chunk, byte_offset, entry_type);

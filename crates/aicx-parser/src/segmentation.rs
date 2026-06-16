@@ -344,12 +344,12 @@ fn classify_segment_kind(entries: &[TimelineEntry]) -> Kind {
 
     let report_score = entries
         .iter()
-        .map(|entry| classify_report_signal(entry.message.as_str()))
-        .sum::<u8>();
+        .map(|entry| u16::from(classify_report_signal(entry.message.as_str())))
+        .sum::<u16>();
     let plan_score = entries
         .iter()
-        .map(|entry| classify_plan_signal(entry.message.as_str()))
-        .sum::<u8>();
+        .map(|entry| u16::from(classify_plan_signal(entry.message.as_str())))
+        .sum::<u16>();
 
     if report_score >= 2 && report_score > plan_score && !has_conversation {
         Kind::Reports
@@ -719,6 +719,23 @@ mod tests {
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ))
+    }
+
+    #[test]
+    fn segment_kind_scoring_handles_large_signal_counts_without_overflow() {
+        let entries: Vec<TimelineEntry> = (0..300)
+            .map(|idx| {
+                entry(
+                    (2026, 3, 21, 9, 0, 0),
+                    "huge-session",
+                    "system",
+                    &format!("status report {idx}\nsummary: follow-up required"),
+                    None,
+                )
+            })
+            .collect();
+
+        assert_eq!(classify_segment_kind(&entries), Kind::Reports);
     }
 
     #[test]

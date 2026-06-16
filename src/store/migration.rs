@@ -156,6 +156,7 @@ enum SourceFormat {
     Gemini,
     GeminiAntigravity,
     Junie,
+    Grok,
 }
 
 #[derive(Debug, Clone)]
@@ -656,6 +657,12 @@ fn source_format_hint(path: &Path, agent_hint: Option<&str>) -> Option<SourceFor
             }
             return None;
         }
+        Some("grok") => {
+            if extension.as_deref() == Some("jsonl") && path_str.contains("/.grok/") {
+                return Some(SourceFormat::Grok);
+            }
+            return None;
+        }
         Some(_) => return None,
         None => {}
     }
@@ -691,6 +698,10 @@ fn source_format_hint(path: &Path, agent_hint: Option<&str>) -> Option<SourceFor
             || path_str.contains("/.codex/"))
     {
         return Some(SourceFormat::Codex);
+    }
+
+    if extension.as_deref() == Some("jsonl") && path_str.contains("/.grok/") {
+        return Some(SourceFormat::Grok);
     }
 
     if (extension.as_deref() == Some("jsonl") || extension.as_deref() == Some("output"))
@@ -802,6 +813,7 @@ fn extract_entries_from_source(source: &ResolvedSource) -> Result<Vec<TimelineEn
             sources::extract_gemini_antigravity_file(&source.path, &config)
         }
         SourceFormat::Junie => sources::extract_junie_file(&source.path, &config),
+        SourceFormat::Grok => sources::extract_grok_file(&source.path, &config),
     }
 }
 

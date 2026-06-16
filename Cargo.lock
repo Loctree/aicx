@@ -53,11 +53,11 @@ dependencies = [
 
 [[package]]
 name = "aicx"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "aicx-embeddings",
  "aicx-monitor",
- "aicx-parser 0.9.2",
+ "aicx-parser 0.9.3",
  "aicx-progress-contracts",
  "aicx-retrieve",
  "anyhow",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "aicx-embeddings"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "anyhow",
  "dirs",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "aicx-monitor"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "sysinfo",
  "tokio",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "aicx-parser"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "aicx-progress-contracts"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "chrono",
  "serde",
@@ -158,9 +158,9 @@ dependencies = [
 
 [[package]]
 name = "aicx-retrieve"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
- "aicx-parser 0.9.2",
+ "aicx-parser 0.9.3",
  "anyhow",
  "blake3",
  "chrono",

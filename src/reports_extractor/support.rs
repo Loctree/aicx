@@ -193,21 +193,17 @@ pub(super) fn prompt_workflow_slug(prompt_id: Option<&str>) -> Option<String> {
         return None;
     }
 
-    let base = prompt_id
-        .split_once('_')
-        .map(|(left, _)| left)
-        .unwrap_or(prompt_id);
-    normalize_workflow_slug(base)
+    prompt_id
+        .split('_')
+        .filter_map(normalize_content_slug_part)
+        .next()
 }
 
 pub(super) fn stem_workflow_slug(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
+    let stem = artifact_stem(path)?;
     let filtered = stem
         .split('_')
-        .filter(|segment| !segment.is_empty())
-        .filter(|segment| !looks_like_timestamp_segment(segment))
-        .filter(|segment| !is_known_artifact_suffix(segment))
-        .filter(|segment| !is_known_agent(segment))
+        .filter_map(normalize_content_slug_part)
         .collect::<Vec<_>>()
         .join("-");
     normalize_workflow_slug(&filtered)
@@ -243,7 +239,45 @@ fn normalize_workflow_slug(value: &str) -> Option<String> {
         .collect::<Vec<_>>()
         .join("-");
 
-    if slug.is_empty() { None } else { Some(slug) }
+    if slug.is_empty() || is_boilerplate_slug(&slug) {
+        None
+    } else {
+        Some(slug)
+    }
+}
+
+fn normalize_content_slug_part(segment: &str) -> Option<String> {
+    let normalized = normalize_workflow_slug(segment)?;
+    if looks_like_timestamp_segment(&normalized)
+        || looks_like_run_id_segment(&normalized)
+        || is_known_artifact_suffix(&normalized)
+        || is_known_agent(&normalized)
+    {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn artifact_stem(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    for suffix in [
+        ".meta.json",
+        ".transcript.log",
+        "_launch.sh",
+        ".launch.sh",
+        ".md",
+        ".json",
+        ".log",
+        ".sh",
+    ] {
+        if let Some(stem) = name.strip_suffix(suffix) {
+            return Some(stem.to_string());
+        }
+    }
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.to_string())
 }
 
 fn looks_like_timestamp_segment(segment: &str) -> bool {
@@ -251,10 +285,65 @@ fn looks_like_timestamp_segment(segment: &str) -> bool {
     digits_only && matches!(segment.len(), 4 | 6 | 8 | 12 | 14)
 }
 
+fn looks_like_run_id_segment(segment: &str) -> bool {
+    let mut parts = segment.split('-');
+    let Some(prefix) = parts.next() else {
+        return false;
+    };
+    if !is_known_run_id_prefix(prefix) {
+        return false;
+    }
+    parts.any(|part| part.len() >= 4 && part.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn is_known_run_id_prefix(prefix: &str) -> bool {
+    matches!(
+        prefix,
+        "just"
+            | "impl"
+            | "rsch"
+            | "revw"
+            | "audt"
+            | "mrbl"
+            | "marb"
+            | "dou"
+            | "init"
+            | "rel"
+            | "workflow"
+            | "followup"
+            | "wflow"
+    )
+}
+
+fn is_boilerplate_slug(slug: &str) -> bool {
+    matches!(
+        slug,
+        "perform-the-vc-justdo-skill-on-this-repository"
+            | "justdo-skill-on-this-repository"
+            | "perform-the-skill"
+            | "perform-skill"
+            | "do-this-task"
+            | "this-task"
+            | "untitled"
+    ) || (slug.starts_with("perform-the-vc-") && slug.ends_with("-skill-on-this-repository"))
+        || (slug.starts_with("perform-") && slug.ends_with("-skill-on-this-repository"))
+}
+
 fn is_known_artifact_suffix(segment: &str) -> bool {
     matches!(
         segment.to_ascii_lowercase().as_str(),
-        "context" | "research" | "report" | "reports" | "plan" | "plans" | "summary"
+        "context"
+            | "research"
+            | "report"
+            | "reports"
+            | "plan"
+            | "plans"
+            | "summary"
+            | "meta"
+            | "transcript"
+            | "log"
+            | "launch"
+            | "launcher"
     )
 }
 

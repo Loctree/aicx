@@ -196,12 +196,37 @@ fn infers_day_root_workflow_from_prompt_ids_and_file_stems() {
         Some("report-artifacts-dashboard")
     );
     assert_eq!(
+        prompt_workflow_slug(Some(
+            "20260612_0810_improve-aicx-installer-output-ux_20260612"
+        ))
+        .as_deref(),
+        Some("improve-aicx-installer-output-ux")
+    );
+    assert_eq!(
+        prompt_workflow_slug(Some(
+            "20260612_0810_perform-the-vc-justdo-skill-on-this-repository_20260612"
+        )),
+        None
+    );
+    assert_eq!(
         stem_workflow_slug(Path::new(
             "/tmp/20260412_2031_report-artifacts-dashboard_codex.md"
         ))
         .as_deref(),
         Some("report-artifacts-dashboard")
     );
+    for path in [
+        "/tmp/20260612_075248_just-075248-9497_improve-aicx-installer-output-ux_codex.md",
+        "/tmp/20260612_075248_just-075248-9497_improve-aicx-installer-output-ux_codex.meta.json",
+        "/tmp/20260612_075248_just-075248-9497_improve-aicx-installer-output-ux_codex.transcript.log",
+        "/tmp/20260612_075248_just-075248-9497_improve-aicx-installer-output-ux_codex_launch.sh",
+    ] {
+        assert_eq!(
+            stem_workflow_slug(Path::new(path)).as_deref(),
+            Some("improve-aicx-installer-output-ux"),
+            "{path}"
+        );
+    }
     assert_eq!(
         title_workflow_slug("Examination: report artifacts dashboard").as_deref(),
         Some("examination-report-artifacts-dashboard")

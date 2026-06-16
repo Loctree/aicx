@@ -10,7 +10,10 @@ pub use codescribe::{
     CodescribeTranscript, discover_codescribe_transcripts, discover_codescribe_transcripts_at,
     extract_codescribe, extract_codescribe_from_home, parse_codescribe_transcript,
 };
-pub use codex::{extract_codex, extract_codex_file, extract_codex_sessions};
+pub use codex::{
+    extract_codex, extract_codex_file, extract_codex_sessions, extract_grok, extract_grok_file,
+    extract_grok_sessions,
+};
 pub use gemini::{extract_gemini, extract_gemini_antigravity_file, extract_gemini_file};
 pub use junie::{extract_junie, extract_junie_file};
 pub use operator_markdown::{

@@ -1042,6 +1042,7 @@ pub const CLI_SUBCOMMAND_NAMES: &[&str] = &[
     "list",
     "migrate",
     "migrate-intent-schema",
+    "open",
     "read",
     "refs",
     "reports",

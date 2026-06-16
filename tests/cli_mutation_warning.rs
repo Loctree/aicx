@@ -4,7 +4,7 @@
 //! Wave D Cut D1 (2026-05-25) adds a one-line stderr note before any of
 //! the seven mutation subcommands (`all`, `claude`, `codex`, `store`,
 //! `migrate`, `migrate-intent-schema`, `index`) start writing to
-//! `~/.aicx/`. The note is informational only — operators can still
+//! the resolved AICX home. The note is informational only — operators can still
 //! proceed; shipped scripts and automations can opt out via the
 //! `AICX_NO_MUTATION_WARN=1` env var.
 //!
@@ -88,7 +88,9 @@ fn unique_aicx_home(label: &str) -> PathBuf {
     dir
 }
 
-const WARN_TEXT_FRAGMENT: &str = "about to write to ~/.aicx/";
+fn warn_text_fragment_for(home: &std::path::Path) -> String {
+    format!("about to write to {}", home.display())
+}
 
 #[test]
 fn migrate_emits_mutation_warning_on_bare_invocation() {
@@ -118,8 +120,9 @@ fn migrate_emits_mutation_warning_on_bare_invocation() {
         "stderr should include mutation warning header; got:\n{stderr}"
     );
     assert!(
-        stderr.contains(WARN_TEXT_FRAGMENT),
-        "stderr should mention canonical aicx home; got:\n{stderr}"
+        stderr.contains(&warn_text_fragment_for(&home)),
+        "stderr should mention resolved aicx home {}; got:\n{stderr}",
+        home.display()
     );
 
     let _ = std::fs::remove_dir_all(&home);
@@ -184,11 +187,66 @@ fn aicx_no_mutation_warn_env_suppresses_warning() {
         "AICX_NO_MUTATION_WARN=1 must suppress the mutation warning; got:\n{stderr}"
     );
     assert!(
-        !stderr.contains(WARN_TEXT_FRAGMENT),
+        !stderr.contains(&warn_text_fragment_for(&home)),
         "suppression env must also suppress the body fragment; got:\n{stderr}"
     );
 
     let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&legacy);
+}
+
+#[test]
+fn mutation_warning_uses_bootstrap_storage_home_when_env_unset() {
+    // Mirrors the installer path: config stays at $HOME/.aicx/config.toml,
+    // while [storage].home points runtime writes at a custom root.
+    let bin = ensure_aicx_binary_exists();
+    let bootstrap_home = unique_aicx_home("bootstrap-home");
+    let storage_root = unique_aicx_home("bootstrap-storage-root");
+    let legacy = storage_root.join("legacy-src");
+    std::fs::create_dir_all(&legacy).expect("create bootstrap legacy root");
+    let bootstrap_config_dir = bootstrap_home.join(".aicx");
+    std::fs::create_dir_all(&bootstrap_config_dir).expect("create bootstrap config dir");
+    std::fs::write(
+        bootstrap_config_dir.join("config.toml"),
+        format!("[storage]\nhome = \"{}\"\n", storage_root.display()),
+    )
+    .expect("write bootstrap storage config");
+
+    let output = Command::new(&bin)
+        .arg("migrate")
+        .arg("--legacy-root")
+        .arg(&legacy)
+        .arg("--store-root")
+        .arg(&storage_root)
+        .env("HOME", &bootstrap_home)
+        .env_remove("AICX_HOME")
+        .env("AICX_ALLOW_TMP", "1")
+        .env("AICX_MUTATION_WARN_DELAY_SECONDS", "0")
+        .env_remove("AICX_NO_MUTATION_WARN")
+        .output()
+        .expect("run aicx migrate with bootstrap storage.home");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "migrate should succeed against isolated bootstrap storage root; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("aicx migrate: note:"),
+        "stderr should include mutation warning header; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&warn_text_fragment_for(&storage_root)),
+        "stderr should mention resolved storage root {}; got:\n{stderr}",
+        storage_root.display()
+    );
+    assert!(
+        !stderr.contains(&warn_text_fragment_for(&bootstrap_config_dir)),
+        "warning must not describe the bootstrap config dir as the storage root; got:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&bootstrap_home);
+    let _ = std::fs::remove_dir_all(&storage_root);
     let _ = std::fs::remove_dir_all(&legacy);
 }
 

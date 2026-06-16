@@ -21,6 +21,7 @@ impl IntentsScreen {
             project: project_filter.clone(),
             hours,
             strict: false,
+            min_confidence: None,
             kind_filter: None,
             frame_kind: None,
         };
@@ -88,11 +89,17 @@ impl IntentsScreen {
         self.visible
             .get(self.selected)
             .map(|record| {
+                let voice_marker = if record.source.as_deref() == Some("voice_transcript") {
+                    " [voice]"
+                } else {
+                    ""
+                };
                 format!(
-                    "{} | {} | {}\n{}\n\nsource: {}",
+                    "{} | {} | {}{}\n{}\n\nsource: {}",
                     record.date,
                     record.agent,
                     record.kind.heading(),
+                    voice_marker,
                     record.summary,
                     record.source_chunk
                 )
