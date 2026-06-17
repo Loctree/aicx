@@ -60,7 +60,7 @@ impl DiagnosticKind {
     }
 }
 
-const EXTRACTOR_ORDER: &[&str] = &["claude", "codex", "gemini", "junie"];
+const EXTRACTOR_ORDER: &[&str] = &["claude", "codex", "gemini", "junie", "grok"];
 
 #[derive(Default)]
 struct ExtractorCounters {

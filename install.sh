@@ -826,7 +826,7 @@ download_release_bundle() {
   release_tag=$(resolve_release_tag)
   target=$(detect_release_target)
   case "$target" in
-    *apple-darwin|*windows-gnu) archive_ext="zip" ;;
+    *apple-darwin|*windows*) archive_ext="zip" ;;
     *) archive_ext="tar.gz" ;;
   esac
   bundle_name="aicx-${release_tag}-${target}-slim"

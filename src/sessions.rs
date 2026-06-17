@@ -474,6 +474,20 @@ fn scan_codex_session_file(path: &Path) -> Option<SessionInfo> {
     })
 }
 
+/// Thin wrapper around the codex v1/responses scanner so Grok sessions
+/// (which use identical rollout layout under ~/.grok/sessions) get the
+/// correct `agent: "grok"` label. Reuses all the heavy scanning logic.
+pub fn discover_grok_sessions(
+    sessions_root: &Path,
+    modified_after: Option<SystemTime>,
+) -> Vec<SessionInfo> {
+    let mut sessions = discover_codex_sessions(sessions_root, modified_after);
+    for s in &mut sessions {
+        s.agent = "grok".to_string();
+    }
+    sessions
+}
+
 /// Best-effort text of a codex message payload (`content` can be a string or an
 /// array of `{text}` / `{input_text}` parts).
 fn codex_message_text(payload: Option<&serde_json::Value>) -> Option<String> {
@@ -920,7 +934,7 @@ pub fn discover_sessions_at(
         ));
     }
     if agent.is_none_or(|a| a == "grok") {
-        discovered.extend(discover_codex_sessions(
+        discovered.extend(discover_grok_sessions(
             &home.join(".grok").join("sessions"),
             modified_after,
         ));

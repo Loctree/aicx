@@ -19,6 +19,7 @@ name: Merge Queue Gate
 on:
   merge_group:
     types: [ checks_requested ]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -97,14 +98,11 @@ jobs:
           AICX_RELEASE_SKIP_SIGNING: "1"
           LOCTREE_GPG_KEY_ID: ""
         run: |
-          # Windows: pin the gnu target (the runner default may be msvc, which
-          # would yield the wrong asset name and break npm verification),
-          # ensure it is installed, and prepend the mingw-w64 gcc linker
-          # without clobbering PATH.
+          # Windows: use the native msvc target (the runner's default).
+          # We no longer force gnu + Strawberry here — release.yml and the
+          # npm platform packages were updated to expect the msvc triple.
           if [[ "${{ matrix.platform }}" == win32-* ]]; then
-            export TARGET=x86_64-pc-windows-gnu
-            export PATH="/c/Strawberry/c/bin:$PATH"
-            rustup target add x86_64-pc-windows-gnu
+            export TARGET=x86_64-pc-windows-msvc
           fi
           bash tools/release_bundle.sh
 

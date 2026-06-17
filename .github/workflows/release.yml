@@ -176,7 +176,7 @@ jobs:
             target: aarch64-apple-darwin
           - runner_name: windows-pc
             runner: '["self-hosted", "windows-pc"]'
-            target: x86_64-pc-windows-gnu
+            target: x86_64-pc-windows-msvc
 
     steps:
       - uses: actions/checkout@v6
@@ -267,11 +267,10 @@ jobs:
           LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}
         run: |
           cd "$GITHUB_WORKSPACE/aicx"
-          # Prepend the mingw-w64 gcc (Strawberry Perl) linker and GnuPG to
-          # PATH without clobbering the runner's real PATH — the old
-          # `env: PATH: ...${{ env.PATH }}` form expanded `env.PATH` to empty
-          # and wiped cargo/git off PATH. Git Bash uses POSIX-style paths.
-          export PATH="/c/Strawberry/c/bin:/c/Program Files (x86)/GnuPG/bin:$PATH"
+          # Prepend GnuPG to PATH without clobbering the runner's real PATH.
+          # (Strawberry Perl /c/Strawberry/c/bin was only needed for the old
+          # MinGW/gnu target; the runner now builds the native msvc target.)
+          export PATH="/c/Program Files (x86)/GnuPG/bin:$PATH"
           ./tools/release_bundle.sh
 
       - name: Build .deb (linux only)
