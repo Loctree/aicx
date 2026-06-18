@@ -14,11 +14,13 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde::Serialize;
 
 use crate::rank::FuzzyResult;
+use crate::sanitize::normalize_query;
 use crate::timeline::FrameKind;
 
 /// Successful semantic search outcome with rendering-ready data.
@@ -1178,6 +1180,24 @@ pub const FILTER_EXAMINED_CAP_RATIO: usize = 10;
 /// still have enough material for filter pushdown to be meaningful.
 pub const FILTER_EXAMINED_CAP_MIN: usize = 50;
 
+fn default_search_quality_active(frame_kind_filter: Option<FrameKind>) -> bool {
+    frame_kind_filter.is_none()
+}
+
+fn semantic_fetch_limit(
+    user_limit: usize,
+    frame_kind_filter: Option<FrameKind>,
+    post_filters: &SemanticSearchFilters,
+) -> usize {
+    if post_filters.is_active() || default_search_quality_active(frame_kind_filter) {
+        user_limit
+            .saturating_mul(FILTER_EXAMINED_CAP_RATIO)
+            .max(FILTER_EXAMINED_CAP_MIN)
+    } else {
+        user_limit.max(1)
+    }
+}
+
 /// Filter-aware semantic retrieval. Wraps [`try_semantic_search`] with a
 /// bounded examined-pool fetch + canonical post-filter application so
 /// CLI (`aicx search`) and MCP (`aicx_search`) share one truth for the
@@ -1198,13 +1218,7 @@ pub fn try_semantic_search_filtered(
     kind_filter: Option<&str>,
     post_filters: &SemanticSearchFilters,
 ) -> std::result::Result<FilteredSemanticOutcome, SemanticError> {
-    let fetch_limit = if post_filters.is_active() {
-        user_limit
-            .saturating_mul(FILTER_EXAMINED_CAP_RATIO)
-            .max(FILTER_EXAMINED_CAP_MIN)
-    } else {
-        user_limit.max(1)
-    };
+    let fetch_limit = semantic_fetch_limit(user_limit, frame_kind_filter, post_filters);
 
     let outcome = try_semantic_search(
         store_root,
@@ -1224,10 +1238,11 @@ pub fn try_semantic_search_filtered(
     } = outcome;
 
     let examined = results.len();
-    let filtered = apply_semantic_post_filters(results, post_filters);
+    let quality_filtered = apply_default_semantic_quality(results, query, frame_kind_filter);
+    let filtered = apply_semantic_post_filters(quality_filtered, post_filters);
     let matched = filtered.len();
     let diagnostic = partial_pushdown_diagnostic(
-        post_filters.is_active(),
+        post_filters.is_active() || default_search_quality_active(frame_kind_filter),
         examined,
         matched,
         user_limit,
@@ -1244,6 +1259,126 @@ pub fn try_semantic_search_filtered(
         },
         diagnostic,
     })
+}
+
+fn apply_default_semantic_quality(
+    mut results: Vec<FuzzyResult>,
+    query: &str,
+    frame_kind_filter: Option<FrameKind>,
+) -> Vec<FuzzyResult> {
+    if frame_kind_filter.is_none() {
+        results.retain(default_visible_frame);
+    }
+
+    for result in &mut results {
+        result.score = semantic_quality_score(query, result);
+    }
+    results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
+    dedupe_semantic_results(results)
+}
+
+fn default_visible_frame(result: &FuzzyResult) -> bool {
+    match result.frame_kind.as_deref().and_then(FrameKind::parse) {
+        Some(FrameKind::UserMsg | FrameKind::AgentReply) | None => true,
+        Some(FrameKind::InternalThought | FrameKind::ToolCall | FrameKind::SystemNote) => false,
+    }
+}
+
+fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
+    let mut score = result.score as i16;
+    score += match result.frame_kind.as_deref().and_then(FrameKind::parse) {
+        Some(FrameKind::UserMsg) => 6,
+        Some(FrameKind::AgentReply) => 5,
+        None => 1,
+        Some(FrameKind::InternalThought | FrameKind::ToolCall | FrameKind::SystemNote) => -20,
+    };
+
+    let normalized_query = normalize_query(query);
+    let query_terms: Vec<&str> = normalized_query
+        .split_whitespace()
+        .filter(|term| term.len() >= 3)
+        .collect();
+    let haystack = semantic_result_haystack(result);
+    if !normalized_query.is_empty() && haystack.contains(&normalized_query) {
+        score += 12;
+    }
+    if !query_terms.is_empty() {
+        let matched_terms = query_terms
+            .iter()
+            .filter(|term| haystack.contains(**term))
+            .count();
+        score += (matched_terms.saturating_mul(3).min(12)) as i16;
+        if matched_terms == 0 {
+            score -= 15;
+        }
+    }
+    if low_signal_semantic_result(result) {
+        score -= 8;
+    }
+
+    score.clamp(0, 100) as u8
+}
+
+fn semantic_result_haystack(result: &FuzzyResult) -> String {
+    normalize_query(&format!(
+        "{} {} {} {} {} {} {}",
+        result.project,
+        result.kind,
+        result.frame_kind.as_deref().unwrap_or_default(),
+        result.agent,
+        result.date,
+        result.path,
+        result.matched_lines.join(" ")
+    ))
+}
+
+fn low_signal_semantic_result(result: &FuzzyResult) -> bool {
+    let joined = result.matched_lines.join(" ");
+    let normalized = normalize_query(&joined);
+    if normalized.trim().is_empty() {
+        return true;
+    }
+    let noisy_needles = [
+        "last_token_usage",
+        "input_tokens",
+        "reasoning_output_tokens",
+        "model_context_window",
+        "toolu_",
+        "web_search",
+        "open_page",
+        "no matching deferred tools found",
+    ];
+    if noisy_needles
+        .iter()
+        .any(|needle| normalized.contains(needle))
+    {
+        return true;
+    }
+    let content_chars = normalized
+        .chars()
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .count();
+    content_chars < 8
+}
+
+fn dedupe_semantic_results(results: Vec<FuzzyResult>) -> Vec<FuzzyResult> {
+    let mut seen_snippets = HashSet::new();
+    let mut deduped = Vec::with_capacity(results.len());
+    for result in results {
+        let snippet_key = normalize_query(&result.matched_lines.join("\n"));
+        if snippet_key.len() >= 24
+            && !seen_snippets.insert(format!(
+                "{}|{}|{}",
+                result.project,
+                result.frame_kind.as_deref().unwrap_or("-"),
+                snippet_key
+            ))
+        {
+            continue;
+        }
+        deduped.push(result);
+    }
+    deduped
 }
 
 /// Pure helper for the post-fetch filter pass. Kept `pub(crate)` so unit
@@ -1904,22 +2039,136 @@ mod tests {
     }
 
     fn fake_hit(rank: usize, date: &str, agent: &str, score: u8) -> FuzzyResult {
+        fake_hit_with_frame(rank, date, agent, score, None, vec![format!("rank {rank}")])
+    }
+
+    fn fake_hit_with_frame(
+        rank: usize,
+        date: &str,
+        agent: &str,
+        score: u8,
+        frame_kind: Option<&str>,
+        matched_lines: Vec<String>,
+    ) -> FuzzyResult {
         FuzzyResult {
             file: format!("rank-{rank}.md"),
             path: format!("rank-{rank}.md"),
             project: "test/repo".to_string(),
             kind: "conversations".to_string(),
-            frame_kind: None,
+            frame_kind: frame_kind.map(ToString::to_string),
             agent: agent.to_string(),
             date: date.to_string(),
             timestamp: None,
             score,
             label: format!("test:{rank}"),
             density: 0.5,
-            matched_lines: Vec::new(),
+            matched_lines,
             session_id: None,
             cwd: None,
         }
+    }
+
+    #[test]
+    fn default_semantic_quality_drops_machine_frames_and_recovers_human_hits() {
+        let pool = vec![
+            fake_hit_with_frame(
+                0,
+                "2026-06-01",
+                "codex",
+                99,
+                Some("tool_call"),
+                vec!["[12:00:00] tool: id: toolu_01abc".to_string()],
+            ),
+            fake_hit_with_frame(
+                1,
+                "2026-06-01",
+                "codex",
+                98,
+                Some("system_note"),
+                vec![r#"[12:00:01] system: {"last_token_usage":{"input_tokens":123}}"#.to_string()],
+            ),
+            fake_hit_with_frame(
+                2,
+                "2026-06-01",
+                "claude",
+                82,
+                Some("user_msg"),
+                vec!["[21:47:27] user: dorobmy shot features (1, 2, 3 powyzej)".to_string()],
+            ),
+            fake_hit_with_frame(
+                3,
+                "2026-06-01",
+                "claude",
+                81,
+                Some("agent_reply"),
+                vec!["[21:48:10] assistant: shot features implementation plan".to_string()],
+            ),
+        ];
+
+        let filtered = apply_default_semantic_quality(pool, "shot features", None);
+        let frames: Vec<Option<&str>> = filtered
+            .iter()
+            .map(|result| result.frame_kind.as_deref())
+            .collect();
+
+        assert_eq!(
+            frames,
+            vec![Some("user_msg"), Some("agent_reply")],
+            "default operator search should hide machine frames from top results"
+        );
+        assert!(
+            filtered[0].score > 82,
+            "literal human match should get a quality boost, got {}",
+            filtered[0].score
+        );
+    }
+
+    #[test]
+    fn explicit_frame_kind_keeps_requested_machine_frame() {
+        let pool = vec![
+            fake_hit_with_frame(
+                0,
+                "2026-06-01",
+                "codex",
+                92,
+                Some("tool_call"),
+                vec!["[12:00:00] tool: rg frame_kind".to_string()],
+            ),
+            fake_hit_with_frame(
+                1,
+                "2026-06-01",
+                "codex",
+                80,
+                Some("user_msg"),
+                vec!["[12:00:03] user: frame kind please".to_string()],
+            ),
+        ];
+
+        let filtered =
+            apply_default_semantic_quality(pool, "frame_kind", Some(FrameKind::ToolCall));
+
+        assert!(
+            filtered
+                .iter()
+                .any(|result| result.frame_kind.as_deref() == Some("tool_call")),
+            "explicit frame-kind search must still allow tool_call results"
+        );
+    }
+
+    #[test]
+    fn default_semantic_quality_expands_examined_pool_without_user_filters() {
+        let filters = SemanticSearchFilters::default();
+
+        assert_eq!(
+            semantic_fetch_limit(10, None, &filters),
+            10 * FILTER_EXAMINED_CAP_RATIO,
+            "default human-facing quality gate needs a wider pool than the displayed limit"
+        );
+        assert_eq!(
+            semantic_fetch_limit(10, Some(FrameKind::ToolCall), &filters),
+            10,
+            "explicit frame-kind queries should not pay the default quality-pool expansion"
+        );
     }
 
     /// Bug #31 regression: top-N raw semantic hits sit outside the
