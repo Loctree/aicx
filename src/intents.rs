@@ -756,6 +756,9 @@ fn infer_kind_from_line(line: &str, is_user_line: bool) -> Option<IntentKind> {
     if is_user_line && looks_like_operator_decision_line(line) {
         return Some(IntentKind::Decision);
     }
+    if is_user_line && looks_like_operator_requirement_line(line) {
+        return Some(IntentKind::Intent);
+    }
     if is_outcome_line(line) {
         return Some(IntentKind::Outcome);
     }
@@ -771,9 +774,12 @@ fn infer_kind_from_line(line: &str, is_user_line: bool) -> Option<IntentKind> {
 fn entry_type_to_timeline_kind(entry_type: EntryType) -> Option<IntentKind> {
     match entry_type {
         EntryType::Decision => Some(IntentKind::Decision),
+        EntryType::Task => Some(IntentKind::Task),
         EntryType::Intent | EntryType::Question | EntryType::Why => Some(IntentKind::Intent),
         EntryType::Outcome | EntryType::Result => Some(IntentKind::Outcome),
-        EntryType::Argue | EntryType::Assumption | EntryType::Insight => None,
+        EntryType::Argue | EntryType::Assumption | EntryType::Insight | EntryType::Commitment => {
+            None
+        }
     }
 }
 
@@ -998,7 +1004,38 @@ fn is_source_metadata_line(line: &str) -> bool {
 
 fn looks_like_operator_decision_line(line: &str) -> bool {
     let lower = line.to_lowercase();
-    [
+    const POLICY_MARKERS: &[&str] = &[
+        // Scope rejections / accepted boundaries.
+        "nie fixujemy",
+        "nie robimy",
+        "nie ruszamy",
+        "out of scope",
+        "poza scope",
+        // Durable policy/default/constraint language.
+        "od teraz",
+        "from now on",
+        "canonical",
+        "kanonicz",
+        "default",
+        "domysln",
+        "domyśln",
+        "tylko przez",
+        "bez zgadywania",
+        "bez fallback",
+        "no fallback",
+        "musi mieć",
+        "musi miec",
+        // Product principles phrased as "X is an addon, not a rescue layer".
+        "ma byc dodatkiem",
+        "ma być dodatkiem",
+    ];
+
+    POLICY_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+fn looks_like_operator_requirement_line(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    const REQUIREMENT_MARKERS: &[&str] = &[
         "nie może być",
         "nie moze byc",
         "ma być",
@@ -1011,9 +1048,11 @@ fn looks_like_operator_decision_line(line: &str) -> bool {
         "pełny ownership",
         "pelny ownership",
         "teraz wypuszuj",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
+    ];
+
+    REQUIREMENT_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 fn is_garbled_transcription(summary: &str) -> bool {
@@ -1781,7 +1820,7 @@ fn push_unique(target: &mut Vec<String>, value: String) {
     target.push(value);
 }
 
-// ── 9-type intent entry classifier ──────────────────────────────────
+// ── 11-type intent entry classifier ─────────────────────────────────
 
 const CLASSIFIER_ABSTAIN_THRESHOLD: f32 = 0.5;
 
@@ -1813,7 +1852,9 @@ const ASSUMPTION_MARKERS: &[&str] = &[
     "we assume",
     "hypothesis:",
     "zakładam",
+    "zakladam",
     "założenie:",
+    "zalozenie:",
     "hipoteza:",
     "przypuszczam",
 ];
@@ -1861,6 +1902,49 @@ const INSIGHT_MARKERS: &[&str] = &[
     "kluczowe:",
 ];
 
+const TASK_DIRECTIVE_MARKERS: &[&str] = &["task:", "todo:", "zadanie:"];
+
+const TASK_ACTION_HEADS: &[&str] = &[
+    // Polish operator requests.
+    "stworz",
+    "stwórz",
+    "utworz",
+    "utwórz",
+    "dodaj",
+    "napraw",
+    "popraw",
+    "zbuduj",
+    "przygotuj",
+    "zapisz",
+    "spisz",
+    "wypisz",
+    "zaimplementuj",
+    "podlacz",
+    "podłącz",
+    "skopiuj",
+    "przekopiuj",
+    "uruchom",
+    "odpal",
+    // English operator requests.
+    "create",
+    "add",
+    "fix",
+    "update",
+    "implement",
+    "write",
+    "run",
+    "copy",
+];
+
+const COMMITMENT_HEADS: &[&str] = &[
+    "zrobie",
+    "zrobię",
+    "zajme sie",
+    "zajmę się",
+    "i will ",
+    "i'll ",
+];
+
 /// Markers whose presence alone is enough to call a line a Result line. Each
 /// carries result-shape on its own (PASS/FAIL outcome, score readout, P-level
 /// count, command name that only appears in result-reporting contexts).
@@ -1902,6 +1986,101 @@ fn line_has_result_shape(lower_line: &str) -> bool {
     SHAPE_TOKENS.iter().any(|t| lower_line.contains(t))
 }
 
+fn looks_like_task_directive_line(line: &str) -> bool {
+    let head = line.trim_start();
+    TASK_DIRECTIVE_MARKERS.iter().any(|marker| {
+        head.get(..marker.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(marker))
+    })
+}
+
+fn looks_like_bare_checkbox_task(line: &str) -> bool {
+    let head = line.trim_start();
+    head.starts_with("[ ] ") || head.starts_with("[x] ") || head.starts_with("[X] ")
+}
+
+fn looks_like_actionable_task_line(line: &str) -> bool {
+    let head = line
+        .trim_start()
+        .trim_start_matches(['-', '*', '+'])
+        .trim_start();
+    let word_count = head.split_whitespace().take(4).count();
+    if word_count < 3 {
+        return false;
+    }
+
+    let lower = head.to_lowercase();
+    TASK_ACTION_HEADS.iter().any(|marker| {
+        lower == *marker
+            || lower
+                .strip_prefix(marker)
+                .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with(':'))
+    })
+}
+
+fn looks_like_completion_outcome_line(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    const COMPLETION_MARKERS: &[&str] = &[
+        "zostal dodany",
+        "został dodany",
+        "zostala dodana",
+        "została dodana",
+        "zostaly dodane",
+        "zostały dodane",
+        "zostal utworzony",
+        "został utworzony",
+        "has been added",
+        "was added",
+        "has been created",
+        "was created",
+    ];
+    if !COMPLETION_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+
+    lower.starts_with("plik ")
+        || lower.starts_with("file ")
+        || lower.starts_with("docs/")
+        || lower.contains(".md")
+        || lower.contains(".rs")
+        || lower.contains('/')
+}
+
+fn looks_like_observed_count_outcome_line(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    if !lower.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let has_observed_counts =
+        lower.contains(" records") || lower.contains(" rekord") || lower.contains(" wynik");
+    let has_result_verb = lower.contains(" dal ")
+        || lower.contains(" dał ")
+        || lower.contains("dala ")
+        || lower.contains(" dała ")
+        || lower.contains("yielded")
+        || lower.contains("produced")
+        || lower.contains("gave");
+
+    has_observed_counts && has_result_verb
+}
+
+fn looks_like_commitment_line(line: &str) -> bool {
+    let head = line.trim_start().to_lowercase();
+    if head.starts_with("commitment:")
+        || head.starts_with("promise:")
+        || head.starts_with("obietnica:")
+    {
+        return true;
+    }
+
+    COMMITMENT_HEADS
+        .iter()
+        .any(|marker| head.starts_with(marker))
+}
+
 pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType, f32)> {
     let lower = line.to_lowercase();
     let trimmed = lower.trim();
@@ -1918,8 +2097,17 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
     if trimmed.starts_with("decision:") || trimmed.contains("[decision]") {
         return Some((EntryType::Decision, 0.95));
     }
-    if is_user && looks_like_operator_decision_line(line) {
-        return Some((EntryType::Decision, 0.75));
+    if looks_like_task_directive_line(line) {
+        return Some((EntryType::Task, 0.95));
+    }
+    if is_user && looks_like_bare_checkbox_task(line) {
+        return Some((EntryType::Task, 0.85));
+    }
+    if is_user && looks_like_actionable_task_line(line) {
+        return Some((EntryType::Task, 0.75));
+    }
+    if looks_like_commitment_line(line) {
+        return Some((EntryType::Commitment, 0.72));
     }
 
     if trimmed.starts_with("question:") || trimmed.ends_with('?') && trimmed.len() > 15 {
@@ -1933,10 +2121,19 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
         }
     }
 
+    if is_user && looks_like_operator_decision_line(line) {
+        return Some((EntryType::Decision, 0.75));
+    }
+    if is_user && looks_like_operator_requirement_line(line) {
+        return Some((EntryType::Intent, 0.7));
+    }
+
     if trimmed.starts_with("assumption:")
         || trimmed.starts_with("hypothesis:")
         || trimmed.starts_with("zakładam")
+        || trimmed.starts_with("zakladam")
         || trimmed.starts_with("założenie:")
+        || trimmed.starts_with("zalozenie:")
         || trimmed.starts_with("hipoteza:")
     {
         return Some((EntryType::Assumption, 0.9));
@@ -1959,6 +2156,12 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
 
     if is_outcome_tag(line) || trimmed.starts_with("[skill_outcome]") {
         return Some((EntryType::Outcome, 0.9));
+    }
+    if looks_like_completion_outcome_line(line) {
+        return Some((EntryType::Outcome, 0.72));
+    }
+    if looks_like_observed_count_outcome_line(line) {
+        return Some((EntryType::Outcome, 0.72));
     }
 
     if trimmed.starts_with("result:") || trimmed.starts_with("wynik:") {
@@ -2134,7 +2337,11 @@ fn classify_signal_line(line: &str) -> Option<(EntryType, f32)> {
 
 fn initial_state(entry_type: EntryType) -> EntryState {
     match entry_type {
-        EntryType::Intent | EntryType::Question | EntryType::Assumption => EntryState::Proposed,
+        EntryType::Intent
+        | EntryType::Task
+        | EntryType::Commitment
+        | EntryType::Question
+        | EntryType::Assumption => EntryState::Proposed,
         EntryType::Decision | EntryType::Insight => EntryState::Active,
         EntryType::Outcome | EntryType::Result => EntryState::Done,
         EntryType::Why | EntryType::Argue => EntryState::Active,
@@ -2154,6 +2361,19 @@ fn clean_entry_title(entry_type: EntryType, raw: &str) -> String {
             strip_case_insensitive_prefix(t, "validation:")
         }
         EntryType::Result => strip_case_insensitive_prefix(text, "result:"),
+        EntryType::Task => {
+            let t = strip_case_insensitive_prefix(text, "task:");
+            let t = strip_case_insensitive_prefix(t, "todo:");
+            let t = strip_case_insensitive_prefix(t, "zadanie:");
+            let t = strip_case_insensitive_prefix(t, "[ ]");
+            let t = strip_case_insensitive_prefix(t, "[x]");
+            strip_case_insensitive_prefix(t, "[X]")
+        }
+        EntryType::Commitment => {
+            let t = strip_case_insensitive_prefix(text, "commitment:");
+            let t = strip_case_insensitive_prefix(t, "promise:");
+            strip_case_insensitive_prefix(t, "obietnica:")
+        }
         EntryType::Question => strip_case_insensitive_prefix(text, "question:"),
         EntryType::Assumption => {
             let t = strip_case_insensitive_prefix(text, "assumption:");

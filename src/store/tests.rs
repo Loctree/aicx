@@ -94,33 +94,22 @@ fn test_resolve_aicx_home_honors_explicit_env_var() {
 }
 
 #[test]
-fn test_resolve_aicx_home_falls_back_to_dot_aicx_when_env_unset() {
-    let _serial = AICX_HOME_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    let _guard = AicxHomeEnvGuard::capture();
-    // SAFETY: lock is held; sibling env-touching tests cannot race.
-    unsafe { env::remove_var("AICX_HOME") };
-    let resolved = resolve_aicx_home().expect("resolve_aicx_home should succeed");
-    assert!(
-        resolved.ends_with(".aicx"),
-        "default home should end with .aicx; got {resolved:?}"
-    );
+fn test_resolve_aicx_home_falls_back_to_dot_aicx_when_env_unset_and_no_bootstrap_config() {
+    let home = std::env::temp_dir().join(format!("aicx-home-default-test-{}", std::process::id()));
+    let resolved =
+        paths::resolve_aicx_home_from(None, &home).expect("resolve_aicx_home_from should succeed");
+    assert_eq!(resolved, home.join(".aicx"));
+    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
-fn test_resolve_aicx_home_treats_empty_env_var_as_unset() {
-    let _serial = AICX_HOME_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    let _guard = AicxHomeEnvGuard::capture();
-    // SAFETY: lock is held; sibling env-touching tests cannot race.
-    unsafe { env::set_var("AICX_HOME", "") };
-    let resolved = resolve_aicx_home().expect("resolve_aicx_home should succeed");
-    assert!(
-        resolved.ends_with(".aicx"),
-        "empty AICX_HOME should fall back to ~/.aicx; got {resolved:?}"
-    );
+fn test_resolve_aicx_home_treats_empty_env_var_as_unset_without_bootstrap_config() {
+    let home =
+        std::env::temp_dir().join(format!("aicx-home-empty-env-test-{}", std::process::id()));
+    let resolved = paths::resolve_aicx_home_from(Some("".into()), &home)
+        .expect("resolve_aicx_home_from should succeed");
+    assert_eq!(resolved, home.join(".aicx"));
+    let _ = fs::remove_dir_all(home);
 }
 
 #[test]

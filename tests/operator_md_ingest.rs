@@ -1,6 +1,7 @@
 use aicx::sanitize::{ContentSanitizationWarning, sanitize_chunk_content};
 use aicx::sources::{
-    ExtractionConfig, discover_operator_markdown, extract_operator_markdown_from_home,
+    ExtractionConfig, discover_operator_markdown, discover_operator_markdown_from_input,
+    extract_operator_markdown_from_home, extract_operator_markdown_from_input,
 };
 use aicx::timeline::FrameKind;
 use chrono::{TimeZone, Utc};
@@ -110,6 +111,216 @@ Outcome: Existing agent-only ingest missed the bug log.
             .message
             .contains("Outcome: Existing agent-only ingest")
     }));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn operator_markdown_explicit_input_extracts_chatgpt_prompt_response_sections() {
+    let root = unique_test_dir("explicit-chatgpt-md");
+    let home = root.join("home");
+    fs::create_dir_all(home.join("Libraxis/vc-runtime/screenscribe")).expect("create repo hint");
+
+    let export = root.join("exports").join("ChatGPT-screenscribe.md");
+    write_file(
+        &export,
+        r#"# screenscribe 1
+
+**Created:** 5/27/2026 1:07:20
+**Updated:** 6/17/2026 10:31:54
+
+## Prompt:
+hej, zapoznaj sie szczegolowo z repozytorium vetcoders/screenscribe.
+
+## Response:
+Jasne. P0 - branch ma literalne artefakty diffa w Pythonie.
+
+## Prompt:
+zrob z tego plan napraw
+
+## Response:
+Decision: naprawiamy najpierw syntax error, potem MIME.
+"#,
+    );
+    let mtime = Utc
+        .with_ymd_and_hms(2026, 6, 17, 10, 35, 41)
+        .unwrap()
+        .timestamp();
+    set_file_mtime(&export, FileTime::from_unix_time(mtime, 0)).expect("set mtime");
+
+    let discovered = discover_operator_markdown_from_input(&export).expect("discover input");
+    assert_eq!(discovered.len(), 1);
+
+    let config = ExtractionConfig {
+        project_filter: vec!["screenscribe".to_string()],
+        cutoff: Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+    let entries =
+        extract_operator_markdown_from_input(&home, &export, &config).expect("extract input");
+
+    assert_eq!(entries.len(), 4);
+    assert_eq!(entries[0].role, "user");
+    assert_eq!(entries[0].frame_kind, Some(FrameKind::UserMsg));
+    assert!(
+        entries[0]
+            .message
+            .contains("source_format: chatgpt-markdown")
+    );
+    assert!(
+        entries[0]
+            .message
+            .contains("zapoznaj sie szczegolowo z repozytorium")
+    );
+    assert_eq!(entries[1].role, "assistant");
+    assert_eq!(entries[1].frame_kind, Some(FrameKind::AgentReply));
+    assert!(entries[1].message.contains("P0 - branch"));
+    assert!(entries.iter().all(|entry| {
+        entry
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| cwd.ends_with("screenscribe"))
+    }));
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.message.contains("Decision: naprawiamy najpierw"))
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn operator_markdown_frontmatter_overrides_foreign_markdown_import_metadata() {
+    let root = unique_test_dir("frontmatter-chatgpt-md");
+    let home = root.join("home");
+    let repo = home.join("Git").join("ScreenScribe");
+    fs::create_dir_all(&repo).expect("create repo hint");
+
+    let export = root.join("foreign").join("note.md");
+    write_file(
+        &export,
+        r#"---
+aicx_import: 1
+project: vetcoders/screen_scribe_depr
+cwd: ~/Git/ScreenScribe
+date: 2026-06-17
+source_format: chatgpt-export
+author: monika
+session_id: manual-chatgpt-screenscribe
+---
+
+## Prompt:
+ustal priorytety dla ScreenScribe.
+
+## Response:
+Decision: najpierw kontrakt exportu, potem UI copy.
+"#,
+    );
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+    let entries =
+        extract_operator_markdown_from_input(&home, &export, &config).expect("extract input");
+
+    assert_eq!(entries.len(), 2);
+    let expected_timestamps = [
+        Utc.with_ymd_and_hms(2026, 6, 17, 0, 0, 0).unwrap(),
+        Utc.with_ymd_and_hms(2026, 6, 17, 0, 0, 1).unwrap(),
+    ];
+    assert!(entries.iter().all(|entry| {
+        entry.session_id == "manual-chatgpt-screenscribe"
+            && expected_timestamps.contains(&entry.timestamp)
+    }));
+    assert!(entries.iter().all(|entry| {
+        entry
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| cwd == repo.to_str().unwrap())
+    }));
+    assert!(entries[0].message.contains("source_format: chatgpt-export"));
+    assert!(
+        entries[0]
+            .message
+            .contains("project: vetcoders/screen_scribe_depr")
+    );
+    assert!(entries[0].message.contains("author: monika"));
+    assert!(
+        entries[1]
+            .message
+            .contains("Decision: najpierw kontrakt exportu")
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn operator_markdown_explicit_input_without_metadata_stays_unattached() {
+    let root = unique_test_dir("explicit-unattached-md");
+    let home = root.join("home");
+    fs::create_dir_all(home.join("Git").join("aicx")).expect("create repo hint");
+
+    let export = root.join("foreign").join("aicx-note.md");
+    write_file(
+        &export,
+        r#"# Loose note
+
+P0: aicx should not attach this explicit foreign markdown without metadata.
+"#,
+    );
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+    let entries =
+        extract_operator_markdown_from_input(&home, &export, &config).expect("extract input");
+
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].cwd.is_none());
+    assert!(entries[0].message.contains("P0"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn operator_markdown_explicit_input_falls_back_to_plain_markdown_entry() {
+    let root = unique_test_dir("plain-md-input");
+    let home = root.join("home");
+
+    let export = root.join("foreign").join("architecture.md");
+    write_file(
+        &export,
+        r#"# Architecture note
+
+This is a normal markdown document without chat transcript headings.
+
+It should still become one operator-md entry when imported explicitly.
+"#,
+    );
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+    let entries =
+        extract_operator_markdown_from_input(&home, &export, &config).expect("extract input");
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].role, "user");
+    assert_eq!(entries[0].frame_kind, Some(FrameKind::UserMsg));
+    assert!(entries[0].cwd.is_none());
+    assert!(entries[0].message.contains("source_format: plain-markdown"));
+    assert!(entries[0].message.contains("# Architecture note"));
 
     let _ = fs::remove_dir_all(&root);
 }

@@ -1350,6 +1350,7 @@ fn ingest_accepts_operator_markdown_source_and_since() {
         "2026-05-01",
         "--emit",
         "json",
+        "/tmp/chatgpt-export.md",
     ])
     .expect("operator markdown ingest command should parse");
 
@@ -1358,11 +1359,16 @@ fn ingest_accepts_operator_markdown_source_and_since() {
             source,
             since,
             emit,
+            input,
             ..
         }) => {
             assert!(matches!(source, IngestSource::OperatorMd));
             assert_eq!(since.as_deref(), Some("2026-05-01"));
             assert!(matches!(emit, StdoutEmit::Json));
+            assert_eq!(
+                input.as_deref(),
+                Some(std::path::Path::new("/tmp/chatgpt-export.md"))
+            );
         }
         other => panic!("expected ingest command, got {:?}", other.map(|_| "other")),
     }

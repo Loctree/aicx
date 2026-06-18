@@ -1,0 +1,122 @@
+[
+  {
+    "id": "G01",
+    "speaker": "user",
+    "text": "musimy dodac parser dla obcych md",
+    "expected": "intent",
+    "not": ["decision"],
+    "reason": "strong need, no durable choice"
+  },
+  {
+    "id": "G02",
+    "speaker": "user",
+    "text": "trzeba sprawdzic outcomes i claims",
+    "expected": "intent",
+    "not": ["decision"],
+    "reason": "investigation need"
+  },
+  {
+    "id": "G03",
+    "speaker": "user",
+    "text": "stworz prosze plik z zasadami klasyfikacji",
+    "expected": "task",
+    "not": ["intent"],
+    "reason": "concrete deliverable"
+  },
+  {
+    "id": "G04",
+    "speaker": "user",
+    "text": "[ ] stworz prosze plik z zasadami klasyfikacji",
+    "expected": "task",
+    "not": ["intent"],
+    "reason": "explicit open work item"
+  },
+  {
+    "id": "G05",
+    "speaker": "user",
+    "text": "task: stworz plik z zasadami klasyfikacji",
+    "expected": "task",
+    "not": ["intent"],
+    "reason": "typed task directive with deliverable"
+  },
+  {
+    "id": "G06",
+    "speaker": "user",
+    "text": "obce md importujemy tylko przez operator-md, bez zgadywania cwd",
+    "expected": "decision",
+    "not": ["intent"],
+    "reason": "durable constraint"
+  },
+  {
+    "id": "G07",
+    "speaker": "user",
+    "text": "slownik ma byc dodatkiem, nie kolem ratunkowym dla ontologii",
+    "expected": "decision",
+    "not": ["intent"],
+    "reason": "product principle / constraint"
+  },
+  {
+    "id": "G08",
+    "speaker": "assistant",
+    "text": "zrobie to zaraz",
+    "expected": "commitment",
+    "not": ["outcome"],
+    "reason": "promise, no evidence yet"
+  },
+  {
+    "id": "G09",
+    "speaker": "assistant",
+    "text": "plik docs/INTENTS_CLASSIFICATION_RULES.md zostal dodany",
+    "expected": "outcome",
+    "not": ["promise"],
+    "reason": "completed-state report"
+  },
+  {
+    "id": "G10",
+    "speaker": "user",
+    "text": "batch 10 plikow dal 66 records: 48 intent, 14 outcome, 4 decision",
+    "expected": "outcome",
+    "not": ["intent"],
+    "reason": "observed extraction result"
+  },
+  {
+    "id": "G11",
+    "speaker": "user",
+    "text": "czy to jest mozliwe?",
+    "expected": "intent",
+    "not": ["task"],
+    "reason": "question/investigation need"
+  },
+  {
+    "id": "G12",
+    "speaker": "assistant",
+    "text": "zakladam, ze cwd mozna wywnioskowac z tresci",
+    "expected": "assumption",
+    "not": ["decision"],
+    "reason": "provisional belief"
+  },
+  {
+    "id": "G13",
+    "speaker": "assistant",
+    "text": "wniosek: frame_kind domyslnie filtruje user_msg",
+    "expected": "insight",
+    "not": ["decision"],
+    "reason": "understanding, not policy"
+  },
+  {
+    "id": "G14",
+    "speaker": "user",
+    "text": "nie fixujemy tego teraz",
+    "expected": "decision",
+    "not": ["task"],
+    "reason": "explicit scope rejection"
+  },
+  {
+    "id": "G15",
+    "speaker": "user",
+    "text": "nie moze byc tak, ze task oznacza tylko checklisty",
+    "expected": "intent",
+    "not": ["decision"],
+    "reason": "complaint/requirement pressure unless paired with policy"
+  }
+]

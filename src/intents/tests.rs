@@ -191,7 +191,7 @@ Product truth beats local elegance.
 
     assert!(
         records.iter().any(|record| {
-            record.kind == IntentKind::Intent
+            record.kind == IntentKind::Task
                 && record
                     .summary
                     .contains("keep the real user directive visible after charter")
@@ -427,7 +427,7 @@ fn pasted_text_placeholder_reference_is_pasted_reference_not_intent() {
 }
 
 #[test]
-fn zadanie_head_is_typed_directive_and_remains_intent() {
+fn zadanie_head_is_typed_directive_and_becomes_task() {
     let line = "Zadanie: dopnij pasted-vs-typed modality gate";
     assert_eq!(
         intent_line_modality("user", line),
@@ -441,12 +441,12 @@ fn zadanie_head_is_typed_directive_and_remains_intent() {
 
     assert!(
         records.iter().any(|record| {
-            record.kind == IntentKind::Intent
+            record.kind == IntentKind::Task
                 && record
                     .summary
                     .contains("Zadanie: dopnij pasted-vs-typed modality gate")
         }),
-        "typed Zadanie directive did not produce an intent record: {records:?}"
+        "typed Zadanie directive did not produce a task record: {records:?}"
     );
 }
 
@@ -556,7 +556,7 @@ fn user_comment_after_local_command_output_still_surfaces() {
 }
 
 #[test]
-fn typed_directive_with_reference_marker_mid_body_remains_intent() {
+fn typed_directive_with_reference_marker_mid_body_remains_task() {
     let line =
         "Zadanie: analyze this pasted reference > intent: old plan [Pasted text #2 +4 lines]";
     assert_eq!(
@@ -571,7 +571,7 @@ fn typed_directive_with_reference_marker_mid_body_remains_intent() {
 
     assert!(
         records.iter().any(|record| {
-            record.kind == IntentKind::Intent
+            record.kind == IntentKind::Task
                 && record
                     .summary
                     .contains("Zadanie: analyze this pasted reference")
@@ -1532,6 +1532,91 @@ mod classifier {
     use super::*;
     use crate::types::{EntryState, EntryType};
 
+    #[derive(Debug, serde::Deserialize)]
+    struct CoreOntologyGolden {
+        id: String,
+        speaker: String,
+        text: String,
+        expected: String,
+        #[serde(rename = "not")]
+        not_labels: Vec<String>,
+        reason: String,
+    }
+
+    fn core_ontology_goldens() -> Vec<CoreOntologyGolden> {
+        serde_json::from_str(include_str!(
+            "../../tests/fixtures/intents_core_ontology_goldens.json"
+        ))
+        .expect("core ontology fixture must be valid JSON")
+    }
+
+    fn current_classifier_label(golden: &CoreOntologyGolden) -> Option<&'static str> {
+        if parse_checklist_task(&golden.text).is_some() {
+            return Some("task");
+        }
+
+        let is_user = golden.speaker.eq_ignore_ascii_case("user");
+        let (entry_type, _) = classify_line_entry_type(&golden.text, is_user)?;
+        Some(match entry_type {
+            EntryType::Decision => "decision",
+            EntryType::Task => "task",
+            EntryType::Commitment => "commitment",
+            EntryType::Intent | EntryType::Question | EntryType::Why => "intent",
+            EntryType::Outcome | EntryType::Result => "outcome",
+            EntryType::Assumption => "assumption",
+            EntryType::Insight => "insight",
+            EntryType::Argue => "argue",
+        })
+    }
+
+    #[test]
+    fn core_ontology_golden_fixture_is_well_formed() {
+        let goldens = core_ontology_goldens();
+        assert_eq!(goldens.len(), 15);
+
+        let mut ids = HashSet::new();
+        for golden in &goldens {
+            assert!(ids.insert(&golden.id), "duplicate golden id {}", golden.id);
+            assert!(
+                !golden.text.trim().is_empty(),
+                "{} must include text",
+                golden.id
+            );
+            assert!(
+                !golden.expected.trim().is_empty(),
+                "{} must include expected label",
+                golden.id
+            );
+            assert!(
+                !golden.reason.trim().is_empty(),
+                "{} must include a reason",
+                golden.id
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "target ontology audit: current classifier is expected to fail until semantics are fixed"]
+    fn core_ontology_goldens_match_target_semantics() {
+        let mut failures = Vec::new();
+
+        for golden in core_ontology_goldens() {
+            let actual = current_classifier_label(&golden).unwrap_or("unclassified");
+            if actual != golden.expected || golden.not_labels.iter().any(|label| label == actual) {
+                failures.push(format!(
+                    "{}: expected {}, got {}; text={:?}; reason={}",
+                    golden.id, golden.expected, actual, golden.text, golden.reason
+                ));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "core ontology mismatches:\n{}",
+            failures.join("\n")
+        );
+    }
+
     #[test]
     fn classifies_decision_marker() {
         let result = classify_line_entry_type("[decision] Use flat parser", false);
@@ -1571,6 +1656,13 @@ mod classifier {
     }
 
     #[test]
+    fn classifies_ascii_polish_assumption() {
+        let result =
+            classify_line_entry_type("zakladam, ze cwd mozna wywnioskowac z tresci", false);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Assumption));
+    }
+
+    #[test]
     fn classifies_insight_marker() {
         let result = classify_line_entry_type(
             "insight: aicx is an intention engine not a formatter",
@@ -1594,6 +1686,24 @@ mod classifier {
     #[test]
     fn classifies_outcome_tag() {
         let result = classify_line_entry_type("[skill_outcome] p0=0 after cargo test", false);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Outcome));
+    }
+
+    #[test]
+    fn classifies_file_completion_report_as_outcome() {
+        let result = classify_line_entry_type(
+            "plik docs/INTENTS_CLASSIFICATION_RULES.md zostal dodany",
+            false,
+        );
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Outcome));
+    }
+
+    #[test]
+    fn classifies_observed_batch_counts_as_outcome() {
+        let result = classify_line_entry_type(
+            "batch 10 plikow dal 66 records: 48 intent, 14 outcome, 4 decision",
+            true,
+        );
         assert_eq!(result.map(|r| r.0), Some(EntryType::Outcome));
     }
 
@@ -1626,12 +1736,80 @@ mod classifier {
     }
 
     #[test]
-    fn classifies_polish_operator_decision() {
+    fn classifies_polish_operator_requirement_as_intent() {
         let result = classify_line_entry_type(
             "Nie może być tak, że ostatnie słowo gubi kolor akcentu",
             true,
         );
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Intent));
+    }
+
+    #[test]
+    fn classifies_polish_musimy_requirement_as_intent() {
+        let result = classify_line_entry_type("musimy dodac parser dla obcych md", true);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Intent));
+    }
+
+    #[test]
+    fn classifies_polish_trzeba_requirement_as_intent() {
+        let result = classify_line_entry_type("trzeba sprawdzic outcomes i claims", true);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Intent));
+    }
+
+    #[test]
+    fn classifies_operator_import_policy_as_decision() {
+        let result = classify_line_entry_type(
+            "obce md importujemy tylko przez operator-md, bez zgadywania cwd",
+            true,
+        );
         assert_eq!(result.map(|r| r.0), Some(EntryType::Decision));
+    }
+
+    #[test]
+    fn classifies_operator_scope_rejection_as_decision() {
+        let result = classify_line_entry_type("nie fixujemy tego teraz", true);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Decision));
+    }
+
+    #[test]
+    fn classifies_required_artifact_property_as_decision() {
+        let result = classify_line_entry_type(
+            "Materiał ma być deterministyczny — musi mieć source_hash",
+            true,
+        );
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Decision));
+    }
+
+    #[test]
+    fn classifies_canonical_question_as_question_not_decision() {
+        let result =
+            classify_line_entry_type("Why keep the canonical index path for first users?", true);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Question));
+    }
+
+    #[test]
+    fn classifies_task_directive_as_task() {
+        let result = classify_line_entry_type("task: stworz plik z zasadami klasyfikacji", true);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Task));
+    }
+
+    #[test]
+    fn classifies_polish_action_request_as_task() {
+        let result = classify_line_entry_type("stworz prosze plik z zasadami klasyfikacji", true);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Task));
+    }
+
+    #[test]
+    fn classifies_bare_checkbox_as_task() {
+        let result =
+            classify_line_entry_type("[ ] stworz prosze plik z zasadami klasyfikacji", true);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Task));
+    }
+
+    #[test]
+    fn classifies_future_promise_as_commitment() {
+        let result = classify_line_entry_type("zrobie to zaraz", false);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Commitment));
     }
 
     #[test]
@@ -1647,14 +1825,16 @@ mod classifier {
     }
 
     #[test]
-    fn classify_chunk_all_nine_types() {
+    fn classify_chunk_all_eleven_types() {
         let content = r#"[project: demo | agent: claude | date: 2026-04-15]
 
 [signals]
 Decision:
-- [decision] Use 9-type taxonomy
+- [decision] Use 11-type taxonomy
 Intent:
 - Let's ship intent engine
+Task:
+- task: add semantic fixture coverage
 Outcome:
 - outcome: migration completed successfully
 [/signals]
@@ -1666,6 +1846,7 @@ Outcome:
 [12:04:00] user: How does the chunker handle overlap?
 [12:05:00] assistant: because the old approach created duplicates
 [12:06:00] assistant: on the other hand, flat parsing is simpler
+[12:07:00] assistant: promise: zrobie to zaraz
 "#;
 
         let entries = classify_chunk_entries(
@@ -1679,6 +1860,8 @@ Outcome:
 
         let types: HashSet<EntryType> = entries.iter().map(|e| e.entry_type).collect();
         assert!(types.contains(&EntryType::Decision), "missing Decision");
+        assert!(types.contains(&EntryType::Task), "missing Task");
+        assert!(types.contains(&EntryType::Commitment), "missing Commitment");
         assert!(types.contains(&EntryType::Outcome), "missing Outcome");
         assert!(types.contains(&EntryType::Intent), "missing Intent");
         assert!(types.contains(&EntryType::Assumption), "missing Assumption");
@@ -1721,6 +1904,8 @@ Outcome:
     #[test]
     fn initial_state_mapping() {
         assert_eq!(initial_state(EntryType::Intent), EntryState::Proposed);
+        assert_eq!(initial_state(EntryType::Task), EntryState::Proposed);
+        assert_eq!(initial_state(EntryType::Commitment), EntryState::Proposed);
         assert_eq!(initial_state(EntryType::Question), EntryState::Proposed);
         assert_eq!(initial_state(EntryType::Assumption), EntryState::Proposed);
         assert_eq!(initial_state(EntryType::Decision), EntryState::Active);

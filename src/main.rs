@@ -1060,7 +1060,8 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = StdoutEmit::None)]
         emit: StdoutEmit,
 
-        /// Source path for pack-style ingests such as --source loct-context-pack
+        /// Source path for explicit ingests: markdown file/directory for --source operator-md,
+        /// pack directory for --source loct-context-pack
         input: Option<PathBuf>,
     },
 
@@ -1530,7 +1531,7 @@ enum Commands {
         no_intent_schema: bool,
     },
 
-    /// Classify stored chunks into 9-type intent entries and report counts.
+    /// Classify stored chunks into 11-type intent entries and report counts.
     #[command(name = "migrate-intent-schema")]
     MigrateIntentSchema {
         /// Strict project filter: `owner/repo`, `/repo` (cross-org repo
@@ -2123,6 +2124,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 emit,
                 redact_secrets: redaction.redact_secrets,
                 noise_filter_enabled: !no_noise_filter,
+                operator_md_input: None,
             })?;
         }
         Some(Commands::Ingest {
@@ -2180,6 +2182,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 emit,
                 redact_secrets: redaction.redact_secrets,
                 noise_filter_enabled: !no_noise_filter,
+                operator_md_input: input,
             })?;
         }
         Some(Commands::List) => {
@@ -6098,6 +6101,8 @@ struct StoreRunArgs {
     /// `ChunkerConfig::noise_filter_enabled`; the CLI surface is
     /// `--no-noise-filter` (negated to keep the default ergonomic).
     noise_filter_enabled: bool,
+    /// Optional explicit markdown file/directory for `operator-md` ingestion.
+    operator_md_input: Option<PathBuf>,
 }
 
 fn resolve_store_agents(agent: Option<&str>) -> Result<Vec<&'static str>> {
@@ -6699,6 +6704,7 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         emit,
         redact_secrets,
         noise_filter_enabled,
+        operator_md_input,
     } = args;
 
     let cutoff = cutoff.unwrap_or_else(|| lookback_cutoff(hours));
@@ -6768,7 +6774,14 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
             "grok" => sources::extract_grok(&config),
             "grok-sessions" => sources::extract_grok_sessions(&config),
             "codescribe" => sources::extract_codescribe(&config),
-            "operator-md" => sources::extract_operator_markdown(&config),
+            "operator-md" => {
+                if let Some(input) = operator_md_input.as_deref() {
+                    let home = dirs::home_dir().context("No home dir")?;
+                    sources::extract_operator_markdown_from_input(&home, input, &config)
+                } else {
+                    sources::extract_operator_markdown(&config)
+                }
+            }
             _ => Ok(Vec::new()),
         };
         hb.stop();
@@ -7836,6 +7849,7 @@ fn run_index(
                 emit: StdoutEmit::None,
                 redact_secrets: true,
                 noise_filter_enabled: true,
+                operator_md_input: None,
             })?;
         } else {
             eprintln!("Canonical catch-up: no source sessions newer than chunks");

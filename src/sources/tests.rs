@@ -2986,6 +2986,19 @@ fn test_operator_md_owner_repo_decode_preserves_owner() {
 }
 
 #[test]
+fn test_operator_md_project_hint_resolves_git_checkout_case_insensitively() {
+    let root = unique_test_dir("operator-git-checkout");
+    let home = root.join("home");
+    let repo_dir = home.join("Git").join("ScreenScribe");
+    fs::create_dir_all(&repo_dir).unwrap();
+
+    let cwd = resolve_operator_cwd_hint(&home, Path::new("dummy"), Some("screenscribe"));
+    assert_eq!(cwd.as_deref(), Some(repo_dir.to_str().unwrap()));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn test_discover_operator_markdown_honors_caller_cutoff_for_all_time() {
     let root = unique_test_dir("operator-md-cutoff-all-time");
     let home = root.join("home");
