@@ -4,7 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use aicx_retrieve::{
-    ChunkRef, FilterSet, LexicalIndex, LexicalQuery, TANTIVY_INDEX_DIR, TantivyAdapter,
+    ChunkRef, FilterSet, LexicalIndex, LexicalQuery, TANTIVY_INDEX_DIR, TANTIVY_SCHEMA_VERSION,
+    TantivyAdapter,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -92,6 +93,22 @@ fn commit_id_is_stable_across_noop_queries() {
     adapter.query(&query("foo", 3)).unwrap();
 
     assert_eq!(&before, adapter.commit_id());
+}
+
+#[test]
+fn commit_id_includes_tantivy_schema_version() {
+    let temp = TempDir::new().unwrap();
+    let mut adapter = TantivyAdapter::new(temp.path().to_path_buf()).unwrap();
+    let chunks = vec![chunk(1, "schema versioned foo text", "codex")];
+
+    adapter.build(&chunks).unwrap();
+
+    assert!(
+        adapter
+            .commit_id()
+            .0
+            .starts_with(&format!("{TANTIVY_SCHEMA_VERSION}:"))
+    );
 }
 
 #[test]

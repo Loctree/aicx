@@ -2098,6 +2098,13 @@ fn hybrid_manifest_matches_committed_source(
     let Ok(manifest) = aicx_retrieve::Manifest::read_from_path(&path) else {
         return false;
     };
+    let lexical_schema_prefix = format!("{}:", aicx_retrieve::TANTIVY_SCHEMA_VERSION);
+    if !manifest
+        .lexical_commit_id
+        .starts_with(&lexical_schema_prefix)
+    {
+        return false;
+    }
     manifest.source_chunk_count == source_chunk_count
         && manifest.source_hash_blake3 == source_hash_blake3
 }

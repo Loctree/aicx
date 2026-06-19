@@ -1127,6 +1127,22 @@ fn no_op_incremental_preserves_skip_against_pre_commit_source() {
         "steady no-op incremental should keep the cheap skip path despite header-only rewrite"
     );
 
+    let manifest_path = hybrid_manifest_path(Some(project)).expect("hybrid manifest path");
+    let mut manifest =
+        aicx_retrieve::Manifest::read_from_path(&manifest_path).expect("read hybrid manifest");
+    manifest.lexical_commit_id = "legacy-segment-id-without-schema-prefix".to_string();
+    manifest
+        .write_to_path(&manifest_path)
+        .expect("write legacy-shaped manifest");
+    assert!(
+        !hybrid_manifest_matches_committed_source(
+            Some(project),
+            baseline.source_chunk_count,
+            &baseline.source_hash_blake3,
+        ),
+        "legacy lexical commit ids without the Tantivy schema prefix must force a rebuild"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }
 

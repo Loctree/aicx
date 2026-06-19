@@ -21,7 +21,7 @@ use tantivy_stemmers::algorithms;
 use crate::{ChunkRef, FilterSet, Hit, LexicalCommitId, LexicalIndex, LexicalQuery};
 
 pub const TANTIVY_KIND: &str = "tantivy_lexical";
-pub const TANTIVY_SCHEMA_VERSION: &str = "tantivy_lexical_v1";
+pub const TANTIVY_SCHEMA_VERSION: &str = "tantivy_lexical_v2_fast_body";
 pub const TANTIVY_INDEX_DIR: &str = "tantivy_lex";
 
 const BODY_TOKENIZER: &str = "aicx_body_pl_en";
@@ -393,9 +393,6 @@ fn register_tokenizers(index: &Index) {
     let tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
         .filter(RemoveLongFilter::limit(40))
         .filter(LowerCaser)
-        .filter(TantivyStemmersFilter::new(
-            algorithms::polish_yarovoy_unaccented,
-        ))
         .filter(PolishParticipleTrim)
         .filter(TantivyStemmersFilter::new(algorithms::english_porter_2))
         .build();
@@ -409,7 +406,7 @@ fn read_commit_id(index: &Index) -> Result<LexicalCommitId> {
         .first()
         .map(|segment| segment.uuid_string())
         .unwrap_or_else(|| "empty".to_string());
-    Ok(LexicalCommitId(id))
+    Ok(LexicalCommitId(format!("{TANTIVY_SCHEMA_VERSION}:{id}")))
 }
 
 fn read_doc_count(index: &Index) -> Result<usize> {
@@ -614,8 +611,13 @@ impl<T: TokenStream> TokenStream for PolishParticipleTrimTokenStream<T> {
             return false;
         }
         let token = self.tail.token_mut();
-        if token.text.len() > 6 && token.text.ends_with("ion") {
-            token.text.truncate(token.text.len() - 3);
+        if token.text.len() > 7 {
+            for suffix in ["iony", "iona", "ione", "ieni"] {
+                if token.text.ends_with(suffix) {
+                    token.text.truncate(token.text.len() - suffix.len());
+                    break;
+                }
+            }
         }
         true
     }
