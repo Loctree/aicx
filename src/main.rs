@@ -1356,7 +1356,7 @@ enum Commands {
         )]
         require_auth: bool,
 
-        /// Disable Bearer auth on HTTP transport. Only use on trusted local/tailnet links.
+        /// Disable Bearer auth on HTTP transport. Only allowed on loopback binds.
         #[arg(long = "no-require-auth", action = clap::ArgAction::SetTrue)]
         no_require_auth: bool,
     },
@@ -2425,9 +2425,9 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }) => {
             let require_auth = require_auth && !no_require_auth;
             let auth_config = aicx::auth::load_auth_config(auth_token.as_deref(), require_auth)?;
-            if matches!(transport, McpTransport::Http) && !require_auth {
+            if matches!(transport, McpTransport::Http) && !require_auth && host.is_loopback() {
                 eprintln!(
-                    "! Warning: MCP HTTP transport bound without auth — knowing the port is enough to invoke MCP tools."
+                    "! Warning: loopback MCP HTTP transport bound without auth — knowing the port is enough to invoke MCP tools."
                 );
             }
             let rt = tokio::runtime::Runtime::new()?;

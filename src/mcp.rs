@@ -1393,6 +1393,7 @@ pub async fn run_http(
 
     let auth_source_label = auth_config.source.describe();
     let auth_enforced = auth_config.is_enforced();
+    validate_http_auth_policy(host, &auth_config)?;
 
     // F-P3-18: emit the truthful auth posture + tool surface as a single
     // tracing event so security review can audit boot configuration
@@ -1439,7 +1440,7 @@ pub async fn run_http(
     eprintln!("  Transport: Streamable HTTP (POST + GET /mcp)");
     if allowed_hosts.is_empty() {
         eprintln!(
-            "  Host validation: DISABLED because --host is an all-interfaces bind; use only on trusted local/tailnet links"
+            "  Host validation: DISABLED because --host is an all-interfaces bind; /mcp remains Bearer-auth gated"
         );
     } else {
         eprintln!(
@@ -1461,6 +1462,20 @@ pub async fn run_http(
     )
     .await
     .map_err(|e| anyhow::anyhow!("MCP HTTP server error: {e}"))
+}
+
+fn validate_http_auth_policy(
+    host: std::net::IpAddr,
+    auth_config: &AuthConfig,
+) -> anyhow::Result<()> {
+    if host.is_loopback() || auth_config.is_enforced() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "Refusing to bind MCP HTTP without auth on non-loopback host {host}. \
+         Use loopback for --no-require-auth, or provide --auth-token / AICX_HTTP_AUTH_TOKEN."
+    );
 }
 
 async fn mcp_health() -> axum::http::StatusCode {
@@ -1583,9 +1598,10 @@ mod tests {
         MCP_SESSION_SWEEP_INTERVAL, McpTransport, RankItem, RankResponse, SearchParams,
         SteerResponse, background_refresh_args, build_mcp_semantic_filters,
         configured_mcp_session_manager, inject_mcp_filter_pushdown_payload, parse_date_filter_mcp,
-        spawn_mcp_session_cleanup, streamable_http_config_for_bind, validate_score_filter,
-        validate_string_len,
+        spawn_mcp_session_cleanup, streamable_http_config_for_bind, validate_http_auth_policy,
+        validate_score_filter, validate_string_len,
     };
+    use crate::auth::{AuthConfig, AuthSource};
     use crate::oracle::OracleStatus;
     use clap::ValueEnum as _;
     use rmcp::transport::streamable_http_server::session::SessionManager as _;
@@ -2003,6 +2019,38 @@ mod tests {
             config.allowed_hosts.is_empty(),
             "0.0.0.0 needs to accept real interface Host headers such as Tailscale IPs"
         );
+    }
+
+    #[test]
+    fn test_mcp_http_policy_allows_loopback_without_auth() {
+        let host = std::net::IpAddr::from([127u8, 0, 0, 1]);
+        assert!(validate_http_auth_policy(host, &AuthConfig::disabled()).is_ok());
+    }
+
+    #[test]
+    fn test_mcp_http_policy_refuses_non_loopback_without_auth() {
+        for host in [
+            std::net::IpAddr::from([100u8, 75, 30, 90]),
+            std::net::IpAddr::from([0u8, 0, 0, 0]),
+        ] {
+            let err = validate_http_auth_policy(host, &AuthConfig::disabled())
+                .expect_err("non-loopback no-auth bind must fail closed");
+            assert!(
+                err.to_string()
+                    .contains("Refusing to bind MCP HTTP without auth"),
+                "unexpected error: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mcp_http_policy_allows_non_loopback_with_auth_token() {
+        let host = std::net::IpAddr::from([100u8, 75, 30, 90]);
+        let auth = AuthConfig {
+            token: Some("tailnet-token".to_string()),
+            source: AuthSource::Cli,
+        };
+        assert!(validate_http_auth_policy(host, &auth).is_ok());
     }
 
     #[test]

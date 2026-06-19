@@ -6,7 +6,7 @@
 //! Usage:
 //!   aicx-mcp                          # stdio transport
 //!   aicx-mcp --transport http         # streamable HTTP on port 8044
-//!   aicx-mcp --transport http --host 0.0.0.0 --port 9000
+//!   aicx-mcp --transport http --host 0.0.0.0 --port 9000 --auth-token "$TOKEN"
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
@@ -50,7 +50,7 @@ struct Args {
     )]
     require_auth: bool,
 
-    /// Disable Bearer auth on HTTP transport. Only use on trusted local/tailnet links.
+    /// Disable Bearer auth on HTTP transport. Only allowed on loopback binds.
     #[arg(long = "no-require-auth", action = clap::ArgAction::SetTrue)]
     no_require_auth: bool,
 }
@@ -119,9 +119,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if matches!(args.transport, McpTransport::Http) && !require_auth {
+    if matches!(args.transport, McpTransport::Http) && !require_auth && args.host.is_loopback() {
         safe_stderr_log(
-            "[aicx-mcp] WARNING: HTTP transport bound without auth (--no-require-auth)",
+            "[aicx-mcp] WARNING: loopback HTTP transport bound without auth (--no-require-auth)",
         );
     }
     match rt.block_on(async {
