@@ -20,8 +20,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: windows-pc
-            runner: '["self-hosted", "windows-pc"]'
+          - name: linux-self-hosted
+            runner: '["self-hosted", "ops-linux"]'
+          - name: macos-self-hosted
+            runner: '["self-hosted", "dragon-macos"]'
+          - name: windows-latest
+            runner: '"windows-latest"'
 
     steps:
       - uses: actions/checkout@v6
