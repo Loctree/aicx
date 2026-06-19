@@ -189,10 +189,29 @@ fn is_cargo_test_exe_path(path: &Path) -> bool {
 }
 
 fn is_temp_allowlist_path(path: &Path) -> bool {
-    path.starts_with("/tmp")
+    if path.starts_with("/tmp")
         || path.starts_with("/var/folders")
         || path.starts_with("/private/tmp")
         || path.starts_with("/private/var/folders")
+    {
+        return true;
+    }
+    // Test harnesses put scratch dirs under `<cwd>/target/test-tmp` (see the
+    // mk_tmp_dir helpers). On Windows CI the checkout lives on a different drive
+    // (D:\a\...) than the user dirs (C:\Users\...), so target/test-tmp is under no
+    // allowed base — recognise any path containing a `target/test-tmp` segment pair.
+    // Still gated by temp_allowlist_enabled() at the call site (test-only by default).
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        if component.as_os_str() == std::ffi::OsStr::new("target") {
+            if let Some(next) = components.peek() {
+                if next.as_os_str() == std::ffi::OsStr::new("test-tmp") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Strip a Windows `\\?\` (or `\\?\UNC\`) verbatim prefix so `Path::starts_with`
