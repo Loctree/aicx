@@ -88,9 +88,16 @@ fn build_reports_explorer_merges_markdown_and_meta_and_keeps_meta_only_runs() {
   "agent": "codex",
   "run_id": "marb-131611-001",
   "prompt_id": "marbles-ancestor_L1_20260411",
-  "transcript": "__TRANSCRIPT__"
+  "transcript": __TRANSCRIPT__
 }"#
-        .replace("__TRANSCRIPT__", &transcript.display().to_string()),
+        .replace(
+            "__TRANSCRIPT__",
+            // serde_json quotes + escapes the path so a Windows path with
+            // backslashes (`C:\…`) stays valid JSON; on Unix the value is
+            // byte-identical to the previous raw embedding.
+            &serde_json::to_string(&transcript.display().to_string())
+                .expect("encode transcript path as JSON"),
+        ),
     );
     write_file(&transcript, "[13:16:11] assistant: booting artifact scan\n");
 
@@ -159,9 +166,14 @@ fn build_reports_explorer_does_not_read_transcripts_outside_repo_root() {
   "agent": "codex",
   "run_id": "marb-outside-transcript",
   "prompt_id": "outside-transcript",
-  "transcript": "__TRANSCRIPT__"
+  "transcript": __TRANSCRIPT__
 }"#
-        .replace("__TRANSCRIPT__", &outside.display().to_string()),
+        .replace(
+            "__TRANSCRIPT__",
+            // serde_json quotes + escapes so a Windows path stays valid JSON.
+            &serde_json::to_string(&outside.display().to_string())
+                .expect("encode transcript path as JSON"),
+        ),
     );
 
     let config = ReportsExtractorConfig {

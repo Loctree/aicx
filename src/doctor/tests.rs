@@ -303,9 +303,15 @@ fn check_corpus_buckets_flags_template_literals() {
     // case (relaxed 2026-05-12 only loosened case + leading-char
     // rules; mid-segment garbage stays junk).
     std::fs::create_dir_all(store.join("vetcoders").join("vibecrafted.git`")).unwrap();
+    // Names containing Windows-illegal characters (`*`, control chars, `<`,
+    // `>`) cannot exist on NTFS at all, so the scanner can never encounter
+    // them on Windows — they are an impossible input there, not a skipped
+    // case. Create + assert them on non-Windows only.
+    #[cfg(not(windows))]
     std::fs::create_dir_all(store.join("vetcoders").join("loctree\n\n**AICX")).unwrap();
     // Template-placeholder leaks (leading `{`, `<`, `$`):
     std::fs::create_dir_all(store.join("{target_owner}")).unwrap();
+    #[cfg(not(windows))]
     std::fs::create_dir_all(store.join("<owner>")).unwrap();
     std::fs::create_dir_all(store.join("$RELEASE_REPO")).unwrap();
     // (Note: pure dot-string `"..."` was previously asserted as junk,
@@ -315,9 +321,11 @@ fn check_corpus_buckets_flags_template_literals() {
     let result = check_corpus_buckets(&tmp);
     assert_eq!(result.severity, Severity::Warning);
     assert!(result.detail.contains("{target_owner}"));
+    #[cfg(not(windows))]
     assert!(result.detail.contains("<owner>"));
     assert!(result.detail.contains("$RELEASE_REPO"));
     assert!(result.detail.contains("vetcoders/vibecrafted.git`"));
+    #[cfg(not(windows))]
     assert!(result.detail.contains("vetcoders/loctree"));
 
     let _ = std::fs::remove_dir_all(&tmp);
@@ -339,6 +347,10 @@ fn quarantine_moves_bucket_atomically() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+// The nested bucket name carries Windows-illegal characters (`"`, `<`, `>`),
+// so it cannot exist on NTFS — quarantine of a legal-but-invalid bucket is
+// covered portably by `quarantine_moves_bucket_atomically` (`{x}`).
+#[cfg(not(windows))]
 #[test]
 fn quarantine_moves_nested_repo_bucket_atomically() {
     let tmp = unique_test_dir("quarantine-nested-move");
@@ -397,6 +409,8 @@ fn scan_passes_camelcase_dotfile_underscore_buckets_through() {
 
     // Truly invalid (template placeholders, leading non-alphanumeric):
     std::fs::create_dir_all(store.join("{target_owner}").join("repo")).unwrap();
+    // `<owner>` holds Windows-illegal characters — impossible on NTFS.
+    #[cfg(not(windows))]
     std::fs::create_dir_all(store.join("<owner>")).unwrap();
     std::fs::create_dir_all(store.join("$RELEASE_REPO")).unwrap();
 
@@ -423,6 +437,7 @@ fn scan_passes_camelcase_dotfile_underscore_buckets_through() {
 
     // Real text-extracted junk and placeholder leaks ARE suspicious:
     assert!(suspicious.iter().any(|n| n == "{target_owner}"));
+    #[cfg(not(windows))]
     assert!(suspicious.iter().any(|n| n == "<owner>"));
     assert!(suspicious.iter().any(|n| n == "$RELEASE_REPO"));
 
