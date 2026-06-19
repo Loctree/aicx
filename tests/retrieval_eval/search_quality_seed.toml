@@ -1,0 +1,466 @@
+# aicx eval search-quality — curated seed matrix (human-facing evidence drift).
+# Separate from the backend 50-query gold set in queries.toml.
+#
+# Schema: aicx.search_quality_seed.v1
+#   id            stable identifier (independent of ordering)
+#   scope         project
+#   type          "evidence" | "ask_answer"
+#                   ask_answer => score evidence relevance (right session/chunk),
+#                   NOT narrative quality.
+#   query         the (deliberately messy) operator query
+#   good_result / bad_result   human description of hit vs miss
+#   anchors_match "any_of" | "all_of"  (only meaningful when >1 anchor)
+#   [[questions.anchors]]
+#     map_id        session folder in tb-out-anchor-v4-20260619-121218
+#     expected_terms  tokens a correct top-hit must contain, CHECKED IN .md BODY
+#                     (not .meta.json). terms_match defaults to "any".
+#     terms_match   "any" | "all"
+#
+# Secrets policy: no key fragments in query or expected_terms — only var names,
+# locations, and the rotate action.
+
+schema = "aicx.search_quality_seed.v1"
+corpus = "tb-out-anchor-v4-20260619-121218"
+
+# ---------- aicx ----------
+
+[[questions]]
+id = "aicx-all-bucket"
+scope = "aicx"
+type = "evidence"
+query = "wtf jest z tym _all bucketem i czemu aicx search -p vista nie chodzi a _all chodzi?"
+good_result = "_all = zbiorczy indeks calego store'a (indexed/_all/embeddings.ndjson); tryb projektowy oczekuje osobnego bucketu indexed/vetcoders_vista ktorego nie bylo."
+bad_result = "sama skladnia aicx search albo surowy index_status bez roznicy _all vs project."
+[[questions.anchors]]
+map_id = "codex__019ed8cb__2026-06-18__d0055557"
+expected_terms = ["_all", "indexed/vetcoders_vista", "embeddings.ndjson", "bucket"]
+terms_match = "any"
+
+[[questions]]
+id = "aicx-sztudio-vs-silver"
+scope = "aicx"
+type = "ask_answer"
+query = "czemu przenieslismy embeddingi i model na sztudio a nie zostawilismy na silver, po co silverowi model?"
+good_result = "decyzja: Silver nie powinien miec modelu ani pelnego indexu; sztudio = runtime truth z Ollama qwen3-embedding:8b, silver tylko klient."
+bad_result = "sama komenda search/status bez 'dlaczego sztudio', albo wynik o innym hoscie."
+anchors_match = "any_of"
+[[questions.anchors]]
+map_id = "codex__019ed8cb__2026-06-18__d0055557"
+expected_terms = ["Silver", "sztudio", "qwen3-embedding:8b", "runtime truth"]
+terms_match = "any"
+[[questions.anchors]]
+map_id = "claude__d7bbf152__2026-06-04__cab6a103"
+expected_terms = ["qwen3-embedding:8b", "4096", "sztudio"]
+terms_match = "any"
+
+[[questions]]
+id = "aicx-ssh-openai-key"
+scope = "aicx"
+type = "evidence"
+query = "czemu semantic search pada przez ssh, cos z kluczem openai mimo ollamy?"
+good_result = "config wymusza api_key_env = OPENAI_API_KEY mimo ze Ollama nie potrzebuje klucza -> twardy fail w cloud.rs; fix = zakomentowac + ustawic AICX_HOME."
+bad_result = "generyczne 'uruchom aicx index' / 'indeks nie zbudowany' bez wskazania na klucz/config."
+[[questions.anchors]]
+map_id = "codex__019ed8cb__2026-06-18__d0055557"
+expected_terms = ["OPENAI_API_KEY", "cloud.rs", "api_key_env", "AICX_HOME"]
+terms_match = "any"
+
+[[questions]]
+id = "aicx-corpus-noise"
+scope = "aicx"
+type = "evidence"
+query = "ile z indexu to realnie ludzkie wiadomosci a ile maszynowy szum?"
+good_result = "~36% to user_msg + agent_reply, ~64% kanaly maszynowe (system_note ~93k itd.) z 228018 rows."
+bad_result = "ogolnik 'indeks duzy' albo sama komenda statusu bez rozbicia per frame."
+[[questions.anchors]]
+map_id = "codex__019ed8cb__2026-06-18__d0055557"
+expected_terms = ["228018", "system_note", "agent_reply", "user_msg"]
+terms_match = "any"
+
+[[questions]]
+id = "aicx-oracle-dense-only"
+scope = "aicx"
+type = "evidence"
+query = "co znaczy ten oracle_status semantic_dense_only hybrid_unavailable i co z tym zrobilismy?"
+good_result = "dense-only vector search bez warstwy hybrydowej/leksykalnej/rerankingu; zdrowy stan = hybrid_rrf; fix poprawil default (ukrycie tool_call/system_note, wiekszy candidate pool)."
+bad_result = "powtorzenie samego stringu statusu bez diagnozy/naprawy."
+[[questions.anchors]]
+map_id = "codex__019ed8cb__2026-06-18__d0055557"
+expected_terms = ["hybrid_unavailable", "semantic_dense_only", "hybrid_rrf"]
+terms_match = "any"
+
+[[questions]]
+id = "aicx-derive-buckets"
+scope = "aicx"
+type = "evidence"
+query = "czy warto trzymac osobne project buckety, ile to zjada miejsca i czy cos dodaje?"
+good_result = "project bucket to glownie latency cache (np. 3.24s vs ~68s), nie dodaje wiedzy; derive --all-projects rozdal indexed/ do ~51G -> odrzucone jako default."
+bad_result = "'buckety sa lepsze' bez tradeoffu latency/storage; albo sama komenda derive."
+[[questions.anchors]]
+map_id = "codex__019ed8cb__2026-06-18__d0055557"
+expected_terms = ["index derive", "latency cache", "51G", "3.24s"]
+terms_match = "any"
+
+[[questions]]
+id = "aicx-intents-scan-vs-search"
+scope = "aicx"
+type = "evidence"
+query = "czy aicx intents searchuje po indeksie czy skanuje pliki, bo --limit 3 i tak miele wszystko?"
+good_result = "intents = timeline-reducer, nie search; --hours tnie na skanie, --since/--until na display, --limit jest display-only."
+bad_result = "opis aicx search zamiast intents, albo twierdzenie ze limit ogranicza skan."
+[[questions.anchors]]
+map_id = "codex__019ed7c6__2026-06-17__ff7c50d1"
+expected_terms = ["timeline", "--limit", "--hours", "--since"]
+terms_match = "any"
+
+[[questions]]
+id = "aicx-since-exact-day"
+scope = "aicx"
+type = "evidence"
+query = "czemu --since 2026-06-01 daje 0 wynikow a --since 2026-06-01.. dziala?"
+good_result = "bug: parse_date_filter dla pojedynczej daty zwraca (Some(day), Some(day)) czyli exact-day zamiast lower-bound jak mowi help."
+bad_result = "'to feature' albo workaround bez nazwania parse_date_filter."
+[[questions.anchors]]
+map_id = "codex__019ed7c6__2026-06-17__ff7c50d1"
+expected_terms = ["parse_date_filter", "--since", "lower bound"]
+terms_match = "any"
+
+# ---------- transcript-builder ----------
+
+[[questions]]
+id = "tb-layers"
+scope = "transcript-builder"
+type = "ask_answer"
+query = "przypomnij co jest L0 / L1 / L2 w TB, ktory plik jest source of truth?"
+good_result = "L0 = raw logs, L1 = session_record.json (forensic source of truth), L2 = human.md + index_payload.jsonl."
+bad_result = "pomieszanie warstw albo nazwanie spotlight/human jako 'prawdy' zamiast session_record."
+[[questions.anchors]]
+map_id = "claude__0f082081__2026-06-05__8c77dec0"
+expected_terms = ["L1", "session_record.json", "L2", "index_payload", "human.md"]
+terms_match = "any"
+
+[[questions]]
+id = "tb-r1-historical-snapshot"
+scope = "transcript-builder"
+type = "ask_answer"
+query = "czemu dorobilismy te labelki historical snapshot not runtime truth - co poszlo nie tak wczesniej?"
+good_result = "claim 'P6 partial, refire needed' byl prawdziwy tylko na zamknieciu sesji, live repo pokazal P6 done -> ryzyko refire; stad snapshot_as_of, claim_scope=session_close."
+bad_result = "ogolne 'dla porzadku' bez historii refire/staleness."
+[[questions.anchors]]
+map_id = "codex__019ec4b6__2026-06-14__3e56c850"
+expected_terms = ["snapshot_as_of", "claim_scope", "session_close", "P6"]
+terms_match = "any"
+
+[[questions]]
+id = "tb-r2-chunking"
+scope = "transcript-builder"
+type = "evidence"
+query = "czemu wielka sesja 960-turnowa dawala tylko 1 chunk i jak teraz chunkujemy?"
+good_result = "960-turn / 8MB -> 1 chunk bylo 'too flat'; rozbilismy na typed chunks (session_card, intent, decisions, deliverables, verification_gates, handoff, files_entities), dedupe key -> chunk_id."
+bad_result = "sama definicja 'round' z aicx albo nic o typed chunkach."
+[[questions.anchors]]
+map_id = "codex__019ec4c1__2026-06-14__231c0e5e"
+expected_terms = ["960", "chunk_id", "session_card", "verification_gates"]
+terms_match = "any"
+
+[[questions]]
+id = "tb-human-vs-spotlight"
+scope = "transcript-builder"
+type = "evidence"
+query = "human.md mial byc one-page a robil sie 180 linii - jak go rozdzielilismy od spotlight?"
+good_result = "human.md = one-page summary (~77 linii), spotlight.md = pelny clean-flow (np. 2583 linie) z build-session-record, bez wycinania srodka, z czyszczeniem toolu_ / name: Bash / [tool result payload omitted]."
+bad_result = "traktowanie human.md i spotlight.md jako to samo, albo 'obetnij ogon' jako fix."
+anchors_match = "any_of"
+[[questions.anchors]]
+map_id = "codex__019ec549__2026-06-14__a54f902c"
+expected_terms = ["human.md", "spotlight.md", "one-page", "2583"]
+terms_match = "any"
+[[questions.anchors]]
+map_id = "codex__019ec4c9__2026-06-14__fd6e76b5"
+expected_terms = ["clean flow", "toolu_", "build-session-record"]
+terms_match = "any"
+
+[[questions]]
+id = "tb-index-payload-titles"
+scope = "transcript-builder"
+type = "evidence"
+query = "czemu w index_payload wszystkie chunki mialy te same tytuly i co to psulo?"
+good_result = "long sessiony dawaly N chunkow z tym samym uciętym promptem; fix podniosl distinct titles (np. 7->33), dodal recall scoring i de-noising files_entities; tez fix verification_gates z samym jest: unknown."
+bad_result = "tylko 'tytuly brzydkie' bez zwiazku z retrievalem/recall."
+[[questions.anchors]]
+map_id = "claude__761bc3a0__2026-06-14__a3c45682"
+expected_terms = ["distinct titles", "files_entities", "recall_value", "Memex"]
+terms_match = "any"
+
+# ---------- md-radar ----------
+
+[[questions]]
+id = "mdradar-intents-empty"
+scope = "aicx+md-radar"
+type = "evidence"
+query = "czemu aicx_intents dla md-radar jest pusty - to lance, stale czy co?"
+good_result = "ingest gap: intent-bogata 5h sesja ruszyla z cwd=~/Git (non-repo), nigdy nie trafila do AICX; wpadl tylko szumowy ogon. Nie lance, nie stale."
+bad_result = "'przebuduj lance' / 'to stale index' - bledne tropy."
+[[questions.anchors]]
+map_id = "claude__cf9e5ef4__2026-06-15__2bd40f7b"
+expected_terms = ["md-radar", "ingest", "cwd", "non-repo"]
+terms_match = "any"
+
+[[questions]]
+id = "mdradar-runtime-truth-status"
+scope = "md-radar"
+type = "evidence"
+query = "czy md-radar status mowi prawde po runtime-truth fix? worker# source# i ten head 314293b"
+good_result = "runtime-truth fix rozdziela Launchd/Exec/Bin#/Worker#/Source#/Version; tu Worker# == Source#, Version == HEAD (314293b), zero falszywego WARN."
+bad_result = "trafienie w stara sesje sprzed fixa albo sam status bez wyjasnienia co fix rozdzielil."
+[[questions.anchors]]
+map_id = "claude__5ac8b48a__2026-06-15__7ac8321b"
+expected_terms = ["Runtime-truth fix", "Worker#", "Source#", "314293b"]
+terms_match = "any"
+
+[[questions]]
+id = "mdradar-readme-drift"
+scope = "md-radar"
+type = "evidence"
+query = "co z tym znikiem strzalki w dol i martwym visit/last_visit_ts w md-radar readme?"
+good_result = "README opisuje licznik 'od ostatniej wizyty' ktorego nie ma; visit/last_visit_ts to martwa funkcja (zapisywana, nieczytana); zywy naglowek dasha ma 3 liczniki (725 nowe itd.)."
+bad_result = "opis aktualnego dasha bez wskazania driftu README<->kod / martwej funkcji."
+[[questions.anchors]]
+map_id = "claude__5ac8b48a__2026-06-15__7ac8321b"
+expected_terms = ["last_visit_ts", "visit", "README", "725 nowe"]
+terms_match = "any"
+
+# ---------- Pensieve ----------
+
+[[questions]]
+id = "pensieve-autocomplete-mock"
+scope = "pensieve"
+type = "evidence"
+query = "czemu AI autocomplete chodzi w produkcji na mocku, ten caly VistaEngine wydmuszka?"
+good_result = "realny VistaEngine.complete() jest w FFI (qube_ffi.swift.patch:629) ale nic go nie podpina -> default MockVistaAutocompleteEngine zwraca literalne ' continuation'; mock zyje w prod i ma fatalError (loadConfig, transcribeFile) = crash."
+bad_result = "'autocomplete dziala' / czysto frontendowa odpowiedz bez FFI/mock."
+[[questions.anchors]]
+map_id = "claude__f30e5b56__2026-06-10__ec142ff3"
+expected_terms = ["MockVistaAutocompleteEngine", "qube_ffi.swift.patch:629", "continuation", "fatalError"]
+terms_match = "any"
+
+# ---------- ScreenScribe ----------
+
+[[questions]]
+id = "screenscribe-race-disaster"
+scope = "screenscribe"
+type = "evidence"
+query = "czemu nie odpalamy dwoch sesji na screenscribe-seed naraz, byl jakis race?"
+good_result = "'race disaster': dwie sesje na screenscribe-seed -> living-tree race; decyzja: fan-out tylko do myslenia, write single-session inline, bo rownolegle blind-writes = powrot awarii."
+bad_result = "ogolne 'git konflikt' bez living-tree race / decyzji single-session."
+[[questions.anchors]]
+map_id = "claude__3d2716aa__2026-06-14__7fbabcf5"
+expected_terms = ["race", "living-tree", "single-session", "screenscribe-seed"]
+terms_match = "any"
+
+[[questions]]
+id = "screenscribe-aicx-home-mismatch"
+scope = "screenscribe"
+type = "evidence"
+query = "czemu semantic search w screenscribe walil index_not_built wszedzie, cos z home path?"
+good_result = "rescan pisal do ~/aicx/indexed/_all/... (bez kropki), search czytal z ~/.aicx/indexed/_all/... (z kropka) -> indeks budowany w jednym home, szukany w drugim."
+bad_result = "'przebuduj indeks' bez wskazania na rozjazd aicx vs .aicx home."
+[[questions.anchors]]
+map_id = "claude__3d2716aa__2026-06-14__7fbabcf5"
+expected_terms = ["index_not_built", ".aicx/indexed", "~/aicx", "_all"]
+terms_match = "any"
+
+[[questions]]
+id = "screenscribe-confirmed-to-verdict"
+scope = "screenscribe"
+type = "evidence"
+query = "ten rename confirmed -> verdict, czemu zabilismy dual-model?"
+good_result = "nie chcemy dual-modelu confirmed(bool)/verdict; po cutcie jeden jezyk = human_review.verdict (accepted|rejected|none)."
+bad_result = "trafienie w niezwiazany 'verdict' z innego repo (TB verdict enum) zamiast screenscribe rename."
+[[questions.anchors]]
+map_id = "claude__3d2716aa__2026-06-14__7fbabcf5"
+expected_terms = ["confirmed", "verdict", "human_review", "accepted"]
+terms_match = "any"
+
+# ---------- Loctree ----------
+
+[[questions]]
+id = "loctree-mcp-spawn-fail"
+scope = "loctree-mcp"
+type = "evidence"
+query = "claude desktop sypie sie na loctree mcp, failed to spawn process - co to bylo i jak naprawione?"
+good_result = "config wskazywal command na ~/.cargo/bin/loctree-mcp ktorego nie ma; zywa binarka (0.13.0-dev) jest w ~/.local/bin/; fix = jedna linia w claude_desktop_config.json + pelny restart."
+bad_result = "'przeinstaluj loctree' bez wskazania zlej sciezki w configu."
+[[questions.anchors]]
+map_id = "claude__e20908f4__2026-06-17__31add79e"
+expected_terms = ["Failed to spawn process", ".cargo/bin", ".local/bin", "claude_desktop_config.json"]
+terms_match = "any"
+
+[[questions]]
+id = "loctree-context-pill-dom-id"
+scope = "loctree-suite"
+type = "evidence"
+query = "czemu Context Pill webview sie nie renderuje, cos z DOM id mismatch?"
+good_result = "cross-file bug: Context Pill webview nie renderuje przez niezgodnosc DOM id miedzy HTML a skryptem."
+bad_result = "ogolny 'webview nie dziala' bez DOM id mismatch, albo inny loctree audit."
+[[questions.anchors]]
+map_id = "claude__f3146748__2026-06-06__d26b8a53"
+expected_terms = ["Context Pill", "DOM id", "webview"]
+terms_match = "any"
+
+# ---------- Agent-blackbox ----------
+
+[[questions]]
+id = "blackbox-i18n-verdict-tokens"
+scope = "agent-blackbox"
+type = "evidence"
+query = "w blackboxie ten i18n - czemu linia powody: zostaje po angielsku mimo PL?"
+good_result = "swiadoma decyzja: tokeny verdiktow, skladnia komend i schema JSON zostaja po angielsku; tlumaczona jest proza/etykiety, a powody to czlowiecza proza, nie stabilny token jak potential-treasure."
+bad_result = "'to bug, przetlumacz powody' - odwrotnie do decyzji."
+[[questions.anchors]]
+map_id = "claude__0009bbad__2026-06-05__a128708f"
+expected_terms = ["powody:", "i18n", "potential-treasure"]
+terms_match = "any"
+
+# ---------- vibecrafted (tooling) ----------
+
+[[questions]]
+id = "vibecrafted-path-doctor-authority"
+scope = "vibecrafted"
+type = "evidence"
+query = "czemu path-doctor krzyczy FAIL na vc-* a vibecrafted doctor mowi ok? cos z venv/bin entrypointami"
+good_result = "path-doctor ma stary/ostrzejszy kontrakt PYTHON_ENTRYPOINT_LAUNCHERS (oczekuje symlinka do vibecrafted), a runtime packaging poszedl na .venv/bin -> falszywe FAIL (failures=16); repo doctor traktuje to jako OK."
+bad_result = "'napraw symlinki vc-*' bez root-cause stale-contract vs .venv/bin."
+[[questions.anchors]]
+map_id = "codex__019ebea6__2026-06-13__9e44fe9f"
+expected_terms = ["path-doctor", "PYTHON_ENTRYPOINT_LAUNCHERS", ".venv/bin", "failures=16"]
+terms_match = "any"
+
+[[questions]]
+id = "vibecrafted-doctor-verbose-flag"
+scope = "vibecrafted"
+type = "evidence"
+query = "vibecrafted doctor --verbose nie pokazuje verbose, czemu? cos z $@ w wrapperze?"
+good_result = "wrapper wola python3 \"$installer\" doctor bez \"$@\", wiec --verbose ginie - scripts/vibecrafted:1861."
+bad_result = "'doctor nie ma trybu verbose' zamiast wskazania na zgubiony $@ w wrapperze."
+[[questions.anchors]]
+map_id = "codex__019ebea6__2026-06-13__9e44fe9f"
+expected_terms = ["--verbose", "scripts/vibecrafted:1861", '"$@"']
+terms_match = "any"
+
+# ---------- secrets (redacted) ----------
+
+[[questions]]
+id = "secrets-plaintext-rotate"
+scope = "transcript-builder"
+type = "evidence"
+query = "gdzie mialam ten klucz plaintextem i co trzeba z nim zrobic?"
+good_result = "OPENAI_API_KEY zapisany plaintextem w ~/.zshrc (ok. linii 43) -> potraktowac jako spalony, zrotowac i przeniesc do osobnego secrets.zsh. Bez pokazywania wartosci klucza."
+bad_result = "zacytowanie/wyswietlenie samego klucza, albo zignorowanie rekomendacji rotacji."
+[[questions.anchors]]
+map_id = "claude__21852ec7__2026-06-14__ae23ef0f"
+expected_terms = ["OPENAI_API_KEY", ".zshrc", "plaintext", "zrotuj"]
+terms_match = "any"
+
+# ---------- v3 additions: Pensieve / ScreenScribe / Loctree ----------
+
+[[questions]]
+id = "pensieve-stoprecording-cadence"
+scope = "pensieve"
+type = "evidence"
+query = "ten bug gdzie po wyjatku w stopRecording dalej leci nagrywanie i cadence - co bylo nie tak?"
+good_result = "stopRecording() w error-path zostawia isRecording=true i zywa petle cadence - throw omija isRecording=false i stopCadenceCommitLoop(); zalecany defer."
+bad_result = "ogolne 'obsluz wyjatek' bez wskazania isRecording/cadence loop w TranscriptionService."
+[[questions.anchors]]
+map_id = "claude__f30e5b56__2026-06-10__ec142ff3"
+expected_terms = ["stopRecording", "isRecording", "stopCadenceCommitLoop", "TranscriptionService.swift.patch"]
+terms_match = "any"
+
+[[questions]]
+id = "pensieve-pr7-ci-gate"
+scope = "pensieve"
+type = "ask_answer"
+query = "czemu na pr #7 nie ma zadnych checkow na githubie i co jest gate'em zamiast ci?"
+good_result = "CI (ci.yml) odpala sie tylko na pull_request targeting main; PR #7 celuje w inny branch -> brak CI by config; gate to lokalny make test (336 green)."
+bad_result = "'CI jest zepsute' zamiast wyjasnienia ze trigger nie lapie tego brancha + lokalny gate."
+[[questions.anchors]]
+map_id = "claude__f30e5b56__2026-06-11__a512f197"
+expected_terms = ["ci.yml", "pull_request targeting", "make test", "336"]
+terms_match = "any"
+
+[[questions]]
+id = "screenscribe-transcribe-lang-default"
+scope = "screenscribe"
+type = "ask_answer"
+query = "mowilam po polsku w video a screenscribe przetlumaczyl na angielski mimo ze w configu mam language pl - czemu?"
+good_result = "CLI ma default --lang en, wiec bez flagi STT dostaje language=en i ignoruje SCREENSCRIBE_LANGUAGE=pl z config.env -> 'polski sens po angielsku'."
+bad_result = "'model slabo radzi sobie z polskim' bez wskazania na default --lang en nadpisujacy config."
+[[questions.anchors]]
+map_id = "codex__019eb27b__2026-06-10__0d101f81"
+expected_terms = ["SCREENSCRIBE_LANGUAGE", "--lang en", "transcribe", "language=en"]
+terms_match = "any"
+
+[[questions]]
+id = "screenscribe-manualframe-css-leak"
+scope = "screenscribe"
+type = "evidence"
+query = "w review html pro tekst manual frame karty laduje sie pod miniaturka - co to za bug z css?"
+good_result = "globalna regula .annotation-container { display: inline-block } z report-pro.css przecieka do manual card (miniatura w .annotation-container), wiec tekst laduje za thumbnailem."
+bad_result = "'popraw z-index' bez wskazania na leak .annotation-container z report-pro.css."
+[[questions.anchors]]
+map_id = "codex__019ec0c7__2026-06-13__89e1cf3c"
+expected_terms = ["annotation-container", "report-pro.css", "manual-frame", "inline-block"]
+terms_match = "any"
+
+[[questions]]
+id = "screenscribe-save-reload-localstorage"
+scope = "screenscribe"
+type = "ask_answer"
+query = "screenscribe gubi moje decyzje review po reloadzie w innej przegladarce - gdzie sie zapisuje human_review?"
+good_result = "/api/save zapisuje human_review do report.json na dysku, ale klient przy starcie czyta draft z localStorage -> decyzje gina na swiezym loadzie; fix = WorkItem + read-state endpoint + hydracja z dysku."
+bad_result = "'wyczysc cache' bez wskazania rozjazdu localStorage vs report.json."
+[[questions.anchors]]
+map_id = "codex__019ec108__2026-06-13__ec2c5ae5"
+expected_terms = ["human_review", "localStorage", "report.json", "/api/save"]
+terms_match = "any"
+
+[[questions]]
+id = "loctree-literal-cache-stale"
+scope = "loctree-suite"
+type = "ask_answer"
+query = "czemu loctree lsp literal cache zwraca stale wyniki po zapisaniu pliku bez commita?"
+good_result = "klucz cache (git_scan_id = branch@short-HEAD) jest na granularnosci committed-HEAD, a scan_literal czyta zywy dysk -> edycja bez commita nie zmienia klucza -> stale."
+bad_result = "'zrestartuj LSP' bez wskazania ze cache key jest na committed HEAD a skan czyta uncommitted dysk."
+[[questions.anchors]]
+map_id = "claude__f3146748__2026-06-06__3cef4590"
+expected_terms = ["LiteralScanCache", "git_scan_id", "scan_literal", "uncommitted"]
+terms_match = "any"
+
+[[questions]]
+id = "loctree-slownet-hero-fallback"
+scope = "loctree-suite"
+type = "evidence"
+query = "loctree landing slow net fallback - po ile ms pokazuje sie static headline i kiedy odpalaja sie reveal jak wasm nie dojedzie?"
+good_result = "static headline po grace 600ms, .reveal fail-open po 1.4s gdy WASM nie wstanie; podwojny headline to celowy a11y (sr-only), nie bug."
+bad_result = "'to bug z podwojnym naglowkiem' zamiast celowego sr-only fallbacku + timingow."
+[[questions.anchors]]
+map_id = "claude__65e6ccc9__2026-06-10__2ec2f3e6"
+expected_terms = ["fail-open", "grace 600ms", "sr-only", "reveal"]
+terms_match = "any"
+
+[[questions]]
+id = "loctree-0124-checksums-signing"
+scope = "loctree"
+type = "ask_answer"
+query = "dlaczego darwin bundle 0.12.3 mial 6/6 failed checksums po rozpakowaniu i jaka jest poprawna kolejnosc podpisywania?"
+good_result = "zywy darwin 0.12.3 ma 6/6 FAILED internal CHECKSUMS (liczone przed codesign) i nic w pipeline tego nie gate'uje; poprawna kolejnosc: codesign -> notarize -> repack -> checksums."
+bad_result = "'przelicz checksumy' bez wyjasnienia ze musza byc PO podpisie."
+anchors_match = "any_of"
+[[questions.anchors]]
+map_id = "claude__20ff45fb__2026-06-11__0b3410d2"
+expected_terms = ["6/6 FAILED", "CHECKSUMS", "codesign"]
+terms_match = "any"
+[[questions.anchors]]
+map_id = "claude__20ff45fb__2026-06-12__5635a8ff"
+expected_terms = ["codesign", "notarize", "repack", "CHECKSUMS"]
+terms_match = "any"

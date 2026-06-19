@@ -1467,6 +1467,7 @@ fn eval_search_quality_lists_seed_matrix_by_default() {
             assert!(args.cases.is_empty());
             assert_eq!(args.top, 3);
             assert_eq!(args.limit, 10);
+            assert!(args.seed.is_none());
             assert!(!args.strict);
         }
         _ => panic!("expected eval search-quality command"),
@@ -1486,6 +1487,8 @@ fn eval_search_quality_accepts_run_flags() {
         "5",
         "--limit",
         "12",
+        "--seed",
+        "tests/retrieval_eval/search_quality_seed.toml",
         "--json",
         "--strict",
     ])
@@ -1505,6 +1508,12 @@ fn eval_search_quality_accepts_run_flags() {
             );
             assert_eq!(args.top, 5);
             assert_eq!(args.limit, 12);
+            assert_eq!(
+                args.seed,
+                Some(PathBuf::from(
+                    "tests/retrieval_eval/search_quality_seed.toml"
+                ))
+            );
             assert!(args.json);
             assert!(args.strict);
         }

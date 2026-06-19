@@ -693,6 +693,10 @@ struct SearchQualityEvalArgs {
     #[arg(long, default_value_t = 10)]
     limit: usize,
 
+    /// Load a custom search-quality seed TOML. Defaults to the embedded curated seed.
+    #[arg(long)]
+    seed: Option<PathBuf>,
+
     /// Emit JSON instead of plain text.
     #[arg(short = 'j', long)]
     json: bool,
@@ -7439,13 +7443,15 @@ fn run_eval_search_quality(args: SearchQualityEvalArgs) -> Result<()> {
         cases,
         top,
         limit,
+        seed,
         json,
         strict,
         aicx_bin,
     } = args;
 
     validate_cli_search_limit(limit)?;
-    let selected = aicx::search_eval::select_search_quality_cases(&cases)?;
+    let seed = aicx::search_eval::load_search_quality_seed(seed.as_deref())?;
+    let selected = aicx::search_eval::select_search_quality_cases(&seed, &cases)?;
 
     if !run {
         if json {
@@ -7457,33 +7463,52 @@ fn run_eval_search_quality(args: SearchQualityEvalArgs) -> Result<()> {
     }
 
     let bin = aicx_bin.unwrap_or(std::env::current_exe()?);
-    let store_root = store::store_base_dir()?.display().to_string();
+    let store_root = store::store_base_dir()?;
+    let project_filters = aicx::search_eval::discover_projects_for_cases(&store_root, &selected)?;
     let mut evaluations = Vec::new();
 
     for case in selected {
-        let output = ProcessCommand::new(&bin)
+        let projects = project_filters.get(&case.id).cloned().unwrap_or_default();
+        if projects.is_empty() {
+            evaluations.push(aicx::search_eval::project_resolution_error_evaluation(
+                case,
+                format!(
+                    "no project buckets found for anchored map_id(s): {}",
+                    case.anchors
+                        .iter()
+                        .map(|anchor| anchor.map_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+            continue;
+        }
+
+        let mut command = ProcessCommand::new(&bin);
+        command
             .arg("search")
-            .arg(case.query)
+            .arg(&case.query)
             .arg("--evidence")
             .arg("--json")
             .arg("--limit")
             .arg(limit.to_string())
-            .arg("-p")
-            .arg(case.project)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| {
-                format!(
-                    "run search-quality case {} using {}",
-                    case.id,
-                    bin.display()
-                )
-            })?;
+            .stderr(Stdio::piped());
+        for project in &projects {
+            command.arg("-p").arg(project);
+        }
+        let output = command.output().with_context(|| {
+            format!(
+                "run search-quality case {} using {}",
+                case.id,
+                bin.display()
+            )
+        })?;
 
         if !output.status.success() {
             evaluations.push(aicx::search_eval::command_error_evaluation(
                 case,
+                projects,
                 output.status.code(),
                 &output.stderr,
             ));
@@ -7492,17 +7517,18 @@ fn run_eval_search_quality(args: SearchQualityEvalArgs) -> Result<()> {
 
         match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
             Ok(payload) => evaluations.push(aicx::search_eval::evaluate_evidence_payload(
-                case, &payload, top,
+                case, projects, &payload, top,
             )),
             Err(err) => evaluations.push(aicx::search_eval::invalid_json_evaluation(
                 case,
+                projects,
                 &err,
                 &output.stdout,
             )),
         }
     }
 
-    let report = aicx::search_eval::build_run_report(store_root, evaluations);
+    let report = aicx::search_eval::build_run_report(store_root.display().to_string(), evaluations);
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
