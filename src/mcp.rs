@@ -313,6 +313,9 @@ pub struct SearchParams {
     pub frame_kind: Option<FrameKind>,
     /// Optional canonical corpus kind filter: conversations, plans, reports, other
     pub kind: Option<String>,
+    /// Return an evidence packet re-ranked by answer/support signals.
+    #[serde(default)]
+    pub evidence: bool,
     /// Return only metadata without full snippet content
     #[serde(default = "default_true")]
     pub slim: bool,
@@ -823,6 +826,36 @@ impl AicxMcpServer {
         let scanned = outcome.scanned;
         let retrieval_status = outcome.retrieval_status.clone();
         let mut results = outcome.results;
+
+        if params.evidence {
+            let report = crate::evidence::build_evidence_report(&query, results, limit);
+            let source_paths_verified = crate::oracle::verify_paths(
+                crate::evidence::evidence_source_paths(&report).map(std::path::Path::to_path_buf),
+            );
+            let oracle_status = if let Some(ref retrieval_status) = retrieval_status {
+                OracleStatus::hybrid_rrf(
+                    &store_root,
+                    retrieval_status,
+                    report.results,
+                    source_paths_verified,
+                )
+            } else {
+                OracleStatus::content_semantic(
+                    &store_root,
+                    scanned,
+                    report.results,
+                    source_paths_verified,
+                )
+            };
+            let rendered = crate::evidence::render_evidence_json(&report, scanned, oracle_status)
+                .map_err(|e| {
+                McpError::internal_error(format!("Serialize evidence search JSON: {e}"), None)
+            })?;
+            let payload =
+                inject_mcp_filter_pushdown_payload(&rendered, pushdown_diagnostic.as_ref())?;
+
+            return Ok(CallToolResult::success(vec![Content::text(payload)]));
+        }
 
         if let Some(sort_order) = params.sort.as_deref() {
             results.sort_by(|a, b| {
@@ -1500,6 +1533,7 @@ mod tests {
             sort: None,
             frame_kind: None,
             kind: None,
+            evidence: false,
             slim: true,
             verbose: false,
         }
@@ -1651,6 +1685,15 @@ mod tests {
         assert!(params.score.is_none());
         assert!(params.hours.is_none());
         assert!(params.date.is_none());
+        assert!(!params.evidence);
+    }
+
+    #[test]
+    fn search_params_roundtrip_accepts_evidence_mode() {
+        let params: SearchParams = serde_json::from_str(r#"{"query":"dashboard","evidence":true}"#)
+            .expect("search params should parse evidence mode");
+
+        assert!(params.evidence);
     }
 
     #[test]

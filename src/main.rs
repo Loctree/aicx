@@ -1405,8 +1405,13 @@ enum Commands {
         kind: Option<String>,
 
         /// Bypass semantic vector search and run filesystem-fuzzy search.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "evidence")]
         no_semantic: bool,
+
+        /// Return an evidence packet: semantic candidates re-ranked by
+        /// answer/support signals, with source sections and diagnostics.
+        #[arg(long)]
+        evidence: bool,
 
         /// Emit compact JSON instead of plain text
         #[arg(short = 'j', long)]
@@ -2372,6 +2377,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             filters,
             kind,
             no_semantic,
+            evidence,
             json,
         }) => {
             run_search(SearchRunArgs {
@@ -2383,6 +2389,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 filters,
                 kind: kind.as_deref(),
                 no_semantic,
+                evidence,
             })?;
         }
         Some(Commands::Index {
@@ -7356,6 +7363,7 @@ struct SearchRunArgs<'a> {
     filters: RetrievalFilters,
     kind: Option<&'a str>,
     no_semantic: bool,
+    evidence: bool,
 }
 
 fn validate_cli_search_limit(limit: usize) -> Result<()> {
@@ -7388,9 +7396,13 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         filters,
         kind,
         no_semantic,
+        evidence,
     } = args;
     let limit = filters.limit.unwrap_or(DEFAULT_RETRIEVAL_LIMIT);
     validate_cli_search_limit(limit)?;
+    if evidence && no_semantic {
+        anyhow::bail!("search --evidence requires semantic search; remove --no-semantic");
+    }
     let kind_filter = kind.and_then(aicx::timeline::Kind::parse);
     // Extract inline date hints from query if no explicit --date given
     let (effective_query, inline_date) = if date.is_none() {
@@ -7502,6 +7514,114 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     // index regression cannot smuggle off-kind hits past the operator.
     if let Some(kind_filter) = kind_filter {
         results.retain(|r| r.kind == kind_filter.dir_name());
+    }
+
+    if evidence {
+        let report = aicx::evidence::build_evidence_report(&search_query, results, limit);
+        let source_paths_verified = aicx::oracle::verify_paths(
+            aicx::evidence::evidence_source_paths(&report).map(Path::to_path_buf),
+        );
+        let oracle_status = match semantic_status.as_ref() {
+            Some((_, _, _, Some(retrieval_status))) => aicx::oracle::OracleStatus::hybrid_rrf(
+                &root,
+                retrieval_status,
+                report.results,
+                source_paths_verified,
+            ),
+            Some((_, _, semantic_scanned, None)) => aicx::oracle::OracleStatus::content_semantic(
+                &root,
+                *semantic_scanned,
+                report.results,
+                source_paths_verified,
+            ),
+            None => aicx::oracle::OracleStatus::filesystem_fuzzy(
+                &root,
+                scanned,
+                report.results,
+                source_paths_verified,
+            ),
+        };
+
+        if json {
+            let rendered = aicx::evidence::render_evidence_json(&report, scanned, oracle_status)?;
+            let mut payload = aicx::search_engine::inject_filter_pushdown_diagnostic(
+                &rendered,
+                pushdown_diagnostic.as_ref(),
+            )?;
+            if let Some(ref fallback) = semantic_fallback {
+                let mut value: serde_json::Value = serde_json::from_str(&payload)?;
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert(
+                        "semantic_fallback".to_string(),
+                        serde_json::json!({
+                            "used": true,
+                            "backend": "filesystem_fuzzy",
+                            "kind": fallback.kind,
+                            "reason": fallback.reason,
+                            "recommendation": fallback.recommendation,
+                        }),
+                    );
+                }
+                payload = serde_json::to_string(&value)?;
+            }
+            println!("{}", payload);
+            return Ok(());
+        }
+
+        if report.items.is_empty() {
+            eprintln!(
+                "No evidence for {:?} (examined {} candidates).",
+                query, report.candidates_examined
+            );
+            return Ok(());
+        }
+
+        print!(
+            "{}",
+            aicx::evidence::render_evidence_text(&report, io::stdout().is_terminal())
+        );
+        let _ = io::stdout().flush();
+
+        if io::stderr().is_terminal() {
+            let base_line = match semantic_status.as_ref() {
+                Some((semantic_backend, semantic_model_id, semantic_scanned, retrieval_status)) => {
+                    aicx::search_engine::render_semantic_status_line(
+                        semantic_backend,
+                        semantic_model_id,
+                        report.results,
+                        *semantic_scanned,
+                        retrieval_status.as_ref(),
+                    )
+                }
+                None => {
+                    let fallback = semantic_fallback
+                        .as_ref()
+                        .map(|notice| format!("semantic_unavailable kind={}", notice.kind))
+                        .unwrap_or_else(|| "operator_requested".to_string());
+                    format!(
+                        "{} evidence result(s) from {} scanned chunks. oracle_status: backend=filesystem_fuzzy index=none fallback={} loctree_scope_safe=false",
+                        report.results, scanned, fallback
+                    )
+                }
+            };
+            let suffix = pushdown_diagnostic
+                .as_ref()
+                .map(|d| {
+                    format!(
+                        " filter_pushdown={} examined={} matched={} requested_limit={}",
+                        d.kind, d.examined, d.matched, d.requested_limit
+                    )
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "\n{} evidence_mode=post_fusion candidates_examined={} suppressed={}{}",
+                base_line,
+                report.candidates_examined,
+                report.suppressed.len(),
+                suffix
+            );
+        }
+        return Ok(());
     }
 
     if let Some(sort_order) = filters.sort {

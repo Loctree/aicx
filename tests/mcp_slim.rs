@@ -15,6 +15,7 @@ use tower::ServiceExt;
 fn test_mcp_slim_defaults() {
     let params: SearchParams = serde_json::from_str(r#"{"query": "test"}"#).unwrap();
     assert_eq!(params.limit, 20);
+    assert!(!params.evidence);
     assert!(params.slim);
     assert!(!params.verbose);
 

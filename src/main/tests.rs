@@ -499,6 +499,7 @@ fn run_search_rejects_limit_over_hard_cap_before_store_access() {
         filters,
         kind: None,
         no_semantic: true,
+        evidence: false,
     })
     .expect_err("oversized search limit must fail before reading the store");
 
@@ -1430,6 +1431,27 @@ fn search_accepts_no_semantic_escape_hatch() {
         }
         _ => panic!("expected search command"),
     }
+}
+
+#[test]
+fn search_accepts_evidence_mode() {
+    let cli = Cli::try_parse_from(["aicx", "search", "dashboard", "--evidence"])
+        .expect("search command with --evidence should parse");
+
+    match cli.command {
+        Some(Commands::Search { evidence, .. }) => {
+            assert!(evidence);
+        }
+        _ => panic!("expected search command"),
+    }
+}
+
+#[test]
+fn search_rejects_evidence_with_no_semantic() {
+    let err = Cli::try_parse_from(["aicx", "search", "dashboard", "--evidence", "--no-semantic"])
+        .expect_err("evidence mode must require semantic search");
+
+    assert!(err.to_string().contains("cannot be used with"));
 }
 
 #[test]

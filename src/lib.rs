@@ -35,6 +35,8 @@ mod diagnostics;
 pub mod doctor;
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub mod embedder;
+#[cfg(feature = "app")]
+pub mod evidence;
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub mod hf_cache;
 pub mod intents;
