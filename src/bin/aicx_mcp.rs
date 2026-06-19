@@ -6,7 +6,7 @@
 //! Usage:
 //!   aicx-mcp                          # stdio transport
 //!   aicx-mcp --transport http         # streamable HTTP on port 8044
-//!   aicx-mcp --transport http --port 9000
+//!   aicx-mcp --transport http --host 0.0.0.0 --port 9000
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
@@ -17,6 +17,7 @@ use std::panic;
 use std::process::ExitCode;
 
 use clap::Parser;
+use std::net::IpAddr;
 
 /// aicx MCP server — AI session context as MCP tools
 #[derive(Parser)]
@@ -28,6 +29,10 @@ struct Args {
     #[arg(long, value_enum, default_value_t = McpTransport::Stdio)]
     transport: McpTransport,
 
+    /// Bind address for streamable HTTP transport.
+    #[arg(long, default_value = "127.0.0.1")]
+    host: IpAddr,
+
     /// Port for streamable HTTP transport
     #[arg(long, default_value = "8044")]
     port: u16,
@@ -37,8 +42,17 @@ struct Args {
     auth_token: Option<String>,
 
     /// Require Bearer auth on HTTP transport (default: true). Pass `--no-require-auth` to opt out.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        conflicts_with = "no_require_auth"
+    )]
     require_auth: bool,
+
+    /// Disable Bearer auth on HTTP transport. Only use on trusted local/tailnet links.
+    #[arg(long = "no-require-auth", action = clap::ArgAction::SetTrue)]
+    no_require_auth: bool,
 }
 
 // Safe stderr logging — never panics, even if stderr is closed.
@@ -96,19 +110,23 @@ fn main() -> ExitCode {
         }
     };
 
-    let auth_config = match auth::load_auth_config(args.auth_token.as_deref(), args.require_auth) {
+    let require_auth = args.require_auth && !args.no_require_auth;
+
+    let auth_config = match auth::load_auth_config(args.auth_token.as_deref(), require_auth) {
         Ok(cfg) => cfg,
         Err(e) => {
             safe_stderr_log(&format!("[aicx-mcp] Failed to load auth config: {e:#}"));
             return ExitCode::FAILURE;
         }
     };
-    if matches!(args.transport, McpTransport::Http) && !args.require_auth {
+    if matches!(args.transport, McpTransport::Http) && !require_auth {
         safe_stderr_log(
             "[aicx-mcp] WARNING: HTTP transport bound without auth (--no-require-auth)",
         );
     }
-    match rt.block_on(async { mcp::run_transport(args.transport, args.port, auth_config).await }) {
+    match rt.block_on(async {
+        mcp::run_transport(args.transport, args.host, args.port, auth_config).await
+    }) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let err_str = format!("{e:?}");
@@ -120,5 +138,55 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory as _;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn http_host_defaults_to_loopback() {
+        let args = Args::try_parse_from(["aicx-mcp", "--transport", "http"])
+            .expect("http transport should parse with default host");
+
+        assert_eq!(args.host, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn http_host_accepts_explicit_bind_address() {
+        let args = Args::try_parse_from([
+            "aicx-mcp",
+            "--transport",
+            "http",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8055",
+        ])
+        .expect("explicit http host should parse");
+
+        assert_eq!(args.host, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(args.port, 8055);
+    }
+
+    #[test]
+    fn http_accepts_no_require_auth_alias() {
+        let args = Args::try_parse_from(["aicx-mcp", "--transport", "http", "--no-require-auth"])
+            .expect("no-require-auth alias should parse");
+
+        assert!(!args.require_auth || args.no_require_auth);
+    }
+
+    #[test]
+    fn help_shows_http_host_flag() {
+        let mut cmd = Args::command();
+        let rendered = cmd.render_long_help().to_string();
+
+        assert!(rendered.contains("--host"));
+        assert!(rendered.contains("Bind address for streamable HTTP transport"));
+        assert!(rendered.contains("--no-require-auth"));
     }
 }

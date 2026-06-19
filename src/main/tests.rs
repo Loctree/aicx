@@ -1861,6 +1861,60 @@ fn serve_accepts_http_and_legacy_sse_transport_names() {
 }
 
 #[test]
+fn serve_http_host_defaults_to_loopback() {
+    let parsed = Cli::try_parse_from(["aicx", "serve", "--transport", "http"])
+        .expect("serve http should parse with default host");
+
+    match parsed.command {
+        Some(Commands::Serve { host, .. }) => {
+            assert_eq!(host, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        }
+        _ => panic!("expected serve command for http transport"),
+    }
+}
+
+#[test]
+fn serve_http_host_accepts_explicit_bind_address() {
+    let parsed = Cli::try_parse_from([
+        "aicx",
+        "serve",
+        "--transport",
+        "http",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8055",
+    ])
+    .expect("serve http should parse explicit host");
+
+    match parsed.command {
+        Some(Commands::Serve { host, port, .. }) => {
+            assert_eq!(host, std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            assert_eq!(port, 8055);
+        }
+        _ => panic!("expected serve command for http transport"),
+    }
+}
+
+#[test]
+fn serve_http_accepts_no_require_auth_alias() {
+    let parsed = Cli::try_parse_from(["aicx", "serve", "--transport", "http", "--no-require-auth"])
+        .expect("serve http should parse no-require-auth alias");
+
+    match parsed.command {
+        Some(Commands::Serve {
+            require_auth,
+            no_require_auth,
+            ..
+        }) => {
+            assert!(require_auth);
+            assert!(no_require_auth);
+        }
+        _ => panic!("expected serve command for http transport"),
+    }
+}
+
+#[test]
 fn serve_help_prefers_http_name_and_stays_compact() {
     let mut cmd = Cli::command();
     let serve = cmd
@@ -1869,10 +1923,13 @@ fn serve_help_prefers_http_name_and_stays_compact() {
     let rendered = serve.render_long_help().to_string();
 
     assert!(rendered.contains("Transport: stdio (default) or http."));
+    assert!(rendered.contains("--host"));
+    assert!(rendered.contains("Bind address for streamable HTTP transport"));
+    assert!(rendered.contains("--no-require-auth"));
     assert!(!rendered.contains("Transport: stdio (default) or sse"));
     assert!(!rendered.contains("embedding mode"));
     assert!(
-        rendered.lines().count() < 30,
+        rendered.lines().count() < 40,
         "serve help should stay compact"
     );
 }

@@ -1335,6 +1335,10 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = McpTransport::Stdio)]
         transport: McpTransport,
 
+        /// Bind address for streamable HTTP transport (default: 127.0.0.1)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: std::net::IpAddr,
+
         /// Port for streamable HTTP transport (default: 8044)
         #[arg(long, default_value = "8044")]
         port: u16,
@@ -1344,8 +1348,17 @@ enum Commands {
         auth_token: Option<String>,
 
         /// Require Bearer auth on HTTP transport (default: true). Pass `--no-require-auth` to opt out.
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        #[arg(
+            long,
+            default_value_t = true,
+            action = clap::ArgAction::Set,
+            conflicts_with = "no_require_auth"
+        )]
         require_auth: bool,
+
+        /// Disable Bearer auth on HTTP transport. Only use on trusted local/tailnet links.
+        #[arg(long = "no-require-auth", action = clap::ArgAction::SetTrue)]
+        no_require_auth: bool,
     },
 
     #[command(
@@ -2404,10 +2417,13 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }
         Some(Commands::Serve {
             transport,
+            host,
             port,
             auth_token,
             require_auth,
+            no_require_auth,
         }) => {
+            let require_auth = require_auth && !no_require_auth;
             let auth_config = aicx::auth::load_auth_config(auth_token.as_deref(), require_auth)?;
             if matches!(transport, McpTransport::Http) && !require_auth {
                 eprintln!(
@@ -2415,7 +2431,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 );
             }
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async { mcp::run_transport(transport, port, auth_config).await })?;
+            rt.block_on(async { mcp::run_transport(transport, host, port, auth_config).await })?;
         }
         Some(Commands::Search {
             query,

@@ -1377,15 +1377,19 @@ pub async fn run_stdio() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run MCP server over streamable HTTP transport on given port with the given auth state.
-pub async fn run_http(port: u16, auth_config: AuthConfig) -> anyhow::Result<()> {
+/// Run MCP server over streamable HTTP transport on the given host/port with the given auth state.
+pub async fn run_http(
+    host: std::net::IpAddr,
+    port: u16,
+    auth_config: AuthConfig,
+) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .try_init()
         .ok();
 
-    let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
+    let addr = std::net::SocketAddr::new(host, port);
 
     let auth_source_label = auth_config.source.describe();
     let auth_enforced = auth_config.is_enforced();
@@ -1446,18 +1450,24 @@ pub async fn run_http(port: u16, auth_config: AuthConfig) -> anyhow::Result<()> 
 
 /// Legacy compatibility wrapper for callers that still use the old `run_sse` name.
 pub async fn run_sse(port: u16, auth_config: AuthConfig) -> anyhow::Result<()> {
-    run_http(port, auth_config).await
+    run_http(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        auth_config,
+    )
+    .await
 }
 
 /// Run the selected MCP transport. Stdio bypasses HTTP auth (no network surface).
 pub async fn run_transport(
     transport: McpTransport,
+    host: std::net::IpAddr,
     port: u16,
     auth_config: AuthConfig,
 ) -> anyhow::Result<()> {
     match transport {
         McpTransport::Stdio => run_stdio().await,
-        McpTransport::Http => run_http(port, auth_config).await,
+        McpTransport::Http => run_http(host, port, auth_config).await,
     }
 }
 
