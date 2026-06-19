@@ -1420,8 +1420,9 @@ enum Commands {
     /// chunks from source sessions, then embed only sidecars whose mtime is
     /// newer than the existing index `header.generated_at`; new rows are
     /// appended to the committed index file. With no `-p`, AICX builds the
-    /// `_all` index for global search and derives project buckets from it so
-    /// `aicx search -p <project>` works without extra setup. Pass
+    /// `_all` index used by global search and project-scoped `search -p`
+    /// queries. Optional per-project buckets can be derived later with
+    /// `aicx index derive -p <project>` as a local cache. Pass
     /// `--full-rescan` to re-embed every chunk from scratch — useful when
     /// the embedder model changes, the index file is corrupt, or an
     /// operator wants a deterministic from-zero rebuild.
@@ -1430,7 +1431,7 @@ enum Commands {
         #[command(subcommand)]
         action: Option<IndexAction>,
 
-        /// Project filter. Omit to index every project and derive project buckets.
+        /// Project filter. Omit to index the global `_all` bucket.
         ///
         /// Accepted forms (case-insensitive, repeatable):
         ///   `-p owner/repo`   strict `<owner>/<repo>` slug match
@@ -7901,24 +7902,6 @@ fn run_index(
         reports.push((scope.map(ToString::to_string), stats));
     }
 
-    let auto_derived_project_reports = if !dry_run
-        && projects.is_empty()
-        && sample == 0
-        && reports
-            .iter()
-            .any(|(project, stats)| project.is_none() && stats.index_path.is_some())
-    {
-        if !json {
-            eprintln!("\nProject buckets: deriving all project-scoped indexes from `_all`");
-        }
-        Some(derive_project_bucket_reports(&[])?)
-    } else {
-        if !dry_run && projects.is_empty() && sample != 0 && !json {
-            eprintln!("\nProject buckets: skipped because --sample wrote a partial `_all` index");
-        }
-        None
-    };
-
     if json {
         if reports.len() == 1 {
             println!("{}", aicx::vector_index::render_stats_json(&reports[0].1)?);
@@ -7952,9 +7935,6 @@ fn run_index(
             if let Some(path) = &stats.index_path {
                 eprintln!("\n  index_path:          {}", path.display());
             }
-        }
-        if let Some(project_reports) = &auto_derived_project_reports {
-            print_index_derive_reports(project_reports);
         }
     }
     Ok(())

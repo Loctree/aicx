@@ -47,9 +47,9 @@ pub struct SemanticSearchOutcome {
 pub type SemanticOutcome = SemanticSearchOutcome;
 
 const BACKEND_HYBRID_RRF: &str = "hybrid_rrf";
-const BACKEND_HYBRID_RRF_ALL_FALLBACK: &str = "hybrid_rrf_all_fallback";
+const BACKEND_HYBRID_RRF_GLOBAL_SCOPED: &str = "hybrid_rrf_global_scoped";
 const BACKEND_SEMANTIC_DENSE_ONLY: &str = "semantic_dense_only";
-const BACKEND_SEMANTIC_DENSE_ONLY_ALL_FALLBACK: &str = "semantic_dense_only_all_fallback";
+const BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED: &str = "semantic_dense_only_global_scoped";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HybridRetrievalStatus {
@@ -276,7 +276,7 @@ pub fn try_semantic_search(
         // outcome reports the degraded backend instead of silently claiming
         // hybrid — the degraded status must reach the CLI/MCP boundary.
         let mut any_dense_only = false;
-        let mut any_all_bucket_fallback = false;
+        let mut any_global_project_scope = false;
         for scope in scopes {
             let mut outcome = try_semantic_search_native(
                 query,
@@ -291,8 +291,8 @@ pub fn try_semantic_search(
             {
                 any_dense_only = true;
             }
-            if outcome.backend_label.ends_with("_all_fallback") {
-                any_all_bucket_fallback = true;
+            if outcome.backend_label.ends_with("_global_scoped") {
+                any_global_project_scope = true;
             }
             scanned += outcome.scanned;
             model_id.get_or_insert(outcome.model_id.clone());
@@ -306,12 +306,12 @@ pub fn try_semantic_search(
         Ok(SemanticOutcome {
             results: merged_results,
             scanned,
-            backend_label: if any_dense_only && any_all_bucket_fallback {
-                BACKEND_SEMANTIC_DENSE_ONLY_ALL_FALLBACK
+            backend_label: if any_dense_only && any_global_project_scope {
+                BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
             } else if any_dense_only {
                 BACKEND_SEMANTIC_DENSE_ONLY
-            } else if any_all_bucket_fallback {
-                BACKEND_HYBRID_RRF_ALL_FALLBACK
+            } else if any_global_project_scope {
+                BACKEND_HYBRID_RRF_GLOBAL_SCOPED
             } else {
                 BACKEND_HYBRID_RRF
             },
@@ -327,7 +327,7 @@ struct SemanticBucketScope<'a> {
     index_project: Option<&'a str>,
     retrieval_project_filter: Option<&'a str>,
     index_path: std::path::PathBuf,
-    used_all_bucket_fallback: bool,
+    used_global_project_scope: bool,
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -340,9 +340,14 @@ struct SemanticRetrievalFilters<'a> {
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn index_not_built_error(path: std::path::PathBuf, project_filter: Option<&str>) -> SemanticError {
-    let cmd = match project_filter {
-        Some(p) => format!("aicx index --project {p}"),
-        None => "aicx index".to_string(),
+    let recommendation = match project_filter {
+        Some(p) => format!(
+            "run `aicx index` to build the global index used by `search -p {p}`; \
+             optionally run `aicx index --project {p}` to materialize a local project cache"
+        ),
+        None => {
+            "run `aicx index` (one-off; subsequent runs query the index in-process)".to_string()
+        }
     };
     let legacy_hint = legacy_index_hint(project_filter, &path)
         .map(|hint| format!(" {hint}"))
@@ -354,9 +359,7 @@ fn index_not_built_error(path: std::path::PathBuf, project_filter: Option<&str>)
             path.display(),
             legacy_hint
         ),
-        recommendation: format!(
-            "run `{cmd}` (one-off; subsequent runs query the index in-process)"
-        ),
+        recommendation,
     }
 }
 
@@ -390,7 +393,7 @@ fn select_semantic_bucket_scope<'a>(
             // a defensive guard against stale or mixed-project artifacts.
             retrieval_project_filter: project_filter,
             index_path: project_index_path,
-            used_all_bucket_fallback: false,
+            used_global_project_scope: false,
         });
     }
 
@@ -400,7 +403,7 @@ fn select_semantic_bucket_scope<'a>(
                 index_project: None,
                 retrieval_project_filter: Some(project),
                 index_path: all_index_path,
-                used_all_bucket_fallback: true,
+                used_global_project_scope: true,
             });
         }
         return Err(index_not_built_error(project_index_path, project_filter));
@@ -601,7 +604,7 @@ fn try_semantic_search_native(
                     limit,
                     retrieval_filters,
                     &info.model_id,
-                    scope.used_all_bucket_fallback,
+                    scope.used_global_project_scope,
                 );
             }
             Err(other) => return Err(other),
@@ -617,7 +620,7 @@ fn try_semantic_search_native(
             limit,
             retrieval_filters,
             &info.model_id,
-            scope.used_all_bucket_fallback,
+            scope.used_global_project_scope,
         );
     };
     let manifest = hybrid.manifest().cloned();
@@ -662,8 +665,8 @@ fn try_semantic_search_native(
             let path = hit_path(&h);
             let score_pct = hybrid_score_pct(h.score);
             let matched_lines = semantic_preview_lines(&path);
-            let label_backend = if scope.used_all_bucket_fallback {
-                BACKEND_HYBRID_RRF_ALL_FALLBACK
+            let label_backend = if scope.used_global_project_scope {
+                BACKEND_HYBRID_RRF_GLOBAL_SCOPED
             } else {
                 BACKEND_HYBRID_RRF
             };
@@ -690,8 +693,8 @@ fn try_semantic_search_native(
     Ok(SemanticOutcome {
         results,
         scanned,
-        backend_label: if scope.used_all_bucket_fallback {
-            BACKEND_HYBRID_RRF_ALL_FALLBACK
+        backend_label: if scope.used_global_project_scope {
+            BACKEND_HYBRID_RRF_GLOBAL_SCOPED
         } else {
             BACKEND_HYBRID_RRF
         },
@@ -803,7 +806,7 @@ fn query_dense_only_from_primary(
     limit: usize,
     filters: SemanticRetrievalFilters<'_>,
     model_id: &str,
-    used_all_bucket_fallback: bool,
+    used_global_project_scope: bool,
 ) -> std::result::Result<SemanticOutcome, SemanticError> {
     use aicx_retrieve::{BruteForceAdapter, ChunkRef, DenseChunkRef, DenseIndex, Distance};
 
@@ -896,8 +899,8 @@ fn query_dense_only_from_primary(
             let path = hit_path(&h);
             let score_pct = dense_score_pct(h.score);
             let matched_lines = semantic_preview_lines(&path);
-            let label = if used_all_bucket_fallback {
-                format!("dense_only_all_fallback:{}", h.chunk_id)
+            let label = if used_global_project_scope {
+                format!("dense_only_global_scoped:{}", h.chunk_id)
             } else {
                 format!("dense_only:{}", h.chunk_id)
             };
@@ -923,8 +926,8 @@ fn query_dense_only_from_primary(
     Ok(SemanticOutcome {
         results,
         scanned,
-        backend_label: if used_all_bucket_fallback {
-            BACKEND_SEMANTIC_DENSE_ONLY_ALL_FALLBACK
+        backend_label: if used_global_project_scope {
+            BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
         } else {
             BACKEND_SEMANTIC_DENSE_ONLY
         },
@@ -1622,17 +1625,32 @@ pub fn render_semantic_status_line(
     // and that this is a fallback, not the full stack.
     let dense_only = backend_label.starts_with(BACKEND_SEMANTIC_DENSE_ONLY);
     let all_bucket_fallback = backend_label.ends_with("_all_fallback");
-    let (prefix, index_label, fallback_label) = if dense_only && all_bucket_fallback {
-        ("[degraded] ", "dense_only", "hybrid_unavailable,all_bucket")
+    let global_project_scope = backend_label.ends_with("_global_scoped");
+    let (prefix, index_label, fallback_label, scope_label) = if dense_only && all_bucket_fallback {
+        (
+            "[degraded] ",
+            "dense_only",
+            "hybrid_unavailable,all_bucket",
+            "",
+        )
+    } else if dense_only && global_project_scope {
+        (
+            "[degraded] ",
+            "dense_only",
+            "hybrid_unavailable",
+            " scope=global_project_filter",
+        )
     } else if dense_only {
-        ("[degraded] ", "dense_only", "hybrid_unavailable")
+        ("[degraded] ", "dense_only", "hybrid_unavailable", "")
     } else if all_bucket_fallback {
-        ("", "hybrid", "all_bucket")
+        ("", "hybrid", "all_bucket", "")
+    } else if global_project_scope {
+        ("", "hybrid", "none", " scope=global_project_filter")
     } else {
-        ("", "hybrid", "none")
+        ("", "hybrid", "none", "")
     };
     format!(
-        "{}{} result(s) from {} candidate chunks. oracle_status: backend={} index={} fallback={} model={} loctree_scope_safe=true{}",
+        "{}{} result(s) from {} candidate chunks. oracle_status: backend={} index={} fallback={} model={} loctree_scope_safe=true{}{}",
         prefix,
         result_count,
         scanned,
@@ -1640,6 +1658,7 @@ pub fn render_semantic_status_line(
         index_label,
         fallback_label,
         model_id,
+        scope_label,
         manifest
     )
 }
@@ -1809,35 +1828,34 @@ mod tests {
     }
 
     #[test]
-    fn semantic_status_line_marks_hybrid_all_bucket_fallback() {
+    fn semantic_status_line_marks_hybrid_global_project_scope() {
         let line = render_semantic_status_line(
-            BACKEND_HYBRID_RRF_ALL_FALLBACK,
+            BACKEND_HYBRID_RRF_GLOBAL_SCOPED,
             "qwen3-embedding:8b",
             10,
             259_007,
             None,
         );
 
-        assert!(line.contains("backend=hybrid_rrf_all_fallback"));
+        assert!(line.contains("backend=hybrid_rrf_global_scoped"));
         assert!(line.contains("index=hybrid"));
-        assert!(line.contains("fallback=all_bucket"));
+        assert!(line.contains("fallback=none"));
+        assert!(line.contains("scope=global_project_filter"));
         assert!(
             !line.contains("degraded"),
-            "all-bucket hybrid fallback should be observable without claiming degraded dense-only: {line}"
+            "global-scoped hybrid search should not claim degraded dense-only: {line}"
         );
     }
 
     /// F1 regression: project-scoped semantic search may run on a host where
-    /// only the cross-project `_all` bucket is materialized. In that case the
-    /// search path should fall back to `_all`, while keeping the requested
-    /// project as a strict retrieval filter.
+    /// only the cross-project `_all` bucket is materialized. In that case `_all`
+    /// is the canonical global index, and the requested project stays a strict
+    /// retrieval filter.
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
-    fn project_bucket_missing_falls_back_to_all_with_project_filter() {
-        let dir = std::env::temp_dir().join(format!(
-            "aicx-semantic-scope-fallback-{}",
-            std::process::id()
-        ));
+    fn project_bucket_missing_uses_global_index_with_project_filter() {
+        let dir =
+            std::env::temp_dir().join(format!("aicx-semantic-global-scope-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let project_index_path = dir.join("vetcoders_vista").join("embeddings.ndjson");
@@ -1856,19 +1874,20 @@ mod tests {
         assert_eq!(scope.index_project, None);
         assert_eq!(scope.retrieval_project_filter, Some("vetcoders/vista"));
         assert!(
-            scope.used_all_bucket_fallback,
-            "scope should explicitly mark the _all fallback"
+            scope.used_global_project_scope,
+            "scope should explicitly mark the global project filter path"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// F1 regression: when dense-only fallback queries `_all`, project
-    /// filtering must happen inside retrieval before top-N selection. A very
-    /// close hit from another project must not crowd out the requested project.
+    /// F1 regression: when dense-only fallback queries the global `_all` index,
+    /// project filtering must happen inside retrieval before top-N selection. A
+    /// very close hit from another project must not crowd out the requested
+    /// project.
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
-    fn dense_only_all_bucket_project_filter_is_strict_before_limit() {
+    fn dense_only_global_index_project_filter_is_strict_before_limit() {
         use crate::vector_index::{IndexEntry, IndexHeader};
         use std::io::Write;
 
@@ -1942,7 +1961,7 @@ mod tests {
             "test-model",
             false,
         )
-        .expect("dense-only _all query should retain requested project hits");
+        .expect("dense-only global query should retain requested project hits");
 
         assert_eq!(outcome.results.len(), 1);
         assert_eq!(outcome.results[0].project, "vetcoders/vista");
@@ -2038,7 +2057,7 @@ mod tests {
 
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
-    fn dense_only_all_bucket_fallback_labels_backend_explicitly() {
+    fn dense_only_global_scope_labels_backend_explicitly() {
         use crate::vector_index::{IndexEntry, IndexHeader};
         use std::io::Write;
 
@@ -2086,17 +2105,17 @@ mod tests {
             "test-model",
             true,
         )
-        .expect("dense-only all-bucket fallback should succeed");
+        .expect("dense-only global scoped query should succeed");
 
         assert_eq!(
             outcome.backend_label,
-            BACKEND_SEMANTIC_DENSE_ONLY_ALL_FALLBACK
+            BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
         );
         assert!(
             outcome.results[0]
                 .label
-                .starts_with("dense_only_all_fallback:"),
-            "all-bucket fallback hit label should be explicit, got {}",
+                .starts_with("dense_only_global_scoped:"),
+            "global-scoped hit label should be explicit, got {}",
             outcome.results[0].label
         );
 
