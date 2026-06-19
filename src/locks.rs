@@ -1,7 +1,8 @@
 //! Cross-process advisory locks for the shared `~/.aicx` store.
 //!
-//! The lock files live in `~/.aicx/locks/` and use POSIX fcntl record locks
-//! so separate CLI/MCP processes serialize writes to shared state.
+//! The lock files live in `~/.aicx/locks/` and use platform-specific advisory
+//! file locks (POSIX fcntl on Unix, LockFileEx on Windows) so separate
+//! CLI/MCP processes serialize writes to shared state.
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -9,7 +10,10 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
@@ -42,7 +46,7 @@ impl Drop for LockHandle {
         {
             let _ = fs::remove_file(&sidecar.path);
         }
-        let _ = fcntl_unlock(&self.file);
+        let _ = os_unlock(&self.file);
         self.local_guard.take();
     }
 }
@@ -117,7 +121,7 @@ fn acquire_with_timeout(path: &Path, mode: LockMode, timeout: Duration) -> Resul
     let local_guard = acquire_local(path.to_path_buf(), mode, deadline)?;
 
     loop {
-        match fcntl_try_lock(&file, path, mode) {
+        match os_try_lock(&file, path, mode) {
             Ok(()) => {
                 let holder_sidecar = write_holder(&mut file, path, mode)?;
                 return Ok(LockHandle {
@@ -386,6 +390,7 @@ fn epoch_seconds(time: SystemTime) -> Result<u64> {
         .as_secs())
 }
 
+#[cfg(unix)]
 fn pid_is_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -399,7 +404,27 @@ fn pid_is_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
-fn fcntl_try_lock(file: &File, path: &Path, mode: LockMode) -> Result<()> {
+#[cfg(windows)]
+fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    // PROCESS_QUERY_LIMITED_INFORMATION is sufficient to probe existence.
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    // ERROR_ACCESS_DENIED means the process exists but we lack permission.
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    // SAFETY: FFI call; returned handle is valid when non-null.
+    let handle =
+        unsafe { windows_ffi::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED);
+    }
+    unsafe { windows_ffi::CloseHandle(handle) };
+    true
+}
+
+#[cfg(unix)]
+fn os_try_lock(file: &File, path: &Path, mode: LockMode) -> Result<()> {
     #[cfg(not(test))]
     let _ = path;
 
@@ -415,10 +440,12 @@ fn fcntl_try_lock(file: &File, path: &Path, mode: LockMode) -> Result<()> {
     fcntl_set_lock(file, lock_type as libc::c_short)
 }
 
-fn fcntl_unlock(file: &File) -> Result<()> {
+#[cfg(unix)]
+fn os_unlock(file: &File) -> Result<()> {
     fcntl_set_lock(file, libc::F_UNLCK as libc::c_short)
 }
 
+#[cfg(unix)]
 fn fcntl_set_lock(file: &File, lock_type: libc::c_short) -> Result<()> {
     let mut lock = libc::flock {
         l_type: lock_type,
@@ -437,10 +464,129 @@ fn fcntl_set_lock(file: &File, lock_type: libc::c_short) -> Result<()> {
     }
 }
 
+#[cfg(windows)]
+fn os_try_lock(file: &File, path: &Path, mode: LockMode) -> Result<()> {
+    #[cfg(not(test))]
+    let _ = path;
+
+    #[cfg(test)]
+    if forced_would_block(path) {
+        // Simulate a lock-violation error so lock_would_block detects it.
+        return Err(std::io::Error::from_raw_os_error(windows_ffi::ERROR_LOCK_VIOLATION).into());
+    }
+
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x00000001;
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x00000002;
+
+    let flags = LOCKFILE_FAIL_IMMEDIATELY
+        | match mode {
+            LockMode::Exclusive => LOCKFILE_EXCLUSIVE_LOCK,
+            LockMode::Shared => 0,
+        };
+
+    let mut overlapped = windows_ffi::OVERLAPPED {
+        internal: 0,
+        internal_high: 0,
+        offset: 0,
+        offset_high: 0,
+        h_event: std::ptr::null_mut(),
+    };
+
+    // SAFETY: `file` is a valid open handle; `overlapped` is a properly
+    // zeroed structure valid for the lifetime of the call.
+    let result = unsafe {
+        windows_ffi::LockFileEx(
+            file.as_raw_handle().cast(),
+            flags,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn os_unlock(file: &File) -> Result<()> {
+    // SAFETY: `file` is a valid open handle.
+    let result = unsafe {
+        windows_ffi::UnlockFile(file.as_raw_handle().cast(), 0, 0, u32::MAX, u32::MAX)
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 fn lock_would_block(err: &anyhow::Error) -> bool {
     err.downcast_ref::<std::io::Error>()
         .and_then(std::io::Error::raw_os_error)
         .is_some_and(|code| code == libc::EACCES || code == libc::EAGAIN)
+}
+
+#[cfg(windows)]
+fn lock_would_block(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+        .is_some_and(|code| code == windows_ffi::ERROR_LOCK_VIOLATION)
+}
+
+/// Windows-only FFI declarations for file-locking and process-existence APIs.
+#[cfg(windows)]
+mod windows_ffi {
+    use std::ffi::c_void;
+
+    pub const ERROR_LOCK_VIOLATION: i32 = 33;
+
+    /// Mirror of the Win32 `OVERLAPPED` structure used by `LockFileEx`.
+    /// Only the `Offset`/`OffsetHigh` fields (union first member) and
+    /// `hEvent` matter for our non-async usage; all others must be zero.
+    #[repr(C)]
+    pub struct OVERLAPPED {
+        pub internal: usize,
+        pub internal_high: usize,
+        pub offset: u32,
+        pub offset_high: u32,
+        pub h_event: *mut c_void,
+    }
+
+    // SAFETY: OVERLAPPED contains only plain integer fields and a raw pointer.
+    // It is never shared across threads without synchronisation.
+    unsafe impl Send for OVERLAPPED {}
+
+    extern "system" {
+        pub fn LockFileEx(
+            h_file: *mut c_void,
+            dw_flags: u32,
+            dw_reserved: u32,
+            n_number_of_bytes_to_lock_low: u32,
+            n_number_of_bytes_to_lock_high: u32,
+            lp_overlapped: *mut OVERLAPPED,
+        ) -> i32;
+
+        pub fn UnlockFile(
+            h_file: *mut c_void,
+            dw_file_offset_low: u32,
+            dw_file_offset_high: u32,
+            n_number_of_bytes_to_unlock_low: u32,
+            n_number_of_bytes_to_unlock_high: u32,
+        ) -> i32;
+
+        pub fn OpenProcess(
+            dw_desired_access: u32,
+            b_inherit_handle: i32,
+            dw_process_id: u32,
+        ) -> *mut c_void;
+
+        pub fn CloseHandle(h_object: *mut c_void) -> i32;
+    }
 }
 
 impl LockMode {
