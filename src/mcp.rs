@@ -1406,7 +1406,8 @@ pub async fn run_http(
         "mcp server starting (http)"
     );
 
-    let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default();
+    let config = streamable_http_config_for_bind(host);
+    let allowed_hosts = config.allowed_hosts.clone();
     let session_manager = configured_mcp_session_manager();
     spawn_mcp_session_cleanup(session_manager.clone(), MCP_SESSION_SWEEP_INTERVAL);
     let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
@@ -1415,13 +1416,18 @@ pub async fn run_http(
         config,
     );
 
-    let mcp_router = axum::Router::new().route(
-        "/mcp",
-        axum::routing::any(move |req: axum::http::Request<axum::body::Body>| {
-            let svc = service.clone();
-            async move { svc.handle(req).await }
-        }),
-    );
+    let mcp_router = axum::Router::new()
+        .route(
+            "/mcp",
+            axum::routing::any(move |req: axum::http::Request<axum::body::Body>| {
+                let svc = service.clone();
+                async move { svc.handle(req).await }
+            }),
+        )
+        .route(
+            "/health",
+            axum::routing::get(|| async { axum::http::StatusCode::OK }),
+        );
 
     let app = auth::require_auth_layer(mcp_router, auth_config);
 
@@ -1431,7 +1437,18 @@ pub async fn run_http(
 
     eprintln!("aicx MCP server running (streamable HTTP)");
     eprintln!("  Endpoint: http://{addr}/mcp");
+    eprintln!("  Health: http://{addr}/health");
     eprintln!("  Transport: Streamable HTTP (POST + GET /mcp)");
+    if allowed_hosts.is_empty() {
+        eprintln!(
+            "  Host validation: DISABLED because --host is an all-interfaces bind; use only on trusted local/tailnet links"
+        );
+    } else {
+        eprintln!(
+            "  Host validation: allowed Host headers: {}",
+            allowed_hosts.join(", ")
+        );
+    }
     if auth_enforced {
         eprintln!("  Auth: enabled (source: {auth_source_label})");
     } else {
@@ -1446,6 +1463,26 @@ pub async fn run_http(
     )
     .await
     .map_err(|e| anyhow::anyhow!("MCP HTTP server error: {e}"))
+}
+
+fn streamable_http_config_for_bind(
+    host: std::net::IpAddr,
+) -> rmcp::transport::streamable_http_server::StreamableHttpServerConfig {
+    let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default();
+    if host.is_unspecified() {
+        // `0.0.0.0`/`::` means clients will use a real interface address in
+        // the Host header. Without an explicit operator-provided hostname list
+        // there is no single authority to add, so this all-interfaces mode
+        // intentionally follows the operator's trust boundary.
+        return config.disable_allowed_hosts();
+    }
+
+    let mut allowed_hosts = config.allowed_hosts.clone();
+    let host = host.to_string();
+    if !allowed_hosts.iter().any(|allowed| allowed == &host) {
+        allowed_hosts.push(host);
+    }
+    config.with_allowed_hosts(allowed_hosts)
 }
 
 /// Legacy compatibility wrapper for callers that still use the old `run_sse` name.
@@ -1518,7 +1555,8 @@ mod tests {
         MCP_SESSION_SWEEP_INTERVAL, McpTransport, RankItem, RankResponse, SearchParams,
         SteerResponse, background_refresh_args, build_mcp_semantic_filters,
         configured_mcp_session_manager, inject_mcp_filter_pushdown_payload, parse_date_filter_mcp,
-        spawn_mcp_session_cleanup, validate_score_filter, validate_string_len,
+        spawn_mcp_session_cleanup, streamable_http_config_for_bind, validate_score_filter,
+        validate_string_len,
     };
     use crate::oracle::OracleStatus;
     use clap::ValueEnum as _;
@@ -1907,6 +1945,36 @@ mod tests {
         );
         assert_eq!(manager.max_sessions, MCP_SESSION_MAX_SESSIONS);
         assert_eq!(MCP_SESSION_SWEEP_INTERVAL, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_mcp_http_config_allows_explicit_non_loopback_host() {
+        let host = std::net::IpAddr::from([100u8, 75, 30, 90]);
+        let config = streamable_http_config_for_bind(host);
+
+        assert!(
+            config
+                .allowed_hosts
+                .iter()
+                .any(|allowed| allowed == "127.0.0.1")
+        );
+        assert!(
+            config
+                .allowed_hosts
+                .iter()
+                .any(|allowed| allowed == "100.75.30.90")
+        );
+    }
+
+    #[test]
+    fn test_mcp_http_config_disables_host_guard_for_all_interfaces_bind() {
+        let host = std::net::IpAddr::from([0u8, 0, 0, 0]);
+        let config = streamable_http_config_for_bind(host);
+
+        assert!(
+            config.allowed_hosts.is_empty(),
+            "0.0.0.0 needs to accept real interface Host headers such as Tailscale IPs"
+        );
     }
 
     #[test]
