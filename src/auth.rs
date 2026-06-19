@@ -113,7 +113,7 @@ pub fn load_auth_config(cli_token: Option<&str>, require_auth: bool) -> Result<A
 
     let path = default_token_path()?;
     if path.exists() {
-        let content = std::fs::read_to_string(&path)
+        let content = crate::sanitize::read_to_string_validated(&path)
             .with_context(|| format!("Read auth token file {}", path.display()))?;
         let token = content.trim().to_string();
         if !token.is_empty() {
