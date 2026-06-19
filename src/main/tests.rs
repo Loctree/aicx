@@ -1574,6 +1574,7 @@ fn index_derive_accepts_project_filters() {
             action:
                 Some(IndexAction::Derive {
                     project,
+                    all_projects: false,
                     json: false,
                 }),
             ..
@@ -1581,6 +1582,27 @@ fn index_derive_accepts_project_filters() {
             assert_eq!(project, vec!["vista", "vetcoders/aicx"]);
         }
         _ => panic!("expected index derive command"),
+    }
+}
+
+#[test]
+fn index_derive_accepts_all_projects() {
+    let cli = Cli::try_parse_from(["aicx", "index", "derive", "--all-projects"])
+        .expect("index derive should accept all-projects mode");
+
+    match cli.command {
+        Some(Commands::Index {
+            action:
+                Some(IndexAction::Derive {
+                    project,
+                    all_projects: true,
+                    json: false,
+                }),
+            ..
+        }) => {
+            assert!(project.is_empty());
+        }
+        _ => panic!("expected index derive all-projects command"),
     }
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -445,6 +446,73 @@ fn derive_project_index_from_all_streams_matching_rows_only() {
             .all(|entry| entry.project == "vetcoders/Vista"),
         "derived bucket must not include other projects: {derived_entries:?}"
     );
+
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[test]
+fn derive_project_indexes_from_all_materializes_every_project_in_one_call() {
+    let home = tempdir_for_test();
+    let _guard = ScopedAicxHome::set(&home);
+    std::fs::create_dir_all(home.join("locks")).expect("create locks dir");
+
+    let all_index = index_path(None).expect("all index path");
+    std::fs::create_dir_all(all_index.parent().unwrap()).expect("create all index dir");
+
+    let header = IndexHeader {
+        schema_version: INDEX_SCHEMA_VERSION.to_string(),
+        model_id: "test-model".to_string(),
+        model_profile: "base".to_string(),
+        dimension: 2,
+        generated_at: "2026-06-01T00:00:00Z".to_string(),
+        entry_count: 4,
+    };
+    let mk_entry = |id: &str, project: &str| IndexEntry {
+        id: id.to_string(),
+        project: project.to_string(),
+        agent: "codex".to_string(),
+        date: "20260601".to_string(),
+        path: home.join("store").join(format!("{id}.md")),
+        kind: "conversations".to_string(),
+        session_id: format!("session-{id}"),
+        frame_kind: Some("user_msg".to_string()),
+        cwd: None,
+        embedding: vec![1.0, 0.0],
+    };
+    let rows = [
+        mk_entry("vista-1", "vetcoders/Vista"),
+        mk_entry("blackbox-1", "m-szymanska/agent-blackbox"),
+        mk_entry("vista-2", "vetcoders/Vista"),
+        mk_entry("blackbox-2", "m-szymanska/agent-blackbox"),
+    ];
+    let mut body = serde_json::to_string(&header).unwrap();
+    body.push('\n');
+    for row in rows {
+        body.push_str(&serde_json::to_string(&row).unwrap());
+        body.push('\n');
+    }
+    std::fs::write(&all_index, body).expect("write synthetic all index");
+
+    let stats = derive_project_indexes_from_all(&[]).expect("derive every project");
+    let projects: HashSet<_> = stats.iter().map(|stat| stat.project.as_str()).collect();
+    assert_eq!(
+        projects,
+        HashSet::from(["vetcoders/Vista", "m-szymanska/agent-blackbox"])
+    );
+    assert!(stats.iter().all(|stat| stat.entries_written == 2));
+
+    for project in ["vetcoders/Vista", "m-szymanska/agent-blackbox"] {
+        let project_index = index_path(Some(project)).expect("project index path");
+        let (derived_header, derived_entries) =
+            read_committed_index_entries(&project_index).expect("read derived project index");
+        assert_eq!(derived_header.entry_count, 2);
+        assert_eq!(derived_entries.len(), 2);
+        assert!(
+            derived_entries.iter().all(|entry| entry.project == project),
+            "derived bucket for {project} must not include other projects: {derived_entries:?}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(home);
 }

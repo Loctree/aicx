@@ -655,9 +655,13 @@ enum IndexAction {
     },
     /// Derive project-scoped semantic buckets from the existing `_all` index without re-embedding.
     Derive {
-        /// Strict project filter, repeatable. Requires at least one project.
+        /// Strict project filter, repeatable. Omit only with --all-projects.
         #[arg(short, long, value_delimiter = ',')]
         project: Vec<String>,
+
+        /// Derive buckets for every project present in the existing `_all` index.
+        #[arg(long, conflicts_with = "project")]
+        all_projects: bool,
 
         /// Emit JSON report instead of plain text.
         #[arg(short = 'j', long)]
@@ -1415,7 +1419,9 @@ enum Commands {
     /// Default behaviour is INCREMENTAL: first materialize missing canonical
     /// chunks from source sessions, then embed only sidecars whose mtime is
     /// newer than the existing index `header.generated_at`; new rows are
-    /// appended to the committed index file. Pass
+    /// appended to the committed index file. With no `-p`, AICX builds the
+    /// `_all` index for global search and derives project buckets from it so
+    /// `aicx search -p <project>` works without extra setup. Pass
     /// `--full-rescan` to re-embed every chunk from scratch — useful when
     /// the embedder model changes, the index file is corrupt, or an
     /// operator wants a deterministic from-zero rebuild.
@@ -1424,7 +1430,7 @@ enum Commands {
         #[command(subcommand)]
         action: Option<IndexAction>,
 
-        /// Project filter. Omit to index every project.
+        /// Project filter. Omit to index every project and derive project buckets.
         ///
         /// Accepted forms (case-insensitive, repeatable):
         ///   `-p owner/repo`   strict `<owner>/<repo>` slug match
@@ -2389,8 +2395,12 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             Some(IndexAction::Status { project, json }) => {
                 run_index_status(&project, json)?;
             }
-            Some(IndexAction::Derive { project, json }) => {
-                run_index_derive(&project, json)?;
+            Some(IndexAction::Derive {
+                project,
+                all_projects,
+                json,
+            }) => {
+                run_index_derive(&project, all_projects, json)?;
             }
             None => {
                 if !dry_run {
@@ -7891,6 +7901,24 @@ fn run_index(
         reports.push((scope.map(ToString::to_string), stats));
     }
 
+    let auto_derived_project_reports = if !dry_run
+        && projects.is_empty()
+        && sample == 0
+        && reports
+            .iter()
+            .any(|(project, stats)| project.is_none() && stats.index_path.is_some())
+    {
+        if !json {
+            eprintln!("\nProject buckets: deriving all project-scoped indexes from `_all`");
+        }
+        Some(derive_project_bucket_reports(&[])?)
+    } else {
+        if !dry_run && projects.is_empty() && sample != 0 && !json {
+            eprintln!("\nProject buckets: skipped because --sample wrote a partial `_all` index");
+        }
+        None
+    };
+
     if json {
         if reports.len() == 1 {
             println!("{}", aicx::vector_index::render_stats_json(&reports[0].1)?);
@@ -7925,27 +7953,50 @@ fn run_index(
                 eprintln!("\n  index_path:          {}", path.display());
             }
         }
+        if let Some(project_reports) = &auto_derived_project_reports {
+            print_index_derive_reports(project_reports);
+        }
     }
     Ok(())
 }
 
-fn run_index_derive(projects: &[String], json: bool) -> Result<()> {
-    if projects.is_empty() {
-        anyhow::bail!("`aicx index derive` requires at least one `-p/--project` filter");
+fn run_index_derive(projects: &[String], all_projects: bool, json: bool) -> Result<()> {
+    if projects.is_empty() && !all_projects {
+        anyhow::bail!(
+            "`aicx index derive` requires at least one `-p/--project` filter or `--all-projects`"
+        );
     }
-    let resolved_scopes = resolve_index_scopes(projects)?;
-    let mut reports = Vec::with_capacity(resolved_scopes.len());
+    let reports = if all_projects {
+        derive_project_bucket_reports(&[])?
+    } else {
+        let resolved_scopes = resolve_index_scopes(projects)?;
+        let mut projects_to_derive = Vec::with_capacity(resolved_scopes.len());
+        for scope in resolved_scopes {
+            let Some(project) = scope else {
+                anyhow::bail!(
+                    "`aicx index derive` cannot derive `_all`; pass one or more projects with `-p`"
+                );
+            };
+            projects_to_derive.push(project);
+        }
+        derive_project_bucket_reports(&projects_to_derive)?
+    };
 
-    for scope in resolved_scopes {
-        let Some(project) = scope else {
-            anyhow::bail!(
-                "`aicx index derive` cannot derive `_all`; pass one or more projects with `-p`"
-            );
-        };
-        let derived =
-            aicx::vector_index::derive_project_index_from_all(&project).with_context(|| {
-                format!("derive project semantic index for `{project}` from `_all`")
-            })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&reports)?);
+    } else {
+        print_index_derive_reports(&reports);
+    }
+
+    Ok(())
+}
+
+fn derive_project_bucket_reports(projects: &[String]) -> Result<Vec<serde_json::Value>> {
+    let derived_reports = aicx::vector_index::derive_project_indexes_from_all(projects)
+        .with_context(|| "derive project semantic indexes from `_all`")?;
+    let mut reports = Vec::with_capacity(derived_reports.len());
+    for derived in derived_reports {
+        let project = derived.project.clone();
         let manifest = aicx::vector_index::repair_hybrid_from_committed(Some(&project))
             .with_context(|| format!("build hybrid artifacts for derived project `{project}`"))?;
         reports.push(serde_json::json!({
@@ -7960,51 +8011,48 @@ fn run_index_derive(projects: &[String], json: bool) -> Result<()> {
             }
         }));
     }
+    Ok(reports)
+}
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&reports)?);
-    } else {
-        for (idx, report) in reports.iter().enumerate() {
-            if idx > 0 {
-                eprintln!();
-            }
-            let project = report["project"].as_str().unwrap_or("<unknown>");
-            let derived = &report["derived"];
-            let hybrid = &report["hybrid"];
-            eprintln!("aicx index derive");
-            eprintln!("  project:               {project}");
-            eprintln!(
-                "  entries_written:       {}",
-                derived["entries_written"].as_u64().unwrap_or(0)
-            );
-            eprintln!(
-                "  elapsed_ms:            {}",
-                derived["elapsed_ms"].as_u64().unwrap_or(0)
-            );
-            eprintln!(
-                "  index_path:            {}",
-                derived["index_path"].as_str().unwrap_or("<unknown>")
-            );
-            eprintln!(
-                "  hybrid_source_chunks:  {}",
-                hybrid["source_chunk_count"].as_u64().unwrap_or(0)
-            );
-            eprintln!(
-                "  hybrid_dense_count:    {}",
-                hybrid["dense_count"].as_u64().unwrap_or(0)
-            );
-            eprintln!(
-                "  hybrid_lexical_docs:   {}",
-                hybrid["lexical_doc_count"].as_u64().unwrap_or(0)
-            );
-            eprintln!(
-                "  hybrid_generation:     {}",
-                hybrid["generation_id"].as_str().unwrap_or("<unknown>")
-            );
+fn print_index_derive_reports(reports: &[serde_json::Value]) {
+    for (idx, report) in reports.iter().enumerate() {
+        if idx > 0 {
+            eprintln!();
         }
+        let project = report["project"].as_str().unwrap_or("<unknown>");
+        let derived = &report["derived"];
+        let hybrid = &report["hybrid"];
+        eprintln!("aicx index derive");
+        eprintln!("  project:               {project}");
+        eprintln!(
+            "  entries_written:       {}",
+            derived["entries_written"].as_u64().unwrap_or(0)
+        );
+        eprintln!(
+            "  elapsed_ms:            {}",
+            derived["elapsed_ms"].as_u64().unwrap_or(0)
+        );
+        eprintln!(
+            "  index_path:            {}",
+            derived["index_path"].as_str().unwrap_or("<unknown>")
+        );
+        eprintln!(
+            "  hybrid_source_chunks:  {}",
+            hybrid["source_chunk_count"].as_u64().unwrap_or(0)
+        );
+        eprintln!(
+            "  hybrid_dense_count:    {}",
+            hybrid["dense_count"].as_u64().unwrap_or(0)
+        );
+        eprintln!(
+            "  hybrid_lexical_docs:   {}",
+            hybrid["lexical_doc_count"].as_u64().unwrap_or(0)
+        );
+        eprintln!(
+            "  hybrid_generation:     {}",
+            hybrid["generation_id"].as_str().unwrap_or("<unknown>")
+        );
     }
-
-    Ok(())
 }
 
 fn run_index_status(projects: &[String], json: bool) -> Result<()> {
