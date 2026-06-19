@@ -148,6 +148,20 @@ fn acquire_with_timeout(path: &Path, mode: LockMode, timeout: Duration) -> Resul
 }
 
 fn write_holder(file: &mut File, path: &Path, mode: LockMode) -> Result<Option<HolderSidecar>> {
+    // Shared acquirers hold a read lock and must not mutate the lock file.
+    // On Windows a `LockFileEx` shared lock makes the byte range read-only for
+    // *every* handle, including the owning one, so writing the diagnostic
+    // pid/timestamp record into the freshly shared-locked region fails with
+    // ERROR_LOCK_VIOLATION — the failure that broke shared-lock acquisition on
+    // windows-latest (panic at the first `acquire_shared`). The main lock-file
+    // body is never read back either: every holder lookup consults the
+    // exclusive-only `.holder` sidecar. So shared locks skip the mutation
+    // entirely; exclusive owners keep full read/write over their region and
+    // still write the record + sidecar.
+    if !matches!(mode, LockMode::Exclusive) {
+        return Ok(None);
+    }
+
     let holder = Holder::new(
         std::process::id(),
         SystemTime::now(),
