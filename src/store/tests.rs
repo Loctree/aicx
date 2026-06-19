@@ -131,7 +131,10 @@ fn test_resolve_aicx_home_uses_bootstrap_storage_home_when_env_unset() {
     fs::create_dir_all(&default_home).unwrap();
     fs::write(
         default_home.join("config.toml"),
-        format!("[storage]\nhome = \"{}\"\n", configured.display()),
+        // TOML *literal* string (single quotes): a Windows path's backslashes
+        // are invalid escapes in a basic ("...") string, so a literal string
+        // keeps the fixture parseable on Windows (no-op for Unix paths).
+        format!("[storage]\nhome = '{}'\n", configured.display()),
     )
     .unwrap();
 
@@ -151,7 +154,10 @@ fn test_resolve_aicx_home_env_wins_over_bootstrap_storage_home() {
     fs::create_dir_all(&default_home).unwrap();
     fs::write(
         default_home.join("config.toml"),
-        format!("[storage]\nhome = \"{}\"\n", configured.display()),
+        // TOML *literal* string (single quotes): a Windows path's backslashes
+        // are invalid escapes in a basic ("...") string, so a literal string
+        // keeps the fixture parseable on Windows (no-op for Unix paths).
+        format!("[storage]\nhome = '{}'\n", configured.display()),
     )
     .unwrap();
 

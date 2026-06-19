@@ -48,17 +48,20 @@ impl MigrationItem {
             .collect();
         existing_sources.sort();
 
+        // Manifest store paths are reported in canonical forward-slash form on
+        // every OS (matching the store's canonical chunk refs); `\` -> `/` is a
+        // no-op on Unix and keeps Windows manifests consistent + greppable.
         let mut canonical_paths: Vec<String> = plan
             .canonical_paths
             .iter()
-            .map(|path| path.display().to_string())
+            .map(|path| path.display().to_string().replace('\\', "/"))
             .collect();
         canonical_paths.sort();
 
         let mut salvage_paths: Vec<String> = plan
             .salvage_paths
             .iter()
-            .map(|path| path.display().to_string())
+            .map(|path| path.display().to_string().replace('\\', "/"))
             .collect();
         salvage_paths.sort();
 
@@ -598,7 +601,14 @@ fn collect_source_hints_from_text(
 }
 
 fn source_format_hint(path: &Path, agent_hint: Option<&str>) -> Option<SourceFormat> {
-    let path_str = path.to_string_lossy().to_ascii_lowercase();
+    // Source detection matches provider markers (`/.claude/`, `/antigravity/brain/`,
+    // `/.gemini/tmp/`, …) as forward-slash substrings. On Windows the native path
+    // separator is `\`, so normalize before matching or every provider check
+    // misses and migration classifies no source files.
+    let path_str = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
