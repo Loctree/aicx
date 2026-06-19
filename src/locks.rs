@@ -414,8 +414,7 @@ fn pid_is_alive(pid: u32) -> bool {
     // ERROR_ACCESS_DENIED means the process exists but we lack permission.
     const ERROR_ACCESS_DENIED: i32 = 5;
     // SAFETY: FFI call; returned handle is valid when non-null.
-    let handle =
-        unsafe { windows_ffi::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    let handle = unsafe { windows_ffi::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
         return std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED);
     }
@@ -514,9 +513,8 @@ fn os_try_lock(file: &File, path: &Path, mode: LockMode) -> Result<()> {
 #[cfg(windows)]
 fn os_unlock(file: &File) -> Result<()> {
     // SAFETY: `file` is a valid open handle.
-    let result = unsafe {
-        windows_ffi::UnlockFile(file.as_raw_handle().cast(), 0, 0, u32::MAX, u32::MAX)
-    };
+    let result =
+        unsafe { windows_ffi::UnlockFile(file.as_raw_handle().cast(), 0, 0, u32::MAX, u32::MAX) };
     if result == 0 {
         Err(std::io::Error::last_os_error().into())
     } else {
