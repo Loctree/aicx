@@ -203,12 +203,11 @@ fn is_temp_allowlist_path(path: &Path) -> bool {
     // Still gated by temp_allowlist_enabled() at the call site (test-only by default).
     let mut components = path.components().peekable();
     while let Some(component) = components.next() {
-        if component.as_os_str() == std::ffi::OsStr::new("target") {
-            if let Some(next) = components.peek() {
-                if next.as_os_str() == std::ffi::OsStr::new("test-tmp") {
-                    return true;
-                }
-            }
+        if component.as_os_str() == std::ffi::OsStr::new("target")
+            && let Some(next) = components.peek()
+            && next.as_os_str() == std::ffi::OsStr::new("test-tmp")
+        {
+            return true;
         }
     }
     false
