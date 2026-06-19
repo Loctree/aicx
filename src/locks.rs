@@ -559,7 +559,7 @@ mod windows_ffi {
     // It is never shared across threads without synchronisation.
     unsafe impl Send for OVERLAPPED {}
 
-    extern "system" {
+    unsafe extern "system" {
         pub fn LockFileEx(
             h_file: *mut c_void,
             dw_flags: u32,
