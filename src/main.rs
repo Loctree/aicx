@@ -8592,6 +8592,7 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
     };
 
     if !args.no_open {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let url = format!("http://{}:{}", host, args.port);
         #[cfg(target_os = "macos")]
         {

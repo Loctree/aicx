@@ -216,12 +216,13 @@ fn persist_token_file(path: &Path, token: &str) -> Result<TokenPersistOutcome> {
                 //      load_auth_config fell through to generate+persist.
                 // Reading the file once tells us which case we're in and
                 // lets us avoid aborting the entire auth init on either.
-                let existing = std::fs::read_to_string(path).with_context(|| {
-                    format!(
-                        "Re-read existing token file after AlreadyExists: {}",
-                        path.display()
-                    )
-                })?;
+                let existing =
+                    crate::sanitize::read_to_string_validated(path).with_context(|| {
+                        format!(
+                            "Re-read existing token file after AlreadyExists: {}",
+                            path.display()
+                        )
+                    })?;
                 let trimmed = existing.trim();
                 if !trimmed.is_empty() {
                     return Ok(TokenPersistOutcome::AdoptedExisting(trimmed.to_string()));
