@@ -653,6 +653,16 @@ enum IndexAction {
         #[arg(short = 'j', long)]
         json: bool,
     },
+    /// Derive project-scoped semantic buckets from the existing `_all` index without re-embedding.
+    Derive {
+        /// Strict project filter, repeatable. Requires at least one project.
+        #[arg(short, long, value_delimiter = ',')]
+        project: Vec<String>,
+
+        /// Emit JSON report instead of plain text.
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2378,6 +2388,9 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }) => match action {
             Some(IndexAction::Status { project, json }) => {
                 run_index_status(&project, json)?;
+            }
+            Some(IndexAction::Derive { project, json }) => {
+                run_index_derive(&project, json)?;
             }
             None => {
                 if !dry_run {
@@ -7913,6 +7926,84 @@ fn run_index(
             }
         }
     }
+    Ok(())
+}
+
+fn run_index_derive(projects: &[String], json: bool) -> Result<()> {
+    if projects.is_empty() {
+        anyhow::bail!("`aicx index derive` requires at least one `-p/--project` filter");
+    }
+    let resolved_scopes = resolve_index_scopes(projects)?;
+    let mut reports = Vec::with_capacity(resolved_scopes.len());
+
+    for scope in resolved_scopes {
+        let Some(project) = scope else {
+            anyhow::bail!(
+                "`aicx index derive` cannot derive `_all`; pass one or more projects with `-p`"
+            );
+        };
+        let derived =
+            aicx::vector_index::derive_project_index_from_all(&project).with_context(|| {
+                format!("derive project semantic index for `{project}` from `_all`")
+            })?;
+        let manifest = aicx::vector_index::repair_hybrid_from_committed(Some(&project))
+            .with_context(|| format!("build hybrid artifacts for derived project `{project}`"))?;
+        reports.push(serde_json::json!({
+            "project": project,
+            "derived": derived,
+            "hybrid": {
+                "generation_id": manifest.generation_id,
+                "source_chunk_count": manifest.source_chunk_count,
+                "dense_count": manifest.dense_count,
+                "lexical_doc_count": manifest.lexical_doc_count,
+                "fusion_algorithm": manifest.fusion_algorithm,
+            }
+        }));
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&reports)?);
+    } else {
+        for (idx, report) in reports.iter().enumerate() {
+            if idx > 0 {
+                eprintln!();
+            }
+            let project = report["project"].as_str().unwrap_or("<unknown>");
+            let derived = &report["derived"];
+            let hybrid = &report["hybrid"];
+            eprintln!("aicx index derive");
+            eprintln!("  project:               {project}");
+            eprintln!(
+                "  entries_written:       {}",
+                derived["entries_written"].as_u64().unwrap_or(0)
+            );
+            eprintln!(
+                "  elapsed_ms:            {}",
+                derived["elapsed_ms"].as_u64().unwrap_or(0)
+            );
+            eprintln!(
+                "  index_path:            {}",
+                derived["index_path"].as_str().unwrap_or("<unknown>")
+            );
+            eprintln!(
+                "  hybrid_source_chunks:  {}",
+                hybrid["source_chunk_count"].as_u64().unwrap_or(0)
+            );
+            eprintln!(
+                "  hybrid_dense_count:    {}",
+                hybrid["dense_count"].as_u64().unwrap_or(0)
+            );
+            eprintln!(
+                "  hybrid_lexical_docs:   {}",
+                hybrid["lexical_doc_count"].as_u64().unwrap_or(0)
+            );
+            eprintln!(
+                "  hybrid_generation:     {}",
+                hybrid["generation_id"].as_str().unwrap_or("<unknown>")
+            );
+        }
+    }
+
     Ok(())
 }
 

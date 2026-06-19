@@ -1557,6 +1557,34 @@ fn index_accepts_multiple_project_filters() {
 }
 
 #[test]
+fn index_derive_accepts_project_filters() {
+    let cli = Cli::try_parse_from([
+        "aicx",
+        "index",
+        "derive",
+        "-p",
+        "vista",
+        "-p",
+        "vetcoders/aicx",
+    ])
+    .expect("index derive should accept repeated project filters");
+
+    match cli.command {
+        Some(Commands::Index {
+            action:
+                Some(IndexAction::Derive {
+                    project,
+                    json: false,
+                }),
+            ..
+        }) => {
+            assert_eq!(project, vec!["vista", "vetcoders/aicx"]);
+        }
+        _ => panic!("expected index derive command"),
+    }
+}
+
+#[test]
 fn intents_accepts_multiple_project_filters() {
     let cli = Cli::try_parse_from([
         "aicx",
