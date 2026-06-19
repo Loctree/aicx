@@ -47,6 +47,7 @@ pub struct SemanticSearchOutcome {
 pub type SemanticOutcome = SemanticSearchOutcome;
 
 const BACKEND_HYBRID_RRF: &str = "hybrid_rrf";
+const BACKEND_HYBRID_RRF_ALL_FALLBACK: &str = "hybrid_rrf_all_fallback";
 const BACKEND_SEMANTIC_DENSE_ONLY: &str = "semantic_dense_only";
 const BACKEND_SEMANTIC_DENSE_ONLY_ALL_FALLBACK: &str = "semantic_dense_only_all_fallback";
 
@@ -309,6 +310,8 @@ pub fn try_semantic_search(
                 BACKEND_SEMANTIC_DENSE_ONLY_ALL_FALLBACK
             } else if any_dense_only {
                 BACKEND_SEMANTIC_DENSE_ONLY
+            } else if any_all_bucket_fallback {
+                BACKEND_HYBRID_RRF_ALL_FALLBACK
             } else {
                 BACKEND_HYBRID_RRF
             },
@@ -578,23 +581,6 @@ fn try_semantic_search_native(
         project: scope.retrieval_project_filter,
     };
 
-    if scope.used_all_bucket_fallback {
-        // `_all` is a cross-project bucket. Loading its manifest-managed dense
-        // brute-force artifact materializes every vector in memory before the
-        // adapter can apply FilterSet. For project-scoped fallback, use the
-        // primary committed index with a pre-deserialize project guard so the
-        // operator does not pay an 11GB dense load for one repo query.
-        return query_dense_only_from_primary(
-            &path,
-            &query_embedding,
-            embedder_dim,
-            limit,
-            retrieval_filters,
-            &info.model_id,
-            true,
-        );
-    }
-
     // Patch 3 / Bug B+: the hybrid (tantivy lexical + dense fusion) stack can
     // be unavailable for manifest-side reasons — never committed
     // (`RetrievalManifestMissing`) or mid-rebuild / mismatched
@@ -615,7 +601,7 @@ fn try_semantic_search_native(
                     limit,
                     retrieval_filters,
                     &info.model_id,
-                    false,
+                    scope.used_all_bucket_fallback,
                 );
             }
             Err(other) => return Err(other),
@@ -631,7 +617,7 @@ fn try_semantic_search_native(
             limit,
             retrieval_filters,
             &info.model_id,
-            false,
+            scope.used_all_bucket_fallback,
         );
     };
     let manifest = hybrid.manifest().cloned();
@@ -676,7 +662,12 @@ fn try_semantic_search_native(
             let path = hit_path(&h);
             let score_pct = hybrid_score_pct(h.score);
             let matched_lines = semantic_preview_lines(&path);
-            let label = format!("hybrid_rrf:{}", h.chunk_id);
+            let label_backend = if scope.used_all_bucket_fallback {
+                BACKEND_HYBRID_RRF_ALL_FALLBACK
+            } else {
+                BACKEND_HYBRID_RRF
+            };
+            let label = format!("{label_backend}:{}", h.chunk_id);
             FuzzyResult {
                 file: path.to_string_lossy().to_string(),
                 path: path.to_string_lossy().to_string(),
@@ -699,7 +690,11 @@ fn try_semantic_search_native(
     Ok(SemanticOutcome {
         results,
         scanned,
-        backend_label: BACKEND_HYBRID_RRF,
+        backend_label: if scope.used_all_bucket_fallback {
+            BACKEND_HYBRID_RRF_ALL_FALLBACK
+        } else {
+            BACKEND_HYBRID_RRF
+        },
         model_id: info.model_id,
         retrieval_status,
     })
@@ -1810,6 +1805,25 @@ mod tests {
         assert!(
             line.contains("degraded") && line.contains("fallback=hybrid_unavailable"),
             "dense-only must surface degraded status explicitly: {line}"
+        );
+    }
+
+    #[test]
+    fn semantic_status_line_marks_hybrid_all_bucket_fallback() {
+        let line = render_semantic_status_line(
+            BACKEND_HYBRID_RRF_ALL_FALLBACK,
+            "qwen3-embedding:8b",
+            10,
+            259_007,
+            None,
+        );
+
+        assert!(line.contains("backend=hybrid_rrf_all_fallback"));
+        assert!(line.contains("index=hybrid"));
+        assert!(line.contains("fallback=all_bucket"));
+        assert!(
+            !line.contains("degraded"),
+            "all-bucket hybrid fallback should be observable without claiming degraded dense-only: {line}"
         );
     }
 
