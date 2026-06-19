@@ -1299,9 +1299,12 @@ fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
         .filter(|term| term.len() >= 3)
         .collect();
     let haystack = semantic_result_haystack(result);
+    let anchors = query_anchors(&normalized_query);
     if !normalized_query.is_empty() && haystack.contains(&normalized_query) {
         score += 12;
     }
+    score += anchor_quality_delta(&anchors, &haystack);
+    score += informative_agent_reply_delta(result, &anchors, &haystack);
     if !query_terms.is_empty() {
         let matched_terms = query_terms
             .iter()
@@ -1317,6 +1320,166 @@ fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
     }
 
     score.clamp(0, 100) as u8
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueryAnchor {
+    token: String,
+    parts: Vec<String>,
+    strong: bool,
+}
+
+fn query_anchors(normalized_query: &str) -> Vec<QueryAnchor> {
+    let mut seen = HashSet::new();
+    let mut anchors = Vec::new();
+
+    for raw_token in normalized_query.split_whitespace() {
+        let token = raw_token
+            .trim_matches(|ch: char| !is_anchor_char(ch))
+            .to_string();
+        if token.len() < 3 || !seen.insert(token.clone()) {
+            continue;
+        }
+
+        let parts = split_anchor_parts(&token);
+        let has_separator = token.chars().any(is_anchor_separator);
+        let has_digit = token.chars().any(|ch| ch.is_ascii_digit());
+        let strong = token.len() >= 5 && ((has_separator && parts.len() >= 2) || has_digit);
+
+        anchors.push(QueryAnchor {
+            token,
+            parts,
+            strong,
+        });
+    }
+
+    anchors
+}
+
+fn is_anchor_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/' | ':' | '.')
+}
+
+fn is_anchor_separator(ch: char) -> bool {
+    matches!(ch, '-' | '_' | '/' | ':' | '.')
+}
+
+fn split_anchor_parts(token: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    token
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| part.len() >= 3)
+        .filter_map(|part| {
+            let part = part.to_string();
+            seen.insert(part.clone()).then_some(part)
+        })
+        .collect()
+}
+
+fn anchor_quality_delta(anchors: &[QueryAnchor], haystack: &str) -> i16 {
+    let strong_anchors: Vec<&QueryAnchor> = anchors.iter().filter(|anchor| anchor.strong).collect();
+    if strong_anchors.is_empty() {
+        return 0;
+    }
+
+    let mut exact_matches = 0usize;
+    let mut full_part_matches = 0usize;
+    let mut matched_parts = HashSet::new();
+
+    for anchor in strong_anchors {
+        if haystack.contains(&anchor.token) {
+            exact_matches += 1;
+        }
+
+        let matched_count = anchor
+            .parts
+            .iter()
+            .filter(|part| {
+                let matched = haystack.contains(part.as_str());
+                if matched {
+                    matched_parts.insert((*part).clone());
+                }
+                matched
+            })
+            .count();
+
+        if anchor.parts.len() >= 2 && matched_count == anchor.parts.len() {
+            full_part_matches += 1;
+        }
+    }
+
+    let mut delta = 0i16;
+    delta += (exact_matches.saturating_mul(28).min(56)) as i16;
+    delta += (full_part_matches.saturating_mul(18).min(36)) as i16;
+    delta += (matched_parts.len().saturating_mul(4).min(16)) as i16;
+
+    if exact_matches == 0 && full_part_matches == 0 {
+        if matched_parts.is_empty() {
+            delta -= 30;
+        } else {
+            delta -= 8;
+        }
+    }
+
+    delta
+}
+
+fn informative_agent_reply_delta(
+    result: &FuzzyResult,
+    anchors: &[QueryAnchor],
+    haystack: &str,
+) -> i16 {
+    if result.frame_kind.as_deref().and_then(FrameKind::parse) != Some(FrameKind::AgentReply) {
+        return 0;
+    }
+    if !has_strong_anchor_evidence(anchors, haystack) {
+        return 0;
+    }
+
+    let text = normalize_query(&result.matched_lines.join(" "));
+    let word_count = text
+        .split_whitespace()
+        .filter(|word| word.chars().filter(|ch| ch.is_ascii_alphabetic()).count() >= 3)
+        .count();
+    if word_count < 10 {
+        return 0;
+    }
+
+    let answer_markers = [
+        "to jest to",
+        "chodzi o",
+        "dlatego",
+        "poniewaz",
+        "przyczyna",
+        "diagnoza",
+        "wniosek",
+        "incydent",
+        "root cause",
+        "because",
+        "reason",
+        "summary",
+        "diagnosis",
+        "conclusion",
+    ];
+    if answer_markers.iter().any(|marker| text.contains(marker)) {
+        22
+    } else if word_count >= 22 {
+        8
+    } else {
+        0
+    }
+}
+
+fn has_strong_anchor_evidence(anchors: &[QueryAnchor], haystack: &str) -> bool {
+    anchors.iter().any(|anchor| {
+        anchor.strong
+            && (haystack.contains(&anchor.token)
+                || (anchor.parts.len() >= 2
+                    && anchor
+                        .parts
+                        .iter()
+                        .all(|part| haystack.contains(part.as_str()))))
+    })
 }
 
 fn semantic_result_haystack(result: &FuzzyResult) -> String {
@@ -2120,6 +2283,148 @@ mod tests {
             filtered[0].score > 82,
             "literal human match should get a quality boost, got {}",
             filtered[0].score
+        );
+    }
+
+    #[test]
+    fn default_semantic_quality_prioritizes_hyphenated_anchor_overlap() {
+        let pool = vec![
+            fake_hit_with_frame(
+                0,
+                "2026-06-01",
+                "codex",
+                93,
+                Some("agent_reply"),
+                vec![
+                    "[10:00:00] assistant: zrobmy tak, przeklikam appke i zobaczymy co sie wysypie"
+                        .to_string(),
+                ],
+            ),
+            fake_hit_with_frame(
+                1,
+                "2026-06-01",
+                "claude",
+                68,
+                Some("agent_reply"),
+                vec![
+                    "[10:01:00] assistant: To jest to - vista leak + devista; leak-vista-info poszlo do public repo"
+                        .to_string(),
+                ],
+            ),
+        ];
+
+        let filtered =
+            apply_default_semantic_quality(pool, "vista-leak o co w tym chodziolo?", None);
+
+        assert_eq!(
+            filtered[0].label, "test:1",
+            "hyphenated query anchors should beat higher dense-score vibe matches"
+        );
+        assert!(
+            filtered[0].score > filtered[1].score,
+            "anchor-bearing hit should outrank no-anchor hit: {filtered:?}"
+        );
+    }
+
+    #[test]
+    fn default_semantic_quality_prioritizes_underscore_anchor_overlap() {
+        let pool = vec![
+            fake_hit_with_frame(
+                0,
+                "2026-06-01",
+                "codex",
+                91,
+                Some("agent_reply"),
+                vec!["[10:00:00] assistant: auth flow and trusted device notes".to_string()],
+            ),
+            fake_hit_with_frame(
+                1,
+                "2026-06-01",
+                "claude",
+                64,
+                Some("agent_reply"),
+                vec![
+                    "[10:01:00] assistant: deep-link includes completion_token and portal completion endpoint"
+                        .to_string(),
+                ],
+            ),
+        ];
+
+        let filtered = apply_default_semantic_quality(pool, "completion_token auth leak", None);
+
+        assert_eq!(
+            filtered[0].label, "test:1",
+            "underscore/code-ish anchors should carry lexical evidence weight"
+        );
+    }
+
+    #[test]
+    fn default_semantic_quality_prioritizes_digit_code_anchor_overlap() {
+        let pool = vec![
+            fake_hit_with_frame(
+                0,
+                "2026-06-01",
+                "codex",
+                88,
+                Some("agent_reply"),
+                vec![
+                    "[10:00:00] assistant: Silver and Sztudio connection is now stable".to_string(),
+                ],
+            ),
+            fake_hit_with_frame(
+                1,
+                "2026-06-01",
+                "claude",
+                57,
+                Some("agent_reply"),
+                vec![
+                    "[10:01:00] assistant: Sztudio uses qwen3 embedding model for semantic index"
+                        .to_string(),
+                ],
+            ),
+        ];
+
+        let filtered = apply_default_semantic_quality(pool, "qwen3-embedding sztudio silver", None);
+
+        assert_eq!(
+            filtered[0].label, "test:1",
+            "digit/code anchors should prevent generic host mentions from winning"
+        );
+    }
+
+    #[test]
+    fn default_semantic_quality_prefers_answer_like_agent_reply_over_anchor_echo() {
+        let pool = vec![
+            fake_hit_with_frame(
+                0,
+                "2026-06-01",
+                "codex",
+                76,
+                Some("user_msg"),
+                vec![
+                    "[10:00:00] user: spoko, ostatnio w podobny sposob poszlo duzo leak-vista-info"
+                        .to_string(),
+                ],
+            ),
+            fake_hit_with_frame(
+                1,
+                "2026-06-01",
+                "claude",
+                60,
+                Some("agent_reply"),
+                vec![
+                    "[10:01:00] assistant: To jest to - vista leak plus devista; leak-vista-info poszlo do public repo i trzeba zamknac incydent"
+                        .to_string(),
+                ],
+            ),
+        ];
+
+        let filtered =
+            apply_default_semantic_quality(pool, "vista-leak o co w tym chodzilo?", None);
+
+        assert_eq!(
+            filtered[0].label, "test:1",
+            "answer-like agent replies with the same anchor evidence should beat short anchor echoes"
         );
     }
 
