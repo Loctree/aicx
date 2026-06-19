@@ -483,7 +483,7 @@ fn os_try_lock(file: &File, path: &Path, mode: LockMode) -> Result<()> {
             LockMode::Shared => 0,
         };
 
-    let mut overlapped = windows_ffi::OVERLAPPED {
+    let mut overlapped = windows_ffi::Overlapped {
         internal: 0,
         internal_high: 0,
         offset: 0,
@@ -547,7 +547,7 @@ mod windows_ffi {
     /// Only the `Offset`/`OffsetHigh` fields (union first member) and
     /// `hEvent` matter for our non-async usage; all others must be zero.
     #[repr(C)]
-    pub struct OVERLAPPED {
+    pub struct Overlapped {
         pub internal: usize,
         pub internal_high: usize,
         pub offset: u32,
@@ -557,7 +557,7 @@ mod windows_ffi {
 
     // SAFETY: OVERLAPPED contains only plain integer fields and a raw pointer.
     // It is never shared across threads without synchronisation.
-    unsafe impl Send for OVERLAPPED {}
+    unsafe impl Send for Overlapped {}
 
     unsafe extern "system" {
         pub fn LockFileEx(
@@ -566,7 +566,7 @@ mod windows_ffi {
             dw_reserved: u32,
             n_number_of_bytes_to_lock_low: u32,
             n_number_of_bytes_to_lock_high: u32,
-            lp_overlapped: *mut OVERLAPPED,
+            lp_overlapped: *mut Overlapped,
         ) -> i32;
 
         pub fn UnlockFile(

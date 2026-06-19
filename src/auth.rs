@@ -144,6 +144,7 @@ pub fn load_auth_config(cli_token: Option<&str>, require_auth: bool) -> Result<A
 /// happy-path create, recovering from a startup race against another
 /// process, and atomically replacing a truncated / empty existing file.
 #[derive(Debug)]
+#[cfg_attr(not(unix), allow(dead_code))]
 enum TokenPersistOutcome {
     /// We won the create race and wrote our token to disk.
     Created,
@@ -173,14 +174,14 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn persist_token_file(path: &PathBuf, token: &str) -> Result<TokenPersistOutcome> {
+fn persist_token_file(path: &Path, token: &str) -> Result<TokenPersistOutcome> {
     #[cfg(windows)]
     {
         let _ = token;
-        return Err(anyhow!(
+        Err(anyhow!(
             "Refusing to persist aicx auth token file {} on Windows because this build does not configure restricted file ACLs. Run aicx auth on Linux/macOS, or pass --auth-token <token> explicitly so the token file is never written.",
             path.display()
-        ));
+        ))
     }
 
     #[cfg(unix)]
