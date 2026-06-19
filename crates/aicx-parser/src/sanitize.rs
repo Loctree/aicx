@@ -195,21 +195,38 @@ fn is_temp_allowlist_path(path: &Path) -> bool {
         || path.starts_with("/private/var/folders")
 }
 
+/// Strip a Windows `\\?\` (or `\\?\UNC\`) verbatim prefix so `Path::starts_with`
+/// compares plain `C:\…` components. `canonicalize()` yields verbatim paths on
+/// Windows; starts_with between a verbatim path and either a non-verbatim base
+/// (the canonicalize-fallback case) or another verbatim path is unreliable — so
+/// normalise BOTH sides to non-verbatim before comparing. No-op on Unix.
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
+}
+
 /// Validate that a path is under an allowed base directory.
 fn is_under_allowed_base(path: &Path) -> Result<bool> {
+    // The incoming `path` is already canonicalized (verbatim on Windows). Strip the
+    // verbatim prefix and compare against likewise-stripped, canonicalized bases so
+    // reads under the user dirs (incl. %TEMP%, which lives under the local cache
+    // dir) are not wrongly rejected on Windows. No-op on Unix.
+    let path = strip_verbatim_prefix(path);
     for base in current_user_allowed_bases()? {
-        // Canonicalize the base so it matches the already-canonicalized `path`.
-        // On Windows, canonicalize() adds the `\\?\` verbatim prefix; comparing a
-        // verbatim canonical path against a plain base makes every starts_with
-        // fail, wrongly rejecting reads under the user dirs (incl. %TEMP%, which
-        // lives under the local cache dir). No-op on Unix.
         let base = base.canonicalize().unwrap_or(base);
+        let base = strip_verbatim_prefix(&base);
         if path.starts_with(&base) {
             return Ok(true);
         }
     }
 
-    if is_temp_allowlist_path(path) {
+    if is_temp_allowlist_path(&path) {
         return Ok(temp_allowlist_enabled());
     }
 
