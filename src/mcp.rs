@@ -1416,20 +1416,19 @@ pub async fn run_http(
         config,
     );
 
-    let mcp_router = axum::Router::new()
-        .route(
-            "/mcp",
-            axum::routing::any(move |req: axum::http::Request<axum::body::Body>| {
-                let svc = service.clone();
-                async move { svc.handle(req).await }
-            }),
-        )
-        .route(
-            "/health",
-            axum::routing::get(|| async { axum::http::StatusCode::OK }),
-        );
+    let health_router = axum::Router::new().route(
+        "/health",
+        axum::routing::get(|| async { axum::http::StatusCode::OK }),
+    );
+    let mcp_router = axum::Router::new().route(
+        "/mcp",
+        axum::routing::any(move |req: axum::http::Request<axum::body::Body>| {
+            let svc = service.clone();
+            async move { svc.handle(req).await }
+        }),
+    );
 
-    let app = auth::require_auth_layer(mcp_router, auth_config);
+    let app = health_router.merge(auth::require_auth_layer(mcp_router, auth_config));
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -1450,10 +1449,10 @@ pub async fn run_http(
         );
     }
     if auth_enforced {
-        eprintln!("  Auth: enabled (source: {auth_source_label})");
+        eprintln!("  Auth: enabled on /mcp (source: {auth_source_label})");
     } else {
         eprintln!(
-            "  Auth: DISABLED ({auth_source_label}) — anyone who reaches {addr} can invoke MCP tools"
+            "  Auth: DISABLED on /mcp ({auth_source_label}) — anyone who reaches {addr} can invoke MCP tools"
         );
     }
 
