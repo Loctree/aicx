@@ -440,10 +440,8 @@ fn parse_chatgpt_markdown_document(
     }
 
     let mut entries = Vec::new();
-    let mut sequence = 0i64;
-    for (section, text) in sections {
-        let timestamp = base_timestamp + Duration::seconds(sequence);
-        sequence += 1;
+    for (sequence, (section, text)) in sections.into_iter().enumerate() {
+        let timestamp = base_timestamp + Duration::seconds(sequence as i64);
         if timestamp < config.cutoff || config.watermark.is_some_and(|w| timestamp < w) {
             continue;
         }
