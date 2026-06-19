@@ -198,7 +198,13 @@ fn is_temp_allowlist_path(path: &Path) -> bool {
 /// Validate that a path is under an allowed base directory.
 fn is_under_allowed_base(path: &Path) -> Result<bool> {
     for base in current_user_allowed_bases()? {
-        if path.starts_with(base) {
+        // Canonicalize the base so it matches the already-canonicalized `path`.
+        // On Windows, canonicalize() adds the `\\?\` verbatim prefix; comparing a
+        // verbatim canonical path against a plain base makes every starts_with
+        // fail, wrongly rejecting reads under the user dirs (incl. %TEMP%, which
+        // lives under the local cache dir). No-op on Unix.
+        let base = base.canonicalize().unwrap_or(base);
+        if path.starts_with(&base) {
             return Ok(true);
         }
     }
