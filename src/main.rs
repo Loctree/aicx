@@ -669,6 +669,43 @@ enum IndexAction {
     },
 }
 
+#[derive(Debug, Clone, Subcommand)]
+enum EvalAction {
+    /// Run/list the operator search quality seed matrix.
+    SearchQuality(SearchQualityEvalArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct SearchQualityEvalArgs {
+    /// Execute the matrix against the active AICX runtime. Omit to only list cases.
+    #[arg(long)]
+    run: bool,
+
+    /// Only evaluate selected case ids. Repeat or pass comma-separated values.
+    #[arg(long = "case", value_delimiter = ',')]
+    cases: Vec<String>,
+
+    /// Number of evidence hits inspected per case.
+    #[arg(long, default_value_t = 3)]
+    top: usize,
+
+    /// Search limit passed to `aicx search --evidence`.
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
+
+    /// Emit JSON instead of plain text.
+    #[arg(short = 'j', long)]
+    json: bool,
+
+    /// Exit non-zero when any case fails. Useful for CI or local gates.
+    #[arg(long)]
+    strict: bool,
+
+    /// Override the aicx binary used by --run.
+    #[arg(long, hide = true)]
+    aicx_bin: Option<PathBuf>,
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     // ── Layer 1: Canonical corpus ─────────────────────────────────────
@@ -1418,6 +1455,13 @@ enum Commands {
         json: bool,
     },
 
+    /// Run local evaluation helpers for retrieval/search quality.
+    #[command(display_order = 13)]
+    Eval {
+        #[command(subcommand)]
+        action: EvalAction,
+    },
+
     /// Catch up the canonical corpus, then build the semantic index. Use
     /// `--dry-run` to preview without writing.
     ///
@@ -1431,7 +1475,7 @@ enum Commands {
     /// `--full-rescan` to re-embed every chunk from scratch — useful when
     /// the embedder model changes, the index file is corrupt, or an
     /// operator wants a deterministic from-zero rebuild.
-    #[command(display_order = 13)]
+    #[command(display_order = 14)]
     Index {
         #[command(subcommand)]
         action: Option<IndexAction>,
@@ -2392,6 +2436,9 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 evidence,
             })?;
         }
+        Some(Commands::Eval { action }) => match action {
+            EvalAction::SearchQuality(args) => run_eval_search_quality(args)?,
+        },
         Some(Commands::Index {
             action,
             project,
@@ -7384,6 +7431,93 @@ fn search_examined_fetch_limit(user_limit: usize, filters_active: bool) -> usize
     } else {
         user_limit
     }
+}
+
+fn run_eval_search_quality(args: SearchQualityEvalArgs) -> Result<()> {
+    let SearchQualityEvalArgs {
+        run,
+        cases,
+        top,
+        limit,
+        json,
+        strict,
+        aicx_bin,
+    } = args;
+
+    validate_cli_search_limit(limit)?;
+    let selected = aicx::search_eval::select_search_quality_cases(&cases)?;
+
+    if !run {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&selected)?);
+        } else {
+            print!("{}", aicx::search_eval::render_seed_cases_text(&selected));
+        }
+        return Ok(());
+    }
+
+    let bin = aicx_bin.unwrap_or(std::env::current_exe()?);
+    let store_root = store::store_base_dir()?.display().to_string();
+    let mut evaluations = Vec::new();
+
+    for case in selected {
+        let output = ProcessCommand::new(&bin)
+            .arg("search")
+            .arg(case.query)
+            .arg("--evidence")
+            .arg("--json")
+            .arg("--limit")
+            .arg(limit.to_string())
+            .arg("-p")
+            .arg(case.project)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| {
+                format!(
+                    "run search-quality case {} using {}",
+                    case.id,
+                    bin.display()
+                )
+            })?;
+
+        if !output.status.success() {
+            evaluations.push(aicx::search_eval::command_error_evaluation(
+                case,
+                output.status.code(),
+                &output.stderr,
+            ));
+            continue;
+        }
+
+        match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+            Ok(payload) => evaluations.push(aicx::search_eval::evaluate_evidence_payload(
+                case, &payload, top,
+            )),
+            Err(err) => evaluations.push(aicx::search_eval::invalid_json_evaluation(
+                case,
+                &err,
+                &output.stdout,
+            )),
+        }
+    }
+
+    let report = aicx::search_eval::build_run_report(store_root, evaluations);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", aicx::search_eval::render_run_report_text(&report));
+    }
+
+    if strict && report.failed > 0 {
+        anyhow::bail!(
+            "search-quality eval failed: {}/{} case(s) failed",
+            report.failed,
+            report.total
+        );
+    }
+
+    Ok(())
 }
 
 fn run_search(args: SearchRunArgs<'_>) -> Result<()> {

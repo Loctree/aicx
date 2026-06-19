@@ -64,6 +64,8 @@ pub mod redact;
 pub mod reports_extractor;
 #[cfg(feature = "app")]
 pub mod search_engine;
+#[cfg(feature = "app")]
+pub mod search_eval;
 pub mod sessions;
 #[cfg(feature = "app")]
 pub mod sources;

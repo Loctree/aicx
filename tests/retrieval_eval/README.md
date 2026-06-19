@@ -6,6 +6,17 @@ and committed baseline shape without requiring an operator-local semantic index.
 The live target exercises production `hybrid_rrf` retrieval and compares it
 against the committed baseline.
 
+For operator-side runtime smoke checks, use:
+
+```sh
+aicx eval search-quality --run
+```
+
+That command exercises the active `AICX_HOME` via real `aicx search --evidence
+--json` calls. It is intentionally separate from this backend gold-set harness:
+this file gates stable retrieval metrics, while `eval search-quality` catches
+human-facing evidence drift on a small curated seed matrix.
+
 ## Workflow
 
 ### Adding a new gold query

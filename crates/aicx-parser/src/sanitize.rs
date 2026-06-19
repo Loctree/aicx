@@ -1033,6 +1033,7 @@ pub const CLI_SUBCOMMAND_NAMES: &[&str] = &[
     "dashboard",
     "dashboard-serve",
     "doctor",
+    "eval",
     "extract",
     "health",
     "index",

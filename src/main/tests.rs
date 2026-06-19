@@ -1455,6 +1455,64 @@ fn search_rejects_evidence_with_no_semantic() {
 }
 
 #[test]
+fn eval_search_quality_lists_seed_matrix_by_default() {
+    let cli = Cli::try_parse_from(["aicx", "eval", "search-quality"])
+        .expect("eval search-quality command should parse");
+
+    match cli.command {
+        Some(Commands::Eval {
+            action: EvalAction::SearchQuality(args),
+        }) => {
+            assert!(!args.run);
+            assert!(args.cases.is_empty());
+            assert_eq!(args.top, 3);
+            assert_eq!(args.limit, 10);
+            assert!(!args.strict);
+        }
+        _ => panic!("expected eval search-quality command"),
+    }
+}
+
+#[test]
+fn eval_search_quality_accepts_run_flags() {
+    let cli = Cli::try_parse_from([
+        "aicx",
+        "eval",
+        "search-quality",
+        "--run",
+        "--case",
+        "aicx_sztudio_reason,md_radar_marbles",
+        "--top",
+        "5",
+        "--limit",
+        "12",
+        "--json",
+        "--strict",
+    ])
+    .expect("eval search-quality run command should parse");
+
+    match cli.command {
+        Some(Commands::Eval {
+            action: EvalAction::SearchQuality(args),
+        }) => {
+            assert!(args.run);
+            assert_eq!(
+                args.cases,
+                vec![
+                    "aicx_sztudio_reason".to_string(),
+                    "md_radar_marbles".to_string()
+                ]
+            );
+            assert_eq!(args.top, 5);
+            assert_eq!(args.limit, 12);
+            assert!(args.json);
+            assert!(args.strict);
+        }
+        _ => panic!("expected eval search-quality command"),
+    }
+}
+
+#[test]
 fn search_accepts_frame_kind_filter() {
     let cli = Cli::try_parse_from([
         "aicx",
