@@ -1874,6 +1874,10 @@ fn context_files_since_does_not_leak_substring_into_neighbor_repos() {
         files[0]
             .path
             .to_string_lossy()
+            // Canonical store paths are compared forward-slash; the stored
+            // `path` carries the OS separator, so normalize before matching
+            // (`\vista\…` on Windows must satisfy the `/vista/…` literal).
+            .replace('\\', "/")
             .contains("/vista/2026_0401/"),
         "expected vista hit, got {:?}",
         files[0].path
@@ -1945,6 +1949,10 @@ fn chunks_by_run_id_does_not_leak_substring_into_neighbor_repos() {
         files[0]
             .path
             .to_string_lossy()
+            // Canonical store paths are compared forward-slash; the stored
+            // `path` carries the OS separator, so normalize before matching
+            // (`\vista\…` on Windows must satisfy the `/vista/…` literal).
+            .replace('\\', "/")
             .contains("/vista/2026_0401/"),
         "expected vista hit, got {:?}",
         files[0].path
