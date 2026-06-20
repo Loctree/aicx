@@ -262,6 +262,12 @@ jobs:
           DIST_DIR: ${{ github.workspace }}/aicx/dist
           AICX_RELEASE_BUNDLE_ONLY_BINARIES: "1"
           AICX_BUNDLE_FLAVOR: slim
+          # Windows release runners have no LLVM, so drop the default
+          # `native-embedder` feature (it pulls llama-cpp-sys -> bindgen ->
+          # libclang). The slim Windows binary keeps the cloud embedder; in-process
+          # GGUF stays a Unix/native-runner capability.
+          NO_DEFAULT_FEATURES: "1"
+          FEATURES: app,cloud-embedder
           AICX_CLEAN_AFTER_BUILD: "0"
           PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
           LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}
