@@ -712,7 +712,13 @@ fn write_store_chunk(root: &Path, slug: &str, date: &str, session: &str) -> Path
 }
 
 fn encode_claude_project_dir(path: &Path) -> String {
-    path.display().to_string().replace('/', "-")
+    // Claude encodes a cwd into a single project-dir component by replacing the
+    // path separators. On Windows the path is `\`-separated and drive-prefixed
+    // (`C:\Users\x\Compass`), so a `/`-only replace leaves `:` and `\` in the
+    // name — an invalid component, and `join`ing a drive-absolute string escapes
+    // the projects root entirely. Replace both separators and the drive colon so
+    // the encoded dir is valid and discoverable on every platform.
+    path.display().to_string().replace(['/', '\\', ':'], "-")
 }
 
 fn session_info(project: &str, repo_path: &str) -> sessions::SessionInfo {
