@@ -147,6 +147,12 @@ fn current_user_allowed_bases() -> Result<Vec<PathBuf>> {
 /// Canonicalize a path, returning error if it doesn't exist.
 fn canonicalize_existing(path: &Path) -> Result<PathBuf> {
     path.canonicalize()
+        // Strip the Windows verbatim prefix (`\\?\`) so validated paths returned to
+        // callers carry plain separators. Otherwise the verbatim form leaks into
+        // user-facing messages and into path keys/comparisons (e.g. gemini step
+        // entries, ignore-matcher bases), where downstream `Path::join`/display of
+        // non-canonicalized paths never matches. No-op on Unix.
+        .map(|canonical| strip_verbatim_prefix(&canonical))
         .map_err(|e| anyhow!("Cannot canonicalize path '{}': {}", path.display(), e))
 }
 
