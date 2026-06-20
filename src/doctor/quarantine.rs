@@ -476,7 +476,15 @@ pub fn render_rebuild_sidecars_script(base: &Path) -> Result<String> {
 }
 
 pub(crate) fn shell_quote_path(path: &Path) -> String {
+    // These lines render into a `#!/usr/bin/env bash` script, so emit POSIX
+    // forward-slash paths even on Windows: strip the `\\?\` verbatim prefix that
+    // canonicalize() leaves on chunk paths and convert separators. Otherwise the
+    // generated `mv`/`mkdir` carry `\\?\C:\…\org\repo\…`, which is not a valid
+    // bash path and never matches the canonical `org/repo/…/file` shape callers
+    // (and tests) assert. No-op on Unix.
     let value = path.display().to_string();
+    let value = value.strip_prefix(r"\\?\").unwrap_or(&value);
+    let value = value.replace('\\', "/");
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 

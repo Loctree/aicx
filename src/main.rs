@@ -2741,7 +2741,7 @@ fn load_session_claims(
     agent: Option<String>,
     hours: u64,
 ) -> Result<LaneSessionContext> {
-    let home = dirs::home_dir().context("No home dir")?;
+    let home = aicx::os_user_home().context("No home dir")?;
     let session_info = sessions::find_session_by_id(&home, session);
     let agent_str = match agent {
         Some(a) => a,
@@ -3194,7 +3194,7 @@ fn run_session_report(
 }
 
 fn run_session_show(session_id: String, format: &str) -> Result<()> {
-    let home = dirs::home_dir().context("No home dir")?;
+    let home = aicx::os_user_home().context("No home dir")?;
     let Some(info) = sessions::find_session_by_id(&home, &session_id) else {
         anyhow::bail!("no session found matching id '{session_id}'");
     };
@@ -3268,7 +3268,7 @@ fn current_session_from_env() -> Option<CurrentSessionPayload> {
 /// This gives a reliable "current" even if the transcript jsonl files use a different
 /// shape than codex rollouts (chat_history etc. don't always have session_meta).
 fn current_session_from_grok_active() -> Option<CurrentSessionPayload> {
-    let home = dirs::home_dir()?;
+    let home = aicx::os_user_home()?;
     let active_path = home.join(".grok").join("active_sessions.json");
     let content = std::fs::read_to_string(&active_path).ok()?;
     let active: Vec<serde_json::Value> = serde_json::from_str(&content).ok()?;
@@ -3311,7 +3311,7 @@ fn current_session_from_env_lookup(
 }
 
 fn current_session_from_disk() -> Result<Option<CurrentSessionPayload>> {
-    let home = dirs::home_dir().context("No home dir")?;
+    let home = aicx::os_user_home().context("No home dir")?;
     let here = std::env::current_dir()?.to_string_lossy().into_owned();
     let since_dt = Utc::now() - chrono::Duration::days(7);
     let modified_after = std::time::SystemTime::UNIX_EPOCH
@@ -3393,7 +3393,7 @@ fn run_sessions_list(
         None
     };
 
-    let home = dirs::home_dir().context("No home dir")?;
+    let home = aicx::os_user_home().context("No home dir")?;
     // Gate discovery by --agent so e.g. `--agent gemini` scans only gemini
     // instead of reading every claude+codex file and filtering afterwards.
     let want_agent = agent.as_deref();
@@ -3501,7 +3501,7 @@ fn session_project_label(session: &sessions::SessionInfo) -> String {
 
 fn compact_repo_path(path: &str) -> String {
     let normalized = if let Some(home) =
-        dirs::home_dir().and_then(|path| path.into_os_string().into_string().ok())
+        aicx::os_user_home().and_then(|path| path.into_os_string().into_string().ok())
         && let Some(stripped) = path.strip_prefix(&format!("{home}/"))
     {
         format!("~/{stripped}")
@@ -3759,7 +3759,7 @@ struct BucketHint {
 fn resolve_intents_project_filters(projects: &[String]) -> Result<IntentsProjectResolution> {
     let store_root = store::store_base_dir()?;
     let cwd = std::env::current_dir().ok();
-    let session_home = dirs::home_dir();
+    let session_home = aicx::os_user_home();
     resolve_intents_project_filters_with_session_home_at(
         projects,
         &store_root,
@@ -5253,7 +5253,7 @@ fn read_codex_session_meta_id(path: &Path) -> Option<String> {
 
 fn collect_codex_session_alias_matches(requested: &str) -> Result<BTreeSet<String>> {
     let mut matches = BTreeSet::new();
-    let sessions_dir = dirs::home_dir()
+    let sessions_dir = aicx::os_user_home()
         .context("No home dir")?
         .join(".codex")
         .join("sessions");
@@ -8592,6 +8592,7 @@ fn run_dashboard_server(args: DashboardServerRunArgs) -> Result<()> {
     };
 
     if !args.no_open {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         let url = format!("http://{}:{}", host, args.port);
         #[cfg(target_os = "macos")]
         {
@@ -8955,7 +8956,7 @@ fn run_reports_extractor(args: ReportsExtractorRunArgs) -> Result<()> {
 
 fn default_vibecrafted_artifacts_root() -> Result<PathBuf> {
     let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+        aicx::os_user_home().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
     Ok(home.join(".vibecrafted").join("artifacts"))
 }
 

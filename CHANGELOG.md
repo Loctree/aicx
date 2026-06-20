@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+## [0.9.4] - 2026-06-20
+
+### Added
+
+- Windows (`x86_64-pc-windows-msvc`) is now a first-class, prebuilt release
+  target: native file locking (`LockFileEx` shared/exclusive byte-range),
+  process-liveness checks, and DACL-restricted auth-token persistence. The
+  release pipeline builds a signed, GPG-detached Windows `.zip` alongside the
+  notarized macOS and GPG-detached Linux bundles, and ships a
+  `@loctree/aicx-win32-x64-gnu` npm platform package.
+
+### Fixed
+
+- Path handling across the Windows boundary: canonical chunk refs, config /
+  lookup / manifest paths, and the reports lane filter are normalized to
+  forward slash so cross-OS comparisons match; the `\\?\` verbatim prefix is
+  stripped at the single `canonicalize` source so validated paths compare
+  cleanly (gemini step entries, ignore-matcher bases) instead of leaking the
+  verbatim form into messages and keys.
+- Traversal guard now catches a bare `..` segment under a Windows verbatim
+  prefix and on both path separators, closing a guard bypass.
+- Migration extracts Windows drive-letter source paths (`C:\…\rollout.jsonl`)
+  from legacy bundles, so rebuilds are not silently downgraded to salvage on
+  Windows runners.
+- `distribution/npm/sync-version.mjs` now includes the `win32-x64-gnu`
+  platform package, so the Windows manifest no longer drifts out of the
+  release-channel version check.
+- Windows `extern` block marked `unsafe` for Rust edition 2024.
+
 ## [0.9.3] - 2026-06-12
 
 ### Added

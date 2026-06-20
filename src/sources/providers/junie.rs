@@ -457,7 +457,7 @@ fn project_junie_block(kind: &str, agent_event: &serde_json::Value) -> Option<Bl
 
 /// Extract timeline entries from all Junie session logs under `~/.junie/sessions/`.
 pub fn extract_junie(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let sessions_dir = dirs::home_dir()
+    let sessions_dir = crate::os_user_home()
         .context("No home dir")?
         .join(".junie")
         .join("sessions");

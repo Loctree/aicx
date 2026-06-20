@@ -23,7 +23,7 @@ const __dirname = path.dirname(__filename);
 const ROOT = __dirname;
 
 const WRAPPERS = ["aicx"];
-const PLATFORMS = ["darwin-arm64", "linux-x64-gnu"];
+const PLATFORMS = ["darwin-arm64", "linux-x64-gnu", "win32-x64-gnu"];
 
 function allPackageJsonPaths() {
   const paths = [];

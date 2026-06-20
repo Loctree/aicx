@@ -16,7 +16,7 @@ pub(super) enum SourceLookupOutcome {
 
 impl SourceLocator {
     pub(super) fn from_home() -> Self {
-        let Some(home) = dirs::home_dir() else {
+        let Some(home) = crate::os_user_home() else {
             return Self::default();
         };
 

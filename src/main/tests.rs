@@ -712,7 +712,13 @@ fn write_store_chunk(root: &Path, slug: &str, date: &str, session: &str) -> Path
 }
 
 fn encode_claude_project_dir(path: &Path) -> String {
-    path.display().to_string().replace('/', "-")
+    // Claude encodes a cwd into a single project-dir component by replacing the
+    // path separators. On Windows the path is `\`-separated and drive-prefixed
+    // (`C:\Users\x\Compass`), so a `/`-only replace leaves `:` and `\` in the
+    // name — an invalid component, and `join`ing a drive-absolute string escapes
+    // the projects root entirely. Replace both separators and the drive colon so
+    // the encoded dir is valid and discoverable on every platform.
+    path.display().to_string().replace(['/', '\\', ':'], "-")
 }
 
 fn session_info(project: &str, repo_path: &str) -> sessions::SessionInfo {
@@ -2258,8 +2264,9 @@ fn conversations_output_path_is_deterministic() {
     let path =
         conversation_batch_output_path(Path::new("/tmp/aicx-conversations"), "claude", "abc/def");
     // Path contains the sanitized base + SipHash suffix; assert the
-    // shape, not a fixed hash literal.
-    let path_str = path.to_string_lossy().to_string();
+    // shape, not a fixed hash literal. `Path::join` uses `\` on Windows, so
+    // normalize to forward slash before the shape assertion (no-op on Unix).
+    let path_str = path.to_string_lossy().replace('\\', "/");
     assert!(
         path_str.starts_with("/tmp/aicx-conversations/claude/abc_def-"),
         "unexpected path: {path_str}"

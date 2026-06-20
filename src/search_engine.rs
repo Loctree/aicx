@@ -357,7 +357,7 @@ fn index_not_built_error(path: std::path::PathBuf, project_filter: Option<&str>)
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn legacy_index_hint(project_filter: Option<&str>, canonical_path: &Path) -> Option<String> {
-    let legacy_path = dirs::home_dir()?
+    let legacy_path = crate::os_user_home()?
         .join("index")
         .join(crate::vector_index::index_bucket_name(project_filter))
         .join("embeddings.ndjson");

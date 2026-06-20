@@ -137,9 +137,13 @@ fn decode_claude_project_dir(dir_name: &str) -> Option<String> {
 }
 
 /// Derive a short project label (last path segment) from a cwd.
+///
+/// Splits on both separators: a recorded cwd is an OS-native path, so on Windows
+/// it is `\`-separated (e.g. `C:\Users\x\Compass`) and a `/`-only split would
+/// return the whole path as the "label" instead of the trailing segment.
 fn project_label_from_cwd(cwd: &str) -> Option<String> {
-    cwd.trim_end_matches('/')
-        .rsplit('/')
+    cwd.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
         .find(|seg| !seg.is_empty())
         .map(str::to_string)
 }

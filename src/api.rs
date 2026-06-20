@@ -406,7 +406,7 @@ fn discover_source_sessions_for_status(
     if active_store_root != base {
         return Vec::new();
     }
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = crate::os_user_home() else {
         return Vec::new();
     };
 
@@ -587,17 +587,20 @@ mod tests {
             status
                 .semantic_index_path
                 .as_deref()
-                .is_some_and(|path| path.ends_with("indexed/_all/embeddings.ndjson")),
+                // The reported path carries the OS separator; compare on the
+                // canonical forward-slash form so `\indexed\_all\…` on Windows
+                // still satisfies the `/`-literal suffix.
+                .is_some_and(|path| path
+                    .replace('\\', "/")
+                    .ends_with("indexed/_all/embeddings.ndjson")),
             "status must report the _all query bucket, not sibling projects"
         );
         assert!(status.temp_index_present);
         assert_eq!(status.temp_index_rows, 3);
-        assert!(
-            status
-                .temp_index_path
-                .as_deref()
-                .is_some_and(|path| path.ends_with("indexed/_all/embeddings.ndjson.tmp"))
-        );
+        assert!(status.temp_index_path.as_deref().is_some_and(|path| {
+            path.replace('\\', "/")
+                .ends_with("indexed/_all/embeddings.ndjson.tmp")
+        }));
         assert_eq!(
             status.readiness,
             IndexReadiness::Ready,

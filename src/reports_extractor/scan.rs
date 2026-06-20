@@ -195,7 +195,9 @@ fn collect_candidates(
             Err(_) => continue,
         };
 
-        let rel_string = rel.to_string_lossy();
+        // Lane markers are forward-slash; normalise the OS-native relative path
+        // so `/reports/` and `/plans/` match on Windows too.
+        let rel_string = rel.to_string_lossy().replace('\\', "/");
         let contains_lane = rel_string.contains("/reports/") || rel_string.contains("/plans/");
         if !contains_lane && !rel_string.ends_with("/reports") && !rel_string.ends_with("/plans") {
             continue;
