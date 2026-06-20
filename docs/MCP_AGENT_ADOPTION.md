@@ -97,7 +97,10 @@ material and rotate the token before sharing configs.
 
 ### Codex
 
-Codex supports streamable HTTP MCP with a bearer-token environment variable:
+Codex supports streamable HTTP MCP with a bearer-token environment variable, but
+non-interactive `codex exec` also needs the tools to be explicitly approved.
+Without the per-tool approval config, Codex can discover `aicx-sztudio` and then
+cancel the MCP call with `user cancelled MCP tool call`.
 
 ```bash
 export AICX_MCP_TOKEN="<same token>"
@@ -112,6 +115,43 @@ codex mcp get aicx-sztudio
 The environment variable must be present in the shell or app environment that
 starts Codex. If Codex runs from the desktop app, verify the app receives the
 token before declaring adoption complete.
+
+For non-interactive proof runs, create a Codex profile with the full server
+definition plus the exact tools that may run without a manual approval prompt:
+
+```toml
+# ~/.codex/aicx-sztudio-smoke.config.toml
+[mcp_servers.aicx-sztudio]
+url = "http://100.75.30.90:8067/mcp"
+bearer_token_env_var = "AICX_MCP_TOKEN"
+
+[mcp_servers.aicx-sztudio.tools.aicx_index_status]
+approval_mode = "approve"
+
+[mcp_servers.aicx-sztudio.tools.aicx_search]
+approval_mode = "approve"
+```
+
+Then run a fresh proof session:
+
+```bash
+AICX_MCP_TOKEN="<same token>" codex exec \
+  -p aicx-sztudio-smoke \
+  -C /Users/silver/Git/aicx \
+  -s read-only \
+  --ephemeral \
+  'Use MCP server aicx-sztudio. Call aicx_index_status with project omitted, then call aicx_search with query "po co Silverowi model embeddingowy", limit 1, slim true. Do not use shell. Return proof: server name, semantic_index_rows, readiness, backend, top project, top source path.'
+```
+
+Expected proof shape:
+
+```text
+mcp: aicx-sztudio/aicx_index_status (completed)
+mcp: aicx-sztudio/aicx_search (completed)
+semantic_index_rows: 3918
+search backend: hybrid_rrf
+top source path: .../tb14d-anchor-v4-.../aicx-home/store/tb14d-anchor-v4/...
+```
 
 ## Agent-Level Proof
 
