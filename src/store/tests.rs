@@ -2028,7 +2028,21 @@ fn load_ignore_matcher_rejects_traversal_base() {
     fs::create_dir_all(root.join("nested")).unwrap();
     fs::write(root.join(AICX_IGNORE_FILENAME), "store/**\n").unwrap();
 
-    let traversal_base = root.join("nested").join("..");
+    // `retrieval_test_root` canonicalizes the temp dir, so on Windows `root` is
+    // a `\\?\` verbatim path. Building the base with `root.join("nested")
+    // .join("..")` does not preserve the `..` to the validator there — CI showed
+    // `load` receiving a base with the `..` already gone (and the real
+    // `.aicxignore` resolved), so the traversal guard was never exercised. Build
+    // the base as a de-verbatim'd literal string instead: the `..` survives into
+    // `contains_traversal` (which splits on both separators), while the OS still
+    // resolves `..` for the file-exists probe on a non-verbatim path. No-op on
+    // Unix (no `\\?\` prefix to strip; separator is `/`).
+    let root_str = root.display().to_string();
+    let root_str = root_str.strip_prefix(r"\\?\").unwrap_or(root_str.as_str());
+    let traversal_base = PathBuf::from(format!(
+        "{root_str}{sep}nested{sep}..",
+        sep = std::path::MAIN_SEPARATOR
+    ));
     let err = load_ignore_matcher_at(&traversal_base)
         .expect_err("traversal base should be rejected by validated read");
     let message = err.to_string().to_lowercase();
