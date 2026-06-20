@@ -571,6 +571,26 @@ fn collect_source_hints_from_text(
         }
     }
 
+    // Windows absolute paths (`C:\…\file.jsonl`) are what `Path::display()` writes
+    // into legacy bundles on Windows runners; the forward-slash `absolute_path_re`
+    // above never matches a drive-letter + backslash path, so without this pass
+    // migration extracts zero direct source candidates and rebuilds nothing
+    // (rebuild_items: 0). Matches nothing in Unix text (no `C:\` segments).
+    let windows_path_re = Regex::new(
+        r"([A-Za-z]:\\(?:[A-Za-z0-9._~\-]+\\)*[A-Za-z0-9._~\-]+(?:\.[A-Za-z0-9._~-]+)?)",
+    )
+    .expect("windows legacy source hint regex should compile");
+
+    for capture in windows_path_re.captures_iter(text) {
+        if let Some(raw) = capture.get(1) {
+            let candidate = PathBuf::from(raw.as_str());
+            if source_format_hint(&candidate, agent_hint).is_some() {
+                source_hints.insert(candidate.display().to_string());
+                direct_candidates.insert(candidate);
+            }
+        }
+    }
+
     for capture in tilde_path_re.captures_iter(text) {
         if let Some(raw) = capture.get(1) {
             let expanded = expand_tilde(raw.as_str());
