@@ -95,7 +95,7 @@ jobs:
         working-directory: aicx
         # Keep serialized until remaining AICX_HOME-mutating tests share one
         # root-crate lock or move to explicit-home helpers (Wave F).
-        run: cargo test --locked --all-targets -- --test-threads=2
+        run: cargo test --locked --all-targets --no-fail-fast -- --test-threads=2
 
       - name: cargo test native GGUF
         working-directory: aicx
