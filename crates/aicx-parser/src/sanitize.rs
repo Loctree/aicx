@@ -119,6 +119,17 @@ fn contains_traversal(path: &str) -> bool {
     if path.contains('\0') || path.contains('\n') || path.contains('\r') {
         return true;
     }
+    // `Path::components()` resolves `..` to `ParentDir` for ordinary paths, but a
+    // Windows verbatim prefix (`\\?\…`, which `canonicalize()` emits) disables
+    // that normalization — there `..` surfaces as a literal `Normal("..")` and
+    // slips straight past the component check, defeating the traversal guard.
+    // A standalone `..` segment is genuine traversal regardless of verbatim form
+    // or separator flavour, so split on BOTH separators and catch it directly.
+    // This stays as conservative as the component scan: `...`, `foo..bar`, and
+    // `a..b` are never flagged because they are not a bare `..` segment.
+    if path.split(['/', '\\']).any(|segment| segment == "..") {
+        return true;
+    }
     Path::new(path)
         .components()
         .any(|c| matches!(c, Component::ParentDir))
@@ -702,6 +713,21 @@ mod tests {
         assert!(!contains_traversal("a..b/c"));
         assert!(!contains_traversal("normal..text"));
         assert!(!contains_traversal("/srv/a..b/c"));
+    }
+
+    #[test]
+    fn test_contains_traversal_flags_backslash_and_verbatim_segments() {
+        // On Windows, `canonicalize()` returns a `\\?\` verbatim path. For
+        // verbatim paths `Path::components()` reports `..` as `Normal("..")`
+        // instead of `ParentDir`, so the component scan alone misses real
+        // traversal (this is what let `load_ignore_matcher` read a `..` base on
+        // windows-msvc). The string split catches `..` on either separator,
+        // verbatim or not — assert that here on every platform.
+        assert!(contains_traversal(r"foo\..\bar"));
+        assert!(contains_traversal(r"\\?\C:\tmp\nested\..\.aicxignore"));
+        // …while a verbatim `...` folder or embedded `..` is still innocent.
+        assert!(!contains_traversal(r"\\?\C:\tmp\store\..."));
+        assert!(!contains_traversal(r"C:\srv\a..b\c"));
     }
 
     #[test]

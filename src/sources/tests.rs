@@ -44,6 +44,20 @@ fn set_mtime(path: &Path, unix_seconds: i64) {
     set_file_mtime(path, FileTime::from_unix_time(unix_seconds, 0)).unwrap();
 }
 
+/// Render a path the way the extractors embed it in their messages. Production
+/// runs every source path through `sanitize::validate_read_path`, which
+/// canonicalizes and strips the Windows `\\?\` verbatim prefix. These tests
+/// build raw `env::temp_dir()` paths, so on windows-msvc the raw form (8.3 short
+/// names, non-canonical casing) never appears verbatim in the embedded long
+/// form — assert against the same canonicalized rendering production emits. On
+/// Unix the temp paths already round-trip, so this is effectively a no-op there.
+fn canonical_display(path: &Path) -> String {
+    sanitize::validate_read_path(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
 fn frame_kinds(entries: &[TimelineEntry]) -> Vec<Option<FrameKind>> {
     entries.iter().map(|entry| entry.frame_kind).collect()
 }
@@ -1547,7 +1561,7 @@ fn test_extract_gemini_antigravity_prefers_conversation_artifacts_for_brain_inpu
     assert!(
         entries[0]
             .message
-            .contains(&conversation_artifact.display().to_string())
+            .contains(&canonical_display(&conversation_artifact))
     );
     assert!(
         !entries
@@ -1654,7 +1668,7 @@ fn test_extract_gemini_antigravity_pb_input_resolves_brain_and_falls_back_to_ste
             .message
             .contains("not a full conversation transcript")
     );
-    assert!(entries[0].message.contains(&pb.display().to_string()));
+    assert!(entries[0].message.contains(&canonical_display(&pb)));
     assert_eq!(entries[1].role, "artifact");
     assert!(entries[1].message.contains("step output fallback"));
     assert!(
@@ -1723,8 +1737,8 @@ fn test_extract_gemini_antigravity_brain_input_falls_back_explicitly() {
 
     let entries = extract_gemini_antigravity_file(&brain, &config).unwrap();
     assert!(entries[0].message.contains("mode: step-output-fallback"));
-    assert!(entries[1].message.contains(&step_a.display().to_string()));
-    assert!(entries[2].message.contains(&step_b.display().to_string()));
+    assert!(entries[1].message.contains(&canonical_display(&step_a)));
+    assert!(entries[2].message.contains(&canonical_display(&step_b)));
     assert_eq!(entries[1].cwd.as_deref(), Some("RepoGamma"));
     assert_eq!(entries[2].cwd.as_deref(), Some("RepoGamma"));
 

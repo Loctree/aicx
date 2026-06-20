@@ -573,11 +573,14 @@ fn collect_source_hints_from_text(
 
     // Windows absolute paths (`C:\…\file.jsonl`) are what `Path::display()` writes
     // into legacy bundles on Windows runners; the forward-slash `absolute_path_re`
-    // above never matches a drive-letter + backslash path, so without this pass
-    // migration extracts zero direct source candidates and rebuilds nothing
-    // (rebuild_items: 0). Matches nothing in Unix text (no `C:\` segments).
+    // above never matches a drive-letter path, so without this pass migration
+    // extracts zero direct source candidates and rebuilds nothing (rebuild_items:
+    // 0). Accept both separators because serialized JSON content (codex `cwd`,
+    // gemini `projectRoot`) can carry forward-slash drive paths too. The leading
+    // `(?:^|[^A-Za-z0-9])` guard keeps a URL scheme like `https:` from being read
+    // as a drive letter; Unix text has no `C:\`/`C:/` segments so this is inert.
     let windows_path_re = Regex::new(
-        r"([A-Za-z]:\\(?:[A-Za-z0-9._~\-]+\\)*[A-Za-z0-9._~\-]+(?:\.[A-Za-z0-9._~-]+)?)",
+        r"(?:^|[^A-Za-z0-9])([A-Za-z]:[\\/](?:[A-Za-z0-9._~\-]+[\\/])*[A-Za-z0-9._~\-]+(?:\.[A-Za-z0-9._~-]+)?)",
     )
     .expect("windows legacy source hint regex should compile");
 
@@ -969,5 +972,68 @@ fn register_lookup_keys(path: &Path, handled_lookup_hints: &mut BTreeSet<String>
     }
     if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
         handled_lookup_hints.insert(stem.to_ascii_lowercase());
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+
+    fn collect(text: &str, agent: Option<&str>) -> (BTreeSet<PathBuf>, BTreeSet<String>) {
+        let mut direct = BTreeSet::new();
+        let mut lookups = BTreeSet::new();
+        let mut hints = BTreeSet::new();
+        collect_source_hints_from_text(text, agent, &mut direct, &mut lookups, &mut hints);
+        (direct, hints)
+    }
+
+    #[test]
+    fn windows_drive_path_is_extracted_as_direct_source_candidate() {
+        // Regression for the windows-msvc migration build: a legacy bundle line
+        // `input: C:\…\rollout-….jsonl` (what `Path::display()` emits on Windows)
+        // must surface as a direct candidate, or migration resolves no source and
+        // rebuild_items stays 0. Pure string logic — verifiable on any platform.
+        let text = r"input: C:\Users\runner\sources\rollout-rebuild-canonical-019be5e4.jsonl";
+        let (direct, hints) = collect(text, Some("codex"));
+        assert!(
+            direct
+                .iter()
+                .any(|path| path.to_string_lossy().contains("rollout-rebuild-canonical")),
+            "windows drive path not captured: {direct:?}"
+        );
+        assert!(
+            hints
+                .iter()
+                .any(|hint| hint.contains("rollout-rebuild-canonical"))
+        );
+    }
+
+    #[test]
+    fn windows_forward_slash_drive_path_is_extracted() {
+        // Serialized JSON content can carry forward-slash drive paths.
+        let text = r#"{"input":"D:/data/aicx/rollout-non-repo-019be5e4.jsonl"}"#;
+        let (direct, _) = collect(text, Some("codex"));
+        assert!(
+            direct
+                .iter()
+                .any(|path| path.to_string_lossy().contains("rollout-non-repo")),
+            "forward-slash drive path not captured: {direct:?}"
+        );
+    }
+
+    #[test]
+    fn url_scheme_is_not_mistaken_for_a_drive_letter() {
+        // The `https:` in a URL must not be read as drive `s:`. The path tail
+        // here carries no source extension, so neither the Unix nor the Windows
+        // pass yields a candidate — and crucially none starts with a bogus
+        // `s:` drive captured out of `https:`.
+        let text = "visit https://example/readme for context";
+        let (direct, _) = collect(text, Some("codex"));
+        assert!(
+            !direct
+                .iter()
+                .any(|path| path.to_string_lossy().starts_with("s:")),
+            "https scheme misread as drive letter: {direct:?}"
+        );
     }
 }
