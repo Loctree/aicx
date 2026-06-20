@@ -1426,9 +1426,7 @@ pub async fn run_http(
         }),
     );
 
-    let app = health_router
-        .merge(auth::require_auth_layer(mcp_router, auth_config))
-        .layer(axum::middleware::from_fn(mcp_outermost_request_log));
+    let app = health_router.merge(auth::require_auth_layer(mcp_router, auth_config));
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -1479,33 +1477,7 @@ fn validate_http_auth_policy(
 }
 
 async fn mcp_health() -> axum::http::StatusCode {
-    eprintln!("[aicx-mcp diag] health handler start");
-    eprintln!("[aicx-mcp diag] health handler end status=200");
     axum::http::StatusCode::OK
-}
-
-async fn mcp_outermost_request_log(
-    axum::extract::ConnectInfo(remote): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    let method = req.method().clone();
-    let path = req.uri().path().to_string();
-    let host = req
-        .headers()
-        .get(axum::http::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("<missing>")
-        .to_string();
-    eprintln!(
-        "[aicx-mcp diag] request start remote={remote} method={method} path={path} host={host}"
-    );
-    let response = next.run(req).await;
-    eprintln!(
-        "[aicx-mcp diag] request end remote={remote} method={method} path={path} status={}",
-        response.status()
-    );
-    response
 }
 
 fn streamable_http_config_for_bind(

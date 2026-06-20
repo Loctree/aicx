@@ -711,13 +711,44 @@ aicx serve [OPTIONS]
 
 Options:
 - `--transport <stdio|http>` transport (default: `stdio`; legacy alias `sse` is still accepted)
+- `--host <IP>` streamable HTTP bind address (default: `127.0.0.1`)
 - `--port <PORT>` streamable HTTP port (default: `8044`)
+- `--auth-token <TOKEN>` explicit Bearer token for HTTP transport
+- `--require-auth <true|false>` require Bearer auth on HTTP transport (default: `true`)
+- `--no-require-auth` disable Bearer auth; accepted only for loopback binds
 
 Example:
 
 ```bash
 aicx serve --transport http --port 8044
 ```
+
+Remote or tailnet example:
+
+```bash
+aicx serve --transport http \
+  --host 0.0.0.0 \
+  --port 8044 \
+  --auth-token "$AICX_MCP_TOKEN"
+```
+
+Security contract:
+
+- Loopback (`127.0.0.1`) may use `--no-require-auth` for local operator flows.
+- Non-loopback binds (`0.0.0.0`, Tailscale IPs, LAN IPs) refuse to start when
+  auth is disabled. Use `--auth-token` or `AICX_HTTP_AUTH_TOKEN`.
+- `/health` is public liveness. `/mcp` is Bearer-auth gated when auth is enabled.
+
+macOS first-run note:
+
+On macOS, the Application Firewall can show a modal prompt such as
+`Do you want the application "aicx-mcp" to accept incoming network connections?`
+for a newly built or newly installed binary. Until the operator clicks
+**Allow** on the host running the server, non-loopback requests can appear as
+TCP connects followed by HTTP timeouts. This is a host-level permission prompt,
+not an MCP routing, auth, index, or ranking failure. If non-loopback HTTP hangs
+with `CLOSE_WAIT` and no request reaches the server logs, verify the host's
+Firewall settings before changing AICX code.
 
 ## `aicx init` (Retired)
 

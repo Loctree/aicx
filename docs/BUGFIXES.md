@@ -2835,3 +2835,60 @@ wisiala ponad 30s i zostala przerwana. Po fixie zielone:
 **Lessons.** Test fail-fast nie moze zalezec od hostowego runtime. Jesli code path
 czyta `$AICX_HOME`, test musi ten home jawnie izolowac albo testuje operatorowy
 stan maszyny, nie kontrakt kodu.
+
+---
+
+## 2026-06-20 — MCP HTTP non-loopback auth contract + macOS ALF trap · `this workflow`
+
+**Symptom.** `aicx-mcp --transport http --host 100.75.30.90` i
+`--host 0.0.0.0` na Sztudio wygladaly jak transport hang: `curl` robil TCP
+connect, wysylal request, po czym timeoutowal z 0 bytes; `netstat` pokazywal
+`CLOSE_WAIT`, a request nie dochodzil do Axum middleware ani `/health`.
+
+**Root cause.** Byly dwie nakladajace sie rzeczy:
+
+- kontrakt CLI pozwalal operatorowi probowac non-loopback HTTP z
+  `--no-require-auth`, co jest P0 surface gdy port wychodzi poza loopback;
+- macOS Application Firewall na Sztudio pokazal first-run prompt dla nowych
+  binarek (`aicx-mcp`, `tiny-axum-smoke`). Dopoki operator fizycznie nie kliknal
+  **Allow**, non-loopback Rust/Axum serwery potrafily wygladac jak app-level
+  hang mimo poprawnego listen socketu.
+
+**Fix.**
+
+- Dodano `--host` do streamable HTTP MCP runtime i logowanie realnego endpointu.
+- Non-loopback MCP HTTP bez auth odmawia startu z jasnym bledem. Loopback
+  `--no-require-auth` zostaje do lokalnych operator flows.
+- `0.0.0.0` nadal moze obslugiwac tailnet/LAN, ale `/mcp` musi byc Bearer-auth
+  gated.
+- `/health` zostalo publicznym liveness endpointem poza `/mcp` auth layer.
+- Tymczasowe request-level `diag` logi z dochodzenia usunieto po potwierdzeniu
+  root cause.
+- `docs/COMMANDS.md` opisuje `--host`, tokenowy non-loopback contract oraz macOS
+  ALF first-run prompt jako znana bramke diagnostyczna.
+
+**Touched.**
+
+- `src/bin/aicx_mcp.rs` — standalone MCP CLI host/auth surface.
+- `src/main.rs` — `aicx serve` host/auth surface.
+- `src/mcp.rs` — HTTP bind host, auth policy, `/health`, rmcp host allowlist.
+- `docs/COMMANDS.md` — operator runbook dla remote/tailnet MCP HTTP.
+
+**Tests.** Local targeted: `cargo test --lib mcp_http_policy -- --nocapture`,
+`cargo test --lib mcp_http_config -- --nocapture`,
+`cargo test --bin aicx-mcp -- --nocapture`, `cargo build --bin aicx-mcp`,
+`cargo build --bin aicx`, `git diff --check`.
+Live Sztudio smoke po kliknieciu macOS **Allow**: Silver -> Tailscale ->
+Sztudio `aicx-mcp` z V4 runtime, `initialize 200`, `tools/list 200`,
+`aicx_index_status` pokazal `semantic_index_rows=3918`, `aicx_search` pokazal
+`backend=hybrid_rrf`, `dense_count=3918`, `fallback_reason=null`; request bez
+tokenu zwrocil `401 Unauthorized`.
+
+**Lessons.**
+
+- `CLOSE_WAIT` + brak request loga nie oznacza handler bug; najpierw sprawdz
+  host-level firewall / ALF prompt na maszynie serwera.
+- Non-loopback MCP nigdy nie powinien byc "naprawiany" przez otwarcie
+  no-auth. Poprawny stan to fail-closed bez tokenu albo token-auth pass.
+- Python `http.server` passing on the same port disproves broad Tailscale/port
+  failure, but does not disprove macOS per-binary firewall prompts.
