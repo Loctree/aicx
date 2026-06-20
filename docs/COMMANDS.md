@@ -750,6 +750,9 @@ not an MCP routing, auth, index, or ranking failure. If non-loopback HTTP hangs
 with `CLOSE_WAIT` and no request reaches the server logs, verify the host's
 Firewall settings before changing AICX code.
 
+For remote agent adoption and a repeatable Silver -> Sztudio smoke, see
+`docs/MCP_AGENT_ADOPTION.md`.
+
 ## `aicx init` (Retired)
 
 `aicx init` has been retired. Context initialisation is now handled by `/vc-init` inside Claude Code.

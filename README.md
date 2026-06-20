@@ -158,6 +158,7 @@ See `AGENTS.md`. In short: `make check` always, loctree semantic first, verify o
 
 - Architecture & mental model: `docs/ARCHITECTURE.md`
 - Exhaustive command reference: `docs/COMMANDS.md`
+- Remote MCP agent adoption: `docs/MCP_AGENT_ADOPTION.md`
 - Oracle / truth contract: `docs/ORACLE_CORPUS.md`
 - Store layout, protection, redaction: `docs/STORE_LAYOUT.md`, `docs/SOURCE_PROTECTION.md`, `docs/REDACTION.md`
 - Releases: `docs/RELEASES.md`

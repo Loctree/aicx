@@ -1,0 +1,143 @@
+# AICX MCP Agent Adoption Runbook
+
+This runbook turns a one-off streamable HTTP success into a repeatable agent
+runtime. It deliberately separates four gates:
+
+1. the Sztudio server is running the intended binary and AICX home,
+2. the HTTP MCP transport is reachable and token-gated,
+3. the MCP tool flow sees the expected semantic index,
+4. agent clients are explicitly configured to use that endpoint.
+
+Do not skip gate 2/3. A TCP connect or `/health` alone does not prove that
+agents are using the intended corpus.
+
+## Server Contract
+
+Run the server on the host that owns the semantic index:
+
+```bash
+export AICX_HOME="/Users/silver/.cache/aicx-experiments/tb14d-anchor-v4-20260619-121428/aicx-home"
+export AICX_EMBEDDER_CONFIG="/Users/silver/.cache/aicx-experiments/tb14d-anchor-v4-20260619-121428/.aicx/config.toml"
+export AICX_HTTP_AUTH_TOKEN="<token>"
+
+aicx-mcp --transport http \
+  --host 0.0.0.0 \
+  --port 8067 \
+  --auth-token "$AICX_HTTP_AUTH_TOKEN"
+```
+
+For a permanent service, put the same binary path, environment, host, port, and
+token source into the Sztudio launchd unit. Keep logs visible. The launchd unit
+is operator-owned because it contains host paths and token policy.
+
+Security contract:
+
+- `127.0.0.1 --no-require-auth` is acceptable for local-only operator smoke.
+- non-loopback `--no-require-auth` must refuse startup.
+- non-loopback `/mcp` requires Bearer auth.
+- `/health` is public liveness only; it does not prove the MCP tool plane.
+
+macOS note: first run of a new binary may trigger the Application Firewall
+prompt. If non-loopback curl hangs with `CLOSE_WAIT` and no request logs, check
+the host UI/firewall before debugging MCP routing.
+
+## Smoke Before Agent Adoption
+
+From the client machine, run:
+
+```bash
+export AICX_MCP_TOKEN="<same token>"
+
+AICX_MCP_URL="http://100.75.30.90:8067/mcp" \
+AICX_MCP_TOKEN="$AICX_MCP_TOKEN" \
+AICX_MCP_EXPECT_ROWS=3918 \
+AICX_MCP_EXPECT_BACKEND=hybrid_rrf \
+AICX_MCP_EXPECT_SOURCE_CONTAINS="/aicx-home/store/tb14d-anchor-v4" \
+tools/mcp-http-smoke.sh
+```
+
+The smoke checks:
+
+- `/health` returns `200`,
+- unauthenticated `/mcp` returns `401` or `403`,
+- authenticated `initialize` returns `200` and a session id,
+- `notifications/initialized` returns `202` or `200`,
+- `tools/list` includes `aicx_search`,
+- `aicx_index_status` reports `semantic_index_rows > 0` and optionally the
+  expected row count,
+- `aicx_search` returns the expected backend and does not contain
+  `filesystem_fuzzy` or `semantic_unavailable`.
+
+For a non-V4 runtime, omit or change the `AICX_MCP_EXPECT_*` values. Keep
+`AICX_MCP_EXPECT_BACKEND=hybrid_rrf` when testing semantic/hybrid quality.
+
+## Agent Client Configuration
+
+Add the remote server first as a separate name, for example `aicx-sztudio`.
+Leave the existing local stdio `aicx` entry in place until the remote path has
+survived real agent use.
+
+### Claude Code
+
+Claude Code supports streamable HTTP MCP and headers:
+
+```bash
+claude mcp add \
+  --scope user \
+  --transport http \
+  --header "Authorization: Bearer ${AICX_MCP_TOKEN}" \
+  aicx-sztudio \
+  http://100.75.30.90:8067/mcp
+
+claude mcp get aicx-sztudio
+```
+
+If the token is expanded into a local config file, treat that file as secret
+material and rotate the token before sharing configs.
+
+### Codex
+
+Codex supports streamable HTTP MCP with a bearer-token environment variable:
+
+```bash
+export AICX_MCP_TOKEN="<same token>"
+
+codex mcp add aicx-sztudio \
+  --url http://100.75.30.90:8067/mcp \
+  --bearer-token-env-var AICX_MCP_TOKEN
+
+codex mcp get aicx-sztudio
+```
+
+The environment variable must be present in the shell or app environment that
+starts Codex. If Codex runs from the desktop app, verify the app receives the
+token before declaring adoption complete.
+
+## Agent-Level Proof
+
+After adding the server, start a fresh agent session and ask it to call:
+
+1. `aicx_index_status`
+2. `aicx_search` with a known V4 query, for example:
+   `po co Silverowi model embeddingowy`
+
+The agent must report:
+
+- MCP server name (`aicx-sztudio` during rollout),
+- backend class (`hybrid_rrf`, not `filesystem_fuzzy`),
+- `semantic_index_rows`,
+- top result project/path under the intended store.
+
+If an agent only says "search found something" without backend/index details,
+the adoption proof is incomplete.
+
+## Rollback
+
+Remove only the remote entry:
+
+```bash
+claude mcp remove aicx-sztudio
+codex mcp remove aicx-sztudio
+```
+
+The existing local stdio entry can remain untouched during rollout.
