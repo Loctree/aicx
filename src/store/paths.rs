@@ -66,7 +66,7 @@ fn canonical_path_segment(value: &str, label: &str) -> Result<String> {
 /// Pure: no filesystem side effects, no directory creation. Use
 /// [`store_base_dir`] for the side-effecting public variant.
 pub fn resolve_aicx_home() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("No home directory")?;
+    let home = crate::os_user_home().context("No home directory")?;
     resolve_aicx_home_from(std::env::var_os("AICX_HOME"), &home)
 }
 
@@ -222,7 +222,7 @@ pub fn non_repository_contexts_dir() -> Result<PathBuf> {
 
 /// Returns the legacy input-store root used for truthful migration inventory.
 pub fn legacy_store_base_dir() -> Result<PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(crate::os_user_home()
         .context("No home directory")?
         .join(".ai-contexters"))
 }

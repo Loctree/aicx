@@ -98,6 +98,8 @@ fn run_aicx(home: &Path, args: &[&str]) -> Output {
     Command::new(ensure_aicx_binary_exists())
         .args(args)
         .env("HOME", home)
+        // Windows resolves the home dir from USERPROFILE, not HOME (dirs::home_dir).
+        .env("USERPROFILE", home)
         .env("AICX_HOME", home.join(".aicx"))
         .env("AICX_ALLOW_TMP", "1")
         .output()

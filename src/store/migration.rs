@@ -66,9 +66,13 @@ impl MigrationItem {
         salvage_paths.sort();
 
         Self {
-            item_id: plan.item_id.clone(),
+            // Manifest identifiers are canonical forward-slash on every OS, like
+            // canonical_paths/salvage_paths above: `legacy_group`/`item_id` come
+            // from a `Path::display()` (the bundle key), which is `\`-separated
+            // on Windows. `\` -> `/` is a no-op on Unix.
+            item_id: plan.item_id.replace('\\', "/"),
             legacy_kind: plan.legacy_kind,
-            legacy_group: plan.legacy_group.clone(),
+            legacy_group: plan.legacy_group.replace('\\', "/"),
             legacy_files,
             agent_hint: plan.agent_hint.clone(),
             date_hint: plan.date_hint.clone(),
@@ -950,7 +954,7 @@ fn looks_like_iso_date(value: &str) -> bool {
 
 fn expand_tilde(raw: &str) -> PathBuf {
     if let Some(rest) = raw.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
+        && let Some(home) = crate::os_user_home()
     {
         return home.join(rest);
     }

@@ -471,7 +471,7 @@ fn antigravity_brain_candidates(pb_path: &Path, conversation_id: &str) -> Vec<Pa
         candidates.push(antigravity_root.join("brain").join(conversation_id));
     }
 
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::os_user_home() {
         let default = home
             .join(".gemini")
             .join("antigravity")
@@ -1143,7 +1143,7 @@ fn normalize_project_hint(raw: &str) -> Option<String> {
     }
 
     if trimmed.starts_with("~/") {
-        return dirs::home_dir()
+        return crate::os_user_home()
             .map(|home| {
                 home.join(trimmed.trim_start_matches("~/"))
                     .display()
@@ -1156,7 +1156,7 @@ fn normalize_project_hint(raw: &str) -> Option<String> {
 }
 
 pub fn extract_gemini(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let home = dirs::home_dir().context("No home dir")?;
+    let home = crate::os_user_home().context("No home dir")?;
     let gemini_tmp = home.join(".gemini").join("tmp");
 
     if !gemini_tmp.exists() || !gemini_tmp.is_dir() {

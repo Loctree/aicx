@@ -208,7 +208,12 @@ fn mutation_warning_uses_bootstrap_storage_home_when_env_unset() {
     std::fs::create_dir_all(&bootstrap_config_dir).expect("create bootstrap config dir");
     std::fs::write(
         bootstrap_config_dir.join("config.toml"),
-        format!("[storage]\nhome = \"{}\"\n", storage_root.display()),
+        // A Windows `C:\Users\…` value embeds `\U`, which a TOML *basic*
+        // (double-quoted) string parses as a unicode escape and rejects. Use a
+        // TOML literal (single-quoted) string, which performs no escaping, so
+        // the backslash path round-trips verbatim into the resolved-root note
+        // the assertion below checks.
+        format!("[storage]\nhome = '{}'\n", storage_root.display()),
     )
     .expect("write bootstrap storage config");
 
@@ -219,6 +224,8 @@ fn mutation_warning_uses_bootstrap_storage_home_when_env_unset() {
         .arg("--store-root")
         .arg(&storage_root)
         .env("HOME", &bootstrap_home)
+        // Windows resolves the home dir from USERPROFILE, not HOME (dirs::home_dir).
+        .env("USERPROFILE", &bootstrap_home)
         .env_remove("AICX_HOME")
         .env("AICX_ALLOW_TMP", "1")
         .env("AICX_MUTATION_WARN_DELAY_SECONDS", "0")

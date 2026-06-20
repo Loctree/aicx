@@ -406,7 +406,7 @@ fn discover_source_sessions_for_status(
     if active_store_root != base {
         return Vec::new();
     }
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = crate::os_user_home() else {
         return Vec::new();
     };
 

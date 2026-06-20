@@ -734,7 +734,7 @@ fn path_tokens(text: &str) -> Vec<String> {
 /// honors `$HOME` on Unix). Only whole-component prefixes are redacted —
 /// `/Users/silverton` is not touched when home is `/Users/silver`.
 fn redact_home(path: &str) -> String {
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = crate::os_user_home() else {
         return path.to_string();
     };
     let home = home.to_string_lossy();

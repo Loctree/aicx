@@ -93,6 +93,8 @@ fn run_aicx(home: &Path, args: &[&str]) -> Output {
     Command::new(ensure_aicx_binary_exists())
         .args(args)
         .env("HOME", home)
+        // Windows resolves the home dir from USERPROFILE, not HOME (dirs::home_dir).
+        .env("USERPROFILE", home)
         .env("AICX_ALLOW_TMP", "1")
         // Drop any operator-pinned AICX_HOME so the spawned binary
         // resolves under the test's temp HOME — see frame_kind_contract.rs
