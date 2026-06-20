@@ -22,7 +22,7 @@ export AICX_HTTP_AUTH_TOKEN="<token>"
 
 aicx-mcp --transport http \
   --host 0.0.0.0 \
-  --port 8067 \
+  --port 8069 \
   --auth-token "$AICX_HTTP_AUTH_TOKEN"
 ```
 
@@ -132,6 +132,39 @@ Then run the Silver smoke above. Do not declare the runtime healthy from
 Do not rotate the token silently while agent sessions are actively using the
 remote server.
 
+## Current Operator Checkpoint
+
+As of the Sztudio V4 adoption proof, keep two entrypoints:
+
+- `aicx`: local fallback.
+- `aicx-sztudio`: remote Sztudio V4 MCP endpoint.
+
+Do not remove the local entrypoint while the remote service is still being
+observed in real agent sessions.
+
+Verified Sztudio V4 state:
+
+```text
+host: sztudio
+tailnet_endpoint: http://100.75.30.90:8069/mcp
+AICX_HOME: /Users/silver/.cache/aicx-experiments/tb14d-anchor-v4-20260619-121428/aicx-home
+AICX_EMBEDDER_CONFIG: /Users/silver/.cache/aicx-experiments/tb14d-anchor-v4-20260619-121428/.aicx/config.toml
+semantic_index_rows: 3918
+search_backend: hybrid_rrf
+source_path_contains: /aicx-home/store/tb14d-anchor-v4
+token_required: yes
+no-token /mcp: 401
+```
+
+Fresh agent proof completed for both Claude Code and Codex. For Codex, the
+successful proof used a profile that explicitly approves `aicx_index_status`
+and `aicx_search`; without that profile, non-interactive `codex exec` can
+discover the server and still cancel the tool invocation.
+
+This checkpoint proves transport/runtime adoption, not final global ranking
+quality. Ranking and evidence scoring should be evaluated only against a real
+semantic/hybrid backend, never against filesystem fuzzy fallback.
+
 ## Smoke Before Agent Adoption
 
 From the client machine, run:
@@ -139,7 +172,7 @@ From the client machine, run:
 ```bash
 export AICX_MCP_TOKEN="<same token>"
 
-AICX_MCP_URL="http://100.75.30.90:8067/mcp" \
+AICX_MCP_URL="http://100.75.30.90:8069/mcp" \
 AICX_MCP_TOKEN="$AICX_MCP_TOKEN" \
 AICX_MCP_EXPECT_ROWS=3918 \
 AICX_MCP_EXPECT_BACKEND=hybrid_rrf \
@@ -178,7 +211,7 @@ claude mcp add \
   --transport http \
   --header "Authorization: Bearer ${AICX_MCP_TOKEN}" \
   aicx-sztudio \
-  http://100.75.30.90:8067/mcp
+  http://100.75.30.90:8069/mcp
 
 claude mcp get aicx-sztudio
 ```
@@ -197,7 +230,7 @@ cancel the MCP call with `user cancelled MCP tool call`.
 export AICX_MCP_TOKEN="<same token>"
 
 codex mcp add aicx-sztudio \
-  --url http://100.75.30.90:8067/mcp \
+  --url http://100.75.30.90:8069/mcp \
   --bearer-token-env-var AICX_MCP_TOKEN
 
 codex mcp get aicx-sztudio
@@ -213,7 +246,7 @@ definition plus the exact tools that may run without a manual approval prompt:
 ```toml
 # ~/.codex/aicx-sztudio-smoke.config.toml
 [mcp_servers.aicx-sztudio]
-url = "http://100.75.30.90:8067/mcp"
+url = "http://100.75.30.90:8069/mcp"
 bearer_token_env_var = "AICX_MCP_TOKEN"
 
 [mcp_servers.aicx-sztudio.tools.aicx_index_status]
