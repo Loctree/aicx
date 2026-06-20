@@ -41,6 +41,97 @@ macOS note: first run of a new binary may trigger the Application Firewall
 prompt. If non-loopback curl hangs with `CLOSE_WAIT` and no request logs, check
 the host UI/firewall before debugging MCP routing.
 
+## Stable Sztudio Runtime
+
+The proof server may be started manually during diagnosis, but the durable
+operator runtime should not live in `/tmp`. The stable Sztudio service layout is:
+
+```text
+/Users/silver/.local/share/aicx/sztudio-v4/
+  bin/aicx-mcp
+  bin/aicx-sztudio-v4-service
+  log/aicx-mcp.log
+  run/aicx-mcp.pid
+```
+
+The service script is tracked in this repository:
+
+```text
+tools/aicx-sztudio-v4-service.sh
+```
+
+It pins the V4 runtime explicitly:
+
+```text
+AICX_HOME=/Users/silver/.cache/aicx-experiments/tb14d-anchor-v4-20260619-121428/aicx-home
+AICX_EMBEDDER_CONFIG=/Users/silver/.cache/aicx-experiments/tb14d-anchor-v4-20260619-121428/.aicx/config.toml
+host=0.0.0.0
+port=8069
+```
+
+The server token lives at:
+
+```text
+/Users/silver/.cache/aicx-experiments/tb14d-anchor-v4-20260619-121428/aicx-home/auth-token
+```
+
+It must be mode `0600`. The server loads it through the normal AICX auth
+resolution because the service pins `AICX_HOME`; the token is not passed on the
+command line.
+
+Useful Sztudio commands:
+
+```bash
+/Users/silver/.local/share/aicx/sztudio-v4/bin/aicx-sztudio-v4-service status
+/Users/silver/.local/share/aicx/sztudio-v4/bin/aicx-sztudio-v4-service health
+/Users/silver/.local/share/aicx/sztudio-v4/bin/aicx-sztudio-v4-service restart
+/Users/silver/.local/share/aicx/sztudio-v4/bin/aicx-sztudio-v4-service smoke-hint
+```
+
+From Silver, the matching client token should be stored with `0600` at:
+
+```text
+/Users/silver/.local/share/aicx/sztudio-v4/client-token
+```
+
+Then smoke after every restart:
+
+```bash
+cd /Users/silver/Git/aicx
+
+AICX_MCP_URL="http://100.75.30.90:8069/mcp" \
+AICX_MCP_TOKEN="$(cat /Users/silver/.local/share/aicx/sztudio-v4/client-token)" \
+AICX_MCP_EXPECT_ROWS=3918 \
+AICX_MCP_EXPECT_BACKEND=hybrid_rrf \
+AICX_MCP_EXPECT_SOURCE_CONTAINS="/aicx-home/store/tb14d-anchor-v4" \
+tools/mcp-http-smoke.sh
+```
+
+### Restart
+
+```bash
+ssh sztudio '/Users/silver/.local/share/aicx/sztudio-v4/bin/aicx-sztudio-v4-service restart'
+```
+
+Then run the Silver smoke above. Do not declare the runtime healthy from
+`/health` alone.
+
+### Token Rotation
+
+1. Stop the service on Sztudio.
+2. Move the old server token aside instead of deleting it.
+3. Start the service; it will create a fresh `AICX_HOME/auth-token` with mode
+   `0600`.
+4. Copy the new token to Silver's client-token file with mode `0600`.
+5. Re-add/update `aicx-sztudio` in Claude Code because Claude stores the
+   Authorization header in its config.
+6. Ensure Codex sessions get `AICX_MCP_TOKEN` from the client-token file.
+7. Run `tools/mcp-http-smoke.sh`.
+8. Run one fresh Claude or Codex agent proof.
+
+Do not rotate the token silently while agent sessions are actively using the
+remote server.
+
 ## Smoke Before Agent Adoption
 
 From the client machine, run:
