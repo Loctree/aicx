@@ -323,7 +323,16 @@ if expect_backend and expect_backend not in backends:
 if expect_source and expect_source not in text:
     raise SystemExit(f"search output does not contain expected source substring: {expect_source}")
 
-result_count = len(data.get("results") or data.get("items") or [])
+items = data.get("items")
+results = data.get("results")
+if isinstance(items, list):
+    result_count = len(items)
+elif isinstance(results, list):
+    result_count = len(results)
+elif isinstance(results, int):
+    result_count = results
+else:
+    result_count = 0
 if result_count <= 0:
     raise SystemExit("search returned zero results")
 print(f"search: PASS backend={expect_backend or (backends[0] if backends else '<unknown>')} results={result_count}")
