@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 pub const DEFAULT_SEARCH_QUALITY_SEED_TOML: &str =
     include_str!("../tests/retrieval_eval/search_quality_seed.toml");
@@ -151,6 +151,9 @@ pub fn discover_projects_for_cases(
             store_dir.display()
         );
     }
+    let store_dir = store_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", store_dir.display()))?;
 
     let mut anchor_to_cases: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut projects_by_case: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -442,11 +445,20 @@ fn scan_meta_projects(
     anchor_to_cases: &BTreeMap<String, Vec<String>>,
     projects_by_case: &mut BTreeMap<String, BTreeSet<String>>,
 ) -> Result<()> {
-    for entry in fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+    let safe_dir = validated_store_subdir(dir, store_dir)?;
+    for entry in fs::read_dir(&safe_dir) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path -- FP: safe_dir is canonicalized and strip_prefix-checked by validated_store_subdir; regression test rejects outside-store paths.
+        .with_context(|| format!("read {}", safe_dir.display()))?
+    {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("inspect {}", path.display()))?;
+        if file_type.is_dir() {
             scan_meta_projects(&path, store_dir, anchor_to_cases, projects_by_case)?;
+            continue;
+        }
+        if !file_type.is_file() {
             continue;
         }
         if !path
@@ -474,6 +486,20 @@ fn scan_meta_projects(
         }
     }
     Ok(())
+}
+
+fn validated_store_subdir(dir: &Path, store_dir: &Path) -> Result<PathBuf> {
+    let canonical_dir = dir
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", dir.display()))?;
+    canonical_dir.strip_prefix(store_dir).with_context(|| {
+        format!(
+            "search-quality eval refused to scan outside canonical store: {} is not under {}",
+            canonical_dir.display(),
+            store_dir.display()
+        )
+    })?;
+    Ok(canonical_dir)
 }
 
 fn project_slug_from_meta_path(store_dir: &Path, meta_path: &Path) -> Option<String> {
@@ -830,6 +856,23 @@ mod tests {
             projects.get("demo-case").cloned().unwrap_or_default(),
             vec!["tb14d-anchor-v4/aicx".to_string()]
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn store_subdir_guard_rejects_paths_outside_store() {
+        let root = temp_root("project-discovery-guard");
+        let store_dir = root.join("store");
+        let outside_dir = root.join("outside");
+        fs::create_dir_all(&store_dir).expect("create store");
+        fs::create_dir_all(&outside_dir).expect("create outside");
+        let store_dir = store_dir.canonicalize().expect("canonical store");
+
+        let error = validated_store_subdir(&outside_dir, &store_dir)
+            .expect_err("outside directory should be rejected");
+
+        assert!(error.to_string().contains("outside canonical store"));
 
         let _ = fs::remove_dir_all(root);
     }
