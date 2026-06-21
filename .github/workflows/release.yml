@@ -231,7 +231,7 @@ jobs:
           PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
           LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}
         run: |
-          # KEYS dir + .notary.env live on the dragon runner under $HOME/.keys.
+          # KEYS dir + .notary.env live on the signing runner under $HOME/.keys.
           KEYS="$HOME/.keys" ./tools/release_bundle.sh
 
       - name: Build binaries-only release (ops-linux, GPG-detached)

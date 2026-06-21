@@ -122,7 +122,7 @@ pub struct SessionInfo {
 /// Decode a Claude project directory name back into a cwd path.
 ///
 /// Claude encodes the cwd by replacing `/` with `-`, e.g.
-/// `-Users-silver-Git-transcript-builder`. The encoding is lossy (real hyphens
+/// `-Users-user-Git-transcript-builder`. The encoding is lossy (real hyphens
 /// are indistinguishable from separators), so this is a best-effort INFERENCE,
 /// not exact truth — callers mark the association as [`Association::Inferred`]
 /// and any path comparison against such a decoded value must happen in the
@@ -1246,13 +1246,13 @@ mod tests {
     #[test]
     fn discovers_claude_session_with_absolute_time_and_counts() {
         let root = temp_root("basic");
-        let proj = root.join("-Users-silver-Git-transcript-builder");
+        let proj = root.join("-Users-user-Git-transcript-builder");
         fs::create_dir_all(&proj).unwrap();
         write_session(
             &proj,
             "0eb1a73c-1234.jsonl",
             &[
-                r#"{"type":"user","cwd":"/Users/silver/Git/transcript-builder","sessionId":"0eb1a73c","message":{"role":"user","content":"hej claude, pomóż mi"},"timestamp":"2026-06-08T01:42:13.000Z"}"#,
+                r#"{"type":"user","cwd":"/Users/user/Git/transcript-builder","sessionId":"0eb1a73c","message":{"role":"user","content":"hej claude, pomóż mi"},"timestamp":"2026-06-08T01:42:13.000Z"}"#,
                 r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"jasne"}]},"timestamp":"2026-06-08T01:42:23.000Z"}"#,
                 r#"{"type":"user","message":{"role":"user","content":"dzięki"},"timestamp":"2026-06-08T01:45:00.000Z"}"#,
             ],
@@ -1279,7 +1279,7 @@ mod tests {
         assert_eq!(s.association, Association::Exact);
         assert_eq!(
             s.repo_path.as_deref(),
-            Some("/Users/silver/Git/transcript-builder")
+            Some("/Users/user/Git/transcript-builder")
         );
         assert_eq!(s.project.as_deref(), Some("transcript-builder"));
         // counts split user vs agent

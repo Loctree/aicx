@@ -66,7 +66,7 @@ Error: state.json corrupted, no backup; manual recovery needed: ~/.aicx/state.js
 
 ## G-3 (P2/scale) — `aicx index` full rebuild via cloud-embed = 37h ETA for 76k chunks; no incremental path
 
-**Symptom.** Observed 2026-05-20: after fresh `aicx all -H 24` adding 2617 chunks to existing 74k canonical store, `aicx index` started embedding ALL 76k chunks through cloud (`http://100.75.30.90:11434/v1/embeddings`) at ~2.5s/req. ETA: 2240+ minutes (37h). Unusable for daily ops.
+**Symptom.** Observed 2026-05-20: after fresh `aicx all -H 24` adding 2617 chunks to existing 74k canonical store, `aicx index` started embedding ALL 76k chunks through cloud (`http://100.64.0.1:11434/v1/embeddings`) at ~2.5s/req. ETA: 2240+ minutes (37h). Unusable for daily ops.
 
 **Files involved:**
 - `src/vector_index.rs` (write_index, primary index build loop)
@@ -94,7 +94,7 @@ Error: state.json corrupted, no backup; manual recovery needed: ~/.aicx/state.js
 
 Example seen today:
 ```
-Claude session warning: ~/.claude/projects/-Users-silver-Git-vista/abc.jsonl
+Claude session warning: ~/.claude/projects/-Users-user-Git-vista/abc.jsonl
   has 134 unparsable timestamp(s); frames dropped.
   Sample(s): line 1: <missing>, line 5: <missing>, line 10: <missing>, line 11: <missing>, line 34: <missing>
 Claude content warning: ... preserved zero-width character U+FEFF at byte offset 124

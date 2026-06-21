@@ -1155,7 +1155,7 @@ mod tests {
     // Replaces the legacy `test_state_path_is_under_store` which asserted
     // `path.contains(".aicx")` — a literal-pattern relic from before
     // `$AICX_HOME` override existed. Under any pinned `AICX_HOME` (e.g.
-    // the operator's `AICX_HOME=/Users/silver/aicx`) that asserted
+    // the operator's `AICX_HOME=/Users/user/aicx`) that asserted
     // false-positive failed silently as a "baseline failure". Pass-4
     // op-agent + operator agreed to refuse that anti-pattern: the
     // contract is "state path lives under base dir, named state.json"

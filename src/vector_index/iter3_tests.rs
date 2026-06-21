@@ -664,7 +664,7 @@ fn incremental_materialize_hybrid_refreshes_persisted_artifacts() {
         kind: "conversations".to_string(),
         session_id: format!("session-{id}"),
         frame_kind: Some("agent_reply".to_string()),
-        cwd: Some("/Users/silver/Git/Vista".to_string()),
+        cwd: Some("/Users/user/Git/Vista".to_string()),
         embedding,
     };
     let write_semantic_index = |entries: &[IndexEntry], generated_at: &str| {
@@ -788,7 +788,7 @@ fn materialize_hybrid_index_skips_missing_source_rows() {
         kind: "conversations".to_string(),
         session_id: format!("session-{id}"),
         frame_kind: Some("agent_reply".to_string()),
-        cwd: Some("/Users/maciejgad/vc-workspace/vetcoders/aicx".to_string()),
+        cwd: Some("/Users/user/vc-workspace/vetcoders/aicx".to_string()),
         embedding,
     };
     let header = IndexHeader {
@@ -855,7 +855,7 @@ fn incremental_baseline_detects_hybrid_manifest_stale_against_committed_source()
         kind: "conversations".to_string(),
         session_id: format!("session-{id}"),
         frame_kind: Some("agent_reply".to_string()),
-        cwd: Some("/Users/silver/Git/Vista".to_string()),
+        cwd: Some("/Users/user/Git/Vista".to_string()),
         embedding,
     };
     let write_semantic_index = |entries: &[IndexEntry], generated_at: &str| {
@@ -937,7 +937,7 @@ fn no_op_incremental_preserves_skip_against_pre_commit_source() {
         kind: "conversations".to_string(),
         session_id: "session-a".to_string(),
         frame_kind: Some("agent_reply".to_string()),
-        cwd: Some("/Users/silver/Git/Vista".to_string()),
+        cwd: Some("/Users/user/Git/Vista".to_string()),
         embedding: vec![1.0, 0.0],
     };
     let write_semantic_index = |generated_at: &str| {
@@ -1030,7 +1030,7 @@ fn existing_hybrid_artifacts_require_lexical_tantivy_meta() {
         kind: "conversations".to_string(),
         session_id: "session-a".to_string(),
         frame_kind: Some("agent_reply".to_string()),
-        cwd: Some("/Users/silver/Git/Vista".to_string()),
+        cwd: Some("/Users/user/Git/Vista".to_string()),
         embedding: vec![1.0, 0.0],
     };
     let mut body = serde_json::to_string(&header).expect("serialize header");
