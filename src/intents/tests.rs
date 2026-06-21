@@ -3301,6 +3301,49 @@ mod flexible_dates {
     }
 
     #[test]
+    fn record_project_is_canonical_not_query_filter() {
+        // Round II / oś 3 cut 1: a record's project must be the chunk's canonical
+        // bucket (file.project), not the query filter. An empty filter previously
+        // stamped every record with an empty project.
+        let tmp = migration_test_root("record-project-canonical");
+        let _ = fs::remove_dir_all(&tmp);
+
+        let chunk = "[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]\n\n\
+[12:00:00] user: dodaj walidacje do importera operator-md\n";
+        write_chunk(&tmp, "demo", "2026-03-15", "120000_codex-001.md", chunk);
+
+        let config = IntentsConfig {
+            project: String::new(), // no filter -> must not blank the record project
+            hours: 24,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: None,
+        };
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 3, 15)
+                .expect("date")
+                .and_hms_opt(13, 0, 0)
+                .expect("time"),
+            Utc,
+        );
+
+        let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+        assert!(!records.is_empty(), "expected at least one record");
+        for r in &records {
+            assert!(
+                !r.project.is_empty(),
+                "record project must not be empty: {r:?}"
+            );
+            assert!(
+                r.project.to_lowercase().contains("demo"),
+                "record project must be the canonical bucket, got {:?}",
+                r.project
+            );
+        }
+    }
+
+    #[test]
     fn commit_block_indices_run_rule() {
         use super::commit_block_indices;
         let to_lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();

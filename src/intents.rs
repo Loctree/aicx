@@ -111,8 +111,11 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         let (signal_lines, transcript_entries) = parse_chunk_document(&content);
         let source_chunk = file.path.to_string_lossy().to_string();
 
+        // oś 3: stamp records with the chunk's canonical bucket (file.project),
+        // not the query filter (config.project) — empty/aliased filters must not
+        // leak into record provenance.
         let (signal_candidates, signal_tasks) =
-            extract_signal_candidates(&file, &config.project, &source_chunk, &signal_lines);
+            extract_signal_candidates(&file, &file.project, &source_chunk, &signal_lines);
         extend_with_cap(
             &mut candidates,
             signal_candidates,
@@ -126,12 +129,8 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
             "task_events",
         );
 
-        let (raw_candidates, raw_tasks) = extract_transcript_candidates(
-            &file,
-            &config.project,
-            &source_chunk,
-            &transcript_entries,
-        );
+        let (raw_candidates, raw_tasks) =
+            extract_transcript_candidates(&file, &file.project, &source_chunk, &transcript_entries);
         extend_with_cap(
             &mut candidates,
             raw_candidates,
