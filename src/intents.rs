@@ -692,8 +692,14 @@ fn extract_transcript_candidates(
             }
         }
         let mut codescribe_parser = CodescribeParser::new();
+        // Document-role awareness: a pasted run of commit/changelog lines is
+        // historical reference, not operator intent (Round II / oś 2 cut 2).
+        let commit_block = commit_block_indices(&entry.lines);
 
         for (index, raw_line) in entry.lines.iter().enumerate() {
+            if commit_block.contains(&index) {
+                continue;
+            }
             let (cleaned, is_voice) = codescribe_parser.process(raw_line);
             let line = cleaned.trim();
             if line.is_empty() {
@@ -1206,6 +1212,120 @@ fn has_kwarg_call(s: &str) -> bool {
         }
     }
     false
+}
+
+/// Capitalized English commit-subject verbs (git/changelog/conventional-commit
+/// imperative mood). Case-sensitive: real commit subjects are Capitalized, so
+/// lowercase prose ("add a retry") is not matched here.
+const COMMIT_SUBJECT_VERBS: &[&str] = &[
+    "Add",
+    "Fix",
+    "Update",
+    "Remove",
+    "Refactor",
+    "Implement",
+    "Create",
+    "Delete",
+    "Move",
+    "Rename",
+    "Drop",
+    "Bump",
+    "Split",
+    "Harden",
+    "Allow",
+    "Stabilize",
+    "Port",
+    "Merge",
+    "Revert",
+    "Close",
+    "Resolve",
+    "Improve",
+    "Switch",
+    "Enable",
+    "Disable",
+    "Replace",
+    "Extract",
+    "Introduce",
+    "Wire",
+    "Guard",
+    "Expose",
+    "Prevent",
+    "Support",
+];
+
+const CONVENTIONAL_COMMIT_TYPES: &[&str] = &[
+    "feat", "fix", "chore", "docs", "refactor", "test", "perf", "build", "ci", "style", "revert",
+    "ops", "polish", "release",
+];
+
+/// `type: subject` or `type(scope): subject` conventional-commit prefix.
+fn is_conventional_commit_prefix(s: &str) -> bool {
+    let Some((head, rest)) = s.split_once(": ") else {
+        return false;
+    };
+    if rest.trim().is_empty() {
+        return false;
+    }
+    let type_word = head.split_once('(').map(|(t, _)| t).unwrap_or(head);
+    // scope form must actually close its paren
+    if head.contains('(') && !head.ends_with(')') {
+        return false;
+    }
+    CONVENTIONAL_COMMIT_TYPES.contains(&type_word)
+}
+
+/// `true` when a line reads like a git-log / changelog entry: a leading commit
+/// hash, a conventional-commit prefix, or a capitalized commit-subject verb.
+/// Used only as a per-line signal; a single such line is NOT enough to suppress
+/// it (see [`commit_block_indices`]).
+fn looks_like_commit_log_line(line: &str) -> bool {
+    let s = line.trim().trim_start_matches(['-', '*', '+', '>']).trim();
+    if s.is_empty() {
+        return false;
+    }
+    if let Some((first, rest)) = s.split_once(char::is_whitespace)
+        && !rest.trim().is_empty()
+        && looks_like_commit_hash(first)
+    {
+        return true;
+    }
+    if is_conventional_commit_prefix(s) {
+        return true;
+    }
+    if let Some((first, rest)) = s.split_once(char::is_whitespace)
+        && !rest.trim().is_empty()
+        && COMMIT_SUBJECT_VERBS.contains(&first)
+    {
+        return true;
+    }
+    false
+}
+
+/// Document-role awareness (Round II / oś 2): indices of lines that belong to a
+/// pasted commit-list / changelog BLOCK — a run of >=2 consecutive
+/// commit-log-like lines. A lone imperative is left alone (it may be a real
+/// task); only a run is treated as historical reference.
+fn commit_block_indices(lines: &[String]) -> HashSet<usize> {
+    let flags: Vec<bool> = lines
+        .iter()
+        .map(|l| looks_like_commit_log_line(l))
+        .collect();
+    let mut block = HashSet::new();
+    let mut i = 0;
+    while i < flags.len() {
+        if flags[i] {
+            let start = i;
+            while i < flags.len() && flags[i] {
+                i += 1;
+            }
+            if i - start >= 2 {
+                block.extend(start..i);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    block
 }
 
 fn looks_like_operator_requirement_line(line: &str) -> bool {

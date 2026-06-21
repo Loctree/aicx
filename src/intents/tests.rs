@@ -3301,6 +3301,87 @@ mod flexible_dates {
     }
 
     #[test]
+    fn commit_block_indices_run_rule() {
+        use super::commit_block_indices;
+        let to_lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // a run of >=2 commit-log lines -> all suppressed
+        let block = commit_block_indices(&to_lines(&[
+            "Add Windows-compatible file locking",
+            "Fix migration artifact path validation",
+            "feat(search): anchored ranking",
+        ]));
+        assert_eq!(block.len(), 3);
+
+        // a lone commit-style imperative is NOT suppressed (may be a real task)
+        let lone = commit_block_indices(&to_lines(&["Add retry logic to the search client"]));
+        assert!(lone.is_empty(), "lone imperative must stay a candidate");
+
+        // lowercase prose 'add' is not a commit-subject verb
+        let prose = commit_block_indices(&to_lines(&[
+            "dodaj prosze walidacje",
+            "add some tests when you can",
+        ]));
+        assert!(
+            prose.is_empty(),
+            "lowercase prose must not form a commit block"
+        );
+    }
+
+    #[test]
+    fn commit_list_block_is_not_classified_as_tasks() {
+        // Round II / oś 2 cut 2 — document-role awareness: a pasted run of
+        // commit/changelog lines (>=2 consecutive) is historical reference, not
+        // operator tasks. A lone real task in another turn must still survive.
+        let tmp = migration_test_root("commit-block-not-tasks");
+        let _ = fs::remove_dir_all(&tmp);
+
+        let chunk = "[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]\n\n\
+[12:00:00] user: dodaj prosze walidacje do importera operator-md\n\
+[12:01:00] user: ostatnie commity ktore wrzucam dla kontekstu:\n\
+Add Windows-compatible file locking and process checking\n\
+Fix migration artifact path validation\n\
+Update Cargo.lock dependencies\n";
+
+        write_chunk(&tmp, "demo", "2026-03-15", "120000_codex-001.md", chunk);
+
+        let config = IntentsConfig {
+            project: "demo".to_string(),
+            hours: 24,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: None,
+        };
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 3, 15)
+                .expect("date")
+                .and_hms_opt(13, 0, 0)
+                .expect("time"),
+            Utc,
+        );
+
+        let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+
+        for needle in ["windows-compatible", "migration artifact", "cargo.lock"] {
+            assert!(
+                !records
+                    .iter()
+                    .any(|r| r.summary.to_lowercase().contains(needle)),
+                "commit-list line '{needle}' must not become a record: {records:?}"
+            );
+        }
+        // the genuine Polish task in a separate turn survives
+        assert!(
+            records
+                .iter()
+                .any(|r| r.kind == IntentKind::Task
+                    && r.summary.to_lowercase().contains("walidacje")),
+            "real operator task must survive document-role filtering: {records:?}"
+        );
+    }
+
+    #[test]
     fn is_code_fragment_line_contract() {
         use super::is_code_fragment_line;
         // code fragments -> true
