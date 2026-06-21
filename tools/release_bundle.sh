@@ -55,6 +55,14 @@ PACKAGE_NAME="${PACKAGE_NAME:-}"
 CLEAN_AFTER_BUILD="${AICX_CLEAN_AFTER_BUILD:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 FEATURES_VALUE="${FEATURES:-${AICX_CARGO_FEATURES:-}}"
+# Opt out of default features (e.g. drop `native-embedder` -> no llama-cpp-sys ->
+# no libclang requirement). Windows release runners have no LLVM, so the Windows
+# leg builds slim (`NO_DEFAULT_FEATURES=1 FEATURES=app,cloud-embedder`).
+NODEFAULT_VALUE="${NO_DEFAULT_FEATURES:-${AICX_CARGO_NO_DEFAULT:-}}"
+NODEFAULT_FLAG=""
+if [[ "$NODEFAULT_VALUE" == "1" ]]; then
+  NODEFAULT_FLAG="--no-default-features"
+fi
 NATIVE_VALUE="${NATIVE:-0}"
 
 usage() {
@@ -324,10 +332,10 @@ EOF
     cd "$REPO_ROOT"
     if [[ -n "$FEATURES_VALUE" ]]; then
       # shellcheck disable=SC2086
-      $BUILD_CMD --locked --release --target "$TARGET" --features "$FEATURES_VALUE" --bin aicx --bin aicx-mcp
+      $BUILD_CMD --locked --release --target "$TARGET" $NODEFAULT_FLAG --features "$FEATURES_VALUE" --bin aicx --bin aicx-mcp
     else
       # shellcheck disable=SC2086
-      $BUILD_CMD --locked --release --target "$TARGET" --bin aicx --bin aicx-mcp
+      $BUILD_CMD --locked --release --target "$TARGET" $NODEFAULT_FLAG --bin aicx --bin aicx-mcp
     fi
   )
 
@@ -554,9 +562,9 @@ echo "[1/6] Building release binaries..."
 (
   cd "$REPO_ROOT"
   if [[ -n "$FEATURES_VALUE" ]]; then
-    cargo build --locked --release --target "$TARGET" --features "$FEATURES_VALUE" --bin aicx --bin aicx-mcp
+    cargo build --locked --release --target "$TARGET" $NODEFAULT_FLAG --features "$FEATURES_VALUE" --bin aicx --bin aicx-mcp
   else
-    cargo build --locked --release --target "$TARGET" --bin aicx --bin aicx-mcp
+    cargo build --locked --release --target "$TARGET" $NODEFAULT_FLAG --bin aicx --bin aicx-mcp
   fi
 )
 
@@ -598,6 +606,12 @@ security list-keychains -d user -s "$TEMP_KEYCHAIN_PATH" $EXISTING_KEYCHAINS >/d
 # restores when a previous default actually existed.
 ORIGINAL_DEFAULT_KEYCHAIN="$(security default-keychain -d user 2>/dev/null | tr -d ' "' || true)"
 security default-keychain -d user -s "$TEMP_KEYCHAIN_PATH"
+# Also set the COMMON (dynamic/session) default — not just the `-d user` domain.
+# Under a headless LaunchDaemon runner session codesign resolves the signing
+# identity from the session default, which the user-domain set above does not
+# populate: that is why a clean import (verified: 1 valid identity) still failed
+# `[3/6]` with "no identity found" on the release runner. No-op interactively.
+security default-keychain -s "$TEMP_KEYCHAIN_PATH" 2>/dev/null || true
 security import "$CERT_P12" \
   -k "$TEMP_KEYCHAIN_PATH" \
   -P "$CERT_PASSWORD" \

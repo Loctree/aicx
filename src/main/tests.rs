@@ -552,9 +552,9 @@ fn sessions_table_compacts_home_repo_path_for_scanning() {
 
 #[test]
 fn sessions_table_user_comes_from_source_users_path() {
-    let info = session_info("aicx", "/Users/dragon/Loctree/aicx");
+    let info = session_info("aicx", "/Users/user/Loctree/aicx");
 
-    assert_eq!(session_user_label(&info), "dragon");
+    assert_eq!(session_user_label(&info), "user");
 }
 
 #[test]

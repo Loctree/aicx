@@ -160,7 +160,7 @@ Keep new work out of this PR unless it closes an existing merge blocker.
 Current live evidence:
 
 - Loctree prism pass: score 11/15, band `9..12`, payload
-  `/Users/maciejgad/.vibecrafted/artifacts/Loctree/aicx/2026_0524/polarize/polr-222423-57363/prism.json`.
+  `/Users/user/.vibecrafted/artifacts/Loctree/aicx/2026_0524/polarize/polr-222423-57363/prism.json`.
 - GitHub PR #5 is open, non-draft, mergeable, with green remote checks.
 - Local `cargo test --lib dashboard::tests::test_inline_markdown -- --test-threads=1`
   is green after `2030d3f` switched the Node harness to

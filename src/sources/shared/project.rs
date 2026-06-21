@@ -81,7 +81,7 @@ fn canonical_project_parts(value: &str) -> Option<(String, String)> {
 /// It caused the cross-org leak flagged by `chatgpt-codex-connector` P1
 /// on PR #8 (filter `Loctree/aicx` matched `/.../VetCoders/aicx`).
 /// The original bug #14 workflow (`-p Loctree/aicx` against
-/// `/Users/silver/Git/aicx`) now travels through Tier 1: when the local
+/// `/Users/user/Git/aicx`) now travels through Tier 1: when the local
 /// path has a `.git/config` pointing at `github.com/Loctree/aicx`, the
 /// canonical resolver returns `(Loctree, aicx)` and the filter matches
 /// honestly — by ground truth, not by path-noise heuristic. For paths
@@ -216,10 +216,10 @@ pub(crate) fn body_mentions_repo_token(body_lower: &str, repo_lower: &str) -> bo
 ///
 /// The Claude on-disk encoding is the original cwd with `/` replaced by
 /// `-` (optionally prefixed with a leading `-` for absolute paths). The
-/// encoding is **inherently lossy** — given `-Users-silver-Git-vista` we
-/// cannot recover whether the original was `/Users/silver/Git/vista`
-/// (single-segment repo `vista`) or `/Users/silver/Git/nextra-docs-vista`
-/// or `/Users-silver/Git/vista`, etc.
+/// encoding is **inherently lossy** — given `-Users-user-Git-vista` we
+/// cannot recover whether the original was `/Users/user/Git/vista`
+/// (single-segment repo `vista`) or `/Users/user/Git/nextra-docs-vista`
+/// or `/Users-user/Git/vista`, etc.
 ///
 /// This function therefore acts as a **permissive pre-filter** at the
 /// directory-listing stage. Three legal match shapes for a bare `repo`
@@ -235,8 +235,8 @@ pub(crate) fn body_mentions_repo_token(body_lower: &str, repo_lower: &str) -> bo
 /// path-shaped matcher on a best-effort decoded form.
 ///
 /// Case 3 reintroduces a controlled ambiguity — `-p vista` will match
-/// both `-Users-silver-Git-vista` (correct) **and**
-/// `-Users-silver-Git-nextra-docs-vista` (likely not what the operator
+/// both `-Users-user-Git-vista` (correct) **and**
+/// `-Users-user-Git-nextra-docs-vista` (likely not what the operator
 /// meant). That ambiguity is **inherent** to the Claude encoding and
 /// cannot be resolved from the directory name alone. The strict
 /// per-entry `cwd` filter inside `extract_claude` (sources.rs ~1587,
@@ -248,7 +248,7 @@ pub(crate) fn body_mentions_repo_token(body_lower: &str, repo_lower: &str) -> bo
 ///
 /// History: the previous `decoded.eq_ignore_ascii_case(filter) ||
 /// dir_name.eq_ignore_ascii_case(filter)` required the filter to be the
-/// **whole** encoded dir name (e.g. `-p Users-silver-Git-aicx`) instead
+/// **whole** encoded dir name (e.g. `-p Users-user-Git-aicx`) instead
 /// of just the repo name. That broke every existing `-p reponame`
 /// invocation against absolute-path Claude dirs and was the regression
 /// flagged by gemini-code-assist HIGH + chatgpt-codex-connector P1

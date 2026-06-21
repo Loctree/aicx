@@ -422,8 +422,8 @@ fn try_semantic_search_native(
 ) -> std::result::Result<SemanticOutcome, SemanticError> {
     // Resolve + verify the committed index FIRST, BEFORE paying the
     // (potentially heavy) embedder bootstrap. On a host with no local index
-    // (e.g. the silver mirror, which serves semantic from sztudio and keeps
-    // `indexed/` empty by design) this makes `aicx search` / the MCP
+    // (e.g. a read mirror, which serves semantic from a remote mesh host and
+    // keeps `indexed/` empty by design) this makes `aicx search` / the MCP
     // `aicx_search` fail-fast with `IndexNotBuilt` WITHOUT loading the
     // embedder — so a client retrying a deterministically-missing index does
     // not pay a model/config bootstrap (the most expensive step) on every

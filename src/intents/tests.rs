@@ -140,10 +140,10 @@ Intent:
 - 10. Use `cron` to keep heartbeat and schedule the next step when the session
 - Input: "You drive. I want this local AI stack to feel production-ready."
 Notes:
-- Base directory for this skill: /Users/maciejgad/.claude/skills/vc-ownership
+- Base directory for this skill: /Users/user/.claude/skills/vc-ownership
 [/signals]
 
-[12:00:00] user: Base directory for this skill: /Users/maciejgad/.claude/skills/vc-ownership
+[12:00:00] user: Base directory for this skill: /Users/user/.claude/skills/vc-ownership
 
 # vc-ownership
 
@@ -177,7 +177,7 @@ fn charter_block_does_not_become_intent_or_outcome() {
         "charter-block-filter",
         r#"[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]
 
-[12:00:00] user: # AGENTS.md instructions for /Users/maciejgad/vc-workspace/vetcoders/aicx
+[12:00:00] user: # AGENTS.md instructions for /Users/user/vc-workspace/vetcoders/aicx
 <INSTRUCTIONS>
 <!-- loctree-doctrine: v1 -->
 ## **LOCTREE + AICX + VIBECRAFTED — ZŁOTE RUNO**

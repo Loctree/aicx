@@ -9,7 +9,7 @@ use std::{env, fs};
 // The legacy tests asserted `path.contains(".aicx")` which was a
 // literal-pattern relic from before `$AICX_HOME` override existed.
 // Under any pinned `AICX_HOME` (e.g. the operator's
-// `AICX_HOME=/Users/silver/aicx`) those asserts silently failed and
+// `AICX_HOME=/Users/user/aicx`) those asserts silently failed and
 // accumulated as "pre-existing baseline failures" — pass-4
 // operator-agent + operator agreed that is exactly the anti-pattern
 // we refuse to ship.
@@ -2449,7 +2449,7 @@ fn resolve_filters_to_store_or_index_slugs_supports_index_only_all_bucket() {
         "kind": "conversations",
         "session_id": "session-a",
         "frame_kind": "agent_reply",
-        "cwd": "/Users/silver/Git/Vista",
+        "cwd": "/Users/user/Git/Vista",
         "embedding": [1.0, 0.0]
     });
     fs::write(

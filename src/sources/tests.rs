@@ -110,16 +110,16 @@ fn test_repo_name_from_cwd() {
 
 #[test]
 fn test_decode_claude_project_path_with_leading_dash() {
-    let encoded = "-Users-maciejgad-hosted-VetCoders-CodeScribe";
+    let encoded = "-Users-user-hosted-VetCoders-CodeScribe";
     let decoded = decode_claude_project_path(encoded);
-    assert_eq!(decoded, "Users-maciejgad-hosted-VetCoders-CodeScribe");
+    assert_eq!(decoded, "Users-user-hosted-VetCoders-CodeScribe");
 }
 
 #[test]
 fn test_decode_claude_project_path_without_leading_dash() {
-    let encoded = "Users-maciejgad-projects-foo";
+    let encoded = "Users-user-projects-foo";
     let decoded = decode_claude_project_path(encoded);
-    assert_eq!(decoded, "Users-maciejgad-projects-foo");
+    assert_eq!(decoded, "Users-user-projects-foo");
 }
 
 #[test]
@@ -1816,7 +1816,7 @@ fn test_codex_session_filtering_cwd_match() {
     // Simulate cwd-based matching
     let session_msgs: Vec<(Option<String>, String)> = vec![
         (
-            Some("/Users/maciejgad/hosted/VetCoders/CodeScribe".to_string()),
+            Some("/Users/user/hosted/VetCoders/CodeScribe".to_string()),
             "run tests".to_string(),
         ),
         (None, "looks good".to_string()),

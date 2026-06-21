@@ -732,7 +732,7 @@ fn path_tokens(text: &str) -> Vec<String> {
 /// not leak the local username into exported lane records. Home is resolved
 /// the same way as everywhere else in the repo (`dirs::home_dir()`, which
 /// honors `$HOME` on Unix). Only whole-component prefixes are redacted —
-/// `/Users/silverton` is not touched when home is `/Users/silver`.
+/// `/Users/userton` is not touched when home is `/Users/user`.
 fn redact_home(path: &str) -> String {
     let Some(home) = crate::os_user_home() else {
         return path.to_string();
