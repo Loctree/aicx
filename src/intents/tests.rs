@@ -3280,6 +3280,15 @@ mod flexible_dates {
             .find(|c| c.record.summary.to_lowercase().contains("825 passed"))
             .expect("genuine result candidate should survive as outcome");
         assert_eq!(result.record.kind, IntentKind::Outcome);
+        assert!(
+            result
+                .record
+                .source
+                .as_deref()
+                .is_some_and(|s| s.contains("signals")),
+            "every signal-sourced record must carry signal provenance, got {:?}",
+            result.record.source
+        );
 
         // (c) the assumption filed under Outcome: is dropped (classifier maps it
         // to a non-bucket role)
@@ -3288,6 +3297,61 @@ mod flexible_dates {
                 .iter()
                 .any(|c| c.record.summary.to_lowercase().contains("zakladam")),
             "assumption wrongly under Outcome: must be dropped, not emitted as outcome"
+        );
+    }
+
+    #[test]
+    fn signals_revalidation_gate_e2e_question_under_results_not_outcome() {
+        // Round II / oś 1 — pipeline-level guard: a full canonical chunk with a
+        // [signals] Results: block carrying a question must NOT surface that
+        // question as an outcome record after the whole extraction pipeline
+        // (parse -> signals+raw -> dedup -> records), while a genuine result in
+        // the same block is preserved.
+        let tmp = migration_test_root("signals-gate-e2e-question-results");
+        let _ = fs::remove_dir_all(&tmp);
+
+        let chunk = r#"[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]
+
+[signals]
+Results:
+- Czy ten gate dziala poprawnie i ma dla nas sens?
+- result: cargo test 825 passed, 0 failed
+[/signals]
+
+[12:00:00] user: musimy dodac walidacje signali w pipeline
+"#;
+
+        write_chunk(&tmp, "demo", "2026-03-15", "120000_codex-001.md", chunk);
+
+        let config = IntentsConfig {
+            project: "demo".to_string(),
+            hours: 24,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: None,
+        };
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 3, 15)
+                .expect("date")
+                .and_hms_opt(13, 0, 0)
+                .expect("time"),
+            Utc,
+        );
+
+        let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+
+        // the question under Results: must not be an outcome anywhere in the pipeline output
+        assert!(
+            !records.iter().any(|r| r.kind == IntentKind::Outcome
+                && r.summary.to_lowercase().contains("gate dziala")),
+            "question under [signals] Results: must not become an outcome: {records:?}"
+        );
+        // the genuine result in the same block survives as an outcome
+        assert!(
+            records.iter().any(|r| r.kind == IntentKind::Outcome
+                && r.summary.to_lowercase().contains("825 passed")),
+            "genuine result under [signals] Results: must remain an outcome: {records:?}"
         );
     }
 

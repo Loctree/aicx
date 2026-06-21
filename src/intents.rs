@@ -586,9 +586,19 @@ fn extract_signal_candidates(
                     verdict.source,
                 )
             }),
-            // No section header: fall back to the line classifier (unchanged).
+            // No section header: classify the line, but still tag it as
+            // signal-sourced (it came from the [signals] block).
             None => infer_kind_from_line(payload, false).and_then(|kind| {
-                build_candidate(kind, payload, None, file, project, source_chunk, true, None)
+                build_candidate(
+                    kind,
+                    payload,
+                    None,
+                    file,
+                    project,
+                    source_chunk,
+                    true,
+                    Some(SIGNAL_SOURCE.to_string()),
+                )
             }),
         };
 
@@ -622,6 +632,11 @@ struct SignalVerdict {
 /// contrary reading it wins (operator decision 2026-06-21). Returns `None` when
 /// the classifier confidently reads the line as a non-bucket role
 /// (assumption/insight/argue/commitment), dropping the section's false positive.
+/// Provenance tag for records derived from a `[signals]` block. Every
+/// signal-sourced record carries at least this, so downstream can distinguish
+/// signal-origin from raw-transcript-origin records.
+const SIGNAL_SOURCE: &str = "signals";
+
 fn revalidate_signal_kind(declared: IntentKind, payload: &str) -> Option<SignalVerdict> {
     match classify_line_entry_type(payload, false) {
         Some((entry_type, confidence)) if confidence >= CLASSIFIER_ABSTAIN_THRESHOLD => {
@@ -629,14 +644,14 @@ fn revalidate_signal_kind(declared: IntentKind, payload: &str) -> Option<SignalV
                 // classifier agrees with the section hint -> trusted signal
                 Some(kind) if kind == declared => Some(SignalVerdict {
                     kind: declared,
-                    source: None,
+                    source: Some(SIGNAL_SOURCE.to_string()),
                     trusted: true,
                 }),
                 // classifier disagrees -> classifier wins, record provenance
                 Some(kind) => Some(SignalVerdict {
                     kind,
                     source: Some(format!(
-                        "signals:revalidated({}->{})",
+                        "{SIGNAL_SOURCE}:revalidated({}->{})",
                         declared.heading().to_ascii_lowercase(),
                         kind.heading().to_ascii_lowercase()
                     )),
@@ -649,7 +664,7 @@ fn revalidate_signal_kind(declared: IntentKind, payload: &str) -> Option<SignalV
         // classifier abstains -> honor the section hint
         _ => Some(SignalVerdict {
             kind: declared,
-            source: None,
+            source: Some(SIGNAL_SOURCE.to_string()),
             trusted: true,
         }),
     }
