@@ -316,7 +316,7 @@ Examples:
 
 ```bash
 aicx refs -H 24 --emit paths
-aicx read /Users/polyversai/.aicx/store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md
+aicx read /Users/user/.aicx/store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md
 aicx read store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md --max-chars 4000 --json
 ```
 
