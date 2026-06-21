@@ -3301,6 +3301,77 @@ mod flexible_dates {
     }
 
     #[test]
+    fn is_code_fragment_line_contract() {
+        use super::is_code_fragment_line;
+        // code fragments -> true
+        assert!(is_code_fragment_line("field(default_factory=list)"));
+        assert!(is_code_fragment_line(
+            "- DEFAULT_KEYWORDS_PATH = \"/etc/keywords\""
+        ));
+        assert!(is_code_fragment_line("MAX_RETRIES"));
+        // prose -> false (even when it mentions a CONSTANT or a config word)
+        assert!(!is_code_fragment_line(
+            "musimy ustawic nowy DEFAULT_KEYWORDS_PATH w configu"
+        ));
+        assert!(!is_code_fragment_line(
+            "od teraz importujemy tylko przez operator-md"
+        ));
+        assert!(!is_code_fragment_line("batch 10 plikow dal 66 records"));
+        // a bare cap word without underscore is not constant-case
+        assert!(!is_code_fragment_line("OK to powinno dzialac dobrze tej"));
+    }
+
+    #[test]
+    fn signals_code_fragment_lines_are_dropped() {
+        // Round II / oś 2 cut 1: code/log fragments under a [signals] section
+        // header must NOT become records (they abstain in the classifier, so the
+        // section hint would otherwise be honored). "default" in
+        // DEFAULT_KEYWORDS_PATH / field(default_factory=list) previously made
+        // them decisions.
+        use super::{StoredChunkFile, extract_signal_candidates};
+        use chrono::Utc;
+        use std::path::PathBuf;
+
+        let chunk_file = StoredChunkFile {
+            agent: "codex".to_string(),
+            date: "2026-06-21".to_string(),
+            path: PathBuf::from("chunk.md"),
+            project: "aicx".to_string(),
+            sequence: 1,
+            timestamp: Utc::now(),
+            session_id: "sess-code".to_string(),
+        };
+
+        let signal_lines: Vec<String> = vec![
+            "Decision:".to_string(),
+            "- field(default_factory=list)".to_string(),
+            "- DEFAULT_KEYWORDS_PATH = \"/etc/keywords\"".to_string(),
+            // a genuine prose decision in the same section must survive
+            "- od teraz importujemy tylko przez operator-md".to_string(),
+        ];
+
+        let (candidates, _tasks) =
+            extract_signal_candidates(&chunk_file, "aicx", "chunk.md", &signal_lines);
+
+        assert!(
+            !candidates
+                .iter()
+                .any(|c| c.record.summary.to_lowercase().contains("default")),
+            "code fragments containing 'default' must be dropped, got {:?}",
+            candidates
+                .iter()
+                .map(|c| &c.record.summary)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.record.summary.to_lowercase().contains("operator-md")),
+            "genuine prose decision must survive the code-fragment guard"
+        );
+    }
+
+    #[test]
     fn signals_revalidation_gate_e2e_question_under_results_not_outcome() {
         // Round II / oś 1 — pipeline-level guard: a full canonical chunk with a
         // [signals] Results: block carrying a question must NOT surface that

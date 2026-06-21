@@ -561,6 +561,7 @@ fn extract_signal_candidates(
         if is_source_metadata_line(payload)
             || is_local_command_artifact_line(payload)
             || is_reingested_charter_line(payload)
+            || is_code_fragment_line(payload)
         {
             continue;
         }
@@ -1119,6 +1120,92 @@ fn looks_like_operator_decision_line(line: &str) -> bool {
     ];
 
     POLICY_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// `true` when a line is a code/log fragment rather than prose — a bare
+/// identifier (`DEFAULT_KEYWORDS_PATH`), an assignment to one
+/// (`DEFAULT_KEYWORDS_PATH = "..."`), or a kwarg call
+/// (`field(default_factory=list)`). These leak into the classifier through
+/// substring policy markers ("default", "canonical") and must not become
+/// intents/decisions/outcomes (Round II / oś 2).
+fn is_code_fragment_line(line: &str) -> bool {
+    let s = line.trim().trim_start_matches(['-', '*', '+']).trim();
+    if s.is_empty() {
+        return false;
+    }
+
+    // (a) keyword-arg / assignment inside a call: foo(bar=baz)
+    if has_kwarg_call(s) {
+        return true;
+    }
+
+    // (b) the line is essentially a CONSTANT_CASE identifier (optionally
+    // assigned), with at most one trailing prose word.
+    let mut has_constant_case = false;
+    let mut prose_words = 0usize;
+    for token in s.split_whitespace() {
+        let core = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+        if core.is_empty() {
+            continue; // pure punctuation (=, (), "", ...)
+        }
+        if is_constant_case_identifier(core) {
+            has_constant_case = true;
+            continue;
+        }
+        if core.chars().all(|c| c.is_ascii_digit()) {
+            continue; // numbers / counts
+        }
+        if core.chars().all(|c| c.is_alphabetic()) && core.chars().any(|c| c.is_lowercase()) {
+            prose_words += 1; // a natural lowercase word is prose
+        }
+    }
+    has_constant_case && prose_words <= 1
+}
+
+/// `FOO_BAR`, `DEFAULT_KEYWORDS_PATH` — all-caps/digits with at least one
+/// underscore-joined segment. Plain `OK`/`PASS` (no underscore) are not matched.
+fn is_constant_case_identifier(token: &str) -> bool {
+    if !token.contains('_') {
+        return false;
+    }
+    let mut has_alpha = false;
+    for c in token.chars() {
+        if c.is_ascii_uppercase() {
+            has_alpha = true;
+        } else if c.is_ascii_digit() || c == '_' {
+            // allowed
+        } else {
+            return false; // lowercase or other -> not constant case
+        }
+    }
+    has_alpha
+}
+
+/// Detects `ident(... = ...)` — a bare `=` (not `==`/`<=`/`>=`/`!=`) between the
+/// first `(` and the next `)`, i.e. a keyword argument / call assignment.
+fn has_kwarg_call(s: &str) -> bool {
+    let Some(open) = s.find('(') else {
+        return false;
+    };
+    let rest = &s[open + 1..];
+    let Some(close) = rest.find(')') else {
+        return false;
+    };
+    let bytes = &rest.as_bytes()[..close];
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'=' {
+            let prev = if i > 0 { bytes[i - 1] } else { b' ' };
+            let next = if i + 1 < bytes.len() {
+                bytes[i + 1]
+            } else {
+                b' '
+            };
+            if prev != b'=' && prev != b'<' && prev != b'>' && prev != b'!' && next != b'=' {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn looks_like_operator_requirement_line(line: &str) -> bool {
