@@ -3221,6 +3221,77 @@ mod flexible_dates {
     }
 
     #[test]
+    fn signals_revalidation_gate_classifier_wins_on_disagreement() {
+        // Round II / oś 1: [signals] section headers are a strong HINT, not
+        // ground truth. A line whose section says `Results:`/`Outcome:` must
+        // still pass the shared classifier; on confident disagreement the
+        // classifier wins (operator decision 2026-06-21).
+        use super::{IntentKind, StoredChunkFile, extract_signal_candidates};
+        use chrono::Utc;
+        use std::path::PathBuf;
+
+        let chunk_file = StoredChunkFile {
+            agent: "codex".to_string(),
+            date: "2026-06-21".to_string(),
+            path: PathBuf::from("chunk.md"),
+            project: "aicx".to_string(),
+            sequence: 1,
+            timestamp: Utc::now(),
+            session_id: "sess-gate".to_string(),
+        };
+
+        let signal_lines: Vec<String> = vec![
+            "Results:".to_string(),
+            // (a) a question wrongly filed under Results: must NOT become outcome
+            "- Czy ten gate dziala poprawnie i ma dla nas sens?".to_string(),
+            // (b) a genuine result under Results: must stay outcome
+            "- result: cargo test 825 passed, 0 failed".to_string(),
+            "Outcome:".to_string(),
+            // (c) an assumption wrongly filed under Outcome: must be dropped
+            "- zakladam ze to zadziala bez problemow".to_string(),
+        ];
+
+        let (candidates, _tasks) =
+            extract_signal_candidates(&chunk_file, "aicx", "chunk.md", &signal_lines);
+
+        // (a) the question is reclassified to Intent, not Outcome, with provenance
+        let question = candidates
+            .iter()
+            .find(|c| c.record.summary.to_lowercase().contains("gate dziala"))
+            .expect("question candidate should survive (reclassified, not dropped)");
+        assert_eq!(
+            question.record.kind,
+            IntentKind::Intent,
+            "question under Results: must be reclassified to Intent, not Outcome"
+        );
+        assert!(
+            question
+                .record
+                .source
+                .as_deref()
+                .is_some_and(|s| s.contains("revalidated")),
+            "reclassified signal must carry revalidation provenance, got {:?}",
+            question.record.source
+        );
+
+        // (b) the genuine result stays Outcome
+        let result = candidates
+            .iter()
+            .find(|c| c.record.summary.to_lowercase().contains("825 passed"))
+            .expect("genuine result candidate should survive as outcome");
+        assert_eq!(result.record.kind, IntentKind::Outcome);
+
+        // (c) the assumption filed under Outcome: is dropped (classifier maps it
+        // to a non-bucket role)
+        assert!(
+            !candidates
+                .iter()
+                .any(|c| c.record.summary.to_lowercase().contains("zakladam")),
+            "assumption wrongly under Outcome: must be dropped, not emitted as outcome"
+        );
+    }
+
+    #[test]
     fn test_voice_intent_sorts_lower() {
         use super::sort_intent_records;
         let mut r1 = make_record("Intent voice", "2026-06-12", None);

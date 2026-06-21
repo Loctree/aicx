@@ -564,22 +564,95 @@ fn extract_signal_candidates(
         {
             continue;
         }
-        let kind = match section {
+        let declared = match section {
             SignalSection::Intent => Some(IntentKind::Intent),
             SignalSection::Decision => Some(IntentKind::Decision),
             SignalSection::Results | SignalSection::Outcome => Some(IntentKind::Outcome),
-            SignalSection::Ignore | SignalSection::None => infer_kind_from_line(payload, false),
+            SignalSection::Ignore | SignalSection::None => None,
         };
 
-        if let Some(kind) = kind
-            && let Some(candidate) =
+        let built = match declared {
+            // Section-tagged line: the [signals] header is a strong hint, but it
+            // must pass the shared classifier before becoming a record (oś 1).
+            Some(declared) => revalidate_signal_kind(declared, payload).and_then(|verdict| {
+                build_candidate(
+                    verdict.kind,
+                    payload,
+                    None,
+                    file,
+                    project,
+                    source_chunk,
+                    verdict.trusted,
+                    verdict.source,
+                )
+            }),
+            // No section header: fall back to the line classifier (unchanged).
+            None => infer_kind_from_line(payload, false).and_then(|kind| {
                 build_candidate(kind, payload, None, file, project, source_chunk, true, None)
-        {
+            }),
+        };
+
+        if let Some(candidate) = built {
             candidates.push(candidate);
         }
     }
 
     (candidates, task_events)
+}
+
+/// Kind + provenance verdict from passing a `[signals]` section line through the
+/// shared semantic classifier (Round II / oś 1).
+struct SignalVerdict {
+    kind: IntentKind,
+    /// Provenance for `IntentRecord.source`: `None` when the section hint is
+    /// honored as-is, `Some("signals:revalidated(<from>->,<to>)")` when the
+    /// classifier overrode it.
+    source: Option<String>,
+    /// Whether to score this with full signal confidence. Honored hints stay
+    /// trusted; overridden lines drop to normal classified confidence.
+    trusted: bool,
+}
+
+/// Revalidate a `[signals]` section-declared kind against the shared classifier.
+///
+/// `[signals]` headers (`Intent:`/`Decision:`/`Results:`/`Outcome:`) are a
+/// strong upstream hint, but they must not bypass the ontology — previously the
+/// section header alone set the kind, so e.g. a question filed under `Results:`
+/// became an outcome. The classifier now runs on the payload; on a confident
+/// contrary reading it wins (operator decision 2026-06-21). Returns `None` when
+/// the classifier confidently reads the line as a non-bucket role
+/// (assumption/insight/argue/commitment), dropping the section's false positive.
+fn revalidate_signal_kind(declared: IntentKind, payload: &str) -> Option<SignalVerdict> {
+    match classify_line_entry_type(payload, false) {
+        Some((entry_type, confidence)) if confidence >= CLASSIFIER_ABSTAIN_THRESHOLD => {
+            match entry_type_to_timeline_kind(entry_type) {
+                // classifier agrees with the section hint -> trusted signal
+                Some(kind) if kind == declared => Some(SignalVerdict {
+                    kind: declared,
+                    source: None,
+                    trusted: true,
+                }),
+                // classifier disagrees -> classifier wins, record provenance
+                Some(kind) => Some(SignalVerdict {
+                    kind,
+                    source: Some(format!(
+                        "signals:revalidated({}->{})",
+                        declared.heading().to_ascii_lowercase(),
+                        kind.heading().to_ascii_lowercase()
+                    )),
+                    trusted: false,
+                }),
+                // classifier confidently reads a non-bucket role -> drop false positive
+                None => None,
+            }
+        }
+        // classifier abstains -> honor the section hint
+        _ => Some(SignalVerdict {
+            kind: declared,
+            source: None,
+            trusted: true,
+        }),
+    }
 }
 
 fn extract_transcript_candidates(
