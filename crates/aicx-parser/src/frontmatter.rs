@@ -26,6 +26,13 @@ pub struct ReportFrontmatterTelemetry {
     pub completed_at: Option<String>,
     pub token_usage: Option<u64>,
     pub findings_count: Option<u32>,
+    /// Foreign-import provenance (operator-md and similar). Structural, so it
+    /// reaches the sidecar instead of living as body text (Round II / oś 3+5).
+    pub source_file: Option<String>,
+    pub source_format: Option<String>,
+    /// Stable content-hash identity for the imported source, so re-importing the
+    /// same material (even moved/renamed) does not create a fresh record.
+    pub import_id: Option<String>,
 }
 
 /// Small, stable steering metadata that can route retrieval and framework behavior.
@@ -103,6 +110,9 @@ fn parse_frontmatter_fields(yaml_str: &str) -> Option<ReportFrontmatter> {
             "completed_at" => parsed.telemetry.completed_at = string_value(value),
             "token_usage" => parsed.telemetry.token_usage = value.parse::<u64>().ok(),
             "findings_count" => parsed.telemetry.findings_count = value.parse::<u32>().ok(),
+            "source_file" => parsed.telemetry.source_file = string_value(value),
+            "source_format" => parsed.telemetry.source_format = string_value(value),
+            "import_id" => parsed.telemetry.import_id = string_value(value),
             "workflow_phase" | "phase" => parsed.steering.workflow_phase = string_value(value),
             "mode" => parsed.steering.mode = string_value(value),
             "skill_code" | "skill" => parsed.steering.skill_code = string_value(value),

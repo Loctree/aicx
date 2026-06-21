@@ -59,6 +59,11 @@ pub struct Chunk {
     pub skill_code: Option<String>,
     /// Optional steering schema/framework version reported by the source frontmatter
     pub framework_version: Option<String>,
+    /// Foreign-import provenance (operator-md and similar): originating file,
+    /// its format, and a stable content-hash import id (Round II / oś 3+5).
+    pub source_file: Option<String>,
+    pub source_format: Option<String>,
+    pub import_id: Option<String>,
     /// Index range in original day's entries (start, end exclusive)
     pub msg_range: (usize, usize),
     /// Formatted chunk text with header
@@ -114,6 +119,12 @@ pub struct ChunkMetadataSidecar {
     pub skill_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub framework_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intent_entries: Vec<crate::types::IntentEntry>,
     /// Weak repo/content mentions preserved for query/tag surfaces. This is
@@ -192,6 +203,9 @@ impl From<&Chunk> for ChunkMetadataSidecar {
             mode: chunk.mode.clone(),
             skill_code: chunk.skill_code.clone(),
             framework_version: chunk.framework_version.clone(),
+            source_file: chunk.source_file.clone(),
+            source_format: chunk.source_format.clone(),
+            import_id: chunk.import_id.clone(),
             intent_entries: Vec::new(),
             tags: Vec::new(),
             artifact_family: None,
@@ -384,6 +398,9 @@ fn apply_frontmatter(chunk: &mut Chunk, frontmatter: &crate::frontmatter::Report
     chunk.mode = frontmatter.steering.mode.clone();
     chunk.skill_code = frontmatter.steering.skill_code.clone();
     chunk.framework_version = frontmatter.steering.framework_version.clone();
+    chunk.source_file = frontmatter.telemetry.source_file.clone();
+    chunk.source_format = frontmatter.telemetry.source_format.clone();
+    chunk.import_id = frontmatter.telemetry.import_id.clone();
 }
 
 fn split_day_entries_by_frame_kind<'a>(
@@ -576,6 +593,9 @@ fn chunk_day_entries(
             mode: None,
             skill_code: None,
             framework_version: None,
+            source_file: None,
+            source_format: None,
+            import_id: None,
             msg_range: (global_start, global_end),
             text,
             token_estimate,
@@ -1610,6 +1630,40 @@ mod tests {
     }
 
     #[test]
+    fn test_chunk_entries_extracts_foreign_import_provenance() {
+        // Round II / oś 3+5 cut 1: foreign-import provenance carried structurally
+        // from frontmatter through Chunk to the sidecar (not left as body text).
+        let entries = vec![make_entry(
+            14,
+            30,
+            "user",
+            "---\nsource_file: Downloads/ChatGPT-export.md\nsource_format: chatgpt-markdown\nimport_id: blake3:abc123\nframe_kind: user_msg\n---\n## Prompt\nzbadaj temat",
+        )];
+
+        let chunks = chunk_entries(&entries, "proj", "operator", &ChunkerConfig::default());
+        assert_eq!(chunks.len(), 1);
+        let chunk = &chunks[0];
+
+        assert_eq!(
+            chunk.source_file.as_deref(),
+            Some("Downloads/ChatGPT-export.md")
+        );
+        assert_eq!(chunk.source_format.as_deref(), Some("chatgpt-markdown"));
+        assert_eq!(chunk.import_id.as_deref(), Some("blake3:abc123"));
+        // provenance is stripped from the chunk body (lives in metadata now)
+        assert!(!chunk.text.contains("import_id: blake3:abc123"));
+
+        // and it flows into the structural sidecar
+        let sidecar = ChunkMetadataSidecar::from(chunk);
+        assert_eq!(
+            sidecar.source_file.as_deref(),
+            Some("Downloads/ChatGPT-export.md")
+        );
+        assert_eq!(sidecar.source_format.as_deref(), Some("chatgpt-markdown"));
+        assert_eq!(sidecar.import_id.as_deref(), Some("blake3:abc123"));
+    }
+
+    #[test]
     fn test_chunk_entries_skips_unsupported_frontmatter_values_without_dropping_metadata() {
         let entries = vec![make_entry(
             14,
@@ -1656,6 +1710,9 @@ mod tests {
                 mode: Some("session-first".to_string()),
                 skill_code: Some("vc-workflow".to_string()),
                 framework_version: Some("2026-03".to_string()),
+                source_file: None,
+                source_format: None,
+                import_id: None,
                 msg_range: (0, 5),
                 text: "chunk one content".to_string(),
                 token_estimate: 4,
@@ -1683,6 +1740,9 @@ mod tests {
                 mode: None,
                 skill_code: None,
                 framework_version: None,
+                source_file: None,
+                source_format: None,
+                import_id: None,
                 msg_range: (3, 8),
                 text: "chunk two content".to_string(),
                 token_estimate: 4,
@@ -1847,6 +1907,9 @@ mod tests {
                 mode: None,
                 skill_code: None,
                 framework_version: None,
+                source_file: None,
+                source_format: None,
+                import_id: None,
                 msg_range: (0, 5),
                 text: "x".repeat(100),
                 token_estimate: 25,
@@ -1874,6 +1937,9 @@ mod tests {
                 mode: None,
                 skill_code: None,
                 framework_version: None,
+                source_file: None,
+                source_format: None,
+                import_id: None,
                 msg_range: (5, 10),
                 text: "y".repeat(200),
                 token_estimate: 50,
