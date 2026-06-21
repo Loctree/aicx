@@ -90,7 +90,7 @@ fn source_info(
 
 /// List available sources with session counts, sizes, and read-only protection status.
 pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
-    let home = dirs::home_dir().context("No home dir")?;
+    let home = crate::os_user_home().context("No home dir")?;
     let mut sources: Vec<SourceInfo> = Vec::new();
 
     // Claude

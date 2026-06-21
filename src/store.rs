@@ -1128,7 +1128,9 @@ pub fn read_context_chunk_at(
         .strip_prefix(&base)
         .unwrap_or(&file.path)
         .to_string_lossy()
-        .to_string();
+        // Canonical store keys are forward-slash on every OS so the same
+        // conversation resolves to the same relative path on Windows and Unix.
+        .replace('\\', "/");
     let path = sanitize::validate_read_path(&file.path)?;
     let bytes = path.metadata().map(|meta| meta.len()).unwrap_or(0);
     let content = sanitize::read_to_string_validated(&path)?;
@@ -1229,7 +1231,9 @@ fn stored_file_matches_reference(base: &Path, file: &StoredContextFile, referenc
         .path
         .strip_prefix(base)
         .ok()
-        .is_some_and(|relative| relative.to_string_lossy() == reference)
+        // Canonical references are forward-slash; normalise the OS-native
+        // relative path so a `store/org/repo/...` ref matches on Windows too.
+        .is_some_and(|relative| relative.to_string_lossy().replace('\\', "/") == reference)
     {
         return true;
     }

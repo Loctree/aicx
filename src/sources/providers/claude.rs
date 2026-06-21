@@ -289,7 +289,7 @@ fn select_claude_session_id<'a>(
 /// Reads `~/.claude/projects/<project_dir>/<uuid>.jsonl` files.
 /// Uses filename stem (UUID) as session_id for consistency.
 pub fn extract_claude(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let claude_dir = dirs::home_dir()
+    let claude_dir = crate::os_user_home()
         .context("No home dir")?
         .join(".claude")
         .join("projects");
@@ -524,7 +524,7 @@ struct ClaudeHistoryEntry {
 /// Contains user prompts with `project` (=cwd), `display` (text), `timestamp` (ms epoch).
 /// Skips slash commands (`/init`, `/status`, `/model`, etc.).
 pub fn extract_claude_history(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let history_path = dirs::home_dir()
+    let history_path = crate::os_user_home()
         .context("No home dir")?
         .join(".claude")
         .join("history.jsonl");

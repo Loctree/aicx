@@ -206,6 +206,16 @@ cleanup() {
   if [[ -n "${ORIGINAL_DEFAULT_KEYCHAIN:-}" ]]; then
     security default-keychain -s "${ORIGINAL_DEFAULT_KEYCHAIN}" >/dev/null 2>&1 || true
   fi
+  # Restore the user search list to its pre-run state FIRST, unconditionally.
+  # This drops the temp entry whether or not the keychain file still exists —
+  # `delete-keychain` below only removes the entry when the file is present, so
+  # a killed run or wiped DIST_DIR would otherwise leave a dangling reference
+  # that breaks every later `security unlock-keychain` and pops "Keychain Not
+  # Found" on the next signing op.
+  if [[ -n "${ORIGINAL_KEYCHAIN_LIST:-}" ]]; then
+    # shellcheck disable=SC2086  # intentional word-split over the keychain path list
+    security list-keychains -d user -s ${ORIGINAL_KEYCHAIN_LIST} >/dev/null 2>&1 || true
+  fi
   if [[ -n "${TEMP_KEYCHAIN_PATH:-}" && -f "${TEMP_KEYCHAIN_PATH}" ]]; then
     security delete-keychain "${TEMP_KEYCHAIN_PATH}" >/dev/null 2>&1 || true
   fi
@@ -566,6 +576,12 @@ echo "[2/6] Preparing temporary signing keychain..."
 TEMP_KEYCHAIN_PATH="$DIST_DIR/${BUNDLE_BASENAME}.keychain-db"
 TEMP_KEYCHAIN_PASSWORD="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 EXISTING_KEYCHAINS="$(security list-keychains -d user | tr -d '"' | tr '\n' ' ')"
+# Snapshot the pre-modification search list so cleanup can restore it verbatim.
+# `delete-keychain` only drops the temp entry while the keychain FILE exists; a
+# killed run or a wiped DIST_DIR leaves the file gone but the entry behind as a
+# dangling reference, which is what surfaces later as a "Keychain Not Found"
+# dialog and breaks `security unlock-keychain` for every subsequent session.
+ORIGINAL_KEYCHAIN_LIST="$EXISTING_KEYCHAINS"
 
 security create-keychain -p "$TEMP_KEYCHAIN_PASSWORD" "$TEMP_KEYCHAIN_PATH"
 security set-keychain-settings -lut 21600 "$TEMP_KEYCHAIN_PATH"

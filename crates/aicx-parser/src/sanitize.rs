@@ -119,6 +119,17 @@ fn contains_traversal(path: &str) -> bool {
     if path.contains('\0') || path.contains('\n') || path.contains('\r') {
         return true;
     }
+    // `Path::components()` resolves `..` to `ParentDir` for ordinary paths, but a
+    // Windows verbatim prefix (`\\?\…`, which `canonicalize()` emits) disables
+    // that normalization — there `..` surfaces as a literal `Normal("..")` and
+    // slips straight past the component check, defeating the traversal guard.
+    // A standalone `..` segment is genuine traversal regardless of verbatim form
+    // or separator flavour, so split on BOTH separators and catch it directly.
+    // This stays as conservative as the component scan: `...`, `foo..bar`, and
+    // `a..b` are never flagged because they are not a bare `..` segment.
+    if path.split(['/', '\\']).any(|segment| segment == "..") {
+        return true;
+    }
     Path::new(path)
         .components()
         .any(|c| matches!(c, Component::ParentDir))
@@ -189,21 +200,62 @@ fn is_cargo_test_exe_path(path: &Path) -> bool {
 }
 
 fn is_temp_allowlist_path(path: &Path) -> bool {
-    path.starts_with("/tmp")
+    if path.starts_with("/tmp")
         || path.starts_with("/var/folders")
         || path.starts_with("/private/tmp")
         || path.starts_with("/private/var/folders")
+    {
+        return true;
+    }
+    // Test harnesses put scratch dirs under `<cwd>/target/test-tmp` (see the
+    // mk_tmp_dir helpers). On Windows CI the checkout lives on a different drive
+    // (D:\a\...) than the user dirs (C:\Users\...), so target/test-tmp is under no
+    // allowed base — recognise any path containing a `target/test-tmp` segment pair.
+    // Still gated by temp_allowlist_enabled() at the call site (test-only by default).
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        if component.as_os_str() == std::ffi::OsStr::new("target")
+            && let Some(next) = components.peek()
+            && next.as_os_str() == std::ffi::OsStr::new("test-tmp")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Strip a Windows `\\?\` (or `\\?\UNC\`) verbatim prefix so `Path::starts_with`
+/// compares plain `C:\…` components. `canonicalize()` yields verbatim paths on
+/// Windows; starts_with between a verbatim path and either a non-verbatim base
+/// (the canonicalize-fallback case) or another verbatim path is unreliable — so
+/// normalise BOTH sides to non-verbatim before comparing. No-op on Unix.
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
 }
 
 /// Validate that a path is under an allowed base directory.
 fn is_under_allowed_base(path: &Path) -> Result<bool> {
+    // The incoming `path` is already canonicalized (verbatim on Windows). Strip the
+    // verbatim prefix and compare against likewise-stripped, canonicalized bases so
+    // reads under the user dirs (incl. %TEMP%, which lives under the local cache
+    // dir) are not wrongly rejected on Windows. No-op on Unix.
+    let path = strip_verbatim_prefix(path);
     for base in current_user_allowed_bases()? {
-        if path.starts_with(base) {
+        let base = base.canonicalize().unwrap_or(base);
+        let base = strip_verbatim_prefix(&base);
+        if path.starts_with(&base) {
             return Ok(true);
         }
     }
 
-    if is_temp_allowlist_path(path) {
+    if is_temp_allowlist_path(&path) {
         return Ok(temp_allowlist_enabled());
     }
 
@@ -655,6 +707,21 @@ mod tests {
         assert!(!contains_traversal("a..b/c"));
         assert!(!contains_traversal("normal..text"));
         assert!(!contains_traversal("/srv/a..b/c"));
+    }
+
+    #[test]
+    fn test_contains_traversal_flags_backslash_and_verbatim_segments() {
+        // On Windows, `canonicalize()` returns a `\\?\` verbatim path. For
+        // verbatim paths `Path::components()` reports `..` as `Normal("..")`
+        // instead of `ParentDir`, so the component scan alone misses real
+        // traversal (this is what let `load_ignore_matcher` read a `..` base on
+        // windows-msvc). The string split catches `..` on either separator,
+        // verbatim or not — assert that here on every platform.
+        assert!(contains_traversal(r"foo\..\bar"));
+        assert!(contains_traversal(r"\\?\C:\tmp\nested\..\.aicxignore"));
+        // …while a verbatim `...` folder or embedded `..` is still innocent.
+        assert!(!contains_traversal(r"\\?\C:\tmp\store\..."));
+        assert!(!contains_traversal(r"C:\srv\a..b\c"));
     }
 
     #[test]

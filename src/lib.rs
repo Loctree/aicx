@@ -101,6 +101,28 @@ pub use api::{SearchOptions, SearchResults};
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub use aicx_embeddings as embeddings;
 
+/// Resolve the OS user home directory, honoring `HOME`/`USERPROFILE` env
+/// overrides before the platform default.
+///
+/// `dirs::home_dir()` on Windows reads the profile through the Win32
+/// known-folder API and ignores environment variables, so a spawned process
+/// cannot be redirected to a sandbox home the way `HOME` does on Unix — which
+/// breaks every test (and any caller) that sets `HOME`/`USERPROFILE` to isolate
+/// session/source/store discovery. Honor those vars first so redirection works
+/// on every platform; for a real user `USERPROFILE` already equals the
+/// known-folder profile, so this is behavior-preserving outside an explicit
+/// override.
+pub fn os_user_home() -> Option<std::path::PathBuf> {
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(value) = std::env::var_os(key)
+            && !value.is_empty()
+        {
+            return Some(std::path::PathBuf::from(value));
+        }
+    }
+    dirs::home_dir()
+}
+
 pub mod prelude {
     #[cfg(feature = "app")]
     pub use crate::api::SearchOptions;

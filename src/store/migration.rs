@@ -48,24 +48,31 @@ impl MigrationItem {
             .collect();
         existing_sources.sort();
 
+        // Manifest store paths are reported in canonical forward-slash form on
+        // every OS (matching the store's canonical chunk refs); `\` -> `/` is a
+        // no-op on Unix and keeps Windows manifests consistent + greppable.
         let mut canonical_paths: Vec<String> = plan
             .canonical_paths
             .iter()
-            .map(|path| path.display().to_string())
+            .map(|path| path.display().to_string().replace('\\', "/"))
             .collect();
         canonical_paths.sort();
 
         let mut salvage_paths: Vec<String> = plan
             .salvage_paths
             .iter()
-            .map(|path| path.display().to_string())
+            .map(|path| path.display().to_string().replace('\\', "/"))
             .collect();
         salvage_paths.sort();
 
         Self {
-            item_id: plan.item_id.clone(),
+            // Manifest identifiers are canonical forward-slash on every OS, like
+            // canonical_paths/salvage_paths above: `legacy_group`/`item_id` come
+            // from a `Path::display()` (the bundle key), which is `\`-separated
+            // on Windows. `\` -> `/` is a no-op on Unix.
+            item_id: plan.item_id.replace('\\', "/"),
             legacy_kind: plan.legacy_kind,
-            legacy_group: plan.legacy_group.clone(),
+            legacy_group: plan.legacy_group.replace('\\', "/"),
             legacy_files,
             agent_hint: plan.agent_hint.clone(),
             date_hint: plan.date_hint.clone(),
@@ -568,6 +575,29 @@ fn collect_source_hints_from_text(
         }
     }
 
+    // Windows absolute paths (`C:\…\file.jsonl`) are what `Path::display()` writes
+    // into legacy bundles on Windows runners; the forward-slash `absolute_path_re`
+    // above never matches a drive-letter path, so without this pass migration
+    // extracts zero direct source candidates and rebuilds nothing (rebuild_items:
+    // 0). Accept both separators because serialized JSON content (codex `cwd`,
+    // gemini `projectRoot`) can carry forward-slash drive paths too. The leading
+    // `(?:^|[^A-Za-z0-9])` guard keeps a URL scheme like `https:` from being read
+    // as a drive letter; Unix text has no `C:\`/`C:/` segments so this is inert.
+    let windows_path_re = Regex::new(
+        r"(?:^|[^A-Za-z0-9])([A-Za-z]:[\\/](?:[A-Za-z0-9._~\-]+[\\/])*[A-Za-z0-9._~\-]+(?:\.[A-Za-z0-9._~-]+)?)",
+    )
+    .expect("windows legacy source hint regex should compile");
+
+    for capture in windows_path_re.captures_iter(text) {
+        if let Some(raw) = capture.get(1) {
+            let candidate = PathBuf::from(raw.as_str());
+            if source_format_hint(&candidate, agent_hint).is_some() {
+                source_hints.insert(candidate.display().to_string());
+                direct_candidates.insert(candidate);
+            }
+        }
+    }
+
     for capture in tilde_path_re.captures_iter(text) {
         if let Some(raw) = capture.get(1) {
             let expanded = expand_tilde(raw.as_str());
@@ -598,7 +628,14 @@ fn collect_source_hints_from_text(
 }
 
 fn source_format_hint(path: &Path, agent_hint: Option<&str>) -> Option<SourceFormat> {
-    let path_str = path.to_string_lossy().to_ascii_lowercase();
+    // Source detection matches provider markers (`/.claude/`, `/antigravity/brain/`,
+    // `/.gemini/tmp/`, …) as forward-slash substrings. On Windows the native path
+    // separator is `\`, so normalize before matching or every provider check
+    // misses and migration classifies no source files.
+    let path_str = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -917,7 +954,7 @@ fn looks_like_iso_date(value: &str) -> bool {
 
 fn expand_tilde(raw: &str) -> PathBuf {
     if let Some(rest) = raw.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
+        && let Some(home) = crate::os_user_home()
     {
         return home.join(rest);
     }
@@ -939,5 +976,68 @@ fn register_lookup_keys(path: &Path, handled_lookup_hints: &mut BTreeSet<String>
     }
     if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
         handled_lookup_hints.insert(stem.to_ascii_lowercase());
+    }
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+
+    fn collect(text: &str, agent: Option<&str>) -> (BTreeSet<PathBuf>, BTreeSet<String>) {
+        let mut direct = BTreeSet::new();
+        let mut lookups = BTreeSet::new();
+        let mut hints = BTreeSet::new();
+        collect_source_hints_from_text(text, agent, &mut direct, &mut lookups, &mut hints);
+        (direct, hints)
+    }
+
+    #[test]
+    fn windows_drive_path_is_extracted_as_direct_source_candidate() {
+        // Regression for the windows-msvc migration build: a legacy bundle line
+        // `input: C:\…\rollout-….jsonl` (what `Path::display()` emits on Windows)
+        // must surface as a direct candidate, or migration resolves no source and
+        // rebuild_items stays 0. Pure string logic — verifiable on any platform.
+        let text = r"input: C:\Users\runner\sources\rollout-rebuild-canonical-019be5e4.jsonl";
+        let (direct, hints) = collect(text, Some("codex"));
+        assert!(
+            direct
+                .iter()
+                .any(|path| path.to_string_lossy().contains("rollout-rebuild-canonical")),
+            "windows drive path not captured: {direct:?}"
+        );
+        assert!(
+            hints
+                .iter()
+                .any(|hint| hint.contains("rollout-rebuild-canonical"))
+        );
+    }
+
+    #[test]
+    fn windows_forward_slash_drive_path_is_extracted() {
+        // Serialized JSON content can carry forward-slash drive paths.
+        let text = r#"{"input":"D:/data/aicx/rollout-non-repo-019be5e4.jsonl"}"#;
+        let (direct, _) = collect(text, Some("codex"));
+        assert!(
+            direct
+                .iter()
+                .any(|path| path.to_string_lossy().contains("rollout-non-repo")),
+            "forward-slash drive path not captured: {direct:?}"
+        );
+    }
+
+    #[test]
+    fn url_scheme_is_not_mistaken_for_a_drive_letter() {
+        // The `https:` in a URL must not be read as drive `s:`. The path tail
+        // here carries no source extension, so neither the Unix nor the Windows
+        // pass yields a candidate — and crucially none starts with a bogus
+        // `s:` drive captured out of `https:`.
+        let text = "visit https://example/readme for context";
+        let (direct, _) = collect(text, Some("codex"));
+        assert!(
+            !direct
+                .iter()
+                .any(|path| path.to_string_lossy().starts_with("s:")),
+            "https scheme misread as drive letter: {direct:?}"
+        );
     }
 }

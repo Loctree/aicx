@@ -682,7 +682,22 @@ pub fn extract_claims(sources: &[ClaimSource], extracted_at: &str) -> Vec<ClaimR
 /// cannot honestly test here — skipping them avoids manufacturing false
 /// contradictions (absence of checkable evidence is NOT a Fail).
 fn is_checkable_path(token: &str) -> bool {
-    token.contains('/') && !token.contains("://") && !token.starts_with('~') && !token.contains('*')
+    // On Windows a claim can name a `C:\…\file.rs`-shaped artifact that carries
+    // no `/` at all; accept the OS separator there. Gated on `cfg!(windows)` so
+    // Unix heuristics stay byte-identical (no new false positives on tokens
+    // that merely contain a backslash).
+    let has_separator = token.contains('/') || (cfg!(windows) && token.contains('\\'));
+    has_separator && !token.contains("://") && !token.starts_with('~') && !token.contains('*')
+}
+
+/// Final path component, honoring the backslash separator on Windows so
+/// Windows-shaped tokens (`C:\…\file.rs`) resolve their file-ish suffix.
+fn last_path_component(token: &str) -> Option<&str> {
+    if cfg!(windows) {
+        token.rsplit(['/', '\\']).next()
+    } else {
+        token.rsplit('/').next()
+    }
 }
 
 fn path_tokens(text: &str) -> Vec<String> {
@@ -703,7 +718,7 @@ fn path_tokens(text: &str) -> Vec<String> {
         let w = word.trim_matches(|c: char| ",.;:()[]\"'".contains(c));
         if is_checkable_path(w)
             && !w.starts_with('`')
-            && w.rsplit('/').next().is_some_and(|f| f.contains('.'))
+            && last_path_component(w).is_some_and(|f| f.contains('.'))
         {
             out.push(w.to_string());
         }
@@ -719,18 +734,22 @@ fn path_tokens(text: &str) -> Vec<String> {
 /// honors `$HOME` on Unix). Only whole-component prefixes are redacted —
 /// `/Users/silverton` is not touched when home is `/Users/silver`.
 fn redact_home(path: &str) -> String {
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = crate::os_user_home() else {
         return path.to_string();
     };
     let home = home.to_string_lossy();
-    let home = home.trim_end_matches('/');
+    let home = home.trim_end_matches(['/', '\\']);
     if home.is_empty() || !path.starts_with(home) {
         return path.to_string();
     }
     let rest = &path[home.len()..];
     match rest.chars().next() {
         None => "~".to_string(),
-        Some('/') => format!("~{rest}"),
+        // Whole-component boundary on either separator (Windows home is
+        // `C:\Users\<user>`). Normalise the shown suffix to `/` so redacted
+        // excerpts read consistently across OSes and never leak the local
+        // username; the unredacted `artifact_path` keeps native separators.
+        Some('/') | Some('\\') => format!("~{}", rest.replace('\\', "/")),
         Some(_) => path.to_string(),
     }
 }

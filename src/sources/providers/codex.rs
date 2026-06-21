@@ -136,7 +136,7 @@ pub(crate) fn parse_codex_file_with_diagnostics(
 }
 
 pub fn extract_codex(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let codex_path = dirs::home_dir()
+    let codex_path = crate::os_user_home()
         .context("No home dir")?
         .join(".codex")
         .join("history.jsonl");
@@ -609,7 +609,7 @@ fn build_codex_history_entries(
 /// Walks `~/.codex/sessions/` recursively for `*.jsonl` files.
 /// Two-pass per file: extract session metadata, then collect user/agent messages.
 pub fn extract_codex_sessions(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let sessions_dir = dirs::home_dir()
+    let sessions_dir = crate::os_user_home()
         .context("No home dir")?
         .join(".codex")
         .join("sessions");
@@ -1037,7 +1037,7 @@ pub fn extract_grok_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<T
 /// Walk `~/.grok/sessions/` (and nested project-slug / uuid dirs) for *.jsonl and
 /// parse using the Codex v1/responses session event parser.
 pub fn extract_grok_sessions(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let sessions_root = dirs::home_dir()
+    let sessions_root = crate::os_user_home()
         .context("No home dir")?
         .join(".grok")
         .join("sessions");
@@ -1076,7 +1076,7 @@ pub fn extract_grok_sessions(config: &ExtractionConfig) -> Result<Vec<TimelineEn
 /// Prefers the session/rollout layout under ~/.grok/sessions (v1/responses).
 /// If a top-level ~/.grok/history.jsonl in legacy CodexEntry format exists, it is also included.
 pub fn extract_grok(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
-    let grok_root = dirs::home_dir().context("No home dir")?.join(".grok");
+    let grok_root = crate::os_user_home().context("No home dir")?.join(".grok");
 
     let mut entries = Vec::new();
 

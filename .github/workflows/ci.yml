@@ -24,6 +24,8 @@ jobs:
             runner: '["self-hosted", "ops-linux"]'
           - name: macos-self-hosted
             runner: '["self-hosted", "dragon-macos"]'
+          - name: windows-latest
+            runner: '"windows-latest"'
 
     steps:
       - uses: actions/checkout@v6
@@ -38,13 +40,10 @@ jobs:
           path: rust-memex
 
       - name: Install protoc
-        # Manual install instead of arduino/setup-protoc@v3 — that action
-        # GitHub-API-fetches release metadata even for pinned versions,
-        # which times out intermittently on the macos-self-hosted runner
-        # (arduino/setup-protoc#108; observed 2026-05-24 PR #9 macOS:
-        # 34s "unable to get latest version" hang after 2+ successful
-        # runs). brew/apt provide protoc v23+, prost-build / tonic-build
-        # compatible.
+        # Skipped on Windows: the slim Windows bundle builds default features
+        # only (no `lance`), so rust-memex/grpc — the sole protoc consumer —
+        # is never compiled.
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           if command -v protoc >/dev/null 2>&1; then
@@ -96,7 +95,7 @@ jobs:
         working-directory: aicx
         # Keep serialized until remaining AICX_HOME-mutating tests share one
         # root-crate lock or move to explicit-home helpers (Wave F).
-        run: cargo test --locked --all-targets -- --test-threads=2
+        run: cargo test --locked --all-targets --no-fail-fast -- --test-threads=2
 
       - name: cargo test native GGUF
         working-directory: aicx
