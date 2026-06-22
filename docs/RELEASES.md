@@ -194,6 +194,43 @@ crate depends on local first-party product crates (`rust-memex` and
 `cargo publish --dry-run` failures as expected unless the product decision
 changes and all first-party crates get a crates.io-compatible publication plan.
 
+## macOS Signing Runner Session Requirement
+
+The macOS release leg (`dragon-macos`) Apple-codesigns the binaries with the
+Developer ID identity. `codesign` can only resolve a keychain signing identity
+from inside a GUI login (`Aqua`) security session. This is a hard macOS
+constraint, not a property of `tools/release_bundle.sh`.
+
+Symptom when the runner is in the wrong session: `codesign` fails at step
+`[3/6]` with **"no identity found"** even though the Developer ID identity is
+valid (`security find-identity -v -p codesigning` → `1 valid identities found`)
+and the temporary-keychain import at step `[2/6]` succeeds.
+
+The signing script is correct: it creates a temp keychain, imports the `.p12`,
+runs `set-key-partition-list`, sets the temp keychain as the user default
+(needed for `SessionCreate=true` launchd sessions), and signs with `--keychain`.
+Reproducing that exact sequence in an `Aqua` session signs cleanly and passes
+`codesign --verify --deep --strict` (full chain Developer ID → Apple Root CA,
+hardened runtime, secure timestamp). No keychain-default trick in the script can
+compensate for a runner session that has no access to keychain services at all.
+
+Requirement: the `dragon-macos` self-hosted runner that builds aicx must run as
+a per-user LaunchAgent **inside the logged-in GUI session** (`launchctl
+managername` → `Aqua`), with `SessionCreate=true`. A runner started from a
+system-domain `LaunchDaemon` (or any pre-login / non-Aqua bootstrap parent) runs
+without an Aqua security session and cannot codesign, regardless of the script.
+
+Diagnose the runner's session before a release:
+
+```bash
+launchctl managername                       # must print: Aqua
+security find-identity -v -p codesigning    # must list the Developer ID identity
+```
+
+If `managername` is not `Aqua`, fix the runner's launchd configuration (move it
+into the GUI session) before re-running the release — do not patch the signing
+script.
+
 ## Recovery and Reruns
 
 - To rebuild a release for an existing tag, rerun the failed workflow or use `workflow_dispatch` with the same `vX.Y.Z` tag.
