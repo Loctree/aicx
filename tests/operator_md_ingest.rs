@@ -192,6 +192,64 @@ Decision: naprawiamy najpierw syntax error, potem MIME.
 }
 
 #[test]
+fn operator_markdown_emits_structural_import_provenance() {
+    // Round II / oś 3+5 cut 2: every extracted entry leads with a frontmatter
+    // block carrying source_file, source_format and a content-hash import_id.
+    // The chunker lifts these into the sidecar (see aicx-parser chunker test
+    // test_chunk_entries_extracts_foreign_import_provenance) and strips the
+    // block from the chunk body. import_id is deterministic per content.
+    let root = unique_test_dir("op-md-import-provenance");
+    let home = root.join("home");
+    fs::create_dir_all(&home).expect("create home");
+    let export = root.join("exports").join("ChatGPT-provenance.md");
+    write_file(
+        &export,
+        "## Prompt:\nzbadaj temat importu\n\n## Response:\nDecision: importujemy tylko przez operator-md\n",
+    );
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+
+    let entries =
+        extract_operator_markdown_from_input(&home, &export, &config).expect("extract input");
+    assert!(!entries.is_empty());
+    for entry in &entries {
+        assert!(
+            entry.message.starts_with("---\n"),
+            "entry must lead with a frontmatter block, got: {:?}",
+            entry.message.lines().next()
+        );
+        assert!(entry.message.contains("source_file: "));
+        assert!(entry.message.contains("source_format: "));
+        assert!(
+            entry.message.contains("import_id: blake3:"),
+            "entry must carry a blake3 content-hash import_id"
+        );
+    }
+
+    // determinism: the same content yields the same import_id
+    let first_import_id = |message: &str| -> String {
+        message
+            .lines()
+            .find_map(|l| l.strip_prefix("import_id: "))
+            .expect("import_id present")
+            .to_string()
+    };
+    let entries2 =
+        extract_operator_markdown_from_input(&home, &export, &config).expect("re-extract");
+    assert_eq!(
+        first_import_id(&entries[0].message),
+        first_import_id(&entries2[0].message)
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn operator_markdown_frontmatter_overrides_foreign_markdown_import_metadata() {
     let root = unique_test_dir("frontmatter-chatgpt-md");
     let home = root.join("home");

@@ -283,7 +283,7 @@ fn parse_operator_markdown_document(
             )
         });
 
-    if let Some(entries) = parse_chatgpt_markdown_document(
+    if let Some(mut entries) = parse_chatgpt_markdown_document(
         &body,
         &document.path,
         &frontmatter,
@@ -292,6 +292,7 @@ fn parse_operator_markdown_document(
         base_timestamp,
         config,
     ) {
+        attach_import_provenance(&mut entries, &document.path, &content);
         return Ok(entries);
     }
 
@@ -389,7 +390,32 @@ fn parse_operator_markdown_document(
         entries.push(entry);
     }
 
+    attach_import_provenance(&mut entries, &document.path, &content);
     Ok(entries)
+}
+
+/// Round II / oś 3+5 cut 2: prepend a frontmatter block carrying structural
+/// import provenance to every entry, so the chunker lifts source_file /
+/// source_format / import_id into the sidecar (and strips the block from the
+/// chunk body). `import_id` is a blake3 content hash, so re-importing the same
+/// material — even moved or renamed — resolves to the same id.
+fn attach_import_provenance(entries: &mut [TimelineEntry], path: &Path, content: &str) {
+    let import_id = format!("blake3:{}", blake3::hash(content.as_bytes()).to_hex());
+    for entry in entries.iter_mut() {
+        let source_format = entry
+            .message
+            .lines()
+            .find_map(|line| line.strip_prefix("source_format: "))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(OPERATOR_MD_KIND)
+            .to_string();
+        let block = format!(
+            "---\nsource_file: {}\nsource_format: {source_format}\nimport_id: {import_id}\n---\n",
+            path.display()
+        );
+        entry.message = format!("{block}{}", entry.message);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
