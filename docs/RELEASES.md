@@ -215,9 +215,12 @@ hardened runtime, secure timestamp). No keychain-default trick in the script can
 compensate for a runner session that has no access to keychain services at all.
 
 Requirement: the `dragon-macos` self-hosted runner that builds aicx must run as
-a per-user LaunchAgent **inside the logged-in GUI session** (`launchctl
-managername` → `Aqua`), with `SessionCreate=true`. A runner started from a
-system-domain `LaunchDaemon` (or any pre-login / non-Aqua bootstrap parent) runs
+a per-user LaunchAgent **inside the logged-in GUI session**, bootstrapped into
+`gui/$(id -u)` as the logged-in user. The decisive, verifiable property is
+`launchctl managername` → `Aqua` from inside the job — not any single plist flag
+(`SessionCreate` values differ across this host's runner plists, so do not treat
+the flag as the contract; verify `managername`). A runner started from a
+system-domain `LaunchDaemon`, over ssh, or by a detached non-Aqua supervisor runs
 without an Aqua security session and cannot codesign, regardless of the script.
 
 Diagnose the runner's session before a release:
@@ -230,6 +233,12 @@ security find-identity -v -p codesigning    # must list the Developer ID identit
 If `managername` is not `Aqua`, fix the runner's launchd configuration (move it
 into the GUI session) before re-running the release — do not patch the signing
 script.
+
+As a backstop, `tools/release_bundle.sh` fails fast at step `[2b/6]` (after the
+temp-keychain import + `set-key-partition-list`, before the codesign loop) when
+the imported identity is not resolvable in the build session. It prints the same
+remedy and the in-session `find-identity` output instead of dying mid-run at
+`[3/6]` with a cryptic "no identity found" and a SecurityAgent GUI dialog.
 
 ## Recovery and Reruns
 

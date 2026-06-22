@@ -609,6 +609,33 @@ security set-key-partition-list \
   -k "$TEMP_KEYCHAIN_PASSWORD" \
   "$TEMP_KEYCHAIN_PATH" >/dev/null
 
+# Preflight: prove the imported identity is actually resolvable for codesigning
+# in THIS session BEFORE the signing loop. The create/import/partition-list dance
+# above succeeds even in a session with no keychain services (a runner spawned
+# from a system LaunchDaemon, over ssh, or by a detached non-Aqua supervisor),
+# but codesign then fails at [3/6] with "no identity found" — after the entire
+# build, often behind a SecurityAgent GUI dialog. Fail fast here with the remedy.
+SESSION_MANAGER="$(launchctl managername 2>/dev/null || echo '<unknown>')"
+if ! security find-identity -v -p codesigning "$TEMP_KEYCHAIN_PATH" 2>/dev/null \
+    | grep -qF -- "$SIGNING_IDENTITY"; then
+  {
+    echo "Error: signing identity '$SIGNING_IDENTITY' imported into the temp"
+    echo "       keychain but NOT resolvable for codesigning in this session"
+    echo "       (launchctl managername: $SESSION_MANAGER — must be: Aqua)."
+    echo ""
+    echo "codesign resolves a keychain identity only inside the logged-in user's"
+    echo "Aqua GUI session. Run the dragon-macos runner as a per-user LaunchAgent"
+    echo "bootstrapped into gui/\$(id -u) WHILE LOGGED IN — never from a system"
+    echo "LaunchDaemon or a detached non-Aqua supervisor."
+    echo "See docs/RELEASES.md -> 'macOS Signing Runner Session Requirement'."
+    echo ""
+    echo "find-identity in this session:"
+    security find-identity -v -p codesigning 2>&1 | sed 's/^/  /'
+  } >&2
+  exit 1
+fi
+echo "[2b/6] Signing identity resolvable in session ($SESSION_MANAGER)."
+
 echo "[3/6] Signing release binaries..."
 for binary in "$BUNDLE_DIR/aicx" "$BUNDLE_DIR/aicx-mcp"; do
   codesign \
