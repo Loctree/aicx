@@ -153,7 +153,11 @@ Decision: naprawiamy najpierw syntax error, potem MIME.
 
     let config = ExtractionConfig {
         project_filter: vec!["screenscribe".to_string()],
-        cutoff: Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap(),
+        // cutoff before the export's Created date (5/27): oś 5 now dates the
+        // conversation to Created, not the 6/17 mtime, so a 6/1 cutoff would
+        // (correctly) exclude it. This test exercises section parsing, not date
+        // filtering.
+        cutoff: Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
         include_assistant: true,
         watermark: None,
     };
@@ -161,6 +165,13 @@ Decision: naprawiamy najpierw syntax error, potem MIME.
         extract_operator_markdown_from_input(&home, &export, &config).expect("extract input");
 
     assert_eq!(entries.len(), 4);
+    // dated to Created (5/27), not the mtime (6/17)
+    assert_eq!(
+        entries[0].timestamp.date_naive(),
+        Utc.with_ymd_and_hms(2026, 5, 27, 0, 0, 0)
+            .unwrap()
+            .date_naive()
+    );
     assert_eq!(entries[0].role, "user");
     assert_eq!(entries[0].frame_kind, Some(FrameKind::UserMsg));
     assert!(
@@ -189,6 +200,47 @@ Decision: naprawiamy najpierw syntax error, potem MIME.
     );
 
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn operator_markdown_chatgpt_dates_from_created_header_not_mtime() {
+    // Round II / oś 5: a ChatGPT export carries a "**Created:**" timestamp. The
+    // conversation must be dated to that (its real start), not to the file mtime
+    // (the download time), which previously flattened weeks-old conversations to
+    // "today".
+    let root = unique_test_dir("op-md-created-date");
+    let home = root.join("home");
+    fs::create_dir_all(&home).expect("create home");
+    let export = root.join("exports").join("ChatGPT-old.md");
+    write_file(
+        &export,
+        "# old talk\n\n**Created:** 5/27/2026 1:07:20\n**Updated:** 6/17/2026 10:31:54\n\n## Prompt:\nzbadaj temat\n\n## Response:\nDecision: robimy X\n",
+    );
+    // mtime = download time, far after the real conversation date
+    let mtime = Utc
+        .with_ymd_and_hms(2026, 6, 17, 10, 35, 41)
+        .unwrap()
+        .timestamp();
+    set_file_mtime(&export, FileTime::from_unix_time(mtime, 0)).expect("set mtime");
+
+    let config = ExtractionConfig {
+        project_filter: vec![],
+        cutoff: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        include_assistant: true,
+        watermark: None,
+    };
+    let entries =
+        extract_operator_markdown_from_input(&home, &export, &config).expect("extract input");
+    assert!(!entries.is_empty());
+    for entry in &entries {
+        assert_eq!(
+            entry.timestamp.date_naive(),
+            Utc.with_ymd_and_hms(2026, 5, 27, 0, 0, 0)
+                .unwrap()
+                .date_naive(),
+            "ChatGPT export must be dated to Created (5/27), not mtime (6/17)"
+        );
+    }
 }
 
 #[test]

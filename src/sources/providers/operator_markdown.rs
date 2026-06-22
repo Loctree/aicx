@@ -260,10 +260,13 @@ fn parse_operator_markdown_document(
         .as_deref()
         .and_then(|cwd| normalize_operator_frontmatter_cwd(home, cwd))
         .or_else(|| resolve_operator_cwd_hint(home, &document.path, project_hint.as_deref()));
+    // Date precedence (oś 5): explicit operator frontmatter date > the export's
+    // own "Created" header (real conversation start) > file mtime (download time).
     let base_timestamp = frontmatter
         .date
         .as_deref()
         .and_then(parse_operator_timestamp)
+        .or_else(|| extract_chatgpt_created_timestamp(&content))
         .unwrap_or(document.modified);
     let session_id = frontmatter
         .session_id
@@ -699,6 +702,39 @@ fn parse_operator_timestamp(value: &str) -> Option<DateTime<Utc>> {
         }
     }
     None
+}
+
+/// Parse a ChatGPT-export US-style timestamp like `5/27/2026 1:07:20` (or
+/// date-only `5/27/2026`). chrono accepts unpadded month/day on input.
+fn parse_chatgpt_export_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    for fmt in ["%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(value, fmt) {
+            return Some(Utc.from_utc_datetime(&dt));
+        }
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(value, "%m/%d/%Y")
+        && let Some(time) = NaiveTime::from_hms_opt(0, 0, 0)
+    {
+        return Some(Utc.from_utc_datetime(&date.and_time(time)));
+    }
+    None
+}
+
+/// Pull the conversation start date from a ChatGPT export's `**Created:**`
+/// header so weeks-old conversations are dated to their real start, not the
+/// download mtime (Round II / oś 5).
+fn extract_chatgpt_created_timestamp(content: &str) -> Option<DateTime<Utc>> {
+    content.lines().find_map(|line| {
+        let line = line.trim();
+        let rest = line
+            .strip_prefix("**Created:**")
+            .or_else(|| line.strip_prefix("Created:"))?;
+        parse_chatgpt_export_timestamp(rest.trim_start_matches('*').trim())
+    })
 }
 
 fn parse_markdown_heading(line: &str) -> Option<String> {
