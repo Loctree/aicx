@@ -1741,6 +1741,17 @@ enum Commands {
     },
 }
 
+/// Index of the top-level subcommand token: the first argument that is not
+/// a leading global flag. AICX exposes exactly one global flag
+/// (`--verbose`/`-v`, boolean — see [`Cli`]), so the first token that does
+/// not start with `-` is the subcommand. Returns `None` when every argument
+/// is a flag. Used by the pre-clap hint detectors so they fire only on the
+/// actual subcommand, never on a word that reappears later as an argument or
+/// search term (e.g. `aicx search ingest`).
+fn first_subcommand_index(args: &[String]) -> Option<usize> {
+    args.iter().position(|a| !a.starts_with('-'))
+}
+
 /// Detect `aicx <cmd>` invocations that clap would otherwise reject with
 /// a generic "the following required arguments were not provided" or
 /// "missing required subcommand" error. Returns a `(cmd_name,
@@ -1768,13 +1779,16 @@ where
         return None;
     }
 
-    // Locate the leftmost top-level subcommand. We accept arbitrary
-    // top-level flags before it (e.g. `aicx --verbose ingest`).
-    let cmd_idx = args
-        .iter()
-        .position(|a| matches!(a.as_str(), "ingest" | "conversations" | "sources"))?;
+    // Locate the top-level subcommand (first non-flag token; global flags
+    // like `aicx --verbose ingest` are accepted before it). Only emit a
+    // hint when THAT token is a boundary subcommand — otherwise the same
+    // words appearing later (e.g. `aicx search ingest`) would be hijacked.
+    let cmd_idx = first_subcommand_index(&args)?;
 
     let cmd = args[cmd_idx].as_str();
+    if !matches!(cmd, "ingest" | "conversations" | "sources") {
+        return None;
+    }
     let tail = &args[cmd_idx + 1..];
 
     match cmd {
@@ -1854,8 +1868,13 @@ where
 {
     let args: Vec<String> = args.into_iter().collect();
 
-    // Step 1: locate the first positional that equals `config`.
-    let config_idx = args.iter().position(|a| a == "config")?;
+    // Step 1: the top-level subcommand must BE `config`. Use the first
+    // non-flag token so `config` reappearing later as a search term
+    // (`aicx search config --show`) is never mistaken for the subcommand.
+    let config_idx = first_subcommand_index(&args)?;
+    if args[config_idx] != "config" {
+        return None;
+    }
 
     // Step 2: walk forward; if we hit `show`/`init` first, the user is
     // already on a valid subcommand path → no mistake.

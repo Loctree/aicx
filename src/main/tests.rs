@@ -147,6 +147,62 @@ fn detect_config_show_flag_accepts_global_flags_before_config() {
     assert!(detect_config_show_flag_mistake(args).is_some());
 }
 
+/// P2 regression (BACKLOG 2026-06-01 [aicx/cli]): the `config --show` hint
+/// must only fire when `config` is the top-level subcommand, not when it
+/// appears later as a search term (`aicx search config --show`).
+#[test]
+fn detect_config_show_flag_ignores_config_as_search_term() {
+    let args = ["search", "config", "--show"].iter().map(|s| s.to_string());
+    assert!(
+        detect_config_show_flag_mistake(args).is_none(),
+        "`config` as a search term must not hijack the config-show hint"
+    );
+}
+
+/// P2 regression (BACKLOG 2026-06-01 [aicx/cli]): the missing-required-arg
+/// boundary hint must only fire when `ingest`/`conversations`/`sources` is
+/// the top-level subcommand, not when one of those words is a search term
+/// (`aicx search ingest`).
+#[test]
+fn detect_missing_required_boundary_ignores_subcommand_word_as_search_term() {
+    for term in ["ingest", "conversations", "sources"] {
+        let args = ["search", term].into_iter().map(|s| s.to_string());
+        assert!(
+            detect_missing_required_boundary(args).is_none(),
+            "`{term}` as a search term must not hijack the missing-arg hint"
+        );
+    }
+}
+
+/// The boundary hint still fires on the canonical bad shapes (subcommand
+/// present, required arg/subcommand missing).
+#[test]
+fn detect_missing_required_boundary_fires_on_canonical_bad_shapes() {
+    for cmd in ["ingest", "conversations", "sources"] {
+        let args = [cmd].into_iter().map(|s| s.to_string());
+        assert!(
+            detect_missing_required_boundary(args).is_some(),
+            "`aicx {cmd}` with no required arg should still emit the hint"
+        );
+    }
+}
+
+/// Global flags before the subcommand are still accepted (`aicx -v ingest`).
+#[test]
+fn detect_missing_required_boundary_accepts_global_flag_before_subcommand() {
+    let args = ["--verbose", "ingest"].iter().map(|s| s.to_string());
+    assert!(detect_missing_required_boundary(args).is_some());
+}
+
+/// A satisfied required arg still suppresses the hint.
+#[test]
+fn detect_missing_required_boundary_silent_when_arg_present() {
+    let args = ["ingest", "--source", "operator-md"]
+        .iter()
+        .map(|s| s.to_string());
+    assert!(detect_missing_required_boundary(args).is_none());
+}
+
 /// Bug #26 regression: the branches of `aicx config show`
 /// must each render a distinct marker so an operator can tell at
 /// a glance which file the embedder actually loaded (env override,
