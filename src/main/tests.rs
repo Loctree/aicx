@@ -509,15 +509,17 @@ fn run_search_rejects_limit_over_hard_cap_before_store_access() {
 
 #[test]
 fn fuzzy_fetch_limit_uses_semantic_filter_cap_constants() {
+    // The CLI fuzzy fallback now routes through the shared search_engine
+    // primitive; assert it still honors the bounded over-fetch contract.
     assert_eq!(
-        search_examined_fetch_limit(1, true),
+        aicx::search_engine::fuzzy_fetch_limit(1, true),
         aicx::search_engine::FILTER_EXAMINED_CAP_MIN
     );
     assert_eq!(
-        search_examined_fetch_limit(10, true),
+        aicx::search_engine::fuzzy_fetch_limit(10, true),
         10 * aicx::search_engine::FILTER_EXAMINED_CAP_RATIO
     );
-    assert_eq!(search_examined_fetch_limit(1, false), 1);
+    assert_eq!(aicx::search_engine::fuzzy_fetch_limit(1, false), 1);
 }
 
 #[test]
@@ -1722,6 +1724,37 @@ fn serve_accepts_http_and_legacy_sse_transport_names() {
 }
 
 #[test]
+fn serve_accepts_explicit_http_host() {
+    let parsed = Cli::try_parse_from([
+        "aicx",
+        "serve",
+        "--transport",
+        "http",
+        "--host",
+        "0.0.0.0",
+        "--allowed-host",
+        "mcp.example.internal",
+        "--port",
+        "9000",
+    ])
+    .expect("http host should parse");
+
+    match parsed.command {
+        Some(Commands::Serve {
+            host,
+            port,
+            allowed_hosts,
+            ..
+        }) => {
+            assert_eq!(host, std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            assert_eq!(allowed_hosts, vec!["mcp.example.internal"]);
+            assert_eq!(port, 9000);
+        }
+        _ => panic!("expected serve command"),
+    }
+}
+
+#[test]
 fn serve_help_prefers_http_name_and_stays_compact() {
     let mut cmd = Cli::command();
     let serve = cmd
@@ -1730,10 +1763,13 @@ fn serve_help_prefers_http_name_and_stays_compact() {
     let rendered = serve.render_long_help().to_string();
 
     assert!(rendered.contains("Transport: stdio (default) or http."));
+    assert!(rendered.contains("--host <HOST>"));
+    assert!(rendered.contains("--allowed-host <HOST>"));
+    assert!(rendered.contains("default: 127.0.0.1"));
     assert!(!rendered.contains("Transport: stdio (default) or sse"));
     assert!(!rendered.contains("embedding mode"));
     assert!(
-        rendered.lines().count() < 30,
+        rendered.lines().count() < 48,
         "serve help should stay compact"
     );
 }

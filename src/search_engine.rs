@@ -1351,10 +1351,248 @@ pub fn render_semantic_status_line(
     )
 }
 
+/// Bounded fetch limit for fuzzy retrieval. When post-filters are active we
+/// over-fetch up to `FILTER_EXAMINED_CAP_RATIO`× the requested limit (floored
+/// at `FILTER_EXAMINED_CAP_MIN`) so inside-window matches that sit below the
+/// raw top-N still surface instead of being lost to a silent-empty result.
+pub fn fuzzy_fetch_limit(user_limit: usize, filters_active: bool) -> usize {
+    if filters_active {
+        user_limit
+            .saturating_mul(FILTER_EXAMINED_CAP_RATIO)
+            .max(FILTER_EXAMINED_CAP_MIN)
+    } else {
+        user_limit
+    }
+}
+
+/// Apply the shared score/agent/date/hours post-filters to a fuzzy result set
+/// in place. Date bounds win over the `--hours` cutoff to match legacy
+/// precedence.
+fn apply_fuzzy_post_filters(
+    results: &mut Vec<crate::rank::FuzzyResult>,
+    post_filters: &SemanticSearchFilters,
+) {
+    if let Some(min_score) = post_filters.score_min {
+        results.retain(|r| r.score >= min_score);
+    }
+    if let Some(ref agent_filter) = post_filters.agent {
+        results.retain(|r| r.agent == *agent_filter);
+    }
+    if post_filters.date_lo.is_some() || post_filters.date_hi.is_some() {
+        let lo = post_filters.date_lo.as_deref();
+        let hi = post_filters.date_hi.as_deref();
+        results.retain(|r| {
+            lo.is_none_or(|lo| r.date.as_str() >= lo) && hi.is_none_or(|hi| r.date.as_str() <= hi)
+        });
+    } else if let Some(ref cutoff) = post_filters.hours_cutoff {
+        let cutoff = cutoff.as_str();
+        results.retain(|r| r.date.as_str() >= cutoff);
+    }
+}
+
+/// Shared fuzzy retrieval + post-filter primitive. Both the CLI `aicx search`
+/// fallback and the MCP `aicx_search` fallback route through this so the two
+/// surfaces cannot drift in *what* they retrieve and filter. Fetches a bounded
+/// pool then applies the post-filters; ordering/truncation is the caller's job
+/// via [`finalize_fuzzy_results`].
+pub fn fuzzy_search_with_post_filters(
+    store_root: &Path,
+    query: &str,
+    limit: usize,
+    project_scopes: &[Option<&str>],
+    frame_kind: Option<FrameKind>,
+    post_filters: &SemanticSearchFilters,
+) -> anyhow::Result<(Vec<crate::rank::FuzzyResult>, usize)> {
+    let fetch_limit = fuzzy_fetch_limit(limit, post_filters.is_active());
+    let (mut results, scanned) = crate::rank::fuzzy_search_store(
+        store_root,
+        query,
+        fetch_limit,
+        project_scopes,
+        frame_kind,
+    )?;
+    apply_fuzzy_post_filters(&mut results, post_filters);
+    Ok((results, scanned))
+}
+
+/// Shared "finalize" step for fuzzy/semantic result sets: optional kind retain,
+/// then sort, then truncate to `limit`. Both CLI and MCP search call this so
+/// ordering and limit semantics stay byte-identical across surfaces. `sort`
+/// accepts `"newest"` / `"oldest"` / `"score"`; `None` (and any unknown token)
+/// falls back to descending score.
+pub fn finalize_fuzzy_results(
+    mut results: Vec<crate::rank::FuzzyResult>,
+    kind_filter: Option<&str>,
+    sort: Option<&str>,
+    limit: usize,
+) -> Vec<crate::rank::FuzzyResult> {
+    if let Some(kind_filter) = kind_filter {
+        results.retain(|r| r.kind == kind_filter);
+    }
+    match sort {
+        Some(sort_order) => results.sort_by(|a, b| {
+            let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
+            let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
+            match sort_order {
+                "newest" => t_b.cmp(t_a),
+                "oldest" => t_a.cmp(t_b),
+                "score" => b.score.cmp(&a.score).then(t_b.cmp(t_a)),
+                _ => t_b.cmp(t_a),
+            }
+        }),
+        None => results.sort_by_key(|b| std::cmp::Reverse(b.score)),
+    }
+    results.into_iter().take(limit).collect()
+}
+
+/// Append an `index_snapshot` honesty hint to a rendered hybrid search payload.
+///
+/// Hybrid results reflect the committed index *manifest* (a snapshot of the
+/// corpus at index-build time), not a live freshness check — that check scans
+/// canonical chunks and is intentionally kept off the search hot path. Without
+/// this hint a `hybrid_rrf` result reads as "fully fresh"; the hint keeps the
+/// surface honest by pointing callers at `aicx index status` to confirm there
+/// are no pending (un-embedded) chunks. Shared by CLI and MCP so both surfaces
+/// emit the identical honesty signal.
+pub fn inject_index_snapshot_hint(rendered: &str, source_chunks: usize) -> anyhow::Result<String> {
+    let mut value: serde_json::Value = serde_json::from_str(rendered).map_err(|e| {
+        anyhow::anyhow!("parse rendered search payload for index_snapshot hint: {e}")
+    })?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "index_snapshot".to_string(),
+            serde_json::json!({
+                "source_chunks": source_chunks,
+                "freshness_verified": false,
+                "note": "results reflect the committed index snapshot; run `aicx index status` to confirm there are no pending (un-embedded) chunks",
+            }),
+        );
+    }
+    serde_json::to_string(&value)
+        .map_err(|e| anyhow::anyhow!("serialize search payload with index_snapshot hint: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    fn fuzzy(score: u8, kind: &str, date: &str, ts: Option<&str>) -> crate::rank::FuzzyResult {
+        crate::rank::FuzzyResult {
+            file: "f".to_string(),
+            path: "p".to_string(),
+            project: "proj".to_string(),
+            kind: kind.to_string(),
+            frame_kind: None,
+            agent: "claude".to_string(),
+            date: date.to_string(),
+            timestamp: ts.map(|s| s.to_string()),
+            score,
+            label: "l".to_string(),
+            density: 0.0,
+            matched_lines: Vec::new(),
+            session_id: None,
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn fuzzy_fetch_limit_over_fetches_only_when_filters_active() {
+        // Inactive filters: fetch exactly the requested limit.
+        assert_eq!(fuzzy_fetch_limit(5, false), 5);
+        // Active filters: over-fetch CAP_RATIO× the limit, floored at CAP_MIN.
+        assert_eq!(
+            fuzzy_fetch_limit(20, true),
+            20 * FILTER_EXAMINED_CAP_RATIO // 200, above the floor
+        );
+        assert_eq!(fuzzy_fetch_limit(1, true), FILTER_EXAMINED_CAP_MIN);
+    }
+
+    #[test]
+    fn finalize_fuzzy_results_defaults_to_descending_score() {
+        let input = vec![
+            fuzzy(10, "decision", "2026-01-01", None),
+            fuzzy(50, "decision", "2026-01-01", None),
+            fuzzy(30, "decision", "2026-01-01", None),
+        ];
+        let out = finalize_fuzzy_results(input, None, None, 10);
+        assert_eq!(
+            out.iter().map(|r| r.score).collect::<Vec<_>>(),
+            vec![50, 30, 10]
+        );
+    }
+
+    #[test]
+    fn finalize_fuzzy_results_honors_newest_and_oldest() {
+        let input = vec![
+            fuzzy(10, "decision", "2026-01-01", Some("2026-01-01T00:00:00Z")),
+            fuzzy(10, "decision", "2026-01-03", Some("2026-01-03T00:00:00Z")),
+            fuzzy(10, "decision", "2026-01-02", Some("2026-01-02T00:00:00Z")),
+        ];
+        let newest = finalize_fuzzy_results(input.clone(), None, Some("newest"), 10);
+        assert_eq!(
+            newest.iter().map(|r| r.date.clone()).collect::<Vec<_>>(),
+            vec!["2026-01-03", "2026-01-02", "2026-01-01"]
+        );
+        let oldest = finalize_fuzzy_results(input, None, Some("oldest"), 10);
+        assert_eq!(
+            oldest.iter().map(|r| r.date.clone()).collect::<Vec<_>>(),
+            vec!["2026-01-01", "2026-01-02", "2026-01-03"]
+        );
+    }
+
+    #[test]
+    fn finalize_fuzzy_results_retains_kind_then_truncates() {
+        let input = vec![
+            fuzzy(90, "decision", "2026-01-01", None),
+            fuzzy(80, "task", "2026-01-01", None),
+            fuzzy(70, "decision", "2026-01-01", None),
+            fuzzy(60, "decision", "2026-01-01", None),
+        ];
+        let out = finalize_fuzzy_results(input, Some("decision"), None, 2);
+        assert_eq!(out.len(), 2, "kind retain then truncate to limit");
+        assert!(out.iter().all(|r| r.kind == "decision"));
+        assert_eq!(
+            out.iter().map(|r| r.score).collect::<Vec<_>>(),
+            vec![90, 70]
+        );
+    }
+
+    #[test]
+    fn finalize_fuzzy_results_unknown_sort_token_falls_back_to_newest() {
+        // The shared primitive treats any unknown sort token as "newest" so a
+        // caller passing an out-of-contract string degrades gracefully instead
+        // of panicking or diverging from the MCP surface.
+        let input = vec![
+            fuzzy(10, "decision", "2026-01-01", Some("2026-01-01T00:00:00Z")),
+            fuzzy(10, "decision", "2026-01-02", Some("2026-01-02T00:00:00Z")),
+        ];
+        let out = finalize_fuzzy_results(input, None, Some("nonsense"), 10);
+        assert_eq!(
+            out.iter().map(|r| r.date.clone()).collect::<Vec<_>>(),
+            vec!["2026-01-02", "2026-01-01"]
+        );
+    }
+
+    #[test]
+    fn inject_index_snapshot_hint_marks_freshness_unverified() {
+        let payload = inject_index_snapshot_hint(
+            r#"{"oracle_status":{"backend":"hybrid_rrf"},"results":2,"items":[]}"#,
+            11906,
+        )
+        .expect("index_snapshot hint should inject");
+        let json: serde_json::Value =
+            serde_json::from_str(&payload).expect("payload stays valid JSON");
+        assert_eq!(json["results"], 2);
+        assert_eq!(json["index_snapshot"]["source_chunks"], 11906);
+        assert_eq!(json["index_snapshot"]["freshness_verified"], false);
+        assert!(
+            json["index_snapshot"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("aicx index status")
+        );
+    }
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard, OnceLock};

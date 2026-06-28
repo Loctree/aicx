@@ -1,6 +1,7 @@
 //! Shared HTTP Bearer-token auth for MCP HTTP transport and dashboard server.
 //!
-//! Single token loaded from CLI override, `AICX_HTTP_AUTH_TOKEN`, `~/.aicx/auth-token`,
+//! Single token loaded from CLI override, `AICX_HTTP_AUTH_TOKEN`,
+//! `<AICX_HOME>/auth-token` (honors `$AICX_HOME`; defaults to `~/.aicx`),
 //! or generated and persisted on Unix (mode 0600). Compared in constant time.
 //! Mismatch and missing produce the same 401 body to defeat oracle probing.
 //!
@@ -80,6 +81,60 @@ impl AuthConfig {
 /// everything else moves.
 fn default_token_path() -> Result<PathBuf> {
     Ok(crate::store::resolve_aicx_home()?.join("auth-token"))
+}
+
+/// Where the HTTP auth token resolves from, as a non-mutating probe.
+///
+/// Distinct from [`AuthSource`] (which is produced by [`load_auth_config`] and
+/// may *generate* a token as a side effect). This probe never reads the token
+/// value, never generates, and never writes — it only reports the source so
+/// `aicx doctor` can show operators where the token comes from without
+/// triggering token creation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenSourceProbe {
+    /// `AICX_HTTP_AUTH_TOKEN` is set and non-empty.
+    Env,
+    /// A persisted token file exists at this path.
+    File(PathBuf),
+    /// No token present yet; one would be generated at this path on first
+    /// authenticated HTTP serve.
+    WouldGenerate(PathBuf),
+    /// The token path could not be resolved (no home directory).
+    Unresolved,
+}
+
+impl TokenSourceProbe {
+    /// Operator-facing label. Never includes the token value.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Env => "env (AICX_HTTP_AUTH_TOKEN)".to_string(),
+            Self::File(path) => format!("file: {}", path.display()),
+            Self::WouldGenerate(path) => {
+                format!(
+                    "none yet — would generate at {} on first HTTP serve",
+                    path.display()
+                )
+            }
+            Self::Unresolved => "unresolved (no home directory)".to_string(),
+        }
+    }
+}
+
+/// Non-mutating probe of the active HTTP auth-token source. Mirrors the
+/// resolution order of [`load_auth_config`] (env → file → would-generate) but
+/// performs no reads of the token value, no generation, and no writes.
+pub fn probe_token_source() -> TokenSourceProbe {
+    if std::env::var("AICX_HTTP_AUTH_TOKEN")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return TokenSourceProbe::Env;
+    }
+    match default_token_path() {
+        Ok(path) if path.exists() => TokenSourceProbe::File(path),
+        Ok(path) => TokenSourceProbe::WouldGenerate(path),
+        Err(_) => TokenSourceProbe::Unresolved,
+    }
 }
 
 /// Load auth configuration from (in order): CLI override, env, file, or generate.
@@ -695,6 +750,31 @@ mod tests {
 
     // Serialise env-var manipulation to avoid cross-test interference.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn token_source_probe_describe_never_leaks_value() {
+        assert_eq!(
+            TokenSourceProbe::Env.describe(),
+            "env (AICX_HTTP_AUTH_TOKEN)"
+        );
+        let file = TokenSourceProbe::File(std::path::PathBuf::from("/x/auth-token"));
+        assert!(file.describe().starts_with("file:"));
+        assert!(file.describe().contains("/x/auth-token"));
+        let would = TokenSourceProbe::WouldGenerate(std::path::PathBuf::from("/x/auth-token"));
+        assert!(would.describe().contains("would generate"));
+    }
+
+    #[test]
+    fn probe_token_source_detects_env_without_generating() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        // Safety: env access is serialised by ENV_MUTEX for the test's duration.
+        unsafe {
+            std::env::set_var("AICX_HTTP_AUTH_TOKEN", "probe-test-token");
+        }
+        assert_eq!(probe_token_source(), TokenSourceProbe::Env);
+        clear_env();
+    }
 
     fn clear_env() {
         // Safety: the mutex guards concurrent access to process env across tests.

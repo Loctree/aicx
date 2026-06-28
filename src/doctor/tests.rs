@@ -215,6 +215,9 @@ fn oracle_readiness_is_ready_when_semantic_and_freshness_are_green() {
             detail: "ok".to_string(),
             recommendation: None,
         },
+        aicx_home: CheckResult::default(),
+        binary_pair: CheckResult::default(),
+        http_auth_token: CheckResult::default(),
         rebuild_sidecars_script: None,
         prune_empty_bodies_script: None,
         fixes_applied: Vec::new(),
@@ -277,6 +280,40 @@ fn check_canonical_store_warns_when_missing() {
     let result = check_canonical_store(&tmp);
     assert_eq!(result.severity, Severity::Warning);
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn check_aicx_home_is_green_when_store_present() {
+    let tmp = unique_test_dir("home-present");
+    std::fs::create_dir_all(tmp.join("store")).unwrap();
+    let result = check_aicx_home(&tmp);
+    assert_eq!(result.name, "aicx_home");
+    assert_eq!(result.severity, Severity::Green);
+    assert!(result.detail.contains("store/ present"));
+    assert!(result.detail.contains(&tmp.display().to_string()));
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn check_aicx_home_warns_and_advises_when_store_missing() {
+    let tmp = unique_test_dir("home-missing");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let result = check_aicx_home(&tmp);
+    assert_eq!(result.name, "aicx_home");
+    assert_eq!(result.severity, Severity::Warning);
+    assert!(result.detail.contains("store/ missing"));
+    assert!(result.recommendation.unwrap().contains("AICX_HOME"));
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn check_http_auth_token_is_informational_and_never_leaks_value() {
+    let result = check_http_auth_token();
+    assert_eq!(result.name, "http_auth_token");
+    // Always Green: it reports a source, it does not gate health.
+    assert_eq!(result.severity, Severity::Green);
+    assert!(result.detail.starts_with("HTTP auth token source:"));
+    let _ = result.recommendation;
 }
 
 #[test]

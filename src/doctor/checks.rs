@@ -52,6 +52,14 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
     };
     let mut context_corpus = check_context_corpus(base);
 
+    // Informational diagnostics — deliberately NOT folded into `overall`.
+    // They report where the runtime resolved its home, whether the CLI and
+    // aicx-mcp binaries match on PATH, and where the HTTP auth token comes
+    // from. Health gating stays with the canonical/index checks above.
+    let aicx_home = check_aicx_home(base);
+    let binary_pair = check_binary_pair();
+    let http_auth_token = check_http_auth_token();
+
     let mut fixes_applied = Vec::new();
     let rebuild_sidecars_script = if opts.rebuild_sidecars {
         Some(render_rebuild_sidecars_script(base)?)
@@ -206,11 +214,119 @@ pub async fn run_at(base: &Path, opts: &DoctorOptions) -> Result<DoctorReport> {
         empty_body_chunks,
         content_dedup,
         context_corpus,
+        aicx_home,
+        binary_pair,
+        http_auth_token,
         rebuild_sidecars_script,
         prune_empty_bodies_script,
         fixes_applied,
         overall,
     })
+}
+
+/// Informational: report the resolved AICX_HOME, whether it is pinned via the
+/// environment, and whether the canonical store / semantic index live under
+/// it. Diagnostic only — `canonical_store` owns the health gate; this exists so
+/// an operator can see *where* aicx is looking without spelunking.
+pub(crate) fn check_aicx_home(base: &Path) -> CheckResult {
+    let env_pin = std::env::var_os("AICX_HOME").filter(|value| !value.is_empty());
+    let resolved = base.display().to_string();
+    let store_present = base.join("store").exists();
+    let indexed_present = base.join("indexed").exists();
+    let source = match &env_pin {
+        Some(value) => format!("pinned via AICX_HOME={}", PathBuf::from(value).display()),
+        None => "default (bootstrap config or ~/.aicx)".to_string(),
+    };
+    let detail = format!(
+        "resolved home: {resolved} [{source}]; store/ {}, indexed/ {}",
+        if store_present { "present" } else { "missing" },
+        if indexed_present {
+            "present"
+        } else {
+            "missing"
+        },
+    );
+    let (severity, recommendation) = if store_present {
+        (Severity::Green, None)
+    } else {
+        (
+            Severity::Warning,
+            Some(format!(
+                "No canonical store under {resolved}. If your corpus lives elsewhere, set AICX_HOME to that path before running aicx (default is ~/.aicx)."
+            )),
+        )
+    };
+    CheckResult {
+        name: "aicx_home".to_string(),
+        severity,
+        detail,
+        recommendation,
+    }
+}
+
+/// Informational: compare the running aicx CLI version against the aicx-mcp
+/// companion resolved on PATH. Surfaces the "fresh CLI, stale MCP" drift class
+/// where a long-running MCP service answers health checks while serving older
+/// search behavior. Diagnostic only — not part of `overall`.
+pub(crate) fn check_binary_pair() -> CheckResult {
+    let cli_version = env!("CARGO_PKG_VERSION");
+    let probed = std::process::Command::new("aicx-mcp")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+    match probed {
+        None => CheckResult {
+            name: "binary_pair".to_string(),
+            severity: Severity::Warning,
+            detail: format!("aicx CLI {cli_version}; aicx-mcp not found on PATH"),
+            recommendation: Some(
+                "Install the matching aicx-mcp so `aicx serve` MCP behavior tracks the CLI."
+                    .to_string(),
+            ),
+        },
+        Some(version_line) => {
+            let mcp_version = version_line
+                .rsplit(char::is_whitespace)
+                .next()
+                .unwrap_or(version_line.as_str());
+            if mcp_version == cli_version {
+                CheckResult {
+                    name: "binary_pair".to_string(),
+                    severity: Severity::Green,
+                    detail: format!(
+                        "aicx CLI {cli_version} matches aicx-mcp {mcp_version} on PATH"
+                    ),
+                    recommendation: None,
+                }
+            } else {
+                CheckResult {
+                    name: "binary_pair".to_string(),
+                    severity: Severity::Warning,
+                    detail: format!(
+                        "version drift: aicx CLI {cli_version} vs aicx-mcp {mcp_version} on PATH"
+                    ),
+                    recommendation: Some(
+                        "Reinstall so both binaries match; a stale aicx-mcp service can serve old search behavior while looking healthy."
+                            .to_string(),
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// Informational: report where the HTTP auth token resolves from, without
+/// reading the token value or generating one. Diagnostic only.
+pub(crate) fn check_http_auth_token() -> CheckResult {
+    let probe = crate::auth::probe_token_source();
+    CheckResult {
+        name: "http_auth_token".to_string(),
+        severity: Severity::Green,
+        detail: format!("HTTP auth token source: {}", probe.describe()),
+        recommendation: None,
+    }
 }
 
 pub(crate) fn check_context_corpus(base: &Path) -> CheckResult {
