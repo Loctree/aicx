@@ -699,7 +699,10 @@ aicx state --info
 Run `aicx` as an MCP server (stdio or streamable HTTP transport).
 
 Exposes search, read, steer, intents, and rank tools over MCP for agent retrieval.
-`aicx_search` is semantic and fails fast when the index is not ready.
+`aicx_search` is semantic-first and uses the same filtered retrieval primitive
+as CLI `aicx search`. When the semantic index or embedder is not ready it
+returns filesystem-fuzzy results with an explicit `semantic_fallback` payload;
+pass `strict_semantic = true` to get fail-fast semantic errors.
 `aicx_steer`, `aicx_intents`, and `aicx_rank` query the canonical corpus on disk
 and return grounded source paths or chunk references.
 `aicx_read` pulls the actual chunk content by path, file name, or compact
@@ -711,13 +714,34 @@ aicx serve [OPTIONS]
 
 Options:
 - `--transport <stdio|http>` transport (default: `stdio`; legacy alias `sse` is still accepted)
+- `--host <HOST>` streamable HTTP bind host (default: `127.0.0.1`)
 - `--port <PORT>` streamable HTTP port (default: `8044`)
+- `--allowed-host <HOST>` allowed inbound HTTP `Host` header for streamable HTTP clients; repeat for remote hostnames/IPs
+- `--allow-any-host` disable HTTP `Host` validation; only use on trusted networks
+- `--auth-token <TOKEN>` explicit Bearer token for HTTP transport
+- `--no-require-auth` disable HTTP auth for local debugging only
 
 Example:
 
 ```bash
 aicx serve --transport http --port 8044
+aicx serve --transport http --host 0.0.0.0 --allowed-host mcp.example.internal --port 8044
+aicx-mcp --transport http --host 127.0.0.1 --port 8044
 ```
+
+### HTTP auth token resolution
+
+The HTTP transport resolves a single Bearer token from one canonical cascade
+(first match wins):
+
+1. `--auth-token <TOKEN>` (explicit CLI override)
+2. `AICX_HTTP_AUTH_TOKEN` environment variable
+3. `<AICX_HOME>/auth-token` file — honors `$AICX_HOME`; defaults to `~/.aicx/auth-token`
+4. otherwise a token is generated and persisted to that file (mode `0600` on Unix)
+
+`--no-require-auth` skips the cascade entirely and serves without auth (local
+debugging only). Run `aicx doctor` to see which source is active — it reports
+the token *source*, never the token value.
 
 ## `aicx init` (Retired)
 
