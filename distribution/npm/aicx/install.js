@@ -92,11 +92,11 @@ function cleanupShadowDir(scope, targetVersion) {
   }
 }
 
-function scanAicxShadows(installedPath, targetVersion) {
-  const pathBinaries = Array.from(new Set(whichAll("aicx")));
+function scanBinaryShadows(binaryName, installedPath, targetVersion) {
+  const pathBinaries = Array.from(new Set(whichAll(binaryName)));
   if (pathBinaries.length === 0) return;
 
-  console.warn("[AICX npm] Existing aicx binaries on PATH:");
+  console.warn(`[AICX npm] Existing ${binaryName} binaries on PATH:`);
   for (const path of pathBinaries) {
     const version = commandOutput(path, ["--version"]) || "unknown";
     console.warn(`  ${path} -> ${version}`);
@@ -104,12 +104,16 @@ function scanAicxShadows(installedPath, targetVersion) {
 
   const resolved = pathBinaries[0];
   if (resolved && resolved !== installedPath) {
-    console.warn("[AICX npm] WARNING: PATH may resolve to a different aicx than this npm package.");
+    console.warn(`[AICX npm] WARNING: PATH may resolve to a different ${binaryName} than this npm package.`);
     console.warn(`  npm package binary: ${installedPath} -> ${targetVersion}`);
     console.warn(`  PATH resolves to:   ${resolved}`);
     console.warn("  Set AICX_NPM_REPLACE_LOCAL=1 to remove older/equal ~/.local/bin or cargo-bin shadows during npm install.");
   }
+}
 
+function scanAicxShadows(installedAicxPath, installedMcpPath, targetVersion) {
+  scanBinaryShadows("aicx", installedAicxPath, targetVersion);
+  scanBinaryShadows("aicx-mcp", installedMcpPath, targetVersion);
   if (envFlag("AICX_NPM_REPLACE_LOCAL")) {
     cleanupShadowDir("local-bin", targetVersion);
     cleanupShadowDir("cargo-bin", targetVersion);
@@ -155,4 +159,4 @@ if (hasError) {
   process.exit(1);
 }
 
-scanAicxShadows(getBinaryPath("aicx"), VERSION);
+scanAicxShadows(getBinaryPath("aicx"), getBinaryPath("aicx-mcp"), VERSION);
