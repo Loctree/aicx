@@ -287,9 +287,13 @@ pub(crate) fn check_binary_pair() -> CheckResult {
             ),
         },
         Some(version_line) => {
+            // `aicx-mcp --version` prints "aicx-mcp <semver>"; pick the first
+            // token that starts with a digit so a trailing build suffix
+            // ("0.9.4 (abc)") or a different binary-name prefix cannot corrupt
+            // the comparison.
             let mcp_version = version_line
-                .rsplit(char::is_whitespace)
-                .next()
+                .split_whitespace()
+                .find(|token| token.chars().next().is_some_and(|c| c.is_ascii_digit()))
                 .unwrap_or(version_line.as_str());
             if mcp_version == cli_version {
                 CheckResult {
