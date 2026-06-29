@@ -177,8 +177,8 @@ Current live evidence:
   backed by a single process-global subscriber (max level TRACE, so no callsite
   is ever cached as disabled) routing to a thread-local buffer. 0 flakes in 15
   full `make test` runs (prior rate ~1/3–1/10).
-- `docs/BUGFIXES.md` already records M-13 as deferred; keep that truth unless a
-  dedicated CSP nonce/header implementation lands in a separate scoped cut.
+- M-13 (CSP nonce/header) remains deferred; keep that truth unless a
+  dedicated implementation lands in a separate scoped cut.
 
 Split / block list before merge:
 
