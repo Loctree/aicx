@@ -289,10 +289,10 @@ Intent:
 fn collapse_session_merges_exact_daily_duplicates_across_session_forks() {
     let make_record = |session_id: &str, source_chunk: &str| IntentRecord {
         kind: IntentKind::Intent,
-        summary: "przerobimy ScreenScribe na portal".to_string(),
+        summary: "przerobimy Screenscribe na portal".to_string(),
         context: None,
         evidence: vec![],
-        project: "VetCoders/ScreenScribe".to_string(),
+        project: "Vetcoders/Screenscribe".to_string(),
         agent: "codex".to_string(),
         date: "2026-05-31".to_string(),
         timestamp: None,
@@ -331,7 +331,7 @@ fn collapse_session_tolerates_existing_none_count() {
         summary: summary.to_string(),
         context: None,
         evidence: vec![],
-        project: "VetCoders/ScreenScribe".to_string(),
+        project: "Vetcoders/Screenscribe".to_string(),
         agent: "codex".to_string(),
         date: "2026-05-31".to_string(),
         timestamp: None,
@@ -2187,7 +2187,7 @@ mod quality {
     #[test]
     fn long_summary_ends_at_sentence_terminator_when_available() {
         let mut text = String::new();
-        text.push_str("Pierwsza część decyzji o canonical corpus i jego znaczeniu dla całego stacku VetCoders w kontekście długoterminowej strategii AICX. ");
+        text.push_str("Pierwsza część decyzji o canonical corpus i jego znaczeniu dla całego stacku Vetcoders w kontekście długoterminowej strategii AICX. ");
         // Force length > 480 bytes; ensure a full sentence-terminator
         // exists in the lookback window (last 80 bytes before cutoff).
         text.push_str(

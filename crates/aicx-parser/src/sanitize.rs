@@ -6,7 +6,7 @@
 //! Prevents path traversal and command injection from user-supplied inputs
 //! (CLI arguments, project names, agent names).
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use anyhow::{Result, anyhow};
 use std::borrow::Cow;
@@ -987,7 +987,7 @@ mod tests {
     fn test_safe_project_name_valid() {
         assert!(safe_project_name("my-project").is_ok());
         assert!(safe_project_name("lbrx-services").is_ok());
-        assert!(safe_project_name("CodeScribe").is_ok());
+        assert!(safe_project_name("Codescribe").is_ok());
     }
 }
 

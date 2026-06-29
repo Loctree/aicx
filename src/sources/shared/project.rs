@@ -79,7 +79,7 @@ fn canonical_project_parts(value: &str) -> Option<(String, String)> {
 /// The previous "tier 3 relax" (path's last segment equals filter's
 /// repo, even when the owner is absent from the path) is **gone**.
 /// It caused the cross-org leak flagged by `chatgpt-codex-connector` P1
-/// on PR #8 (filter `Loctree/aicx` matched `/.../VetCoders/aicx`).
+/// on PR #8 (filter `Loctree/aicx` matched `/.../Vetcoders/aicx`).
 /// The original bug #14 workflow (`-p Loctree/aicx` against
 /// `/Users/user/Git/aicx`) now travels through Tier 1: when the local
 /// path has a `.git/config` pointing at `github.com/Loctree/aicx`, the
@@ -177,7 +177,7 @@ pub(crate) fn project_filter_matches_path(cwd: &str, filters: &[String]) -> bool
                 return false;
             }
             // Strict adjacency — no last-segment relax. Cross-org leak
-            // (filter `Loctree/aicx` matching `/.../VetCoders/aicx`)
+            // (filter `Loctree/aicx` matching `/.../Vetcoders/aicx`)
             // is impossible in this branch. For a local checkout to
             // match by canonical identity, Tier 1 must resolve it via
             // `.git/config` remote URL.

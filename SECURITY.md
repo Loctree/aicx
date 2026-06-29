@@ -8,7 +8,7 @@ If you discover a security vulnerability in aicx, please report it responsibly.
 
 ### How to Report
 
-- Use [GitHub Security Advisories](https://github.com/VetCoders/ai-contexters/security/advisories/new) to submit a private report.
+- Use [GitHub Security Advisories](https://github.com/vetcoders/ai-contexters/security/advisories/new) to submit a private report.
 - Alternatively, contact us directly at **hello@vetcoders.io**.
 
 ### What to Include
@@ -72,4 +72,4 @@ is a conscious design decision, not an accidental omission.
 
 ---
 
-Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders

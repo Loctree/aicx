@@ -48,7 +48,7 @@ Why GGUF:
 - quantized model files are dramatically smaller than fp16 safetensors
 - one model file is easier to hydrate, verify, and cache
 - llama.cpp already exposes pooled embeddings for BERT/F2LLM-style GGUF models
-- CodeScribe's Candle path is a good architectural precedent, but it was built
+- Codescribe's Candle path is a good architectural precedent, but it was built
   for MiniLM/BERT safetensors, not for the F2LLM quant line
 
 Runtime details:
@@ -233,6 +233,6 @@ in the local cache, so the command is safe on clean CI runners.
 
 ## Credits
 
-CodeScribe proved the in-process local model shape is comfortable in Rust.
+Codescribe proved the in-process local model shape is comfortable in Rust.
 AICX keeps that architectural lesson but switches the production model format
 to GGUF because quantized F2LLM is the sharper distribution path here.

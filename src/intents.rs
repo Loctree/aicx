@@ -3,7 +3,7 @@
 //! Elevates stored chunk `[signals]` metadata and matching raw conversation
 //! lines into first-class, queryable intent records.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, Utc};
@@ -724,8 +724,8 @@ fn charter_head_markers() -> &'static [&'static str] {
         "<INSTRUCTIONS>",
         "<!-- loctree-doctrine",
         "<!-- loctree-advise",
-        "# VetCoders Global Agent Charter",
-        "# VetCoders Agent Operating Guide",
+        "# Vetcoders Global Agent Charter",
+        "# Vetcoders Agent Operating Guide",
         "# Loctree + AICX + Vibecrafted Agent Operating Guide",
         "# The Vibecrafted Manifesto",
         "## **LOCTREE + AICX + VIBECRAFTED",

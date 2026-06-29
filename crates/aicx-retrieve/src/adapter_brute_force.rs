@@ -1,4 +1,4 @@
-// Vibecrafted with AI Agents by VetCoders (c)2024-2026 LibraxisAI
+// Vibecrafted with AI Agents by Vetcoders (c)2024-2026 LibraxisAI
 //! Pure-Rust brute-force `DenseIndex` adapter.
 //!
 //! This is the Linux-musl-safe fallback dense leg from research synthesis

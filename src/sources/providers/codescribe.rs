@@ -16,7 +16,7 @@ const CODESCRIBE_NO_SPEECH_MARKERS: &[&str] = &[
     "vad_no_speech_detected",
 ];
 
-/// A discovered CodeScribe transcript under `$HOME/.codescribe/transcriptions`.
+/// A discovered Codescribe transcript under `$HOME/.codescribe/transcriptions`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodescribeTranscript {
     pub path: PathBuf,
@@ -78,7 +78,7 @@ pub fn discover_codescribe_transcripts(home: &Path) -> Vec<CodescribeTranscript>
     discover_codescribe_transcripts_at(&home.join(".codescribe").join("transcriptions"))
 }
 
-/// Discover CodeScribe transcript files under an explicit transcriptions root.
+/// Discover Codescribe transcript files under an explicit transcriptions root.
 pub fn discover_codescribe_transcripts_at(root: &Path) -> Vec<CodescribeTranscript> {
     if !root.is_dir() {
         return Vec::new();
@@ -341,7 +341,7 @@ fn is_codescribe_no_speech(text: &str) -> bool {
         .any(|marker| lower.contains(marker))
 }
 
-/// Parse one CodeScribe transcript file into timeline entries.
+/// Parse one Codescribe transcript file into timeline entries.
 pub fn parse_codescribe_transcript(
     path: &Path,
     date: NaiveDate,
@@ -459,13 +459,13 @@ fn codescribe_path_fingerprint(path: &Path) -> String {
     format!("{hash:016x}")
 }
 
-/// Extract CodeScribe transcript entries from `$HOME/.codescribe/transcriptions`.
+/// Extract Codescribe transcript entries from `$HOME/.codescribe/transcriptions`.
 pub fn extract_codescribe(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     let home = crate::os_user_home().context("No home dir")?;
     extract_codescribe_from_home(&home, config)
 }
 
-/// Extract CodeScribe transcript entries using an explicit home directory.
+/// Extract Codescribe transcript entries using an explicit home directory.
 pub fn extract_codescribe_from_home(
     home: &Path,
     config: &ExtractionConfig,
@@ -483,7 +483,7 @@ pub fn extract_codescribe_from_home(
         ) {
             Ok(mut parsed) => entries.append(&mut parsed),
             Err(e) => eprintln!(
-                "CodeScribe transcript extraction warning ({}): {}",
+                "Codescribe transcript extraction warning ({}): {}",
                 transcript.path.display(),
                 e
             ),
@@ -535,8 +535,8 @@ fn resolve_codescribe_cwd_hint(home: &Path, project_hint: Option<&str>) -> Optio
                 .join("01_deployed_libraxis_vm")
                 .join(repo),
             home.join("Libraxis").join("vc-runtime").join(repo),
-            home.join("hosted").join("VetCoders").join(repo),
-            home.join("vc-workspace").join("VetCoders").join(repo),
+            home.join("hosted").join("Vetcoders").join(repo),
+            home.join("vc-workspace").join("Vetcoders").join(repo),
         ]
     };
 

@@ -280,10 +280,10 @@ fn index_status_routes_through_index_canonical_resolver() {
     // Canonical on-disk store: 4 buckets across 2 orgs / 3 repo names.
     // Mixed case mirrors real-world GitHub slugs (filesystem preserves it).
     let bucket_slugs = [
-        "VetCoders/Loctree",
-        "VetCoders/aicx",
+        "Vetcoders/Loctree",
+        "Vetcoders/aicx",
         "Szowesgad/Loctree",
-        "Szowesgad/CodeScribe",
+        "Szowesgad/Codescribe",
     ];
     for slug in bucket_slugs {
         fs::create_dir_all(canonical_root.join(slug)).unwrap();
@@ -308,9 +308,9 @@ fn index_status_routes_through_index_canonical_resolver() {
     // The 4 canonical filter shapes from the bug brief.
     let shapes: &[(&str, &[&str])] = &[
         // strict slug
-        ("VetCoders/Loctree", &["vetcoders_loctree"]),
+        ("Vetcoders/Loctree", &["vetcoders_loctree"]),
         // org wildcard
-        ("VetCoders/", &["vetcoders_aicx", "vetcoders_loctree"]),
+        ("Vetcoders/", &["vetcoders_aicx", "vetcoders_loctree"]),
         // cross-org repo
         ("/Loctree", &["szowesgad_loctree", "vetcoders_loctree"]),
         // bare name (matches as repo name across orgs)
@@ -455,7 +455,7 @@ fn index_status_json_payload_is_always_array_for_single_scope() {
 fn index_status_json_payload_is_array_for_multiple_scopes() {
     let reports = vec![
         (
-            Some("VetCoders/aicx".to_string()),
+            Some("Vetcoders/aicx".to_string()),
             dummy_index_status("vetcoders_aicx"),
         ),
         (
@@ -469,7 +469,7 @@ fn index_status_json_payload_is_array_for_multiple_scopes() {
         .expect("multi-scope index status JSON must use the same envelope");
 
     assert_eq!(items.len(), 2);
-    assert_eq!(items[0]["project"], "VetCoders/aicx");
+    assert_eq!(items[0]["project"], "Vetcoders/aicx");
     assert_eq!(items[1]["project"], "Loctree/loctree-suite");
     assert_eq!(items[0]["status"]["project_bucket"], "vetcoders_aicx");
     assert_eq!(
@@ -805,7 +805,7 @@ fn intents_project_resolver_discovers_session_display_bridge_in_production_path(
 fn intents_project_resolver_prefers_session_display_before_alias() {
     let root = unique_test_dir("intents-project-display");
     let _ = fs::remove_dir_all(&root);
-    write_store_chunk(&root, "legacy/ScreenScribe", "2026_0612", "legacy");
+    write_store_chunk(&root, "legacy/Screenscribe", "2026_0612", "legacy");
     write_store_chunk(
         &root,
         "vetcoders/screen_scribe_depr",
@@ -813,12 +813,12 @@ fn intents_project_resolver_prefers_session_display_before_alias() {
         "canonical",
     );
     let sessions = vec![session_info(
-        "ScreenScribe",
+        "Screenscribe",
         "git@github.com:vetcoders/screen_scribe_depr.git",
     )];
 
     let got =
-        resolve_intents_project_filters_at(&["ScreenScribe".to_string()], &root, &sessions, None)
+        resolve_intents_project_filters_at(&["Screenscribe".to_string()], &root, &sessions, None)
             .unwrap();
     let _ = fs::remove_dir_all(&root);
 
@@ -831,16 +831,16 @@ fn intents_project_resolver_errors_on_ambiguous_alias() {
     let root = unique_test_dir("intents-project-ambiguous");
     let _ = fs::remove_dir_all(&root);
     write_store_chunk(&root, "one/screen_scribe_depr", "2026_0612", "one");
-    write_store_chunk(&root, "two/ScreenScribe", "2026_0612", "two");
+    write_store_chunk(&root, "two/Screenscribe", "2026_0612", "two");
 
-    let err = resolve_intents_project_filters_at(&["ScreenScribe".to_string()], &root, &[], None)
+    let err = resolve_intents_project_filters_at(&["Screenscribe".to_string()], &root, &[], None)
         .expect_err("alias collision should force explicit bucket");
     let msg = err.to_string();
     let _ = fs::remove_dir_all(&root);
 
     assert!(msg.contains("ambiguous"));
     assert!(msg.contains("one/screen_scribe_depr"));
-    assert!(msg.contains("two/ScreenScribe"));
+    assert!(msg.contains("two/Screenscribe"));
 }
 
 #[test]
@@ -862,9 +862,9 @@ fn intents_empty_result_hint_ranks_nearby_recent_buckets() {
     let mut counts = BTreeMap::new();
     counts.insert("vetcoders/screen_scribe_depr".to_string(), 12);
     counts.insert("vetcoders/other".to_string(), 99);
-    counts.insert("local/ScreenScribe".to_string(), 3);
+    counts.insert("local/Screenscribe".to_string(), 3);
 
-    let hints = nearby_bucket_hints(&["ScreenScribe".to_string()], &counts);
+    let hints = nearby_bucket_hints(&["Screenscribe".to_string()], &counts);
 
     assert_eq!(
         hints,
@@ -874,7 +874,7 @@ fn intents_empty_result_hint_ranks_nearby_recent_buckets() {
                 chunks: 12,
             },
             BucketHint {
-                slug: "local/ScreenScribe".to_string(),
+                slug: "local/Screenscribe".to_string(),
                 chunks: 3,
             },
         ]
@@ -1814,7 +1814,7 @@ fn read_command_parses_discover_path_and_json_mode() {
     let cli = Cli::try_parse_from([
         "aicx",
         "read",
-        "store/VetCoders/aicx/2026_0502/reports/codex/chunk.md",
+        "store/Vetcoders/aicx/2026_0502/reports/codex/chunk.md",
         "--max-chars",
         "400",
         "--json",
@@ -1829,7 +1829,7 @@ fn read_command_parses_discover_path_and_json_mode() {
         }) => {
             assert_eq!(
                 reference,
-                "store/VetCoders/aicx/2026_0502/reports/codex/chunk.md"
+                "store/Vetcoders/aicx/2026_0502/reports/codex/chunk.md"
             );
             assert_eq!(max_chars, Some(400));
             assert!(json);
@@ -2563,7 +2563,7 @@ fn test_pipeline_redacts_once_before_dedup() {
     // marks `seen_hashes` under the post-redact hash (not the raw).
     let mut state = StateManager::default();
     let seg = mk_segment(
-        Some(("VetCoders", "aicx")),
+        Some(("Vetcoders", "aicx")),
         "claude",
         "s1",
         vec![entry_redacted],
@@ -2571,11 +2571,11 @@ fn test_pipeline_redacts_once_before_dedup() {
     let kept = dedup_segments_per_repo(vec![seg], &mut state, false, |_| {});
     assert_eq!(kept.iter().map(|s| s.entries.len()).sum::<usize>(), 1);
     assert!(
-        !state.is_new("VetCoders/aicx", &hash_redacted),
+        !state.is_new("Vetcoders/aicx", &hash_redacted),
         "post-redact hash must be in seen_hashes after dedup"
     );
     assert!(
-        state.is_new("VetCoders/aicx", &hash_raw),
+        state.is_new("Vetcoders/aicx", &hash_raw),
         "pre-redact hash must NOT appear in seen_hashes — proves redaction ran before dedup"
     );
 }
@@ -2604,13 +2604,13 @@ fn test_dedup_keyed_per_canonical_repo() {
 
     // Two segments, two different canonical repos, identical content.
     let seg_a = mk_segment(
-        Some(("VetCoders", "repo-a")),
+        Some(("Vetcoders", "repo-a")),
         "claude",
         "session-a",
         vec![entry_a.clone()],
     );
     let seg_b = mk_segment(
-        Some(("VetCoders", "repo-b")),
+        Some(("Vetcoders", "repo-b")),
         "claude",
         "session-b",
         vec![entry_b.clone()],
@@ -2631,7 +2631,7 @@ fn test_dedup_keyed_per_canonical_repo() {
         &entry_a.message,
     );
     assert!(
-        !state.is_new("VetCoders/repo-a", &hash),
+        !state.is_new("Vetcoders/repo-a", &hash),
         "hash must be marked under repo-a's bucket"
     );
     // Different timestamps → different exact hashes. Just verify the
@@ -2642,7 +2642,7 @@ fn test_dedup_keyed_per_canonical_repo() {
         &entry_b.message,
     );
     assert!(
-        !state.is_new("VetCoders/repo-b", &hash_b),
+        !state.is_new("Vetcoders/repo-b", &hash_b),
         "hash must be marked under repo-b's bucket"
     );
 
@@ -2656,13 +2656,13 @@ fn test_dedup_keyed_per_canonical_repo() {
     // Re-running dedup with the same segments should now SKIP both,
     // because each repo bucket already saw its own hash.
     let seg_a2 = mk_segment(
-        Some(("VetCoders", "repo-a")),
+        Some(("Vetcoders", "repo-a")),
         "claude",
         "session-a",
         vec![entry_a],
     );
     let seg_b2 = mk_segment(
-        Some(("VetCoders", "repo-b")),
+        Some(("Vetcoders", "repo-b")),
         "claude",
         "session-b",
         vec![entry_b],
@@ -2685,7 +2685,7 @@ fn test_dedup_keyed_per_canonical_repo() {
 fn test_full_rescan_dedups_across_segments_within_same_repo() {
     // Same content, same timestamp, same agent — both entries
     // produce identical `content_hash` and `overlap_hash`. The
-    // segments share a canonical repo (VetCoders/repo-a) but live
+    // segments share a canonical repo (Vetcoders/repo-a) but live
     // in distinct sessions (the realistic shape: one repo touched
     // by several Claude sessions over time).
     let dup_message = "echo across sessions";
@@ -2694,13 +2694,13 @@ fn test_full_rescan_dedups_across_segments_within_same_repo() {
     let entry_a2 = mk_entry("claude", "s2", dup_ts, dup_message, Some("/tmp/a"));
 
     let seg_s1 = mk_segment(
-        Some(("VetCoders", "repo-a")),
+        Some(("Vetcoders", "repo-a")),
         "claude",
         "s1",
         vec![entry_a1.clone()],
     );
     let seg_s2 = mk_segment(
-        Some(("VetCoders", "repo-a")),
+        Some(("Vetcoders", "repo-a")),
         "claude",
         "s2",
         vec![entry_a2.clone()],
@@ -2723,14 +2723,14 @@ fn test_full_rescan_dedups_across_segments_within_same_repo() {
     // its own dedup bucket.
     let entry_b1 = mk_entry("claude", "s3", dup_ts, dup_message, Some("/tmp/b"));
     let seg_b = mk_segment(
-        Some(("VetCoders", "repo-b")),
+        Some(("Vetcoders", "repo-b")),
         "claude",
         "s3",
         vec![entry_b1],
     );
     let entry_a3 = mk_entry("claude", "s4", dup_ts, dup_message, Some("/tmp/a"));
     let seg_a3 = mk_segment(
-        Some(("VetCoders", "repo-a")),
+        Some(("Vetcoders", "repo-a")),
         "claude",
         "s4",
         vec![entry_a3],

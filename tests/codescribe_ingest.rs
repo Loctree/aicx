@@ -47,11 +47,11 @@ fn codescribe_ingest_discovers_and_parses_txt_md_json_transcripts() {
 
     write_file(
         &home.join(".codescribe").join("lexicon.custom.jsonl"),
-        r#"{"speaker":"maciej","keywords":["VetCoders","vibecrafted"]}"#,
+        r#"{"speaker":"maciej","keywords":["Vetcoders","vibecrafted"]}"#,
     );
     write_file(
         &day.join("175300_operator-decision_raw.txt"),
-        "Decision: Vibecrafted owns the operator workflow for VetCoders.",
+        "Decision: Vibecrafted owns the operator workflow for Vetcoders.",
     );
     write_file(
         &day.join("191400_chat.md"),
@@ -59,7 +59,7 @@ fn codescribe_ingest_discovers_and_parses_txt_md_json_transcripts() {
     );
     write_file(
         &day.join("193600_whisper.json"),
-        r#"{"segments":[{"start":1.5,"end":3.0,"speaker":"Maciej","text":"Decision: index CodeScribe transcripts."}]}"#,
+        r#"{"segments":[{"start":1.5,"end":3.0,"speaker":"Maciej","text":"Decision: index Codescribe transcripts."}]}"#,
     );
     write_file(
         &day.join("193600_whisper.wav.truth.json"),

@@ -6,6 +6,6 @@
 //! API. Today this is just structured failure-as-state — see
 //! [`failure::StructuredFailure`].
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 pub mod failure;

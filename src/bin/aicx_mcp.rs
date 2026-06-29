@@ -9,7 +9,7 @@
 //!   aicx-mcp --transport http --port 9000
 //!   aicx-mcp --transport http --host 0.0.0.0 --port 9000
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use aicx::auth;
 use aicx::mcp::{self, McpHttpConfig, McpTransport};

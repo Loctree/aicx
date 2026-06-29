@@ -5,7 +5,7 @@
 //! or generated and persisted on Unix (mode 0600). Compared in constant time.
 //! Mismatch and missing produce the same 401 body to defeat oracle probing.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use anyhow::{Context, Result, anyhow};
 use axum::{

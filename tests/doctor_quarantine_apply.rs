@@ -11,7 +11,7 @@
 //!   (proving rename, not delete)
 //! - non-empty chunks are untouched
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,7 +37,7 @@ fn apply_empty_body_quarantine_moves_to_recoverable_dir_not_delete() {
     let base = unique_base("apply-empty-bodies");
     let chunk_dir = base
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("aicx")
         .join("2026_0506")
         .join("conversations")
@@ -49,7 +49,7 @@ fn apply_empty_body_quarantine_moves_to_recoverable_dir_not_delete() {
     let empty_sidecar = empty_chunk.with_extension("meta.json");
     std::fs::write(
         &empty_chunk,
-        "[project: VetCoders/aicx | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
+        "[project: Vetcoders/aicx | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
     )
     .expect("write empty chunk");
     std::fs::write(&empty_sidecar, "{}").expect("write empty sidecar");
@@ -58,7 +58,7 @@ fn apply_empty_body_quarantine_moves_to_recoverable_dir_not_delete() {
     let full_chunk = chunk_dir.join("2026_0506_claude_sess-full_001.md");
     std::fs::write(
         &full_chunk,
-        "[project: VetCoders/aicx | agent: claude | date: 2026-05-06]\n\nReal body content that exceeds the empty-body detection threshold.",
+        "[project: Vetcoders/aicx | agent: claude | date: 2026-05-06]\n\nReal body content that exceeds the empty-body detection threshold.",
     )
     .expect("write full chunk");
 
@@ -153,7 +153,7 @@ fn apply_empty_body_quarantine_moves_to_recoverable_dir_not_delete() {
     // simply gain a `store/` prefix inside quarantine.
     let moved_chunk = quarantine_root
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("aicx")
         .join("2026_0506")
         .join("conversations")
@@ -177,7 +177,7 @@ fn apply_empty_body_quarantine_moves_to_recoverable_dir_not_delete() {
     // so content must be preserved exactly.
     let moved_bytes = std::fs::read(&moved_chunk).expect("read moved chunk bytes");
     assert!(
-        moved_bytes.starts_with(b"[project: VetCoders/aicx | agent: claude | date: 2026-05-06"),
+        moved_bytes.starts_with(b"[project: Vetcoders/aicx | agent: claude | date: 2026-05-06"),
         "quarantined chunk content must match original (rename preserves bytes)"
     );
 

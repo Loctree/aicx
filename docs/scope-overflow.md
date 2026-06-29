@@ -48,7 +48,7 @@ follow-up implementation pass:
 - `src/api.rs:352` - semantic index row count uses `BufReader::lines()`.
 - `src/output.rs:501` - `find_last_sync_timestamp` scans markdown lines.
 - `src/main.rs:2718` - Codex session metadata scan uses `BufReader::lines()`.
-- `src/sources.rs:4613` - CodeScribe custom lexicon JSONL uses
+- `src/sources.rs:4613` - Codescribe custom lexicon JSONL uses
   `BufReader::lines()`.
 - `src/vector_index.rs:1018` / `src/vector_index.rs:1021` - tmp index header
   uses `read_line`.

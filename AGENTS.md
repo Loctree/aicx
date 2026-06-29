@@ -1,4 +1,4 @@
-# VetCoders Agent Operating Guide v1
+# Vetcoders Agent Operating Guide v1
 
 <!-- loctree-advise: v0.12 -->
 
@@ -314,7 +314,7 @@ Rules:
   `tools/aicx_problem_log.sh "short title" <<'EOF' ... EOF`
 - If the helper fails, append manually. Missing helper is not a reason to skip
   the log.
-# VetCoders Agent Operating Guide v1
+# Vetcoders Agent Operating Guide v1
 
 <!-- loctree-advise: v0.12 -->
 

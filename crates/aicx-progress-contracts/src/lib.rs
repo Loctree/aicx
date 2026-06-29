@@ -1,6 +1,6 @@
 //! Rich event contracts for aicx pipeline progress.
 //!
-//! Vibecrafted. with AI Agents by VetCoders (c)2024-2026 LibraxisAI
+//! Vibecrafted. with AI Agents by Vetcoders (c)2024-2026 LibraxisAI
 //!
 //! This crate is the canonical source of truth for the indexing/embedding
 //! progress event stream emitted by aicx pipelines. It is intentionally a

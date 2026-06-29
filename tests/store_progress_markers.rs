@@ -5,7 +5,7 @@
 //! without spinning the full `aicx store` pipeline (which would touch
 //! `~/.aicx/store/` and is excluded from this pass).
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2024-2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2024-2026 Vetcoders
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

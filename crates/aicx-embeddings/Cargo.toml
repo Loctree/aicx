@@ -20,7 +20,7 @@ openmp = ["gguf", "llama-cpp-2/openmp"]
 cuda = ["gguf", "llama-cpp-2/cuda"]
 vulkan = ["gguf", "llama-cpp-2/vulkan"]
 # Cloud-config based embedder: HTTP POST against an OpenAI-compatible
-# `/v1/embeddings` endpoint. The recommended VetCoders default for
+# `/v1/embeddings` endpoint. The recommended Vetcoders default for
 # zero-install operator workflows; native GGUF stays for offline use.
 cloud = ["dep:reqwest", "dep:serde_json"]
 

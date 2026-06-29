@@ -6,7 +6,7 @@
 //! workspace fast on clean machines while giving real coverage on dev boxes
 //! that already have the model cached.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 #![cfg(feature = "native-embedder")]
 

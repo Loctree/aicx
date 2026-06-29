@@ -14,7 +14,7 @@
 //! (`verification_status` defaults to `Unverified`); a result needs evidence
 //! pointers; clarify asks decisions, not discoverable facts.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;

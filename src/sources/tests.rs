@@ -110,9 +110,9 @@ fn test_repo_name_from_cwd() {
 
 #[test]
 fn test_decode_claude_project_path_with_leading_dash() {
-    let encoded = "-Users-user-hosted-VetCoders-CodeScribe";
+    let encoded = "-Users-user-hosted-Vetcoders-Codescribe";
     let decoded = decode_claude_project_path(encoded);
-    assert_eq!(decoded, "Users-user-hosted-VetCoders-CodeScribe");
+    assert_eq!(decoded, "Users-user-hosted-Vetcoders-Codescribe");
 }
 
 #[test]
@@ -235,7 +235,7 @@ fn test_claude_dir_filter_owner_repo_form_cannot_decide_from_encoded_dir_alone()
 
     // The corollary: an unrelated repo also doesn't match. (Symmetric.)
     assert!(!claude_project_dir_matches_filter(
-        "-Users-test-user-Git-VetCoders-loct-io",
+        "-Users-test-user-Git-Vetcoders-loct-io",
         &lo
     ));
 
@@ -557,7 +557,7 @@ fn test_extract_claude_file_drops_empty_thinking_signature_block() {
     let root = unique_test_dir("claude-empty-signature-thinking");
     let tmp = root.join("session.jsonl");
     let _ = fs::remove_dir_all(&root);
-    let content = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Visible assistant reply"},{"type":"thinking","thinking":"","signature":"abc123"}]},"timestamp":"2026-04-14T10:00:01Z","sessionId":"claude-signature-regression","gitBranch":"main","cwd":"/Users/tester/workspaces/VetCoders/ai-contexters"}"#;
+    let content = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Visible assistant reply"},{"type":"thinking","thinking":"","signature":"abc123"}]},"timestamp":"2026-04-14T10:00:01Z","sessionId":"claude-signature-regression","gitBranch":"main","cwd":"/Users/tester/workspaces/Vetcoders/ai-contexters"}"#;
     write_file(&tmp, content);
 
     let config = ExtractionConfig {
@@ -588,8 +588,8 @@ fn test_extract_claude_conversation_mode_stays_signature_clean() {
     let root = unique_test_dir("claude-conversation-signature-clean");
     let tmp = root.join("session.jsonl");
     let _ = fs::remove_dir_all(&root);
-    let content = r#"{"type":"user","message":{"role":"user","content":"Hello"},"timestamp":"2026-04-14T10:00:00Z","sessionId":"claude-conversation-clean","cwd":"/Users/tester/workspaces/VetCoders/ai-contexters"}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Visible assistant reply"},{"type":"thinking","thinking":"","signature":"abc123"}]},"timestamp":"2026-04-14T10:00:01Z","sessionId":"claude-conversation-clean","cwd":"/Users/tester/workspaces/VetCoders/ai-contexters"}"#;
+    let content = r#"{"type":"user","message":{"role":"user","content":"Hello"},"timestamp":"2026-04-14T10:00:00Z","sessionId":"claude-conversation-clean","cwd":"/Users/tester/workspaces/Vetcoders/ai-contexters"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Visible assistant reply"},{"type":"thinking","thinking":"","signature":"abc123"}]},"timestamp":"2026-04-14T10:00:01Z","sessionId":"claude-conversation-clean","cwd":"/Users/tester/workspaces/Vetcoders/ai-contexters"}"#;
     write_file(&tmp, content);
 
     let config = ExtractionConfig {
@@ -1751,7 +1751,7 @@ fn test_codex_session_filtering_includes_all_messages() {
     // If any message in a session mentions the filter, all messages are included.
 
     let session_a_msgs = [
-        ("s1", "work on CodeScribe refactoring", 1000i64),
+        ("s1", "work on Codescribe refactoring", 1000i64),
         ("s1", "fix the bug in controller", 1001),
         ("s1", "done with changes", 1002),
     ];
@@ -1769,7 +1769,7 @@ fn test_codex_session_filtering_includes_all_messages() {
             .push((text.to_string(), *ts));
     }
 
-    let filter = "CodeScribe";
+    let filter = "Codescribe";
     let filter_lower = filter.to_lowercase();
 
     // Determine matching sessions
@@ -1782,12 +1782,12 @@ fn test_codex_session_filtering_includes_all_messages() {
         .map(|(id, _)| id.clone())
         .collect();
 
-    // Session s1 should match (has "CodeScribe" in first message)
+    // Session s1 should match (has "Codescribe" in first message)
     assert!(matching.contains("s1"));
     // Session s2 should NOT match
     assert!(!matching.contains("s2"));
 
-    // All 3 messages from s1 should be included, not just the one mentioning CodeScribe
+    // All 3 messages from s1 should be included, not just the one mentioning Codescribe
     let included_count: usize = sessions
         .iter()
         .filter(|(id, _)| matching.contains(id.as_str()))
@@ -1816,13 +1816,13 @@ fn test_codex_session_filtering_cwd_match() {
     // Simulate cwd-based matching
     let session_msgs: Vec<(Option<String>, String)> = vec![
         (
-            Some("/Users/user/hosted/VetCoders/CodeScribe".to_string()),
+            Some("/Users/user/hosted/Vetcoders/Codescribe".to_string()),
             "run tests".to_string(),
         ),
         (None, "looks good".to_string()),
     ];
 
-    let filter = "CodeScribe";
+    let filter = "Codescribe";
     let filter_lower = filter.to_lowercase();
 
     let session_matches = session_msgs.iter().any(|(cwd, text)| {
@@ -2688,7 +2688,7 @@ fn test_project_filter_matches_path_local_checkout_without_git_does_not_match_ow
     // Pass-4 Wave F-2 (PR #8 follow-up to chatgpt-codex-connector P1):
     // the old "last-segment relax" that let `-p Loctree/aicx` match
     // `/Users/user/Git/aicx` regardless of owner is gone. It leaked
-    // cross-org: filter `Loctree/aicx` ALSO matched `/.../VetCoders/aicx`.
+    // cross-org: filter `Loctree/aicx` ALSO matched `/.../Vetcoders/aicx`.
     //
     // Bug #14's original intent ("local checkout matches canonical
     // identity") now travels through Tier 1 — `aicx_parser::segmentation::
@@ -2706,15 +2706,15 @@ fn test_project_filter_matches_path_local_checkout_without_git_does_not_match_ow
          strict matcher must NOT accept `-p Loctree/aicx` for a directory \
          that merely ends in `aicx` — that's the cross-org leak we removed"
     );
-    // The symmetric anti-leak: a checkout literally under `/VetCoders/aicx`
+    // The symmetric anti-leak: a checkout literally under `/Vetcoders/aicx`
     // must also be rejected by `-p Loctree/aicx` at the strict tier.
     assert!(
         !project_filter_matches_path(
-            "/some/non-git/scratch/VetCoders/aicx",
+            "/some/non-git/scratch/Vetcoders/aicx",
             &["Loctree/aicx".to_string()]
         ),
         "cross-org leak guard: `-p Loctree/aicx` must NOT accept a path \
-         under /VetCoders/aicx"
+         under /Vetcoders/aicx"
     );
     // And the positive control: strict adjacency `Loctree/aicx` in the
     // path DOES match (this is Tier 3 strict behavior).
@@ -2739,7 +2739,7 @@ fn test_project_filter_matches_path_tier1_resolves_canonical_from_remote_url() {
     );
     assert!(
         !project_filter_matches_path(
-            "https://github.com/VetCoders/aicx",
+            "https://github.com/vetcoders/aicx",
             &["Loctree/aicx".to_string()]
         ),
         "Tier 1 must reject a github URL whose owner differs from the filter"

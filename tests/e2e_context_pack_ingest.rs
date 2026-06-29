@@ -127,13 +127,13 @@ fn context_pack_ingest_retains_immutable_pack_and_live_reads_skip_examples() {
 
     write_file(
         &pack.join("raw").join("ctx-example.md"),
-        "[project: VetCoders/aicx | agent: loct-context-pack | date: 2026-05-08]\n\n[signals]\nDecision:\n- [decision] Frozen prism example must not become live truth\n[/signals]\n",
+        "[project: Vetcoders/aicx | agent: loct-context-pack | date: 2026-05-08]\n\n[signals]\nDecision:\n- [decision] Frozen prism example must not become live truth\n[/signals]\n",
     );
     write_file(
         &pack.join("sidecars").join("ctx-example.json"),
         &json!({
             "id": "ctx-example",
-            "project": "VetCoders/aicx",
+            "project": "Vetcoders/aicx",
             "agent": "loct-context-pack",
             "date": "2026-05-08",
             "session_id": "batch-alpha",

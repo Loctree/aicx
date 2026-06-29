@@ -277,7 +277,7 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
         }
     }
 
-    // CodeScribe transcripts: ~/.codescribe/transcriptions/YYYY-MM-DD/*.{txt,md,json}
+    // Codescribe transcripts: ~/.codescribe/transcriptions/YYYY-MM-DD/*.{txt,md,json}
     let codescribe_transcripts = discover_codescribe_transcripts(&home);
     if !codescribe_transcripts.is_empty() {
         let total_size: u64 = codescribe_transcripts

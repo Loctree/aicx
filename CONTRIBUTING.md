@@ -59,4 +59,4 @@ This project follows the [Contributor Covenant Code of Conduct](https://www.cont
 
 ---
 
-Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders

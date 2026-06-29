@@ -5,7 +5,7 @@
 //! metadata-filtered recall.  Public functions delegate to the store base
 //! directory discovered at runtime, keeping callers free of path logic.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 #[cfg(feature = "lance")]
 mod documents;

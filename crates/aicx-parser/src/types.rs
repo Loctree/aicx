@@ -1,6 +1,6 @@
 //! Shared canonical types used by the intent engine.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

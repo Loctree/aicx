@@ -5,7 +5,7 @@
 //! reminders) and rewarding actionable content (decisions, TODOs,
 //! architecture changes, bug findings).
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -1657,17 +1657,17 @@ Some boilerplate text.
 
         let vista_path = write_canonical_search_fixture(
             &root,
-            "VetCoders",
+            "Vetcoders",
             "Vista",
             "sessvista",
-            "[project: VetCoders/Vista | agent: codex | date: 2026-05-24]\n\nDecision: strictneedle belongs to the exact Vista repository.\n",
+            "[project: Vetcoders/Vista | agent: codex | date: 2026-05-24]\n\nDecision: strictneedle belongs to the exact Vista repository.\n",
         );
         write_canonical_search_fixture(
             &root,
-            "VetCoders",
+            "Vetcoders",
             "vista-portal",
             "sessportal",
-            "[project: VetCoders/vista-portal | agent: codex | date: 2026-05-24]\n\nDecision: strictneedle must not leak through a bare vista filter.\n",
+            "[project: Vetcoders/vista-portal | agent: codex | date: 2026-05-24]\n\nDecision: strictneedle must not leak through a bare vista filter.\n",
         );
 
         let (results, scanned) =
@@ -1676,7 +1676,7 @@ Some boilerplate text.
 
         assert_eq!(scanned, 1, "bare `-p vista` must scan only exact Vista");
         assert_eq!(results.len(), 1, "vista-portal must not match `-p vista`");
-        assert_eq!(results[0].project, "VetCoders/Vista");
+        assert_eq!(results[0].project, "Vetcoders/Vista");
         assert_eq!(
             results[0].path,
             fs::canonicalize(&vista_path)
@@ -1696,7 +1696,7 @@ Some boilerplate text.
             &[FuzzyResult {
                 file: "chunk.md".to_string(),
                 path: "/tmp/chunk.md".to_string(),
-                project: "VetCoders/ai-contexters".to_string(),
+                project: "Vetcoders/ai-contexters".to_string(),
                 kind: "reports".to_string(),
                 frame_kind: None,
                 agent: "codex".to_string(),
@@ -1750,7 +1750,7 @@ Some boilerplate text.
         );
         assert_eq!(payload["items"][0]["score"], 88);
         assert_eq!(payload["items"][0]["label"], "HIGH");
-        assert_eq!(payload["items"][0]["project"], "VetCoders/ai-contexters");
+        assert_eq!(payload["items"][0]["project"], "Vetcoders/ai-contexters");
         assert_eq!(payload["items"][0]["kind"], "reports");
         assert_eq!(payload["items"][0]["agent"], "codex");
         assert_eq!(payload["items"][0]["date"], "2026-03-31");

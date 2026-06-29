@@ -109,7 +109,7 @@ fn test_concurrent_run_store_does_not_lose_state_updates() {
         .expect("AICX_HOME test lock");
     let _home = ScopedAicxHome::new("rmw");
     let source = "claude:test";
-    let project = "VetCoders/Vista";
+    let project = "Vetcoders/Vista";
 
     let first = thread::spawn(move || {
         locked_state_update(

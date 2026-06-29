@@ -15,10 +15,10 @@
 //! - Gemini: ~/.gemini/tmp/<hash>/chats/session-*.json
 //! - Gemini Antigravity: ~/.gemini/antigravity/{conversations/<uuid>.pb,brain/<uuid>/}
 //! - Junie: ~/.junie/sessions/session-*/events.jsonl
-//! - CodeScribe: ~/.codescribe/transcriptions/YYYY-MM-DD/*.{txt,md,json}
+//! - Codescribe: ~/.codescribe/transcriptions/YYYY-MM-DD/*.{txt,md,json}
 //! - Operator markdown: ~/Downloads/*.md, ~/.vibecrafted/inbox/*.md
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
@@ -85,7 +85,7 @@ fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
 ///   aicx all -H 4                      # build canonical corpus
 #[derive(Debug, Parser)]
 #[command(name = "aicx")]
-#[command(author = "(c)2026 VetCoders")]
+#[command(author = "(c)2026 Vetcoders")]
 #[command(version)]
 #[command(verbatim_doc_comment)]
 struct Cli {
@@ -498,7 +498,7 @@ struct ReportsArgs {
     artifacts_root: Option<PathBuf>,
 
     /// Artifact organization bucket
-    #[arg(long, default_value = "VetCoders")]
+    #[arg(long, default_value = "Vetcoders")]
     org: String,
 
     /// Repository bucket (defaults to the current directory name)
@@ -799,7 +799,7 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract and store from all agents (Claude + Codex + Gemini + Junie + CodeScribe) into the canonical corpus.
+    /// Extract and store from all agents (Claude + Codex + Gemini + Junie + Codescribe) into the canonical corpus.
     ///
     /// The daily-driver command: runs each extractor, deduplicates, chunks, and
     /// writes steerable markdown to ~/.aicx/. By default, uses per-source
@@ -1587,7 +1587,7 @@ enum Commands {
 
         /// Move suspicious top-level corpus buckets to $HOME/.aicx/quarantine/.
         /// Buckets that are merely CamelCase (legitimate GitHub orgs like
-        /// `LibraxisAI`, `VetCoders`, `Loctree`, `Szowesgad`) are
+        /// `LibraxisAI`, `Vetcoders`, `Loctree`, `Szowesgad`) are
         /// canonicalized in place to lowercase instead of quarantined,
         /// merging into existing lowercase buckets if present.
         #[arg(long)]

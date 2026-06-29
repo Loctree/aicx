@@ -318,7 +318,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `segment.repo` no longer carries non-ownership signals.
 - **`is_probably_repo_name` accepted date-shaped names.** Strings like
   `2026-01-22`, `2026_01_22`, `2026_0122` passed the alphanumeric+`.-_`
-  filter and produced pseudo-repos such as `CodeScribe/2026-01-22` in
+  filter and produced pseudo-repos such as `Codescribe/2026-01-22` in
   the canonical store. New `looks_like_date_pattern` guard rejects
   these three shapes outright.
 - **`aicx index/search -p <bare-name>` ambiguity is now reported.**
@@ -430,7 +430,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 - Gemini JSONL extraction now treats `.jsonl` files as session transcripts,
   preserving `sessionId` metadata and allowing `aicx all` to ingest Gemini
-  sources alongside Claude, Codex, Junie, and CodeScribe.
+  sources alongside Claude, Codex, Junie, and Codescribe.
 - Junk corpus bucket slugs are covered so malformed or placeholder project
   names no longer leak into canonical project grouping.
 
@@ -580,7 +580,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- Corrected the `SECURITY.md` disclosure path so private vulnerability reports go to the public `VetCoders/ai-contexters` repository instead of a stale owner link.
+- Corrected the `SECURITY.md` disclosure path so private vulnerability reports go to the public `Vetcoders/ai-contexters` repository instead of a stale owner link.
 - Updated GitHub Actions workflow dependencies to current major versions for `checkout`, `cache`, `setup-python`, `upload-artifact`, and `download-artifact`, removing the Node 20 deprecation surface from future CI and release runs.
 
 ## [0.4.2] - 2026-03-17
@@ -625,7 +625,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - Rank made default command (`aicx -p proj` runs rank).
-- Skills removed from repo — canonical source: VetCoders/vetcoders-skills.
+- Skills removed from repo — canonical source: Vetcoders/vetcoders-skills.
 - Package excludes: `*.html`, `*.patch`, `*.orig`, `.ai-agents/`, `skills/`.
 
 ### Added (Governance)
@@ -661,7 +661,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- VetCoders skills suite and ai-contexters skill.
+- Vetcoders skills suite and ai-contexters skill.
 - `vetcoders-decorate` and showcase polish.
 - Memex-first dashboard generator.
 
@@ -698,4 +698,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders

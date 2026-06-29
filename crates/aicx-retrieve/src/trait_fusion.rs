@@ -1,4 +1,4 @@
-// Vibecrafted with AI Agents by VetCoders (c)2024-2026 LibraxisAI
+// Vibecrafted with AI Agents by Vetcoders (c)2024-2026 LibraxisAI
 use crate::Hit;
 
 /// Contract for combining lexical and dense retrieval results.
