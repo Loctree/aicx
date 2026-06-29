@@ -122,7 +122,7 @@ fn extract_outputs_do_not_leak_modern_secret_families() {
             role: if idx % 2 == 0 { "user" } else { "assistant" }.to_string(),
             message: payload.clone(),
             repo_project: "Loctree/aicx".to_string(),
-            source_path: Some("/Users/test-user/Git/aicx".to_string()),
+            source_path: Some("/Users/user/Git/aicx".to_string()),
             branch: Some("feat/test-branch".to_string()),
             message_kind: Default::default(),
             collapse_stub_kind: None,

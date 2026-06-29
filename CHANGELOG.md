@@ -329,7 +329,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   returns the union); the warning just removes the silent WTF.
 - `infer_repo_identity_from_known_layout` matches markers
   (`hosted`/`repos`/`repositories`/`github`/`git`) case-insensitively, so
-  macOS conventions like `/Users/u/Git/Org/Repo` resolve through cwd
+  macOS conventions like `/Users/user/Git/Org/Repo` resolve through cwd
   instead of falling back to text inference.
 - `aicx index -p` / `aicx search -p` reject filters with no matching
   project (instead of silently resolving to the `_all` bucket after a

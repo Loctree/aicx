@@ -98,7 +98,7 @@ pub fn collapse_repeats(
 /// Examples:
 /// - `"Base directory for this skill: /Users/x/.claude/skills/vc-ownership"`
 ///   → `Some("vc-ownership")`
-/// - `"> Base directory for this skill: /home/y/.claude/skills/vc-init"`
+/// - `"> Base directory for this skill: /home/user/.claude/skills/vc-init"`
 ///   → `Some("vc-init")`
 /// - `"Some other content"` → `None`
 pub fn detect_skill_marker(message: &str) -> Option<String> {
@@ -147,7 +147,8 @@ mod tests {
     }
 
     fn long_skill_body(skill: &str, suffix: &str) -> String {
-        let mut body = format!("Base directory for this skill: /home/u/.claude/skills/{skill}\n");
+        let mut body =
+            format!("Base directory for this skill: /home/user/.claude/skills/{skill}\n");
         body.push_str("# SkillName\n## Purpose\n");
         for i in 0..30 {
             body.push_str(&format!("- bullet line {i}\n"));
@@ -242,13 +243,13 @@ mod tests {
 
     #[test]
     fn detect_skill_marker_plain() {
-        let msg = "Base directory for this skill: /home/u/.claude/skills/vc-init\n# Init\n";
+        let msg = "Base directory for this skill: /home/user/.claude/skills/vc-init\n# Init\n";
         assert_eq!(detect_skill_marker(msg).as_deref(), Some("vc-init"));
     }
 
     #[test]
     fn detect_skill_marker_quote_prefix() {
-        let msg = "> Base directory for this skill: /home/u/.claude/skills/vc-ownership\n";
+        let msg = "> Base directory for this skill: /home/user/.claude/skills/vc-ownership\n";
         assert_eq!(detect_skill_marker(msg).as_deref(), Some("vc-ownership"));
     }
 

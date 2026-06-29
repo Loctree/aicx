@@ -525,9 +525,9 @@ record the specific reason.
 
 **Symptom.** `crates/aicx-parser/src/sanitize.rs:107-112` allows ANY
 `/Users/{x}/{y}/...` with 3+ components. A malicious agent could request
-`validate_read_path("/Users/other_user/Documents/secret.txt")` and it
+`validate_read_path("/Users/user/Documents/secret.txt")` and it
 passes the allowlist. Filesystem permissions usually save us, but
-`/Users/Shared/` or world-readable files leak.
+a shared or world-readable directory leaks.
 
 **Files involved.** `crates/aicx-parser/src/sanitize.rs`
 
@@ -535,7 +535,7 @@ passes the allowlist. Filesystem permissions usually save us, but
 + `dirs::cache_dir()` + `dirs::data_dir()`. Don't generalize over `/Users`.
 
 **Acceptance:**
-- [ ] `/Users/other_user/...` rejected by validate_read_path on macOS.
+- [ ] `/Users/user/...` rejected by validate_read_path on macOS.
 - [ ] Existing tests pass.
 
 ---

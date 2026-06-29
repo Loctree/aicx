@@ -1379,7 +1379,7 @@ mod tests {
         // Mac convention `/Users/<u>/Git/...` (capital G) must match the
         // lowercase `git` marker. Previously case-sensitive comparison rejected
         // it, sending identity inference into the now-removed text fallback.
-        let path = Path::new("/Users/test-user/Git/VetCoders/ai-contexters/src/lib.rs");
+        let path = Path::new("/Users/user/Git/VetCoders/ai-contexters/src/lib.rs");
         let id = infer_repo_identity_from_known_layout(path).expect("Git (capital) matches");
         assert_eq!(id.organization, "VetCoders");
         assert_eq!(id.repository, "ai-contexters");

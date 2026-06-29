@@ -82,7 +82,7 @@ segment.repo non-ownership signałami.
   Zostaje tylko `https://github.com/X/Y` URL mention, clamped do non-assertable
   Fallback tier.
 - `segmentation.rs`: case-insensitive markers w `infer_repo_identity_from_known_layout`
-  — macOS `/Users/u/Git/...` resolwuje przez cwd zamiast wpadać w text inference.
+  — macOS `/Users/user/Git/...` resolwuje przez cwd zamiast wpadać w text inference.
 - `segmentation.rs` (round-2): `infer_tiered_identity_from_entry` przestaje
   wołać text inference jako trzeci fallback. Entry-level identity wyłącznie
   z cwd / projectHash registry. Text mentions zostają dostępne przez standalone

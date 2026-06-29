@@ -776,7 +776,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn test_macos_other_user_path_rejected() {
-        let path = Path::new("/Users/other_user/Documents/secret.txt");
+        let path = Path::new("/Users/user/Documents/secret.txt");
         assert!(
             !is_under_allowed_base(path).expect("allowlist check"),
             "macOS /Users allowlist must not generalize across users"
