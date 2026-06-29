@@ -109,9 +109,9 @@ const SKILL_BOILERPLATE_HEADERS: &[&str] = &[
 
 /// Footers/signatures that are boilerplate.
 const BOILERPLATE_FOOTERS: &[&str] = &[
-    "created by m&k",
+    "created by vetcoders",
     "vibecrafted with ai agents",
-    "*created by m&k",
+    "*created by vetcoders",
     "*vibecrafted with",
 ];
 
@@ -1233,7 +1233,7 @@ fn speaker_role(frame_kind: Option<&str>, speaker_hint: Option<&str>, line: &str
 
     let hint = speaker_hint.or_else(|| conversation_speaker(line));
     match hint.map(|hint| hint.trim().to_ascii_lowercase()) {
-        Some(hint) if matches!(hint.as_str(), "user" | "human" | "operator" | "monika") => {
+        Some(hint) if matches!(hint.as_str(), "user" | "human" | "operator") => {
             SpeakerRole::Operator
         }
         Some(hint)
@@ -1307,7 +1307,7 @@ fn is_word_char(ch: char) -> bool {
 }
 
 /// Lines that are generic preamble/boilerplate — should not contribute to search matching.
-const SEARCH_BOILERPLATE: &[&str] = &["created by m&k", "vibecrafted with ai agents"];
+const SEARCH_BOILERPLATE: &[&str] = &["created by vetcoders", "vibecrafted with ai agents"];
 
 /// Sentinel brackets for aicx read blocks. Content between these markers
 /// is injected context from aicx tools — not original session signal.

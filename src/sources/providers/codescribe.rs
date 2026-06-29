@@ -263,8 +263,9 @@ fn parse_markdown_speaker_heading(line: &str) -> Option<String> {
     let trimmed = line.trim();
     let heading = trimmed.strip_prefix('#')?.trim_start_matches('#').trim();
     let lower = heading.to_lowercase();
-    if !(lower.starts_with("speaker") || lower.starts_with("maciej") || lower.starts_with("monika"))
-    {
+    // Speaker turns use the `### <Name>:` convention; accept the explicit
+    // "speaker" prefix or any colon-terminated heading as a speaker label.
+    if !(lower.starts_with("speaker") || heading.ends_with(':')) {
         return None;
     }
     Some(

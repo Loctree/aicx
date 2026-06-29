@@ -2015,7 +2015,7 @@ fn test_gemini_session_deserialization() {
                     "id": "64b73173-3b0f-4838-9121-5dfd1f1bb5e1",
                     "timestamp": "2026-01-20T19:50:51.778Z",
                     "type": "gemini",
-                    "content": "Cześć Maciej.",
+                    "content": "Cześć Alex.",
                     "model": "gemini-3-flash-preview",
                     "thoughts": [{"subject": "test", "description": "ignored"}],
                     "tokens": {"input": 100, "output": 25}
@@ -2037,7 +2037,7 @@ fn test_gemini_session_deserialization() {
     assert_eq!(session.messages[1].msg_type.as_deref(), Some("gemini"));
     assert_eq!(
         session.messages[1].content.as_ref(),
-        Some(&serde_json::Value::String("Cześć Maciej.".to_string()))
+        Some(&serde_json::Value::String("Cześć Alex.".to_string()))
     );
 }
 
@@ -2952,12 +2952,12 @@ fn test_codescribe_filter_per_transcript_not_splattered() {
     fs::create_dir_all(&widgets_dir).unwrap();
 
     // Transcript 1: explicitly mentions "aicx" in content (JSON)
-    let content_matching = r#"{"segments":[{"start":0,"end":1,"speaker":"Maciej","text":"let's work on Loctree/aicx today."}]}"#;
+    let content_matching = r#"{"segments":[{"start":0,"end":1,"speaker":"Engineer","text":"let's work on Loctree/aicx today."}]}"#;
     write_file(&day.join("100000_match.json"), content_matching);
 
     // Transcript 2: explicit project frontmatter to contradict the fallback
     let content_unmatching =
-        "---\nproject: acme/widgets\n---\n### Maciej:\nlet's work on widgets.\n";
+        "---\nproject: acme/widgets\n---\n### Engineer:\nlet's work on widgets.\n";
     write_file(&day.join("110000_unmatch.md"), content_unmatching);
 
     let config = ExtractionConfig {

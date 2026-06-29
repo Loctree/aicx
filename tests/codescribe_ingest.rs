@@ -47,7 +47,7 @@ fn codescribe_ingest_discovers_and_parses_txt_md_json_transcripts() {
 
     write_file(
         &home.join(".codescribe").join("lexicon.custom.jsonl"),
-        r#"{"speaker":"maciej","keywords":["Vetcoders","vibecrafted"]}"#,
+        r#"{"speaker":"engineer","keywords":["Vetcoders","vibecrafted"]}"#,
     );
     write_file(
         &day.join("175300_operator-decision_raw.txt"),
@@ -55,11 +55,11 @@ fn codescribe_ingest_discovers_and_parses_txt_md_json_transcripts() {
     );
     write_file(
         &day.join("191400_chat.md"),
-        "### Monika:\nDecision: portal copy must stay concrete.\n\n### Maciej:\nIntent: ship the aicx adapter today.\n",
+        "### Operator:\nDecision: portal copy must stay concrete.\n\n### Engineer:\nIntent: ship the aicx adapter today.\n",
     );
     write_file(
         &day.join("193600_whisper.json"),
-        r#"{"segments":[{"start":1.5,"end":3.0,"speaker":"Maciej","text":"Decision: index Codescribe transcripts."}]}"#,
+        r#"{"segments":[{"start":1.5,"end":3.0,"speaker":"Engineer","text":"Decision: index Codescribe transcripts."}]}"#,
     );
     write_file(
         &day.join("193600_whisper.wav.truth.json"),
@@ -94,7 +94,7 @@ fn codescribe_ingest_discovers_and_parses_txt_md_json_transcripts() {
     assert!(
         entries
             .iter()
-            .any(|entry| entry.message.contains("speaker_hint: maciej"))
+            .any(|entry| entry.message.contains("speaker_hint: engineer"))
     );
     assert!(entries.iter().any(|entry| entry.timestamp
         == Utc.with_ymd_and_hms(2026, 4, 30, 19, 36, 1).unwrap()
