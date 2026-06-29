@@ -976,10 +976,11 @@ impl AicxMcpServer {
         let retrieval_status = outcome.retrieval_status.clone();
         // Shared finalize keeps MCP success ordering identical to the CLI and
         // the fuzzy fallback. Kind is already pushed into the semantic query,
-        // so no kind retain is needed here.
+        // but we still pass it as a defensive retain (matching the CLI tail) so
+        // an off-kind hit cannot slip through if the semantic backend regresses.
         let results = crate::search_engine::finalize_fuzzy_results(
             outcome.results,
-            None,
+            kind_filter_dir,
             params.sort.as_deref(),
             limit,
         );
