@@ -6,7 +6,7 @@
 ## Product Truth
 
 AICX now treats the native embedder as its first-choice local embedding path,
-not as a fallback behind memex.
+not as a fallback behind rust-memex.
 
 The split is:
 
@@ -15,8 +15,8 @@ The split is:
 - **Roost/rust-memex** owns the advanced retrieval/operator plane: heavier
   provider routing, richer indexing, and premium retrieval workflows.
 
-This removes the old schizophrenia where AICX pretended to be memex while also
-depending on memex internals for the same job.
+This removes the old schizophrenia where AICX pretended to be rust-memex while also
+depending on rust-memex internals for the same job.
 
 ## Library Boundary
 

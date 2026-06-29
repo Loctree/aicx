@@ -173,7 +173,7 @@ pub(super) fn validate_score_filter(score: Option<u8>) -> Result<Option<u8>, Str
 }
 
 /// In-process semantic search against the persistent NDJSON vector
-/// index ([`crate::vector_index::query_index`]). No external memex CLI
+/// index ([`crate::vector_index::query_index`]). No external rust-memex CLI
 /// spawn — the dashboard ships with the same `try_semantic_search`
 /// dispatch the CLI and MCP surfaces use.
 ///
@@ -344,7 +344,7 @@ pub(super) async fn get_semantic_search(
     }
 }
 
-// Cross-namespace memex CLI fork removed: `aicx` no longer shells out to
+// Cross-namespace rust-memex CLI fork removed: `aicx` no longer shells out to
 // `rust-memex` / `rmcp-memex`. AICX is the canonical corpus surface
 // (operator decision 2026-05-23). The `/api/search/cross` route is kept
 // so a client polling the endpoint gets a clean Gone surface instead of

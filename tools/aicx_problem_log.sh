@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-BACKLOG_PATH="${AICX_PROBLEM_LOG:-${HOME}/AI_notes/projects/aicx/aicx-problems.md}"
+BACKLOG_PATH="${AICX_PROBLEM_LOG:-${HOME}/.aicx/aicx-problems.md}"
 CREATED_DATE="2026-06-28"
 
 usage() {

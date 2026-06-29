@@ -1092,8 +1092,8 @@ fn test_parse_codex_session_mcp_tool_call_is_kept_in_timeline() {
     let _ = fs::remove_dir_all(&root);
 
     let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"sess","cwd":"/tmp"}}
-{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"mcp_tool_call","server":"memex","tool":"memory_search"}}
-{"timestamp":"2026-02-01T00:00:02Z","type":"event_msg","payload":{"type":"mcp_tool_call_response","server":"memex","result":"ok"}}"#;
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"mcp_tool_call","server":"rust-memex","tool":"memory_search"}}
+{"timestamp":"2026-02-01T00:00:02Z","type":"event_msg","payload":{"type":"mcp_tool_call_response","server":"rust-memex","result":"ok"}}"#;
     write_file(&tmp, content);
 
     let config = ExtractionConfig {

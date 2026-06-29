@@ -295,7 +295,7 @@ Do not claim confidence you have not earned.
 Every AICX problem observed while working in this repository must be appended
 to the operator-managed log:
 
-`~/AI_notes/projects/aicx/aicx-problems.md`
+`~/.aicx/aicx-problems.md`
 
 Problem means: bug, regression risk, flaky behavior, contract drift,
 docs/runtime mismatch, tooling failure, test gap, zombie path, unsafe fallback,

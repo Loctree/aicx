@@ -462,7 +462,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - `aicx intents` and semantic index writes exclude immutable `loct-context-pack` examples from the live-truth namespace; context-corpus embeddings materialize to a separate `context-corpus.embeddings.ndjson` namespace.
 - Operator surface wording: "push" → "materialize" in CLI help text, progress messages, and doc comments to reinforce the two-layer mental model (canonical corpus first, semantic materialization second).
-- Semantic compatibility validation now detects stale metadata even when no documents exist yet in the memex index; reports diverged fields explicitly.
+- Semantic compatibility validation now detects stale metadata even when no documents exist yet in the rust-memex index; reports diverged fields explicitly.
 - Compatibility validation runs before file scanning in `memex-sync`, failing fast on config mismatches.
 - `claude`, `codex`, `all`, and `store` now use watermark-tracked incremental refresh by default. `--full-rescan` is the explicit escape hatch for backfills, while legacy `--incremental` is accepted as a hidden no-op with a deprecation notice.
 - `aicx dashboard` now owns both static HTML generation and live serving. `dashboard-serve` is kept as a hidden compatibility shim while public help/doc surfaces point to `aicx dashboard --serve`, including explicit `--allow-cors-origins` policies for non-loopback binds and `--bg` background launch.
@@ -547,13 +547,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - **YAML frontmatter parsing** for chunk metadata extraction.
-- **Sidecar files** (`.meta.yaml`) written alongside memex chunks for external tooling.
+- **Sidecar files** (`.meta.yaml`) written alongside rust-memex chunks for external tooling.
 
 ## [0.5.1] - 2026-03-24
 
 ### Added
 - **Repo-signal segmentation** in the store pipeline — chunks now carry repository identity signals.
-- **Memex chunk sidecars** and `--preprocess` flag for pre-processing before memex push.
+- **rust-memex chunk sidecars** and `--preprocess` flag for pre-processing before memex push.
 - **Makefile** with comprehensive build, test, lint, and release targets.
 - Gemini truncation support and improved fuzzy search scoring.
 - Test: repo-centric store runtime contract (`runtime_cli_store_contract.rs`).
@@ -573,7 +573,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Repo-centric Migration Assistant:** Added the `aicx migrate` subcommand. This tool safely migrates older file-centric contexts (`file: <name>`) in your `~/.ai-contexters` store to the new canonical repo-centric directories. Use `aicx migrate --dry-run` to preview the changes.
 
 ### Changed
-- **Behavioral Shift (Identity Model):** AICX now uses a canonical repo-centric identity model. Extracted contexts and stored artifacts are now grouped primarily by repository name rather than the raw filename of the agent log. This significantly improves retrieval quality and consistency, especially when syncing contexts to vector stores (memex) or running direct extractions.
+- **Behavioral Shift (Identity Model):** AICX now uses a canonical repo-centric identity model. Extracted contexts and stored artifacts are now grouped primarily by repository name rather than the raw filename of the agent log. This significantly improves retrieval quality and consistency, especially when syncing contexts to vector stores (rust-memex) or running direct extractions.
 - Direct `extract` now infers repository identity when possible, demoting file provenance to secondary metadata.
 
 ## [0.4.3] - 2026-03-17
@@ -677,7 +677,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Ultrathink/Insight and Plan Mode signal extraction.
 - Chunk highlights and redaction optimizations.
 - `action`/`emit` flags and artifacts layout.
-- Semantic chunker and memex integration.
+- Semantic chunker and rust-memex integration.
 
 ### Changed
 
