@@ -1418,8 +1418,9 @@ pub fn fuzzy_search_with_post_filters(
 /// Shared "finalize" step for fuzzy/semantic result sets: optional kind retain,
 /// then sort, then truncate to `limit`. Both CLI and MCP search call this so
 /// ordering and limit semantics stay byte-identical across surfaces. `sort`
-/// accepts `"newest"` / `"oldest"` / `"score"`; `None` (and any unknown token)
-/// falls back to descending score.
+/// accepts `"newest"` / `"oldest"` / `"score"`. `None` falls back to descending
+/// score; any unknown token falls back to `"newest"` (timestamp/date
+/// descending), matching the unit test below.
 pub fn finalize_fuzzy_results(
     mut results: Vec<crate::rank::FuzzyResult>,
     kind_filter: Option<&str>,
