@@ -1227,7 +1227,7 @@ fn default_session_extract_path_oversized_with_extension_like_suffix_is_capped()
 
 #[test]
 fn default_session_extract_path_normal_input_passthrough() {
-    // Closes Klaudiusz audit gap I-3 (P3): a UUID-like session id that
+    // Closes audit gap I-3 (P3): a UUID-like session id that
     // uses only the safe charset (`[a-zA-Z0-9-_.]`) and fits under
     // DEFAULT_SESSION_EXTRACT_FILENAME_STEM_MAX_BYTES must round-trip
     // verbatim into the filename — no hash suffix, no sanitization

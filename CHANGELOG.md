@@ -280,7 +280,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   union. Filters resolve to canonical `<owner>/<repo>` slugs before
   downstream index lookup so a short repo name like
   `-p spotlight-convo-pipeline-v2` expands to its full
-  `m-szymanska/spotlight-convo-pipeline-v2` index path.
+  `vetcoders/spotlight-convo-pipeline-v2` index path.
 
 ### Changed
 - **Project filter is now word-boundary path match, not substring.**

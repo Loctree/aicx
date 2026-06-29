@@ -1782,7 +1782,7 @@ pub fn project_filter_matches(organization: &str, repository: &str, filter: &str
 /// Resolve user-supplied `-p` filters into canonical `<owner>/<repo>` slugs
 /// by enumerating the on-disk canonical store. Used by `aicx search` and
 /// `aicx index` so a single short name like `-p spotlight-convo-pipeline-v2`
-/// expands to `m-szymanska/spotlight-convo-pipeline-v2` before downstream
+/// expands to `example-org/spotlight-convo-pipeline-v2` before downstream
 /// index path / search engine lookup.
 ///
 /// Returns:

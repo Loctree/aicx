@@ -125,7 +125,7 @@ query = "gdzie jest kod do parsowania markdowna"
 expected_top_3_paths = [
     "/Users/<operator>/.aicx/store/Loctree/loctree-suite/2026_0428/conversations/claude/2026_0428_claude_e25341f7-045_069.md",
     "/Users/<operator>/.aicx/store/VetCoders/vibecrafted/2026_0411/plans/codex/2026_0411_codex_019d7c48-4c8_091.md",
-    "/Users/<operator>/.aicx/store/m-szymanska/loctree/2025_1211/conversations/claude/2025_1211_claude_edc6fd4a-d6f_003.md"
+    "/Users/<operator>/.aicx/store/example-org/loctree/2025_1211/conversations/claude/2025_1211_claude_edc6fd4a-d6f_003.md"
 ]
 expected_minimum_recall_at_5 = 0.5
 notes = "Auto-generated polish query"

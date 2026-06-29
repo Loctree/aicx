@@ -485,7 +485,7 @@ fn user_question_and_why_lines_bridge_into_main_intents_view() {
 fn md_radar_style_user_messages_surface_in_main_intents_view() {
     let extraction = extract_demo_extraction(
         "md-radar-natural-human-lines",
-        "[project: m-szymanska/md-radar | agent: codex | date: 2026-06-15 | frame_kind: user_msg]\n\n\
+        "[project: example-org/md-radar | agent: codex | date: 2026-06-15 | frame_kind: user_msg]\n\n\
          [12:00:00] user: Proszę odpal /vc-init na tym repo i ustal, gdzie zaczęła się wcześniejsza sesja.\n\
          [12:01:00] user: Czy AICX umie wyciągać intents z JSONL?\n\
          [12:02:00] user: Usuń hardkody i ścieżki z README, bo to ma być gotowe dla świeżego repo.\n",

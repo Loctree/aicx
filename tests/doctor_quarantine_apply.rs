@@ -1,5 +1,5 @@
 //! Integration test for `doctor --prune-empty-bodies --apply` quarantine
-//! pathway. Closes Klaudiusz audit gap H-1 (P2): the production
+//! pathway. Closes audit gap H-1 (P2): the production
 //! `apply_empty_body_quarantine` path had no dedicated integration test
 //! verifying the rename-not-delete contract from outside the crate.
 //!

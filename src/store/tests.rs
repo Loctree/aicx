@@ -2282,14 +2282,14 @@ fn project_filter_strict_owner_repo_match() {
 #[test]
 fn project_filter_org_wildcard_with_trailing_slash() {
     // `-p owner/` matches every repo under that owner.
-    assert!(project_filter_matches("m-szymanska", "lab", "m-szymanska/"));
+    assert!(project_filter_matches("example-org", "lab", "example-org/"));
     assert!(project_filter_matches(
-        "m-szymanska",
+        "example-org",
         "spotlight-convo-pipeline-v2",
-        "m-szymanska/"
+        "example-org/"
     ));
-    assert!(project_filter_matches("M-SZYMANSKA", "lab", "m-szymanska/"));
-    assert!(!project_filter_matches("vetcoders", "lab", "m-szymanska/"));
+    assert!(project_filter_matches("EXAMPLE-ORG", "lab", "example-org/"));
+    assert!(!project_filter_matches("vetcoders", "lab", "example-org/"));
 }
 
 #[test]
@@ -2327,11 +2327,11 @@ fn project_filter_bare_name_matches_org_or_repo() {
         "codescribe",
         "codescribe"
     ));
-    // Org match (regression for `-p m-szymanska` use case).
+    // Org match (regression for `-p example-org` use case).
     assert!(project_filter_matches(
-        "m-szymanska",
+        "example-org",
         "spotlight-convo-pipeline-v2",
-        "m-szymanska"
+        "example-org"
     ));
     // No match — different name.
     assert!(!project_filter_matches("vetcoders", "Vista", "codescribe"));
@@ -2364,17 +2364,17 @@ fn resolve_filters_to_slugs_expands_short_name_to_canonical() {
     let canonical = root.join(CANONICAL_STORE_DIRNAME);
     fs::create_dir_all(
         canonical
-            .join("m-szymanska")
+            .join("example-org")
             .join("spotlight-convo-pipeline-v2"),
     )
     .unwrap();
-    fs::create_dir_all(canonical.join("m-szymanska").join("lab")).unwrap();
+    fs::create_dir_all(canonical.join("example-org").join("lab")).unwrap();
     fs::create_dir_all(canonical.join("vetcoders").join("CodeScribe")).unwrap();
 
     let resolved =
         resolve_filters_to_slugs_at(&canonical, &["spotlight-convo-pipeline-v2".to_string()])
             .unwrap();
-    assert_eq!(resolved, vec!["m-szymanska/spotlight-convo-pipeline-v2"]);
+    assert_eq!(resolved, vec!["example-org/spotlight-convo-pipeline-v2"]);
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -2383,15 +2383,15 @@ fn resolve_filters_to_slugs_expands_short_name_to_canonical() {
 fn resolve_filters_to_slugs_supports_explicit_syntax() {
     let root = migration_test_root("resolve-explicit");
     let canonical = root.join(CANONICAL_STORE_DIRNAME);
-    fs::create_dir_all(canonical.join("m-szymanska").join("lab")).unwrap();
-    fs::create_dir_all(canonical.join("m-szymanska").join("badi")).unwrap();
+    fs::create_dir_all(canonical.join("example-org").join("lab")).unwrap();
+    fs::create_dir_all(canonical.join("example-org").join("badi")).unwrap();
     fs::create_dir_all(canonical.join("vetcoders").join("CodeScribe")).unwrap();
     fs::create_dir_all(canonical.join("OtherOrg").join("CodeScribe")).unwrap();
 
     // owner/ → all repos under owner
-    let mut got = resolve_filters_to_slugs_at(&canonical, &["m-szymanska/".to_string()]).unwrap();
+    let mut got = resolve_filters_to_slugs_at(&canonical, &["example-org/".to_string()]).unwrap();
     got.sort();
-    assert_eq!(got, vec!["m-szymanska/badi", "m-szymanska/lab"]);
+    assert_eq!(got, vec!["example-org/badi", "example-org/lab"]);
 
     // /repo → cross-org repo match
     let mut got = resolve_filters_to_slugs_at(&canonical, &["/CodeScribe".to_string()]).unwrap();

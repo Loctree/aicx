@@ -23,7 +23,7 @@ use clap::Parser;
 /// aicx MCP server — AI session context as MCP tools
 #[derive(Parser)]
 #[command(name = "aicx-mcp")]
-#[command(author = "M&K (c)2026 VetCoders")]
+#[command(author = "vetcoders (c)2026")]
 #[command(version)]
 struct Args {
     /// Transport: stdio (default) or http. Legacy alias: sse.

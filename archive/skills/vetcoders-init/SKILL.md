@@ -141,4 +141,4 @@ If **both** unavailable: read CLAUDE.md + README.md + recent git log. Announce g
 
 ---
 
-*Created by M&K (c)2026 VetCoders*
+*Created by vetcoders (c)2026*

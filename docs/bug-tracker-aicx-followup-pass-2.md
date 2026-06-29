@@ -6,7 +6,7 @@
 
 **⚠️ AUDIT FIRST.** This plan was written 2026-05-20 right after pass-1 close-out. By the time the next vc-operator session runs, some of these may already be addressed by spontaneous follow-up commits (especially B5 `rust-toolchain.toml` pin, B6 log-spam, C2 fallback timestamp — they're high-leverage and any contributor could pick them off). Each worker must verify current state with `loctree:find <symbol>` + `git log -S '<symbol>'` before implementing.
 
-**Out of scope of this pass.** Vibecrafted runtime issues (Fleet wrapper zombie, gemini reliability, cancel API, etc.) — those live in `~/AI_notes/projects/vibecrafted/specs/vibecrafted-runtime-pass-1.md` for Maciej's vibecrafted repo session.
+**Out of scope of this pass.** Vibecrafted runtime issues (Fleet wrapper zombie, gemini reliability, cancel API, etc.) — those live in `~/AI_notes/projects/vibecrafted/specs/vibecrafted-runtime-pass-1.md` for the vibecrafted repo session.
 
 ---
 

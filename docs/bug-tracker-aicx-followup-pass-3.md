@@ -411,7 +411,7 @@ operator button.
 - Audit Fleet wrapper for implicit `git push` step.
 - Worker prompt should disable auto-push declaratively (already in brief;
   needs runtime enforcement).
-- May require collaboration with vibecrafted maintainers (Maciej).
+- May require collaboration with vibecrafted maintainers (vetcoders).
 
 **Acceptance:**
 - [ ] Vibecrafted-side issue / spec entry linked from this task.
