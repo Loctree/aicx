@@ -36,7 +36,7 @@ use aicx::corpus;
 use aicx::dashboard::{self, DashboardConfig, DashboardScope};
 use aicx::dashboard_server::{self, DashboardCorsPolicy, DashboardServerConfig};
 use aicx::intents;
-use aicx::mcp::{self, McpTransport};
+use aicx::mcp::{self, McpHttpConfig, McpTransport};
 use aicx::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
 use aicx::rank;
 use aicx::reports_extractor::{self, ReportsExtractorConfig};
@@ -1343,6 +1343,14 @@ enum Commands {
         #[arg(long, default_value = "8044")]
         port: u16,
 
+        /// Allowed HTTP Host header for streamable HTTP clients. Repeat for remote hostnames/IPs.
+        #[arg(long = "allowed-host", value_name = "HOST")]
+        allowed_hosts: Vec<String>,
+
+        /// Disable HTTP Host header validation. Not recommended outside trusted networks.
+        #[arg(long)]
+        allow_any_host: bool,
+
         /// Optional explicit auth token (overrides env / file / generated). HTTP transport only.
         #[arg(long, value_name = "TOKEN")]
         auth_token: Option<String>,
@@ -2438,6 +2446,8 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             transport,
             host,
             port,
+            allowed_hosts,
+            allow_any_host,
             auth_token,
             require_auth,
             no_require_auth,
@@ -2449,8 +2459,17 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                     "! Warning: loopback MCP HTTP transport bound without auth — knowing the port is enough to invoke MCP tools."
                 );
             }
+            if matches!(transport, McpTransport::Http) && allow_any_host {
+                eprintln!("! Warning: MCP HTTP Host validation disabled (--allow-any-host).");
+            }
+            let http_config = McpHttpConfig {
+                host,
+                port,
+                allowed_hosts,
+                allow_any_host,
+            };
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async { mcp::run_transport(transport, host, port, auth_config).await })?;
+            rt.block_on(async { mcp::run_transport(transport, http_config, auth_config).await })?;
         }
         Some(Commands::Search {
             query,
@@ -7462,16 +7481,6 @@ fn validate_cli_search_limit(limit: usize) -> Result<()> {
     Ok(())
 }
 
-fn search_examined_fetch_limit(user_limit: usize, filters_active: bool) -> usize {
-    if filters_active {
-        user_limit
-            .saturating_mul(aicx::search_engine::FILTER_EXAMINED_CAP_RATIO)
-            .max(aicx::search_engine::FILTER_EXAMINED_CAP_MIN)
-    } else {
-        user_limit
-    }
-}
-
 fn run_eval_search_quality(args: SearchQualityEvalArgs) -> Result<()> {
     let SearchQualityEvalArgs {
         run,
@@ -7641,72 +7650,73 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     let resolved_projects = resolve_project_filters_or_error(projects)?;
     let scopes = project_scopes(&resolved_projects);
 
-    let (mut results, scanned, semantic_status, pushdown_diagnostic, semantic_fallback) =
-        if no_semantic {
-            let (results, scanned) = run_fuzzy_search_with_filters(
-                &root,
-                &search_query,
-                limit,
-                &scopes,
-                filters.frame_kind.map(Into::into),
-                &post_filters,
-            )?;
-            (results, scanned, None, None, None)
-        } else {
-            match aicx::search_engine::try_semantic_search_filtered(
-                &root,
-                &search_query,
-                limit,
-                &scopes,
-                filters.frame_kind.map(Into::into),
-                kind_filter.map(|kind| kind.dir_name()),
-                &post_filters,
-            ) {
-                Ok(filtered) => {
-                    let aicx::search_engine::FilteredSemanticOutcome {
-                        outcome,
-                        diagnostic,
-                    } = filtered;
-                    let status = (
-                        outcome.backend_label,
-                        outcome.model_id.clone(),
-                        outcome.scanned,
-                        outcome.retrieval_status.clone(),
-                    );
-                    (
-                        outcome.results,
-                        outcome.scanned,
-                        Some(status),
-                        diagnostic,
-                        None,
-                    )
-                }
-                Err(err) => {
-                    let fallback = SemanticFallbackNotice::from_error(&err);
-                    let (results, scanned) = run_fuzzy_search_with_filters(
-                        &root,
-                        &search_query,
-                        limit,
-                        &scopes,
-                        filters.frame_kind.map(Into::into),
-                        &post_filters,
-                    )?;
-                    if !json {
-                        eprintln!(
-                            "aicx search: semantic search unavailable; falling back to filesystem fuzzy."
-                        );
-                        eprintln!("  kind:           {}", err.kind());
-                        eprintln!("  reason:         {}", err.reason());
-                        eprintln!("  recommendation: {}", err.recommendation());
-                    }
-                    (results, scanned, None, None, Some(fallback))
-                }
+    let (results, scanned, semantic_status, pushdown_diagnostic, semantic_fallback) = if no_semantic
+    {
+        let (results, scanned) = aicx::search_engine::fuzzy_search_with_post_filters(
+            &root,
+            &search_query,
+            limit,
+            &scopes,
+            filters.frame_kind.map(Into::into),
+            &post_filters,
+        )?;
+        (results, scanned, None, None, None)
+    } else {
+        match aicx::search_engine::try_semantic_search_filtered(
+            &root,
+            &search_query,
+            limit,
+            &scopes,
+            filters.frame_kind.map(Into::into),
+            kind_filter.map(|kind| kind.dir_name()),
+            &post_filters,
+        ) {
+            Ok(filtered) => {
+                let aicx::search_engine::FilteredSemanticOutcome {
+                    outcome,
+                    diagnostic,
+                } = filtered;
+                let status = (
+                    outcome.backend_label,
+                    outcome.model_id.clone(),
+                    outcome.scanned,
+                    outcome.retrieval_status.clone(),
+                );
+                (
+                    outcome.results,
+                    outcome.scanned,
+                    Some(status),
+                    diagnostic,
+                    None,
+                )
             }
-        };
+            Err(err) => {
+                let fallback = SemanticFallbackNotice::from_error(&err);
+                let (results, scanned) = aicx::search_engine::fuzzy_search_with_post_filters(
+                    &root,
+                    &search_query,
+                    limit,
+                    &scopes,
+                    filters.frame_kind.map(Into::into),
+                    &post_filters,
+                )?;
+                if !json {
+                    eprintln!(
+                        "aicx search: semantic search unavailable; falling back to filesystem fuzzy."
+                    );
+                    eprintln!("  kind:           {}", err.kind());
+                    eprintln!("  reason:         {}", err.reason());
+                    eprintln!("  recommendation: {}", err.recommendation());
+                }
+                (results, scanned, None, None, Some(fallback))
+            }
+        }
+    };
 
-    // Defensive kind retain: the semantic path pushes `kind_filter`
-    // into the hybrid query, but we keep the explicit check so a future
-    // index regression cannot smuggle off-kind hits past the operator.
+    // Defensive kind retain ahead of the evidence path: the shared finalize
+    // below retains too, but `--evidence` consumes `results` before finalize
+    // and must never leak off-kind hits into the evidence report.
+    let mut results = results;
     if let Some(kind_filter) = kind_filter {
         results.retain(|r| r.kind == kind_filter.dir_name());
     }
@@ -7819,23 +7829,28 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         return Ok(());
     }
 
-    if let Some(sort_order) = filters.sort {
-        results.sort_by(|a, b| {
-            let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
-            let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
-            match sort_order {
-                SortOrder::Newest => t_b.cmp(t_a),
-                SortOrder::Oldest => t_a.cmp(t_b),
-                SortOrder::Score => b.score.cmp(&a.score).then(t_b.cmp(t_a)),
-            }
-        });
-    } else {
-        // default sort
-        results.sort_by_key(|b| std::cmp::Reverse(b.score));
-    }
+    // Shared finalize (kind retain + sort + truncate) keeps CLI and MCP search
+    // ordering/limit semantics identical across surfaces. The defensive kind
+    // retain also guards against a future index regression smuggling off-kind
+    // hits past the operator.
+    let sort_label = filters.sort.map(|order| match order {
+        SortOrder::Newest => "newest",
+        SortOrder::Oldest => "oldest",
+        SortOrder::Score => "score",
+    });
+    let results = aicx::search_engine::finalize_fuzzy_results(
+        results,
+        kind_filter.map(|kind| kind.dir_name()),
+        sort_label,
+        limit,
+    );
 
-    // Truncate to requested limit after date filtering
-    let results: Vec<_> = results.into_iter().take(limit).collect();
+    // Source-chunk count from the hybrid manifest (if this was a hybrid run);
+    // borrow so the by-value `match semantic_status` below still owns it.
+    let hybrid_source_chunks = match &semantic_status {
+        Some((_, _, _, Some(retrieval_status))) => Some(retrieval_status.source_chunk_count),
+        _ => None,
+    };
 
     if json {
         let oracle_status = match semantic_status {
@@ -7874,6 +7889,11 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
             &rendered,
             pushdown_diagnostic.as_ref(),
         )?;
+        // Hybrid results reflect the committed index snapshot, not a live
+        // freshness check; attach the honesty hint pointing at `index status`.
+        if let Some(source_chunks) = hybrid_source_chunks {
+            payload = aicx::search_engine::inject_index_snapshot_hint(&payload, source_chunks)?;
+        }
         if let Some(ref fallback) = semantic_fallback {
             let mut value: serde_json::Value = serde_json::from_str(&payload)?;
             if let Some(obj) = value.as_object_mut() {
@@ -7972,39 +7992,6 @@ impl SemanticFallbackNotice {
             recommendation: err.recommendation().to_string(),
         }
     }
-}
-
-fn run_fuzzy_search_with_filters(
-    root: &Path,
-    search_query: &str,
-    limit: usize,
-    scopes: &[Option<&str>],
-    frame_kind: Option<timeline::FrameKind>,
-    post_filters: &aicx::search_engine::SemanticSearchFilters,
-) -> Result<(Vec<rank::FuzzyResult>, usize)> {
-    // Fuzzy path keeps the legacy "fetch then post-filter" shape. It is
-    // reached either by operator request (`--no-semantic`) or by explicit
-    // semantic degradation when the committed index cannot be served.
-    let fuzzy_fetch_limit = search_examined_fetch_limit(limit, post_filters.is_active());
-    let (mut results, scanned) =
-        rank::fuzzy_search_store(root, search_query, fuzzy_fetch_limit, scopes, frame_kind)?;
-    if let Some(min_score) = post_filters.score_min {
-        results.retain(|r| r.score >= min_score);
-    }
-    if let Some(ref agent_filter) = post_filters.agent {
-        results.retain(|r| r.agent == *agent_filter);
-    }
-    if post_filters.date_lo.is_some() || post_filters.date_hi.is_some() {
-        let lo = post_filters.date_lo.as_deref();
-        let hi = post_filters.date_hi.as_deref();
-        results.retain(|r| {
-            lo.is_none_or(|lo| r.date.as_str() >= lo) && hi.is_none_or(|hi| r.date.as_str() <= hi)
-        });
-    } else if let Some(ref cutoff) = post_filters.hours_cutoff {
-        let cutoff = cutoff.as_str();
-        results.retain(|r| r.date.as_str() >= cutoff);
-    }
-    Ok((results, scanned))
 }
 
 /// Build the `IndexEvent` -> sink fanout used by `aicx index`. Always

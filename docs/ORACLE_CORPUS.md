@@ -17,10 +17,20 @@ embedding surface is a derived view that must be rebuildable from that corpus.
 
 ## Operator Surfaces
 
-- `aicx search --json` and MCP `aicx_search` return `oracle_status.backend =
-  filesystem_fuzzy`, `index_kind = none`, and a non-null `fallback_reason`.
-  Treat these results as routing evidence only. Loctree must read the canonical
-  chunks before trusting scope.
+- `aicx search --json` and MCP `aicx_search` are semantic-first. When the
+  semantic index and embedder are ready they return `oracle_status.backend =
+  hybrid_rrf`, `index_kind = onion_content`, and `loctree_scope_safe = true`.
+  This is the preferred retrieval surface for humans and agents. Hybrid results
+  also carry an `index_snapshot` payload (`freshness_verified = false`,
+  `source_chunks = N`): the result reflects the committed index manifest, not a
+  live freshness check. To confirm there are no pending (un-embedded) chunks,
+  run `aicx index status` (or `aicx doctor`, check `index_freshness`) — the
+  search hot path deliberately does not pay for that scan.
+- If semantic preconditions are missing, `aicx search --json` and MCP
+  `aicx_search` degrade to canonical-store filesystem fuzzy search and include
+  an explicit `semantic_fallback` payload. Treat fallback results as routing
+  evidence only; Loctree must read the canonical chunks before trusting scope.
+  MCP clients that need fail-fast behavior can pass `strict_semantic = true`.
 - `aicx intents --emit json` and MCP `aicx_intents` return
   `backend = canonical_corpus` and `index_kind = canonical_chunks`. This is
   canonical intent evidence, not semantic similarity.

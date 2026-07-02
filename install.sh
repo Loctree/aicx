@@ -603,18 +603,19 @@ target_install_version() {
   esac
 }
 
-scan_aicx_shadows() {
-  local target_path="$1"
+scan_binary_shadows() {
+  local binary_name="$1"
+  local target_path="$2"
   local shadow_paths count path version resolved
 
-  echo "Scanning current aicx installation surface..."
-  shadow_paths=$(which -a aicx 2>/dev/null | sort -u || true)
+  echo "Scanning current $binary_name installation surface..."
+  shadow_paths=$(which -a "$binary_name" 2>/dev/null | sort -u || true)
   if [ -z "$shadow_paths" ]; then
-    echo "  no existing aicx on PATH"
+    echo "  no existing $binary_name on PATH"
     return 0
   fi
 
-  echo "Found existing aicx installations:"
+  echo "Found existing $binary_name installations:"
   count=0
   while IFS= read -r path; do
     [ -n "$path" ] || continue
@@ -623,10 +624,10 @@ scan_aicx_shadows() {
     echo "  $path -> $version"
   done <<< "$shadow_paths"
 
-  resolved=$(command -v aicx 2>/dev/null || true)
+  resolved=$(command -v "$binary_name" 2>/dev/null || true)
   if [ "$count" -gt 1 ] || { [ -n "$resolved" ] && ! same_path "$resolved" "$target_path"; }; then
     echo ""
-    echo "WARNING: Multiple or shadowing aicx binaries detected."
+    echo "WARNING: Multiple or shadowing $binary_name binaries detected."
     echo "  target install path: $target_path"
     if [ -n "$resolved" ]; then
       echo "  PATH currently resolves to: $resolved"
@@ -650,6 +651,14 @@ scan_aicx_shadows() {
   fi
 }
 
+scan_aicx_shadows() {
+  local target_aicx="$1"
+  local target_mcp="$2"
+
+  scan_binary_shadows "aicx" "$target_aicx"
+  scan_binary_shadows "aicx-mcp" "$target_mcp"
+}
+
 cleanup_shadow_pair() {
   local dir="$1"
   local target_dir="$2"
@@ -671,7 +680,11 @@ cleanup_shadow_pair() {
   fi
 
   if semver_le "$candidate_version" "$target_version"; then
-    echo "  removing shadow aicx $candidate_version from $dir (target $target_version)"
+    if [ "$AICX_INSTALL_DRY_RUN" = "1" ]; then
+      echo "  would remove shadow aicx $candidate_version from $dir (target $target_version)"
+    else
+      echo "  removing shadow aicx $candidate_version from $dir (target $target_version)"
+    fi
     cleanup_old_binaries "$dir/aicx"
     cleanup_old_binaries "$dir/aicx-mcp"
   else
@@ -694,6 +707,7 @@ cleanup_shadow_aicx_binaries() {
 
 verify_install_path_resolution() {
   local installed_path="$1"
+  local binary_name="${2:-aicx}"
   local installed_version path_resolved path_resolved_version
 
   if ! [ -x "$installed_path" ]; then
@@ -701,17 +715,17 @@ verify_install_path_resolution() {
   fi
 
   installed_version=$("$installed_path" --version 2>/dev/null || echo "unknown")
-  path_resolved=$(command -v aicx 2>/dev/null || true)
+  path_resolved=$(command -v "$binary_name" 2>/dev/null || true)
   if [ -z "$path_resolved" ]; then
     echo ""
     echo "=========================================="
-    echo "WARNING: installed aicx is not on PATH"
+    echo "WARNING: installed $binary_name is not on PATH"
     echo "  Installed to: $installed_path -> $installed_version"
-    echo "  Add $(dirname "$installed_path") to PATH before running aicx."
+    echo "  Add $(dirname "$installed_path") to PATH before running $binary_name."
     echo "=========================================="
     return 0
   fi
-  path_resolved_version=$(aicx --version 2>/dev/null || echo "unknown")
+  path_resolved_version=$("$binary_name" --version 2>/dev/null || echo "unknown")
   if [ -n "$path_resolved" ] && { ! same_path "$path_resolved" "$installed_path" || [ "$installed_version" != "$path_resolved_version" ]; }; then
     echo ""
     echo "=========================================="
@@ -719,14 +733,14 @@ verify_install_path_resolution() {
     echo "  Installed to: $installed_path -> $installed_version"
     echo "  PATH resolves to: $path_resolved -> $path_resolved_version"
     echo ""
-    echo "Other aicx binaries in PATH:"
-    which -a aicx 2>/dev/null | sort -u | while IFS= read -r path; do
+    echo "Other $binary_name binaries in PATH:"
+    which -a "$binary_name" 2>/dev/null | sort -u | while IFS= read -r path; do
       if [ -n "$path" ] && ! same_path "$path" "$installed_path"; then
         echo "  $path"
       fi
     done
     echo ""
-    echo "To fix: ensure $(dirname "$installed_path") is before other aicx locations in your PATH,"
+    echo "To fix: ensure $(dirname "$installed_path") is before other $binary_name locations in your PATH,"
     echo "or remove the older binary shown above."
     echo "=========================================="
   fi
@@ -927,13 +941,15 @@ resolve_install_mode() {
 INSTALL_MODE=$(resolve_install_mode)
 INSTALL_TARGET_BIN_DIR=$(install_target_bin_dir "$INSTALL_MODE")
 INSTALL_TARGET_AICX="$INSTALL_TARGET_BIN_DIR/aicx"
+INSTALL_TARGET_AICX_MCP="$INSTALL_TARGET_BIN_DIR/aicx-mcp"
 INSTALL_TARGET_VERSION=$(target_install_version "$INSTALL_MODE")
 if [ "$VERIFY_PATH_ONLY" -eq 1 ]; then
-  verify_install_path_resolution "$INSTALL_TARGET_AICX"
+  verify_install_path_resolution "$INSTALL_TARGET_AICX" "aicx"
+  verify_install_path_resolution "$INSTALL_TARGET_AICX_MCP" "aicx-mcp"
   exit 0
 fi
 if [ "$SKIP_INSTALL" -eq 0 ]; then
-  scan_aicx_shadows "$INSTALL_TARGET_AICX"
+  scan_aicx_shadows "$INSTALL_TARGET_AICX" "$INSTALL_TARGET_AICX_MCP"
   cleanup_shadow_aicx_binaries "$INSTALL_TARGET_BIN_DIR" "$INSTALL_TARGET_VERSION"
 fi
 if [ "$SHADOW_CHECK_ONLY" -eq 1 ]; then
@@ -998,7 +1014,8 @@ else
 fi
 
 if [ "$SKIP_INSTALL" -eq 0 ]; then
-  verify_install_path_resolution "$INSTALL_TARGET_AICX"
+  verify_install_path_resolution "$INSTALL_TARGET_AICX" "aicx"
+  verify_install_path_resolution "$INSTALL_TARGET_AICX_MCP" "aicx-mcp"
 fi
 
 # --- Step 2: Verify ---

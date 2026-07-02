@@ -18,6 +18,7 @@ use std::{
     collections::HashMap,
     error::Error,
     fmt,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -283,6 +284,60 @@ pub enum McpTransport {
     Http,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpHttpConfig {
+    pub host: IpAddr,
+    pub port: u16,
+    pub allowed_hosts: Vec<String>,
+    pub allow_any_host: bool,
+}
+
+impl McpHttpConfig {
+    pub fn new(host: IpAddr, port: u16) -> Self {
+        Self {
+            host,
+            port,
+            allowed_hosts: Vec::new(),
+            allow_any_host: false,
+        }
+    }
+
+    pub fn localhost(port: u16) -> Self {
+        Self::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    /// True when the operator bound all interfaces without naming any allowed
+    /// Host header. Clients then arrive with real interface addresses
+    /// (Tailscale/LAN IPs) that no static list can predict, so Host
+    /// validation is disabled and `/mcp` stays Bearer-auth gated instead
+    /// (`validate_http_auth_policy` refuses no-auth non-loopback binds).
+    pub fn open_all_interfaces_bind(&self) -> bool {
+        self.host.is_unspecified() && self.allowed_hosts.is_empty() && !self.allow_any_host
+    }
+
+    pub fn allowed_hosts_for_rmcp(&self) -> Vec<String> {
+        let mut allowed = Vec::new();
+        push_allowed_host(&mut allowed, "localhost");
+        push_allowed_host(&mut allowed, "127.0.0.1");
+        push_allowed_host(&mut allowed, "::1");
+        push_allowed_host(&mut allowed, self.host.to_string());
+        for host in &self.allowed_hosts {
+            push_allowed_host(&mut allowed, host.trim());
+        }
+        allowed
+    }
+}
+
+fn push_allowed_host(allowed: &mut Vec<String>, host: impl AsRef<str>) {
+    let host = host.as_ref();
+    if host.is_empty() {
+        return;
+    }
+    if !allowed.iter().any(|existing| existing == host) {
+        allowed.push(host.to_string());
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchParams {
     /// Search query text
@@ -322,6 +377,10 @@ pub struct SearchParams {
     /// Return snippet + full evidence
     #[serde(default)]
     pub verbose: bool,
+    /// Return a structured error instead of filesystem-fuzzy fallback when
+    /// semantic preconditions are missing.
+    #[serde(default)]
+    pub strict_semantic: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -630,6 +689,109 @@ fn inject_mcp_filter_pushdown_payload(
         .map_err(|e| McpError::internal_error(format!("Inject filter_pushdown JSON: {e}"), None))
 }
 
+#[derive(Debug, Clone)]
+struct McpSemanticFallbackNotice {
+    kind: String,
+    reason: String,
+    recommendation: String,
+}
+
+impl McpSemanticFallbackNotice {
+    fn from_error(err: &crate::search_engine::SemanticError) -> Self {
+        Self {
+            kind: err.kind().to_string(),
+            reason: err.reason().to_string(),
+            recommendation: err.recommendation().to_string(),
+        }
+    }
+}
+
+fn mcp_semantic_unavailable_error(fallback: &McpSemanticFallbackNotice) -> McpError {
+    let payload = serde_json::json!({
+        "ok": false,
+        "error": "semantic_search_unavailable",
+        "kind": fallback.kind,
+        "reason": fallback.reason,
+        "recommendation": fallback.recommendation,
+    });
+    McpError::invalid_params(
+        format!(
+            "semantic search unavailable [{}]: {} — recommendation: {}",
+            fallback.kind, fallback.reason, fallback.recommendation
+        ),
+        Some(payload),
+    )
+}
+
+fn inject_mcp_semantic_fallback_payload(
+    rendered: &str,
+    fallback: &McpSemanticFallbackNotice,
+) -> Result<String, McpError> {
+    let mut value: serde_json::Value = serde_json::from_str(rendered).map_err(|e| {
+        McpError::internal_error(format!("Inject semantic_fallback JSON: {e}"), None)
+    })?;
+    let obj = value.as_object_mut().ok_or_else(|| {
+        McpError::internal_error(
+            "Inject semantic_fallback JSON: rendered search payload is not an object",
+            None,
+        )
+    })?;
+    obj.insert(
+        "semantic_fallback".to_string(),
+        serde_json::json!({
+            "used": true,
+            "backend": "filesystem_fuzzy",
+            "kind": fallback.kind,
+            "reason": fallback.reason,
+            "recommendation": fallback.recommendation,
+        }),
+    );
+    serde_json::to_string(&value).map_err(|e| {
+        McpError::internal_error(format!("Serialize semantic_fallback JSON: {e}"), None)
+    })
+}
+
+/// Shared inputs for the MCP filesystem-fuzzy fallback. Groups the search
+/// parameters so the renderer keeps a 2-argument shape (request + fallback
+/// notice) and both fallback call sites build one value instead of threading
+/// eight positional args.
+struct McpFuzzyFallbackRequest<'a> {
+    store_root: &'a std::path::Path,
+    query: &'a str,
+    limit: usize,
+    project_scopes: &'a [Option<&'a str>],
+    frame_kind: Option<FrameKind>,
+    kind_filter: Option<&'a str>,
+    post_filters: &'a crate::search_engine::SemanticSearchFilters,
+    sort: Option<&'a str>,
+}
+
+fn render_mcp_fuzzy_fallback_payload(
+    req: &McpFuzzyFallbackRequest<'_>,
+    fallback: &McpSemanticFallbackNotice,
+) -> Result<String, McpError> {
+    // Shared retrieval + post-filter + finalize primitives keep this MCP
+    // fallback byte-identical to the CLI `aicx search` fuzzy path.
+    let (results, scanned) = crate::search_engine::fuzzy_search_with_post_filters(
+        req.store_root,
+        req.query,
+        req.limit,
+        req.project_scopes,
+        req.frame_kind,
+        req.post_filters,
+    )
+    .map_err(|e| McpError::internal_error(format!("Filesystem fuzzy search: {e}"), None))?;
+    let results =
+        crate::search_engine::finalize_fuzzy_results(results, req.kind_filter, req.sort, req.limit);
+    let oracle_status = rank::search_oracle_status(req.store_root, &results, scanned);
+    let rendered =
+        rank::render_search_json_with_oracle(req.store_root, &results, scanned, oracle_status)
+            .map_err(|e| {
+                McpError::internal_error(format!("Serialize fallback search JSON: {e}"), None)
+            })?;
+    inject_mcp_semantic_fallback_payload(&rendered, fallback)
+}
+
 #[derive(Clone)]
 pub struct AicxMcpServer {
     #[allow(dead_code)]
@@ -682,7 +844,7 @@ impl AicxMcpServer {
 
     #[tool(
         name = "aicx_search",
-        description = "Semantic search over the canonical corpus. Fails fast with kind/reason/recommendation when the index or embedder is not ready. Filter pushdown (agent/score/date/hours) iterates a bounded retrieval pool (up to 10x the requested limit) so a corpus whose top-N raw hits all sit outside the filter window still surfaces inside-window matches further down the ranking instead of returning silent-empty. When the cap is examined without satisfying the limit, the response carries a `filter_pushdown` payload with `kind=\"filter_yielded_partial\"` so callers can distinguish bounded under-delivery from a genuinely empty corpus."
+        description = "Semantic-first search over the canonical corpus. When the semantic index or embedder is not ready, returns filesystem-fuzzy results with an explicit `semantic_fallback` payload; pass `strict_semantic=true` to receive the old fail-fast kind/reason/recommendation error. Filter pushdown (agent/score/date/hours) iterates a bounded semantic retrieval pool (up to 10x the requested limit) so a corpus whose top-N raw hits all sit outside the filter window still surfaces inside-window matches further down the ranking instead of returning silent-empty. When the cap is examined without satisfying the limit, the response carries a `filter_pushdown` payload with `kind=\"filter_yielded_partial\"` so callers can distinguish bounded under-delivery from a genuinely empty corpus."
     )]
     async fn search(
         &self,
@@ -693,30 +855,6 @@ impl AicxMcpServer {
         // operator secrets and the audit log is intended to be safe to
         // archive long-term.
         tracing::info!(target: "mcp.audit", tool_name = "aicx_search", "mcp tool invoked");
-
-        // D-6: short-circuit while the embedder is in the negative-cache
-        // window. Returns a structured error the MCP caller can act on
-        // without further round-trips to the embedder.
-        let now = Instant::now();
-        if let Some(remaining) = self.embedder_negative_cache_remaining(now) {
-            let payload = serde_json::json!({
-                "ok": false,
-                "error": "semantic_search_unavailable",
-                "kind": "embedder_unavailable",
-                "reason": format!(
-                    "embedder negative cache active for another {}s — last embed attempt failed",
-                    remaining.as_secs()
-                ),
-                "recommendation": "run `aicx doctor` to inspect embedder health; the cache clears automatically after the TTL elapses",
-            });
-            return Err(McpError::invalid_params(
-                format!(
-                    "semantic search unavailable [embedder_unavailable]: negative cache active for {}s",
-                    remaining.as_secs()
-                ),
-                Some(payload),
-            ));
-        }
 
         validate_string_len(Some(params.query.as_str()), 4096, "query")?;
         validate_string_len(params.project.as_deref(), 4096, "project")?;
@@ -754,8 +892,10 @@ impl AicxMcpServer {
             },
             None => None,
         };
+        let kind_filter_dir = kind_filter.map(|kind| kind.dir_name());
         let query = params.query;
         let limit = params.limit.min(50);
+        let strict_semantic = params.strict_semantic;
         let project = params.project;
         let owned_projects = params
             .projects
@@ -773,22 +913,53 @@ impl AicxMcpServer {
 
         let post_filters = filter_build.post_filters;
 
-        // Semantic-only dispatch with filter pushdown. No fuzzy fallback.
+        // One request value shared by both fuzzy-fallback exits below.
+        let fallback_request = McpFuzzyFallbackRequest {
+            store_root: &store_root,
+            query: &query,
+            limit,
+            project_scopes: &project_scopes,
+            frame_kind,
+            kind_filter: kind_filter_dir,
+            post_filters: &post_filters,
+            sort: params.sort.as_deref(),
+        };
+
+        // D-6: short-circuit semantic work while the embedder is in the
+        // negative-cache window. Default MCP behavior still serves Layer 1
+        // corpus fuzzy search, so local agents remain useful without a
+        // hydrated embedder; strict clients can opt back into fail-fast.
+        let now = Instant::now();
+        if let Some(remaining) = self.embedder_negative_cache_remaining(now) {
+            let fallback = McpSemanticFallbackNotice {
+                kind: "embedder_unavailable".to_string(),
+                reason: format!(
+                    "embedder negative cache active for another {}s — last embed attempt failed",
+                    remaining.as_secs()
+                ),
+                recommendation: "run `aicx doctor` to inspect embedder health; the cache clears automatically after the TTL elapses".to_string(),
+            };
+            if strict_semantic {
+                return Err(mcp_semantic_unavailable_error(&fallback));
+            }
+            let payload = render_mcp_fuzzy_fallback_payload(&fallback_request, &fallback)?;
+            return Ok(CallToolResult::success(vec![Content::text(payload)]));
+        }
+
+        // Semantic-first dispatch with filter pushdown. Missing semantic
+        // preconditions degrade to filesystem-fuzzy by default, matching the
+        // CLI contract. `strict_semantic=true` keeps the fail-fast MCP mode.
         // The wrapper iterates a bounded retrieval pool (`FILTER_EXAMINED_CAP_RATIO`
         // x `limit`) so the canonical pathology — top-N raw hits sit
         // outside the filter window while valid hits exist below — does
-        // not surface as silent-empty. When a precondition is missing
-        // (embedder unhydrated, index not built, ...) the wrapper still
-        // returns a structured McpError carrying the same `kind` +
-        // `reason` + `recommendation` triple the CLI fail-fast surface
-        // emits.
+        // not surface as silent-empty.
         let filtered = match crate::search_engine::try_semantic_search_filtered(
             &store_root,
             &query,
             limit,
             &project_scopes,
             frame_kind,
-            kind_filter.map(|kind| kind.dir_name()),
+            kind_filter_dir,
             &post_filters,
         ) {
             Ok(filtered) => filtered,
@@ -801,22 +972,12 @@ impl AicxMcpServer {
                 if err.kind() == "embedder_unavailable" {
                     self.mark_embedder_unavailable(Instant::now(), MCP_EMBEDDER_NEGATIVE_TTL);
                 }
-                let payload = serde_json::json!({
-                    "ok": false,
-                    "error": "semantic_search_unavailable",
-                    "kind": err.kind(),
-                    "reason": err.reason(),
-                    "recommendation": err.recommendation(),
-                });
-                return Err(McpError::invalid_params(
-                    format!(
-                        "semantic search unavailable [{}]: {} — recommendation: {}",
-                        err.kind(),
-                        err.reason(),
-                        err.recommendation()
-                    ),
-                    Some(payload),
-                ));
+                let fallback = McpSemanticFallbackNotice::from_error(&err);
+                if strict_semantic {
+                    return Err(mcp_semantic_unavailable_error(&fallback));
+                }
+                let payload = render_mcp_fuzzy_fallback_payload(&fallback_request, &fallback)?;
+                return Ok(CallToolResult::success(vec![Content::text(payload)]));
             }
         };
         let crate::search_engine::FilteredSemanticOutcome {
@@ -825,7 +986,7 @@ impl AicxMcpServer {
         } = filtered;
         let scanned = outcome.scanned;
         let retrieval_status = outcome.retrieval_status.clone();
-        let mut results = outcome.results;
+        let results = outcome.results;
 
         if params.evidence {
             let report = crate::evidence::build_evidence_report(&query, results, limit);
@@ -857,22 +1018,16 @@ impl AicxMcpServer {
             return Ok(CallToolResult::success(vec![Content::text(payload)]));
         }
 
-        if let Some(sort_order) = params.sort.as_deref() {
-            results.sort_by(|a, b| {
-                let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
-                let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
-                match sort_order {
-                    "newest" => t_b.cmp(t_a),
-                    "oldest" => t_a.cmp(t_b),
-                    "score" => b.score.cmp(&a.score).then(t_b.cmp(t_a)),
-                    _ => t_b.cmp(t_a),
-                }
-            });
-        } else {
-            results.sort_by_key(|b| std::cmp::Reverse(b.score));
-        }
-
-        let results: Vec<_> = results.into_iter().take(limit).collect();
+        // Shared finalize keeps MCP success ordering identical to the CLI and
+        // the fuzzy fallback. Kind is already pushed into the semantic query,
+        // but we still pass it as a defensive retain (matching the CLI tail) so
+        // an off-kind hit cannot slip through if the semantic backend regresses.
+        let results = crate::search_engine::finalize_fuzzy_results(
+            results,
+            kind_filter_dir,
+            params.sort.as_deref(),
+            limit,
+        );
 
         let source_paths_verified = crate::oracle::verify_paths(
             results
@@ -900,6 +1055,20 @@ impl AicxMcpServer {
                     McpError::internal_error(format!("Serialize search JSON: {e}"), None)
                 })?;
         let payload = inject_mcp_filter_pushdown_payload(&rendered, pushdown_diagnostic.as_ref())?;
+        // Hybrid results reflect the committed index snapshot, not a live
+        // freshness check; attach the honesty hint so callers verify pending
+        // chunks via `aicx index status` instead of assuming full freshness.
+        let payload = if let Some(ref retrieval_status) = retrieval_status {
+            crate::search_engine::inject_index_snapshot_hint(
+                &payload,
+                retrieval_status.source_chunk_count,
+            )
+            .map_err(|e| {
+                McpError::internal_error(format!("Inject index_snapshot hint: {e}"), None)
+            })?
+        } else {
+            payload
+        };
 
         Ok(CallToolResult::success(vec![Content::text(payload)]))
     }
@@ -1377,10 +1546,19 @@ pub async fn run_stdio() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Run MCP server over streamable HTTP transport on localhost with the given auth state.
+pub async fn run_http(port: u16, auth_config: AuthConfig) -> anyhow::Result<()> {
+    run_http_config(McpHttpConfig::localhost(port), auth_config).await
+}
+
 /// Run MCP server over streamable HTTP transport on the given host/port with the given auth state.
-pub async fn run_http(
-    host: std::net::IpAddr,
-    port: u16,
+pub async fn run_http_on(host: IpAddr, port: u16, auth_config: AuthConfig) -> anyhow::Result<()> {
+    run_http_config(McpHttpConfig::new(host, port), auth_config).await
+}
+
+/// Run MCP server over streamable HTTP transport with explicit bind and Host validation config.
+pub async fn run_http_config(
+    http_config: McpHttpConfig,
     auth_config: AuthConfig,
 ) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -1389,11 +1567,12 @@ pub async fn run_http(
         .try_init()
         .ok();
 
-    let addr = std::net::SocketAddr::new(host, port);
+    let addr = SocketAddr::new(http_config.host, http_config.port);
+    let allowed_hosts = http_config.allowed_hosts_for_rmcp();
 
     let auth_source_label = auth_config.source.describe();
     let auth_enforced = auth_config.is_enforced();
-    validate_http_auth_policy(host, &auth_config)?;
+    validate_http_auth_policy(http_config.host, &auth_config)?;
 
     // F-P3-18: emit the truthful auth posture + tool surface as a single
     // tracing event so security review can audit boot configuration
@@ -1403,12 +1582,20 @@ pub async fn run_http(
         auth_enabled = auth_enforced,
         auth_source = %auth_source_label,
         tools = ?MCP_TOOL_SURFACE,
-        port = port,
+        host = %http_config.host,
+        port = http_config.port,
+        allow_any_host = http_config.allow_any_host,
+        allowed_hosts = ?allowed_hosts,
         "mcp server starting (http)"
     );
 
-    let config = streamable_http_config_for_bind(host);
-    let allowed_hosts = config.allowed_hosts.clone();
+    let config = if http_config.allow_any_host || http_config.open_all_interfaces_bind() {
+        rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+            .disable_allowed_hosts()
+    } else {
+        rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+            .with_allowed_hosts(allowed_hosts.clone())
+    };
     let session_manager = configured_mcp_session_manager();
     spawn_mcp_session_cleanup(session_manager.clone(), MCP_SESSION_SWEEP_INTERVAL);
     let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
@@ -1436,9 +1623,11 @@ pub async fn run_http(
     eprintln!("  Endpoint: http://{addr}/mcp");
     eprintln!("  Health: http://{addr}/health");
     eprintln!("  Transport: Streamable HTTP (POST + GET /mcp)");
-    if allowed_hosts.is_empty() {
+    if http_config.allow_any_host {
+        eprintln!("  Host validation: DISABLED (--allow-any-host)");
+    } else if http_config.open_all_interfaces_bind() {
         eprintln!(
-            "  Host validation: DISABLED because --host is an all-interfaces bind; /mcp remains Bearer-auth gated"
+            "  Host validation: DISABLED because --host is an all-interfaces bind without --allowed-host; /mcp remains Bearer-auth gated"
         );
     } else {
         eprintln!(
@@ -1480,46 +1669,20 @@ async fn mcp_health() -> axum::http::StatusCode {
     axum::http::StatusCode::OK
 }
 
-fn streamable_http_config_for_bind(
-    host: std::net::IpAddr,
-) -> rmcp::transport::streamable_http_server::StreamableHttpServerConfig {
-    let config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default();
-    if host.is_unspecified() {
-        // `0.0.0.0`/`::` means clients will use a real interface address in
-        // the Host header. Without an explicit operator-provided hostname list
-        // there is no single authority to add, so this all-interfaces mode
-        // intentionally follows the operator's trust boundary.
-        return config.disable_allowed_hosts();
-    }
-
-    let mut allowed_hosts = config.allowed_hosts.clone();
-    let host = host.to_string();
-    if !allowed_hosts.iter().any(|allowed| allowed == &host) {
-        allowed_hosts.push(host);
-    }
-    config.with_allowed_hosts(allowed_hosts)
-}
-
 /// Legacy compatibility wrapper for callers that still use the old `run_sse` name.
 pub async fn run_sse(port: u16, auth_config: AuthConfig) -> anyhow::Result<()> {
-    run_http(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        port,
-        auth_config,
-    )
-    .await
+    run_http(port, auth_config).await
 }
 
 /// Run the selected MCP transport. Stdio bypasses HTTP auth (no network surface).
 pub async fn run_transport(
     transport: McpTransport,
-    host: std::net::IpAddr,
-    port: u16,
+    http_config: McpHttpConfig,
     auth_config: AuthConfig,
 ) -> anyhow::Result<()> {
     match transport {
         McpTransport::Stdio => run_stdio().await,
-        McpTransport::Http => run_http(host, port, auth_config).await,
+        McpTransport::Http => run_http_config(http_config, auth_config).await,
     }
 }
 
@@ -1567,10 +1730,11 @@ mod tests {
     use super::{
         AicxMcpServer, AicxSessionManager, AicxSessionManagerError, MAX_SCORE_FILTER,
         MCP_EMBEDDER_NEGATIVE_TTL, MCP_SESSION_IDLE_TTL, MCP_SESSION_MAX_SESSIONS,
-        MCP_SESSION_SWEEP_INTERVAL, McpTransport, RankItem, RankResponse, SearchParams,
-        SteerResponse, background_refresh_args, build_mcp_semantic_filters,
-        configured_mcp_session_manager, inject_mcp_filter_pushdown_payload, parse_date_filter_mcp,
-        spawn_mcp_session_cleanup, streamable_http_config_for_bind, validate_http_auth_policy,
+        MCP_SESSION_SWEEP_INTERVAL, McpHttpConfig, McpSemanticFallbackNotice, McpTransport,
+        RankItem, RankResponse, SearchParams, SteerResponse, background_refresh_args,
+        build_mcp_semantic_filters, configured_mcp_session_manager,
+        inject_mcp_filter_pushdown_payload, inject_mcp_semantic_fallback_payload,
+        parse_date_filter_mcp, spawn_mcp_session_cleanup, validate_http_auth_policy,
         validate_score_filter, validate_string_len,
     };
     use crate::auth::{AuthConfig, AuthSource};
@@ -1578,6 +1742,7 @@ mod tests {
     use clap::ValueEnum as _;
     use rmcp::transport::streamable_http_server::session::SessionManager as _;
     use std::{
+        net::{IpAddr, Ipv4Addr},
         sync::Arc,
         time::{Duration, Instant},
     };
@@ -1600,6 +1765,7 @@ mod tests {
             evidence: false,
             slim: true,
             verbose: false,
+            strict_semantic: false,
         }
     }
 
@@ -1750,6 +1916,7 @@ mod tests {
         assert!(params.hours.is_none());
         assert!(params.date.is_none());
         assert!(!params.evidence);
+        assert!(!params.strict_semantic);
     }
 
     #[test]
@@ -1758,6 +1925,14 @@ mod tests {
             .expect("search params should parse evidence mode");
 
         assert!(params.evidence);
+    }
+
+    #[test]
+    fn search_params_can_opt_back_into_strict_semantic() {
+        let params: SearchParams =
+            serde_json::from_str(r#"{"query":"dashboard","strict_semantic":true}"#)
+                .expect("search params should parse");
+        assert!(params.strict_semantic);
     }
 
     #[test]
@@ -1828,6 +2003,33 @@ mod tests {
         assert_eq!(json["filter_pushdown"]["matched"], 2);
         assert_eq!(json["filter_pushdown"]["requested_limit"], 10);
         assert_eq!(json["filter_pushdown"]["examined_cap_ratio"], 10);
+    }
+
+    #[test]
+    fn mcp_search_payload_includes_semantic_fallback_diagnostic() {
+        let fallback = McpSemanticFallbackNotice {
+            kind: "index_not_built".to_string(),
+            reason: "index missing".to_string(),
+            recommendation: "run `aicx index`".to_string(),
+        };
+
+        let payload = inject_mcp_semantic_fallback_payload(
+            r#"{"oracle_status":{"backend":"filesystem_fuzzy"},"results":0,"items":[]}"#,
+            &fallback,
+        )
+        .expect("fallback payload should inject");
+        let json: serde_json::Value =
+            serde_json::from_str(&payload).expect("payload should stay valid JSON");
+
+        assert_eq!(json["results"], 0);
+        assert_eq!(json["semantic_fallback"]["used"], true);
+        assert_eq!(json["semantic_fallback"]["backend"], "filesystem_fuzzy");
+        assert_eq!(json["semantic_fallback"]["kind"], "index_not_built");
+        assert_eq!(json["semantic_fallback"]["reason"], "index missing");
+        assert_eq!(
+            json["semantic_fallback"]["recommendation"],
+            "run `aicx index`"
+        );
     }
 
     #[test]
@@ -1966,30 +2168,29 @@ mod tests {
     #[test]
     fn test_mcp_http_config_allows_explicit_non_loopback_host() {
         let host = std::net::IpAddr::from([100u8, 75, 30, 90]);
-        let config = streamable_http_config_for_bind(host);
+        let config = McpHttpConfig::new(host, 8044);
+        let allowed = config.allowed_hosts_for_rmcp();
 
-        assert!(
-            config
-                .allowed_hosts
-                .iter()
-                .any(|allowed| allowed == "127.0.0.1")
-        );
-        assert!(
-            config
-                .allowed_hosts
-                .iter()
-                .any(|allowed| allowed == "100.75.30.90")
-        );
+        assert!(allowed.iter().any(|allowed| allowed == "127.0.0.1"));
+        assert!(allowed.iter().any(|allowed| allowed == "100.75.30.90"));
+        assert!(!config.open_all_interfaces_bind());
     }
 
     #[test]
     fn test_mcp_http_config_disables_host_guard_for_all_interfaces_bind() {
         let host = std::net::IpAddr::from([0u8, 0, 0, 0]);
-        let config = streamable_http_config_for_bind(host);
+        let config = McpHttpConfig::new(host, 8044);
 
         assert!(
-            config.allowed_hosts.is_empty(),
-            "0.0.0.0 needs to accept real interface Host headers such as Tailscale IPs"
+            config.open_all_interfaces_bind(),
+            "0.0.0.0 without --allowed-host needs to accept real interface Host headers such as Tailscale IPs"
+        );
+
+        let mut with_list = McpHttpConfig::new(host, 8044);
+        with_list.allowed_hosts = vec!["mcp.example.internal".to_string()];
+        assert!(
+            !with_list.open_all_interfaces_bind(),
+            "an explicit --allowed-host list re-enables strict Host validation"
         );
     }
 
@@ -2087,5 +2288,26 @@ mod tests {
         assert_eq!(possible, vec!["stdio".to_string(), "http".to_string()]);
         assert_eq!(McpTransport::from_str("http", true), Ok(McpTransport::Http));
         assert_eq!(McpTransport::from_str("sse", true), Ok(McpTransport::Http));
+    }
+
+    #[test]
+    fn mcp_http_config_keeps_loopback_and_adds_remote_allowed_hosts() {
+        let mut config = McpHttpConfig::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9000);
+        config.allowed_hosts = vec![
+            "mcp.example.internal".to_string(),
+            "127.0.0.1".to_string(),
+            "mcp.example.internal".to_string(),
+        ];
+
+        assert_eq!(
+            config.allowed_hosts_for_rmcp(),
+            vec![
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "::1".to_string(),
+                "0.0.0.0".to_string(),
+                "mcp.example.internal".to_string(),
+            ]
+        );
     }
 }

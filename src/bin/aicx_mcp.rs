@@ -6,18 +6,19 @@
 //! Usage:
 //!   aicx-mcp                          # stdio transport
 //!   aicx-mcp --transport http         # streamable HTTP on port 8044
+//!   aicx-mcp --transport http --port 9000
 //!   aicx-mcp --transport http --host 0.0.0.0 --port 9000 --auth-token "$TOKEN"
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 use aicx::auth;
-use aicx::mcp::{self, McpTransport};
+use aicx::mcp::{self, McpHttpConfig, McpTransport};
 use std::io::Write as _;
+use std::net::IpAddr;
 use std::panic;
 use std::process::ExitCode;
 
 use clap::Parser;
-use std::net::IpAddr;
 
 /// aicx MCP server — AI session context as MCP tools
 #[derive(Parser)]
@@ -36,6 +37,14 @@ struct Args {
     /// Port for streamable HTTP transport
     #[arg(long, default_value = "8044")]
     port: u16,
+
+    /// Allowed HTTP Host header for streamable HTTP clients. Repeat for remote hostnames/IPs.
+    #[arg(long = "allowed-host", value_name = "HOST")]
+    allowed_hosts: Vec<String>,
+
+    /// Disable HTTP Host header validation. Not recommended outside trusted networks.
+    #[arg(long)]
+    allow_any_host: bool,
 
     /// Optional explicit auth token (overrides env / file / generated). HTTP transport only.
     #[arg(long, value_name = "TOKEN")]
@@ -124,9 +133,17 @@ fn main() -> ExitCode {
             "[aicx-mcp] WARNING: loopback HTTP transport bound without auth (--no-require-auth)",
         );
     }
-    match rt.block_on(async {
-        mcp::run_transport(args.transport, args.host, args.port, auth_config).await
-    }) {
+    if matches!(args.transport, McpTransport::Http) && args.allow_any_host {
+        safe_stderr_log("[aicx-mcp] WARNING: HTTP Host validation disabled (--allow-any-host)");
+    }
+    let http_config = McpHttpConfig {
+        host: args.host,
+        port: args.port,
+        allowed_hosts: args.allowed_hosts,
+        allow_any_host: args.allow_any_host,
+    };
+    match rt.block_on(async { mcp::run_transport(args.transport, http_config, auth_config).await })
+    {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let err_str = format!("{e:?}");
@@ -153,6 +170,27 @@ mod tests {
             .expect("http transport should parse with default host");
 
         assert_eq!(args.host, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(args.port, 8044);
+    }
+
+    #[test]
+    fn http_host_accepts_all_interfaces() {
+        let args = Args::try_parse_from([
+            "aicx-mcp",
+            "--transport",
+            "http",
+            "--host",
+            "0.0.0.0",
+            "--allowed-host",
+            "mcp.example.internal",
+            "--port",
+            "9000",
+        ])
+        .expect("explicit http host should parse");
+
+        assert_eq!(args.host, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(args.allowed_hosts, vec!["mcp.example.internal"]);
+        assert_eq!(args.port, 9000);
     }
 
     #[test]

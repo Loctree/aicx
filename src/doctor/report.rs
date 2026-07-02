@@ -41,6 +41,10 @@ pub fn format_report_text(report: &DoctorReport, verbose: bool) -> String {
         &report.embedder_warmth,
         &report.empty_body_chunks,
         &report.content_dedup,
+        &report.context_corpus,
+        &report.aicx_home,
+        &report.binary_pair,
+        &report.http_auth_token,
     ];
     for check in checks {
         out.push_str(&format!(

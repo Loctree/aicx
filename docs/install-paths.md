@@ -1,7 +1,7 @@
 # AICX Install Paths
 
 This document maps the supported binary install channels and the shadow checks
-that keep `PATH` from resolving an older `aicx`.
+that keep `PATH` from resolving older `aicx` or `aicx-mcp` binaries.
 
 ## Install Surface
 
@@ -37,15 +37,16 @@ npm @loctree/aicx
 
 ## Pre-install Scan
 
-Shell installers run a preflight inventory:
+Shell installers run a preflight inventory for both binaries:
 
 ```bash
 which -a aicx
+which -a aicx-mcp
 ```
 
 Each path is probed with `--version` when executable. If multiple binaries are
-visible, or the current `PATH` winner is not the target install path, interactive
-installs ask for confirmation. Automation can set:
+visible, or the current `PATH` winner is not the target install path,
+interactive installs ask for confirmation. Automation can set:
 
 ```bash
 AICX_INSTALL_FORCE=1 bash install.sh
@@ -72,17 +73,63 @@ because the installer cannot prove that removal is safe.
 
 ## Post-install Sanity
 
-After shell installs, `install.sh` compares:
+After shell installs, `install.sh` compares both runtime entry points:
 
 ```bash
 <target>/aicx --version
 command -v aicx
 aicx --version
+<target>/aicx-mcp --version
+command -v aicx-mcp
+aicx-mcp --version
 ```
 
 If the versions or paths differ, the installer prints a warning with the target
-path, the `PATH`-resolved path, and all other `which -a aicx` entries. The fix is
-to move the target directory earlier in `PATH` or remove the older channel.
+path, the `PATH`-resolved path, and all other `which -a` entries for that
+binary. The fix is to move the target directory earlier in `PATH` or remove the
+older channel.
+
+## MCP Runtime Drift
+
+The CLI and MCP server are shipped as one versioned pair. Any long-running MCP
+service, launchd unit, systemd unit, or hand-written wrapper must point at the
+same installed `aicx-mcp` that the installer verifies on `PATH`. A copied
+service-local binary can keep answering MCP health checks while running older
+search behavior.
+
+`aicx doctor` reports this drift class directly: the `binary_pair` check
+compares the running CLI against the `aicx-mcp` resolved on `PATH`, `aicx_home`
+shows which `AICX_HOME` was resolved (and whether `store/` + `indexed/` live
+there), and `http_auth_token` shows where the HTTP token resolves from without
+printing its value.
+
+Minimum parity smoke after updating a service:
+
+```bash
+aicx --version
+aicx-mcp --version
+aicx-mcp --help | grep -- "--host"
+aicx doctor --format json   # inspect binary_pair / aicx_home / http_auth_token
+aicx index status --json
+aicx search "operator decision" --json --limit 1
+```
+
+For streamable HTTP MCP, also call `aicx_index_status` and `aicx_search` through
+the client transport and compare the reported `indexed_count`, `readiness`, and
+`oracle_status.backend` with the CLI output. `aicx_search` should report
+`hybrid_rrf` when the same CLI search does; if it reports `content_semantic` or
+silent zero results while CLI returns `hybrid_rrf`, the service is stale or
+running a different binary/config.
+
+Remote MCP services that bind outside loopback also need HTTP `Host` validation
+configured for the client-facing hostname/IP:
+
+```bash
+aicx-mcp --transport http --host 0.0.0.0 --allowed-host mcp.example.internal --port 8044
+```
+
+Without a matching `--allowed-host`, rmcp rejects the request before MCP tools
+run and the client sees `403 Forbidden: Host header is not allowed`.
 
 ## npm Opt-in Replacement
 
