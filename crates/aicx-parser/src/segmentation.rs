@@ -874,7 +874,7 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "git@github.com:vetcoders/ai-contexters.git",
+                "git@github.com:Vetcoders/ai-contexters.git",
             ])
             .output()
             .expect("git remote add should run");
@@ -996,7 +996,7 @@ mod tests {
     #[test]
     fn fallback_routes_invalid_remote_repo_to_unknown_local_bucket() {
         let identity = infer_repo_identity_from_remote_like(
-            "https://github.com/vetcoders/${RELEASE_REPO}.git",
+            "https://github.com/Vetcoders/${RELEASE_REPO}.git",
         )
         .expect("malformed repository should resolve to local unknown fallback");
 
@@ -1021,7 +1021,7 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "git@github.com:vetcoders/loctree.git",
+                "git@github.com:Vetcoders/loctree.git",
             ])
             .output()
             .expect("git remote add");
@@ -1094,7 +1094,7 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "git@github.com:vetcoders/ai-contexters.git",
+                "git@github.com:Vetcoders/ai-contexters.git",
             ])
             .output()
             .expect("git remote add");
@@ -1240,7 +1240,7 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "git@github.com:vetcoders/ai-contexters.git",
+                "git@github.com:Vetcoders/ai-contexters.git",
             ])
             .output()
             .expect("git remote add");
@@ -1449,7 +1449,7 @@ mod tests {
             (2026, 5, 19, 10, 0, 0),
             "sess-url",
             "user",
-            "See https://github.com/vetcoders/aicx for context.",
+            "See https://github.com/Vetcoders/aicx for context.",
             None,
         );
         assert!(
@@ -1468,7 +1468,7 @@ mod tests {
             (2026, 5, 19, 10, 0, 0),
             "sess-bucket",
             "user",
-            "Read https://github.com/vetcoders/aicx and tell me what you see.",
+            "Read https://github.com/Vetcoders/aicx and tell me what you see.",
             None,
         );
         let resolution = resolve_bucket(&e, &ProjectHashRegistry::default());
@@ -1495,7 +1495,7 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "git@github.com:vetcoders/vista.git",
+                "git@github.com:Vetcoders/vista.git",
             ])
             .output()
             .unwrap();
@@ -1513,7 +1513,7 @@ mod tests {
                 (2026, 5, 19, 10, 1, 0),
                 "sess-no-split",
                 "assistant",
-                "See https://github.com/vetcoders/aicx for the shared parser.",
+                "See https://github.com/Vetcoders/aicx for the shared parser.",
                 None,
             ),
             entry(
