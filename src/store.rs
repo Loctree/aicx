@@ -7,7 +7,7 @@
 //! - `chunks/` — the base location for chunk content
 //! - `index.json` — manifest of stored contexts
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -1782,7 +1782,7 @@ pub fn project_filter_matches(organization: &str, repository: &str, filter: &str
 /// Resolve user-supplied `-p` filters into canonical `<owner>/<repo>` slugs
 /// by enumerating the on-disk canonical store. Used by `aicx search` and
 /// `aicx index` so a single short name like `-p spotlight-convo-pipeline-v2`
-/// expands to `m-szymanska/spotlight-convo-pipeline-v2` before downstream
+/// expands to `example-org/spotlight-convo-pipeline-v2` before downstream
 /// index path / search engine lookup.
 ///
 /// Returns:

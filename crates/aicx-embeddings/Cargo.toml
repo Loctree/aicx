@@ -4,7 +4,7 @@ version = "0.9.4"
 edition = "2024"
 rust-version = "1.88"
 description = "Embedding providers for aicx and rust-memex: local GGUF and OpenAI-compatible HTTP backends"
-authors = ["Maciej Gad <void@div0.space>", "Monika Szymanska <hello@vetcoders.io>"]
+authors = ["Vetcoders <hello@vetcoders.io>"]
 license = "BUSL-1.1"
 repository = "https://github.com/Loctree/aicx"
 homepage = "https://github.com/Loctree/aicx"
@@ -20,7 +20,7 @@ openmp = ["gguf", "llama-cpp-2/openmp"]
 cuda = ["gguf", "llama-cpp-2/cuda"]
 vulkan = ["gguf", "llama-cpp-2/vulkan"]
 # Cloud-config based embedder: HTTP POST against an OpenAI-compatible
-# `/v1/embeddings` endpoint. The recommended VetCoders default for
+# `/v1/embeddings` endpoint. The recommended Vetcoders default for
 # zero-install operator workflows; native GGUF stays for offline use.
 cloud = ["dep:reqwest", "dep:serde_json"]
 

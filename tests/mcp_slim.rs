@@ -52,8 +52,8 @@ fn test_mcp_slim_defaults() {
     );
 
     let params: ReadParams =
-        serde_json::from_str(r#"{"reference":"store/VetCoders/aicx/chunk.md"}"#).unwrap();
-    assert_eq!(params.reference, "store/VetCoders/aicx/chunk.md");
+        serde_json::from_str(r#"{"reference":"store/Vetcoders/aicx/chunk.md"}"#).unwrap();
+    assert_eq!(params.reference, "store/Vetcoders/aicx/chunk.md");
     assert!(params.max_chars.is_none());
 }
 

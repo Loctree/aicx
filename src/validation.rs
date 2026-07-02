@@ -3,7 +3,7 @@
 //! The canonical store bucket schema is **case-preserving**: ASCII
 //! alphanumeric first character (either case), then ASCII alphanumeric,
 //! dot, underscore, or dash. GitHub orgs are CamelCase by convention
-//! (`LibraxisAI`, `VetCoders`, `Loctree`, `Szowesgad`), and forcing
+//! (`LibraxisAI`, `Vetcoders`, `Loctree`, `Szowesgad`), and forcing
 //! lowercase here loses preserved-case provenance information without a
 //! corresponding correctness gain on case-insensitive filesystems
 //! (macOS APFS, Windows NTFS) which already collapse case at the inode
@@ -61,7 +61,7 @@ mod tests {
 
         // CamelCase GitHub org names — case-preserving canonical form
         // (relaxed 2026-05-12 from lowercase-only):
-        assert!(is_valid_repo_bucket_name("VetCoders"));
+        assert!(is_valid_repo_bucket_name("Vetcoders"));
         assert!(is_valid_repo_bucket_name("LibraxisAI"));
         assert!(is_valid_repo_bucket_name("Loctree"));
         assert!(is_valid_repo_bucket_name("Szowesgad"));
@@ -119,21 +119,21 @@ mod tests {
         assert!(is_valid_repo_project_slug("vetcoders/mlx-batch-server.git"));
 
         // CamelCase paths valid (case-preserving canonical):
-        assert!(is_valid_repo_project_slug("VetCoders/aicx"));
-        assert!(is_valid_repo_project_slug("VetCoders/Vista"));
+        assert!(is_valid_repo_project_slug("Vetcoders/aicx"));
+        assert!(is_valid_repo_project_slug("Vetcoders/Vista"));
         assert!(is_valid_repo_project_slug("LibraxisAI/lbrxAgents"));
         assert!(is_valid_repo_project_slug("Loctree/aicx"));
 
         // Mid-segment garbage still rejected (extractor-bug evidence):
-        assert!(!is_valid_repo_project_slug("VetCoders/vibecrafted.git`"));
-        assert!(!is_valid_repo_project_slug("VetCoders/loctree\n\n**AICX"));
+        assert!(!is_valid_repo_project_slug("Vetcoders/vibecrafted.git`"));
+        assert!(!is_valid_repo_project_slug("Vetcoders/loctree\n\n**AICX"));
         assert!(!is_valid_repo_project_slug(
-            "VetCoders/loctxc_O)outcomqqqqqqq]]qqqqqqqqqqqqqqqqqqqqqqqqqqq;;'["
+            "Vetcoders/loctxc_O)outcomqqqqqqq]]qqqqqqqqqqqqqqqqqqqqqqqqqqq;;'["
         ));
 
         // Structural rejects:
-        assert!(!is_valid_repo_project_slug("VetCoders/aicx/extra"));
+        assert!(!is_valid_repo_project_slug("Vetcoders/aicx/extra"));
         assert!(!is_valid_repo_project_slug("/aicx"));
-        assert!(!is_valid_repo_project_slug("VetCoders/"));
+        assert!(!is_valid_repo_project_slug("Vetcoders/"));
     }
 }

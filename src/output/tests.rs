@@ -74,7 +74,7 @@ fn sample_entries() -> Vec<TimelineEntry> {
             role: "user".to_string(),
             message: "Fix the build pipeline".to_string(),
             branch: Some("feat/pipeline".to_string()),
-            cwd: Some("/home/project".to_string()),
+            cwd: Some("/home/user".to_string()),
             timestamp_source: None,
             frame_kind: None,
         },

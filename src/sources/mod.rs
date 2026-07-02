@@ -2,7 +2,7 @@
 //!
 //! Thin facade over provider-specific extractors and shared source utilities.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 pub(crate) use anyhow::Context;
 use anyhow::Result;
@@ -75,10 +75,10 @@ pub fn extract_all(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
         Err(e) => eprintln!("Junie extraction warning: {}", e),
     }
 
-    // CodeScribe
+    // Codescribe
     match extract_codescribe(config) {
         Ok(entries) => all.extend(entries),
-        Err(e) => eprintln!("CodeScribe extraction warning: {}", e),
+        Err(e) => eprintln!("Codescribe extraction warning: {}", e),
     }
 
     // Operator markdown

@@ -1,9 +1,9 @@
 //! Semantic windowing chunker for RAG indexing.
 //!
 //! Splits timeline entries into overlapping windows of ~1.5k tokens,
-//! suitable for vector embedding and semantic search via memex.
+//! suitable for vector embedding and semantic search via rust-memex.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

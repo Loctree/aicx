@@ -1,7 +1,7 @@
 # Semgrep ignore list for ai-contexters
 # Pattern follows loctree-suite convention: coarse exclusions with rationale.
 #
-# Created by M&K (c)2026 VetCoders
+# Created by vetcoders (c)2026
 
 # Test files — use controlled fixture paths, not user input
 src/*/tests/

@@ -224,4 +224,4 @@ For detailed command flags and architecture:
 
 ---
 
-*Created by M&K (c)2026 VetCoders*
+*Created by vetcoders (c)2026*

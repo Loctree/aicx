@@ -5,7 +5,7 @@
 //!
 //! Supports stdio and streamable HTTP transports.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use clap::ValueEnum;
 use rmcp::schemars::{self, JsonSchema};
@@ -1833,13 +1833,13 @@ mod tests {
     #[test]
     fn rank_response_serializes_as_compact_json() {
         let json = serde_json::to_string(&RankResponse {
-            project: "VetCoders/ai-contexters".to_string(),
+            project: "Vetcoders/ai-contexters".to_string(),
             hours: 72,
             strict: true,
             results: 1,
             items: vec![RankItem {
                 file: "chunk.md".to_string(),
-                project: "VetCoders/ai-contexters".to_string(),
+                project: "Vetcoders/ai-contexters".to_string(),
                 date: "2026-03-31".to_string(),
                 timestamp: Some("2026-03-31T10:00:00Z".to_string()),
                 kind: "reports".to_string(),
@@ -1870,7 +1870,7 @@ mod tests {
             results: 1,
             items: vec![serde_json::json!({
                 "path": "/tmp/chunk.md",
-                "project": "VetCoders/ai-contexters",
+                "project": "Vetcoders/ai-contexters",
                 "agent": "codex",
                 "kind": "reports",
             })],

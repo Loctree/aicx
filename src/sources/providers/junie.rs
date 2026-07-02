@@ -648,5 +648,5 @@ fn junie_timestamp_in_window(timestamp: DateTime<Utc>, config: &ExtractionConfig
 }
 
 // ============================================================================
-// CodeScribe transcript extractor
+// Codescribe transcript extractor
 // ============================================================================

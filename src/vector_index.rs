@@ -21,7 +21,7 @@
 //! query patterns; the public API ([`query_index`]) stays the same so the
 //! storage swap is transparent to callers.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};

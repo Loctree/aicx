@@ -6,7 +6,7 @@
 //! Prevents path traversal and command injection from user-supplied inputs
 //! (CLI arguments, project names, agent names).
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use anyhow::{Result, anyhow};
 use std::borrow::Cow;
@@ -776,7 +776,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn test_macos_other_user_path_rejected() {
-        let path = Path::new("/Users/other_user/Documents/secret.txt");
+        let path = Path::new("/Users/user/Documents/secret.txt");
         assert!(
             !is_under_allowed_base(path).expect("allowlist check"),
             "macOS /Users allowlist must not generalize across users"
@@ -987,7 +987,7 @@ mod tests {
     fn test_safe_project_name_valid() {
         assert!(safe_project_name("my-project").is_ok());
         assert!(safe_project_name("lbrx-services").is_ok());
-        assert!(safe_project_name("CodeScribe").is_ok());
+        assert!(safe_project_name("Codescribe").is_ok());
     }
 }
 

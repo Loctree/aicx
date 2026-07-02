@@ -6,7 +6,7 @@
 ## Product Truth
 
 AICX now treats the native embedder as its first-choice local embedding path,
-not as a fallback behind memex.
+not as a fallback behind rust-memex.
 
 The split is:
 
@@ -15,8 +15,8 @@ The split is:
 - **Roost/rust-memex** owns the advanced retrieval/operator plane: heavier
   provider routing, richer indexing, and premium retrieval workflows.
 
-This removes the old schizophrenia where AICX pretended to be memex while also
-depending on memex internals for the same job.
+This removes the old schizophrenia where AICX pretended to be rust-memex while also
+depending on rust-memex internals for the same job.
 
 ## Library Boundary
 
@@ -48,7 +48,7 @@ Why GGUF:
 - quantized model files are dramatically smaller than fp16 safetensors
 - one model file is easier to hydrate, verify, and cache
 - llama.cpp already exposes pooled embeddings for BERT/F2LLM-style GGUF models
-- CodeScribe's Candle path is a good architectural precedent, but it was built
+- Codescribe's Candle path is a good architectural precedent, but it was built
   for MiniLM/BERT safetensors, not for the F2LLM quant line
 
 Runtime details:
@@ -233,6 +233,6 @@ in the local cache, so the command is safe on clean CI runners.
 
 ## Credits
 
-CodeScribe proved the in-process local model shape is comfortable in Rust.
+Codescribe proved the in-process local model shape is comfortable in Rust.
 AICX keeps that architectural lesson but switches the production model format
 to GGUF because quantized F2LLM is the sharper distribution path here.

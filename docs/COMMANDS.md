@@ -94,16 +94,16 @@ Examples:
 
 ```bash
 # Last 24h, store-first chunks, keep stdout quiet
-aicx claude -p CodeScribe -H 24
+aicx claude -p Codescribe -H 24
 
 # Print chunk paths explicitly
-aicx claude -p CodeScribe -H 24 --emit paths
+aicx claude -p Codescribe -H 24 --emit paths
 
 # Also write a local JSON report
-aicx claude -p CodeScribe -H 24 -o ./reports -f json
+aicx claude -p Codescribe -H 24 -o ./reports -f json
 
 # Automation-friendly JSON payload on stdout
-aicx claude -p CodeScribe -H 24 --emit json | jq .
+aicx claude -p Codescribe -H 24 --emit json | jq .
 ```
 
 `--emit json` payload shape (stable fields):
@@ -111,12 +111,12 @@ aicx claude -p CodeScribe -H 24 --emit json | jq .
 ```json
 {
   "generated_at": "2026-02-08T03:12:34Z",
-  "project_filter": "CodeScribe",
-  "requested_source_filters": ["CodeScribe"],
-  "resolved_repositories": ["VetCoders/CodeScribe"],
+  "project_filter": "Codescribe",
+  "requested_source_filters": ["Codescribe"],
+  "resolved_repositories": ["Vetcoders/Codescribe"],
   "includes_non_repository_contexts": false,
   "resolved_store_buckets": {
-    "VetCoders/CodeScribe": { "claude": 123 }
+    "Vetcoders/Codescribe": { "claude": 123 }
   },
   "hours_back": 24,
   "total_entries": 123,
@@ -139,7 +139,7 @@ Same as `claude`, including `--emit <paths|json|none>` with default `none`, and 
 Example:
 
 ```bash
-aicx codex -p CodeScribe -H 48 --loctree --emit json | jq .
+aicx codex -p Codescribe -H 48 --loctree --emit json | jq .
 ```
 
 ## `aicx all`
@@ -225,7 +225,7 @@ Notes:
 Example:
 
 ```bash
-aicx store -p CodeScribe --agent claude -H 720 --emit paths
+aicx store -p Codescribe --agent claude -H 720 --emit paths
 ```
 
 ## `aicx corpus`
@@ -316,8 +316,8 @@ Examples:
 
 ```bash
 aicx refs -H 24 --emit paths
-aicx read /Users/user/.aicx/store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md
-aicx read store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md --max-chars 4000 --json
+aicx read /Users/user/.aicx/store/Vetcoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md
+aicx read store/Vetcoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md --max-chars 4000 --json
 ```
 
 ## `aicx steer`
@@ -468,7 +468,7 @@ Options:
 Example:
 
 ```bash
-aicx refs -H 72 -p CodeScribe
+aicx refs -H 72 -p Codescribe
 ```
 
 ## `aicx rank`
@@ -501,7 +501,7 @@ Options:
 Example:
 
 ```bash
-aicx intents -p CodeScribe loctree-suite --strict --kind decision
+aicx intents -p Codescribe loctree-suite --strict --kind decision
 ```
 
 ## Truth-pipeline lanes (sessions / claims / results / clarify)
@@ -648,7 +648,7 @@ aicx reports [OPTIONS]
 
 Options:
 - `--artifacts-root <DIR>` override the Vibecrafted artifact root (default: `~/.vibecrafted/artifacts`)
-- `--org <ORG>` artifact organization bucket (default: `VetCoders`)
+- `--org <ORG>` artifact organization bucket (default: `Vetcoders`)
 - `--repo <REPO>` repo bucket (defaults to current directory name)
 - `--workflow <FILTER>` case-insensitive filter across workflow label, skill code, run/prompt IDs, lane, and title
 - `--date-from <YYYY-MM-DD|YYYY_MMDD>` inclusive start date

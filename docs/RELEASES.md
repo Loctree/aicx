@@ -157,7 +157,7 @@ Notes:
   that asset set.
 - The target does not print secret values; it only reads the files from the operator-owned keys directory.
 - `install.sh` inside the bundle copies binaries into `~/.local/bin` and removes stale user-local / `~/.cargo/bin` copies before configuring MCP.
-- That install path does not require Rust or a local memex compile on the target machine.
+- That install path does not require Rust or a local rust-memex compile on the target machine.
 - `AICX_INSTALL_MODE=release` downloads the official release asset, fetches the adjacent `.sha256`, verifies the checksum, and only then delegates to the bundled installer.
 - On macOS, `AICX_INSTALL_MODE=release` expects the
   `aicx-vX.Y.Z-aarch64-apple-darwin-slim-unsigned.tar.gz` asset.

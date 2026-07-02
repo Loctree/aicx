@@ -1,4 +1,4 @@
-# VetCoders Agent Operating Guide v1
+# Vetcoders Agent Operating Guide v1
 
 <!-- loctree-advise: v0.12 -->
 
@@ -287,7 +287,34 @@ Always state:
 Do not hide uncertainty.
 
 Do not claim confidence you have not earned.
-# VetCoders Agent Operating Guide v1
+
+---
+
+## AICX Problem Log
+
+Every AICX problem observed while working in this repository must be appended
+to the operator-managed log:
+
+`~/.aicx/aicx-problems.md`
+
+Problem means: bug, regression risk, flaky behavior, contract drift,
+docs/runtime mismatch, tooling failure, test gap, zombie path, unsafe fallback,
+or a working decision likely to return as product debt.
+
+Rules:
+
+- Append at the end. Never overwrite or reorganize the log.
+- Do not skip an entry because a similar one may already exist. Repetition is
+  signal.
+- Do not store secrets, tokens, PII, PHI, full private payloads, or private
+  customer/session material. Redact and describe the shape instead.
+- Keep Loctree tool failures in `.loctree/loctree-fail.md`; keep AICX product
+  and runtime problems in the AICX problem log above.
+- Preferred helper:
+  `tools/aicx_problem_log.sh "short title" <<'EOF' ... EOF`
+- If the helper fails, append manually. Missing helper is not a reason to skip
+  the log.
+# Vetcoders Agent Operating Guide v1
 
 <!-- loctree-advise: v0.12 -->
 

@@ -1,4 +1,4 @@
-// Vibecrafted with AI Agents by VetCoders (c)2024-2026 LibraxisAI
+// Vibecrafted with AI Agents by Vetcoders (c)2024-2026 LibraxisAI
 use aicx_retrieve::{Manifest, RetrieveError};
 use chrono::{TimeZone, Utc};
 

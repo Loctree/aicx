@@ -1428,7 +1428,7 @@ pub(crate) fn count_corpus_buckets(store_root: &Path) -> Result<usize> {
 ///
 /// Pre-2026-05-12 the validator also rejected CamelCase orgs and
 /// dot-prefixed names, which on 2026-05-09 mass-quarantined ~89k
-/// legitimate chunks across `LibraxisAI/`, `VetCoders/`, `Loctree/`,
+/// legitimate chunks across `LibraxisAI/`, `Vetcoders/`, `Loctree/`,
 /// `Szowesgad/`. Relaxing the validator (not adding canonicalization
 /// magic) was the correct response.
 pub(crate) fn scan_corpus_buckets(store_root: &Path) -> Result<Vec<String>> {

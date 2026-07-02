@@ -5,7 +5,7 @@
 //! or generated and persisted on Unix (mode 0600). Compared in constant time.
 //! Mismatch and missing produce the same 401 body to defeat oracle probing.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use anyhow::{Context, Result, anyhow};
 use axum::{
@@ -809,7 +809,7 @@ mod tests {
             "warning must reference peer-IP / proxy contract: {msg}"
         );
 
-        let tailscale = std::net::IpAddr::from([100u8, 75, 30, 90]);
+        let tailscale = std::net::IpAddr::from([100u8, 64, 0, 1]);
         assert!(super::proxy_rate_limit_warning(tailscale).is_some());
     }
 

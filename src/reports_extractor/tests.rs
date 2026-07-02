@@ -46,7 +46,7 @@ fn parses_artifact_frontmatter_and_status() {
 #[test]
 fn build_reports_explorer_merges_markdown_and_meta_and_keeps_meta_only_runs() {
     let root = tmp_dir("merge-meta");
-    let repo_root = root.join("VetCoders").join("ai-contexters");
+    let repo_root = root.join("Vetcoders").join("ai-contexters");
     let report_path = repo_root
         .join("2026_0412")
         .join("reports")
@@ -103,7 +103,7 @@ fn build_reports_explorer_merges_markdown_and_meta_and_keeps_meta_only_runs() {
 
     let config = ReportsExtractorConfig {
         artifacts_root: root.clone(),
-        org: "VetCoders".to_string(),
+        org: "Vetcoders".to_string(),
         repo: "ai-contexters".to_string(),
         date_from: Some(NaiveDate::from_ymd_opt(2026, 4, 11).expect("date")),
         date_to: Some(NaiveDate::from_ymd_opt(2026, 4, 12).expect("date")),
@@ -151,7 +151,7 @@ fn build_reports_explorer_merges_markdown_and_meta_and_keeps_meta_only_runs() {
 #[test]
 fn build_reports_explorer_does_not_read_transcripts_outside_repo_root() {
     let root = tmp_dir("outside-transcript");
-    let repo_root = root.join("VetCoders").join("ai-contexters");
+    let repo_root = root.join("Vetcoders").join("ai-contexters");
     let meta_path = repo_root
         .join("2026_0411")
         .join("reports")
@@ -178,7 +178,7 @@ fn build_reports_explorer_does_not_read_transcripts_outside_repo_root() {
 
     let config = ReportsExtractorConfig {
         artifacts_root: root.clone(),
-        org: "VetCoders".to_string(),
+        org: "Vetcoders".to_string(),
         repo: "ai-contexters".to_string(),
         date_from: None,
         date_to: None,

@@ -8,7 +8,7 @@ set -euo pipefail
 #   bash install.sh --skip-install  # MCP config only
 # Run from a local checkout, or pass --release to install from GitHub Releases.
 #
-# Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+# Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 SOURCE_PATH="${BASH_SOURCE[0]:-$0}"
 if [ -n "$SOURCE_PATH" ] && [ -e "$SOURCE_PATH" ]; then

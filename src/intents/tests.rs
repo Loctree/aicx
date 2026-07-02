@@ -289,10 +289,10 @@ Intent:
 fn collapse_session_merges_exact_daily_duplicates_across_session_forks() {
     let make_record = |session_id: &str, source_chunk: &str| IntentRecord {
         kind: IntentKind::Intent,
-        summary: "przerobimy ScreenScribe na portal".to_string(),
+        summary: "przerobimy Screenscribe na portal".to_string(),
         context: None,
         evidence: vec![],
-        project: "VetCoders/ScreenScribe".to_string(),
+        project: "Vetcoders/Screenscribe".to_string(),
         agent: "codex".to_string(),
         date: "2026-05-31".to_string(),
         timestamp: None,
@@ -331,7 +331,7 @@ fn collapse_session_tolerates_existing_none_count() {
         summary: summary.to_string(),
         context: None,
         evidence: vec![],
-        project: "VetCoders/ScreenScribe".to_string(),
+        project: "Vetcoders/Screenscribe".to_string(),
         agent: "codex".to_string(),
         date: "2026-05-31".to_string(),
         timestamp: None,
@@ -485,7 +485,7 @@ fn user_question_and_why_lines_bridge_into_main_intents_view() {
 fn md_radar_style_user_messages_surface_in_main_intents_view() {
     let extraction = extract_demo_extraction(
         "md-radar-natural-human-lines",
-        "[project: m-szymanska/md-radar | agent: codex | date: 2026-06-15 | frame_kind: user_msg]\n\n\
+        "[project: example-org/md-radar | agent: codex | date: 2026-06-15 | frame_kind: user_msg]\n\n\
          [12:00:00] user: Proszę odpal /vc-init na tym repo i ustal, gdzie zaczęła się wcześniejsza sesja.\n\
          [12:01:00] user: Czy AICX umie wyciągać intents z JSONL?\n\
          [12:02:00] user: Usuń hardkody i ścieżki z README, bo to ma być gotowe dla świeżego repo.\n",
@@ -2375,7 +2375,7 @@ mod quality {
     #[test]
     fn long_summary_ends_at_sentence_terminator_when_available() {
         let mut text = String::new();
-        text.push_str("Pierwsza część decyzji o canonical corpus i jego znaczeniu dla całego stacku VetCoders w kontekście długoterminowej strategii AICX. ");
+        text.push_str("Pierwsza część decyzji o canonical corpus i jego znaczeniu dla całego stacku Vetcoders w kontekście długoterminowej strategii AICX. ");
         // Force length > 480 bytes; ensure a full sentence-terminator
         // exists in the lookback window (last 80 bytes before cutoff).
         text.push_str(

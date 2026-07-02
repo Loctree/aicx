@@ -4,7 +4,7 @@
 //! from an explicit path or from the local HuggingFace cache; this crate never
 //! performs network downloads on its own.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use std::fmt;
 use std::path::PathBuf;
@@ -60,7 +60,7 @@ pub enum BackendPreference {
     /// Let the crate choose the strongest compiled local backend.
     Auto,
     /// Cloud HTTP embedder (OpenAI-compatible `/v1/embeddings`). The
-    /// VetCoders default for zero-install operator workflows; the actual
+    /// Vetcoders default for zero-install operator workflows; the actual
     /// `[embedder.cloud]` section in config supplies URL + model + key.
     Cloud,
     /// GGUF through llama.cpp. The first-choice local backend for

@@ -48,7 +48,7 @@ follow-up implementation pass:
 - `src/api.rs:352` - semantic index row count uses `BufReader::lines()`.
 - `src/output.rs:501` - `find_last_sync_timestamp` scans markdown lines.
 - `src/main.rs:2718` - Codex session metadata scan uses `BufReader::lines()`.
-- `src/sources.rs:4613` - CodeScribe custom lexicon JSONL uses
+- `src/sources.rs:4613` - Codescribe custom lexicon JSONL uses
   `BufReader::lines()`.
 - `src/vector_index.rs:1018` / `src/vector_index.rs:1021` - tmp index header
   uses `read_line`.
@@ -177,8 +177,8 @@ Current live evidence:
   backed by a single process-global subscriber (max level TRACE, so no callsite
   is ever cached as disabled) routing to a thread-local buffer. 0 flakes in 15
   full `make test` runs (prior rate ~1/3–1/10).
-- `docs/BUGFIXES.md` already records M-13 as deferred; keep that truth unless a
-  dedicated CSP nonce/header implementation lands in a separate scoped cut.
+- M-13 (CSP nonce/header) remains deferred; keep that truth unless a
+  dedicated implementation lands in a separate scoped cut.
 
 Split / block list before merge:
 

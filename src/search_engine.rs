@@ -12,7 +12,7 @@
 //! an actionable `recommendation`. The CLI may then explicitly degrade to
 //! filesystem-fuzzy while surfacing the semantic failure in its rendered output.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use std::collections::HashSet;
 use std::path::Path;

@@ -40,7 +40,7 @@
 //! can match on. The `reason` and `recommendation` strings are
 //! human-readable and **may** change across releases.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use serde::Serialize;
 use serde_json::json;

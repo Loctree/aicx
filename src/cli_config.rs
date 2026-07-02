@@ -28,11 +28,11 @@ pub(crate) enum ConfigAction {
 
 /// Default canonical config template written by `aicx config init`.
 ///
-/// Set up to advertise cloud-embedder as the recommended VetCoders
+/// Set up to advertise cloud-embedder as the recommended Vetcoders
 /// production default with concrete provider examples; the native GGUF
 /// section ships fully-commented so operators can flip backends without
 /// hunting for the schema.
-const DEFAULT_CONFIG_TOML: &str = r#"# aicx — Vibecrafted with AI Agents (c)2026 VetCoders
+const DEFAULT_CONFIG_TOML: &str = r#"# aicx — Vibecrafted with AI Agents (c)2026 Vetcoders
 #
 # Canonical AICX configuration. Loaded by `aicx` (CLI), `aicx-mcp`,
 # and any in-process consumer of the embedder. Config file search order:
@@ -51,7 +51,7 @@ const DEFAULT_CONFIG_TOML: &str = r#"# aicx — Vibecrafted with AI Agents (c)20
 # home = "~/aicx"
 
 [embedder]
-# Recommended VetCoders default: cloud HTTP embedder, zero-install,
+# Recommended Vetcoders default: cloud HTTP embedder, zero-install,
 # config-driven URL/model/API key. Switch to "gguf" for offline / dev
 # workstations with native llama.cpp inference. Use "auto" to let the
 # binary pick the strongest compiled-in backend.

@@ -284,11 +284,11 @@ fn test_canonical_resolvers_agree_on_pinned_home() {
 
 #[test]
 fn test_get_context_path_new_layout() {
-    // Case-preserving canonical (relaxed 2026-05-12): `CodeScribe`
-    // stays `CodeScribe` instead of being lowered to `codescribe`.
-    if let Ok(path) = get_context_path("CodeScribe", "claude", "2026-01-22", "143005") {
+    // Case-preserving canonical (relaxed 2026-05-12): `Codescribe`
+    // stays `Codescribe` instead of being lowered to `codescribe`.
+    if let Ok(path) = get_context_path("Codescribe", "claude", "2026-01-22", "143005") {
         let s = path.to_string_lossy();
-        assert!(s.contains("CodeScribe"));
+        assert!(s.contains("Codescribe"));
         assert!(s.contains("2026-01-22"));
         assert!(s.ends_with("143005_claude-context.md"));
     }
@@ -296,9 +296,9 @@ fn test_get_context_path_new_layout() {
 
 #[test]
 fn test_get_context_json_path_new_layout() {
-    if let Ok(path) = get_context_json_path("CodeScribe", "claude", "2026-01-22", "143005") {
+    if let Ok(path) = get_context_json_path("Codescribe", "claude", "2026-01-22", "143005") {
         let s = path.to_string_lossy();
-        assert!(s.contains("CodeScribe"));
+        assert!(s.contains("Codescribe"));
         assert!(s.contains("2026-01-22"));
         assert!(s.ends_with("143005_claude-context.json"));
     }
@@ -315,7 +315,7 @@ fn canonical_project_slug_preserves_legit_shapes_and_lets_validator_reject_junk(
     assert_eq!(canonical_project_slug("local/.scripts"), "local/.scripts");
     assert_eq!(canonical_project_slug("local/.aicx"), "local/.aicx");
     assert_eq!(canonical_project_slug("local/_priv"), "local/_priv");
-    assert_eq!(canonical_project_slug("VetCoders/Vista"), "VetCoders/Vista");
+    assert_eq!(canonical_project_slug("Vetcoders/Vista"), "Vetcoders/Vista");
     assert_eq!(
         canonical_project_slug("LibraxisAI/lbrxAgents"),
         "LibraxisAI/lbrxAgents"
@@ -331,7 +331,7 @@ fn canonical_project_slug_preserves_legit_shapes_and_lets_validator_reject_junk(
         "local/.scripts",
         "local/.aicx",
         "local/_priv",
-        "VetCoders/Vista",
+        "Vetcoders/Vista",
         "LibraxisAI/lbrxAgents",
         ".github",
         ".aicx",
@@ -347,10 +347,10 @@ fn canonical_project_slug_preserves_legit_shapes_and_lets_validator_reject_junk(
     // still reject it so an extractor bug surfaces instead of silently
     // writing mangled-but-passable filesystem paths.
     assert!(!is_valid_repo_project_slug(&canonical_project_slug(
-        "VetCoders/vibecrafted.git`"
+        "Vetcoders/vibecrafted.git`"
     )));
     assert!(!is_valid_repo_project_slug(&canonical_project_slug(
-        "VetCoders/loctree\n\n**AICX"
+        "Vetcoders/loctree\n\n**AICX"
     )));
     assert!(!is_valid_repo_project_slug(&canonical_project_slug(
         "${RELEASE_REPO}/releases"
@@ -363,23 +363,23 @@ fn validated_store_project_dir_rejects_junk_bucket_segments() {
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
 
-    let bad = "VetCoders/vibecrafted.git`";
+    let bad = "Vetcoders/vibecrafted.git`";
     let err = validated_store_project_dir(&root, bad).expect_err("invalid repo bucket");
     assert!(
         err.to_string()
             .contains("invalid canonical store project bucket")
     );
-    assert!(!root.join("VetCoders").join("vibecrafted.git`").exists());
+    assert!(!root.join("Vetcoders").join("vibecrafted.git`").exists());
 
-    let bad = "VetCoders/loctree\n\n**AICX";
+    let bad = "Vetcoders/loctree\n\n**AICX";
     assert!(validated_store_project_dir(&root, bad).is_err());
-    assert!(!root.join("VetCoders").join("loctree\n\n**AICX").exists());
+    assert!(!root.join("Vetcoders").join("loctree\n\n**AICX").exists());
 
-    let bad = "VetCoders/loctxc_O)outcomqqqqqqq]]qqqqqqqqqqqqqqqqqqqqqqqqqqq;;'[";
+    let bad = "Vetcoders/loctxc_O)outcomqqqqqqq]]qqqqqqqqqqqqqqqqqqqqqqqqqqq;;'[";
     assert!(validated_store_project_dir(&root, bad).is_err());
     assert!(
         !root
-            .join("VetCoders")
+            .join("Vetcoders")
             .join("loctxc_O)outcomqqqqqqq]]qqqqqqqqqqqqqqqqqqqqqqqqqqq;;'[")
             .exists()
     );
@@ -404,7 +404,7 @@ fn session_first_write_blocks_invalid_project_before_mkdir() {
     let err = write_context_session_first_at(
         &root,
         SessionWriteSpec {
-            project: Some("VetCoders/vc-skills.git\"><span"),
+            project: Some("Vetcoders/vc-skills.git\"><span"),
             agent: "codex",
             date: "2026-05-06",
             session_id: "sess-invalid-bucket",
@@ -421,7 +421,7 @@ fn session_first_write_blocks_invalid_project_before_mkdir() {
     );
     assert!(
         !root
-            .join("VetCoders")
+            .join("Vetcoders")
             .join("vc-skills.git\"><span")
             .exists()
     );
@@ -494,20 +494,20 @@ fn test_write_context_creates_both_files() {
 #[test]
 fn test_index_serialization_roundtrip() {
     let mut index = StoreIndex::default();
-    update_index(&mut index, "CodeScribe", "claude", "2026-01-22", 42);
-    update_index(&mut index, "CodeScribe", "gemini", "2026-01-20", 10);
+    update_index(&mut index, "Codescribe", "claude", "2026-01-22", 42);
+    update_index(&mut index, "Codescribe", "gemini", "2026-01-20", 10);
     update_index(&mut index, "vista", "claude", "2026-01-21", 5);
 
     let json = serde_json::to_string_pretty(&index).unwrap();
     let restored: StoreIndex = serde_json::from_str(&json).unwrap();
 
-    // Case-preserving canonical (relaxed 2026-05-12): `CodeScribe`
-    // stays `CodeScribe` instead of being lowered to `codescribe`.
+    // Case-preserving canonical (relaxed 2026-05-12): `Codescribe`
+    // stays `Codescribe` instead of being lowered to `codescribe`.
     assert_eq!(restored.projects.len(), 2);
-    assert!(restored.projects.contains_key("CodeScribe"));
+    assert!(restored.projects.contains_key("Codescribe"));
     assert!(restored.projects.contains_key("vista"));
 
-    let cs = &restored.projects["CodeScribe"];
+    let cs = &restored.projects["Codescribe"];
     assert_eq!(cs.agents["claude"].total_entries, 42);
     assert_eq!(cs.agents["claude"].dates, vec!["2026-01-22"]);
     assert_eq!(cs.agents["gemini"].total_entries, 10);
@@ -821,7 +821,7 @@ fn canonical_store_writes_sidecar_with_frontmatter_telemetry() {
     let written = write_context_session_first_at(
         &root.join("store"),
         SessionWriteSpec {
-            project: Some("VetCoders/ai-contexters"),
+            project: Some("Vetcoders/ai-contexters"),
             agent: "codex",
             date: "2026-03-27",
             session_id: "sess-telemetry",
@@ -900,7 +900,7 @@ fn session_first_write_skips_empty_body_chunks() {
     let written = write_context_session_first_at(
         &root.join("store"),
         SessionWriteSpec {
-            project: Some("VetCoders/aicx"),
+            project: Some("Vetcoders/aicx"),
             agent: "claude",
             date: "2026-05-06",
             session_id: "sess-empty-body",
@@ -964,15 +964,15 @@ fn test_store_semantic_segments_emit_repo_and_non_repo_roots() {
             (2026, 3, 21, 9, 2, 0),
             "sess-a",
             "user",
-            "Switch to https://github.com/VetCoders/ai-contexters now.",
-            Some("https://github.com/VetCoders/ai-contexters"),
+            "Switch to https://github.com/vetcoders/ai-contexters now.",
+            Some("https://github.com/vetcoders/ai-contexters"),
         ),
         semantic_entry(
             (2026, 3, 21, 9, 3, 0),
             "sess-a",
             "user",
-            "Then inspect https://github.com/VetCoders/loctree as well.",
-            Some("https://github.com/VetCoders/loctree"),
+            "Then inspect https://github.com/vetcoders/loctree as well.",
+            Some("https://github.com/vetcoders/loctree"),
         ),
     ];
 
@@ -986,16 +986,16 @@ fn test_store_semantic_segments_emit_repo_and_non_repo_roots() {
             .iter()
             .any(|path| { path.starts_with(root.join("non-repository-contexts")) })
     );
-    // Case-preserving canonical (relaxed 2026-05-12): `VetCoders` from
-    // git remote stays `VetCoders`, not lowered to `vetcoders`.
+    // Case-preserving canonical (relaxed 2026-05-12): the org from the git
+    // remote is preserved verbatim (here `vetcoders`), not re-cased.
     assert!(summary.written_paths.iter().any(|path| {
-        path.starts_with(root.join("store").join("VetCoders").join("ai-contexters"))
+        path.starts_with(root.join("store").join("vetcoders").join("ai-contexters"))
     }));
     assert!(
         summary
             .written_paths
             .iter()
-            .any(|path| { path.starts_with(root.join("store").join("VetCoders").join("loctree")) })
+            .any(|path| { path.starts_with(root.join("store").join("vetcoders").join("loctree")) })
     );
 
     let scanned = scan_context_files_at(&root).expect("scan stored files");
@@ -1007,12 +1007,12 @@ fn test_store_semantic_segments_emit_repo_and_non_repo_roots() {
     assert!(
         scanned
             .iter()
-            .any(|file| file.project == "VetCoders/ai-contexters")
+            .any(|file| file.project == "vetcoders/ai-contexters")
     );
     assert!(
         scanned
             .iter()
-            .any(|file| file.project == "VetCoders/loctree")
+            .any(|file| file.project == "vetcoders/loctree")
     );
 
     let _ = fs::remove_dir_all(&root);
@@ -1100,8 +1100,8 @@ fn test_store_semantic_segments_reports_progress_per_segment() {
     // build two on-disk repos and switch cwd between them mid-session.
     // Result: one "plans" segment (no cwd) followed by two cwd-owned
     // segments → three progress ticks, same as before.
-    let repo_a = root.join("hosted").join("VetCoders").join("ai-contexters");
-    let repo_b = root.join("hosted").join("VetCoders").join("loctree");
+    let repo_a = root.join("hosted").join("Vetcoders").join("ai-contexters");
+    let repo_b = root.join("hosted").join("Vetcoders").join("loctree");
     for r in [&repo_a, &repo_b] {
         fs::create_dir_all(r).unwrap();
         std::process::Command::new("git")
@@ -1267,7 +1267,7 @@ fn write_dir_sha_cache_test_sidecar(dir: &Path, stem: &str, sha: &str) {
     let path = dir.join(format!("{stem}.meta.json"));
     let sidecar = serde_json::json!({
         "id": stem,
-        "project": "VetCoders/aicx",
+        "project": "Vetcoders/aicx",
         "agent": "claude",
         "date": "2026-05-22",
         "session_id": "dir-sha-cache-test",
@@ -1281,7 +1281,7 @@ fn write_dir_sha_cache_test_sidecar(dir: &Path, stem: &str, sha: &str) {
 fn test_dir_sha_cache_contains_after_insert() {
     let root = retrieval_test_root("dir-sha-cache-insert");
     let _ = fs::remove_dir_all(&root);
-    let dir = root.join("store").join("VetCoders").join("aicx");
+    let dir = root.join("store").join("Vetcoders").join("aicx");
     fs::create_dir_all(&dir).unwrap();
 
     let mut cache = DirShaCache::default();
@@ -1296,7 +1296,7 @@ fn test_dir_sha_cache_contains_after_insert() {
 fn test_dir_sha_cache_lazy_population() {
     let root = retrieval_test_root("dir-sha-cache-lazy");
     let _ = fs::remove_dir_all(&root);
-    let dir = root.join("store").join("VetCoders").join("aicx");
+    let dir = root.join("store").join("Vetcoders").join("aicx");
     write_dir_sha_cache_test_sidecar(&dir, "old", "sha-old");
 
     let mut cache = DirShaCache::default();
@@ -1318,7 +1318,7 @@ fn test_dir_sha_cache_lazy_population() {
 fn test_dir_sha_cache_does_not_cross_dirs() {
     let root = retrieval_test_root("dir-sha-cache-dir-isolation");
     let _ = fs::remove_dir_all(&root);
-    let left = root.join("store").join("VetCoders").join("aicx");
+    let left = root.join("store").join("Vetcoders").join("aicx");
     let right = root.join("store").join("Loctree").join("aicx");
     write_dir_sha_cache_test_sidecar(&left, "left", "sha-left");
     write_dir_sha_cache_test_sidecar(&right, "right", "sha-right");
@@ -1356,7 +1356,7 @@ fn write_chunk_file(path: &Path, content: &str) {
 
 fn repo_chunk_path(root: &Path, session_id: &str, chunk: u32) -> PathBuf {
     root.join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("ai-contexters")
         .join("2026_0321")
         .join("conversations")
@@ -1374,10 +1374,10 @@ fn scan_retrieves_repo_centric_files_with_correct_metadata() {
     let _ = fs::remove_dir_all(&root);
 
     // Create canonical repo-centric layout:
-    // store/VetCoders/ai-contexters/2026_0321/conversations/claude/<file>.md
+    // store/Vetcoders/ai-contexters/2026_0321/conversations/claude/<file>.md
     let chunk_dir = root
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("ai-contexters")
         .join("2026_0321")
         .join("conversations")
@@ -1391,7 +1391,7 @@ fn scan_retrieves_repo_centric_files_with_correct_metadata() {
     assert_eq!(scanned.len(), 1);
 
     let file = &scanned[0];
-    assert_eq!(file.project, "VetCoders/ai-contexters");
+    assert_eq!(file.project, "Vetcoders/ai-contexters");
     assert_eq!(file.agent, "claude");
     assert_eq!(file.kind, Kind::Conversations);
     assert_eq!(file.date_compact, "2026_0321");
@@ -1401,7 +1401,7 @@ fn scan_retrieves_repo_centric_files_with_correct_metadata() {
     assert!(file.repo.is_some());
     assert_eq!(
         file.repo.as_ref().unwrap().slug(),
-        "VetCoders/ai-contexters"
+        "Vetcoders/ai-contexters"
     );
 
     let _ = fs::remove_dir_all(&root);
@@ -1414,7 +1414,7 @@ fn scan_and_read_accept_four_digit_and_collision_suffix_chunks() {
 
     let chunk_dir = root
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("aicx")
         .join("2026_0321")
         .join("conversations")
@@ -1506,7 +1506,7 @@ fn load_sidecar_keeps_adjacent_meta_json_priority_for_legacy_chunks() {
 
     let chunk_dir = root
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("aicx")
         .join("2026_0508")
         .join("reports")
@@ -1522,7 +1522,7 @@ fn load_sidecar_keeps_adjacent_meta_json_priority_for_legacy_chunks() {
         &adjacent,
         &serde_json::json!({
             "id": "legacy-live",
-            "project": "VetCoders/aicx",
+            "project": "Vetcoders/aicx",
             "agent": "codex",
             "date": "2026-05-08",
             "session_id": "live-sess",
@@ -1534,7 +1534,7 @@ fn load_sidecar_keeps_adjacent_meta_json_priority_for_legacy_chunks() {
         &sidecars,
         &serde_json::json!({
             "id": "sidecars-example",
-            "project": "VetCoders/aicx",
+            "project": "Vetcoders/aicx",
             "agent": "codex",
             "date": "2026-05-08",
             "session_id": "live-sess",
@@ -1563,7 +1563,7 @@ fn read_context_chunk_accepts_relative_path_file_name_and_compact_ref() {
 
     let chunk_path = root
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("ai-contexters")
         .join("2026_0321")
         .join("conversations")
@@ -1573,11 +1573,11 @@ fn read_context_chunk_accepts_relative_path_file_name_and_compact_ref() {
 
     let by_relative = read_context_chunk_at(
             &root,
-            "store/VetCoders/ai-contexters/2026_0321/conversations/claude/2026_0321_claude_sess-abc123_001.md",
+            "store/Vetcoders/ai-contexters/2026_0321/conversations/claude/2026_0321_claude_sess-abc123_001.md",
             Some(14),
         )
         .expect("read by relative path");
-    assert_eq!(by_relative.project, "VetCoders/ai-contexters");
+    assert_eq!(by_relative.project, "Vetcoders/ai-contexters");
     assert_eq!(by_relative.kind, "conversations");
     assert_eq!(by_relative.session_id, "sess-abc123");
     assert_eq!(by_relative.chunk, 1);
@@ -1590,7 +1590,7 @@ fn read_context_chunk_accepts_relative_path_file_name_and_compact_ref() {
 
     let by_compact = read_context_chunk_at(
         &root,
-        "VetCoders/ai-contexters|2026-03-21|conversations|claude|sess-abc123|001",
+        "Vetcoders/ai-contexters|2026-03-21|conversations|claude|sess-abc123|001",
         None,
     )
     .expect("read by compact ref");
@@ -1607,11 +1607,11 @@ fn chunk_ref_spec_parse_accepts_paths_and_chunk_ids() {
     );
     assert_eq!(
         ChunkRefSpec::parse(
-            "store/VetCoders/ai-contexters/2026_0321/conversations/claude/chunk.md"
+            "store/Vetcoders/ai-contexters/2026_0321/conversations/claude/chunk.md"
         )
         .unwrap(),
         ChunkRefSpec::Path(PathBuf::from(
-            "store/VetCoders/ai-contexters/2026_0321/conversations/claude/chunk.md"
+            "store/Vetcoders/ai-contexters/2026_0321/conversations/claude/chunk.md"
         ))
     );
     assert_eq!(
@@ -1738,7 +1738,7 @@ fn scan_retrieves_both_repo_and_non_repo_files_together() {
     // Repo-centric file
     let repo_dir = root
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("loctree")
         .join("2026_0320")
         .join("reports")
@@ -1762,7 +1762,7 @@ fn scan_retrieves_both_repo_and_non_repo_files_together() {
     let scanned = scan_context_files_at(&root).expect("scan should succeed");
     assert_eq!(scanned.len(), 2);
 
-    let repo_file = scanned.iter().find(|f| f.project == "VetCoders/loctree");
+    let repo_file = scanned.iter().find(|f| f.project == "Vetcoders/loctree");
     let non_repo_file = scanned
         .iter()
         .find(|f| f.project == NON_REPOSITORY_CONTEXTS);
@@ -1790,7 +1790,7 @@ fn context_files_since_uses_canonical_chunk_date_not_mtime() {
 
     let recent = root
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("ai-contexters")
         .join("2026_0331")
         .join("reports")
@@ -1798,7 +1798,7 @@ fn context_files_since_uses_canonical_chunk_date_not_mtime() {
         .join("2026_0331_claude_sess-new_001.md");
     let old = root
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("ai-contexters")
         .join("2026_0328")
         .join("reports")
@@ -1841,7 +1841,7 @@ fn context_files_since_does_not_leak_substring_into_neighbor_repos() {
 
     let vista = root
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("vista")
         .join("2026_0401")
         .join("reports")
@@ -1849,7 +1849,7 @@ fn context_files_since_does_not_leak_substring_into_neighbor_repos() {
         .join("2026_0401_claude_sess-vista_001.md");
     let vista_portal = root
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("vista-portal")
         .join("2026_0401")
         .join("reports")
@@ -1892,7 +1892,7 @@ fn chunks_by_run_id_does_not_leak_substring_into_neighbor_repos() {
     let run_id = "just-122007-20901";
     let vista = root
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("vista")
         .join("2026_0401")
         .join("reports")
@@ -1900,7 +1900,7 @@ fn chunks_by_run_id_does_not_leak_substring_into_neighbor_repos() {
         .join("2026_0401_claude_sess-vista_001.md");
     let vista_portal = root
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("vista-portal")
         .join("2026_0401")
         .join("reports")
@@ -1912,7 +1912,7 @@ fn chunks_by_run_id_does_not_leak_substring_into_neighbor_repos() {
         &vista.with_extension("meta.json"),
         &serde_json::json!({
             "id": "vista-run",
-            "project": "VetCoders/vista",
+            "project": "Vetcoders/vista",
             "agent": "claude",
             "date": "2026-04-01",
             "session_id": "sess-vista",
@@ -1925,7 +1925,7 @@ fn chunks_by_run_id_does_not_leak_substring_into_neighbor_repos() {
         &vista_portal.with_extension("meta.json"),
         &serde_json::json!({
             "id": "vista-portal-run",
-            "project": "VetCoders/vista-portal",
+            "project": "Vetcoders/vista-portal",
             "agent": "claude",
             "date": "2026-04-01",
             "session_id": "sess-portal",
@@ -1963,7 +1963,7 @@ fn scan_context_files_respects_aicxignore_and_negation() {
 
     let ignored = root
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("ai-contexters")
         .join("2026_0331")
         .join("reports")
@@ -1971,7 +1971,7 @@ fn scan_context_files_respects_aicxignore_and_negation() {
         .join("2026_0331_codex_sess-rpt_001.md");
     let kept = root
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("ai-contexters")
         .join("2026_0331")
         .join("conversations")
@@ -1982,7 +1982,7 @@ fn scan_context_files_respects_aicxignore_and_negation() {
     write_chunk_file(&kept, "Conversation that should remain visible");
     fs::write(
         root.join(AICX_IGNORE_FILENAME),
-        "store/VetCoders/ai-contexters/**\n!store/VetCoders/ai-contexters/**/conversations/**\n",
+        "store/Vetcoders/ai-contexters/**\n!store/Vetcoders/ai-contexters/**/conversations/**\n",
     )
     .unwrap();
 
@@ -2045,7 +2045,7 @@ fn migration_rebuilds_existing_sources_into_canonical_store() {
     let root = migration_test_root("rebuild-canonical");
     let legacy_root = root.join("legacy");
     let store_root = root.join("aicx");
-    let repo_root = root.join("hosted").join("VetCoders").join("ai-contexters");
+    let repo_root = root.join("hosted").join("Vetcoders").join("ai-contexters");
     let source = root
         .join("sources")
         .join("rollout-rebuild-canonical-019be5e4.jsonl");
@@ -2082,17 +2082,17 @@ fn migration_rebuilds_existing_sources_into_canonical_store() {
     assert_eq!(manifest.totals.rebuild_items, 1);
     assert_eq!(manifest.totals.rebuilt_items, 1);
     assert_eq!(manifest.totals.salvaged_items, 0);
-    // Case-preserving canonical (relaxed 2026-05-12): `VetCoders` from
-    // git remote stays `VetCoders`, not lowered to `vetcoders`.
+    // Case-preserving canonical (relaxed 2026-05-12): `Vetcoders` from
+    // git remote stays `Vetcoders`, not lowered to `vetcoders`.
     assert!(manifest.items.iter().any(|item| {
         item.canonical_paths.iter().any(|path| {
-            path.contains("/store/VetCoders/ai-contexters/2025_0321/conversations/codex/")
+            path.contains("/store/Vetcoders/ai-contexters/2025_0321/conversations/codex/")
         })
     }));
     assert!(
         store_root
             .join("store")
-            .join("VetCoders")
+            .join("Vetcoders")
             .join("ai-contexters")
             .join("2025_0321")
             .join("conversations")
@@ -2246,60 +2246,60 @@ fn write_codex_history(
 #[test]
 fn project_filter_strict_owner_repo_match() {
     assert!(project_filter_matches(
-        "VetCoders",
-        "CodeScribe",
-        "VetCoders/CodeScribe"
+        "Vetcoders",
+        "Codescribe",
+        "Vetcoders/Codescribe"
     ));
     // Case-insensitive both sides.
     assert!(project_filter_matches(
-        "VetCoders",
-        "CodeScribe",
+        "Vetcoders",
+        "Codescribe",
         "vetcoders/codescribe"
     ));
     assert!(!project_filter_matches(
-        "VetCoders",
-        "CodeScribe",
-        "VetCoders/Vista"
+        "Vetcoders",
+        "Codescribe",
+        "Vetcoders/Vista"
     ));
     assert!(!project_filter_matches(
-        "VetCoders",
-        "CodeScribe",
-        "OtherOrg/CodeScribe"
+        "Vetcoders",
+        "Codescribe",
+        "OtherOrg/Codescribe"
     ));
 }
 
 #[test]
 fn project_filter_org_wildcard_with_trailing_slash() {
     // `-p owner/` matches every repo under that owner.
-    assert!(project_filter_matches("m-szymanska", "lab", "m-szymanska/"));
+    assert!(project_filter_matches("example-org", "lab", "example-org/"));
     assert!(project_filter_matches(
-        "m-szymanska",
+        "example-org",
         "spotlight-convo-pipeline-v2",
-        "m-szymanska/"
+        "example-org/"
     ));
-    assert!(project_filter_matches("M-SZYMANSKA", "lab", "m-szymanska/"));
-    assert!(!project_filter_matches("vetcoders", "lab", "m-szymanska/"));
+    assert!(project_filter_matches("EXAMPLE-ORG", "lab", "example-org/"));
+    assert!(!project_filter_matches("vetcoders", "lab", "example-org/"));
 }
 
 #[test]
 fn project_filter_repo_wildcard_with_leading_slash() {
     // `-p /repo` matches the same repo name across every owner.
     assert!(project_filter_matches(
-        "VetCoders",
-        "CodeScribe",
-        "/CodeScribe"
+        "Vetcoders",
+        "Codescribe",
+        "/Codescribe"
     ));
     assert!(project_filter_matches(
         "OtherOrg",
         "codescribe",
-        "/CodeScribe"
+        "/Codescribe"
     ));
-    assert!(!project_filter_matches("VetCoders", "Vista", "/CodeScribe"));
+    assert!(!project_filter_matches("Vetcoders", "Vista", "/Codescribe"));
     // Exact name only — no substring leakage.
     assert!(!project_filter_matches(
-        "VetCoders",
-        "CodeScribe-extra",
-        "/CodeScribe"
+        "Vetcoders",
+        "Codescribe-extra",
+        "/Codescribe"
     ));
 }
 
@@ -2307,8 +2307,8 @@ fn project_filter_repo_wildcard_with_leading_slash() {
 fn project_filter_bare_name_matches_org_or_repo() {
     // Cross-org repo match.
     assert!(project_filter_matches(
-        "VetCoders",
-        "CodeScribe",
+        "Vetcoders",
+        "Codescribe",
         "codescribe"
     ));
     assert!(project_filter_matches(
@@ -2316,11 +2316,11 @@ fn project_filter_bare_name_matches_org_or_repo() {
         "codescribe",
         "codescribe"
     ));
-    // Org match (regression for `-p m-szymanska` use case).
+    // Org match (regression for `-p example-org` use case).
     assert!(project_filter_matches(
-        "m-szymanska",
+        "example-org",
         "spotlight-convo-pipeline-v2",
-        "m-szymanska"
+        "example-org"
     ));
     // No match — different name.
     assert!(!project_filter_matches("vetcoders", "Vista", "codescribe"));
@@ -2353,17 +2353,17 @@ fn resolve_filters_to_slugs_expands_short_name_to_canonical() {
     let canonical = root.join(CANONICAL_STORE_DIRNAME);
     fs::create_dir_all(
         canonical
-            .join("m-szymanska")
+            .join("example-org")
             .join("spotlight-convo-pipeline-v2"),
     )
     .unwrap();
-    fs::create_dir_all(canonical.join("m-szymanska").join("lab")).unwrap();
-    fs::create_dir_all(canonical.join("vetcoders").join("CodeScribe")).unwrap();
+    fs::create_dir_all(canonical.join("example-org").join("lab")).unwrap();
+    fs::create_dir_all(canonical.join("vetcoders").join("Codescribe")).unwrap();
 
     let resolved =
         resolve_filters_to_slugs_at(&canonical, &["spotlight-convo-pipeline-v2".to_string()])
             .unwrap();
-    assert_eq!(resolved, vec!["m-szymanska/spotlight-convo-pipeline-v2"]);
+    assert_eq!(resolved, vec!["example-org/spotlight-convo-pipeline-v2"]);
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -2372,30 +2372,30 @@ fn resolve_filters_to_slugs_expands_short_name_to_canonical() {
 fn resolve_filters_to_slugs_supports_explicit_syntax() {
     let root = migration_test_root("resolve-explicit");
     let canonical = root.join(CANONICAL_STORE_DIRNAME);
-    fs::create_dir_all(canonical.join("m-szymanska").join("lab")).unwrap();
-    fs::create_dir_all(canonical.join("m-szymanska").join("badi")).unwrap();
-    fs::create_dir_all(canonical.join("vetcoders").join("CodeScribe")).unwrap();
-    fs::create_dir_all(canonical.join("OtherOrg").join("CodeScribe")).unwrap();
+    fs::create_dir_all(canonical.join("example-org").join("lab")).unwrap();
+    fs::create_dir_all(canonical.join("example-org").join("badi")).unwrap();
+    fs::create_dir_all(canonical.join("vetcoders").join("Codescribe")).unwrap();
+    fs::create_dir_all(canonical.join("OtherOrg").join("Codescribe")).unwrap();
 
     // owner/ → all repos under owner
-    let mut got = resolve_filters_to_slugs_at(&canonical, &["m-szymanska/".to_string()]).unwrap();
+    let mut got = resolve_filters_to_slugs_at(&canonical, &["example-org/".to_string()]).unwrap();
     got.sort();
-    assert_eq!(got, vec!["m-szymanska/badi", "m-szymanska/lab"]);
+    assert_eq!(got, vec!["example-org/badi", "example-org/lab"]);
 
     // /repo → cross-org repo match
-    let mut got = resolve_filters_to_slugs_at(&canonical, &["/CodeScribe".to_string()]).unwrap();
+    let mut got = resolve_filters_to_slugs_at(&canonical, &["/Codescribe".to_string()]).unwrap();
     got.sort();
-    assert_eq!(got, vec!["OtherOrg/CodeScribe", "vetcoders/CodeScribe"]);
+    assert_eq!(got, vec!["OtherOrg/Codescribe", "vetcoders/Codescribe"]);
 
     // strict slug match
     let got =
-        resolve_filters_to_slugs_at(&canonical, &["vetcoders/CodeScribe".to_string()]).unwrap();
-    assert_eq!(got, vec!["vetcoders/CodeScribe"]);
+        resolve_filters_to_slugs_at(&canonical, &["vetcoders/Codescribe".to_string()]).unwrap();
+    assert_eq!(got, vec!["vetcoders/Codescribe"]);
 
     // strict slug match stays case-insensitive, but resolves to stored canonical casing
     let got =
         resolve_filters_to_slugs_at(&canonical, &["VETCODERS/codescribe".to_string()]).unwrap();
-    assert_eq!(got, vec!["vetcoders/CodeScribe"]);
+    assert_eq!(got, vec!["vetcoders/Codescribe"]);
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -2442,7 +2442,7 @@ fn resolve_filters_to_store_or_index_slugs_supports_index_only_all_bucket() {
     });
     let entry = serde_json::json!({
         "id": "chunk-a",
-        "project": "VetCoders/Vista",
+        "project": "Vetcoders/Vista",
         "agent": "claude",
         "date": "20260603",
         "path": "/tmp/chunk-a.md",
@@ -2467,7 +2467,7 @@ fn resolve_filters_to_store_or_index_slugs_supports_index_only_all_bucket() {
         &["vetcoders/vista".to_string()],
     )
     .unwrap();
-    assert_eq!(got, vec!["VetCoders/Vista"]);
+    assert_eq!(got, vec!["Vetcoders/Vista"]);
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -2581,7 +2581,7 @@ fn resolve_filters_to_index_slugs_reads_only_project_field() {
     });
     let entry = serde_json::json!({
         "id": "chunk-a",
-        "project": "VetCoders/Vista",
+        "project": "Vetcoders/Vista",
         "embedding": ["project resolver must not deserialize this as f32"]
     });
     fs::write(
@@ -2600,7 +2600,7 @@ fn resolve_filters_to_index_slugs_reads_only_project_field() {
         false,
     )
     .unwrap();
-    assert_eq!(got, vec!["VetCoders/Vista"]);
+    assert_eq!(got, vec!["Vetcoders/Vista"]);
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -2755,7 +2755,7 @@ fn test_uuidv7_prefix_collision_does_not_overwrite_silently() {
         write_context_session_first_at(
             &root.join("store"),
             SessionWriteSpec {
-                project: Some("VetCoders/aicx"),
+                project: Some("Vetcoders/aicx"),
                 agent: "claude",
                 date: "2026-05-20",
                 session_id: sid,
@@ -2769,7 +2769,7 @@ fn test_uuidv7_prefix_collision_does_not_overwrite_silently() {
 
     let dir = root
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("aicx")
         .join("2026_0520")
         .join(Kind::Reports.dir_name())
@@ -2808,7 +2808,7 @@ fn test_existing_target_with_different_content_disambiguates() {
     let date_dir = compact_date("2026-05-20");
     let dir = root
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("aicx")
         .join(&date_dir)
         .join(Kind::Reports.dir_name())
@@ -2830,7 +2830,7 @@ fn test_existing_target_with_different_content_disambiguates() {
     let written = write_context_session_first_at(
         &root.join("store"),
         SessionWriteSpec {
-            project: Some("VetCoders/aicx"),
+            project: Some("Vetcoders/aicx"),
             agent: "claude",
             date: "2026-05-20",
             session_id: sid,
@@ -2877,7 +2877,7 @@ fn test_existing_target_with_identical_content_dedupes() {
     )];
 
     let spec = SessionWriteSpec {
-        project: Some("VetCoders/aicx"),
+        project: Some("Vetcoders/aicx"),
         agent: "claude",
         date: "2026-05-20",
         session_id: sid,
@@ -2894,7 +2894,7 @@ fn test_existing_target_with_identical_content_dedupes() {
     let second = write_context_session_first_at(
         &root.join("store"),
         SessionWriteSpec {
-            project: Some("VetCoders/aicx"),
+            project: Some("Vetcoders/aicx"),
             agent: "claude",
             date: "2026-05-20",
             session_id: sid,
@@ -2942,7 +2942,7 @@ fn test_atomic_write_crash_simulation() {
     let written = write_context_session_first_at(
         &root.join("store"),
         SessionWriteSpec {
-            project: Some("VetCoders/aicx"),
+            project: Some("Vetcoders/aicx"),
             agent: "claude",
             date: "2026-05-20",
             session_id: sid,
@@ -2970,7 +2970,7 @@ fn test_atomic_write_crash_simulation() {
     let _ = write_context_session_first_at(
         &root.join("store"),
         SessionWriteSpec {
-            project: Some("VetCoders/aicx"),
+            project: Some("Vetcoders/aicx"),
             agent: "claude",
             date: "2026-05-20",
             session_id: sid,
@@ -3018,7 +3018,7 @@ fn test_malformed_index_json_returns_error_not_default() {
     // Add a valid .bak sibling → recovery returns it.
     let bak_path = index_path.with_extension("json.bak");
     let mut good = StoreIndex::default();
-    update_index(&mut good, "VetCoders/aicx", "claude", "2026_0520", 7);
+    update_index(&mut good, "Vetcoders/aicx", "claude", "2026_0520", 7);
     fs::write(
         &bak_path,
         serde_json::to_string_pretty(&good).unwrap().as_bytes(),
@@ -3028,7 +3028,7 @@ fn test_malformed_index_json_returns_error_not_default() {
     assert!(
         recovered
             .projects
-            .get("VetCoders/aicx")
+            .get("Vetcoders/aicx")
             .and_then(|p| p.agents.get("claude"))
             .is_some(),
         "recovered index must contain the .bak payload"
@@ -3064,7 +3064,7 @@ fn test_two_phase_write_parent_fsync_on_rename() {
     let written = write_context_session_first_at(
         &root.join("store"),
         SessionWriteSpec {
-            project: Some("VetCoders/aicx"),
+            project: Some("Vetcoders/aicx"),
             agent: "claude",
             date: "2026-05-22",
             session_id: sid,
@@ -3114,7 +3114,7 @@ fn test_orphan_md_reclaimed_not_shadowed() {
     let first = write_context_session_first_at(
         &root.join("store"),
         SessionWriteSpec {
-            project: Some("VetCoders/aicx"),
+            project: Some("Vetcoders/aicx"),
             agent: "claude",
             date: "2026-05-22",
             session_id: sid,
@@ -3139,7 +3139,7 @@ fn test_orphan_md_reclaimed_not_shadowed() {
     let second = write_context_session_first_at(
         &root.join("store"),
         SessionWriteSpec {
-            project: Some("VetCoders/aicx"),
+            project: Some("Vetcoders/aicx"),
             agent: "claude",
             date: "2026-05-22",
             session_id: sid,
@@ -3207,7 +3207,7 @@ fn test_store_segments_at_index_persists_on_drop() {
 
     {
         let mut index = StoreIndex::default();
-        update_index(&mut index, "VetCoders/aicx", "claude", "2026_0522", 5);
+        update_index(&mut index, "Vetcoders/aicx", "claude", "2026_0522", 5);
         let _guard = IndexSaveGuard {
             base: &root,
             index,
@@ -3224,7 +3224,7 @@ fn test_store_segments_at_index_persists_on_drop() {
     let loaded = read_and_parse_index(&index_path).expect("re-read persisted index");
     let agent = loaded
         .projects
-        .get("VetCoders/aicx")
+        .get("Vetcoders/aicx")
         .and_then(|p| p.agents.get("claude"))
         .expect("persisted index must contain the partial state");
     assert_eq!(agent.total_entries, 5);
@@ -3235,7 +3235,7 @@ fn test_store_segments_at_index_persists_on_drop() {
     let sentinel_bytes = fs::read(&index_path).unwrap();
     {
         let mut index = StoreIndex::default();
-        update_index(&mut index, "VetCoders/other", "codex", "2026_0522", 99);
+        update_index(&mut index, "Vetcoders/other", "codex", "2026_0522", 99);
         let _guard = IndexSaveGuard {
             base: &root,
             index,
@@ -3302,7 +3302,7 @@ fn write_pack_sidecar(pack: &Path, stem: &str, project: &str, date: &str) {
 #[test]
 fn ingest_loct_context_pack_rejects_mixed_projects() {
     let pack = unique_pack_dir("mixed");
-    write_pack_sidecar(&pack, "alpha", "VetCoders/aicx", "2026-05-08");
+    write_pack_sidecar(&pack, "alpha", "Vetcoders/aicx", "2026-05-08");
     write_pack_sidecar(&pack, "beta", "Loctree/aicx", "2026-05-08");
 
     let err = ingest_loct_context_pack(&pack)
@@ -3311,7 +3311,7 @@ fn ingest_loct_context_pack_rejects_mixed_projects() {
 
     // Names both project tuples.
     assert!(
-        message.contains("VetCoders/aicx") || message.contains("vetcoders/aicx"),
+        message.contains("Vetcoders/aicx") || message.contains("vetcoders/aicx"),
         "error should name first project tuple; got {message}"
     );
     assert!(
@@ -3436,14 +3436,14 @@ fn ingest_loct_context_pack_preserves_rows_for_subset_reingest() {
         write_pack_chunk(
             &pack,
             "alpha",
-            "VetCoders/aicx",
+            "Vetcoders/aicx",
             "2026-05-08",
             "first chunk",
         );
         write_pack_chunk(
             &pack,
             "beta",
-            "VetCoders/aicx",
+            "Vetcoders/aicx",
             "2026-05-08",
             "second chunk",
         );
@@ -3459,7 +3459,7 @@ fn ingest_loct_context_pack_preserves_rows_for_subset_reingest() {
         write_pack_chunk(
             &pack,
             "alpha",
-            "VetCoders/aicx",
+            "Vetcoders/aicx",
             "2026-05-08",
             "first chunk",
         );
@@ -3490,14 +3490,14 @@ fn ingest_loct_context_pack_preserves_rows_for_identical_reingest() {
         write_pack_chunk(
             &pack,
             "alpha",
-            "VetCoders/aicx",
+            "Vetcoders/aicx",
             "2026-05-08",
             "first chunk",
         );
         write_pack_chunk(
             &pack,
             "beta",
-            "VetCoders/aicx",
+            "Vetcoders/aicx",
             "2026-05-08",
             "second chunk",
         );
@@ -3508,14 +3508,14 @@ fn ingest_loct_context_pack_preserves_rows_for_identical_reingest() {
         write_pack_chunk(
             &pack,
             "alpha",
-            "VetCoders/aicx",
+            "Vetcoders/aicx",
             "2026-05-08",
             "first chunk",
         );
         write_pack_chunk(
             &pack,
             "beta",
-            "VetCoders/aicx",
+            "Vetcoders/aicx",
             "2026-05-08",
             "second chunk",
         );
@@ -3546,7 +3546,7 @@ fn ingest_loct_context_pack_unions_old_and_new_on_reingest() {
         write_pack_chunk(
             &pack,
             "alpha",
-            "VetCoders/aicx",
+            "Vetcoders/aicx",
             "2026-05-08",
             "first chunk",
         );
@@ -3560,14 +3560,14 @@ fn ingest_loct_context_pack_unions_old_and_new_on_reingest() {
         write_pack_chunk(
             &pack,
             "alpha",
-            "VetCoders/aicx",
+            "Vetcoders/aicx",
             "2026-05-08",
             "first chunk",
         );
         write_pack_chunk(
             &pack,
             "gamma",
-            "VetCoders/aicx",
+            "Vetcoders/aicx",
             "2026-05-08",
             "third chunk",
         );

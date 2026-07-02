@@ -51,7 +51,7 @@ fn operator_markdown_discovers_and_extracts_intents_decisions_tasks() {
         r#"---
 project: rust-memex
 date: 2026-05-01
-author: Monika
+author: operator
 ---
 # rust-memex bug log
 

@@ -148,5 +148,4 @@ See [LICENSE](LICENSE).
 
 ## Authors
 
-- Maciej Gad <void@div0.space>
-- Monika Szymanska <hello@vetcoders.io>
+- Vetcoders <hello@vetcoders.io>

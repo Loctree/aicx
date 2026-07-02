@@ -91,7 +91,7 @@ Dashboard cross-search still has one legacy external boundary:
 `HOME`, `XDG_CONFIG_HOME`, and `XDG_DATA_HOME` are passed through for config-dir
 resolution. `PATH` is never passed; the binary must be resolved before
 `env_clear()` so a user-controlled `PATH` cannot change what gets executed.
-If the memex CLI becomes fully self-contained, these variables may be absent and
+If the rust-memex CLI becomes fully self-contained, these variables may be absent and
 the child process must still fail with a normal command error, not by inheriting
 the parent environment.
 

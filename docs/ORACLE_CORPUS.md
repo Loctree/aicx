@@ -6,7 +6,7 @@ embedding surface is a derived view that must be rebuildable from that corpus.
 
 ## Layers
 
-- Layer 0 source logs: Claude, Codex, Gemini, Junie, CodeScribe, and other
+- Layer 0 source logs: Claude, Codex, Gemini, Junie, Codescribe, and other
   local transcript sources. These are raw evidence.
 - Layer 1 canonical corpus: normalized, deduplicated, chunked markdown plus
   sidecar metadata under `$HOME/.aicx/store/` and

@@ -909,8 +909,8 @@ pub(crate) fn resolve_operator_cwd_hint(
             home.join("Libraxis")
                 .join("01_deployed_libraxis_vm")
                 .join(repo),
-            home.join("hosted").join("VetCoders").join(repo),
-            home.join("vc-workspace").join("VetCoders").join(repo),
+            home.join("hosted").join("Vetcoders").join(repo),
+            home.join("vc-workspace").join("Vetcoders").join(repo),
         ]
     };
 

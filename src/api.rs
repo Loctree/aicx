@@ -684,7 +684,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create root");
 
-        let status = index_status_at_with_sessions(&root, Some("VetCoders/Loctree"), Some(&[]))
+        let status = index_status_at_with_sessions(&root, Some("Vetcoders/Loctree"), Some(&[]))
             .expect("index status with project");
 
         // Mirrors the on-disk bucket: lowercase + path separators replaced.
