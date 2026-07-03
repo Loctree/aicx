@@ -16,7 +16,11 @@ pub use card_header::{CardHeader, card_body, is_bracket_header_line, parse_card_
 pub use chunker::{
     CARD_CLAIM_SCOPE_SESSION_CLOSE, CARD_FRESHNESS_CONTRACT_HISTORICAL, CARD_SCHEMA_VERSION,
     CARD_VERIFICATION_STATE_NOT_VERIFIED_BY_AICX, CardSignal, CardSource, Chunk,
-    ChunkMetadataSidecar, ChunkerConfig, LearningUse, TruthRole, TruthStatus, classify_kind,
+    ChunkMetadataSidecar, ChunkerConfig, LearningUse, SIGNAL_EXTRACTOR_VERSION,
+    SIGNAL_KIND_DECISION, SIGNAL_KIND_HIGHLIGHT, SIGNAL_KIND_INSIGHT, SIGNAL_KIND_INTENT,
+    SIGNAL_KIND_OUTCOME, SIGNAL_KIND_PLAN_MODE, SIGNAL_KIND_RESULT, SIGNAL_KIND_SKILL,
+    SIGNAL_KIND_TODO_DONE, SIGNAL_KIND_TODO_OPEN, SIGNAL_KIND_ULTRATHINK, TruthRole, TruthStatus,
+    classify_kind,
 };
 pub use frontmatter::ReportFrontmatter;
 pub use sanitize::{filter_self_echo, is_self_echo, normalize_query, read_state_json_validated};
