@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use super::MigrationExecution;
-use crate::card_header::{card_body, parse_card_header};
+use crate::card_header::{HeaderForm, card_body, header_form, parse_card_header};
 use crate::chunker::{
     CARD_CLAIM_SCOPE_SESSION_CLOSE, CARD_FRESHNESS_CONTRACT_HISTORICAL, CARD_SCHEMA_VERSION,
     CARD_VERIFICATION_STATE_NOT_VERIFIED_BY_AICX, ChunkMetadataSidecar,
@@ -44,9 +44,6 @@ const CARDS_V2_MIGRATION_DIRNAME: &str = ".migration";
 const CARDS_V2_SUBDIR: &str = "cards-v2";
 const CARDS_V2_MANIFEST_FILENAME: &str = "manifest.json";
 const CARDS_V2_REPORT_FILENAME: &str = "report.md";
-
-/// The v1 writer emitted the bracket header at byte 0; anything else is body.
-const BRACKET_HEADER_PREFIX: &str = "[project:";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -80,6 +77,10 @@ pub struct CardsV2Item {
     /// Sidecar fields this migration set, e.g. `schema_version=2`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub new_sidecar_fields: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_content_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_content_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -290,6 +291,8 @@ fn migrate_one_card(card_path: &Path, dry_run: bool) -> Result<CardOutcome> {
             execution,
             old_header: None,
             new_sidecar_fields: Vec::new(),
+            old_content_sha256: None,
+            new_content_sha256: None,
             note: Some(note),
         })
     };
@@ -388,6 +391,8 @@ fn migrate_one_card(card_path: &Path, dry_run: bool) -> Result<CardOutcome> {
                 execution,
                 old_header: Some(old_header.clone()),
                 new_sidecar_fields: Vec::new(),
+                old_content_sha256: typed.content_sha256.clone(),
+                new_content_sha256: None,
                 note: Some(format!(
                     "body sha256 changed under header rewrite ({old_body_sha} -> {new_body_sha}); card left untouched"
                 )),
@@ -395,7 +400,13 @@ fn migrate_one_card(card_path: &Path, dry_run: bool) -> Result<CardOutcome> {
         }
     }
 
-    let new_sidecar_fields = upgrade_sidecar_value(&mut sidecar_value, &typed);
+    let old_content_sha256 = typed.content_sha256.clone();
+    let new_card_text = rewrite
+        .as_ref()
+        .map(|(new_text, _)| new_text.as_str())
+        .unwrap_or(&card_text);
+    let new_content_sha256 = content_sha256(new_card_text);
+    let new_sidecar_fields = upgrade_sidecar_value(&mut sidecar_value, &typed, &new_content_sha256);
 
     if !dry_run {
         // Write the .md before the sidecar: if the process dies between the
@@ -422,6 +433,8 @@ fn migrate_one_card(card_path: &Path, dry_run: bool) -> Result<CardOutcome> {
         execution,
         old_header: rewrite.map(|(_, old_header)| old_header),
         new_sidecar_fields,
+        old_content_sha256,
+        new_content_sha256: Some(new_content_sha256),
         note: None,
     }))
 }
@@ -431,7 +444,7 @@ fn migrate_one_card(card_path: &Path, dry_run: bool) -> Result<CardOutcome> {
 /// `None` when the card does not start with a bracket header (nothing to
 /// rewrite; the sidecar-only upgrade still applies).
 fn rewrite_bracket_header(text: &str) -> Option<(String, String)> {
-    if !text.starts_with(BRACKET_HEADER_PREFIX) {
+    if !matches!(header_form(text), Some(HeaderForm::Bracket { .. })) {
         return None;
     }
     let header = parse_card_header(text)?;
@@ -471,6 +484,7 @@ fn rewrite_bracket_header(text: &str) -> Option<(String, String)> {
 fn upgrade_sidecar_value(
     value: &mut serde_json::Value,
     typed: &ChunkMetadataSidecar,
+    new_content_sha256: &str,
 ) -> Vec<String> {
     let Some(object) = value.as_object_mut() else {
         return Vec::new();
@@ -482,6 +496,12 @@ fn upgrade_sidecar_value(
         serde_json::json!(CARD_SCHEMA_VERSION),
     );
     set_fields.push(format!("schema_version={CARD_SCHEMA_VERSION}"));
+
+    object.insert(
+        "migrated_from_schema".to_string(),
+        serde_json::json!(typed.schema_version),
+    );
+    set_fields.push(format!("migrated_from_schema={}", typed.schema_version));
 
     for (key, canonical) in [
         ("claim_scope", CARD_CLAIM_SCOPE_SESSION_CLOSE),
@@ -506,6 +526,12 @@ fn upgrade_sidecar_value(
         );
         set_fields.push(format!("source.path={source_file}"));
     }
+
+    object.insert(
+        "content_sha256".to_string(),
+        serde_json::json!(new_content_sha256),
+    );
+    set_fields.push(format!("content_sha256={new_content_sha256}"));
 
     set_fields
 }
@@ -597,6 +623,9 @@ where
                 item.new_sidecar_fields.join("`, `")
             ));
         }
+        if let (Some(old), Some(new)) = (&item.old_content_sha256, &item.new_content_sha256) {
+            report.push_str(&format!("  content_sha256: `{old}` -> `{new}`\n"));
+        }
         if let Some(note) = &item.note {
             report.push_str(&format!("  note: `{}`\n", note));
         }
@@ -658,7 +687,19 @@ mod tests {
         )
     }
 
+    fn v1_card_text_without_signals() -> String {
+        "[project: demo/repo | agent: claude | date: 2026-03-15 | frame_kind: user_msg]\n\n[13:44:56] user: kind: transcript\n[13:45:02] assistant: done\n".to_string()
+    }
+
     fn v1_sidecar_json(extra_unknown_field: bool, source_file: Option<&str>) -> String {
+        v1_sidecar_json_with_hash(extra_unknown_field, source_file, "__AUTO__")
+    }
+
+    fn v1_sidecar_json_with_hash(
+        extra_unknown_field: bool,
+        source_file: Option<&str>,
+        content_sha256: &str,
+    ) -> String {
         let mut object = serde_json::json!({
             "id": "demo/repo_claude_2026-03-15_001",
             "project": "demo/repo",
@@ -667,7 +708,7 @@ mod tests {
             "session_id": "sess-1",
             "kind": "conversations",
             "frame_kind": "user_msg",
-            "content_sha256": "feedbeef"
+            "content_sha256": content_sha256
         });
         if extra_unknown_field {
             object["future_field"] = serde_json::json!("survives");
@@ -684,7 +725,20 @@ mod tests {
         fs::write(&md_path, md).unwrap();
         let sidecar_path = dir.join(format!("{stem}.meta.json"));
         if let Some(sidecar) = sidecar {
-            fs::write(&sidecar_path, sidecar).unwrap();
+            let sidecar_bytes = match serde_json::from_str::<serde_json::Value>(sidecar) {
+                Ok(mut value) => {
+                    if value
+                        .get("content_sha256")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("__AUTO__")
+                    {
+                        value["content_sha256"] = serde_json::json!(content_sha256(md));
+                    }
+                    serde_json::to_vec_pretty(&value).unwrap()
+                }
+                Err(_) => sidecar.as_bytes().to_vec(),
+            };
+            fs::write(&sidecar_path, sidecar_bytes).unwrap();
         }
         (md_path, sidecar_path)
     }
@@ -760,6 +814,7 @@ mod tests {
         let sidecar: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&sidecar_path).unwrap()).unwrap();
         assert_eq!(sidecar["schema_version"], serde_json::json!(2));
+        assert_eq!(sidecar["migrated_from_schema"], serde_json::json!(1));
         assert_eq!(
             sidecar["claim_scope"],
             serde_json::json!(CARD_CLAIM_SCOPE_SESSION_CLOSE)
@@ -774,13 +829,51 @@ mod tests {
         );
         // Unknown fields and untouched v1 fields survive the rewrite.
         assert_eq!(sidecar["future_field"], serde_json::json!("survives"));
-        assert_eq!(sidecar["content_sha256"], serde_json::json!("feedbeef"));
+        let old_hash = content_sha256(&old_text);
+        let new_hash = content_sha256(&new_text);
+        assert_ne!(old_hash, new_hash);
+        assert_eq!(sidecar["content_sha256"], serde_json::json!(new_hash));
+        let item = manifest.items.first().expect("upgrade item");
+        assert_eq!(item.old_content_sha256.as_deref(), Some(old_hash.as_str()));
+        assert_eq!(item.new_content_sha256.as_deref(), Some(new_hash.as_str()));
+        assert!(
+            item.new_sidecar_fields
+                .iter()
+                .any(|field| field == "migrated_from_schema=1")
+        );
         // No source provenance existed, so none may be invented.
         assert!(sidecar.get("source").is_none());
 
         // Manifest + report landed under the dot-dir.
         assert!(cards_v2_manifest_path(&root).exists());
         assert!(cards_v2_report_path(&root).exists());
+    }
+
+    #[test]
+    fn apply_refreshes_stale_content_sha256_after_header_rewrite() {
+        let root = cards_v2_test_root("stale-hash");
+        let dir = root.join("demo/repo/2026_0315/conversations/claude");
+        let (md_path, sidecar_path) = write_card(
+            &dir,
+            "chunk_001",
+            &v1_card_text(),
+            Some(&v1_sidecar_json_with_hash(false, None, "feedbeef")),
+        );
+
+        let manifest = run_cards_v2_migration_at(&root, false).expect("apply");
+        let new_text = fs::read_to_string(&md_path).unwrap();
+        let refreshed_hash = content_sha256(&new_text);
+        let sidecar: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+
+        assert_ne!(sidecar["content_sha256"], serde_json::json!("feedbeef"));
+        assert_eq!(sidecar["content_sha256"], serde_json::json!(refreshed_hash));
+        let item = manifest.items.first().expect("upgrade item");
+        assert_eq!(item.old_content_sha256.as_deref(), Some("feedbeef"));
+        assert_eq!(
+            item.new_content_sha256.as_deref(),
+            Some(refreshed_hash.as_str())
+        );
     }
 
     #[test]
@@ -965,6 +1058,64 @@ mod tests {
         let without_source: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&without_sidecar_path).unwrap()).unwrap();
         assert!(without_source.get("source").is_none());
+    }
+
+    #[test]
+    fn apply_then_validate_composes_for_migrated_legacy_cards() {
+        let root = cards_v2_test_root("compose-validate");
+        let dir = root.join("demo/repo/2026_0315/conversations/claude");
+        let (with_source_md, with_source_sidecar) = write_card(
+            &dir,
+            "chunk_001",
+            &v1_card_text_without_signals(),
+            Some(&v1_sidecar_json(
+                false,
+                Some("/home/user/.claude/session.jsonl"),
+            )),
+        );
+        let (legacy_gap_md, legacy_gap_sidecar) = write_card(
+            &dir,
+            "chunk_002",
+            &v1_card_text(),
+            Some(&v1_sidecar_json(false, None)),
+        );
+
+        let manifest = run_cards_v2_migration_at(&root, false).expect("apply");
+        assert_eq!(manifest.totals.upgraded_cards, 2);
+        assert_eq!(manifest.totals.rewritten_headers, 2);
+
+        let findings: Vec<_> = [&with_source_md, &legacy_gap_md]
+            .into_iter()
+            .flat_map(|path| crate::corpus::validate_card(path))
+            .collect();
+        let errors: Vec<_> = findings
+            .iter()
+            .filter(|finding| finding.severity == "error")
+            .collect();
+        assert!(errors.is_empty(), "unexpected hard violations: {errors:#?}");
+        let warning_classes: Vec<_> = findings
+            .iter()
+            .filter(|finding| finding.severity == "warn")
+            .map(|finding| finding.class.as_str())
+            .collect();
+        assert_eq!(
+            warning_classes,
+            vec!["migrated_missing_source", "migrated_signals_unbackfilled"]
+        );
+
+        for (md_path, sidecar_path) in [
+            (&with_source_md, &with_source_sidecar),
+            (&legacy_gap_md, &legacy_gap_sidecar),
+        ] {
+            let markdown = fs::read_to_string(md_path).unwrap();
+            let sidecar: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(sidecar_path).unwrap()).unwrap();
+            assert_eq!(sidecar["migrated_from_schema"], serde_json::json!(1));
+            assert_eq!(
+                sidecar["content_sha256"],
+                serde_json::json!(content_sha256(&markdown))
+            );
+        }
     }
 
     #[test]

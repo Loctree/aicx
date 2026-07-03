@@ -702,6 +702,7 @@ fn write_sidecar(
         source_format: None,
         import_id: None,
         schema_version: 1,
+        migrated_from_schema: None,
         source: None,
         claim_scope: None,
         freshness_contract: None,

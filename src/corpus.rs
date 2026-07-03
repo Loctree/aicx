@@ -24,6 +24,8 @@ pub use types::{
     CorpusRepairItem, CorpusRepairManifest, CorpusRepairOptions, CorpusValidateOptions,
     CorpusValidateReport, CorpusValidateTotals, RootAuditReport, RootValidateReport,
 };
+#[cfg(test)]
+pub(crate) use validate::validate_card;
 pub use validate::validate_cards;
 
 pub(crate) const REPAIR_VERSION: &str = "aicx-corpus-repair-v1";

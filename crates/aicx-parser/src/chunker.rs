@@ -96,6 +96,8 @@ pub struct ChunkMetadataSidecar {
         skip_serializing_if = "is_default_card_schema_version"
     )]
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migrated_from_schema: Option<u32>,
     pub project: String,
     pub agent: String,
     pub date: String,
@@ -306,6 +308,7 @@ impl From<&Chunk> for ChunkMetadataSidecar {
             source_format: chunk.source_format.clone(),
             import_id: chunk.import_id.clone(),
             schema_version: CARD_SCHEMA_VERSION,
+            migrated_from_schema: None,
             source: chunk.source.clone(),
             claim_scope: Some(CARD_CLAIM_SCOPE_SESSION_CLOSE.to_string()),
             freshness_contract: Some(CARD_FRESHNESS_CONTRACT_HISTORICAL.to_string()),

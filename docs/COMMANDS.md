@@ -235,8 +235,11 @@ files remain provenance; this surface is for cleaned-but-faithful markdown that
 feeds retrieval.
 
 `validate-cards` is the card-contract gate: it validates card schema v1/v2
-sidecars, headers, hashes, and md↔sidecar signal parity (see
-[`CARD_CONTRACT.md`](./CARD_CONTRACT.md)).
+sidecars, headers, full-file hashes, and md↔sidecar signal parity (see
+[`CARD_CONTRACT.md`](./CARD_CONTRACT.md)). Writer-born v2 cards stay strict.
+Migration-stamped v2 cards (`migrated_from_schema`) downgrade legacy-impossible
+gaps to explicit warnings: `migrated_missing_source` and
+`migrated_signals_unbackfilled`.
 
 ```bash
 aicx corpus audit [OPTIONS]
@@ -248,7 +251,7 @@ Options:
 - `--root <DIR>...` corpus roots to scan (default: `$HOME/.aicx`, `$HOME/.ai-contexters`, optional `$HOME/.xcia`)
 - `--emit <text|json>` output format
 - `ROOT` store subtree or markdown card to validate with `validate-cards` (defaults to the corpus roots used by audit)
-- `--strict` make `validate-cards` exit non-zero when hard validation errors are present
+- `--strict` make `validate-cards` exit non-zero when hard validation errors are present; migrated warning classes do not fail the gate
 - `--json` emit the `validate-cards` report as compact JSON
 - `-v, --verbose` echo per-file extractor warnings to stderr (default aggregates a per-extractor summary; structured detail always lands in `~/.aicx/state/diagnostics-<run-id>.log`)
 - `--dry-run` preview repair candidates without modifying markdown (repair default unless `--apply` is passed)
@@ -379,7 +382,7 @@ Options:
 - `--legacy-root <DIR>` override legacy input store root (default: `~/.ai-contexters`)
 - `--store-root <DIR>` override AICX store root (default: `~/.aicx`)
 - `--no-intent-schema` skip the post-migration intent schema scan on the canonical store
-- `--cards-v2 [<ROOT>]` upgrade store cards v1 -> v2 in place (sidecar schema/honesty fields, bracket header -> YAML frontmatter; body bytes never change). Optional `ROOT` overrides the walked directory (default: canonical store dir). Dry-run by default
+- `--cards-v2 [<ROOT>]` upgrade store cards v1 -> v2 in place (sidecar schema/honesty fields, `migrated_from_schema: 1`, refreshed full-file `content_sha256`, bracket header -> YAML frontmatter; body bytes never change). Optional `ROOT` overrides the walked directory (default: canonical store dir). Dry-run by default
 - `--apply` write the cards-v2 migration (without it, `--cards-v2` is a dry run)
 - `-v, --verbose` echo per-file extractor warnings to stderr (default aggregates a per-extractor summary)
 
@@ -399,7 +402,7 @@ aicx migrate
 # Preview the card v1 -> v2 upgrade on the canonical store (dry-run default)
 aicx migrate --cards-v2
 
-# Write the card upgrade (body-hash invariant, idempotent)
+# Write the card upgrade (body bytes invariant, full-file hash refreshed, idempotent)
 aicx migrate --cards-v2 --apply
 ```
 

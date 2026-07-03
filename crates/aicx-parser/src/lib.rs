@@ -12,7 +12,9 @@ pub mod skill_collapse;
 pub mod timeline;
 pub mod types;
 
-pub use card_header::{CardHeader, card_body, is_bracket_header_line, parse_card_header};
+pub use card_header::{
+    CardHeader, HeaderForm, card_body, header_form, is_bracket_header_line, parse_card_header,
+};
 pub use chunker::{
     CARD_CLAIM_SCOPE_SESSION_CLOSE, CARD_FRESHNESS_CONTRACT_HISTORICAL, CARD_SCHEMA_VERSION,
     CARD_VERIFICATION_STATE_NOT_VERIFIED_BY_AICX, CardSignal, CardSource, Chunk,

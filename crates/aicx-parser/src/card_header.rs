@@ -21,9 +21,34 @@ pub struct CardHeader {
     pub frame_kind: Option<FrameKind>,
 }
 
-enum HeaderForm<'a> {
-    Bracket { fields: &'a str, body: &'a str },
-    Frontmatter { header: CardHeader, body: &'a str },
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeaderForm<'a> {
+    Bracket {
+        fields: &'a str,
+        body: &'a str,
+        text: &'a str,
+    },
+    Frontmatter {
+        header: CardHeader,
+        body: &'a str,
+        text: &'a str,
+    },
+}
+
+impl<'a> HeaderForm<'a> {
+    pub fn text(&self) -> &'a str {
+        match self {
+            Self::Bracket { text, .. } | Self::Frontmatter { text, .. } => text,
+        }
+    }
+
+    pub fn is_bracket(&self) -> bool {
+        matches!(self, Self::Bracket { .. })
+    }
+
+    pub fn is_frontmatter(&self) -> bool {
+        matches!(self, Self::Frontmatter { .. })
+    }
 }
 
 /// Single-line guard for the legacy bracket header. Line-stream filters
@@ -53,16 +78,27 @@ pub fn card_body(text: &str) -> &str {
     }
 }
 
-fn header_form(text: &str) -> Option<HeaderForm<'_>> {
+pub fn header_form(text: &str) -> Option<HeaderForm<'_>> {
     if let Some(rest) = text.strip_prefix(BRACKET_PREFIX) {
         // Body semantics must stay byte-identical to the historical
         // `chunk_body_after_header`: everything after the first line, with
         // leading CR/LF trimmed; a header-only card has an empty body.
-        let (fields, body) = match rest.split_once('\n') {
-            Some((fields, body)) => (fields, body.trim_start_matches(['\r', '\n'])),
-            None => (rest, ""),
+        let (fields, body, header_text) = match rest.split_once('\n') {
+            Some((fields, body)) => {
+                let header_len = BRACKET_PREFIX.len() + fields.len();
+                (
+                    fields,
+                    body.trim_start_matches(['\r', '\n']),
+                    &text[..header_len],
+                )
+            }
+            None => (rest, "", text),
         };
-        return Some(HeaderForm::Bracket { fields, body });
+        return Some(HeaderForm::Bracket {
+            fields,
+            body,
+            text: header_text,
+        });
     }
     frontmatter_form(text)
 }
@@ -112,9 +148,12 @@ fn frontmatter_form(text: &str) -> Option<HeaderForm<'_>> {
     // Key gate: only a block carrying at least one card identity field is a
     // card header; anything else stays part of the body untouched.
     let header = parse_frontmatter_card_fields(block)?;
+    let body = rest.trim_start_matches(['\r', '\n']);
+    let header_text = text[..text.len() - body.len()].trim_end_matches(['\r', '\n']);
     Some(HeaderForm::Frontmatter {
         header,
-        body: rest.trim_start_matches(['\r', '\n']),
+        body,
+        text: header_text,
     })
 }
 
@@ -249,5 +288,26 @@ mod tests {
         assert!(!is_bracket_header_line("project: demo"));
         assert!(!is_bracket_header_line("---"));
         assert!(!is_bracket_header_line("[metadata] project: demo"));
+    }
+
+    #[test]
+    fn header_form_exposes_bracket_line_and_body() {
+        let text = "[project: demo | agent: codex]\r\n\r\nbody\n";
+        let form = header_form(text).expect("bracket form");
+        assert!(form.is_bracket());
+        assert_eq!(form.text(), "[project: demo | agent: codex]\r");
+        assert_eq!(card_body(text), "body\n");
+    }
+
+    #[test]
+    fn header_form_exposes_frontmatter_region_for_shared_readers() {
+        let text = "---\r\nproject: demo\r\nschema: card.v2\r\n---\r\n\r\nbody\n";
+        let form = header_form(text).expect("frontmatter form");
+        assert!(form.is_frontmatter());
+        assert_eq!(
+            form.text(),
+            "---\r\nproject: demo\r\nschema: card.v2\r\n---"
+        );
+        assert_eq!(card_body(text), "body\n");
     }
 }

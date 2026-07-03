@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::card_header::{card_body, is_bracket_header_line, parse_card_header};
+use crate::card_header::{HeaderForm, card_body, header_form, parse_card_header};
 use crate::corpus::io::{markdown_files, validate_optional_root};
 use crate::corpus::roots::default_roots;
 use crate::corpus::types::{
@@ -143,7 +143,7 @@ fn record_sample(samples: &mut Vec<CorpusCardFinding>, finding: CorpusCardFindin
     }
 }
 
-fn validate_card(path: &Path) -> Vec<CorpusCardFinding> {
+pub(crate) fn validate_card(path: &Path) -> Vec<CorpusCardFinding> {
     let sidecar_path = path.with_extension("meta.json");
     let mut findings = Vec::new();
     let content = match sanitize::read_to_string_validated(path) {
@@ -160,8 +160,9 @@ fn validate_card(path: &Path) -> Vec<CorpusCardFinding> {
         }
     };
 
-    let header = detect_header(&content);
-    if header.form == HeaderForm::Missing {
+    let header = header_form(&content);
+    let header_text = header.as_ref().map(|form| form.text()).unwrap_or("");
+    if header.is_none() {
         push_error(
             &mut findings,
             path,
@@ -178,7 +179,7 @@ fn validate_card(path: &Path) -> Vec<CorpusCardFinding> {
             "markdown card header could not be parsed".to_string(),
         );
     }
-    if header.text.contains("${") || header.text.contains("{{") {
+    if header_text.contains("${") || header_text.contains("{{") {
         push_error(
             &mut findings,
             path,
@@ -235,8 +236,15 @@ fn validate_card(path: &Path) -> Vec<CorpusCardFinding> {
     }
 
     if sidecar.schema_version == CARD_SCHEMA_VERSION {
-        validate_v2_required_fields(path, &sidecar_path, &sidecar, &mut findings);
-        if header.form != HeaderForm::Frontmatter {
+        let migrated_from_schema = sidecar.migrated_from_schema.is_some();
+        validate_v2_required_fields(
+            path,
+            &sidecar_path,
+            &sidecar,
+            migrated_from_schema,
+            &mut findings,
+        );
+        if !matches!(header, Some(HeaderForm::Frontmatter { .. })) {
             push_error(
                 &mut findings,
                 path,
@@ -244,8 +252,7 @@ fn validate_card(path: &Path) -> Vec<CorpusCardFinding> {
                 "header_form_mismatch",
                 "schema_version 2 cards must use YAML frontmatter".to_string(),
             );
-        } else if !header
-            .text
+        } else if !header_text
             .lines()
             .any(|line| line.trim() == "schema: card.v2")
         {
@@ -257,7 +264,8 @@ fn validate_card(path: &Path) -> Vec<CorpusCardFinding> {
                 "schema_version 2 frontmatter must declare schema: card.v2".to_string(),
             );
         }
-    } else if sidecar.schema_version == 1 && header.form == HeaderForm::Frontmatter {
+    } else if sidecar.schema_version == 1 && matches!(header, Some(HeaderForm::Frontmatter { .. }))
+    {
         push_warn(
             &mut findings,
             path,
@@ -288,6 +296,7 @@ fn validate_v2_required_fields(
     path: &Path,
     sidecar_path: &Path,
     sidecar: &ChunkMetadataSidecar,
+    migrated_from_schema: bool,
     findings: &mut Vec<CorpusCardFinding>,
 ) {
     if sidecar
@@ -295,13 +304,23 @@ fn validate_v2_required_fields(
         .as_ref()
         .is_none_or(|source| source.path.trim().is_empty())
     {
-        push_error(
-            findings,
-            path,
-            Some(sidecar_path),
-            "missing_required_field",
-            "schema_version 2 sidecar is missing source.path".to_string(),
-        );
+        if migrated_from_schema {
+            push_warn(
+                findings,
+                path,
+                Some(sidecar_path),
+                "migrated_missing_source",
+                "migrated schema_version 2 sidecar is missing legacy source.path".to_string(),
+            );
+        } else {
+            push_error(
+                findings,
+                path,
+                Some(sidecar_path),
+                "missing_required_field",
+                "schema_version 2 sidecar is missing source.path".to_string(),
+            );
+        }
     }
     if sidecar.claim_scope.as_deref() != Some(CARD_CLAIM_SCOPE_SESSION_CLOSE) {
         push_error(
@@ -358,7 +377,15 @@ fn validate_signal_presence(
     }
 
     let message = "sidecar signals[] presence does not match markdown [signals] block".to_string();
-    if sidecar.schema_version == CARD_SCHEMA_VERSION {
+    if sidecar.schema_version == CARD_SCHEMA_VERSION && sidecar.migrated_from_schema.is_some() {
+        push_warn(
+            findings,
+            path,
+            Some(sidecar_path),
+            "migrated_signals_unbackfilled",
+            message,
+        );
+    } else if sidecar.schema_version == CARD_SCHEMA_VERSION {
         push_error(
             findings,
             path,
@@ -379,43 +406,6 @@ fn validate_signal_presence(
 
 fn markdown_has_signal_block(content: &str) -> bool {
     content.contains("[signals]") && content.contains("[/signals]")
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HeaderForm {
-    Frontmatter,
-    Bracket,
-    Missing,
-}
-
-struct HeaderRegion<'a> {
-    form: HeaderForm,
-    text: &'a str,
-}
-
-fn detect_header(content: &str) -> HeaderRegion<'_> {
-    if content.starts_with("---\n")
-        && let Some(end) = content[4..].find("\n---\n")
-    {
-        let end = 4 + end + "\n---\n".len();
-        return HeaderRegion {
-            form: HeaderForm::Frontmatter,
-            text: &content[..end],
-        };
-    }
-
-    let first_line = content.lines().next().unwrap_or_default();
-    if is_bracket_header_line(first_line) {
-        return HeaderRegion {
-            form: HeaderForm::Bracket,
-            text: first_line,
-        };
-    }
-
-    HeaderRegion {
-        form: HeaderForm::Missing,
-        text: "",
-    }
 }
 
 fn starts_with_harness_noise(content: &str) -> bool {
@@ -556,6 +546,12 @@ mod tests {
         })
     }
 
+    fn migrated_v2_sidecar(id: &str) -> Value {
+        let mut sidecar = v2_sidecar(id);
+        sidecar["migrated_from_schema"] = Value::from(1);
+        sidecar
+    }
+
     fn valid_v1_markdown() -> &'static str {
         "[project: vetcoders/aicx | agent: codex | date: 2026-07-02]\n\n[00:00:00] user: hello\n"
     }
@@ -652,6 +648,142 @@ mod tests {
         assert_eq!(report.totals.violations_by_class["signals_mismatch"], 1);
         assert_eq!(report.totals.warnings, 0);
         assert!(!report.passed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validate_cards_keeps_born_v2_missing_source_as_error() {
+        let root = temp_root("born-v2-missing-source");
+        let mut sidecar = v2_sidecar("born-v2-missing-source");
+        sidecar.as_object_mut().unwrap().remove("source");
+        write_card(&root, "missing-source", valid_v2_markdown(), sidecar);
+
+        let report = validate_cards(&CorpusValidateOptions {
+            roots: vec![root.clone()],
+            strict: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.totals.violations_by_class["missing_required_field"],
+            1
+        );
+        assert!(
+            !report
+                .totals
+                .warnings_by_class
+                .contains_key("migrated_missing_source")
+        );
+        assert!(!report.passed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validate_cards_warns_for_migrated_v2_missing_source() {
+        let root = temp_root("migrated-missing-source");
+        let mut sidecar = migrated_v2_sidecar("migrated-missing-source");
+        sidecar.as_object_mut().unwrap().remove("source");
+        write_card(&root, "missing-source", valid_v2_markdown(), sidecar);
+
+        let report = validate_cards(&CorpusValidateOptions {
+            roots: vec![root.clone()],
+            strict: true,
+        })
+        .unwrap();
+
+        assert_eq!(report.totals.hard_violations, 0);
+        assert_eq!(
+            report.totals.warnings_by_class["migrated_missing_source"],
+            1
+        );
+        assert!(report.passed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validate_cards_warns_for_migrated_v2_signal_mismatch() {
+        let root = temp_root("migrated-signals");
+        let markdown = "---\nproject: vetcoders/aicx\nagent: codex\ndate: 2026-07-02\nschema: card.v2\n---\n\n[signals]\nDecision:\n- [decision] keep\n[/signals]\n\n[00:00:00] user: hello\n";
+        write_card(&root, "signals", markdown, migrated_v2_sidecar("signals"));
+
+        let report = validate_cards(&CorpusValidateOptions {
+            roots: vec![root.clone()],
+            strict: true,
+        })
+        .unwrap();
+
+        assert_eq!(report.totals.hard_violations, 0);
+        assert_eq!(
+            report.totals.warnings_by_class["migrated_signals_unbackfilled"],
+            1
+        );
+        assert!(
+            !report
+                .totals
+                .violations_by_class
+                .contains_key("signals_mismatch")
+        );
+        assert!(report.passed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validate_cards_keeps_migrated_content_sha256_mismatch_as_error() {
+        let root = temp_root("migrated-bad-sha");
+        let mut sidecar = migrated_v2_sidecar("migrated-bad-sha");
+        sidecar["content_sha256"] = Value::String("bad".to_string());
+        write_card(&root, "bad-sha", valid_v2_markdown(), sidecar);
+
+        let report = validate_cards(&CorpusValidateOptions {
+            roots: vec![root.clone()],
+            strict: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.totals.violations_by_class["content_sha256_mismatch"],
+            1
+        );
+        assert!(!report.passed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validate_cards_accepts_crlf_frontmatter_from_shared_header_reader() {
+        let root = temp_root("crlf-frontmatter");
+        let markdown = "---\r\nproject: vetcoders/aicx\r\nagent: codex\r\ndate: 2026-07-02\r\nschema: card.v2\r\n---\r\n\r\n[00:00:00] user: hello\r\n";
+        write_card(&root, "v2-crlf", markdown, v2_sidecar("v2-crlf"));
+
+        let report = validate_cards(&CorpusValidateOptions {
+            roots: vec![root.clone()],
+            strict: true,
+        })
+        .unwrap();
+
+        assert_eq!(report.totals.cards, 1);
+        assert_eq!(report.totals.ok, 1);
+        assert!(report.passed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validate_cards_ignores_dot_directory_artifacts() {
+        let root = temp_root("dot-dir-artifacts");
+        write_card(&root, "v2", valid_v2_markdown(), v2_sidecar("v2"));
+        let report_path = root.join(".migration/cards-v2/report.md");
+        fs::create_dir_all(report_path.parent().unwrap()).unwrap();
+        fs::write(&report_path, "# migration report\n\nnot a card\n").unwrap();
+
+        let report = validate_cards(&CorpusValidateOptions {
+            roots: vec![root.clone()],
+            strict: true,
+        })
+        .unwrap();
+
+        assert_eq!(report.totals.cards, 1);
+        assert_eq!(report.totals.ok, 1);
+        assert_eq!(report.totals.hard_violations, 0);
+        assert!(report.passed);
         fs::remove_dir_all(root).unwrap();
     }
 

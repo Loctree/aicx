@@ -44,6 +44,7 @@ against that struct; the constants live at `chunker.rs:172-194`.
 | Field | Type | Required | Canonical value | Meaning | Struct ref |
 |---|---:|---:|---|---|---|
 | `schema_version` | `u32` | No | `2` for v2, default `1` when absent | Card sidecar schema version. Missing means legacy v1. Serialized only when ≠ 1. | `chunker.rs:98` |
+| `migrated_from_schema` | `u32` | No | `1` on cards upgraded by `migrate --cards-v2` | Explicit marker that a v2 sidecar was born from legacy data. Validators use this marker to keep born-v2 strict while tolerating legacy-only gaps as warnings. | `chunker.rs:99` |
 | `source` | `CardSource` | No | L0 pointer object | Provenance pointer to the raw session file. | `chunker.rs:197` |
 | `source.path` | `string` | Yes within `source` | Raw session path | L0 source pointer for forensic recovery. | `chunker.rs:198` |
 | `source.sha256` | `string` | No | SHA-256 of raw source | Optional integrity pointer for the L0 source. | `chunker.rs:200` |
@@ -60,6 +61,10 @@ Existing sidecar fields remain valid and keep their current meaning:
 `id`, `project`, `agent`, `date`, `session_id`, `cwd`, `kind`, `frame_kind`,
 `content_sha256`, `run_id`, `prompt_id`, source import fields, tags, and
 context-corpus metadata.
+
+`content_sha256` is the SHA-256 of the full markdown card file as stored on
+disk, including the header/frontmatter. It is not a body-only hash. A header
+rewrite that preserves body bytes must still refresh `content_sha256`.
 
 `schema_version` deserialization is tolerant: it accepts a JSON number or a
 string, and strings may carry the prefixes `card.v`, `context_corpus.v`, or
@@ -105,6 +110,8 @@ Card schema evolution is additive.
 - The writer emits `schema_version: 2` since the A2 writer cut (`a37460f`);
   every new sidecar carries the honesty tuple and, when present, typed
   `signals`.
+- The migration emits `migrated_from_schema: 1`; new writer-born v2 cards leave
+  this field absent.
 - Readers stay header-agnostic: both the legacy bracket header
   (`[project: … | agent: … | date: …]`) and the v2 YAML frontmatter are
   parsed structurally (shared helper in
@@ -117,8 +124,8 @@ Card schema evolution is additive.
 |---|---|---|
 | Writer | `crates/aicx-parser/src/chunker.rs` (`format_chunk_text_inner`, l. 833; `From<&Chunk> for ChunkMetadataSidecar`, l. 281) | Emits `.md` with YAML frontmatter (`schema: card.v2`) + optional `[signals]` block, and a sidecar with `schema_version: 2`, honesty tuple, `source` L0 pointer, typed `signals`. |
 | Readers | `crates/aicx-parser/src/card_header.rs`, `src/intents.rs::parse_chunk_document` | Header-agnostic (bracket or frontmatter); sidecar-first metadata selection. |
-| Validator | `src/corpus/validate.rs` (`aicx corpus validate-cards`) | Accepts `schema_version` 1 or 2; on v2 checks honesty values, header shape, body-hash, and md↔sidecar signal parity. |
-| Migration | `src/store/migration/cards_v2.rs` (`aicx migrate --cards-v2`) | In-place v1→v2 upgrade: sidecar gains schema/honesty fields, bracket header → YAML frontmatter. Body bytes never change (body-hash invariant); dry-run by default, `--apply` to write; idempotent. |
+| Validator | `src/corpus/validate.rs` (`aicx corpus validate-cards`) | Accepts `schema_version` 1 or 2; on born-v2 checks honesty values, `source.path`, header shape, full-file `content_sha256`, and md↔sidecar signal parity as hard errors. On migrated-v2 (`migrated_from_schema` present), missing legacy `source.path` becomes `migrated_missing_source` warning and unbackfilled markdown signals become `migrated_signals_unbackfilled` warning. Hash mismatch stays an error for all cards. |
+| Migration | `src/store/migration/cards_v2.rs` (`aicx migrate --cards-v2`) | In-place v1→v2 upgrade: sidecar gains schema/honesty fields plus `migrated_from_schema: 1`, bracket header → YAML frontmatter, and refreshed full-file `content_sha256` with old/new hashes recorded in the manifest. Body bytes never change; dry-run by default, `--apply` to write; idempotent. |
 
 ## Decision Log
 
@@ -132,6 +139,7 @@ Card schema evolution is additive.
 | 2026-07-02 | `corpus validate-cards` contract gate for v1/v2 (cut C2). | same plan · commit `fe59416` (content originally in a peer envelope; re-committed after a Living Tree reset) |
 | 2026-07-02 | Store migration v1→v2 with body-hash invariant + CLI arm `migrate --cards-v2` (dry-run default, `--apply` gate) (cut D1). | same plan · commits `2d2b12d`, `8ca7a6b` |
 | 2026-07-02 | Contract finalized against landed runtime; A1 "Cut Boundary" section retired (cut D2). | same plan · this commit |
+| 2026-07-02 | Migration and validation reconciled with explicit `migrated_from_schema` marker, full-file hash refresh, and born-vs-migrated validation policy (cut D1b). | settlement review · this commit |
 
 ## Open / not landed
 
@@ -143,10 +151,13 @@ above.
   custom `AICX_HOME`) fails with "Cannot read from path outside allowed
   directories". Works against the default `~/.aicx` store. Control experiment
   proved this pre-dates the cards-v2 line (found during A2/D1 verification).
-- **~35 `signals_mismatch` cards exist in the live store**: v2 cards written
-  in the A2→B1 gap have a rendered `[signals]` block but no sidecar
-  `signals[]` records; dedup prevents a natural rewrite. Candidate touch-up
-  cut.
+- **Legacy migration warning debt is real and large**: settlement review counted
+  about `10,033` source-less v1 cards and about `2,089` cards whose markdown
+  `[signals]` blocks cannot be represented in legacy sidecars without a
+  re-extraction/backfill cut. After D1b, migrated cards surface these as
+  `migrated_missing_source` and `migrated_signals_unbackfilled` warnings, not
+  hard validation failures. The earlier `~35` note only covered the A2→B1
+  born-v2 gap and was not the full migration debt.
 - **Signal re-extraction policy** is not defined: `extractor_version` is
   stamped, but no cut re-extracts signals from older cards yet.
 - Retiring the bracket-header read fallback would require a migration
