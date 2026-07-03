@@ -40,6 +40,60 @@ Notes:
 - Each `.md` chunk has a sibling `.meta.json` sidecar containing steering and telemetry metadata.
 - `steer_db` is a fast LanceDB-backed index of all sidecar metadata, enabling millisecond filtering by `run_id`, `prompt_id`, `agent`, etc.
 
+### Card Anatomy (schema v2)
+
+A card is the pair `.md` + `.meta.json`. Since card schema v2
+(see [`CARD_CONTRACT.md`](./CARD_CONTRACT.md)) the sidecar is the structured
+L1 truth and the `.md` is a human projection.
+
+The `.md` starts with YAML frontmatter (v2 writer and v2-migrated cards):
+
+```markdown
+---
+project: loctree/aicx
+agent: claude
+date: 2026-06-27
+frame_kind: tool_call
+schema: card.v2
+---
+
+[03:11:42] tool: id: toolu_013dHDzbZaSHP3VjscubvrBv
+...
+```
+
+The sidecar carries schema version, honesty fields, and (when present) the L0
+`source` pointer and typed `signals`. Real v2 sidecar produced by
+`aicx migrate --cards-v2` (from the D1 verification walk-around; home path
+neutralized):
+
+```json
+{
+    "agent": "claude",
+    "claim_scope": "session_close",
+    "content_sha256": "94239a770d4bc024b06106fbb0aec7ed2bc549ed7daf25bebb095e1ceb7729cd",
+    "cwd": "/Users/user/vc-workspace/vetcoders/aicx",
+    "date": "2026-06-27",
+    "frame_kind": "tool_call",
+    "freshness_contract": "historical",
+    "id": "loctree/aicx_claude_2026-06-27_052",
+    "kind": "other",
+    "project": "loctree/aicx",
+    "schema_version": 2,
+    "session_id": "d0dcea8a-f733-4583-9f02-b135af7319c4",
+    "verification_state": "not_verified_by_aicx"
+}
+```
+
+Freshly written cards (post-A2 writer) additionally carry `source`
+(`path`/`sha256`/`span` L0 pointer) and `signals` typed records when the chunk
+has high-signal content.
+
+**v1 compatibility:** legacy cards use a bracket header
+(`[project: <project> | agent: <agent> | date: <YYYY-MM-DD>]`) instead of
+frontmatter, and their sidecars have no `schema_version` field (reads as `1`).
+Readers are header-agnostic; v1 cards remain readable forever.
+`aicx migrate --cards-v2` upgrades them in place without changing body bytes.
+
 ### `index.json`
 
 `index.json` is a manifest used to quickly list stored projects, dates and totals.

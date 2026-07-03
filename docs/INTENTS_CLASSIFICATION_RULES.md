@@ -82,7 +82,8 @@ Transcript entries are recognized only from headers shaped like:
 
 The parser skips:
 
-- `[project: ...]` header lines
+- card header lines — both the legacy v1 bracket shape (`[project: ...]`)
+  and the v2 YAML frontmatter block are stripped structurally
 - fenced code blocks in transcript
 - fenced code blocks inside `[signals]`
 - skill banner boilerplate inside `[signals]`
