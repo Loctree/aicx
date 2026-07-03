@@ -592,6 +592,20 @@ struct CorpusRepairArgs {
     emit: CorpusEmit,
 }
 
+#[derive(Debug, Clone, Args)]
+struct CorpusValidateCardsArgs {
+    /// Store subtree or markdown card to validate. Defaults to the corpus roots used by audit.
+    root: Option<PathBuf>,
+
+    /// Exit non-zero when hard validation errors are present.
+    #[arg(long)]
+    strict: bool,
+
+    /// Emit compact JSON instead of readable text.
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Debug, Clone, Subcommand)]
 enum CorpusCommand {
     /// Audit derived markdown corpora for Claude signature/thinking leakage and tool JSON noise.
@@ -599,6 +613,9 @@ enum CorpusCommand {
 
     /// Repair derived markdown without inventing or summarizing semantic content.
     Repair(CorpusRepairArgs),
+
+    /// Validate card schema v1/v2 sidecars, headers, hashes, and signal parity.
+    ValidateCards(CorpusValidateCardsArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -9330,6 +9347,24 @@ fn run_corpus_command(args: CorpusArgs) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&repair_manifest)?);
             } else {
                 print!("{}", corpus::format_repair_text(&repair_manifest));
+            }
+        }
+        CorpusCommand::ValidateCards(validate_args) => {
+            let roots = validate_args.root.into_iter().collect();
+            let report = corpus::validate_cards(&corpus::CorpusValidateOptions {
+                roots,
+                strict: validate_args.strict,
+            })?;
+            if validate_args.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", corpus::format_validate_cards_text(&report));
+            }
+            if report.strict && !report.passed {
+                anyhow::bail!(
+                    "corpus validate-cards found {} hard violation(s)",
+                    report.totals.hard_violations
+                );
             }
         }
     }

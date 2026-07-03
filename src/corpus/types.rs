@@ -16,6 +16,12 @@ pub struct CorpusRepairOptions {
     pub manifest_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CorpusValidateOptions {
+    pub roots: Vec<PathBuf>,
+    pub strict: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CorpusAuditReport {
     pub roots: Vec<RootAuditReport>,
@@ -58,6 +64,54 @@ pub struct CorpusFileFinding {
     pub artifact_birthtime: Option<String>,
     pub artifact_mtime: Option<String>,
     pub noise_classes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CorpusValidateReport {
+    pub roots: Vec<RootValidateReport>,
+    pub totals: CorpusValidateTotals,
+    pub strict: bool,
+    pub passed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CorpusValidateTotals {
+    pub roots_present: usize,
+    pub roots_missing: usize,
+    pub cards: usize,
+    pub ok: usize,
+    pub warn: usize,
+    pub error: usize,
+    pub hard_violations: usize,
+    pub warnings: usize,
+    pub violations_by_class: BTreeMap<String, usize>,
+    pub warnings_by_class: BTreeMap<String, usize>,
+    pub verdicts: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RootValidateReport {
+    pub root: PathBuf,
+    pub present: bool,
+    pub cards: usize,
+    pub ok: usize,
+    pub warn: usize,
+    pub error: usize,
+    pub hard_violations: usize,
+    pub warnings: usize,
+    pub violations_by_class: BTreeMap<String, usize>,
+    pub warnings_by_class: BTreeMap<String, usize>,
+    pub verdicts: BTreeMap<String, usize>,
+    pub samples: Vec<CorpusCardFinding>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CorpusCardFinding {
+    pub path: PathBuf,
+    pub sidecar_path: Option<PathBuf>,
+    pub severity: String,
+    pub class: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -2277,6 +2277,26 @@ fn corpus_audit_and_repair_commands_parse() {
         }
         _ => panic!("expected corpus repair command"),
     }
+
+    let validate = Cli::try_parse_from([
+        "aicx",
+        "corpus",
+        "validate-cards",
+        "/tmp/aicx-store",
+        "--strict",
+        "--json",
+    ])
+    .expect("corpus validate-cards should parse");
+    match validate.command {
+        Some(Commands::Corpus(CorpusArgs {
+            command: CorpusCommand::ValidateCards(args),
+        })) => {
+            assert_eq!(args.root, Some(PathBuf::from("/tmp/aicx-store")));
+            assert!(args.strict);
+            assert!(args.json);
+        }
+        _ => panic!("expected corpus validate-cards command"),
+    }
 }
 
 #[test]

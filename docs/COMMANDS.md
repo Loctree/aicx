@@ -237,11 +237,15 @@ feeds retrieval.
 ```bash
 aicx corpus audit [OPTIONS]
 aicx corpus repair [OPTIONS]
+aicx corpus validate-cards [ROOT] [--strict] [--json]
 ```
 
 Options:
 - `--root <DIR>...` corpus roots to scan (default: `$HOME/.aicx`, `$HOME/.ai-contexters`, optional `$HOME/.xcia`)
 - `--emit <text|json>` output format
+- `ROOT` store subtree or markdown card to validate with `validate-cards`
+- `--strict` make `validate-cards` exit non-zero when hard violations are present
+- `--json` emit the `validate-cards` report as stable-keyed JSON
 - `--dry-run` preview repair candidates without modifying markdown (repair default unless `--apply` is passed)
 - `--apply` rewrite derived markdown deterministically
 - `--backup` write backups before applying repairs
@@ -251,6 +255,8 @@ Examples:
 
 ```bash
 aicx corpus audit --root "$HOME/.aicx" --emit json
+aicx corpus validate-cards "$HOME/.aicx/store/Loctree/aicx" --json
+aicx corpus validate-cards "$HOME/.aicx/store/Loctree/aicx" --strict
 aicx corpus repair --root "$HOME/.aicx/store/Loctree/aicx/2026_0502" --dry-run --manifest /tmp/aicx-repair-preview.json
 aicx corpus repair --root "$HOME/.aicx/store/Loctree/aicx/2026_0502" --apply --backup
 ```
