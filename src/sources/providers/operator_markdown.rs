@@ -853,7 +853,15 @@ fn normalize_operator_frontmatter_cwd(home: &Path, cwd: &str) -> Option<String> 
         return None;
     }
     if let Some(rest) = cwd.strip_prefix("~/") {
-        return Some(home.join(rest).display().to_string());
+        // Join segment-by-segment so the expanded path uses native separators
+        // on every platform; a raw join(rest) leaves the frontmatter's `/`
+        // embedded inside a `\`-separated path on Windows and the resulting
+        // cwd never matches the repo path the rest of the pipeline derives.
+        let mut path = home.to_path_buf();
+        for segment in rest.split('/').filter(|segment| !segment.is_empty()) {
+            path.push(segment);
+        }
+        return Some(path.display().to_string());
     }
     Some(cwd.to_string())
 }
