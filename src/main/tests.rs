@@ -2709,14 +2709,54 @@ fn migrate_accepts_custom_roots() {
             legacy_root,
             store_root,
             no_intent_schema,
+            cards_v2,
+            apply,
         }) => {
             assert!(dry_run);
             assert!(no_intent_schema);
             assert_eq!(legacy_root, Some(PathBuf::from("/tmp/legacy")));
             assert_eq!(store_root, Some(PathBuf::from("/tmp/aicx")));
+            assert_eq!(cards_v2, None);
+            assert!(!apply);
         }
         _ => panic!("expected migrate command"),
     }
+}
+
+#[test]
+fn migrate_cards_v2_parses_optional_root_and_apply_requires_the_flag() {
+    // Bare flag: dry-run cards-v2 over the default root.
+    let cli = Cli::try_parse_from(["aicx", "migrate", "--cards-v2"])
+        .expect("bare --cards-v2 should parse");
+    match cli.command {
+        Some(Commands::Migrate {
+            cards_v2, apply, ..
+        }) => {
+            assert_eq!(cards_v2, Some(None));
+            assert!(!apply);
+        }
+        _ => panic!("expected migrate command"),
+    }
+
+    // Flag with ROOT + --apply: write mode over an explicit directory.
+    let cli = Cli::try_parse_from(["aicx", "migrate", "--cards-v2", "/tmp/copy", "--apply"])
+        .expect("--cards-v2 ROOT --apply should parse");
+    match cli.command {
+        Some(Commands::Migrate {
+            cards_v2, apply, ..
+        }) => {
+            assert_eq!(cards_v2, Some(Some(PathBuf::from("/tmp/copy"))));
+            assert!(apply);
+        }
+        _ => panic!("expected migrate command"),
+    }
+
+    // --apply is meaningless without --cards-v2 and must be rejected.
+    assert!(Cli::try_parse_from(["aicx", "migrate", "--apply"]).is_err());
+    // --dry-run contradicts --apply; the pair must be rejected.
+    assert!(
+        Cli::try_parse_from(["aicx", "migrate", "--cards-v2", "--apply", "--dry-run"]).is_err()
+    );
 }
 
 #[test]

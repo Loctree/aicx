@@ -1637,6 +1637,17 @@ enum Commands {
         /// Skip post-migration intent schema scan on the canonical store
         #[arg(long, default_value_t = false)]
         no_intent_schema: bool,
+
+        /// Upgrade store cards v1 -> v2 in place (sidecar schema/honesty
+        /// fields, bracket header -> YAML frontmatter; body bytes never
+        /// change). Optional ROOT overrides the walked directory (default:
+        /// canonical store dir). Dry-run by default; pass --apply to write.
+        #[arg(long, value_name = "ROOT", num_args = 0..=1)]
+        cards_v2: Option<Option<PathBuf>>,
+
+        /// Write the cards-v2 migration (without it, --cards-v2 is a dry run)
+        #[arg(long, requires = "cards_v2", conflicts_with = "dry_run")]
+        apply: bool,
     },
 
     /// Classify stored chunks into 11-type intent entries and report counts.
@@ -2573,7 +2584,20 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             legacy_root,
             store_root,
             no_intent_schema,
+            cards_v2,
+            apply,
         }) => {
+            if let Some(root) = cards_v2 {
+                // Cards-v2 arm: dry-run by default, --apply writes. The
+                // legacy sweep and the intent-schema scan stay out of this
+                // path — it only upgrades existing cards in place.
+                let cards_dry_run = !apply;
+                if !cards_dry_run {
+                    warn_pending_mutation("migrate --cards-v2");
+                }
+                aicx::store::run_cards_v2_migration(cards_dry_run, root)?;
+                return Ok(());
+            }
             if !dry_run {
                 warn_pending_mutation("migrate");
             }
