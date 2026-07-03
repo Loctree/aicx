@@ -7225,12 +7225,14 @@ fn is_noise_artifact(path: &std::path::Path) -> bool {
         return false; // Not short enough to be considered noise
     }
 
-    // Check if it's task-notification only
+    // Check if it's task-notification only. The card header (bracket or
+    // frontmatter) is stripped structurally so its meta lines never count
+    // as signal; the length gate above stays on the full content.
     let mut is_noise = true;
-    for line in &lines {
+    for line in aicx::card_header::card_body(&content).lines() {
         let l = line.trim().to_lowercase();
         if l.is_empty()
-            || l.starts_with("[project:")
+            || aicx::card_header::is_bracket_header_line(&l)
             || l.starts_with("[signals")
             || l.starts_with("[/signals")
             || l.starts_with("-") // checklist/signals

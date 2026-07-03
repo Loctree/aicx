@@ -378,7 +378,9 @@ fn parse_chunk_document(content: &str) -> (Vec<String>, Vec<TranscriptEntry>) {
     let mut signal_lines = Vec::new();
     let mut transcript_lines = Vec::new();
 
-    for line in content.lines() {
+    // Header-agnostic: strip the card header (bracket or frontmatter)
+    // structurally so frontmatter meta lines never read as transcript.
+    for line in crate::card_header::card_body(content).lines() {
         let trimmed = line.trim();
         if trimmed == "[signals]" {
             in_signals = true;
@@ -392,7 +394,7 @@ fn parse_chunk_document(content: &str) -> (Vec<String>, Vec<TranscriptEntry>) {
             signal_lines.push(line.to_string());
             continue;
         }
-        if trimmed.starts_with("[project:") {
+        if crate::card_header::is_bracket_header_line(trimmed) {
             continue;
         }
         // Track triple-backtick fence in the transcript section. Lines inside a

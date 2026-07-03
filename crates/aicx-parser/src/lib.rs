@@ -2,6 +2,7 @@
 //!
 //! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
+pub mod card_header;
 pub mod chunker;
 pub mod frontmatter;
 pub mod noise;
@@ -11,6 +12,7 @@ pub mod skill_collapse;
 pub mod timeline;
 pub mod types;
 
+pub use card_header::{CardHeader, card_body, is_bracket_header_line, parse_card_header};
 pub use chunker::{
     CARD_CLAIM_SCOPE_SESSION_CLOSE, CARD_FRESHNESS_CONTRACT_HISTORICAL, CARD_SCHEMA_VERSION,
     CARD_VERIFICATION_STATE_NOT_VERIFIED_BY_AICX, CardSignal, CardSource, Chunk,

@@ -1074,11 +1074,11 @@ fn semantic_preview_lines(path: &std::path::Path) -> Vec<String> {
     let Ok(content) = crate::sanitize::read_to_string_validated(path) else {
         return Vec::new();
     };
-    content
+    crate::card_header::card_body(&content)
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .filter(|line| !line.starts_with("[project:"))
+        .filter(|line| !crate::card_header::is_bracket_header_line(line))
         .filter(|line| *line != "[signals]" && *line != "[/signals]")
         .filter(|line| !line.starts_with("id: "))
         .take(MAX_LINES)

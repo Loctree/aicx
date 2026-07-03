@@ -283,7 +283,6 @@ struct CompactSearchItem {
 }
 
 const SEARCH_MATCH_MAX_CHARS: usize = 200;
-const SEARCH_META_PREFIX: &str = "[project:";
 const SEARCH_METADATA_PREFIX: &str = "[metadata]";
 const SEARCH_GENERATED_METADATA_PREFIXES: &[&str] = &[
     "[frame_kind:",
@@ -424,7 +423,7 @@ fn display_search_matches(result: &FuzzyResult) -> Vec<String> {
 fn is_search_metadata_line(line: &str) -> bool {
     let trimmed = line.trim();
     let lower = trimmed.to_lowercase();
-    trimmed.starts_with(SEARCH_META_PREFIX)
+    crate::card_header::is_bracket_header_line(trimmed)
         || trimmed.starts_with(SEARCH_METADATA_PREFIX)
         || SEARCH_GENERATED_METADATA_PREFIXES
             .iter()
@@ -771,7 +770,10 @@ fn fuzzy_search_store_one(
             continue;
         };
 
-        let all_lines: Vec<&str> = content.lines().collect();
+        // Header-agnostic: drop the card header (bracket or frontmatter)
+        // structurally before line-level filtering, so frontmatter meta
+        // lines never surface as search matches.
+        let all_lines: Vec<&str> = crate::card_header::card_body(&content).lines().collect();
         let without_aicx = strip_aicx_read_blocks(all_lines);
         let signal_lines: Vec<&str> = without_aicx
             .into_iter()
@@ -1742,6 +1744,43 @@ Some boilerplate text.
                 .iter()
                 .any(|line| is_search_metadata_line(line)),
             "metadata lines should not be kept when content evidence exists"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fuzzy_search_tolerates_frontmatter_card_header() {
+        let root = unique_rank_test_store_root("frontmatter-header");
+        fs::create_dir_all(&root).expect("fixture root should be created");
+
+        write_canonical_search_fixture(
+            &root,
+            "Vetcoders",
+            "Vista",
+            "sessfront",
+            "---\nproject: Vetcoders/Vista\nagent: codex\ndate: 2026-05-24\nframe_kind: agent_reply\n---\n\nDecision: frontneedle lives only in the body.\n",
+        );
+
+        let (results, scanned) =
+            fuzzy_search_store_one(&root, "frontneedle", 10, Some("Vetcoders/Vista"), None)
+                .expect("fixture fuzzy search should succeed");
+
+        assert_eq!(scanned, 1);
+        assert_eq!(results.len(), 1, "frontmatter card must stay searchable");
+        let matches = &results[0].matched_lines;
+        assert!(
+            matches.iter().any(|line| line.contains("frontneedle")),
+            "body evidence must surface: {matches:?}"
+        );
+        assert!(
+            matches.iter().all(|line| {
+                !line.starts_with("---")
+                    && !line.starts_with("project:")
+                    && !line.starts_with("agent:")
+                    && !line.starts_with("frame_kind:")
+            }),
+            "frontmatter meta lines must not surface as matches: {matches:?}"
         );
 
         let _ = fs::remove_dir_all(&root);

@@ -36,7 +36,9 @@ pub(crate) fn empty_body_report(base: &Path) -> EmptyBodyReport {
         let Ok(content) = sanitize::read_to_string_validated(&file.path) else {
             continue;
         };
-        if !chunk_body_is_empty(&content) && chunk_body_after_header(&content).trim().len() >= 50 {
+        if !store::chunk_body_is_empty(&content)
+            && crate::card_header::card_body(&content).trim().len() >= 50
+        {
             continue;
         }
 
@@ -45,42 +47,19 @@ pub(crate) fn empty_body_report(base: &Path) -> EmptyBodyReport {
         if report.sample_paths.len() < 20 {
             report.sample_paths.push(file.path.clone());
         }
+        // Sidecar metadata is authoritative; the card header (bracket or
+        // frontmatter) only fills in for sidecar-less legacy chunks.
         let frame_kind = store::load_sidecar(&file.path)
-            .and_then(|sidecar| sidecar.frame_kind.map(|kind| kind.as_str().to_string()))
+            .and_then(|sidecar| sidecar.frame_kind)
+            .or_else(|| {
+                crate::card_header::parse_card_header(&content).and_then(|header| header.frame_kind)
+            })
+            .map(|kind| kind.as_str().to_string())
             .unwrap_or_else(|| "unknown".to_string());
         *report.by_frame_kind.entry(frame_kind).or_insert(0) += 1;
     }
 
     report
-}
-
-pub(crate) fn chunk_body_after_header(content: &str) -> &str {
-    let Some(rest) = content.strip_prefix("[project:") else {
-        return content;
-    };
-    let Some((_, body)) = rest.split_once('\n') else {
-        return "";
-    };
-    body.trim_start_matches(['\r', '\n'])
-}
-
-pub(crate) fn chunk_body_is_empty(content: &str) -> bool {
-    !chunk_body_after_header(content)
-        .lines()
-        .any(chunk_line_has_signal)
-}
-
-pub(crate) fn chunk_line_has_signal(line: &str) -> bool {
-    let line = line.trim();
-    if line.is_empty() {
-        return false;
-    }
-    if let Some((_, rest)) = line.split_once("] ")
-        && let Some((_, message)) = rest.split_once(':')
-    {
-        return !message.trim().is_empty();
-    }
-    true
 }
 
 pub fn render_prune_empty_bodies_script(base: &Path) -> Result<String> {

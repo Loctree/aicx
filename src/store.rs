@@ -725,18 +725,8 @@ fn write_context_session_first_outcome_at(
     Ok(outcome)
 }
 
-fn chunk_body_after_header(content: &str) -> &str {
-    let Some(rest) = content.strip_prefix("[project:") else {
-        return content;
-    };
-    let Some((_, body)) = rest.split_once('\n') else {
-        return "";
-    };
-    body.trim_start_matches(['\r', '\n'])
-}
-
-fn chunk_body_is_empty(content: &str) -> bool {
-    !chunk_body_after_header(content)
+pub(crate) fn chunk_body_is_empty(content: &str) -> bool {
+    !crate::card_header::card_body(content)
         .lines()
         .any(chunk_line_has_signal)
 }

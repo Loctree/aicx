@@ -3583,3 +3583,28 @@ fn ingest_loct_context_pack_unions_old_and_new_on_reingest() {
         let _ = fs::remove_dir_all(pack.parent().unwrap());
     });
 }
+
+#[test]
+fn chunk_body_is_empty_is_header_agnostic() {
+    // Legacy bracket header — empty and non-empty bodies.
+    assert!(chunk_body_is_empty(
+        "[project: demo | agent: codex | date: 2026-07-02]\n\n"
+    ));
+    assert!(!chunk_body_is_empty(
+        "[project: demo | agent: codex | date: 2026-07-02]\n\nDecision: real content survives\n"
+    ));
+
+    // Card schema v2 YAML frontmatter — same verdicts.
+    assert!(chunk_body_is_empty(
+        "---\nproject: demo\nagent: codex\ndate: 2026-07-02\n---\n\n"
+    ));
+    assert!(!chunk_body_is_empty(
+        "---\nproject: demo\nagent: codex\ndate: 2026-07-02\n---\n\nDecision: real content survives\n"
+    ));
+
+    // A body that merely opens with a horizontal rule is NOT a header and
+    // must never be chopped into an empty verdict.
+    assert!(!chunk_body_is_empty(
+        "---\nsome unrelated text\n---\nDecision: real content survives\n"
+    ));
+}

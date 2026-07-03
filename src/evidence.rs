@@ -653,7 +653,9 @@ fn parse_evidence_sections(body: &str) -> EvidenceSections {
     let mut user_evidence = String::new();
     let mut agent_answered = String::new();
 
-    for line in body.lines() {
+    // Header-agnostic: strip the card header (bracket or frontmatter)
+    // structurally before per-line metadata filtering.
+    for line in crate::card_header::card_body(body).lines() {
         let trimmed = line.trim();
         if is_source_metadata_line(trimmed) {
             continue;
@@ -726,7 +728,7 @@ fn clean_matches(result: &FuzzyResult) -> Vec<String> {
 
 fn is_source_metadata_line(trimmed: &str) -> bool {
     let lower = trimmed.to_ascii_lowercase();
-    trimmed.starts_with("[project:")
+    crate::card_header::is_bracket_header_line(trimmed)
         || trimmed.starts_with("[metadata]")
         || lower.starts_with("[frame_kind:")
         || lower.starts_with("source project:")

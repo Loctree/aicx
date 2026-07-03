@@ -76,6 +76,36 @@ fn extract_demo_records(label: &str, body: &str) -> Vec<IntentRecord> {
 }
 
 #[test]
+fn frontmatter_header_chunk_extracts_intents_like_bracket_header() {
+    let bracket_records = extract_demo_records(
+        "bracket-header-parity",
+        "[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]\n\n\
+         [12:00:00] user: Let's ship the header-agnostic reader\n",
+    );
+    let frontmatter_records = extract_demo_records(
+        "frontmatter-header-parity",
+        "---\nproject: demo\nagent: codex\ndate: 2026-03-15\nframe_kind: user_msg\n---\n\n\
+         [12:00:00] user: Let's ship the header-agnostic reader\n",
+    );
+
+    assert!(
+        !bracket_records.is_empty(),
+        "bracket fixture must extract an intent"
+    );
+    assert_eq!(
+        bracket_records
+            .iter()
+            .map(|record| record.summary.as_str())
+            .collect::<Vec<_>>(),
+        frontmatter_records
+            .iter()
+            .map(|record| record.summary.as_str())
+            .collect::<Vec<_>>(),
+        "both header forms must yield identical intent extraction"
+    );
+}
+
+#[test]
 fn local_command_artifacts_do_not_become_intents() {
     let root = migration_test_root("local-command-artifact-intent");
     let _ = fs::remove_dir_all(&root);

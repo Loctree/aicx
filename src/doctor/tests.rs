@@ -818,6 +818,96 @@ fn index_freshness_reports_fresh_when_index_mtime_meets_or_exceeds_chunks() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+#[test]
+fn empty_body_frame_kind_prefers_sidecar_and_falls_back_to_header() {
+    let tmp = unique_test_dir("empty-body-frame-kind-source");
+    let dir = tmp
+        .join("store")
+        .join("Vetcoders")
+        .join("aicx")
+        .join("2026_0702")
+        .join("conversations")
+        .join("claude");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Sidecar and header disagree — the sidecar must win.
+    let with_sidecar = dir.join("2026_0702_claude_sess-sidecar_001.md");
+    std::fs::write(
+        &with_sidecar,
+        "[project: Vetcoders/aicx | agent: claude | date: 2026-07-02 | frame_kind: internal_thought]\n\n",
+    )
+    .unwrap();
+    std::fs::write(
+        with_sidecar.with_extension("meta.json"),
+        r#"{"id":"sess-sidecar_001","project":"Vetcoders/aicx","agent":"claude","date":"2026-07-02","session_id":"sess-sidecar","kind":"conversations","frame_kind":"system_note"}"#,
+    )
+    .unwrap();
+
+    // No sidecar — the legacy bracket header fills in.
+    std::fs::write(
+        dir.join("2026_0702_claude_sess-header_001.md"),
+        "[project: Vetcoders/aicx | agent: claude | date: 2026-07-02 | frame_kind: internal_thought]\n\n",
+    )
+    .unwrap();
+
+    // No sidecar, YAML frontmatter header — the v2 form fills in the same way.
+    std::fs::write(
+        dir.join("2026_0702_claude_sess-front_001.md"),
+        "---\nproject: Vetcoders/aicx\nagent: claude\ndate: 2026-07-02\nframe_kind: tool_call\n---\n\n",
+    )
+    .unwrap();
+
+    let report = empty_body_report(&tmp);
+    assert_eq!(report.empty, 3, "all three fixtures are empty-body cards");
+    assert_eq!(
+        report.by_frame_kind.get("system_note"),
+        Some(&1),
+        "sidecar frame_kind must beat the disagreeing header: {:?}",
+        report.by_frame_kind
+    );
+    assert_eq!(report.by_frame_kind.get("internal_thought"), Some(&1));
+    assert_eq!(report.by_frame_kind.get("tool_call"), Some(&1));
+    assert_eq!(report.by_frame_kind.get("unknown"), None);
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn empty_body_detection_is_header_agnostic_for_frontmatter_cards() {
+    let tmp = unique_test_dir("empty-bodies-frontmatter");
+    let dir = tmp
+        .join("store")
+        .join("Vetcoders")
+        .join("aicx")
+        .join("2026_0702")
+        .join("conversations")
+        .join("claude");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("2026_0702_claude_sess-fm-empty_001.md"),
+        "---\nproject: Vetcoders/aicx\nagent: claude\ndate: 2026-07-02\n---\n\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("2026_0702_claude_sess-fm-full_001.md"),
+        "---\nproject: Vetcoders/aicx\nagent: claude\ndate: 2026-07-02\n---\n\nThis chunk carries enough real body content to avoid the empty-body threshold.",
+    )
+    .unwrap();
+
+    let check = check_empty_body_chunks(&tmp);
+    assert!(
+        check.detail.contains("1 empty-body"),
+        "frontmatter header must not hide an empty body nor mask a real one: {}",
+        check.detail
+    );
+
+    let script = render_prune_empty_bodies_script(&tmp).unwrap();
+    assert!(script.contains("sess-fm-empty"));
+    assert!(!script.contains("sess-fm-full"));
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 fn unique_test_dir(label: &str) -> PathBuf {
     let tmp = std::env::temp_dir().join(format!(
         "aicx-doctor-{label}-{}-{}",
