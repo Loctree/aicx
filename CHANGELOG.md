@@ -280,7 +280,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   union. Filters resolve to canonical `<owner>/<repo>` slugs before
   downstream index lookup so a short repo name like
   `-p spotlight-convo-pipeline-v2` expands to its full
-  `m-szymanska/spotlight-convo-pipeline-v2` index path.
+  `vetcoders/spotlight-convo-pipeline-v2` index path.
 
 ### Changed
 - **Project filter is now word-boundary path match, not substring.**
@@ -318,7 +318,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `segment.repo` no longer carries non-ownership signals.
 - **`is_probably_repo_name` accepted date-shaped names.** Strings like
   `2026-01-22`, `2026_01_22`, `2026_0122` passed the alphanumeric+`.-_`
-  filter and produced pseudo-repos such as `CodeScribe/2026-01-22` in
+  filter and produced pseudo-repos such as `Codescribe/2026-01-22` in
   the canonical store. New `looks_like_date_pattern` guard rejects
   these three shapes outright.
 - **`aicx index/search -p <bare-name>` ambiguity is now reported.**
@@ -329,7 +329,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   returns the union); the warning just removes the silent WTF.
 - `infer_repo_identity_from_known_layout` matches markers
   (`hosted`/`repos`/`repositories`/`github`/`git`) case-insensitively, so
-  macOS conventions like `/Users/u/Git/Org/Repo` resolve through cwd
+  macOS conventions like `/Users/user/Git/Org/Repo` resolve through cwd
   instead of falling back to text inference.
 - `aicx index -p` / `aicx search -p` reject filters with no matching
   project (instead of silently resolving to the `_all` bucket after a
@@ -430,7 +430,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 - Gemini JSONL extraction now treats `.jsonl` files as session transcripts,
   preserving `sessionId` metadata and allowing `aicx all` to ingest Gemini
-  sources alongside Claude, Codex, Junie, and CodeScribe.
+  sources alongside Claude, Codex, Junie, and Codescribe.
 - Junk corpus bucket slugs are covered so malformed or placeholder project
   names no longer leak into canonical project grouping.
 
@@ -462,7 +462,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - `aicx intents` and semantic index writes exclude immutable `loct-context-pack` examples from the live-truth namespace; context-corpus embeddings materialize to a separate `context-corpus.embeddings.ndjson` namespace.
 - Operator surface wording: "push" → "materialize" in CLI help text, progress messages, and doc comments to reinforce the two-layer mental model (canonical corpus first, semantic materialization second).
-- Semantic compatibility validation now detects stale metadata even when no documents exist yet in the memex index; reports diverged fields explicitly.
+- Semantic compatibility validation now detects stale metadata even when no documents exist yet in the rust-memex index; reports diverged fields explicitly.
 - Compatibility validation runs before file scanning in `memex-sync`, failing fast on config mismatches.
 - `claude`, `codex`, `all`, and `store` now use watermark-tracked incremental refresh by default. `--full-rescan` is the explicit escape hatch for backfills, while legacy `--incremental` is accepted as a hidden no-op with a deprecation notice.
 - `aicx dashboard` now owns both static HTML generation and live serving. `dashboard-serve` is kept as a hidden compatibility shim while public help/doc surfaces point to `aicx dashboard --serve`, including explicit `--allow-cors-origins` policies for non-loopback binds and `--bg` background launch.
@@ -547,13 +547,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 - **YAML frontmatter parsing** for chunk metadata extraction.
-- **Sidecar files** (`.meta.yaml`) written alongside memex chunks for external tooling.
+- **Sidecar files** (`.meta.yaml`) written alongside rust-memex chunks for external tooling.
 
 ## [0.5.1] - 2026-03-24
 
 ### Added
 - **Repo-signal segmentation** in the store pipeline — chunks now carry repository identity signals.
-- **Memex chunk sidecars** and `--preprocess` flag for pre-processing before memex push.
+- **rust-memex chunk sidecars** and `--preprocess` flag for pre-processing before memex push.
 - **Makefile** with comprehensive build, test, lint, and release targets.
 - Gemini truncation support and improved fuzzy search scoring.
 - Test: repo-centric store runtime contract (`runtime_cli_store_contract.rs`).
@@ -573,14 +573,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Repo-centric Migration Assistant:** Added the `aicx migrate` subcommand. This tool safely migrates older file-centric contexts (`file: <name>`) in your `~/.ai-contexters` store to the new canonical repo-centric directories. Use `aicx migrate --dry-run` to preview the changes.
 
 ### Changed
-- **Behavioral Shift (Identity Model):** AICX now uses a canonical repo-centric identity model. Extracted contexts and stored artifacts are now grouped primarily by repository name rather than the raw filename of the agent log. This significantly improves retrieval quality and consistency, especially when syncing contexts to vector stores (memex) or running direct extractions.
+- **Behavioral Shift (Identity Model):** AICX now uses a canonical repo-centric identity model. Extracted contexts and stored artifacts are now grouped primarily by repository name rather than the raw filename of the agent log. This significantly improves retrieval quality and consistency, especially when syncing contexts to vector stores (rust-memex) or running direct extractions.
 - Direct `extract` now infers repository identity when possible, demoting file provenance to secondary metadata.
 
 ## [0.4.3] - 2026-03-17
 
 ### Fixed
 
-- Corrected the `SECURITY.md` disclosure path so private vulnerability reports go to the public `VetCoders/ai-contexters` repository instead of a stale owner link.
+- Corrected the `SECURITY.md` disclosure path so private vulnerability reports go to the public `Vetcoders/ai-contexters` repository instead of a stale owner link.
 - Updated GitHub Actions workflow dependencies to current major versions for `checkout`, `cache`, `setup-python`, `upload-artifact`, and `download-artifact`, removing the Node 20 deprecation surface from future CI and release runs.
 
 ## [0.4.2] - 2026-03-17
@@ -625,7 +625,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - Rank made default command (`aicx -p proj` runs rank).
-- Skills removed from repo — canonical source: VetCoders/vetcoders-skills.
+- Skills removed from repo — canonical source: Vetcoders/vetcoders-skills.
 - Package excludes: `*.html`, `*.patch`, `*.orig`, `.ai-agents/`, `skills/`.
 
 ### Added (Governance)
@@ -661,7 +661,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- VetCoders skills suite and ai-contexters skill.
+- Vetcoders skills suite and ai-contexters skill.
 - `vetcoders-decorate` and showcase polish.
 - Memex-first dashboard generator.
 
@@ -677,7 +677,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Ultrathink/Insight and Plan Mode signal extraction.
 - Chunk highlights and redaction optimizations.
 - `action`/`emit` flags and artifacts layout.
-- Semantic chunker and memex integration.
+- Semantic chunker and rust-memex integration.
 
 ### Changed
 
@@ -698,4 +698,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders

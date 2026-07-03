@@ -138,7 +138,7 @@ fn cors_policy_matches_supported_origin_sets() {
     assert!(!local.allows_origin("https://dashboard.example.com"));
 
     assert!(tailscale.allows_origin("http://100.64.0.1:9478"));
-    assert!(tailscale.allows_origin("https://vetcoders-mbp.tail2c9f.ts.net"));
+    assert!(tailscale.allows_origin("https://host.example.ts.net"));
     assert!(!tailscale.allows_origin("http://192.168.0.4:9478"));
     assert!(!tailscale.allows_origin("https://dashboard.example.com"));
 

@@ -4,7 +4,7 @@
 //! given HF repository in a list of cache directories. The runtime copy also
 //! supports operator overrides via `AICX_EMBEDDER_PATH`.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use std::env;
 use std::fs;

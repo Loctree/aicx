@@ -91,7 +91,7 @@ Dashboard cross-search still has one legacy external boundary:
 `HOME`, `XDG_CONFIG_HOME`, and `XDG_DATA_HOME` are passed through for config-dir
 resolution. `PATH` is never passed; the binary must be resolved before
 `env_clear()` so a user-controlled `PATH` cannot change what gets executed.
-If the memex CLI becomes fully self-contained, these variables may be absent and
+If the rust-memex CLI becomes fully self-contained, these variables may be absent and
 the child process must still fail with a normal command error, not by inheriting
 the parent environment.
 
@@ -130,14 +130,22 @@ Frontmatter is not just telemetry — it is part of the steering and selective r
 
 ## MCP Surface (`src/mcp.rs`)
 
-The MCP server exposes four tools via stdio and streamable HTTP transports:
+The MCP server exposes six tools via stdio and streamable HTTP transports:
 
-- `aicx_search` — canonical-store filesystem fuzzy search with quality scoring and `oracle_status`; this is not semantic retrieval and is not safe for Loctree scope narrowing until callers read the canonical chunks
-- `aicx_read` — read one canonical chunk by path, file name, or compact reference; this is the direct re-entry step after search, refs, steer, or dashboard discovery
-- `aicx_rank` — rank chunks by signal density for a project as compact JSON
-- `aicx_steer` — retrieve chunks by steering metadata (run_id, prompt_id, agent, kind, project, date) using sidecar data; returns `oracle_status` for the rebuildable metadata index and is safe for Loctree metadata narrowing only when source paths verify
+- `aicx_search` — semantic-first search over the canonical corpus. Ready indexes return `hybrid_rrf` oracle status and are safe for Loctree scope narrowing. Missing semantic preconditions degrade to filesystem fuzzy with an explicit `semantic_fallback` payload; callers that need fail-fast semantics pass `strict_semantic = true`.
+- `aicx_read` — read one canonical chunk by path, file name, or compact reference; this is the direct re-entry step after search, refs, steer, or dashboard discovery.
+- `aicx_rank` — rank chunks by signal density for a project as compact JSON.
+- `aicx_steer` — retrieve chunks by steering metadata (run_id, prompt_id, agent, kind, project, date) using sidecar data; returns `oracle_status` for the rebuildable metadata index and is safe for Loctree metadata narrowing only when source paths verify.
+- `aicx_intents` — extract intent/outcome/decision/task records from canonical chunks.
+- `aicx_index_status` — report the sessions -> chunks -> semantic-index pipeline for a project bucket, including readiness, backend, row count, and artifact paths.
 
 Recency filtering in `aicx_search` and `aicx_steer` uses canonical chunk dates from the store layout, not filesystem `mtime` accidents.
+
+The streamable HTTP transport binds to `127.0.0.1` by default and keeps rmcp's
+loopback-only `Host` validation. Operators can explicitly pass `--host <IP>` to
+listen on another interface and `--allowed-host <HOST>` for each remote
+hostname/IP clients will use. `--allow-any-host` disables that DNS-rebinding
+guard and is intended only for trusted networks.
 
 ## Security Model (Pragmatic)
 

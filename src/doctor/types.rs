@@ -107,6 +107,19 @@ pub struct DoctorReport {
     pub content_dedup: CheckResult,
     #[serde(default)]
     pub context_corpus: CheckResult,
+    /// Informational: which AICX_HOME the runtime resolved, whether it is
+    /// pinned via env, and whether store/indexed live there. Not part of
+    /// `overall` — diagnostic, not a gate.
+    #[serde(default)]
+    pub aicx_home: CheckResult,
+    /// Informational: aicx CLI vs aicx-mcp version parity on PATH. Catches the
+    /// "fresh CLI, stale MCP service" drift class. Not part of `overall`.
+    #[serde(default)]
+    pub binary_pair: CheckResult,
+    /// Informational: where the HTTP auth token resolves from (env / file /
+    /// would-generate). Never exposes the token value. Not part of `overall`.
+    #[serde(default)]
+    pub http_auth_token: CheckResult,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rebuild_sidecars_script: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

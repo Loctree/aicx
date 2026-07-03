@@ -18,10 +18,14 @@ use crate::timeline::TimelineEntry;
 
 // ============================================================================
 // Migration
+mod cards_v2;
 mod report;
 mod source_locator;
 mod types;
 
+pub use cards_v2::{
+    CardsV2Action, CardsV2Item, CardsV2Manifest, CardsV2Totals, run_cards_v2_migration,
+};
 use report::{print_migration_summary, render_migration_report};
 pub(crate) use source_locator::SourceLocator;
 use source_locator::SourceLookupOutcome;

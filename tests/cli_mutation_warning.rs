@@ -19,7 +19,7 @@
 //! All tests use a per-invocation `AICX_HOME` so they never touch the
 //! real operator store and never race against each other.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2024-2026 LibraxisAI
+//! Vibecrafted with AI Agents by Vetcoders (c)2024-2026 LibraxisAI
 
 use std::path::PathBuf;
 use std::process::Command;

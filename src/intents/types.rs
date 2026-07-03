@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::oracle::ClaimHonesty;
 use crate::timeline::FrameKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -54,6 +55,12 @@ pub struct IntentRecord {
     pub source_chunk: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Claim-honesty frame lifted from the source card sidecar (schema v2).
+    /// Flattened so records expose `claim_scope`/`freshness_contract`/
+    /// `verification_state` as plain keys; pre-v2 cards serialize no keys at
+    /// all, keeping the JSON additive for existing consumers.
+    #[serde(flatten)]
+    pub honesty: ClaimHonesty,
 }
 #[derive(Debug, Clone)]
 pub struct IntentsConfig {
@@ -97,6 +104,7 @@ pub(super) struct StoredChunkFile {
     pub(super) sequence: u32,
     pub(super) timestamp: DateTime<Utc>,
     pub(super) session_id: String,
+    pub(super) honesty: ClaimHonesty,
 }
 
 #[derive(Debug, Clone)]

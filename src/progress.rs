@@ -9,7 +9,7 @@
 //! failure reporting, heartbeat threads, terminal/structured renderers, and
 //! the richer generic event-sink layer used by index progress contracts.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2024-2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2024-2026 Vetcoders
 
 mod core;
 mod events;

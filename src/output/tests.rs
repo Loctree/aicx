@@ -74,8 +74,11 @@ fn sample_entries() -> Vec<TimelineEntry> {
             role: "user".to_string(),
             message: "Fix the build pipeline".to_string(),
             branch: Some("feat/pipeline".to_string()),
-            cwd: Some("/home/project".to_string()),
+            cwd: Some("/home/user".to_string()),
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -87,6 +90,9 @@ fn sample_entries() -> Vec<TimelineEntry> {
             branch: Some("feat/pipeline".to_string()),
             cwd: None,
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -98,6 +104,9 @@ fn sample_entries() -> Vec<TimelineEntry> {
             branch: None,
             cwd: None,
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         },
     ]

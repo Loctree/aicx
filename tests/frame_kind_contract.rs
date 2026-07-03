@@ -313,7 +313,7 @@ fn json_paths(value: &Value, key: &str) -> Vec<PathBuf> {
 fn codex_store_round_trips_frame_kind_filters() {
     let root = unique_test_dir("round-trip");
     let home = root.join("home");
-    let repo_root = home.join("hosted").join("VetCoders").join("ai-contexters");
+    let repo_root = home.join("hosted").join("Vetcoders").join("ai-contexters");
     let history_path = home.join(".codex").join("history.jsonl");
     let session_path = home
         .join(".codex")
@@ -451,11 +451,11 @@ fn codex_store_round_trips_frame_kind_filters() {
 fn claude_store_does_not_emit_empty_thinking_signature() {
     let root = unique_test_dir("claude-signature-store");
     let home = root.join("home");
-    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
     let session_path = home
         .join(".claude")
         .join("projects")
-        .join("-Users-test-hosted-VetCoders-aicx")
+        .join("-Users-test-hosted-Vetcoders-aicx")
         .join("claude-signature-contract.jsonl");
 
     fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
@@ -515,11 +515,11 @@ fn claude_store_does_not_emit_empty_thinking_signature() {
 fn session_extract_conversation_flag_writes_distinct_denoised_default_file() {
     let root = unique_test_dir("claude-session-conversation-default");
     let home = root.join("home");
-    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
     let session_path = home
         .join(".claude")
         .join("projects")
-        .join("-Users-test-hosted-VetCoders-aicx")
+        .join("-Users-test-hosted-Vetcoders-aicx")
         .join("claude-session-extract-contract.jsonl");
 
     fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
@@ -649,11 +649,11 @@ fn write_claude_session_with_harness_noise(path: &Path, cwd: &Path) {
 fn session_conversation_extract_strips_harness_injected_noise_keeps_real_turns() {
     let root = unique_test_dir("claude-session-harness-noise");
     let home = root.join("home");
-    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
     let session_path = home
         .join(".claude")
         .join("projects")
-        .join("-Users-test-hosted-VetCoders-aicx")
+        .join("-Users-test-hosted-Vetcoders-aicx")
         .join("claude-session-harness-noise.jsonl");
 
     fs::create_dir_all(repo_root.join(".git")).expect("create repo root");

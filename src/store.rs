@@ -7,7 +7,7 @@
 //! - `chunks/` — the base location for chunk content
 //! - `index.json` — manifest of stored contexts
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -725,18 +725,8 @@ fn write_context_session_first_outcome_at(
     Ok(outcome)
 }
 
-fn chunk_body_after_header(content: &str) -> &str {
-    let Some(rest) = content.strip_prefix("[project:") else {
-        return content;
-    };
-    let Some((_, body)) = rest.split_once('\n') else {
-        return "";
-    };
-    body.trim_start_matches(['\r', '\n'])
-}
-
-fn chunk_body_is_empty(content: &str) -> bool {
-    !chunk_body_after_header(content)
+pub(crate) fn chunk_body_is_empty(content: &str) -> bool {
+    !crate::card_header::card_body(content)
         .lines()
         .any(chunk_line_has_signal)
 }
@@ -1357,7 +1347,6 @@ fn ingest_loct_context_pack_into(
         let mut sidecar = load_sidecar_from_path(&sidecar_path)
             .with_context(|| format!("missing or invalid sidecar: {}", sidecar_path.display()))?;
         sidecar.artifact_family = Some(LOCT_CONTEXT_PACK_FAMILY.to_string());
-        sidecar.schema_version = Some(CONTEXT_CORPUS_SCHEMA_VERSION.to_string());
         if sidecar.truth_status.is_none() {
             sidecar.truth_status = Some(chunker::TruthStatus {
                 role: chunker::TruthRole::Example,
@@ -1475,7 +1464,7 @@ fn ingest_loct_context_pack_into(
             id: sidecar.id.clone(),
             path: raw_target.display().to_string(),
             artifact_family: sidecar.artifact_family.clone(),
-            schema_version: sidecar.schema_version.clone(),
+            schema_version: Some(CONTEXT_CORPUS_SCHEMA_VERSION.to_string()),
             truth_status_role: sidecar
                 .truth_status
                 .as_ref()
@@ -1782,7 +1771,7 @@ pub fn project_filter_matches(organization: &str, repository: &str, filter: &str
 /// Resolve user-supplied `-p` filters into canonical `<owner>/<repo>` slugs
 /// by enumerating the on-disk canonical store. Used by `aicx search` and
 /// `aicx index` so a single short name like `-p spotlight-convo-pipeline-v2`
-/// expands to `m-szymanska/spotlight-convo-pipeline-v2` before downstream
+/// expands to `example-org/spotlight-convo-pipeline-v2` before downstream
 /// index path / search engine lookup.
 ///
 /// Returns:
@@ -2262,8 +2251,9 @@ pub fn expand_compact_date(compact: &str) -> String {
 
 pub(crate) mod migration;
 pub use migration::{
-    LegacyItemKind, MigrationAction, MigrationExecution, MigrationItem, MigrationManifest,
-    MigrationTotals, run_migration, run_migration_with_paths,
+    CardsV2Action, CardsV2Item, CardsV2Manifest, CardsV2Totals, LegacyItemKind, MigrationAction,
+    MigrationExecution, MigrationItem, MigrationManifest, MigrationTotals, run_cards_v2_migration,
+    run_migration, run_migration_with_paths,
 };
 #[cfg(all(test, feature = "app"))]
 pub(crate) use migration::{SourceLocator, run_migration_at};

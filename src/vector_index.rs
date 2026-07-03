@@ -21,7 +21,7 @@
 //! query patterns; the public API ([`query_index`]) stays the same so the
 //! storage swap is transparent to callers.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
@@ -150,6 +150,160 @@ pub struct IndexStats {
     /// Checkpoint path used for resume, when a full build continued from
     /// an existing temporary index instead of truncating it.
     pub resume_tmp_path: Option<PathBuf>,
+}
+
+/// Report for deriving one project-scoped semantic bucket from the
+/// cross-project `_all` bucket without re-embedding.
+#[derive(Debug, Clone, Serialize)]
+pub struct DerivedProjectIndexStats {
+    pub project: String,
+    pub source_index_path: PathBuf,
+    pub index_path: PathBuf,
+    pub entries_written: usize,
+    pub elapsed_ms: u128,
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+struct DerivedProjectIndexWriter {
+    project: String,
+    source_index_path: PathBuf,
+    index_path: PathBuf,
+    tmp_path: PathBuf,
+    final_tmp_path: PathBuf,
+    writer: std::io::BufWriter<std::fs::File>,
+    source_header: IndexHeader,
+    entries_written: usize,
+    started: Instant,
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+impl DerivedProjectIndexWriter {
+    fn create(
+        project: &str,
+        source_index_path: &Path,
+        source_header: &IndexHeader,
+    ) -> Result<Self> {
+        use std::fs;
+        use std::io::Write;
+
+        let index_path = index_path(Some(project))?;
+        if source_index_path == index_path {
+            anyhow::bail!(
+                "source and target index paths are identical: {}",
+                index_path.display()
+            );
+        }
+        let Some(parent) = index_path.parent() else {
+            anyhow::bail!("index path has no parent: {}", index_path.display());
+        };
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create derived project index dir: {}", parent.display()))?;
+
+        let tmp_path = index_path.with_extension("ndjson.tmp");
+        let final_tmp_path = index_path.with_extension("ndjson.commit.tmp");
+        let _ = fs::remove_file(&tmp_path);
+        let _ = fs::remove_file(&final_tmp_path);
+
+        let tmp = crate::sanitize::create_file_validated(&tmp_path)
+            .with_context(|| format!("create derived project tmp index: {}", tmp_path.display()))?;
+        let mut writer = std::io::BufWriter::new(tmp);
+        writeln!(
+            writer,
+            "{}",
+            serde_json::to_string(&IndexHeader {
+                schema_version: source_header.schema_version.clone(),
+                model_id: source_header.model_id.clone(),
+                model_profile: source_header.model_profile.clone(),
+                dimension: source_header.dimension,
+                generated_at: chrono::Utc::now().to_rfc3339(),
+                entry_count: 0,
+            })?
+        )
+        .with_context(|| format!("write placeholder derived header: {}", tmp_path.display()))?;
+
+        Ok(Self {
+            project: project.to_string(),
+            source_index_path: source_index_path.to_path_buf(),
+            index_path,
+            tmp_path,
+            final_tmp_path,
+            writer,
+            source_header: source_header.clone(),
+            entries_written: 0,
+            started: Instant::now(),
+        })
+    }
+
+    fn write_row(&mut self, line: &str) -> Result<()> {
+        use std::io::Write;
+
+        writeln!(self.writer, "{line}")
+            .with_context(|| format!("write derived project row: {}", self.tmp_path.display()))?;
+        self.entries_written += 1;
+        Ok(())
+    }
+
+    fn cleanup_tmp(&self) {
+        let _ = std::fs::remove_file(&self.tmp_path);
+        let _ = std::fs::remove_file(&self.final_tmp_path);
+    }
+
+    fn finalize(self) -> Result<DerivedProjectIndexStats> {
+        use std::fs;
+        use std::io::Write;
+
+        let Self {
+            project,
+            source_index_path,
+            index_path,
+            tmp_path,
+            final_tmp_path,
+            mut writer,
+            source_header,
+            entries_written,
+            started,
+        } = self;
+
+        writer
+            .flush()
+            .with_context(|| format!("flush derived project tmp index: {}", tmp_path.display()))?;
+        drop(writer);
+
+        if entries_written == 0 {
+            let _ = fs::remove_file(&tmp_path);
+            anyhow::bail!(
+                "no entries for project `{project}` found in {}",
+                source_index_path.display()
+            );
+        }
+
+        let truthful_header = IndexHeader {
+            schema_version: source_header.schema_version,
+            model_id: source_header.model_id,
+            model_profile: source_header.model_profile,
+            dimension: source_header.dimension,
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            entry_count: entries_written,
+        };
+        rewrite_index_with_truthful_header(&tmp_path, &final_tmp_path, &truthful_header)
+            .with_context(|| format!("rewrite derived project header: {}", tmp_path.display()))?;
+        let _ = fs::remove_file(&tmp_path);
+        fs::rename(&final_tmp_path, &index_path).with_context(|| {
+            format!(
+                "commit derived project index: {} -> {}",
+                final_tmp_path.display(),
+                index_path.display()
+            )
+        })?;
+
+        Ok(DerivedProjectIndexStats {
+            project,
+            source_index_path,
+            index_path,
+            entries_written,
+            elapsed_ms: started.elapsed().as_millis(),
+        })
+    }
 }
 
 /// One row of the persistent NDJSON-backed index.
@@ -1390,6 +1544,172 @@ pub fn repair_hybrid_from_committed(_project: Option<&str>) -> Result<aicx_retri
     )
 }
 
+/// Materialize `indexed/<project>/embeddings.ndjson` from the existing
+/// cross-project `_all` semantic index without invoking the embedder.
+///
+/// The `_all` index already stores full [`IndexEntry`] rows including each
+/// vector. For project-scoped fast paths we can stream-filter those rows into
+/// a project bucket, rewrite the header with the truthful row count, and then
+/// let [`repair_hybrid_from_committed`] build lexical+dense hybrid artifacts
+/// from that committed project index. This is a repair/derivation path, not a
+/// semantic refresh: any chunks missing from `_all` are necessarily missing
+/// from the derived bucket too.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub fn derive_project_index_from_all(project: &str) -> Result<DerivedProjectIndexStats> {
+    if project.trim().is_empty() {
+        anyhow::bail!("project is required; refusing to derive the cross-project _all bucket");
+    }
+    let mut stats = derive_project_indexes_from_all(&[project.to_string()])?;
+    stats
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("no derived report for project `{project}`"))
+}
+
+/// Materialize project-scoped semantic buckets from the existing `_all`
+/// semantic index in one streaming pass.
+///
+/// `projects` is a set of canonical `<owner>/<repo>` slugs. When empty, every
+/// project present in `_all` is materialized. This is the public-repo contract
+/// repair path for `aicx index`: a user who builds the global semantic index
+/// must also get project-scoped `aicx search -p ...` without learning about
+/// storage buckets or running one manual derive per project.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub fn derive_project_indexes_from_all(
+    projects: &[String],
+) -> Result<Vec<DerivedProjectIndexStats>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io::BufReader;
+
+    let source_index_path = index_path(None)?;
+    if !source_index_path.exists() {
+        anyhow::bail!(
+            "no cross-project semantic index at {} — build `_all` first with `aicx index`",
+            source_index_path.display()
+        );
+    }
+
+    let _lock = crate::locks::acquire_exclusive(crate::locks::lance_lock_path()?)?;
+    let source = crate::sanitize::open_file_validated(&source_index_path)
+        .with_context(|| format!("open _all semantic index: {}", source_index_path.display()))?;
+    let mut reader = BufReader::new(source);
+    let header_line = read_index_line_capped(
+        &mut reader,
+        &source_index_path,
+        1,
+        "cross-project semantic header",
+    )
+    .with_context(|| format!("read _all header: {}", source_index_path.display()))?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "empty cross-project semantic index: {}",
+            source_index_path.display()
+        )
+    })?;
+    let source_header = serde_json::from_str::<IndexHeader>(&header_line)
+        .with_context(|| format!("parse _all header: {}", source_index_path.display()))?;
+
+    let requested: BTreeSet<String> = projects
+        .iter()
+        .map(|project| project.trim())
+        .filter(|project| !project.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    let derive_all_projects = requested.is_empty();
+    let mut writers: BTreeMap<String, DerivedProjectIndexWriter> = BTreeMap::new();
+
+    for (idx, line) in
+        capped_index_lines(reader, &source_index_path, 2, "cross-project semantic data").enumerate()
+    {
+        let line = line.with_context(|| {
+            format!(
+                "read _all semantic index line {}: {}",
+                idx + 2,
+                source_index_path.display()
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let project = extract_project_from_index_line(&line).with_context(|| {
+            format!(
+                "read project field from _all semantic index line {}: {}",
+                idx + 2,
+                source_index_path.display()
+            )
+        })?;
+        let Some(project) = project else {
+            anyhow::bail!(
+                "missing project field in _all semantic index line {}: {}",
+                idx + 2,
+                source_index_path.display()
+            );
+        };
+        if !derive_all_projects && !requested.contains(&project) {
+            continue;
+        }
+        if !writers.contains_key(&project) {
+            let writer =
+                DerivedProjectIndexWriter::create(&project, &source_index_path, &source_header)
+                    .with_context(|| {
+                        format!("create derived project writer for `{project}` from `_all`")
+                    })?;
+            writers.insert(project.clone(), writer);
+        }
+        writers
+            .get_mut(&project)
+            .expect("writer inserted for project")
+            .write_row(&line)?;
+    }
+
+    if !derive_all_projects {
+        let found: BTreeSet<String> = writers.keys().cloned().collect();
+        let missing: Vec<String> = requested.difference(&found).cloned().collect();
+        if !missing.is_empty() {
+            for writer in writers.values() {
+                writer.cleanup_tmp();
+            }
+            anyhow::bail!(
+                "no entries for project(s) {} found in {}",
+                missing.join(", "),
+                source_index_path.display()
+            );
+        }
+    }
+
+    writers
+        .into_values()
+        .map(DerivedProjectIndexWriter::finalize)
+        .collect()
+}
+
+#[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+pub fn derive_project_index_from_all(_project: &str) -> Result<DerivedProjectIndexStats> {
+    anyhow::bail!(
+        "derive requires an embedder feature — rebuild with `--features native-embedder` or `--features cloud-embedder`"
+    )
+}
+
+#[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+pub fn derive_project_indexes_from_all(
+    _projects: &[String],
+) -> Result<Vec<DerivedProjectIndexStats>> {
+    anyhow::bail!(
+        "derive requires an embedder feature — rebuild with `--features native-embedder` or `--features cloud-embedder`"
+    )
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn extract_project_from_index_line(line: &str) -> Result<Option<String>> {
+    let Some(offset) = line.find("\"project\":") else {
+        return Ok(None);
+    };
+    let tail = &line[offset + "\"project\":".len()..];
+    let mut deserializer = serde_json::Deserializer::from_str(tail);
+    String::deserialize(&mut deserializer)
+        .map(Some)
+        .context("parse compact project string")
+}
+
 /// Rewrite the placeholder header in `tmp_path` with the truthful one and
 /// stream the remaining entries into `final_tmp_path`. Caller renames
 /// `final_tmp_path` onto the committed target after this succeeds.
@@ -1778,6 +2098,13 @@ fn hybrid_manifest_matches_committed_source(
     let Ok(manifest) = aicx_retrieve::Manifest::read_from_path(&path) else {
         return false;
     };
+    let lexical_schema_prefix = format!("{}:", aicx_retrieve::TANTIVY_SCHEMA_VERSION);
+    if !manifest
+        .lexical_commit_id
+        .starts_with(&lexical_schema_prefix)
+    {
+        return false;
+    }
     manifest.source_chunk_count == source_chunk_count
         && manifest.source_hash_blake3 == source_hash_blake3
 }

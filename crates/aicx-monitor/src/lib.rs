@@ -1,4 +1,4 @@
-//! Live system monitor for aicx pipelines. Vibecrafted. with AI Agents by VetCoders (c)2024-2026 LibraxisAI
+//! Live system monitor for aicx pipelines. Vibecrafted. with AI Agents by Vetcoders (c)2024-2026 LibraxisAI
 //!
 //! Foundation crate exposing a [`tokio::sync::watch::Receiver<MonitorSnapshot>`]
 //! sampler. Future TUI / dashboard consumers attach to the receiver and render

@@ -2,6 +2,7 @@ use super::*;
 use crate::chunker::{ChunkMetadataSidecar, ChunkerConfig, chunk_entries};
 use chrono::{Duration, TimeZone};
 use filetime::{FileTime, set_file_mtime};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
@@ -29,6 +30,12 @@ fn write_file(path: &Path, content: &str) {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(path, content).unwrap();
+}
+
+fn test_sha256_hex(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn default_config(include_assistant: bool) -> ExtractionConfig {
@@ -66,11 +73,11 @@ fn frame_kinds(entries: &[TimelineEntry]) -> Vec<Option<FrameKind>> {
 fn test_repo_name_from_cwd() {
     // Fallback behavior
     assert_eq!(
-        repo_name_from_cwd(Some("/Users/test-user/test-org/lbrx-services"), &[]),
+        repo_name_from_cwd(Some("/Users/user/test-org/lbrx-services"), &[]),
         "lbrx-services"
     );
     assert_eq!(
-        repo_name_from_cwd(Some("/Users/test-user/test-org/mlx-batch-runner"), &[]),
+        repo_name_from_cwd(Some("/Users/user/test-org/mlx-batch-runner"), &[]),
         "mlx-batch-runner"
     );
     assert_eq!(repo_name_from_cwd(None, &[]), "unknown");
@@ -80,7 +87,7 @@ fn test_repo_name_from_cwd() {
     // Single project filter
     assert_eq!(
         repo_name_from_cwd(
-            Some("/Users/test-user/test-org/lbrx-services/subfolder"),
+            Some("/Users/user/test-org/lbrx-services/subfolder"),
             &["lbrx".to_string()]
         ),
         "lbrx"
@@ -90,7 +97,7 @@ fn test_repo_name_from_cwd() {
     let filters = vec!["lbrx-services".to_string(), "foo".to_string()];
     assert_eq!(
         repo_name_from_cwd(
-            Some("/Users/test-user/test-org/lbrx-services/subfolder"),
+            Some("/Users/user/test-org/lbrx-services/subfolder"),
             &filters
         ),
         "lbrx-services"
@@ -110,9 +117,9 @@ fn test_repo_name_from_cwd() {
 
 #[test]
 fn test_decode_claude_project_path_with_leading_dash() {
-    let encoded = "-Users-user-hosted-VetCoders-CodeScribe";
+    let encoded = "-Users-user-hosted-Vetcoders-Codescribe";
     let decoded = decode_claude_project_path(encoded);
-    assert_eq!(decoded, "Users-user-hosted-VetCoders-CodeScribe");
+    assert_eq!(decoded, "Users-user-hosted-Vetcoders-Codescribe");
 }
 
 #[test]
@@ -235,7 +242,7 @@ fn test_claude_dir_filter_owner_repo_form_cannot_decide_from_encoded_dir_alone()
 
     // The corollary: an unrelated repo also doesn't match. (Symmetric.)
     assert!(!claude_project_dir_matches_filter(
-        "-Users-test-user-Git-VetCoders-loct-io",
+        "-Users-test-user-Git-Vetcoders-loct-io",
         &lo
     ));
 
@@ -247,7 +254,7 @@ fn test_claude_dir_filter_owner_repo_form_cannot_decide_from_encoded_dir_alone()
     // to `super::` aka `crate::sources`; reachable via `use super::*`
     // at the top of this tests module.)
     assert!(
-        project_filter_matches_path("/Users/test-user/Git/Loctree/aicx", &lo),
+        project_filter_matches_path("/Users/user/Git/Loctree/aicx", &lo),
         "the strict matcher (used per-entry on real cwd values) DOES \
          match Loctree/aicx against a proper /-separated cwd"
     );
@@ -336,6 +343,37 @@ fn test_extract_claude_file_parses_text_only_blocks() {
     );
     assert_eq!(user_entries[0].message, "Hello");
     assert_eq!(agent_entries[0].message, "Hi");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_extract_claude_file_stamps_source_provenance() {
+    let root = unique_test_dir("claude-source-provenance");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"type":"user","message":{"role":"user","content":"Hello"},"timestamp":"2026-02-09T22:03:06.765Z","sessionId":"sess123","cwd":"/tmp"}
+{"type":"assistant","message":{"role":"assistant","content":"Hi"},"timestamp":"2026-02-09T22:03:07.765Z","sessionId":"sess123"}"#;
+    write_file(&tmp, content);
+
+    let entries = extract_claude_file(&tmp, &default_config(true)).unwrap();
+    let expected_path = tmp.display().to_string();
+    let expected_sha = test_sha256_hex(content);
+
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.source_path.as_deref() == Some(expected_path.as_str()))
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.source_sha256.as_deref() == Some(expected_sha.as_str()))
+    );
+    assert_eq!(entries[0].source_line_span, Some((1, 1)));
+    assert_eq!(entries[1].source_line_span, Some((2, 2)));
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -557,7 +595,7 @@ fn test_extract_claude_file_drops_empty_thinking_signature_block() {
     let root = unique_test_dir("claude-empty-signature-thinking");
     let tmp = root.join("session.jsonl");
     let _ = fs::remove_dir_all(&root);
-    let content = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Visible assistant reply"},{"type":"thinking","thinking":"","signature":"abc123"}]},"timestamp":"2026-04-14T10:00:01Z","sessionId":"claude-signature-regression","gitBranch":"main","cwd":"/Users/tester/workspaces/VetCoders/ai-contexters"}"#;
+    let content = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Visible assistant reply"},{"type":"thinking","thinking":"","signature":"abc123"}]},"timestamp":"2026-04-14T10:00:01Z","sessionId":"claude-signature-regression","gitBranch":"main","cwd":"/Users/tester/workspaces/Vetcoders/ai-contexters"}"#;
     write_file(&tmp, content);
 
     let config = ExtractionConfig {
@@ -588,8 +626,8 @@ fn test_extract_claude_conversation_mode_stays_signature_clean() {
     let root = unique_test_dir("claude-conversation-signature-clean");
     let tmp = root.join("session.jsonl");
     let _ = fs::remove_dir_all(&root);
-    let content = r#"{"type":"user","message":{"role":"user","content":"Hello"},"timestamp":"2026-04-14T10:00:00Z","sessionId":"claude-conversation-clean","cwd":"/Users/tester/workspaces/VetCoders/ai-contexters"}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Visible assistant reply"},{"type":"thinking","thinking":"","signature":"abc123"}]},"timestamp":"2026-04-14T10:00:01Z","sessionId":"claude-conversation-clean","cwd":"/Users/tester/workspaces/VetCoders/ai-contexters"}"#;
+    let content = r#"{"type":"user","message":{"role":"user","content":"Hello"},"timestamp":"2026-04-14T10:00:00Z","sessionId":"claude-conversation-clean","cwd":"/Users/tester/workspaces/Vetcoders/ai-contexters"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Visible assistant reply"},{"type":"thinking","thinking":"","signature":"abc123"}]},"timestamp":"2026-04-14T10:00:01Z","sessionId":"claude-conversation-clean","cwd":"/Users/tester/workspaces/Vetcoders/ai-contexters"}"#;
     write_file(&tmp, content);
 
     let config = ExtractionConfig {
@@ -666,6 +704,35 @@ fn test_extract_codex_file_history_format() {
 }
 
 #[test]
+fn test_extract_codex_history_file_stamps_source_provenance() {
+    let root = unique_test_dir("codex-history-source-provenance");
+    let tmp = root.join("history.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"session_id":"s1","text":"hello","ts":1000,"role":"user","cwd":"/tmp/a"}
+{"session_id":"s1","text":"hi back","ts":1001,"role":"assistant","cwd":"/tmp/a"}"#;
+    write_file(&tmp, content);
+
+    let entries = extract_codex_file(&tmp, &default_config(true)).unwrap();
+    let expected_path = tmp.display().to_string();
+    let expected_sha = test_sha256_hex(content);
+
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.source_path.as_deref() == Some(expected_path.as_str()))
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.source_sha256.as_deref() == Some(expected_sha.as_str()))
+    );
+    assert!(entries.iter().all(|entry| entry.source_line_span.is_none()));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn test_extract_codex_file_session_format_detects() {
     let root = unique_test_dir("codex-direct-session");
     let tmp = root.join("session.jsonl");
@@ -685,6 +752,35 @@ fn test_extract_codex_file_session_format_detects() {
 
     let entries = extract_codex_file(&tmp, &config).unwrap();
     assert!(entries.is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_codex_session_file_stamps_source_provenance() {
+    let root = unique_test_dir("codex-session-source-provenance");
+    let tmp = root.join("rollout.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"session-a","cwd":"/tmp/a"}}
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#;
+    write_file(&tmp, content);
+
+    let (entries, warnings) =
+        parse_codex_session_file_with_diagnostics(&tmp, "codex", &default_config(true)).unwrap();
+    let expected_path = tmp.display().to_string();
+    let expected_sha = test_sha256_hex(content);
+
+    assert!(warnings.is_empty());
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].source_path.as_deref(),
+        Some(expected_path.as_str())
+    );
+    assert_eq!(
+        entries[0].source_sha256.as_deref(),
+        Some(expected_sha.as_str())
+    );
+    assert_eq!(entries[0].source_line_span, None);
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -1092,8 +1188,8 @@ fn test_parse_codex_session_mcp_tool_call_is_kept_in_timeline() {
     let _ = fs::remove_dir_all(&root);
 
     let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"sess","cwd":"/tmp"}}
-{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"mcp_tool_call","server":"memex","tool":"memory_search"}}
-{"timestamp":"2026-02-01T00:00:02Z","type":"event_msg","payload":{"type":"mcp_tool_call_response","server":"memex","result":"ok"}}"#;
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"mcp_tool_call","server":"rust-memex","tool":"memory_search"}}
+{"timestamp":"2026-02-01T00:00:02Z","type":"event_msg","payload":{"type":"mcp_tool_call_response","server":"rust-memex","result":"ok"}}"#;
     write_file(&tmp, content);
 
     let config = ExtractionConfig {
@@ -1248,7 +1344,7 @@ fn test_extract_gemini_file_prefers_session_path_project_over_content_hints() {
     let _ = fs::remove_dir_all(&root);
 
     let content = r##"{"sessionId":"6d5b2959-c56b-4c90-b198-41eb2ce399da","projectHash":"atomic-orbitals-b716c2b71310439897d3f81602f6c799","startTime":"2026-05-17T11:29:00.000Z","kind":"main"}
-{"id":"u1","timestamp":"2026-05-17T11:29:01.000Z","type":"user","content":[{"cwd":"/Users/test-user/Desktop/screenshot/Screenshot","text":"Review this screenshot for Vista Portal."}]}
+{"id":"u1","timestamp":"2026-05-17T11:29:01.000Z","type":"user","content":[{"cwd":"/Users/user/Desktop/screenshot/Screenshot","text":"Review this screenshot for Vista Portal."}]}
 {"id":"a1","timestamp":"2026-05-17T11:29:02.000Z","type":"gemini","content":"The screenshot review belongs to the Vista Portal session."}"##;
     write_file(&tmp, content);
 
@@ -1751,7 +1847,7 @@ fn test_codex_session_filtering_includes_all_messages() {
     // If any message in a session mentions the filter, all messages are included.
 
     let session_a_msgs = [
-        ("s1", "work on CodeScribe refactoring", 1000i64),
+        ("s1", "work on Codescribe refactoring", 1000i64),
         ("s1", "fix the bug in controller", 1001),
         ("s1", "done with changes", 1002),
     ];
@@ -1769,7 +1865,7 @@ fn test_codex_session_filtering_includes_all_messages() {
             .push((text.to_string(), *ts));
     }
 
-    let filter = "CodeScribe";
+    let filter = "Codescribe";
     let filter_lower = filter.to_lowercase();
 
     // Determine matching sessions
@@ -1782,12 +1878,12 @@ fn test_codex_session_filtering_includes_all_messages() {
         .map(|(id, _)| id.clone())
         .collect();
 
-    // Session s1 should match (has "CodeScribe" in first message)
+    // Session s1 should match (has "Codescribe" in first message)
     assert!(matching.contains("s1"));
     // Session s2 should NOT match
     assert!(!matching.contains("s2"));
 
-    // All 3 messages from s1 should be included, not just the one mentioning CodeScribe
+    // All 3 messages from s1 should be included, not just the one mentioning Codescribe
     let included_count: usize = sessions
         .iter()
         .filter(|(id, _)| matching.contains(id.as_str()))
@@ -1816,13 +1912,13 @@ fn test_codex_session_filtering_cwd_match() {
     // Simulate cwd-based matching
     let session_msgs: Vec<(Option<String>, String)> = vec![
         (
-            Some("/Users/user/hosted/VetCoders/CodeScribe".to_string()),
+            Some("/Users/user/hosted/Vetcoders/Codescribe".to_string()),
             "run tests".to_string(),
         ),
         (None, "looks good".to_string()),
     ];
 
-    let filter = "CodeScribe";
+    let filter = "Codescribe";
     let filter_lower = filter.to_lowercase();
 
     let session_matches = session_msgs.iter().any(|(cwd, text)| {
@@ -1893,6 +1989,9 @@ fn test_dedup_logic() {
             branch: None,
             cwd: None,
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -1904,6 +2003,9 @@ fn test_dedup_logic() {
             branch: None,
             cwd: None,
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -1915,6 +2017,9 @@ fn test_dedup_logic() {
             branch: None,
             cwd: None,
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         },
     ];
@@ -2015,7 +2120,7 @@ fn test_gemini_session_deserialization() {
                     "id": "64b73173-3b0f-4838-9121-5dfd1f1bb5e1",
                     "timestamp": "2026-01-20T19:50:51.778Z",
                     "type": "gemini",
-                    "content": "Cześć Maciej.",
+                    "content": "Cześć Alex.",
                     "model": "gemini-3-flash-preview",
                     "thoughts": [{"subject": "test", "description": "ignored"}],
                     "tokens": {"input": 100, "output": 25}
@@ -2037,7 +2142,7 @@ fn test_gemini_session_deserialization() {
     assert_eq!(session.messages[1].msg_type.as_deref(), Some("gemini"));
     assert_eq!(
         session.messages[1].content.as_ref(),
-        Some(&serde_json::Value::String("Cześć Maciej.".to_string()))
+        Some(&serde_json::Value::String("Cześć Alex.".to_string()))
     );
 }
 
@@ -2678,7 +2783,7 @@ fn test_junie_session_id_wrapper_uses_ancestor_logic() {
 #[test]
 fn test_project_filter_matches_owner_repo_segments() {
     assert!(project_filter_matches_path(
-        "/Users/test-user/Git/Loctree/aicx/src",
+        "/Users/user/Git/Loctree/aicx/src",
         &["Loctree/aicx".to_string()]
     ));
 }
@@ -2687,8 +2792,8 @@ fn test_project_filter_matches_owner_repo_segments() {
 fn test_project_filter_matches_path_local_checkout_without_git_does_not_match_owner() {
     // Pass-4 Wave F-2 (PR #8 follow-up to chatgpt-codex-connector P1):
     // the old "last-segment relax" that let `-p Loctree/aicx` match
-    // `/Users/test-user/Git/aicx` regardless of owner is gone. It leaked
-    // cross-org: filter `Loctree/aicx` ALSO matched `/.../VetCoders/aicx`.
+    // `/Users/user/Git/aicx` regardless of owner is gone. It leaked
+    // cross-org: filter `Loctree/aicx` ALSO matched `/.../Vetcoders/aicx`.
     //
     // Bug #14's original intent ("local checkout matches canonical
     // identity") now travels through Tier 1 — `aicx_parser::segmentation::
@@ -2706,15 +2811,15 @@ fn test_project_filter_matches_path_local_checkout_without_git_does_not_match_ow
          strict matcher must NOT accept `-p Loctree/aicx` for a directory \
          that merely ends in `aicx` — that's the cross-org leak we removed"
     );
-    // The symmetric anti-leak: a checkout literally under `/VetCoders/aicx`
+    // The symmetric anti-leak: a checkout literally under `/Vetcoders/aicx`
     // must also be rejected by `-p Loctree/aicx` at the strict tier.
     assert!(
         !project_filter_matches_path(
-            "/some/non-git/scratch/VetCoders/aicx",
+            "/some/non-git/scratch/Vetcoders/aicx",
             &["Loctree/aicx".to_string()]
         ),
         "cross-org leak guard: `-p Loctree/aicx` must NOT accept a path \
-         under /VetCoders/aicx"
+         under /Vetcoders/aicx"
     );
     // And the positive control: strict adjacency `Loctree/aicx` in the
     // path DOES match (this is Tier 3 strict behavior).
@@ -2739,7 +2844,7 @@ fn test_project_filter_matches_path_tier1_resolves_canonical_from_remote_url() {
     );
     assert!(
         !project_filter_matches_path(
-            "https://github.com/VetCoders/aicx",
+            "https://github.com/vetcoders/aicx",
             &["Loctree/aicx".to_string()]
         ),
         "Tier 1 must reject a github URL whose owner differs from the filter"
@@ -2749,14 +2854,14 @@ fn test_project_filter_matches_path_tier1_resolves_canonical_from_remote_url() {
 #[test]
 fn test_is_windows_absolute_path_recognizes_drive_letter_and_unc() {
     // Drive-letter form, both separators
-    assert!(is_windows_absolute_path("C:\\Users\\test-user\\Git\\aicx"));
-    assert!(is_windows_absolute_path("C:/Users/test-user/Git/aicx"));
+    assert!(is_windows_absolute_path("C:\\Users\\user\\Git\\aicx"));
+    assert!(is_windows_absolute_path("C:/Users/user/Git/aicx"));
     assert!(is_windows_absolute_path("d:\\code"));
     assert!(is_windows_absolute_path("Z:/work"));
     // UNC form
     assert!(is_windows_absolute_path("\\\\fileserver\\share\\repo"));
     // Negative cases
-    assert!(!is_windows_absolute_path("/Users/test-user/Git/aicx")); // Unix
+    assert!(!is_windows_absolute_path("/Users/user/Git/aicx")); // Unix
     assert!(!is_windows_absolute_path("Loctree/aicx")); // canonical slug
     assert!(!is_windows_absolute_path("C")); // too short
     assert!(!is_windows_absolute_path("C:")); // missing separator
@@ -2811,7 +2916,7 @@ fn test_project_filter_matches_path_substring_does_not_leak() {
 #[test]
 fn test_project_filter_matches_owner_wildcard_segment() {
     assert!(project_filter_matches_path(
-        "/Users/test-user/Git/Loctree/aicx",
+        "/Users/user/Git/Loctree/aicx",
         &["Loctree/".to_string()]
     ));
 }
@@ -2819,7 +2924,7 @@ fn test_project_filter_matches_owner_wildcard_segment() {
 #[test]
 fn test_project_filter_matches_repo_wildcard_segment() {
     assert!(project_filter_matches_path(
-        "/Users/test-user/Git/Other/aicx",
+        "/Users/user/Git/Other/aicx",
         &["/aicx".to_string()]
     ));
 }
@@ -2827,7 +2932,7 @@ fn test_project_filter_matches_repo_wildcard_segment() {
 #[test]
 fn test_project_filter_rejects_vista_for_vista_portal() {
     assert!(!project_filter_matches_path(
-        "/Users/test-user/Git/vista-portal",
+        "/Users/user/Git/vista-portal",
         &["vista".to_string()]
     ));
 }
@@ -2850,11 +2955,11 @@ fn test_project_filter_matches_path_strict_segments() {
 
     // No word-boundary matching inside a segment.
     assert!(!project_filter_matches_path(
-        "/Users/test-user/Git/vista-portal-pr15-hotfix",
+        "/Users/user/Git/vista-portal-pr15-hotfix",
         &["portal".to_string()]
     ));
     assert!(!project_filter_matches_path(
-        "/Users/test-user/Git/vista-portal-pr15-hotfix",
+        "/Users/user/Git/vista-portal-pr15-hotfix",
         &["vista-portal".to_string()]
     ));
 
@@ -2952,12 +3057,12 @@ fn test_codescribe_filter_per_transcript_not_splattered() {
     fs::create_dir_all(&widgets_dir).unwrap();
 
     // Transcript 1: explicitly mentions "aicx" in content (JSON)
-    let content_matching = r#"{"segments":[{"start":0,"end":1,"speaker":"Maciej","text":"let's work on Loctree/aicx today."}]}"#;
+    let content_matching = r#"{"segments":[{"start":0,"end":1,"speaker":"Engineer","text":"let's work on Loctree/aicx today."}]}"#;
     write_file(&day.join("100000_match.json"), content_matching);
 
     // Transcript 2: explicit project frontmatter to contradict the fallback
     let content_unmatching =
-        "---\nproject: acme/widgets\n---\n### Maciej:\nlet's work on widgets.\n";
+        "---\nproject: acme/widgets\n---\n### Engineer:\nlet's work on widgets.\n";
     write_file(&day.join("110000_unmatch.md"), content_unmatching);
 
     let config = ExtractionConfig {
@@ -2995,6 +3100,19 @@ fn test_operator_md_owner_repo_decode_preserves_owner() {
     assert_eq!(globex_cwd.as_deref(), Some(globex_dir.to_str().unwrap()));
 
     assert_ne!(acme_cwd, globex_cwd);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_operator_md_project_hint_resolves_git_checkout_case_insensitively() {
+    let root = unique_test_dir("operator-git-checkout");
+    let home = root.join("home");
+    let repo_dir = home.join("Git").join("ScreenScribe");
+    fs::create_dir_all(&repo_dir).unwrap();
+
+    let cwd = resolve_operator_cwd_hint(&home, Path::new("dummy"), Some("screenscribe"));
+    assert_eq!(cwd.as_deref(), Some(repo_dir.to_str().unwrap()));
 
     let _ = fs::remove_dir_all(&root);
 }

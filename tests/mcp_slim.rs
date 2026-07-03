@@ -15,6 +15,7 @@ use tower::ServiceExt;
 fn test_mcp_slim_defaults() {
     let params: SearchParams = serde_json::from_str(r#"{"query": "test"}"#).unwrap();
     assert_eq!(params.limit, 20);
+    assert!(!params.evidence);
     assert!(params.slim);
     assert!(!params.verbose);
 
@@ -51,8 +52,8 @@ fn test_mcp_slim_defaults() {
     );
 
     let params: ReadParams =
-        serde_json::from_str(r#"{"reference":"store/VetCoders/aicx/chunk.md"}"#).unwrap();
-    assert_eq!(params.reference, "store/VetCoders/aicx/chunk.md");
+        serde_json::from_str(r#"{"reference":"store/Vetcoders/aicx/chunk.md"}"#).unwrap();
+    assert_eq!(params.reference, "store/Vetcoders/aicx/chunk.md");
     assert!(params.max_chars.is_none());
 }
 

@@ -26,16 +26,95 @@ pub struct OperatorMarkdown {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct OperatorMarkdownFrontmatter {
+    #[serde(default, rename = "aicx_import")]
+    _aicx_import: Option<serde_yaml::Value>,
     #[serde(default)]
     pub(crate) project: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
     #[serde(default)]
     date: Option<String>,
     #[serde(default)]
     author: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    source_format: Option<String>,
 }
 
 pub fn discover_operator_markdown(home: &Path) -> Vec<OperatorMarkdown> {
     discover_operator_markdown_from(home, None, None)
+}
+
+/// Discover operator markdown from an explicit file or directory.
+///
+/// Directory inputs scan only their direct `.md` children; recursive import is
+/// intentionally left to a future explicit flag so an accidental home/workspace
+/// path does not walk a huge tree.
+pub fn discover_operator_markdown_from_input(input: &Path) -> Result<Vec<OperatorMarkdown>> {
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    collect_operator_markdown_input(input, &mut entries, &mut seen)?;
+    entries.sort_by_key(|entry| (entry.modified, entry.path.clone()));
+    Ok(entries)
+}
+
+fn collect_operator_markdown_input(
+    input: &Path,
+    entries: &mut Vec<OperatorMarkdown>,
+    seen: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    let meta = fs::metadata(input)
+        .with_context(|| format!("operator-md input not readable: {}", input.display()))?;
+    if meta.is_file() {
+        push_operator_markdown_input(input, meta, entries, seen);
+        return Ok(());
+    }
+    if meta.is_dir() {
+        for entry in fs::read_dir(input)
+            .with_context(|| {
+                format!(
+                    "operator-md input directory not readable: {}",
+                    input.display()
+                )
+            })?
+            .flatten()
+        {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_file() {
+                push_operator_markdown_input(&path, meta, entries, seen);
+            }
+        }
+        return Ok(());
+    }
+    anyhow::bail!(
+        "operator-md input is neither file nor directory: {}",
+        input.display()
+    );
+}
+
+fn push_operator_markdown_input(
+    path: &Path,
+    meta: fs::Metadata,
+    entries: &mut Vec<OperatorMarkdown>,
+    seen: &mut HashSet<PathBuf>,
+) {
+    if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+        return;
+    }
+    let Ok(modified) = meta.modified() else {
+        return;
+    };
+    if !seen.insert(path.to_path_buf()) {
+        return;
+    }
+    entries.push(OperatorMarkdown {
+        path: path.to_path_buf(),
+        modified: DateTime::<Utc>::from(modified),
+    });
 }
 
 /// Discover operator markdown files, optionally including `<repo>/docs/operator`.
@@ -121,7 +200,7 @@ pub fn extract_operator_markdown_from_home_and_repo(
     let mut entries = Vec::new();
 
     for document in discover_operator_markdown_from(home, repo_root, Some(config.cutoff)) {
-        match parse_operator_markdown_document(home, &document, config) {
+        match parse_operator_markdown_document(home, &document, config, true, false) {
             Ok(mut parsed) => entries.append(&mut parsed),
             Err(e) => eprintln!(
                 "Operator markdown extraction warning ({}): {}",
@@ -135,29 +214,90 @@ pub fn extract_operator_markdown_from_home_and_repo(
     Ok(entries)
 }
 
+/// Extract operator markdown from an explicit file or directory.
+///
+/// This is the bridge for ad-hoc `.md` exports: the file still goes through the
+/// same operator-md parser and canonical store writer, but discovery is scoped
+/// to the provided path rather than Downloads / inbox / docs/operator.
+pub fn extract_operator_markdown_from_input(
+    home: &Path,
+    input: &Path,
+    config: &ExtractionConfig,
+) -> Result<Vec<TimelineEntry>> {
+    let mut entries = Vec::new();
+    for document in discover_operator_markdown_from_input(input)? {
+        match parse_operator_markdown_document(home, &document, config, false, true) {
+            Ok(mut parsed) => entries.append(&mut parsed),
+            Err(e) => eprintln!(
+                "Operator markdown extraction warning ({}): {}",
+                document.path.display(),
+                e
+            ),
+        }
+    }
+    entries.sort_by_key(|entry| entry.timestamp);
+    Ok(entries)
+}
+
 fn parse_operator_markdown_document(
     home: &Path,
     document: &OperatorMarkdown,
     config: &ExtractionConfig,
+    allow_body_project_inference: bool,
+    plain_markdown_fallback: bool,
 ) -> Result<Vec<TimelineEntry>> {
     let content = sanitize::read_to_string_validated(&document.path)?;
     let (frontmatter, body) = split_operator_frontmatter(&content);
-    let project_hint = infer_operator_project_hint(&frontmatter, &body, &document.path, config);
-    let cwd_hint = resolve_operator_cwd_hint(home, &document.path, project_hint.as_deref());
+    let project_hint = infer_operator_project_hint(
+        &frontmatter,
+        &body,
+        &document.path,
+        config,
+        allow_body_project_inference,
+    );
+    let cwd_hint = frontmatter
+        .cwd
+        .as_deref()
+        .and_then(|cwd| normalize_operator_frontmatter_cwd(home, cwd))
+        .or_else(|| resolve_operator_cwd_hint(home, &document.path, project_hint.as_deref()));
+    // Date precedence (oś 5): explicit operator frontmatter date > the export's
+    // own "Created" header (real conversation start) > file mtime (download time).
     let base_timestamp = frontmatter
         .date
         .as_deref()
         .and_then(parse_operator_timestamp)
+        .or_else(|| extract_chatgpt_created_timestamp(&content))
         .unwrap_or(document.modified);
-    let session_id = format!(
-        "{}-{}",
-        operator_path_fingerprint(&document.path),
-        document
-            .path
-            .file_stem()
-            .map(|stem| stem.to_string_lossy())
-            .unwrap_or_else(|| "operator-md".into())
-    );
+    let session_id = frontmatter
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "{}-{}",
+                operator_path_fingerprint(&document.path),
+                document
+                    .path
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy())
+                    .unwrap_or_else(|| "operator-md".into())
+            )
+        });
+
+    if let Some(mut entries) = parse_chatgpt_markdown_document(
+        &body,
+        &document.path,
+        &frontmatter,
+        &session_id,
+        cwd_hint.clone(),
+        base_timestamp,
+        config,
+    ) {
+        attach_import_provenance(&mut entries, &document.path, &content);
+        return Ok(entries);
+    }
 
     let mut entries = Vec::new();
     let mut heading: Option<String> = None;
@@ -238,7 +378,237 @@ fn parse_operator_markdown_document(
         ));
     }
 
+    if entries.is_empty()
+        && plain_markdown_fallback
+        && let Some(entry) = parse_plain_markdown_document(
+            &body,
+            &document.path,
+            &frontmatter,
+            &session_id,
+            cwd_hint,
+            base_timestamp,
+            config,
+        )
+    {
+        entries.push(entry);
+    }
+
+    attach_import_provenance(&mut entries, &document.path, &content);
     Ok(entries)
+}
+
+/// Round II / oś 3+5 cut 2: prepend a frontmatter block carrying structural
+/// import provenance to every entry, so the chunker lifts source_file /
+/// source_format / import_id into the sidecar (and strips the block from the
+/// chunk body). `import_id` is a blake3 content hash, so re-importing the same
+/// material — even moved or renamed — resolves to the same id.
+fn attach_import_provenance(entries: &mut [TimelineEntry], path: &Path, content: &str) {
+    let import_id = format!("blake3:{}", blake3::hash(content.as_bytes()).to_hex());
+    let (source_path, source_sha256) = source_path_and_sha256(path);
+    let source_line_span = Some((1, content.lines().count().max(1) as u64));
+    for entry in entries.iter_mut() {
+        entry.source_path = Some(source_path.clone());
+        entry.source_sha256 = source_sha256.clone();
+        entry.source_line_span = source_line_span;
+        let source_format = entry
+            .message
+            .lines()
+            .find_map(|line| line.strip_prefix("source_format: "))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(OPERATOR_MD_KIND)
+            .to_string();
+        let block = format!(
+            "---\nsource_file: {}\nsource_format: {source_format}\nimport_id: {import_id}\n---\n",
+            path.display()
+        );
+        entry.message = format!("{block}{}", entry.message);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatGptMarkdownSection {
+    Prompt,
+    Response,
+}
+
+fn parse_chatgpt_markdown_document(
+    body: &str,
+    path: &Path,
+    frontmatter: &OperatorMarkdownFrontmatter,
+    session_id: &str,
+    cwd_hint: Option<String>,
+    base_timestamp: DateTime<Utc>,
+    config: &ExtractionConfig,
+) -> Option<Vec<TimelineEntry>> {
+    let mut sections: Vec<(ChatGptMarkdownSection, String)> = Vec::new();
+    let mut current: Option<ChatGptMarkdownSection> = None;
+    let mut lines: Vec<String> = Vec::new();
+
+    for raw_line in body.lines() {
+        if let Some(next_section) = parse_chatgpt_section_heading(raw_line) {
+            if let Some(section) = current.take() {
+                let text = lines.join("\n").trim().to_string();
+                if !text.is_empty() {
+                    sections.push((section, text));
+                }
+                lines.clear();
+            }
+            current = Some(next_section);
+            continue;
+        }
+        if current.is_some() {
+            lines.push(raw_line.to_string());
+        }
+    }
+
+    if let Some(section) = current {
+        let text = lines.join("\n").trim().to_string();
+        if !text.is_empty() {
+            sections.push((section, text));
+        }
+    }
+
+    if sections.is_empty() {
+        return None;
+    }
+
+    let mut entries = Vec::new();
+    for (sequence, (section, text)) in sections.into_iter().enumerate() {
+        let timestamp = base_timestamp + Duration::seconds(sequence as i64);
+        if timestamp < config.cutoff || config.watermark.is_some_and(|w| timestamp < w) {
+            continue;
+        }
+
+        let (role, frame_kind) = match section {
+            ChatGptMarkdownSection::Prompt => ("user", FrameKind::UserMsg),
+            ChatGptMarkdownSection::Response => ("assistant", FrameKind::AgentReply),
+        };
+        entries.push(build_timeline_entry(
+            timestamp,
+            OPERATOR_MD_AGENT,
+            session_id,
+            role,
+            format_chatgpt_markdown_message(path, frontmatter, section, &text),
+            TimelineEntryMeta {
+                cwd: cwd_hint.clone(),
+                frame_kind: Some(frame_kind),
+                ..TimelineEntryMeta::default()
+            },
+        ));
+    }
+
+    Some(entries)
+}
+
+fn parse_chatgpt_section_heading(line: &str) -> Option<ChatGptMarkdownSection> {
+    let trimmed = line.trim_start();
+    let level = trimmed.chars().take_while(|ch| *ch == '#').count();
+    if level == 0 {
+        return None;
+    }
+    let heading = trimmed.get(level..)?.trim();
+    let heading = heading.trim_end_matches(':').trim();
+    if heading.eq_ignore_ascii_case("prompt") {
+        Some(ChatGptMarkdownSection::Prompt)
+    } else if heading.eq_ignore_ascii_case("response") {
+        Some(ChatGptMarkdownSection::Response)
+    } else {
+        None
+    }
+}
+
+fn format_chatgpt_markdown_message(
+    path: &Path,
+    frontmatter: &OperatorMarkdownFrontmatter,
+    section: ChatGptMarkdownSection,
+    text: &str,
+) -> String {
+    let source_format = frontmatter_source_format(frontmatter).unwrap_or("chatgpt-markdown");
+    let mut message = format!(
+        "source: {OPERATOR_MD_KIND}\nsource_file: {}\nsource_format: {source_format}\nsection: {}",
+        path.display(),
+        match section {
+            ChatGptMarkdownSection::Prompt => "prompt",
+            ChatGptMarkdownSection::Response => "response",
+        }
+    );
+    if let Some(project) = frontmatter
+        .project
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        message.push_str(&format!("\nproject: {}", project.trim()));
+    }
+    if let Some(author) = frontmatter
+        .author
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        message.push_str(&format!("\nauthor: {}", author.trim()));
+    }
+    message.push_str("\n\n");
+    message.push_str(text.trim());
+    message
+}
+
+fn parse_plain_markdown_document(
+    body: &str,
+    path: &Path,
+    frontmatter: &OperatorMarkdownFrontmatter,
+    session_id: &str,
+    cwd_hint: Option<String>,
+    base_timestamp: DateTime<Utc>,
+    config: &ExtractionConfig,
+) -> Option<TimelineEntry> {
+    if base_timestamp < config.cutoff || config.watermark.is_some_and(|w| base_timestamp < w) {
+        return None;
+    }
+    let text = body.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(build_timeline_entry(
+        base_timestamp,
+        OPERATOR_MD_AGENT,
+        session_id,
+        "user",
+        format_plain_markdown_message(path, frontmatter, text),
+        TimelineEntryMeta {
+            cwd: cwd_hint,
+            frame_kind: Some(FrameKind::UserMsg),
+            ..TimelineEntryMeta::default()
+        },
+    ))
+}
+
+fn format_plain_markdown_message(
+    path: &Path,
+    frontmatter: &OperatorMarkdownFrontmatter,
+    text: &str,
+) -> String {
+    let source_format = frontmatter_source_format(frontmatter).unwrap_or("plain-markdown");
+    let mut message = format!(
+        "source: {OPERATOR_MD_KIND}\nsource_file: {}\nsource_format: {source_format}\nsection: body",
+        path.display()
+    );
+    if let Some(project) = frontmatter
+        .project
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        message.push_str(&format!("\nproject: {}", project.trim()));
+    }
+    if let Some(author) = frontmatter
+        .author
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        message.push_str(&format!("\nauthor: {}", author.trim()));
+    }
+    message.push_str("\n\n");
+    message.push_str(text.trim());
+    message
 }
 
 #[derive(Debug, Clone)]
@@ -276,6 +646,9 @@ fn format_operator_markdown_message(
         .filter(|value| !value.trim().is_empty())
     {
         message.push_str(&format!("\nauthor: {}", author.trim()));
+    }
+    if let Some(source_format) = frontmatter_source_format(frontmatter) {
+        message.push_str(&format!("\nsource_format: {source_format}"));
     }
     if let Some(heading) = heading.filter(|value| !value.trim().is_empty()) {
         message.push_str(&format!("\nheading: {}", heading.trim()));
@@ -334,6 +707,39 @@ fn parse_operator_timestamp(value: &str) -> Option<DateTime<Utc>> {
         }
     }
     None
+}
+
+/// Parse a ChatGPT-export US-style timestamp like `5/27/2026 1:07:20` (or
+/// date-only `5/27/2026`). chrono accepts unpadded month/day on input.
+fn parse_chatgpt_export_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    for fmt in ["%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(value, fmt) {
+            return Some(Utc.from_utc_datetime(&dt));
+        }
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(value, "%m/%d/%Y")
+        && let Some(time) = NaiveTime::from_hms_opt(0, 0, 0)
+    {
+        return Some(Utc.from_utc_datetime(&date.and_time(time)));
+    }
+    None
+}
+
+/// Pull the conversation start date from a ChatGPT export's `**Created:**`
+/// header so weeks-old conversations are dated to their real start, not the
+/// download mtime (Round II / oś 5).
+fn extract_chatgpt_created_timestamp(content: &str) -> Option<DateTime<Utc>> {
+    content.lines().find_map(|line| {
+        let line = line.trim();
+        let rest = line
+            .strip_prefix("**Created:**")
+            .or_else(|| line.strip_prefix("Created:"))?;
+        parse_chatgpt_export_timestamp(rest.trim_start_matches('*').trim())
+    })
 }
 
 fn parse_markdown_heading(line: &str) -> Option<String> {
@@ -415,6 +821,7 @@ fn infer_operator_project_hint(
     body: &str,
     path: &Path,
     config: &ExtractionConfig,
+    allow_body_project_inference: bool,
 ) -> Option<String> {
     if let Some(project) = frontmatter
         .project
@@ -426,6 +833,9 @@ fn infer_operator_project_hint(
     if config.project_filter.len() == 1 {
         return config.project_filter.first().cloned();
     }
+    if !allow_body_project_inference {
+        return None;
+    }
 
     let lower_path = path.to_string_lossy().to_ascii_lowercase();
     let lower_body = body.to_ascii_lowercase();
@@ -435,6 +845,33 @@ fn infer_operator_project_hint(
         }
     }
     None
+}
+
+fn normalize_operator_frontmatter_cwd(home: &Path, cwd: &str) -> Option<String> {
+    let cwd = cwd.trim();
+    if cwd.is_empty() {
+        return None;
+    }
+    if let Some(rest) = cwd.strip_prefix("~/") {
+        // Join segment-by-segment so the expanded path uses native separators
+        // on every platform; a raw join(rest) leaves the frontmatter's `/`
+        // embedded inside a `\`-separated path on Windows and the resulting
+        // cwd never matches the repo path the rest of the pipeline derives.
+        let mut path = home.to_path_buf();
+        for segment in rest.split('/').filter(|segment| !segment.is_empty()) {
+            path.push(segment);
+        }
+        return Some(path.display().to_string());
+    }
+    Some(cwd.to_string())
+}
+
+fn frontmatter_source_format(frontmatter: &OperatorMarkdownFrontmatter) -> Option<&str> {
+    frontmatter
+        .source_format
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 pub(crate) fn resolve_operator_cwd_hint(
@@ -462,6 +899,8 @@ pub(crate) fn resolve_operator_cwd_hint(
     let candidates = if !org.is_empty() {
         vec![
             home.join(org).join(repo),
+            home.join("Git").join(repo),
+            home.join("Git").join(org).join(repo),
             home.join("Libraxis").join(org).join(repo),
             home.join("Libraxis")
                 .join("vc-runtime")
@@ -477,20 +916,35 @@ pub(crate) fn resolve_operator_cwd_hint(
     } else {
         vec![
             home.join(repo),
+            home.join("Git").join(repo),
             home.join("Libraxis").join(repo),
             home.join("Libraxis").join("vc-runtime").join(repo),
             home.join("Libraxis")
                 .join("01_deployed_libraxis_vm")
                 .join(repo),
-            home.join("hosted").join("VetCoders").join(repo),
-            home.join("vc-workspace").join("VetCoders").join(repo),
+            home.join("hosted").join("Vetcoders").join(repo),
+            home.join("vc-workspace").join("Vetcoders").join(repo),
         ]
     };
 
     candidates
         .into_iter()
+        .filter_map(resolve_case_insensitive_dir)
         .find(|candidate| candidate.is_dir())
         .map(|candidate| candidate.display().to_string())
+}
+
+fn resolve_case_insensitive_dir(candidate: PathBuf) -> Option<PathBuf> {
+    if let (Some(parent), Some(name)) = (candidate.parent(), candidate.file_name()) {
+        let needle = name.to_string_lossy().to_ascii_lowercase();
+        for entry in fs::read_dir(parent).ok()?.filter_map(|entry| entry.ok()) {
+            let path = entry.path();
+            if path.is_dir() && entry.file_name().to_string_lossy().to_ascii_lowercase() == needle {
+                return Some(path);
+            }
+        }
+    }
+    candidate.is_dir().then_some(candidate)
 }
 
 fn discover_git_root_from_path(path: &Path) -> Option<PathBuf> {

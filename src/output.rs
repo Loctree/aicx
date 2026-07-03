@@ -10,7 +10,7 @@
 //! The public surface stays here; implementation lives in focused submodules
 //! for types, decision detection, report file writing, and conversation export.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 mod conversation;
 mod decision;

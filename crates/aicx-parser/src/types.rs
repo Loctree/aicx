@@ -1,6 +1,6 @@
 //! Shared canonical types used by the intent engine.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -14,6 +14,8 @@ pub use crate::timeline::{FrameKind, Kind, RepoIdentity, SemanticSegment, Source
 #[serde(rename_all = "lowercase")]
 pub enum EntryType {
     Intent,
+    Task,
+    Commitment,
     Why,
     Argue,
     Decision,
@@ -28,6 +30,8 @@ impl EntryType {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Intent => "intent",
+            Self::Task => "task",
+            Self::Commitment => "commitment",
             Self::Why => "why",
             Self::Argue => "argue",
             Self::Decision => "decision",
@@ -42,6 +46,8 @@ impl EntryType {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "intent" => Some(Self::Intent),
+            "task" | "todo" => Some(Self::Task),
+            "commitment" | "promise" => Some(Self::Commitment),
             "why" => Some(Self::Why),
             "argue" | "argument" | "debate" => Some(Self::Argue),
             "decision" => Some(Self::Decision),

@@ -13,7 +13,7 @@
 //! Everything behind `feature = "app"` is internal product surface, not the slim
 //! consumer contract.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 pub mod api;
 #[cfg(feature = "app")]
@@ -35,6 +35,8 @@ mod diagnostics;
 pub mod doctor;
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub mod embedder;
+#[cfg(feature = "app")]
+pub mod evidence;
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub mod hf_cache;
 pub mod intents;
@@ -62,6 +64,8 @@ pub mod redact;
 pub mod reports_extractor;
 #[cfg(feature = "app")]
 pub mod search_engine;
+#[cfg(feature = "app")]
+pub mod search_eval;
 pub mod sessions;
 #[cfg(feature = "app")]
 pub mod sources;
@@ -89,7 +93,7 @@ pub mod wizard;
 mod test_support;
 
 pub use aicx_parser as parser;
-pub use aicx_parser::{chunker, frontmatter, sanitize, segmentation, timeline, types};
+pub use aicx_parser::{card_header, chunker, frontmatter, sanitize, segmentation, timeline, types};
 pub use api::{Aicx, AicxConfig, IndexReadiness, IndexStatus, StoreOptions};
 #[cfg(feature = "app")]
 pub use api::{SearchOptions, SearchResults};

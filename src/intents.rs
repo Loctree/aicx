@@ -3,7 +3,7 @@
 //! Elevates stored chunk `[signals]` metadata and matching raw conversation
 //! lines into first-class, queryable intent records.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, Utc};
@@ -111,8 +111,11 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
         let (signal_lines, transcript_entries) = parse_chunk_document(&content);
         let source_chunk = file.path.to_string_lossy().to_string();
 
+        // oś 3: stamp records with the chunk's canonical bucket (file.project),
+        // not the query filter (config.project) — empty/aliased filters must not
+        // leak into record provenance.
         let (signal_candidates, signal_tasks) =
-            extract_signal_candidates(&file, &config.project, &source_chunk, &signal_lines);
+            extract_signal_candidates(&file, &file.project, &source_chunk, &signal_lines);
         extend_with_cap(
             &mut candidates,
             signal_candidates,
@@ -126,12 +129,8 @@ pub(crate) fn extract_intents_from_root_at_with_stats(
             "task_events",
         );
 
-        let (raw_candidates, raw_tasks) = extract_transcript_candidates(
-            &file,
-            &config.project,
-            &source_chunk,
-            &transcript_entries,
-        );
+        let (raw_candidates, raw_tasks) =
+            extract_transcript_candidates(&file, &file.project, &source_chunk, &transcript_entries);
         extend_with_cap(
             &mut candidates,
             raw_candidates,
@@ -298,6 +297,17 @@ fn collect_chunk_files(
         }) {
             continue;
         }
+        // Claim-honesty frame travels from the v2 sidecar into every record
+        // extracted from this chunk; pre-v2 sidecars leave it empty (rendered
+        // as unknown, serialized as no keys).
+        let honesty = sidecar
+            .as_ref()
+            .map(|sidecar| crate::oracle::ClaimHonesty {
+                claim_scope: sidecar.claim_scope.clone(),
+                freshness_contract: sidecar.freshness_contract.clone(),
+                verification_state: sidecar.verification_state.clone(),
+            })
+            .unwrap_or_default();
         // Legacy chunks (no sidecar yet, or a pre-frame_kind sidecar) belong
         // to the default user_msg lane; requiring an explicit frame_kind here
         // silently emptied intents on stores written before the field existed.
@@ -340,6 +350,7 @@ fn collect_chunk_files(
             sequence: file.chunk,
             timestamp,
             session_id: file.session_id,
+            honesty,
         });
     }
 
@@ -379,7 +390,9 @@ fn parse_chunk_document(content: &str) -> (Vec<String>, Vec<TranscriptEntry>) {
     let mut signal_lines = Vec::new();
     let mut transcript_lines = Vec::new();
 
-    for line in content.lines() {
+    // Header-agnostic: strip the card header (bracket or frontmatter)
+    // structurally so frontmatter meta lines never read as transcript.
+    for line in crate::card_header::card_body(content).lines() {
         let trimmed = line.trim();
         if trimmed == "[signals]" {
             in_signals = true;
@@ -393,7 +406,7 @@ fn parse_chunk_document(content: &str) -> (Vec<String>, Vec<TranscriptEntry>) {
             signal_lines.push(line.to_string());
             continue;
         }
-        if trimmed.starts_with("[project:") {
+        if crate::card_header::is_bracket_header_line(trimmed) {
             continue;
         }
         // Track triple-backtick fence in the transcript section. Lines inside a
@@ -561,25 +574,114 @@ fn extract_signal_candidates(
         if is_source_metadata_line(payload)
             || is_local_command_artifact_line(payload)
             || is_reingested_charter_line(payload)
+            || is_code_fragment_line(payload)
         {
             continue;
         }
-        let kind = match section {
+        let declared = match section {
             SignalSection::Intent => Some(IntentKind::Intent),
             SignalSection::Decision => Some(IntentKind::Decision),
             SignalSection::Results | SignalSection::Outcome => Some(IntentKind::Outcome),
-            SignalSection::Ignore | SignalSection::None => infer_kind_from_line(payload, false),
+            SignalSection::Ignore | SignalSection::None => None,
         };
 
-        if let Some(kind) = kind
-            && let Some(candidate) =
-                build_candidate(kind, payload, None, file, project, source_chunk, true, None)
-        {
+        let built = match declared {
+            // Section-tagged line: the [signals] header is a strong hint, but it
+            // must pass the shared classifier before becoming a record (oś 1).
+            Some(declared) => revalidate_signal_kind(declared, payload).and_then(|verdict| {
+                build_candidate(
+                    verdict.kind,
+                    payload,
+                    None,
+                    file,
+                    project,
+                    source_chunk,
+                    verdict.trusted,
+                    verdict.source,
+                )
+            }),
+            // No section header: classify the line, but still tag it as
+            // signal-sourced (it came from the [signals] block).
+            None => infer_kind_from_line(payload, false).and_then(|kind| {
+                build_candidate(
+                    kind,
+                    payload,
+                    None,
+                    file,
+                    project,
+                    source_chunk,
+                    true,
+                    Some(SIGNAL_SOURCE.to_string()),
+                )
+            }),
+        };
+
+        if let Some(candidate) = built {
             candidates.push(candidate);
         }
     }
 
     (candidates, task_events)
+}
+
+/// Kind + provenance verdict from passing a `[signals]` section line through the
+/// shared semantic classifier (Round II / oś 1).
+struct SignalVerdict {
+    kind: IntentKind,
+    /// Provenance for `IntentRecord.source`: `None` when the section hint is
+    /// honored as-is, `Some("signals:revalidated(<from>->,<to>)")` when the
+    /// classifier overrode it.
+    source: Option<String>,
+    /// Whether to score this with full signal confidence. Honored hints stay
+    /// trusted; overridden lines drop to normal classified confidence.
+    trusted: bool,
+}
+
+/// Revalidate a `[signals]` section-declared kind against the shared classifier.
+///
+/// `[signals]` headers (`Intent:`/`Decision:`/`Results:`/`Outcome:`) are a
+/// strong upstream hint, but they must not bypass the ontology — previously the
+/// section header alone set the kind, so e.g. a question filed under `Results:`
+/// became an outcome. The classifier now runs on the payload; on a confident
+/// contrary reading it wins (operator decision 2026-06-21). Returns `None` when
+/// the classifier confidently reads the line as a non-bucket role
+/// (assumption/insight/argue/commitment), dropping the section's false positive.
+/// Provenance tag for records derived from a `[signals]` block. Every
+/// signal-sourced record carries at least this, so downstream can distinguish
+/// signal-origin from raw-transcript-origin records.
+const SIGNAL_SOURCE: &str = "signals";
+
+fn revalidate_signal_kind(declared: IntentKind, payload: &str) -> Option<SignalVerdict> {
+    match classify_line_entry_type(payload, false) {
+        Some((entry_type, confidence)) if confidence >= CLASSIFIER_ABSTAIN_THRESHOLD => {
+            match entry_type_to_timeline_kind(entry_type) {
+                // classifier agrees with the section hint -> trusted signal
+                Some(kind) if kind == declared => Some(SignalVerdict {
+                    kind: declared,
+                    source: Some(SIGNAL_SOURCE.to_string()),
+                    trusted: true,
+                }),
+                // classifier disagrees -> classifier wins, record provenance
+                Some(kind) => Some(SignalVerdict {
+                    kind,
+                    source: Some(format!(
+                        "{SIGNAL_SOURCE}:revalidated({}->{})",
+                        declared.heading().to_ascii_lowercase(),
+                        kind.heading().to_ascii_lowercase()
+                    )),
+                    trusted: false,
+                }),
+                // classifier confidently reads a non-bucket role -> drop false positive
+                None => None,
+            }
+        }
+        // classifier abstains -> honor the section hint
+        _ => Some(SignalVerdict {
+            kind: declared,
+            source: Some(SIGNAL_SOURCE.to_string()),
+            trusted: true,
+        }),
+    }
 }
 
 fn extract_transcript_candidates(
@@ -603,8 +705,14 @@ fn extract_transcript_candidates(
             }
         }
         let mut codescribe_parser = CodescribeParser::new();
+        // Document-role awareness: a pasted run of commit/changelog lines is
+        // historical reference, not operator intent (Round II / oś 2 cut 2).
+        let commit_block = commit_block_indices(&entry.lines);
 
         for (index, raw_line) in entry.lines.iter().enumerate() {
+            if commit_block.contains(&index) {
+                continue;
+            }
             let (cleaned, is_voice) = codescribe_parser.process(raw_line);
             let line = cleaned.trim();
             if line.is_empty() {
@@ -724,8 +832,8 @@ fn charter_head_markers() -> &'static [&'static str] {
         "<INSTRUCTIONS>",
         "<!-- loctree-doctrine",
         "<!-- loctree-advise",
-        "# VetCoders Global Agent Charter",
-        "# VetCoders Agent Operating Guide",
+        "# Vetcoders Global Agent Charter",
+        "# Vetcoders Agent Operating Guide",
         "# Loctree + AICX + Vibecrafted Agent Operating Guide",
         "# The Vibecrafted Manifesto",
         "## **LOCTREE + AICX + VIBECRAFTED",
@@ -756,6 +864,9 @@ fn infer_kind_from_line(line: &str, is_user_line: bool) -> Option<IntentKind> {
     if is_user_line && looks_like_operator_decision_line(line) {
         return Some(IntentKind::Decision);
     }
+    if is_user_line && looks_like_operator_requirement_line(line) {
+        return Some(IntentKind::Intent);
+    }
     if is_outcome_line(line) {
         return Some(IntentKind::Outcome);
     }
@@ -771,9 +882,12 @@ fn infer_kind_from_line(line: &str, is_user_line: bool) -> Option<IntentKind> {
 fn entry_type_to_timeline_kind(entry_type: EntryType) -> Option<IntentKind> {
     match entry_type {
         EntryType::Decision => Some(IntentKind::Decision),
+        EntryType::Task => Some(IntentKind::Task),
         EntryType::Intent | EntryType::Question | EntryType::Why => Some(IntentKind::Intent),
         EntryType::Outcome | EntryType::Result => Some(IntentKind::Outcome),
-        EntryType::Argue | EntryType::Assumption | EntryType::Insight => None,
+        EntryType::Argue | EntryType::Assumption | EntryType::Insight | EntryType::Commitment => {
+            None
+        }
     }
 }
 
@@ -998,7 +1112,238 @@ fn is_source_metadata_line(line: &str) -> bool {
 
 fn looks_like_operator_decision_line(line: &str) -> bool {
     let lower = line.to_lowercase();
-    [
+    const POLICY_MARKERS: &[&str] = &[
+        // Scope rejections / accepted boundaries.
+        "nie fixujemy",
+        "nie robimy",
+        "nie ruszamy",
+        "out of scope",
+        "poza scope",
+        // Durable policy/default/constraint language.
+        "od teraz",
+        "from now on",
+        "canonical",
+        "kanonicz",
+        "default",
+        "domysln",
+        "domyśln",
+        "tylko przez",
+        "bez zgadywania",
+        "bez fallback",
+        "no fallback",
+        "musi mieć",
+        "musi miec",
+        // Product principles phrased as "X is an addon, not a rescue layer".
+        "ma byc dodatkiem",
+        "ma być dodatkiem",
+    ];
+
+    POLICY_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// `true` when a line is a code/log fragment rather than prose — a bare
+/// identifier (`DEFAULT_KEYWORDS_PATH`), an assignment to one
+/// (`DEFAULT_KEYWORDS_PATH = "..."`), or a kwarg call
+/// (`field(default_factory=list)`). These leak into the classifier through
+/// substring policy markers ("default", "canonical") and must not become
+/// intents/decisions/outcomes (Round II / oś 2).
+fn is_code_fragment_line(line: &str) -> bool {
+    let s = line.trim().trim_start_matches(['-', '*', '+']).trim();
+    if s.is_empty() {
+        return false;
+    }
+
+    // (a) keyword-arg / assignment inside a call: foo(bar=baz)
+    if has_kwarg_call(s) {
+        return true;
+    }
+
+    // (b) the line is essentially a CONSTANT_CASE identifier (optionally
+    // assigned), with at most one trailing prose word.
+    let mut has_constant_case = false;
+    let mut prose_words = 0usize;
+    for token in s.split_whitespace() {
+        let core = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+        if core.is_empty() {
+            continue; // pure punctuation (=, (), "", ...)
+        }
+        if is_constant_case_identifier(core) {
+            has_constant_case = true;
+            continue;
+        }
+        if core.chars().all(|c| c.is_ascii_digit()) {
+            continue; // numbers / counts
+        }
+        if core.chars().all(|c| c.is_alphabetic()) && core.chars().any(|c| c.is_lowercase()) {
+            prose_words += 1; // a natural lowercase word is prose
+        }
+    }
+    has_constant_case && prose_words <= 1
+}
+
+/// `FOO_BAR`, `DEFAULT_KEYWORDS_PATH` — all-caps/digits with at least one
+/// underscore-joined segment. Plain `OK`/`PASS` (no underscore) are not matched.
+fn is_constant_case_identifier(token: &str) -> bool {
+    if !token.contains('_') {
+        return false;
+    }
+    let mut has_alpha = false;
+    for c in token.chars() {
+        if c.is_ascii_uppercase() {
+            has_alpha = true;
+        } else if c.is_ascii_digit() || c == '_' {
+            // allowed
+        } else {
+            return false; // lowercase or other -> not constant case
+        }
+    }
+    has_alpha
+}
+
+/// Detects `ident(... = ...)` — a bare `=` (not `==`/`<=`/`>=`/`!=`) between the
+/// first `(` and the next `)`, i.e. a keyword argument / call assignment.
+fn has_kwarg_call(s: &str) -> bool {
+    let Some(open) = s.find('(') else {
+        return false;
+    };
+    let rest = &s[open + 1..];
+    let Some(close) = rest.find(')') else {
+        return false;
+    };
+    let bytes = &rest.as_bytes()[..close];
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'=' {
+            let prev = if i > 0 { bytes[i - 1] } else { b' ' };
+            let next = if i + 1 < bytes.len() {
+                bytes[i + 1]
+            } else {
+                b' '
+            };
+            if prev != b'=' && prev != b'<' && prev != b'>' && prev != b'!' && next != b'=' {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Capitalized English commit-subject verbs (git/changelog/conventional-commit
+/// imperative mood). Case-sensitive: real commit subjects are Capitalized, so
+/// lowercase prose ("add a retry") is not matched here.
+const COMMIT_SUBJECT_VERBS: &[&str] = &[
+    "Add",
+    "Fix",
+    "Update",
+    "Remove",
+    "Refactor",
+    "Implement",
+    "Create",
+    "Delete",
+    "Move",
+    "Rename",
+    "Drop",
+    "Bump",
+    "Split",
+    "Harden",
+    "Allow",
+    "Stabilize",
+    "Port",
+    "Merge",
+    "Revert",
+    "Close",
+    "Resolve",
+    "Improve",
+    "Switch",
+    "Enable",
+    "Disable",
+    "Replace",
+    "Extract",
+    "Introduce",
+    "Wire",
+    "Guard",
+    "Expose",
+    "Prevent",
+    "Support",
+];
+
+const CONVENTIONAL_COMMIT_TYPES: &[&str] = &[
+    "feat", "fix", "chore", "docs", "refactor", "test", "perf", "build", "ci", "style", "revert",
+    "ops", "polish", "release",
+];
+
+/// `type: subject` or `type(scope): subject` conventional-commit prefix.
+fn is_conventional_commit_prefix(s: &str) -> bool {
+    let Some((head, rest)) = s.split_once(": ") else {
+        return false;
+    };
+    if rest.trim().is_empty() {
+        return false;
+    }
+    let type_word = head.split_once('(').map(|(t, _)| t).unwrap_or(head);
+    // scope form must actually close its paren
+    if head.contains('(') && !head.ends_with(')') {
+        return false;
+    }
+    CONVENTIONAL_COMMIT_TYPES.contains(&type_word)
+}
+
+/// `true` when a line reads like a git-log / changelog entry: a leading commit
+/// hash, a conventional-commit prefix, or a capitalized commit-subject verb.
+/// Used only as a per-line signal; a single such line is NOT enough to suppress
+/// it (see [`commit_block_indices`]).
+fn looks_like_commit_log_line(line: &str) -> bool {
+    let s = line.trim().trim_start_matches(['-', '*', '+', '>']).trim();
+    if s.is_empty() {
+        return false;
+    }
+    if let Some((first, rest)) = s.split_once(char::is_whitespace)
+        && !rest.trim().is_empty()
+        && looks_like_commit_hash(first)
+    {
+        return true;
+    }
+    if is_conventional_commit_prefix(s) {
+        return true;
+    }
+    if let Some((first, rest)) = s.split_once(char::is_whitespace)
+        && !rest.trim().is_empty()
+        && COMMIT_SUBJECT_VERBS.contains(&first)
+    {
+        return true;
+    }
+    false
+}
+
+/// Document-role awareness (Round II / oś 2): indices of lines that belong to a
+/// pasted commit-list / changelog BLOCK — a run of >=2 consecutive
+/// commit-log-like lines. A lone imperative is left alone (it may be a real
+/// task); only a run is treated as historical reference.
+fn commit_block_indices(lines: &[String]) -> HashSet<usize> {
+    let flags: Vec<bool> = lines
+        .iter()
+        .map(|l| looks_like_commit_log_line(l))
+        .collect();
+    let mut block = HashSet::new();
+    let mut i = 0;
+    while i < flags.len() {
+        if flags[i] {
+            let start = i;
+            while i < flags.len() && flags[i] {
+                i += 1;
+            }
+            if i - start >= 2 {
+                block.extend(start..i);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    block
+}
+
+fn looks_like_operator_requirement_line(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    const REQUIREMENT_MARKERS: &[&str] = &[
         "nie może być",
         "nie moze byc",
         "ma być",
@@ -1011,9 +1356,11 @@ fn looks_like_operator_decision_line(line: &str) -> bool {
         "pełny ownership",
         "pelny ownership",
         "teraz wypuszuj",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
+    ];
+
+    REQUIREMENT_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 fn is_garbled_transcription(summary: &str) -> bool {
@@ -1128,6 +1475,7 @@ fn build_candidate(
             source_chunk: source_chunk.to_string(),
             timestamp: Some(file.timestamp.to_rfc3339()),
             source: source_provenance,
+            honesty: file.honesty.clone(),
         },
         confidence,
         timestamp: file.timestamp,
@@ -1781,7 +2129,7 @@ fn push_unique(target: &mut Vec<String>, value: String) {
     target.push(value);
 }
 
-// ── 9-type intent entry classifier ──────────────────────────────────
+// ── 11-type intent entry classifier ─────────────────────────────────
 
 const CLASSIFIER_ABSTAIN_THRESHOLD: f32 = 0.5;
 
@@ -1813,7 +2161,9 @@ const ASSUMPTION_MARKERS: &[&str] = &[
     "we assume",
     "hypothesis:",
     "zakładam",
+    "zakladam",
     "założenie:",
+    "zalozenie:",
     "hipoteza:",
     "przypuszczam",
 ];
@@ -1861,6 +2211,49 @@ const INSIGHT_MARKERS: &[&str] = &[
     "kluczowe:",
 ];
 
+const TASK_DIRECTIVE_MARKERS: &[&str] = &["task:", "todo:", "zadanie:"];
+
+const TASK_ACTION_HEADS: &[&str] = &[
+    // Polish operator requests.
+    "stworz",
+    "stwórz",
+    "utworz",
+    "utwórz",
+    "dodaj",
+    "napraw",
+    "popraw",
+    "zbuduj",
+    "przygotuj",
+    "zapisz",
+    "spisz",
+    "wypisz",
+    "zaimplementuj",
+    "podlacz",
+    "podłącz",
+    "skopiuj",
+    "przekopiuj",
+    "uruchom",
+    "odpal",
+    // English operator requests.
+    "create",
+    "add",
+    "fix",
+    "update",
+    "implement",
+    "write",
+    "run",
+    "copy",
+];
+
+const COMMITMENT_HEADS: &[&str] = &[
+    "zrobie",
+    "zrobię",
+    "zajme sie",
+    "zajmę się",
+    "i will ",
+    "i'll ",
+];
+
 /// Markers whose presence alone is enough to call a line a Result line. Each
 /// carries result-shape on its own (PASS/FAIL outcome, score readout, P-level
 /// count, command name that only appears in result-reporting contexts).
@@ -1902,6 +2295,101 @@ fn line_has_result_shape(lower_line: &str) -> bool {
     SHAPE_TOKENS.iter().any(|t| lower_line.contains(t))
 }
 
+fn looks_like_task_directive_line(line: &str) -> bool {
+    let head = line.trim_start();
+    TASK_DIRECTIVE_MARKERS.iter().any(|marker| {
+        head.get(..marker.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(marker))
+    })
+}
+
+fn looks_like_bare_checkbox_task(line: &str) -> bool {
+    let head = line.trim_start();
+    head.starts_with("[ ] ") || head.starts_with("[x] ") || head.starts_with("[X] ")
+}
+
+fn looks_like_actionable_task_line(line: &str) -> bool {
+    let head = line
+        .trim_start()
+        .trim_start_matches(['-', '*', '+'])
+        .trim_start();
+    let word_count = head.split_whitespace().take(4).count();
+    if word_count < 3 {
+        return false;
+    }
+
+    let lower = head.to_lowercase();
+    TASK_ACTION_HEADS.iter().any(|marker| {
+        lower == *marker
+            || lower
+                .strip_prefix(marker)
+                .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with(':'))
+    })
+}
+
+fn looks_like_completion_outcome_line(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    const COMPLETION_MARKERS: &[&str] = &[
+        "zostal dodany",
+        "został dodany",
+        "zostala dodana",
+        "została dodana",
+        "zostaly dodane",
+        "zostały dodane",
+        "zostal utworzony",
+        "został utworzony",
+        "has been added",
+        "was added",
+        "has been created",
+        "was created",
+    ];
+    if !COMPLETION_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+
+    lower.starts_with("plik ")
+        || lower.starts_with("file ")
+        || lower.starts_with("docs/")
+        || lower.contains(".md")
+        || lower.contains(".rs")
+        || lower.contains('/')
+}
+
+fn looks_like_observed_count_outcome_line(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    if !lower.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let has_observed_counts =
+        lower.contains(" records") || lower.contains(" rekord") || lower.contains(" wynik");
+    let has_result_verb = lower.contains(" dal ")
+        || lower.contains(" dał ")
+        || lower.contains("dala ")
+        || lower.contains(" dała ")
+        || lower.contains("yielded")
+        || lower.contains("produced")
+        || lower.contains("gave");
+
+    has_observed_counts && has_result_verb
+}
+
+fn looks_like_commitment_line(line: &str) -> bool {
+    let head = line.trim_start().to_lowercase();
+    if head.starts_with("commitment:")
+        || head.starts_with("promise:")
+        || head.starts_with("obietnica:")
+    {
+        return true;
+    }
+
+    COMMITMENT_HEADS
+        .iter()
+        .any(|marker| head.starts_with(marker))
+}
+
 pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType, f32)> {
     let lower = line.to_lowercase();
     let trimmed = lower.trim();
@@ -1918,8 +2406,17 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
     if trimmed.starts_with("decision:") || trimmed.contains("[decision]") {
         return Some((EntryType::Decision, 0.95));
     }
-    if is_user && looks_like_operator_decision_line(line) {
-        return Some((EntryType::Decision, 0.75));
+    if looks_like_task_directive_line(line) {
+        return Some((EntryType::Task, 0.95));
+    }
+    if is_user && looks_like_bare_checkbox_task(line) {
+        return Some((EntryType::Task, 0.85));
+    }
+    if is_user && looks_like_actionable_task_line(line) {
+        return Some((EntryType::Task, 0.75));
+    }
+    if looks_like_commitment_line(line) {
+        return Some((EntryType::Commitment, 0.72));
     }
 
     if trimmed.starts_with("question:") || trimmed.ends_with('?') && trimmed.len() > 15 {
@@ -1933,10 +2430,19 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
         }
     }
 
+    if is_user && looks_like_operator_decision_line(line) {
+        return Some((EntryType::Decision, 0.75));
+    }
+    if is_user && looks_like_operator_requirement_line(line) {
+        return Some((EntryType::Intent, 0.7));
+    }
+
     if trimmed.starts_with("assumption:")
         || trimmed.starts_with("hypothesis:")
         || trimmed.starts_with("zakładam")
+        || trimmed.starts_with("zakladam")
         || trimmed.starts_with("założenie:")
+        || trimmed.starts_with("zalozenie:")
         || trimmed.starts_with("hipoteza:")
     {
         return Some((EntryType::Assumption, 0.9));
@@ -1959,6 +2465,12 @@ pub fn classify_line_entry_type(line: &str, is_user: bool) -> Option<(EntryType,
 
     if is_outcome_tag(line) || trimmed.starts_with("[skill_outcome]") {
         return Some((EntryType::Outcome, 0.9));
+    }
+    if looks_like_completion_outcome_line(line) {
+        return Some((EntryType::Outcome, 0.72));
+    }
+    if looks_like_observed_count_outcome_line(line) {
+        return Some((EntryType::Outcome, 0.72));
     }
 
     if trimmed.starts_with("result:") || trimmed.starts_with("wynik:") {
@@ -2134,7 +2646,11 @@ fn classify_signal_line(line: &str) -> Option<(EntryType, f32)> {
 
 fn initial_state(entry_type: EntryType) -> EntryState {
     match entry_type {
-        EntryType::Intent | EntryType::Question | EntryType::Assumption => EntryState::Proposed,
+        EntryType::Intent
+        | EntryType::Task
+        | EntryType::Commitment
+        | EntryType::Question
+        | EntryType::Assumption => EntryState::Proposed,
         EntryType::Decision | EntryType::Insight => EntryState::Active,
         EntryType::Outcome | EntryType::Result => EntryState::Done,
         EntryType::Why | EntryType::Argue => EntryState::Active,
@@ -2154,6 +2670,19 @@ fn clean_entry_title(entry_type: EntryType, raw: &str) -> String {
             strip_case_insensitive_prefix(t, "validation:")
         }
         EntryType::Result => strip_case_insensitive_prefix(text, "result:"),
+        EntryType::Task => {
+            let t = strip_case_insensitive_prefix(text, "task:");
+            let t = strip_case_insensitive_prefix(t, "todo:");
+            let t = strip_case_insensitive_prefix(t, "zadanie:");
+            let t = strip_case_insensitive_prefix(t, "[ ]");
+            let t = strip_case_insensitive_prefix(t, "[x]");
+            strip_case_insensitive_prefix(t, "[X]")
+        }
+        EntryType::Commitment => {
+            let t = strip_case_insensitive_prefix(text, "commitment:");
+            let t = strip_case_insensitive_prefix(t, "promise:");
+            strip_case_insensitive_prefix(t, "obietnica:")
+        }
         EntryType::Question => strip_case_insensitive_prefix(text, "question:"),
         EntryType::Assumption => {
             let t = strip_case_insensitive_prefix(text, "assumption:");

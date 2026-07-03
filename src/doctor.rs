@@ -21,7 +21,7 @@
 //! never deletes store contents. Bucket quarantine is a rename into
 //! `~/.aicx/quarantine/<timestamp>/`, preserving the original payload.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 mod checks;
 mod cleanup;

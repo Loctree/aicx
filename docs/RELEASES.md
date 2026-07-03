@@ -157,7 +157,7 @@ Notes:
   that asset set.
 - The target does not print secret values; it only reads the files from the operator-owned keys directory.
 - `install.sh` inside the bundle copies binaries into `~/.local/bin` and removes stale user-local / `~/.cargo/bin` copies before configuring MCP.
-- That install path does not require Rust or a local memex compile on the target machine.
+- That install path does not require Rust or a local rust-memex compile on the target machine.
 - `AICX_INSTALL_MODE=release` downloads the official release asset, fetches the adjacent `.sha256`, verifies the checksum, and only then delegates to the bundled installer.
 - On macOS, `AICX_INSTALL_MODE=release` expects the
   `aicx-vX.Y.Z-aarch64-apple-darwin-slim-unsigned.tar.gz` asset.
@@ -193,6 +193,52 @@ crate depends on local first-party product crates (`rust-memex` and
 `aicx-embeddings`) that are not published to crates.io. Treat `cargo publish` /
 `cargo publish --dry-run` failures as expected unless the product decision
 changes and all first-party crates get a crates.io-compatible publication plan.
+
+## macOS Signing Runner Session Requirement
+
+The macOS release leg (`dragon-macos`) Apple-codesigns the binaries with the
+Developer ID identity. `codesign` can only resolve a keychain signing identity
+from inside a GUI login (`Aqua`) security session. This is a hard macOS
+constraint, not a property of `tools/release_bundle.sh`.
+
+Symptom when the runner is in the wrong session: `codesign` fails at step
+`[3/6]` with **"no identity found"** even though the Developer ID identity is
+valid (`security find-identity -v -p codesigning` → `1 valid identities found`)
+and the temporary-keychain import at step `[2/6]` succeeds.
+
+The signing script is correct: it creates a temp keychain, imports the `.p12`,
+runs `set-key-partition-list`, sets the temp keychain as the user default
+(needed for `SessionCreate=true` launchd sessions), and signs with `--keychain`.
+Reproducing that exact sequence in an `Aqua` session signs cleanly and passes
+`codesign --verify --deep --strict` (full chain Developer ID → Apple Root CA,
+hardened runtime, secure timestamp). No keychain-default trick in the script can
+compensate for a runner session that has no access to keychain services at all.
+
+Requirement: the `dragon-macos` self-hosted runner that builds aicx must run as
+a per-user LaunchAgent **inside the logged-in GUI session**, bootstrapped into
+`gui/$(id -u)` as the logged-in user. The decisive, verifiable property is
+`launchctl managername` → `Aqua` from inside the job — not any single plist flag
+(`SessionCreate` values differ across this host's runner plists, so do not treat
+the flag as the contract; verify `managername`). A runner started from a
+system-domain `LaunchDaemon`, over ssh, or by a detached non-Aqua supervisor runs
+without an Aqua security session and cannot codesign, regardless of the script.
+
+Diagnose the runner's session before a release:
+
+```bash
+launchctl managername                       # must print: Aqua
+security find-identity -v -p codesigning    # must list the Developer ID identity
+```
+
+If `managername` is not `Aqua`, fix the runner's launchd configuration (move it
+into the GUI session) before re-running the release — do not patch the signing
+script.
+
+As a backstop, `tools/release_bundle.sh` fails fast at step `[2b/6]` (after the
+temp-keychain import + `set-key-partition-list`, before the codesign loop) when
+the imported identity is not resolvable in the build session. It prints the same
+remedy and the in-session `find-identity` output instead of dying mid-run at
+`[3/6]` with a cryptic "no identity found" and a SecurityAgent GUI dialog.
 
 ## Recovery and Reruns
 

@@ -215,6 +215,9 @@ fn oracle_readiness_is_ready_when_semantic_and_freshness_are_green() {
             detail: "ok".to_string(),
             recommendation: None,
         },
+        aicx_home: CheckResult::default(),
+        binary_pair: CheckResult::default(),
+        http_auth_token: CheckResult::default(),
         rebuild_sidecars_script: None,
         prune_empty_bodies_script: None,
         fixes_applied: Vec::new(),
@@ -235,7 +238,7 @@ fn index_consistency_flags_orphaned_and_missing_tuples() {
     let tmp = unique_test_dir("index-consistency");
     let dir = tmp
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("aicx")
         .join("2026_0506")
         .join("conversations")
@@ -246,7 +249,7 @@ fn index_consistency_flags_orphaned_and_missing_tuples() {
         tmp.join("index.json"),
         serde_json::json!({
             "projects": {
-                "VetCoders/aicx": {
+                "Vetcoders/aicx": {
                     "agents": {
                         "codex": {
                             "dates": ["2026_0505"],
@@ -277,6 +280,40 @@ fn check_canonical_store_warns_when_missing() {
     let result = check_canonical_store(&tmp);
     assert_eq!(result.severity, Severity::Warning);
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn check_aicx_home_is_green_when_store_present() {
+    let tmp = unique_test_dir("home-present");
+    std::fs::create_dir_all(tmp.join("store")).unwrap();
+    let result = check_aicx_home(&tmp);
+    assert_eq!(result.name, "aicx_home");
+    assert_eq!(result.severity, Severity::Green);
+    assert!(result.detail.contains("store/ present"));
+    assert!(result.detail.contains(&tmp.display().to_string()));
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn check_aicx_home_warns_and_advises_when_store_missing() {
+    let tmp = unique_test_dir("home-missing");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let result = check_aicx_home(&tmp);
+    assert_eq!(result.name, "aicx_home");
+    assert_eq!(result.severity, Severity::Warning);
+    assert!(result.detail.contains("store/ missing"));
+    assert!(result.recommendation.unwrap().contains("AICX_HOME"));
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn check_http_auth_token_is_informational_and_never_leaks_value() {
+    let result = check_http_auth_token();
+    assert_eq!(result.name, "http_auth_token");
+    // Always Green: it reports a source, it does not gate health.
+    assert_eq!(result.severity, Severity::Green);
+    assert!(result.detail.starts_with("HTTP auth token source:"));
+    let _ = result.recommendation;
 }
 
 #[test]
@@ -390,7 +427,7 @@ fn scan_passes_camelcase_dotfile_underscore_buckets_through() {
     // lowercase-only validator (the `20260509_023025` incident).
     // Post-relax they pass the validator unchanged.
     std::fs::create_dir_all(store.join("LibraxisAI").join("vista")).unwrap();
-    std::fs::create_dir_all(store.join("VetCoders").join("Vista")).unwrap();
+    std::fs::create_dir_all(store.join("Vetcoders").join("Vista")).unwrap();
     std::fs::create_dir_all(store.join("Loctree").join("aicx")).unwrap();
     std::fs::create_dir_all(store.join("Szowesgad").join("family-onko-portal")).unwrap();
 
@@ -419,7 +456,7 @@ fn scan_passes_camelcase_dotfile_underscore_buckets_through() {
     // Legit names of every relaxed shape are NOT suspicious:
     for legit in [
         "LibraxisAI",
-        "VetCoders",
+        "Vetcoders",
         "Loctree",
         "Szowesgad",
         "vetcoders",
@@ -449,7 +486,7 @@ fn empty_body_chunks_red_when_over_threshold_and_script_is_reviewable() {
     let tmp = unique_test_dir("empty-bodies");
     let dir = tmp
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("aicx")
         .join("2026_0506")
         .join("conversations")
@@ -459,12 +496,12 @@ fn empty_body_chunks_red_when_over_threshold_and_script_is_reviewable() {
     let full = dir.join("2026_0506_claude_sess-full_001.md");
     std::fs::write(
         &empty,
-        "[project: VetCoders/aicx | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
+        "[project: Vetcoders/aicx | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
     )
     .unwrap();
     std::fs::write(
         &full,
-        "[project: VetCoders/aicx | agent: claude | date: 2026-05-06]\n\nThis chunk carries enough real body content to avoid the empty-body threshold.",
+        "[project: Vetcoders/aicx | agent: claude | date: 2026-05-06]\n\nThis chunk carries enough real body content to avoid the empty-body threshold.",
     )
     .unwrap();
 
@@ -488,7 +525,7 @@ fn apply_prune_empty_bodies_moves_chunks_to_quarantine_and_rechecks() {
     let tmp = unique_test_dir("apply-empty-bodies");
     let dir = tmp
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("aicx")
         .join("2026_0506")
         .join("conversations")
@@ -499,13 +536,13 @@ fn apply_prune_empty_bodies_moves_chunks_to_quarantine_and_rechecks() {
     let empty_sidecar = empty.with_extension("meta.json");
     std::fs::write(
         &empty,
-        "[project: VetCoders/aicx | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
+        "[project: Vetcoders/aicx | agent: claude | date: 2026-05-06 | frame_kind: internal_thought]\n\n",
     )
     .unwrap();
     std::fs::write(&empty_sidecar, "{}").unwrap();
     std::fs::write(
         &full,
-        "[project: VetCoders/aicx | agent: claude | date: 2026-05-06]\n\nThis chunk carries enough real body content to avoid the empty-body threshold.",
+        "[project: Vetcoders/aicx | agent: claude | date: 2026-05-06]\n\nThis chunk carries enough real body content to avoid the empty-body threshold.",
     )
     .unwrap();
 
@@ -558,7 +595,7 @@ fn apply_prune_empty_bodies_moves_chunks_to_quarantine_and_rechecks() {
     // of crashing on the prefix check.
     let moved = quarantine_root
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("aicx")
         .join("2026_0506")
         .join("conversations")
@@ -575,7 +612,7 @@ fn test_doctor_sidecars_and_coverage_share_check_result() {
     let tmp = unique_test_dir("sidecars-shared-result");
     let dir = tmp
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("aicx")
         .join("2026_0506")
         .join("conversations")
@@ -617,7 +654,7 @@ fn index_freshness_reports_missing_when_chunks_exist_but_no_indexed_dir() {
     // Plant one chunk in the canonical store.
     let chunk_dir = tmp
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("aicx")
         .join("2026_0506")
         .join("conversations")
@@ -690,7 +727,7 @@ fn index_freshness_reports_stale_when_chunk_mtime_exceeds_index_mtime() {
     use filetime::{FileTime, set_file_mtime};
     let tmp = unique_test_dir("freshness-stale");
 
-    let chunk_dir = tmp.join("store").join("VetCoders").join("aicx");
+    let chunk_dir = tmp.join("store").join("Vetcoders").join("aicx");
     std::fs::create_dir_all(&chunk_dir).unwrap();
     let chunk_path = chunk_dir.join("chunk.md");
     std::fs::write(&chunk_path, "chunk body").unwrap();
@@ -736,7 +773,7 @@ fn index_freshness_reports_fresh_when_index_mtime_meets_or_exceeds_chunks() {
     use filetime::{FileTime, set_file_mtime};
     let tmp = unique_test_dir("freshness-fresh");
 
-    let chunk_dir = tmp.join("store").join("VetCoders").join("aicx");
+    let chunk_dir = tmp.join("store").join("Vetcoders").join("aicx");
     std::fs::create_dir_all(&chunk_dir).unwrap();
     let chunk_path = chunk_dir.join("chunk.md");
     std::fs::write(&chunk_path, "chunk body").unwrap();
@@ -756,7 +793,7 @@ fn index_freshness_reports_fresh_when_index_mtime_meets_or_exceeds_chunks() {
     set_file_mtime(&chunk_dir, FileTime::from_unix_time(t0, 0)).unwrap();
     set_file_mtime(tmp.join("store"), FileTime::from_unix_time(t0, 0)).unwrap();
     set_file_mtime(
-        tmp.join("store").join("VetCoders"),
+        tmp.join("store").join("Vetcoders"),
         FileTime::from_unix_time(t0, 0),
     )
     .unwrap();
@@ -777,6 +814,96 @@ fn index_freshness_reports_fresh_when_index_mtime_meets_or_exceeds_chunks() {
         result.recommendation.is_none(),
         "fresh state needs no recovery hint"
     );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn empty_body_frame_kind_prefers_sidecar_and_falls_back_to_header() {
+    let tmp = unique_test_dir("empty-body-frame-kind-source");
+    let dir = tmp
+        .join("store")
+        .join("Vetcoders")
+        .join("aicx")
+        .join("2026_0702")
+        .join("conversations")
+        .join("claude");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Sidecar and header disagree — the sidecar must win.
+    let with_sidecar = dir.join("2026_0702_claude_sess-sidecar_001.md");
+    std::fs::write(
+        &with_sidecar,
+        "[project: Vetcoders/aicx | agent: claude | date: 2026-07-02 | frame_kind: internal_thought]\n\n",
+    )
+    .unwrap();
+    std::fs::write(
+        with_sidecar.with_extension("meta.json"),
+        r#"{"id":"sess-sidecar_001","project":"Vetcoders/aicx","agent":"claude","date":"2026-07-02","session_id":"sess-sidecar","kind":"conversations","frame_kind":"system_note"}"#,
+    )
+    .unwrap();
+
+    // No sidecar — the legacy bracket header fills in.
+    std::fs::write(
+        dir.join("2026_0702_claude_sess-header_001.md"),
+        "[project: Vetcoders/aicx | agent: claude | date: 2026-07-02 | frame_kind: internal_thought]\n\n",
+    )
+    .unwrap();
+
+    // No sidecar, YAML frontmatter header — the v2 form fills in the same way.
+    std::fs::write(
+        dir.join("2026_0702_claude_sess-front_001.md"),
+        "---\nproject: Vetcoders/aicx\nagent: claude\ndate: 2026-07-02\nframe_kind: tool_call\n---\n\n",
+    )
+    .unwrap();
+
+    let report = empty_body_report(&tmp);
+    assert_eq!(report.empty, 3, "all three fixtures are empty-body cards");
+    assert_eq!(
+        report.by_frame_kind.get("system_note"),
+        Some(&1),
+        "sidecar frame_kind must beat the disagreeing header: {:?}",
+        report.by_frame_kind
+    );
+    assert_eq!(report.by_frame_kind.get("internal_thought"), Some(&1));
+    assert_eq!(report.by_frame_kind.get("tool_call"), Some(&1));
+    assert_eq!(report.by_frame_kind.get("unknown"), None);
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn empty_body_detection_is_header_agnostic_for_frontmatter_cards() {
+    let tmp = unique_test_dir("empty-bodies-frontmatter");
+    let dir = tmp
+        .join("store")
+        .join("Vetcoders")
+        .join("aicx")
+        .join("2026_0702")
+        .join("conversations")
+        .join("claude");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("2026_0702_claude_sess-fm-empty_001.md"),
+        "---\nproject: Vetcoders/aicx\nagent: claude\ndate: 2026-07-02\n---\n\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("2026_0702_claude_sess-fm-full_001.md"),
+        "---\nproject: Vetcoders/aicx\nagent: claude\ndate: 2026-07-02\n---\n\nThis chunk carries enough real body content to avoid the empty-body threshold.",
+    )
+    .unwrap();
+
+    let check = check_empty_body_chunks(&tmp);
+    assert!(
+        check.detail.contains("1 empty-body"),
+        "frontmatter header must not hide an empty body nor mask a real one: {}",
+        check.detail
+    );
+
+    let script = render_prune_empty_bodies_script(&tmp).unwrap();
+    assert!(script.contains("sess-fm-empty"));
+    assert!(!script.contains("sess-fm-full"));
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

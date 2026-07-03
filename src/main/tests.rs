@@ -3,6 +3,29 @@ use filetime::{FileTime, set_file_mtime};
 use std::fs;
 
 #[test]
+fn intents_pack_report_carries_header_level_honesty_notice() {
+    // B2: the default `aicx intents` text surface is the pack report; its
+    // header metadata must carry the honesty frame so a weeks-old INTENT
+    // never reads like current runtime truth.
+    let sections: Vec<IntentPackSection> = Vec::new();
+
+    let out = format_intents_pack_markdown("(all projects)", 720, Some(10), &sections);
+
+    assert!(
+        out.contains("- claims: historical @ session close · not verified by aicx\n"),
+        "pack report header lost the honesty notice:\n{out}"
+    );
+    let notice_pos = out
+        .find("- claims: historical @ session close")
+        .expect("notice present");
+    let source_pos = out.find("- source: canonical corpus").expect("source line");
+    assert!(
+        source_pos < notice_pos,
+        "honesty notice should sit with the header metadata lines"
+    );
+}
+
+#[test]
 fn default_intents_markdown_uses_pack_report() {
     let sections = vec![
         IntentPackSection {
@@ -22,6 +45,7 @@ fn default_intents_markdown_uses_pack_report() {
                 last_chunk: None,
                 source_chunk: "chunk-a.md".to_string(),
                 source: None,
+                honesty: Default::default(),
             }],
         },
         IntentPackSection {
@@ -145,6 +169,62 @@ fn detect_config_show_flag_accepts_global_flags_before_config() {
         .iter()
         .map(|s| s.to_string());
     assert!(detect_config_show_flag_mistake(args).is_some());
+}
+
+/// P2 regression (BACKLOG 2026-06-01 [aicx/cli]): the `config --show` hint
+/// must only fire when `config` is the top-level subcommand, not when it
+/// appears later as a search term (`aicx search config --show`).
+#[test]
+fn detect_config_show_flag_ignores_config_as_search_term() {
+    let args = ["search", "config", "--show"].iter().map(|s| s.to_string());
+    assert!(
+        detect_config_show_flag_mistake(args).is_none(),
+        "`config` as a search term must not hijack the config-show hint"
+    );
+}
+
+/// P2 regression (BACKLOG 2026-06-01 [aicx/cli]): the missing-required-arg
+/// boundary hint must only fire when `ingest`/`conversations`/`sources` is
+/// the top-level subcommand, not when one of those words is a search term
+/// (`aicx search ingest`).
+#[test]
+fn detect_missing_required_boundary_ignores_subcommand_word_as_search_term() {
+    for term in ["ingest", "conversations", "sources"] {
+        let args = ["search", term].into_iter().map(|s| s.to_string());
+        assert!(
+            detect_missing_required_boundary(args).is_none(),
+            "`{term}` as a search term must not hijack the missing-arg hint"
+        );
+    }
+}
+
+/// The boundary hint still fires on the canonical bad shapes (subcommand
+/// present, required arg/subcommand missing).
+#[test]
+fn detect_missing_required_boundary_fires_on_canonical_bad_shapes() {
+    for cmd in ["ingest", "conversations", "sources"] {
+        let args = [cmd].into_iter().map(|s| s.to_string());
+        assert!(
+            detect_missing_required_boundary(args).is_some(),
+            "`aicx {cmd}` with no required arg should still emit the hint"
+        );
+    }
+}
+
+/// Global flags before the subcommand are still accepted (`aicx -v ingest`).
+#[test]
+fn detect_missing_required_boundary_accepts_global_flag_before_subcommand() {
+    let args = ["--verbose", "ingest"].iter().map(|s| s.to_string());
+    assert!(detect_missing_required_boundary(args).is_some());
+}
+
+/// A satisfied required arg still suppresses the hint.
+#[test]
+fn detect_missing_required_boundary_silent_when_arg_present() {
+    let args = ["ingest", "--source", "operator-md"]
+        .iter()
+        .map(|s| s.to_string());
+    assert!(detect_missing_required_boundary(args).is_none());
 }
 
 /// Bug #26 regression: the branches of `aicx config show`
@@ -280,10 +360,10 @@ fn index_status_routes_through_index_canonical_resolver() {
     // Canonical on-disk store: 4 buckets across 2 orgs / 3 repo names.
     // Mixed case mirrors real-world GitHub slugs (filesystem preserves it).
     let bucket_slugs = [
-        "VetCoders/Loctree",
-        "VetCoders/aicx",
+        "Vetcoders/Loctree",
+        "Vetcoders/aicx",
         "Szowesgad/Loctree",
-        "Szowesgad/CodeScribe",
+        "Szowesgad/Codescribe",
     ];
     for slug in bucket_slugs {
         fs::create_dir_all(canonical_root.join(slug)).unwrap();
@@ -308,9 +388,9 @@ fn index_status_routes_through_index_canonical_resolver() {
     // The 4 canonical filter shapes from the bug brief.
     let shapes: &[(&str, &[&str])] = &[
         // strict slug
-        ("VetCoders/Loctree", &["vetcoders_loctree"]),
+        ("Vetcoders/Loctree", &["vetcoders_loctree"]),
         // org wildcard
-        ("VetCoders/", &["vetcoders_aicx", "vetcoders_loctree"]),
+        ("Vetcoders/", &["vetcoders_aicx", "vetcoders_loctree"]),
         // cross-org repo
         ("/Loctree", &["szowesgad_loctree", "vetcoders_loctree"]),
         // bare name (matches as repo name across orgs)
@@ -455,7 +535,7 @@ fn index_status_json_payload_is_always_array_for_single_scope() {
 fn index_status_json_payload_is_array_for_multiple_scopes() {
     let reports = vec![
         (
-            Some("VetCoders/aicx".to_string()),
+            Some("Vetcoders/aicx".to_string()),
             dummy_index_status("vetcoders_aicx"),
         ),
         (
@@ -469,7 +549,7 @@ fn index_status_json_payload_is_array_for_multiple_scopes() {
         .expect("multi-scope index status JSON must use the same envelope");
 
     assert_eq!(items.len(), 2);
-    assert_eq!(items[0]["project"], "VetCoders/aicx");
+    assert_eq!(items[0]["project"], "Vetcoders/aicx");
     assert_eq!(items[1]["project"], "Loctree/loctree-suite");
     assert_eq!(items[0]["status"]["project_bucket"], "vetcoders_aicx");
     assert_eq!(
@@ -499,6 +579,7 @@ fn run_search_rejects_limit_over_hard_cap_before_store_access() {
         filters,
         kind: None,
         no_semantic: true,
+        evidence: false,
     })
     .expect_err("oversized search limit must fail before reading the store");
 
@@ -509,15 +590,17 @@ fn run_search_rejects_limit_over_hard_cap_before_store_access() {
 
 #[test]
 fn fuzzy_fetch_limit_uses_semantic_filter_cap_constants() {
+    // The CLI fuzzy fallback now routes through the shared search_engine
+    // primitive; assert it still honors the bounded over-fetch contract.
     assert_eq!(
-        search_examined_fetch_limit(1, true),
+        aicx::search_engine::fuzzy_fetch_limit(1, true),
         aicx::search_engine::FILTER_EXAMINED_CAP_MIN
     );
     assert_eq!(
-        search_examined_fetch_limit(10, true),
+        aicx::search_engine::fuzzy_fetch_limit(10, true),
         10 * aicx::search_engine::FILTER_EXAMINED_CAP_RATIO
     );
-    assert_eq!(search_examined_fetch_limit(1, false), 1);
+    assert_eq!(aicx::search_engine::fuzzy_fetch_limit(1, false), 1);
 }
 
 #[test]
@@ -803,7 +886,7 @@ fn intents_project_resolver_discovers_session_display_bridge_in_production_path(
 fn intents_project_resolver_prefers_session_display_before_alias() {
     let root = unique_test_dir("intents-project-display");
     let _ = fs::remove_dir_all(&root);
-    write_store_chunk(&root, "legacy/ScreenScribe", "2026_0612", "legacy");
+    write_store_chunk(&root, "legacy/Screenscribe", "2026_0612", "legacy");
     write_store_chunk(
         &root,
         "vetcoders/screen_scribe_depr",
@@ -811,12 +894,12 @@ fn intents_project_resolver_prefers_session_display_before_alias() {
         "canonical",
     );
     let sessions = vec![session_info(
-        "ScreenScribe",
+        "Screenscribe",
         "git@github.com:vetcoders/screen_scribe_depr.git",
     )];
 
     let got =
-        resolve_intents_project_filters_at(&["ScreenScribe".to_string()], &root, &sessions, None)
+        resolve_intents_project_filters_at(&["Screenscribe".to_string()], &root, &sessions, None)
             .unwrap();
     let _ = fs::remove_dir_all(&root);
 
@@ -829,16 +912,16 @@ fn intents_project_resolver_errors_on_ambiguous_alias() {
     let root = unique_test_dir("intents-project-ambiguous");
     let _ = fs::remove_dir_all(&root);
     write_store_chunk(&root, "one/screen_scribe_depr", "2026_0612", "one");
-    write_store_chunk(&root, "two/ScreenScribe", "2026_0612", "two");
+    write_store_chunk(&root, "two/Screenscribe", "2026_0612", "two");
 
-    let err = resolve_intents_project_filters_at(&["ScreenScribe".to_string()], &root, &[], None)
+    let err = resolve_intents_project_filters_at(&["Screenscribe".to_string()], &root, &[], None)
         .expect_err("alias collision should force explicit bucket");
     let msg = err.to_string();
     let _ = fs::remove_dir_all(&root);
 
     assert!(msg.contains("ambiguous"));
     assert!(msg.contains("one/screen_scribe_depr"));
-    assert!(msg.contains("two/ScreenScribe"));
+    assert!(msg.contains("two/Screenscribe"));
 }
 
 #[test]
@@ -860,9 +943,9 @@ fn intents_empty_result_hint_ranks_nearby_recent_buckets() {
     let mut counts = BTreeMap::new();
     counts.insert("vetcoders/screen_scribe_depr".to_string(), 12);
     counts.insert("vetcoders/other".to_string(), 99);
-    counts.insert("local/ScreenScribe".to_string(), 3);
+    counts.insert("local/Screenscribe".to_string(), 3);
 
-    let hints = nearby_bucket_hints(&["ScreenScribe".to_string()], &counts);
+    let hints = nearby_bucket_hints(&["Screenscribe".to_string()], &counts);
 
     assert_eq!(
         hints,
@@ -872,7 +955,7 @@ fn intents_empty_result_hint_ranks_nearby_recent_buckets() {
                 chunks: 12,
             },
             BucketHint {
-                slug: "local/ScreenScribe".to_string(),
+                slug: "local/Screenscribe".to_string(),
                 chunks: 3,
             },
         ]
@@ -1225,7 +1308,7 @@ fn default_session_extract_path_oversized_with_extension_like_suffix_is_capped()
 
 #[test]
 fn default_session_extract_path_normal_input_passthrough() {
-    // Closes Klaudiusz audit gap I-3 (P3): a UUID-like session id that
+    // Closes audit gap I-3 (P3): a UUID-like session id that
     // uses only the safe charset (`[a-zA-Z0-9-_.]`) and fits under
     // DEFAULT_SESSION_EXTRACT_FILENAME_STEM_MAX_BYTES must round-trip
     // verbatim into the filename — no hash suffix, no sanitization
@@ -1356,6 +1439,7 @@ fn ingest_accepts_operator_markdown_source_and_since() {
         "2026-05-01",
         "--emit",
         "json",
+        "/tmp/chatgpt-export.md",
     ])
     .expect("operator markdown ingest command should parse");
 
@@ -1364,11 +1448,16 @@ fn ingest_accepts_operator_markdown_source_and_since() {
             source,
             since,
             emit,
+            input,
             ..
         }) => {
             assert!(matches!(source, IngestSource::OperatorMd));
             assert_eq!(since.as_deref(), Some("2026-05-01"));
             assert!(matches!(emit, StdoutEmit::Json));
+            assert_eq!(
+                input.as_deref(),
+                Some(std::path::Path::new("/tmp/chatgpt-export.md"))
+            );
         }
         other => panic!("expected ingest command, got {:?}", other.map(|_| "other")),
     }
@@ -1429,6 +1518,94 @@ fn search_accepts_no_semantic_escape_hatch() {
             assert!(no_semantic);
         }
         _ => panic!("expected search command"),
+    }
+}
+
+#[test]
+fn search_accepts_evidence_mode() {
+    let cli = Cli::try_parse_from(["aicx", "search", "dashboard", "--evidence"])
+        .expect("search command with --evidence should parse");
+
+    match cli.command {
+        Some(Commands::Search { evidence, .. }) => {
+            assert!(evidence);
+        }
+        _ => panic!("expected search command"),
+    }
+}
+
+#[test]
+fn search_rejects_evidence_with_no_semantic() {
+    let err = Cli::try_parse_from(["aicx", "search", "dashboard", "--evidence", "--no-semantic"])
+        .expect_err("evidence mode must require semantic search");
+
+    assert!(err.to_string().contains("cannot be used with"));
+}
+
+#[test]
+fn eval_search_quality_lists_seed_matrix_by_default() {
+    let cli = Cli::try_parse_from(["aicx", "eval", "search-quality"])
+        .expect("eval search-quality command should parse");
+
+    match cli.command {
+        Some(Commands::Eval {
+            action: EvalAction::SearchQuality(args),
+        }) => {
+            assert!(!args.run);
+            assert!(args.cases.is_empty());
+            assert_eq!(args.top, 3);
+            assert_eq!(args.limit, 10);
+            assert!(args.seed.is_none());
+            assert!(!args.strict);
+        }
+        _ => panic!("expected eval search-quality command"),
+    }
+}
+
+#[test]
+fn eval_search_quality_accepts_run_flags() {
+    let cli = Cli::try_parse_from([
+        "aicx",
+        "eval",
+        "search-quality",
+        "--run",
+        "--case",
+        "aicx_sztudio_reason,md_radar_marbles",
+        "--top",
+        "5",
+        "--limit",
+        "12",
+        "--seed",
+        "tests/retrieval_eval/search_quality_seed.toml",
+        "--json",
+        "--strict",
+    ])
+    .expect("eval search-quality run command should parse");
+
+    match cli.command {
+        Some(Commands::Eval {
+            action: EvalAction::SearchQuality(args),
+        }) => {
+            assert!(args.run);
+            assert_eq!(
+                args.cases,
+                vec![
+                    "aicx_sztudio_reason".to_string(),
+                    "md_radar_marbles".to_string()
+                ]
+            );
+            assert_eq!(args.top, 5);
+            assert_eq!(args.limit, 12);
+            assert_eq!(
+                args.seed,
+                Some(PathBuf::from(
+                    "tests/retrieval_eval/search_quality_seed.toml"
+                ))
+            );
+            assert!(args.json);
+            assert!(args.strict);
+        }
+        _ => panic!("expected eval search-quality command"),
     }
 }
 
@@ -1553,6 +1730,56 @@ fn index_accepts_multiple_project_filters() {
             assert_eq!(project, vec!["vc-operator", "vibecrafted", "loctree"]);
         }
         _ => panic!("expected index command"),
+    }
+}
+
+#[test]
+fn index_derive_accepts_project_filters() {
+    let cli = Cli::try_parse_from([
+        "aicx",
+        "index",
+        "derive",
+        "-p",
+        "vista",
+        "-p",
+        "vetcoders/aicx",
+    ])
+    .expect("index derive should accept repeated project filters");
+
+    match cli.command {
+        Some(Commands::Index {
+            action:
+                Some(IndexAction::Derive {
+                    project,
+                    all_projects: false,
+                    json: false,
+                }),
+            ..
+        }) => {
+            assert_eq!(project, vec!["vista", "vetcoders/aicx"]);
+        }
+        _ => panic!("expected index derive command"),
+    }
+}
+
+#[test]
+fn index_derive_accepts_all_projects() {
+    let cli = Cli::try_parse_from(["aicx", "index", "derive", "--all-projects"])
+        .expect("index derive should accept all-projects mode");
+
+    match cli.command {
+        Some(Commands::Index {
+            action:
+                Some(IndexAction::Derive {
+                    project,
+                    all_projects: true,
+                    json: false,
+                }),
+            ..
+        }) => {
+            assert!(project.is_empty());
+        }
+        _ => panic!("expected index derive all-projects command"),
     }
 }
 
@@ -1722,6 +1949,91 @@ fn serve_accepts_http_and_legacy_sse_transport_names() {
 }
 
 #[test]
+fn serve_http_host_defaults_to_loopback() {
+    let parsed = Cli::try_parse_from(["aicx", "serve", "--transport", "http"])
+        .expect("serve http should parse with default host");
+
+    match parsed.command {
+        Some(Commands::Serve { host, .. }) => {
+            assert_eq!(host, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        }
+        _ => panic!("expected serve command for http transport"),
+    }
+}
+
+#[test]
+fn serve_http_host_accepts_explicit_bind_address() {
+    let parsed = Cli::try_parse_from([
+        "aicx",
+        "serve",
+        "--transport",
+        "http",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8055",
+    ])
+    .expect("serve http should parse explicit host");
+
+    match parsed.command {
+        Some(Commands::Serve { host, port, .. }) => {
+            assert_eq!(host, std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            assert_eq!(port, 8055);
+        }
+        _ => panic!("expected serve command for http transport"),
+    }
+}
+
+#[test]
+fn serve_http_accepts_no_require_auth_alias() {
+    let parsed = Cli::try_parse_from(["aicx", "serve", "--transport", "http", "--no-require-auth"])
+        .expect("serve http should parse no-require-auth alias");
+
+    match parsed.command {
+        Some(Commands::Serve {
+            require_auth,
+            no_require_auth,
+            ..
+        }) => {
+            assert!(require_auth);
+            assert!(no_require_auth);
+        }
+        _ => panic!("expected serve command for http transport"),
+    }
+}
+
+#[test]
+fn serve_accepts_explicit_http_host() {
+    let parsed = Cli::try_parse_from([
+        "aicx",
+        "serve",
+        "--transport",
+        "http",
+        "--host",
+        "0.0.0.0",
+        "--allowed-host",
+        "mcp.example.internal",
+        "--port",
+        "9000",
+    ])
+    .expect("http host should parse");
+
+    match parsed.command {
+        Some(Commands::Serve {
+            host,
+            port,
+            allowed_hosts,
+            ..
+        }) => {
+            assert_eq!(host, std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            assert_eq!(allowed_hosts, vec!["mcp.example.internal"]);
+            assert_eq!(port, 9000);
+        }
+        _ => panic!("expected serve command"),
+    }
+}
+
+#[test]
 fn serve_help_prefers_http_name_and_stays_compact() {
     let mut cmd = Cli::command();
     let serve = cmd
@@ -1730,10 +2042,15 @@ fn serve_help_prefers_http_name_and_stays_compact() {
     let rendered = serve.render_long_help().to_string();
 
     assert!(rendered.contains("Transport: stdio (default) or http."));
+    assert!(rendered.contains("--host <HOST>"));
+    assert!(rendered.contains("Bind address for streamable HTTP transport"));
+    assert!(rendered.contains("--allowed-host <HOST>"));
+    assert!(rendered.contains("default: 127.0.0.1"));
+    assert!(rendered.contains("--no-require-auth"));
     assert!(!rendered.contains("Transport: stdio (default) or sse"));
     assert!(!rendered.contains("embedding mode"));
     assert!(
-        rendered.lines().count() < 30,
+        rendered.lines().count() < 48,
         "serve help should stay compact"
     );
 }
@@ -1778,7 +2095,7 @@ fn read_command_parses_discover_path_and_json_mode() {
     let cli = Cli::try_parse_from([
         "aicx",
         "read",
-        "store/VetCoders/aicx/2026_0502/reports/codex/chunk.md",
+        "store/Vetcoders/aicx/2026_0502/reports/codex/chunk.md",
         "--max-chars",
         "400",
         "--json",
@@ -1793,7 +2110,7 @@ fn read_command_parses_discover_path_and_json_mode() {
         }) => {
             assert_eq!(
                 reference,
-                "store/VetCoders/aicx/2026_0502/reports/codex/chunk.md"
+                "store/Vetcoders/aicx/2026_0502/reports/codex/chunk.md"
             );
             assert_eq!(max_chars, Some(400));
             assert!(json);
@@ -1959,6 +2276,26 @@ fn corpus_audit_and_repair_commands_parse() {
             );
         }
         _ => panic!("expected corpus repair command"),
+    }
+
+    let validate = Cli::try_parse_from([
+        "aicx",
+        "corpus",
+        "validate-cards",
+        "/tmp/aicx-store",
+        "--strict",
+        "--json",
+    ])
+    .expect("corpus validate-cards should parse");
+    match validate.command {
+        Some(Commands::Corpus(CorpusArgs {
+            command: CorpusCommand::ValidateCards(args),
+        })) => {
+            assert_eq!(args.root, Some(PathBuf::from("/tmp/aicx-store")));
+            assert!(args.strict);
+            assert!(args.json);
+        }
+        _ => panic!("expected corpus validate-cards command"),
     }
 }
 
@@ -2295,6 +2632,9 @@ fn conversations_batch_writes_synthetic_sessions_without_store_path() {
             branch: Some("main".to_string()),
             cwd: Some("/tmp/project-one".to_string()),
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
         },
         timeline::TimelineEntry {
             timestamp: ts + chrono::Duration::seconds(1),
@@ -2306,6 +2646,9 @@ fn conversations_batch_writes_synthetic_sessions_without_store_path() {
             branch: None,
             cwd: Some("/tmp/project-two".to_string()),
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
         },
     ];
 
@@ -2366,14 +2709,54 @@ fn migrate_accepts_custom_roots() {
             legacy_root,
             store_root,
             no_intent_schema,
+            cards_v2,
+            apply,
         }) => {
             assert!(dry_run);
             assert!(no_intent_schema);
             assert_eq!(legacy_root, Some(PathBuf::from("/tmp/legacy")));
             assert_eq!(store_root, Some(PathBuf::from("/tmp/aicx")));
+            assert_eq!(cards_v2, None);
+            assert!(!apply);
         }
         _ => panic!("expected migrate command"),
     }
+}
+
+#[test]
+fn migrate_cards_v2_parses_optional_root_and_apply_requires_the_flag() {
+    // Bare flag: dry-run cards-v2 over the default root.
+    let cli = Cli::try_parse_from(["aicx", "migrate", "--cards-v2"])
+        .expect("bare --cards-v2 should parse");
+    match cli.command {
+        Some(Commands::Migrate {
+            cards_v2, apply, ..
+        }) => {
+            assert_eq!(cards_v2, Some(None));
+            assert!(!apply);
+        }
+        _ => panic!("expected migrate command"),
+    }
+
+    // Flag with ROOT + --apply: write mode over an explicit directory.
+    let cli = Cli::try_parse_from(["aicx", "migrate", "--cards-v2", "/tmp/copy", "--apply"])
+        .expect("--cards-v2 ROOT --apply should parse");
+    match cli.command {
+        Some(Commands::Migrate {
+            cards_v2, apply, ..
+        }) => {
+            assert_eq!(cards_v2, Some(Some(PathBuf::from("/tmp/copy"))));
+            assert!(apply);
+        }
+        _ => panic!("expected migrate command"),
+    }
+
+    // --apply is meaningless without --cards-v2 and must be rejected.
+    assert!(Cli::try_parse_from(["aicx", "migrate", "--apply"]).is_err());
+    // --dry-run contradicts --apply; the pair must be rejected.
+    assert!(
+        Cli::try_parse_from(["aicx", "migrate", "--cards-v2", "--apply", "--dry-run"]).is_err()
+    );
 }
 
 #[test]
@@ -2470,6 +2853,9 @@ fn mk_entry(
         branch: None,
         cwd: cwd.map(str::to_string),
         timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
     }
 }
 
@@ -2527,7 +2913,7 @@ fn test_pipeline_redacts_once_before_dedup() {
     // marks `seen_hashes` under the post-redact hash (not the raw).
     let mut state = StateManager::default();
     let seg = mk_segment(
-        Some(("VetCoders", "aicx")),
+        Some(("Vetcoders", "aicx")),
         "claude",
         "s1",
         vec![entry_redacted],
@@ -2535,11 +2921,11 @@ fn test_pipeline_redacts_once_before_dedup() {
     let kept = dedup_segments_per_repo(vec![seg], &mut state, false, |_| {});
     assert_eq!(kept.iter().map(|s| s.entries.len()).sum::<usize>(), 1);
     assert!(
-        !state.is_new("VetCoders/aicx", &hash_redacted),
+        !state.is_new("Vetcoders/aicx", &hash_redacted),
         "post-redact hash must be in seen_hashes after dedup"
     );
     assert!(
-        state.is_new("VetCoders/aicx", &hash_raw),
+        state.is_new("Vetcoders/aicx", &hash_raw),
         "pre-redact hash must NOT appear in seen_hashes — proves redaction ran before dedup"
     );
 }
@@ -2568,13 +2954,13 @@ fn test_dedup_keyed_per_canonical_repo() {
 
     // Two segments, two different canonical repos, identical content.
     let seg_a = mk_segment(
-        Some(("VetCoders", "repo-a")),
+        Some(("Vetcoders", "repo-a")),
         "claude",
         "session-a",
         vec![entry_a.clone()],
     );
     let seg_b = mk_segment(
-        Some(("VetCoders", "repo-b")),
+        Some(("Vetcoders", "repo-b")),
         "claude",
         "session-b",
         vec![entry_b.clone()],
@@ -2595,7 +2981,7 @@ fn test_dedup_keyed_per_canonical_repo() {
         &entry_a.message,
     );
     assert!(
-        !state.is_new("VetCoders/repo-a", &hash),
+        !state.is_new("Vetcoders/repo-a", &hash),
         "hash must be marked under repo-a's bucket"
     );
     // Different timestamps → different exact hashes. Just verify the
@@ -2606,7 +2992,7 @@ fn test_dedup_keyed_per_canonical_repo() {
         &entry_b.message,
     );
     assert!(
-        !state.is_new("VetCoders/repo-b", &hash_b),
+        !state.is_new("Vetcoders/repo-b", &hash_b),
         "hash must be marked under repo-b's bucket"
     );
 
@@ -2620,13 +3006,13 @@ fn test_dedup_keyed_per_canonical_repo() {
     // Re-running dedup with the same segments should now SKIP both,
     // because each repo bucket already saw its own hash.
     let seg_a2 = mk_segment(
-        Some(("VetCoders", "repo-a")),
+        Some(("Vetcoders", "repo-a")),
         "claude",
         "session-a",
         vec![entry_a],
     );
     let seg_b2 = mk_segment(
-        Some(("VetCoders", "repo-b")),
+        Some(("Vetcoders", "repo-b")),
         "claude",
         "session-b",
         vec![entry_b],
@@ -2649,7 +3035,7 @@ fn test_dedup_keyed_per_canonical_repo() {
 fn test_full_rescan_dedups_across_segments_within_same_repo() {
     // Same content, same timestamp, same agent — both entries
     // produce identical `content_hash` and `overlap_hash`. The
-    // segments share a canonical repo (VetCoders/repo-a) but live
+    // segments share a canonical repo (Vetcoders/repo-a) but live
     // in distinct sessions (the realistic shape: one repo touched
     // by several Claude sessions over time).
     let dup_message = "echo across sessions";
@@ -2658,13 +3044,13 @@ fn test_full_rescan_dedups_across_segments_within_same_repo() {
     let entry_a2 = mk_entry("claude", "s2", dup_ts, dup_message, Some("/tmp/a"));
 
     let seg_s1 = mk_segment(
-        Some(("VetCoders", "repo-a")),
+        Some(("Vetcoders", "repo-a")),
         "claude",
         "s1",
         vec![entry_a1.clone()],
     );
     let seg_s2 = mk_segment(
-        Some(("VetCoders", "repo-a")),
+        Some(("Vetcoders", "repo-a")),
         "claude",
         "s2",
         vec![entry_a2.clone()],
@@ -2687,14 +3073,14 @@ fn test_full_rescan_dedups_across_segments_within_same_repo() {
     // its own dedup bucket.
     let entry_b1 = mk_entry("claude", "s3", dup_ts, dup_message, Some("/tmp/b"));
     let seg_b = mk_segment(
-        Some(("VetCoders", "repo-b")),
+        Some(("Vetcoders", "repo-b")),
         "claude",
         "s3",
         vec![entry_b1],
     );
     let entry_a3 = mk_entry("claude", "s4", dup_ts, dup_message, Some("/tmp/a"));
     let seg_a3 = mk_segment(
-        Some(("VetCoders", "repo-a")),
+        Some(("Vetcoders", "repo-a")),
         "claude",
         "s4",
         vec![entry_a3],

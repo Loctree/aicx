@@ -12,13 +12,15 @@
 //! an actionable `recommendation`. The CLI may then explicitly degrade to
 //! filesystem-fuzzy while surfacing the semantic failure in its rendered output.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde::Serialize;
 
 use crate::rank::FuzzyResult;
+use crate::sanitize::normalize_query;
 use crate::timeline::FrameKind;
 
 /// Successful semantic search outcome with rendering-ready data.
@@ -45,8 +47,9 @@ pub struct SemanticSearchOutcome {
 pub type SemanticOutcome = SemanticSearchOutcome;
 
 const BACKEND_HYBRID_RRF: &str = "hybrid_rrf";
+const BACKEND_HYBRID_RRF_GLOBAL_SCOPED: &str = "hybrid_rrf_global_scoped";
 const BACKEND_SEMANTIC_DENSE_ONLY: &str = "semantic_dense_only";
-const BACKEND_SEMANTIC_DENSE_ONLY_ALL_FALLBACK: &str = "semantic_dense_only_all_fallback";
+const BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED: &str = "semantic_dense_only_global_scoped";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HybridRetrievalStatus {
@@ -273,7 +276,7 @@ pub fn try_semantic_search(
         // outcome reports the degraded backend instead of silently claiming
         // hybrid — the degraded status must reach the CLI/MCP boundary.
         let mut any_dense_only = false;
-        let mut any_all_bucket_fallback = false;
+        let mut any_global_project_scope = false;
         for scope in scopes {
             let mut outcome = try_semantic_search_native(
                 query,
@@ -288,8 +291,8 @@ pub fn try_semantic_search(
             {
                 any_dense_only = true;
             }
-            if outcome.backend_label.ends_with("_all_fallback") {
-                any_all_bucket_fallback = true;
+            if outcome.backend_label.ends_with("_global_scoped") {
+                any_global_project_scope = true;
             }
             scanned += outcome.scanned;
             model_id.get_or_insert(outcome.model_id.clone());
@@ -303,10 +306,12 @@ pub fn try_semantic_search(
         Ok(SemanticOutcome {
             results: merged_results,
             scanned,
-            backend_label: if any_dense_only && any_all_bucket_fallback {
-                BACKEND_SEMANTIC_DENSE_ONLY_ALL_FALLBACK
+            backend_label: if any_dense_only && any_global_project_scope {
+                BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
             } else if any_dense_only {
                 BACKEND_SEMANTIC_DENSE_ONLY
+            } else if any_global_project_scope {
+                BACKEND_HYBRID_RRF_GLOBAL_SCOPED
             } else {
                 BACKEND_HYBRID_RRF
             },
@@ -322,7 +327,7 @@ struct SemanticBucketScope<'a> {
     index_project: Option<&'a str>,
     retrieval_project_filter: Option<&'a str>,
     index_path: std::path::PathBuf,
-    used_all_bucket_fallback: bool,
+    used_global_project_scope: bool,
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -335,9 +340,14 @@ struct SemanticRetrievalFilters<'a> {
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 fn index_not_built_error(path: std::path::PathBuf, project_filter: Option<&str>) -> SemanticError {
-    let cmd = match project_filter {
-        Some(p) => format!("aicx index --project {p}"),
-        None => "aicx index".to_string(),
+    let recommendation = match project_filter {
+        Some(p) => format!(
+            "run `aicx index` to build the global index used by `search -p {p}`; \
+             optionally run `aicx index --project {p}` to materialize a local project cache"
+        ),
+        None => {
+            "run `aicx index` (one-off; subsequent runs query the index in-process)".to_string()
+        }
     };
     let legacy_hint = legacy_index_hint(project_filter, &path)
         .map(|hint| format!(" {hint}"))
@@ -349,9 +359,7 @@ fn index_not_built_error(path: std::path::PathBuf, project_filter: Option<&str>)
             path.display(),
             legacy_hint
         ),
-        recommendation: format!(
-            "run `{cmd}` (one-off; subsequent runs query the index in-process)"
-        ),
+        recommendation,
     }
 }
 
@@ -385,7 +393,7 @@ fn select_semantic_bucket_scope<'a>(
             // a defensive guard against stale or mixed-project artifacts.
             retrieval_project_filter: project_filter,
             index_path: project_index_path,
-            used_all_bucket_fallback: false,
+            used_global_project_scope: false,
         });
     }
 
@@ -395,7 +403,7 @@ fn select_semantic_bucket_scope<'a>(
                 index_project: None,
                 retrieval_project_filter: Some(project),
                 index_path: all_index_path,
-                used_all_bucket_fallback: true,
+                used_global_project_scope: true,
             });
         }
         return Err(index_not_built_error(project_index_path, project_filter));
@@ -576,23 +584,6 @@ fn try_semantic_search_native(
         project: scope.retrieval_project_filter,
     };
 
-    if scope.used_all_bucket_fallback {
-        // `_all` is a cross-project bucket. Loading its manifest-managed dense
-        // brute-force artifact materializes every vector in memory before the
-        // adapter can apply FilterSet. For project-scoped fallback, use the
-        // primary committed index with a pre-deserialize project guard so the
-        // operator does not pay an 11GB dense load for one repo query.
-        return query_dense_only_from_primary(
-            &path,
-            &query_embedding,
-            embedder_dim,
-            limit,
-            retrieval_filters,
-            &info.model_id,
-            true,
-        );
-    }
-
     // Patch 3 / Bug B+: the hybrid (tantivy lexical + dense fusion) stack can
     // be unavailable for manifest-side reasons — never committed
     // (`RetrievalManifestMissing`) or mid-rebuild / mismatched
@@ -613,7 +604,7 @@ fn try_semantic_search_native(
                     limit,
                     retrieval_filters,
                     &info.model_id,
-                    false,
+                    scope.used_global_project_scope,
                 );
             }
             Err(other) => return Err(other),
@@ -629,7 +620,7 @@ fn try_semantic_search_native(
             limit,
             retrieval_filters,
             &info.model_id,
-            false,
+            scope.used_global_project_scope,
         );
     };
     let manifest = hybrid.manifest().cloned();
@@ -674,7 +665,12 @@ fn try_semantic_search_native(
             let path = hit_path(&h);
             let score_pct = hybrid_score_pct(h.score);
             let matched_lines = semantic_preview_lines(&path);
-            let label = format!("hybrid_rrf:{}", h.chunk_id);
+            let label_backend = if scope.used_global_project_scope {
+                BACKEND_HYBRID_RRF_GLOBAL_SCOPED
+            } else {
+                BACKEND_HYBRID_RRF
+            };
+            let label = format!("{label_backend}:{}", h.chunk_id);
             FuzzyResult {
                 file: path.to_string_lossy().to_string(),
                 path: path.to_string_lossy().to_string(),
@@ -697,7 +693,11 @@ fn try_semantic_search_native(
     Ok(SemanticOutcome {
         results,
         scanned,
-        backend_label: BACKEND_HYBRID_RRF,
+        backend_label: if scope.used_global_project_scope {
+            BACKEND_HYBRID_RRF_GLOBAL_SCOPED
+        } else {
+            BACKEND_HYBRID_RRF
+        },
         model_id: info.model_id,
         retrieval_status,
     })
@@ -806,7 +806,7 @@ fn query_dense_only_from_primary(
     limit: usize,
     filters: SemanticRetrievalFilters<'_>,
     model_id: &str,
-    used_all_bucket_fallback: bool,
+    used_global_project_scope: bool,
 ) -> std::result::Result<SemanticOutcome, SemanticError> {
     use aicx_retrieve::{BruteForceAdapter, ChunkRef, DenseChunkRef, DenseIndex, Distance};
 
@@ -899,8 +899,8 @@ fn query_dense_only_from_primary(
             let path = hit_path(&h);
             let score_pct = dense_score_pct(h.score);
             let matched_lines = semantic_preview_lines(&path);
-            let label = if used_all_bucket_fallback {
-                format!("dense_only_all_fallback:{}", h.chunk_id)
+            let label = if used_global_project_scope {
+                format!("dense_only_global_scoped:{}", h.chunk_id)
             } else {
                 format!("dense_only:{}", h.chunk_id)
             };
@@ -926,8 +926,8 @@ fn query_dense_only_from_primary(
     Ok(SemanticOutcome {
         results,
         scanned,
-        backend_label: if used_all_bucket_fallback {
-            BACKEND_SEMANTIC_DENSE_ONLY_ALL_FALLBACK
+        backend_label: if used_global_project_scope {
+            BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
         } else {
             BACKEND_SEMANTIC_DENSE_ONLY
         },
@@ -1074,11 +1074,11 @@ fn semantic_preview_lines(path: &std::path::Path) -> Vec<String> {
     let Ok(content) = crate::sanitize::read_to_string_validated(path) else {
         return Vec::new();
     };
-    content
+    crate::card_header::card_body(&content)
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .filter(|line| !line.starts_with("[project:"))
+        .filter(|line| !crate::card_header::is_bracket_header_line(line))
         .filter(|line| *line != "[signals]" && *line != "[/signals]")
         .filter(|line| !line.starts_with("id: "))
         .take(MAX_LINES)
@@ -1178,6 +1178,24 @@ pub const FILTER_EXAMINED_CAP_RATIO: usize = 10;
 /// still have enough material for filter pushdown to be meaningful.
 pub const FILTER_EXAMINED_CAP_MIN: usize = 50;
 
+fn default_search_quality_active(frame_kind_filter: Option<FrameKind>) -> bool {
+    frame_kind_filter.is_none()
+}
+
+fn semantic_fetch_limit(
+    user_limit: usize,
+    frame_kind_filter: Option<FrameKind>,
+    post_filters: &SemanticSearchFilters,
+) -> usize {
+    if post_filters.is_active() || default_search_quality_active(frame_kind_filter) {
+        user_limit
+            .saturating_mul(FILTER_EXAMINED_CAP_RATIO)
+            .max(FILTER_EXAMINED_CAP_MIN)
+    } else {
+        user_limit.max(1)
+    }
+}
+
 /// Filter-aware semantic retrieval. Wraps [`try_semantic_search`] with a
 /// bounded examined-pool fetch + canonical post-filter application so
 /// CLI (`aicx search`) and MCP (`aicx_search`) share one truth for the
@@ -1198,13 +1216,7 @@ pub fn try_semantic_search_filtered(
     kind_filter: Option<&str>,
     post_filters: &SemanticSearchFilters,
 ) -> std::result::Result<FilteredSemanticOutcome, SemanticError> {
-    let fetch_limit = if post_filters.is_active() {
-        user_limit
-            .saturating_mul(FILTER_EXAMINED_CAP_RATIO)
-            .max(FILTER_EXAMINED_CAP_MIN)
-    } else {
-        user_limit.max(1)
-    };
+    let fetch_limit = semantic_fetch_limit(user_limit, frame_kind_filter, post_filters);
 
     let outcome = try_semantic_search(
         store_root,
@@ -1224,10 +1236,11 @@ pub fn try_semantic_search_filtered(
     } = outcome;
 
     let examined = results.len();
-    let filtered = apply_semantic_post_filters(results, post_filters);
+    let quality_filtered = apply_default_semantic_quality(results, query, frame_kind_filter);
+    let filtered = apply_semantic_post_filters(quality_filtered, post_filters);
     let matched = filtered.len();
     let diagnostic = partial_pushdown_diagnostic(
-        post_filters.is_active(),
+        post_filters.is_active() || default_search_quality_active(frame_kind_filter),
         examined,
         matched,
         user_limit,
@@ -1244,6 +1257,289 @@ pub fn try_semantic_search_filtered(
         },
         diagnostic,
     })
+}
+
+fn apply_default_semantic_quality(
+    mut results: Vec<FuzzyResult>,
+    query: &str,
+    frame_kind_filter: Option<FrameKind>,
+) -> Vec<FuzzyResult> {
+    if frame_kind_filter.is_none() {
+        results.retain(default_visible_frame);
+    }
+
+    for result in &mut results {
+        result.score = semantic_quality_score(query, result);
+    }
+    results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
+    dedupe_semantic_results(results)
+}
+
+fn default_visible_frame(result: &FuzzyResult) -> bool {
+    match result.frame_kind.as_deref().and_then(FrameKind::parse) {
+        Some(FrameKind::UserMsg | FrameKind::AgentReply) | None => true,
+        Some(FrameKind::InternalThought | FrameKind::ToolCall | FrameKind::SystemNote) => false,
+    }
+}
+
+fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
+    let mut score = result.score as i16;
+    score += match result.frame_kind.as_deref().and_then(FrameKind::parse) {
+        Some(FrameKind::UserMsg) => 6,
+        Some(FrameKind::AgentReply) => 5,
+        None => 1,
+        Some(FrameKind::InternalThought | FrameKind::ToolCall | FrameKind::SystemNote) => -20,
+    };
+
+    let normalized_query = normalize_query(query);
+    let query_terms: Vec<&str> = normalized_query
+        .split_whitespace()
+        .filter(|term| term.len() >= 3)
+        .collect();
+    let haystack = semantic_result_haystack(result);
+    let anchors = query_anchors(&normalized_query);
+    if !normalized_query.is_empty() && haystack.contains(&normalized_query) {
+        score += 12;
+    }
+    score += anchor_quality_delta(&anchors, &haystack);
+    score += informative_agent_reply_delta(result, &anchors, &haystack);
+    if !query_terms.is_empty() {
+        let matched_terms = query_terms
+            .iter()
+            .filter(|term| haystack.contains(**term))
+            .count();
+        score += (matched_terms.saturating_mul(3).min(12)) as i16;
+        if matched_terms == 0 {
+            score -= 15;
+        }
+    }
+    if low_signal_semantic_result(result) {
+        score -= 8;
+    }
+
+    score.clamp(0, 100) as u8
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueryAnchor {
+    token: String,
+    parts: Vec<String>,
+    strong: bool,
+}
+
+fn query_anchors(normalized_query: &str) -> Vec<QueryAnchor> {
+    let mut seen = HashSet::new();
+    let mut anchors = Vec::new();
+
+    for raw_token in normalized_query.split_whitespace() {
+        let token = raw_token
+            .trim_matches(|ch: char| !is_anchor_char(ch))
+            .to_string();
+        if token.len() < 3 || !seen.insert(token.clone()) {
+            continue;
+        }
+
+        let parts = split_anchor_parts(&token);
+        let has_separator = token.chars().any(is_anchor_separator);
+        let has_digit = token.chars().any(|ch| ch.is_ascii_digit());
+        let strong = token.len() >= 5 && ((has_separator && parts.len() >= 2) || has_digit);
+
+        anchors.push(QueryAnchor {
+            token,
+            parts,
+            strong,
+        });
+    }
+
+    anchors
+}
+
+fn is_anchor_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/' | ':' | '.')
+}
+
+fn is_anchor_separator(ch: char) -> bool {
+    matches!(ch, '-' | '_' | '/' | ':' | '.')
+}
+
+fn split_anchor_parts(token: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    token
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| part.len() >= 3)
+        .filter_map(|part| {
+            let part = part.to_string();
+            seen.insert(part.clone()).then_some(part)
+        })
+        .collect()
+}
+
+fn anchor_quality_delta(anchors: &[QueryAnchor], haystack: &str) -> i16 {
+    let strong_anchors: Vec<&QueryAnchor> = anchors.iter().filter(|anchor| anchor.strong).collect();
+    if strong_anchors.is_empty() {
+        return 0;
+    }
+
+    let mut exact_matches = 0usize;
+    let mut full_part_matches = 0usize;
+    let mut matched_parts = HashSet::new();
+
+    for anchor in strong_anchors {
+        if haystack.contains(&anchor.token) {
+            exact_matches += 1;
+        }
+
+        let matched_count = anchor
+            .parts
+            .iter()
+            .filter(|part| {
+                let matched = haystack.contains(part.as_str());
+                if matched {
+                    matched_parts.insert((*part).clone());
+                }
+                matched
+            })
+            .count();
+
+        if anchor.parts.len() >= 2 && matched_count == anchor.parts.len() {
+            full_part_matches += 1;
+        }
+    }
+
+    let mut delta = 0i16;
+    delta += (exact_matches.saturating_mul(28).min(56)) as i16;
+    delta += (full_part_matches.saturating_mul(18).min(36)) as i16;
+    delta += (matched_parts.len().saturating_mul(4).min(16)) as i16;
+
+    if exact_matches == 0 && full_part_matches == 0 {
+        if matched_parts.is_empty() {
+            delta -= 30;
+        } else {
+            delta -= 8;
+        }
+    }
+
+    delta
+}
+
+fn informative_agent_reply_delta(
+    result: &FuzzyResult,
+    anchors: &[QueryAnchor],
+    haystack: &str,
+) -> i16 {
+    if result.frame_kind.as_deref().and_then(FrameKind::parse) != Some(FrameKind::AgentReply) {
+        return 0;
+    }
+    if !has_strong_anchor_evidence(anchors, haystack) {
+        return 0;
+    }
+
+    let text = normalize_query(&result.matched_lines.join(" "));
+    let word_count = text
+        .split_whitespace()
+        .filter(|word| word.chars().filter(|ch| ch.is_ascii_alphabetic()).count() >= 3)
+        .count();
+    if word_count < 10 {
+        return 0;
+    }
+
+    let answer_markers = [
+        "to jest to",
+        "chodzi o",
+        "dlatego",
+        "poniewaz",
+        "przyczyna",
+        "diagnoza",
+        "wniosek",
+        "incydent",
+        "root cause",
+        "because",
+        "reason",
+        "summary",
+        "diagnosis",
+        "conclusion",
+    ];
+    if answer_markers.iter().any(|marker| text.contains(marker)) {
+        22
+    } else if word_count >= 22 {
+        8
+    } else {
+        0
+    }
+}
+
+fn has_strong_anchor_evidence(anchors: &[QueryAnchor], haystack: &str) -> bool {
+    anchors.iter().any(|anchor| {
+        anchor.strong
+            && (haystack.contains(&anchor.token)
+                || (anchor.parts.len() >= 2
+                    && anchor
+                        .parts
+                        .iter()
+                        .all(|part| haystack.contains(part.as_str()))))
+    })
+}
+
+fn semantic_result_haystack(result: &FuzzyResult) -> String {
+    normalize_query(&format!(
+        "{} {} {} {} {} {} {}",
+        result.project,
+        result.kind,
+        result.frame_kind.as_deref().unwrap_or_default(),
+        result.agent,
+        result.date,
+        result.path,
+        result.matched_lines.join(" ")
+    ))
+}
+
+fn low_signal_semantic_result(result: &FuzzyResult) -> bool {
+    let joined = result.matched_lines.join(" ");
+    let normalized = normalize_query(&joined);
+    if normalized.trim().is_empty() {
+        return true;
+    }
+    let noisy_needles = [
+        "last_token_usage",
+        "input_tokens",
+        "reasoning_output_tokens",
+        "model_context_window",
+        "toolu_",
+        "web_search",
+        "open_page",
+        "no matching deferred tools found",
+    ];
+    if noisy_needles
+        .iter()
+        .any(|needle| normalized.contains(needle))
+    {
+        return true;
+    }
+    let content_chars = normalized
+        .chars()
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .count();
+    content_chars < 8
+}
+
+fn dedupe_semantic_results(results: Vec<FuzzyResult>) -> Vec<FuzzyResult> {
+    let mut seen_snippets = HashSet::new();
+    let mut deduped = Vec::with_capacity(results.len());
+    for result in results {
+        let snippet_key = normalize_query(&result.matched_lines.join("\n"));
+        if snippet_key.len() >= 24
+            && !seen_snippets.insert(format!(
+                "{}|{}|{}",
+                result.project,
+                result.frame_kind.as_deref().unwrap_or("-"),
+                snippet_key
+            ))
+        {
+            continue;
+        }
+        deduped.push(result);
+    }
+    deduped
 }
 
 /// Pure helper for the post-fetch filter pass. Kept `pub(crate)` so unit
@@ -1329,17 +1625,32 @@ pub fn render_semantic_status_line(
     // and that this is a fallback, not the full stack.
     let dense_only = backend_label.starts_with(BACKEND_SEMANTIC_DENSE_ONLY);
     let all_bucket_fallback = backend_label.ends_with("_all_fallback");
-    let (prefix, index_label, fallback_label) = if dense_only && all_bucket_fallback {
-        ("[degraded] ", "dense_only", "hybrid_unavailable,all_bucket")
+    let global_project_scope = backend_label.ends_with("_global_scoped");
+    let (prefix, index_label, fallback_label, scope_label) = if dense_only && all_bucket_fallback {
+        (
+            "[degraded] ",
+            "dense_only",
+            "hybrid_unavailable,all_bucket",
+            "",
+        )
+    } else if dense_only && global_project_scope {
+        (
+            "[degraded] ",
+            "dense_only",
+            "hybrid_unavailable",
+            " scope=global_project_filter",
+        )
     } else if dense_only {
-        ("[degraded] ", "dense_only", "hybrid_unavailable")
+        ("[degraded] ", "dense_only", "hybrid_unavailable", "")
     } else if all_bucket_fallback {
-        ("", "hybrid", "all_bucket")
+        ("", "hybrid", "all_bucket", "")
+    } else if global_project_scope {
+        ("", "hybrid", "none", " scope=global_project_filter")
     } else {
-        ("", "hybrid", "none")
+        ("", "hybrid", "none", "")
     };
     format!(
-        "{}{} result(s) from {} candidate chunks. oracle_status: backend={} index={} fallback={} model={} loctree_scope_safe=true{}",
+        "{}{} result(s) from {} candidate chunks. oracle_status: backend={} index={} fallback={} model={} loctree_scope_safe=true{}{}",
         prefix,
         result_count,
         scanned,
@@ -1347,14 +1658,254 @@ pub fn render_semantic_status_line(
         index_label,
         fallback_label,
         model_id,
+        scope_label,
         manifest
     )
+}
+
+/// Bounded fetch limit for fuzzy retrieval. When post-filters are active we
+/// over-fetch up to `FILTER_EXAMINED_CAP_RATIO`× the requested limit (floored
+/// at `FILTER_EXAMINED_CAP_MIN`) so inside-window matches that sit below the
+/// raw top-N still surface instead of being lost to a silent-empty result.
+pub fn fuzzy_fetch_limit(user_limit: usize, filters_active: bool) -> usize {
+    if filters_active {
+        user_limit
+            .saturating_mul(FILTER_EXAMINED_CAP_RATIO)
+            .max(FILTER_EXAMINED_CAP_MIN)
+    } else {
+        user_limit
+    }
+}
+
+/// Apply the shared score/agent/date/hours post-filters to a fuzzy result set
+/// in place. Date bounds win over the `--hours` cutoff to match legacy
+/// precedence.
+fn apply_fuzzy_post_filters(
+    results: &mut Vec<crate::rank::FuzzyResult>,
+    post_filters: &SemanticSearchFilters,
+) {
+    if let Some(min_score) = post_filters.score_min {
+        results.retain(|r| r.score >= min_score);
+    }
+    if let Some(ref agent_filter) = post_filters.agent {
+        results.retain(|r| r.agent == *agent_filter);
+    }
+    if post_filters.date_lo.is_some() || post_filters.date_hi.is_some() {
+        let lo = post_filters.date_lo.as_deref();
+        let hi = post_filters.date_hi.as_deref();
+        results.retain(|r| {
+            lo.is_none_or(|lo| r.date.as_str() >= lo) && hi.is_none_or(|hi| r.date.as_str() <= hi)
+        });
+    } else if let Some(ref cutoff) = post_filters.hours_cutoff {
+        let cutoff = cutoff.as_str();
+        results.retain(|r| r.date.as_str() >= cutoff);
+    }
+}
+
+/// Shared fuzzy retrieval + post-filter primitive. Both the CLI `aicx search`
+/// fallback and the MCP `aicx_search` fallback route through this so the two
+/// surfaces cannot drift in *what* they retrieve and filter. Fetches a bounded
+/// pool then applies the post-filters; ordering/truncation is the caller's job
+/// via [`finalize_fuzzy_results`].
+pub fn fuzzy_search_with_post_filters(
+    store_root: &Path,
+    query: &str,
+    limit: usize,
+    project_scopes: &[Option<&str>],
+    frame_kind: Option<FrameKind>,
+    post_filters: &SemanticSearchFilters,
+) -> anyhow::Result<(Vec<crate::rank::FuzzyResult>, usize)> {
+    let fetch_limit = fuzzy_fetch_limit(limit, post_filters.is_active());
+    let (mut results, scanned) = crate::rank::fuzzy_search_store(
+        store_root,
+        query,
+        fetch_limit,
+        project_scopes,
+        frame_kind,
+    )?;
+    apply_fuzzy_post_filters(&mut results, post_filters);
+    Ok((results, scanned))
+}
+
+/// Shared "finalize" step for fuzzy/semantic result sets: optional kind retain,
+/// then sort, then truncate to `limit`. Both CLI and MCP search call this so
+/// ordering and limit semantics stay byte-identical across surfaces. `sort`
+/// accepts `"newest"` / `"oldest"` / `"score"`. `None` falls back to descending
+/// score; any unknown token falls back to `"newest"` (timestamp/date
+/// descending), matching the unit test below.
+pub fn finalize_fuzzy_results(
+    mut results: Vec<crate::rank::FuzzyResult>,
+    kind_filter: Option<&str>,
+    sort: Option<&str>,
+    limit: usize,
+) -> Vec<crate::rank::FuzzyResult> {
+    if let Some(kind_filter) = kind_filter {
+        results.retain(|r| r.kind == kind_filter);
+    }
+    match sort {
+        Some(sort_order) => results.sort_by(|a, b| {
+            let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
+            let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
+            match sort_order {
+                "newest" => t_b.cmp(t_a),
+                "oldest" => t_a.cmp(t_b),
+                "score" => b.score.cmp(&a.score).then(t_b.cmp(t_a)),
+                _ => t_b.cmp(t_a),
+            }
+        }),
+        None => results.sort_by_key(|b| std::cmp::Reverse(b.score)),
+    }
+    results.into_iter().take(limit).collect()
+}
+
+/// Append an `index_snapshot` honesty hint to a rendered hybrid search payload.
+///
+/// Hybrid results reflect the committed index *manifest* (a snapshot of the
+/// corpus at index-build time), not a live freshness check — that check scans
+/// canonical chunks and is intentionally kept off the search hot path. Without
+/// this hint a `hybrid_rrf` result reads as "fully fresh"; the hint keeps the
+/// surface honest by pointing callers at `aicx index status` to confirm there
+/// are no pending (un-embedded) chunks. Shared by CLI and MCP so both surfaces
+/// emit the identical honesty signal.
+pub fn inject_index_snapshot_hint(rendered: &str, source_chunks: usize) -> anyhow::Result<String> {
+    let mut value: serde_json::Value = serde_json::from_str(rendered).map_err(|e| {
+        anyhow::anyhow!("parse rendered search payload for index_snapshot hint: {e}")
+    })?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "index_snapshot".to_string(),
+            serde_json::json!({
+                "source_chunks": source_chunks,
+                "freshness_verified": false,
+                "note": "results reflect the committed index snapshot; run `aicx index status` to confirm there are no pending (un-embedded) chunks",
+            }),
+        );
+    }
+    serde_json::to_string(&value)
+        .map_err(|e| anyhow::anyhow!("serialize search payload with index_snapshot hint: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    fn fuzzy(score: u8, kind: &str, date: &str, ts: Option<&str>) -> crate::rank::FuzzyResult {
+        crate::rank::FuzzyResult {
+            file: "f".to_string(),
+            path: "p".to_string(),
+            project: "proj".to_string(),
+            kind: kind.to_string(),
+            frame_kind: None,
+            agent: "claude".to_string(),
+            date: date.to_string(),
+            timestamp: ts.map(|s| s.to_string()),
+            score,
+            label: "l".to_string(),
+            density: 0.0,
+            matched_lines: Vec::new(),
+            session_id: None,
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn fuzzy_fetch_limit_over_fetches_only_when_filters_active() {
+        // Inactive filters: fetch exactly the requested limit.
+        assert_eq!(fuzzy_fetch_limit(5, false), 5);
+        // Active filters: over-fetch CAP_RATIO× the limit, floored at CAP_MIN.
+        assert_eq!(
+            fuzzy_fetch_limit(20, true),
+            20 * FILTER_EXAMINED_CAP_RATIO // 200, above the floor
+        );
+        assert_eq!(fuzzy_fetch_limit(1, true), FILTER_EXAMINED_CAP_MIN);
+    }
+
+    #[test]
+    fn finalize_fuzzy_results_defaults_to_descending_score() {
+        let input = vec![
+            fuzzy(10, "decision", "2026-01-01", None),
+            fuzzy(50, "decision", "2026-01-01", None),
+            fuzzy(30, "decision", "2026-01-01", None),
+        ];
+        let out = finalize_fuzzy_results(input, None, None, 10);
+        assert_eq!(
+            out.iter().map(|r| r.score).collect::<Vec<_>>(),
+            vec![50, 30, 10]
+        );
+    }
+
+    #[test]
+    fn finalize_fuzzy_results_honors_newest_and_oldest() {
+        let input = vec![
+            fuzzy(10, "decision", "2026-01-01", Some("2026-01-01T00:00:00Z")),
+            fuzzy(10, "decision", "2026-01-03", Some("2026-01-03T00:00:00Z")),
+            fuzzy(10, "decision", "2026-01-02", Some("2026-01-02T00:00:00Z")),
+        ];
+        let newest = finalize_fuzzy_results(input.clone(), None, Some("newest"), 10);
+        assert_eq!(
+            newest.iter().map(|r| r.date.clone()).collect::<Vec<_>>(),
+            vec!["2026-01-03", "2026-01-02", "2026-01-01"]
+        );
+        let oldest = finalize_fuzzy_results(input, None, Some("oldest"), 10);
+        assert_eq!(
+            oldest.iter().map(|r| r.date.clone()).collect::<Vec<_>>(),
+            vec!["2026-01-01", "2026-01-02", "2026-01-03"]
+        );
+    }
+
+    #[test]
+    fn finalize_fuzzy_results_retains_kind_then_truncates() {
+        let input = vec![
+            fuzzy(90, "decision", "2026-01-01", None),
+            fuzzy(80, "task", "2026-01-01", None),
+            fuzzy(70, "decision", "2026-01-01", None),
+            fuzzy(60, "decision", "2026-01-01", None),
+        ];
+        let out = finalize_fuzzy_results(input, Some("decision"), None, 2);
+        assert_eq!(out.len(), 2, "kind retain then truncate to limit");
+        assert!(out.iter().all(|r| r.kind == "decision"));
+        assert_eq!(
+            out.iter().map(|r| r.score).collect::<Vec<_>>(),
+            vec![90, 70]
+        );
+    }
+
+    #[test]
+    fn finalize_fuzzy_results_unknown_sort_token_falls_back_to_newest() {
+        // The shared primitive treats any unknown sort token as "newest" so a
+        // caller passing an out-of-contract string degrades gracefully instead
+        // of panicking or diverging from the MCP surface.
+        let input = vec![
+            fuzzy(10, "decision", "2026-01-01", Some("2026-01-01T00:00:00Z")),
+            fuzzy(10, "decision", "2026-01-02", Some("2026-01-02T00:00:00Z")),
+        ];
+        let out = finalize_fuzzy_results(input, None, Some("nonsense"), 10);
+        assert_eq!(
+            out.iter().map(|r| r.date.clone()).collect::<Vec<_>>(),
+            vec!["2026-01-02", "2026-01-01"]
+        );
+    }
+
+    #[test]
+    fn inject_index_snapshot_hint_marks_freshness_unverified() {
+        let payload = inject_index_snapshot_hint(
+            r#"{"oracle_status":{"backend":"hybrid_rrf"},"results":2,"items":[]}"#,
+            11906,
+        )
+        .expect("index_snapshot hint should inject");
+        let json: serde_json::Value =
+            serde_json::from_str(&payload).expect("payload stays valid JSON");
+        assert_eq!(json["results"], 2);
+        assert_eq!(json["index_snapshot"]["source_chunks"], 11906);
+        assert_eq!(json["index_snapshot"]["freshness_verified"], false);
+        assert!(
+            json["index_snapshot"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("aicx index status")
+        );
+    }
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -1515,17 +2066,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn semantic_status_line_marks_hybrid_global_project_scope() {
+        let line = render_semantic_status_line(
+            BACKEND_HYBRID_RRF_GLOBAL_SCOPED,
+            "qwen3-embedding:8b",
+            10,
+            259_007,
+            None,
+        );
+
+        assert!(line.contains("backend=hybrid_rrf_global_scoped"));
+        assert!(line.contains("index=hybrid"));
+        assert!(line.contains("fallback=none"));
+        assert!(line.contains("scope=global_project_filter"));
+        assert!(
+            !line.contains("degraded"),
+            "global-scoped hybrid search should not claim degraded dense-only: {line}"
+        );
+    }
+
     /// F1 regression: project-scoped semantic search may run on a host where
-    /// only the cross-project `_all` bucket is materialized. In that case the
-    /// search path should fall back to `_all`, while keeping the requested
-    /// project as a strict retrieval filter.
+    /// only the cross-project `_all` bucket is materialized. In that case `_all`
+    /// is the canonical global index, and the requested project stays a strict
+    /// retrieval filter.
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
-    fn project_bucket_missing_falls_back_to_all_with_project_filter() {
-        let dir = std::env::temp_dir().join(format!(
-            "aicx-semantic-scope-fallback-{}",
-            std::process::id()
-        ));
+    fn project_bucket_missing_uses_global_index_with_project_filter() {
+        let dir =
+            std::env::temp_dir().join(format!("aicx-semantic-global-scope-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let project_index_path = dir.join("vetcoders_vista").join("embeddings.ndjson");
@@ -1544,19 +2113,20 @@ mod tests {
         assert_eq!(scope.index_project, None);
         assert_eq!(scope.retrieval_project_filter, Some("vetcoders/vista"));
         assert!(
-            scope.used_all_bucket_fallback,
-            "scope should explicitly mark the _all fallback"
+            scope.used_global_project_scope,
+            "scope should explicitly mark the global project filter path"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// F1 regression: when dense-only fallback queries `_all`, project
-    /// filtering must happen inside retrieval before top-N selection. A very
-    /// close hit from another project must not crowd out the requested project.
+    /// F1 regression: when dense-only fallback queries the global `_all` index,
+    /// project filtering must happen inside retrieval before top-N selection. A
+    /// very close hit from another project must not crowd out the requested
+    /// project.
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
-    fn dense_only_all_bucket_project_filter_is_strict_before_limit() {
+    fn dense_only_global_index_project_filter_is_strict_before_limit() {
         use crate::vector_index::{IndexEntry, IndexHeader};
         use std::io::Write;
 
@@ -1630,7 +2200,7 @@ mod tests {
             "test-model",
             false,
         )
-        .expect("dense-only _all query should retain requested project hits");
+        .expect("dense-only global query should retain requested project hits");
 
         assert_eq!(outcome.results.len(), 1);
         assert_eq!(outcome.results[0].project, "vetcoders/vista");
@@ -1726,7 +2296,7 @@ mod tests {
 
     #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
     #[test]
-    fn dense_only_all_bucket_fallback_labels_backend_explicitly() {
+    fn dense_only_global_scope_labels_backend_explicitly() {
         use crate::vector_index::{IndexEntry, IndexHeader};
         use std::io::Write;
 
@@ -1774,17 +2344,17 @@ mod tests {
             "test-model",
             true,
         )
-        .expect("dense-only all-bucket fallback should succeed");
+        .expect("dense-only global scoped query should succeed");
 
         assert_eq!(
             outcome.backend_label,
-            BACKEND_SEMANTIC_DENSE_ONLY_ALL_FALLBACK
+            BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
         );
         assert!(
             outcome.results[0]
                 .label
-                .starts_with("dense_only_all_fallback:"),
-            "all-bucket fallback hit label should be explicit, got {}",
+                .starts_with("dense_only_global_scoped:"),
+            "global-scoped hit label should be explicit, got {}",
             outcome.results[0].label
         );
 
@@ -1904,22 +2474,278 @@ mod tests {
     }
 
     fn fake_hit(rank: usize, date: &str, agent: &str, score: u8) -> FuzzyResult {
+        fake_hit_with_frame(rank, date, agent, score, None, vec![format!("rank {rank}")])
+    }
+
+    fn fake_hit_with_frame(
+        rank: usize,
+        date: &str,
+        agent: &str,
+        score: u8,
+        frame_kind: Option<&str>,
+        matched_lines: Vec<String>,
+    ) -> FuzzyResult {
         FuzzyResult {
             file: format!("rank-{rank}.md"),
             path: format!("rank-{rank}.md"),
             project: "test/repo".to_string(),
             kind: "conversations".to_string(),
-            frame_kind: None,
+            frame_kind: frame_kind.map(ToString::to_string),
             agent: agent.to_string(),
             date: date.to_string(),
             timestamp: None,
             score,
             label: format!("test:{rank}"),
             density: 0.5,
-            matched_lines: Vec::new(),
+            matched_lines,
             session_id: None,
             cwd: None,
         }
+    }
+
+    #[test]
+    fn default_semantic_quality_drops_machine_frames_and_recovers_human_hits() {
+        let pool = vec![
+            fake_hit_with_frame(
+                0,
+                "2026-06-01",
+                "codex",
+                99,
+                Some("tool_call"),
+                vec!["[12:00:00] tool: id: toolu_01abc".to_string()],
+            ),
+            fake_hit_with_frame(
+                1,
+                "2026-06-01",
+                "codex",
+                98,
+                Some("system_note"),
+                vec![r#"[12:00:01] system: {"last_token_usage":{"input_tokens":123}}"#.to_string()],
+            ),
+            fake_hit_with_frame(
+                2,
+                "2026-06-01",
+                "claude",
+                82,
+                Some("user_msg"),
+                vec!["[21:47:27] user: dorobmy shot features (1, 2, 3 powyzej)".to_string()],
+            ),
+            fake_hit_with_frame(
+                3,
+                "2026-06-01",
+                "claude",
+                81,
+                Some("agent_reply"),
+                vec!["[21:48:10] assistant: shot features implementation plan".to_string()],
+            ),
+        ];
+
+        let filtered = apply_default_semantic_quality(pool, "shot features", None);
+        let frames: Vec<Option<&str>> = filtered
+            .iter()
+            .map(|result| result.frame_kind.as_deref())
+            .collect();
+
+        assert_eq!(
+            frames,
+            vec![Some("user_msg"), Some("agent_reply")],
+            "default operator search should hide machine frames from top results"
+        );
+        assert!(
+            filtered[0].score > 82,
+            "literal human match should get a quality boost, got {}",
+            filtered[0].score
+        );
+    }
+
+    #[test]
+    fn default_semantic_quality_prioritizes_hyphenated_anchor_overlap() {
+        let pool = vec![
+            fake_hit_with_frame(
+                0,
+                "2026-06-01",
+                "codex",
+                93,
+                Some("agent_reply"),
+                vec![
+                    "[10:00:00] assistant: zrobmy tak, przeklikam appke i zobaczymy co sie wysypie"
+                        .to_string(),
+                ],
+            ),
+            fake_hit_with_frame(
+                1,
+                "2026-06-01",
+                "claude",
+                68,
+                Some("agent_reply"),
+                vec![
+                    "[10:01:00] assistant: To jest to - vista leak + devista; leak-vista-info poszlo do public repo"
+                        .to_string(),
+                ],
+            ),
+        ];
+
+        let filtered =
+            apply_default_semantic_quality(pool, "vista-leak o co w tym chodziolo?", None);
+
+        assert_eq!(
+            filtered[0].label, "test:1",
+            "hyphenated query anchors should beat higher dense-score vibe matches"
+        );
+        assert!(
+            filtered[0].score > filtered[1].score,
+            "anchor-bearing hit should outrank no-anchor hit: {filtered:?}"
+        );
+    }
+
+    #[test]
+    fn default_semantic_quality_prioritizes_underscore_anchor_overlap() {
+        let pool = vec![
+            fake_hit_with_frame(
+                0,
+                "2026-06-01",
+                "codex",
+                91,
+                Some("agent_reply"),
+                vec!["[10:00:00] assistant: auth flow and trusted device notes".to_string()],
+            ),
+            fake_hit_with_frame(
+                1,
+                "2026-06-01",
+                "claude",
+                64,
+                Some("agent_reply"),
+                vec![
+                    "[10:01:00] assistant: deep-link includes completion_token and portal completion endpoint"
+                        .to_string(),
+                ],
+            ),
+        ];
+
+        let filtered = apply_default_semantic_quality(pool, "completion_token auth leak", None);
+
+        assert_eq!(
+            filtered[0].label, "test:1",
+            "underscore/code-ish anchors should carry lexical evidence weight"
+        );
+    }
+
+    #[test]
+    fn default_semantic_quality_prioritizes_digit_code_anchor_overlap() {
+        let pool = vec![
+            fake_hit_with_frame(
+                0,
+                "2026-06-01",
+                "codex",
+                88,
+                Some("agent_reply"),
+                vec![
+                    "[10:00:00] assistant: Silver and Sztudio connection is now stable".to_string(),
+                ],
+            ),
+            fake_hit_with_frame(
+                1,
+                "2026-06-01",
+                "claude",
+                57,
+                Some("agent_reply"),
+                vec![
+                    "[10:01:00] assistant: Sztudio uses qwen3 embedding model for semantic index"
+                        .to_string(),
+                ],
+            ),
+        ];
+
+        let filtered = apply_default_semantic_quality(pool, "qwen3-embedding sztudio silver", None);
+
+        assert_eq!(
+            filtered[0].label, "test:1",
+            "digit/code anchors should prevent generic host mentions from winning"
+        );
+    }
+
+    #[test]
+    fn default_semantic_quality_prefers_answer_like_agent_reply_over_anchor_echo() {
+        let pool = vec![
+            fake_hit_with_frame(
+                0,
+                "2026-06-01",
+                "codex",
+                76,
+                Some("user_msg"),
+                vec![
+                    "[10:00:00] user: spoko, ostatnio w podobny sposob poszlo duzo leak-vista-info"
+                        .to_string(),
+                ],
+            ),
+            fake_hit_with_frame(
+                1,
+                "2026-06-01",
+                "claude",
+                60,
+                Some("agent_reply"),
+                vec![
+                    "[10:01:00] assistant: To jest to - vista leak plus devista; leak-vista-info poszlo do public repo i trzeba zamknac incydent"
+                        .to_string(),
+                ],
+            ),
+        ];
+
+        let filtered =
+            apply_default_semantic_quality(pool, "vista-leak o co w tym chodzilo?", None);
+
+        assert_eq!(
+            filtered[0].label, "test:1",
+            "answer-like agent replies with the same anchor evidence should beat short anchor echoes"
+        );
+    }
+
+    #[test]
+    fn explicit_frame_kind_keeps_requested_machine_frame() {
+        let pool = vec![
+            fake_hit_with_frame(
+                0,
+                "2026-06-01",
+                "codex",
+                92,
+                Some("tool_call"),
+                vec!["[12:00:00] tool: rg frame_kind".to_string()],
+            ),
+            fake_hit_with_frame(
+                1,
+                "2026-06-01",
+                "codex",
+                80,
+                Some("user_msg"),
+                vec!["[12:00:03] user: frame kind please".to_string()],
+            ),
+        ];
+
+        let filtered =
+            apply_default_semantic_quality(pool, "frame_kind", Some(FrameKind::ToolCall));
+
+        assert!(
+            filtered
+                .iter()
+                .any(|result| result.frame_kind.as_deref() == Some("tool_call")),
+            "explicit frame-kind search must still allow tool_call results"
+        );
+    }
+
+    #[test]
+    fn default_semantic_quality_expands_examined_pool_without_user_filters() {
+        let filters = SemanticSearchFilters::default();
+
+        assert_eq!(
+            semantic_fetch_limit(10, None, &filters),
+            10 * FILTER_EXAMINED_CAP_RATIO,
+            "default human-facing quality gate needs a wider pool than the displayed limit"
+        );
+        assert_eq!(
+            semantic_fetch_limit(10, Some(FrameKind::ToolCall), &filters),
+            10,
+            "explicit frame-kind queries should not pay the default quality-pool expansion"
+        );
     }
 
     /// Bug #31 regression: top-N raw semantic hits sit outside the

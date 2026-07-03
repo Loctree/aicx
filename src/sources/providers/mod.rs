@@ -18,8 +18,9 @@ pub use gemini::{extract_gemini, extract_gemini_antigravity_file, extract_gemini
 pub use junie::{extract_junie, extract_junie_file};
 pub use operator_markdown::{
     OperatorMarkdown, discover_operator_markdown, discover_operator_markdown_from,
-    extract_operator_markdown, extract_operator_markdown_from_home,
-    extract_operator_markdown_from_home_and_repo,
+    discover_operator_markdown_from_input, extract_operator_markdown,
+    extract_operator_markdown_from_home, extract_operator_markdown_from_home_and_repo,
+    extract_operator_markdown_from_input,
 };
 
 pub(crate) use codex::count_codex_sessions;

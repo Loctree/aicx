@@ -684,7 +684,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create root");
 
-        let status = index_status_at_with_sessions(&root, Some("VetCoders/Loctree"), Some(&[]))
+        let status = index_status_at_with_sessions(&root, Some("Vetcoders/Loctree"), Some(&[]))
             .expect("index status with project");
 
         // Mirrors the on-disk bucket: lowercase + path separators replaced.
@@ -752,6 +752,9 @@ mod tests {
             branch: None,
             cwd: Some("/Users/me/vc-workspace/vetcoders/aicx".to_string()),
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
         };
         let summary = crate::store::store_semantic_segments_at(
             &root,
@@ -821,6 +824,9 @@ mod tests {
             branch: None,
             cwd: None,
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
         }];
 
         let summary = client

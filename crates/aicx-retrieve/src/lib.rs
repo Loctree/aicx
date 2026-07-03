@@ -1,4 +1,4 @@
-// Vibecrafted with AI Agents by VetCoders (c)2024-2026 LibraxisAI
+// Vibecrafted with AI Agents by Vetcoders (c)2024-2026 LibraxisAI
 //! Retrieval trait facade for aicx hybrid indexes.
 //!
 //! This crate defines the public contracts shared by lexical, dense, and

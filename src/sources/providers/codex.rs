@@ -37,6 +37,7 @@ pub(crate) fn parse_codex_file_with_diagnostics(
     config: &ExtractionConfig,
 ) -> Result<(Vec<TimelineEntry>, Vec<CodexSessionWarning>)> {
     let file = sanitize::open_file_validated(path)?;
+    let (source_path, source_sha256) = source_path_and_sha256(path);
     let mut reader = BufReader::new(file);
     let mut history_records = Vec::new();
     let mut session_events = Vec::new();
@@ -100,7 +101,13 @@ pub(crate) fn parse_codex_file_with_diagnostics(
             });
         }
 
-        let mut entries = build_codex_history_entries(&history_records, config, &mut warnings);
+        let mut entries = build_codex_history_entries(
+            &history_records,
+            config,
+            &mut warnings,
+            &source_path,
+            source_sha256.as_deref(),
+        );
         if !session_events.is_empty() {
             let (mut session_entries, session_warnings) =
                 parse_codex_session_events_with_diagnostics(
@@ -146,6 +153,7 @@ pub fn extract_codex(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     }
 
     let file = sanitize::open_file_validated(&codex_path)?;
+    let (source_path, source_sha256) = source_path_and_sha256(&codex_path);
     let mut reader = BufReader::new(file);
 
     let mut records = Vec::new();
@@ -179,7 +187,13 @@ pub fn extract_codex(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
             samples: oversized_samples,
         });
     }
-    let mut entries = build_codex_history_entries(&records, config, &mut warnings);
+    let mut entries = build_codex_history_entries(
+        &records,
+        config,
+        &mut warnings,
+        &source_path,
+        source_sha256.as_deref(),
+    );
     emit_codex_session_warnings(&codex_path, &warnings);
 
     // Merge codex sessions entries
@@ -512,6 +526,8 @@ fn build_codex_history_entries(
     records: &[CodexEntry],
     config: &ExtractionConfig,
     warnings: &mut Vec<CodexSessionWarning>,
+    source_path: &str,
+    source_sha256: Option<&str>,
 ) -> Vec<TimelineEntry> {
     let mut sessions: HashMap<String, Vec<&CodexEntry>> = HashMap::new();
     for entry in records {
@@ -588,6 +604,9 @@ fn build_codex_history_entries(
                     cwd: msg.cwd.clone(),
                     frame_kind,
                     timestamp_source: None,
+                    source_path: Some(source_path.to_string()),
+                    source_sha256: source_sha256.map(str::to_string),
+                    source_line_span: None,
                 },
                 warnings,
             ));
@@ -700,6 +719,7 @@ fn parse_codex_session_events_with_diagnostics(
     events: &[CodexSessionEvent],
     config: &ExtractionConfig,
 ) -> (Vec<TimelineEntry>, Vec<CodexSessionWarning>) {
+    let (source_path, source_sha256) = source_path_and_sha256(path);
     // Extract global session metadata (like session_id) and the initial cwd
     let mut session_id: Option<String> = None;
     let mut initial_cwd: Option<String> = None;
@@ -938,6 +958,9 @@ fn parse_codex_session_events_with_diagnostics(
                 cwd: current_cwd.clone(),
                 frame_kind,
                 timestamp_source: None,
+                source_path: Some(source_path.clone()),
+                source_sha256: source_sha256.clone(),
+                source_line_span: None,
             },
             &mut warnings,
         ));
@@ -1112,7 +1135,14 @@ pub fn extract_grok(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
                 samples: oversized_samples,
             });
         }
-        let mut hist = build_codex_history_entries(&records, config, &mut warnings);
+        let (source_path, source_sha256) = source_path_and_sha256(&history_path);
+        let mut hist = build_codex_history_entries(
+            &records,
+            config,
+            &mut warnings,
+            &source_path,
+            source_sha256.as_deref(),
+        );
         emit_codex_session_warnings(&history_path, &warnings);
         entries.append(&mut hist);
     }
@@ -1161,6 +1191,7 @@ fn parse_grok_chat_history(
     config: &ExtractionConfig,
 ) -> Result<(Vec<TimelineEntry>, Vec<CodexSessionWarning>)> {
     let file = sanitize::open_file_validated(path)?;
+    let (source_path, source_sha256) = source_path_and_sha256(path);
     let reader = BufReader::new(file);
     let mut entries = Vec::new();
     let mut warnings: Vec<CodexSessionWarning> = Vec::new();
@@ -1293,6 +1324,9 @@ fn parse_grok_chat_history(
                 cwd: None,
                 frame_kind,
                 timestamp_source: None,
+                source_path: Some(source_path.clone()),
+                source_sha256: source_sha256.clone(),
+                source_line_span: Some((line_no as u64, line_no as u64)),
             },
             &mut warnings,
         ));

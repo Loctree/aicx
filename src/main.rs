@@ -15,10 +15,10 @@
 //! - Gemini: ~/.gemini/tmp/<hash>/chats/session-*.json
 //! - Gemini Antigravity: ~/.gemini/antigravity/{conversations/<uuid>.pb,brain/<uuid>/}
 //! - Junie: ~/.junie/sessions/session-*/events.jsonl
-//! - CodeScribe: ~/.codescribe/transcriptions/YYYY-MM-DD/*.{txt,md,json}
+//! - Codescribe: ~/.codescribe/transcriptions/YYYY-MM-DD/*.{txt,md,json}
 //! - Operator markdown: ~/Downloads/*.md, ~/.vibecrafted/inbox/*.md
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
@@ -36,7 +36,7 @@ use aicx::corpus;
 use aicx::dashboard::{self, DashboardConfig, DashboardScope};
 use aicx::dashboard_server::{self, DashboardCorsPolicy, DashboardServerConfig};
 use aicx::intents;
-use aicx::mcp::{self, McpTransport};
+use aicx::mcp::{self, McpHttpConfig, McpTransport};
 use aicx::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
 use aicx::rank;
 use aicx::reports_extractor::{self, ReportsExtractorConfig};
@@ -84,7 +84,7 @@ fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
 ///   aicx all -H 4                      # build canonical corpus
 #[derive(Debug, Parser)]
 #[command(name = "aicx")]
-#[command(author = "(c)2026 VetCoders")]
+#[command(author = "(c)2026 Vetcoders")]
 #[command(version)]
 #[command(verbatim_doc_comment)]
 struct Cli {
@@ -497,7 +497,7 @@ struct ReportsArgs {
     artifacts_root: Option<PathBuf>,
 
     /// Artifact organization bucket
-    #[arg(long, default_value = "VetCoders")]
+    #[arg(long, default_value = "Vetcoders")]
     org: String,
 
     /// Repository bucket (defaults to the current directory name)
@@ -592,6 +592,20 @@ struct CorpusRepairArgs {
     emit: CorpusEmit,
 }
 
+#[derive(Debug, Clone, Args)]
+struct CorpusValidateCardsArgs {
+    /// Store subtree or markdown card to validate. Defaults to the corpus roots used by audit.
+    root: Option<PathBuf>,
+
+    /// Exit non-zero when hard validation errors are present.
+    #[arg(long)]
+    strict: bool,
+
+    /// Emit compact JSON instead of readable text.
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Debug, Clone, Subcommand)]
 enum CorpusCommand {
     /// Audit derived markdown corpora for Claude signature/thinking leakage and tool JSON noise.
@@ -599,6 +613,9 @@ enum CorpusCommand {
 
     /// Repair derived markdown without inventing or summarizing semantic content.
     Repair(CorpusRepairArgs),
+
+    /// Validate card schema v1/v2 sidecars, headers, hashes, and signal parity.
+    ValidateCards(CorpusValidateCardsArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -653,6 +670,61 @@ enum IndexAction {
         #[arg(short = 'j', long)]
         json: bool,
     },
+    /// Derive project-scoped semantic buckets from the existing `_all` index without re-embedding.
+    Derive {
+        /// Strict project filter, repeatable. Omit only with --all-projects.
+        #[arg(short, long, value_delimiter = ',')]
+        project: Vec<String>,
+
+        /// Derive buckets for every project present in the existing `_all` index.
+        #[arg(long, conflicts_with = "project")]
+        all_projects: bool,
+
+        /// Emit JSON report instead of plain text.
+        #[arg(short = 'j', long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum EvalAction {
+    /// Run/list the operator search quality seed matrix.
+    SearchQuality(SearchQualityEvalArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct SearchQualityEvalArgs {
+    /// Execute the matrix against the active AICX runtime. Omit to only list cases.
+    #[arg(long)]
+    run: bool,
+
+    /// Only evaluate selected case ids. Repeat or pass comma-separated values.
+    #[arg(long = "case", value_delimiter = ',')]
+    cases: Vec<String>,
+
+    /// Number of evidence hits inspected per case.
+    #[arg(long, default_value_t = 3)]
+    top: usize,
+
+    /// Search limit passed to `aicx search --evidence`.
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
+
+    /// Load a custom search-quality seed TOML. Defaults to the embedded curated seed.
+    #[arg(long)]
+    seed: Option<PathBuf>,
+
+    /// Emit JSON instead of plain text.
+    #[arg(short = 'j', long)]
+    json: bool,
+
+    /// Exit non-zero when any case fails. Useful for CI or local gates.
+    #[arg(long)]
+    strict: bool,
+
+    /// Override the aicx binary used by --run.
+    #[arg(long, hide = true)]
+    aicx_bin: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -798,7 +870,7 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract and store from all agents (Claude + Codex + Gemini + Junie + CodeScribe) into the canonical corpus.
+    /// Extract and store from all agents (Claude + Codex + Gemini + Junie + Codescribe) into the canonical corpus.
     ///
     /// The daily-driver command: runs each extractor, deduplicates, chunks, and
     /// writes steerable markdown to ~/.aicx/. By default, uses per-source
@@ -1060,7 +1132,8 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = StdoutEmit::None)]
         emit: StdoutEmit,
 
-        /// Source path for pack-style ingests such as --source loct-context-pack
+        /// Source path for explicit ingests: markdown file/directory for --source operator-md,
+        /// pack directory for --source loct-context-pack
         input: Option<PathBuf>,
     },
 
@@ -1279,17 +1352,38 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = McpTransport::Stdio)]
         transport: McpTransport,
 
+        /// Bind address for streamable HTTP transport (default: 127.0.0.1)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: std::net::IpAddr,
+
         /// Port for streamable HTTP transport (default: 8044)
         #[arg(long, default_value = "8044")]
         port: u16,
+
+        /// Allowed HTTP Host header for streamable HTTP clients. Repeat for remote hostnames/IPs.
+        #[arg(long = "allowed-host", value_name = "HOST")]
+        allowed_hosts: Vec<String>,
+
+        /// Disable HTTP Host header validation. Not recommended outside trusted networks.
+        #[arg(long)]
+        allow_any_host: bool,
 
         /// Optional explicit auth token (overrides env / file / generated). HTTP transport only.
         #[arg(long, value_name = "TOKEN")]
         auth_token: Option<String>,
 
         /// Require Bearer auth on HTTP transport (default: true). Pass `--no-require-auth` to opt out.
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        #[arg(
+            long,
+            default_value_t = true,
+            action = clap::ArgAction::Set,
+            conflicts_with = "no_require_auth"
+        )]
         require_auth: bool,
+
+        /// Disable Bearer auth on HTTP transport. Only allowed on loopback binds.
+        #[arg(long = "no-require-auth", action = clap::ArgAction::SetTrue)]
+        no_require_auth: bool,
     },
 
     #[command(
@@ -1390,12 +1484,24 @@ enum Commands {
         kind: Option<String>,
 
         /// Bypass semantic vector search and run filesystem-fuzzy search.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "evidence")]
         no_semantic: bool,
+
+        /// Return an evidence packet: semantic candidates re-ranked by
+        /// answer/support signals, with source sections and diagnostics.
+        #[arg(long)]
+        evidence: bool,
 
         /// Emit compact JSON instead of plain text
         #[arg(short = 'j', long)]
         json: bool,
+    },
+
+    /// Run local evaluation helpers for retrieval/search quality.
+    #[command(display_order = 13)]
+    Eval {
+        #[command(subcommand)]
+        action: EvalAction,
     },
 
     /// Catch up the canonical corpus, then build the semantic index. Use
@@ -1404,16 +1510,19 @@ enum Commands {
     /// Default behaviour is INCREMENTAL: first materialize missing canonical
     /// chunks from source sessions, then embed only sidecars whose mtime is
     /// newer than the existing index `header.generated_at`; new rows are
-    /// appended to the committed index file. Pass
+    /// appended to the committed index file. With no `-p`, AICX builds the
+    /// `_all` index used by global search and project-scoped `search -p`
+    /// queries. Optional per-project buckets can be derived later with
+    /// `aicx index derive -p <project>` as a local cache. Pass
     /// `--full-rescan` to re-embed every chunk from scratch — useful when
     /// the embedder model changes, the index file is corrupt, or an
     /// operator wants a deterministic from-zero rebuild.
-    #[command(display_order = 13)]
+    #[command(display_order = 14)]
     Index {
         #[command(subcommand)]
         action: Option<IndexAction>,
 
-        /// Project filter. Omit to index every project.
+        /// Project filter. Omit to index the global `_all` bucket.
         ///
         /// Accepted forms (case-insensitive, repeatable):
         ///   `-p owner/repo`   strict `<owner>/<repo>` slug match
@@ -1528,9 +1637,20 @@ enum Commands {
         /// Skip post-migration intent schema scan on the canonical store
         #[arg(long, default_value_t = false)]
         no_intent_schema: bool,
+
+        /// Upgrade store cards v1 -> v2 in place (sidecar schema/honesty
+        /// fields, bracket header -> YAML frontmatter; body bytes never
+        /// change). Optional ROOT overrides the walked directory (default:
+        /// canonical store dir). Dry-run by default; pass --apply to write.
+        #[arg(long, value_name = "ROOT", num_args = 0..=1)]
+        cards_v2: Option<Option<PathBuf>>,
+
+        /// Write the cards-v2 migration (without it, --cards-v2 is a dry run)
+        #[arg(long, requires = "cards_v2", conflicts_with = "dry_run")]
+        apply: bool,
     },
 
-    /// Classify stored chunks into 9-type intent entries and report counts.
+    /// Classify stored chunks into 11-type intent entries and report counts.
     #[command(name = "migrate-intent-schema")]
     MigrateIntentSchema {
         /// Strict project filter: `owner/repo`, `/repo` (cross-org repo
@@ -1574,7 +1694,7 @@ enum Commands {
 
         /// Move suspicious top-level corpus buckets to $HOME/.aicx/quarantine/.
         /// Buckets that are merely CamelCase (legitimate GitHub orgs like
-        /// `LibraxisAI`, `VetCoders`, `Loctree`, `Szowesgad`) are
+        /// `LibraxisAI`, `Vetcoders`, `Loctree`, `Szowesgad`) are
         /// canonicalized in place to lowercase instead of quarantined,
         /// merging into existing lowercase buckets if present.
         #[arg(long)]
@@ -1657,6 +1777,17 @@ enum Commands {
     },
 }
 
+/// Index of the top-level subcommand token: the first argument that is not
+/// a leading global flag. AICX exposes exactly one global flag
+/// (`--verbose`/`-v`, boolean — see [`Cli`]), so the first token that does
+/// not start with `-` is the subcommand. Returns `None` when every argument
+/// is a flag. Used by the pre-clap hint detectors so they fire only on the
+/// actual subcommand, never on a word that reappears later as an argument or
+/// search term (e.g. `aicx search ingest`).
+fn first_subcommand_index(args: &[String]) -> Option<usize> {
+    args.iter().position(|a| !a.starts_with('-'))
+}
+
 /// Detect `aicx <cmd>` invocations that clap would otherwise reject with
 /// a generic "the following required arguments were not provided" or
 /// "missing required subcommand" error. Returns a `(cmd_name,
@@ -1684,13 +1815,16 @@ where
         return None;
     }
 
-    // Locate the leftmost top-level subcommand. We accept arbitrary
-    // top-level flags before it (e.g. `aicx --verbose ingest`).
-    let cmd_idx = args
-        .iter()
-        .position(|a| matches!(a.as_str(), "ingest" | "conversations" | "sources"))?;
+    // Locate the top-level subcommand (first non-flag token; global flags
+    // like `aicx --verbose ingest` are accepted before it). Only emit a
+    // hint when THAT token is a boundary subcommand — otherwise the same
+    // words appearing later (e.g. `aicx search ingest`) would be hijacked.
+    let cmd_idx = first_subcommand_index(&args)?;
 
     let cmd = args[cmd_idx].as_str();
+    if !matches!(cmd, "ingest" | "conversations" | "sources") {
+        return None;
+    }
     let tail = &args[cmd_idx + 1..];
 
     match cmd {
@@ -1770,8 +1904,13 @@ where
 {
     let args: Vec<String> = args.into_iter().collect();
 
-    // Step 1: locate the first positional that equals `config`.
-    let config_idx = args.iter().position(|a| a == "config")?;
+    // Step 1: the top-level subcommand must BE `config`. Use the first
+    // non-flag token so `config` reappearing later as a search term
+    // (`aicx search config --show`) is never mistaken for the subcommand.
+    let config_idx = first_subcommand_index(&args)?;
+    if args[config_idx] != "config" {
+        return None;
+    }
 
     // Step 2: walk forward; if we hit `show`/`init` first, the user is
     // already on a valid subcommand path → no mistake.
@@ -2123,6 +2262,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 emit,
                 redact_secrets: redaction.redact_secrets,
                 noise_filter_enabled: !no_noise_filter,
+                operator_md_input: None,
             })?;
         }
         Some(Commands::Ingest {
@@ -2180,6 +2320,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 emit,
                 redact_secrets: redaction.redact_secrets,
                 noise_filter_enabled: !no_noise_filter,
+                operator_md_input: input,
             })?;
         }
         Some(Commands::List) => {
@@ -2331,18 +2472,32 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }
         Some(Commands::Serve {
             transport,
+            host,
             port,
+            allowed_hosts,
+            allow_any_host,
             auth_token,
             require_auth,
+            no_require_auth,
         }) => {
+            let require_auth = require_auth && !no_require_auth;
             let auth_config = aicx::auth::load_auth_config(auth_token.as_deref(), require_auth)?;
-            if matches!(transport, McpTransport::Http) && !require_auth {
+            if matches!(transport, McpTransport::Http) && !require_auth && host.is_loopback() {
                 eprintln!(
-                    "! Warning: MCP HTTP transport bound without auth — knowing the port is enough to invoke MCP tools."
+                    "! Warning: loopback MCP HTTP transport bound without auth — knowing the port is enough to invoke MCP tools."
                 );
             }
+            if matches!(transport, McpTransport::Http) && allow_any_host {
+                eprintln!("! Warning: MCP HTTP Host validation disabled (--allow-any-host).");
+            }
+            let http_config = McpHttpConfig {
+                host,
+                port,
+                allowed_hosts,
+                allow_any_host,
+            };
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async { mcp::run_transport(transport, port, auth_config).await })?;
+            rt.block_on(async { mcp::run_transport(transport, http_config, auth_config).await })?;
         }
         Some(Commands::Search {
             query,
@@ -2352,6 +2507,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             filters,
             kind,
             no_semantic,
+            evidence,
             json,
         }) => {
             run_search(SearchRunArgs {
@@ -2363,8 +2519,12 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                 filters,
                 kind: kind.as_deref(),
                 no_semantic,
+                evidence,
             })?;
         }
+        Some(Commands::Eval { action }) => match action {
+            EvalAction::SearchQuality(args) => run_eval_search_quality(args)?,
+        },
         Some(Commands::Index {
             action,
             project,
@@ -2375,6 +2535,13 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }) => match action {
             Some(IndexAction::Status { project, json }) => {
                 run_index_status(&project, json)?;
+            }
+            Some(IndexAction::Derive {
+                project,
+                all_projects,
+                json,
+            }) => {
+                run_index_derive(&project, all_projects, json)?;
             }
             None => {
                 if !dry_run {
@@ -2417,7 +2584,20 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             legacy_root,
             store_root,
             no_intent_schema,
+            cards_v2,
+            apply,
         }) => {
+            if let Some(root) = cards_v2 {
+                // Cards-v2 arm: dry-run by default, --apply writes. The
+                // legacy sweep and the intent-schema scan stay out of this
+                // path — it only upgrades existing cards in place.
+                let cards_dry_run = !apply;
+                if !cards_dry_run {
+                    warn_pending_mutation("migrate --cards-v2");
+                }
+                aicx::store::run_cards_v2_migration(cards_dry_run, root)?;
+                return Ok(());
+            }
             if !dry_run {
                 warn_pending_mutation("migrate");
             }
@@ -4488,7 +4668,11 @@ fn format_intents_pack_markdown(
     if let Some(limit) = per_section_limit {
         out.push_str(&format!("- per_section_limit: {limit}\n"));
     }
-    out.push_str("- source: canonical corpus\n\n");
+    out.push_str("- source: canonical corpus\n");
+    out.push_str(&format!(
+        "- {}\n\n",
+        aicx::oracle::ClaimHonesty::canonical().display_line()
+    ));
 
     for section in sections {
         out.push_str(&format!("## {}\n\n", section.title));
@@ -6098,6 +6282,8 @@ struct StoreRunArgs {
     /// `ChunkerConfig::noise_filter_enabled`; the CLI surface is
     /// `--no-noise-filter` (negated to keep the default ergonomic).
     noise_filter_enabled: bool,
+    /// Optional explicit markdown file/directory for `operator-md` ingestion.
+    operator_md_input: Option<PathBuf>,
 }
 
 fn resolve_store_agents(agent: Option<&str>) -> Result<Vec<&'static str>> {
@@ -6699,6 +6885,7 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
         emit,
         redact_secrets,
         noise_filter_enabled,
+        operator_md_input,
     } = args;
 
     let cutoff = cutoff.unwrap_or_else(|| lookback_cutoff(hours));
@@ -6768,7 +6955,14 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
             "grok" => sources::extract_grok(&config),
             "grok-sessions" => sources::extract_grok_sessions(&config),
             "codescribe" => sources::extract_codescribe(&config),
-            "operator-md" => sources::extract_operator_markdown(&config),
+            "operator-md" => {
+                if let Some(input) = operator_md_input.as_deref() {
+                    let home = dirs::home_dir().context("No home dir")?;
+                    sources::extract_operator_markdown_from_input(&home, input, &config)
+                } else {
+                    sources::extract_operator_markdown(&config)
+                }
+            }
             _ => Ok(Vec::new()),
         };
         hb.stop();
@@ -7076,12 +7270,14 @@ fn is_noise_artifact(path: &std::path::Path) -> bool {
         return false; // Not short enough to be considered noise
     }
 
-    // Check if it's task-notification only
+    // Check if it's task-notification only. The card header (bracket or
+    // frontmatter) is stripped structurally so its meta lines never count
+    // as signal; the length gate above stays on the full content.
     let mut is_noise = true;
-    for line in &lines {
+    for line in aicx::card_header::card_body(&content).lines() {
         let l = line.trim().to_lowercase();
         if l.is_empty()
-            || l.starts_with("[project:")
+            || aicx::card_header::is_bracket_header_line(&l)
             || l.starts_with("[signals")
             || l.starts_with("[/signals")
             || l.starts_with("-") // checklist/signals
@@ -7319,6 +7515,7 @@ struct SearchRunArgs<'a> {
     filters: RetrievalFilters,
     kind: Option<&'a str>,
     no_semantic: bool,
+    evidence: bool,
 }
 
 fn validate_cli_search_limit(limit: usize) -> Result<()> {
@@ -7331,14 +7528,113 @@ fn validate_cli_search_limit(limit: usize) -> Result<()> {
     Ok(())
 }
 
-fn search_examined_fetch_limit(user_limit: usize, filters_active: bool) -> usize {
-    if filters_active {
-        user_limit
-            .saturating_mul(aicx::search_engine::FILTER_EXAMINED_CAP_RATIO)
-            .max(aicx::search_engine::FILTER_EXAMINED_CAP_MIN)
-    } else {
-        user_limit
+fn run_eval_search_quality(args: SearchQualityEvalArgs) -> Result<()> {
+    let SearchQualityEvalArgs {
+        run,
+        cases,
+        top,
+        limit,
+        seed,
+        json,
+        strict,
+        aicx_bin,
+    } = args;
+
+    validate_cli_search_limit(limit)?;
+    let seed = aicx::search_eval::load_search_quality_seed(seed.as_deref())?;
+    let selected = aicx::search_eval::select_search_quality_cases(&seed, &cases)?;
+
+    if !run {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&selected)?);
+        } else {
+            print!("{}", aicx::search_eval::render_seed_cases_text(&selected));
+        }
+        return Ok(());
     }
+
+    let bin = aicx_bin.unwrap_or(std::env::current_exe()?);
+    let store_root = store::store_base_dir()?;
+    let project_filters = aicx::search_eval::discover_projects_for_cases(&store_root, &selected)?;
+    let mut evaluations = Vec::new();
+
+    for case in selected {
+        let projects = project_filters.get(&case.id).cloned().unwrap_or_default();
+        if projects.is_empty() {
+            evaluations.push(aicx::search_eval::project_resolution_error_evaluation(
+                case,
+                format!(
+                    "no project buckets found for anchored map_id(s): {}",
+                    case.anchors
+                        .iter()
+                        .map(|anchor| anchor.map_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+            continue;
+        }
+
+        let mut command = ProcessCommand::new(&bin);
+        command
+            .arg("search")
+            .arg(&case.query)
+            .arg("--evidence")
+            .arg("--json")
+            .arg("--limit")
+            .arg(limit.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for project in &projects {
+            command.arg("-p").arg(project);
+        }
+        let output = command.output().with_context(|| {
+            format!(
+                "run search-quality case {} using {}",
+                case.id,
+                bin.display()
+            )
+        })?;
+
+        if !output.status.success() {
+            evaluations.push(aicx::search_eval::command_error_evaluation(
+                case,
+                projects,
+                output.status.code(),
+                &output.stderr,
+            ));
+            continue;
+        }
+
+        match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+            Ok(payload) => evaluations.push(aicx::search_eval::evaluate_evidence_payload(
+                case, projects, &payload, top,
+            )),
+            Err(err) => evaluations.push(aicx::search_eval::invalid_json_evaluation(
+                case,
+                projects,
+                &err,
+                &output.stdout,
+            )),
+        }
+    }
+
+    let report = aicx::search_eval::build_run_report(store_root.display().to_string(), evaluations);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", aicx::search_eval::render_run_report_text(&report));
+    }
+
+    if strict && report.failed > 0 {
+        anyhow::bail!(
+            "search-quality eval failed: {}/{} case(s) failed",
+            report.failed,
+            report.total
+        );
+    }
+
+    Ok(())
 }
 
 fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
@@ -7351,9 +7647,13 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
         filters,
         kind,
         no_semantic,
+        evidence,
     } = args;
     let limit = filters.limit.unwrap_or(DEFAULT_RETRIEVAL_LIMIT);
     validate_cli_search_limit(limit)?;
+    if evidence && no_semantic {
+        anyhow::bail!("search --evidence requires semantic search; remove --no-semantic");
+    }
     let kind_filter = kind.and_then(aicx::timeline::Kind::parse);
     // Extract inline date hints from query if no explicit --date given
     let (effective_query, inline_date) = if date.is_none() {
@@ -7397,93 +7697,207 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
     let resolved_projects = resolve_project_filters_or_error(projects)?;
     let scopes = project_scopes(&resolved_projects);
 
-    let (mut results, scanned, semantic_status, pushdown_diagnostic, semantic_fallback) =
-        if no_semantic {
-            let (results, scanned) = run_fuzzy_search_with_filters(
-                &root,
-                &search_query,
-                limit,
-                &scopes,
-                filters.frame_kind.map(Into::into),
-                &post_filters,
-            )?;
-            (results, scanned, None, None, None)
-        } else {
-            match aicx::search_engine::try_semantic_search_filtered(
-                &root,
-                &search_query,
-                limit,
-                &scopes,
-                filters.frame_kind.map(Into::into),
-                kind_filter.map(|kind| kind.dir_name()),
-                &post_filters,
-            ) {
-                Ok(filtered) => {
-                    let aicx::search_engine::FilteredSemanticOutcome {
-                        outcome,
-                        diagnostic,
-                    } = filtered;
-                    let status = (
-                        outcome.backend_label,
-                        outcome.model_id.clone(),
-                        outcome.scanned,
-                        outcome.retrieval_status.clone(),
-                    );
-                    (
-                        outcome.results,
-                        outcome.scanned,
-                        Some(status),
-                        diagnostic,
-                        None,
-                    )
-                }
-                Err(err) => {
-                    let fallback = SemanticFallbackNotice::from_error(&err);
-                    let (results, scanned) = run_fuzzy_search_with_filters(
-                        &root,
-                        &search_query,
-                        limit,
-                        &scopes,
-                        filters.frame_kind.map(Into::into),
-                        &post_filters,
-                    )?;
-                    if !json {
-                        eprintln!(
-                            "aicx search: semantic search unavailable; falling back to filesystem fuzzy."
-                        );
-                        eprintln!("  kind:           {}", err.kind());
-                        eprintln!("  reason:         {}", err.reason());
-                        eprintln!("  recommendation: {}", err.recommendation());
-                    }
-                    (results, scanned, None, None, Some(fallback))
-                }
+    let (results, scanned, semantic_status, pushdown_diagnostic, semantic_fallback) = if no_semantic
+    {
+        let (results, scanned) = aicx::search_engine::fuzzy_search_with_post_filters(
+            &root,
+            &search_query,
+            limit,
+            &scopes,
+            filters.frame_kind.map(Into::into),
+            &post_filters,
+        )?;
+        (results, scanned, None, None, None)
+    } else {
+        match aicx::search_engine::try_semantic_search_filtered(
+            &root,
+            &search_query,
+            limit,
+            &scopes,
+            filters.frame_kind.map(Into::into),
+            kind_filter.map(|kind| kind.dir_name()),
+            &post_filters,
+        ) {
+            Ok(filtered) => {
+                let aicx::search_engine::FilteredSemanticOutcome {
+                    outcome,
+                    diagnostic,
+                } = filtered;
+                let status = (
+                    outcome.backend_label,
+                    outcome.model_id.clone(),
+                    outcome.scanned,
+                    outcome.retrieval_status.clone(),
+                );
+                (
+                    outcome.results,
+                    outcome.scanned,
+                    Some(status),
+                    diagnostic,
+                    None,
+                )
             }
-        };
+            Err(err) => {
+                let fallback = SemanticFallbackNotice::from_error(&err);
+                let (results, scanned) = aicx::search_engine::fuzzy_search_with_post_filters(
+                    &root,
+                    &search_query,
+                    limit,
+                    &scopes,
+                    filters.frame_kind.map(Into::into),
+                    &post_filters,
+                )?;
+                if !json {
+                    eprintln!(
+                        "aicx search: semantic search unavailable; falling back to filesystem fuzzy."
+                    );
+                    eprintln!("  kind:           {}", err.kind());
+                    eprintln!("  reason:         {}", err.reason());
+                    eprintln!("  recommendation: {}", err.recommendation());
+                }
+                (results, scanned, None, None, Some(fallback))
+            }
+        }
+    };
 
-    // Defensive kind retain: the semantic path pushes `kind_filter`
-    // into the hybrid query, but we keep the explicit check so a future
-    // index regression cannot smuggle off-kind hits past the operator.
+    // Defensive kind retain ahead of the evidence path: the shared finalize
+    // below retains too, but `--evidence` consumes `results` before finalize
+    // and must never leak off-kind hits into the evidence report.
+    let mut results = results;
     if let Some(kind_filter) = kind_filter {
         results.retain(|r| r.kind == kind_filter.dir_name());
     }
 
-    if let Some(sort_order) = filters.sort {
-        results.sort_by(|a, b| {
-            let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
-            let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
-            match sort_order {
-                SortOrder::Newest => t_b.cmp(t_a),
-                SortOrder::Oldest => t_a.cmp(t_b),
-                SortOrder::Score => b.score.cmp(&a.score).then(t_b.cmp(t_a)),
+    if evidence {
+        let report = aicx::evidence::build_evidence_report(&search_query, results, limit);
+        let source_paths_verified = aicx::oracle::verify_paths(
+            aicx::evidence::evidence_source_paths(&report).map(Path::to_path_buf),
+        );
+        let oracle_status = match semantic_status.as_ref() {
+            Some((_, _, _, Some(retrieval_status))) => aicx::oracle::OracleStatus::hybrid_rrf(
+                &root,
+                retrieval_status,
+                report.results,
+                source_paths_verified,
+            ),
+            Some((_, _, semantic_scanned, None)) => aicx::oracle::OracleStatus::content_semantic(
+                &root,
+                *semantic_scanned,
+                report.results,
+                source_paths_verified,
+            ),
+            None => aicx::oracle::OracleStatus::filesystem_fuzzy(
+                &root,
+                scanned,
+                report.results,
+                source_paths_verified,
+            ),
+        };
+
+        if json {
+            let rendered = aicx::evidence::render_evidence_json(&report, scanned, oracle_status)?;
+            let mut payload = aicx::search_engine::inject_filter_pushdown_diagnostic(
+                &rendered,
+                pushdown_diagnostic.as_ref(),
+            )?;
+            if let Some(ref fallback) = semantic_fallback {
+                let mut value: serde_json::Value = serde_json::from_str(&payload)?;
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert(
+                        "semantic_fallback".to_string(),
+                        serde_json::json!({
+                            "used": true,
+                            "backend": "filesystem_fuzzy",
+                            "kind": fallback.kind,
+                            "reason": fallback.reason,
+                            "recommendation": fallback.recommendation,
+                        }),
+                    );
+                }
+                payload = serde_json::to_string(&value)?;
             }
-        });
-    } else {
-        // default sort
-        results.sort_by_key(|b| std::cmp::Reverse(b.score));
+            println!("{}", payload);
+            return Ok(());
+        }
+
+        if report.items.is_empty() {
+            eprintln!(
+                "No evidence for {:?} (examined {} candidates).",
+                query, report.candidates_examined
+            );
+            return Ok(());
+        }
+
+        print!(
+            "{}",
+            aicx::evidence::render_evidence_text(&report, io::stdout().is_terminal())
+        );
+        let _ = io::stdout().flush();
+
+        if io::stderr().is_terminal() {
+            let base_line = match semantic_status.as_ref() {
+                Some((semantic_backend, semantic_model_id, semantic_scanned, retrieval_status)) => {
+                    aicx::search_engine::render_semantic_status_line(
+                        semantic_backend,
+                        semantic_model_id,
+                        report.results,
+                        *semantic_scanned,
+                        retrieval_status.as_ref(),
+                    )
+                }
+                None => {
+                    let fallback = semantic_fallback
+                        .as_ref()
+                        .map(|notice| format!("semantic_unavailable kind={}", notice.kind))
+                        .unwrap_or_else(|| "operator_requested".to_string());
+                    format!(
+                        "{} evidence result(s) from {} scanned chunks. oracle_status: backend=filesystem_fuzzy index=none fallback={} loctree_scope_safe=false",
+                        report.results, scanned, fallback
+                    )
+                }
+            };
+            let suffix = pushdown_diagnostic
+                .as_ref()
+                .map(|d| {
+                    format!(
+                        " filter_pushdown={} examined={} matched={} requested_limit={}",
+                        d.kind, d.examined, d.matched, d.requested_limit
+                    )
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "\n{} evidence_mode=post_fusion candidates_examined={} suppressed={}{}",
+                base_line,
+                report.candidates_examined,
+                report.suppressed.len(),
+                suffix
+            );
+        }
+        return Ok(());
     }
 
-    // Truncate to requested limit after date filtering
-    let results: Vec<_> = results.into_iter().take(limit).collect();
+    // Shared finalize (kind retain + sort + truncate) keeps CLI and MCP search
+    // ordering/limit semantics identical across surfaces. The defensive kind
+    // retain also guards against a future index regression smuggling off-kind
+    // hits past the operator.
+    let sort_label = filters.sort.map(|order| match order {
+        SortOrder::Newest => "newest",
+        SortOrder::Oldest => "oldest",
+        SortOrder::Score => "score",
+    });
+    let results = aicx::search_engine::finalize_fuzzy_results(
+        results,
+        kind_filter.map(|kind| kind.dir_name()),
+        sort_label,
+        limit,
+    );
+
+    // Source-chunk count from the hybrid manifest (if this was a hybrid run);
+    // borrow so the by-value `match semantic_status` below still owns it.
+    let hybrid_source_chunks = match &semantic_status {
+        Some((_, _, _, Some(retrieval_status))) => Some(retrieval_status.source_chunk_count),
+        _ => None,
+    };
 
     if json {
         let oracle_status = match semantic_status {
@@ -7522,6 +7936,11 @@ fn run_search(args: SearchRunArgs<'_>) -> Result<()> {
             &rendered,
             pushdown_diagnostic.as_ref(),
         )?;
+        // Hybrid results reflect the committed index snapshot, not a live
+        // freshness check; attach the honesty hint pointing at `index status`.
+        if let Some(source_chunks) = hybrid_source_chunks {
+            payload = aicx::search_engine::inject_index_snapshot_hint(&payload, source_chunks)?;
+        }
         if let Some(ref fallback) = semantic_fallback {
             let mut value: serde_json::Value = serde_json::from_str(&payload)?;
             if let Some(obj) = value.as_object_mut() {
@@ -7620,39 +8039,6 @@ impl SemanticFallbackNotice {
             recommendation: err.recommendation().to_string(),
         }
     }
-}
-
-fn run_fuzzy_search_with_filters(
-    root: &Path,
-    search_query: &str,
-    limit: usize,
-    scopes: &[Option<&str>],
-    frame_kind: Option<timeline::FrameKind>,
-    post_filters: &aicx::search_engine::SemanticSearchFilters,
-) -> Result<(Vec<rank::FuzzyResult>, usize)> {
-    // Fuzzy path keeps the legacy "fetch then post-filter" shape. It is
-    // reached either by operator request (`--no-semantic`) or by explicit
-    // semantic degradation when the committed index cannot be served.
-    let fuzzy_fetch_limit = search_examined_fetch_limit(limit, post_filters.is_active());
-    let (mut results, scanned) =
-        rank::fuzzy_search_store(root, search_query, fuzzy_fetch_limit, scopes, frame_kind)?;
-    if let Some(min_score) = post_filters.score_min {
-        results.retain(|r| r.score >= min_score);
-    }
-    if let Some(ref agent_filter) = post_filters.agent {
-        results.retain(|r| r.agent == *agent_filter);
-    }
-    if post_filters.date_lo.is_some() || post_filters.date_hi.is_some() {
-        let lo = post_filters.date_lo.as_deref();
-        let hi = post_filters.date_hi.as_deref();
-        results.retain(|r| {
-            lo.is_none_or(|lo| r.date.as_str() >= lo) && hi.is_none_or(|hi| r.date.as_str() <= hi)
-        });
-    } else if let Some(ref cutoff) = post_filters.hours_cutoff {
-        let cutoff = cutoff.as_str();
-        results.retain(|r| r.date.as_str() >= cutoff);
-    }
-    Ok((results, scanned))
 }
 
 /// Build the `IndexEvent` -> sink fanout used by `aicx index`. Always
@@ -7836,6 +8222,7 @@ fn run_index(
                 emit: StdoutEmit::None,
                 redact_secrets: true,
                 noise_filter_enabled: true,
+                operator_md_input: None,
             })?;
         } else {
             eprintln!("Canonical catch-up: no source sessions newer than chunks");
@@ -7900,6 +8287,101 @@ fn run_index(
         }
     }
     Ok(())
+}
+
+fn run_index_derive(projects: &[String], all_projects: bool, json: bool) -> Result<()> {
+    if projects.is_empty() && !all_projects {
+        anyhow::bail!(
+            "`aicx index derive` requires at least one `-p/--project` filter or `--all-projects`"
+        );
+    }
+    let reports = if all_projects {
+        derive_project_bucket_reports(&[])?
+    } else {
+        let resolved_scopes = resolve_index_scopes(projects)?;
+        let mut projects_to_derive = Vec::with_capacity(resolved_scopes.len());
+        for scope in resolved_scopes {
+            let Some(project) = scope else {
+                anyhow::bail!(
+                    "`aicx index derive` cannot derive `_all`; pass one or more projects with `-p`"
+                );
+            };
+            projects_to_derive.push(project);
+        }
+        derive_project_bucket_reports(&projects_to_derive)?
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&reports)?);
+    } else {
+        print_index_derive_reports(&reports);
+    }
+
+    Ok(())
+}
+
+fn derive_project_bucket_reports(projects: &[String]) -> Result<Vec<serde_json::Value>> {
+    let derived_reports = aicx::vector_index::derive_project_indexes_from_all(projects)
+        .with_context(|| "derive project semantic indexes from `_all`")?;
+    let mut reports = Vec::with_capacity(derived_reports.len());
+    for derived in derived_reports {
+        let project = derived.project.clone();
+        let manifest = aicx::vector_index::repair_hybrid_from_committed(Some(&project))
+            .with_context(|| format!("build hybrid artifacts for derived project `{project}`"))?;
+        reports.push(serde_json::json!({
+            "project": project,
+            "derived": derived,
+            "hybrid": {
+                "generation_id": manifest.generation_id,
+                "source_chunk_count": manifest.source_chunk_count,
+                "dense_count": manifest.dense_count,
+                "lexical_doc_count": manifest.lexical_doc_count,
+                "fusion_algorithm": manifest.fusion_algorithm,
+            }
+        }));
+    }
+    Ok(reports)
+}
+
+fn print_index_derive_reports(reports: &[serde_json::Value]) {
+    for (idx, report) in reports.iter().enumerate() {
+        if idx > 0 {
+            eprintln!();
+        }
+        let project = report["project"].as_str().unwrap_or("<unknown>");
+        let derived = &report["derived"];
+        let hybrid = &report["hybrid"];
+        eprintln!("aicx index derive");
+        eprintln!("  project:               {project}");
+        eprintln!(
+            "  entries_written:       {}",
+            derived["entries_written"].as_u64().unwrap_or(0)
+        );
+        eprintln!(
+            "  elapsed_ms:            {}",
+            derived["elapsed_ms"].as_u64().unwrap_or(0)
+        );
+        eprintln!(
+            "  index_path:            {}",
+            derived["index_path"].as_str().unwrap_or("<unknown>")
+        );
+        eprintln!(
+            "  hybrid_source_chunks:  {}",
+            hybrid["source_chunk_count"].as_u64().unwrap_or(0)
+        );
+        eprintln!(
+            "  hybrid_dense_count:    {}",
+            hybrid["dense_count"].as_u64().unwrap_or(0)
+        );
+        eprintln!(
+            "  hybrid_lexical_docs:   {}",
+            hybrid["lexical_doc_count"].as_u64().unwrap_or(0)
+        );
+        eprintln!(
+            "  hybrid_generation:     {}",
+            hybrid["generation_id"].as_str().unwrap_or("<unknown>")
+        );
+    }
 }
 
 fn run_index_status(projects: &[String], json: bool) -> Result<()> {
@@ -8217,6 +8699,7 @@ fn run_steer(
     if json {
         let json = serde_json::to_string_pretty(&aicx::oracle::OracleEnvelope {
             oracle_status,
+            claim_honesty: aicx::oracle::ClaimHonesty::canonical(),
             results: metadatas.len(),
             items: &metadatas,
         })?;
@@ -8888,6 +9371,24 @@ fn run_corpus_command(args: CorpusArgs) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&repair_manifest)?);
             } else {
                 print!("{}", corpus::format_repair_text(&repair_manifest));
+            }
+        }
+        CorpusCommand::ValidateCards(validate_args) => {
+            let roots = validate_args.root.into_iter().collect();
+            let report = corpus::validate_cards(&corpus::CorpusValidateOptions {
+                roots,
+                strict: validate_args.strict,
+            })?;
+            if validate_args.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", corpus::format_validate_cards_text(&report));
+            }
+            if report.strict && !report.passed {
+                anyhow::bail!(
+                    "corpus validate-cards found {} hard violation(s)",
+                    report.totals.hard_violations
+                );
             }
         }
     }

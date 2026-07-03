@@ -5,7 +5,7 @@
 //! reminders) and rewarding actionable content (decisions, TODOs,
 //! architecture changes, bug findings).
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -109,9 +109,9 @@ const SKILL_BOILERPLATE_HEADERS: &[&str] = &[
 
 /// Footers/signatures that are boilerplate.
 const BOILERPLATE_FOOTERS: &[&str] = &[
-    "created by m&k",
+    "created by vetcoders",
     "vibecrafted with ai agents",
-    "*created by m&k",
+    "*created by vetcoders",
     "*vibecrafted with",
 ];
 
@@ -283,7 +283,14 @@ struct CompactSearchItem {
 }
 
 const SEARCH_MATCH_MAX_CHARS: usize = 200;
-const SEARCH_META_PREFIX: &str = "[project:";
+const SEARCH_METADATA_PREFIX: &str = "[metadata]";
+const SEARCH_GENERATED_METADATA_PREFIXES: &[&str] = &[
+    "[frame_kind:",
+    "source project:",
+    "canonical test project:",
+    "tb artifact:",
+    "round status:",
+];
 const METADATA_CANDIDATE_FLOOR: usize = 200;
 const METADATA_CANDIDATE_MULTIPLIER: usize = 100;
 
@@ -399,12 +406,28 @@ pub fn render_search_text(results: &[FuzzyResult], color: bool) -> String {
 }
 
 fn display_search_matches(result: &FuzzyResult) -> Vec<String> {
-    result
+    let mut lines = result
         .matched_lines
         .iter()
-        .filter(|line| !line.trim().starts_with(SEARCH_META_PREFIX))
+        .filter(|line| !is_search_metadata_line(line))
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines = result.matched_lines.iter().collect();
+    }
+    lines
+        .into_iter()
         .map(|line| truncate_search_match(line, SEARCH_MATCH_MAX_CHARS))
         .collect()
+}
+
+fn is_search_metadata_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let lower = trimmed.to_lowercase();
+    crate::card_header::is_bracket_header_line(trimmed)
+        || trimmed.starts_with(SEARCH_METADATA_PREFIX)
+        || SEARCH_GENERATED_METADATA_PREFIXES
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
 }
 
 fn truncate_search_match(line: &str, max_chars: usize) -> String {
@@ -747,7 +770,10 @@ fn fuzzy_search_store_one(
             continue;
         };
 
-        let all_lines: Vec<&str> = content.lines().collect();
+        // Header-agnostic: drop the card header (bracket or frontmatter)
+        // structurally before line-level filtering, so frontmatter meta
+        // lines never surface as search matches.
+        let all_lines: Vec<&str> = crate::card_header::card_body(&content).lines().collect();
         let without_aicx = strip_aicx_read_blocks(all_lines);
         let signal_lines: Vec<&str> = without_aicx
             .into_iter()
@@ -768,19 +794,20 @@ fn fuzzy_search_store_one(
             continue;
         }
 
-        let mut matched_lines: Vec<String> = metadata_matches;
-        matched_lines.extend(
-            signal_lines
-                .iter()
-                .filter(|line| {
-                    let normalized_line = normalize_query(line);
-                    query_terms
-                        .iter()
-                        .any(|term| normalized_line.contains(term))
-                })
-                .take(5)
-                .map(|line| line.trim().to_string()),
-        );
+        let mut matched_lines: Vec<String> = signal_lines
+            .iter()
+            .filter(|line| {
+                let normalized_line = normalize_query(line);
+                query_terms
+                    .iter()
+                    .any(|term| normalized_line.contains(term))
+            })
+            .take(5)
+            .map(|line| line.trim().to_string())
+            .collect();
+        if matched_lines.is_empty() && !metadata_matches.is_empty() {
+            matched_lines = metadata_matches;
+        }
         if matched_lines.is_empty() && metadata_match_count(&stored_file, &query_terms) > 0 {
             matched_lines = metadata_line(&stored_file);
         }
@@ -923,9 +950,6 @@ fn fuzzy_search_store_one(
         }
         for result in &mut deduped {
             result.matched_lines.retain(|line| {
-                if line.trim().starts_with("[metadata]") {
-                    return true;
-                }
                 line_freq.get(&normalize_query(line)).copied().unwrap_or(0) < threshold
             });
         }
@@ -1233,7 +1257,7 @@ fn speaker_role(frame_kind: Option<&str>, speaker_hint: Option<&str>, line: &str
 
     let hint = speaker_hint.or_else(|| conversation_speaker(line));
     match hint.map(|hint| hint.trim().to_ascii_lowercase()) {
-        Some(hint) if matches!(hint.as_str(), "user" | "human" | "operator" | "monika") => {
+        Some(hint) if matches!(hint.as_str(), "user" | "human" | "operator") => {
             SpeakerRole::Operator
         }
         Some(hint)
@@ -1307,7 +1331,7 @@ fn is_word_char(ch: char) -> bool {
 }
 
 /// Lines that are generic preamble/boilerplate — should not contribute to search matching.
-const SEARCH_BOILERPLATE: &[&str] = &["created by m&k", "vibecrafted with ai agents"];
+const SEARCH_BOILERPLATE: &[&str] = &["created by vetcoders", "vibecrafted with ai agents"];
 
 /// Sentinel brackets for aicx read blocks. Content between these markers
 /// is injected context from aicx tools — not original session signal.
@@ -1315,6 +1339,9 @@ const AICX_READ_BEGIN: &str = "【aicx:read】";
 const AICX_READ_END: &str = "【/aicx:read】";
 
 fn is_search_boilerplate(line: &str) -> bool {
+    if is_search_metadata_line(line) {
+        return true;
+    }
     let lower = line.trim().to_lowercase();
     if lower.is_empty() {
         return false;
@@ -1657,17 +1684,17 @@ Some boilerplate text.
 
         let vista_path = write_canonical_search_fixture(
             &root,
-            "VetCoders",
+            "Vetcoders",
             "Vista",
             "sessvista",
-            "[project: VetCoders/Vista | agent: codex | date: 2026-05-24]\n\nDecision: strictneedle belongs to the exact Vista repository.\n",
+            "[project: Vetcoders/Vista | agent: codex | date: 2026-05-24]\n\nDecision: strictneedle belongs to the exact Vista repository.\n",
         );
         write_canonical_search_fixture(
             &root,
-            "VetCoders",
+            "Vetcoders",
             "vista-portal",
             "sessportal",
-            "[project: VetCoders/vista-portal | agent: codex | date: 2026-05-24]\n\nDecision: strictneedle must not leak through a bare vista filter.\n",
+            "[project: Vetcoders/vista-portal | agent: codex | date: 2026-05-24]\n\nDecision: strictneedle must not leak through a bare vista filter.\n",
         );
 
         let (results, scanned) =
@@ -1676,13 +1703,84 @@ Some boilerplate text.
 
         assert_eq!(scanned, 1, "bare `-p vista` must scan only exact Vista");
         assert_eq!(results.len(), 1, "vista-portal must not match `-p vista`");
-        assert_eq!(results[0].project, "VetCoders/Vista");
+        assert_eq!(results[0].project, "Vetcoders/Vista");
         assert_eq!(
             results[0].path,
             fs::canonicalize(&vista_path)
                 .expect("fixture path should canonicalize")
                 .display()
                 .to_string()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fuzzy_search_store_one_prefers_content_matches_over_metadata_lines() {
+        let root = unique_rank_test_store_root("content-before-metadata");
+        fs::create_dir_all(&root).expect("fixture root should be created");
+
+        write_canonical_search_fixture(
+            &root,
+            "VetCoders",
+            "aicx",
+            "sessaicx",
+            "User asked:\nWhy did we move embeddings to Sztudio?\n\nAgent answered:\nDecision: foundationneedle belongs in the content match, not in a metadata banner.\n",
+        );
+
+        let (results, scanned) =
+            fuzzy_search_store_one(&root, "aicx foundationneedle", 10, None, None)
+                .expect("fixture fuzzy search should succeed");
+
+        assert_eq!(scanned, 1);
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].matched_lines[0].contains("foundationneedle"),
+            "content evidence should be first"
+        );
+        assert!(
+            !results[0]
+                .matched_lines
+                .iter()
+                .any(|line| is_search_metadata_line(line)),
+            "metadata lines should not be kept when content evidence exists"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fuzzy_search_tolerates_frontmatter_card_header() {
+        let root = unique_rank_test_store_root("frontmatter-header");
+        fs::create_dir_all(&root).expect("fixture root should be created");
+
+        write_canonical_search_fixture(
+            &root,
+            "Vetcoders",
+            "Vista",
+            "sessfront",
+            "---\nproject: Vetcoders/Vista\nagent: codex\ndate: 2026-05-24\nframe_kind: agent_reply\n---\n\nDecision: frontneedle lives only in the body.\n",
+        );
+
+        let (results, scanned) =
+            fuzzy_search_store_one(&root, "frontneedle", 10, Some("Vetcoders/Vista"), None)
+                .expect("fixture fuzzy search should succeed");
+
+        assert_eq!(scanned, 1);
+        assert_eq!(results.len(), 1, "frontmatter card must stay searchable");
+        let matches = &results[0].matched_lines;
+        assert!(
+            matches.iter().any(|line| line.contains("frontneedle")),
+            "body evidence must surface: {matches:?}"
+        );
+        assert!(
+            matches.iter().all(|line| {
+                !line.starts_with("---")
+                    && !line.starts_with("project:")
+                    && !line.starts_with("agent:")
+                    && !line.starts_with("frame_kind:")
+            }),
+            "frontmatter meta lines must not surface as matches: {matches:?}"
         );
 
         let _ = fs::remove_dir_all(&root);
@@ -1696,7 +1794,7 @@ Some boilerplate text.
             &[FuzzyResult {
                 file: "chunk.md".to_string(),
                 path: "/tmp/chunk.md".to_string(),
-                project: "VetCoders/ai-contexters".to_string(),
+                project: "Vetcoders/ai-contexters".to_string(),
                 kind: "reports".to_string(),
                 frame_kind: None,
                 agent: "codex".to_string(),
@@ -1707,6 +1805,12 @@ Some boilerplate text.
                 density: 0.8,
                 matched_lines: vec![
                     "[project: test | agent: codex | date: 2026-03-31]".to_string(),
+                    "[metadata] project: test | agent: codex | date: 2026-03-31 | kind: reports | path: /tmp/chunk.md".to_string(),
+                    "[frame_kind: agent_reply | cwd: /repo]".to_string(),
+                    "Source project: aicx".to_string(),
+                    "Canonical test project: tb14d-rounds/aicx".to_string(),
+                    "TB artifact: spotlight_rounds".to_string(),
+                    "Round status: answered".to_string(),
                     long_line.clone(),
                     "decision: align MCP search JSON with CLI".to_string(),
                 ],
@@ -1750,7 +1854,7 @@ Some boilerplate text.
         );
         assert_eq!(payload["items"][0]["score"], 88);
         assert_eq!(payload["items"][0]["label"], "HIGH");
-        assert_eq!(payload["items"][0]["project"], "VetCoders/ai-contexters");
+        assert_eq!(payload["items"][0]["project"], "Vetcoders/ai-contexters");
         assert_eq!(payload["items"][0]["kind"], "reports");
         assert_eq!(payload["items"][0]["agent"], "codex");
         assert_eq!(payload["items"][0]["date"], "2026-03-31");
@@ -1769,5 +1873,38 @@ Some boilerplate text.
                 .unwrap()
                 .ends_with(" ...")
         );
+    }
+
+    #[test]
+    fn render_search_json_keeps_metadata_when_it_is_the_only_match() {
+        let json = render_search_json(
+            Path::new("/tmp/aicx"),
+            &[FuzzyResult {
+                file: "chunk.md".to_string(),
+                path: "/tmp/chunk.md".to_string(),
+                project: "VetCoders/aicx".to_string(),
+                kind: "conversations".to_string(),
+                frame_kind: None,
+                agent: "codex".to_string(),
+                date: "2026-06-19".to_string(),
+                timestamp: None,
+                score: 90,
+                label: "HIGH".to_string(),
+                density: 1.0,
+                matched_lines: vec![
+                    "[metadata] project: VetCoders/aicx | agent: codex | date: 2026-06-19 | kind: conversations | path: /tmp/chunk.md".to_string(),
+                ],
+                session_id: Some("sess-456".to_string()),
+                cwd: None,
+            }],
+            1,
+        )
+        .expect("search JSON should serialize");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&json).expect("search JSON should parse");
+        let matches = payload["items"][0]["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].as_str().unwrap().starts_with("[metadata]"));
     }
 }

@@ -7,7 +7,7 @@ This is the piece that makes the tool useful for:
 - fast onboarding for new agents,
 - avoiding “paste 4000 lines of history” prompts.
 
-Implementation lives in `src/chunker.rs`.
+Implementation lives in `crates/aicx-parser/src/chunker.rs`.
 
 ## Chunk Model
 
@@ -16,10 +16,18 @@ The chunker processes `TimelineEntry` streams and produces `Chunk` items:
 - target size defaults to ~1500 tokens with overlap (2 messages)
 - extremely long messages are UTF-8 safely truncated (4000 bytes) in the chunk text
 
-The output text format is stable and line-oriented:
+The output text format is stable and line-oriented. Since card schema v2
+(see [`CARD_CONTRACT.md`](./CARD_CONTRACT.md)) the writer emits a YAML
+frontmatter header:
 
 ```text
-[project: <project> | agent: <agent> | date: <YYYY-MM-DD>]
+---
+project: <project>
+agent: <agent>
+date: <YYYY-MM-DD>
+frame_kind: <frame_kind>        # optional
+schema: card.v2
+---
 
 [signals]
 ...
@@ -30,12 +38,18 @@ The output text format is stable and line-oriented:
 ...
 ```
 
+Legacy v1 cards start with a bracket header instead
+(`[project: <project> | agent: <agent> | date: <YYYY-MM-DD>]`); readers accept
+both shapes, and `aicx migrate --cards-v2` upgrades stored v1 cards in place.
+
 The `[signals]` block is optional and only appears when the chunk contains at least one
 high-signal marker (checklist items, intent lines, results, or keyword-based highlights).
+In v2 the block is a projection of the typed `signals[]` records persisted in the
+`.meta.json` sidecar; the sidecar records are the canonical form.
 
 ## Tuning Knobs
 
-Defaults (see `ChunkerConfig::default()` in `src/chunker.rs`):
+Defaults (see `ChunkerConfig::default()` in `crates/aicx-parser/src/chunker.rs`):
 - `target_tokens=1500`
 - `min_tokens=500`
 - `max_tokens=2500`
@@ -49,7 +63,7 @@ Practical guidance:
 ## Signals + Highlight Extraction
 
 Chunks compute lightweight “signals” and “highlights” (see `extract_signals` and
-`extract_highlights` in `src/chunker.rs`).
+`extract_highlights` in `crates/aicx-parser/src/chunker.rs`).
 
 Signals (persisted in the chunk text as `[signals]...[/signals]`):
 - TODO checklist extraction (`- [ ]`, `- [x]`) with a prominent "RED LIGHT" marker when open items exist
@@ -80,4 +94,4 @@ The current chunker is correct and tested, but there are clear performance wins 
 3. Replace the per-date `BTreeMap` grouping with a single-pass scan of already-sorted entries.
 4. Reduce per-chunk string work in hot paths (chunk IDs and text builders).
 
-If you implement these, keep tests in `src/chunker.rs` as the behavioral contract.
+If you implement these, keep tests in `crates/aicx-parser/src/chunker.rs` as the behavioral contract.

@@ -22,7 +22,17 @@ fn entry(seconds_offset: i64, role: &str, message: &str) -> TimelineEntry {
         branch: None,
         cwd: None,
         timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
     }
+}
+
+fn card_body(text: &str) -> &str {
+    text.strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n\n"))
+        .map(|(_, body)| body)
+        .unwrap_or(text)
 }
 
 #[test]
@@ -53,21 +63,22 @@ fn chunk_entries_strips_three_noise_classes_end_to_end() {
 
     for (idx, chunk) in chunks.iter().enumerate() {
         let text = &chunk.text;
+        let body = card_body(text);
 
         // Class 1: line-numbered grep matches must be absent.
         assert!(
-            !text.contains("60 Passed:"),
+            !body.contains("60 Passed:"),
             "chunk {idx}: line-numbered noise leaked into chunk text:\n{text}"
         );
 
         // Class 2: tool-call echo must be absent.
         assert!(
-            !text.contains("input: {\"command\""),
+            !body.contains("input: {\"command\""),
             "chunk {idx}: tool-call echo leaked into chunk text:\n{text}"
         );
 
-        // Class 3: stray YAML delimiter must be absent on its own line.
-        for line in text.lines() {
+        // Class 3: stray YAML delimiter must be absent from the card body.
+        for line in body.lines() {
             assert!(
                 line.trim() != "---",
                 "chunk {idx}: stray YAML delimiter survived as line:\n{text}"
@@ -76,21 +87,21 @@ fn chunk_entries_strips_three_noise_classes_end_to_end() {
 
         // Semantic content must survive.
         assert!(
-            text.contains("Real semantic content paragraph"),
+            body.contains("Real semantic content paragraph"),
             "chunk {idx}: semantic content was dropped:\n{text}"
         );
         assert!(
-            text.contains("More real content"),
+            body.contains("More real content"),
             "chunk {idx}: post-noise semantic content was dropped:\n{text}"
         );
 
-        // Chunker scaffolding (project header + timestamp lines) must remain.
+        // Chunker scaffolding (card frontmatter + timestamp lines) must remain.
         assert!(
-            text.contains("[project: test-project"),
-            "chunk {idx}: project header missing — filter overreached:\n{text}"
+            text.starts_with("---\nproject: test-project\nagent: claude\n"),
+            "chunk {idx}: card frontmatter missing - filter overreached:\n{text}"
         );
         assert!(
-            text.contains("[18:0"),
+            body.contains("[18:0"),
             "chunk {idx}: timestamp scaffolding missing — filter overreached:\n{text}"
         );
     }

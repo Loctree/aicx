@@ -15,6 +15,7 @@ endif
 .PHONY: precheck precheck-native loctree-consumer-check test test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
 .PHONY: embeddings-check embeddings-test embeddings-clippy embeddings-hydrate embeddings-info
 .PHONY: version version-show version-check version-bump version-patch bump-patch changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle release-bundle-only-binaries test-e2e
+.PHONY: publish-crates publish-crates-dry
 
 all: build
 
@@ -349,9 +350,27 @@ release-push:
 	git push origin "$(TAG)"
 
 package-check:
-	@echo "crates.io packaging is intentionally disabled for aicx."
-	@echo "Use GitHub Release archives + npm platform packages instead."
-	@echo "Run: make release-check"
+	@echo "crates.io is NOT the user-facing release path — that is GitHub Releases."
+	@echo "User binaries: GitHub Release archives + npm + Homebrew tap."
+	@echo "Publishing aicx to crates.io as a LIBRARY (e.g. for Loctree to depend on): make publish-crates"
+
+# --- crates.io publish (SOURCE registry — library consumption, NOT the real release) ---
+# The REAL, user-facing publish is GitHub Releases (signed prebuilt binaries):
+#   make release-tag && make release-push   (or `gh release create`).
+# This target exists so aicx is consumable as a LIBRARY crate (Loctree depends on it)
+# and `cargo install aicx` works from source. crates.io is PERMANENT (yank, never delete).
+# Order is topological: leaves first, then aicx-retrieve (needs aicx-parser), then aicx.
+CRATE_LEAVES := aicx-parser aicx-embeddings aicx-monitor aicx-progress-contracts
+CRATE_PUBLISH_ORDER := aicx-parser aicx-embeddings aicx-monitor aicx-progress-contracts aicx-retrieve aicx
+
+publish-crates-dry:
+	@echo "crates.io DRY-RUN (no upload). SOURCE registry — NOT the real release (= GitHub Releases)."
+	@for c in $(CRATE_LEAVES); do echo "==> dry-run $$c"; cargo publish --dry-run -p $$c --locked --allow-dirty || exit $$?; done
+	@echo "OK: leaves dry-run clean. aicx-retrieve + aicx verify only AFTER their deps are live on crates.io."
+
+publish-crates:
+	@echo "crates.io publish (SOURCE registry, PERMANENT). The user-facing release is GitHub Releases — see 'make release-push'."
+	@for c in $(CRATE_PUBLISH_ORDER); do echo "==> publish $$c"; cargo publish -p $$c --locked || exit $$?; done
 
 release-bundle:
 	@KEYS="$(KEYS)" \

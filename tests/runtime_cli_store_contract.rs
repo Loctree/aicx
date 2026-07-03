@@ -250,7 +250,7 @@ fn test_doctor_fix_critical_returns_non_zero_exit() {
     let chunk = home
         .join(".aicx")
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("aicx")
         .join("2026_0520")
         .join("conversations")
@@ -471,7 +471,7 @@ fn normal_store_and_extract_do_not_initialize_source_git() {
 fn store_cli_deduplicates_exact_entries_on_first_run() {
     let root = unique_test_dir("store-exact-dedup");
     let home = root.join("home");
-    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
     let history = home.join(".codex").join("history.jsonl");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -510,7 +510,7 @@ fn store_cli_deduplicates_exact_entries_on_first_run() {
 fn store_cli_codex_emits_repo_and_non_repo_canonical_roots() {
     let root = unique_test_dir("codex-command");
     let home = root.join("home");
-    let repo_root = home.join("hosted").join("VetCoders").join("ai-contexters");
+    let repo_root = home.join("hosted").join("Vetcoders").join("ai-contexters");
     let history = home.join(".codex").join("history.jsonl");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -573,19 +573,19 @@ fn store_cli_codex_emits_repo_and_non_repo_canonical_roots() {
     assert!(payload["requested_source_filters"].is_null());
     assert_eq!(
         resolved_repositories,
-        vec!["VetCoders/ai-contexters".to_string()]
+        vec!["Vetcoders/ai-contexters".to_string()]
     );
     assert_eq!(
         payload["includes_non_repository_contexts"].as_bool(),
         Some(true)
     );
-    assert!(payload["resolved_store_buckets"]["VetCoders/ai-contexters"].is_object());
+    assert!(payload["resolved_store_buckets"]["Vetcoders/ai-contexters"].is_object());
     assert!(payload["resolved_store_buckets"]["non-repository-contexts"].is_object());
     assert!(store_paths.iter().any(|path| {
         path.starts_with(
             home.join(".aicx")
                 .join("store")
-                .join("VetCoders")
+                .join("Vetcoders")
                 .join("ai-contexters"),
         )
     }));
@@ -608,7 +608,7 @@ fn store_cli_codex_emits_repo_and_non_repo_canonical_roots() {
 fn store_cli_store_command_emits_repo_and_non_repo_canonical_roots() {
     let root = unique_test_dir("store-command");
     let home = root.join("home");
-    let repo_root = home.join("hosted").join("VetCoders").join("loctree");
+    let repo_root = home.join("hosted").join("Vetcoders").join("loctree");
     let history = home.join(".codex").join("history.jsonl");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -670,14 +670,14 @@ fn store_cli_store_command_emits_repo_and_non_repo_canonical_roots() {
         "expected at least 2 chunks"
     );
     assert!(payload["requested_source_filters"].is_null());
-    assert_eq!(resolved_repositories, vec!["VetCoders/loctree".to_string()]);
+    assert_eq!(resolved_repositories, vec!["Vetcoders/loctree".to_string()]);
     assert_eq!(
         payload["includes_non_repository_contexts"].as_bool(),
         Some(true)
     );
-    assert!(payload["resolved_store_buckets"]["VetCoders/loctree"].is_object());
+    assert!(payload["resolved_store_buckets"]["Vetcoders/loctree"].is_object());
     assert!(payload["resolved_store_buckets"]["non-repository-contexts"].is_object());
-    assert!(payload["repos"]["VetCoders/loctree"].is_object());
+    assert!(payload["repos"]["Vetcoders/loctree"].is_object());
     assert!(payload["repos"].get("non-repository-contexts").is_none());
     assert!(
         store_paths.len() >= 2,
@@ -688,7 +688,7 @@ fn store_cli_store_command_emits_repo_and_non_repo_canonical_roots() {
         path.starts_with(
             home.join(".aicx")
                 .join("store")
-                .join("VetCoders")
+                .join("Vetcoders")
                 .join("loctree"),
         )
     }));
@@ -708,7 +708,7 @@ fn migration_cli_rebuilds_and_salvages_realistic_bundle() {
     let home = root.join("home");
     let legacy_root = root.join("legacy");
     let store_root = root.join("aicx");
-    let repo_root = root.join("hosted").join("VetCoders").join("ai-contexters");
+    let repo_root = root.join("hosted").join("Vetcoders").join("ai-contexters");
     let source_dir = root.join("sources");
     let existing_source = source_dir.join("rollout-existing.jsonl");
     let missing_source = source_dir.join("rollout-missing.jsonl");
@@ -797,7 +797,7 @@ fn migration_cli_rebuilds_and_salvages_realistic_bundle() {
         canonical_paths[0].starts_with(
             store_root
                 .join("store")
-                .join("VetCoders")
+                .join("Vetcoders")
                 .join("ai-contexters")
         )
     );
@@ -851,7 +851,7 @@ fn migration_cli_rebuilds_and_salvages_realistic_bundle() {
 fn all_cli_defaults_to_incremental_and_full_rescan_recovers_backfill() {
     let root = unique_test_dir("all-incremental-default");
     let home = root.join("home");
-    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
     let history = home.join(".codex").join("history.jsonl");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -943,7 +943,7 @@ fn all_cli_defaults_to_incremental_and_full_rescan_recovers_backfill() {
 fn all_cli_hours_zero_means_all_time() {
     let root = unique_test_dir("all-hours-zero");
     let home = root.join("home");
-    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
     let history = home.join(".codex").join("history.jsonl");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -982,7 +982,7 @@ fn all_cli_hours_zero_means_all_time() {
 fn all_cli_force_ignores_watermark_like_full_rescan() {
     let root = unique_test_dir("all-force-watermark");
     let home = root.join("home");
-    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
     let history = home.join(".codex").join("history.jsonl");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1035,7 +1035,7 @@ fn all_cli_force_ignores_watermark_like_full_rescan() {
 fn store_cli_defaults_to_incremental_and_full_rescan_recovers_backfill() {
     let root = unique_test_dir("store-incremental-default");
     let home = root.join("home");
-    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
     let history = home.join(".codex").join("history.jsonl");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1128,7 +1128,7 @@ fn store_cli_defaults_to_incremental_and_full_rescan_recovers_backfill() {
 fn store_cli_hours_zero_means_all_time() {
     let root = unique_test_dir("store-hours-zero");
     let home = root.join("home");
-    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
+    let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
     let history = home.join(".codex").join("history.jsonl");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

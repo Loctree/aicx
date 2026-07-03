@@ -169,4 +169,4 @@ No async runtime. Single-threaded synchronous execution.
 
 ---
 
-*Created by M&K (c)2026 VetCoders*
+*Created by vetcoders (c)2026*

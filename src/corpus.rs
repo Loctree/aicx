@@ -13,15 +13,20 @@ mod roots;
 #[cfg(test)]
 mod tests;
 mod types;
+mod validate;
 
 pub use audit::audit;
-pub use format::{format_audit_text, format_repair_text};
+pub use format::{format_audit_text, format_repair_text, format_validate_cards_text};
 pub use repair::repair;
 pub use roots::default_roots;
 pub use types::{
-    CorpusAuditOptions, CorpusAuditReport, CorpusAuditTotals, CorpusFileFinding, CorpusRepairItem,
-    CorpusRepairManifest, CorpusRepairOptions, RootAuditReport,
+    CorpusAuditOptions, CorpusAuditReport, CorpusAuditTotals, CorpusCardFinding, CorpusFileFinding,
+    CorpusRepairItem, CorpusRepairManifest, CorpusRepairOptions, CorpusValidateOptions,
+    CorpusValidateReport, CorpusValidateTotals, RootAuditReport, RootValidateReport,
 };
+#[cfg(test)]
+pub(crate) use validate::validate_card;
+pub use validate::validate_cards;
 
 pub(crate) const REPAIR_VERSION: &str = "aicx-corpus-repair-v1";
 pub(crate) const REPAIR_MANIFEST_DIR: &str = "repair-manifests";

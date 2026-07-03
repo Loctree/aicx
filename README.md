@@ -71,7 +71,7 @@ Quick start:
 ```
 
 ### Corpus building (Layer 1)
-- `all` — extract + store from all agents (Claude + Codex + Gemini + Junie + CodeScribe) into the canonical corpus.
+- `all` — extract + store from all agents (Claude + Codex + Gemini + Junie + Codescribe) into the canonical corpus.
 - `claude`, `codex`, `extract` (with `--format`), `store`, `ingest`.
 - `conversations` — batch-export clean conversation JSONs without writing to the store.
 
@@ -105,7 +105,7 @@ See `docs/COMMANDS.md` for the full map and every flag.
 
 ## Supported Agents
 
-Claude Code, Codex (history + rollouts), Gemini (classic + Antigravity), **Grok** (full layout under `~/.grok/sessions/<encoded-cwd>/<session-uuid>/` — `chat_history.jsonl`, `events.jsonl`, `active_sessions.json`, etc.; first-class support via the same v1/responses parser + explicit current-session handling), Junie, CodeScribe, and raw operator markdown via `ingest`.
+Claude Code, Codex (history + rollouts), Gemini (classic + Antigravity), **Grok** (full layout under `~/.grok/sessions/<encoded-cwd>/<session-uuid>/` — `chat_history.jsonl`, `events.jsonl`, `active_sessions.json`, etc.; first-class support via the same v1/responses parser + explicit current-session handling), Junie, Codescribe, and raw operator markdown via `ingest`.
 
 ## Quick Start (realistic operator flow)
 
@@ -158,6 +158,7 @@ See `AGENTS.md`. In short: `make check` always, loctree semantic first, verify o
 
 - Architecture & mental model: `docs/ARCHITECTURE.md`
 - Exhaustive command reference: `docs/COMMANDS.md`
+- Remote MCP agent adoption: `docs/MCP_AGENT_ADOPTION.md`
 - Oracle / truth contract: `docs/ORACLE_CORPUS.md`
 - Store layout, protection, redaction: `docs/STORE_LAYOUT.md`, `docs/SOURCE_PROTECTION.md`, `docs/REDACTION.md`
 - Releases: `docs/RELEASES.md`

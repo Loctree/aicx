@@ -28,13 +28,13 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
           path: aicx
 
       - name: Checkout rust-memex sibling
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: Loctree/rust-memex
           ref: ${{ env.RUST_MEMEX_REF }}
@@ -87,7 +87,7 @@ jobs:
           RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
         run: git rev-parse --verify "refs/tags/${RELEASE_TAG}" >/dev/null
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
 
@@ -123,7 +123,7 @@ jobs:
           python -m pip install --upgrade pip semgrep
           semgrep --config auto --error --quiet
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
         with:
           components: clippy, rustfmt
 
@@ -179,12 +179,12 @@ jobs:
             target: x86_64-pc-windows-msvc
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           path: aicx
 
       - name: Checkout rust-memex sibling
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: Loctree/rust-memex
           ref: ${{ env.RUST_MEMEX_REF }}
@@ -215,7 +215,7 @@ jobs:
           fi
           protoc --version
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
         with:
           targets: ${{ matrix.target }}
 
@@ -316,7 +316,7 @@ jobs:
               "${deb}"
           done
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-${{ matrix.target }}
           # Selective: archives + checksums + sigs + debs only — exclude bundle
@@ -349,17 +349,17 @@ jobs:
     runs-on: [self-hosted, ops-linux]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
           pattern: release-*
           merge-multiple: true
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
 

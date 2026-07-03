@@ -188,6 +188,9 @@ fn test_no_truncation_by_default() {
         branch: None,
         cwd: None,
         timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
         frame_kind: None,
     }];
     let metadata = ReportMetadata {
@@ -227,6 +230,9 @@ fn test_truncation_when_configured() {
         branch: None,
         cwd: None,
         timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
         frame_kind: None,
     }];
     let metadata = ReportMetadata {
@@ -333,6 +339,9 @@ fn test_append_timeline_adds_new_entries() {
         branch: None,
         cwd: None,
         timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
         frame_kind: None,
     }];
     let metadata1 = ReportMetadata {
@@ -355,6 +364,9 @@ fn test_append_timeline_adds_new_entries() {
             branch: None,
             cwd: None,
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -366,6 +378,9 @@ fn test_append_timeline_adds_new_entries() {
             branch: None,
             cwd: None,
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         },
     ];
@@ -411,6 +426,9 @@ fn test_code_blocks_preserved() {
         branch: None,
         cwd: None,
         timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
         frame_kind: None,
     }];
     let metadata = ReportMetadata {
@@ -525,6 +543,9 @@ fn test_multiline_without_code_uses_blockquote_lines() {
         branch: None,
         cwd: None,
         timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
         frame_kind: None,
     }];
     let metadata = ReportMetadata {
@@ -643,6 +664,9 @@ fn json_roundtrip_entry(msg: &str) -> serde_json::Value {
         branch: None,
         cwd: None,
         timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
         frame_kind: None,
     }];
     let metadata = ReportMetadata {

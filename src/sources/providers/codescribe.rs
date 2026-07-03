@@ -16,7 +16,7 @@ const CODESCRIBE_NO_SPEECH_MARKERS: &[&str] = &[
     "vad_no_speech_detected",
 ];
 
-/// A discovered CodeScribe transcript under `$HOME/.codescribe/transcriptions`.
+/// A discovered Codescribe transcript under `$HOME/.codescribe/transcriptions`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodescribeTranscript {
     pub path: PathBuf,
@@ -78,7 +78,7 @@ pub fn discover_codescribe_transcripts(home: &Path) -> Vec<CodescribeTranscript>
     discover_codescribe_transcripts_at(&home.join(".codescribe").join("transcriptions"))
 }
 
-/// Discover CodeScribe transcript files under an explicit transcriptions root.
+/// Discover Codescribe transcript files under an explicit transcriptions root.
 pub fn discover_codescribe_transcripts_at(root: &Path) -> Vec<CodescribeTranscript> {
     if !root.is_dir() {
         return Vec::new();
@@ -263,8 +263,9 @@ fn parse_markdown_speaker_heading(line: &str) -> Option<String> {
     let trimmed = line.trim();
     let heading = trimmed.strip_prefix('#')?.trim_start_matches('#').trim();
     let lower = heading.to_lowercase();
-    if !(lower.starts_with("speaker") || lower.starts_with("maciej") || lower.starts_with("monika"))
-    {
+    // Speaker turns use the `### <Name>:` convention; accept the explicit
+    // "speaker" prefix or any colon-terminated heading as a speaker label.
+    if !(lower.starts_with("speaker") || heading.ends_with(':')) {
         return None;
     }
     Some(
@@ -341,7 +342,7 @@ fn is_codescribe_no_speech(text: &str) -> bool {
         .any(|marker| lower.contains(marker))
 }
 
-/// Parse one CodeScribe transcript file into timeline entries.
+/// Parse one Codescribe transcript file into timeline entries.
 pub fn parse_codescribe_transcript(
     path: &Path,
     date: NaiveDate,
@@ -360,6 +361,8 @@ fn parse_codescribe_transcript_with_lexicon(
     home: &Path,
 ) -> Result<Vec<TimelineEntry>> {
     let content = sanitize::read_to_string_validated(path)?;
+    let (source_path, source_sha256) = source_path_and_sha256(path);
+    let source_line_span = Some((1, content.lines().count().max(1) as u64));
 
     let mut project_hint = None;
     let (frontmatter, body) = split_operator_frontmatter(&content);
@@ -442,6 +445,9 @@ fn parse_codescribe_transcript_with_lexicon(
             TimelineEntryMeta {
                 cwd: cwd_hint.map(ToOwned::to_owned),
                 frame_kind: Some(FrameKind::UserMsg),
+                source_path: Some(source_path.clone()),
+                source_sha256: source_sha256.clone(),
+                source_line_span,
                 ..TimelineEntryMeta::default()
             },
         ));
@@ -459,13 +465,13 @@ fn codescribe_path_fingerprint(path: &Path) -> String {
     format!("{hash:016x}")
 }
 
-/// Extract CodeScribe transcript entries from `$HOME/.codescribe/transcriptions`.
+/// Extract Codescribe transcript entries from `$HOME/.codescribe/transcriptions`.
 pub fn extract_codescribe(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     let home = crate::os_user_home().context("No home dir")?;
     extract_codescribe_from_home(&home, config)
 }
 
-/// Extract CodeScribe transcript entries using an explicit home directory.
+/// Extract Codescribe transcript entries using an explicit home directory.
 pub fn extract_codescribe_from_home(
     home: &Path,
     config: &ExtractionConfig,
@@ -483,7 +489,7 @@ pub fn extract_codescribe_from_home(
         ) {
             Ok(mut parsed) => entries.append(&mut parsed),
             Err(e) => eprintln!(
-                "CodeScribe transcript extraction warning ({}): {}",
+                "Codescribe transcript extraction warning ({}): {}",
                 transcript.path.display(),
                 e
             ),
@@ -535,8 +541,8 @@ fn resolve_codescribe_cwd_hint(home: &Path, project_hint: Option<&str>) -> Optio
                 .join("01_deployed_libraxis_vm")
                 .join(repo),
             home.join("Libraxis").join("vc-runtime").join(repo),
-            home.join("hosted").join("VetCoders").join(repo),
-            home.join("vc-workspace").join("VetCoders").join(repo),
+            home.join("hosted").join("Vetcoders").join(repo),
+            home.join("vc-workspace").join("Vetcoders").join(repo),
         ]
     };
 

@@ -1,6 +1,6 @@
 # Embedder Distribution Contract
 
-This document is the cross-repo source of truth for how VetCoders products
+This document is the cross-repo source of truth for how Vetcoders products
 should ship optional embedders without turning every binary into a giant blob.
 
 ## Product truth
@@ -75,7 +75,7 @@ For native embedder selection:
 6. build/runtime defaults
 
 For active heavy retrieval, use the runtime provider config of the retrieval
-engine itself. In VetCoders products that is Roost/rust-memex, typically:
+engine itself. In Vetcoders products that is Roost/rust-memex, typically:
 
 - `~/.rmcp-servers/rust-memex/config.toml`
 - or `RUST_MEMEX_CONFIG`

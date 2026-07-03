@@ -12,7 +12,7 @@
 //! [`TemporalConfidence::None`] rather than silently presenting partial time as
 //! truth.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -52,7 +52,7 @@ fn nests_under(child: &str, parent: &str, sep: char) -> bool {
 /// the end), so `repo` never matches `repo-backup`.
 fn cwd_nests(here: &str, repo: &str) -> bool {
     // Case-insensitive: macOS filesystems are case-insensitive, and the same repo
-    // is recorded under mixed casing (e.g. `vetcoders` vs `VetCoders`).
+    // is recorded under mixed casing (e.g. `vetcoders` vs `Vetcoders`).
     let (here, repo) = (here.to_lowercase(), repo.to_lowercase());
     let (here, repo) = (here.trim_end_matches('/'), repo.trim_end_matches('/'));
     nests_under(here, repo, '/') || nests_under(repo, here, '/')
@@ -182,7 +182,7 @@ pub fn discover_claude_sessions(
         // is indistinguishable from a separator) and would mis-prune those paths.
         if let Some(want) = cwd_filter {
             // Lowercase: macOS is case-insensitive and the same repo appears under
-            // mixed casing (`vetcoders` vs `VetCoders`). The prefix match enforces
+            // mixed casing (`vetcoders` vs `Vetcoders`). The prefix match enforces
             // a `-` segment boundary (encoded separator) so `-a-repo` does not
             // keep `-a-repository`; an encoded subdir like `-a-repo-backup` stays
             // (it could be `/a/repo/backup` — conservative keep, the post-discovery
@@ -1429,7 +1429,7 @@ mod tests {
             &day,
             "rollout-2026-01-29T13-58-09-019c09d5.jsonl",
             &[
-                r#"{"timestamp":"2026-01-29T12:58:09.421Z","type":"session_meta","payload":{"id":"019c09d5-codex","cwd":"/Users/me/hosted/VetCoders"}}"#,
+                r#"{"timestamp":"2026-01-29T12:58:09.421Z","type":"session_meta","payload":{"id":"019c09d5-codex","cwd":"/Users/me/hosted/Vetcoders"}}"#,
                 r#"{"timestamp":"2026-01-29T12:58:10.000Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"text":"bootstrap"}]}}"#,
                 r#"{"timestamp":"2026-01-29T12:59:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"zrób to"}]}}"#,
                 r#"{"timestamp":"2026-01-29T13:00:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"robię"}]}}"#,
@@ -1443,7 +1443,7 @@ mod tests {
         assert_eq!(s.agent, "codex");
         // canonical id from session_meta.payload.id, not the filename
         assert_eq!(s.session_id, "019c09d5-codex");
-        assert_eq!(s.project.as_deref(), Some("VetCoders"));
+        assert_eq!(s.project.as_deref(), Some("Vetcoders"));
         assert_eq!(s.association, Association::Exact);
         // developer row is NOT conversation — only user + assistant counted
         assert_eq!(s.user_message_count, 1);

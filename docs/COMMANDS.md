@@ -94,16 +94,16 @@ Examples:
 
 ```bash
 # Last 24h, store-first chunks, keep stdout quiet
-aicx claude -p CodeScribe -H 24
+aicx claude -p Codescribe -H 24
 
 # Print chunk paths explicitly
-aicx claude -p CodeScribe -H 24 --emit paths
+aicx claude -p Codescribe -H 24 --emit paths
 
 # Also write a local JSON report
-aicx claude -p CodeScribe -H 24 -o ./reports -f json
+aicx claude -p Codescribe -H 24 -o ./reports -f json
 
 # Automation-friendly JSON payload on stdout
-aicx claude -p CodeScribe -H 24 --emit json | jq .
+aicx claude -p Codescribe -H 24 --emit json | jq .
 ```
 
 `--emit json` payload shape (stable fields):
@@ -111,12 +111,12 @@ aicx claude -p CodeScribe -H 24 --emit json | jq .
 ```json
 {
   "generated_at": "2026-02-08T03:12:34Z",
-  "project_filter": "CodeScribe",
-  "requested_source_filters": ["CodeScribe"],
-  "resolved_repositories": ["VetCoders/CodeScribe"],
+  "project_filter": "Codescribe",
+  "requested_source_filters": ["Codescribe"],
+  "resolved_repositories": ["Vetcoders/Codescribe"],
   "includes_non_repository_contexts": false,
   "resolved_store_buckets": {
-    "VetCoders/CodeScribe": { "claude": 123 }
+    "Vetcoders/Codescribe": { "claude": 123 }
   },
   "hours_back": 24,
   "total_entries": 123,
@@ -139,7 +139,7 @@ Same as `claude`, including `--emit <paths|json|none>` with default `none`, and 
 Example:
 
 ```bash
-aicx codex -p CodeScribe -H 48 --loctree --emit json | jq .
+aicx codex -p Codescribe -H 48 --loctree --emit json | jq .
 ```
 
 ## `aicx all`
@@ -225,7 +225,7 @@ Notes:
 Example:
 
 ```bash
-aicx store -p CodeScribe --agent claude -H 720 --emit paths
+aicx store -p Codescribe --agent claude -H 720 --emit paths
 ```
 
 ## `aicx corpus`
@@ -234,14 +234,26 @@ Audit and deterministically repair derived markdown corpora. Raw JSONL and log
 files remain provenance; this surface is for cleaned-but-faithful markdown that
 feeds retrieval.
 
+`validate-cards` is the card-contract gate: it validates card schema v1/v2
+sidecars, headers, full-file hashes, and md↔sidecar signal parity (see
+[`CARD_CONTRACT.md`](./CARD_CONTRACT.md)). Writer-born v2 cards stay strict.
+Migration-stamped v2 cards (`migrated_from_schema`) downgrade legacy-impossible
+gaps to explicit warnings: `migrated_missing_source` and
+`migrated_signals_unbackfilled`.
+
 ```bash
 aicx corpus audit [OPTIONS]
 aicx corpus repair [OPTIONS]
+aicx corpus validate-cards [ROOT] [--strict] [--json]
 ```
 
 Options:
 - `--root <DIR>...` corpus roots to scan (default: `$HOME/.aicx`, `$HOME/.ai-contexters`, optional `$HOME/.xcia`)
 - `--emit <text|json>` output format
+- `ROOT` store subtree or markdown card to validate with `validate-cards` (defaults to the corpus roots used by audit)
+- `--strict` make `validate-cards` exit non-zero when hard validation errors are present; migrated warning classes do not fail the gate
+- `--json` emit the `validate-cards` report as compact JSON
+- `-v, --verbose` echo per-file extractor warnings to stderr (default aggregates a per-extractor summary; structured detail always lands in `~/.aicx/state/diagnostics-<run-id>.log`)
 - `--dry-run` preview repair candidates without modifying markdown (repair default unless `--apply` is passed)
 - `--apply` rewrite derived markdown deterministically
 - `--backup` write backups before applying repairs
@@ -251,6 +263,8 @@ Examples:
 
 ```bash
 aicx corpus audit --root "$HOME/.aicx" --emit json
+aicx corpus validate-cards "$HOME/.aicx/store/Loctree/aicx" --json
+aicx corpus validate-cards "$HOME/.aicx/store/Loctree/aicx" --strict
 aicx corpus repair --root "$HOME/.aicx/store/Loctree/aicx/2026_0502" --dry-run --manifest /tmp/aicx-repair-preview.json
 aicx corpus repair --root "$HOME/.aicx/store/Loctree/aicx/2026_0502" --apply --backup
 ```
@@ -316,8 +330,8 @@ Examples:
 
 ```bash
 aicx refs -H 24 --emit paths
-aicx read /Users/user/.aicx/store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md
-aicx read store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md --max-chars 4000 --json
+aicx read /Users/user/.aicx/store/Vetcoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md
+aicx read store/Vetcoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md --max-chars 4000 --json
 ```
 
 ## `aicx steer`
@@ -368,14 +382,28 @@ Options:
 - `--legacy-root <DIR>` override legacy input store root (default: `~/.ai-contexters`)
 - `--store-root <DIR>` override AICX store root (default: `~/.aicx`)
 - `--no-intent-schema` skip the post-migration intent schema scan on the canonical store
+- `--cards-v2 [<ROOT>]` upgrade store cards v1 -> v2 in place (sidecar schema/honesty fields, `migrated_from_schema: 1`, refreshed full-file `content_sha256`, bracket header -> YAML frontmatter; body bytes never change). Optional `ROOT` overrides the walked directory (default: canonical store dir). Dry-run by default
+- `--apply` write the cards-v2 migration (without it, `--cards-v2` is a dry run)
+- `-v, --verbose` echo per-file extractor warnings to stderr (default aggregates a per-extractor summary)
 
-Example:
+Known limitation: `--cards-v2` with a non-default `ROOT` is currently blocked
+by a pre-existing sanitize read-allowlist bug ("Cannot read from path outside
+allowed directories"); it works against the default `~/.aicx` store. See
+"Open / not landed" in [`CARD_CONTRACT.md`](./CARD_CONTRACT.md).
+
+Examples:
 
 ```bash
 aicx migrate --dry-run
 
 # Full legacy -> canonical migration plus intent-schema pass from home directory
 aicx migrate
+
+# Preview the card v1 -> v2 upgrade on the canonical store (dry-run default)
+aicx migrate --cards-v2
+
+# Write the card upgrade (body bytes invariant, full-file hash refreshed, idempotent)
+aicx migrate --cards-v2 --apply
 ```
 
 ## `aicx migrate-intent-schema`
@@ -468,7 +496,7 @@ Options:
 Example:
 
 ```bash
-aicx refs -H 72 -p CodeScribe
+aicx refs -H 72 -p Codescribe
 ```
 
 ## `aicx rank`
@@ -501,7 +529,7 @@ Options:
 Example:
 
 ```bash
-aicx intents -p CodeScribe loctree-suite --strict --kind decision
+aicx intents -p Codescribe loctree-suite --strict --kind decision
 ```
 
 ## Truth-pipeline lanes (sessions / claims / results / clarify)
@@ -648,7 +676,7 @@ aicx reports [OPTIONS]
 
 Options:
 - `--artifacts-root <DIR>` override the Vibecrafted artifact root (default: `~/.vibecrafted/artifacts`)
-- `--org <ORG>` artifact organization bucket (default: `VetCoders`)
+- `--org <ORG>` artifact organization bucket (default: `Vetcoders`)
 - `--repo <REPO>` repo bucket (defaults to current directory name)
 - `--workflow <FILTER>` case-insensitive filter across workflow label, skill code, run/prompt IDs, lane, and title
 - `--date-from <YYYY-MM-DD|YYYY_MMDD>` inclusive start date
@@ -699,7 +727,10 @@ aicx state --info
 Run `aicx` as an MCP server (stdio or streamable HTTP transport).
 
 Exposes search, read, steer, intents, and rank tools over MCP for agent retrieval.
-`aicx_search` is semantic and fails fast when the index is not ready.
+`aicx_search` is semantic-first and uses the same filtered retrieval primitive
+as CLI `aicx search`. When the semantic index or embedder is not ready it
+returns filesystem-fuzzy results with an explicit `semantic_fallback` payload;
+pass `strict_semantic = true` to get fail-fast semantic errors.
 `aicx_steer`, `aicx_intents`, and `aicx_rank` query the canonical corpus on disk
 and return grounded source paths or chunk references.
 `aicx_read` pulls the actual chunk content by path, file name, or compact
@@ -711,13 +742,65 @@ aicx serve [OPTIONS]
 
 Options:
 - `--transport <stdio|http>` transport (default: `stdio`; legacy alias `sse` is still accepted)
+- `--host <HOST>` streamable HTTP bind host (default: `127.0.0.1`)
 - `--port <PORT>` streamable HTTP port (default: `8044`)
+- `--allowed-host <HOST>` allowed inbound HTTP `Host` header for streamable HTTP clients; repeat for remote hostnames/IPs
+- `--allow-any-host` disable HTTP `Host` validation; only use on trusted networks
+- `--auth-token <TOKEN>` explicit Bearer token for HTTP transport
+- `--require-auth <true|false>` require Bearer auth on HTTP transport (default: `true`)
+- `--no-require-auth` disable Bearer auth; accepted only for loopback binds
 
 Example:
 
 ```bash
 aicx serve --transport http --port 8044
+aicx serve --transport http --host 0.0.0.0 --allowed-host mcp.example.internal --port 8044
+aicx-mcp --transport http --host 127.0.0.1 --port 8044
 ```
+
+Remote or tailnet example:
+
+```bash
+aicx serve --transport http \
+  --host 0.0.0.0 \
+  --port 8044 \
+  --auth-token "$AICX_MCP_TOKEN"
+```
+
+Security contract:
+
+- Loopback (`127.0.0.1`) may use `--no-require-auth` for local operator flows.
+- Non-loopback binds (`0.0.0.0`, Tailscale IPs, LAN IPs) refuse to start when
+  auth is disabled. Use `--auth-token` or `AICX_HTTP_AUTH_TOKEN`.
+- `/health` is public liveness. `/mcp` is Bearer-auth gated when auth is enabled.
+
+macOS first-run note:
+
+On macOS, the Application Firewall can show a modal prompt such as
+`Do you want the application "aicx-mcp" to accept incoming network connections?`
+for a newly built or newly installed binary. Until the operator clicks
+**Allow** on the host running the server, non-loopback requests can appear as
+TCP connects followed by HTTP timeouts. This is a host-level permission prompt,
+not an MCP routing, auth, index, or ranking failure. If non-loopback HTTP hangs
+with `CLOSE_WAIT` and no request reaches the server logs, verify the host's
+Firewall settings before changing AICX code.
+
+For remote agent adoption and a repeatable Silver -> Sztudio smoke, see
+`docs/MCP_AGENT_ADOPTION.md`.
+
+### HTTP auth token resolution
+
+The HTTP transport resolves a single Bearer token from one canonical cascade
+(first match wins):
+
+1. `--auth-token <TOKEN>` (explicit CLI override)
+2. `AICX_HTTP_AUTH_TOKEN` environment variable
+3. `<AICX_HOME>/auth-token` file — honors `$AICX_HOME`; defaults to `~/.aicx/auth-token`
+4. otherwise a token is generated and persisted to that file (mode `0600` on Unix)
+
+`--no-require-auth` skips the cascade entirely and serves without auth (local
+debugging only). Run `aicx doctor` to see which source is active — it reports
+the token *source*, never the token value.
 
 ## `aicx init` (Retired)
 

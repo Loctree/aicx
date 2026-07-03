@@ -76,6 +76,36 @@ fn extract_demo_records(label: &str, body: &str) -> Vec<IntentRecord> {
 }
 
 #[test]
+fn frontmatter_header_chunk_extracts_intents_like_bracket_header() {
+    let bracket_records = extract_demo_records(
+        "bracket-header-parity",
+        "[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]\n\n\
+         [12:00:00] user: Let's ship the header-agnostic reader\n",
+    );
+    let frontmatter_records = extract_demo_records(
+        "frontmatter-header-parity",
+        "---\nproject: demo\nagent: codex\ndate: 2026-03-15\nframe_kind: user_msg\n---\n\n\
+         [12:00:00] user: Let's ship the header-agnostic reader\n",
+    );
+
+    assert!(
+        !bracket_records.is_empty(),
+        "bracket fixture must extract an intent"
+    );
+    assert_eq!(
+        bracket_records
+            .iter()
+            .map(|record| record.summary.as_str())
+            .collect::<Vec<_>>(),
+        frontmatter_records
+            .iter()
+            .map(|record| record.summary.as_str())
+            .collect::<Vec<_>>(),
+        "both header forms must yield identical intent extraction"
+    );
+}
+
+#[test]
 fn local_command_artifacts_do_not_become_intents() {
     let root = migration_test_root("local-command-artifact-intent");
     let _ = fs::remove_dir_all(&root);
@@ -191,7 +221,7 @@ Product truth beats local elegance.
 
     assert!(
         records.iter().any(|record| {
-            record.kind == IntentKind::Intent
+            record.kind == IntentKind::Task
                 && record
                     .summary
                     .contains("keep the real user directive visible after charter")
@@ -289,10 +319,10 @@ Intent:
 fn collapse_session_merges_exact_daily_duplicates_across_session_forks() {
     let make_record = |session_id: &str, source_chunk: &str| IntentRecord {
         kind: IntentKind::Intent,
-        summary: "przerobimy ScreenScribe na portal".to_string(),
+        summary: "przerobimy Screenscribe na portal".to_string(),
         context: None,
         evidence: vec![],
-        project: "VetCoders/ScreenScribe".to_string(),
+        project: "Vetcoders/Screenscribe".to_string(),
         agent: "codex".to_string(),
         date: "2026-05-31".to_string(),
         timestamp: None,
@@ -302,6 +332,7 @@ fn collapse_session_merges_exact_daily_duplicates_across_session_forks() {
         last_chunk: None,
         source_chunk: source_chunk.to_string(),
         source: None,
+        honesty: Default::default(),
     };
 
     let records = vec![
@@ -331,7 +362,7 @@ fn collapse_session_tolerates_existing_none_count() {
         summary: summary.to_string(),
         context: None,
         evidence: vec![],
-        project: "VetCoders/ScreenScribe".to_string(),
+        project: "Vetcoders/Screenscribe".to_string(),
         agent: "codex".to_string(),
         date: "2026-05-31".to_string(),
         timestamp: None,
@@ -341,6 +372,7 @@ fn collapse_session_tolerates_existing_none_count() {
         last_chunk: None,
         source_chunk: format!("{summary}.md"),
         source: None,
+        honesty: Default::default(),
     };
 
     let collapsed = apply_display_filters(
@@ -427,7 +459,7 @@ fn pasted_text_placeholder_reference_is_pasted_reference_not_intent() {
 }
 
 #[test]
-fn zadanie_head_is_typed_directive_and_remains_intent() {
+fn zadanie_head_is_typed_directive_and_becomes_task() {
     let line = "Zadanie: dopnij pasted-vs-typed modality gate";
     assert_eq!(
         intent_line_modality("user", line),
@@ -441,12 +473,12 @@ fn zadanie_head_is_typed_directive_and_remains_intent() {
 
     assert!(
         records.iter().any(|record| {
-            record.kind == IntentKind::Intent
+            record.kind == IntentKind::Task
                 && record
                     .summary
                     .contains("Zadanie: dopnij pasted-vs-typed modality gate")
         }),
-        "typed Zadanie directive did not produce an intent record: {records:?}"
+        "typed Zadanie directive did not produce a task record: {records:?}"
     );
 }
 
@@ -485,7 +517,7 @@ fn user_question_and_why_lines_bridge_into_main_intents_view() {
 fn md_radar_style_user_messages_surface_in_main_intents_view() {
     let extraction = extract_demo_extraction(
         "md-radar-natural-human-lines",
-        "[project: m-szymanska/md-radar | agent: codex | date: 2026-06-15 | frame_kind: user_msg]\n\n\
+        "[project: example-org/md-radar | agent: codex | date: 2026-06-15 | frame_kind: user_msg]\n\n\
          [12:00:00] user: Proszę odpal /vc-init na tym repo i ustal, gdzie zaczęła się wcześniejsza sesja.\n\
          [12:01:00] user: Czy AICX umie wyciągać intents z JSONL?\n\
          [12:02:00] user: Usuń hardkody i ścieżki z README, bo to ma być gotowe dla świeżego repo.\n",
@@ -556,7 +588,7 @@ fn user_comment_after_local_command_output_still_surfaces() {
 }
 
 #[test]
-fn typed_directive_with_reference_marker_mid_body_remains_intent() {
+fn typed_directive_with_reference_marker_mid_body_remains_task() {
     let line =
         "Zadanie: analyze this pasted reference > intent: old plan [Pasted text #2 +4 lines]";
     assert_eq!(
@@ -571,7 +603,7 @@ fn typed_directive_with_reference_marker_mid_body_remains_intent() {
 
     assert!(
         records.iter().any(|record| {
-            record.kind == IntentKind::Intent
+            record.kind == IntentKind::Task
                 && record
                     .summary
                     .contains("Zadanie: analyze this pasted reference")
@@ -666,10 +698,19 @@ fn write_sidecar(
         mode: None,
         skill_code: None,
         framework_version: None,
+        source_file: None,
+        source_format: None,
+        import_id: None,
+        schema_version: 1,
+        migrated_from_schema: None,
+        source: None,
+        claim_scope: None,
+        freshness_contract: None,
+        verification_state: None,
+        signals: None,
         intent_entries: Vec::new(),
         tags: Vec::new(),
         artifact_family: None,
-        schema_version: None,
         truth_status: None,
         learning_use: None,
         keywords: None,
@@ -1244,6 +1285,7 @@ fn formats_markdown_with_required_sections() {
         last_chunk: None,
         source_chunk: "/tmp/demo/2026-03-15/120000_codex-001.md".to_string(),
         source: None,
+        honesty: Default::default(),
     }];
 
     let markdown = format_intents_markdown(&records);
@@ -1270,6 +1312,7 @@ fn formats_json_with_same_fields() {
         last_chunk: None,
         source_chunk: "/tmp/demo/2026-03-15/120500_claude-002.md".to_string(),
         source: None,
+        honesty: Default::default(),
     }];
 
     let json = format_intents_json(&records).expect("serialize intents");
@@ -1295,6 +1338,7 @@ fn formats_oracle_json_as_canonical_corpus_not_semantic_fallback() {
         last_chunk: None,
         source_chunk: "/tmp/aicx/chunk.md".to_string(),
         source: None,
+        honesty: Default::default(),
     }];
 
     let status = OracleStatus::canonical_corpus_scan(Path::new("/tmp/aicx"), 1, 1, true);
@@ -1321,6 +1365,148 @@ fn formats_oracle_json_as_canonical_corpus_not_semantic_fallback() {
 fn strip_case_prefix_is_utf8_safe() {
     let text = "Działa pięknie — pełny artifact pack z Rust flow...";
     assert_eq!(strip_case_insensitive_prefix(text, "validation:"), text);
+}
+
+// ── B2 claim-honesty threading (cards v2, SCAFFOLD §4.5) ─────────────────
+//
+// Every intent/decision/outcome shown by aicx is a HISTORICAL claim valid at
+// session close, never runtime truth. These tests lock the honesty frame on
+// the display surfaces: markdown notice, oracle-JSON envelope, per-record
+// flat keys, and the sidecar → StoredChunkFile → IntentRecord threading.
+
+fn honesty_probe_record(honesty: crate::oracle::ClaimHonesty) -> IntentRecord {
+    IntentRecord {
+        kind: IntentKind::Intent,
+        summary: "thread honesty frame through display surfaces".to_string(),
+        context: None,
+        evidence: vec![],
+        project: "Loctree/aicx".to_string(),
+        agent: "claude".to_string(),
+        date: "2026-07-02".to_string(),
+        timestamp: None,
+        session_id: "sess-b2".to_string(),
+        count: None,
+        first_chunk: None,
+        last_chunk: None,
+        source_chunk: "/tmp/aicx/b2-chunk.md".to_string(),
+        source: None,
+        honesty,
+    }
+}
+
+#[test]
+fn markdown_timeline_opens_with_header_level_honesty_notice() {
+    let records = vec![honesty_probe_record(Default::default())];
+
+    let markdown = format_intents_markdown(&records);
+
+    // The notice must frame the WHOLE surface, so it sits directly under the
+    // title, before any record group.
+    let title_pos = markdown.find("# Intent Timeline").expect("title present");
+    let notice_pos = markdown
+        .find("_claims: historical @ session close · not verified by aicx_")
+        .expect("honesty notice present");
+    let first_record_pos = markdown.find("### INTENT").expect("record present");
+    assert!(title_pos < notice_pos && notice_pos < first_record_pos);
+}
+
+#[test]
+fn oracle_json_envelope_adds_claim_honesty_without_touching_existing_keys() {
+    // Additive-only proof: the pre-B2 key sets are pinned here as fixtures.
+    // A v1 record (no sidecar honesty) must serialize the EXACT legacy key
+    // set, and the envelope may grow by `claim_honesty` and nothing else.
+    let records = vec![honesty_probe_record(Default::default())];
+    let status = OracleStatus::canonical_corpus_scan(Path::new("/tmp/aicx"), 1, 1, true);
+
+    let json = format_intents_oracle_json(&records, status).expect("serialize oracle intents");
+    let payload: serde_json::Value = serde_json::from_str(&json).expect("payload parses");
+
+    let mut envelope_keys: Vec<&str> = payload
+        .as_object()
+        .expect("envelope is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    envelope_keys.sort_unstable();
+    assert_eq!(
+        envelope_keys,
+        ["claim_honesty", "items", "oracle_status", "results"]
+    );
+
+    let frame = &payload["claim_honesty"];
+    assert_eq!(frame["claim_scope"], "session_close");
+    assert_eq!(frame["freshness_contract"], "historical");
+    assert_eq!(frame["verification_state"], "not_verified_by_aicx");
+
+    let mut record_keys: Vec<&str> = payload["items"][0]
+        .as_object()
+        .expect("record is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    record_keys.sort_unstable();
+    assert_eq!(
+        record_keys,
+        [
+            "agent",
+            "count",
+            "date",
+            "evidence",
+            "kind",
+            "project",
+            "session_id",
+            "source_chunk",
+            "summary",
+            "timestamp",
+        ],
+        "v1 record JSON keys drifted — the honesty threading must stay additive"
+    );
+}
+
+#[test]
+fn record_with_v2_sidecar_honesty_emits_flat_claim_keys() {
+    let records = vec![honesty_probe_record(
+        crate::oracle::ClaimHonesty::canonical(),
+    )];
+
+    let json = format_intents_json(&records).expect("serialize intents");
+    let payload: serde_json::Value = serde_json::from_str(&json).expect("records parse");
+
+    let record = &payload[0];
+    assert_eq!(record["claim_scope"], "session_close");
+    assert_eq!(record["freshness_contract"], "historical");
+    assert_eq!(record["verification_state"], "not_verified_by_aicx");
+}
+
+#[test]
+fn build_candidate_threads_sidecar_honesty_into_record() {
+    let chunk_file = StoredChunkFile {
+        agent: "claude".to_string(),
+        date: "2026-07-02".to_string(),
+        path: PathBuf::from("chunk.md"),
+        project: "aicx".to_string(),
+        sequence: 1,
+        timestamp: Utc::now(),
+        session_id: "sess-b2".to_string(),
+        honesty: crate::oracle::ClaimHonesty::canonical(),
+    };
+
+    let candidate = build_candidate(
+        IntentKind::Intent,
+        "carry the claim honesty frame into intents output",
+        Some("operator must see historical framing".to_string()),
+        &chunk_file,
+        "aicx",
+        "chunk.md",
+        false,
+        None,
+    )
+    .expect("candidate should build");
+
+    assert_eq!(
+        candidate.record.honesty,
+        crate::oracle::ClaimHonesty::canonical()
+    );
 }
 
 // ── C0.1 native regression anchors ───────────────────────────────
@@ -1410,6 +1596,7 @@ fn unresolved_filter_narrows_when_session_resolved() {
             last_chunk: None,
             source_chunk: "/tmp/demo/resolved-intent.md".to_string(),
             source: None,
+            honesty: Default::default(),
         },
         IntentRecord {
             kind: IntentKind::Outcome,
@@ -1426,6 +1613,7 @@ fn unresolved_filter_narrows_when_session_resolved() {
             last_chunk: None,
             source_chunk: "/tmp/demo/resolved-outcome.md".to_string(),
             source: None,
+            honesty: Default::default(),
         },
         IntentRecord {
             kind: IntentKind::Intent,
@@ -1442,6 +1630,7 @@ fn unresolved_filter_narrows_when_session_resolved() {
             last_chunk: None,
             source_chunk: "/tmp/demo/open-intent.md".to_string(),
             source: None,
+            honesty: Default::default(),
         },
     ];
 
@@ -1493,6 +1682,7 @@ fn none_limit_does_not_clip_roadmap() {
             last_chunk: None,
             source_chunk: format!("/tmp/demo/limit-{i}.md"),
             source: None,
+            honesty: Default::default(),
         })
         .collect();
 
@@ -1531,6 +1721,91 @@ fn none_limit_does_not_clip_roadmap() {
 mod classifier {
     use super::*;
     use crate::types::{EntryState, EntryType};
+
+    #[derive(Debug, serde::Deserialize)]
+    struct CoreOntologyGolden {
+        id: String,
+        speaker: String,
+        text: String,
+        expected: String,
+        #[serde(rename = "not")]
+        not_labels: Vec<String>,
+        reason: String,
+    }
+
+    fn core_ontology_goldens() -> Vec<CoreOntologyGolden> {
+        serde_json::from_str(include_str!(
+            "../../tests/fixtures/intents_core_ontology_goldens.json"
+        ))
+        .expect("core ontology fixture must be valid JSON")
+    }
+
+    fn current_classifier_label(golden: &CoreOntologyGolden) -> Option<&'static str> {
+        if parse_checklist_task(&golden.text).is_some() {
+            return Some("task");
+        }
+
+        let is_user = golden.speaker.eq_ignore_ascii_case("user");
+        let (entry_type, _) = classify_line_entry_type(&golden.text, is_user)?;
+        Some(match entry_type {
+            EntryType::Decision => "decision",
+            EntryType::Task => "task",
+            EntryType::Commitment => "commitment",
+            EntryType::Intent | EntryType::Question | EntryType::Why => "intent",
+            EntryType::Outcome | EntryType::Result => "outcome",
+            EntryType::Assumption => "assumption",
+            EntryType::Insight => "insight",
+            EntryType::Argue => "argue",
+        })
+    }
+
+    #[test]
+    fn core_ontology_golden_fixture_is_well_formed() {
+        let goldens = core_ontology_goldens();
+        assert_eq!(goldens.len(), 15);
+
+        let mut ids = HashSet::new();
+        for golden in &goldens {
+            assert!(ids.insert(&golden.id), "duplicate golden id {}", golden.id);
+            assert!(
+                !golden.text.trim().is_empty(),
+                "{} must include text",
+                golden.id
+            );
+            assert!(
+                !golden.expected.trim().is_empty(),
+                "{} must include expected label",
+                golden.id
+            );
+            assert!(
+                !golden.reason.trim().is_empty(),
+                "{} must include a reason",
+                golden.id
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "target ontology audit: current classifier is expected to fail until semantics are fixed"]
+    fn core_ontology_goldens_match_target_semantics() {
+        let mut failures = Vec::new();
+
+        for golden in core_ontology_goldens() {
+            let actual = current_classifier_label(&golden).unwrap_or("unclassified");
+            if actual != golden.expected || golden.not_labels.iter().any(|label| label == actual) {
+                failures.push(format!(
+                    "{}: expected {}, got {}; text={:?}; reason={}",
+                    golden.id, golden.expected, actual, golden.text, golden.reason
+                ));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "core ontology mismatches:\n{}",
+            failures.join("\n")
+        );
+    }
 
     #[test]
     fn classifies_decision_marker() {
@@ -1571,6 +1846,13 @@ mod classifier {
     }
 
     #[test]
+    fn classifies_ascii_polish_assumption() {
+        let result =
+            classify_line_entry_type("zakladam, ze cwd mozna wywnioskowac z tresci", false);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Assumption));
+    }
+
+    #[test]
     fn classifies_insight_marker() {
         let result = classify_line_entry_type(
             "insight: aicx is an intention engine not a formatter",
@@ -1594,6 +1876,24 @@ mod classifier {
     #[test]
     fn classifies_outcome_tag() {
         let result = classify_line_entry_type("[skill_outcome] p0=0 after cargo test", false);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Outcome));
+    }
+
+    #[test]
+    fn classifies_file_completion_report_as_outcome() {
+        let result = classify_line_entry_type(
+            "plik docs/INTENTS_CLASSIFICATION_RULES.md zostal dodany",
+            false,
+        );
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Outcome));
+    }
+
+    #[test]
+    fn classifies_observed_batch_counts_as_outcome() {
+        let result = classify_line_entry_type(
+            "batch 10 plikow dal 66 records: 48 intent, 14 outcome, 4 decision",
+            true,
+        );
         assert_eq!(result.map(|r| r.0), Some(EntryType::Outcome));
     }
 
@@ -1626,12 +1926,80 @@ mod classifier {
     }
 
     #[test]
-    fn classifies_polish_operator_decision() {
+    fn classifies_polish_operator_requirement_as_intent() {
         let result = classify_line_entry_type(
             "Nie może być tak, że ostatnie słowo gubi kolor akcentu",
             true,
         );
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Intent));
+    }
+
+    #[test]
+    fn classifies_polish_musimy_requirement_as_intent() {
+        let result = classify_line_entry_type("musimy dodac parser dla obcych md", true);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Intent));
+    }
+
+    #[test]
+    fn classifies_polish_trzeba_requirement_as_intent() {
+        let result = classify_line_entry_type("trzeba sprawdzic outcomes i claims", true);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Intent));
+    }
+
+    #[test]
+    fn classifies_operator_import_policy_as_decision() {
+        let result = classify_line_entry_type(
+            "obce md importujemy tylko przez operator-md, bez zgadywania cwd",
+            true,
+        );
         assert_eq!(result.map(|r| r.0), Some(EntryType::Decision));
+    }
+
+    #[test]
+    fn classifies_operator_scope_rejection_as_decision() {
+        let result = classify_line_entry_type("nie fixujemy tego teraz", true);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Decision));
+    }
+
+    #[test]
+    fn classifies_required_artifact_property_as_decision() {
+        let result = classify_line_entry_type(
+            "Materiał ma być deterministyczny — musi mieć source_hash",
+            true,
+        );
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Decision));
+    }
+
+    #[test]
+    fn classifies_canonical_question_as_question_not_decision() {
+        let result =
+            classify_line_entry_type("Why keep the canonical index path for first users?", true);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Question));
+    }
+
+    #[test]
+    fn classifies_task_directive_as_task() {
+        let result = classify_line_entry_type("task: stworz plik z zasadami klasyfikacji", true);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Task));
+    }
+
+    #[test]
+    fn classifies_polish_action_request_as_task() {
+        let result = classify_line_entry_type("stworz prosze plik z zasadami klasyfikacji", true);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Task));
+    }
+
+    #[test]
+    fn classifies_bare_checkbox_as_task() {
+        let result =
+            classify_line_entry_type("[ ] stworz prosze plik z zasadami klasyfikacji", true);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Task));
+    }
+
+    #[test]
+    fn classifies_future_promise_as_commitment() {
+        let result = classify_line_entry_type("zrobie to zaraz", false);
+        assert_eq!(result.map(|r| r.0), Some(EntryType::Commitment));
     }
 
     #[test]
@@ -1647,14 +2015,16 @@ mod classifier {
     }
 
     #[test]
-    fn classify_chunk_all_nine_types() {
+    fn classify_chunk_all_eleven_types() {
         let content = r#"[project: demo | agent: claude | date: 2026-04-15]
 
 [signals]
 Decision:
-- [decision] Use 9-type taxonomy
+- [decision] Use 11-type taxonomy
 Intent:
 - Let's ship intent engine
+Task:
+- task: add semantic fixture coverage
 Outcome:
 - outcome: migration completed successfully
 [/signals]
@@ -1666,6 +2036,7 @@ Outcome:
 [12:04:00] user: How does the chunker handle overlap?
 [12:05:00] assistant: because the old approach created duplicates
 [12:06:00] assistant: on the other hand, flat parsing is simpler
+[12:07:00] assistant: promise: zrobie to zaraz
 "#;
 
         let entries = classify_chunk_entries(
@@ -1679,6 +2050,8 @@ Outcome:
 
         let types: HashSet<EntryType> = entries.iter().map(|e| e.entry_type).collect();
         assert!(types.contains(&EntryType::Decision), "missing Decision");
+        assert!(types.contains(&EntryType::Task), "missing Task");
+        assert!(types.contains(&EntryType::Commitment), "missing Commitment");
         assert!(types.contains(&EntryType::Outcome), "missing Outcome");
         assert!(types.contains(&EntryType::Intent), "missing Intent");
         assert!(types.contains(&EntryType::Assumption), "missing Assumption");
@@ -1721,6 +2094,8 @@ Outcome:
     #[test]
     fn initial_state_mapping() {
         assert_eq!(initial_state(EntryType::Intent), EntryState::Proposed);
+        assert_eq!(initial_state(EntryType::Task), EntryState::Proposed);
+        assert_eq!(initial_state(EntryType::Commitment), EntryState::Proposed);
         assert_eq!(initial_state(EntryType::Question), EntryState::Proposed);
         assert_eq!(initial_state(EntryType::Assumption), EntryState::Proposed);
         assert_eq!(initial_state(EntryType::Decision), EntryState::Active);
@@ -2187,7 +2562,7 @@ mod quality {
     #[test]
     fn long_summary_ends_at_sentence_terminator_when_available() {
         let mut text = String::new();
-        text.push_str("Pierwsza część decyzji o canonical corpus i jego znaczeniu dla całego stacku VetCoders w kontekście długoterminowej strategii AICX. ");
+        text.push_str("Pierwsza część decyzji o canonical corpus i jego znaczeniu dla całego stacku Vetcoders w kontekście długoterminowej strategii AICX. ");
         // Force length > 480 bytes; ensure a full sentence-terminator
         // exists in the lookback window (last 80 bytes before cutoff).
         text.push_str(
@@ -2444,6 +2819,7 @@ mod quality {
                 "/store/Loctree/aicx/2026_0504/conversations/codex/2026_0504_codex_019df273-2c1_027.md"
                     .to_string(),
             source: None,
+            honesty: Default::default(),
         }];
 
         reconcile_session_id_with_path(&mut records);
@@ -2473,6 +2849,7 @@ mod quality {
                 "/store/Loctree/aicx/2026_0504/conversations/codex/2026_0504_codex_019df273-2c1_027.md"
                     .to_string(),
             source: None,
+            honesty: Default::default(),
         }];
 
         reconcile_session_id_with_path(&mut records);
@@ -2499,6 +2876,7 @@ mod quality {
                 timestamp: None,
                 context: None,
                 source: None,
+                honesty: Default::default(),
             },
             IntentRecord {
                 kind: IntentKind::Decision,
@@ -2515,6 +2893,7 @@ mod quality {
                 timestamp: None,
                 context: None,
                 source: None,
+                honesty: Default::default(),
             },
         ];
 
@@ -2549,6 +2928,7 @@ mod quality {
             timestamp: None,
             context: None,
             source: None,
+            honesty: Default::default(),
         }
     }
 
@@ -2671,6 +3051,7 @@ mod area_e_regressions {
             last_chunk: None,
             source_chunk: "chunk-1".to_string(),
             source: None,
+            honesty: Default::default(),
         }
     }
 
@@ -2865,6 +3246,7 @@ mod flexible_dates {
             last_chunk: None,
             source_chunk: format!("/tmp/demo/{summary}.md"),
             source: None,
+            honesty: Default::default(),
         }
     }
 
@@ -3000,6 +3382,7 @@ mod flexible_dates {
             sequence: 1,
             timestamp: Utc::now(),
             session_id: "sess-1".to_string(),
+            honesty: Default::default(),
         };
 
         // Repro case: no context, no evidence -> degraded (returns None)
@@ -3032,6 +3415,338 @@ mod flexible_dates {
         assert!(
             candidate_with_context.is_some(),
             "Intent with context should not be blindly degraded"
+        );
+    }
+
+    #[test]
+    fn signals_revalidation_gate_classifier_wins_on_disagreement() {
+        // Round II / oś 1: [signals] section headers are a strong HINT, not
+        // ground truth. A line whose section says `Results:`/`Outcome:` must
+        // still pass the shared classifier; on confident disagreement the
+        // classifier wins (operator decision 2026-06-21).
+        use super::{IntentKind, StoredChunkFile, extract_signal_candidates};
+        use chrono::Utc;
+        use std::path::PathBuf;
+
+        let chunk_file = StoredChunkFile {
+            agent: "codex".to_string(),
+            date: "2026-06-21".to_string(),
+            path: PathBuf::from("chunk.md"),
+            project: "aicx".to_string(),
+            sequence: 1,
+            timestamp: Utc::now(),
+            session_id: "sess-gate".to_string(),
+            honesty: Default::default(),
+        };
+
+        let signal_lines: Vec<String> = vec![
+            "Results:".to_string(),
+            // (a) a question wrongly filed under Results: must NOT become outcome
+            "- Czy ten gate dziala poprawnie i ma dla nas sens?".to_string(),
+            // (b) a genuine result under Results: must stay outcome
+            "- result: cargo test 825 passed, 0 failed".to_string(),
+            "Outcome:".to_string(),
+            // (c) an assumption wrongly filed under Outcome: must be dropped
+            "- zakladam ze to zadziala bez problemow".to_string(),
+        ];
+
+        let (candidates, _tasks) =
+            extract_signal_candidates(&chunk_file, "aicx", "chunk.md", &signal_lines);
+
+        // (a) the question is reclassified to Intent, not Outcome, with provenance
+        let question = candidates
+            .iter()
+            .find(|c| c.record.summary.to_lowercase().contains("gate dziala"))
+            .expect("question candidate should survive (reclassified, not dropped)");
+        assert_eq!(
+            question.record.kind,
+            IntentKind::Intent,
+            "question under Results: must be reclassified to Intent, not Outcome"
+        );
+        assert!(
+            question
+                .record
+                .source
+                .as_deref()
+                .is_some_and(|s| s.contains("revalidated")),
+            "reclassified signal must carry revalidation provenance, got {:?}",
+            question.record.source
+        );
+
+        // (b) the genuine result stays Outcome
+        let result = candidates
+            .iter()
+            .find(|c| c.record.summary.to_lowercase().contains("825 passed"))
+            .expect("genuine result candidate should survive as outcome");
+        assert_eq!(result.record.kind, IntentKind::Outcome);
+        assert!(
+            result
+                .record
+                .source
+                .as_deref()
+                .is_some_and(|s| s.contains("signals")),
+            "every signal-sourced record must carry signal provenance, got {:?}",
+            result.record.source
+        );
+
+        // (c) the assumption filed under Outcome: is dropped (classifier maps it
+        // to a non-bucket role)
+        assert!(
+            !candidates
+                .iter()
+                .any(|c| c.record.summary.to_lowercase().contains("zakladam")),
+            "assumption wrongly under Outcome: must be dropped, not emitted as outcome"
+        );
+    }
+
+    #[test]
+    fn record_project_is_canonical_not_query_filter() {
+        // Round II / oś 3 cut 1: a record's project must be the chunk's canonical
+        // bucket (file.project), not the query filter. An empty filter previously
+        // stamped every record with an empty project.
+        let tmp = migration_test_root("record-project-canonical");
+        let _ = fs::remove_dir_all(&tmp);
+
+        let chunk = "[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]\n\n\
+[12:00:00] user: dodaj walidacje do importera operator-md\n";
+        write_chunk(&tmp, "demo", "2026-03-15", "120000_codex-001.md", chunk);
+
+        let config = IntentsConfig {
+            project: String::new(), // no filter -> must not blank the record project
+            hours: 24,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: None,
+        };
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 3, 15)
+                .expect("date")
+                .and_hms_opt(13, 0, 0)
+                .expect("time"),
+            Utc,
+        );
+
+        let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+        assert!(!records.is_empty(), "expected at least one record");
+        for r in &records {
+            assert!(
+                !r.project.is_empty(),
+                "record project must not be empty: {r:?}"
+            );
+            assert!(
+                r.project.to_lowercase().contains("demo"),
+                "record project must be the canonical bucket, got {:?}",
+                r.project
+            );
+        }
+    }
+
+    #[test]
+    fn commit_block_indices_run_rule() {
+        use super::commit_block_indices;
+        let to_lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // a run of >=2 commit-log lines -> all suppressed
+        let block = commit_block_indices(&to_lines(&[
+            "Add Windows-compatible file locking",
+            "Fix migration artifact path validation",
+            "feat(search): anchored ranking",
+        ]));
+        assert_eq!(block.len(), 3);
+
+        // a lone commit-style imperative is NOT suppressed (may be a real task)
+        let lone = commit_block_indices(&to_lines(&["Add retry logic to the search client"]));
+        assert!(lone.is_empty(), "lone imperative must stay a candidate");
+
+        // lowercase prose 'add' is not a commit-subject verb
+        let prose = commit_block_indices(&to_lines(&[
+            "dodaj prosze walidacje",
+            "add some tests when you can",
+        ]));
+        assert!(
+            prose.is_empty(),
+            "lowercase prose must not form a commit block"
+        );
+    }
+
+    #[test]
+    fn commit_list_block_is_not_classified_as_tasks() {
+        // Round II / oś 2 cut 2 — document-role awareness: a pasted run of
+        // commit/changelog lines (>=2 consecutive) is historical reference, not
+        // operator tasks. A lone real task in another turn must still survive.
+        let tmp = migration_test_root("commit-block-not-tasks");
+        let _ = fs::remove_dir_all(&tmp);
+
+        let chunk = "[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]\n\n\
+[12:00:00] user: dodaj prosze walidacje do importera operator-md\n\
+[12:01:00] user: ostatnie commity ktore wrzucam dla kontekstu:\n\
+Add Windows-compatible file locking and process checking\n\
+Fix migration artifact path validation\n\
+Update Cargo.lock dependencies\n";
+
+        write_chunk(&tmp, "demo", "2026-03-15", "120000_codex-001.md", chunk);
+
+        let config = IntentsConfig {
+            project: "demo".to_string(),
+            hours: 24,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: None,
+        };
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 3, 15)
+                .expect("date")
+                .and_hms_opt(13, 0, 0)
+                .expect("time"),
+            Utc,
+        );
+
+        let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+
+        for needle in ["windows-compatible", "migration artifact", "cargo.lock"] {
+            assert!(
+                !records
+                    .iter()
+                    .any(|r| r.summary.to_lowercase().contains(needle)),
+                "commit-list line '{needle}' must not become a record: {records:?}"
+            );
+        }
+        // the genuine Polish task in a separate turn survives
+        assert!(
+            records
+                .iter()
+                .any(|r| r.kind == IntentKind::Task
+                    && r.summary.to_lowercase().contains("walidacje")),
+            "real operator task must survive document-role filtering: {records:?}"
+        );
+    }
+
+    #[test]
+    fn is_code_fragment_line_contract() {
+        use super::is_code_fragment_line;
+        // code fragments -> true
+        assert!(is_code_fragment_line("field(default_factory=list)"));
+        assert!(is_code_fragment_line(
+            "- DEFAULT_KEYWORDS_PATH = \"/etc/keywords\""
+        ));
+        assert!(is_code_fragment_line("MAX_RETRIES"));
+        // prose -> false (even when it mentions a CONSTANT or a config word)
+        assert!(!is_code_fragment_line(
+            "musimy ustawic nowy DEFAULT_KEYWORDS_PATH w configu"
+        ));
+        assert!(!is_code_fragment_line(
+            "od teraz importujemy tylko przez operator-md"
+        ));
+        assert!(!is_code_fragment_line("batch 10 plikow dal 66 records"));
+        // a bare cap word without underscore is not constant-case
+        assert!(!is_code_fragment_line("OK to powinno dzialac dobrze tej"));
+    }
+
+    #[test]
+    fn signals_code_fragment_lines_are_dropped() {
+        // Round II / oś 2 cut 1: code/log fragments under a [signals] section
+        // header must NOT become records (they abstain in the classifier, so the
+        // section hint would otherwise be honored). "default" in
+        // DEFAULT_KEYWORDS_PATH / field(default_factory=list) previously made
+        // them decisions.
+        use super::{StoredChunkFile, extract_signal_candidates};
+        use chrono::Utc;
+        use std::path::PathBuf;
+
+        let chunk_file = StoredChunkFile {
+            agent: "codex".to_string(),
+            date: "2026-06-21".to_string(),
+            path: PathBuf::from("chunk.md"),
+            project: "aicx".to_string(),
+            sequence: 1,
+            timestamp: Utc::now(),
+            session_id: "sess-code".to_string(),
+            honesty: Default::default(),
+        };
+
+        let signal_lines: Vec<String> = vec![
+            "Decision:".to_string(),
+            "- field(default_factory=list)".to_string(),
+            "- DEFAULT_KEYWORDS_PATH = \"/etc/keywords\"".to_string(),
+            // a genuine prose decision in the same section must survive
+            "- od teraz importujemy tylko przez operator-md".to_string(),
+        ];
+
+        let (candidates, _tasks) =
+            extract_signal_candidates(&chunk_file, "aicx", "chunk.md", &signal_lines);
+
+        assert!(
+            !candidates
+                .iter()
+                .any(|c| c.record.summary.to_lowercase().contains("default")),
+            "code fragments containing 'default' must be dropped, got {:?}",
+            candidates
+                .iter()
+                .map(|c| &c.record.summary)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.record.summary.to_lowercase().contains("operator-md")),
+            "genuine prose decision must survive the code-fragment guard"
+        );
+    }
+
+    #[test]
+    fn signals_revalidation_gate_e2e_question_under_results_not_outcome() {
+        // Round II / oś 1 — pipeline-level guard: a full canonical chunk with a
+        // [signals] Results: block carrying a question must NOT surface that
+        // question as an outcome record after the whole extraction pipeline
+        // (parse -> signals+raw -> dedup -> records), while a genuine result in
+        // the same block is preserved.
+        let tmp = migration_test_root("signals-gate-e2e-question-results");
+        let _ = fs::remove_dir_all(&tmp);
+
+        let chunk = r#"[project: demo | agent: codex | date: 2026-03-15 | frame_kind: user_msg]
+
+[signals]
+Results:
+- Czy ten gate dziala poprawnie i ma dla nas sens?
+- result: cargo test 825 passed, 0 failed
+[/signals]
+
+[12:00:00] user: musimy dodac walidacje signali w pipeline
+"#;
+
+        write_chunk(&tmp, "demo", "2026-03-15", "120000_codex-001.md", chunk);
+
+        let config = IntentsConfig {
+            project: "demo".to_string(),
+            hours: 24,
+            strict: false,
+            min_confidence: None,
+            kind_filter: None,
+            frame_kind: None,
+        };
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 3, 15)
+                .expect("date")
+                .and_hms_opt(13, 0, 0)
+                .expect("time"),
+            Utc,
+        );
+
+        let records = extract_intents_from_root_at(&config, &tmp, now).expect("extract intents");
+
+        // the question under Results: must not be an outcome anywhere in the pipeline output
+        assert!(
+            !records.iter().any(|r| r.kind == IntentKind::Outcome
+                && r.summary.to_lowercase().contains("gate dziala")),
+            "question under [signals] Results: must not become an outcome: {records:?}"
+        );
+        // the genuine result in the same block survives as an outcome
+        assert!(
+            records.iter().any(|r| r.kind == IntentKind::Outcome
+                && r.summary.to_lowercase().contains("825 passed")),
+            "genuine result under [signals] Results: must remain an outcome: {records:?}"
         );
     }
 
@@ -3070,6 +3785,7 @@ mod flexible_dates {
                 last_chunk: None,
                 source_chunk: "chunk1.md".to_string(),
                 source: None,
+                honesty: Default::default(),
             },
             IntentRecord {
                 kind: IntentKind::Intent,
@@ -3086,6 +3802,7 @@ mod flexible_dates {
                 last_chunk: None,
                 source_chunk: "chunk1.md".to_string(),
                 source: None,
+                honesty: Default::default(),
             },
             IntentRecord {
                 kind: IntentKind::Outcome,
@@ -3102,6 +3819,7 @@ mod flexible_dates {
                 last_chunk: None,
                 source_chunk: "chunk2.md".to_string(),
                 source: None,
+                honesty: Default::default(),
             },
         ];
 
@@ -3157,6 +3875,7 @@ mod flexible_dates {
                 last_chunk: None,
                 source_chunk: "chunk1.md".to_string(),
                 source: None,
+                honesty: Default::default(),
             },
             IntentRecord {
                 kind: IntentKind::Intent,
@@ -3173,6 +3892,7 @@ mod flexible_dates {
                 last_chunk: None,
                 source_chunk: "chunk1.md".to_string(),
                 source: None,
+                honesty: Default::default(),
             },
             IntentRecord {
                 kind: IntentKind::Outcome,
@@ -3189,6 +3909,7 @@ mod flexible_dates {
                 last_chunk: None,
                 source_chunk: "chunk2.md".to_string(),
                 source: None,
+                honesty: Default::default(),
             },
         ];
 
@@ -3222,6 +3943,7 @@ mod flexible_dates {
             sequence: 1,
             timestamp: Utc::now(),
             session_id: "sess-1".to_string(),
+            honesty: Default::default(),
         };
 
         // 1. Voice transcript intent without context/evidence (confidence 2)
@@ -3241,6 +3963,7 @@ mod flexible_dates {
                 last_chunk: None,
                 source_chunk: "chunk.md".to_string(),
                 source: Some("voice_transcript".to_string()),
+                honesty: Default::default(),
             },
             confidence: 2,
             timestamp: chunk_file.timestamp,
@@ -3263,6 +3986,7 @@ mod flexible_dates {
                 last_chunk: None,
                 source_chunk: "chunk.md".to_string(),
                 source: None,
+                honesty: Default::default(),
             },
             confidence: 4,
             timestamp: chunk_file.timestamp,

@@ -129,7 +129,7 @@ fn unique_test_dir(label: &str) -> PathBuf {
 fn write_store_chunk(base: &Path) -> PathBuf {
     let dir = base
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("ai-contexters")
         .join("2026_0405")
         .join("reports")
@@ -142,12 +142,15 @@ fn write_store_chunk(base: &Path) -> PathBuf {
         chunk_path.with_extension("meta.json"),
         serde_json::to_vec_pretty(&ChunkMetadataSidecar {
             id: "chunk-1".to_string(),
-            project: "VetCoders/ai-contexters".to_string(),
+            project: "Vetcoders/ai-contexters".to_string(),
             agent: "codex".to_string(),
             date: "2026-04-05".to_string(),
             session_id: "session123".to_string(),
-            cwd: Some("/Users/user/vc-workspace/VetCoders/ai-contexters".to_string()),
+            cwd: Some("/Users/user/vc-workspace/Vetcoders/ai-contexters".to_string()),
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             kind: Kind::Reports,
             run_id: Some("impl-055522".to_string()),
             prompt_id: Some("20260405_045135".to_string()),
@@ -187,7 +190,7 @@ fn write_chunk_with_sidecar(
 ) -> PathBuf {
     let chunk_path = base
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("ai-contexters")
         .join("2026_0331")
         .join("reports")
@@ -198,12 +201,15 @@ fn write_chunk_with_sidecar(
 
     let sidecar = ChunkMetadataSidecar {
         id: chunk_id_for_path(&chunk_path),
-        project: "VetCoders/ai-contexters".to_string(),
+        project: "Vetcoders/ai-contexters".to_string(),
         agent: "codex".to_string(),
         date: "2026-03-31".to_string(),
         session_id: "sess-1".to_string(),
         cwd: Some("/Users/tester/workspaces/ai-contexters".to_string()),
         timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
         kind: Kind::Reports,
         run_id: Some(run_id.to_string()),
         prompt_id: Some(prompt_id.to_string()),
@@ -555,7 +561,7 @@ fn store_scan_metadata_falls_back_to_path_fields() {
     ));
     let chunk_dir = temp
         .join("store")
-        .join("VetCoders")
+        .join("Vetcoders")
         .join("ai-contexters")
         .join("2026_0331")
         .join("reports")
@@ -568,7 +574,7 @@ fn store_scan_metadata_falls_back_to_path_fields() {
     let meta = build_store_scan_metadata(&files[0]);
     assert_eq!(
         meta.get("project").and_then(|v| v.as_str()),
-        Some("VetCoders/ai-contexters")
+        Some("Vetcoders/ai-contexters")
     );
     assert_eq!(meta.get("agent").and_then(|v| v.as_str()), Some("codex"));
     assert_eq!(meta.get("kind").and_then(|v| v.as_str()), Some("reports"));
@@ -582,7 +588,7 @@ fn candidate_query_uses_filter_terms() {
         run_id: Some("mrbl-001"),
         agent: Some("claude"),
         kind: Some("reports"),
-        project: Some("VetCoders/vibecrafted"),
+        project: Some("Vetcoders/vibecrafted"),
         ..SteerFilter::default()
     };
     let query = build_candidate_query(&filter).unwrap();

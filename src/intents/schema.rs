@@ -14,7 +14,7 @@
 //! (`verification_status` defaults to `Unverified`); a result needs evidence
 //! pointers; clarify asks decisions, not discoverable facts.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -732,7 +732,7 @@ fn path_tokens(text: &str) -> Vec<String> {
 /// not leak the local username into exported lane records. Home is resolved
 /// the same way as everywhere else in the repo (`dirs::home_dir()`, which
 /// honors `$HOME` on Unix). Only whole-component prefixes are redacted —
-/// `/Users/userton` is not touched when home is `/Users/user`.
+/// `/Users/username` is not touched when home is `/Users/user`.
 fn redact_home(path: &str) -> String {
     let Some(home) = crate::os_user_home() else {
         return path.to_string();
@@ -2372,6 +2372,7 @@ mod tests {
             last_chunk: None,
             source_chunk: "chunk-1".to_string(),
             source: None,
+            honesty: Default::default(),
         };
 
         let fractures = detect_contract_fractures(&[intent], &[], &[]);
@@ -2403,6 +2404,7 @@ mod tests {
             last_chunk: None,
             source_chunk: "chunk-1".to_string(),
             source: None,
+            honesty: Default::default(),
         };
 
         let claim = ClaimRecord {

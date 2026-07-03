@@ -110,7 +110,7 @@ impl IntentsScreen {
     pub fn cycle_project_filter(&mut self) {
         self.project = match self.project.as_deref() {
             None => Some("aicx".to_string()),
-            Some("aicx") => Some("memex".to_string()),
+            Some("aicx") => Some("rust-memex".to_string()),
             Some(_) => None,
         };
         *self = Self::load(self.project.clone(), self.hours, self.agent.clone());
