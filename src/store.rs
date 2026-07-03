@@ -2251,8 +2251,9 @@ pub fn expand_compact_date(compact: &str) -> String {
 
 pub(crate) mod migration;
 pub use migration::{
-    LegacyItemKind, MigrationAction, MigrationExecution, MigrationItem, MigrationManifest,
-    MigrationTotals, run_migration, run_migration_with_paths,
+    CardsV2Action, CardsV2Item, CardsV2Manifest, CardsV2Totals, LegacyItemKind, MigrationAction,
+    MigrationExecution, MigrationItem, MigrationManifest, MigrationTotals, run_cards_v2_migration,
+    run_migration, run_migration_with_paths,
 };
 #[cfg(all(test, feature = "app"))]
 pub(crate) use migration::{SourceLocator, run_migration_at};
