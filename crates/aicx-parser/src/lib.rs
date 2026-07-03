@@ -12,7 +12,9 @@ pub mod timeline;
 pub mod types;
 
 pub use chunker::{
-    Chunk, ChunkMetadataSidecar, ChunkerConfig, LearningUse, TruthRole, TruthStatus, classify_kind,
+    CARD_CLAIM_SCOPE_SESSION_CLOSE, CARD_FRESHNESS_CONTRACT_HISTORICAL, CARD_SCHEMA_VERSION,
+    CARD_VERIFICATION_STATE_NOT_VERIFIED_BY_AICX, CardSignal, CardSource, Chunk,
+    ChunkMetadataSidecar, ChunkerConfig, LearningUse, TruthRole, TruthStatus, classify_kind,
 };
 pub use frontmatter::ReportFrontmatter;
 pub use sanitize::{filter_self_echo, is_self_echo, normalize_query, read_state_json_validated};

@@ -1357,7 +1357,6 @@ fn ingest_loct_context_pack_into(
         let mut sidecar = load_sidecar_from_path(&sidecar_path)
             .with_context(|| format!("missing or invalid sidecar: {}", sidecar_path.display()))?;
         sidecar.artifact_family = Some(LOCT_CONTEXT_PACK_FAMILY.to_string());
-        sidecar.schema_version = Some(CONTEXT_CORPUS_SCHEMA_VERSION.to_string());
         if sidecar.truth_status.is_none() {
             sidecar.truth_status = Some(chunker::TruthStatus {
                 role: chunker::TruthRole::Example,
@@ -1475,7 +1474,7 @@ fn ingest_loct_context_pack_into(
             id: sidecar.id.clone(),
             path: raw_target.display().to_string(),
             artifact_family: sidecar.artifact_family.clone(),
-            schema_version: sidecar.schema_version.clone(),
+            schema_version: Some(CONTEXT_CORPUS_SCHEMA_VERSION.to_string()),
             truth_status_role: sidecar
                 .truth_status
                 .as_ref()

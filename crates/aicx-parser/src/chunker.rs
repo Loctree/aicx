@@ -6,7 +6,7 @@
 //! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -84,6 +84,12 @@ pub struct Chunk {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChunkMetadataSidecar {
     pub id: String,
+    #[serde(
+        default = "default_card_schema_version",
+        deserialize_with = "deserialize_card_schema_version",
+        skip_serializing_if = "is_default_card_schema_version"
+    )]
+    pub schema_version: u32,
     pub project: String,
     pub agent: String,
     pub date: String,
@@ -125,6 +131,16 @@ pub struct ChunkMetadataSidecar {
     pub source_format: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub import_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<CardSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness_contract: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signals: Option<Vec<CardSignal>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intent_entries: Vec<crate::types::IntentEntry>,
     /// Weak repo/content mentions preserved for query/tag surfaces. This is
@@ -133,8 +149,6 @@ pub struct ChunkMetadataSidecar {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_family: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub schema_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truth_status: Option<TruthStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,6 +161,30 @@ pub struct ChunkMetadataSidecar {
     /// `0` when the field is absent in older sidecars.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub noise_lines_dropped: usize,
+}
+
+pub const CARD_SCHEMA_VERSION: u32 = 2;
+pub const CARD_CLAIM_SCOPE_SESSION_CLOSE: &str = "session_close";
+pub const CARD_FRESHNESS_CONTRACT_HISTORICAL: &str = "historical";
+pub const CARD_VERIFICATION_STATE_NOT_VERIFIED_BY_AICX: &str = "not_verified_by_aicx";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CardSource {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<(u64, u64)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CardSignal {
+    pub kind: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_span: Option<(u64, u64)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extractor_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -173,6 +211,42 @@ pub struct LearningUse {
     pub allowed: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forbidden: Vec<String>,
+}
+
+fn default_card_schema_version() -> u32 {
+    1
+}
+
+fn is_default_card_schema_version(value: &u32) -> bool {
+    *value == default_card_schema_version()
+}
+
+fn deserialize_card_schema_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SchemaVersionWire {
+        Number(u32),
+        String(String),
+    }
+
+    match SchemaVersionWire::deserialize(deserializer)? {
+        SchemaVersionWire::Number(version) => Ok(version),
+        SchemaVersionWire::String(version) => parse_schema_version_string(&version)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid schema_version {version:?}"))),
+    }
+}
+
+fn parse_schema_version_string(value: &str) -> Option<u32> {
+    if let Ok(version) = value.parse::<u32>() {
+        return Some(version);
+    }
+
+    ["card.v", "context_corpus.v", "v"]
+        .iter()
+        .find_map(|prefix| value.strip_prefix(prefix)?.parse::<u32>().ok())
 }
 
 fn is_zero_usize(value: &usize) -> bool {
@@ -206,10 +280,15 @@ impl From<&Chunk> for ChunkMetadataSidecar {
             source_file: chunk.source_file.clone(),
             source_format: chunk.source_format.clone(),
             import_id: chunk.import_id.clone(),
+            schema_version: default_card_schema_version(),
+            source: None,
+            claim_scope: None,
+            freshness_contract: None,
+            verification_state: None,
+            signals: None,
             intent_entries: Vec::new(),
             tags: Vec::new(),
             artifact_family: None,
-            schema_version: None,
             truth_status: None,
             learning_use: None,
             keywords: None,
@@ -1791,7 +1870,7 @@ mod tests {
         assert_eq!(legacy.skill_code, None);
         assert_eq!(legacy.framework_version, None);
         assert_eq!(legacy.artifact_family, None);
-        assert_eq!(legacy.schema_version, None);
+        assert_eq!(legacy.schema_version, 1);
         assert_eq!(legacy.truth_status, None);
         assert_eq!(legacy.learning_use, None);
         assert_eq!(legacy.keywords, None);
@@ -1830,7 +1909,7 @@ mod tests {
             sidecar.artifact_family.as_deref(),
             Some("loct-context-pack")
         );
-        assert_eq!(sidecar.schema_version.as_deref(), Some("context_corpus.v1"));
+        assert_eq!(sidecar.schema_version, 1);
         assert_eq!(
             sidecar.truth_status.as_ref().map(|status| status.role),
             Some(TruthRole::Example)
