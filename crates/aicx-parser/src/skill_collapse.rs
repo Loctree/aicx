@@ -143,6 +143,9 @@ mod tests {
             branch: None,
             cwd: None,
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
         }
     }
 

@@ -2612,6 +2612,9 @@ fn conversations_batch_writes_synthetic_sessions_without_store_path() {
             branch: Some("main".to_string()),
             cwd: Some("/tmp/project-one".to_string()),
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
         },
         timeline::TimelineEntry {
             timestamp: ts + chrono::Duration::seconds(1),
@@ -2623,6 +2626,9 @@ fn conversations_batch_writes_synthetic_sessions_without_store_path() {
             branch: None,
             cwd: Some("/tmp/project-two".to_string()),
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
         },
     ];
 
@@ -2787,6 +2793,9 @@ fn mk_entry(
         branch: None,
         cwd: cwd.map(str::to_string),
         timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
     }
 }
 

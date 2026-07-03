@@ -404,7 +404,12 @@ fn parse_operator_markdown_document(
 /// material — even moved or renamed — resolves to the same id.
 fn attach_import_provenance(entries: &mut [TimelineEntry], path: &Path, content: &str) {
     let import_id = format!("blake3:{}", blake3::hash(content.as_bytes()).to_hex());
+    let (source_path, source_sha256) = source_path_and_sha256(path);
+    let source_line_span = Some((1, content.lines().count().max(1) as u64));
     for entry in entries.iter_mut() {
+        entry.source_path = Some(source_path.clone());
+        entry.source_sha256 = source_sha256.clone();
+        entry.source_line_span = source_line_span;
         let source_format = entry
             .message
             .lines()

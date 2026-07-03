@@ -2,6 +2,7 @@ use super::*;
 use crate::chunker::{ChunkMetadataSidecar, ChunkerConfig, chunk_entries};
 use chrono::{Duration, TimeZone};
 use filetime::{FileTime, set_file_mtime};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
@@ -29,6 +30,12 @@ fn write_file(path: &Path, content: &str) {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(path, content).unwrap();
+}
+
+fn test_sha256_hex(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn default_config(include_assistant: bool) -> ExtractionConfig {
@@ -336,6 +343,37 @@ fn test_extract_claude_file_parses_text_only_blocks() {
     );
     assert_eq!(user_entries[0].message, "Hello");
     assert_eq!(agent_entries[0].message, "Hi");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_extract_claude_file_stamps_source_provenance() {
+    let root = unique_test_dir("claude-source-provenance");
+    let tmp = root.join("session.jsonl");
+    let _ = fs::remove_dir_all(&root);
+
+    let content = r#"{"type":"user","message":{"role":"user","content":"Hello"},"timestamp":"2026-02-09T22:03:06.765Z","sessionId":"sess123","cwd":"/tmp"}
+{"type":"assistant","message":{"role":"assistant","content":"Hi"},"timestamp":"2026-02-09T22:03:07.765Z","sessionId":"sess123"}"#;
+    write_file(&tmp, content);
+
+    let entries = extract_claude_file(&tmp, &default_config(true)).unwrap();
+    let expected_path = tmp.display().to_string();
+    let expected_sha = test_sha256_hex(content);
+
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.source_path.as_deref() == Some(expected_path.as_str()))
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.source_sha256.as_deref() == Some(expected_sha.as_str()))
+    );
+    assert_eq!(entries[0].source_line_span, Some((1, 1)));
+    assert_eq!(entries[1].source_line_span, Some((2, 2)));
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -666,6 +704,35 @@ fn test_extract_codex_file_history_format() {
 }
 
 #[test]
+fn test_extract_codex_history_file_stamps_source_provenance() {
+    let root = unique_test_dir("codex-history-source-provenance");
+    let tmp = root.join("history.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"session_id":"s1","text":"hello","ts":1000,"role":"user","cwd":"/tmp/a"}
+{"session_id":"s1","text":"hi back","ts":1001,"role":"assistant","cwd":"/tmp/a"}"#;
+    write_file(&tmp, content);
+
+    let entries = extract_codex_file(&tmp, &default_config(true)).unwrap();
+    let expected_path = tmp.display().to_string();
+    let expected_sha = test_sha256_hex(content);
+
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.source_path.as_deref() == Some(expected_path.as_str()))
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.source_sha256.as_deref() == Some(expected_sha.as_str()))
+    );
+    assert!(entries.iter().all(|entry| entry.source_line_span.is_none()));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn test_extract_codex_file_session_format_detects() {
     let root = unique_test_dir("codex-direct-session");
     let tmp = root.join("session.jsonl");
@@ -685,6 +752,35 @@ fn test_extract_codex_file_session_format_detects() {
 
     let entries = extract_codex_file(&tmp, &config).unwrap();
     assert!(entries.is_empty());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_parse_codex_session_file_stamps_source_provenance() {
+    let root = unique_test_dir("codex-session-source-provenance");
+    let tmp = root.join("rollout.jsonl");
+    let _ = fs::remove_dir_all(&root);
+    let content = r#"{"timestamp":"2026-02-01T00:00:00Z","type":"session_meta","payload":{"id":"session-a","cwd":"/tmp/a"}}
+{"timestamp":"2026-02-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#;
+    write_file(&tmp, content);
+
+    let (entries, warnings) =
+        parse_codex_session_file_with_diagnostics(&tmp, "codex", &default_config(true)).unwrap();
+    let expected_path = tmp.display().to_string();
+    let expected_sha = test_sha256_hex(content);
+
+    assert!(warnings.is_empty());
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].source_path.as_deref(),
+        Some(expected_path.as_str())
+    );
+    assert_eq!(
+        entries[0].source_sha256.as_deref(),
+        Some(expected_sha.as_str())
+    );
+    assert_eq!(entries[0].source_line_span, None);
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -1893,6 +1989,9 @@ fn test_dedup_logic() {
             branch: None,
             cwd: None,
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -1904,6 +2003,9 @@ fn test_dedup_logic() {
             branch: None,
             cwd: None,
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -1915,6 +2017,9 @@ fn test_dedup_logic() {
             branch: None,
             cwd: None,
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         },
     ];

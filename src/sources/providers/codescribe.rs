@@ -361,6 +361,8 @@ fn parse_codescribe_transcript_with_lexicon(
     home: &Path,
 ) -> Result<Vec<TimelineEntry>> {
     let content = sanitize::read_to_string_validated(path)?;
+    let (source_path, source_sha256) = source_path_and_sha256(path);
+    let source_line_span = Some((1, content.lines().count().max(1) as u64));
 
     let mut project_hint = None;
     let (frontmatter, body) = split_operator_frontmatter(&content);
@@ -443,6 +445,9 @@ fn parse_codescribe_transcript_with_lexicon(
             TimelineEntryMeta {
                 cwd: cwd_hint.map(ToOwned::to_owned),
                 frame_kind: Some(FrameKind::UserMsg),
+                source_path: Some(source_path.clone()),
+                source_sha256: source_sha256.clone(),
+                source_line_span,
                 ..TimelineEntryMeta::default()
             },
         ));

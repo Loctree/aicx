@@ -526,6 +526,13 @@ fn extract_gemini_antigravity_conversation_artifacts(
             config,
         );
         if !parsed.is_empty() {
+            let (source_path, source_sha256) = source_path_and_sha256(&path);
+            let source_line_span = Some((1, content.lines().count().max(1) as u64));
+            for entry in &mut parsed {
+                entry.source_path = Some(source_path.clone());
+                entry.source_sha256 = source_sha256.clone();
+                entry.source_line_span = source_line_span;
+            }
             used_paths.push(path.to_path_buf());
             entries.append(&mut parsed);
         }
@@ -569,6 +576,8 @@ fn extract_gemini_antigravity_step_outputs(
         if trimmed.is_empty() {
             continue;
         }
+        let (source_path, source_sha256) = source_path_and_sha256(path);
+        let source_line_span = Some((1, content.lines().count().max(1) as u64));
 
         let timestamp =
             file_timestamp(path).unwrap_or_else(|| Utc::now() + Duration::seconds(index as i64));
@@ -595,6 +604,9 @@ fn extract_gemini_antigravity_step_outputs(
                     .or_else(|| session_default_cwd.clone()),
                 frame_kind: None,
                 timestamp_source: None,
+                source_path: Some(source_path),
+                source_sha256,
+                source_line_span,
             },
         ));
     }
@@ -849,6 +861,9 @@ fn antigravity_json_message_to_entries(
                     cwd: cwd.clone(),
                     frame_kind: Some(block.frame_kind),
                     timestamp_source: None,
+                    source_path: None,
+                    source_sha256: None,
+                    source_line_span: None,
                 },
             ));
         }
@@ -971,6 +986,9 @@ fn parse_antigravity_transcript_text(
                 cwd: default_cwd.clone(),
                 frame_kind: frame_kind_from_role(role),
                 timestamp_source: None,
+                source_path: None,
+                source_sha256: None,
+                source_line_span: None,
             },
         ));
     }
@@ -1213,6 +1231,7 @@ pub(crate) fn parse_gemini_session_with_diagnostics(
     config: &ExtractionConfig,
 ) -> Result<(Vec<TimelineEntry>, Vec<GeminiSessionWarning>)> {
     let content = sanitize::read_to_string_validated(path)?;
+    let (source_path, source_sha256) = source_path_and_sha256(path);
     let (mut session, mut warnings) = parse_gemini_session_content(path, &content)?;
 
     let session_id = match session.session_id.take() {
@@ -1357,6 +1376,9 @@ pub(crate) fn parse_gemini_session_with_diagnostics(
                     cwd: inferred_cwd.clone(),
                     frame_kind: Some(block.frame_kind),
                     timestamp_source: None,
+                    source_path: Some(source_path.clone()),
+                    source_sha256: source_sha256.clone(),
+                    source_line_span: None,
                 },
                 &mut warnings,
             ));
@@ -1406,6 +1428,9 @@ pub(crate) fn parse_gemini_session_with_diagnostics(
                         cwd: inferred_cwd.clone(),
                         frame_kind: Some(FrameKind::InternalThought),
                         timestamp_source: None,
+                        source_path: Some(source_path.clone()),
+                        source_sha256: source_sha256.clone(),
+                        source_line_span: None,
                     },
                     &mut warnings,
                 ));

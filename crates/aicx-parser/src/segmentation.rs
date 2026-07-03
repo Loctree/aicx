@@ -709,6 +709,9 @@ mod tests {
             branch: None,
             cwd: cwd.map(ToOwned::to_owned),
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         }
     }

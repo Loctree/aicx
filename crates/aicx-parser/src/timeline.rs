@@ -139,6 +139,12 @@ pub struct TimelineEntry {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_line_span: Option<(u64, u64)>,
 }
 
 /// Denoised conversation message — the canonical projection of a TimelineEntry

@@ -64,6 +64,9 @@ pub struct Chunk {
     pub source_file: Option<String>,
     pub source_format: Option<String>,
     pub import_id: Option<String>,
+    /// Raw L0 source pointer for provider-backed transcripts when every entry
+    /// in the chunk window comes from the same source file.
+    pub source: Option<CardSource>,
     /// Index range in original day's entries (start, end exclusive)
     pub msg_range: (usize, usize),
     /// Formatted chunk text with header
@@ -280,11 +283,11 @@ impl From<&Chunk> for ChunkMetadataSidecar {
             source_file: chunk.source_file.clone(),
             source_format: chunk.source_format.clone(),
             import_id: chunk.import_id.clone(),
-            schema_version: default_card_schema_version(),
-            source: None,
-            claim_scope: None,
-            freshness_contract: None,
-            verification_state: None,
+            schema_version: CARD_SCHEMA_VERSION,
+            source: chunk.source.clone(),
+            claim_scope: Some(CARD_CLAIM_SCOPE_SESSION_CLOSE.to_string()),
+            freshness_contract: Some(CARD_FRESHNESS_CONTRACT_HISTORICAL.to_string()),
+            verification_state: Some(CARD_VERIFICATION_STATE_NOT_VERIFIED_BY_AICX.to_string()),
             signals: None,
             intent_entries: Vec::new(),
             tags: Vec::new(),
@@ -525,6 +528,48 @@ fn timestamp_source_for_window(entries: &[&TimelineEntry]) -> Option<String> {
     Some(source)
 }
 
+fn source_for_window(entries: &[&TimelineEntry]) -> Option<CardSource> {
+    let mut sourced_entries = entries.iter().filter_map(|entry| {
+        entry
+            .source_path
+            .as_ref()
+            .map(|path| (*entry, path.as_str()))
+    });
+    let (first_entry, first_path) = sourced_entries.next()?;
+    if sourced_entries.any(|(_, path)| path != first_path) {
+        return None;
+    }
+
+    let sha256 = entries
+        .iter()
+        .filter(|entry| entry.source_path.as_deref() == Some(first_path))
+        .filter_map(|entry| entry.source_sha256.as_deref())
+        .try_fold(None, |known: Option<&str>, sha| match known {
+            Some(existing) if existing != sha => None,
+            Some(existing) => Some(Some(existing)),
+            None => Some(Some(sha)),
+        })
+        .flatten()
+        .map(ToOwned::to_owned);
+
+    let span = entries
+        .iter()
+        .filter(|entry| entry.source_path.as_deref() == Some(first_path))
+        .filter_map(|entry| entry.source_line_span)
+        .fold(None, |acc: Option<(u64, u64)>, (start, end)| {
+            Some(match acc {
+                Some((known_start, known_end)) => (known_start.min(start), known_end.max(end)),
+                None => (start, end),
+            })
+        });
+
+    Some(CardSource {
+        path: first_entry.source_path.clone().unwrap_or_default(),
+        sha256,
+        span,
+    })
+}
+
 // ============================================================================
 // Chunking logic
 // ============================================================================
@@ -628,6 +673,7 @@ fn chunk_day_entries(
         let signals = extract_signals(&window);
         let frame_kind = frame_kind_for_window(&window);
         let timestamp_source = timestamp_source_for_window(&window);
+        let source = source_for_window(&window);
         let text = format_chunk_text_inner(
             &window,
             project,
@@ -675,6 +721,7 @@ fn chunk_day_entries(
             source_file: None,
             source_format: None,
             import_id: None,
+            source,
             msg_range: (global_start, global_end),
             text,
             token_estimate,
@@ -776,17 +823,11 @@ fn format_chunk_text_inner(
     signals: &ChunkSignals,
     highlights: &[String],
 ) -> String {
-    let mut text = if let Some(frame_kind) = frame_kind {
-        format!(
-            "[project: {} | agent: {} | date: {} | frame_kind: {}]\n\n",
-            project, agent, date, frame_kind
-        )
-    } else {
-        format!(
-            "[project: {} | agent: {} | date: {}]\n\n",
-            project, agent, date
-        )
-    };
+    let mut text = format!("---\nproject: {project}\nagent: {agent}\ndate: {date}\n");
+    if let Some(frame_kind) = frame_kind {
+        text.push_str(&format!("frame_kind: {frame_kind}\n"));
+    }
+    text.push_str("schema: card.v2\n---\n\n");
 
     if let Some(block) = format_signals_block(signals, highlights) {
         text.push_str(&block);
@@ -1535,7 +1576,61 @@ mod tests {
             branch: None,
             cwd: None,
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
         }
+    }
+
+    fn legacy_format_chunk_text_for_body_compare(
+        entries: &[&TimelineEntry],
+        project: &str,
+        agent: &str,
+        date: &str,
+        frame_kind: Option<FrameKind>,
+        signals: &ChunkSignals,
+        highlights: &[String],
+    ) -> String {
+        let mut text = if let Some(frame_kind) = frame_kind {
+            format!(
+                "[project: {} | agent: {} | date: {} | frame_kind: {}]\n\n",
+                project, agent, date, frame_kind
+            )
+        } else {
+            format!(
+                "[project: {} | agent: {} | date: {}]\n\n",
+                project, agent, date
+            )
+        };
+
+        if let Some(block) = format_signals_block(signals, highlights) {
+            text.push_str(&block);
+            text.push('\n');
+        }
+
+        for entry in entries {
+            if entry.message.is_empty() {
+                continue;
+            }
+            let time = entry.timestamp.format("%H:%M:%S");
+            let msg = if entry.message.len() > 4000 {
+                truncate_message_bytes(&entry.message, 4000)
+            } else {
+                entry.message.clone()
+            };
+            text.push_str(&format!("[{}] {}: {}\n", time, entry.role, msg));
+        }
+
+        text
+    }
+
+    fn body_after_card_header(text: &str) -> &str {
+        if let Some(rest) = text.strip_prefix("---\n")
+            && let Some((_, body)) = rest.split_once("\n---\n\n")
+        {
+            return body;
+        }
+        text.split_once("\n\n").map(|(_, body)| body).unwrap_or("")
     }
 
     #[test]
@@ -1628,6 +1723,9 @@ mod tests {
                 branch: None,
                 cwd: None,
                 timestamp_source: None,
+                source_path: None,
+                source_sha256: None,
+                source_line_span: None,
             },
             TimelineEntry {
                 timestamp: Utc.with_ymd_and_hms(2026, 1, 21, 10, 0, 0).unwrap(),
@@ -1639,6 +1737,9 @@ mod tests {
                 branch: None,
                 cwd: None,
                 timestamp_source: None,
+                source_path: None,
+                source_sha256: None,
+                source_line_span: None,
             },
         ];
 
@@ -1660,9 +1761,66 @@ mod tests {
 
         let text = format_chunk_text(&refs, "TestProj", "claude", "2026-01-22");
 
-        assert!(text.starts_with("[project: testproj | agent: claude | date: 2026-01-22]"));
+        assert!(text.starts_with(
+            "---\nproject: testproj\nagent: claude\ndate: 2026-01-22\nschema: card.v2\n---\n\n"
+        ));
         assert!(text.contains("[14:30:00] user: hello"));
         assert!(text.contains("[14:31:00] assistant: hi there"));
+    }
+
+    #[test]
+    fn test_format_chunk_text_emits_card_v2_frontmatter_with_frame_kind() {
+        let mut entry = make_entry(14, 30, "user", "hello");
+        entry.frame_kind = Some(FrameKind::UserMsg);
+        let entries = [entry];
+        let refs: Vec<&TimelineEntry> = entries.iter().collect();
+
+        let text = format_chunk_text(&refs, "Loctree/AICX", "claude", "2026-01-22");
+
+        assert!(text.starts_with("---\n"));
+        assert!(text.contains("project: loctree/aicx\n"));
+        assert!(text.contains("agent: claude\n"));
+        assert!(text.contains("date: 2026-01-22\n"));
+        assert!(text.contains("frame_kind: user_msg\n"));
+        assert!(text.contains("schema: card.v2\n---\n\n"));
+        assert!(!text.starts_with("[project:"));
+    }
+
+    #[test]
+    fn test_card_v2_body_bytes_match_legacy_writer_after_header() {
+        let mut entries = [
+            make_entry(14, 30, "user", "todo: keep the body stable"),
+            make_entry(14, 31, "assistant", "done"),
+        ];
+        entries[0].frame_kind = Some(FrameKind::UserMsg);
+        entries[1].frame_kind = Some(FrameKind::UserMsg);
+        let refs: Vec<&TimelineEntry> = entries.iter().collect();
+        let config = ChunkerConfig::default();
+        let (sanitized_owned, _dropped) = sanitize_window(&refs, &config);
+        let sanitized_refs: Vec<&TimelineEntry> = sanitized_owned.iter().collect();
+        let highlights = extract_highlights(&sanitized_refs);
+        let signals = extract_signals(&sanitized_refs);
+
+        let v2 = format_chunk_text_inner(
+            &sanitized_refs,
+            "proj",
+            "claude",
+            "2026-01-22",
+            Some(FrameKind::UserMsg),
+            &signals,
+            &highlights,
+        );
+        let legacy = legacy_format_chunk_text_for_body_compare(
+            &sanitized_refs,
+            "proj",
+            "claude",
+            "2026-01-22",
+            Some(FrameKind::UserMsg),
+            &signals,
+            &highlights,
+        );
+
+        assert_eq!(body_after_card_header(&v2), body_after_card_header(&legacy));
     }
 
     #[test]
@@ -1743,6 +1901,98 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_from_chunk_defaults_to_card_v2_contract_fields() {
+        let mut chunks = chunk_entries(
+            &[make_entry(14, 30, "user", "hello")],
+            "Loctree/AICX",
+            "claude",
+            &ChunkerConfig::default(),
+        );
+        assert_eq!(chunks.len(), 1);
+        chunks[0].source = Some(CardSource {
+            path: "/tmp/raw.jsonl".to_string(),
+            sha256: Some("abc123".to_string()),
+            span: Some((7, 9)),
+        });
+
+        let sidecar = ChunkMetadataSidecar::from(&chunks[0]);
+
+        assert_eq!(sidecar.schema_version, CARD_SCHEMA_VERSION);
+        assert_eq!(
+            sidecar.claim_scope.as_deref(),
+            Some(CARD_CLAIM_SCOPE_SESSION_CLOSE)
+        );
+        assert_eq!(
+            sidecar.freshness_contract.as_deref(),
+            Some(CARD_FRESHNESS_CONTRACT_HISTORICAL)
+        );
+        assert_eq!(
+            sidecar.verification_state.as_deref(),
+            Some(CARD_VERIFICATION_STATE_NOT_VERIFIED_BY_AICX)
+        );
+        assert_eq!(
+            sidecar.source.as_ref().map(|source| source.path.as_str()),
+            Some("/tmp/raw.jsonl")
+        );
+        assert_eq!(
+            sidecar
+                .source
+                .as_ref()
+                .and_then(|source| source.sha256.as_deref()),
+            Some("abc123")
+        );
+        assert_eq!(
+            sidecar.source.as_ref().and_then(|source| source.span),
+            Some((7, 9))
+        );
+    }
+
+    #[test]
+    fn test_chunk_entries_lifts_homogeneous_source_pointer_with_span() {
+        let mut first = make_entry(14, 30, "user", "hello");
+        first.source_path = Some("/tmp/raw.jsonl".to_string());
+        first.source_sha256 = Some("abc123".to_string());
+        first.source_line_span = Some((3, 3));
+        let mut second = make_entry(14, 31, "assistant", "hi");
+        second.source_path = Some("/tmp/raw.jsonl".to_string());
+        second.source_sha256 = Some("abc123".to_string());
+        second.source_line_span = Some((4, 4));
+
+        let chunks = chunk_entries(
+            &[first, second],
+            "proj",
+            "claude",
+            &ChunkerConfig::default(),
+        );
+
+        assert_eq!(chunks.len(), 1);
+        let source = chunks[0].source.as_ref().expect("source is lifted");
+        assert_eq!(source.path, "/tmp/raw.jsonl");
+        assert_eq!(source.sha256.as_deref(), Some("abc123"));
+        assert_eq!(source.span, Some((3, 4)));
+    }
+
+    #[test]
+    fn test_chunk_entries_omits_source_pointer_for_mixed_raw_paths() {
+        let mut first = make_entry(14, 30, "user", "hello");
+        first.source_path = Some("/tmp/raw-a.jsonl".to_string());
+        first.source_sha256 = Some("aaa".to_string());
+        let mut second = make_entry(14, 31, "assistant", "hi");
+        second.source_path = Some("/tmp/raw-b.jsonl".to_string());
+        second.source_sha256 = Some("bbb".to_string());
+
+        let chunks = chunk_entries(
+            &[first, second],
+            "proj",
+            "claude",
+            &ChunkerConfig::default(),
+        );
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].source, None);
+    }
+
+    #[test]
     fn test_chunk_entries_skips_unsupported_frontmatter_values_without_dropping_metadata() {
         let entries = vec![make_entry(
             14,
@@ -1792,6 +2042,7 @@ mod tests {
                 source_file: None,
                 source_format: None,
                 import_id: None,
+                source: None,
                 msg_range: (0, 5),
                 text: "chunk one content".to_string(),
                 token_estimate: 4,
@@ -1822,6 +2073,7 @@ mod tests {
                 source_file: None,
                 source_format: None,
                 import_id: None,
+                source: None,
                 msg_range: (3, 8),
                 text: "chunk two content".to_string(),
                 token_estimate: 4,
@@ -1871,6 +2123,10 @@ mod tests {
         assert_eq!(legacy.framework_version, None);
         assert_eq!(legacy.artifact_family, None);
         assert_eq!(legacy.schema_version, 1);
+        assert_eq!(legacy.source, None);
+        assert_eq!(legacy.claim_scope, None);
+        assert_eq!(legacy.freshness_contract, None);
+        assert_eq!(legacy.verification_state, None);
         assert_eq!(legacy.truth_status, None);
         assert_eq!(legacy.learning_use, None);
         assert_eq!(legacy.keywords, None);
@@ -1989,6 +2245,7 @@ mod tests {
                 source_file: None,
                 source_format: None,
                 import_id: None,
+                source: None,
                 msg_range: (0, 5),
                 text: "x".repeat(100),
                 token_estimate: 25,
@@ -2019,6 +2276,7 @@ mod tests {
                 source_file: None,
                 source_format: None,
                 import_id: None,
+                source: None,
                 msg_range: (5, 10),
                 text: "y".repeat(200),
                 token_estimate: 50,

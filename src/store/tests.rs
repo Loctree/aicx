@@ -446,6 +446,9 @@ fn test_write_context_creates_both_files() {
             branch: None,
             cwd: None,
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -457,6 +460,9 @@ fn test_write_context_creates_both_files() {
             branch: None,
             cwd: None,
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         },
     ];
@@ -563,6 +569,9 @@ fn make_entry(role: &str, message: &str) -> TimelineEntry {
         branch: None,
         cwd: None,
         timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
         frame_kind: None,
     }
 }
@@ -815,6 +824,9 @@ fn canonical_store_writes_sidecar_with_frontmatter_telemetry() {
             branch: None,
             cwd: None,
             timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
             frame_kind: None,
         }];
 
@@ -894,6 +906,9 @@ fn session_first_write_skips_empty_body_chunks() {
         branch: None,
         cwd: None,
         timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
         frame_kind: Some(crate::timeline::FrameKind::InternalThought),
     }];
 
@@ -935,6 +950,9 @@ fn semantic_entry(
         branch: None,
         cwd: cwd.map(ToOwned::to_owned),
         timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
         frame_kind: None,
     }
 }
@@ -2710,6 +2728,9 @@ fn session_first_entry(
         branch: None,
         cwd: None,
         timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
         frame_kind: None,
     }
 }

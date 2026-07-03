@@ -13,6 +13,9 @@ fn test_conversation_first_excludes_reasoning() {
             branch: Some("main".to_string()),
             cwd: Some("/home/user/myrepo".to_string()),
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -24,6 +27,9 @@ fn test_conversation_first_excludes_reasoning() {
             branch: Some("main".to_string()),
             cwd: Some("/home/user/myrepo".to_string()),
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -35,6 +41,9 @@ fn test_conversation_first_excludes_reasoning() {
             branch: None,
             cwd: Some("/home/user/myrepo".to_string()),
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -46,6 +55,9 @@ fn test_conversation_first_excludes_reasoning() {
             branch: None,
             cwd: Some("/home/user/myrepo".to_string()),
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         },
     ];
@@ -74,6 +86,9 @@ fn test_conversation_first_preserves_full_messages() {
         branch: None,
         cwd: None,
         timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
         frame_kind: None,
     }];
 
@@ -95,6 +110,9 @@ fn test_conversation_first_repo_project_identity() {
             branch: None,
             cwd: Some("/Users/user/hosted/Vetcoders/ai-contexters".to_string()),
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         },
         TimelineEntry {
@@ -106,6 +124,9 @@ fn test_conversation_first_repo_project_identity() {
             branch: None,
             cwd: None,
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
             frame_kind: None,
         },
     ];
@@ -131,6 +152,9 @@ fn test_conversation_first_preserves_provenance() {
         branch: Some("release/v2".to_string()),
         cwd: Some("/home/user/project".to_string()),
         timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
         frame_kind: None,
     }];
 
@@ -166,6 +190,9 @@ fn conversation_entry_agent(
         branch: None,
         cwd: None,
         timestamp_source: None,
+        source_path: None,
+        source_sha256: None,
+        source_line_span: None,
         frame_kind: None,
     }
 }

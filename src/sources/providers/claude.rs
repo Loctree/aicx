@@ -148,11 +148,18 @@ fn extract_claude_classified_blocks(
     blocks
 }
 
+struct RawSourceProvenance<'a> {
+    path: &'a str,
+    sha256: Option<&'a str>,
+    line_number: usize,
+}
+
 fn extract_claude_line_entries(
     entry: ClaudeEntry,
     timestamp: DateTime<Utc>,
     timestamp_source: Option<&str>,
     session_id: &str,
+    source: RawSourceProvenance<'_>,
     config: &ExtractionConfig,
     warnings: &mut Vec<ClaudeSessionWarning>,
 ) -> Vec<TimelineEntry> {
@@ -199,6 +206,9 @@ fn extract_claude_line_entries(
                     cwd: entry.cwd.clone(),
                     frame_kind: Some(frame_kind),
                     timestamp_source: timestamp_source.map(str::to_string),
+                    source_path: Some(source.path.to_string()),
+                    source_sha256: source.sha256.map(str::to_string),
+                    source_line_span: Some((source.line_number as u64, source.line_number as u64)),
                 },
                 warnings,
             ));
@@ -237,6 +247,9 @@ fn extract_claude_line_entries(
             cwd: entry.cwd,
             frame_kind,
             timestamp_source: timestamp_source.map(str::to_string),
+            source_path: Some(source.path.to_string()),
+            source_sha256: source.sha256.map(str::to_string),
+            source_line_span: Some((source.line_number as u64, source.line_number as u64)),
         },
         warnings,
     ));
@@ -368,6 +381,7 @@ pub(crate) fn parse_claude_jsonl_with_diagnostics(
     config: &ExtractionConfig,
 ) -> Result<(Vec<TimelineEntry>, Vec<ClaudeSessionWarning>)> {
     let file = sanitize::open_file_validated(path)?;
+    let (source_path, source_sha256) = source_path_and_sha256(path);
     let file_mtime = file
         .metadata()
         .ok()
@@ -446,6 +460,11 @@ pub(crate) fn parse_claude_jsonl_with_diagnostics(
             timestamp,
             timestamp_source,
             &effective_session_id,
+            RawSourceProvenance {
+                path: &source_path,
+                sha256: source_sha256.as_deref(),
+                line_number: raw.line_number,
+            },
             config,
             &mut warnings,
         );
@@ -534,6 +553,7 @@ pub fn extract_claude_history(config: &ExtractionConfig) -> Result<Vec<TimelineE
     }
 
     let file = sanitize::open_file_validated(&history_path)?;
+    let (source_path, source_sha256) = source_path_and_sha256(&history_path);
     let mut reader = BufReader::new(file);
     let mut entries = Vec::new();
     let mut warnings = Vec::new();
@@ -625,6 +645,9 @@ pub fn extract_claude_history(config: &ExtractionConfig) -> Result<Vec<TimelineE
                 cwd: entry.project,
                 frame_kind: Some(FrameKind::UserMsg),
                 timestamp_source: None,
+                source_path: Some(source_path.clone()),
+                source_sha256: source_sha256.clone(),
+                source_line_span: Some((line_number as u64, line_number as u64)),
             },
             &mut warnings,
         ));

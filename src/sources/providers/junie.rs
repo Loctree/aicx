@@ -13,6 +13,7 @@ pub(crate) const JUNIE_EVENTS_FILENAME: &str = "events.jsonl";
 
 pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
     let path = sanitize::validate_read_path(path)?;
+    let (source_path, source_sha256) = source_path_and_sha256(&path);
     let file = sanitize::open_file_validated(&path)?;
     let mut reader = BufReader::new(file);
     let (session_id, fallback_warning) = junie_session_id_from_path_with_warning(&path);
@@ -95,6 +96,9 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                             cwd: current_cwd.clone(),
                             frame_kind: Some(frame_kind),
                             timestamp_source: None,
+                            source_path: Some(source_path.clone()),
+                            source_sha256: source_sha256.clone(),
+                            source_line_span: Some((line_number as u64, line_number as u64)),
                         },
                         &mut warnings,
                     ));
@@ -124,6 +128,9 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                             cwd: current_cwd.clone(),
                             frame_kind: Some(FrameKind::UserMsg),
                             timestamp_source: None,
+                            source_path: Some(source_path.clone()),
+                            source_sha256: source_sha256.clone(),
+                            source_line_span: Some((line_number as u64, line_number as u64)),
                         },
                         &mut warnings,
                     ));
@@ -152,6 +159,9 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                             cwd: current_cwd.clone(),
                             frame_kind: Some(frame_kind),
                             timestamp_source: None,
+                            source_path: Some(source_path.clone()),
+                            source_sha256: source_sha256.clone(),
+                            source_line_span: Some((line_number as u64, line_number as u64)),
                         },
                         &mut warnings,
                     ));
@@ -245,6 +255,9 @@ pub fn extract_junie_file(path: &Path, config: &ExtractionConfig) -> Result<Vec<
                             cwd: current_cwd.clone(),
                             frame_kind: Some(frame_kind),
                             timestamp_source: None,
+                            source_path: Some(source_path.clone()),
+                            source_sha256: source_sha256.clone(),
+                            source_line_span: Some((line_number as u64, line_number as u64)),
                         },
                         &mut warnings,
                     ));
