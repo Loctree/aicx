@@ -117,6 +117,7 @@ struct EvidenceJsonResponse<'a> {
     query: &'a str,
     query_class: EvidenceQueryClass,
     oracle_status: OracleStatus,
+    claim_honesty: crate::oracle::ClaimHonesty,
     results: usize,
     candidates_examined: usize,
     scanned: usize,
@@ -247,6 +248,7 @@ pub fn render_evidence_json(
         query: &report.query,
         query_class: report.query_class,
         oracle_status,
+        claim_honesty: crate::oracle::ClaimHonesty::canonical(),
         results: report.results,
         candidates_examined: report.candidates_examined,
         scanned,
@@ -909,6 +911,49 @@ mod tests {
         )
         .expect("write meta");
         path
+    }
+
+    #[test]
+    fn evidence_json_carries_claim_honesty_frame_additively() {
+        // B2: `aicx search --evidence` (CLI and MCP both render through
+        // `render_evidence_json`) must stamp the honesty frame while leaving
+        // every pre-existing top-level key in place.
+        let report = build_evidence_report("czemu honesty frame", Vec::new(), 5);
+        let status = OracleStatus::filesystem_fuzzy(Path::new("/tmp/aicx"), 0, 0, true);
+
+        let json = render_evidence_json(&report, 0, status).expect("render evidence json");
+        let payload: serde_json::Value = serde_json::from_str(&json).expect("payload parses");
+
+        assert_eq!(payload["claim_honesty"]["claim_scope"], "session_close");
+        assert_eq!(payload["claim_honesty"]["freshness_contract"], "historical");
+        assert_eq!(
+            payload["claim_honesty"]["verification_state"],
+            "not_verified_by_aicx"
+        );
+
+        let mut keys: Vec<&str> = payload
+            .as_object()
+            .expect("payload is object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "candidates_examined",
+                "claim_honesty",
+                "items",
+                "mode",
+                "oracle_status",
+                "query",
+                "query_class",
+                "results",
+                "scanned",
+                "suppressed",
+            ],
+            "evidence JSON top-level keys drifted — honesty frame must stay additive"
+        );
     }
 
     #[test]

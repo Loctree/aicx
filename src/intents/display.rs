@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 
-use crate::oracle::{OracleEnvelope, OracleStatus};
+use crate::oracle::{ClaimHonesty, OracleEnvelope, OracleStatus};
 
 use super::{IntentKind, IntentRecord, cmp_dates_flexible, parse_flexible_utc};
 
@@ -386,6 +386,12 @@ pub fn format_intents_markdown(records: &[IntentRecord]) -> String {
     }
 
     let mut out = String::from("# Intent Timeline\n\n");
+    // Honesty frame for the whole surface: every record below is a historical
+    // claim bound to its session close, never runtime-verified by aicx.
+    out.push_str(&format!(
+        "_{}_\n\n",
+        ClaimHonesty::canonical().display_line()
+    ));
     let mut last_date: Option<&str> = None;
 
     for record in records {
@@ -434,6 +440,7 @@ pub fn format_intents_oracle_json(
 ) -> Result<String> {
     serde_json::to_string_pretty(&OracleEnvelope {
         oracle_status,
+        claim_honesty: ClaimHonesty::canonical(),
         results: records.len(),
         items: records,
     })

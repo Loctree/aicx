@@ -4627,7 +4627,11 @@ fn format_intents_pack_markdown(
     if let Some(limit) = per_section_limit {
         out.push_str(&format!("- per_section_limit: {limit}\n"));
     }
-    out.push_str("- source: canonical corpus\n\n");
+    out.push_str("- source: canonical corpus\n");
+    out.push_str(&format!(
+        "- {}\n\n",
+        aicx::oracle::ClaimHonesty::canonical().display_line()
+    ));
 
     for section in sections {
         out.push_str(&format!("## {}\n\n", section.title));
@@ -8654,6 +8658,7 @@ fn run_steer(
     if json {
         let json = serde_json::to_string_pretty(&aicx::oracle::OracleEnvelope {
             oracle_status,
+            claim_honesty: aicx::oracle::ClaimHonesty::canonical(),
             results: metadatas.len(),
             items: &metadatas,
         })?;

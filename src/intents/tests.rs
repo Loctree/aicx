@@ -332,6 +332,7 @@ fn collapse_session_merges_exact_daily_duplicates_across_session_forks() {
         last_chunk: None,
         source_chunk: source_chunk.to_string(),
         source: None,
+        honesty: Default::default(),
     };
 
     let records = vec![
@@ -371,6 +372,7 @@ fn collapse_session_tolerates_existing_none_count() {
         last_chunk: None,
         source_chunk: format!("{summary}.md"),
         source: None,
+        honesty: Default::default(),
     };
 
     let collapsed = apply_display_filters(
@@ -1282,6 +1284,7 @@ fn formats_markdown_with_required_sections() {
         last_chunk: None,
         source_chunk: "/tmp/demo/2026-03-15/120000_codex-001.md".to_string(),
         source: None,
+        honesty: Default::default(),
     }];
 
     let markdown = format_intents_markdown(&records);
@@ -1308,6 +1311,7 @@ fn formats_json_with_same_fields() {
         last_chunk: None,
         source_chunk: "/tmp/demo/2026-03-15/120500_claude-002.md".to_string(),
         source: None,
+        honesty: Default::default(),
     }];
 
     let json = format_intents_json(&records).expect("serialize intents");
@@ -1333,6 +1337,7 @@ fn formats_oracle_json_as_canonical_corpus_not_semantic_fallback() {
         last_chunk: None,
         source_chunk: "/tmp/aicx/chunk.md".to_string(),
         source: None,
+        honesty: Default::default(),
     }];
 
     let status = OracleStatus::canonical_corpus_scan(Path::new("/tmp/aicx"), 1, 1, true);
@@ -1359,6 +1364,148 @@ fn formats_oracle_json_as_canonical_corpus_not_semantic_fallback() {
 fn strip_case_prefix_is_utf8_safe() {
     let text = "Działa pięknie — pełny artifact pack z Rust flow...";
     assert_eq!(strip_case_insensitive_prefix(text, "validation:"), text);
+}
+
+// ── B2 claim-honesty threading (cards v2, SCAFFOLD §4.5) ─────────────────
+//
+// Every intent/decision/outcome shown by aicx is a HISTORICAL claim valid at
+// session close, never runtime truth. These tests lock the honesty frame on
+// the display surfaces: markdown notice, oracle-JSON envelope, per-record
+// flat keys, and the sidecar → StoredChunkFile → IntentRecord threading.
+
+fn honesty_probe_record(honesty: crate::oracle::ClaimHonesty) -> IntentRecord {
+    IntentRecord {
+        kind: IntentKind::Intent,
+        summary: "thread honesty frame through display surfaces".to_string(),
+        context: None,
+        evidence: vec![],
+        project: "Loctree/aicx".to_string(),
+        agent: "claude".to_string(),
+        date: "2026-07-02".to_string(),
+        timestamp: None,
+        session_id: "sess-b2".to_string(),
+        count: None,
+        first_chunk: None,
+        last_chunk: None,
+        source_chunk: "/tmp/aicx/b2-chunk.md".to_string(),
+        source: None,
+        honesty,
+    }
+}
+
+#[test]
+fn markdown_timeline_opens_with_header_level_honesty_notice() {
+    let records = vec![honesty_probe_record(Default::default())];
+
+    let markdown = format_intents_markdown(&records);
+
+    // The notice must frame the WHOLE surface, so it sits directly under the
+    // title, before any record group.
+    let title_pos = markdown.find("# Intent Timeline").expect("title present");
+    let notice_pos = markdown
+        .find("_claims: historical @ session close · not verified by aicx_")
+        .expect("honesty notice present");
+    let first_record_pos = markdown.find("### INTENT").expect("record present");
+    assert!(title_pos < notice_pos && notice_pos < first_record_pos);
+}
+
+#[test]
+fn oracle_json_envelope_adds_claim_honesty_without_touching_existing_keys() {
+    // Additive-only proof: the pre-B2 key sets are pinned here as fixtures.
+    // A v1 record (no sidecar honesty) must serialize the EXACT legacy key
+    // set, and the envelope may grow by `claim_honesty` and nothing else.
+    let records = vec![honesty_probe_record(Default::default())];
+    let status = OracleStatus::canonical_corpus_scan(Path::new("/tmp/aicx"), 1, 1, true);
+
+    let json = format_intents_oracle_json(&records, status).expect("serialize oracle intents");
+    let payload: serde_json::Value = serde_json::from_str(&json).expect("payload parses");
+
+    let mut envelope_keys: Vec<&str> = payload
+        .as_object()
+        .expect("envelope is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    envelope_keys.sort_unstable();
+    assert_eq!(
+        envelope_keys,
+        ["claim_honesty", "items", "oracle_status", "results"]
+    );
+
+    let frame = &payload["claim_honesty"];
+    assert_eq!(frame["claim_scope"], "session_close");
+    assert_eq!(frame["freshness_contract"], "historical");
+    assert_eq!(frame["verification_state"], "not_verified_by_aicx");
+
+    let mut record_keys: Vec<&str> = payload["items"][0]
+        .as_object()
+        .expect("record is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    record_keys.sort_unstable();
+    assert_eq!(
+        record_keys,
+        [
+            "agent",
+            "count",
+            "date",
+            "evidence",
+            "kind",
+            "project",
+            "session_id",
+            "source_chunk",
+            "summary",
+            "timestamp",
+        ],
+        "v1 record JSON keys drifted — the honesty threading must stay additive"
+    );
+}
+
+#[test]
+fn record_with_v2_sidecar_honesty_emits_flat_claim_keys() {
+    let records = vec![honesty_probe_record(
+        crate::oracle::ClaimHonesty::canonical(),
+    )];
+
+    let json = format_intents_json(&records).expect("serialize intents");
+    let payload: serde_json::Value = serde_json::from_str(&json).expect("records parse");
+
+    let record = &payload[0];
+    assert_eq!(record["claim_scope"], "session_close");
+    assert_eq!(record["freshness_contract"], "historical");
+    assert_eq!(record["verification_state"], "not_verified_by_aicx");
+}
+
+#[test]
+fn build_candidate_threads_sidecar_honesty_into_record() {
+    let chunk_file = StoredChunkFile {
+        agent: "claude".to_string(),
+        date: "2026-07-02".to_string(),
+        path: PathBuf::from("chunk.md"),
+        project: "aicx".to_string(),
+        sequence: 1,
+        timestamp: Utc::now(),
+        session_id: "sess-b2".to_string(),
+        honesty: crate::oracle::ClaimHonesty::canonical(),
+    };
+
+    let candidate = build_candidate(
+        IntentKind::Intent,
+        "carry the claim honesty frame into intents output",
+        Some("operator must see historical framing".to_string()),
+        &chunk_file,
+        "aicx",
+        "chunk.md",
+        false,
+        None,
+    )
+    .expect("candidate should build");
+
+    assert_eq!(
+        candidate.record.honesty,
+        crate::oracle::ClaimHonesty::canonical()
+    );
 }
 
 // ── C0.1 native regression anchors ───────────────────────────────
@@ -1448,6 +1595,7 @@ fn unresolved_filter_narrows_when_session_resolved() {
             last_chunk: None,
             source_chunk: "/tmp/demo/resolved-intent.md".to_string(),
             source: None,
+            honesty: Default::default(),
         },
         IntentRecord {
             kind: IntentKind::Outcome,
@@ -1464,6 +1612,7 @@ fn unresolved_filter_narrows_when_session_resolved() {
             last_chunk: None,
             source_chunk: "/tmp/demo/resolved-outcome.md".to_string(),
             source: None,
+            honesty: Default::default(),
         },
         IntentRecord {
             kind: IntentKind::Intent,
@@ -1480,6 +1629,7 @@ fn unresolved_filter_narrows_when_session_resolved() {
             last_chunk: None,
             source_chunk: "/tmp/demo/open-intent.md".to_string(),
             source: None,
+            honesty: Default::default(),
         },
     ];
 
@@ -1531,6 +1681,7 @@ fn none_limit_does_not_clip_roadmap() {
             last_chunk: None,
             source_chunk: format!("/tmp/demo/limit-{i}.md"),
             source: None,
+            honesty: Default::default(),
         })
         .collect();
 
@@ -2667,6 +2818,7 @@ mod quality {
                 "/store/Loctree/aicx/2026_0504/conversations/codex/2026_0504_codex_019df273-2c1_027.md"
                     .to_string(),
             source: None,
+            honesty: Default::default(),
         }];
 
         reconcile_session_id_with_path(&mut records);
@@ -2696,6 +2848,7 @@ mod quality {
                 "/store/Loctree/aicx/2026_0504/conversations/codex/2026_0504_codex_019df273-2c1_027.md"
                     .to_string(),
             source: None,
+            honesty: Default::default(),
         }];
 
         reconcile_session_id_with_path(&mut records);
@@ -2722,6 +2875,7 @@ mod quality {
                 timestamp: None,
                 context: None,
                 source: None,
+                honesty: Default::default(),
             },
             IntentRecord {
                 kind: IntentKind::Decision,
@@ -2738,6 +2892,7 @@ mod quality {
                 timestamp: None,
                 context: None,
                 source: None,
+                honesty: Default::default(),
             },
         ];
 
@@ -2772,6 +2927,7 @@ mod quality {
             timestamp: None,
             context: None,
             source: None,
+            honesty: Default::default(),
         }
     }
 
@@ -2894,6 +3050,7 @@ mod area_e_regressions {
             last_chunk: None,
             source_chunk: "chunk-1".to_string(),
             source: None,
+            honesty: Default::default(),
         }
     }
 
@@ -3088,6 +3245,7 @@ mod flexible_dates {
             last_chunk: None,
             source_chunk: format!("/tmp/demo/{summary}.md"),
             source: None,
+            honesty: Default::default(),
         }
     }
 
@@ -3223,6 +3381,7 @@ mod flexible_dates {
             sequence: 1,
             timestamp: Utc::now(),
             session_id: "sess-1".to_string(),
+            honesty: Default::default(),
         };
 
         // Repro case: no context, no evidence -> degraded (returns None)
@@ -3276,6 +3435,7 @@ mod flexible_dates {
             sequence: 1,
             timestamp: Utc::now(),
             session_id: "sess-gate".to_string(),
+            honesty: Default::default(),
         };
 
         let signal_lines: Vec<String> = vec![
@@ -3502,6 +3662,7 @@ Update Cargo.lock dependencies\n";
             sequence: 1,
             timestamp: Utc::now(),
             session_id: "sess-code".to_string(),
+            honesty: Default::default(),
         };
 
         let signal_lines: Vec<String> = vec![
@@ -3623,6 +3784,7 @@ Results:
                 last_chunk: None,
                 source_chunk: "chunk1.md".to_string(),
                 source: None,
+                honesty: Default::default(),
             },
             IntentRecord {
                 kind: IntentKind::Intent,
@@ -3639,6 +3801,7 @@ Results:
                 last_chunk: None,
                 source_chunk: "chunk1.md".to_string(),
                 source: None,
+                honesty: Default::default(),
             },
             IntentRecord {
                 kind: IntentKind::Outcome,
@@ -3655,6 +3818,7 @@ Results:
                 last_chunk: None,
                 source_chunk: "chunk2.md".to_string(),
                 source: None,
+                honesty: Default::default(),
             },
         ];
 
@@ -3710,6 +3874,7 @@ Results:
                 last_chunk: None,
                 source_chunk: "chunk1.md".to_string(),
                 source: None,
+                honesty: Default::default(),
             },
             IntentRecord {
                 kind: IntentKind::Intent,
@@ -3726,6 +3891,7 @@ Results:
                 last_chunk: None,
                 source_chunk: "chunk1.md".to_string(),
                 source: None,
+                honesty: Default::default(),
             },
             IntentRecord {
                 kind: IntentKind::Outcome,
@@ -3742,6 +3908,7 @@ Results:
                 last_chunk: None,
                 source_chunk: "chunk2.md".to_string(),
                 source: None,
+                honesty: Default::default(),
             },
         ];
 
@@ -3775,6 +3942,7 @@ Results:
             sequence: 1,
             timestamp: Utc::now(),
             session_id: "sess-1".to_string(),
+            honesty: Default::default(),
         };
 
         // 1. Voice transcript intent without context/evidence (confidence 2)
@@ -3794,6 +3962,7 @@ Results:
                 last_chunk: None,
                 source_chunk: "chunk.md".to_string(),
                 source: Some("voice_transcript".to_string()),
+                honesty: Default::default(),
             },
             confidence: 2,
             timestamp: chunk_file.timestamp,
@@ -3816,6 +3985,7 @@ Results:
                 last_chunk: None,
                 source_chunk: "chunk.md".to_string(),
                 source: None,
+                honesty: Default::default(),
             },
             confidence: 4,
             timestamp: chunk_file.timestamp,

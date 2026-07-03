@@ -297,6 +297,17 @@ fn collect_chunk_files(
         }) {
             continue;
         }
+        // Claim-honesty frame travels from the v2 sidecar into every record
+        // extracted from this chunk; pre-v2 sidecars leave it empty (rendered
+        // as unknown, serialized as no keys).
+        let honesty = sidecar
+            .as_ref()
+            .map(|sidecar| crate::oracle::ClaimHonesty {
+                claim_scope: sidecar.claim_scope.clone(),
+                freshness_contract: sidecar.freshness_contract.clone(),
+                verification_state: sidecar.verification_state.clone(),
+            })
+            .unwrap_or_default();
         // Legacy chunks (no sidecar yet, or a pre-frame_kind sidecar) belong
         // to the default user_msg lane; requiring an explicit frame_kind here
         // silently emptied intents on stores written before the field existed.
@@ -339,6 +350,7 @@ fn collect_chunk_files(
             sequence: file.chunk,
             timestamp,
             session_id: file.session_id,
+            honesty,
         });
     }
 
@@ -1463,6 +1475,7 @@ fn build_candidate(
             source_chunk: source_chunk.to_string(),
             timestamp: Some(file.timestamp.to_rfc3339()),
             source: source_provenance,
+            honesty: file.honesty.clone(),
         },
         confidence,
         timestamp: file.timestamp,

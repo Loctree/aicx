@@ -3,6 +3,60 @@
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
+use crate::chunker::{
+    CARD_CLAIM_SCOPE_SESSION_CLOSE, CARD_FRESHNESS_CONTRACT_HISTORICAL,
+    CARD_VERIFICATION_STATE_NOT_VERIFIED_BY_AICX,
+};
+
+/// Claim-honesty frame (card contract v2): every intent/decision/outcome the
+/// operator sees from aicx is a HISTORICAL claim valid at session close, not
+/// live runtime truth. Fields mirror the card sidecar; `None` means the source
+/// card predates schema v2 and is rendered as `unknown` on text surfaces.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ClaimHonesty {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim_scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness_contract: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_state: Option<String>,
+}
+
+impl ClaimHonesty {
+    /// Canonical frame stamped on aicx display envelopes: claims are bound to
+    /// session close, historical by contract, and never verified by aicx.
+    pub fn canonical() -> Self {
+        Self {
+            claim_scope: Some(CARD_CLAIM_SCOPE_SESSION_CLOSE.to_string()),
+            freshness_contract: Some(CARD_FRESHNESS_CONTRACT_HISTORICAL.to_string()),
+            verification_state: Some(CARD_VERIFICATION_STATE_NOT_VERIFIED_BY_AICX.to_string()),
+        }
+    }
+
+    /// Compact operator-facing honesty line, e.g.
+    /// `claims: historical @ session close · not verified by aicx`.
+    /// Missing fields (pre-v2 cards) render as `unknown`.
+    pub fn display_line(&self) -> String {
+        let humanize = |value: &str| value.replace('_', " ");
+        let freshness = self
+            .freshness_contract
+            .as_deref()
+            .map(humanize)
+            .unwrap_or_else(|| "unknown".to_string());
+        let scope = self
+            .claim_scope
+            .as_deref()
+            .map(humanize)
+            .unwrap_or_else(|| "claim_scope=unknown".to_string());
+        let verification = self
+            .verification_state
+            .as_deref()
+            .map(humanize)
+            .unwrap_or_else(|| "not verified by aicx".to_string());
+        format!("claims: {freshness} @ {scope} · {verification}")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OracleBackend {
@@ -66,6 +120,10 @@ where
     T: Serialize,
 {
     pub oracle_status: OracleStatus,
+    /// Honesty frame for every item in this envelope: historical claims,
+    /// valid at session close, not verified by aicx. Additive key — existing
+    /// envelope consumers keep their fields untouched.
+    pub claim_honesty: ClaimHonesty,
     pub results: usize,
     pub items: T,
 }
@@ -291,6 +349,55 @@ mod tests {
                 .loctree_scope_note
                 .contains("unsafe_for_scope_narrowing")
         );
+    }
+
+    #[test]
+    fn canonical_claim_honesty_matches_card_contract_constants() {
+        let honesty = ClaimHonesty::canonical();
+
+        assert_eq!(honesty.claim_scope.as_deref(), Some("session_close"));
+        assert_eq!(honesty.freshness_contract.as_deref(), Some("historical"));
+        assert_eq!(
+            honesty.verification_state.as_deref(),
+            Some("not_verified_by_aicx")
+        );
+        assert_eq!(
+            honesty.display_line(),
+            "claims: historical @ session close · not verified by aicx"
+        );
+    }
+
+    #[test]
+    fn empty_claim_honesty_renders_unknown_scope_not_a_fake_frame() {
+        // Pre-v2 cards carry no honesty fields; the display line must say so
+        // instead of implying a canonical frame that was never stamped.
+        let honesty = ClaimHonesty::default();
+
+        let line = honesty.display_line();
+        assert!(line.contains("claim_scope=unknown"), "line was: {line}");
+        assert!(line.starts_with("claims: unknown @ "), "line was: {line}");
+        assert!(line.ends_with("not verified by aicx"), "line was: {line}");
+
+        // Default (absent) honesty must serialize to ZERO keys so v1 records
+        // stay byte-identical on JSON surfaces.
+        let json = serde_json::to_value(&honesty).expect("serialize honesty");
+        assert_eq!(json, serde_json::json!({}));
+    }
+
+    #[test]
+    fn oracle_envelope_carries_claim_honesty_frame() {
+        let envelope = OracleEnvelope {
+            oracle_status: OracleStatus::canonical_corpus_scan(Path::new("/tmp/aicx"), 2, 2, true),
+            claim_honesty: ClaimHonesty::canonical(),
+            results: 0,
+            items: Vec::<u8>::new(),
+        };
+
+        let json = serde_json::to_value(&envelope).expect("serialize envelope");
+        let frame = &json["claim_honesty"];
+        assert_eq!(frame["claim_scope"], "session_close");
+        assert_eq!(frame["freshness_contract"], "historical");
+        assert_eq!(frame["verification_state"], "not_verified_by_aicx");
     }
 
     #[test]

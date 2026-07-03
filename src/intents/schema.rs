@@ -2372,6 +2372,7 @@ mod tests {
             last_chunk: None,
             source_chunk: "chunk-1".to_string(),
             source: None,
+            honesty: Default::default(),
         };
 
         let fractures = detect_contract_fractures(&[intent], &[], &[]);
@@ -2403,6 +2404,7 @@ mod tests {
             last_chunk: None,
             source_chunk: "chunk-1".to_string(),
             source: None,
+            honesty: Default::default(),
         };
 
         let claim = ClaimRecord {

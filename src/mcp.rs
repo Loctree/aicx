@@ -2104,6 +2104,56 @@ mod tests {
     }
 
     #[test]
+    fn aicx_intents_json_payload_carries_claim_honesty_frame() {
+        // B2: the `aicx_intents` JSON branch serializes through
+        // `intents::format_intents_oracle_json`; this locks the exact payload
+        // the MCP tool returns so every consumer sees the honesty frame —
+        // historical claims at session close, not verified by aicx.
+        let records = vec![crate::intents::IntentRecord {
+            kind: crate::intents::IntentKind::Intent,
+            summary: "expose honesty frame over MCP".to_string(),
+            context: None,
+            evidence: vec![],
+            project: "Loctree/aicx".to_string(),
+            agent: "claude".to_string(),
+            date: "2026-07-02".to_string(),
+            timestamp: None,
+            session_id: "sess-mcp-b2".to_string(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: "/tmp/aicx/mcp-b2.md".to_string(),
+            source: None,
+            honesty: crate::oracle::ClaimHonesty::canonical(),
+        }];
+        let oracle_status = crate::oracle::OracleStatus::canonical_corpus_scan(
+            std::path::Path::new("/tmp/aicx"),
+            1,
+            1,
+            true,
+        );
+
+        let body = crate::intents::format_intents_oracle_json(&records, oracle_status)
+            .expect("serialize intents payload");
+        let payload: serde_json::Value =
+            serde_json::from_str(&body).expect("intents payload parses");
+
+        // Envelope-level frame is always present with canonical values.
+        assert_eq!(payload["claim_honesty"]["claim_scope"], "session_close");
+        assert_eq!(payload["claim_honesty"]["freshness_contract"], "historical");
+        assert_eq!(
+            payload["claim_honesty"]["verification_state"],
+            "not_verified_by_aicx"
+        );
+        // Record-level flat keys surface when the source card sidecar has them.
+        assert_eq!(payload["items"][0]["claim_scope"], "session_close");
+        assert_eq!(
+            payload["items"][0]["verification_state"],
+            "not_verified_by_aicx"
+        );
+    }
+
+    #[test]
     fn embedder_negative_ttl_is_five_minutes() {
         // D-6: production TTL is five minutes; a regression to the test-only
         // 30s value would let a flapping endpoint retry-storm an unhealthy

@@ -3,6 +3,29 @@ use filetime::{FileTime, set_file_mtime};
 use std::fs;
 
 #[test]
+fn intents_pack_report_carries_header_level_honesty_notice() {
+    // B2: the default `aicx intents` text surface is the pack report; its
+    // header metadata must carry the honesty frame so a weeks-old INTENT
+    // never reads like current runtime truth.
+    let sections: Vec<IntentPackSection> = Vec::new();
+
+    let out = format_intents_pack_markdown("(all projects)", 720, Some(10), &sections);
+
+    assert!(
+        out.contains("- claims: historical @ session close · not verified by aicx\n"),
+        "pack report header lost the honesty notice:\n{out}"
+    );
+    let notice_pos = out
+        .find("- claims: historical @ session close")
+        .expect("notice present");
+    let source_pos = out.find("- source: canonical corpus").expect("source line");
+    assert!(
+        source_pos < notice_pos,
+        "honesty notice should sit with the header metadata lines"
+    );
+}
+
+#[test]
 fn default_intents_markdown_uses_pack_report() {
     let sections = vec![
         IntentPackSection {
@@ -22,6 +45,7 @@ fn default_intents_markdown_uses_pack_report() {
                 last_chunk: None,
                 source_chunk: "chunk-a.md".to_string(),
                 source: None,
+                honesty: Default::default(),
             }],
         },
         IntentPackSection {
