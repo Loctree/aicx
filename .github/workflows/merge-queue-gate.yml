@@ -37,7 +37,7 @@ jobs:
     name: cargo check (workspace)
     runs-on: [ self-hosted, ops-linux ]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - name: Cargo check --locked --workspace
         run: cargo check --locked --workspace --all-targets
 
@@ -65,11 +65,11 @@ jobs:
             npm_package_dir: distribution/npm/aicx/platform-packages/win32-x64-gnu
             bash: 'C:\Program Files\Git\bin\bash.exe -eo pipefail {0}'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: 24.11.1
           registry-url: "https://registry.npmjs.org"
