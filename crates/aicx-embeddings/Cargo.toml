@@ -1,6 +1,6 @@
 [package]
 name = "aicx-embeddings"
-version = "0.9.4"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Embedding providers for aicx and rust-memex: local GGUF and OpenAI-compatible HTTP backends"

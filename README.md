@@ -148,6 +148,12 @@ cargo install --locked aicx --features native-embedder
 
 Prebuilt releases + the smart `install.sh` that ships with them are the recommended path for non-Rust users. See `docs/install-paths.md`.
 
+Pin a specific release instead of `latest`:
+
+```bash
+AICX_INSTALL_MODE=release AICX_RELEASE_TAG=v0.10.0 bash install.sh
+```
+
 npm wrapper (`@loctree/aicx`) also exists.
 
 ## Development

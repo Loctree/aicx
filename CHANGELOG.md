@@ -5,6 +5,79 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-05
+
+### Added
+
+- **Card schema v2** for the canonical store: versioned sidecars
+  (`schema_version: 2`), YAML `card.v2` frontmatter replacing the legacy
+  bracket header, an L0 provenance pointer (`source { path, sha256, span }`
+  to the raw session file), and claim-honesty metadata
+  (`claim_scope=session_close`, `freshness_contract=historical`,
+  `verification_state=not_verified_by_aicx`) on every new card. Contract:
+  `docs/CARD_CONTRACT.md`.
+- **Typed signals**: `ChunkSignals` now serialize as structured
+  `signals[]` records (`kind`, `text`, `line_span`, `extractor_version`) in
+  the sidecar; the md `[signals]` block is a deterministic render of those
+  records instead of the only artifact.
+- `aicx corpus validate-cards [ROOT] [--strict] [--json]` — card contract
+  gate: schema/versioning checks, full-file `content_sha256` verification,
+  header-form consistency, placeholder ban, harness-noise heuristic, and
+  md↔sidecar signal parity, with a born-v2 vs migrated-v2 severity policy.
+- `aicx migrate --cards-v2 [ROOT] [--apply]` — in-place v1→v2 store
+  migration: dry-run by default, streaming walk, per-file manifest with the
+  old header preserved for reversibility, body-byte invariance enforced by
+  a hard sha256 pre/post check, `migrated_from_schema: 1` marker, and
+  refreshed `content_sha256` after the header rewrite.
+- **Evidence mode** (`aicx search --evidence`, MCP `aicx_search`
+  `evidence: true`): evidence packets with answer/support re-ranking,
+  verified source paths, and oracle-status envelopes.
+- **Search quality**: TOML-seeded quality eval harness
+  (`aicx eval search-quality`), anchored-answer preference, content-first
+  excerpts, scoped-fallback and project-bucket fixes, and a lighter Polish
+  stemming profile in the Tantivy adapter.
+- **Intent taxonomy** extended with Task & Commitment kinds; every
+  `[signals]`-sourced record now carries provenance tags and is revalidated
+  through the shared classifier (document-role awareness skips pasted
+  commit/changelog blocks; code/log fragments are dropped).
+- **Claim-honesty frame on display surfaces**: `aicx intents` (text + JSON)
+  and MCP `aicx_intents`/`aicx_search` payloads label claims as
+  `historical @ session close · not verified by aicx`.
+- **CLI/MCP search parity**: shared `fuzzy_search_with_post_filters` +
+  `finalize_fuzzy_results` so ordering/limit semantics are identical across
+  surfaces; end-to-end parity test.
+- **MCP host contract**: `--host`, `--allowed-host` (repeatable),
+  `--allow-any-host`, HTTP `Host`-header validation with an explicit
+  trust policy, Bearer-auth token cascade documentation, and
+  `aicx doctor` MCP version-pair diagnostics.
+- Operator-markdown imports carry structural provenance
+  (`source_file`/`source_format`/content-hash `import_id`); ChatGPT exports
+  are dated from their `Created` header instead of file mtime.
+
+### Changed
+
+- Card readers are header-agnostic (bracket v1 or frontmatter v2) through a
+  single shared `card_header` helper, and prefer sidecar metadata over
+  re-parsing the md header.
+- Repository deprivatized for public release: personal names, contact
+  addresses, internal infra references, and internal planning docs removed;
+  npm/crate author metadata now `Vetcoders <hello@vetcoders.io>`.
+- GitHub Actions workflows pin every action to a full commit SHA
+  (supply-chain hardening; semgrep `github-actions-mutable-action-tag`
+  gate is clean).
+
+### Fixed
+
+- MCP HTTP security posture: non-loopback binds refuse to start without
+  auth; loopback-only `--no-require-auth`; a bare all-interfaces bind
+  without `--allowed-host` disables Host validation explicitly (tailnet
+  flow) while staying Bearer-gated.
+- CLI pre-parse hints (`--source` requirement, `config --show` hint) fire
+  only on the top-level subcommand instead of matching anywhere in argv.
+- `~/`-prefixed frontmatter `cwd` values expand with native path separators
+  on every platform (fixes windows-latest CI on operator-md ingest).
+- Search-seed project discovery paths guarded in the eval harness.
+
 ## [0.9.4] - 2026-06-20
 
 ### Added
