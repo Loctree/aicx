@@ -1,6 +1,6 @@
 [package]
 name = "aicx-retrieve"
-version = "0.9.4"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.91.1"
 license = "BUSL-1.1"
@@ -15,7 +15,7 @@ categories = ["text-processing", "development-tools"]
 
 [dependencies]
 anyhow = "1.0"
-aicx-parser = { path = "../aicx-parser", version = "0.9.4" }
+aicx-parser = { path = "../aicx-parser", version = "0.10.0" }
 blake3 = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"

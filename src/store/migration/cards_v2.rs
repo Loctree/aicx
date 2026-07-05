@@ -1060,6 +1060,10 @@ mod tests {
         assert!(without_source.get("source").is_none());
     }
 
+    // The composition half of this suite calls the corpus validator, which is
+    // app-surface — the slim `loctree-consumer` profile compiles this crate
+    // without `crate::corpus`, so the test must be gated with it.
+    #[cfg(feature = "app")]
     #[test]
     fn apply_then_validate_composes_for_migrated_legacy_cards() {
         let root = cards_v2_test_root("compose-validate");

@@ -1,6 +1,6 @@
 {
   "name": "@loctree/aicx-win32-x64-gnu",
-  "version": "0.9.4",
+  "version": "0.10.0",
   "description": "aicx + aicx-mcp binaries for Windows x64 (MinGW-w64 GNU)",
   "keywords": [
     "aicx",
