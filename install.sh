@@ -851,7 +851,13 @@ download_release_bundle() {
   checksum_path="$tmp_dir/${archive_name}.sha256"
 
   cleanup_release_tmp() {
-    rm -rf "$tmp_dir"
+    # The EXIT trap runs at global scope after the function stack is unwound
+    # (e.g. when `set -e` aborts on the delegated installer failing), so the
+    # `local tmp_dir` is no longer in scope. Guard against nounset and skip the
+    # removal when it is empty/unset.
+    if [ -n "${tmp_dir:-}" ]; then
+      rm -rf "$tmp_dir"
+    fi
   }
   trap cleanup_release_tmp EXIT
 
