@@ -889,8 +889,19 @@ archive_path = Path(os.environ["ARCHIVE_PATH"])
 dest_dir = Path(os.environ["DEST_DIR"])
 
 if archive_path.name.endswith(".zip"):
+    # zipfile.extractall does NOT restore POSIX modes from external_attr, so the
+    # bundled `aicx`/`aicx-mcp`/`install.sh` would land as 0644 and the delegated
+    # bundled installer would reject them (no executable bit). Extract per entry
+    # and restore the mode from the high 16 bits of external_attr. Skip macOS
+    # AppleDouble (`._*`) sidecar entries produced by the system zip tool.
     with zipfile.ZipFile(archive_path) as archive:
-        archive.extractall(dest_dir)
+        for info in archive.infolist():
+            if os.path.basename(info.filename).startswith("._"):
+                continue
+            extracted = archive.extract(info, dest_dir)
+            mode = info.external_attr >> 16
+            if mode:
+                os.chmod(extracted, mode)
 elif archive_path.name.endswith(".tar.gz"):
     with tarfile.open(archive_path, "r:gz") as archive:
         archive.extractall(dest_dir)
