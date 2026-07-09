@@ -1273,3 +1273,125 @@ fn scan_index_entries_kind_filter_excludes_non_matching() {
     let scan2 = scan_index_entries(ok_lines(lines), &q, Some("session"), None).expect("scan");
     assert_eq!(scan2.hits.len(), 2);
 }
+
+// ---------------------------------------------------------------------------
+// Batched-embedding logic (perf fix): grouping, batch fast path, retry, and
+// per-item poison fallback. Exercised against a mock so no live endpoint or
+// GGUF model is required.
+// ---------------------------------------------------------------------------
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+mod batch {
+    use super::super::{BatchEmbedder, embed_batch_spans, embed_batch_with_fallback};
+    use anyhow::{Result, anyhow};
+
+    /// Scripted embedder: fails the first `fail_batch_times` batch calls,
+    /// and any per-item embed whose text starts with `"poison"`. All other
+    /// outputs are a constant `dim`-length vector so callers can assert
+    /// success without caring about values.
+    struct MockEmbedder {
+        dim: usize,
+        fail_batch_times: usize,
+        batch_calls: usize,
+        one_calls: usize,
+    }
+
+    impl MockEmbedder {
+        fn new(dim: usize, fail_batch_times: usize) -> Self {
+            Self {
+                dim,
+                fail_batch_times,
+                batch_calls: 0,
+                one_calls: 0,
+            }
+        }
+    }
+
+    impl BatchEmbedder for MockEmbedder {
+        fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.batch_calls += 1;
+            if self.batch_calls <= self.fail_batch_times {
+                return Err(anyhow!("mock batch failure #{}", self.batch_calls));
+            }
+            Ok(texts.iter().map(|_| vec![1.0; self.dim]).collect())
+        }
+
+        fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
+            self.one_calls += 1;
+            if text.starts_with("poison") {
+                return Err(anyhow!("mock poison item"));
+            }
+            Ok(vec![2.0; self.dim])
+        }
+    }
+
+    fn prefixes(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn spans_cover_range_without_gaps() {
+        // 64 capped items, batch 16 -> exactly 4 full batches, covering 0..64.
+        let spans = embed_batch_spans(64, 16);
+        assert_eq!(spans, vec![(0, 16), (16, 32), (32, 48), (48, 64)]);
+        let total: usize = spans.iter().map(|(s, e)| e - s).sum();
+        assert_eq!(total, 64, "spans must cover every capped item once");
+    }
+
+    #[test]
+    fn spans_handle_partial_tail_and_small_counts() {
+        // sample-limit interaction: a cap smaller than one batch is a single
+        // short batch, never an empty or over-long span.
+        assert_eq!(embed_batch_spans(10, 16), vec![(0, 10)]);
+        assert_eq!(embed_batch_spans(0, 16), Vec::<(usize, usize)>::new());
+        // batch_size 0 degrades to serial (size 1), never an infinite loop.
+        assert_eq!(embed_batch_spans(3, 0), vec![(0, 1), (1, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn batch_happy_path_is_single_call_no_fallback() {
+        let mut e = MockEmbedder::new(4, 0);
+        let out = embed_batch_with_fallback(&mut e, &prefixes(&["a", "b", "c", "d"]));
+        assert_eq!(out.len(), 4);
+        assert!(out.iter().all(|r| r.is_ok()));
+        assert_eq!(e.batch_calls, 1, "one batch call for the whole slice");
+        assert_eq!(e.one_calls, 0, "happy path must not touch per-item embed");
+    }
+
+    #[test]
+    fn batch_retries_once_before_falling_back() {
+        // First batch call fails, second succeeds -> no per-item fallback.
+        let mut e = MockEmbedder::new(4, 1);
+        let out = embed_batch_with_fallback(&mut e, &prefixes(&["a", "b", "c"]));
+        assert!(out.iter().all(|r| r.is_ok()));
+        assert_eq!(e.batch_calls, 2, "one failure + one retry");
+        assert_eq!(e.one_calls, 0, "successful retry must skip per-item path");
+    }
+
+    #[test]
+    fn batch_falls_back_per_item_and_isolates_poison() {
+        // Both batch attempts fail; per-item fallback isolates the poison
+        // chunk as Err while its neighbors still succeed. One bad chunk must
+        // not sink the whole batch.
+        let mut e = MockEmbedder::new(4, 2);
+        let out = embed_batch_with_fallback(&mut e, &prefixes(&["good-1", "poison-x", "good-2"]));
+        assert_eq!(e.batch_calls, 2, "batch attempted twice before fallback");
+        assert_eq!(e.one_calls, 3, "every item retried individually");
+        assert!(out[0].is_ok());
+        assert!(out[1].is_err(), "poison chunk is the only failure");
+        assert!(out[2].is_ok());
+    }
+
+    #[test]
+    fn single_item_skips_batch_call() {
+        let mut e = MockEmbedder::new(4, 0);
+        let out = embed_batch_with_fallback(&mut e, &prefixes(&["solo"]));
+        assert_eq!(out.len(), 1);
+        assert!(out[0].is_ok());
+        assert_eq!(
+            e.batch_calls, 0,
+            "a batch of one goes straight to embed_one"
+        );
+        assert_eq!(e.one_calls, 1);
+    }
+}
