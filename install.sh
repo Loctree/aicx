@@ -1152,12 +1152,12 @@ echo "  aicx      - command-line tool for indexing and searching agent history"
 echo "  aicx-mcp  - MCP server for Claude Code, Codex and Gemini"
 echo ""
 echo "Install path:"
-echo "  $AICX_BIN_DIR"
-if path_has_dir "$AICX_BIN_DIR"; then
+echo "  $INSTALL_TARGET_BIN_DIR"
+if path_has_dir "$INSTALL_TARGET_BIN_DIR"; then
   echo "  This path is already available in PATH."
 else
   echo "  Add this path to PATH so new shells pick up the bundled install first."
-  echo "  Example: export PATH=\"$AICX_BIN_DIR:\$PATH\""
+  echo "  Example: export PATH=\"$INSTALL_TARGET_BIN_DIR:\$PATH\""
 fi
 echo ""
 if [ -d "$HOME/.ai-contexters" ]; then
