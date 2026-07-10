@@ -321,6 +321,179 @@ fn incremental_round_trip_appends_only_new_rows() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Build an `EmbeddingModelInfo` matching the headers written by the
+/// resume-checkpoint tests below (profile `base`, dimension `dim`).
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn test_model_info(dim: usize) -> crate::embedder::EmbeddingModelInfo {
+    crate::embedder::EmbeddingModelInfo {
+        model_id: "test-model".into(),
+        dimension: dim,
+        backend: "test".into(),
+        profile: crate::embedder::EmbeddingProfile::Base,
+        source: crate::embedder::NativeEmbeddingSource::ExplicitPath(std::path::PathBuf::from("")),
+    }
+}
+
+/// Serialize a well-formed resume checkpoint (header + `count` id rows)
+/// into `path`. Ids are `existing-{i}`. When `trailing_newline` is false
+/// the final row is written without a terminating `\n`, mirroring a build
+/// killed mid-write.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn write_resume_checkpoint(path: &Path, dim: usize, count: usize, trailing_newline: bool) {
+    let header = IndexHeader {
+        schema_version: INDEX_SCHEMA_VERSION.into(),
+        model_id: "test-model".into(),
+        model_profile: "base".into(),
+        dimension: dim,
+        generated_at: "2026-05-15T12:00:00Z".into(),
+        entry_count: 0,
+    };
+    let embedding: Vec<f32> = (0..dim).map(|_| 0.1_f32).collect();
+    let mut body = serde_json::to_string(&header).unwrap();
+    body.push('\n');
+    for i in 0..count {
+        body.push_str(&make_entry_line(
+            &format!("existing-{i}"),
+            embedding.clone(),
+        ));
+        body.push('\n');
+    }
+    if !trailing_newline {
+        body.pop();
+    }
+    std::fs::write(path, &body).unwrap();
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[test]
+fn load_resume_tmp_index_reads_full_checkpoint_and_flags_newline() {
+    // Resume precedence input: an interrupted full build leaves a `.tmp`
+    // checkpoint. The loader must surface every embedded id and the exact
+    // row count so the classifier can skip them — and must report whether
+    // the file needs a repair newline before append. If this returned
+    // `None`/short counts the resume path would silently re-embed.
+    let dir = tempdir_for_test();
+    let tmp = dir.join("embeddings.ndjson.tmp");
+    let info = test_model_info(4);
+
+    // Well-formed checkpoint (ends with `\n`).
+    write_resume_checkpoint(&tmp, 4, 6, true);
+    let state = load_resume_tmp_index(&tmp, &info)
+        .unwrap()
+        .expect("checkpoint must be resumable");
+    assert_eq!(state.rows, 6, "all 6 embedded rows counted");
+    assert_eq!(state.ids.len(), 6, "all 6 ids captured for skip set");
+    for i in 0..6 {
+        assert!(
+            state.ids.contains(&format!("existing-{i}")),
+            "id existing-{i} must be in the resume skip set"
+        );
+    }
+    assert!(
+        !state.needs_newline,
+        "trailing newline present -> no repair"
+    );
+
+    // Checkpoint killed mid-write (no trailing newline) must flag repair
+    // so the appended rows do not glue onto a partial last line.
+    write_resume_checkpoint(&tmp, 4, 6, false);
+    let state = load_resume_tmp_index(&tmp, &info).unwrap().unwrap();
+    assert_eq!(
+        state.rows, 6,
+        "partial-newline checkpoint still counts rows"
+    );
+    assert!(
+        state.needs_newline,
+        "missing trailing newline -> repair before append"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[test]
+fn resume_appends_new_rows_without_truncating_checkpoint() {
+    // Regression: the resume path must APPEND onto the surviving `.tmp`
+    // checkpoint, never truncate + re-seed it. Repro shape: a full build
+    // is interrupted with K embedded rows; resuming classifies the first
+    // K chunks as already-done (skip) and only embeds the M new ones, so
+    // the file ends with K + M rows and the original K are byte-preserved.
+    let dir = tempdir_for_test();
+    let tmp = dir.join("embeddings.ndjson.tmp");
+    let info = test_model_info(4);
+
+    const K: usize = 5;
+    const M: usize = 3;
+
+    // Interrupted full build: K embedded rows in the checkpoint.
+    write_resume_checkpoint(&tmp, 4, K, true);
+    let before = std::fs::read_to_string(&tmp).unwrap();
+    let original_rows: Vec<String> = before.lines().skip(1).map(str::to_string).collect();
+    assert_eq!(original_rows.len(), K, "checkpoint seeded with K rows");
+
+    // Resume reads the checkpoint -> skip set of the K embedded ids.
+    let state = load_resume_tmp_index(&tmp, &info).unwrap().unwrap();
+    let resumed_ids: HashSet<String> = state.ids.clone();
+
+    // Phase-1 classification (production predicate): the capped window is
+    // the K already-embedded chunks followed by M fresh ones. Ids come
+    // from `chunk_id_from_path`, exactly as the embed loop derives them.
+    let mut to_embed = Vec::new();
+    let mut skipped = 0usize;
+    let existing_paths: Vec<std::path::PathBuf> = (0..K)
+        .map(|i| dir.join(format!("existing-{i}.md")))
+        .collect();
+    let fresh_paths: Vec<std::path::PathBuf> =
+        (0..M).map(|i| dir.join(format!("fresh-{i}.md"))).collect();
+    for path in existing_paths.iter().chain(fresh_paths.iter()) {
+        let entry_id = chunk_id_from_path(path);
+        if resumed_ids.contains(&entry_id) {
+            skipped += 1;
+        } else {
+            to_embed.push(entry_id);
+        }
+    }
+    assert_eq!(skipped, K, "the K embedded chunks are resume-skipped");
+    assert_eq!(
+        to_embed.len(),
+        M,
+        "only the M new chunks flow to the embedder"
+    );
+    assert!(
+        to_embed.iter().all(|id| id.starts_with("fresh-")),
+        "zero re-embed of already-committed chunks"
+    );
+
+    // Resume writer (production sequencing): open with append(true), never
+    // create/truncate, then write the M new rows.
+    {
+        use std::fs::OpenOptions;
+        use std::io::{BufWriter, Write};
+        let mut writer = BufWriter::new(OpenOptions::new().append(true).open(&tmp).unwrap());
+        let embedding: Vec<f32> = vec![0.5, 0.6, 0.7, 0.8];
+        for id in &to_embed {
+            writeln!(writer, "{}", make_entry_line(id, embedding.clone())).unwrap();
+        }
+    }
+
+    // File ends with K + M rows; the original K are byte-identical.
+    let after = std::fs::read_to_string(&tmp).unwrap();
+    let data: Vec<&str> = after.lines().skip(1).collect();
+    assert_eq!(
+        data.len(),
+        K + M,
+        "checkpoint grew to K + M rows (no truncation)"
+    );
+    for (i, original) in original_rows.iter().enumerate() {
+        assert_eq!(data[i], original, "original row {i} preserved verbatim");
+    }
+    for row in data.iter().skip(K) {
+        assert!(row.contains("fresh-"), "appended rows are the new chunks");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 #[test]
 fn rewrite_index_with_truthful_header_replaces_placeholder_and_preserves_entries() {

@@ -868,12 +868,33 @@ pub fn write_index_with_options(
             .with_context(|| format!("create index dir: {}", parent.display()))?;
     }
 
+    // Detect a resumable full-build checkpoint BEFORE choosing the walk
+    // strategy. A surviving `.tmp` from an interrupted full (`sample == 0`)
+    // build is authoritative and must be *appended* to, never clobbered.
+    // Only `sample == 0` builds ever write `.tmp`; a `sample != 0` run with
+    // a checkpoint present is already rejected by the guard above, so this
+    // never truncates a diagnostic checkpoint.
+    //
+    // Crucially the checkpoint takes precedence over the incremental walk
+    // even when a committed index ALSO exists. Without this, resuming via
+    // the operator-advised `aicx index --sample 0` would take the
+    // incremental branch, truncate the checkpoint, and re-seed it from the
+    // (typically smaller) committed body — silently discarding every
+    // embedded row accumulated by the interrupted full build.
+    let resume = if sample == 0 {
+        load_resume_tmp_index(&tmp_path, &info)?
+    } else {
+        None
+    };
+
     // G-3: decide build mode. `--full-rescan` always rebuilds from zero.
     // `sample != 0` is a deterministic-subset diagnostic mode, also full.
-    // Otherwise look for a compatible committed index — if absent or
-    // incompatible (dim/model/profile drift), fall back to full so the
-    // operator does not silently mix model outputs.
-    let incremental_baseline = if options.full_rescan || sample != 0 {
+    // A live resume checkpoint forces a full-build continuation, so the
+    // incremental walk is suppressed. Otherwise look for a compatible
+    // committed index — if absent or incompatible (dim/model/profile
+    // drift), fall back to full so the operator does not silently mix
+    // model outputs.
+    let incremental_baseline = if options.full_rescan || sample != 0 || resume.is_some() {
         None
     } else {
         load_incremental_baseline(&target_path, &info)?
@@ -891,14 +912,6 @@ pub fn write_index_with_options(
         files.len()
     } else {
         sample.min(files.len())
-    };
-    // Resume-from-checkpoint only applies to a full rebuild; an
-    // incremental walk never writes to `ndjson.tmp` so there is nothing
-    // to resume from.
-    let resume = if sample == 0 && incremental_baseline.is_none() {
-        load_resume_tmp_index(&tmp_path, &info)?
-    } else {
-        None
     };
     let resumed_ids: HashSet<String> = resume
         .as_ref()
