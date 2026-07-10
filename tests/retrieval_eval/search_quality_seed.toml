@@ -244,7 +244,7 @@ map_id = "claude__f30e5b56__2026-06-10__ec142ff3"
 expected_terms = ["MockVistaAutocompleteEngine", "qube_ffi.swift.patch:629", "continuation", "fatalError"]
 terms_match = "any"
 
-# ---------- ScreenScribe ----------
+# ---------- Screenscribe ----------
 
 [[questions]]
 id = "screenscribe-race-disaster"
@@ -362,7 +362,7 @@ map_id = "claude__21852ec7__2026-06-14__ae23ef0f"
 expected_terms = ["OPENAI_API_KEY", ".zshrc", "plaintext", "zrotuj"]
 terms_match = "any"
 
-# ---------- v3 additions: Pensieve / ScreenScribe / Loctree ----------
+# ---------- v3 additions: Pensieve / Screenscribe / Loctree ----------
 
 [[questions]]
 id = "pensieve-stoprecording-cadence"
