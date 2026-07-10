@@ -851,7 +851,13 @@ download_release_bundle() {
   checksum_path="$tmp_dir/${archive_name}.sha256"
 
   cleanup_release_tmp() {
-    rm -rf "$tmp_dir"
+    # The EXIT trap runs at global scope after the function stack is unwound
+    # (e.g. when `set -e` aborts on the delegated installer failing), so the
+    # `local tmp_dir` is no longer in scope. Guard against nounset and skip the
+    # removal when it is empty/unset.
+    if [ -n "${tmp_dir:-}" ]; then
+      rm -rf "$tmp_dir"
+    fi
   }
   trap cleanup_release_tmp EXIT
 
@@ -889,8 +895,19 @@ archive_path = Path(os.environ["ARCHIVE_PATH"])
 dest_dir = Path(os.environ["DEST_DIR"])
 
 if archive_path.name.endswith(".zip"):
+    # zipfile.extractall does NOT restore POSIX modes from external_attr, so the
+    # bundled `aicx`/`aicx-mcp`/`install.sh` would land as 0644 and the delegated
+    # bundled installer would reject them (no executable bit). Extract per entry
+    # and restore the mode from the high 16 bits of external_attr. Skip macOS
+    # AppleDouble (`._*`) sidecar entries produced by the system zip tool.
     with zipfile.ZipFile(archive_path) as archive:
-        archive.extractall(dest_dir)
+        for info in archive.infolist():
+            if os.path.basename(info.filename).startswith("._"):
+                continue
+            extracted = archive.extract(info, dest_dir)
+            mode = info.external_attr >> 16
+            if mode:
+                os.chmod(extracted, mode)
 elif archive_path.name.endswith(".tar.gz"):
     with tarfile.open(archive_path, "r:gz") as archive:
         archive.extractall(dest_dir)
@@ -1135,12 +1152,12 @@ echo "  aicx      - command-line tool for indexing and searching agent history"
 echo "  aicx-mcp  - MCP server for Claude Code, Codex and Gemini"
 echo ""
 echo "Install path:"
-echo "  $AICX_BIN_DIR"
-if path_has_dir "$AICX_BIN_DIR"; then
+echo "  $INSTALL_TARGET_BIN_DIR"
+if path_has_dir "$INSTALL_TARGET_BIN_DIR"; then
   echo "  This path is already available in PATH."
 else
   echo "  Add this path to PATH so new shells pick up the bundled install first."
-  echo "  Example: export PATH=\"$AICX_BIN_DIR:\$PATH\""
+  echo "  Example: export PATH=\"$INSTALL_TARGET_BIN_DIR:\$PATH\""
 fi
 echo ""
 if [ -d "$HOME/.ai-contexters" ]; then
