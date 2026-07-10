@@ -604,7 +604,8 @@ fn derive_project_index_from_all_streams_matching_rows_only() {
     }
     std::fs::write(&all_index, body).expect("write synthetic all index");
 
-    let stats = derive_project_index_from_all("vetcoders/example-app").expect("derive project index");
+    let stats =
+        derive_project_index_from_all("vetcoders/example-app").expect("derive project index");
     assert_eq!(stats.entries_written, 2);
 
     let project_index = index_path(Some("vetcoders/example-app")).expect("project index path");
