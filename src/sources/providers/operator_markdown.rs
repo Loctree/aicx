@@ -907,7 +907,7 @@ pub(crate) fn resolve_operator_cwd_hint(
                 .join(org)
                 .join(repo),
             home.join("Libraxis")
-                .join("01_deployed_libraxis_vm")
+                .join("01_deployed_sample_vm")
                 .join(org)
                 .join(repo),
             home.join("hosted").join(org).join(repo),
@@ -920,7 +920,7 @@ pub(crate) fn resolve_operator_cwd_hint(
             home.join("Libraxis").join(repo),
             home.join("Libraxis").join("vc-runtime").join(repo),
             home.join("Libraxis")
-                .join("01_deployed_libraxis_vm")
+                .join("01_deployed_sample_vm")
                 .join(repo),
             home.join("hosted").join("Vetcoders").join(repo),
             home.join("vc-workspace").join("Vetcoders").join(repo),

@@ -523,7 +523,7 @@ fn resolve_codescribe_cwd_hint(home: &Path, project_hint: Option<&str>) -> Optio
             home.join(org).join(repo),
             home.join("Libraxis").join(org).join(repo),
             home.join("Libraxis")
-                .join("01_deployed_libraxis_vm")
+                .join("01_deployed_sample_vm")
                 .join(org)
                 .join(repo),
             home.join("Libraxis")
@@ -538,7 +538,7 @@ fn resolve_codescribe_cwd_hint(home: &Path, project_hint: Option<&str>) -> Optio
             home.join(repo),
             home.join("Libraxis").join(repo),
             home.join("Libraxis")
-                .join("01_deployed_libraxis_vm")
+                .join("01_deployed_sample_vm")
                 .join(repo),
             home.join("Libraxis").join("vc-runtime").join(repo),
             home.join("hosted").join("Vetcoders").join(repo),
