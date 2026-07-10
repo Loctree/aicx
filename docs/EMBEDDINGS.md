@@ -6,7 +6,7 @@
 ## Product Truth
 
 AICX now treats the native embedder as its first-choice local embedding path,
-not as a fallback behind rust-memex.
+not as a fallback behind memex.
 
 The split is:
 
