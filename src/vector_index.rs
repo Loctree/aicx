@@ -656,6 +656,85 @@ fn maybe_emit_stats_tick(
     *last_tick = Instant::now();
 }
 
+/// Minimal embedding surface the batch loop needs. Split out from the
+/// concrete [`crate::embedder::EmbeddingEngine`] so the batch + fallback
+/// logic is unit-testable against a mock — no live endpoint or model.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub(crate) trait BatchEmbedder {
+    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+    fn embed_one(&mut self, text: &str) -> Result<Vec<f32>>;
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+impl BatchEmbedder for crate::embedder::EmbeddingEngine {
+    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        crate::embedder::EmbeddingEngine::embed_batch(self, texts)
+    }
+
+    fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
+        self.embed(text)
+    }
+}
+
+/// Embed a batch of chunk prefixes with graceful degradation.
+///
+/// Attempt order:
+/// 1. One `embed_batch` for the whole slice — the fast path (a single HTTP
+///    round-trip for the cloud backend instead of one per chunk).
+/// 2. On a transport error, retry the whole batch exactly once — covers a
+///    transient endpoint hiccup / rate-limit blip.
+/// 3. On persistent failure (or a provider that returns the wrong count),
+///    fall back to per-item `embed_one` so a single poison chunk is
+///    isolated as one `Err` rather than sinking the whole batch.
+///
+/// Returns one `Result` per input, index-aligned with `prefixes`. A
+/// single-element input goes straight to `embed_one` (a batch of one has
+/// no latency win and keeps the retry semantics trivial).
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn embed_batch_with_fallback<E: BatchEmbedder>(
+    embedder: &mut E,
+    prefixes: &[String],
+) -> Vec<Result<Vec<f32>>> {
+    if prefixes.is_empty() {
+        return Vec::new();
+    }
+    if prefixes.len() == 1 {
+        return vec![embedder.embed_one(&prefixes[0])];
+    }
+    match embedder.embed_batch(prefixes) {
+        Ok(vecs) if vecs.len() == prefixes.len() => {
+            return vecs.into_iter().map(Ok).collect();
+        }
+        Ok(_) => {
+            // Provider contract break (wrong embedding count). Do not retry
+            // the same malformed call; isolate per item below.
+        }
+        Err(_) => {
+            // Retry the whole batch exactly once for transient failures.
+            if let Ok(vecs) = embedder.embed_batch(prefixes)
+                && vecs.len() == prefixes.len()
+            {
+                return vecs.into_iter().map(Ok).collect();
+            }
+        }
+    }
+    prefixes.iter().map(|p| embedder.embed_one(p)).collect()
+}
+
+/// Group `count` capped items into embed batches of at most `batch_size`.
+/// Returns `(start, end)` spans (start inclusive, end exclusive) that cover
+/// exactly `0..count` with no gaps or overlap. A `batch_size` of 0 degrades
+/// to serial (size 1) rather than looping forever. Centralized so the
+/// `--sample` cap ↔ batch-size interaction stays unit-testable.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn embed_batch_spans(count: usize, batch_size: usize) -> Vec<(usize, usize)> {
+    let step = batch_size.max(1);
+    (0..count)
+        .step_by(step)
+        .map(|start| (start, (start + step).min(count)))
+        .collect()
+}
+
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub fn write_index(project: Option<&str>, sample: usize) -> Result<IndexStats> {
     write_index_with_progress(project, sample, &|_| {})
@@ -789,12 +868,33 @@ pub fn write_index_with_options(
             .with_context(|| format!("create index dir: {}", parent.display()))?;
     }
 
+    // Detect a resumable full-build checkpoint BEFORE choosing the walk
+    // strategy. A surviving `.tmp` from an interrupted full (`sample == 0`)
+    // build is authoritative and must be *appended* to, never clobbered.
+    // Only `sample == 0` builds ever write `.tmp`; a `sample != 0` run with
+    // a checkpoint present is already rejected by the guard above, so this
+    // never truncates a diagnostic checkpoint.
+    //
+    // Crucially the checkpoint takes precedence over the incremental walk
+    // even when a committed index ALSO exists. Without this, resuming via
+    // the operator-advised `aicx index --sample 0` would take the
+    // incremental branch, truncate the checkpoint, and re-seed it from the
+    // (typically smaller) committed body — silently discarding every
+    // embedded row accumulated by the interrupted full build.
+    let resume = if sample == 0 {
+        load_resume_tmp_index(&tmp_path, &info)?
+    } else {
+        None
+    };
+
     // G-3: decide build mode. `--full-rescan` always rebuilds from zero.
     // `sample != 0` is a deterministic-subset diagnostic mode, also full.
-    // Otherwise look for a compatible committed index — if absent or
-    // incompatible (dim/model/profile drift), fall back to full so the
-    // operator does not silently mix model outputs.
-    let incremental_baseline = if options.full_rescan || sample != 0 {
+    // A live resume checkpoint forces a full-build continuation, so the
+    // incremental walk is suppressed. Otherwise look for a compatible
+    // committed index — if absent or incompatible (dim/model/profile
+    // drift), fall back to full so the operator does not silently mix
+    // model outputs.
+    let incremental_baseline = if options.full_rescan || sample != 0 || resume.is_some() {
         None
     } else {
         load_incremental_baseline(&target_path, &info)?
@@ -812,14 +912,6 @@ pub fn write_index_with_options(
         files.len()
     } else {
         sample.min(files.len())
-    };
-    // Resume-from-checkpoint only applies to a full rebuild; an
-    // incremental walk never writes to `ndjson.tmp` so there is nothing
-    // to resume from.
-    let resume = if sample == 0 && incremental_baseline.is_none() {
-        load_resume_tmp_index(&tmp_path, &info)?
-    } else {
-        None
     };
     let resumed_ids: HashSet<String> = resume
         .as_ref()
@@ -901,6 +993,17 @@ pub fn write_index_with_options(
     let tick_interval = Duration::from_secs(1);
     let mut hybrid_delta_chunks = Vec::new();
 
+    // Batched embedding (perf): the cloud backend spends one HTTP round-trip
+    // per chunk when embedded serially, which dominates a full build. Group
+    // chunks into `batch_size` slices and hand each to `embed_batch` — one
+    // POST per batch instead of one per chunk. Progress ticks stay per-chunk.
+    let batch_size = engine.embed_batch_size();
+
+    // Phase 1: classify the capped window into resumed-skip vs to-embed.
+    // Skips are cheap and emitted inline; only genuinely new chunks flow into
+    // the batch loop, so a resumed build never re-embeds a committed chunk.
+    let mut to_embed: Vec<(usize, &crate::store::StoredContextFile)> =
+        Vec::with_capacity(cap.saturating_sub(resumed_ids.len()));
     for (item_index, stored) in files.iter().take(cap).enumerate() {
         let entry_id = chunk_id_from_path(&stored.path);
         if resumed_ids.contains(&entry_id) {
@@ -925,98 +1028,150 @@ pub fn write_index_with_options(
             );
             continue;
         }
-        stats.chunks_sampled += 1;
-        let item_started = Instant::now();
-        let content = match crate::sanitize::read_to_string_validated(&stored.path) {
-            Ok(text) => text,
-            Err(err) => {
-                stats.embed_errors += 1;
-                failed += 1;
-                processed += 1;
-                on_event(&IndexEvent::ItemFailed {
-                    item_index,
-                    label: entry_id,
-                    error: format!("read failed: {err}"),
-                });
-                continue;
-            }
-        };
-        let prefix = take_prefix_bytes(&content, DEFAULT_EMBED_PREFIX_BYTES);
-        let embedder_started = Instant::now();
-        let embedding = match engine.embed(&prefix) {
-            Ok(vec) => vec,
-            Err(err) => {
-                stats.embed_errors += 1;
-                failed += 1;
-                processed += 1;
-                on_event(&IndexEvent::ItemFailed {
-                    item_index,
-                    label: entry_id,
-                    error: format!("embed failed: {err}"),
-                });
-                continue;
-            }
-        };
-        let embedder_ms = embedder_started.elapsed().as_millis() as u64;
-        let duration_ms = item_started.elapsed().as_millis() as u64;
-        let entry = IndexEntry {
-            id: entry_id.clone(),
-            project: stored.project.clone(),
-            agent: stored.agent.clone(),
-            date: stored.date_iso.clone(),
-            path: stored.path.clone(),
-            kind: stored.kind.dir_name().to_string(),
-            session_id: stored.session_id.clone(),
-            frame_kind: chunk_frame_kind(&stored.path),
-            cwd: chunk_cwd(&stored.path),
-            embedding,
-        };
-        if incremental_baseline.is_some() {
-            let metadata = serde_json::json!({
-                "source_path": stored.path.to_string_lossy(),
-                "project": stored.project,
-                "agent": stored.agent,
-                "date": stored.date_iso,
-                "kind": stored.kind.dir_name(),
-                "session_id": stored.session_id,
-                "frame_kind": chunk_frame_kind(&stored.path),
-                "cwd": chunk_cwd(&stored.path),
-            });
-            hybrid_delta_chunks.push(aicx_retrieve::DenseChunkRef {
-                chunk: aicx_retrieve::ChunkRef {
-                    id: entry_id.clone(),
-                    source_path: stored.path.to_string_lossy().to_string(),
-                    text: content,
-                    metadata,
-                },
-                embedding: entry.embedding.clone(),
-            });
+        to_embed.push((item_index, stored));
+    }
+
+    // Phase 2: embed the new chunks in bounded batches. Each batch is one
+    // `embed_batch` call (one cloud POST) yet still emits one progress event
+    // per chunk, so `[aicx][phase=...]` counts stay per-chunk not per-batch.
+    for (start, end) in embed_batch_spans(to_embed.len(), batch_size) {
+        let batch = &to_embed[start..end];
+
+        // Read + prefix each chunk in the batch. Read failures are recorded
+        // per item and excluded from the embed call (they carry no text).
+        let mut batch_meta: Vec<(usize, &crate::store::StoredContextFile, String)> =
+            Vec::with_capacity(batch.len());
+        let mut prefixes: Vec<String> = Vec::with_capacity(batch.len());
+        for &(item_index, stored) in batch {
+            let entry_id = chunk_id_from_path(&stored.path);
+            stats.chunks_sampled += 1;
+            let content = match crate::sanitize::read_to_string_validated(&stored.path) {
+                Ok(text) => text,
+                Err(err) => {
+                    stats.embed_errors += 1;
+                    failed += 1;
+                    processed += 1;
+                    on_event(&IndexEvent::ItemFailed {
+                        item_index,
+                        label: entry_id,
+                        error: format!("read failed: {err}"),
+                    });
+                    maybe_emit_stats_tick(
+                        on_event,
+                        &rolling,
+                        &mut last_tick,
+                        tick_interval,
+                        processed,
+                        indexed,
+                        skipped,
+                        failed,
+                        total_items,
+                    );
+                    continue;
+                }
+            };
+            let prefix = take_prefix_bytes(&content, DEFAULT_EMBED_PREFIX_BYTES);
+            prefixes.push(prefix);
+            batch_meta.push((item_index, stored, content));
         }
-        writeln!(writer, "{}", serde_json::to_string(&entry)?)?;
-        stats.embeddings_computed += 1;
-        indexed += 1;
-        processed += 1;
-        rolling.record(1);
-        on_event(&IndexEvent::ItemIndexed {
-            item_index,
-            label: entry_id,
-            chunks_indexed: 1,
-            duration_ms,
-            embedder_ms: Some(embedder_ms),
-            tokens_estimated: None,
-            content_hash: None,
-        });
-        maybe_emit_stats_tick(
-            on_event,
-            &rolling,
-            &mut last_tick,
-            tick_interval,
-            processed,
-            indexed,
-            skipped,
-            failed,
-            total_items,
-        );
+
+        if prefixes.is_empty() {
+            continue;
+        }
+
+        let batch_started = Instant::now();
+        let results = embed_batch_with_fallback(&mut engine, &prefixes);
+        let batch_ms = batch_started.elapsed().as_millis() as u64;
+        // Attribute the batch's wall time evenly across its chunks so the
+        // per-chunk `embedder_ms` stays honest under batching.
+        let per_item_ms = batch_ms / (prefixes.len() as u64).max(1);
+
+        for ((item_index, stored, content), result) in batch_meta.into_iter().zip(results) {
+            let entry_id = chunk_id_from_path(&stored.path);
+            let embedding = match result {
+                Ok(vec) => vec,
+                Err(err) => {
+                    stats.embed_errors += 1;
+                    failed += 1;
+                    processed += 1;
+                    on_event(&IndexEvent::ItemFailed {
+                        item_index,
+                        label: entry_id,
+                        error: format!("embed failed: {err}"),
+                    });
+                    maybe_emit_stats_tick(
+                        on_event,
+                        &rolling,
+                        &mut last_tick,
+                        tick_interval,
+                        processed,
+                        indexed,
+                        skipped,
+                        failed,
+                        total_items,
+                    );
+                    continue;
+                }
+            };
+            let entry = IndexEntry {
+                id: entry_id.clone(),
+                project: stored.project.clone(),
+                agent: stored.agent.clone(),
+                date: stored.date_iso.clone(),
+                path: stored.path.clone(),
+                kind: stored.kind.dir_name().to_string(),
+                session_id: stored.session_id.clone(),
+                frame_kind: chunk_frame_kind(&stored.path),
+                cwd: chunk_cwd(&stored.path),
+                embedding,
+            };
+            if incremental_baseline.is_some() {
+                let metadata = serde_json::json!({
+                    "source_path": stored.path.to_string_lossy(),
+                    "project": stored.project,
+                    "agent": stored.agent,
+                    "date": stored.date_iso,
+                    "kind": stored.kind.dir_name(),
+                    "session_id": stored.session_id,
+                    "frame_kind": chunk_frame_kind(&stored.path),
+                    "cwd": chunk_cwd(&stored.path),
+                });
+                hybrid_delta_chunks.push(aicx_retrieve::DenseChunkRef {
+                    chunk: aicx_retrieve::ChunkRef {
+                        id: entry_id.clone(),
+                        source_path: stored.path.to_string_lossy().to_string(),
+                        text: content,
+                        metadata,
+                    },
+                    embedding: entry.embedding.clone(),
+                });
+            }
+            writeln!(writer, "{}", serde_json::to_string(&entry)?)?;
+            stats.embeddings_computed += 1;
+            indexed += 1;
+            processed += 1;
+            rolling.record(1);
+            on_event(&IndexEvent::ItemIndexed {
+                item_index,
+                label: entry_id,
+                chunks_indexed: 1,
+                duration_ms: per_item_ms,
+                embedder_ms: Some(per_item_ms),
+                tokens_estimated: None,
+                content_hash: None,
+            });
+            maybe_emit_stats_tick(
+                on_event,
+                &rolling,
+                &mut last_tick,
+                tick_interval,
+                processed,
+                indexed,
+                skipped,
+                failed,
+                total_items,
+            );
+        }
     }
 
     // Emit completion only after the final atomic commit lands on disk so the
