@@ -34,7 +34,7 @@ tylko nazwy zmiennych/lokalizacje i instrukcja rotacji.
 > `Transcript Ownership Refactor` żyją w korpusie tylko jako jedna gęsta linia
 > meta-triage pamięci (cytat z `vista-claude/MEMORY.md`), więc grep je znajduje,
 > ale retrievalny chunk `.md` jest słaby. To NIE jest dobry in-corpus case → wycięte.
-> Zakres v2: aicx + Pensieve, Agent-blackbox, ScreenScribe, Loctree, md-radar,
+> Zakres v2: aicx + Pensieve, Agent-blackbox, Screenscribe, Loctree, md-radar,
 > transcript-builder, vibecrafted.
 
 ---
@@ -194,24 +194,24 @@ anchors: claude__f30e5b56__2026-06-11__a512f197 → expected_terms: [`ci.yml`, `
 
 ---
 
-## ScreenScribe
+## Screenscribe
 
 ### `screenscribe-race-disaster`
-type: evidence · scope: ScreenScribe
+type: evidence · scope: Screenscribe
 Pytanie: czemu nie odpalamy dwoch sesji na screenscribe-seed naraz, byl jakis race?
 Dobry wynik: "race disaster" — dwie sesje na `screenscribe-seed` → living-tree race; decyzja: fan-out tylko do myślenia, write single-session inline, bo równoległe blind-writes = powrót awarii.
 Zły wynik: ogólne "git konflikt" bez living-tree race / decyzji single-session.
 anchors: claude__3d2716aa__2026-06-14__7fbabcf5 → expected_terms: [`race`, `living-tree`, `single-session`, `screenscribe-seed`]
 
 ### `screenscribe-aicx-home-mismatch`
-type: evidence · scope: ScreenScribe
+type: evidence · scope: Screenscribe
 Pytanie: czemu semantic search w screenscribe walil index_not_built wszedzie, cos z home path?
 Dobry wynik: rescan pisał do `~/aicx/indexed/_all/...` (bez kropki), search czytał z `~/.aicx/indexed/_all/...` (z kropką) → indeks budowany w jednym home, szukany w drugim.
 Zły wynik: "przebuduj indeks" bez wskazania na rozjazd `aicx` vs `.aicx` home.
 anchors: claude__3d2716aa__2026-06-14__7fbabcf5 → expected_terms: [`index_not_built`, `.aicx/indexed`, `~/aicx`, `_all`]
 
 ### `screenscribe-confirmed-to-verdict`
-type: evidence · scope: ScreenScribe
+type: evidence · scope: Screenscribe
 Pytanie: ten rename confirmed -> verdict, czemu zabilismy dual-model?
 Dobry wynik: nie chcemy dual-modelu `confirmed`(bool)/`verdict`; po cutcie jeden język = `human_review.verdict` (`accepted|rejected|none`).
 Zły wynik: trafienie w niezwiązany "verdict" z innego repo/sesji (TB verdict enum) zamiast screenscribe rename.
