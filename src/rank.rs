@@ -1722,7 +1722,7 @@ Some boilerplate text.
 
         write_canonical_search_fixture(
             &root,
-            "VetCoders",
+            "Vetcoders",
             "aicx",
             "sessaicx",
             "User asked:\nWhy did we move embeddings to Sztudio?\n\nAgent answered:\nDecision: foundationneedle belongs in the content match, not in a metadata banner.\n",
@@ -1882,7 +1882,7 @@ Some boilerplate text.
             &[FuzzyResult {
                 file: "chunk.md".to_string(),
                 path: "/tmp/chunk.md".to_string(),
-                project: "VetCoders/aicx".to_string(),
+                project: "Vetcoders/aicx".to_string(),
                 kind: "conversations".to_string(),
                 frame_kind: None,
                 agent: "codex".to_string(),
@@ -1892,7 +1892,7 @@ Some boilerplate text.
                 label: "HIGH".to_string(),
                 density: 1.0,
                 matched_lines: vec![
-                    "[metadata] project: VetCoders/aicx | agent: codex | date: 2026-06-19 | kind: conversations | path: /tmp/chunk.md".to_string(),
+                    "[metadata] project: Vetcoders/aicx | agent: codex | date: 2026-06-19 | kind: conversations | path: /tmp/chunk.md".to_string(),
                 ],
                 session_id: Some("sess-456".to_string()),
                 cwd: None,

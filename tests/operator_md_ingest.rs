@@ -305,7 +305,7 @@ fn operator_markdown_emits_structural_import_provenance() {
 fn operator_markdown_frontmatter_overrides_foreign_markdown_import_metadata() {
     let root = unique_test_dir("frontmatter-chatgpt-md");
     let home = root.join("home");
-    let repo = home.join("Git").join("ScreenScribe");
+    let repo = home.join("Git").join("Screenscribe");
     fs::create_dir_all(&repo).expect("create repo hint");
 
     let export = root.join("foreign").join("note.md");
@@ -314,7 +314,7 @@ fn operator_markdown_frontmatter_overrides_foreign_markdown_import_metadata() {
         r#"---
 aicx_import: 1
 project: vetcoders/screen_scribe_depr
-cwd: ~/Git/ScreenScribe
+cwd: ~/Git/Screenscribe
 date: 2026-06-17
 source_format: chatgpt-export
 author: monika
@@ -322,7 +322,7 @@ session_id: manual-chatgpt-screenscribe
 ---
 
 ## Prompt:
-ustal priorytety dla ScreenScribe.
+ustal priorytety dla Screenscribe.
 
 ## Response:
 Decision: najpierw kontrakt exportu, potem UI copy.
