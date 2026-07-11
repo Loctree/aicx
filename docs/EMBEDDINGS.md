@@ -12,18 +12,18 @@ The split is:
 
 - **AICX** owns the canonical corpus, steering surfaces, MCP front door, and a
   reusable local embedding library.
-- **Roost/rust-memex** owns the advanced retrieval/operator plane: heavier
+- **Roost/memex** owns the advanced retrieval/operator plane: heavier
   provider routing, richer indexing, and premium retrieval workflows.
 
-This removes the old schizophrenia where AICX pretended to be rust-memex while also
-depending on rust-memex internals for the same job.
+This removes the old schizophrenia where AICX pretended to be memex while also
+depending on memex internals for the same job.
 
 ## Library Boundary
 
 The reusable code lives in `crates/aicx-embeddings`.
 
 `aicx` re-exports it under `aicx::embedder::*` for compatibility, but
-rust-memex can depend on the smaller crate directly later:
+memex can depend on the smaller crate directly later:
 
 ```rust
 use aicx_embeddings::{EmbeddingConfig, EmbeddingEngine};
@@ -34,7 +34,7 @@ let vector = engine.embed("hello local retrieval")?;
 
 Core API:
 
-- `LocalEmbeddingProvider` — minimal provider trait for future rust-memex adaptation.
+- `LocalEmbeddingProvider` — minimal provider trait for future memex adaptation.
 - `EmbeddingEngine` — backend-hiding runtime wrapper.
 - `EmbeddingConfig` — env/config-driven model selection.
 - `EmbeddingModelInfo` — model id, backend, dimension, profile, source.
@@ -208,16 +208,16 @@ Lookup paths:
 - `~/.aicx/embeddings`
 - `~/.aicx/embeddings/hub`
 
-## Relationship To Roost/Rust-Memex
+## Relationship To Roost/Memex
 
 Do not conflate config planes:
 
 - `~/.aicx/embedder.toml` controls AICX local embeddings.
 - `RUST_MEMEX_CONFIG` / `~/.rmcp-servers/rust-memex/config.toml` controls the
-  Roost/rust-memex retrieval plane.
+  Roost/memex retrieval plane.
 
 AICX local embeddings are enough for portable steering and lightweight local
-retrieval. Roost/rust-memex is still the right home for premium retrieval,
+retrieval. Roost/memex is still the right home for premium retrieval,
 operator settings, alternate providers, and larger indexing pipelines.
 
 ## Testing
