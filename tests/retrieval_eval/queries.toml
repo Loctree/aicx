@@ -111,7 +111,7 @@ id = "po-009"
 category = "polish"
 query = "problem z generowaniem manifest schema"
 expected_top_3_paths = [
-    "/Users/tester/.aicx/store/vetcoders/sample-portal/2026_0101/conversations/claude/2026_0101_claude_11111111-111_169.md",
+    "/Users/tester/.aicx/store/Vetcoders/sample-portal/2026_0101/conversations/claude/2026_0101_claude_11111111-111_169.md",
     "/Users/tester/.aicx/store/local/BratPrezent/2025_1226/conversations/claude/2025_1226_claude_faae82be-38b_066.md",
     "/Users/tester/.aicx/store/Vetcoders/sample-portal/2026_0411/conversations/claude/2026_0411_claude_5cff2603-1ec_100.md"
 ]
@@ -137,7 +137,7 @@ query = "wątek o migracji na lokalne gguf"
 expected_top_3_paths = [
     "/Users/tester/.aicx/store/Vetcoders/codescribe/2026_0405/conversations/codex/2026_0405_codex_019d5ca3-094_002.md",
     "/Users/tester/.aicx/store/Vetcoders/codescribe/2026_0416/plans/claude/2026_0416_claude_f9d68621-683_497.md",
-    "/Users/tester/.aicx/store/vetcoders/sample-portal/2026_0102/conversations/claude/2026_0102_claude_22222222-222_028.md"
+    "/Users/tester/.aicx/store/Vetcoders/sample-portal/2026_0102/conversations/claude/2026_0102_claude_22222222-222_028.md"
 ]
 expected_minimum_recall_at_5 = 0.5
 notes = "Auto-generated polish query"
@@ -316,7 +316,7 @@ category = "english"
 query = "removing html tags from corpus"
 expected_top_3_paths = [
     "/Users/tester/.aicx/store/Homebrew/brew/2026_0405/conversations/claude/2026_0405_claude_1c3b75cf-aa9_004.md",
-    "/Users/tester/.aicx/store/vetcoders/sample-portal/2026_0103/plans/codex/2026_0103_codex_33333333-333_099.md",
+    "/Users/tester/.aicx/store/Vetcoders/sample-portal/2026_0103/plans/codex/2026_0103_codex_33333333-333_099.md",
     "/Users/tester/.aicx/store/Homebrew/brew/2026_0211/conversations/codex/2026_0211_codex_019c4a10-695_119.md"
 ]
 expected_minimum_recall_at_5 = 0.5
@@ -423,7 +423,7 @@ id = "co-035"
 category = "code_id"
 query = "query_index"
 expected_top_3_paths = [
-    "/Users/tester/.aicx/store/vetcoders/sample-portal/2026_0104/plans/claude/2026_0104_claude_44444444-444_042.md",
+    "/Users/tester/.aicx/store/Vetcoders/sample-portal/2026_0104/plans/claude/2026_0104_claude_44444444-444_042.md",
     "/Users/tester/.aicx/store/LibraxisAI/rust-mcp-sdk/2025_1121/conversations/codex/2025_1121_codex_019aa85c-03a_085.md",
     "/Users/tester/.aicx/store/Vetcoders/codescribe/2026_0417/plans/claude/2026_0417_claude_f9d68621-683_018.md"
 ]
@@ -592,7 +592,7 @@ category = "mixed"
 query = "ustawienia dla LanceConfig"
 expected_top_3_paths = [
     "/Users/tester/.aicx/store/Vetcoders/codescribe/2026_0416/plans/gemini/2026_0416_gemini_e3102f2d-804_129.md",
-    "/Users/tester/.aicx/store/vetcoders/sample-portal/2026_0104/plans/claude/2026_0104_claude_44444444-444_021.md",
+    "/Users/tester/.aicx/store/Vetcoders/sample-portal/2026_0104/plans/claude/2026_0104_claude_44444444-444_021.md",
     "/Users/tester/.aicx/store/Vetcoders/example-app/2025_1124/conversations/gemini/2025_1124_gemini_79b9571d-273_008.md"
 ]
 expected_minimum_recall_at_5 = 0.5
