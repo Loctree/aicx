@@ -1826,7 +1826,7 @@ enum Commands {
 
         /// Move suspicious top-level corpus buckets to $HOME/.aicx/quarantine/.
         /// Buckets that are merely CamelCase (legitimate GitHub orgs like
-        /// `LibraxisAI`, `Vetcoders`, `Loctree`, `Szowesgad`) are
+        /// `LibraxisAI`, `Vetcoders`, `Loctree`, `Sampleorg`) are
         /// canonicalized in place to lowercase instead of quarantined,
         /// merging into existing lowercase buckets if present.
         #[arg(long)]
