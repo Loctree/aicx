@@ -961,7 +961,7 @@ fn incremental_materialize_hybrid_refreshes_persisted_artifacts() {
 
     let make_entry = |id: &str, path: &std::path::Path, embedding: Vec<f32>| IndexEntry {
         id: id.to_string(),
-        project: "vetcoders/vista".to_string(),
+        project: "vetcoders/example-app".to_string(),
         agent: "claude".to_string(),
         date: "20260603".to_string(),
         path: path.to_path_buf(),
@@ -1085,7 +1085,7 @@ fn materialize_hybrid_index_skips_missing_source_rows() {
 
     let make_entry = |id: &str, path: &std::path::Path, embedding: Vec<f32>| IndexEntry {
         id: id.to_string(),
-        project: "vetcoders/vista".to_string(),
+        project: "vetcoders/example-app".to_string(),
         agent: "codex".to_string(),
         date: "20260614".to_string(),
         path: path.to_path_buf(),
@@ -1152,7 +1152,7 @@ fn incremental_baseline_detects_hybrid_manifest_stale_against_committed_source()
 
     let make_entry = |id: &str, path: &std::path::Path, embedding: Vec<f32>| IndexEntry {
         id: id.to_string(),
-        project: "vetcoders/vista".to_string(),
+        project: "vetcoders/example-app".to_string(),
         agent: "claude".to_string(),
         date: "20260603".to_string(),
         path: path.to_path_buf(),
@@ -1234,7 +1234,7 @@ fn no_op_incremental_preserves_skip_against_pre_commit_source() {
 
     let entry = IndexEntry {
         id: "a".to_string(),
-        project: "vetcoders/vista".to_string(),
+        project: "vetcoders/example-app".to_string(),
         agent: "claude".to_string(),
         date: "20260603".to_string(),
         path: chunk_path,
@@ -1343,7 +1343,7 @@ fn existing_hybrid_artifacts_require_lexical_tantivy_meta() {
     };
     let entry = IndexEntry {
         id: "a".to_string(),
-        project: "vetcoders/vista".to_string(),
+        project: "vetcoders/example-app".to_string(),
         agent: "claude".to_string(),
         date: "20260603".to_string(),
         path: chunk_path,
