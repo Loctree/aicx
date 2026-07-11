@@ -592,9 +592,9 @@ fn derive_project_index_from_all_streams_matching_rows_only() {
         embedding: vec![1.0, 0.0],
     };
     let rows = [
-        mk_entry("vista-1", "vetcoders/Vista"),
+        mk_entry("example-app-1", "vetcoders/example-app"),
         mk_entry("other-1", "vetcoders/Other"),
-        mk_entry("vista-2", "vetcoders/Vista"),
+        mk_entry("example-app-2", "vetcoders/example-app"),
     ];
     let mut body = serde_json::to_string(&header).unwrap();
     body.push('\n');
@@ -604,10 +604,11 @@ fn derive_project_index_from_all_streams_matching_rows_only() {
     }
     std::fs::write(&all_index, body).expect("write synthetic all index");
 
-    let stats = derive_project_index_from_all("vetcoders/Vista").expect("derive project index");
+    let stats =
+        derive_project_index_from_all("vetcoders/example-app").expect("derive project index");
     assert_eq!(stats.entries_written, 2);
 
-    let project_index = index_path(Some("vetcoders/Vista")).expect("project index path");
+    let project_index = index_path(Some("vetcoders/example-app")).expect("project index path");
     assert_eq!(stats.index_path, project_index);
     let (derived_header, derived_entries) =
         read_committed_index_entries(&project_index).expect("read derived project index");
@@ -616,7 +617,7 @@ fn derive_project_index_from_all_streams_matching_rows_only() {
     assert!(
         derived_entries
             .iter()
-            .all(|entry| entry.project == "vetcoders/Vista"),
+            .all(|entry| entry.project == "vetcoders/example-app"),
         "derived bucket must not include other projects: {derived_entries:?}"
     );
 
@@ -654,9 +655,9 @@ fn derive_project_indexes_from_all_materializes_every_project_in_one_call() {
         embedding: vec![1.0, 0.0],
     };
     let rows = [
-        mk_entry("vista-1", "vetcoders/Vista"),
+        mk_entry("example-app-1", "vetcoders/example-app"),
         mk_entry("blackbox-1", "m-szymanska/agent-blackbox"),
-        mk_entry("vista-2", "vetcoders/Vista"),
+        mk_entry("example-app-2", "vetcoders/example-app"),
         mk_entry("blackbox-2", "m-szymanska/agent-blackbox"),
     ];
     let mut body = serde_json::to_string(&header).unwrap();
@@ -671,11 +672,11 @@ fn derive_project_indexes_from_all_materializes_every_project_in_one_call() {
     let projects: HashSet<_> = stats.iter().map(|stat| stat.project.as_str()).collect();
     assert_eq!(
         projects,
-        HashSet::from(["vetcoders/Vista", "m-szymanska/agent-blackbox"])
+        HashSet::from(["vetcoders/example-app", "m-szymanska/agent-blackbox"])
     );
     assert!(stats.iter().all(|stat| stat.entries_written == 2));
 
-    for project in ["vetcoders/Vista", "m-szymanska/agent-blackbox"] {
+    for project in ["vetcoders/example-app", "m-szymanska/agent-blackbox"] {
         let project_index = index_path(Some(project)).expect("project index path");
         let (derived_header, derived_entries) =
             read_committed_index_entries(&project_index).expect("read derived project index");
@@ -945,7 +946,7 @@ fn incremental_materialize_hybrid_refreshes_persisted_artifacts() {
 
     let root = tempdir_for_test();
     let _aicx_home_guard = ScopedAicxHome::set(&root);
-    let project = "vetcoders/Vista";
+    let project = "vetcoders/example-app";
     let semantic_index = index_path_for(&root, Some(project));
     std::fs::create_dir_all(semantic_index.parent().expect("semantic parent")).unwrap();
 
@@ -960,14 +961,14 @@ fn incremental_materialize_hybrid_refreshes_persisted_artifacts() {
 
     let make_entry = |id: &str, path: &std::path::Path, embedding: Vec<f32>| IndexEntry {
         id: id.to_string(),
-        project: "vetcoders/vista".to_string(),
+        project: "vetcoders/example-app".to_string(),
         agent: "claude".to_string(),
         date: "20260603".to_string(),
         path: path.to_path_buf(),
         kind: "conversations".to_string(),
         session_id: format!("session-{id}"),
         frame_kind: Some("agent_reply".to_string()),
-        cwd: Some("/Users/user/Git/Vista".to_string()),
+        cwd: Some("/Users/tester/Git/example-app".to_string()),
         embedding,
     };
     let write_semantic_index = |entries: &[IndexEntry], generated_at: &str| {
@@ -1072,7 +1073,7 @@ fn incremental_materialize_hybrid_refreshes_persisted_artifacts() {
 fn materialize_hybrid_index_skips_missing_source_rows() {
     let root = tempdir_for_test();
     let _aicx_home_guard = ScopedAicxHome::set(&root);
-    let project = "vetcoders/Vista";
+    let project = "vetcoders/example-app";
     let semantic_index = index_path_for(&root, Some(project));
     std::fs::create_dir_all(semantic_index.parent().expect("semantic parent")).unwrap();
 
@@ -1084,14 +1085,14 @@ fn materialize_hybrid_index_skips_missing_source_rows() {
 
     let make_entry = |id: &str, path: &std::path::Path, embedding: Vec<f32>| IndexEntry {
         id: id.to_string(),
-        project: "vetcoders/vista".to_string(),
+        project: "vetcoders/example-app".to_string(),
         agent: "codex".to_string(),
         date: "20260614".to_string(),
         path: path.to_path_buf(),
         kind: "conversations".to_string(),
         session_id: format!("session-{id}"),
         frame_kind: Some("agent_reply".to_string()),
-        cwd: Some("/Users/user/vc-workspace/vetcoders/aicx".to_string()),
+        cwd: Some("/Users/tester/vc-workspace/vetcoders/aicx".to_string()),
         embedding,
     };
     let header = IndexHeader {
@@ -1138,7 +1139,7 @@ fn materialize_hybrid_index_skips_missing_source_rows() {
 fn incremental_baseline_detects_hybrid_manifest_stale_against_committed_source() {
     let root = tempdir_for_test();
     let _aicx_home_guard = ScopedAicxHome::set(&root);
-    let project = "vetcoders/Vista";
+    let project = "vetcoders/example-app";
     let semantic_index = index_path_for(&root, Some(project));
     std::fs::create_dir_all(semantic_index.parent().expect("semantic parent")).unwrap();
 
@@ -1151,14 +1152,14 @@ fn incremental_baseline_detects_hybrid_manifest_stale_against_committed_source()
 
     let make_entry = |id: &str, path: &std::path::Path, embedding: Vec<f32>| IndexEntry {
         id: id.to_string(),
-        project: "vetcoders/vista".to_string(),
+        project: "vetcoders/example-app".to_string(),
         agent: "claude".to_string(),
         date: "20260603".to_string(),
         path: path.to_path_buf(),
         kind: "conversations".to_string(),
         session_id: format!("session-{id}"),
         frame_kind: Some("agent_reply".to_string()),
-        cwd: Some("/Users/user/Git/Vista".to_string()),
+        cwd: Some("/Users/tester/Git/example-app".to_string()),
         embedding,
     };
     let write_semantic_index = |entries: &[IndexEntry], generated_at: &str| {
@@ -1222,7 +1223,7 @@ fn incremental_baseline_detects_hybrid_manifest_stale_against_committed_source()
 fn no_op_incremental_preserves_skip_against_pre_commit_source() {
     let root = tempdir_for_test();
     let _aicx_home_guard = ScopedAicxHome::set(&root);
-    let project = "vetcoders/Vista";
+    let project = "vetcoders/example-app";
     let semantic_index = index_path_for(&root, Some(project));
     std::fs::create_dir_all(semantic_index.parent().expect("semantic parent")).unwrap();
 
@@ -1233,14 +1234,14 @@ fn no_op_incremental_preserves_skip_against_pre_commit_source() {
 
     let entry = IndexEntry {
         id: "a".to_string(),
-        project: "vetcoders/vista".to_string(),
+        project: "vetcoders/example-app".to_string(),
         agent: "claude".to_string(),
         date: "20260603".to_string(),
         path: chunk_path,
         kind: "conversations".to_string(),
         session_id: "session-a".to_string(),
         frame_kind: Some("agent_reply".to_string()),
-        cwd: Some("/Users/user/Git/Vista".to_string()),
+        cwd: Some("/Users/tester/Git/example-app".to_string()),
         embedding: vec![1.0, 0.0],
     };
     let write_semantic_index = |generated_at: &str| {
@@ -1324,7 +1325,7 @@ fn no_op_incremental_preserves_skip_against_pre_commit_source() {
 fn existing_hybrid_artifacts_require_lexical_tantivy_meta() {
     let root = tempdir_for_test();
     let _aicx_home_guard = ScopedAicxHome::set(&root);
-    let project = "vetcoders/Vista";
+    let project = "vetcoders/example-app";
     let semantic_index = index_path_for(&root, Some(project));
     std::fs::create_dir_all(semantic_index.parent().expect("semantic parent")).unwrap();
 
@@ -1342,14 +1343,14 @@ fn existing_hybrid_artifacts_require_lexical_tantivy_meta() {
     };
     let entry = IndexEntry {
         id: "a".to_string(),
-        project: "vetcoders/vista".to_string(),
+        project: "vetcoders/example-app".to_string(),
         agent: "claude".to_string(),
         date: "20260603".to_string(),
         path: chunk_path,
         kind: "conversations".to_string(),
         session_id: "session-a".to_string(),
         frame_kind: Some("agent_reply".to_string()),
-        cwd: Some("/Users/user/Git/Vista".to_string()),
+        cwd: Some("/Users/tester/Git/example-app".to_string()),
         embedding: vec![1.0, 0.0],
     };
     let mut body = serde_json::to_string(&header).expect("serialize header");

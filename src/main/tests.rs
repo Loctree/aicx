@@ -362,8 +362,8 @@ fn index_status_routes_through_index_canonical_resolver() {
     let bucket_slugs = [
         "Vetcoders/Loctree",
         "Vetcoders/aicx",
-        "Szowesgad/Loctree",
-        "Szowesgad/Codescribe",
+        "Sampleorg/Loctree",
+        "Sampleorg/Codescribe",
     ];
     for slug in bucket_slugs {
         fs::create_dir_all(canonical_root.join(slug)).unwrap();
@@ -373,8 +373,8 @@ fn index_status_routes_through_index_canonical_resolver() {
     for bucket in [
         "vetcoders_loctree",
         "vetcoders_aicx",
-        "szowesgad_loctree",
-        "szowesgad_codescribe",
+        "sampleorg_loctree",
+        "sampleorg_codescribe",
     ] {
         let dir = root.join("indexed").join(bucket);
         fs::create_dir_all(&dir).unwrap();
@@ -392,9 +392,9 @@ fn index_status_routes_through_index_canonical_resolver() {
         // org wildcard
         ("Vetcoders/", &["vetcoders_aicx", "vetcoders_loctree"]),
         // cross-org repo
-        ("/Loctree", &["szowesgad_loctree", "vetcoders_loctree"]),
+        ("/Loctree", &["sampleorg_loctree", "vetcoders_loctree"]),
         // bare name (matches as repo name across orgs)
-        ("Loctree", &["szowesgad_loctree", "vetcoders_loctree"]),
+        ("Loctree", &["sampleorg_loctree", "vetcoders_loctree"]),
     ];
 
     for (filter, expected_buckets) in shapes {

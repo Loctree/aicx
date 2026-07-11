@@ -146,7 +146,7 @@ fn write_store_chunk(base: &Path) -> PathBuf {
             agent: "codex".to_string(),
             date: "2026-04-05".to_string(),
             session_id: "session123".to_string(),
-            cwd: Some("/Users/user/vc-workspace/Vetcoders/ai-contexters".to_string()),
+            cwd: Some("/Users/tester/vc-workspace/Vetcoders/ai-contexters".to_string()),
             timestamp_source: None,
             source_path: None,
             source_sha256: None,
