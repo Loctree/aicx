@@ -1,0 +1,160 @@
+# UsageEvent fixture matrix — contract §4.
+# Token/cost components are either a non-negative number (known) or the string
+# "unknown". Fabricating 0 for an unreported value is a contract violation —
+# the type system keeps unknown and zero distinguishable.
+# Coverage the checker enforces: cumulative + delta + snapshot semantics,
+# known cache tokens, missing (unknown) cost, and mid-session model drift.
+# [[invalid_event]] rows MUST be rejected by validation.
+
+schema = "aicx.parser.usage_matrix.v1"
+
+[[event]]
+name = "codex_cumulative_snapshot"
+session = "s-codex-1"
+provider = "openai"
+model = "gpt-5"
+counter_semantics = "cumulative"
+timestamp = "2026-07-13T00:00:10Z"
+[event.tokens]
+input = 4200
+output = 980
+reasoning = 512
+cache_read = "unknown"
+cache_creation = "unknown"
+[event.cost]
+value = "unknown"
+
+[[event]]
+name = "claude_delta_with_cache"
+session = "s-claude-1"
+provider = "anthropic"
+model = "claude-opus-4-8"
+counter_semantics = "delta"
+timestamp = "2026-07-13T00:01:00Z"
+[event.tokens]
+input = 1200
+output = 480
+reasoning = "unknown"
+cache_read = 18000
+cache_creation = 2400
+[event.cost]
+amount = 0.4185
+currency = "USD"
+
+[[event]]
+name = "gemini_per_message_snapshot"
+session = "s-gemini-1"
+provider = "google"
+model = "gemini-3-pro"
+counter_semantics = "snapshot"
+timestamp = "unknown"
+[event.tokens]
+input = 900
+output = 210
+reasoning = 128
+cache_read = "unknown"
+cache_creation = "unknown"
+[event.cost]
+value = "unknown"
+
+[[event]]
+name = "model_drift_first"
+session = "s-drift-1"
+provider = "anthropic"
+model = "claude-opus-4-8"
+counter_semantics = "delta"
+timestamp = "2026-07-13T00:02:00Z"
+[event.tokens]
+input = 100
+output = 40
+reasoning = "unknown"
+cache_read = "unknown"
+cache_creation = "unknown"
+[event.cost]
+value = "unknown"
+
+[[event]]
+name = "model_drift_second"
+session = "s-drift-1"
+provider = "anthropic"
+model = "claude-sonnet-5"
+counter_semantics = "delta"
+timestamp = "2026-07-13T00:03:00Z"
+[event.tokens]
+input = 90
+output = 35
+reasoning = "unknown"
+cache_read = "unknown"
+cache_creation = "unknown"
+[event.cost]
+value = "unknown"
+
+# ---------------------------------------------------------------- rejected
+
+[[invalid_event]]
+name = "bad_counter_semantics"
+session = "s-bad-1"
+provider = "openai"
+model = "gpt-5"
+counter_semantics = "total"
+timestamp = "unknown"
+violation = "counter_semantics outside snapshot|delta|cumulative"
+[invalid_event.tokens]
+input = 10
+output = 5
+reasoning = "unknown"
+cache_read = "unknown"
+cache_creation = "unknown"
+[invalid_event.cost]
+value = "unknown"
+
+[[invalid_event]]
+name = "fabricated_zero_cost"
+session = "s-bad-2"
+provider = "openai"
+model = "gpt-5"
+counter_semantics = "delta"
+timestamp = "unknown"
+violation = "unreported cost serialized as bare 0 instead of the string 'unknown'"
+[invalid_event.tokens]
+input = 10
+output = 5
+reasoning = "unknown"
+cache_read = "unknown"
+cache_creation = "unknown"
+[invalid_event.cost]
+value = 0
+
+[[invalid_event]]
+name = "negative_token_component"
+session = "s-bad-3"
+provider = "anthropic"
+model = "claude-opus-4-8"
+counter_semantics = "delta"
+timestamp = "unknown"
+violation = "token component below zero"
+[invalid_event.tokens]
+input = -5
+output = 5
+reasoning = "unknown"
+cache_read = "unknown"
+cache_creation = "unknown"
+[invalid_event.cost]
+value = "unknown"
+
+[[invalid_event]]
+name = "cost_without_currency"
+session = "s-bad-4"
+provider = "anthropic"
+model = "claude-opus-4-8"
+counter_semantics = "delta"
+timestamp = "unknown"
+violation = "reported cost amount missing its currency"
+[invalid_event.tokens]
+input = 10
+output = 5
+reasoning = "unknown"
+cache_read = "unknown"
+cache_creation = "unknown"
+[invalid_event.cost]
+amount = 1.25

@@ -1,0 +1,139 @@
+# Parse-status truth table — contract §3.3.
+# visible_completeness is exactly one of: complete_visible | partial_visible | fatal.
+# Boundary flags (opaque_reasoning_present, unsupported_visible_event) are orthogonal.
+# expect = "valid" rows must pass all rules; expect = "invalid" rows must be
+# rejected (contradictory states) — both directions are checker-enforced.
+
+schema = "aicx.parser.parse_status_truth_table.v1"
+
+[[case]]
+name = "clean_complete"
+visible_completeness = "complete_visible"
+opaque_reasoning_present = false
+unsupported_visible_event = false
+malformed_tail_present = false
+visible_event_lost = false
+warnings_count = 0
+model_projected = true
+expect = "valid"
+reason = "Every supported visible event accounted; no boundaries."
+
+[[case]]
+name = "complete_with_opaque_reasoning"
+visible_completeness = "complete_visible"
+opaque_reasoning_present = true
+unsupported_visible_event = false
+malformed_tail_present = false
+visible_event_lost = false
+warnings_count = 1
+model_projected = true
+expect = "valid"
+reason = "Modern Codex session with encrypted reasoning: opaque alone NEVER degrades visible completeness."
+
+[[case]]
+name = "complete_with_unsupported_preserved"
+visible_completeness = "complete_visible"
+opaque_reasoning_present = false
+unsupported_visible_event = true
+malformed_tail_present = false
+visible_event_lost = false
+warnings_count = 1
+model_projected = true
+expect = "valid"
+reason = "Unsupported visible unit preserved with an explicit warning: preservation is not loss."
+
+[[case]]
+name = "partial_with_malformed_tail"
+visible_completeness = "partial_visible"
+opaque_reasoning_present = false
+unsupported_visible_event = false
+malformed_tail_present = true
+visible_event_lost = false
+warnings_count = 1
+model_projected = true
+expect = "valid"
+reason = "Malformed tail is concrete visible loss; earlier valid units survive (non-fatal)."
+
+[[case]]
+name = "partial_with_lost_event"
+visible_completeness = "partial_visible"
+opaque_reasoning_present = true
+unsupported_visible_event = false
+malformed_tail_present = false
+visible_event_lost = true
+warnings_count = 2
+model_projected = true
+expect = "valid"
+reason = "Visible event lost justifies partial; the opaque flag rides along without being the cause."
+
+[[case]]
+name = "fatal_no_model"
+visible_completeness = "fatal"
+opaque_reasoning_present = false
+unsupported_visible_event = false
+malformed_tail_present = true
+visible_event_lost = true
+warnings_count = 1
+model_projected = false
+expect = "valid"
+reason = "Fatal: no valid model may be projected or ingested."
+
+[[case]]
+name = "contradiction_opaque_only_partial"
+visible_completeness = "partial_visible"
+opaque_reasoning_present = true
+unsupported_visible_event = false
+malformed_tail_present = false
+visible_event_lost = false
+warnings_count = 1
+model_projected = true
+expect = "invalid"
+reason = "Opaque reasoning alone can never justify partial_visible (rule 2)."
+
+[[case]]
+name = "contradiction_malformed_but_complete"
+visible_completeness = "complete_visible"
+opaque_reasoning_present = false
+unsupported_visible_event = false
+malformed_tail_present = true
+visible_event_lost = false
+warnings_count = 1
+model_projected = true
+expect = "invalid"
+reason = "A malformed tail forbids complete_visible (rule 1)."
+
+[[case]]
+name = "contradiction_unsupported_without_warning"
+visible_completeness = "complete_visible"
+opaque_reasoning_present = false
+unsupported_visible_event = true
+malformed_tail_present = false
+visible_event_lost = false
+warnings_count = 0
+model_projected = true
+expect = "invalid"
+reason = "Unsupported visible event requires an explicit warning/boundary record (rule 3)."
+
+[[case]]
+name = "contradiction_fatal_yet_projected"
+visible_completeness = "fatal"
+opaque_reasoning_present = false
+unsupported_visible_event = false
+malformed_tail_present = true
+visible_event_lost = true
+warnings_count = 1
+model_projected = true
+expect = "invalid"
+reason = "Fatal forbids projecting or ingesting a model (rule 4)."
+
+[[case]]
+name = "contradiction_unknown_completeness_enum"
+visible_completeness = "partial"
+opaque_reasoning_present = false
+unsupported_visible_event = false
+malformed_tail_present = true
+visible_event_lost = false
+warnings_count = 1
+model_projected = true
+expect = "invalid"
+reason = "Donor enum token leaked in: 'partial' is not a C0A visible-completeness value."

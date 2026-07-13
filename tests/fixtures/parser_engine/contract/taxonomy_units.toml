@@ -1,0 +1,262 @@
+# Taxonomy fixture units — contract §2.
+# Every unit must terminate in EXACTLY ONE declared taxonomy kind among its
+# (agent, level, parent, container_file) candidates, and that kind must equal
+# expected_kind. Samples are synthetic contract shapes, not captured bytes.
+
+schema = "aicx.parser.taxonomy_units.v1"
+
+# ---------------------------------------------------------------- codex
+
+[[unit]]
+agent = "codex"
+level = "physical"
+expected_kind = "session_meta"
+sample = '{"type":"session_meta","payload":{"id":"0d3adbe6-1111-7000-8000-000000000001","model":"gpt-5"}}'
+
+[[unit]]
+agent = "codex"
+level = "physical"
+expected_kind = "response_item"
+sample = '{"type":"response_item","payload":{"type":"message","role":"assistant","content":"ok"}}'
+
+[[unit]]
+agent = "codex"
+level = "physical"
+expected_kind = "event_msg"
+sample = '{"type":"event_msg","payload":{"type":"token_count","info":{}}}'
+
+[[unit]]
+agent = "codex"
+level = "logical"
+parent = "response_item"
+expected_kind = "message"
+sample = '{"type":"message","role":"user","content":"hello"}'
+
+[[unit]]
+agent = "codex"
+level = "logical"
+parent = "response_item"
+expected_kind = "function_call"
+sample = '{"type":"function_call","name":"bash","arguments":"{\"command\":\"echo ok\"}","call_id":"c1"}'
+
+[[unit]]
+agent = "codex"
+level = "logical"
+parent = "response_item"
+expected_kind = "reasoning"
+sample = '{"type":"reasoning","summary":[{"text":"visible thought"}]}'
+
+[[unit]]
+agent = "codex"
+level = "logical"
+parent = "response_item"
+expected_kind = "encrypted_reasoning"
+sample = '{"type":"encrypted_reasoning","encrypted_content":"opaque-blob"}'
+
+[[unit]]
+agent = "codex"
+level = "logical"
+parent = "event_msg"
+expected_kind = "token_count"
+sample = '{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":50}}}'
+
+# ---------------------------------------------------------------- claude
+
+[[unit]]
+agent = "claude"
+level = "physical"
+expected_kind = "user"
+sample = '{"type":"user","sessionId":"a1b2","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}'
+
+[[unit]]
+agent = "claude"
+level = "physical"
+expected_kind = "assistant"
+sample = '{"type":"assistant","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":12,"output_tokens":8}}}'
+
+[[unit]]
+agent = "claude"
+level = "physical"
+expected_kind = "system"
+sample = '{"type":"system","content":"context note"}'
+
+[[unit]]
+agent = "claude"
+level = "physical"
+expected_kind = "metadata_record"
+sample = '{"type":"attachment","attachment":{"name":"notes.md"}}'
+
+[[unit]]
+agent = "claude"
+level = "physical"
+expected_kind = "metadata_record"
+sample = '{"type":"pr-link","url":"example: pull request 7"}'
+
+[[unit]]
+agent = "claude"
+level = "logical"
+parent = "assistant"
+expected_kind = "text_block"
+sample = '{"type":"text","text":"answer body"}'
+
+[[unit]]
+agent = "claude"
+level = "logical"
+parent = "assistant"
+expected_kind = "tool_use_block"
+sample = '{"type":"tool_use","id":"tu_1","name":"Read","input":{"file_path":"src/lib.rs"}}'
+
+[[unit]]
+agent = "claude"
+level = "logical"
+parent = "user"
+expected_kind = "tool_result_block"
+sample = '{"type":"tool_result","tool_use_id":"tu_1","content":"file body"}'
+
+[[unit]]
+agent = "claude"
+level = "logical"
+parent = "assistant"
+expected_kind = "thinking_block"
+sample = '{"type":"thinking","thinking":"internal reasoning"}'
+
+# ---------------------------------------------------------------- gemini
+
+[[unit]]
+agent = "gemini"
+level = "physical"
+expected_kind = "whole_file_document"
+sample = '{"sessionId":"g-1","messages":[{"type":"user","content":"hi"}]}'
+
+[[unit]]
+agent = "gemini"
+level = "physical"
+expected_kind = "stream_header"
+sample = '{"sessionId":"g-2","startTime":"2026-07-13T00:00:00Z"}'
+
+[[unit]]
+agent = "gemini"
+level = "physical"
+expected_kind = "state_update"
+sample = '{"$set":{"lastUpdated":"2026-07-13T00:05:00Z"}}'
+
+[[unit]]
+agent = "gemini"
+level = "logical"
+parent = "whole_file_document"
+expected_kind = "message"
+sample = '{"type":"gemini","content":"answer","tokens":{"input":900,"output":210}}'
+
+[[unit]]
+agent = "gemini"
+level = "logical"
+parent = "message"
+expected_kind = "thought"
+sample = '{"subject":"Plan","description":"outline the fix"}'
+
+[[unit]]
+agent = "gemini"
+level = "logical"
+parent = "message"
+expected_kind = "tool_call"
+sample = '{"name":"read_file","args":{"path":"src/main.rs"},"result":"ok"}'
+
+[[unit]]
+agent = "gemini"
+level = "logical"
+parent = "antigravity_opaque_pb"
+container_file = "*.pb"
+expected_kind = "conversation_artifact"
+sample = '{"artifact":"conversation.md","text":"recovered flow"}'
+
+# ---------------------------------------------------------------- grok
+
+[[unit]]
+agent = "grok"
+level = "physical"
+expected_kind = "user"
+sample = '{"type":"user","content":[{"type":"text","text":"<user_query>fix the bug</user_query>"}]}'
+
+[[unit]]
+agent = "grok"
+level = "physical"
+expected_kind = "assistant"
+sample = '{"type":"assistant","content":"done","reasoning":{"text":"why"},"tool_calls":[]}'
+
+[[unit]]
+agent = "grok"
+level = "physical"
+expected_kind = "reasoning"
+sample = '{"type":"reasoning","summary":[{"text":"thinking step"}]}'
+
+[[unit]]
+agent = "grok"
+level = "physical"
+expected_kind = "tool_result"
+sample = '{"type":"tool_result","tool_call_id":"call_1","content":"exit 0"}'
+
+[[unit]]
+agent = "grok"
+level = "physical"
+expected_kind = "system"
+sample = '{"type":"system","content":"xai harness prompt"}'
+
+[[unit]]
+agent = "grok"
+level = "physical"
+expected_kind = "backend_tool_call"
+sample = '{"type":"backend_tool_call"}'
+
+[[unit]]
+agent = "grok"
+level = "physical"
+container_file = "summary.json"
+expected_kind = "summary_document"
+sample = '{"info":{"id":"grok-s1","cwd":"demo-repo"},"generated_title":"Fix","current_model_id":"grok-4","created_at":"2026-07-13T00:00:00Z"}'
+
+[[unit]]
+agent = "grok"
+level = "physical"
+container_file = "hunk_records.jsonl"
+expected_kind = "hunk_record"
+sample = '{"file":"src/lib.rs","hunk":"@@ -1 +1 @@"}'
+
+[[unit]]
+agent = "grok"
+level = "logical"
+parent = "assistant"
+expected_kind = "inline_reasoning"
+sample = '{"text":"inline thought"}'
+
+[[unit]]
+agent = "grok"
+level = "logical"
+parent = "assistant"
+expected_kind = "tool_call"
+sample = '{"id":"call_1","name":"bash","arguments":"{\"command\":\"cargo test\"}"}'
+
+# ---------------------------------------------------------------- junie
+
+[[unit]]
+agent = "junie"
+level = "physical"
+expected_kind = "UserPromptEvent"
+sample = '{"type":"UserPromptEvent","prompt":"implement the feature"}'
+
+[[unit]]
+agent = "junie"
+level = "physical"
+expected_kind = "CurrentDirectoryUpdatedEvent"
+sample = '{"type":"CurrentDirectoryUpdatedEvent","directory":"demo-repo"}'
+
+[[unit]]
+agent = "junie"
+level = "physical"
+expected_kind = "block_update"
+sample = '{"type":"ToolBlockUpdatedEvent","stepId":"step-7","state":"COMPLETED","tool":"bash"}'
+
+[[unit]]
+agent = "junie"
+level = "physical"
+expected_kind = "block_update"
+sample = '{"type":"AgentThoughtBlockUpdatedEvent","stepId":"step-8","state":"IN_PROGRESS","text":"thinking"}'

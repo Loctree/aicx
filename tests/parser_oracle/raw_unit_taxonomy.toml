@@ -1,0 +1,417 @@
+# Per-agent raw-unit taxonomy — physical vs logical units, frozen by C0A.
+# Machine truth for docs/PARSER_NORMATIVE_CONTRACT.md §2.
+#
+# level:      "physical" (independently addressable region: line / whole file)
+#             or "logical" (adapter-declared nested structure; sample = the
+#             nested JSON object itself, parent names the physical kind it
+#             lives in).
+# locator:    how derivation v1 addresses the unit ("ordinal" = zero-padded
+#             1-based physical ordinal; anything else = adapter-declared
+#             logical locator token, contract §5.1).
+# provenance: donor_spec | donor_adapter | aicx_history | recon.
+#             recon kinds are honest best-current-knowledge; the owning
+#             adapter cut (C2/C2G/C3/C4/C5) must confirm or amend them with
+#             native goldens WITHOUT widening this file's match ambiguity.
+# match:      AND-combined rules — any=true | field+equals | field+equals_any |
+#             has_field | lacks_field. Every fixture unit must terminate in
+#             EXACTLY ONE kind among its (agent, level, parent, container_file)
+#             candidates (checker-enforced).
+#
+# Accounting note: an unknown unit shape is NOT a taxonomy kind — it terminates
+# as skipped(unknown_payload_type) with a typed warning. Taxonomy kinds cover
+# only recognized units.
+
+schema = "aicx.parser.raw_unit_taxonomy.v1"
+
+# ================================================================== codex
+
+[[agent]]
+name = "codex"
+container = "jsonl_file"
+primary_file = "rollout JSONL"
+
+[[agent.kind]]
+name = "session_meta"
+level = "physical"
+locator = "ordinal"
+provenance = "donor_spec"
+description = "Session identity/model/cwd root record; malformed session_meta is the only donor hard-fail."
+match = { field = "type", equals = "session_meta" }
+
+[[agent.kind]]
+name = "turn_context"
+level = "physical"
+locator = "ordinal"
+provenance = "donor_spec"
+description = "Per-turn cwd/branch context; segment-split truth source."
+match = { field = "type", equals = "turn_context" }
+
+[[agent.kind]]
+name = "event_msg"
+level = "physical"
+locator = "ordinal"
+provenance = "donor_spec"
+description = "Event stream record; payload.type selects logical units (incl. usage snapshots)."
+match = { field = "type", equals = "event_msg" }
+
+[[agent.kind]]
+name = "response_item"
+level = "physical"
+locator = "ordinal"
+provenance = "donor_spec"
+description = "Model response record; payload.type selects logical units. Ignoring these was the legacy AICX silent-skip bug."
+match = { field = "type", equals = "response_item" }
+
+[[agent.kind]]
+name = "message"
+level = "logical"
+parent = "response_item"
+locator = "ordinal"
+provenance = "donor_spec"
+description = "Visible message payload."
+match = { field = "type", equals = "message" }
+
+[[agent.kind]]
+name = "function_call"
+level = "logical"
+parent = "response_item"
+locator = "ordinal"
+provenance = "donor_spec"
+description = "Tool call; args arrive as a JSON string in `arguments`."
+match = { field = "type", equals = "function_call" }
+
+[[agent.kind]]
+name = "function_call_output"
+level = "logical"
+parent = "response_item"
+locator = "ordinal"
+provenance = "donor_spec"
+description = "Tool result correlated by call id."
+match = { field = "type", equals = "function_call_output" }
+
+[[agent.kind]]
+name = "reasoning"
+level = "logical"
+parent = "response_item"
+locator = "ordinal"
+provenance = "donor_spec"
+description = "Visible reasoning payload."
+match = { field = "type", equals = "reasoning", lacks_field = "encrypted_content" }
+
+[[agent.kind]]
+name = "encrypted_reasoning"
+level = "logical"
+parent = "response_item"
+locator = "ordinal"
+provenance = "donor_spec"
+description = "Opaque reasoning — accounting: skipped(encrypted_opaque) + opaque_reasoning_present flag; never degrades visible completeness alone."
+match = { field = "type", equals = "encrypted_reasoning" }
+
+[[agent.kind]]
+name = "token_count"
+level = "logical"
+parent = "event_msg"
+locator = "ordinal"
+provenance = "recon"
+description = "Usage snapshot payload — CUMULATIVE session counters (UsageEvent counter_semantics=cumulative)."
+match = { field = "type", equals = "token_count" }
+
+# ================================================================== claude
+
+[[agent]]
+name = "claude"
+container = "jsonl_file"
+primary_file = "project session JSONL"
+
+[[agent.kind]]
+name = "user"
+level = "physical"
+locator = "ordinal"
+provenance = "donor_spec"
+description = "User record; message.content[] carries logical blocks."
+match = { field = "type", equals = "user" }
+
+[[agent.kind]]
+name = "assistant"
+level = "physical"
+locator = "ordinal"
+provenance = "donor_spec"
+description = "Assistant record; message.content[] blocks; message.usage is the DELTA usage source (UsageEvent counter_semantics=delta, incl. cache_read/cache_creation tokens, per-message model provenance)."
+match = { field = "type", equals = "assistant" }
+
+[[agent.kind]]
+name = "system"
+level = "physical"
+locator = "ordinal"
+provenance = "donor_spec"
+description = "System context record; consumed as metadata, not chat."
+match = { field = "type", equals = "system" }
+
+[[agent.kind]]
+name = "metadata_record"
+level = "physical"
+locator = "ordinal"
+provenance = "donor_spec"
+description = "Recognized non-conversational records: summary, attachment, file-history-snapshot, pr-link, queue-operation, ai-title, mode, permission-mode, last-prompt. Consumed as metadata — non-conversational does NOT mean skipped."
+match = { field = "type", equals_any = ["summary", "attachment", "file-history-snapshot", "pr-link", "queue-operation", "ai-title", "mode", "permission-mode", "last-prompt"] }
+
+[[agent.kind]]
+name = "text_block"
+level = "logical"
+parent = "assistant"
+locator = "ordinal"
+provenance = "donor_spec"
+description = "message.content[] text block."
+match = { field = "type", equals = "text" }
+
+[[agent.kind]]
+name = "tool_use_block"
+level = "logical"
+parent = "assistant"
+locator = "ordinal"
+provenance = "donor_spec"
+description = "Tool call block; cross-line correlation to tool_result by id."
+match = { field = "type", equals = "tool_use" }
+
+[[agent.kind]]
+name = "tool_result_block"
+level = "logical"
+parent = "user"
+locator = "ordinal"
+provenance = "donor_spec"
+description = "Tool result block delivered inside a user record."
+match = { field = "type", equals = "tool_result" }
+
+[[agent.kind]]
+name = "thinking_block"
+level = "logical"
+parent = "assistant"
+locator = "ordinal"
+provenance = "donor_spec"
+description = "Visible thinking block — preserved as its own internal_thought turn, never merged into assistant text."
+match = { field = "type", equals = "thinking" }
+
+# ================================================================== gemini (CLI dual format + Antigravity)
+
+[[agent]]
+name = "gemini"
+container = "dual: whole_file_json | jsonl_stream"
+primary_file = "chats/session-*.{json,jsonl}"
+
+[[agent.kind]]
+name = "whole_file_document"
+level = "physical"
+locator = "msg:<index>"
+provenance = "donor_spec"
+description = "Whole-file JSON {sessionId, messages[]}; no physical lines — locators are logical message indexes and line_no substitution is declared via a typed warning."
+match = { has_field = "messages" }
+
+[[agent.kind]]
+name = "stream_header"
+level = "physical"
+locator = "ordinal"
+provenance = "donor_adapter"
+description = "JSONL first line carrying session metadata."
+match = { has_field = "sessionId", lacks_field = "messages" }
+
+[[agent.kind]]
+name = "state_update"
+level = "physical"
+locator = "ordinal"
+provenance = "donor_adapter"
+description = "$set heartbeat line (lastUpdated only); consumed as session_heartbeat, never reconstructed; warn if $set ever carries more keys."
+match = { has_field = "$set" }
+
+[[agent.kind]]
+name = "message"
+level = "logical"
+parent = "whole_file_document"
+locator = "msg:<index>"
+provenance = "donor_spec"
+description = "messages[i] with type user|gemini|error|info (gemini→assistant); per-message token fields are UsageEvent counter_semantics=snapshot."
+match = { field = "type", equals_any = ["user", "gemini", "error", "info"] }
+
+[[agent.kind]]
+name = "thought"
+level = "logical"
+parent = "message"
+locator = "msg:<index>"
+provenance = "donor_spec"
+description = "thoughts[] {subject, description} → internal_thought units; sub-line accounting required (legacy AICX ignored them)."
+match = { has_field = "subject", lacks_field = "name" }
+
+[[agent.kind]]
+name = "tool_call"
+level = "logical"
+parent = "message"
+locator = "msg:<index>"
+provenance = "donor_spec"
+description = "toolCalls[] {name, args, result…} — result is INLINE (no cross-line correlation); feeds gate evidence."
+match = { has_fields = ["name", "args"] }
+
+[[agent.kind]]
+name = "antigravity_opaque_pb"
+level = "physical"
+locator = "artifact:<name>"
+provenance = "aicx_history"
+description = "Antigravity brain-state .pb — opaque provenance, never parsed as plaintext; accounting: skipped(encrypted_opaque)-class boundary."
+match = { any = true }
+container_file = "*.pb"
+
+[[agent.kind]]
+name = "conversation_artifact"
+level = "logical"
+parent = "antigravity_opaque_pb"
+locator = "artifact:<name>"
+provenance = "aicx_history"
+description = "Readable Antigravity conversation artifact recovered from brain state."
+match = { has_field = "artifact" }
+container_file = "*.pb"
+
+[[agent.kind]]
+name = "step_output_fallback"
+level = "logical"
+parent = "antigravity_opaque_pb"
+locator = "artifact:<name>"
+provenance = "aicx_history"
+description = "Fallback decision stream from .system_generated/steps/*/output.txt — explicitly NOT a full conversation transcript."
+match = { has_field = "step_output" }
+container_file = "*.pb"
+
+# ================================================================== grok
+
+[[agent]]
+name = "grok"
+container = "session_directory"
+primary_file = "chat_history.jsonl"
+
+[[agent.kind]]
+name = "user"
+level = "physical"
+locator = "ordinal"
+provenance = "donor_adapter"
+description = "User record — role lives in `type`, content is a LIST of {type:text,…} blocks; env wrappers (<user_info>/<system-reminder>) mark non-intent turns; <user_query> wrapper is peeled."
+match = { field = "type", equals = "user" }
+
+[[agent.kind]]
+name = "assistant"
+level = "physical"
+locator = "ordinal"
+provenance = "donor_adapter"
+description = "Assistant record — plain-string content + optional inline reasoning + tool_calls[] fan-out."
+match = { field = "type", equals = "assistant" }
+
+[[agent.kind]]
+name = "reasoning"
+level = "physical"
+locator = "ordinal"
+provenance = "donor_adapter"
+description = "Standalone reasoning record: summary[].text → internal_thought; encrypted_content-only → skipped(encrypted_opaque) + opaque_reasoning_present."
+match = { field = "type", equals = "reasoning" }
+
+[[agent.kind]]
+name = "tool_result"
+level = "physical"
+locator = "ordinal"
+provenance = "donor_adapter"
+description = "Tool result correlated cross-line by tool_call_id (no inline result in Grok)."
+match = { field = "type", equals = "tool_result" }
+
+[[agent.kind]]
+name = "system"
+level = "physical"
+locator = "ordinal"
+provenance = "donor_adapter"
+description = "xAI system prompt — harness scaffolding, never operator intent, never the session title."
+match = { field = "type", equals = "system" }
+
+[[agent.kind]]
+name = "backend_tool_call"
+level = "physical"
+locator = "ordinal"
+provenance = "donor_adapter"
+description = "Recognized content-less internal marker — consumed, no turn, no warning."
+match = { field = "type", equals = "backend_tool_call" }
+
+[[agent.kind]]
+name = "summary_document"
+level = "physical"
+locator = "artifact:summary"
+provenance = "donor_adapter"
+description = "summary.json whole-file provenance unit: info{id,cwd}, model, git metadata, created/updated timestamps — Grok's ONLY timing source (no per-turn timestamps)."
+match = { has_field = "info" }
+container_file = "summary.json"
+
+[[agent.kind]]
+name = "hunk_record"
+level = "physical"
+locator = "ordinal"
+provenance = "recon"
+description = "hunk_records.jsonl structural edit ledger — the reliable files_modified signal (inline write tool-calls carry no structured path)."
+match = { any = true }
+container_file = "hunk_records.jsonl"
+
+[[agent.kind]]
+name = "inline_reasoning"
+level = "logical"
+parent = "assistant"
+locator = "ordinal"
+provenance = "donor_adapter"
+description = "Inline {text} reasoning attached to an assistant record."
+match = { has_field = "text", lacks_field = "arguments" }
+
+[[agent.kind]]
+name = "tool_call"
+level = "logical"
+parent = "assistant"
+locator = "ordinal"
+provenance = "donor_adapter"
+description = "tool_calls[] entry; `arguments` is a JSON STRING and must be decoded for footprint/gate accounting."
+match = { has_field = "arguments" }
+
+# ================================================================== junie
+
+[[agent]]
+name = "junie"
+container = "session_directory"
+primary_file = "session-*/events.jsonl"
+
+[[agent.kind]]
+name = "UserPromptEvent"
+level = "physical"
+locator = "ordinal"
+provenance = "aicx_history"
+description = "Operator prompt event (`prompt` field)."
+match = { field = "type", equals = "UserPromptEvent" }
+
+[[agent.kind]]
+name = "UserResponseEvent"
+level = "physical"
+locator = "ordinal"
+provenance = "aicx_history"
+description = "Operator response/answer event."
+match = { field = "type", equals = "UserResponseEvent" }
+
+[[agent.kind]]
+name = "SystemMessageEvent"
+level = "physical"
+locator = "ordinal"
+provenance = "aicx_history"
+description = "System note event."
+match = { field = "type", equals = "SystemMessageEvent" }
+
+[[agent.kind]]
+name = "CurrentDirectoryUpdatedEvent"
+level = "physical"
+locator = "ordinal"
+provenance = "aicx_history"
+description = "cwd change truth source (segment split input)."
+match = { field = "type", equals = "CurrentDirectoryUpdatedEvent" }
+
+[[agent.kind]]
+name = "block_update"
+level = "physical"
+locator = "step:<stepId>:<kind>"
+provenance = "aicx_history"
+description = "Streaming block family: ResultBlockUpdatedEvent | AgentThoughtBlockUpdatedEvent | TerminalBlockUpdatedEvent | McpBlockUpdatedEvent | ToolBlockUpdatedEvent | FileChangesBlockUpdatedEvent | ViewFilesBlockUpdatedEvent. Emits repeated snapshots per stepId (IN_PROGRESS→COMPLETED); the LOGICAL unit is the last snapshot per (stepId, kind) — hence the logical locator; earlier snapshots are consumed as stream updates, not duplicates."
+match = { field = "type", equals_any = ["ResultBlockUpdatedEvent", "AgentThoughtBlockUpdatedEvent", "TerminalBlockUpdatedEvent", "McpBlockUpdatedEvent", "ToolBlockUpdatedEvent", "FileChangesBlockUpdatedEvent", "ViewFilesBlockUpdatedEvent"] }

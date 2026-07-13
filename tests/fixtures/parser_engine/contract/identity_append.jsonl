@@ -1,0 +1,6 @@
+{"type":"session_meta","payload":{"id":"0d3adbe6-1111-7000-8000-000000000001","model":"gpt-5"}}
+{"type":"turn_context","payload":{"cwd":"demo-repo","branch":"main"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":"hello contract"}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":"hi, frozen truth"}}
+{"type":"response_item","payload":{"type":"function_call","name":"bash","arguments":"{\"command\":\"echo ok\"}","call_id":"c1"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":50}}}}
