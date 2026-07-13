@@ -87,12 +87,11 @@ fn unique_dir(label: &str) -> PathBuf {
 fn conversations_dry_run_emits_json_on_stdout() {
     // Pin the GOLD pattern: stdout carries a JSON envelope that downstream
     // tools (`jq`, scripts, vibecrafted-mcp wrappers) can parse cleanly.
-    // Operator-isolated source roots (empty CLAUDE_CONFIG_DIR/AICX_HOME)
+    // Operator-isolated source roots (empty HOME/USERPROFILE/AICX_HOME)
     // keep the discovery histograms at zero so the test stays
     // deterministic — we are pinning the envelope shape, not its values.
     let bin = ensure_aicx_binary_exists();
     let home = unique_dir("home");
-    let claude_cfg = unique_dir("claude-cfg");
     let out_dir = unique_dir("out");
 
     let output = Command::new(&bin)
@@ -103,7 +102,8 @@ fn conversations_dry_run_emits_json_on_stdout() {
         .arg("--hours")
         .arg("1")
         .env("AICX_HOME", &home)
-        .env("CLAUDE_CONFIG_DIR", &claude_cfg)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
         .env("AICX_NO_MUTATION_WARN", "1")
         .output()
         .expect("run aicx conversations --dry-run");
@@ -151,7 +151,6 @@ fn conversations_dry_run_emits_json_on_stdout() {
     );
 
     let _ = std::fs::remove_dir_all(&home);
-    let _ = std::fs::remove_dir_all(&claude_cfg);
     let _ = std::fs::remove_dir_all(&out_dir);
 }
 
@@ -164,7 +163,6 @@ fn conversations_dry_run_preserves_human_summary_on_stderr() {
     // to the JSON channel.
     let bin = ensure_aicx_binary_exists();
     let home = unique_dir("home");
-    let claude_cfg = unique_dir("claude-cfg");
     let out_dir = unique_dir("out");
 
     let output = Command::new(&bin)
@@ -175,7 +173,8 @@ fn conversations_dry_run_preserves_human_summary_on_stderr() {
         .arg("--hours")
         .arg("1")
         .env("AICX_HOME", &home)
-        .env("CLAUDE_CONFIG_DIR", &claude_cfg)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
         .env("AICX_NO_MUTATION_WARN", "1")
         .output()
         .expect("run aicx conversations --dry-run");
@@ -191,7 +190,6 @@ fn conversations_dry_run_preserves_human_summary_on_stderr() {
     );
 
     let _ = std::fs::remove_dir_all(&home);
-    let _ = std::fs::remove_dir_all(&claude_cfg);
     let _ = std::fs::remove_dir_all(&out_dir);
 }
 
@@ -204,7 +202,6 @@ fn conversations_dry_run_stdout_does_not_leak_human_banner() {
     // self-documenting.
     let bin = ensure_aicx_binary_exists();
     let home = unique_dir("home");
-    let claude_cfg = unique_dir("claude-cfg");
     let out_dir = unique_dir("out");
 
     let output = Command::new(&bin)
@@ -215,7 +212,8 @@ fn conversations_dry_run_stdout_does_not_leak_human_banner() {
         .arg("--hours")
         .arg("1")
         .env("AICX_HOME", &home)
-        .env("CLAUDE_CONFIG_DIR", &claude_cfg)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
         .env("AICX_NO_MUTATION_WARN", "1")
         .output()
         .expect("run aicx conversations --dry-run");
@@ -231,6 +229,5 @@ fn conversations_dry_run_stdout_does_not_leak_human_banner() {
     );
 
     let _ = std::fs::remove_dir_all(&home);
-    let _ = std::fs::remove_dir_all(&claude_cfg);
     let _ = std::fs::remove_dir_all(&out_dir);
 }
