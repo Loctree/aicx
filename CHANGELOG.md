@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-13
+
+Parser engine transplant — "Noc francuskiego łącznika". Full session-engine
+swap executed overnight by a five-agent fleet (codex, claude, grok, junie, agy)
+on a single Living Tree checkout; Transcript Builder served as differential
+oracle, never a runtime dependency.
+
+### Added
+
+- Deterministic parser kernel (`crates/aicx-parser`): normative contract
+  (`PARSER_ENGINE_CONTRACT.md` + machine-truth `normative_fields.toml`),
+  visible-completeness + boundary flags instead of donor `parse_status`,
+  typed `UsageEvent`, stable `evidence_event_id` identity.
+- Bounded drift-aware `SessionCatalog` — locate-before-parse; session
+  discovery is `O(one session)` instead of `O(entire store)`.
+- Five per-agent adapters (Codex, Claude, Gemini, Grok, Junie), each built by
+  its own agent, each emitting `parser_oracle.envelope.v1` verified by the
+  differential oracle harness (`tests/parser_oracle/`).
+- Canonical store projection with `store_revision`.
+
+### Changed
+
+- **BREAKING**: canonical CLI is now `aicx extract <agent> …` — the
+  `--agent`/`--format` flags are removed.
+- **BREAKING**: all session providers cut over to the new engine; legacy
+  session engine removed (−9200 lines, fail-closed boundary).
+- 52.8 MB session parse: **75.86 s → 0.466 s** (~160×).
+
+### Fixed
+
+- Dual-channel test isolation: subprocess tests isolate `HOME`/`USERPROFILE`
+  so discovery never scans the operator's live `~/.claude` tree.
+
 ## [0.10.0] - 2026-07-05
 
 ### Added
