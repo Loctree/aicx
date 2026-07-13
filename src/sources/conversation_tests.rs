@@ -364,7 +364,7 @@ fn test_conversation_message_kind_does_not_mark_inline_dedup_ref_as_stub() {
 }
 
 #[test]
-fn test_extract_claude_excludes_tool_blocks_then_conversation_clean() {
+fn legacy_claude_extract_boundary_fails_closed() {
     use std::fs;
     let tmp = std::env::temp_dir().join(format!(
         "ai-ctx-conv-tool-blocks-{}-{}.jsonl",
@@ -390,36 +390,8 @@ fn test_extract_claude_excludes_tool_blocks_then_conversation_clean() {
         watermark: None,
     };
 
-    let entries = extract_claude_file(&tmp, &config).unwrap();
-    assert!(
-        entries.len() >= 2,
-        "expected at least user + assistant entries, got {}",
-        entries.len()
-    );
-    let user_msgs: Vec<_> = entries
-        .iter()
-        .filter(|e| e.frame_kind == Some(FrameKind::UserMsg))
-        .collect();
-    let agent_msgs: Vec<_> = entries
-        .iter()
-        .filter(|e| e.frame_kind == Some(FrameKind::AgentReply))
-        .collect();
-    assert!(!user_msgs.is_empty());
-    assert!(!agent_msgs.is_empty());
-    assert_eq!(user_msgs[0].message, "Hello agent");
-    assert!(
-        agent_msgs
-            .iter()
-            .any(|e| e.message.contains("Let me check"))
-    );
-
-    let conv = to_conversation(&entries, &[]);
-    assert!(
-        conv.len() >= 2,
-        "conversation should have at least user + assistant, got {}",
-        conv.len()
-    );
-    assert_eq!(conv[0].message, "Hello agent");
+    let error = extract_claude_file(&tmp, &config).expect_err("legacy parser must stay removed");
+    assert!(error.to_string().contains("legacy session parser removed"));
 
     let _ = fs::remove_file(&tmp);
 }

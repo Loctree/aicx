@@ -3,9 +3,15 @@ use super::*;
 use crate::sources::UNPROTECTED_SOURCE_WARNING;
 use crate::sources::count_codex_sessions;
 use crate::sources::providers::codescribe::CODESCRIBE_AGENT;
-use crate::sources::providers::gemini::is_gemini_session_file;
-use crate::sources::providers::junie::JUNIE_EVENTS_FILENAME;
 use crate::sources::providers::{discover_codescribe_transcripts, discover_operator_markdown};
+
+const JUNIE_EVENTS_FILENAME: &str = "events.jsonl";
+
+fn is_gemini_session_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "json" | "jsonl"))
+}
 
 fn source_root_for_protection(path: &Path) -> PathBuf {
     if path.is_file() {

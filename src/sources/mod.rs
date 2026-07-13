@@ -128,27 +128,4 @@ pub fn extract_all(config: &ExtractionConfig) -> Result<Vec<TimelineEntry>> {
 // ============================================================================
 
 #[cfg(test)]
-pub(crate) use providers::claude::parse_claude_jsonl_with_diagnostics;
-#[cfg(test)]
-pub(crate) use providers::codex::{
-    CodexSessionDiagnostics, CodexSessionWarning, parse_codex_file_with_diagnostics,
-    parse_codex_session_file_with_diagnostics,
-};
-#[cfg(test)]
-pub(crate) use providers::gemini::{
-    GeminiMessage, GeminiSession, parse_gemini_jsonl_session,
-    parse_gemini_session_with_diagnostics, render_gemini_content_value,
-    render_gemini_message_content,
-};
-#[cfg(test)]
-pub(crate) use providers::junie::junie_session_id_from_path_with_warning;
-#[cfg(test)]
-pub(crate) use providers::operator_markdown::resolve_operator_cwd_hint;
-#[cfg(test)]
-pub(crate) use shared::project::is_windows_absolute_path;
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
 mod conversation_tests;

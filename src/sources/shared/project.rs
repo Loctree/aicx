@@ -253,44 +253,6 @@ pub(crate) fn body_mentions_repo_token(body_lower: &str, repo_lower: &str) -> bo
 /// invocation against absolute-path Claude dirs and was the regression
 /// flagged by gemini-code-assist HIGH + chatgpt-codex-connector P1
 /// comments on PR #8.
-pub(crate) fn claude_project_dir_matches_filter(dir_name: &str, filters: &[String]) -> bool {
-    if filters.is_empty() {
-        return true;
-    }
-
-    filters.iter().any(|filter| {
-        let filter = filter.trim();
-        if filter.is_empty() {
-            return false;
-        }
-
-        if filter.contains('/') {
-            // owner/repo or /repo: defer to the strict path matcher on a
-            // best-effort decoded form. Decode is lossy (hyphens vs
-            // slashes ambiguous) but the path matcher's adjacency
-            // semantics tolerate that; the per-entry cwd filter
-            // downstream catches the strict case.
-            let decoded = decode_claude_project_path(dir_name);
-            return project_filter_matches_path(&decoded, &[filter.to_string()]);
-        }
-
-        let needle_lower = filter.to_ascii_lowercase();
-        let dir_lower = dir_name.to_ascii_lowercase();
-
-        // Shape 1: exact (no leading dash, single-component).
-        if dir_lower == needle_lower {
-            return true;
-        }
-        // Shape 2: leading-dash exact (single-component as absolute).
-        let dash_exact = format!("-{needle_lower}");
-        if dir_lower == dash_exact {
-            return true;
-        }
-        // Shape 3: last-`-`-chunk match (plausible last cwd segment).
-        dir_lower.ends_with(&dash_exact)
-    })
-}
-
 pub fn repo_name_from_cwd(cwd: Option<&str>, project_filter: &[String]) -> String {
     if !project_filter.is_empty() {
         if project_filter.len() == 1 {

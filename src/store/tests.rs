@@ -2098,23 +2098,21 @@ fn migration_rebuilds_existing_sources_into_canonical_store() {
         .expect("run migration");
 
     assert_eq!(manifest.totals.rebuild_items, 1);
-    assert_eq!(manifest.totals.rebuilt_items, 1);
-    assert_eq!(manifest.totals.salvaged_items, 0);
-    // Case-preserving canonical (relaxed 2026-05-12): `Vetcoders` from
-    // git remote stays `Vetcoders`, not lowered to `vetcoders`.
-    assert!(manifest.items.iter().any(|item| {
-        item.canonical_paths.iter().any(|path| {
-            path.contains("/store/Vetcoders/ai-contexters/2025_0321/conversations/codex/")
-        })
-    }));
+    assert_eq!(manifest.totals.rebuilt_items, 0);
+    assert_eq!(manifest.totals.salvaged_items, 1);
+    // The legacy parser is intentionally absent: migration must salvage the
+    // source rather than silently fabricate canonical output.
     assert!(
-        store_root
+        manifest
+            .items
+            .iter()
+            .all(|item| item.canonical_paths.is_empty())
+    );
+    assert!(
+        !store_root
             .join("store")
             .join("Vetcoders")
             .join("ai-contexters")
-            .join("2025_0321")
-            .join("conversations")
-            .join("codex")
             .is_dir()
     );
 
@@ -2197,11 +2195,13 @@ fn migration_writes_manifest_report_and_non_repo_rebuilds() {
     let report = fs::read_to_string(&manifest.report_path).expect("read report");
     let manifest_json = fs::read_to_string(&manifest.manifest_path).expect("read manifest json");
 
-    assert!(manifest.items.iter().any(|item| {
-        item.canonical_paths
+    assert_eq!(manifest.totals.rebuilt_items, 0);
+    assert!(
+        manifest
+            .items
             .iter()
-            .any(|path| path.contains("/non-repository-contexts/2025_0321/conversations/codex/"))
-    }));
+            .all(|item| item.canonical_paths.is_empty())
+    );
     assert!(manifest.items.iter().any(|item| {
         item.action_reason == "non_context_legacy_file"
             && item

@@ -2779,7 +2779,7 @@ fn migrate_intent_schema_accepts_missing_project_and_defaults_to_dry_run() {
 }
 
 #[test]
-fn run_extract_file_uses_repo_identity_over_file_provenance() {
+fn legacy_extract_file_boundary_fails_closed_without_output() {
     let root = unique_test_dir("extract-repo-identity");
     let brain = root.join("brain").join("conv-9");
     let step_output = brain
@@ -2795,7 +2795,7 @@ fn run_extract_file_uses_repo_identity_over_file_provenance() {
     );
     set_mtime(&step_output, 1_706_745_900);
 
-    run_extract_file(
+    let error = run_extract_file(
         ExtractInputFormat::GeminiAntigravity,
         None,
         brain,
@@ -2807,12 +2807,12 @@ fn run_extract_file_uses_repo_identity_over_file_provenance() {
             conversation: false,
         },
     )
-    .unwrap();
-
-    let output = fs::read_to_string(&report).unwrap();
-    assert!(output.contains("| Filter | repodelta |"));
-    assert!(output.contains("Gemini Antigravity recovery report"));
-    assert!(!output.contains("| Filter | file:"));
+    .expect_err("legacy parser must stay removed");
+    assert!(error.to_string().contains("legacy session parser removed"));
+    assert!(
+        !report.exists(),
+        "failed parse must not emit partial output"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }
