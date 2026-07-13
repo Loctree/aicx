@@ -2,8 +2,10 @@
 //!
 //! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
+pub mod adapters;
 pub mod card_header;
 pub mod chunker;
+pub mod engine;
 pub mod frontmatter;
 pub mod noise;
 pub mod sanitize;
