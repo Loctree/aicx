@@ -8,6 +8,7 @@ pub mod chunker;
 pub mod engine;
 pub mod frontmatter;
 pub mod noise;
+pub mod projections;
 pub mod sanitize;
 pub mod segmentation;
 pub mod skill_collapse;

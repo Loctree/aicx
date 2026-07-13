@@ -21,6 +21,12 @@ use std::time::SystemTime;
 pub(crate) mod atomic_write;
 use atomic_write::atomic_write;
 
+pub mod canonical_projection;
+pub use canonical_projection::{
+    CANONICAL_PROJECTION_DIRNAME, CanonicalStoreManifest, read_canonical_projection_at,
+    write_canonical_projection_at,
+};
+
 use crate::chunker::{self, ChunkerConfig};
 use crate::sanitize;
 use crate::segmentation::semantic_segments;
