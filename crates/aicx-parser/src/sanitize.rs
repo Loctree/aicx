@@ -833,9 +833,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_write_path_relative_with_missing_parents() {
-        let nested = Path::new("target/ai-ctx-sanitize-new/subdir/new.txt");
-        assert!(validate_write_path(nested).is_ok());
+    fn test_validate_write_path_with_missing_parents() {
+        let nested = std::env::temp_dir().join("ai-ctx-sanitize-new/subdir/new.txt");
+        assert!(validate_write_path(&nested).is_ok());
     }
 
     #[test]

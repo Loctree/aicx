@@ -7,6 +7,7 @@ Run the harness:
 
 ```bash
 tests/parser_oracle/compare.py --self-test
+tests/parser_oracle/compare.py --all
 tests/parser_oracle/compare.py --manifest tests/parser_oracle/manifest.toml
 tests/parser_oracle/compare.py --case codex_minimal --actual /tmp/aicx-envelope.json
 ```
@@ -15,6 +16,10 @@ For donor-supported agents, materialize a donor record with the exact command
 stored in `manifest.toml`, then adapt `session_record.json` into
 `parser_oracle.envelope.v1`. Junie has no donor adapter and therefore compares
 against a reviewed Rust-native golden.
+
+`--all` is the release aggregate: it materializes and compares every declared
+Transcript Builder donor record, then runs every declared production-native
+golden. Any command failure or exact/heuristic field mismatch fails the gate.
 
 `exact_fields` are compared recursively and fail with the first field path.
 `[[case.heuristic_assertions]]` entries are semantic predicates; they are not

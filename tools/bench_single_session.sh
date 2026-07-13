@@ -3,13 +3,19 @@ set -euo pipefail
 
 usage() {
   echo "usage: tools/bench_single_session.sh --baseline-only <session-path>" >&2
-  echo "       tools/bench_single_session.sh --engine-only --hard-threshold-ms <ms> <session-path>" >&2
+  echo "       tools/bench_single_session.sh --hard-threshold-ms <ms> <session-path>" >&2
+  echo "       tools/bench_single_session.sh --engine-only --hard-threshold-ms <ms> <session-path>  # compatibility" >&2
   exit 2
 }
 
 if [[ $# -eq 2 && "$1" == "--baseline-only" ]]; then
   mode=baseline
   session_path=$2
+elif [[ $# -eq 3 && "$1" == "--hard-threshold-ms" ]]; then
+  mode=engine
+  threshold_ms=$2
+  session_path=$3
+  [[ "$threshold_ms" =~ ^[1-9][0-9]*$ ]] || usage
 elif [[ $# -eq 4 && "$1" == "--engine-only" && "$2" == "--hard-threshold-ms" ]]; then
   mode=engine
   threshold_ms=$3

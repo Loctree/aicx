@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 #[test]
-#[ignore = "invoked by tools/bench_single_session.sh --engine-only"]
+#[ignore = "invoked by tools/bench_single_session.sh --hard-threshold-ms"]
 fn engine_only_benchmark() {
     let path = PathBuf::from(std::env::var("AICX_BENCH_SESSION").expect("AICX_BENCH_SESSION"));
     let threshold_ms: u128 = std::env::var("AICX_BENCH_THRESHOLD_MS")

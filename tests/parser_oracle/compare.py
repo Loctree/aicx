@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import shlex
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -340,6 +342,75 @@ def compare_case(case: Case, actual_document: dict[str, Any]) -> None:
             )
 
 
+def run_checked(case_id: str, command: list[str]) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic"
+        raise OracleError(
+            f"case {case_id}: command exited {completed.returncode}: {detail}"
+        )
+    return completed
+
+
+def materialize_donor(case: Case, oracle_out: Path) -> dict[str, Any]:
+    if case.oracle_command is None:
+        raise OracleError(f"case {case.id}: donor command is unavailable")
+    rendered = case.oracle_command.format(oracle_out=shlex.quote(str(oracle_out)))
+    run_checked(case.id, shlex.split(rendered))
+    records = sorted(oracle_out.glob("*/session_record.json"))
+    if len(records) != 1:
+        raise OracleError(
+            f"case {case.id}: expected one materialized session_record.json, found {len(records)}"
+        )
+    document = load_json(records[0])
+    if not isinstance(document, dict):
+        raise OracleError(f"case {case.id}: donor record root must be an object")
+    return document
+
+
+def run_all(cases: list[Case]) -> None:
+    donor_cases = [case for case in cases if case.oracle_kind == "transcript_builder"]
+    native_cases = [case for case in cases if case.oracle_kind == "rust_golden"]
+    with tempfile.TemporaryDirectory(prefix="aicx-parser-oracle-all-") as tmp:
+        root = Path(tmp)
+        for case in donor_cases:
+            actual = materialize_donor(case, root / case.id)
+            compare_case(case, actual)
+            print(f"parser oracle donor comparison: PASS ({case.id})")
+
+    native_tests = {
+        "junie_minimal": (
+            "cargo",
+            "test",
+            "-p",
+            "aicx-parser",
+            "--test",
+            "junie_adapter",
+            "junie_native_golden_matches_reviewed_fixture",
+            "--",
+            "--exact",
+        )
+    }
+    for case in native_cases:
+        command = native_tests.get(case.id)
+        if command is None:
+            raise OracleError(f"case {case.id}: no production native golden command")
+        run_checked(case.id, list(command))
+        print(f"parser oracle native comparison: PASS ({case.id})")
+
+    print(
+        "parser oracle aggregate: PASS "
+        f"({len(donor_cases)} donor adapters + {len(native_cases)} native golden)"
+    )
+
+
 def self_test() -> None:
     manifest_path = REPO_ROOT / "tests/parser_oracle/manifest.toml"
     cases = parse_manifest(manifest_path)
@@ -408,15 +479,23 @@ def main() -> int:
     parser.add_argument("--actual", type=Path)
     parser.add_argument("--require-normative-matrix", action="store_true")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--all", action="store_true")
     args = parser.parse_args()
     try:
         if args.self_test:
+            if args.all or args.case_id is not None or args.actual is not None:
+                raise OracleError("--self-test cannot be combined with --all/--case/--actual")
             self_test()
             return 0
         cases = parse_manifest(
             args.manifest.resolve(),
             require_normative_matrix=args.require_normative_matrix,
         )
+        if args.all:
+            if args.case_id is not None or args.actual is not None:
+                raise OracleError("--all cannot be combined with --case/--actual")
+            run_all(cases)
+            return 0
         if args.case_id is None and args.actual is None:
             print(f"parser oracle manifest: PASS ({len(cases)} cases)")
             return 0

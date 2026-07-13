@@ -108,7 +108,8 @@ compatibility surfaces.
 
 ## Benchmark contract
 
-`tools/bench_single_session.sh` emits one JSON document with two consecutive
+`tools/bench_single_session.sh --hard-threshold-ms <ms> <session-path>` is the
+canonical engine gate and emits one JSON document with two consecutive
 runs and separate locate, parse, and projection timings. It also reports the
 number and bytes of selected source inputs opened by the measured contract.
 Missing, negative, non-finite, or structurally absent metrics are a hard
