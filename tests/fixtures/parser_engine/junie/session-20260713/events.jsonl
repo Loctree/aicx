@@ -1,0 +1,3 @@
+{"kind":"CurrentDirectoryUpdatedEvent","event":{"agentEvent":{"currentDirectory":"/repo/oracle"}}}
+{"kind":"UserPromptEvent","requestId":"prompt-20260713-000000","prompt":"Build the Junie oracle."}
+{"kind":"ResultBlockUpdatedEvent","event":{"agentEvent":{"stepId":"s1","result":{"text":"The Junie oracle is ready."}}}}
