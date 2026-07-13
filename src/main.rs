@@ -23,6 +23,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{Shell, generate};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -842,6 +843,10 @@ struct SearchQualityEvalArgs {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Generate shell completions for the canonical CLI grammar.
+    #[command(hide = true)]
+    Completions { shell: Shell },
+
     // ── Layer 1: Canonical corpus ─────────────────────────────────────
     /// Extract and store Agents' sessions into the canonical corpus (canonical corpus extraction).
     ///
@@ -2091,6 +2096,10 @@ fn main() -> Result<()> {
 
 fn run_command(command: Option<Commands>) -> Result<()> {
     match command {
+        Some(Commands::Completions { shell }) => {
+            let mut command = Cli::command();
+            generate(shell, &mut command, "aicx", &mut io::stdout());
+        }
         Some(Commands::Claude {
             redaction,
             project,
@@ -2252,7 +2261,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                     json,
                     aicx::cli::failure::StructuredFailure::new(
                         "legacy_flag_grammar",
-                        "`aicx extract --agent/--format ...` was removed; the agent is a required subcommand",
+                        "legacy --agent/--format flag grammar was removed; the agent is a required subcommand",
                         format!("rerun as `{migration}`"),
                     )
                     .with_fallback(migration),

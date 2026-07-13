@@ -40,6 +40,7 @@ app = [
     "dep:aicx-retrieve",
     "dep:axum",
     "dep:clap",
+    "dep:clap_complete",
     "dep:crossterm",
     "dep:futures",
     "dep:indicatif",
@@ -71,6 +72,7 @@ aicx-progress-contracts = { path = "crates/aicx-progress-contracts", version = "
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"], optional = true }
+clap_complete = { version = "4", optional = true }
 dirs = "6"
 getrandom = "0.3"
 serde = { version = "1.0", features = ["derive"] }

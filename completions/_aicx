@@ -1,0 +1,2626 @@
+#compdef aicx
+
+autoload -U is-at-least
+
+_aicx() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_aicx_commands" \
+"*::: :->aicx" \
+&& ret=0
+    case $state in
+    (aicx)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-command-$line[1]:"
+        case $line[1] in
+            (completions)
+_arguments "${_arguments_options[@]}" : \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':shell:(bash elvish fish powershell zsh)' \
+&& ret=0
+;;
+(claude)
+_arguments "${_arguments_options[@]}" : \
+'*-p+[Source cwd/project filter(s)\: narrows session discovery before repo segmentation]:PROJECT:_default' \
+'*--project=[Source cwd/project filter(s)\: narrows session discovery before repo segmentation]:PROJECT:_default' \
+'-H+[Hours to look back (default\: 48, 0 = all time)]:HOURS:_default' \
+'--hours=[Hours to look back (default\: 48, 0 = all time)]:HOURS:_default' \
+'-o+[Output directory (omit to only write to store)]:OUTPUT:_files' \
+'--output=[Output directory (omit to only write to store)]:OUTPUT:_files' \
+'-f+[Output format\: md, json, both]:FORMAT:_default' \
+'--format=[Output format\: md, json, both]:FORMAT:_default' \
+'--append-to=[Append to a single timeline file instead of creating new files]:APPEND_TO:_files' \
+'--rotate=[Keep only last N output files (0 = unlimited)]:ROTATE:_default' \
+'--project-root=[Project root for loctree snapshot (defaults to cwd)]:PROJECT_ROOT:_files' \
+'--emit=[What to print to stdout\: paths, json, none (default\: none)]:EMIT:((paths\:"Print store chunk paths (one per line)"
+json\:"Print JSON report (includes \`store_paths\` for convenience)"
+none\:"Print nothing to stdout"))' \
+'--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
+'--full-rescan[Ignore the stored watermark and previously-seen hashes for this run]' \
+'(--full-rescan)--incremental[Legacy no-op\: incremental mode is now the default]' \
+'--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'(--user-only)--include-assistant[Include assistant messages (legacy flag; now default)]' \
+'--loctree[Include loctree snapshot in output]' \
+'--force[Force full extraction, ignore dedup hashes]' \
+'--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(codex)
+_arguments "${_arguments_options[@]}" : \
+'*-p+[Source cwd/project filter(s)\: narrows session discovery before repo segmentation]:PROJECT:_default' \
+'*--project=[Source cwd/project filter(s)\: narrows session discovery before repo segmentation]:PROJECT:_default' \
+'-H+[Hours to look back (default\: 48, 0 = all time)]:HOURS:_default' \
+'--hours=[Hours to look back (default\: 48, 0 = all time)]:HOURS:_default' \
+'-o+[Output directory (omit to only write to store)]:OUTPUT:_files' \
+'--output=[Output directory (omit to only write to store)]:OUTPUT:_files' \
+'-f+[Output format\: md, json, both]:FORMAT:_default' \
+'--format=[Output format\: md, json, both]:FORMAT:_default' \
+'--append-to=[Append to a single timeline file]:APPEND_TO:_files' \
+'--rotate=[Keep only last N output files (0 = unlimited)]:ROTATE:_default' \
+'--project-root=[Project root for loctree snapshot]:PROJECT_ROOT:_files' \
+'--emit=[What to print to stdout\: paths, json, none (default\: none)]:EMIT:((paths\:"Print store chunk paths (one per line)"
+json\:"Print JSON report (includes \`store_paths\` for convenience)"
+none\:"Print nothing to stdout"))' \
+'--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
+'--full-rescan[Ignore the stored watermark and previously-seen hashes for this run]' \
+'(--full-rescan)--incremental[Legacy no-op\: incremental mode is now the default]' \
+'--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'(--user-only)--include-assistant[Include assistant messages (legacy flag; now default)]' \
+'--loctree[Include loctree snapshot]' \
+'--force[Force full extraction, ignore dedup hashes]' \
+'--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(all)
+_arguments "${_arguments_options[@]}" : \
+'*-p+[Source cwd/project filter(s)\: narrows session discovery before repo segmentation]:PROJECT:_default' \
+'*--project=[Source cwd/project filter(s)\: narrows session discovery before repo segmentation]:PROJECT:_default' \
+'-H+[Hours to look back (default\: 48, 0 = all time)]:HOURS:_default' \
+'--hours=[Hours to look back (default\: 48, 0 = all time)]:HOURS:_default' \
+'-o+[Output directory (omit to only write to store)]:OUTPUT:_files' \
+'--output=[Output directory (omit to only write to store)]:OUTPUT:_files' \
+'--append-to=[Append to a single timeline file]:APPEND_TO:_files' \
+'--rotate=[Keep only last N output files (0 = unlimited)]:ROTATE:_default' \
+'--project-root=[Project root for loctree snapshot]:PROJECT_ROOT:_files' \
+'--emit=[What to print to stdout\: paths, json, none (default\: none)]:EMIT:((paths\:"Print store chunk paths (one per line)"
+json\:"Print JSON report (includes \`store_paths\` for convenience)"
+none\:"Print nothing to stdout"))' \
+'--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
+'--full-rescan[Ignore the stored watermark and previously-seen hashes for this run]' \
+'(--full-rescan)--incremental[Legacy no-op\: incremental mode is now the default]' \
+'--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'(--user-only)--include-assistant[Include assistant messages (legacy flag; now default)]' \
+'--loctree[Include loctree snapshot]' \
+'--force[Force full extraction, ignore dedup hashes]' \
+'--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(extract)
+_arguments "${_arguments_options[@]}" : \
+'--agent=[Removed flag grammar (pre-C7). Present only to emit a structured migration hint instead of a bare clap error]:AGENT:_default' \
+'--format=[]:FORMAT:_default' \
+'--session=[]:SESSION:_default' \
+'-o+[]:OUTPUT:_files' \
+'--output=[]:OUTPUT:_files' \
+'-p+[]:PROJECT:_default' \
+'--project=[]:PROJECT:_default' \
+'-H+[]:HOURS:_default' \
+'--hours=[]:HOURS:_default' \
+'--max-message-chars=[]:MAX_MESSAGE_CHARS:_default' \
+'--conversation[]' \
+'--user-only[]' \
+'--include-assistant[]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'::input:_files' \
+":: :_aicx__subcmd__extract_commands" \
+"*::: :->extract" \
+&& ret=0
+
+    case $state in
+    (extract)
+        words=($line[2] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-extract-command-$line[2]:"
+        case $line[2] in
+            (codex)
+_arguments "${_arguments_options[@]}" : \
+'(--file)--session=[Session id\: source id, logical id, alias, UUID suffix (≥8 chars), or unique prefix. Resolved through the session catalog before any parse]:SESSION:_default' \
+'--file=[Direct source file. Builds a source handle from this path only — no catalog scan, no global AICX state. Requires \`-o/--output\`]:FILE:_files' \
+'-o+[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
+'--output=[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
+'-p+[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
+'--project=[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
+'--max-message-chars=[Maximum message characters in markdown (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
+'--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
+'--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(claude)
+_arguments "${_arguments_options[@]}" : \
+'(--file)--session=[Session id\: source id, logical id, alias, UUID suffix (≥8 chars), or unique prefix. Resolved through the session catalog before any parse]:SESSION:_default' \
+'--file=[Direct source file. Builds a source handle from this path only — no catalog scan, no global AICX state. Requires \`-o/--output\`]:FILE:_files' \
+'-o+[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
+'--output=[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
+'-p+[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
+'--project=[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
+'--max-message-chars=[Maximum message characters in markdown (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
+'--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
+'--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(gemini)
+_arguments "${_arguments_options[@]}" : \
+'(--file)--session=[Session id\: source id, logical id, alias, UUID suffix (≥8 chars), or unique prefix. Resolved through the session catalog before any parse]:SESSION:_default' \
+'--file=[Direct source file. Builds a source handle from this path only — no catalog scan, no global AICX state. Requires \`-o/--output\`]:FILE:_files' \
+'-o+[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
+'--output=[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
+'-p+[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
+'--project=[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
+'--max-message-chars=[Maximum message characters in markdown (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
+'--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
+'--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(grok)
+_arguments "${_arguments_options[@]}" : \
+'(--file)--session=[Session id\: source id, logical id, alias, UUID suffix (≥8 chars), or unique prefix. Resolved through the session catalog before any parse]:SESSION:_default' \
+'--file=[Direct source file. Builds a source handle from this path only — no catalog scan, no global AICX state. Requires \`-o/--output\`]:FILE:_files' \
+'-o+[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
+'--output=[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
+'-p+[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
+'--project=[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
+'--max-message-chars=[Maximum message characters in markdown (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
+'--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
+'--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(junie)
+_arguments "${_arguments_options[@]}" : \
+'(--file)--session=[Session id\: source id, logical id, alias, UUID suffix (≥8 chars), or unique prefix. Resolved through the session catalog before any parse]:SESSION:_default' \
+'--file=[Direct source file. Builds a source handle from this path only — no catalog scan, no global AICX state. Requires \`-o/--output\`]:FILE:_files' \
+'-o+[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
+'--output=[Output file path. Required with \`--file\`; defaults to \`~/.aicx/extracts/<agent>/<session_id>\[_conversation\]\[_user\].md\` in session mode]:OUTPUT:_files' \
+'-p+[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
+'--project=[Explicit project/repo name (overrides inference)]:PROJECT:_default' \
+'--max-message-chars=[Maximum message characters in markdown (0 = no truncation)]:MAX_MESSAGE_CHARS:_default' \
+'--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
+'--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'--conversation[Conversation-first mode\: emit denoised user/assistant transcript only]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__extract__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-extract-help-command-$line[1]:"
+        case $line[1] in
+            (codex)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(claude)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(gemini)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(grok)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(junie)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(conversations)
+_arguments "${_arguments_options[@]}" : \
+'--agent=[Source agent for batch conversation export (v1\: claude only)]:AGENT:(claude)' \
+'*-p+[Source cwd/project filter(s)\: narrows session discovery before export]:PROJECT:_default' \
+'*--project=[Source cwd/project filter(s)\: narrows session discovery before export]:PROJECT:_default' \
+'-H+[Hours to look back when scanning source sessions (default\: 1 year)]:HOURS:_default' \
+'--hours=[Hours to look back when scanning source sessions (default\: 1 year)]:HOURS:_default' \
+'--out-dir=[Output directory. Files are written as \`<out-dir>/<agent>/<sanitized-session-id>.json\`. Session ids that contain characters other than \`\[A-Za-z0-9._-\]\` are sanitized; a SipHash suffix is appended to keep distinct ids from colliding after sanitization]:OUT_DIR:_files' \
+'--limit=[Maximum number of sessions to write, after deterministic session sorting]:LIMIT:_default' \
+'--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
+'--dry-run[Preview discovery without writing; emits a JSON envelope on stdout (sessions_discovered, by_kind, by_agent, filters_applied) and a human-readable summary banner on stderr]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(store)
+_arguments "${_arguments_options[@]}" : \
+'*-p+[Source cwd/project filter(s)\: narrows session discovery before repo segmentation]:PROJECT:_default' \
+'*--project=[Source cwd/project filter(s)\: narrows session discovery before repo segmentation]:PROJECT:_default' \
+'-a+[Agent filter\: one of claude, codex, gemini, junie, grok, codescribe, operator-md. Default\: claude+codex+gemini+junie+grok+codescribe (operator-md is opt-in via \`--agent operator-md\`)]:AGENT:(claude codex gemini junie grok codescribe operator-md)' \
+'--agent=[Agent filter\: one of claude, codex, gemini, junie, grok, codescribe, operator-md. Default\: claude+codex+gemini+junie+grok+codescribe (operator-md is opt-in via \`--agent operator-md\`)]:AGENT:(claude codex gemini junie grok codescribe operator-md)' \
+'-H+[Hours to look back (default\: 48, 0 = all time)]:HOURS:_default' \
+'--hours=[Hours to look back (default\: 48, 0 = all time)]:HOURS:_default' \
+'--emit=[What to print to stdout\: paths, json, none (default\: none)]:EMIT:((paths\:"Print store chunk paths (one per line)"
+json\:"Print JSON report (includes \`store_paths\` for convenience)"
+none\:"Print nothing to stdout"))' \
+'--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
+'--full-rescan[Ignore the stored watermark and previously-seen hashes for this run]' \
+'(--full-rescan)--incremental[Legacy no-op\: incremental mode is now the default]' \
+'--user-only[Only include user messages (exclude assistant + reasoning)]' \
+'(--user-only)--include-assistant[Include assistant messages (legacy flag; now default)]' \
+'--no-noise-filter[Disable structural-noise filter (line-numbered grep matches, tool echoes, stray YAML delimiters). Default\: filter is ON. Use this for debugging or when raw upstream content must be preserved verbatim in the chunk text]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(ingest)
+_arguments "${_arguments_options[@]}" : \
+'--source=[Source adapter to ingest]:SOURCE:(operator-md loct-context-pack)' \
+'*-p+[Source cwd/project filter(s)\: narrows source discovery before repo segmentation]:PROJECT:_default' \
+'*--project=[Source cwd/project filter(s)\: narrows source discovery before repo segmentation]:PROJECT:_default' \
+'-H+[Hours to look back when --since is omitted (default\: 720 = 30 days, 0 = all time)]:HOURS:_default' \
+'--hours=[Hours to look back when --since is omitted (default\: 720 = 30 days, 0 = all time)]:HOURS:_default' \
+'--since=[Lower date bound (YYYY-MM-DD or YYYY_MMDD)]:SINCE:_default' \
+'--emit=[What to print to stdout\: paths, json, none (default\: none)]:EMIT:((paths\:"Print store chunk paths (one per line)"
+json\:"Print JSON report (includes \`store_paths\` for convenience)"
+none\:"Print nothing to stdout"))' \
+'--no-redact-secrets[Redact secrets (tokens/keys) from outputs before writing/syncing]' \
+'--full-rescan[Ignore the stored watermark and previously-seen hashes for this run]' \
+'--no-noise-filter[Disable structural-noise filter]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'::input -- Source path for explicit ingests\: markdown file/directory for --source operator-md, pack directory for --source loct-context-pack:_files' \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(sources)
+_arguments "${_arguments_options[@]}" : \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_aicx__subcmd__sources_commands" \
+"*::: :->sources" \
+&& ret=0
+
+    case $state in
+    (sources)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-sources-command-$line[1]:"
+        case $line[1] in
+            (protect)
+_arguments "${_arguments_options[@]}" : \
+'--root=[Source root to protect. Must be an existing directory]:ROOT:_files' \
+'--backend=[Protection backend to use]:BACKEND:(git-local)' \
+'--apply[Apply the plan. Omit for a dry run]' \
+'--initial-snapshot[Create an initial local commit after git-local setup]' \
+'--no-gitignore[Do not add safe local .gitignore suggestions]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__sources__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-sources-help-command-$line[1]:"
+        case $line[1] in
+            (protect)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(sessions)
+_arguments "${_arguments_options[@]}" : \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_aicx__subcmd__sessions_commands" \
+"*::: :->sessions" \
+&& ret=0
+
+    case $state in
+    (sessions)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-sessions-command-$line[1]:"
+        case $line[1] in
+            (current)
+_arguments "${_arguments_options[@]}" : \
+'-j[Emit JSON with source metadata instead of the bare session id]' \
+'--json[Emit JSON with source metadata instead of the bare session id]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+'--agent=[Filter by agent (claude | codex | gemini | junie | grok)]:AGENT:(claude codex gemini junie grok)' \
+'--since=[Only sessions updated on/after this date (YYYY-MM-DD). Defaults to the last 30 days; pass --all to scan the full history]:SINCE:_default' \
+'--limit=[Max sessions to show (0 = all)]:LIMIT:_default' \
+'--format=[Output format\: table | json]:FORMAT:_default' \
+'--cwd[Restrict to sessions whose repo/cwd matches the current directory]' \
+'--all[Scan the full session history (slower) instead of the default last-30-days window]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(show)
+_arguments "${_arguments_options[@]}" : \
+'--format=[Output format\: markdown | json]:FORMAT:_default' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':session_id -- Session id (or a unique prefix):_default' \
+&& ret=0
+;;
+(report)
+_arguments "${_arguments_options[@]}" : \
+'--agent=[Agent\: claude | codex | gemini | junie | grok. Inferred from the session id when omitted]:AGENT:_default' \
+'--hours=[Hours to look back when locating the session (default 720)]:HOURS:_default' \
+'--repo=[Repo root evidence is checked against (default\: current directory)]:REPO:_files' \
+'--max=[Max clarify questions (hard-capped at 5)]:MAX:_default' \
+'--format=[Output format\: markdown | json]:FORMAT:_default' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':session_id -- Session id (or a unique prefix):_default' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__sessions__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-sessions-help-command-$line[1]:"
+        case $line[1] in
+            (current)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(show)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(report)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(claims)
+_arguments "${_arguments_options[@]}" : \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_aicx__subcmd__claims_commands" \
+"*::: :->claims" \
+&& ret=0
+
+    case $state in
+    (claims)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-claims-command-$line[1]:"
+        case $line[1] in
+            (extract)
+_arguments "${_arguments_options[@]}" : \
+'--session=[Session id (or unique prefix)]:SESSION:_default' \
+'--agent=[Agent\: claude | codex | gemini | junie | grok. Inferred from the session id when omitted]:AGENT:_default' \
+'--hours=[Hours to look back when locating the session (default 720)]:HOURS:_default' \
+'--format=[Output format\: json | summary]:FORMAT:_default' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__claims__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-claims-help-command-$line[1]:"
+        case $line[1] in
+            (extract)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(results)
+_arguments "${_arguments_options[@]}" : \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_aicx__subcmd__results_commands" \
+"*::: :->results" \
+&& ret=0
+
+    case $state in
+    (results)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-results-command-$line[1]:"
+        case $line[1] in
+            (collect)
+_arguments "${_arguments_options[@]}" : \
+'--session=[Session id (or unique prefix)]:SESSION:_default' \
+'--agent=[Agent\: claude | codex | gemini | junie | grok. Inferred from the session id when omitted]:AGENT:_default' \
+'--hours=[Hours to look back when locating the session (default 720)]:HOURS:_default' \
+'--repo=[Repo root evidence is checked against (default\: current directory)]:REPO:_files' \
+'--format=[Output format\: json | summary]:FORMAT:_default' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__results__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-results-help-command-$line[1]:"
+        case $line[1] in
+            (collect)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(clarify)
+_arguments "${_arguments_options[@]}" : \
+'--session=[Session id (or unique prefix)]:SESSION:_default' \
+'--agent=[Agent\: claude | codex | gemini | junie | grok. Inferred from the session id when omitted]:AGENT:_default' \
+'--hours=[Hours to look back when locating the session (default 720)]:HOURS:_default' \
+'--repo=[Repo root evidence is checked against (default\: current directory)]:REPO:_files' \
+'--max=[Max questions (hard-capped at 5)]:MAX:_default' \
+'--format=[Output format\: markdown | json]:FORMAT:_default' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(wizard)
+_arguments "${_arguments_options[@]}" : \
+'--smoke-test[Render one frame and exit; used by automated smoke tests]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(refs)
+_arguments "${_arguments_options[@]}" : \
+'-H+[Hours to look back (filter by canonical chunk date)]:HOURS:_default' \
+'--hours=[Hours to look back (filter by canonical chunk date)]:HOURS:_default' \
+'-p+[Strict project filter\: \`owner/repo\`, \`/repo\` (cross-org repo name), \`owner/\` (org wildcard), or \`name\` (matches org OR repo). Substring matching is intentionally disabled — \`-p vista\` no longer leaks into \`vista-portal\`/\`vista-datasets\`]:PROJECT:_default' \
+'--project=[Strict project filter\: \`owner/repo\`, \`/repo\` (cross-org repo name), \`owner/\` (org wildcard), or \`name\` (matches org OR repo). Substring matching is intentionally disabled — \`-p vista\` no longer leaks into \`vista-portal\`/\`vista-datasets\`]:PROJECT:_default' \
+'--emit=[What to print to stdout\: summary, paths (default\: summary)]:EMIT:((summary\:"Print a compact per-project summary"
+paths\:"Print raw file paths (one per line)"))' \
+'-s[Legacy alias for \`--emit summary\`]' \
+'--summary[Legacy alias for \`--emit summary\`]' \
+'--strict[Filter out low-signal noise (<15 lines, task-notifications only)]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(state)
+_arguments "${_arguments_options[@]}" : \
+'-p+[Project filter (applies to --info as well as --reset). Supports the standard shapes\: \`-p owner/repo\`, \`-p owner/\`, \`-p /repo\`, or a bare \`-p name\` (cross-org)]:PROJECT:_default' \
+'--project=[Project filter (applies to --info as well as --reset). Supports the standard shapes\: \`-p owner/repo\`, \`-p owner/\`, \`-p /repo\`, or a bare \`-p name\` (cross-org)]:PROJECT:_default' \
+'--reset[Reset all dedup hashes]' \
+'--info[Show state info/statistics]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(dashboard)
+_arguments "${_arguments_options[@]}" : \
+'--store-root=[Store root directory (default\: ~/.aicx)]:STORE_ROOT:_files' \
+'-p+[Narrow the dashboard dataset to project/store buckets containing this string]:PROJECT:_default' \
+'--project=[Narrow the dashboard dataset to project/store buckets containing this string]:PROJECT:_default' \
+'-H+[Narrow the dashboard dataset to the last N hours (omit for all time)]:HOURS:_default' \
+'--hours=[Narrow the dashboard dataset to the last N hours (omit for all time)]:HOURS:_default' \
+'-o+[Output HTML path (default\: ~/.aicx/aicx-dashboard.html)]:OUTPUT:_files' \
+'--output=[Output HTML path (default\: ~/.aicx/aicx-dashboard.html)]:OUTPUT:_files' \
+'--host=[Bind host IP address (default\: 127.0.0.1, server mode only)]:HOST:_default' \
+'--port=[Bind TCP port (default\: 9478, server mode only)]:PORT:_default' \
+'--allow-cors-origins=[CORS origin policy for server mode\: \`local\` (default), \`tailscale\`, \`all\`, or an explicit URL]:PRESET|URL:_default' \
+'--auth-token=[Optional explicit auth token (overrides env / file / generated). Server mode only]:TOKEN:_default' \
+'--require-auth=[Require Bearer auth on dashboard \`/api/*\` (default\: true). Pass \`--no-require-auth\` to opt out]:REQUIRE_AUTH:(true false)' \
+'--title=[Document title]:TITLE:_default' \
+'--preview-chars=[Max preview characters per record (0 = no truncation)]:PREVIEW_CHARS:_default' \
+'(--generate-html)--serve[Run the live local HTTP dashboard instead of generating a static HTML file]' \
+'--generate-html[Generate a standalone HTML file (default mode when no mode flag is passed)]' \
+'--no-open[Suppress automatic browser open on startup (server mode only)]' \
+'--bg[Detach the dashboard server into the background (\`--serve\` implies \`--no-open\`)]' \
+'--allow-no-origin[Allow mutating dashboard API calls without Origin or Referer (tooling escape hatch)]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(reports)
+_arguments "${_arguments_options[@]}" : \
+'--artifacts-root=[Vibecrafted artifact root (default\: ~/.vibecrafted/artifacts)]:ARTIFACTS_ROOT:_files' \
+'--org=[Artifact organization bucket]:ORG:_default' \
+'--repo=[Repository bucket (defaults to the current directory name)]:REPO:_default' \
+'--workflow=[Workflow filter (matches workflow label, skill code, run/prompt IDs, lane, and title)]:WORKFLOW:_default' \
+'--date-from=[Inclusive start date (YYYY-MM-DD or YYYY_MMDD)]:DATE_FROM:_default' \
+'--date-to=[Inclusive end date (YYYY-MM-DD or YYYY_MMDD)]:DATE_TO:_default' \
+'-o+[Output HTML path (default\: ~/.aicx/aicx-reports.html)]:OUTPUT:_files' \
+'--output=[Output HTML path (default\: ~/.aicx/aicx-reports.html)]:OUTPUT:_files' \
+'--bundle-output=[Optional JSON bundle output path for later import/merge]:BUNDLE_OUTPUT:_files' \
+'--title=[Document title]:TITLE:_default' \
+'--preview-chars=[Max preview characters per record (0 = no truncation)]:PREVIEW_CHARS:_default' \
+'--force[Overwrite existing HTML/bundle outputs. Without this flag, the command refuses to clobber a pre-existing file at either output path]' \
+'--deterministic[Derive \`generated_at\` from the latest record timestamp instead of \`Utc\:\:now()\`. Also enabled via \`AICX_REPORTS_DETERMINISTIC=1\` env var]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(corpus)
+_arguments "${_arguments_options[@]}" : \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_aicx__subcmd__corpus_commands" \
+"*::: :->corpus" \
+&& ret=0
+
+    case $state in
+    (corpus)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-corpus-command-$line[1]:"
+        case $line[1] in
+            (audit)
+_arguments "${_arguments_options[@]}" : \
+'*--root=[Corpus root(s) to scan. Defaults to \$HOME/.aicx, \$HOME/.ai-contexters, and optional \$HOME/.xcia]:ROOT:_files' \
+'--emit=[Output format\: text or json]:EMIT:((text\:"Print a readable text report"
+json\:"Print compact JSON"))' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(repair)
+_arguments "${_arguments_options[@]}" : \
+'*--root=[Corpus root(s) to scan. Defaults to \$HOME/.aicx, \$HOME/.ai-contexters, and optional \$HOME/.xcia]:ROOT:_files' \
+'--manifest=[Write the repair manifest to an explicit path, including dry-run previews]:MANIFEST:_files' \
+'--emit=[Output format\: text or json]:EMIT:((text\:"Print a readable text report"
+json\:"Print compact JSON"))' \
+'--dry-run[Scan and report changes without modifying files. This is the default when --apply is omitted]' \
+'(--dry-run)--apply[Apply deterministic markdown repairs]' \
+'--backup[Write backups before applying repairs]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(validate-cards)
+_arguments "${_arguments_options[@]}" : \
+'--strict[Exit non-zero when hard validation errors are present]' \
+'--json[Emit compact JSON instead of readable text]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'::root -- Store subtree or markdown card to validate. Defaults to the corpus roots used by audit:_files' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__corpus__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-corpus-help-command-$line[1]:"
+        case $line[1] in
+            (audit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(repair)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(validate-cards)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(reports-extractor)
+_arguments "${_arguments_options[@]}" : \
+'--artifacts-root=[Vibecrafted artifact root (default\: ~/.vibecrafted/artifacts)]:ARTIFACTS_ROOT:_files' \
+'--org=[Artifact organization bucket]:ORG:_default' \
+'--repo=[Repository bucket (defaults to the current directory name)]:REPO:_default' \
+'--workflow=[Workflow filter (matches workflow label, skill code, run/prompt IDs, lane, and title)]:WORKFLOW:_default' \
+'--date-from=[Inclusive start date (YYYY-MM-DD or YYYY_MMDD)]:DATE_FROM:_default' \
+'--date-to=[Inclusive end date (YYYY-MM-DD or YYYY_MMDD)]:DATE_TO:_default' \
+'-o+[Output HTML path (default\: ~/.aicx/aicx-reports.html)]:OUTPUT:_files' \
+'--output=[Output HTML path (default\: ~/.aicx/aicx-reports.html)]:OUTPUT:_files' \
+'--bundle-output=[Optional JSON bundle output path for later import/merge]:BUNDLE_OUTPUT:_files' \
+'--title=[Document title]:TITLE:_default' \
+'--preview-chars=[Max preview characters per record (0 = no truncation)]:PREVIEW_CHARS:_default' \
+'--force[Overwrite existing HTML/bundle outputs. Without this flag, the command refuses to clobber a pre-existing file at either output path]' \
+'--deterministic[Derive \`generated_at\` from the latest record timestamp instead of \`Utc\:\:now()\`. Also enabled via \`AICX_REPORTS_DETERMINISTIC=1\` env var]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(dashboard-serve)
+_arguments "${_arguments_options[@]}" : \
+'--store-root=[Store root directory (default\: ~/.aicx)]:STORE_ROOT:_files' \
+'--host=[Bind host IP address (loopback only; example\: 127.0.0.1)]:HOST:_default' \
+'--port=[Bind TCP port]:PORT:_default' \
+'--artifact=[Legacy compatibility path retained for status surfaces; not written in server mode]:ARTIFACT:_files' \
+'--title=[Document title]:TITLE:_default' \
+'--preview-chars=[Max preview characters per record (0 = no truncation)]:PREVIEW_CHARS:_default' \
+'--no-open[Suppress automatic browser open on startup]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(intents)
+_arguments "${_arguments_options[@]}" : \
+'*-p+[Repo or store-bucket filters. Omit to scan all projects. Repeated \`-p\` flags or comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
+'*--project=[Repo or store-bucket filters. Omit to scan all projects. Repeated \`-p\` flags or comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
+'-H+[Hours to look back (default\: 720 = 30 days)]:HOURS:_default' \
+'--hours=[Hours to look back (default\: 720 = 30 days)]:HOURS:_default' \
+'--limit=[Maximum number of results to return. Default is command-specific\: search/steer 10, tail 20, intents unlimited (full roadmap)]:LIMIT:_default' \
+'--sort=[Sort order applied after filtering. Default\: command-specific]:SORT:(newest oldest score)' \
+'--score=[Minimum score threshold (0-100; semantic match confidence)]:SCORE:_default' \
+'--agent=[Agent name filter\: claude | codex | gemini | junie | codescribe]:AGENT:_default' \
+'--since=[Lower date bound\: YYYY-MM-DD or relative (e.g., 2026-04-23..)]:SINCE:_default' \
+'--until=[Upper date bound\: YYYY-MM-DD]:UNTIL:_default' \
+'--frame-kind=[Frame channel filter\: user_msg | agent_reply | internal_thought | tool_call]:FRAME_KIND:(user_msg agent_reply internal_thought tool_call)' \
+'--unresolved-mode=[Mode for filtering unresolved entries\: session (default) or intent]:UNRESOLVED_MODE:(session intent)' \
+'--emit=[Output format\: markdown or json (json includes oracle_status)]:EMIT:(markdown json)' \
+'--min-confidence=[Minimum confidence threshold (1..5) to keep (overrides --strict if both specified)]:MIN_CONFIDENCE:_default' \
+'--kind=[Filter by kind\: decision, intent, outcome, task]:KIND:(decision intent outcome task)' \
+'--unresolved[Return only intent entries without a matching outcome]' \
+'--collapse-session[Collapse multiple intents from the same session into one entry]' \
+'--strict[Only show high-confidence intents]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(tail)
+_arguments "${_arguments_options[@]}" : \
+'*-p+[Repo or store-bucket filters. Omit to scan all projects. Repeated \`-p\` flags or comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
+'*--project=[Repo or store-bucket filters. Omit to scan all projects. Repeated \`-p\` flags or comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
+'-H+[Hours to look back (default\: 48)]:HOURS:_default' \
+'--hours=[Hours to look back (default\: 48)]:HOURS:_default' \
+'-k+[Filter by kind\: decision, intent, outcome, task]:KIND:_default' \
+'--kind=[Filter by kind\: decision, intent, outcome, task]:KIND:_default' \
+'--limit=[Maximum number of results to return. Default is command-specific\: search/steer 10, tail 20, intents unlimited (full roadmap)]:LIMIT:_default' \
+'--sort=[Sort order applied after filtering. Default\: command-specific]:SORT:(newest oldest score)' \
+'--score=[Minimum score threshold (0-100; semantic match confidence)]:SCORE:_default' \
+'--agent=[Agent name filter\: claude | codex | gemini | junie | codescribe]:AGENT:_default' \
+'--since=[Lower date bound\: YYYY-MM-DD or relative (e.g., 2026-04-23..)]:SINCE:_default' \
+'--until=[Upper date bound\: YYYY-MM-DD]:UNTIL:_default' \
+'--frame-kind=[Frame channel filter\: user_msg | agent_reply | internal_thought | tool_call]:FRAME_KIND:(user_msg agent_reply internal_thought tool_call)' \
+'--follow[Subscribe to filesystem events and stream new entries]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(serve)
+_arguments "${_arguments_options[@]}" : \
+'--transport=[Transport\: stdio (default) or http. Legacy alias\: sse]:TRANSPORT:(stdio http)' \
+'--host=[Bind address for streamable HTTP transport (default\: 127.0.0.1)]:HOST:_default' \
+'--port=[Port for streamable HTTP transport (default\: 8044)]:PORT:_default' \
+'*--allowed-host=[Allowed HTTP Host header for streamable HTTP clients. Repeat for remote hostnames/IPs]:HOST:_default' \
+'--auth-token=[Optional explicit auth token (overrides env / file / generated). HTTP transport only]:TOKEN:_default' \
+'(--no-require-auth)--require-auth=[Require Bearer auth on HTTP transport (default\: true). Pass \`--no-require-auth\` to opt out]:REQUIRE_AUTH:(true false)' \
+'--allow-any-host[Disable HTTP Host header validation. Not recommended outside trusted networks]' \
+'--no-require-auth[Disable Bearer auth on HTTP transport. Only allowed on loopback binds]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(init)
+_arguments "${_arguments_options[@]}" : \
+'-p+[Project name override]:PROJECT:_default' \
+'--project=[Project name override]:PROJECT:_default' \
+'-a+[Agent override\: claude or codex]:AGENT:_default' \
+'--agent=[Agent override\: claude or codex]:AGENT:_default' \
+'--model=[Model override (optional; if omitted uses agent default)]:MODEL:_default' \
+'-H+[Hours to look back for context (default\: 4800)]:HOURS:_default' \
+'--hours=[Hours to look back for context (default\: 4800)]:HOURS:_default' \
+'--max-lines=[Maximum lines per context section in the prompt]:MAX_LINES:_default' \
+'--action=[Action focus appended to the prompt]:ACTION:_default' \
+'--agent-prompt=[Additional agent prompt appended after core rules (verbatim)]:AGENT_PROMPT:_default' \
+'--agent-prompt-file=[Read additional agent prompt from a file (verbatim)]:AGENT_PROMPT_FILE:_files' \
+'--user-only[Only include user messages in context (exclude assistant + reasoning)]' \
+'(--user-only)--include-assistant[Include assistant messages (legacy flag; now default)]' \
+'--no-run[Build context/prompt only, do not run an agent]' \
+'--no-confirm[Skip "Run? (y)es / (n)o" confirmation]' \
+'--no-gitignore[Do not auto-modify \`.gitignore\`]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(search)
+_arguments "${_arguments_options[@]}" : \
+'*-p+[Project filter. Omit to search every project]:PROJECT:_default' \
+'*--project=[Project filter. Omit to search every project]:PROJECT:_default' \
+'-H+[Hours to look back (0 = all time)]:HOURS:_default' \
+'--hours=[Hours to look back (0 = all time)]:HOURS:_default' \
+'-d+[Filter by date\: single day (2026-03-28), range (2026-03-20..2026-03-28), or open-ended (2026-03-20.. or ..2026-03-28)]:DATE:_default' \
+'--date=[Filter by date\: single day (2026-03-28), range (2026-03-20..2026-03-28), or open-ended (2026-03-20.. or ..2026-03-28)]:DATE:_default' \
+'--limit=[Maximum number of results to return. Default is command-specific\: search/steer 10, tail 20, intents unlimited (full roadmap)]:LIMIT:_default' \
+'--sort=[Sort order applied after filtering. Default\: command-specific]:SORT:(newest oldest score)' \
+'--score=[Minimum score threshold (0-100; semantic match confidence)]:SCORE:_default' \
+'--agent=[Agent name filter\: claude | codex | gemini | junie | codescribe]:AGENT:_default' \
+'--since=[Lower date bound\: YYYY-MM-DD or relative (e.g., 2026-04-23..)]:SINCE:_default' \
+'--until=[Upper date bound\: YYYY-MM-DD]:UNTIL:_default' \
+'--frame-kind=[Frame channel filter\: user_msg | agent_reply | internal_thought | tool_call]:FRAME_KIND:(user_msg agent_reply internal_thought tool_call)' \
+'--kind=[Filter by canonical corpus kind\: conversations, plans, reports, other]:KIND:(conversations conversation plans plan reports report other)' \
+'(--evidence)--no-semantic[Bypass semantic vector search and run filesystem-fuzzy search]' \
+'--evidence[Return an evidence packet\: semantic candidates re-ranked by answer/support signals, with source sections and diagnostics]' \
+'-j[Emit compact JSON instead of plain text]' \
+'--json[Emit compact JSON instead of plain text]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':query -- Search query string:_default' \
+&& ret=0
+;;
+(eval)
+_arguments "${_arguments_options[@]}" : \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_aicx__subcmd__eval_commands" \
+"*::: :->eval" \
+&& ret=0
+
+    case $state in
+    (eval)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-eval-command-$line[1]:"
+        case $line[1] in
+            (search-quality)
+_arguments "${_arguments_options[@]}" : \
+'*--case=[Only evaluate selected case ids. Repeat or pass comma-separated values]:CASES:_default' \
+'--top=[Number of evidence hits inspected per case]:TOP:_default' \
+'--limit=[Search limit passed to \`aicx search --evidence\`]:LIMIT:_default' \
+'--seed=[Load a custom search-quality seed TOML. Defaults to the embedded curated seed]:SEED:_files' \
+'--aicx-bin=[Override the aicx binary used by --run]:AICX_BIN:_files' \
+'--run[Execute the matrix against the active AICX runtime. Omit to only list cases]' \
+'-j[Emit JSON instead of plain text]' \
+'--json[Emit JSON instead of plain text]' \
+'--strict[Exit non-zero when any case fails. Useful for CI or local gates]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__eval__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-eval-help-command-$line[1]:"
+        case $line[1] in
+            (search-quality)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(index)
+_arguments "${_arguments_options[@]}" : \
+'*-p+[Project filter. Omit to index the global \`_all\` bucket]:PROJECT:_default' \
+'*--project=[Project filter. Omit to index the global \`_all\` bucket]:PROJECT:_default' \
+'--sample=[Stop after sampling this many chunks (0 = scan all)]:SAMPLE:_default' \
+'--dry-run=[Preview only. Omit this flag to materialize the persistent semantic index used by \`aicx search\`]::DRY_RUN:(true false)' \
+'-j[Emit JSON stats instead of plain text]' \
+'--json[Emit JSON stats instead of plain text]' \
+'--full-rescan[Force a full re-embed of every chunk. Default is incremental\: walk only sidecars newer than the existing index'\''s \`header.generated_at\` and append. Use this flag after embedder model changes or when the committed index is suspect]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_aicx__subcmd__index_commands" \
+"*::: :->index" \
+&& ret=0
+
+    case $state in
+    (index)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-index-command-$line[1]:"
+        case $line[1] in
+            (status)
+_arguments "${_arguments_options[@]}" : \
+'*-p+[Strict project filter, repeatable. Same shapes as \`aicx index\`\: \`-p owner/repo\`   strict \`<owner>/<repo>\` slug match \`-p owner/\`       all repos under that owner (org wildcard) \`-p /repo\`        same repo name across every owner \`-p name\`         name matches an owner OR a repo (cross-org)]:PROJECT:_default' \
+'*--project=[Strict project filter, repeatable. Same shapes as \`aicx index\`\: \`-p owner/repo\`   strict \`<owner>/<repo>\` slug match \`-p owner/\`       all repos under that owner (org wildcard) \`-p /repo\`        same repo name across every owner \`-p name\`         name matches an owner OR a repo (cross-org)]:PROJECT:_default' \
+'-j[Emit JSON status instead of plain text]' \
+'--json[Emit JSON status instead of plain text]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(derive)
+_arguments "${_arguments_options[@]}" : \
+'*-p+[Strict project filter, repeatable. Omit only with --all-projects]:PROJECT:_default' \
+'*--project=[Strict project filter, repeatable. Omit only with --all-projects]:PROJECT:_default' \
+'(-p --project)--all-projects[Derive buckets for every project present in the existing \`_all\` index]' \
+'-j[Emit JSON report instead of plain text]' \
+'--json[Emit JSON report instead of plain text]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__index__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-index-help-command-$line[1]:"
+        case $line[1] in
+            (status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(derive)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(config)
+_arguments "${_arguments_options[@]}" : \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_aicx__subcmd__config_commands" \
+"*::: :->config" \
+&& ret=0
+
+    case $state in
+    (config)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-config-command-$line[1]:"
+        case $line[1] in
+            (init)
+_arguments "${_arguments_options[@]}" : \
+'--path=[Write to a custom path instead of \`~/.aicx/config.toml\`. Useful for shared / repo-local config snapshots]:PATH:_files' \
+'--force[Overwrite the existing config file if present]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(show)
+_arguments "${_arguments_options[@]}" : \
+'-j[Emit JSON instead of human-readable text]' \
+'--json[Emit JSON instead of human-readable text]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__config__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-config-help-command-$line[1]:"
+        case $line[1] in
+            (init)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(show)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(read)
+_arguments "${_arguments_options[@]}" : \
+'--max-chars=[Truncate chunk content to this many UTF-8 characters]:MAX_CHARS:_default' \
+'-j[Emit compact JSON instead of readable text]' \
+'--json[Emit compact JSON instead of readable text]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':reference -- Absolute path, store-relative path, file name, legacy compact ref, or `chunk\:<id>`:_default' \
+&& ret=0
+;;
+(open)
+_arguments "${_arguments_options[@]}" : \
+'--max-chars=[Truncate chunk content to this many UTF-8 characters]:MAX_CHARS:_default' \
+'-j[Emit compact JSON instead of readable text]' \
+'--json[Emit compact JSON instead of readable text]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':reference -- Absolute path, store-relative path, file name, legacy compact ref, or `chunk\:<id>`:_default' \
+&& ret=0
+;;
+(steer)
+_arguments "${_arguments_options[@]}" : \
+'--run-id=[Filter by run_id (exact match)]:RUN_ID:_default' \
+'--prompt-id=[Filter by prompt_id (exact match)]:PROMPT_ID:_default' \
+'-k+[Filter by kind\: conversations, plans, reports, other]:KIND:_default' \
+'--kind=[Filter by kind\: conversations, plans, reports, other]:KIND:_default' \
+'*-p+[Repo or store-bucket filters. Omit to search all projects. Repeated \`-p\` flags or comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
+'*--project=[Repo or store-bucket filters. Omit to search all projects. Repeated \`-p\` flags or comma list (\`-p a,b\`) form a union]:PROJECT:_default' \
+'-d+[Filter by date\: single day (2026-03-28), range (2026-03-20..2026-03-28), or open-ended (2026-03-20.. or ..2026-03-28)]:DATE:_default' \
+'--date=[Filter by date\: single day (2026-03-28), range (2026-03-20..2026-03-28), or open-ended (2026-03-20.. or ..2026-03-28)]:DATE:_default' \
+'--limit=[Maximum number of results to return. Default is command-specific\: search/steer 10, tail 20, intents unlimited (full roadmap)]:LIMIT:_default' \
+'--sort=[Sort order applied after filtering. Default\: command-specific]:SORT:(newest oldest score)' \
+'--score=[Minimum score threshold (0-100; semantic match confidence)]:SCORE:_default' \
+'--agent=[Agent name filter\: claude | codex | gemini | junie | codescribe]:AGENT:_default' \
+'--since=[Lower date bound\: YYYY-MM-DD or relative (e.g., 2026-04-23..)]:SINCE:_default' \
+'--until=[Upper date bound\: YYYY-MM-DD]:UNTIL:_default' \
+'--frame-kind=[Frame channel filter\: user_msg | agent_reply | internal_thought | tool_call]:FRAME_KIND:(user_msg agent_reply internal_thought tool_call)' \
+'-j[Emit compact JSON with oracle_status instead of readable text]' \
+'--json[Emit compact JSON with oracle_status instead of readable text]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(migrate)
+_arguments "${_arguments_options[@]}" : \
+'--legacy-root=[Override legacy input store root (default\: ~/.ai-contexters)]:LEGACY_ROOT:_files' \
+'--store-root=[Override AICX store root (default\: ~/.aicx)]:STORE_ROOT:_files' \
+'--cards-v2=[Upgrade store cards v1 -> v2 in place (sidecar schema/honesty fields, bracket header -> YAML frontmatter; body bytes never change). Optional ROOT overrides the walked directory (default\: canonical store dir). Dry-run by default; pass --apply to write]::ROOT:_files' \
+'--dry-run[Dry run\: show what would be moved without modifying files]' \
+'--no-intent-schema[Skip post-migration intent schema scan on the canonical store]' \
+'(--dry-run)--apply[Write the cards-v2 migration (without it, --cards-v2 is a dry run)]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(migrate-intent-schema)
+_arguments "${_arguments_options[@]}" : \
+'-p+[Strict project filter\: \`owner/repo\`, \`/repo\` (cross-org repo name), \`owner/\` (org wildcard), or \`name\` (matches org OR repo). Omit to scan the whole store. Substring matching is intentionally disabled]:PROJECT:_default' \
+'--project=[Strict project filter\: \`owner/repo\`, \`/repo\` (cross-org repo name), \`owner/\` (org wildcard), or \`name\` (matches org OR repo). Omit to scan the whole store. Substring matching is intentionally disabled]:PROJECT:_default' \
+'--store-root=[Override AICX store root (default\: ~/.aicx)]:STORE_ROOT:_files' \
+'--dry-run[Dry run\: show classification counts without writing sidecars]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(doctor)
+_arguments "${_arguments_options[@]}" : \
+'--restore-quarantine=[Restore files from a quarantine manifest slug]:SLUG:_default' \
+'--format=[Output format\: text (default), json]:FORMAT:_default' \
+'--rebuild-steer-index[Delete and rebuild the steer index from the canonical store when corrupted or schema-incompatible. Narrower contract than the legacy \`--fix\` (which was a no-op for sidecars/index consistency/empty bodies — those have dedicated flags)]' \
+'--fix-buckets[Move suspicious top-level corpus buckets to \$HOME/.aicx/quarantine/. Buckets that are merely CamelCase (legitimate GitHub orgs like \`LibraxisAI\`, \`Vetcoders\`, \`Loctree\`, \`Szowesgad\`) are canonicalized in place to lowercase instead of quarantined, merging into existing lowercase buckets if present]' \
+'--dry-run[With --fix-buckets, preview the planned canonicalize/quarantine actions without modifying the filesystem. Output entries are prefixed with \`\[dry-run\]\`. Use this before running \`--fix-buckets\` against a large store to verify the classification before commit]' \
+'--rebuild-sidecars[Emit a reviewable bash script for missing sidecar backfill]' \
+'--prune-empty-bodies[Emit a reviewable bash script for moving empty-body chunks to quarantine]' \
+'--apply[With --prune-empty-bodies, move empty-body chunks into recoverable quarantine]' \
+'-y[Assume yes on doctor cleanup prompts]' \
+'--yes[Assume yes on doctor cleanup prompts]' \
+'--force[Skip dry-run preview and prompts; intended for CI cleanup runs]' \
+'--check-dedup[Report duplicate content_sha256 groups across store and context-corpus]' \
+'-v[Print recommendations for green checks too]' \
+'--verbose[Print recommendations for green checks too]' \
+'--smoke[Run actual real HTTP POST / embedder tests instead of skipping them. Doctor stays fast and cheap by default; this flag exercises the AI provider]' \
+'--oracle[Report AICX Oracle readiness\: ready | degraded | unsafe_for_loctree_scope.]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(health)
+_arguments "${_arguments_options[@]}" : \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(warmup)
+_arguments "${_arguments_options[@]}" : \
+'-j[Emit JSON instead of readable text]' \
+'--json[Emit JSON instead of readable text]' \
+'-v[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'--verbose[Verbose diagnostics\: echo per-file extractor warnings to stderr]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-help-command-$line[1]:"
+        case $line[1] in
+            (completions)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(claude)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(codex)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(all)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(extract)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__help__subcmd__extract_commands" \
+"*::: :->extract" \
+&& ret=0
+
+    case $state in
+    (extract)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-help-extract-command-$line[1]:"
+        case $line[1] in
+            (codex)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(claude)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(gemini)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(grok)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(junie)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(conversations)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(store)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(ingest)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(sources)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__help__subcmd__sources_commands" \
+"*::: :->sources" \
+&& ret=0
+
+    case $state in
+    (sources)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-help-sources-command-$line[1]:"
+        case $line[1] in
+            (protect)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(sessions)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__help__subcmd__sessions_commands" \
+"*::: :->sessions" \
+&& ret=0
+
+    case $state in
+    (sessions)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-help-sessions-command-$line[1]:"
+        case $line[1] in
+            (current)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(show)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(report)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(claims)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__help__subcmd__claims_commands" \
+"*::: :->claims" \
+&& ret=0
+
+    case $state in
+    (claims)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-help-claims-command-$line[1]:"
+        case $line[1] in
+            (extract)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(results)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__help__subcmd__results_commands" \
+"*::: :->results" \
+&& ret=0
+
+    case $state in
+    (results)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-help-results-command-$line[1]:"
+        case $line[1] in
+            (collect)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(clarify)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(wizard)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(refs)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(state)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(dashboard)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(reports)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(corpus)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__help__subcmd__corpus_commands" \
+"*::: :->corpus" \
+&& ret=0
+
+    case $state in
+    (corpus)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-help-corpus-command-$line[1]:"
+        case $line[1] in
+            (audit)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(repair)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(validate-cards)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(reports-extractor)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(dashboard-serve)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(intents)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(tail)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(serve)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(init)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(search)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(eval)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__help__subcmd__eval_commands" \
+"*::: :->eval" \
+&& ret=0
+
+    case $state in
+    (eval)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-help-eval-command-$line[1]:"
+        case $line[1] in
+            (search-quality)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(index)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__help__subcmd__index_commands" \
+"*::: :->index" \
+&& ret=0
+
+    case $state in
+    (index)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-help-index-command-$line[1]:"
+        case $line[1] in
+            (status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(derive)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(config)
+_arguments "${_arguments_options[@]}" : \
+":: :_aicx__subcmd__help__subcmd__config_commands" \
+"*::: :->config" \
+&& ret=0
+
+    case $state in
+    (config)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:aicx-help-config-command-$line[1]:"
+        case $line[1] in
+            (init)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(show)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(read)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(steer)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(migrate)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(migrate-intent-schema)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(doctor)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(health)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(warmup)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_aicx_commands] )) ||
+_aicx_commands() {
+    local commands; commands=(
+'completions:Generate shell completions for the canonical CLI grammar' \
+'claude:Extract and store Agents'\'' sessions into the canonical corpus (canonical corpus extraction)' \
+'codex:Extract and store Codex sessions into the canonical corpus' \
+'all:Extract and store from all agents (Claude + Codex + Gemini + Junie + Codescribe) into the canonical corpus' \
+'extract:Extract a single session for one agent — by session id or direct file' \
+'conversations:Batch-export conversation JSON files without writing to the canonical store' \
+'store:Build the canonical corpus in from local agents'\'' session files' \
+'ingest:Ingest operator-owned source documents into the canonical corpus' \
+'list:List raw agent session sources on disk (pre-extraction inputs)' \
+'sources:Audit and explicitly protect raw source roots' \
+'sessions:Discover and list agent sessions on disk (session surface)' \
+'claims:Lane 2\: extract agent claims (audit targets) from a session' \
+'results:Lane 3\: collect repo evidence for a session'\''s claims and verify them' \
+'clarify:Lane 5\: generate at most 5 A/B/C decision questions from verified gaps' \
+'wizard:Interactive daily-driver entrypoint for corpus, doctor, intents, and store' \
+'refs:List chunks in the canonical store inventory' \
+'state:Manage extraction dedup state (watermarks and hashes)' \
+'dashboard:Generate a searchable HTML dashboard from the canonical store, or serve it locally' \
+'reports:Extract Vibecrafted workflow and marbles reports into a standalone HTML explorer' \
+'corpus:Audit or repair derived corpus markdown' \
+'reports-extractor:Deprecated compatibility shim for \`aicx reports\`' \
+'dashboard-serve:Deprecated compatibility shim for \`aicx dashboard --serve\`' \
+'intents:Extract structured intents from the canonical corpus' \
+'tail:Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals' \
+'serve:Run aicx as an MCP server' \
+'init:Retired compatibility shim; prints migration guidance' \
+'search:Search the canonical corpus. Semantic by default; automatic filesystem-fuzzy fallback when semantic search is unavailable' \
+'eval:Run local evaluation helpers for retrieval/search quality' \
+'index:Catch up the canonical corpus, then build the semantic index. Use \`--dry-run\` to preview without writing' \
+'config:Manage \`\$HOME/.aicx/config.toml\` for embedders and endpoints' \
+'read:Read one canonical chunk by path, file name, or \`chunk\:<id>\` reference' \
+'open:Read one canonical chunk by path, file name, or \`chunk\:<id>\` reference' \
+'steer:Retrieve chunks by steering metadata (requires --features lance)' \
+'migrate:Migrate legacy ~/.ai-contexters/ data into the canonical AICX store' \
+'migrate-intent-schema:Classify stored chunks into 11-type intent entries and report counts' \
+'doctor:Diagnose and optionally repair the canonical store and steer index' \
+'health:Emit the full AICX health report as JSON for automation' \
+'warmup:Warm/probe the configured local embedder before interactive search' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__all_commands] )) ||
+_aicx__subcmd__all_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx all commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__claims_commands] )) ||
+_aicx__subcmd__claims_commands() {
+    local commands; commands=(
+'extract:Extract Unverified claims (Lane 2) from a session'\''s conversation' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx claims commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__claims__subcmd__extract_commands] )) ||
+_aicx__subcmd__claims__subcmd__extract_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx claims extract commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__claims__subcmd__help_commands] )) ||
+_aicx__subcmd__claims__subcmd__help_commands() {
+    local commands; commands=(
+'extract:Extract Unverified claims (Lane 2) from a session'\''s conversation' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx claims help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__claims__subcmd__help__subcmd__extract_commands] )) ||
+_aicx__subcmd__claims__subcmd__help__subcmd__extract_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx claims help extract commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__claims__subcmd__help__subcmd__help_commands] )) ||
+_aicx__subcmd__claims__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx claims help help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__clarify_commands] )) ||
+_aicx__subcmd__clarify_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx clarify commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__claude_commands] )) ||
+_aicx__subcmd__claude_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx claude commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__codex_commands] )) ||
+_aicx__subcmd__codex_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx codex commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__completions_commands] )) ||
+_aicx__subcmd__completions_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx completions commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__config_commands] )) ||
+_aicx__subcmd__config_commands() {
+    local commands; commands=(
+'init:Write a default \`~/.aicx/config.toml\` with cloud-embedder pre-selected. Bails if the file exists unless \`--force\`' \
+'show:Display the resolved embedder configuration after merging env, \`embedder.toml\`, \`config.toml\`, and built-in defaults' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx config commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__config__subcmd__help_commands] )) ||
+_aicx__subcmd__config__subcmd__help_commands() {
+    local commands; commands=(
+'init:Write a default \`~/.aicx/config.toml\` with cloud-embedder pre-selected. Bails if the file exists unless \`--force\`' \
+'show:Display the resolved embedder configuration after merging env, \`embedder.toml\`, \`config.toml\`, and built-in defaults' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx config help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__config__subcmd__help__subcmd__help_commands] )) ||
+_aicx__subcmd__config__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx config help help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__config__subcmd__help__subcmd__init_commands] )) ||
+_aicx__subcmd__config__subcmd__help__subcmd__init_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx config help init commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__config__subcmd__help__subcmd__show_commands] )) ||
+_aicx__subcmd__config__subcmd__help__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx config help show commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__config__subcmd__init_commands] )) ||
+_aicx__subcmd__config__subcmd__init_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx config init commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__config__subcmd__show_commands] )) ||
+_aicx__subcmd__config__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx config show commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__conversations_commands] )) ||
+_aicx__subcmd__conversations_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx conversations commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__corpus_commands] )) ||
+_aicx__subcmd__corpus_commands() {
+    local commands; commands=(
+'audit:Audit derived markdown corpora for Claude signature/thinking leakage and tool JSON noise' \
+'repair:Repair derived markdown without inventing or summarizing semantic content' \
+'validate-cards:Validate card schema v1/v2 sidecars, headers, hashes, and signal parity' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx corpus commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__corpus__subcmd__audit_commands] )) ||
+_aicx__subcmd__corpus__subcmd__audit_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx corpus audit commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__corpus__subcmd__help_commands] )) ||
+_aicx__subcmd__corpus__subcmd__help_commands() {
+    local commands; commands=(
+'audit:Audit derived markdown corpora for Claude signature/thinking leakage and tool JSON noise' \
+'repair:Repair derived markdown without inventing or summarizing semantic content' \
+'validate-cards:Validate card schema v1/v2 sidecars, headers, hashes, and signal parity' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx corpus help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__corpus__subcmd__help__subcmd__audit_commands] )) ||
+_aicx__subcmd__corpus__subcmd__help__subcmd__audit_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx corpus help audit commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__corpus__subcmd__help__subcmd__help_commands] )) ||
+_aicx__subcmd__corpus__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx corpus help help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__corpus__subcmd__help__subcmd__repair_commands] )) ||
+_aicx__subcmd__corpus__subcmd__help__subcmd__repair_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx corpus help repair commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__corpus__subcmd__help__subcmd__validate-cards_commands] )) ||
+_aicx__subcmd__corpus__subcmd__help__subcmd__validate-cards_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx corpus help validate-cards commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__corpus__subcmd__repair_commands] )) ||
+_aicx__subcmd__corpus__subcmd__repair_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx corpus repair commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__corpus__subcmd__validate-cards_commands] )) ||
+_aicx__subcmd__corpus__subcmd__validate-cards_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx corpus validate-cards commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__dashboard_commands] )) ||
+_aicx__subcmd__dashboard_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx dashboard commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__dashboard-serve_commands] )) ||
+_aicx__subcmd__dashboard-serve_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx dashboard-serve commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__doctor_commands] )) ||
+_aicx__subcmd__doctor_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx doctor commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__eval_commands] )) ||
+_aicx__subcmd__eval_commands() {
+    local commands; commands=(
+'search-quality:Run/list the operator search quality seed matrix' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx eval commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__eval__subcmd__help_commands] )) ||
+_aicx__subcmd__eval__subcmd__help_commands() {
+    local commands; commands=(
+'search-quality:Run/list the operator search quality seed matrix' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx eval help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__eval__subcmd__help__subcmd__help_commands] )) ||
+_aicx__subcmd__eval__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx eval help help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__eval__subcmd__help__subcmd__search-quality_commands] )) ||
+_aicx__subcmd__eval__subcmd__help__subcmd__search-quality_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx eval help search-quality commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__eval__subcmd__search-quality_commands] )) ||
+_aicx__subcmd__eval__subcmd__search-quality_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx eval search-quality commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract_commands] )) ||
+_aicx__subcmd__extract_commands() {
+    local commands; commands=(
+'codex:OpenAI Codex CLI rollouts (~/.codex/sessions)' \
+'claude:Claude Code sessions (~/.claude/projects)' \
+'gemini:Gemini CLI chats (~/.gemini/tmp/<hash>/chats)' \
+'grok:Grok CLI sessions (~/.grok)' \
+'junie:JetBrains Junie event logs (~/.junie/sessions)' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx extract commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract__subcmd__claude_commands] )) ||
+_aicx__subcmd__extract__subcmd__claude_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract claude commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract__subcmd__codex_commands] )) ||
+_aicx__subcmd__extract__subcmd__codex_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract codex commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract__subcmd__gemini_commands] )) ||
+_aicx__subcmd__extract__subcmd__gemini_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract gemini commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract__subcmd__grok_commands] )) ||
+_aicx__subcmd__extract__subcmd__grok_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract grok commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract__subcmd__help_commands] )) ||
+_aicx__subcmd__extract__subcmd__help_commands() {
+    local commands; commands=(
+'codex:OpenAI Codex CLI rollouts (~/.codex/sessions)' \
+'claude:Claude Code sessions (~/.claude/projects)' \
+'gemini:Gemini CLI chats (~/.gemini/tmp/<hash>/chats)' \
+'grok:Grok CLI sessions (~/.grok)' \
+'junie:JetBrains Junie event logs (~/.junie/sessions)' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx extract help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract__subcmd__help__subcmd__claude_commands] )) ||
+_aicx__subcmd__extract__subcmd__help__subcmd__claude_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract help claude commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract__subcmd__help__subcmd__codex_commands] )) ||
+_aicx__subcmd__extract__subcmd__help__subcmd__codex_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract help codex commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract__subcmd__help__subcmd__gemini_commands] )) ||
+_aicx__subcmd__extract__subcmd__help__subcmd__gemini_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract help gemini commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract__subcmd__help__subcmd__grok_commands] )) ||
+_aicx__subcmd__extract__subcmd__help__subcmd__grok_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract help grok commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract__subcmd__help__subcmd__help_commands] )) ||
+_aicx__subcmd__extract__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract help help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract__subcmd__help__subcmd__junie_commands] )) ||
+_aicx__subcmd__extract__subcmd__help__subcmd__junie_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract help junie commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__extract__subcmd__junie_commands] )) ||
+_aicx__subcmd__extract__subcmd__junie_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx extract junie commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__health_commands] )) ||
+_aicx__subcmd__health_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx health commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help_commands] )) ||
+_aicx__subcmd__help_commands() {
+    local commands; commands=(
+'completions:Generate shell completions for the canonical CLI grammar' \
+'claude:Extract and store Agents'\'' sessions into the canonical corpus (canonical corpus extraction)' \
+'codex:Extract and store Codex sessions into the canonical corpus' \
+'all:Extract and store from all agents (Claude + Codex + Gemini + Junie + Codescribe) into the canonical corpus' \
+'extract:Extract a single session for one agent — by session id or direct file' \
+'conversations:Batch-export conversation JSON files without writing to the canonical store' \
+'store:Build the canonical corpus in from local agents'\'' session files' \
+'ingest:Ingest operator-owned source documents into the canonical corpus' \
+'list:List raw agent session sources on disk (pre-extraction inputs)' \
+'sources:Audit and explicitly protect raw source roots' \
+'sessions:Discover and list agent sessions on disk (session surface)' \
+'claims:Lane 2\: extract agent claims (audit targets) from a session' \
+'results:Lane 3\: collect repo evidence for a session'\''s claims and verify them' \
+'clarify:Lane 5\: generate at most 5 A/B/C decision questions from verified gaps' \
+'wizard:Interactive daily-driver entrypoint for corpus, doctor, intents, and store' \
+'refs:List chunks in the canonical store inventory' \
+'state:Manage extraction dedup state (watermarks and hashes)' \
+'dashboard:Generate a searchable HTML dashboard from the canonical store, or serve it locally' \
+'reports:Extract Vibecrafted workflow and marbles reports into a standalone HTML explorer' \
+'corpus:Audit or repair derived corpus markdown' \
+'reports-extractor:Deprecated compatibility shim for \`aicx reports\`' \
+'dashboard-serve:Deprecated compatibility shim for \`aicx dashboard --serve\`' \
+'intents:Extract structured intents from the canonical corpus' \
+'tail:Print recent intents/chunks (snapshot mode); add --follow to stream new arrivals' \
+'serve:Run aicx as an MCP server' \
+'init:Retired compatibility shim; prints migration guidance' \
+'search:Search the canonical corpus. Semantic by default; automatic filesystem-fuzzy fallback when semantic search is unavailable' \
+'eval:Run local evaluation helpers for retrieval/search quality' \
+'index:Catch up the canonical corpus, then build the semantic index. Use \`--dry-run\` to preview without writing' \
+'config:Manage \`\$HOME/.aicx/config.toml\` for embedders and endpoints' \
+'read:Read one canonical chunk by path, file name, or \`chunk\:<id>\` reference' \
+'steer:Retrieve chunks by steering metadata (requires --features lance)' \
+'migrate:Migrate legacy ~/.ai-contexters/ data into the canonical AICX store' \
+'migrate-intent-schema:Classify stored chunks into 11-type intent entries and report counts' \
+'doctor:Diagnose and optionally repair the canonical store and steer index' \
+'health:Emit the full AICX health report as JSON for automation' \
+'warmup:Warm/probe the configured local embedder before interactive search' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__all_commands] )) ||
+_aicx__subcmd__help__subcmd__all_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help all commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__claims_commands] )) ||
+_aicx__subcmd__help__subcmd__claims_commands() {
+    local commands; commands=(
+'extract:Extract Unverified claims (Lane 2) from a session'\''s conversation' \
+    )
+    _describe -t commands 'aicx help claims commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__claims__subcmd__extract_commands] )) ||
+_aicx__subcmd__help__subcmd__claims__subcmd__extract_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help claims extract commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__clarify_commands] )) ||
+_aicx__subcmd__help__subcmd__clarify_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help clarify commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__claude_commands] )) ||
+_aicx__subcmd__help__subcmd__claude_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help claude commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__codex_commands] )) ||
+_aicx__subcmd__help__subcmd__codex_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help codex commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__completions_commands] )) ||
+_aicx__subcmd__help__subcmd__completions_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help completions commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__config_commands] )) ||
+_aicx__subcmd__help__subcmd__config_commands() {
+    local commands; commands=(
+'init:Write a default \`~/.aicx/config.toml\` with cloud-embedder pre-selected. Bails if the file exists unless \`--force\`' \
+'show:Display the resolved embedder configuration after merging env, \`embedder.toml\`, \`config.toml\`, and built-in defaults' \
+    )
+    _describe -t commands 'aicx help config commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__config__subcmd__init_commands] )) ||
+_aicx__subcmd__help__subcmd__config__subcmd__init_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help config init commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__config__subcmd__show_commands] )) ||
+_aicx__subcmd__help__subcmd__config__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help config show commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__conversations_commands] )) ||
+_aicx__subcmd__help__subcmd__conversations_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help conversations commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__corpus_commands] )) ||
+_aicx__subcmd__help__subcmd__corpus_commands() {
+    local commands; commands=(
+'audit:Audit derived markdown corpora for Claude signature/thinking leakage and tool JSON noise' \
+'repair:Repair derived markdown without inventing or summarizing semantic content' \
+'validate-cards:Validate card schema v1/v2 sidecars, headers, hashes, and signal parity' \
+    )
+    _describe -t commands 'aicx help corpus commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__corpus__subcmd__audit_commands] )) ||
+_aicx__subcmd__help__subcmd__corpus__subcmd__audit_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help corpus audit commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__corpus__subcmd__repair_commands] )) ||
+_aicx__subcmd__help__subcmd__corpus__subcmd__repair_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help corpus repair commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__corpus__subcmd__validate-cards_commands] )) ||
+_aicx__subcmd__help__subcmd__corpus__subcmd__validate-cards_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help corpus validate-cards commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__dashboard_commands] )) ||
+_aicx__subcmd__help__subcmd__dashboard_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help dashboard commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__dashboard-serve_commands] )) ||
+_aicx__subcmd__help__subcmd__dashboard-serve_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help dashboard-serve commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__doctor_commands] )) ||
+_aicx__subcmd__help__subcmd__doctor_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help doctor commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__eval_commands] )) ||
+_aicx__subcmd__help__subcmd__eval_commands() {
+    local commands; commands=(
+'search-quality:Run/list the operator search quality seed matrix' \
+    )
+    _describe -t commands 'aicx help eval commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__eval__subcmd__search-quality_commands] )) ||
+_aicx__subcmd__help__subcmd__eval__subcmd__search-quality_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help eval search-quality commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__extract_commands] )) ||
+_aicx__subcmd__help__subcmd__extract_commands() {
+    local commands; commands=(
+'codex:OpenAI Codex CLI rollouts (~/.codex/sessions)' \
+'claude:Claude Code sessions (~/.claude/projects)' \
+'gemini:Gemini CLI chats (~/.gemini/tmp/<hash>/chats)' \
+'grok:Grok CLI sessions (~/.grok)' \
+'junie:JetBrains Junie event logs (~/.junie/sessions)' \
+    )
+    _describe -t commands 'aicx help extract commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__extract__subcmd__claude_commands] )) ||
+_aicx__subcmd__help__subcmd__extract__subcmd__claude_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help extract claude commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__extract__subcmd__codex_commands] )) ||
+_aicx__subcmd__help__subcmd__extract__subcmd__codex_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help extract codex commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__extract__subcmd__gemini_commands] )) ||
+_aicx__subcmd__help__subcmd__extract__subcmd__gemini_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help extract gemini commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__extract__subcmd__grok_commands] )) ||
+_aicx__subcmd__help__subcmd__extract__subcmd__grok_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help extract grok commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__extract__subcmd__junie_commands] )) ||
+_aicx__subcmd__help__subcmd__extract__subcmd__junie_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help extract junie commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__health_commands] )) ||
+_aicx__subcmd__help__subcmd__health_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help health commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__help_commands] )) ||
+_aicx__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__index_commands] )) ||
+_aicx__subcmd__help__subcmd__index_commands() {
+    local commands; commands=(
+'status:Show freshness and pending-corpus status for the semantic index' \
+'derive:Derive project-scoped semantic buckets from the existing \`_all\` index without re-embedding' \
+    )
+    _describe -t commands 'aicx help index commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__index__subcmd__derive_commands] )) ||
+_aicx__subcmd__help__subcmd__index__subcmd__derive_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help index derive commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__index__subcmd__status_commands] )) ||
+_aicx__subcmd__help__subcmd__index__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help index status commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__ingest_commands] )) ||
+_aicx__subcmd__help__subcmd__ingest_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help ingest commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__init_commands] )) ||
+_aicx__subcmd__help__subcmd__init_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help init commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__intents_commands] )) ||
+_aicx__subcmd__help__subcmd__intents_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help intents commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__list_commands] )) ||
+_aicx__subcmd__help__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help list commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__migrate_commands] )) ||
+_aicx__subcmd__help__subcmd__migrate_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help migrate commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__migrate-intent-schema_commands] )) ||
+_aicx__subcmd__help__subcmd__migrate-intent-schema_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help migrate-intent-schema commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__read_commands] )) ||
+_aicx__subcmd__help__subcmd__read_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help read commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__refs_commands] )) ||
+_aicx__subcmd__help__subcmd__refs_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help refs commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__reports_commands] )) ||
+_aicx__subcmd__help__subcmd__reports_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help reports commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__reports-extractor_commands] )) ||
+_aicx__subcmd__help__subcmd__reports-extractor_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help reports-extractor commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__results_commands] )) ||
+_aicx__subcmd__help__subcmd__results_commands() {
+    local commands; commands=(
+'collect:Collect repo evidence (artifact existence) for a session'\''s claims and fold it into verification statuses (Lane 3)' \
+    )
+    _describe -t commands 'aicx help results commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__results__subcmd__collect_commands] )) ||
+_aicx__subcmd__help__subcmd__results__subcmd__collect_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help results collect commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__search_commands] )) ||
+_aicx__subcmd__help__subcmd__search_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help search commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__serve_commands] )) ||
+_aicx__subcmd__help__subcmd__serve_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help serve commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__sessions_commands] )) ||
+_aicx__subcmd__help__subcmd__sessions_commands() {
+    local commands; commands=(
+'current:Print the current agent session id for commit trailers and handoffs' \
+'list:List discovered agent sessions, newest first' \
+'show:Show one session'\''s metadata, located by id (or a unique prefix)' \
+'report:Unified truth report for one session\: human intents (Lane 1), agent claims + evidence verification (Lanes 2-3), contract fractures (Lane 4) and clarify decisions (Lane 5) in a single rendering' \
+    )
+    _describe -t commands 'aicx help sessions commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__sessions__subcmd__current_commands] )) ||
+_aicx__subcmd__help__subcmd__sessions__subcmd__current_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help sessions current commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__sessions__subcmd__list_commands] )) ||
+_aicx__subcmd__help__subcmd__sessions__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help sessions list commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__sessions__subcmd__report_commands] )) ||
+_aicx__subcmd__help__subcmd__sessions__subcmd__report_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help sessions report commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__sessions__subcmd__show_commands] )) ||
+_aicx__subcmd__help__subcmd__sessions__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help sessions show commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__sources_commands] )) ||
+_aicx__subcmd__help__subcmd__sources_commands() {
+    local commands; commands=(
+'protect:Opt in to local source-root protection' \
+    )
+    _describe -t commands 'aicx help sources commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__sources__subcmd__protect_commands] )) ||
+_aicx__subcmd__help__subcmd__sources__subcmd__protect_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help sources protect commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__state_commands] )) ||
+_aicx__subcmd__help__subcmd__state_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help state commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__steer_commands] )) ||
+_aicx__subcmd__help__subcmd__steer_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help steer commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__store_commands] )) ||
+_aicx__subcmd__help__subcmd__store_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help store commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__tail_commands] )) ||
+_aicx__subcmd__help__subcmd__tail_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help tail commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__warmup_commands] )) ||
+_aicx__subcmd__help__subcmd__warmup_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help warmup commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__help__subcmd__wizard_commands] )) ||
+_aicx__subcmd__help__subcmd__wizard_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx help wizard commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__index_commands] )) ||
+_aicx__subcmd__index_commands() {
+    local commands; commands=(
+'status:Show freshness and pending-corpus status for the semantic index' \
+'derive:Derive project-scoped semantic buckets from the existing \`_all\` index without re-embedding' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx index commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__index__subcmd__derive_commands] )) ||
+_aicx__subcmd__index__subcmd__derive_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx index derive commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__index__subcmd__help_commands] )) ||
+_aicx__subcmd__index__subcmd__help_commands() {
+    local commands; commands=(
+'status:Show freshness and pending-corpus status for the semantic index' \
+'derive:Derive project-scoped semantic buckets from the existing \`_all\` index without re-embedding' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx index help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__index__subcmd__help__subcmd__derive_commands] )) ||
+_aicx__subcmd__index__subcmd__help__subcmd__derive_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx index help derive commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__index__subcmd__help__subcmd__help_commands] )) ||
+_aicx__subcmd__index__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx index help help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__index__subcmd__help__subcmd__status_commands] )) ||
+_aicx__subcmd__index__subcmd__help__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx index help status commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__index__subcmd__status_commands] )) ||
+_aicx__subcmd__index__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx index status commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__ingest_commands] )) ||
+_aicx__subcmd__ingest_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx ingest commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__init_commands] )) ||
+_aicx__subcmd__init_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx init commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__intents_commands] )) ||
+_aicx__subcmd__intents_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx intents commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__list_commands] )) ||
+_aicx__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx list commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__migrate_commands] )) ||
+_aicx__subcmd__migrate_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx migrate commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__migrate-intent-schema_commands] )) ||
+_aicx__subcmd__migrate-intent-schema_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx migrate-intent-schema commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__read_commands] )) ||
+_aicx__subcmd__read_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx read commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__refs_commands] )) ||
+_aicx__subcmd__refs_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx refs commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__reports_commands] )) ||
+_aicx__subcmd__reports_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx reports commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__reports-extractor_commands] )) ||
+_aicx__subcmd__reports-extractor_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx reports-extractor commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__results_commands] )) ||
+_aicx__subcmd__results_commands() {
+    local commands; commands=(
+'collect:Collect repo evidence (artifact existence) for a session'\''s claims and fold it into verification statuses (Lane 3)' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx results commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__results__subcmd__collect_commands] )) ||
+_aicx__subcmd__results__subcmd__collect_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx results collect commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__results__subcmd__help_commands] )) ||
+_aicx__subcmd__results__subcmd__help_commands() {
+    local commands; commands=(
+'collect:Collect repo evidence (artifact existence) for a session'\''s claims and fold it into verification statuses (Lane 3)' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx results help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__results__subcmd__help__subcmd__collect_commands] )) ||
+_aicx__subcmd__results__subcmd__help__subcmd__collect_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx results help collect commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__results__subcmd__help__subcmd__help_commands] )) ||
+_aicx__subcmd__results__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx results help help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__search_commands] )) ||
+_aicx__subcmd__search_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx search commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__serve_commands] )) ||
+_aicx__subcmd__serve_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx serve commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__sessions_commands] )) ||
+_aicx__subcmd__sessions_commands() {
+    local commands; commands=(
+'current:Print the current agent session id for commit trailers and handoffs' \
+'list:List discovered agent sessions, newest first' \
+'show:Show one session'\''s metadata, located by id (or a unique prefix)' \
+'report:Unified truth report for one session\: human intents (Lane 1), agent claims + evidence verification (Lanes 2-3), contract fractures (Lane 4) and clarify decisions (Lane 5) in a single rendering' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx sessions commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__sessions__subcmd__current_commands] )) ||
+_aicx__subcmd__sessions__subcmd__current_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx sessions current commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__sessions__subcmd__help_commands] )) ||
+_aicx__subcmd__sessions__subcmd__help_commands() {
+    local commands; commands=(
+'current:Print the current agent session id for commit trailers and handoffs' \
+'list:List discovered agent sessions, newest first' \
+'show:Show one session'\''s metadata, located by id (or a unique prefix)' \
+'report:Unified truth report for one session\: human intents (Lane 1), agent claims + evidence verification (Lanes 2-3), contract fractures (Lane 4) and clarify decisions (Lane 5) in a single rendering' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx sessions help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__sessions__subcmd__help__subcmd__current_commands] )) ||
+_aicx__subcmd__sessions__subcmd__help__subcmd__current_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx sessions help current commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__sessions__subcmd__help__subcmd__help_commands] )) ||
+_aicx__subcmd__sessions__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx sessions help help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__sessions__subcmd__help__subcmd__list_commands] )) ||
+_aicx__subcmd__sessions__subcmd__help__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx sessions help list commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__sessions__subcmd__help__subcmd__report_commands] )) ||
+_aicx__subcmd__sessions__subcmd__help__subcmd__report_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx sessions help report commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__sessions__subcmd__help__subcmd__show_commands] )) ||
+_aicx__subcmd__sessions__subcmd__help__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx sessions help show commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__sessions__subcmd__list_commands] )) ||
+_aicx__subcmd__sessions__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx sessions list commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__sessions__subcmd__report_commands] )) ||
+_aicx__subcmd__sessions__subcmd__report_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx sessions report commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__sessions__subcmd__show_commands] )) ||
+_aicx__subcmd__sessions__subcmd__show_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx sessions show commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__sources_commands] )) ||
+_aicx__subcmd__sources_commands() {
+    local commands; commands=(
+'protect:Opt in to local source-root protection' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx sources commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__sources__subcmd__help_commands] )) ||
+_aicx__subcmd__sources__subcmd__help_commands() {
+    local commands; commands=(
+'protect:Opt in to local source-root protection' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'aicx sources help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__sources__subcmd__help__subcmd__help_commands] )) ||
+_aicx__subcmd__sources__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx sources help help commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__sources__subcmd__help__subcmd__protect_commands] )) ||
+_aicx__subcmd__sources__subcmd__help__subcmd__protect_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx sources help protect commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__sources__subcmd__protect_commands] )) ||
+_aicx__subcmd__sources__subcmd__protect_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx sources protect commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__state_commands] )) ||
+_aicx__subcmd__state_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx state commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__steer_commands] )) ||
+_aicx__subcmd__steer_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx steer commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__store_commands] )) ||
+_aicx__subcmd__store_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx store commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__tail_commands] )) ||
+_aicx__subcmd__tail_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx tail commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__warmup_commands] )) ||
+_aicx__subcmd__warmup_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx warmup commands' commands "$@"
+}
+(( $+functions[_aicx__subcmd__wizard_commands] )) ||
+_aicx__subcmd__wizard_commands() {
+    local commands; commands=()
+    _describe -t commands 'aicx wizard commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_aicx" ]; then
+    _aicx "$@"
+else
+    compdef _aicx aicx
+fi

@@ -11,7 +11,7 @@ ifeq (,$(shell command -v cargo 2>/dev/null))
   endif
 endif
 
-.PHONY: all build build-native release-binaries install install-bin install-config install-cargo git-hooks
+.PHONY: all build build-native completions release-binaries install install-bin install-config install-cargo git-hooks
 .PHONY: precheck precheck-native loctree-consumer-check test test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
 .PHONY: embeddings-check embeddings-test embeddings-clippy embeddings-hydrate embeddings-info
 .PHONY: version version-show version-check version-bump version-patch bump-patch changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle release-bundle-only-binaries test-e2e
@@ -46,6 +46,13 @@ build:
 
 build-native:
 	cargo build --locked --release --features native-embedder --bin aicx --bin aicx-mcp
+
+completions:
+	@mkdir -p completions
+	cargo run --locked --bin aicx -- completions bash > completions/aicx.bash
+	cargo run --locked --bin aicx -- completions zsh > completions/_aicx
+	cargo run --locked --bin aicx -- completions fish > completions/aicx.fish
+	python3 tools/canonicalize_completions.py
 
 release-binaries:
 	@if [ -z "$(STAGING_DIR)" ]; then \

@@ -706,7 +706,7 @@ fn parse_junie_compact_pair(s: &str) -> Option<DateTime<Utc>> {
 /// Discover Junie sessions under a sessions root (`~/.junie/sessions`). Each
 /// session is `session-<YYMMDD>-<HHMMSS>-<suffix>/events.jsonl`; the session
 /// id is the directory name minus the `session-` prefix — the same id
-/// `aicx extract --agent junie` reports. Absolute time comes from the compact
+/// `aicx extract junie ...` reports. Absolute time comes from the compact
 /// timestamps Junie embeds in the dir name and in `prompt-*` request ids
 /// (events carry no per-line RFC3339 stamp). Tolerant: unreadable files are
 /// counted and skipped, never abort the scan.

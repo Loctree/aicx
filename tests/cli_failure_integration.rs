@@ -246,7 +246,7 @@ fn extract_legacy_agent_flag_emits_structured_migration_hint() {
     let output = Command::new(&bin)
         .args(["extract", "--agent", "codex", "--session", "abc12345"])
         .output()
-        .expect("run aicx extract --agent");
+        .expect("run legacy extract flag grammar rejection case");
     assert_eq!(
         output.status.code(),
         Some(2),
