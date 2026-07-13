@@ -3,13 +3,44 @@ set -euo pipefail
 
 usage() {
   echo "usage: tools/bench_single_session.sh --baseline-only <session-path>" >&2
+  echo "       tools/bench_single_session.sh --engine-only --hard-threshold-ms <ms> <session-path>" >&2
   exit 2
 }
 
-[[ $# -eq 2 && "$1" == "--baseline-only" ]] || usage
-session_path=$2
+if [[ $# -eq 2 && "$1" == "--baseline-only" ]]; then
+  mode=baseline
+  session_path=$2
+elif [[ $# -eq 4 && "$1" == "--engine-only" && "$2" == "--hard-threshold-ms" ]]; then
+  mode=engine
+  threshold_ms=$3
+  session_path=$4
+  [[ "$threshold_ms" =~ ^[1-9][0-9]*$ ]] || usage
+else
+  usage
+fi
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 donor_root=${TRANSCRIPT_BUILDER_ROOT:-/Volumes/LibraxisShare/vc-workspace/vetcoders/transcript-builder}
+
+if [[ "$mode" == "engine" ]]; then
+  [[ -f "$session_path" ]] || {
+    echo "benchmark input is not a readable file: $session_path" >&2
+    exit 1
+  }
+  output=$(
+    cd "$repo_root"
+    AICX_BENCH_SESSION="$session_path" \
+      AICX_BENCH_THRESHOLD_MS="$threshold_ms" \
+      cargo test --release -p aicx-parser --test adversarial_perf_helper \
+        engine_only_benchmark -- --ignored --nocapture
+  )
+  json=$(printf '%s\n' "$output" | sed -n 's/^AICX_BENCH_JSON=//p' | tail -n 1)
+  [[ -n "$json" ]] || {
+    echo "engine benchmark emitted no JSON result" >&2
+    exit 1
+  }
+  printf '%s\n' "$json"
+  exit 0
+fi
 
 python3 - "$session_path" "$repo_root" "$donor_root" <<'PY'
 from __future__ import annotations
