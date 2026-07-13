@@ -135,6 +135,11 @@ enum CorpusEmit {
     Json,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OverlayFormat {
+    Json,
+}
+
 /// Canonical extraction agents. The agent is a required `aicx extract`
 /// subcommand — there is no `--agent`/`--format` flag grammar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -846,6 +851,21 @@ enum Commands {
     /// Generate shell completions for the canonical CLI grammar.
     #[command(hide = true)]
     Completions { shell: Shell },
+
+    /// Join typed canonical intents to the current Loctree anchor catalog.
+    Overlay {
+        /// Repository whose `loct anchors` catalog is the attribution target.
+        #[arg(long)]
+        repo: PathBuf,
+
+        /// Machine-readable overlay contract format.
+        #[arg(long, value_enum, default_value_t = OverlayFormat::Json)]
+        format: OverlayFormat,
+
+        /// Re-evaluate every typed card while preserving persisted intent ids.
+        #[arg(long)]
+        rebuild: bool,
+    },
 
     // ── Layer 1: Canonical corpus ─────────────────────────────────────
     /// Extract and store Agents' sessions into the canonical corpus (canonical corpus extraction).
@@ -2099,6 +2119,31 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         Some(Commands::Completions { shell }) => {
             let mut command = Cli::command();
             generate(shell, &mut command, "aicx", &mut io::stdout());
+        }
+        Some(Commands::Overlay {
+            repo,
+            format: OverlayFormat::Json,
+            rebuild,
+        }) => {
+            let (overlay, stats) = aicx::overlay::build_overlay(&aicx::overlay::OverlayOptions {
+                repo,
+                rebuild,
+                loct_bin: None,
+                store_root: None,
+                index_root: None,
+            })?;
+            serde_json::to_writer_pretty(io::stdout().lock(), &overlay)?;
+            println!();
+            eprintln!(
+                "overlay: cards={} new={} retained={} attributions={} unresolved={} files_opened={} raw_session_files_opened={}",
+                stats.canonical_cards_seen,
+                stats.new_intents,
+                stats.retained_intents,
+                stats.emitted_attributions,
+                stats.unresolved_attributions,
+                stats.files_opened,
+                stats.raw_session_files_opened
+            );
         }
         Some(Commands::Claude {
             redaction,

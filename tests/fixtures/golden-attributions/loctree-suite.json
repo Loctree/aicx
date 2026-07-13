@@ -1,0 +1,29 @@
+{
+  "schema": "aicx.golden_attributions.v1",
+  "repo_id": "Loctree/loctree-suite",
+  "snapshot_commit": "8d5feffd",
+  "anchor_catalog_revision": "acr1:b0e72492973c89413271043d74a6f430f8d126fe72eb291100dcfef8bd28cbe5",
+  "producer_version": "0.13.1",
+  "pairs": [
+    {"anchor_id":"anc1:8c05338396dc616a55a6e2e52c1c52d52e5f146dfa96a6177285766b32205b7c","path":"loctree-rs/src/aicx/inprocess.rs","language":"rs","thesis_marker":"typed inprocess boundary","evidence":{"path":"loctree-rs/src/aicx/inprocess.rs","line":1}},
+    {"anchor_id":"anc1:0e95f0d91a80a968ef43f323a08d8660178a7a53bee23676907e88b1e41dec59","path":"loctree-rs/src/aicx/intent_source.rs","language":"rs","thesis_marker":"forward intent source seam","evidence":{"path":"loctree-rs/src/aicx/intent_source.rs","line":1}},
+    {"anchor_id":"anc1:13dd08fb4cfd5645abcba8b13f4af9287cd6e3aa880bb13948a78a84f3149224","path":"loctree-rs/src/aicx/intents.rs","language":"rs","thesis_marker":"intent relevance mapping","evidence":{"path":"loctree-rs/src/aicx/intents.rs","line":1}},
+    {"anchor_id":"anc1:18f8738d892cd8d868447b66c24e8bb9a37c20bac7838c1caf1a9e6f4f32a66a","path":"loctree-rs/src/aicx/mcp.rs","language":"rs","thesis_marker":"stdio overlay transport","evidence":{"path":"loctree-rs/src/aicx/mcp.rs","line":1}},
+    {"anchor_id":"anc1:47965013a0aef76ae0936dbc414b5034de50b63f9c7de4cabab7210e70ebb121","path":"loctree-rs/src/aicx/mod.rs","language":"rs","thesis_marker":"read only consumer wrapper","evidence":{"path":"loctree-rs/src/aicx/mod.rs","line":1}},
+    {"anchor_id":"anc1:ace6480113a33354049bc775ca15d05963771006b7607e500b5ed2c2f7d0978c","path":"loctree-rs/src/aicx/shell.rs","language":"rs","thesis_marker":"shell parser glue","evidence":{"path":"loctree-rs/src/aicx/shell.rs","line":1}},
+    {"anchor_id":"anc1:8cc226a4b7b36caf28fb757c8bdccd9c7191c31a4d2c9e97662e9f0bc2a7d57b","path":"loctree-rs/src/analysis_reports.rs","language":"rs","thesis_marker":"shared analysis reports","evidence":{"path":"loctree-rs/src/analysis_reports.rs","line":1}},
+    {"anchor_id":"anc1:890b9f136630b912c3b4d863ca5fe916d746122d1ec65f58a7d67af88b8d3c68","path":"loctree-rs/src/analyzer/assets.rs","language":"rs","thesis_marker":"embedded analyzer assets","evidence":{"path":"loctree-rs/src/analyzer/assets.rs","line":1}},
+    {"anchor_id":"anc1:614638337e224f0079126247a1f8993d19ed0d0032b0599331e0a08758a9b597","path":"loctree-rs/src/analyzer/ast_js/calls.rs","language":"rs","thesis_marker":"javascript call extraction","evidence":{"path":"loctree-rs/src/analyzer/ast_js/calls.rs","line":1}},
+    {"anchor_id":"anc1:cf446b825cdc9997d4971aa278c22b5314841dd3aa8a71c9293f2670cb5e2d26","path":"loctree-rs/src/analyzer/ast_js/config.rs","language":"rs","thesis_marker":"command detection configuration","evidence":{"path":"loctree-rs/src/analyzer/ast_js/config.rs","line":1}},
+    {"anchor_id":"anc1:d015e59d31e6cbb2ae6cd9efd23e5eebab286c8f76b74012f4de28acca78b082","path":"loctree-rs/src/analyzer/ast_js/exports.rs","language":"rs","thesis_marker":"javascript export declarations","evidence":{"path":"loctree-rs/src/analyzer/ast_js/exports.rs","line":1}},
+    {"anchor_id":"anc1:1c065ca789730701a1320ac3c255a48b0cd3c50cbd4e8e77a0b4e23463036670","path":"loctree-rs/src/analyzer/ast_js/imports.rs","language":"rs","thesis_marker":"javascript import declarations","evidence":{"path":"loctree-rs/src/analyzer/ast_js/imports.rs","line":1}},
+    {"anchor_id":"anc1:5c9497f623eb21d501a7d299400178c43efc37b9ae5dec60c87cb29208f6ded3","path":"loctree-rs/src/analyzer/ast_js/mod.rs","language":"rs","thesis_marker":"javascript analyzer module","evidence":{"path":"loctree-rs/src/analyzer/ast_js/mod.rs","line":1}},
+    {"anchor_id":"anc1:f57827951a2cfb1f0eb6c7110633f82308d7a9db157bc440252f7c1174e0d4b6","path":"loctree-rs/src/analyzer/ast_js/sfc.rs","language":"rs","thesis_marker":"single file component extraction","evidence":{"path":"loctree-rs/src/analyzer/ast_js/sfc.rs","line":1}},
+    {"anchor_id":"anc1:fd43649116731eea8144bd90f209977ae0ec14ca56662aeee645fd53135ea796","path":"loctree-rs/src/analyzer/ast_js/template.rs","language":"rs","thesis_marker":"template expression analysis","evidence":{"path":"loctree-rs/src/analyzer/ast_js/template.rs","line":1}},
+    {"anchor_id":"anc1:36af51ec14537da3501fcc4e82804a42fbc6760c4e4ae09f3d5170556738df47","path":"loctree-rs/src/analyzer/ast_js/visitor.rs","language":"rs","thesis_marker":"ast visitor traversal","evidence":{"path":"loctree-rs/src/analyzer/ast_js/visitor.rs","line":1}},
+    {"anchor_id":"anc1:b3cbf6d67d21e723bc4eb46f1c0ae242bb951b94b8d64446759d44dc02634bdb","path":"loctree-rs/src/analyzer/audit_report.rs","language":"rs","thesis_marker":"analyzer audit report","evidence":{"path":"loctree-rs/src/analyzer/audit_report.rs","line":1}},
+    {"anchor_id":"anc1:6eedb16ccb7c8ac26d43cb7d17a1da838b7ea1d17eb1b780b1bc15e5cbc70036","path":"loctree-rs/src/analyzer/barrels.rs","language":"rs","thesis_marker":"barrel module analysis","evidence":{"path":"loctree-rs/src/analyzer/barrels.rs","line":1}},
+    {"anchor_id":"anc1:e5851e17264a3404a338a9b78a0b5330ab01101a187a6b10aa80ecfc479b7be3","path":"loctree-rs/src/analyzer/c_family_syntax/includes.rs","language":"rs","thesis_marker":"c include extraction","evidence":{"path":"loctree-rs/src/analyzer/c_family_syntax/includes.rs","line":1}},
+    {"anchor_id":"anc1:67de3c0f5387393d3e510e9bfdee5b7814028984af2d1cb7883a0000c9a4080d","path":"loctree-rs/src/analyzer/c_family_syntax/mod.rs","language":"rs","thesis_marker":"c family analyzer module","evidence":{"path":"loctree-rs/src/analyzer/c_family_syntax/mod.rs","line":1}}
+  ]
+}
