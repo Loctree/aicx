@@ -1,3 +1,7 @@
+// App-only integration surface: compiled to an empty target under the slim
+// `loctree-consumer` profile (`--no-default-features`).
+#![cfg(feature = "app")]
+
 //! Wave B close-out cross-cut: strict project filter surface guard.
 //!
 //! Bug #38 cut the last live substring project-filter call-site (the rank

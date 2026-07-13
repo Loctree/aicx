@@ -1,3 +1,7 @@
+// App-only integration surface: compiled to an empty target under the slim
+// `loctree-consumer` profile (`--no-default-features`).
+#![cfg(feature = "app")]
+
 use aicx::auth::{self, AuthConfig, AuthSource};
 use aicx::mcp::{IntentsParams, RankParams, ReadParams, SearchParams, SteerParams};
 use axum::{

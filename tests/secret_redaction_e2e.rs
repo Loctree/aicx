@@ -1,3 +1,7 @@
+// App-only integration surface: compiled to an empty target under the slim
+// `loctree-consumer` profile (`--no-default-features`).
+#![cfg(feature = "app")]
+
 use aicx::output::{
     ConversationExtractStats, ConversationMessage, ReportMetadata, write_conversation_json,
     write_conversation_markdown,

@@ -1,3 +1,7 @@
+// App-only integration surface: compiled to an empty target under the slim
+// `loctree-consumer` profile (`--no-default-features`).
+#![cfg(feature = "app")]
+
 //! Integration coverage for the structured `[aicx][phase=...]` markers
 //! emitted by `aicx::progress` when the pipeline is asked to behave
 //! non-interactively. The chunk + steer + bm25 surface is the contract
