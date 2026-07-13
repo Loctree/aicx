@@ -226,8 +226,8 @@ fn three_thousand_unrelated_files_do_not_expand_selected_source_bytes() {
         assert_eq!(opened_source_bytes, case.base.len() as u64);
     }
     assert_eq!(
-        checked, 4,
-        "only the known Grok baseline defect may block this proof"
+        checked, 5,
+        "all production adapters must prove selected-source isolation"
     );
 
     let discovered: BTreeSet<_> = fs::read_dir(&root)

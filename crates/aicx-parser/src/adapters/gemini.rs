@@ -19,7 +19,7 @@ use crate::engine::{
 };
 use serde_json::Value;
 
-pub const GEMINI_ADAPTER_VERSION: &str = "gemini-adapter-v1";
+pub const GEMINI_ADAPTER_VERSION: &str = "gemini-adapter-v1-c9p";
 
 /// Provider for usage events.
 const USAGE_PROVIDER: &str = "google";
@@ -324,6 +324,8 @@ fn walk_physical_unit(
                 WarningKind::UnknownPayloadType,
                 raw.coverage_ordinal,
             );
+            analysis.unsupported_visible_event = true;
+            analysis.visible_event_lost = true;
             skip_physical(
                 raw,
                 "unknown",

@@ -20,7 +20,7 @@ use crate::adapters::{
 use crate::engine::{
     AgentKind, BoundaryFlags, CoverageReport, ParseStatus, RawUnit, SkippedReason, SourceFraming,
     SourceHandle, SourceRead, UnvalidatedParse, VisibleCompleteness,
-    identity::{evidence_event_id, evidence_event_id_from_hash, ordinal_locator, sha256_hex},
+    identity::{evidence_event_id_from_hash, ordinal_locator, sha256_hex},
     model::{
         Known, Provenance, RawUnitRef, Segment, SessionModel, ToolEvent, ToolEventKind, Turn,
         TurnKind, TurnRange, TurnRole, UsageEvent,
@@ -31,7 +31,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 /// Adapter version for this cut. Bumped only on contract-visible behavior changes.
-const ADAPTER_VERSION: &str = "c2g-2026-07-13";
+const ADAPTER_VERSION: &str = "c9p-2026-07-13";
 
 pub struct GrokAdapter;
 
@@ -59,7 +59,12 @@ impl AgentAdapter for GrokAdapter {
             let text = std::str::from_utf8(&unit.bytes).unwrap_or("");
             let trimmed = text.trim();
 
-            let disposition = if trimmed.is_empty() {
+            let disposition = if unit.boundary == crate::engine::UnitBoundary::Oversized {
+                ClassifiedDisposition::Skipped {
+                    reason: SkippedReason::Oversized,
+                    visible: true,
+                }
+            } else if trimmed.is_empty() {
                 ClassifiedDisposition::Skipped {
                     reason: SkippedReason::Malformed,
                     visible: false,
@@ -291,32 +296,13 @@ impl AgentAdapter for GrokAdapter {
                 continue;
             }
 
-            let unit = units_by_ord.get(ord).expect("unit present");
+            let raw_ref = classified
+                .iter()
+                .find(|classified| classified.ordinal == *ord)
+                .map(|classified| classified.evidence.clone())
+                .expect("classified evidence present");
             let ts = base_ts + ChronoDuration::milliseconds(*ord as i64 + 1);
             let ts_str = ts.to_rfc3339();
-
-            let content_bytes = unit.bytes.clone();
-            let content_hash = sha256_hex(&content_bytes);
-            let locator = ordinal_locator(*ord);
-            let ev_id = evidence_event_id(
-                AgentKind::Grok,
-                &logical_id,
-                &locator,
-                "grok-chat",
-                &content_bytes,
-            )
-            .unwrap_or_else(|_| format!("ev1:grok:{}:{}", logical_id, &content_hash[..16]));
-
-            let raw_ref = RawUnitRef {
-                evidence_event_id: ev_id.clone(),
-                coverage_ordinal: *ord,
-                physical_ordinal: *ord,
-                locator,
-                unit_kind: "grok-chat".to_owned(),
-                artifact: unit.artifact_name.clone(),
-                content_hash,
-                original_bytes: unit.original_bytes,
-            };
 
             turns.push(Turn {
                 turn_idx,
@@ -375,27 +361,13 @@ impl AgentAdapter for GrokAdapter {
                     continue;
                 }
                 let unit = units_by_ord.get(ord).unwrap();
+                let raw_ref = classified
+                    .iter()
+                    .find(|classified| classified.ordinal == *ord)
+                    .map(|classified| classified.evidence.clone())
+                    .expect("classified evidence present");
                 let ts_str = base_ts.to_rfc3339();
                 let content_hash = sha256_hex(&unit.bytes);
-                let locator = ordinal_locator(*ord);
-                let ev_id = evidence_event_id(
-                    AgentKind::Grok,
-                    &logical_id,
-                    &locator,
-                    "grok-event",
-                    &unit.bytes,
-                )
-                .unwrap_or_else(|_| format!("ev1:grok:{}:{}", logical_id, &content_hash[..16]));
-                let raw_ref = RawUnitRef {
-                    evidence_event_id: ev_id,
-                    coverage_ordinal: *ord,
-                    physical_ordinal: *ord,
-                    locator,
-                    unit_kind: "grok-event".to_string(),
-                    artifact: unit.artifact_name.clone(),
-                    content_hash: content_hash.clone(),
-                    original_bytes: unit.original_bytes,
-                };
                 turns.push(Turn {
                     turn_idx,
                     role: match role_str.as_str() {
@@ -424,25 +396,12 @@ impl AgentAdapter for GrokAdapter {
             let Some(u) = units_by_ord.get(&cu.ordinal) else {
                 continue;
             };
-            let ch = sha256_hex(&u.bytes);
-            let loc = ordinal_locator(cu.ordinal);
-            let eid = evidence_event_id(AgentKind::Grok, &logical_id, &loc, "grok-unit", &u.bytes)
-                .unwrap_or_else(|_| format!("ev1:grok:{}:{}", &logical_id, &ch[..16]));
             match &cu.disposition {
                 ClassifiedDisposition::Consumed { kind } => {
                     consumed_units.push(crate::engine::ConsumedUnit {
                         ordinal: cu.ordinal,
                         kind: kind.clone(),
-                        evidence: RawUnitRef {
-                            evidence_event_id: eid,
-                            coverage_ordinal: cu.ordinal,
-                            physical_ordinal: cu.ordinal,
-                            locator: loc,
-                            unit_kind: kind.clone(),
-                            artifact: u.artifact_name.clone(),
-                            content_hash: ch,
-                            original_bytes: u.original_bytes,
-                        },
+                        evidence: cu.evidence.clone(),
                     });
                 }
                 ClassifiedDisposition::Skipped { reason, visible } => {
@@ -451,20 +410,47 @@ impl AgentAdapter for GrokAdapter {
                         reason: *reason,
                         bytes: u.original_bytes,
                         visible: *visible,
-                        evidence: RawUnitRef {
-                            evidence_event_id: eid,
-                            coverage_ordinal: cu.ordinal,
-                            physical_ordinal: cu.ordinal,
-                            locator: loc,
-                            unit_kind: "grok-skipped".to_string(),
-                            artifact: u.artifact_name.clone(),
-                            content_hash: ch,
-                            original_bytes: u.original_bytes,
-                        },
+                        evidence: cu.evidence.clone(),
                     });
                 }
             }
         }
+
+        let mut warnings = Vec::new();
+        for (reason, kind) in [
+            (
+                SkippedReason::UnknownPayloadType,
+                crate::engine::WarningKind::UnknownPayloadType,
+            ),
+            (
+                SkippedReason::Malformed,
+                crate::engine::WarningKind::MalformedUnit,
+            ),
+            (
+                SkippedReason::Oversized,
+                crate::engine::WarningKind::OversizedUnit,
+            ),
+        ] {
+            let matching: Vec<_> = skipped
+                .iter()
+                .filter(|unit| unit.reason == reason)
+                .collect();
+            if let Some(first) = matching.first() {
+                warnings.push(crate::engine::CoverageWarning {
+                    kind,
+                    count: matching.len() as u64,
+                    first_ordinal: first.ordinal,
+                });
+            }
+        }
+        let unsupported_visible = skipped.iter().any(|unit| {
+            unit.visible
+                && matches!(
+                    unit.reason,
+                    SkippedReason::UnknownPayloadType | SkippedReason::Unsupported
+                )
+        });
+        let visible_event_lost = skipped.iter().any(|unit| unit.visible);
 
         let status = ParseStatus {
             visible_completeness: if skipped.is_empty() {
@@ -478,23 +464,19 @@ impl AgentAdapter for GrokAdapter {
                 opaque_reasoning_present: chat_lines
                     .iter()
                     .any(|(_, v)| v.get("type").and_then(|t| t.as_str()) == Some("reasoning")),
-                unsupported_visible_event: skipped
-                    .iter()
-                    .any(|s| s.visible && matches!(s.reason, SkippedReason::Unsupported)),
+                unsupported_visible_event: unsupported_visible,
             },
             malformed_tail_present: skipped
                 .iter()
                 .any(|s| matches!(s.reason, SkippedReason::Malformed)),
-            visible_event_lost: false,
+            visible_event_lost,
         };
 
-        let coverage = CoverageReport::new(
-            raw_unit_count,
-            consumed_units,
-            skipped,
-            vec![], // warnings
-            status,
-        );
+        let coverage =
+            CoverageReport::new(raw_unit_count, consumed_units, skipped, warnings, status);
+        if coverage.status.visible_completeness == VisibleCompleteness::Fatal {
+            return Ok(UnvalidatedParse::fatal(coverage));
+        }
 
         let provenance = Provenance {
             agent: AgentKind::Grok,

@@ -254,7 +254,12 @@ fn assemble_junie(
         state.consume_logical(logical);
     }
 
-    Ok(UnvalidatedParse::from_model(state.finish(classified)))
+    let model = state.finish(classified);
+    if model.coverage.status.visible_completeness == VisibleCompleteness::Fatal {
+        Ok(UnvalidatedParse::fatal(model.coverage))
+    } else {
+        Ok(UnvalidatedParse::from_model(model))
+    }
 }
 
 struct Assembly<'a> {
@@ -529,6 +534,7 @@ impl<'a> Assembly<'a> {
             )
         {
             self.unsupported_visible = true;
+            self.visible_lost = true;
         }
         if visible && matches!(reason, SkippedReason::Malformed | SkippedReason::Oversized) {
             self.visible_lost = true;
