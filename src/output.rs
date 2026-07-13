@@ -18,12 +18,14 @@ mod report;
 mod types;
 
 pub use conversation::{
-    write_conversation_json, write_conversation_json_with_redaction, write_conversation_markdown,
+    conversation_messages_from_model, write_conversation_json,
+    write_conversation_json_with_redaction, write_conversation_markdown,
     write_conversation_markdown_with_redaction,
 };
 pub use report::{
-    capture_loctree_snapshot, rotate_outputs, write_json_report_to_path,
-    write_markdown_report_to_path, write_report,
+    capture_loctree_snapshot, frame_kind_for_turn, role_str_for_turn, rotate_outputs,
+    timeline_entries_from_model, write_json_report_to_path, write_markdown_report_to_path,
+    write_report,
 };
 pub use types::{
     ConversationExtractStats, ConversationMessage, OutputConfig, OutputFormat, OutputMode,

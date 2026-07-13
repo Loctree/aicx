@@ -450,12 +450,12 @@ fn normal_store_and_extract_do_not_initialize_source_git() {
         &home,
         &[
             "extract",
-            "--format",
             "codex",
+            "--file",
             &input_arg,
+            "--conversation",
             "-o",
             &output_arg,
-            "--conversation",
         ],
     );
     assert_success(&extract_output);

@@ -962,151 +962,10 @@ fn intents_empty_result_hint_ranks_nearby_recent_buckets() {
     );
 }
 
-#[test]
-fn uuid_suffix_from_stem_extracts_rollout_uuid() {
-    assert_eq!(
-        uuid_suffix_from_stem("rollout-2026-05-14T00-47-35-019e2574-8a7f-7d33-a318-b365aa0ab970"),
-        Some("019e2574-8a7f-7d33-a318-b365aa0ab970")
-    );
-    assert_eq!(uuid_suffix_from_stem("rollout-2026-05-14"), None);
-}
-
-#[test]
-fn session_reference_resolver_accepts_unique_prefix() {
-    let session_ids = BTreeSet::from([
-        "019e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
-        "119e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
-    ]);
-
-    let resolved = resolve_session_reference_from_candidates(
-        "019e2574",
-        &session_ids,
-        BTreeSet::new(),
-        "codex",
-    )
-    .unwrap();
-
-    assert_eq!(
-        resolved.canonical_id,
-        "019e2574-8a7f-7d33-a318-b365aa0ab970"
-    );
-    assert!(resolved.note.is_some());
-}
-
-#[test]
-fn session_reference_resolver_rejects_ambiguous_prefix() {
-    let session_ids = BTreeSet::from([
-        "019e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
-        "019e2574-9999-7d33-a318-b365aa0ab970".to_string(),
-    ]);
-
-    let err = resolve_session_reference_from_candidates(
-        "019e2574",
-        &session_ids,
-        BTreeSet::new(),
-        "codex",
-    )
-    .unwrap_err()
-    .to_string();
-
-    assert!(err.contains("Ambiguous session reference"));
-}
-
-#[test]
-fn session_reference_resolver_accepts_unique_suffix() {
-    let session_ids = BTreeSet::from([
-        "019e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
-        "119e2574-8a7f-7d33-a318-000000000000".to_string(),
-    ]);
-
-    let resolved = resolve_session_reference_from_candidates(
-        "b365aa0ab970",
-        &session_ids,
-        BTreeSet::new(),
-        "codex",
-    )
-    .unwrap();
-
-    assert_eq!(
-        resolved.canonical_id,
-        "019e2574-8a7f-7d33-a318-b365aa0ab970"
-    );
-}
-
-#[test]
-fn session_reference_resolver_accepts_codex_alias_match() {
-    let session_ids = BTreeSet::from(["019e2574-8a7f-7d33-a318-b365aa0ab970".to_string()]);
-    let aliases = BTreeSet::from(["019e2574-8a7f-7d33-a318-b365aa0ab970".to_string()]);
-
-    let resolved = resolve_session_reference_from_candidates(
-        "rollout-2026-05-14T00-47-35-019e2574-8a7f-7d33-a318-b365aa0ab970",
-        &session_ids,
-        aliases,
-        "codex",
-    )
-    .unwrap();
-
-    assert_eq!(
-        resolved.canonical_id,
-        "019e2574-8a7f-7d33-a318-b365aa0ab970"
-    );
-}
-
-#[test]
-fn read_codex_session_meta_id_skips_malformed_lines() {
-    use std::io::Write;
-    let tmp_dir = unique_test_dir("read-meta-malformed");
-    std::fs::create_dir_all(&tmp_dir).unwrap();
-    let path = tmp_dir.join("partial.jsonl");
-    let mut file = std::fs::File::create(&path).unwrap();
-    // First candidate line contains the `"session_meta"` substring
-    // but is truncated mid-record (typical of a partially-flushed
-    // rollout). Before the fix this caused `read_codex_session_meta_id`
-    // to bail out and miss the valid record on the next line.
-    writeln!(
-        file,
-        r#"{{"timestamp":"2026-05-15T00:00:00Z","type":"session_meta","payload":{{"id":"truncated"#
-    )
-    .unwrap();
-    writeln!(
-            file,
-            r#"{{"timestamp":"2026-05-15T00:00:01Z","type":"session_meta","payload":{{"id":"019e0000-0000-0000-0000-000000000000","cwd":"/tmp"}}}}"#
-        )
-        .unwrap();
-    drop(file);
-
-    let id = read_codex_session_meta_id(&path);
-    assert_eq!(
-        id.as_deref(),
-        Some("019e0000-0000-0000-0000-000000000000"),
-        "malformed first line must not stop the scan"
-    );
-
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-}
-
-#[test]
-fn session_reference_resolver_ignores_out_of_window_alias() {
-    // Only one id is in the current `--hours`/`--project` window.
-    let session_ids = BTreeSet::from(["019e27c0-e492-7790-9c33-52b3dddd1067".to_string()]);
-    // The full sessions/ tree walk surfaced two aliases sharing the
-    // `019e2` prefix: one in-window, one historical/out-of-window.
-    let aliases = BTreeSet::from([
-        "019e27c0-e492-7790-9c33-52b3dddd1067".to_string(),
-        "019e2574-8a7f-7d33-a318-b365aa0ab970".to_string(),
-    ]);
-
-    let resolved =
-        resolve_session_reference_from_candidates("019e2", &session_ids, aliases, "codex").unwrap();
-
-    // Without the in-window filter the resolver would see two
-    // candidates and bail "ambiguous". After the fix it resolves
-    // uniquely to the in-window id.
-    assert_eq!(
-        resolved.canonical_id,
-        "019e27c0-e492-7790-9c33-52b3dddd1067"
-    );
-}
+// The pre-C7 in-CLI session resolver (uuid_suffix_from_stem /
+// read_codex_session_meta_id / resolve_session_reference_from_candidates) is
+// gone: `--session` resolves through `aicx::session_catalog` (covered by
+// tests/session_catalog.rs) and the CLI parses exactly one resolved source.
 
 fn default_session_extract_file_name(session_id: &str) -> String {
     default_session_extract_path_for("claude", session_id, false, false)
@@ -2440,96 +2299,121 @@ fn corpus_builders_accept_redaction_flags() {
 }
 
 #[test]
-fn extract_accepts_gemini_antigravity_format() {
+fn extract_agent_subcommand_accepts_direct_file_mode() {
     let cli = Cli::try_parse_from([
         "aicx",
         "extract",
-        "--format",
-        "gemini-antigravity",
-        "/tmp/brain/uuid",
+        "codex",
+        "--file",
+        "/tmp/session/rollout.jsonl",
+        "--conversation",
         "-o",
         "/tmp/report.md",
     ])
-    .expect("extract command with gemini-antigravity should parse");
-
-    match cli.command {
-        Some(Commands::Extract { format, .. }) => {
-            assert!(matches!(
-                format,
-                Some(ExtractInputFormat::GeminiAntigravity)
-            ));
-        }
-        _ => panic!("expected extract command"),
-    }
-}
-
-#[test]
-fn extract_accepts_junie_format() {
-    let cli = Cli::try_parse_from([
-        "aicx",
-        "extract",
-        "--format",
-        "junie",
-        "/tmp/session/events.jsonl",
-        "-o",
-        "/tmp/report.md",
-    ])
-    .expect("extract command with junie should parse");
-
-    match cli.command {
-        Some(Commands::Extract { format, .. }) => {
-            assert!(matches!(format, Some(ExtractInputFormat::Junie)));
-        }
-        _ => panic!("expected extract command"),
-    }
-}
-
-#[test]
-fn extract_accepts_session_mode() {
-    let cli = Cli::try_parse_from([
-        "aicx",
-        "extract",
-        "--session",
-        "11111111-2222-3333-4444-555555555555",
-        "--agent",
-        "claude",
-    ])
-    .expect("extract --session should parse without positional input");
+    .expect("canonical direct-file grammar should parse");
 
     match cli.command {
         Some(Commands::Extract {
-            session,
-            agent,
-            input,
-            output,
+            target: Some(target),
             ..
         }) => {
+            let (agent, args) = target.split();
+            assert_eq!(agent, ExtractAgent::Codex);
             assert_eq!(
-                session.as_deref(),
-                Some("11111111-2222-3333-4444-555555555555")
+                args.file.as_deref(),
+                Some(Path::new("/tmp/session/rollout.jsonl"))
             );
-            assert!(matches!(agent, Some(ExtractInputFormat::Claude)));
-            assert!(input.is_none());
-            assert!(output.is_none());
+            assert!(args.conversation);
+            assert_eq!(args.output.as_deref(), Some(Path::new("/tmp/report.md")));
+            assert!(args.session.is_none());
         }
-        _ => panic!("expected extract command"),
+        _ => panic!("expected extract subcommand"),
     }
 }
 
 #[test]
-fn extract_session_and_input_are_mutually_exclusive() {
+fn extract_agent_subcommand_accepts_session_mode() {
+    let cli = Cli::try_parse_from([
+        "aicx",
+        "extract",
+        "claude",
+        "--session",
+        "11111111-2222-3333-4444-555555555555",
+    ])
+    .expect("canonical session grammar should parse");
+
+    match cli.command {
+        Some(Commands::Extract {
+            target: Some(target),
+            ..
+        }) => {
+            let (agent, args) = target.split();
+            assert_eq!(agent, ExtractAgent::Claude);
+            assert_eq!(
+                args.session.as_deref(),
+                Some("11111111-2222-3333-4444-555555555555")
+            );
+            assert!(args.file.is_none());
+            assert!(args.output.is_none());
+        }
+        _ => panic!("expected extract subcommand"),
+    }
+}
+
+#[test]
+fn extract_every_agent_subcommand_parses() {
+    for (name, expected) in [
+        ("codex", ExtractAgent::Codex),
+        ("claude", ExtractAgent::Claude),
+        ("gemini", ExtractAgent::Gemini),
+        ("grok", ExtractAgent::Grok),
+        ("junie", ExtractAgent::Junie),
+    ] {
+        let cli = Cli::try_parse_from(["aicx", "extract", name, "--session", "abc12345"])
+            .unwrap_or_else(|error| panic!("agent subcommand `{name}` must parse: {error}"));
+        match cli.command {
+            Some(Commands::Extract {
+                target: Some(target),
+                ..
+            }) => {
+                let (agent, _) = target.split();
+                assert_eq!(agent, expected);
+            }
+            _ => panic!("expected extract subcommand for `{name}`"),
+        }
+    }
+}
+
+#[test]
+fn extract_session_and_file_are_mutually_exclusive() {
     let res = Cli::try_parse_from([
         "aicx",
         "extract",
+        "junie",
         "--session",
         "abc",
-        "--agent",
-        "junie",
+        "--file",
         "/tmp/session/events.jsonl",
     ]);
+    assert!(res.is_err(), "--session must conflict with --file");
+}
+
+#[test]
+fn extract_help_hides_removed_flag_grammar() {
+    let mut cmd = Cli::command();
+    let extract = cmd
+        .find_subcommand_mut("extract")
+        .expect("extract subcommand should exist");
+    let rendered = extract.render_long_help().to_string();
+    for agent in ["codex", "claude", "gemini", "grok", "junie"] {
+        assert!(
+            rendered.contains(agent),
+            "extract --help must list the `{agent}` subcommand"
+        );
+    }
     assert!(
-        res.is_err(),
-        "--session must conflict with positional INPUT path"
+        !rendered.contains("--agent") && !rendered.contains("--format"),
+        "removed flag grammar must not appear in extract --help:\n{rendered}"
     );
 }
 
@@ -2795,11 +2679,13 @@ fn legacy_extract_file_boundary_fails_closed_without_output() {
     );
     set_mtime(&step_output, 1_706_745_900);
 
-    let error = run_extract_file(
-        ExtractInputFormat::GeminiAntigravity,
-        None,
+    // Antigravity brain directories route through the direct-file runner as a
+    // directory input (no SourceHandle is constructible for a directory).
+    let error = run_extract_direct_file(
+        ExtractAgent::Gemini,
         brain,
         report.clone(),
+        None,
         ExtractFileOptions {
             include_assistant: true,
             max_message_chars: 0,
@@ -2807,7 +2693,7 @@ fn legacy_extract_file_boundary_fails_closed_without_output() {
             conversation: false,
         },
     )
-    .expect_err("legacy parser must stay removed");
+    .expect_err("sealed session boundary must stay fail-closed until adapters land");
     assert!(error.to_string().contains("legacy session parser removed"));
     assert!(
         !report.exists(),

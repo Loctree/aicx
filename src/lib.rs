@@ -39,6 +39,11 @@ pub mod embedder;
 pub mod evidence;
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub mod hf_cache;
+#[cfg(feature = "app")]
+pub mod importers;
+#[cfg(not(feature = "app"))]
+#[allow(dead_code, unused_imports)]
+mod importers;
 pub mod intents;
 #[cfg(feature = "app")]
 pub mod locks;
@@ -66,6 +71,11 @@ pub mod reports_extractor;
 pub mod search_engine;
 #[cfg(feature = "app")]
 pub mod search_eval;
+/// Deterministic locate-before-parse session catalog (C1L line). Registered
+/// here for the CLI extraction dispatch; final shared runtime wiring stays
+/// with the C5X cut.
+#[cfg(feature = "app")]
+pub mod session_catalog;
 pub mod sessions;
 #[cfg(feature = "app")]
 pub mod sources;

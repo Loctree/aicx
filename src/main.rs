@@ -26,7 +26,7 @@ use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, BufReader, IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
@@ -45,12 +45,6 @@ use aicx::sources::{self, ExtractionConfig};
 use aicx::state::StateManager;
 use aicx::store;
 use aicx::timeline;
-
-#[derive(Debug, Clone)]
-struct SessionResolution {
-    canonical_id: String,
-    note: Option<String>,
-}
 
 fn print_intent_schema_migration_report(report: &intents::MigrationReport) {
     eprintln!("=== Intent Schema Migration (dry run) ===");
@@ -140,14 +134,133 @@ enum CorpusEmit {
     Json,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum ExtractInputFormat {
-    Claude,
+/// Canonical extraction agents. The agent is a required `aicx extract`
+/// subcommand — there is no `--agent`/`--format` flag grammar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExtractAgent {
     Codex,
+    Claude,
     Gemini,
-    GeminiAntigravity,
-    Junie,
     Grok,
+    Junie,
+}
+
+impl ExtractAgent {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Gemini => "gemini",
+            Self::Grok => "grok",
+            Self::Junie => "junie",
+        }
+    }
+
+    const fn catalog_kind(self) -> aicx::session_catalog::AgentKind {
+        match self {
+            Self::Codex => aicx::session_catalog::AgentKind::Codex,
+            Self::Claude => aicx::session_catalog::AgentKind::Claude,
+            Self::Gemini => aicx::session_catalog::AgentKind::Gemini,
+            Self::Grok => aicx::session_catalog::AgentKind::Grok,
+            Self::Junie => aicx::session_catalog::AgentKind::Junie,
+        }
+    }
+
+    const fn parser_kind(self) -> aicx::parser::engine::AgentKind {
+        match self {
+            Self::Codex => aicx::parser::engine::AgentKind::Codex,
+            Self::Claude => aicx::parser::engine::AgentKind::Claude,
+            Self::Gemini => aicx::parser::engine::AgentKind::Gemini,
+            Self::Grok => aicx::parser::engine::AgentKind::Grok,
+            Self::Junie => aicx::parser::engine::AgentKind::Junie,
+        }
+    }
+
+    /// Session-store root scanned by the catalog locator for `--session`.
+    fn session_root(self, home: &Path) -> PathBuf {
+        match self {
+            Self::Codex => home.join(".codex").join("sessions"),
+            Self::Claude => home.join(".claude").join("projects"),
+            Self::Gemini => home.join(".gemini").join("tmp"),
+            Self::Grok => home.join(".grok"),
+            Self::Junie => home.join(".junie").join("sessions"),
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
+            "gemini" | "gemini-antigravity" => Some(Self::Gemini),
+            "grok" => Some(Self::Grok),
+            "junie" => Some(Self::Junie),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum ExtractTarget {
+    /// OpenAI Codex CLI rollouts (~/.codex/sessions)
+    Codex(ExtractAgentArgs),
+    /// Claude Code sessions (~/.claude/projects)
+    Claude(ExtractAgentArgs),
+    /// Gemini CLI chats (~/.gemini/tmp/<hash>/chats)
+    Gemini(ExtractAgentArgs),
+    /// Grok CLI sessions (~/.grok)
+    Grok(ExtractAgentArgs),
+    /// JetBrains Junie event logs (~/.junie/sessions)
+    Junie(ExtractAgentArgs),
+}
+
+impl ExtractTarget {
+    fn split(self) -> (ExtractAgent, ExtractAgentArgs) {
+        match self {
+            Self::Codex(args) => (ExtractAgent::Codex, args),
+            Self::Claude(args) => (ExtractAgent::Claude, args),
+            Self::Gemini(args) => (ExtractAgent::Gemini, args),
+            Self::Grok(args) => (ExtractAgent::Grok, args),
+            Self::Junie(args) => (ExtractAgent::Junie, args),
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct ExtractAgentArgs {
+    #[command(flatten)]
+    redaction: RedactionArgs,
+
+    /// Session id: source id, logical id, alias, UUID suffix (≥8 chars), or
+    /// unique prefix. Resolved through the session catalog before any parse.
+    #[arg(long, conflicts_with = "file")]
+    session: Option<String>,
+
+    /// Direct source file. Builds a source handle from this path only — no
+    /// catalog scan, no global AICX state. Requires `-o/--output`.
+    #[arg(long)]
+    file: Option<PathBuf>,
+
+    /// Output file path. Required with `--file`; defaults to
+    /// `~/.aicx/extracts/<agent>/<session_id>[_conversation][_user].md`
+    /// in session mode.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Explicit project/repo name (overrides inference)
+    #[arg(short, long)]
+    project: Option<String>,
+
+    /// Only include user messages (exclude assistant + reasoning)
+    #[arg(long)]
+    user_only: bool,
+
+    /// Maximum message characters in markdown (0 = no truncation)
+    #[arg(long, default_value = "0")]
+    max_message_chars: usize,
+
+    /// Conversation-first mode: emit denoised user/assistant transcript only
+    #[arg(long)]
+    conversation: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -938,67 +1051,56 @@ enum Commands {
         conversation: bool,
     },
 
-    /// Extract a single session — by file path or by session id.
+    /// Extract a single session for one agent — by session id or direct file.
     ///
-    /// Two modes:
-    /// 1. File mode (legacy): `aicx extract --format claude /path/to/session.jsonl -o /tmp/report.md`
-    /// 2. Session mode: `aicx extract --session <uuid> --agent {claude,codex,gemini,junie} [-o FILE]`
+    /// Canonical grammar (the agent is a required subcommand):
+    ///   aicx extract {codex|claude|gemini|grok|junie} --session <id> [--conversation] [-o FILE]
+    ///   aicx extract {codex|claude|gemini|grok|junie} --file <path> --conversation -o <path>
     ///
-    /// In session mode, the chosen agent's source store is scanned, all timeline
-    /// entries matching `--session` are filtered, and either a full timeline
-    /// report or a denoised conversation Markdown transcript is written.
-    /// Default output paths are `~/.aicx/extracts/<agent>/<session_id>.md`
-    /// and `~/.aicx/extracts/<agent>/<session_id>_conversation.md`.
+    /// `--session` resolves the session catalog first (bounded identity headers,
+    /// no body parse), then parses exactly one resolved source. `--file` builds a
+    /// direct source handle from the supplied path with no catalog scan and no
+    /// global AICX state. Default output paths encode the mode axes:
+    /// `~/.aicx/extracts/<agent>/<session_id>[_conversation][_user].md`.
     #[command(display_order = 5)]
     Extract {
-        #[command(flatten)]
-        redaction: RedactionArgs,
+        #[command(subcommand)]
+        target: Option<ExtractTarget>,
 
-        /// Input format (agent), required in file mode: claude | codex | gemini | gemini-antigravity | junie | grok
-        #[arg(long, value_enum, alias = "input-format")]
-        format: Option<ExtractInputFormat>,
+        /// Removed flag grammar (pre-C7). Present only to emit a structured
+        /// migration hint instead of a bare clap error.
+        #[arg(long, hide = true)]
+        agent: Option<String>,
 
-        /// Explicit project/repo name (overrides inference)
-        #[arg(short, long)]
-        project: Option<String>,
+        #[arg(long, hide = true, alias = "input-format")]
+        format: Option<String>,
 
-        /// Session id (UUID or agent-native id) for session-mode extraction.
-        /// Mutually exclusive with positional `input`.
-        #[arg(long, conflicts_with = "input")]
+        #[arg(long, hide = true)]
         session: Option<String>,
 
-        /// Source agent for session-mode extraction. Required together with `--session`.
-        #[arg(long, value_enum, conflicts_with = "input")]
-        agent: Option<ExtractInputFormat>,
-
-        /// Hours to look back when scanning sources in session mode (default: 1 year, 0 = all time).
-        #[arg(short = 'H', long, default_value = "8760")]
-        hours: u64,
-
-        /// Input path (JSONL / JSON / Antigravity brain directory depending on agent).
-        /// Used in file mode; mutually exclusive with `--session`.
-        input: Option<PathBuf>,
-
-        /// Output file path. In file mode this is required.
-        /// In session mode, defaults to `~/.aicx/extracts/<agent>/<session_id>.md`.
-        #[arg(short, long)]
+        #[arg(short, long, hide = true)]
         output: Option<PathBuf>,
 
-        /// Only include user messages (exclude assistant + reasoning)
-        #[arg(long)]
+        #[arg(short, long, hide = true)]
+        project: Option<String>,
+
+        #[arg(short = 'H', long, hide = true)]
+        hours: Option<u64>,
+
+        #[arg(long, hide = true)]
+        conversation: bool,
+
+        #[arg(long, hide = true)]
         user_only: bool,
 
-        /// Include assistant messages (legacy flag; now default)
-        #[arg(long, hide = true, conflicts_with = "user_only")]
+        #[arg(long, hide = true)]
         include_assistant: bool,
 
-        /// Maximum message characters in markdown (0 = no truncation)
-        #[arg(long, default_value = "0")]
-        max_message_chars: usize,
+        #[arg(long, hide = true)]
+        max_message_chars: Option<usize>,
 
-        /// Conversation-first mode: emit denoised user/assistant transcript only
-        #[arg(long)]
-        conversation: bool,
+        #[arg(hide = true)]
+        input: Option<PathBuf>,
     },
 
     /// Batch-export conversation JSON files without writing to the canonical store.
@@ -2106,117 +2208,74 @@ fn run_command(command: Option<Commands>) -> Result<()> {
             })?;
         }
         Some(Commands::Extract {
-            redaction,
-            format,
-            project,
-            session,
+            target,
             agent,
-            hours,
-            input,
+            format,
+            session,
             output,
-            user_only,
-            include_assistant: include_assistant_flag,
-            max_message_chars,
+            project,
+            hours,
             conversation,
+            user_only,
+            include_assistant,
+            max_message_chars,
+            input,
         }) => {
-            let include_assistant = include_assistant_flag || !user_only;
-
             let json = aicx::cli::failure::want_json_envelope(false);
 
-            // Session mode: --session [+ --agent] -> scan sources, filter by session_id.
-            if let Some(session_id) = session {
-                let agent = match agent.or(format) {
-                    Some(a) => a,
-                    None => {
-                        aicx::cli::failure::emit_and_error(
-                            "aicx extract",
-                            json,
-                            aicx::cli::failure::StructuredFailure::new(
-                                "missing_required_arg",
-                                "--session requires --agent {claude|codex|gemini|junie|grok}",
-                                "rerun with --agent <name>, e.g. aicx extract --session <id> --agent claude",
-                            )
-                            .with_fallback("aicx extract --session <ID> --agent claude"),
-                        );
-                        std::process::exit(2);
-                    }
+            // Removed flag grammar: reject with a structured migration hint,
+            // never silently alias to the subcommand form.
+            let legacy_flags_used = agent.is_some()
+                || format.is_some()
+                || session.is_some()
+                || output.is_some()
+                || project.is_some()
+                || hours.is_some()
+                || conversation
+                || user_only
+                || include_assistant
+                || max_message_chars.is_some()
+                || input.is_some();
+            if legacy_flags_used {
+                let suggested_agent = agent
+                    .as_deref()
+                    .or(format.as_deref())
+                    .and_then(ExtractAgent::from_str)
+                    .map_or("codex", ExtractAgent::label);
+                let migration = if input.is_some() {
+                    format!("aicx extract {suggested_agent} --file <path> --conversation -o <path>")
+                } else {
+                    format!("aicx extract {suggested_agent} --session <id> --conversation")
                 };
-                run_extract_session(
-                    &session_id,
-                    agent,
-                    output,
-                    hours,
-                    project,
-                    ExtractFileOptions {
-                        include_assistant,
-                        max_message_chars,
-                        redact_secrets: redaction.redact_secrets,
-                        conversation,
-                    },
-                )?;
-            } else {
-                // File mode (legacy): --format <agent> + positional input + -o.
-                let format = match format {
-                    Some(f) => f,
-                    None => {
-                        aicx::cli::failure::emit_and_error(
-                            "aicx extract",
-                            json,
-                            aicx::cli::failure::StructuredFailure::new(
-                                "mode_mismatch",
-                                "file-mode extract requires --format {claude|codex|gemini|gemini-antigravity|junie}",
-                                "pass --format <agent> with positional INPUT and -o <FILE>, or switch to session mode with --session <id> --agent <name>",
-                            )
-                            .with_fallback(
-                                "aicx extract --format claude path/to/session.jsonl -o /tmp/out.md",
-                            ),
-                        );
-                        std::process::exit(2);
-                    }
-                };
-                let input = match input {
-                    Some(i) => i,
-                    None => {
-                        aicx::cli::failure::emit_and_error(
-                            "aicx extract",
-                            json,
-                            aicx::cli::failure::StructuredFailure::new(
-                                "input_path_required",
-                                "file-mode extract requires a positional INPUT path",
-                                "append the agent log path, e.g. aicx extract --format claude ~/.claude/projects/<repo>/<session>.jsonl -o /tmp/out.md",
-                            ),
-                        );
-                        std::process::exit(2);
-                    }
-                };
-                let output = match output {
-                    Some(o) => o,
-                    None => {
-                        aicx::cli::failure::emit_and_error(
-                            "aicx extract",
-                            json,
-                            aicx::cli::failure::StructuredFailure::new(
-                                "output_path_required",
-                                "file-mode extract requires -o/--output <FILE>",
-                                "add -o /path/to/out.md to write the extracted markdown",
-                            ),
-                        );
-                        std::process::exit(2);
-                    }
-                };
-                run_extract_file(
-                    format,
-                    project,
-                    input,
-                    output,
-                    ExtractFileOptions {
-                        include_assistant,
-                        max_message_chars,
-                        redact_secrets: redaction.redact_secrets,
-                        conversation,
-                    },
-                )?;
+                aicx::cli::failure::emit_and_error(
+                    "aicx extract",
+                    json,
+                    aicx::cli::failure::StructuredFailure::new(
+                        "legacy_flag_grammar",
+                        "`aicx extract --agent/--format ...` was removed; the agent is a required subcommand",
+                        format!("rerun as `{migration}`"),
+                    )
+                    .with_fallback(migration),
+                );
+                std::process::exit(2);
             }
+
+            let Some(target) = target else {
+                aicx::cli::failure::emit_and_error(
+                    "aicx extract",
+                    json,
+                    aicx::cli::failure::StructuredFailure::new(
+                        "missing_agent_subcommand",
+                        "extract requires an agent subcommand: codex | claude | gemini | grok | junie",
+                        "rerun as `aicx extract codex --session <id> --conversation` or `aicx extract codex --file <path> --conversation -o <path>`",
+                    )
+                    .with_fallback("aicx extract codex --session <ID> --conversation"),
+                );
+                std::process::exit(2);
+            };
+
+            let (extract_agent, args) = target.split();
+            run_extract_target(extract_agent, args)?;
         }
         Some(Commands::Conversations {
             redaction,
@@ -2827,17 +2886,6 @@ fn run_command(command: Option<Commands>) -> Result<()> {
     Ok(())
 }
 
-fn extract_input_format_from_str(s: &str) -> Option<ExtractInputFormat> {
-    match s.to_lowercase().as_str() {
-        "claude" => Some(ExtractInputFormat::Claude),
-        "codex" => Some(ExtractInputFormat::Codex),
-        "gemini" => Some(ExtractInputFormat::Gemini),
-        "junie" => Some(ExtractInputFormat::Junie),
-        "grok" => Some(ExtractInputFormat::Grok),
-        _ => None,
-    }
-}
-
 fn run_claims_command(command: ClaimsCommand) -> Result<()> {
     match command {
         ClaimsCommand::Extract {
@@ -2914,46 +2962,37 @@ fn lane_time_coverage<Tz: TimeZone>(
     })
 }
 
-/// Locate a session, extract its conversation, and run Lane 2 claim
-/// extraction with full temporal metadata. Shared by claims/results/clarify.
+/// Locate a session (catalog-first, zero body reads), parse exactly the one
+/// resolved source, and run Lane 2 claim extraction with full temporal
+/// metadata. Shared by claims/results/clarify.
 fn load_session_claims(
     session: &str,
     agent: Option<String>,
     hours: u64,
 ) -> Result<LaneSessionContext> {
     let home = aicx::os_user_home().context("No home dir")?;
-    let session_info = sessions::find_session_by_id(&home, session);
     let agent_str = match agent {
         Some(a) => a,
-        None => session_info
-            .as_ref()
+        None => sessions::find_session_by_id(&home, session)
             .map(|s| s.agent.clone())
             .context("could not infer agent from session id; pass --agent")?,
     };
-    let fmt = extract_input_format_from_str(&agent_str)
+    let extract_agent = ExtractAgent::from_str(&agent_str)
         .with_context(|| format!("unknown agent '{agent_str}' (claude|codex|gemini|junie|grok)"))?;
 
-    let config = ExtractionConfig {
-        project_filter: Vec::new(),
-        cutoff: lookback_cutoff(hours),
-        include_assistant: true,
-        watermark: None,
-    };
-    let mut entries = match fmt {
-        ExtractInputFormat::Claude => sources::extract_claude(&config)?,
-        ExtractInputFormat::Codex => sources::extract_codex(&config)?,
-        ExtractInputFormat::Gemini | ExtractInputFormat::GeminiAntigravity => {
-            sources::extract_gemini(&config)?
-        }
-        ExtractInputFormat::Junie => sources::extract_junie(&config)?,
-        ExtractInputFormat::Grok => sources::extract_grok(&config)?,
-    };
-    let label = extract_input_format_label(fmt);
-    let resolution = resolve_session_reference(session, fmt, label, &entries)?;
-    entries.retain(|e| e.session_id == resolution.canonical_id);
+    let root = extract_agent.session_root(&home);
+    let catalog = aicx::session_catalog::SessionCatalog::new(extract_agent.catalog_kind(), &root)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let resolved = catalog
+        .resolve(session)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let canonical_id = resolved.source.source_id.clone();
+
+    let entries = parse_selected_source_once(extract_agent, &resolved.source.path, true)?;
     if entries.is_empty() {
         anyhow::bail!(
-            "no entries for session '{session}' (agent {agent_str}); try a larger --hours"
+            "no entries for session '{session}' (agent {agent_str}, source {}); the source parsed empty within --hours {hours}",
+            resolved.source.path.display(),
         );
     }
 
@@ -2966,14 +3005,11 @@ fn load_session_claims(
         .as_deref()
         .and_then(|c| c.trim_end_matches('/').rsplit('/').find(|s| !s.is_empty()))
         .map(String::from)
-        .unwrap_or_else(|| format!("{agent_str}/{}", resolution.canonical_id));
+        .unwrap_or_else(|| format!("{agent_str}/{canonical_id}"));
 
     let extracted_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let coverage = lane_time_coverage(entries.iter().map(|e| e.timestamp));
-    let source_files = session_info
-        .as_ref()
-        .map(|s| vec![s.source_path.display().to_string()])
-        .unwrap_or_default();
+    let source_files = vec![resolved.source.path.display().to_string()];
 
     // Role filtering happens HERE, at the source build — not only inside the
     // lane stages (which re-guard as defense in depth, using the SAME shared
@@ -2985,7 +3021,7 @@ fn load_session_claims(
         role: e.role.clone(),
         text: e.message.clone(),
         project: project.clone(),
-        session_id: resolution.canonical_id.clone(),
+        session_id: canonical_id.clone(),
         agent: Some(e.agent.clone()),
         source_ref: format!("{}#{i}", e.timestamp.to_rfc3339()),
         timestamp: Some(e.timestamp.to_rfc3339()),
@@ -3025,7 +3061,7 @@ fn load_session_claims(
     }
 
     Ok(LaneSessionContext {
-        canonical_id: resolution.canonical_id,
+        canonical_id,
         agent: agent_str,
         project,
         repo,
@@ -3296,7 +3332,7 @@ fn run_session_report(
     println!("\n## Lane 1 — human intent ({})\n", ctx.user_intents.len());
     if ctx.user_intents.is_empty() {
         println!(
-            "(no classified user intent lines; raw user text may still carry direction — see `aicx extract --conversation --user-only`)"
+            "(no classified user intent lines; raw user text may still carry direction — see `aicx extract <agent> --session <id> --conversation --user-only`)"
         );
     }
     for ui in &ctx.user_intents {
@@ -3402,7 +3438,7 @@ fn run_session_show(session_id: String, format: &str) -> Result<()> {
                 println!("- title: {t}");
             }
             println!(
-                "\n## extract\n\n    aicx extract --agent {} --session {} --conversation",
+                "\n## extract\n\n    aicx extract {} --session {} --conversation",
                 info.agent, info.session_id
             );
         }
@@ -4926,24 +4962,13 @@ fn run_tail(
     }
 }
 
-/// Output-shaping toggles for `run_extract_file`. Keeps the constructor-like
-/// call readable without an argument-list ceiling waiver.
+/// Output-shaping toggles shared by the extract render paths. Keeps the
+/// constructor-like call readable without an argument-list ceiling waiver.
 struct ExtractFileOptions {
     include_assistant: bool,
     max_message_chars: usize,
     redact_secrets: bool,
     conversation: bool,
-}
-
-fn extract_input_format_label(format: ExtractInputFormat) -> &'static str {
-    match format {
-        ExtractInputFormat::Claude => "claude",
-        ExtractInputFormat::Codex => "codex",
-        ExtractInputFormat::Gemini => "gemini",
-        ExtractInputFormat::GeminiAntigravity => "gemini",
-        ExtractInputFormat::Junie => "junie",
-        ExtractInputFormat::Grok => "grok",
-    }
 }
 
 /// Resolve the default output path for `aicx extract --session ...`:
@@ -5385,396 +5410,169 @@ fn write_conversation_batch_session(
     Ok(projection.messages.len())
 }
 
-fn uuid_suffix_from_stem(stem: &str) -> Option<&str> {
-    let start = stem.len().checked_sub(36)?;
-    let suffix = &stem[start..];
-    let bytes = suffix.as_bytes();
-    let is_uuid_like = bytes.iter().enumerate().all(|(idx, byte)| {
-        if matches!(idx, 8 | 13 | 18 | 23) {
-            *byte == b'-'
-        } else {
-            byte.is_ascii_hexdigit()
+/// Dispatch one canonical `aicx extract <agent> ...` invocation.
+///
+/// Exactly one addressing mode is accepted: `--session <id>` (catalog
+/// locate-before-parse) or `--file <path>` (direct handle, no discovery).
+fn run_extract_target(agent: ExtractAgent, args: ExtractAgentArgs) -> Result<()> {
+    let json = aicx::cli::failure::want_json_envelope(false);
+    let options = ExtractFileOptions {
+        include_assistant: !args.user_only,
+        max_message_chars: args.max_message_chars,
+        redact_secrets: args.redaction.redact_secrets,
+        conversation: args.conversation,
+    };
+    match (args.session, args.file) {
+        (Some(session), None) => {
+            run_extract_session(agent, &session, args.output, args.project, options)
         }
-    });
-    is_uuid_like.then_some(suffix)
-}
-
-fn read_codex_session_meta_id(path: &Path) -> Option<String> {
-    // Route through the project-wide validated opener so symlink/path-safety
-    // guarantees apply uniformly to every place that ingests Codex rollouts.
-    let file = aicx::sanitize::open_file_validated(path).ok()?;
-    let mut reader = BufReader::new(file);
-    while let Ok(Some(line)) =
-        aicx::sanitize::read_line_capped(&mut reader, aicx::sanitize::MAX_VALIDATED_BYTES)
-    {
-        if line.exceeded {
-            continue;
-        }
-        let line = line.line;
-        if !line.contains("\"session_meta\"") {
-            continue;
-        }
-        // Skip malformed lines instead of bailing out of the whole scan —
-        // a partially-written rollout file can have a truncated tail, and
-        // the session_meta record we want is usually one of the first
-        // entries. Treat a parse error on a single candidate line as a
-        // miss for that line, not as "this file has no session_meta".
-        let Ok(data) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        if data.get("type").and_then(|value| value.as_str()) != Some("session_meta") {
-            continue;
-        }
-        return data
-            .get("payload")
-            .and_then(|payload| payload.get("id"))
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| value.trim().to_string());
-    }
-    None
-}
-
-fn collect_codex_session_alias_matches(requested: &str) -> Result<BTreeSet<String>> {
-    let mut matches = BTreeSet::new();
-    let sessions_dir = aicx::os_user_home()
-        .context("No home dir")?
-        .join(".codex")
-        .join("sessions");
-    if !sessions_dir.is_dir() {
-        return Ok(matches);
-    }
-
-    let mut stack = vec![sessions_dir];
-    while let Some(dir) = stack.pop() {
-        let Ok(read_dir) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in read_dir.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-                continue;
-            }
-
-            let stem = path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default();
-            let file_name = path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default();
-            let suffix = uuid_suffix_from_stem(stem);
-            let suffix_owned: Option<String> = suffix.map(str::to_string);
-
-            // Avoid reading session_meta from every JSONL in the tree.
-            // Cheap path: try matching against the filename stem / UUID
-            // suffix first. Only open the rollout when (a) the cheap
-            // check matched and we need the canonical id for the output,
-            // or (b) the filename carries no UUID suffix (non-rollout
-            // layout) and we have nothing else to anchor on.
-            let cheap_anchor: &str = suffix_owned.as_deref().unwrap_or(stem);
-            let cheap_match = requested == stem
-                || requested == file_name
-                || cheap_anchor.starts_with(requested)
-                || cheap_anchor.ends_with(requested);
-
-            let canonical = if cheap_match || suffix.is_none() {
-                read_codex_session_meta_id(&path)
-                    .or_else(|| suffix_owned.clone())
-                    .unwrap_or_else(|| stem.to_string())
-            } else {
-                // Have a UUID suffix and no cheap hit — trust the suffix
-                // as the canonical id rather than opening the file.
-                suffix_owned.clone().unwrap_or_default()
+        (None, Some(file)) => {
+            let Some(output) = args.output else {
+                aicx::cli::failure::emit_and_error(
+                    &format!("aicx extract {}", agent.label()),
+                    json,
+                    aicx::cli::failure::StructuredFailure::new(
+                        "output_path_required",
+                        "--file extraction requires -o/--output <FILE>",
+                        "add -o /path/to/out.md to write the extracted markdown",
+                    )
+                    .with_fallback(format!(
+                        "aicx extract {} --file <path> --conversation -o <path>",
+                        agent.label()
+                    )),
+                );
+                std::process::exit(2);
             };
-
-            let alias_matches =
-                cheap_match || canonical.starts_with(requested) || canonical.ends_with(requested);
-            if alias_matches {
-                matches.insert(canonical);
-            }
-        }
-    }
-
-    Ok(matches)
-}
-
-fn resolve_session_reference_from_candidates(
-    requested: &str,
-    session_ids: &BTreeSet<String>,
-    alias_matches: BTreeSet<String>,
-    agent_label: &str,
-) -> Result<SessionResolution> {
-    if session_ids.contains(requested) {
-        return Ok(SessionResolution {
-            canonical_id: requested.to_string(),
-            note: None,
-        });
-    }
-
-    let mut candidates: BTreeSet<String> = session_ids
-        .iter()
-        .filter(|session_id| session_id.starts_with(requested) || session_id.ends_with(requested))
-        .cloned()
-        .collect();
-    // Restrict alias matches (gathered by walking `~/.codex/sessions/` for
-    // filename UUID anchors) to ids that were actually extracted in the
-    // current `--hours` / `--project` window. Without this guard, older
-    // out-of-window sessions inflate the candidate set: a previously unique
-    // in-window prefix can flip to "ambiguous", or the resolver can pick an
-    // out-of-window id that then yields zero entries downstream.
-    let in_window_aliases: BTreeSet<String> = alias_matches
-        .into_iter()
-        .filter(|alias| session_ids.contains(alias))
-        .collect();
-    candidates.extend(in_window_aliases);
-
-    match candidates.len() {
-        0 => anyhow::bail!(
-            "No session matched `{}` in agent `{}`. Scanned {} extracted session id(s).\n\
-             Try: use the full session id, increase --hours, or run `aicx extract --agent {} --help`.",
-            requested,
-            agent_label,
-            session_ids.len(),
-            agent_label,
-        ),
-        1 => {
-            let canonical_id = candidates.into_iter().next().unwrap_or_default();
-            Ok(SessionResolution {
-                note: Some(format!("resolved `{requested}` to `{canonical_id}`")),
-                canonical_id,
-            })
+            run_extract_direct_file(agent, file, output, args.project, options)
         }
         _ => {
-            let shown = candidates.iter().take(8).cloned().collect::<Vec<_>>();
-            anyhow::bail!(
-                "Ambiguous session reference `{}` in agent `{}`; matched {} sessions:\n  {}\n\
-                 Use the full session id.",
-                requested,
-                agent_label,
-                candidates.len(),
-                shown.join("\n  "),
+            aicx::cli::failure::emit_and_error(
+                &format!("aicx extract {}", agent.label()),
+                json,
+                aicx::cli::failure::StructuredFailure::new(
+                    "missing_addressing_mode",
+                    "extract requires exactly one of --session <id> or --file <path>",
+                    format!(
+                        "rerun as `aicx extract {} --session <id> --conversation` or `aicx extract {} --file <path> --conversation -o <path>`",
+                        agent.label(),
+                        agent.label()
+                    ),
+                ),
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Map a catalog resolution failure into the structured CLI failure surface.
+fn emit_catalog_failure(agent: ExtractAgent, error: aicx::session_catalog::CatalogError) -> ! {
+    use aicx::session_catalog::CatalogError;
+    let json = aicx::cli::failure::want_json_envelope(false);
+    let cmd = format!("aicx extract {}", agent.label());
+    let failure = match &error {
+        CatalogError::InvalidQuery(query) => aicx::cli::failure::StructuredFailure::new(
+            "invalid_session_reference",
+            format!("session reference `{query}` is not a valid session identity"),
+            "pass a session id, alias, UUID suffix (>=8 chars), or unique prefix",
+        ),
+        CatalogError::Missing {
+            query,
+            candidates_scanned,
+            ..
+        } => aicx::cli::failure::StructuredFailure::new(
+            "session_not_found",
+            format!(
+                "no {} session matched `{query}` ({candidates_scanned} candidate source(s) scanned)",
+                agent.label()
+            ),
+            "use the full session id, or list sessions with `aicx sessions list`",
+        ),
+        CatalogError::Ambiguous { query, candidates } => {
+            let shown = candidates
+                .iter()
+                .take(8)
+                .map(|candidate| format!("{} ({})", candidate.source_id, candidate.path.display()))
+                .collect::<Vec<_>>()
+                .join("; ");
+            aicx::cli::failure::StructuredFailure::new(
+                "session_ambiguous",
+                format!(
+                    "session reference `{query}` matched {} sources: {shown}",
+                    candidates.len()
+                ),
+                "use the full session id",
             )
         }
-    }
-}
-
-fn resolve_session_reference(
-    requested: &str,
-    agent: ExtractInputFormat,
-    agent_label: &str,
-    entries: &[timeline::TimelineEntry],
-) -> Result<SessionResolution> {
-    let session_ids = entries
-        .iter()
-        .map(|entry| entry.session_id.clone())
-        .collect::<BTreeSet<_>>();
-    let alias_matches = if matches!(agent, ExtractInputFormat::Codex) {
-        collect_codex_session_alias_matches(requested)?
-    } else {
-        BTreeSet::new()
+        CatalogError::Io { path, message } => aicx::cli::failure::StructuredFailure::new(
+            "session_catalog_io",
+            format!("session catalog I/O error at {}: {message}", path.display()),
+            "verify the source root exists and is readable",
+        ),
     };
-    resolve_session_reference_from_candidates(requested, &session_ids, alias_matches, agent_label)
+    aicx::cli::failure::emit_and_error(&cmd, json, failure);
+    std::process::exit(2);
 }
 
-/// Run extraction filtered by `session_id` for a single agent and write either
-/// a full report or a denoised conversation transcript. The default output path
-/// encodes both the `--conversation` and `--user-only` axes so the four modes
-/// never collide:
-///   * `~/.aicx/extracts/<agent>/<session_id>.md`
-///   * `~/.aicx/extracts/<agent>/<session_id>_user.md` (`--user-only`)
-///   * `~/.aicx/extracts/<agent>/<session_id>_conversation.md` (`--conversation`)
-///   * `~/.aicx/extracts/<agent>/<session_id>_conversation_user.md` (both)
+/// Build a direct `SourceHandle` for one already-selected artifact path.
 ///
-/// Override via `output`.
-fn run_extract_session(
-    session_id: &str,
-    agent: ExtractInputFormat,
-    output: Option<PathBuf>,
-    hours: u64,
-    explicit_project: Option<String>,
-    options: ExtractFileOptions,
-) -> Result<()> {
-    let ExtractFileOptions {
-        include_assistant,
-        max_message_chars,
-        redact_secrets,
-        conversation,
-    } = options;
-
-    let agent_label = extract_input_format_label(agent);
-    let cutoff = lookback_cutoff(hours);
-    let config = ExtractionConfig {
-        project_filter: explicit_project
-            .as_ref()
-            .map(|p| vec![p.clone()])
-            .unwrap_or_default(),
-        cutoff,
-        include_assistant,
-        watermark: None,
-    };
-
-    let mut entries: Vec<timeline::TimelineEntry> = match agent {
-        ExtractInputFormat::Claude => sources::extract_claude(&config)?,
-        ExtractInputFormat::Codex => sources::extract_codex(&config)?,
-        ExtractInputFormat::Gemini | ExtractInputFormat::GeminiAntigravity => {
-            sources::extract_gemini(&config)?
-        }
-        ExtractInputFormat::Junie => sources::extract_junie(&config)?,
-        ExtractInputFormat::Grok => sources::extract_grok(&config)?,
-    };
-
-    let resolution = resolve_session_reference(session_id, agent, agent_label, &entries)?;
-    if let Some(note) = &resolution.note {
-        eprintln!("{note}");
-    }
-
-    entries.retain(|e| e.session_id == resolution.canonical_id);
-
-    if entries.is_empty() {
-        anyhow::bail!(
-            "Resolved session `{}` to `{}`, but no entries were extractable for agent `{}` within {}.\n\
-             Try: increase --hours, verify the project filter, or check that the source store is populated.",
-            session_id,
-            resolution.canonical_id,
-            agent_label,
-            lookback_label(hours),
-        );
-    }
-
-    entries.sort_by_key(|e| e.timestamp);
-
-    let (mut entries, collapse_stats) =
-        aicx_parser::collapse_repeats(entries, aicx_parser::DEFAULT_THRESHOLD_LINES);
-    if collapse_stats.messages_collapsed > 0 {
-        eprintln!(
-            "Collapsed {} repeated message body/bodies (saved {} bytes)",
-            collapse_stats.messages_collapsed, collapse_stats.bytes_saved,
-        );
-    }
-
-    if redact_secrets {
-        for e in &mut entries {
-            e.message = aicx::redact::redact_secrets(&e.message);
-        }
-    }
-
-    let output_path = match output {
-        Some(p) => p,
-        // `user_only` (== `!include_assistant`) is a distinct output axis: a
-        // user-only extract must not overwrite the both-roles extract of the
-        // same session/mode, so it earns its own `_user` suffix.
-        None => default_session_extract_path_for(
-            agent_label,
-            &resolution.canonical_id,
-            conversation,
-            !include_assistant,
-        )?,
-    };
-
-    let inferred_repos = sources::repo_labels_from_entries(&entries, &[]);
-    let project_identity = explicit_project.unwrap_or_else(|| {
-        if inferred_repos.is_empty() {
-            format!("{agent_label}/{}", resolution.canonical_id)
-        } else {
-            inferred_repos.join("+")
-        }
-    });
-
-    let hours_back = entries
-        .first()
-        .map(|e| (Utc::now() - e.timestamp).num_hours().max(0) as u64)
-        .unwrap_or(0);
-
-    let metadata = ReportMetadata {
-        generated_at: Utc::now(),
-        project_filter: Some(project_identity.clone()),
-        hours_back,
-        total_entries: entries.len(),
-        sessions: vec![resolution.canonical_id.clone()],
-    };
-
-    if conversation {
-        let projection = sources::to_conversation_with_stats(&entries, &[project_identity]);
-        let extract_stats = output::ConversationExtractStats {
-            aicx_version: env!("CARGO_PKG_VERSION"),
-            redaction_enabled: redact_secrets,
-            raw_entries: entries.len(),
-            conversation_messages: projection.messages.len(),
-            conversation_projection: "user_assistant_only",
-            exact_short_duplicates_dropped: projection.exact_short_duplicates_dropped,
-            harness_noise_dropped: projection.harness_noise_dropped,
-        };
-        let ext = output_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("md")
-            .to_lowercase();
-        if ext == "json" {
-            output::write_conversation_json_with_redaction(
-                &output_path,
-                &projection.messages,
-                &metadata,
-                &extract_stats,
-                false,
-            )?;
-        } else {
-            output::write_conversation_markdown_with_redaction(
-                &output_path,
-                &projection.messages,
-                &metadata,
-                false,
-            )?;
-        }
+/// This is the bounded first-class consumer contract (C0A §7): after the path
+/// is supplied there is no discovery, no corpus scan, and no store access.
+fn source_handle_for_file(
+    agent: ExtractAgent,
+    source_id: &str,
+    logical_session_id: Option<String>,
+    path: &Path,
+) -> Result<aicx::parser::engine::SourceHandle> {
+    use aicx::parser::engine::{SourceArtifact, SourceFraming, SourceHandle};
+    let artifact_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.starts_with('.') && !name.contains(['/', '\\']))
+        .unwrap_or("source.jsonl")
+        .to_string();
+    let framing = if agent == ExtractAgent::Gemini
+        && path.extension().and_then(|ext| ext.to_str()) == Some("json")
+    {
+        SourceFraming::WholeDocument
     } else {
-        let ext = output_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("md")
-            .to_lowercase();
-        if ext == "json" {
-            output::write_json_report_to_path(&output_path, &entries, &metadata)?;
-        } else {
-            output::write_markdown_report_to_path(
-                &output_path,
-                &entries,
-                &metadata,
-                max_message_chars,
-                None,
-            )?;
-        }
-    }
-
-    eprintln!(
-        "Extracted {} entries from session `{}` ({}) -> {}",
-        entries.len(),
-        resolution.canonical_id,
-        agent_label,
-        output_path.display()
-    );
-    Ok(())
+        SourceFraming::JsonLines
+    };
+    let artifact = SourceArtifact::validated_file(artifact_name, path, framing)
+        .map_err(|error| anyhow::anyhow!("invalid source artifact: {error}"))?;
+    SourceHandle::new(
+        agent.parser_kind(),
+        safe_session_extract_stem(source_id),
+        logical_session_id,
+        vec![artifact],
+    )
+    .map_err(|error| anyhow::anyhow!("invalid source handle: {error}"))
 }
 
-fn run_extract_file(
-    format: ExtractInputFormat,
-    explicit_project: Option<String>,
-    input: PathBuf,
-    output_path: PathBuf,
-    options: ExtractFileOptions,
-) -> Result<()> {
-    let ExtractFileOptions {
-        include_assistant,
-        max_message_chars,
-        redact_secrets,
-        conversation,
-    } = options;
-    // For direct file extraction we intentionally don't apply a time cutoff;
-    // set cutoff far in the past.
+/// Parse the artifacts of one resolved `SourceHandle` exactly once.
+///
+/// This is the single C7-owned parse seam: session mode and direct-file mode
+/// both come through here after resolution, so one handle can never be parsed
+/// twice. Runtime dispatch currently routes through the sealed session
+/// boundary (fail-closed until the per-agent adapter cuts land); C5X rewires
+/// this seam to `ParserEngine::parse` + registered adapters without touching
+/// the callers.
+/// Parse one already-selected source exactly once.
+///
+/// This is the single C7-owned parse seam: session mode, direct-file mode, and
+/// the claims/results/clarify lanes all come through here AFTER resolution, so
+/// one selected source is never parsed twice and no bulk `extract(all) ->
+/// retain(one)` path exists. `SourceHandle` seals its validated path inside
+/// the parser crate, so the CLI carries the resolved path alongside the handle
+/// it validated. Runtime dispatch currently routes through the sealed session
+/// boundary (fail-closed until the per-agent adapter cuts land); C5X rewires
+/// this seam to `ParserEngine::parse` + registered adapters without touching
+/// the callers.
+fn parse_selected_source_once(
+    agent: ExtractAgent,
+    path: &Path,
+    include_assistant: bool,
+) -> Result<Vec<timeline::TimelineEntry>> {
+    // Direct single-source parses intentionally apply no time cutoff.
     let cutoff = Utc::now() - chrono::Duration::days(365 * 200);
     let config = ExtractionConfig {
         project_filter: vec![],
@@ -5782,20 +5580,199 @@ fn run_extract_file(
         include_assistant,
         watermark: None,
     };
-
-    let mut entries = match format {
-        ExtractInputFormat::Claude => sources::extract_claude_file(&input, &config)?,
-        ExtractInputFormat::Codex => sources::extract_codex_file(&input, &config)?,
-        ExtractInputFormat::Gemini => sources::extract_gemini_file(&input, &config)?,
-        ExtractInputFormat::GeminiAntigravity => {
-            sources::extract_gemini_antigravity_file(&input, &config)?
+    match agent {
+        ExtractAgent::Codex => sources::extract_codex_file(path, &config),
+        ExtractAgent::Claude => sources::extract_claude_file(path, &config),
+        ExtractAgent::Gemini => {
+            if path.is_dir() {
+                sources::extract_gemini_antigravity_file(path, &config)
+            } else {
+                sources::extract_gemini_file(path, &config)
+            }
         }
-        ExtractInputFormat::Junie => sources::extract_junie_file(&input, &config)?,
-        ExtractInputFormat::Grok => sources::extract_grok_file(&input, &config)?,
+        ExtractAgent::Grok => sources::extract_grok_file(path, &config),
+        ExtractAgent::Junie => sources::extract_junie_file(path, &config),
+    }
+}
+
+/// Run `aicx extract <agent> --session <id>`: resolve the session catalog
+/// first (bounded identity headers, zero body reads), then parse exactly the
+/// one resolved source and project it. The default output path encodes both
+/// the `--conversation` and `--user-only` axes so the four modes never
+/// collide:
+///   * `~/.aicx/extracts/<agent>/<session_id>.md`
+///   * `~/.aicx/extracts/<agent>/<session_id>_user.md` (`--user-only`)
+///   * `~/.aicx/extracts/<agent>/<session_id>_conversation.md` (`--conversation`)
+///   * `~/.aicx/extracts/<agent>/<session_id>_conversation_user.md` (both)
+fn run_extract_session(
+    agent: ExtractAgent,
+    session_reference: &str,
+    output: Option<PathBuf>,
+    explicit_project: Option<String>,
+    options: ExtractFileOptions,
+) -> Result<()> {
+    let home = aicx::os_user_home().context("No home dir")?;
+    let root = agent.session_root(&home);
+    if !root.is_dir() {
+        emit_catalog_failure(
+            agent,
+            aicx::session_catalog::CatalogError::Missing {
+                query: session_reference.to_string(),
+                agent: agent.catalog_kind(),
+                candidates_scanned: 0,
+            },
+        );
+    }
+
+    let catalog = aicx::session_catalog::SessionCatalog::new(agent.catalog_kind(), &root)
+        .unwrap_or_else(|error| emit_catalog_failure(agent, error));
+    let lookup = catalog.resolve_with_stats(session_reference);
+    let resolved = match lookup.result {
+        Ok(resolved) => resolved,
+        Err(error) => emit_catalog_failure(agent, error),
+    };
+    // Locate-before-parse proof surface (instrumented CLI contract): the
+    // catalog inspected bounded headers only, and exactly one source moves on
+    // to the single parse pass below.
+    eprintln!(
+        "extract: resolved `{}` -> `{}` via {:?} ({})",
+        session_reference,
+        resolved.source.source_id,
+        resolved.matched_by,
+        resolved.source.path.display()
+    );
+    eprintln!(
+        "extract: catalog_candidates={} catalog_files_opened={} catalog_body_reads={} sources_parsed=1",
+        lookup.stats.metadata_candidates, lookup.stats.files_opened, lookup.stats.body_reads
+    );
+
+    // Contract discipline: the resolved source must produce a valid direct
+    // handle (validated path, explicit finite artifact list) before parsing.
+    let handle = source_handle_for_file(
+        agent,
+        &resolved.source.source_id,
+        resolved.source.logical_session_id.clone(),
+        &resolved.source.path,
+    )?;
+    debug_assert_eq!(handle.artifacts().len(), 1);
+
+    let entries =
+        parse_selected_source_once(agent, &resolved.source.path, options.include_assistant)?;
+    if entries.is_empty() {
+        anyhow::bail!(
+            "Resolved session `{}` to `{}`, but no entries were extractable from {} for agent `{}`.",
+            session_reference,
+            resolved.source.source_id,
+            resolved.source.path.display(),
+            agent.label(),
+        );
+    }
+
+    let output_path = match output {
+        Some(path) => path,
+        // `user_only` is a distinct output axis: a user-only extract must not
+        // overwrite the both-roles extract of the same session/mode.
+        None => default_session_extract_path_for(
+            agent.label(),
+            &resolved.source.source_id,
+            options.conversation,
+            !options.include_assistant,
+        )?,
     };
 
-    // Sort by timestamp (extractors should already do this).
-    entries.sort_by_key(|a| a.timestamp);
+    let session_label = resolved.source.source_id.clone();
+    write_extract_outputs(ExtractRender {
+        agent,
+        entries,
+        sessions: Some(vec![resolved.source.source_id]),
+        explicit_project,
+        fallback_identity: format!("{}/{}", agent.label(), session_label),
+        output_path: output_path.clone(),
+        options,
+    })?;
+
+    eprintln!(
+        "Extracted session `{}` ({}) -> {}",
+        session_label,
+        agent.label(),
+        output_path.display()
+    );
+    Ok(())
+}
+
+/// Run `aicx extract <agent> --file <path> -o <out>`: direct handle from the
+/// supplied path, no catalog scan, no global AICX state, single parse pass.
+fn run_extract_direct_file(
+    agent: ExtractAgent,
+    input: PathBuf,
+    output_path: PathBuf,
+    explicit_project: Option<String>,
+    options: ExtractFileOptions,
+) -> Result<()> {
+    let file_label = input
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "(unknown)".to_string());
+    let source_id = input
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("direct-source");
+
+    // Antigravity brain directories stay parseable as a direct input; regular
+    // file inputs are validated through the sealed handle contract first.
+    if !input.is_dir() {
+        let handle = source_handle_for_file(agent, source_id, None, &input)?;
+        debug_assert_eq!(handle.artifacts().len(), 1);
+    }
+    eprintln!("extract: catalog_files_opened=0 sources_parsed=1");
+
+    let entries = parse_selected_source_once(agent, &input, options.include_assistant)?;
+
+    let fallback_identity = if options.conversation {
+        "file input".to_string()
+    } else {
+        format!("file: {file_label}")
+    };
+    write_extract_outputs(ExtractRender {
+        agent,
+        entries,
+        sessions: None,
+        explicit_project,
+        fallback_identity,
+        output_path,
+        options,
+    })
+}
+
+/// One fully-parsed extraction ready for rendering.
+struct ExtractRender {
+    agent: ExtractAgent,
+    entries: Vec<timeline::TimelineEntry>,
+    /// Session ids for the report header; derived from entries when `None`.
+    sessions: Option<Vec<String>>,
+    explicit_project: Option<String>,
+    fallback_identity: String,
+    output_path: PathBuf,
+    options: ExtractFileOptions,
+}
+
+/// Render one parsed extraction to Markdown or JSON, in conversation or
+/// full-report mode. Projection only: the raw source is never re-opened here,
+/// and nothing is written to the canonical store. Output is written only
+/// after the parse succeeded, so a fatal parse can never leave partial files.
+fn write_extract_outputs(render: ExtractRender) -> Result<()> {
+    let ExtractRender {
+        agent,
+        entries,
+        sessions,
+        explicit_project,
+        fallback_identity,
+        output_path,
+        options,
+    } = render;
+    let mut entries = entries;
+    entries.sort_by_key(|entry| entry.timestamp);
 
     let (mut entries, collapse_stats) =
         aicx_parser::collapse_repeats(entries, aicx_parser::DEFAULT_THRESHOLD_LINES);
@@ -5806,31 +5783,23 @@ fn run_extract_file(
         );
     }
 
-    // Apply secret redaction in-place (TimelineEntry is now a single timeline type)
-    if redact_secrets {
-        for e in &mut entries {
-            e.message = aicx::redact::redact_secrets(&e.message);
+    if options.redact_secrets {
+        for entry in &mut entries {
+            entry.message = aicx::redact::redact_secrets(&entry.message);
         }
     }
-    // Collect derived data from entries before moving them.
-    let mut sessions: Vec<String> = entries.iter().map(|e| e.session_id.clone()).collect();
-    sessions.sort();
-    sessions.dedup();
 
-    // Canonical Precedence: Explicit --project > Inferred Repo > File Provenance
-    let file_label = input
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "(unknown)".to_string());
+    let sessions = sessions.unwrap_or_else(|| {
+        let mut ids: Vec<String> = entries.iter().map(|e| e.session_id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    });
 
     let inferred_repos = sources::repo_labels_from_entries(&entries, &[]);
     let project_identity = explicit_project.unwrap_or_else(|| {
         if inferred_repos.is_empty() {
-            if conversation {
-                "file input".to_string()
-            } else {
-                format!("file: {file_label}")
-            }
+            fallback_identity
         } else {
             inferred_repos.join("+")
         }
@@ -5838,42 +5807,34 @@ fn run_extract_file(
 
     let hours_back = entries
         .first()
-        .map(|e| (Utc::now() - e.timestamp).num_hours().max(0) as u64)
+        .map(|entry| (Utc::now() - entry.timestamp).num_hours().max(0) as u64)
         .unwrap_or(0);
-
-    let output_entries = entries;
 
     let metadata = ReportMetadata {
         generated_at: Utc::now(),
-        project_filter: Some(project_identity),
+        project_filter: Some(project_identity.clone()),
         hours_back,
-        total_entries: output_entries.len(),
+        total_entries: entries.len(),
         sessions,
     };
 
-    if conversation {
-        let project_filter = metadata
-            .project_filter
-            .as_ref()
-            .map(|p| vec![p.clone()])
-            .unwrap_or_default();
-        let projection = sources::to_conversation_with_stats(&output_entries, &project_filter);
+    let ext = output_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("md")
+        .to_lowercase();
+
+    if options.conversation {
+        let projection = sources::to_conversation_with_stats(&entries, &[project_identity]);
         let extract_stats = output::ConversationExtractStats {
             aicx_version: env!("CARGO_PKG_VERSION"),
-            redaction_enabled: redact_secrets,
-            raw_entries: output_entries.len(),
+            redaction_enabled: options.redact_secrets,
+            raw_entries: entries.len(),
             conversation_messages: projection.messages.len(),
             conversation_projection: "user_assistant_only",
             exact_short_duplicates_dropped: projection.exact_short_duplicates_dropped,
             harness_noise_dropped: projection.harness_noise_dropped,
         };
-
-        let ext = output_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("md")
-            .to_lowercase();
-
         if ext == "json" {
             output::write_conversation_json_with_redaction(
                 &output_path,
@@ -5890,26 +5851,24 @@ fn run_extract_file(
                 false,
             )?;
         }
+    } else if ext == "json" {
+        output::write_json_report_to_path(&output_path, &entries, &metadata)?;
     } else {
-        let ext = output_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("md")
-            .to_lowercase();
-
-        if ext == "json" {
-            output::write_json_report_to_path(&output_path, &output_entries, &metadata)?;
-        } else {
-            output::write_markdown_report_to_path(
-                &output_path,
-                &output_entries,
-                &metadata,
-                max_message_chars,
-                None,
-            )?;
-        }
+        output::write_markdown_report_to_path(
+            &output_path,
+            &entries,
+            &metadata,
+            options.max_message_chars,
+            None,
+        )?;
     }
 
+    eprintln!(
+        "Wrote {} entries ({}) -> {}",
+        entries.len(),
+        agent.label(),
+        output_path.display()
+    );
     Ok(())
 }
 
@@ -6348,14 +6307,6 @@ fn lookback_cutoff(hours: u64) -> DateTime<Utc> {
     Utc::now() - chrono::Duration::hours(hours_i64)
 }
 
-fn lookback_label(hours: u64) -> String {
-    if hours == 0 {
-        "all time".to_string()
-    } else {
-        format!("last {hours} hours")
-    }
-}
-
 fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     let ExtractionParams {
         agents,
@@ -6433,8 +6384,8 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             "gemini" => sources::extract_gemini(&config),
             "junie" => sources::extract_junie(&config),
             "grok" => sources::extract_grok(&config),
-            "codescribe" => sources::extract_codescribe(&config),
-            "operator-md" => sources::extract_operator_markdown(&config),
+            "codescribe" => aicx::importers::extract_codescribe(&config),
+            "operator-md" => aicx::importers::extract_operator_markdown(&config),
             _ => Ok(Vec::new()),
         };
         hb.stop();
@@ -6954,13 +6905,13 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
             "junie" => sources::extract_junie(&config),
             "grok" => sources::extract_grok(&config),
             "grok-sessions" => sources::extract_grok_sessions(&config),
-            "codescribe" => sources::extract_codescribe(&config),
+            "codescribe" => aicx::importers::extract_codescribe(&config),
             "operator-md" => {
                 if let Some(input) = operator_md_input.as_deref() {
                     let home = dirs::home_dir().context("No home dir")?;
-                    sources::extract_operator_markdown_from_input(&home, input, &config)
+                    aicx::importers::extract_operator_markdown_from_input(&home, input, &config)
                 } else {
-                    sources::extract_operator_markdown(&config)
+                    aicx::importers::extract_operator_markdown(&config)
                 }
             }
             _ => Ok(Vec::new()),

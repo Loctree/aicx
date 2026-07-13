@@ -171,28 +171,39 @@ aicx all -H 48 --user-only
 
 ## `aicx extract`
 
-Extract a single session file and write to a specific output path.
+Extract a single session for one agent — by session id or by direct file.
 
-Bypasses the canonical store — useful for one-off inspection or piping.
+Bypasses the canonical store — useful for one-off inspection or piping. The
+agent is a required subcommand; the pre-C7 `--agent`/`--format` flag grammar is
+rejected with a structured migration hint.
 
 ```bash
-aicx extract --format <claude|codex|gemini|gemini-antigravity> --output <FILE> <INPUT>
+aicx extract <codex|claude|gemini|grok|junie> --session <id> [--conversation] [-o FILE]
+aicx extract <codex|claude|gemini|grok|junie> --file <path> --conversation -o <path>
 ```
 
 Options:
-- `--format <FORMAT>` input format / agent
-- `--no-redact-secrets` disable secret redaction for this one-off extract
-- `gemini` reads classic Gemini CLI JSON sessions from `~/.gemini/tmp/.../session-*.json`
-- `gemini-antigravity` resolves either `conversations/<uuid>.pb` or `brain/<uuid>/`, prefers readable conversation artifacts inside `brain/<uuid>/`, and explicitly falls back to `.system_generated/steps/*/output.txt` when no chat-grade artifact is readable
-- `-o, --output <OUTPUT>` output file path
+- `--session <ID>` resolve through the session catalog first (bounded identity
+  headers, zero body reads), then parse exactly the one resolved source.
+  Accepts the full id, a logical alias, a UUID suffix (≥8 chars), or a unique
+  prefix; ambiguous references fail with the sorted candidate list.
+- `--file <PATH>` direct source handle from this path only — no catalog scan,
+  no global AICX state. Requires `-o`. A Gemini Antigravity `brain/<uuid>/`
+  directory is accepted here as a direct input.
+- `-o, --output <OUTPUT>` output file path. Session mode defaults to
+  `~/.aicx/extracts/<agent>/<session_id>[_conversation][_user].md` — the four
+  mode combinations never collide on disk.
+- `--conversation` denoised user/assistant transcript only
 - `--user-only` exclude assistant + reasoning messages
+- `--no-redact-secrets` disable secret redaction for this one-off extract
 - `--max-message-chars <N>` truncate huge messages in markdown (`0` = no truncation)
 
 Example:
 
 ```bash
-aicx extract --format claude /path/to/session.jsonl -o /tmp/report.md
-aicx extract --format gemini-antigravity ~/.gemini/antigravity/conversations/<uuid>.pb -o /tmp/report.md
+aicx extract codex --session 019d780f-6763-7d40-a7f8-ab0c2313c576 --conversation
+aicx extract codex --file ~/.codex/sessions/2026/04/10/rollout-<...>.jsonl --conversation -o /tmp/recall.md
+aicx extract claude --file /path/to/session.jsonl -o /tmp/report.md
 ```
 
 ## `aicx store`

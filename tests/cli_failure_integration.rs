@@ -218,7 +218,7 @@ fn sources_protect_path_still_works() {
 }
 
 #[test]
-fn extract_mode_mismatch_emits_structured_failure() {
+fn extract_without_agent_subcommand_emits_structured_failure() {
     let bin = ensure_aicx_binary_exists();
     let output = Command::new(&bin)
         .arg("extract")
@@ -234,14 +234,37 @@ fn extract_mode_mismatch_emits_structured_failure() {
     assert_structured_text(
         &stderr,
         "aicx extract",
-        "mode_mismatch",
-        "file-mode extract requires --format",
-        "switch to session mode",
+        "missing_agent_subcommand",
+        "extract requires an agent subcommand",
+        "aicx extract codex --session <id> --conversation",
     );
 }
 
 #[test]
-fn extract_mode_mismatch_json_envelope() {
+fn extract_legacy_agent_flag_emits_structured_migration_hint() {
+    let bin = ensure_aicx_binary_exists();
+    let output = Command::new(&bin)
+        .args(["extract", "--agent", "codex", "--session", "abc12345"])
+        .output()
+        .expect("run aicx extract --agent");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "exit code 2; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_structured_text(
+        &stderr,
+        "aicx extract",
+        "legacy_flag_grammar",
+        "the agent is a required subcommand",
+        "aicx extract codex --session <id> --conversation",
+    );
+}
+
+#[test]
+fn extract_without_agent_subcommand_json_envelope() {
     let bin = ensure_aicx_binary_exists();
     let output = Command::new(&bin)
         .env("AICX_JSON", "1")
@@ -255,7 +278,7 @@ fn extract_mode_mismatch_json_envelope() {
         serde_json::from_str(&stdout).expect("AICX_JSON=1 must produce parseable JSON on stdout");
     assert_eq!(
         payload["kind"],
-        serde_json::Value::String("mode_mismatch".to_string())
+        serde_json::Value::String("missing_agent_subcommand".to_string())
     );
     assert_eq!(
         payload["error"],

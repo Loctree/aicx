@@ -202,3 +202,62 @@ fn redact_conversation_messages(messages: &[ConversationMessage]) -> Vec<Convers
         })
         .collect()
 }
+
+// ============================================================================
+// SessionModel projection (C7 model-backed output layer)
+// ============================================================================
+
+use super::report::timeline_entries_from_model;
+use crate::timeline::FrameKind;
+use aicx_parser::engine::SessionModel;
+
+/// Project a validated `SessionModel` into the denoised conversation surface.
+///
+/// Pure function of the model — the raw source is never re-opened. Only
+/// user/assistant frames survive; reasoning, tool traffic, and system notes
+/// stay out of the conversation projection, mirroring the TimelineEntry
+/// conversation contract.
+pub fn conversation_messages_from_model(
+    model: &SessionModel,
+    repo_project_override: Option<&str>,
+) -> Vec<ConversationMessage> {
+    let fallback_project = format!(
+        "{}/{}",
+        model.provenance.agent.as_str(),
+        model.session_id.as_str()
+    );
+    timeline_entries_from_model(model)
+        .into_iter()
+        .filter(|entry| {
+            matches!(
+                entry.frame_kind,
+                Some(FrameKind::UserMsg | FrameKind::AgentReply)
+            )
+        })
+        .map(|entry| {
+            let repo_project = repo_project_override
+                .map(str::to_string)
+                .or_else(|| {
+                    entry.cwd.as_deref().and_then(|cwd| {
+                        cwd.trim_end_matches('/')
+                            .rsplit('/')
+                            .find(|segment| !segment.is_empty())
+                            .map(str::to_string)
+                    })
+                })
+                .unwrap_or_else(|| fallback_project.clone());
+            ConversationMessage {
+                timestamp: entry.timestamp,
+                agent: entry.agent,
+                session_id: entry.session_id,
+                role: entry.role,
+                message: entry.message,
+                repo_project,
+                source_path: entry.cwd,
+                branch: entry.branch,
+                message_kind: Default::default(),
+                collapse_stub_kind: None,
+            }
+        })
+        .collect()
+}

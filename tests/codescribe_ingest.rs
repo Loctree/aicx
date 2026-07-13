@@ -1,6 +1,5 @@
-use aicx::sources::{
-    ExtractionConfig, discover_codescribe_transcripts, extract_codescribe_from_home,
-};
+use aicx::importers::{discover_codescribe_transcripts, extract_codescribe_from_home};
+use aicx::sources::ExtractionConfig;
 use aicx::timeline::FrameKind;
 use chrono::{TimeZone, Utc};
 use std::fs;
