@@ -1095,6 +1095,7 @@ pub const CLI_SUBCOMMAND_NAMES: &[&str] = &[
     "claude",
     "codex",
     "config",
+    "completions",
     "conversations",
     "corpus",
     "dashboard",
