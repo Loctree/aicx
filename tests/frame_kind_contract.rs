@@ -1,3 +1,7 @@
+// App-only integration surface: compiled to an empty target under the slim
+// `loctree-consumer` profile (`--no-default-features`).
+#![cfg(feature = "app")]
+
 //! Frozen projection contract between the typed parser model and the stable
 //! `FrameKind` retrieval vocabulary (C7 model-backed output layer).
 //!

@@ -1,3 +1,7 @@
+// App-only integration surface: compiled to an empty target under the slim
+// `loctree-consumer` profile (`--no-default-features`).
+#![cfg(feature = "app")]
+
 //! Integration tests for shared HTTP Bearer auth on the dashboard `/api/*` surface
 //! and on MCP HTTP transport. Both servers share `aicx::auth::require_auth_layer`,
 //! so these tests exercise the same contract: identical-shape 401 on missing or

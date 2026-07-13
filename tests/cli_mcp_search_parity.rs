@@ -1,3 +1,7 @@
+// App-only integration surface: compiled to an empty target under the slim
+// `loctree-consumer` profile (`--no-default-features`).
+#![cfg(feature = "app")]
+
 //! North Star parity: a human typing `aicx search <q>` and an agent calling
 //! MCP `aicx_search` for the same query must get the same results.
 //!

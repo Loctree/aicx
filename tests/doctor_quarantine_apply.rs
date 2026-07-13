@@ -1,3 +1,7 @@
+// App-only integration surface: compiled to an empty target under the slim
+// `loctree-consumer` profile (`--no-default-features`).
+#![cfg(feature = "app")]
+
 //! Integration test for `doctor --prune-empty-bodies --apply` quarantine
 //! pathway. Closes audit gap H-1 (P2): the production
 //! `apply_empty_body_quarantine` path had no dedicated integration test

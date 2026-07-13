@@ -1,3 +1,7 @@
+// App-only integration surface: compiled to an empty target under the slim
+// `loctree-consumer` profile (`--no-default-features`).
+#![cfg(feature = "app")]
+
 //! Regression tests for Wave B-1 (bugs #27, #28, #30):
 //!
 //! - #27: dashboard per-event project filter is strict (no substring leak).

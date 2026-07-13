@@ -1,3 +1,7 @@
+// App-only integration surface: compiled to an empty target under the slim
+// `loctree-consumer` profile (`--no-default-features`).
+#![cfg(feature = "app")]
+
 use aicx::extraction::ExtractionConfig;
 use aicx::importers::{discover_codescribe_transcripts, extract_codescribe_from_home};
 use aicx::timeline::FrameKind;
