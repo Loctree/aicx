@@ -81,6 +81,22 @@ jobs:
         working-directory: aicx
         run: cargo check --locked
 
+      # Mirrors `make loctree-consumer-check` (raw cargo so windows-latest
+      # does not depend on GNU make): the slim library profile consumed by
+      # Loctree must build, pass its contract test, and stay free of
+      # lancedb/llama dependencies.
+      - name: loctree-consumer-check
+        working-directory: aicx
+        shell: bash
+        run: |
+          cargo check --locked -p aicx --no-default-features --features loctree-consumer
+          cargo test --locked -p aicx --lib --no-default-features --features loctree-consumer slim_profile_exposes_read_core_contract
+          hits=$(cargo tree --locked --no-default-features --features loctree-consumer -p aicx | grep -ciE 'lancedb|llama' || true)
+          if [ "$hits" != "0" ]; then
+            echo "loctree-consumer pulled forbidden lancedb/llama dependencies ($hits hits)" >&2
+            exit 1
+          fi
+
       - name: cargo clippy default
         working-directory: aicx
         run: cargo clippy --locked -p aicx --all-targets -- -D warnings

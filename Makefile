@@ -129,6 +129,7 @@ manifest-check:
 	@$(PYTHON) -c 'import sys, re; text = open("Cargo.toml", "r").read(); bad = [m.group(1) for m in re.finditer(r"^([\w-]+)\s*=.*path\s*=", text, re.MULTILINE) if m.group(1) not in ("rmcp-memex", "aicx-embeddings", "aicx-retrieve", "aicx-parser", "aicx-monitor", "aicx-progress-contracts", "path")]; sys.exit("Manifest policy check failed:\n  - Unexpected local path dependency: " + ", ".join(bad)) if bad else print("Manifest policy: ok (approved local product deps only)")'
 
 test:
+	@$(MAKE) loctree-consumer-check
 	cargo test --locked -p aicx --all-targets
 	cargo test --locked -p aicx-embeddings
 
