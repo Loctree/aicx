@@ -73,27 +73,3 @@ removed_by = "b1f2712"
 [[deleted_path]]
 path = "tests/legacy_codex_format_test.rs"
 removed_by = "b1f2712"
-
-[[temporary_path]]
-path = "src/sources/providers/session_boundary.rs"
-disposition = "git-rm"
-remove_after = "C5X adapter convergence"
-current_consumers = ["src/sources/providers/mod.rs"]
-
-[[temporary_path]]
-path = "src/sources/shared/importer_support.rs"
-disposition = "move-before-rm"
-remove_after = "C6 store projection relocates importer-only helpers"
-current_consumers = ["src/sources/providers/codescribe.rs", "src/sources/providers/operator_markdown.rs"]
-
-[[temporary_path]]
-path = "src/sources/providers/mod.rs"
-disposition = "retain-facade-until-cutover"
-remove_after = "C5X removes session boundary exports while preserving document importers"
-current_consumers = ["src/sources/mod.rs"]
-
-[[temporary_path]]
-path = "src/sources/mod.rs"
-disposition = "retain-facade-until-cutover"
-remove_after = "C7 CLI/importer cutover"
-current_consumers = ["src/main.rs", "src/lib.rs", "src/store.rs", "src/intents.rs"]

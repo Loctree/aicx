@@ -14,8 +14,8 @@ use crate::chunker::{
     INTENT_KEYWORDS, is_decision_tag, is_local_command_artifact_line, is_outcome_tag,
     is_result_line, normalize_key, parse_checklist_task, truncate_signal_line,
 };
+use crate::extraction::{IntentLineModality, intent_line_modality, is_harness_injected_noise};
 use crate::sanitize;
-use crate::sources::shared::{IntentLineModality, intent_line_modality, is_harness_injected_noise};
 use crate::store;
 use crate::timeline::FrameKind;
 use crate::types::{EntryState, EntryType, IntentEntry, Link, LinkType};

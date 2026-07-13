@@ -362,17 +362,10 @@ impl<'a> Assembly<'a> {
             return Ok(());
         }
         self.session_meta_seen = true;
-        if let Some(id) = string_at(event, &["payload", "id"])
-            && id != self.session_id
-        {
-            return Err(AdapterError::new(
-                "assemble",
-                format!(
-                    "SourceHandle session id `{}` differs from session_meta `{id}`",
-                    self.session_id
-                ),
-            ));
-        }
+        // The resolved SourceHandle owns identity. Direct-file mode has no
+        // catalog and may use a filename-derived physical id; an embedded
+        // session_meta id is payload data, not authority to rewrite or reject
+        // the already-selected source.
         self.cwd = known_string(string_at(event, &["payload", "cwd"]));
         self.current_cwd = self.cwd.clone();
         self.model = known_string(string_at(event, &["payload", "model"]));

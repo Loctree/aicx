@@ -364,39 +364,6 @@ fn test_conversation_message_kind_does_not_mark_inline_dedup_ref_as_stub() {
 }
 
 #[test]
-fn legacy_claude_extract_boundary_fails_closed() {
-    use std::fs;
-    let tmp = std::env::temp_dir().join(format!(
-        "ai-ctx-conv-tool-blocks-{}-{}.jsonl",
-        std::process::id(),
-        Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    ));
-    let _ = fs::remove_file(&tmp);
-
-    let content = concat!(
-        r#"{"type":"user","message":{"role":"user","content":"Hello agent"},"timestamp":"2026-03-21T10:00:00.000Z","sessionId":"s1","cwd":"/tmp"}"#,
-        "\n",
-        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Let me check."},{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}},{"type":"text","text":"Here are the files."}]},"timestamp":"2026-03-21T10:00:01.000Z","sessionId":"s1"}"#,
-        "\n",
-        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]},"timestamp":"2026-03-21T10:00:02.000Z","sessionId":"s1"}"#
-    );
-    fs::write(&tmp, content).unwrap();
-
-    let cutoff = Utc.timestamp_opt(0, 0).single().unwrap();
-    let config = ExtractionConfig {
-        project_filter: vec![],
-        cutoff,
-        include_assistant: true,
-        watermark: None,
-    };
-
-    let error = extract_claude_file(&tmp, &config).expect_err("legacy parser must stay removed");
-    assert!(error.to_string().contains("legacy session parser removed"));
-
-    let _ = fs::remove_file(&tmp);
-}
-
-#[test]
 fn test_conversation_exact_short_duplicate_key_includes_agent() {
     // Two extractors can emit the same fallback session id (for example
     // claude history and codex history both fall back to "history" when

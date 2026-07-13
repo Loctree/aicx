@@ -92,6 +92,11 @@ impl ParserEngine {
         }
         validate_parse(parse).map_err(EngineError::Validation)
     }
+
+    /// Parse through the exhaustive built-in adapter registry.
+    pub fn parse_registered(&self, source: &SourceHandle) -> Result<ValidatedParse, EngineError> {
+        self.parse(source, crate::adapters::registered_adapter(source.agent()))
+    }
 }
 
 fn validate_classification(

@@ -12,11 +12,10 @@
 use super::{AdapterError, AgentAdapter, ClassifiedDisposition, ClassifiedUnit, RawUnitLevel};
 use crate::engine::{
     AgentKind, BoundaryFlags, ConsumedUnit, CounterSemantics, CoverageReport, CoverageWarning,
-    Known, ParseStatus, Provenance, RawUnit, RawUnitRef, Segment, SessionModel,
-    SkippedReason, SkippedUnit, SourceFraming, SourceHandle, SourceRead, TokenComponents,
-    ToolEvent, ToolEventKind, Turn, TurnKind, TurnRange, TurnRole, UnitBoundary, UnvalidatedParse,
-    UsageEvent, VisibleCompleteness, WarningKind, evidence_event_id_from_hash, ordinal_locator,
-    sha256_hex,
+    Known, ParseStatus, Provenance, RawUnit, RawUnitRef, Segment, SessionModel, SkippedReason,
+    SkippedUnit, SourceFraming, SourceHandle, SourceRead, TokenComponents, ToolEvent,
+    ToolEventKind, Turn, TurnKind, TurnRange, TurnRole, UnitBoundary, UnvalidatedParse, UsageEvent,
+    VisibleCompleteness, WarningKind, evidence_event_id_from_hash, ordinal_locator, sha256_hex,
 };
 use serde_json::Value;
 
@@ -231,44 +230,42 @@ fn walk_physical_unit(
             if let Some(obj) = value.as_object() {
                 if let Some(_sid) = string_field(obj, "sessionId") {
                     analysis.session_id_seen = true;
-                    if analysis.started_at == Known::unknown() {
-                        if let Some(st) = string_field(obj, "startTime") {
-                            analysis.started_at = Known::value(st.to_owned());
-                        }
+                    if analysis.started_at == Known::unknown()
+                        && let Some(st) = string_field(obj, "startTime")
+                    {
+                        analysis.started_at = Known::value(st.to_owned());
                     }
-                    if analysis.ended_at == Known::unknown() {
-                        if let Some(lt) = string_field(obj, "lastUpdated") {
-                            analysis.ended_at = Known::value(lt.to_owned());
-                        }
+                    if analysis.ended_at == Known::unknown()
+                        && let Some(lt) = string_field(obj, "lastUpdated")
+                    {
+                        analysis.ended_at = Known::value(lt.to_owned());
                     }
                 }
                 // model inference from first gemini message if present
                 if let Some(msgs) = obj.get("messages").and_then(Value::as_array) {
                     for m in msgs {
                         if let Some(mo) = m.as_object() {
-                            if let Some(mdl) = string_field(mo, "model") {
-                                if analysis.model == Known::unknown() {
-                                    analysis.model = Known::value(mdl.to_owned());
-                                }
+                            if let Some(mdl) = string_field(mo, "model")
+                                && analysis.model == Known::unknown()
+                            {
+                                analysis.model = Known::value(mdl.to_owned());
                             }
                             // Also check inside content if object
-                            if let Some(c) = mo.get("content") {
-                                if let Some(co) = c.as_object() {
-                                    if let Some(mdl) = string_field(co, "model") {
-                                        if analysis.model == Known::unknown() {
-                                            analysis.model = Known::value(mdl.to_owned());
-                                        }
-                                    }
-                                }
+                            if let Some(c) = mo.get("content")
+                                && let Some(co) = c.as_object()
+                                && let Some(mdl) = string_field(co, "model")
+                                && analysis.model == Known::unknown()
+                            {
+                                analysis.model = Known::value(mdl.to_owned());
                             }
                         }
                     }
                 }
                 // cwd / project from projectRoot (Antigravity style)
-                if let Some(pr) = string_field(obj, "projectRoot") {
-                    if analysis.first_cwd == Known::unknown() {
-                        analysis.first_cwd = Known::value(pr.to_owned());
-                    }
+                if let Some(pr) = string_field(obj, "projectRoot")
+                    && analysis.first_cwd == Known::unknown()
+                {
+                    analysis.first_cwd = Known::value(pr.to_owned());
                 }
             }
             // Emit logical units from messages array
@@ -282,10 +279,10 @@ fn walk_physical_unit(
             consume_physical(raw, "whole_file_document", ctx, analysis)?;
             analysis.session_id_seen = true;
             if let Some(obj) = value.as_object() {
-                if let Some(pr) = string_field(obj, "projectRoot") {
-                    if analysis.first_cwd == Known::unknown() {
-                        analysis.first_cwd = Known::value(pr.to_owned());
-                    }
+                if let Some(pr) = string_field(obj, "projectRoot")
+                    && analysis.first_cwd == Known::unknown()
+                {
+                    analysis.first_cwd = Known::value(pr.to_owned());
                 }
                 if let Some(msgs) = obj.get("messages").and_then(Value::as_array) {
                     for (i, msg) in msgs.iter().enumerate() {
@@ -306,10 +303,10 @@ fn walk_physical_unit(
                 if let Some(_sid) = string_field(obj, "sessionId") {
                     analysis.session_id_seen = true;
                 }
-                if let Some(lt) = string_field(obj, "lastUpdated") {
-                    if analysis.ended_at == Known::unknown() {
-                        analysis.ended_at = Known::value(lt.to_owned());
-                    }
+                if let Some(lt) = string_field(obj, "lastUpdated")
+                    && analysis.ended_at == Known::unknown()
+                {
+                    analysis.ended_at = Known::value(lt.to_owned());
                 }
             }
         }
@@ -375,9 +372,10 @@ fn detect_shape(value: &Value, framing: SourceFraming) -> GeminiShape {
     }
     if framing == SourceFraming::JsonLines {
         // heuristic for incremental
-        if obj.get("type").map_or(false, |t| {
-            t.as_str() == Some("gemini") || t.as_str() == Some("user")
-        }) || obj.contains_key("role")
+        if obj
+            .get("type")
+            .is_some_and(|t| t.as_str() == Some("gemini") || t.as_str() == Some("user"))
+            || obj.contains_key("role")
         {
             return GeminiShape::JsonlLineMessage;
         }
@@ -401,14 +399,8 @@ fn emit_gemini_message(
         .or_else(|| string_field(obj, "role"))
         .unwrap_or("unknown");
     let is_user = role_str == "user";
-    let is_assistant = role_str == "gemini" || role_str == "model" || role_str == "assistant";
-    let kind = if is_user {
-        "user"
-    } else if is_assistant {
-        "message"
-    } else {
-        "message"
-    };
+    let is_assistant = matches!(role_str, "gemini" | "model" | "assistant");
+    let kind = if is_user { "user" } else { "message" };
 
     let evidence = consume_logical(raw, msg, block_index, kind, ctx, logical, analysis)?;
 
@@ -420,12 +412,11 @@ fn emit_gemini_message(
         .unwrap_or_else(Known::unknown);
 
     // model from this msg
-    if is_assistant {
-        if let Some(mdl) = string_field(obj, "model") {
-            if analysis.model == Known::unknown() {
-                analysis.model = Known::value(mdl.to_owned());
-            }
-        }
+    if is_assistant
+        && let Some(mdl) = string_field(obj, "model")
+        && analysis.model == Known::unknown()
+    {
+        analysis.model = Known::value(mdl.to_owned());
     }
 
     // usage if present
@@ -483,7 +474,7 @@ fn emit_gemini_message(
         if let Some(name) = string_field(obj, "name")
             .or_else(|| fc.as_object().and_then(|f| string_field(f, "name")))
         {
-            emit_tool_call(raw, &name, fc, block_index, ctx, analysis, logical)?;
+            emit_tool_call(raw, name, fc, block_index, ctx, analysis, logical)?;
         }
     } else if let (Some(name), Some(_args)) = (string_field(obj, "name"), obj.get("args")) {
         let v = Value::Object(obj.clone());
@@ -570,12 +561,11 @@ fn emit_part(
     let text = extract_text(obj);
     if text.is_empty() && !is_thought {
         // may be functionCall inside part
-        if let Some(fc) = obj.get("functionCall") {
-            if let Some(name) = string_field(obj, "name")
+        if let Some(fc) = obj.get("functionCall")
+            && let Some(name) = string_field(obj, "name")
                 .or_else(|| fc.as_object().and_then(|f| string_field(f, "name")))
-            {
-                return emit_tool_call(raw, name, fc, parent_block, ctx, analysis, logical);
-            }
+        {
+            return emit_tool_call(raw, name, fc, parent_block, ctx, analysis, logical);
         }
         return Ok(());
     }

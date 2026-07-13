@@ -37,6 +37,11 @@ pub mod doctor;
 pub mod embedder;
 #[cfg(feature = "app")]
 pub mod evidence;
+#[cfg(feature = "app")]
+pub mod extraction;
+#[cfg(not(feature = "app"))]
+#[allow(dead_code, unused_imports)]
+mod extraction;
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 pub mod hf_cache;
 #[cfg(feature = "app")]
@@ -60,6 +65,8 @@ mod oracle;
 #[cfg(feature = "app")]
 pub mod output;
 #[cfg(feature = "app")]
+pub mod parser_dispatch;
+#[cfg(feature = "app")]
 pub mod progress;
 #[cfg(feature = "app")]
 pub mod rank;
@@ -77,11 +84,6 @@ pub mod search_eval;
 #[cfg(feature = "app")]
 pub mod session_catalog;
 pub mod sessions;
-#[cfg(feature = "app")]
-pub mod sources;
-#[cfg(not(feature = "app"))]
-#[allow(dead_code, unused_imports)]
-mod sources;
 #[cfg(feature = "app")]
 pub mod state;
 #[cfg(feature = "app")]

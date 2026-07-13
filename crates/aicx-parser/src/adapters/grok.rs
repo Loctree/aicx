@@ -6,7 +6,7 @@
 //!
 //! - No global discovery; operates only on the explicit artifacts in SourceHandle.
 //! - Separate from Codex; re-derives Grok-specific shapes from historical
-//!   parse_grok_chat_history + summary + tool extensions.
+//!   the historical Grok chat-history shape plus summary and tool extensions.
 //! - Produces deterministic SessionModel with stable evidence ids, coverage,
 //!   ParseStatus per C0A contract.
 //!
@@ -157,53 +157,53 @@ impl AgentAdapter for GrokAdapter {
                     .map(|k| k == "summary")
                     .unwrap_or(false)
                 {
-                    if let Ok(v) = serde_json::from_str::<Value>(text) {
-                        if let Some(info) = v.get("info") {
-                            cwd = info
-                                .get("cwd")
-                                .and_then(|x| x.as_str())
-                                .map(|s| s.to_owned())
-                                .or_else(|| {
-                                    info.get("git_root_dir")
-                                        .and_then(|x| x.as_str())
-                                        .map(|s| s.to_owned())
-                                });
-                            branch = info
-                                .get("head_branch")
-                                .and_then(|x| x.as_str())
-                                .map(|s| s.to_owned());
-                            model_id = info
-                                .get("current_model_id")
-                                .and_then(|x| x.as_str())
-                                .map(|s| s.to_owned());
-                            title = v
-                                .get("session_summary")
-                                .and_then(|x| x.as_str())
-                                .map(|s| s.to_owned());
-                            started_at = info
-                                .get("created_at")
-                                .and_then(|x| x.as_str())
-                                .map(|s| s.to_owned());
-                            ended_at = info
-                                .get("updated_at")
-                                .and_then(|x| x.as_str())
-                                .map(|s| s.to_owned());
-                            git_root = info
-                                .get("git_root_dir")
-                                .and_then(|x| x.as_str())
-                                .map(|s| s.to_owned());
-                        }
+                    if let Ok(v) = serde_json::from_str::<Value>(text)
+                        && let Some(info) = v.get("info")
+                    {
+                        cwd = info
+                            .get("cwd")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_owned())
+                            .or_else(|| {
+                                info.get("git_root_dir")
+                                    .and_then(|x| x.as_str())
+                                    .map(|s| s.to_owned())
+                            });
+                        branch = info
+                            .get("head_branch")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_owned());
+                        model_id = info
+                            .get("current_model_id")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_owned());
+                        title = v
+                            .get("session_summary")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_owned());
+                        started_at = info
+                            .get("created_at")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_owned());
+                        ended_at = info
+                            .get("updated_at")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_owned());
+                        git_root = info
+                            .get("git_root_dir")
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.to_owned());
                     }
-                } else if matches!(cu.disposition, ClassifiedDisposition::Consumed { .. }) {
-                    if let Ok(v) = serde_json::from_str::<Value>(text) {
-                        if unit.artifact_name.contains("event")
-                            || text.contains("\"event_type\"")
-                            || text.contains("\"response_item\"")
-                        {
-                            event_lines.push((cu.ordinal, v));
-                        } else {
-                            chat_lines.push((cu.ordinal, v));
-                        }
+                } else if matches!(cu.disposition, ClassifiedDisposition::Consumed { .. })
+                    && let Ok(v) = serde_json::from_str::<Value>(text)
+                {
+                    if unit.artifact_name.contains("event")
+                        || text.contains("\"event_type\"")
+                        || text.contains("\"response_item\"")
+                    {
+                        event_lines.push((cu.ordinal, v));
+                    } else {
+                        chat_lines.push((cu.ordinal, v));
                     }
                 }
             }
@@ -340,22 +340,22 @@ impl AgentAdapter for GrokAdapter {
                 raw_unit_refs: vec![raw_ref.clone()],
             });
 
-            if let Some(tn) = tool_name {
-                if kind == TurnKind::ToolResult || kind == TurnKind::ToolCall {
-                    tool_events.push(ToolEvent {
-                        kind: if kind == TurnKind::ToolCall {
-                            ToolEventKind::Call
-                        } else {
-                            ToolEventKind::Result
-                        },
-                        turn_idx,
-                        tool_name: tn,
-                        correlation_id: Known::unknown(),
-                        payload_hash: raw_ref.content_hash.clone(),
-                        payload_bytes: raw_ref.original_bytes,
-                        raw_unit_refs: vec![raw_ref],
-                    });
-                }
+            if let Some(tn) = tool_name
+                && (kind == TurnKind::ToolResult || kind == TurnKind::ToolCall)
+            {
+                tool_events.push(ToolEvent {
+                    kind: if kind == TurnKind::ToolCall {
+                        ToolEventKind::Call
+                    } else {
+                        ToolEventKind::Result
+                    },
+                    turn_idx,
+                    tool_name: tn,
+                    correlation_id: Known::unknown(),
+                    payload_hash: raw_ref.content_hash.clone(),
+                    payload_bytes: raw_ref.original_bytes,
+                    raw_unit_refs: vec![raw_ref],
+                });
             }
 
             consumed_ordinals.push(*ord);
@@ -560,10 +560,10 @@ fn classify_grok_event(text: &str) -> Result<String, SkippedReason> {
         || v.get("response_item").is_some()
         || v.get("type").and_then(|t| t.as_str()) == Some("response_item")
     {
-        if let Some(item) = v.get("payload").or_else(|| v.get("item")) {
-            if item.get("type").and_then(|t| t.as_str()) == Some("message") {
-                return Ok("assistant".to_string());
-            }
+        if let Some(item) = v.get("payload").or_else(|| v.get("item"))
+            && item.get("type").and_then(|t| t.as_str()) == Some("message")
+        {
+            return Ok("assistant".to_string());
         }
         return Ok("event".to_string());
     }
@@ -601,41 +601,39 @@ fn extract_assistant_text_and_tool(v: &Value) -> (String, Option<String>) {
         .unwrap_or("")
         .to_string();
     let mut tname = None;
-    if text.is_empty() {
-        if let Some(calls) = v.get("tool_calls").and_then(|c| c.as_array()) {
-            let names: Vec<String> = calls
-                .iter()
-                .filter_map(|c| {
-                    c.get("name")
-                        .and_then(|n| n.as_str())
-                        .map(|s| s.to_string())
-                })
-                .collect();
-            if !names.is_empty() {
-                text = format!("[tool calls: {}]", names.join(", "));
-                tname = names.first().cloned();
-            }
+    if text.is_empty()
+        && let Some(calls) = v.get("tool_calls").and_then(|c| c.as_array())
+    {
+        let names: Vec<String> = calls
+            .iter()
+            .filter_map(|c| {
+                c.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        if !names.is_empty() {
+            text = format!("[tool calls: {}]", names.join(", "));
+            tname = names.first().cloned();
         }
     }
-    if text.is_empty() {
-        if let Some(r) = v
+    if text.is_empty()
+        && let Some(r) = v
             .get("reasoning")
             .and_then(|r| r.get("text"))
             .and_then(|t| t.as_str())
-        {
-            text = r.to_string();
-        }
+    {
+        text = r.to_string();
     }
     (text, tname)
 }
 
 fn extract_reasoning_text(v: &Value) -> String {
-    if let Some(arr) = v.get("summary").and_then(|s| s.as_array()) {
-        if let Some(first) = arr.first() {
-            if let Some(t) = first.get("text").and_then(|x| x.as_str()) {
-                return t.to_string();
-            }
-        }
+    if let Some(arr) = v.get("summary").and_then(|s| s.as_array())
+        && let Some(first) = arr.first()
+        && let Some(t) = first.get("text").and_then(|x| x.as_str())
+    {
+        return t.to_string();
     }
     v.get("text")
         .and_then(|t| t.as_str())
@@ -646,22 +644,21 @@ fn extract_reasoning_text(v: &Value) -> String {
 fn extract_event_turn(v: &Value) -> (String, String, TurnKind) {
     // lightweight for rollout events
     let et = v.get("event_type").and_then(|x| x.as_str()).unwrap_or("");
-    if et == "response_item" {
-        if let Some(p) = v.get("payload") {
-            if p.get("type").and_then(|t| t.as_str()) == Some("message") {
-                let role = p
-                    .get("role")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("assistant");
-                let msg = p.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                let k = if role == "user" {
-                    TurnKind::UserMsg
-                } else {
-                    TurnKind::AgentReply
-                };
-                return (role.to_string(), msg.to_string(), k);
-            }
-        }
+    if et == "response_item"
+        && let Some(p) = v.get("payload")
+        && p.get("type").and_then(|t| t.as_str()) == Some("message")
+    {
+        let role = p
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("assistant");
+        let msg = p.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        let k = if role == "user" {
+            TurnKind::UserMsg
+        } else {
+            TurnKind::AgentReply
+        };
+        return (role.to_string(), msg.to_string(), k);
     }
     // chat style fallback
     let t = v.get("type").and_then(|x| x.as_str()).unwrap_or("");

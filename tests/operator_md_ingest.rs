@@ -1,9 +1,9 @@
+use aicx::extraction::ExtractionConfig;
 use aicx::importers::{
     discover_operator_markdown, discover_operator_markdown_from_input,
     extract_operator_markdown_from_home, extract_operator_markdown_from_input,
 };
 use aicx::sanitize::{ContentSanitizationWarning, sanitize_chunk_content};
-use aicx::sources::ExtractionConfig;
 use aicx::timeline::FrameKind;
 use chrono::{TimeZone, Utc};
 use filetime::{FileTime, set_file_mtime};

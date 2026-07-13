@@ -8,12 +8,12 @@ use std::path::{Path, PathBuf};
 use super::{read_store_dir, store_semantic_segments_at};
 use crate::chunker::ChunkerConfig;
 use crate::sanitize;
-use crate::sources::{self, ExtractionConfig};
 use crate::store::atomic_write::atomic_write;
 use crate::store::paths::{
     legacy_salvage_dir, legacy_store_base_dir, migration_manifest_path, migration_report_path,
     store_base_dir,
 };
+use crate::timeline::ExtractionConfig;
 use crate::timeline::TimelineEntry;
 
 // ============================================================================
@@ -846,16 +846,29 @@ fn extract_entries_from_source(source: &ResolvedSource) -> Result<Vec<TimelineEn
         watermark: None,
     };
 
-    match source.format {
-        SourceFormat::Claude => sources::extract_claude_file(&source.path, &config),
-        SourceFormat::Codex => sources::extract_codex_file(&source.path, &config),
-        SourceFormat::Gemini => sources::extract_gemini_file(&source.path, &config),
-        SourceFormat::GeminiAntigravity => {
-            sources::extract_gemini_antigravity_file(&source.path, &config)
+    let agent = match source.format {
+        SourceFormat::Claude => aicx_parser::engine::AgentKind::Claude,
+        SourceFormat::Codex => aicx_parser::engine::AgentKind::Codex,
+        SourceFormat::Gemini | SourceFormat::GeminiAntigravity => {
+            aicx_parser::engine::AgentKind::Gemini
         }
-        SourceFormat::Junie => sources::extract_junie_file(&source.path, &config),
-        SourceFormat::Grok => sources::extract_grok_file(&source.path, &config),
+        SourceFormat::Junie => aicx_parser::engine::AgentKind::Junie,
+        SourceFormat::Grok => aicx_parser::engine::AgentKind::Grok,
+    };
+    if source.path.is_dir() {
+        anyhow::bail!("migration source must resolve to a concrete session artifact");
     }
+    let source_id = source
+        .path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("migration-source");
+    let session = crate::parser_dispatch::parse_file(agent, source_id, None, &source.path)?;
+    let mut entries = crate::output::timeline_entries_from_model(session.model());
+    entries.retain(|entry| {
+        entry.timestamp >= config.cutoff && (config.include_assistant || entry.role == "user")
+    });
+    Ok(entries)
 }
 
 fn preserve_legacy_item(

@@ -35,13 +35,13 @@ mod cli_config;
 use aicx::corpus;
 use aicx::dashboard::{self, DashboardConfig, DashboardScope};
 use aicx::dashboard_server::{self, DashboardCorsPolicy, DashboardServerConfig};
+use aicx::extraction::{self as sources, ExtractionConfig};
 use aicx::intents;
 use aicx::mcp::{self, McpHttpConfig, McpTransport};
 use aicx::output::{self, OutputConfig, OutputFormat, OutputMode, ReportMetadata};
 use aicx::rank;
 use aicx::reports_extractor::{self, ReportsExtractorConfig};
 use aicx::sessions;
-use aicx::sources::{self, ExtractionConfig};
 use aicx::state::StateManager;
 use aicx::store;
 use aicx::timeline;
@@ -2988,7 +2988,13 @@ fn load_session_claims(
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let canonical_id = resolved.source.source_id.clone();
 
-    let entries = parse_selected_source_once(extract_agent, &resolved.source.path, true)?;
+    let handle = source_handle_for_file(
+        extract_agent,
+        &resolved.source.source_id,
+        resolved.source.logical_session_id.clone(),
+        &resolved.source.path,
+    )?;
+    let entries = parse_selected_source_once(&handle, true)?;
     if entries.is_empty() {
         anyhow::bail!(
             "no entries for session '{session}' (agent {agent_str}, source {}); the source parsed empty within --hours {hours}",
@@ -5164,7 +5170,8 @@ fn run_conversations_batch(options: ConversationsBatchOptions) -> Result<()> {
         watermark: None,
     };
 
-    let entries = sources::extract_claude(&config)?;
+    let entries =
+        sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Claude, &config)?;
 
     // Pre-compute discovery-aware histograms so dry-run can emit a
     // pipe-friendly JSON envelope alongside the human banner (Wave D
@@ -5523,29 +5530,12 @@ fn source_handle_for_file(
     logical_session_id: Option<String>,
     path: &Path,
 ) -> Result<aicx::parser::engine::SourceHandle> {
-    use aicx::parser::engine::{SourceArtifact, SourceFraming, SourceHandle};
-    let artifact_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.starts_with('.') && !name.contains(['/', '\\']))
-        .unwrap_or("source.jsonl")
-        .to_string();
-    let framing = if agent == ExtractAgent::Gemini
-        && path.extension().and_then(|ext| ext.to_str()) == Some("json")
-    {
-        SourceFraming::WholeDocument
-    } else {
-        SourceFraming::JsonLines
-    };
-    let artifact = SourceArtifact::validated_file(artifact_name, path, framing)
-        .map_err(|error| anyhow::anyhow!("invalid source artifact: {error}"))?;
-    SourceHandle::new(
+    aicx::parser_dispatch::source_handle_for_file(
         agent.parser_kind(),
-        safe_session_extract_stem(source_id),
+        source_id,
         logical_session_id,
-        vec![artifact],
+        path,
     )
-    .map_err(|error| anyhow::anyhow!("invalid source handle: {error}"))
 }
 
 /// Parse the artifacts of one resolved `SourceHandle` exactly once.
@@ -5568,31 +5558,15 @@ fn source_handle_for_file(
 /// this seam to `ParserEngine::parse` + registered adapters without touching
 /// the callers.
 fn parse_selected_source_once(
-    agent: ExtractAgent,
-    path: &Path,
+    handle: &aicx::parser::engine::SourceHandle,
     include_assistant: bool,
 ) -> Result<Vec<timeline::TimelineEntry>> {
-    // Direct single-source parses intentionally apply no time cutoff.
-    let cutoff = Utc::now() - chrono::Duration::days(365 * 200);
-    let config = ExtractionConfig {
-        project_filter: vec![],
-        cutoff,
-        include_assistant,
-        watermark: None,
-    };
-    match agent {
-        ExtractAgent::Codex => sources::extract_codex_file(path, &config),
-        ExtractAgent::Claude => sources::extract_claude_file(path, &config),
-        ExtractAgent::Gemini => {
-            if path.is_dir() {
-                sources::extract_gemini_antigravity_file(path, &config)
-            } else {
-                sources::extract_gemini_file(path, &config)
-            }
-        }
-        ExtractAgent::Grok => sources::extract_grok_file(path, &config),
-        ExtractAgent::Junie => sources::extract_junie_file(path, &config),
+    let session = aicx::parser_dispatch::parse_handle(handle)?;
+    let mut entries = aicx::output::timeline_entries_from_model(session.model());
+    if !include_assistant {
+        entries.retain(|entry| entry.role == "user");
     }
+    Ok(entries)
 }
 
 /// Run `aicx extract <agent> --session <id>`: resolve the session catalog
@@ -5656,8 +5630,7 @@ fn run_extract_session(
     )?;
     debug_assert_eq!(handle.artifacts().len(), 1);
 
-    let entries =
-        parse_selected_source_once(agent, &resolved.source.path, options.include_assistant)?;
+    let entries = parse_selected_source_once(&handle, options.include_assistant)?;
     if entries.is_empty() {
         anyhow::bail!(
             "Resolved session `{}` to `{}`, but no entries were extractable from {} for agent `{}`.",
@@ -5719,15 +5692,18 @@ fn run_extract_direct_file(
         .filter(|stem| !stem.is_empty())
         .unwrap_or("direct-source");
 
-    // Antigravity brain directories stay parseable as a direct input; regular
-    // file inputs are validated through the sealed handle contract first.
-    if !input.is_dir() {
-        let handle = source_handle_for_file(agent, source_id, None, &input)?;
-        debug_assert_eq!(handle.artifacts().len(), 1);
+    // Direct mode accepts exactly one finite parser artifact. Directory
+    // discovery belongs to the catalog/importer boundary.
+    if input.is_dir() {
+        anyhow::bail!(
+            "directory session inputs are not parser artifacts; select the concrete session file"
+        );
     }
+    let handle = source_handle_for_file(agent, source_id, None, &input)?;
+    debug_assert_eq!(handle.artifacts().len(), 1);
     eprintln!("extract: catalog_files_opened=0 sources_parsed=1");
 
-    let entries = parse_selected_source_once(agent, &input, options.include_assistant)?;
+    let entries = parse_selected_source_once(&handle, options.include_assistant)?;
 
     let fallback_identity = if options.conversation {
         "file input".to_string()
@@ -6379,11 +6355,21 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             std::time::Duration::from_secs(60),
         );
         let agent_entries_result = match agent {
-            "claude" => sources::extract_claude(&config),
-            "codex" => sources::extract_codex(&config),
-            "gemini" => sources::extract_gemini(&config),
-            "junie" => sources::extract_junie(&config),
-            "grok" => sources::extract_grok(&config),
+            "claude" => {
+                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Claude, &config)
+            }
+            "codex" => {
+                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Codex, &config)
+            }
+            "gemini" => {
+                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Gemini, &config)
+            }
+            "junie" => {
+                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Junie, &config)
+            }
+            "grok" => {
+                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Grok, &config)
+            }
             "codescribe" => aicx::importers::extract_codescribe(&config),
             "operator-md" => aicx::importers::extract_operator_markdown(&config),
             _ => Ok(Vec::new()),
@@ -6897,14 +6883,21 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
             std::time::Duration::from_secs(60),
         );
         let agent_entries_result = match ag {
-            "claude" => sources::extract_claude(&config),
-            "claude-history" => sources::extract_claude_history(&config),
-            "codex" => sources::extract_codex(&config),
-            "codex-sessions" => sources::extract_codex_sessions(&config),
-            "gemini" => sources::extract_gemini(&config),
-            "junie" => sources::extract_junie(&config),
-            "grok" => sources::extract_grok(&config),
-            "grok-sessions" => sources::extract_grok_sessions(&config),
+            "claude" => {
+                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Claude, &config)
+            }
+            "codex" | "codex-sessions" => {
+                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Codex, &config)
+            }
+            "gemini" => {
+                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Gemini, &config)
+            }
+            "junie" => {
+                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Junie, &config)
+            }
+            "grok" | "grok-sessions" => {
+                sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Grok, &config)
+            }
             "codescribe" => aicx::importers::extract_codescribe(&config),
             "operator-md" => {
                 if let Some(input) = operator_md_input.as_deref() {

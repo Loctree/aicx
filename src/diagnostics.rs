@@ -215,8 +215,8 @@ fn lock_state() -> MutexGuard<'static, DiagnosticsState> {
     //
     // Concrete trigger: parallel `cargo test` schedules where
     // `diagnostics::tests::lock_test_init` (calls `reset_for_tests` +
-    // `init`) races with `sources::tests::test_extract_codex_file_*`
-    // (calls production `record` → `lock_state`). If any test panics
+    // `init`) races with extraction tests that call production `record` →
+    // `lock_state`. If any test panics
     // mid-mutation, every sibling test that touches the global state
     // hits the cascade panic at this site. Recovery here keeps the
     // race window from amplifying one flake into five failures.

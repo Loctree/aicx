@@ -169,9 +169,9 @@ pub fn to_conversation_with_stats(
 /// with null-byte delimiters between the fields to avoid prefix collisions
 /// between e.g. `("a", "bc", "d")` and `("ab", "c", "d")`.
 ///
-/// `agent` is part of the key because extractors can emit a shared fallback
-/// session id (for example `extract_claude_history` uses `"history"` when
-/// `sessionId` is absent). Without the agent in the key, identical short
+/// `agent` is part of the key because imported streams can emit a shared
+/// fallback session id when their source lacks one. Without the agent in the
+/// key, identical short
 /// prompts from two unrelated agent streams within a 2 s window would be
 /// silently merged.
 fn exact_short_dup_key(agent: &str, session_id: &str, trimmed: &str) -> u64 {

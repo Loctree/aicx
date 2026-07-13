@@ -49,7 +49,6 @@ def load_manifest(path: Path) -> dict[str, Any]:
         "scan_roots",
         "deleted_path",
         "deleted_symbols",
-        "temporary_path",
     ):
         if not data.get(key):
             raise LegacyError(f"legacy manifest missing {key}")
@@ -111,7 +110,7 @@ def verify(
             raise LegacyError(f"S0 deleted path reintroduced in live tree: {path}")
 
     valid_dispositions = {"git-rm", "move-before-rm", "retain-facade-until-cutover"}
-    for item in data["temporary_path"]:
+    for item in data.get("temporary_path", []):
         path = item.get("path")
         disposition = item.get("disposition")
         consumers = item.get("current_consumers")
@@ -122,7 +121,7 @@ def verify(
         if not isinstance(path, str) or not path:
             raise LegacyError("temporary path entry missing path")
         if not (repo / path).is_file():
-            raise LegacyError(f"temporary boundary/facade path is missing: {path}")
+            raise LegacyError(f"declared temporary boundary/facade path is missing: {path}")
         if not isinstance(consumers, list) or not consumers:
             raise LegacyError(
                 f"temporary path has no current consumer inventory: {path}"

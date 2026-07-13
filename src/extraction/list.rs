@@ -1,9 +1,8 @@
 #![allow(unused_imports)]
 use super::*;
+use crate::extraction::UNPROTECTED_SOURCE_WARNING;
 use crate::importers::codescribe::CODESCRIBE_AGENT;
 use crate::importers::{discover_codescribe_transcripts, discover_operator_markdown};
-use crate::sources::UNPROTECTED_SOURCE_WARNING;
-use crate::sources::count_codex_sessions;
 
 const JUNIE_EVENTS_FILENAME: &str = "events.jsonl";
 
@@ -146,14 +145,6 @@ pub fn list_available_sources() -> Result<Vec<SourceInfo>> {
             1,
             size,
         ));
-    }
-
-    // Codex
-    let codex_path = home.join(".codex").join("history.jsonl");
-    if codex_path.exists() {
-        let size = fs::metadata(&codex_path).map(|m| m.len()).unwrap_or(0);
-        let sessions = count_codex_sessions(&codex_path).unwrap_or(0);
-        sources.push(source_info(&home, "codex", codex_path, sessions, size));
     }
 
     // Codex sessions: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl

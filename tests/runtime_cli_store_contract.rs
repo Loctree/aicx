@@ -29,18 +29,37 @@ fn write_codex_history(
     cwd: Option<&Path>,
     messages: &[(&str, i64, &str)],
 ) {
-    let mut lines = Vec::new();
-
+    let timestamp = |value: i64| {
+        chrono::DateTime::from_timestamp(value, 0)
+            .expect("fixture timestamp")
+            .to_rfc3339()
+    };
+    let first_ts = messages.first().map(|(_, ts, _)| *ts).unwrap_or(0);
+    let mut lines = vec![
+        json!({
+            "timestamp": timestamp(first_ts),
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "timestamp": timestamp(first_ts),
+                "cwd": cwd.map(|path| path.display().to_string()).unwrap_or_default(),
+                "model": "gpt-test"
+            }
+        })
+        .to_string(),
+    ];
     for (role, ts, text) in messages {
-        let mut payload = serde_json::Map::new();
-        payload.insert("session_id".to_string(), json!(session_id));
-        payload.insert("text".to_string(), json!(text));
-        payload.insert("ts".to_string(), json!(ts));
-        payload.insert("role".to_string(), json!(role));
-        if let Some(cwd) = cwd {
-            payload.insert("cwd".to_string(), json!(cwd.display().to_string()));
-        }
-        lines.push(Value::Object(payload).to_string());
+        lines.push(
+            json!({
+                "timestamp": timestamp(*ts),
+                "type": "event_msg",
+                "payload": {
+                    "type": if *role == "user" { "user_message" } else { "agent_message" },
+                    "message": text
+                }
+            })
+            .to_string(),
+        );
     }
 
     write_file(path, &lines.join("\n"));
@@ -189,20 +208,24 @@ fn append_codex_entry(
     ts: i64,
     text: &str,
 ) {
-    let mut payload = serde_json::Map::new();
-    payload.insert("session_id".to_string(), json!(session_id));
-    payload.insert("text".to_string(), json!(text));
-    payload.insert("ts".to_string(), json!(ts));
-    payload.insert("role".to_string(), json!(role));
-    if let Some(cwd) = cwd {
-        payload.insert("cwd".to_string(), json!(cwd.display().to_string()));
-    }
+    let _ = (session_id, cwd);
+    let timestamp = chrono::DateTime::from_timestamp(ts, 0)
+        .expect("fixture timestamp")
+        .to_rfc3339();
+    let payload = json!({
+        "timestamp": timestamp,
+        "type": "event_msg",
+        "payload": {
+            "type": if role == "user" { "user_message" } else { "agent_message" },
+            "message": text
+        }
+    });
 
     let mut existing = fs::read_to_string(path).unwrap_or_default();
     if !existing.is_empty() {
         existing.push('\n');
     }
-    existing.push_str(&Value::Object(payload).to_string());
+    existing.push_str(&payload.to_string());
     write_file(path, &existing);
 }
 
@@ -306,7 +329,13 @@ fn test_doctor_force_yes_json_is_machine_readable_cleanup_report() {
 fn list_cli_reports_unprotected_sources_without_creating_git() {
     let root = unique_test_dir("source-list-unprotected");
     let home = root.join("home");
-    let history = home.join(".codex").join("history.jsonl");
+    let history = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("13")
+        .join("rollout-test.jsonl");
     write_codex_history(&history, "source-list-sess", None, &[("user", 1, "hello")]);
 
     let output = run_aicx(&home, &["list"]);
@@ -326,7 +355,7 @@ fn list_cli_detects_existing_git_protection() {
     let root = unique_test_dir("source-list-protected");
     let home = root.join("home");
     let codex_root = home.join(".codex");
-    let history = codex_root.join("history.jsonl");
+    let history = codex_root.join("sessions/2026/07/13/rollout-test.jsonl");
     fs::create_dir_all(codex_root.join(".git")).expect("create local source git");
     write_codex_history(
         &history,
@@ -377,7 +406,7 @@ fn sources_protect_apply_creates_only_local_git_without_remote() {
     let source_root = home.join(".codex");
     fs::create_dir_all(&source_root).expect("create source root");
     write_file(
-        &source_root.join("history.jsonl"),
+        &source_root.join("sessions/2026/07/13/rollout-test.jsonl"),
         "{\"text\":\"private local session\"}\n",
     );
 
@@ -421,7 +450,7 @@ fn normal_store_and_extract_do_not_initialize_source_git() {
     let root = unique_test_dir("source-normal-readonly");
     let home = root.join("home");
     let source_root = home.join(".codex");
-    let history = source_root.join("history.jsonl");
+    let history = source_root.join("sessions/2026/07/13/rollout-test.jsonl");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
@@ -472,7 +501,13 @@ fn store_cli_deduplicates_exact_entries_on_first_run() {
     let root = unique_test_dir("store-exact-dedup");
     let home = root.join("home");
     let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
-    let history = home.join(".codex").join("history.jsonl");
+    let history = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("13")
+        .join("rollout-test.jsonl");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
@@ -511,7 +546,13 @@ fn store_cli_codex_emits_repo_and_non_repo_canonical_roots() {
     let root = unique_test_dir("codex-command");
     let home = root.join("home");
     let repo_root = home.join("hosted").join("Vetcoders").join("ai-contexters");
-    let history = home.join(".codex").join("history.jsonl");
+    let history = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("13")
+        .join("rollout-test.jsonl");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
@@ -535,29 +576,22 @@ fn store_cli_codex_emits_repo_and_non_repo_canonical_roots() {
             ),
         ],
     );
-    write_file(
-        &history,
-        &format!(
-            "{}\n{}",
-            fs::read_to_string(&history).expect("read repo session history"),
-            [
-                json!({
-                    "session_id": "nonrepo-sess",
-                    "text": "Draft a migration plan before we know the repo.",
-                    "ts": now - 100,
-                    "role": "user"
-                })
-                .to_string(),
-                json!({
-                    "session_id": "nonrepo-sess",
-                    "text": "Working without repository identity for now.",
-                    "ts": now - 90,
-                    "role": "assistant"
-                })
-                .to_string(),
-            ]
-            .join("\n")
-        ),
+    write_codex_history(
+        &history.with_file_name("rollout-nonrepo.jsonl"),
+        "nonrepo-sess",
+        None,
+        &[
+            (
+                "user",
+                now - 100,
+                "Draft a migration plan before we know the repo.",
+            ),
+            (
+                "assistant",
+                now - 90,
+                "Working without repository identity for now.",
+            ),
+        ],
     );
 
     let output = run_aicx(&home, &["codex", "-H", "24", "--emit", "json"]);
@@ -609,48 +643,40 @@ fn store_cli_store_command_emits_repo_and_non_repo_canonical_roots() {
     let root = unique_test_dir("store-command");
     let home = root.join("home");
     let repo_root = home.join("hosted").join("Vetcoders").join("loctree");
-    let history = home.join(".codex").join("history.jsonl");
+    let history = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("13")
+        .join("rollout-test.jsonl");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
         .as_secs() as i64;
 
     fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
-    write_file(
+    write_codex_history(
         &history,
+        "repo-store-sess",
+        Some(&repo_root),
         &[
-            json!({
-                "session_id": "repo-store-sess",
-                "text": "Please inspect the loctree runtime contract.",
-                "ts": now - 120,
-                "role": "user",
-                "cwd": repo_root.display().to_string(),
-            })
-            .to_string(),
-            json!({
-                "session_id": "repo-store-sess",
-                "text": "Reviewing canonical emission now.",
-                "ts": now - 110,
-                "role": "assistant",
-                "cwd": repo_root.display().to_string(),
-            })
-            .to_string(),
-            json!({
-                "session_id": "unknown-store-sess",
-                "text": "Planning first, repository unknown.",
-                "ts": now - 100,
-                "role": "user",
-            })
-            .to_string(),
-            json!({
-                "session_id": "unknown-store-sess",
-                "text": "Still unresolved; keep this honest.",
-                "ts": now - 90,
-                "role": "assistant",
-            })
-            .to_string(),
-        ]
-        .join("\n"),
+            (
+                "user",
+                now - 120,
+                "Please inspect the loctree runtime contract.",
+            ),
+            ("assistant", now - 110, "Reviewing canonical emission now."),
+        ],
+    );
+    write_codex_history(
+        &history.with_file_name("rollout-unknown.jsonl"),
+        "unknown-store-sess",
+        None,
+        &[
+            ("user", now - 100, "Planning first, repository unknown."),
+            ("assistant", now - 90, "Still unresolved; keep this honest."),
+        ],
     );
 
     let output = run_aicx(
@@ -852,7 +878,13 @@ fn all_cli_defaults_to_incremental_and_full_rescan_recovers_backfill() {
     let root = unique_test_dir("all-incremental-default");
     let home = root.join("home");
     let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
-    let history = home.join(".codex").join("history.jsonl");
+    let history = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("13")
+        .join("rollout-test.jsonl");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
@@ -944,7 +976,13 @@ fn all_cli_hours_zero_means_all_time() {
     let root = unique_test_dir("all-hours-zero");
     let home = root.join("home");
     let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
-    let history = home.join(".codex").join("history.jsonl");
+    let history = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("13")
+        .join("rollout-test.jsonl");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
@@ -983,7 +1021,13 @@ fn all_cli_force_ignores_watermark_like_full_rescan() {
     let root = unique_test_dir("all-force-watermark");
     let home = root.join("home");
     let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
-    let history = home.join(".codex").join("history.jsonl");
+    let history = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("13")
+        .join("rollout-test.jsonl");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
@@ -1036,7 +1080,13 @@ fn store_cli_defaults_to_incremental_and_full_rescan_recovers_backfill() {
     let root = unique_test_dir("store-incremental-default");
     let home = root.join("home");
     let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
-    let history = home.join(".codex").join("history.jsonl");
+    let history = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("13")
+        .join("rollout-test.jsonl");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
@@ -1129,7 +1179,13 @@ fn store_cli_hours_zero_means_all_time() {
     let root = unique_test_dir("store-hours-zero");
     let home = root.join("home");
     let repo_root = home.join("hosted").join("Vetcoders").join("aicx");
-    let history = home.join(".codex").join("history.jsonl");
+    let history = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("13")
+        .join("rollout-test.jsonl");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
@@ -1183,7 +1239,13 @@ fn store_cli_hours_zero_means_all_time() {
 fn test_run_store_saves_state_on_empty_result() {
     let root = unique_test_dir("store-empty-save");
     let home = root.join("home");
-    let history = home.join(".codex").join("history.jsonl");
+    let history = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("13")
+        .join("rollout-test.jsonl");
     write_codex_history(&history, "empty-sess", None, &[]);
 
     let output = parse_stdout_json(&run_aicx(
@@ -1207,7 +1269,13 @@ fn test_run_store_saves_state_on_empty_result() {
 fn test_run_extraction_saves_state_on_empty_result() {
     let root = unique_test_dir("extract-empty-save");
     let home = root.join("home");
-    let history = home.join(".codex").join("history.jsonl");
+    let history = home
+        .join(".codex")
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("13")
+        .join("rollout-test.jsonl");
     write_codex_history(&history, "empty-sess", None, &[]);
 
     let output = parse_stdout_json(&run_aicx(&home, &["all", "-H", "24", "--emit", "json"]));

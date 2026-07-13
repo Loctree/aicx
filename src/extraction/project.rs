@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
-use crate::sources::UNPROTECTED_SOURCE_WARNING;
+use crate::extraction::UNPROTECTED_SOURCE_WARNING;
 
 fn project_filter_matches_identity(
     organization: &str,
@@ -239,7 +239,7 @@ pub(crate) fn body_mentions_repo_token(body_lower: &str, repo_lower: &str) -> bo
 /// `-Users-user-Git-nextra-docs-vista` (likely not what the operator
 /// meant). That ambiguity is **inherent** to the Claude encoding and
 /// cannot be resolved from the directory name alone. The strict
-/// per-entry `cwd` filter inside `extract_claude` (sources.rs ~1587,
+/// per-entry `cwd` filter inside the Claude extraction pipeline
 /// `entry.cwd.as_deref().is_some_and(|c| project_filter_matches_path(c, ...))`)
 /// resolves it precisely when the entry carries a `cwd` field — the
 /// common case. Sessions without `cwd` were previously dropped by the

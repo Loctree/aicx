@@ -1,6 +1,6 @@
 use super::*;
+use crate::extraction::{IntentLineModality, intent_line_modality};
 use crate::oracle::OracleStatus;
-use crate::sources::shared::{IntentLineModality, intent_line_modality};
 use filetime::{FileTime, set_file_mtime};
 use std::fs;
 use std::path::PathBuf;

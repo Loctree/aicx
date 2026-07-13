@@ -10,12 +10,12 @@ use crate::corpus::types::{
     CorpusCardFinding, CorpusValidateOptions, CorpusValidateReport, CorpusValidateTotals,
     RootValidateReport,
 };
+use crate::extraction::is_harness_injected_noise;
 use crate::parser::{
     CARD_CLAIM_SCOPE_SESSION_CLOSE, CARD_FRESHNESS_CONTRACT_HISTORICAL, CARD_SCHEMA_VERSION,
     CARD_VERIFICATION_STATE_NOT_VERIFIED_BY_AICX, ChunkMetadataSidecar,
 };
 use crate::sanitize;
-use crate::sources::shared::is_harness_injected_noise;
 
 const MAX_SAMPLES_PER_ROOT: usize = 30;
 

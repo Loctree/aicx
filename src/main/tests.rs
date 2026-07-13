@@ -2663,7 +2663,7 @@ fn migrate_intent_schema_accepts_missing_project_and_defaults_to_dry_run() {
 }
 
 #[test]
-fn legacy_extract_file_boundary_fails_closed_without_output() {
+fn direct_file_boundary_rejects_directory_without_output() {
     let root = unique_test_dir("extract-repo-identity");
     let brain = root.join("brain").join("conv-9");
     let step_output = brain
@@ -2679,8 +2679,8 @@ fn legacy_extract_file_boundary_fails_closed_without_output() {
     );
     set_mtime(&step_output, 1_706_745_900);
 
-    // Antigravity brain directories route through the direct-file runner as a
-    // directory input (no SourceHandle is constructible for a directory).
+    // Direct-file mode now requires the concrete finite parser artifact;
+    // directory discovery belongs to the catalog/importer boundary.
     let error = run_extract_direct_file(
         ExtractAgent::Gemini,
         brain,
@@ -2693,8 +2693,12 @@ fn legacy_extract_file_boundary_fails_closed_without_output() {
             conversation: false,
         },
     )
-    .expect_err("sealed session boundary must stay fail-closed until adapters land");
-    assert!(error.to_string().contains("legacy session parser removed"));
+    .expect_err("directory input must be rejected before parser dispatch");
+    assert!(
+        error
+            .to_string()
+            .contains("select the concrete session file")
+    );
     assert!(
         !report.exists(),
         "failed parse must not emit partial output"

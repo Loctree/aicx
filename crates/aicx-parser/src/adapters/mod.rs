@@ -1,4 +1,16 @@
-//! Frozen adapter boundary. Provider implementations are separate cuts.
+//! Frozen adapter boundary and exhaustive built-in adapter registry.
+
+pub mod claude;
+pub mod codex;
+pub mod gemini;
+pub mod grok;
+pub mod junie;
+
+pub use claude::ClaudeAdapter;
+pub use codex::CodexAdapter;
+pub use gemini::GeminiAdapter;
+pub use grok::GrokAdapter;
+pub use junie::JunieAdapter;
 
 use crate::engine::{
     AgentKind, RawUnitRef, SkippedReason, SourceHandle, SourceRead, UnvalidatedParse,
@@ -63,6 +75,51 @@ pub trait AgentAdapter: sealed::Sealed + Send + Sync {
         read: &SourceRead,
         classified: Vec<ClassifiedUnit>,
     ) -> Result<UnvalidatedParse, AdapterError>;
+}
+
+static CODEX: CodexAdapter = CodexAdapter;
+static CLAUDE: ClaudeAdapter = ClaudeAdapter;
+static GEMINI: GeminiAdapter = GeminiAdapter;
+static GROK: GrokAdapter = GrokAdapter;
+static JUNIE: JunieAdapter = JunieAdapter;
+
+/// Return the one registered parser for an exhaustive [`AgentKind`].
+pub const fn registered_adapter(agent: AgentKind) -> &'static dyn AgentAdapter {
+    match agent {
+        AgentKind::Codex => &CODEX,
+        AgentKind::Claude => &CLAUDE,
+        AgentKind::Gemini => &GEMINI,
+        AgentKind::Grok => &GROK,
+        AgentKind::Junie => &JUNIE,
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    #[test]
+    fn registry_is_exhaustive_and_identity_preserving() {
+        for agent in [
+            AgentKind::Codex,
+            AgentKind::Claude,
+            AgentKind::Gemini,
+            AgentKind::Grok,
+            AgentKind::Junie,
+        ] {
+            let adapter = registered_adapter(agent);
+            assert_eq!(adapter.agent(), agent);
+            assert!(!adapter.adapter_version().is_empty());
+        }
+    }
+
+    #[test]
+    fn codex_and_grok_are_distinct_registrations() {
+        assert_ne!(
+            registered_adapter(AgentKind::Codex).agent(),
+            registered_adapter(AgentKind::Grok).agent()
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -127,9 +127,8 @@ fn phase_label_and_detail_cover_pre_write_phases() {
 // NOTE: Heartbeat behavior tests (periodic ticks + floor pinning) live in
 // `tests/store_progress_markers.rs`. Keeping them out of the lib test
 // binary avoids widening parallel-test scheduling windows around the
-// pre-existing shared `diagnostics::STATE` race exercised by
-// `sources::tests::test_extract_codex_file_mixed_*` and
-// `diagnostics::tests::*`. The integration binary runs in a separate
+// pre-existing shared `diagnostics::STATE` race exercised by extraction
+// tests and `diagnostics::tests::*`. The integration binary runs in a separate
 // process with its own global state.
 #[test]
 fn heartbeat_stop_joins_thread_without_panic() {
