@@ -1,0 +1,3 @@
+{"type":"user","sessionId":"66666666-6666-4666-8666-666666666666","cwd":"/repo/alpha","gitBranch":"main","timestamp":"2026-07-13T08:00:00Z","uuid":"u1","message":{"role":"user","content":"Nieznane ksztalty."}}
+{"type":"wizard","sessionId":"66666666-6666-4666-8666-666666666666","timestamp":"2026-07-13T08:00:01Z","payload":{"spell":1}}
+{"type":"assistant","sessionId":"66666666-6666-4666-8666-666666666666","cwd":"/repo/alpha","gitBranch":"main","timestamp":"2026-07-13T08:00:02Z","uuid":"a1","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"text","text":"Znany tekst."},{"type":"holo_frame","frame":7}]}}

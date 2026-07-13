@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"44444444-4444-4444-8444-444444444444","cwd":"/repo/alpha","gitBranch":"main","timestamp":"2026-07-13T06:00:00Z","uuid":"u1","message":{"role":"user","content":"Sprawdz opaque reasoning."}}
+{"type":"assistant","sessionId":"44444444-4444-4444-8444-444444444444","cwd":"/repo/alpha","gitBranch":"main","timestamp":"2026-07-13T06:00:03Z","uuid":"a1","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"redacted_thinking","data":"T1BBUVVFLXBheWxvYWQ="},{"type":"text","text":"Widoczna odpowiedz."}]}}
