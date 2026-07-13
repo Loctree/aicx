@@ -1,0 +1,4 @@
+{"type":"user","content":[{"type":"text","text":"run ls"}]}
+{"type":"assistant","content":"","tool_calls":[{"name":"shell","arguments":"ls"}]}
+{"type":"tool_result","tool_call_id":"call1","content":"file1\nfile2\nexit 0"}
+{"type":"assistant","content":"done"}
