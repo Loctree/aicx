@@ -687,6 +687,8 @@ mod tests {
         )
     }
 
+    // Only consumed by the app-gated composition test below.
+    #[cfg(feature = "app")]
     fn v1_card_text_without_signals() -> String {
         "[project: demo/repo | agent: claude | date: 2026-03-15 | frame_kind: user_msg]\n\n[13:44:56] user: kind: transcript\n[13:45:02] assistant: done\n".to_string()
     }

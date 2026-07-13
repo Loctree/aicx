@@ -41,6 +41,11 @@ pub use project::{
 const UNPROTECTED_SOURCE_WARNING: &str = "unprotected source material; run `aicx sources protect --root <path> --backend git-local --apply` to opt in";
 
 /// Discover identities with the catalog and parse every selected session once.
+///
+/// App-only: session discovery (`session_catalog`), parser dispatch, and
+/// timeline projection all live behind `feature = "app"`; the slim
+/// loctree-consumer profile reads the canonical store instead of raw sources.
+#[cfg(feature = "app")]
 pub fn extract_agent_sessions(
     agent: crate::session_catalog::AgentKind,
     config: &ExtractionConfig,
@@ -78,6 +83,7 @@ pub fn extract_agent_sessions(
     Ok(entries)
 }
 
+#[cfg(feature = "app")]
 const fn parser_agent(agent: crate::session_catalog::AgentKind) -> aicx_parser::engine::AgentKind {
     match agent {
         crate::session_catalog::AgentKind::Claude => aicx_parser::engine::AgentKind::Claude,

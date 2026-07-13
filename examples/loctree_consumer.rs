@@ -1,56 +1,77 @@
-use aicx::api::{Aicx, SearchOptions};
-use aicx::oracle::OracleStatus;
+//! Slim `loctree-consumer` contract walkthrough.
+//!
+//! Run with the slim profile (the point of this example):
+//!   cargo run --example loctree_consumer --no-default-features --features loctree-consumer
+//!
+//! Everything used here is the stable read core exposed to in-process
+//! consumers such as Loctree: store discovery, canonical chunk enumeration
+//! and reads, typed chunk references, index-readiness inspection, and pure
+//! intent extraction. No CLI, MCP, embedder, or semantic-search surfaces are
+//! linked — `semantic_search`/`SearchOptions` live behind `feature = "app"`.
+
+use aicx::api::Aicx;
+use aicx::intents::IntentsConfig;
+use aicx::store::ChunkRefSpec;
 
 fn main() -> anyhow::Result<()> {
-    // 1. Initialize the library facade.
-    // The Aicx client handles resolution of the store root (~/.aicx by default)
-    // and exposes the primary operations (read, store, search, extract) without
-    // importing the CLI's main.rs glue.
+    // 1. Resolve the store the same way Loctree does in-process
+    //    (~/.aicx by default, honoring AICX_HOME overrides).
     let client = Aicx::from_env()?;
+    println!("Store root: {}", client.store_root().display());
 
-    // 2. Query the current oracle status for semantic search.
-    // The index_status() method determines whether a semantic index is
-    // available, pending, or missing.
+    // 2. Index status is part of the slim surface: a consumer can tell
+    //    whether semantic retrieval would be available without linking it.
     let status = client.index_status(None)?;
+    println!("Index readiness: {:?}", status.readiness);
+    println!("Canonical chunks: {}", status.canonical_chunks);
 
-    println!("Index Readiness: {:?}", status.readiness);
-    println!("Canonical Chunks: {}", status.canonical_chunks);
-    println!("Semantic Rows: {}", status.semantic_index_rows);
-    println!("Temp Index Present: {}", status.temp_index_present);
+    // 3. Enumerate canonical chunks and read one back through the typed
+    //    reference API. `ChunkRefSpec` accepts `chunk:<id>` ids as well as
+    //    store-relative paths.
+    let chunks = client.list_chunks()?;
+    println!("Stored context files: {}", chunks.len());
 
-    // 3. Use the typed Oracle status directly (if we had a direct API for it).
-    // The facade provides the foundational structures for evaluating
-    // index health before searching.
-    let oracle = OracleStatus::canonical_corpus_scan(
-        client.store_root(),
-        status.canonical_chunks,
-        status.canonical_chunks,
-        true,
+    let typed = ChunkRefSpec::parse("chunk:abcdef12")?;
+    println!("Typed chunk ref: {typed:?}");
+
+    if let Some(first) = chunks.first() {
+        let reference = first
+            .path
+            .strip_prefix(client.store_root())
+            .unwrap_or(&first.path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        match client.read_chunk(&reference, Some(200)) {
+            Ok(chunk) => println!(
+                "Read {} ({} bytes, project {}, agent {})",
+                chunk.relative_path, chunk.bytes, chunk.project, chunk.agent
+            ),
+            Err(error) => println!("Chunk read unavailable: {error}"),
+        }
+    }
+
+    // 4. Pure intent extraction — the contract Loctree consumes for
+    //    `aicx_intents`-style recall. Typed `IntentRecord`s carry kind,
+    //    summary, project, and provenance.
+    let config = IntentsConfig {
+        project: String::new(),
+        hours: 24,
+        strict: false,
+        min_confidence: None,
+        kind_filter: None,
+        frame_kind: None,
+    };
+    let extraction = client.extract_intents(&config)?;
+    println!(
+        "Intents (last 24h): {} records from {} scanned chunks",
+        extraction.records.len(),
+        extraction.stats.scanned_count
     );
-
-    println!("\nTyped Oracle Contract:");
-    println!("Backend: {:?}", oracle.backend);
-    println!("Layer: {}", oracle.source_layer);
-    println!("Loctree Safe: {}", oracle.loctree_scope_safe);
-    println!("Note: {}", oracle.loctree_scope_note);
-
-    let readiness = aicx::oracle::readiness(&[oracle]);
-    println!("Readiness: {:?}", readiness);
-
-    // 4. Perform a semantic search.
-    // The Aicx facade handles vector search (if the feature is enabled)
-    // and returns results with scores.
-    println!("\nSearching...");
-    match client.semantic_search("oracle contract", SearchOptions::default()) {
-        Ok(results) => {
-            println!("Found {} results", results.results.len());
-            for (i, res) in results.results.iter().take(3).enumerate() {
-                println!("  [{i}] Score: {:.4} | File: {}", res.score, res.path);
-            }
-        }
-        Err(e) => {
-            println!("Search unavailable: {e}");
-        }
+    if let Some(record) = extraction.records.first() {
+        println!(
+            "  [{:?}] {} ({} / {})",
+            record.kind, record.summary, record.project, record.date
+        );
     }
 
     Ok(())

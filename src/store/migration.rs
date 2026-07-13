@@ -1,5 +1,7 @@
 use anyhow::Result;
-use chrono::{TimeZone, Utc};
+#[cfg(feature = "app")]
+use chrono::TimeZone;
+use chrono::Utc;
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -13,6 +15,7 @@ use crate::store::paths::{
     legacy_salvage_dir, legacy_store_base_dir, migration_manifest_path, migration_report_path,
     store_base_dir,
 };
+#[cfg(feature = "app")]
 use crate::timeline::ExtractionConfig;
 use crate::timeline::TimelineEntry;
 
@@ -835,6 +838,21 @@ fn rebuild_source_into_store_impl(
     Ok(summary.written_paths)
 }
 
+/// Slim profile: raw-source rebuild needs the app-only parser dispatch and
+/// timeline projection. Failing here routes the item into the existing
+/// error path (`SourceProcessingOutcome.error` → `item.errors` →
+/// `should_salvage`), so legacy files are preserved via salvage instead of
+/// silently dropped.
+#[cfg(not(feature = "app"))]
+fn extract_entries_from_source(source: &ResolvedSource) -> Result<Vec<TimelineEntry>> {
+    anyhow::bail!(
+        "legacy {:?} source rebuild ({}) requires the aicx `app` feature; slim loctree-consumer builds preserve legacy items via salvage instead",
+        source.format,
+        source.path.display()
+    )
+}
+
+#[cfg(feature = "app")]
 fn extract_entries_from_source(source: &ResolvedSource) -> Result<Vec<TimelineEntry>> {
     let config = ExtractionConfig {
         project_filter: Vec::new(),
