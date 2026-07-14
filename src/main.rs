@@ -5224,8 +5224,12 @@ fn run_conversations_batch(options: ConversationsBatchOptions) -> Result<()> {
         watermark: None,
     };
 
-    let entries =
-        sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Claude, &config)?;
+    let batch = sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Claude, &config)?;
+    emit_session_batch_summary("claude", &batch);
+    if batch.selected_sessions > 0 && batch.ingested_sessions == 0 {
+        anyhow::bail!("all selected Claude sessions were skipped; see per-session diagnostics");
+    }
+    let entries = batch.entries;
 
     // Pre-compute discovery-aware histograms so dry-run can emit a
     // pipe-friendly JSON envelope alongside the human banner (Wave D
@@ -6337,6 +6341,47 @@ fn lookback_cutoff(hours: u64) -> DateTime<Utc> {
     Utc::now() - chrono::Duration::hours(hours_i64)
 }
 
+fn emit_session_batch_summary(agent: &str, batch: &sources::SessionExtractionBatch) {
+    for skip in &batch.skipped {
+        eprintln!(
+            "  [skip] agent={} session_id={} path={} reason={}",
+            agent,
+            skip.session_id,
+            skip.source_path.display(),
+            skip.reason
+        );
+        eprintln!("    recover: {}", skip.recover);
+    }
+    if batch.selected_sessions > 0 || !batch.skipped.is_empty() {
+        eprintln!(
+            "  [{}] session ingest summary: ingested={} skipped={}",
+            agent,
+            batch.ingested_sessions,
+            batch.skipped.len()
+        );
+    }
+}
+
+fn commit_canonical_projection(
+    fresh_cards: Vec<aicx::parser::projections::CanonicalCard>,
+    ingested_session_ids: &BTreeSet<String>,
+) -> Result<Option<PathBuf>> {
+    if ingested_session_ids.is_empty() {
+        return Ok(None);
+    }
+    let store_root = store::canonical_store_dir()?;
+    let mut cards = store::read_canonical_projection_at(&store_root)?
+        .map(|(_, cards)| cards)
+        .unwrap_or_default();
+    cards.retain(|card| !ingested_session_ids.contains(&card.session_id));
+    cards.extend(fresh_cards);
+    let projection = aicx::parser::projections::projection_from_cards(
+        cards,
+        &sources::canonical_projection_config(),
+    )?;
+    store::write_canonical_projection_at(&store_root, &projection).map(Some)
+}
+
 fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     let ExtractionParams {
         agents,
@@ -6401,6 +6446,11 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     let extract_phase =
         aicx::progress::Phase::start(reporter.clone(), "extract", Some(agents.len() as u64));
     let mut entries = Vec::new();
+    let mut selected_sessions = 0usize;
+    let mut ingested_sessions = 0usize;
+    let mut skipped_sessions = 0usize;
+    let mut canonical_cards = Vec::new();
+    let mut ingested_session_ids = BTreeSet::new();
     let mut agents_done: u64 = 0;
     for &agent in agents {
         let hb = aicx::progress::Heartbeat::spawn_with_backoff(
@@ -6424,13 +6474,15 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
             "grok" => {
                 sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Grok, &config)
             }
-            "codescribe" => aicx::importers::extract_codescribe(&config),
-            "operator-md" => aicx::importers::extract_operator_markdown(&config),
-            _ => Ok(Vec::new()),
+            "codescribe" => aicx::importers::extract_codescribe(&config)
+                .map(sources::SessionExtractionBatch::from_entries),
+            "operator-md" => aicx::importers::extract_operator_markdown(&config)
+                .map(sources::SessionExtractionBatch::from_entries),
+            _ => Ok(sources::SessionExtractionBatch::default()),
         };
         hb.stop();
-        let agent_entries = match agent_entries_result {
-            Ok(entries) => entries,
+        let agent_batch = match agent_entries_result {
+            Ok(batch) => batch,
             Err(e) => {
                 let record =
                     extract_phase.finish_err(&e, aicx::progress::recovery_hint_for("extract"));
@@ -6439,15 +6491,34 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
                 return Err(e);
             }
         };
+        emit_session_batch_summary(agent, &agent_batch);
+        selected_sessions += agent_batch.selected_sessions;
+        ingested_sessions += agent_batch.ingested_sessions;
+        skipped_sessions += agent_batch.skipped.len();
+        canonical_cards.extend(agent_batch.canonical_cards);
+        ingested_session_ids.extend(agent_batch.ingested_session_ids);
+        let agent_entries = agent_batch.entries;
         eprintln!("  [{}] {} entries", agent, agent_entries.len());
         entries.extend(agent_entries);
         agents_done += 1;
         extract_phase.tick(agents_done);
     }
+    if selected_sessions > 0 && ingested_sessions == 0 && skipped_sessions == selected_sessions {
+        let error = anyhow::anyhow!(
+            "all {selected_sessions} selected session(s) were skipped; no invalid session was ingested"
+        );
+        let record =
+            extract_phase.finish_err(&error, Some("inspect the per-session recover hints above"));
+        failures.record(record);
+        let _ = aicx::progress::render_failure_tail(&failures);
+        std::process::exit(3);
+    }
     extract_phase.finish_ok(format!(
-        "{} agents → {} entries",
+        "{} agents → {} entries; ingested={} skipped={}",
         agents.len(),
-        entries.len()
+        entries.len(),
+        ingested_sessions,
+        skipped_sessions
     ));
 
     // Sort by timestamp — done early so the watermark capture and
@@ -6460,7 +6531,14 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
     // trusted as a watermark source — dedup or self-echo can drop the
     // tail, leaving a watermark that re-extracts the same tail forever.
     // ──────────────────────────────────────────────────────────────────
-    let raw_extract_latest: Option<DateTime<Utc>> = entries.last().map(|e| e.timestamp);
+    let raw_extract_latest: Option<DateTime<Utc>> = if skipped_sessions == 0 {
+        entries.last().map(|e| e.timestamp)
+    } else {
+        eprintln!(
+            "  Watermark held: {skipped_sessions} skipped session(s) remain eligible for retry"
+        );
+        None
+    };
 
     // ──────────────────────────────────────────────────────────────────
     // Redact phase (#6): redaction must happen BEFORE dedup so the hash
@@ -6814,6 +6892,10 @@ fn run_extraction(params: ExtractionParams<'_>) -> Result<()> {
         }
     }
 
+    if let Some(path) = commit_canonical_projection(canonical_cards, &ingested_session_ids)? {
+        eprintln!("  Canonical projection: {}", path.display());
+    }
+
     // ──────────────────────────────────────────────────────────────────
     // Watermark write (#19): advance from `raw_extract_latest` captured
     // BEFORE filtering, not from the post-filter survivor list. This
@@ -6925,6 +7007,11 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
     let extract_phase =
         aicx::progress::Phase::start(reporter.clone(), "extract", Some(agents.len() as u64));
     let mut all_entries = Vec::new();
+    let mut selected_sessions = 0usize;
+    let mut ingested_sessions = 0usize;
+    let mut skipped_sessions = 0usize;
+    let mut canonical_cards = Vec::new();
+    let mut ingested_session_ids = BTreeSet::new();
     let mut agents_done: u64 = 0;
     for &ag in &agents {
         // Backoff so a long single-agent extract (e.g. ~/.claude/projects/
@@ -6952,20 +7039,20 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
             "grok" | "grok-sessions" => {
                 sources::extract_agent_sessions(aicx::session_catalog::AgentKind::Grok, &config)
             }
-            "codescribe" => aicx::importers::extract_codescribe(&config),
-            "operator-md" => {
-                if let Some(input) = operator_md_input.as_deref() {
-                    let home = dirs::home_dir().context("No home dir")?;
-                    aicx::importers::extract_operator_markdown_from_input(&home, input, &config)
-                } else {
-                    aicx::importers::extract_operator_markdown(&config)
-                }
+            "codescribe" => aicx::importers::extract_codescribe(&config)
+                .map(sources::SessionExtractionBatch::from_entries),
+            "operator-md" => if let Some(input) = operator_md_input.as_deref() {
+                let home = dirs::home_dir().context("No home dir")?;
+                aicx::importers::extract_operator_markdown_from_input(&home, input, &config)
+            } else {
+                aicx::importers::extract_operator_markdown(&config)
             }
-            _ => Ok(Vec::new()),
+            .map(sources::SessionExtractionBatch::from_entries),
+            _ => Ok(sources::SessionExtractionBatch::default()),
         };
         hb.stop();
-        let agent_entries = match agent_entries_result {
-            Ok(entries) => entries,
+        let agent_batch = match agent_entries_result {
+            Ok(batch) => batch,
             Err(e) => {
                 let record =
                     extract_phase.finish_err(&e, aicx::progress::recovery_hint_for("extract"));
@@ -6974,15 +7061,34 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
                 return Err(e);
             }
         };
+        emit_session_batch_summary(ag, &agent_batch);
+        selected_sessions += agent_batch.selected_sessions;
+        ingested_sessions += agent_batch.ingested_sessions;
+        skipped_sessions += agent_batch.skipped.len();
+        canonical_cards.extend(agent_batch.canonical_cards);
+        ingested_session_ids.extend(agent_batch.ingested_session_ids);
+        let agent_entries = agent_batch.entries;
         eprintln!("  [{}] {} entries", ag, agent_entries.len());
         all_entries.extend(agent_entries);
         agents_done += 1;
         extract_phase.tick(agents_done);
     }
+    if selected_sessions > 0 && ingested_sessions == 0 && skipped_sessions == selected_sessions {
+        let error = anyhow::anyhow!(
+            "all {selected_sessions} selected session(s) were skipped; no invalid session was ingested"
+        );
+        let record =
+            extract_phase.finish_err(&error, Some("inspect the per-session recover hints above"));
+        failures.record(record);
+        let _ = aicx::progress::render_failure_tail(&failures);
+        std::process::exit(3);
+    }
     extract_phase.finish_ok(format!(
-        "{} agents → {} entries",
+        "{} agents → {} entries; ingested={} skipped={}",
         agents.len(),
-        all_entries.len()
+        all_entries.len(),
+        ingested_sessions,
+        skipped_sessions
     ));
 
     all_entries.sort_by_key(|a| a.timestamp);
@@ -6993,7 +7099,14 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
     // a safe watermark source — self-echo or dedup can drop the tail,
     // leaving a watermark that re-extracts the same tail every run.
     // ──────────────────────────────────────────────────────────────────
-    let raw_extract_latest: Option<DateTime<Utc>> = all_entries.last().map(|e| e.timestamp);
+    let raw_extract_latest: Option<DateTime<Utc>> = if skipped_sessions == 0 {
+        all_entries.last().map(|e| e.timestamp)
+    } else {
+        eprintln!(
+            "  Watermark held: {skipped_sessions} skipped session(s) remain eligible for retry"
+        );
+        None
+    };
 
     // ──────────────────────────────────────────────────────────────────
     // Redact phase (#6): redaction must happen BEFORE dedup so the hash
@@ -7184,6 +7297,10 @@ fn run_store(args: StoreRunArgs) -> Result<()> {
             "  Resolved store buckets: {}",
             render_resolved_store_buckets(&scope_surface)
         );
+    }
+
+    if let Some(path) = commit_canonical_projection(canonical_cards, &ingested_session_ids)? {
+        eprintln!("  Canonical projection: {}", path.display());
     }
 
     // ──────────────────────────────────────────────────────────────────

@@ -510,13 +510,26 @@ impl<'a> Assembly<'a> {
             "function_call_output" | "custom_tool_call_output" => {
                 self.push_tool_turn(event, timestamp, evidence, ToolEventKind::Result)
             }
-            "reasoning"
-                if payload.get("encrypted_content").is_some()
-                    && reasoning_text_visible(payload).is_empty() =>
-            {
+            "reasoning" if payload.get("encrypted_content").is_some() => {
+                // A modern Codex reasoning item may carry both an encrypted
+                // body and a visible summary. The logical classifier marks
+                // the opaque unit as EncryptedOpaque in both cases, so the
+                // boundary flag must be set regardless of summary shape.
                 self.opaque_reasoning = true;
                 self.warn(WarningKind::OpaqueReasoning, evidence.coverage_ordinal);
-                Ok(())
+                let visible = reasoning_text_visible(payload);
+                if visible.is_empty() {
+                    Ok(())
+                } else {
+                    self.push_turn(
+                        TurnRole::Assistant,
+                        TurnKind::InternalThought,
+                        visible,
+                        timestamp,
+                        Known::unknown(),
+                        evidence,
+                    )
+                }
             }
             "reasoning" => self.push_turn(
                 TurnRole::Assistant,

@@ -302,6 +302,33 @@ fn codex_opaque_and_unsupported_boundaries_do_not_fake_visible_loss() {
 }
 
 #[test]
+fn codex_real_encrypted_content_shape_sets_opaque_boundary() {
+    let body = br#"{"timestamp":"2026-07-13T00:00:00Z","type":"session_meta","payload":{"id":"real-shape","cwd":"/repo"}}
+{"timestamp":"2026-07-13T00:00:01Z","type":"response_item","payload":{"type":"reasoning","id":"synthetic","summary":[],"encrypted_content":"synthetic-ciphertext","internal_chat_message_metadata_passthrough":null}}
+{"timestamp":"2026-07-13T00:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"visible answer"}]}}
+"#;
+    let model = model("real-shape", body);
+    assert_eq!(
+        model.coverage.status.visible_completeness,
+        VisibleCompleteness::CompleteVisible
+    );
+    assert!(
+        model
+            .coverage
+            .status
+            .boundary_flags
+            .opaque_reasoning_present
+    );
+    assert!(
+        model
+            .coverage
+            .skipped
+            .iter()
+            .any(|unit| unit.reason == SkippedReason::EncryptedOpaque && !unit.visible)
+    );
+}
+
+#[test]
 fn codex_source_identity_cwd_segments_skills_tools_and_physical_evidence_survive() {
     let body = br#"{"timestamp":"2026-07-13T00:00:00Z","type":"session_meta","payload":{"id":"identity","cwd":"/repo/a","model":"gpt-5","cli_version":"1.2.3"}}
 {"timestamp":"2026-07-13T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Run /vc-implement now"}}
