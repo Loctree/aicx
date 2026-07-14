@@ -63,11 +63,6 @@ pub fn project_validated_session(
     session: &ValidatedSession,
     config: &ProjectionConfig,
 ) -> Result<CanonicalProjection, ProjectionError> {
-    if config.extraction_schema.trim().is_empty() || config.producer_version.trim().is_empty() {
-        return Err(ProjectionError(
-            "extraction schema and producer version are required".to_owned(),
-        ));
-    }
     let model = session.model();
     let usage = usage_refs(&model.usage_events);
     let mut cards = Vec::with_capacity(model.turns.len());
@@ -107,7 +102,40 @@ pub fn project_validated_session(
             usage_references: usage.clone(),
         });
     }
+    projection_from_cards(cards, config)
+}
+
+/// Build one deterministic store projection from already validated cards.
+///
+/// Runtime ingest uses this to replace the cards for sessions retried in the
+/// current batch while preserving cards produced by earlier healthy batches.
+pub fn projection_from_cards(
+    mut cards: Vec<CanonicalCard>,
+    config: &ProjectionConfig,
+) -> Result<CanonicalProjection, ProjectionError> {
+    if config.extraction_schema.trim().is_empty() || config.producer_version.trim().is_empty() {
+        return Err(ProjectionError(
+            "extraction schema and producer version are required".to_owned(),
+        ));
+    }
     cards.sort_by(|left, right| left.id.cmp(&right.id));
+    for pair in cards.windows(2) {
+        if pair[0].id == pair[1].id {
+            return Err(ProjectionError(format!(
+                "duplicate canonical card id: {}",
+                pair[0].id
+            )));
+        }
+    }
+    if let Some(card) = cards
+        .iter()
+        .find(|card| card.schema != CANONICAL_CARD_SCHEMA)
+    {
+        return Err(ProjectionError(format!(
+            "unsupported canonical card schema for {}: {}",
+            card.id, card.schema
+        )));
+    }
     let store_revision = store_revision(&cards, config);
     Ok(CanonicalProjection {
         schema: "aicx.store.canonical_projection.v1".to_owned(),
@@ -348,5 +376,19 @@ mod tests {
         let producer =
             project_validated_session(&validated(1, "/src/Loctree/aicx"), &producer).unwrap();
         assert_ne!(one.store_revision, producer.store_revision);
+    }
+
+    #[test]
+    fn merged_cards_are_order_independent_and_reject_duplicates() {
+        let mut cards = project_validated_session(&validated(2, "/src/Loctree/aicx"), &config())
+            .unwrap()
+            .cards;
+        let forward = projection_from_cards(cards.clone(), &config()).unwrap();
+        cards.reverse();
+        let reverse = projection_from_cards(cards, &config()).unwrap();
+        assert_eq!(forward, reverse);
+
+        let duplicate = vec![forward.cards[0].clone(), forward.cards[0].clone()];
+        assert!(projection_from_cards(duplicate, &config()).is_err());
     }
 }

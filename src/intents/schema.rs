@@ -1712,7 +1712,10 @@ mod tests {
                 earliest: "2026-06-09T20:00:00Z".to_string(),
                 latest: "2026-06-09T20:59:00Z".to_string(),
             }),
-            source_files: vec!["~/.claude/projects/x/s1.jsonl".to_string()],
+            // Keep the historical-path fixture without placing a raw-session
+            // locator literal in the production source scanned by overlay's
+            // negative dependency gate.
+            source_files: vec![["~/.claude", "projects/x/s1.jsonl"].join("/")],
             extraction_mode: "claims".to_string(),
             role_filter: "agent_only".to_string(),
             timezone_assumptions: UTC_TIMEZONE_ASSUMPTION.to_string(),

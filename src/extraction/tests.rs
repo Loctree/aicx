@@ -2,6 +2,54 @@ use super::*;
 use chrono::TimeZone;
 
 #[test]
+#[cfg(feature = "app")]
+fn recent_fatal_completeness_is_classified_as_in_flight() {
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    assert!(is_in_flight_failure(
+        now_nanos,
+        "session parse failed with Fatal completeness"
+    ));
+    assert!(!is_in_flight_failure(
+        now_nanos,
+        "validation failed: opaque_boundary"
+    ));
+}
+
+#[test]
+#[cfg(feature = "app")]
+fn stale_fatal_completeness_is_not_mislabeled_in_flight() {
+    let old_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .saturating_sub(StdDuration::from_secs(10 * 60))
+        .as_nanos();
+    assert!(!is_in_flight_failure(
+        old_nanos,
+        "session parse failed with Fatal completeness"
+    ));
+}
+
+#[test]
+#[cfg(feature = "app")]
+fn session_selection_uses_watermark_as_retry_window_floor() {
+    let cutoff = Utc.with_ymd_and_hms(2026, 7, 13, 0, 0, 0).unwrap();
+    let watermark = Utc.with_ymd_and_hms(2026, 7, 14, 0, 0, 0).unwrap();
+    let config = ExtractionConfig {
+        project_filter: Vec::new(),
+        cutoff,
+        include_assistant: true,
+        watermark: Some(watermark),
+    };
+    let before = (watermark.timestamp_nanos_opt().unwrap() - 1) as u128;
+    let after = (watermark.timestamp_nanos_opt().unwrap() + 1) as u128;
+    assert!(!source_is_selected(before, &config));
+    assert!(source_is_selected(after, &config));
+}
+
+#[test]
 fn test_conversation_first_excludes_reasoning() {
     let entries = vec![
         TimelineEntry {

@@ -1,0 +1,29 @@
+{
+  "schema": "aicx.golden_attributions.v1",
+  "repo_id": "Loctree/loctree-suite",
+  "snapshot_commit": "176fdba9",
+  "anchor_catalog_revision": "acr1:3013401bfa924c6c3ce6e224f3aa036da08fc5d4df38564a99ba65fb1f12992f",
+  "producer_version": "0.13.1",
+  "pairs": [
+    {"anchor_id":"anc1:580f9e08d8f8d4d47dd7978f5aa1220be31e706f30402ee1f6f21844e64bb49f","path":"docs/contracts/verify_contracts.py","language":"py","thesis_marker":"uv run docs/contracts/verify_contracts.py","evidence":{"path":"docs/contracts/verify_contracts.py","line":1}},
+    {"anchor_id":"anc1:580f9e08d8f8d4d47dd7978f5aa1220be31e706f30402ee1f6f21844e64bb49f","path":"docs/contracts/verify_contracts.py","language":"py","thesis_marker":"repo-persistowany weryfikator","evidence":{"path":"docs/contracts/verify_contracts.py","line":1}},
+    {"anchor_id":"anc1:66a35d8ddd23d4e54a89fcdce47f42cd48c76e2e28496b9b244b2311ade75a84","path":"tools/forcefeed-probe/README.md","language":"md","thesis_marker":"tools/forcefeed-probe/README.md","evidence":{"path":"tools/forcefeed-probe/README.md","line":1}},
+    {"anchor_id":"anc1:6f2725a9e84880bdbbc17576d0c510f54bbc39b320ca87d805d4dff524eabb72","path":"docs/contracts/loctree.anchors.v1.schema.json","language":"json","thesis_marker":"SCHEMA katalogu kotwic","evidence":{"path":"docs/contracts/loctree.anchors.v1.schema.json","line":1}},
+    {"anchor_id":"anc1:ee201740d1a3e0d2edd04ba2ed56b8f3c95d50749348a420bd77ed583b96ac12","path":"tools/atlas_factset_check.py","language":"py","thesis_marker":"tools/atlas_factset_check.py`:","evidence":{"path":"tools/atlas_factset_check.py","line":1}},
+    {"anchor_id":"anc1:1f0b54c0aa1b572bef3021b815eb8a4fffcc4334e6687383ddbcdcd27dc5526d","path":"tools/forcefeed-probe/run.sh","language":"shell","thesis_marker":"harness + --runner/--repo/--out","evidence":{"path":"tools/forcefeed-probe/run.sh","line":1}},
+    {"anchor_id":"anc1:d90294206022bd6d4bc2a17d4290edb92c1aa814ae659c482b2d54cff4d08894","path":"docs/contracts/loctree.overlay.intent.v1.schema.json","language":"json","thesis_marker":"draft 2020-12","evidence":{"path":"docs/contracts/loctree.overlay.intent.v1.schema.json","line":1}},
+    {"anchor_id":"anc1:fe3a4606fb162da903a33b8c5ba5555362e1688a5fbd60da8461a89d90ef8d64","path":"tools/forcefeed-probe/fake-agent.sh","language":"shell","thesis_marker":"no-op capture before reply","evidence":{"path":"tools/forcefeed-probe/fake-agent.sh","line":1}},
+    {"anchor_id":"anc1:2be0957641f36bde0ebb0447d0a91a2b5245ab8cb060500a261ff4fb2835e291","path":"docs/contracts/sync_fixtures.py","language":"py","thesis_marker":"SYNC OK: 10 fixtures byte-identical","evidence":{"path":"docs/contracts/sync_fixtures.py","line":1}},
+    {"anchor_id":"anc1:38d8f203ed3ce9dcb42f8c479d361e5440c2d3a94f5c9627a9e6c8a24a5d51bc","path":"loctree-plugin/hooks/loct-context-card.sh","language":"shell","thesis_marker":"actual SessionStart","evidence":{"path":"loctree-plugin/hooks/loct-context-card.sh","line":1}},
+    {"anchor_id":"anc1:580f9e08d8f8d4d47dd7978f5aa1220be31e706f30402ee1f6f21844e64bb49f","path":"docs/contracts/verify_contracts.py","language":"py","thesis_marker":"LOCTREE_SUITE_ROOT=… AICX_ROOT=…","evidence":{"path":"docs/contracts/verify_contracts.py","line":1}},
+    {"anchor_id":"anc1:580f9e08d8f8d4d47dd7978f5aa1220be31e706f30402ee1f6f21844e64bb49f","path":"docs/contracts/verify_contracts.py","language":"py","thesis_marker":"superset §6","evidence":{"path":"docs/contracts/verify_contracts.py","line":1}},
+    {"anchor_id":"anc1:ee201740d1a3e0d2edd04ba2ed56b8f3c95d50749348a420bd77ed583b96ac12","path":"tools/atlas_factset_check.py","language":"py","thesis_marker":"L1-01 parser reuse","evidence":{"path":"tools/atlas_factset_check.py","line":1}},
+    {"anchor_id":"anc1:6f2725a9e84880bdbbc17576d0c510f54bbc39b320ca87d805d4dff524eabb72","path":"docs/contracts/loctree.anchors.v1.schema.json","language":"json","thesis_marker":"formaty zamrożone","evidence":{"path":"docs/contracts/loctree.anchors.v1.schema.json","line":1}},
+    {"anchor_id":"anc1:64b9af10029000e9e287c6cd3dbf69f014038f2090a0de5d440d152b32eb03b6","path":"docs/contracts/atlas-card-format.md","language":"md","thesis_marker":"kanon spec kart","evidence":{"path":"docs/contracts/atlas-card-format.md","line":1}},
+    {"anchor_id":"anc1:64b9af10029000e9e287c6cd3dbf69f014038f2090a0de5d440d152b32eb03b6","path":"docs/contracts/atlas-card-format.md","language":"md","thesis_marker":"## Reachability","evidence":{"path":"docs/contracts/atlas-card-format.md","line":1}},
+    {"anchor_id":"anc1:f4b6ac47ac2c0e430347a6b7ae1275c3cb358f247e7518f70135966c0d3c3f99","path":"docs/contracts/fixtures/overlay-intent-v1/valid_01_full_overlay.json","language":"json","thesis_marker":"typed attribution decyzja→symbol","evidence":{"path":"docs/contracts/fixtures/overlay-intent-v1/valid_01_full_overlay.json","line":1}},
+    {"anchor_id":"anc1:80daeeb756be5dad9611586bd7812506d38a9bebdf08f6b0882f455e2df43ae4","path":"docs/contracts/fixtures/overlay-intent-v1/revision_matrix.json","language":"json","thesis_marker":"czterowariantowa macierz","evidence":{"path":"docs/contracts/fixtures/overlay-intent-v1/revision_matrix.json","line":1}},
+    {"anchor_id":"anc1:2be0957641f36bde0ebb0447d0a91a2b5245ab8cb060500a261ff4fb2835e291","path":"docs/contracts/sync_fixtures.py","language":"py","thesis_marker":"mirror z sha256-checkiem","evidence":{"path":"docs/contracts/sync_fixtures.py","line":1}},
+    {"anchor_id":"anc1:7e68a842a04e1635b0fa1806d94ca71def35f44e13ba713afae2b2b105cbed74","path":"docs/contracts/sync_fixtures.py","language":"py","thesis_marker":"mirror z sha256-checkiem","evidence":{"path":"docs/contracts/sync_fixtures.py","line":1}}
+  ]
+}

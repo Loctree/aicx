@@ -65,6 +65,20 @@ fn write_codex_history(
     write_file(path, &lines.join("\n"));
 }
 
+fn write_claude_session_fixture(path: &Path, session_id: Option<&str>, text: &str) {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let mut row = json!({
+        "timestamp": timestamp,
+        "type": "user",
+        "cwd": "/repo",
+        "message": {"role": "user", "content": text}
+    });
+    if let Some(session_id) = session_id {
+        row["sessionId"] = Value::String(session_id.to_owned());
+    }
+    write_file(path, &row.to_string());
+}
+
 fn current_profile_dir() -> PathBuf {
     let test_exe = std::env::current_exe().expect("resolve current test executable");
     test_exe
@@ -1288,6 +1302,91 @@ fn test_run_extraction_saves_state_on_empty_result() {
         1,
         "state should save run history even when no entries were extracted via all/extract"
     );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn session_batch_quarantines_bad_claude_source_and_holds_watermark() {
+    let root = unique_test_dir("claude-batch-quarantine");
+    let home = root.join("home");
+    let sessions = home.join(".claude").join("projects").join("project");
+    let healthy = sessions.join("11111111-1111-4111-8111-111111111111.jsonl");
+    let invalid = sessions.join("22222222-2222-4222-8222-222222222222.jsonl");
+    write_claude_session_fixture(&healthy, Some("healthy-session"), "healthy prompt");
+    write_claude_session_fixture(&invalid, None, "identity-free prompt");
+
+    let output = run_aicx(&home, &["claude", "-H", "24", "--emit", "json"]);
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("session ingest summary: ingested=1 skipped=1"));
+    assert!(stderr.contains(&invalid.display().to_string()));
+    assert!(stderr.contains("session_id=22222222-2222-4222-8222-222222222222"));
+    assert!(stderr.contains("recover: aicx extract claude --file"));
+    assert!(stderr.contains("Watermark held: 1 skipped session(s)"));
+    assert!(stderr.contains("Canonical projection:"));
+
+    let projection_dir = home
+        .join(".aicx")
+        .join("store")
+        .join("canonical-projection-v1");
+    let manifest: Value = serde_json::from_str(
+        &fs::read_to_string(projection_dir.join("manifest.json"))
+            .expect("canonical projection manifest"),
+    )
+    .expect("valid canonical projection manifest");
+    let card_ids = manifest["card_ids"].as_array().expect("manifest card ids");
+    assert_eq!(card_ids.len(), 1, "only the healthy session may project");
+    let card_name = format!(
+        "{}.json",
+        card_ids[0].as_str().expect("card id").replace(':', "_")
+    );
+    let card: Value = serde_json::from_str(
+        &fs::read_to_string(projection_dir.join("cards").join(card_name)).expect("canonical card"),
+    )
+    .expect("valid canonical card");
+    assert_eq!(card["session_id"].as_str(), Some("healthy-session"));
+
+    let state = read_state(&home);
+    assert_eq!(
+        state["last_processed"].as_object().map(|map| map.len()),
+        Some(0),
+        "a skipped session must keep the batch watermark retryable"
+    );
+    let diagnostics_dir = home.join(".aicx").join("state");
+    let diagnostic = fs::read_dir(&diagnostics_dir)
+        .expect("diagnostics directory")
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("diagnostics-")
+        })
+        .expect("diagnostics log");
+    let log = fs::read_to_string(diagnostic.path()).expect("read diagnostics log");
+    assert!(log.contains("session_skip agent=claude"));
+    assert!(log.contains(&invalid.display().to_string()));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn session_batch_returns_exit_three_when_every_session_is_quarantined() {
+    let root = unique_test_dir("claude-batch-all-skipped");
+    let home = root.join("home");
+    let invalid = home
+        .join(".claude")
+        .join("projects")
+        .join("project")
+        .join("33333333-3333-4333-8333-333333333333.jsonl");
+    write_claude_session_fixture(&invalid, None, "identity-free prompt");
+
+    let output = run_aicx(&home, &["claude", "-H", "24"]);
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("session ingest summary: ingested=0 skipped=1"));
+    assert!(stderr.contains("all 1 selected session(s) were skipped"));
 
     let _ = fs::remove_dir_all(&root);
 }

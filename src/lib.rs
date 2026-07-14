@@ -65,6 +65,8 @@ mod oracle;
 #[cfg(feature = "app")]
 pub mod output;
 #[cfg(feature = "app")]
+pub mod overlay;
+#[cfg(feature = "app")]
 pub mod parser_dispatch;
 #[cfg(feature = "app")]
 pub mod progress;

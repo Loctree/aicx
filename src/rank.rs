@@ -238,6 +238,26 @@ pub struct ChunkScore {
     pub label: &'static str,
 }
 
+/// Candidate threshold for semantic intent clustering. The embedding score is
+/// deliberately only a candidate signal: overlay policy still applies its
+/// pair-relative negation/contradiction veto before any merge.
+pub const SEMANTIC_INTENT_CANDIDATE_THRESHOLD: f32 = 0.82;
+
+/// Rank two intent embeddings using the shared AICX embedding similarity
+/// implementation. Keeping the threshold in the rank layer gives search and
+/// overlay one explicit scoring owner while leaving merge policy to overlay.
+pub fn intent_candidate_similarity(left: &[f32], right: &[f32]) -> f32 {
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    {
+        aicx_embeddings::similarity(left, right)
+    }
+    #[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+    {
+        let _ = (left, right);
+        0.0
+    }
+}
+
 /// Shared fuzzy-search result for a stored chunk.
 #[derive(Debug, Clone, Serialize)]
 pub struct FuzzyResult {
@@ -1414,6 +1434,14 @@ fn is_high_value_signal(lower: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_intent_candidate_uses_shared_cosine_ranker() {
+        let close = intent_candidate_similarity(&[1.0, 0.0], &[0.99, 0.01]);
+        let far = intent_candidate_similarity(&[1.0, 0.0], &[0.0, 1.0]);
+        assert!(close >= SEMANTIC_INTENT_CANDIDATE_THRESHOLD);
+        assert!(far < SEMANTIC_INTENT_CANDIDATE_THRESHOLD);
+    }
 
     #[test]
     fn test_empty_content() {
