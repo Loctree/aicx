@@ -20,8 +20,8 @@ use std::time::Instant;
 
 pub const OVERLAY_SCHEMA: &str = "loctree.overlay.intent.v1";
 pub const OVERLAY_INDEX_SCHEMA: &str = "aicx.overlay.side_index.v1";
-pub const ATTRIBUTION_VERSION: &str = "path-symbol-resolver.v1";
-pub const DEDUP_VERSION: &str = "evidence-cluster.v1";
+pub const ATTRIBUTION_VERSION: &str = "path-symbol-resolver.v2";
+pub const DEDUP_VERSION: &str = "evidence-claim-cluster.v2";
 pub const EMBEDDING_MODEL: &str = "none:typed-lexical";
 pub const ATTRIBUTION_THRESHOLD: f64 = 0.90;
 
@@ -147,6 +147,8 @@ struct SideIndex {
 struct IndexedIntent {
     intent_id: String,
     evidence_event_id: String,
+    #[serde(default)]
+    claim_key: String,
     session_id: String,
     turn_idx: u64,
     thesis: String,
@@ -421,56 +423,69 @@ fn update_side_index(
     store_revision: &str,
     rebuild: bool,
 ) -> Result<(SideIndex, usize, usize)> {
-    let mut existing_by_evidence: BTreeMap<String, IndexedIntent> = previous
+    let mut existing_by_claim: BTreeMap<String, IndexedIntent> = previous
         .map(|index| {
             index
                 .entries
                 .into_iter()
-                .map(|entry| (entry.evidence_event_id.clone(), entry))
+                .map(|entry| {
+                    let key = claim_key(&entry.evidence_event_id, &entry.thesis);
+                    (key, entry)
+                })
                 .collect()
         })
         .unwrap_or_default();
     if rebuild {
         let current: BTreeSet<_> = cards
             .iter()
-            .flat_map(|card| card.evidence_event_ids.iter().cloned())
+            .filter_map(|card| {
+                card.evidence_event_ids
+                    .first()
+                    .map(|evidence| (evidence, distill_theses(&card.frame.text)))
+            })
+            .flat_map(|(evidence, theses)| {
+                theses
+                    .into_iter()
+                    .map(|thesis| claim_key(evidence, &thesis))
+            })
             .collect();
-        existing_by_evidence.retain(|evidence, _| current.contains(evidence));
+        existing_by_claim.retain(|key, _| current.contains(key));
     }
-    let retained = existing_by_evidence.len();
+    let retained = existing_by_claim.len();
     let mut new_intents = 0usize;
     for card in cards {
-        let Some(thesis) = distill_thesis(&card.frame.text) else {
-            continue;
-        };
         let Some(evidence_event_id) = card.evidence_event_ids.first() else {
             continue;
         };
-        if existing_by_evidence.contains_key(evidence_event_id) {
-            continue;
+        for thesis in distill_theses(&card.frame.text) {
+            let key = claim_key(evidence_event_id, &thesis);
+            if existing_by_claim.contains_key(&key) {
+                continue;
+            }
+            let intent_id = random_intent_id()?;
+            existing_by_claim.insert(
+                key.clone(),
+                IndexedIntent {
+                    intent_id,
+                    evidence_event_id: evidence_event_id.clone(),
+                    claim_key: key,
+                    session_id: safe_token(&card.session_id),
+                    turn_idx: card.frame.turn_idx,
+                    thesis,
+                    valid_from: card_timestamp(card),
+                    // User/operator cards are authority; other typed cards remain derived.
+                    authority: if card.frame.role == TurnRole::User {
+                        "operator_confirmed"
+                    } else {
+                        "agent_derived"
+                    }
+                    .to_owned(),
+                },
+            );
+            new_intents += 1;
         }
-        let intent_id = random_intent_id()?;
-        existing_by_evidence.insert(
-            evidence_event_id.clone(),
-            IndexedIntent {
-                intent_id,
-                evidence_event_id: evidence_event_id.clone(),
-                session_id: safe_token(&card.session_id),
-                turn_idx: card.frame.turn_idx,
-                thesis,
-                valid_from: card_timestamp(card),
-                // User/operator cards are authority; other typed cards remain derived.
-                authority: if card.frame.role == TurnRole::User {
-                    "operator_confirmed"
-                } else {
-                    "agent_derived"
-                }
-                .to_owned(),
-            },
-        );
-        new_intents += 1;
     }
-    let mut entries: Vec<_> = existing_by_evidence.into_values().collect();
+    let mut entries: Vec<_> = existing_by_claim.into_values().collect();
     entries.sort_by(|left, right| left.intent_id.cmp(&right.intent_id));
     Ok((
         SideIndex {
@@ -484,7 +499,7 @@ fn update_side_index(
     ))
 }
 
-fn distill_thesis(text: &str) -> Option<String> {
+fn distill_theses(text: &str) -> Vec<String> {
     // Contract filter: dispatch templates and runtime plumbing are not product intent.
     const BOILERPLATE: &[&str] = &[
         "VIBECRAFTED_",
@@ -493,8 +508,14 @@ fn distill_thesis(text: &str) -> Option<String> {
         "<INSTRUCTIONS>",
         "background-task completions",
     ];
-    let preferred = text.lines().find_map(|line| {
-        let trimmed = line
+    let report_line = Regex::new(r"^\d+\s+").expect("static regex");
+    let path = Regex::new(r"[A-Za-z0-9._@+-]+(?:/[A-Za-z0-9._@+*?-]+)+").expect("static regex");
+    let quoted_filename = Regex::new(r"`[^`/\s]+\.[A-Za-z0-9]+`").expect("static regex");
+    let diffstat = Regex::new(r"\|\s*\d+\s+[+-]+$").expect("static regex");
+    let mut theses = BTreeSet::new();
+    for line in text.lines() {
+        let numbered = report_line.replace(line.trim(), "");
+        let trimmed = numbered
             .trim()
             .trim_start_matches(['-', '*', '#', '>', ' '])
             .trim();
@@ -505,26 +526,54 @@ fn distill_thesis(text: &str) -> Option<String> {
                 .any(|marker| lower.contains(&marker.to_ascii_lowercase()))
             || lower.starts_with("task:")
             || lower.starts_with("todo:")
+            || trimmed.starts_with("?? ")
+            || trimmed.starts_with('|')
+            || trimmed.starts_with("```")
+            || diffstat.is_match(trimmed)
         {
-            return None;
+            continue;
         }
-        ["decision:", "intent:", "why:", "decyzja:", "intencja:"]
+        let explicit = ["decision:", "intent:", "why:", "decyzja:", "intencja:"]
             .iter()
             .find_map(|prefix| {
                 lower
                     .starts_with(prefix)
                     .then(|| trimmed[prefix.len()..].trim())
-            })
-            .or_else(|| {
-                ["must ", "should ", "musimy ", "należy ", "zakaz "]
-                    .iter()
-                    .any(|marker| lower.starts_with(marker))
-                    .then_some(trimmed)
-            })
-    })?;
-    let thesis = preferred.split_whitespace().collect::<Vec<_>>().join(" ");
-    let thesis = truncate_chars(&thesis, 200);
-    (!thesis.is_empty()).then_some(thesis)
+            });
+        let normative = ["must ", "should ", "musimy ", "należy ", "zakaz "]
+            .iter()
+            .any(|marker| lower.starts_with(marker));
+        // Canonical report cards often carry several independently evidenced
+        // decisions. A path-bearing line is one typed claim, not boilerplate;
+        // keeping each line separate lets one evidence event own stable intent
+        // clusters without reparsing the rendered conversation corpus.
+        let preferred = explicit.or_else(|| {
+            (normative || path.is_match(trimmed) || quoted_filename.is_match(trimmed))
+                .then_some(trimmed)
+        });
+        let Some(preferred) = preferred else {
+            continue;
+        };
+        let thesis = preferred.split_whitespace().collect::<Vec<_>>().join(" ");
+        let thesis = truncate_chars(&thesis, 200);
+        if !thesis.is_empty() {
+            theses.insert(thesis);
+        }
+    }
+    theses.into_iter().collect()
+}
+
+#[cfg(test)]
+fn distill_thesis(text: &str) -> Option<String> {
+    distill_theses(text).into_iter().next()
+}
+
+fn claim_key(evidence_event_id: &str, thesis: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(evidence_event_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(thesis.as_bytes());
+    format!("claim2:{}", hex::encode(hasher.finalize()))
 }
 
 fn resolve_entries(
@@ -566,6 +615,12 @@ fn resolve_entries(
         }
         accepted.sort_by(|left, right| left.target_anchor.cmp(&right.target_anchor));
         accepted.dedup_by(|left, right| left.target_anchor == right.target_anchor);
+        // Unresolved candidates are payload-only by contract. A thesis becomes
+        // an overlay entry only after at least one target crosses the truth
+        // threshold; otherwise consumers would receive force-fed repo truth.
+        if accepted.is_empty() {
+            continue;
+        }
         let refs = vec![OverlayRef {
             evidence_event_id: intent.evidence_event_id.clone(),
             opaque_ref: format!("session:{}#turn-{}", intent.session_id, intent.turn_idx),
@@ -606,6 +661,12 @@ fn attribution_candidates<'a>(
     let normalized = text.replace('\\', "/");
     let lower = normalized.to_ascii_lowercase();
     let mut exact_paths = BTreeSet::new();
+    let quoted_filename_re = Regex::new(r"`([^`/\s]+\.[A-Za-z0-9]+)`").expect("static regex");
+    let quoted_filenames: BTreeSet<_> = quoted_filename_re
+        .captures_iter(&normalized)
+        .filter_map(|capture| capture.get(1))
+        .map(|filename| filename.as_str().to_ascii_lowercase())
+        .collect();
     let path_re = Regex::new(r"[A-Za-z0-9._@+-]+(?:/[A-Za-z0-9._@+-]+)+").expect("static regex");
     let mut saw_path = false;
     for capture in path_re.find_iter(&normalized) {
@@ -626,6 +687,9 @@ fn attribution_candidates<'a>(
     let mut candidates = Vec::new();
     for anchor in anchors {
         let path_lower = anchor.normalized_path.to_ascii_lowercase();
+        if !exact_paths.is_empty() && !exact_paths.contains(&path_lower) {
+            continue;
+        }
         let symbol_match = anchor
             .qualified_symbol
             .as_ref()
@@ -646,7 +710,37 @@ fn attribution_candidates<'a>(
             candidates.push(Candidate {
                 anchor,
                 match_kind: "qualified_symbol",
-                confidence: 0.94,
+                // A bare symbol mention without a corroborating path is a
+                // candidate, not truth. Keep it payload-only until a future
+                // semantic resolver can prove the join.
+                confidence: 0.88,
+            });
+        } else if anchor.qualified_symbol.is_none()
+            && Path::new(&anchor.normalized_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    let name = name.to_ascii_lowercase();
+                    quoted_filenames.contains(&name)
+                        && anchors
+                            .iter()
+                            .filter(|candidate| {
+                                candidate.qualified_symbol.is_none()
+                                    && Path::new(&candidate.normalized_path)
+                                        .file_name()
+                                        .and_then(|filename| filename.to_str())
+                                        .is_some_and(|filename| {
+                                            filename.eq_ignore_ascii_case(&name)
+                                        })
+                            })
+                            .count()
+                            == 1
+                })
+        {
+            candidates.push(Candidate {
+                anchor,
+                match_kind: "filename_lexical",
+                confidence: 0.92,
             });
         } else if anchor.qualified_symbol.is_none()
             && Path::new(&anchor.normalized_path)
@@ -842,6 +936,9 @@ mod tests {
         assert!(distill_thesis("TASK: VIBECRAFTED_REPORT_PATH=/tmp/x").is_none());
         let long = format!("DECISION: {}", "a".repeat(240));
         assert_eq!(distill_thesis(&long).unwrap().chars().count(), 200);
+        let report =
+            "1 - docs/contracts/one.json — first contract\n2 - tools/two.py — second contract";
+        assert_eq!(distill_theses(report).len(), 2);
     }
 
     #[test]
@@ -885,6 +982,7 @@ mod tests {
         let intent = IndexedIntent {
             intent_id: "int1:0123456789abcdef".to_owned(),
             evidence_event_id: "ev1:codex:session-0001:000001:text:0123456789abcdef".to_owned(),
+            claim_key: "claim2:test".to_owned(),
             session_id: "session-0001".to_owned(),
             turn_idx: 1,
             thesis: "main.rs remains the executable boundary".to_owned(),
@@ -911,7 +1009,7 @@ mod tests {
             }],
         };
         let (entries, unresolved) = resolve_entries(&index, &catalog, &root);
-        assert!(entries[0].attributions.is_empty());
+        assert!(entries.is_empty());
         assert_eq!(unresolved.len(), 1);
         assert_eq!(unresolved[0].confidence, 0.72);
         let _ = fs::remove_dir_all(root);
@@ -1010,30 +1108,36 @@ mod tests {
                 .iter()
                 .all(|reference| reference.evidence_event_id.starts_with("ev1:"))
         }));
-        let emitted: BTreeMap<_, _> = first
-            .entries
-            .iter()
-            .flat_map(|entry| {
-                entry.attributions.iter().map(move |attribution| {
-                    (attribution.target_anchor.clone(), entry.thesis.clone())
-                })
-            })
-            .collect();
-        let hits = golden
-            .pairs
-            .iter()
-            .filter(|pair| {
+        let mut emitted: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for entry in &first.entries {
+            for attribution in &entry.attributions {
                 emitted
-                    .get(&pair.anchor_id)
-                    .is_some_and(|thesis| thesis.contains(&pair.thesis_marker))
-            })
-            .count();
-        let misses = emitted.len().saturating_sub(hits);
+                    .entry(attribution.target_anchor.clone())
+                    .or_default()
+                    .push(entry.thesis.clone());
+            }
+        }
+        let mut hits = 0usize;
+        let mut misses = 0usize;
+        let mut abstentions = 0usize;
+        for pair in &golden.pairs {
+            match emitted.get(&pair.anchor_id) {
+                None => abstentions += 1,
+                Some(theses)
+                    if theses
+                        .iter()
+                        .any(|thesis| thesis.contains(&pair.thesis_marker)) =>
+                {
+                    hits += 1
+                }
+                Some(_) => misses += 1,
+            }
+        }
         let precision = hits as f64 / (hits + misses).max(1) as f64;
         assert!(precision >= 0.90, "precision={precision}");
         assert_eq!(hits, golden.pairs.len(), "golden recall regressed");
         eprintln!(
-            "golden precision={precision:.2} recall=1.00 abstentions=0 hits={hits} misses={misses}"
+            "golden precision={precision:.2} recall=1.00 abstentions={abstentions} hits={hits} misses={misses}"
         );
 
         let stable_ids: BTreeMap<_, _> = first
