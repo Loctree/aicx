@@ -5,6 +5,7 @@
 //! conversation Markdown. Loctree owns structural identity; this module joins
 //! distilled card claims to the catalog emitted by `loct anchors`.
 
+use crate::rank::{SEMANTIC_INTENT_CANDIDATE_THRESHOLD, intent_candidate_similarity};
 use crate::store::{canonical_store_dir, read_canonical_projection_at, resolve_aicx_home};
 use aicx_parser::engine::{Known, TurnRole};
 use aicx_parser::projections::CanonicalCard;
@@ -21,8 +22,8 @@ use std::time::Instant;
 pub const OVERLAY_SCHEMA: &str = "loctree.overlay.intent.v1";
 pub const OVERLAY_INDEX_SCHEMA: &str = "aicx.overlay.side_index.v1";
 pub const ATTRIBUTION_VERSION: &str = "path-symbol-resolver.v2";
-pub const DEDUP_VERSION: &str = "evidence-claim-cluster.v2";
-pub const EMBEDDING_MODEL: &str = "none:typed-lexical";
+pub const DEDUP_VERSION: &str = "semantic-negation-veto.v1";
+pub const EMBEDDING_MODEL: &str = "aicx-embeddings.configured.v1";
 pub const ATTRIBUTION_THRESHOLD: f64 = 0.90;
 
 #[derive(Debug, Clone)]
@@ -58,14 +59,16 @@ pub struct OverlayEntry {
     pub authority: String,
     pub verification_status: String,
     pub valid_from: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub relations: Vec<serde_json::Value>,
+    pub relations: Vec<OverlayRelation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attributions: Vec<Attribution>,
     pub refs: Vec<OverlayRef>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OverlayTarget {
     Repo,
@@ -115,6 +118,15 @@ pub struct OverlayRef {
     pub opaque_ref: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OverlayRelation {
+    pub kind: String,
+    pub intent_id: String,
+    pub evidence_ref: String,
+    pub confidence: f64,
+    pub observed_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AnchorCatalog {
     repo_id: String,
@@ -140,12 +152,20 @@ struct SideIndex {
     schema: String,
     repo_id: String,
     store_revision: String,
+    #[serde(default)]
+    embedding_model: String,
     entries: Vec<IndexedIntent>,
+    #[serde(default)]
+    groups: Vec<OverlayEntry>,
+    #[serde(default)]
+    unresolved_attributions: Vec<UnresolvedAttribution>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct IndexedIntent {
     intent_id: String,
+    #[serde(default)]
+    group_intent_id: String,
     evidence_event_id: String,
     #[serde(default)]
     claim_key: String,
@@ -154,6 +174,8 @@ struct IndexedIntent {
     thesis: String,
     valid_from: String,
     authority: String,
+    #[serde(default)]
+    embedding: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -215,7 +237,8 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
     cards.sort_by(|left, right| left.id.cmp(&right.id));
     cards.dedup_by(|left, right| left.id == right.id);
     let store_revision = combined_store_revision(&revisions)?;
-    let overlay_revision = overlay_revision(&catalog, &store_revision);
+    let embedding_model = configured_embedding_model_key();
+    let overlay_revision = overlay_revision(&catalog, &store_revision, &embedding_model);
     let index_root = options.index_root.clone().unwrap_or(
         resolve_aicx_home()?
             .join("overlay-index-v1")
@@ -240,15 +263,18 @@ pub fn build_overlay(options: &OverlayOptions) -> Result<(OverlayDocument, Overl
     }
     let side_index_path = index_root.join("side-index.json");
     let previous = read_side_index(&side_index_path, &catalog.repo_id)?;
-    let (index, new_intents, retained_intents) = update_side_index(
+    let (mut index, new_intents, retained_intents) = update_side_index(
         previous,
         &cards,
         &catalog.repo_id,
         &store_revision,
+        &embedding_model,
         options.rebuild,
     )?;
+    materialize_side_index(&mut index, &catalog, &repo)?;
     atomic_write_json(&side_index_path, &index)?;
-    let (entries, unresolved) = resolve_entries(&index, &catalog, &repo);
+    let entries = index.groups.clone();
+    let unresolved = index.unresolved_attributions.clone();
     let emitted_attributions = entries.iter().map(|entry| entry.attributions.len()).sum();
     let stats = OverlayBuildStats {
         canonical_cards_seen: cards.len(),
@@ -380,14 +406,24 @@ fn combined_store_revision(revisions: &BTreeSet<String>) -> Result<String> {
     Ok(revisions.iter().next().cloned().unwrap_or_default())
 }
 
-fn overlay_revision(catalog: &AnchorCatalog, store_revision: &str) -> String {
-    overlay_revision_with_attribution(catalog, store_revision, ATTRIBUTION_VERSION)
+fn overlay_revision(
+    catalog: &AnchorCatalog,
+    store_revision: &str,
+    embedding_model: &str,
+) -> String {
+    overlay_revision_with_attribution(
+        catalog,
+        store_revision,
+        ATTRIBUTION_VERSION,
+        embedding_model,
+    )
 }
 
 fn overlay_revision_with_attribution(
     catalog: &AnchorCatalog,
     store_revision: &str,
     attribution_version: &str,
+    embedding_model: &str,
 ) -> String {
     let material = [
         catalog.repo_id.as_str(),
@@ -398,10 +434,50 @@ fn overlay_revision_with_attribution(
         attribution_version,
         DEDUP_VERSION,
         EMBEDDING_MODEL,
+        embedding_model,
+        &format!("{SEMANTIC_INTENT_CANDIDATE_THRESHOLD:.2}"),
         "0.90",
     ]
     .join("\0");
     format!("ov1:{}", hex::encode(Sha256::digest(material.as_bytes())))
+}
+
+#[cfg(test)]
+fn configured_embedding_model_key() -> String {
+    // The test embedder is a deterministic offline seam. Do not let unrelated
+    // parallel tests which mutate embedding env/config change cache identity.
+    "test:frozen-semantic-fixture.v1".to_owned()
+}
+
+#[cfg(all(
+    not(test),
+    any(feature = "native-embedder", feature = "cloud-embedder")
+))]
+fn configured_embedding_model_key() -> String {
+    let config = crate::embedder::EmbeddingConfig::from_env();
+    if config.backend.as_str() == "cloud" {
+        let cloud_model = config
+            .cloud
+            .as_ref()
+            .map(|cloud| cloud.model.as_str())
+            .unwrap_or("unconfigured");
+        return format!("cloud:{cloud_model}");
+    }
+    let resolved = config.resolved_model();
+    format!(
+        "{}:{}:{}",
+        config.backend.as_str(),
+        resolved.repo,
+        resolved.filename
+    )
+}
+
+#[cfg(all(
+    not(test),
+    not(any(feature = "native-embedder", feature = "cloud-embedder"))
+))]
+fn configured_embedding_model_key() -> String {
+    "unavailable:no-embedder-feature".to_owned()
 }
 
 fn read_side_index(path: &Path, repo_id: &str) -> Result<Option<SideIndex>> {
@@ -421,8 +497,22 @@ fn update_side_index(
     cards: &[CanonicalCard],
     repo_id: &str,
     store_revision: &str,
+    embedding_model: &str,
     rebuild: bool,
 ) -> Result<(SideIndex, usize, usize)> {
+    let mut previous = previous;
+    if previous
+        .as_ref()
+        .is_some_and(|index| index.embedding_model != embedding_model)
+        && let Some(index) = &mut previous
+    {
+        for entry in &mut index.entries {
+            entry.embedding.clear();
+            entry.group_intent_id.clear();
+        }
+        index.groups.clear();
+        index.unresolved_attributions.clear();
+    }
     let mut existing_by_claim: BTreeMap<String, IndexedIntent> = previous
         .map(|index| {
             index
@@ -467,6 +557,7 @@ fn update_side_index(
                 key.clone(),
                 IndexedIntent {
                     intent_id,
+                    group_intent_id: String::new(),
                     evidence_event_id: evidence_event_id.clone(),
                     claim_key: key,
                     session_id: safe_token(&card.session_id),
@@ -480,6 +571,7 @@ fn update_side_index(
                         "agent_derived"
                     }
                     .to_owned(),
+                    embedding: Vec::new(),
                 },
             );
             new_intents += 1;
@@ -492,7 +584,10 @@ fn update_side_index(
             schema: OVERLAY_INDEX_SCHEMA.to_owned(),
             repo_id: repo_id.to_owned(),
             store_revision: store_revision.to_owned(),
+            embedding_model: embedding_model.to_owned(),
             entries,
+            groups: Vec::new(),
+            unresolved_attributions: Vec::new(),
         },
         new_intents,
         retained,
@@ -576,14 +671,133 @@ fn claim_key(evidence_event_id: &str, thesis: &str) -> String {
     format!("claim2:{}", hex::encode(hasher.finalize()))
 }
 
+fn materialize_side_index(
+    index: &mut SideIndex,
+    catalog: &AnchorCatalog,
+    repo: &Path,
+) -> Result<()> {
+    let (entries, unresolved) = resolve_entries(&index.entries, catalog, repo);
+    // Attribution is the precision gate for overlay emission. Embed only the
+    // typed claims which survived it: unresolved claims cannot participate in
+    // a same-target semantic group, and eagerly embedding them makes a cold
+    // side-index rebuild scale with discarded payload rather than output.
+    let emitted_ids: BTreeSet<_> = entries
+        .iter()
+        .map(|entry| entry.intent_id.clone())
+        .collect();
+    ensure_embeddings(&mut index.entries, &emitted_ids)?;
+    let embeddings_by_id: BTreeMap<_, _> = index
+        .entries
+        .iter()
+        .map(|entry| (entry.intent_id.clone(), entry.embedding.clone()))
+        .collect();
+    let established_groups: BTreeMap<_, _> = index
+        .entries
+        .iter()
+        .filter(|entry| !entry.group_intent_id.is_empty())
+        .map(|entry| (entry.intent_id.clone(), entry.group_intent_id.clone()))
+        .collect();
+    let embeddings = entries
+        .iter()
+        .map(|entry| {
+            embeddings_by_id
+                .get(&entry.intent_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("missing side-index embedding for {}", entry.intent_id))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (groups, membership) = consolidate_entries(entries, embeddings, &established_groups)?;
+    for entry in &mut index.entries {
+        if let Some(group_id) = membership.get(&entry.intent_id) {
+            entry.group_intent_id.clone_from(group_id);
+        }
+    }
+    index.groups = groups;
+    index.unresolved_attributions = unresolved;
+    Ok(())
+}
+
+fn ensure_embeddings(entries: &mut [IndexedIntent], emitted_ids: &BTreeSet<String>) -> Result<()> {
+    let missing: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            emitted_ids.contains(entry.intent_id.as_str()) && entry.embedding.is_empty()
+        })
+        .map(|(index, entry)| (index, entry.thesis.clone()))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let texts: Vec<_> = missing.iter().map(|(_, text)| text.clone()).collect();
+    let vectors = embed_intent_batch(&texts)?;
+    if vectors.len() != missing.len() {
+        bail!(
+            "semantic embedder returned {} vectors for {} intent theses",
+            vectors.len(),
+            missing.len()
+        );
+    }
+    for ((entry_index, _), vector) in missing.into_iter().zip(vectors) {
+        if vector.is_empty() {
+            bail!("semantic embedder returned an empty intent vector");
+        }
+        entries[entry_index].embedding = vector;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn embed_intent_batch(texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    // Unit/e2e overlay tests must not depend on a live model server. This
+    // identity-only seam deliberately creates no semantic candidates; focused
+    // fixture tests below inject frozen vectors into `consolidate_entries`.
+    Ok(texts
+        .iter()
+        .map(|text| {
+            let digest = Sha256::digest(text.as_bytes());
+            digest
+                .iter()
+                .map(|byte| (*byte as f32 / 127.5) - 1.0)
+                .collect()
+        })
+        .collect())
+}
+
+#[cfg(all(
+    not(test),
+    any(feature = "native-embedder", feature = "cloud-embedder")
+))]
+fn embed_intent_batch(texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    let mut engine = crate::embedder::EmbeddingEngine::new()
+        .context("initialize semantic embedder for overlay side-index")?;
+    let mut vectors = Vec::with_capacity(texts.len());
+    for chunk in texts.chunks(64) {
+        vectors.extend(
+            engine
+                .embed_batch(chunk)
+                .context("embed overlay intent candidate batch")?,
+        );
+    }
+    Ok(vectors)
+}
+
+#[cfg(all(
+    not(test),
+    not(any(feature = "native-embedder", feature = "cloud-embedder"))
+))]
+fn embed_intent_batch(_texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    bail!("overlay semantic dedup requires feature `native-embedder` or `cloud-embedder`")
+}
+
 fn resolve_entries(
-    index: &SideIndex,
+    intents: &[IndexedIntent],
     catalog: &AnchorCatalog,
     repo: &Path,
 ) -> (Vec<OverlayEntry>, Vec<UnresolvedAttribution>) {
     let mut entries = Vec::new();
     let mut unresolved = Vec::new();
-    for intent in &index.entries {
+    for intent in intents {
         let evidence_ref = intent.evidence_event_id.clone();
         let candidates = attribution_candidates(&intent.thesis, &catalog.anchors, repo);
         let mut accepted = Vec::new();
@@ -625,7 +839,7 @@ fn resolve_entries(
             evidence_event_id: intent.evidence_event_id.clone(),
             opaque_ref: format!("session:{}#turn-{}", intent.session_id, intent.turn_idx),
         }];
-        let content_hash = content_hash(&intent.thesis, &refs);
+        let content_hash = content_hash(&intent.thesis, "current", &[], &refs);
         entries.push(OverlayEntry {
             intent_id: intent.intent_id.clone(),
             content_hash,
@@ -635,6 +849,7 @@ fn resolve_entries(
             authority: intent.authority.clone(),
             verification_status: "unverified".to_owned(),
             valid_from: intent.valid_from.clone(),
+            valid_to: None,
             relations: Vec::new(),
             attributions: accepted,
             refs,
@@ -645,6 +860,343 @@ fn resolve_entries(
         (&left.intent_id, &left.target_anchor).cmp(&(&right.intent_id, &right.target_anchor))
     });
     (entries, unresolved)
+}
+
+fn consolidate_entries(
+    entries: Vec<OverlayEntry>,
+    embeddings: Vec<Vec<f32>>,
+    established_groups: &BTreeMap<String, String>,
+) -> Result<(Vec<OverlayEntry>, BTreeMap<String, String>)> {
+    if entries.len() != embeddings.len() {
+        bail!("overlay entries and semantic vectors have different lengths");
+    }
+    let mut by_target: BTreeMap<OverlayTarget, Vec<usize>> = BTreeMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        by_target
+            .entry(entry.target.clone())
+            .or_default()
+            .push(index);
+    }
+
+    let mut merge_edges = Vec::new();
+    let mut veto_edges = Vec::new();
+    for indices in by_target.values() {
+        for (offset, &left) in indices.iter().enumerate() {
+            for &right in &indices[offset + 1..] {
+                let similarity = intent_candidate_similarity(&embeddings[left], &embeddings[right]);
+                if similarity < SEMANTIC_INTENT_CANDIDATE_THRESHOLD {
+                    continue;
+                }
+                if negation_veto(&entries[left].thesis, &entries[right].thesis) {
+                    veto_edges.push((left, right, similarity));
+                } else {
+                    merge_edges.push((left, right, similarity));
+                }
+            }
+        }
+    }
+    merge_edges.sort_by(|left, right| right.2.total_cmp(&left.2));
+
+    let mut union = UnionFind::new(entries.len());
+    for (left, right, _) in merge_edges {
+        let left_root = union.find(left);
+        let right_root = union.find(right);
+        if left_root == right_root {
+            continue;
+        }
+        let left_members = union.members(left_root);
+        let right_members = union.members(right_root);
+        let crosses_veto = veto_edges.iter().any(|(a, b, _)| {
+            (left_members.contains(a) && right_members.contains(b))
+                || (left_members.contains(b) && right_members.contains(a))
+        });
+        if !crosses_veto {
+            union.union(left_root, right_root);
+        }
+    }
+
+    let mut components: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for index in 0..entries.len() {
+        components.entry(union.find(index)).or_default().push(index);
+    }
+    let mut groups = Vec::with_capacity(components.len());
+    let mut membership = BTreeMap::new();
+    for members in components.into_values() {
+        let mut chronological = members.clone();
+        chronological.sort_by(|&left, &right| {
+            entries[left]
+                .valid_from
+                .cmp(&entries[right].valid_from)
+                .then_with(|| entries[left].intent_id.cmp(&entries[right].intent_id))
+        });
+        let representative = chronological[0];
+        let established = chronological.iter().find_map(|index| {
+            established_groups
+                .get(&entries[*index].intent_id)
+                .filter(|group_id| !group_id.is_empty())
+                .cloned()
+        });
+        let group_id = established.unwrap_or_else(|| entries[representative].intent_id.clone());
+        let mut refs = Vec::new();
+        let mut attributions = Vec::new();
+        let mut authority = "agent_derived".to_owned();
+        for &member in &members {
+            refs.extend(entries[member].refs.clone());
+            attributions.extend(entries[member].attributions.clone());
+            if entries[member].authority == "operator_confirmed" {
+                authority = "operator_confirmed".to_owned();
+            }
+            membership.insert(entries[member].intent_id.clone(), group_id.clone());
+        }
+        refs.sort_by(|left, right| {
+            (&left.evidence_event_id, &left.opaque_ref)
+                .cmp(&(&right.evidence_event_id, &right.opaque_ref))
+        });
+        refs.dedup_by(|left, right| left == right);
+        attributions.sort_by(|left, right| {
+            (&left.target_anchor, &left.evidence_ref)
+                .cmp(&(&right.target_anchor, &right.evidence_ref))
+        });
+        attributions.dedup_by(|left, right| left == right);
+        let thesis = entries[representative].thesis.clone();
+        groups.push(OverlayEntry {
+            intent_id: group_id,
+            content_hash: content_hash(&thesis, "current", &[], &refs),
+            target: entries[representative].target.clone(),
+            thesis,
+            status: "current".to_owned(),
+            authority,
+            verification_status: entries[representative].verification_status.clone(),
+            valid_from: entries[representative].valid_from.clone(),
+            valid_to: None,
+            relations: Vec::new(),
+            attributions,
+            refs,
+        });
+    }
+
+    apply_veto_relations(&entries, &veto_edges, &membership, &mut groups);
+    for group in &mut groups {
+        group.content_hash =
+            content_hash(&group.thesis, &group.status, &group.relations, &group.refs);
+    }
+    groups.sort_by(|left, right| {
+        left.target
+            .cmp(&right.target)
+            .then_with(|| status_rank(&left.status).cmp(&status_rank(&right.status)))
+            .then_with(|| right.valid_from.cmp(&left.valid_from))
+            .then_with(|| left.intent_id.cmp(&right.intent_id))
+    });
+    Ok((groups, membership))
+}
+
+fn apply_veto_relations(
+    entries: &[OverlayEntry],
+    veto_edges: &[(usize, usize, f32)],
+    membership: &BTreeMap<String, String>,
+    groups: &mut [OverlayEntry],
+) {
+    let group_positions: BTreeMap<_, _> = groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| (group.intent_id.clone(), index))
+        .collect();
+    let mut direct_successors: BTreeMap<String, (String, f32, String, String)> = BTreeMap::new();
+    let mut disputes = Vec::new();
+    for &(left, right, similarity) in veto_edges {
+        let left_group = membership[&entries[left].intent_id].clone();
+        let right_group = membership[&entries[right].intent_id].clone();
+        if left_group == right_group {
+            continue;
+        }
+        match entries[left].valid_from.cmp(&entries[right].valid_from) {
+            std::cmp::Ordering::Less => {
+                record_successor(
+                    &mut direct_successors,
+                    &left_group,
+                    &right_group,
+                    similarity,
+                    &entries[right],
+                );
+            }
+            std::cmp::Ordering::Greater => {
+                record_successor(
+                    &mut direct_successors,
+                    &right_group,
+                    &left_group,
+                    similarity,
+                    &entries[left],
+                );
+            }
+            std::cmp::Ordering::Equal => {
+                disputes.push((
+                    left_group,
+                    right_group,
+                    similarity,
+                    entries[left].valid_from.clone(),
+                ));
+            }
+        }
+    }
+    for (older_id, (newer_id, similarity, evidence_ref, observed_at)) in direct_successors {
+        let Some(&older) = group_positions.get(&older_id) else {
+            continue;
+        };
+        let Some(&newer) = group_positions.get(&newer_id) else {
+            continue;
+        };
+        groups[older].status = "superseded".to_owned();
+        groups[older].valid_to = Some(observed_at.clone());
+        push_relation(
+            &mut groups[older].relations,
+            OverlayRelation {
+                kind: "superseded_by".to_owned(),
+                intent_id: newer_id.clone(),
+                evidence_ref: evidence_ref.clone(),
+                confidence: similarity as f64,
+                observed_at: observed_at.clone(),
+            },
+        );
+        push_relation(
+            &mut groups[newer].relations,
+            OverlayRelation {
+                kind: "supersedes".to_owned(),
+                intent_id: older_id,
+                evidence_ref,
+                confidence: similarity as f64,
+                observed_at,
+            },
+        );
+    }
+    for (left_id, right_id, similarity, observed_at) in disputes {
+        let evidence_ref = group_positions
+            .get(&right_id)
+            .and_then(|&index| groups[index].refs.first())
+            .map(|reference| reference.evidence_event_id.clone())
+            .unwrap_or_default();
+        for (source, target) in [(&left_id, &right_id), (&right_id, &left_id)] {
+            if let Some(&position) = group_positions.get(source) {
+                push_relation(
+                    &mut groups[position].relations,
+                    OverlayRelation {
+                        kind: "disputes".to_owned(),
+                        intent_id: target.clone(),
+                        evidence_ref: evidence_ref.clone(),
+                        confidence: similarity as f64,
+                        observed_at: observed_at.clone(),
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn record_successor(
+    successors: &mut BTreeMap<String, (String, f32, String, String)>,
+    older_id: &str,
+    newer_id: &str,
+    similarity: f32,
+    newer: &OverlayEntry,
+) {
+    let evidence_ref = newer
+        .refs
+        .first()
+        .map(|reference| reference.evidence_event_id.clone())
+        .unwrap_or_default();
+    let candidate = (
+        newer_id.to_owned(),
+        similarity,
+        evidence_ref,
+        newer.valid_from.clone(),
+    );
+    successors
+        .entry(older_id.to_owned())
+        .and_modify(|current| {
+            if candidate.3 < current.3 {
+                *current = candidate.clone();
+            }
+        })
+        .or_insert(candidate);
+}
+
+fn push_relation(relations: &mut Vec<OverlayRelation>, relation: OverlayRelation) {
+    if !relations
+        .iter()
+        .any(|existing| existing.kind == relation.kind && existing.intent_id == relation.intent_id)
+    {
+        relations.push(relation);
+        relations.sort_by(|left, right| {
+            (&left.kind, &left.intent_id).cmp(&(&right.kind, &right.intent_id))
+        });
+    }
+}
+
+fn status_rank(status: &str) -> u8 {
+    u8::from(status != "current")
+}
+
+fn negation_veto(left: &str, right: &str) -> bool {
+    // Contract markers are deliberately strong and pair-relative. A marker in
+    // both theses represents the same negative polarity and does not veto;
+    // exactly one side carrying reversal/negation blocks semantic merging.
+    const REVERSAL_MARKERS: &[&str] = &[
+        " disabled",
+        " rejected",
+        " reverted",
+        " withdrawn",
+        " no longer",
+        " do not ",
+        " don't ",
+        " never ",
+        " instead of ",
+        " wyłączon",
+        " odrzucon",
+        " cofnięt",
+        " wycofan",
+        " nie robimy",
+        " nie używ",
+        " już nie",
+        " nigdy ",
+        " zamiast ",
+    ];
+    let left = format!(" {} ", left.to_lowercase());
+    let right = format!(" {} ", right.to_lowercase());
+    let left_negative = REVERSAL_MARKERS.iter().any(|marker| left.contains(marker));
+    let right_negative = REVERSAL_MARKERS.iter().any(|marker| right.contains(marker));
+    left_negative ^ right_negative
+}
+
+struct UnionFind {
+    parent: Vec<usize>,
+}
+
+impl UnionFind {
+    fn new(len: usize) -> Self {
+        Self {
+            parent: (0..len).collect(),
+        }
+    }
+
+    fn find(&mut self, index: usize) -> usize {
+        if self.parent[index] != index {
+            self.parent[index] = self.find(self.parent[index]);
+        }
+        self.parent[index]
+    }
+
+    fn union(&mut self, left: usize, right: usize) {
+        let left = self.find(left);
+        let right = self.find(right);
+        if left != right {
+            self.parent[right] = left;
+        }
+    }
+
+    fn members(&mut self, root: usize) -> BTreeSet<usize> {
+        (0..self.parent.len())
+            .filter(|&index| self.find(index) == root)
+            .collect()
+    }
 }
 
 struct Candidate<'a> {
@@ -854,9 +1406,28 @@ fn contains_token(haystack: &str, needle: &str) -> bool {
     })
 }
 
-fn content_hash(thesis: &str, refs: &[OverlayRef]) -> String {
+fn content_hash(
+    thesis: &str,
+    status: &str,
+    relations: &[OverlayRelation],
+    refs: &[OverlayRef],
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(thesis.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(status.as_bytes());
+    for relation in relations {
+        hasher.update(b"\0");
+        hasher.update(relation.kind.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(relation.intent_id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(relation.evidence_ref.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(relation.confidence.to_bits().to_le_bytes());
+        hasher.update(b"\0");
+        hasher.update(relation.observed_at.as_bytes());
+    }
     for reference in refs {
         hasher.update(b"\0");
         hasher.update(reference.evidence_event_id.as_bytes());
@@ -931,6 +1502,195 @@ mod tests {
         line: usize,
     }
 
+    #[derive(Debug, Deserialize)]
+    struct SemanticFixture {
+        schema: String,
+        source: String,
+        cases: Vec<SemanticCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SemanticCase {
+        name: String,
+        claims: Vec<SemanticClaim>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SemanticClaim {
+        intent_id: String,
+        session: String,
+        thesis: String,
+        decided_at: String,
+        evidence: String,
+        target: OverlayTarget,
+        embedding: Vec<f32>,
+    }
+
+    fn semantic_fixture() -> SemanticFixture {
+        let fixture: SemanticFixture = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/overlay-intent-v1/dedup_semantic_2026-07-12.json"
+        )))
+        .unwrap();
+        assert_eq!(fixture.schema, "aicx.overlay.semantic-fixture.v1");
+        assert!(fixture.source.contains("2026-07-12"));
+        fixture
+    }
+
+    fn semantic_case(fixture: &SemanticFixture, name: &str) -> (Vec<OverlayEntry>, Vec<Vec<f32>>) {
+        let case = fixture
+            .cases
+            .iter()
+            .find(|case| case.name == name)
+            .unwrap_or_else(|| panic!("missing semantic fixture case {name}"));
+        let entries = case
+            .claims
+            .iter()
+            .map(|claim| {
+                let refs = vec![OverlayRef {
+                    evidence_event_id: claim.evidence.clone(),
+                    opaque_ref: format!("session:{}#turn-1", claim.session),
+                }];
+                OverlayEntry {
+                    intent_id: claim.intent_id.clone(),
+                    content_hash: content_hash(&claim.thesis, "current", &[], &refs),
+                    target: claim.target.clone(),
+                    thesis: claim.thesis.clone(),
+                    status: "current".to_owned(),
+                    authority: "operator_confirmed".to_owned(),
+                    verification_status: "unverified".to_owned(),
+                    valid_from: claim.decided_at.clone(),
+                    valid_to: None,
+                    relations: Vec::new(),
+                    attributions: Vec::new(),
+                    refs,
+                }
+            })
+            .collect();
+        let embeddings = case
+            .claims
+            .iter()
+            .map(|claim| claim.embedding.clone())
+            .collect();
+        (entries, embeddings)
+    }
+
+    #[test]
+    fn overlay_dedup_semantic_merges_paraphrases_and_live_pathologies() {
+        let fixture = semantic_fixture();
+        for (name, expected_refs) in [
+            ("three_session_paraphrases", 3),
+            ("live_decision_why_swap", 2),
+            ("live_intent_15x", 3),
+        ] {
+            let (entries, embeddings) = semantic_case(&fixture, name);
+            let earliest = entries
+                .iter()
+                .min_by_key(|entry| (&entry.valid_from, &entry.intent_id))
+                .unwrap();
+            let expected_id = earliest.intent_id.clone();
+            let expected_date = earliest.valid_from.clone();
+            let evidence_before: BTreeSet<_> = entries
+                .iter()
+                .flat_map(|entry| entry.refs.iter())
+                .map(|reference| reference.evidence_event_id.clone())
+                .collect();
+            let (groups, membership) =
+                consolidate_entries(entries, embeddings, &BTreeMap::new()).unwrap();
+            assert_eq!(groups.len(), 1, "semantic fixture case {name}");
+            assert_eq!(groups[0].intent_id, expected_id);
+            assert_eq!(groups[0].valid_from, expected_date);
+            assert_eq!(groups[0].refs.len(), expected_refs);
+            assert!(membership.values().all(|group| group == &expected_id));
+            let evidence_after: BTreeSet<_> = groups[0]
+                .refs
+                .iter()
+                .map(|reference| reference.evidence_event_id.clone())
+                .collect();
+            assert_eq!(
+                evidence_before, evidence_after,
+                "parser evidence ids changed"
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_dedup_semantic_respects_typed_target_and_persisted_group_id() {
+        let fixture = semantic_fixture();
+        let (entries, embeddings) =
+            semantic_case(&fixture, "same_semantics_different_typed_targets");
+        let (groups, _) = consolidate_entries(entries, embeddings, &BTreeMap::new()).unwrap();
+        assert_eq!(groups.len(), 2, "different typed targets must not merge");
+
+        let (entries, embeddings) = semantic_case(&fixture, "three_session_paraphrases");
+        let established = BTreeMap::from([(
+            entries[0].intent_id.clone(),
+            "int1:persistedcluster".to_owned(),
+        )]);
+        let (groups, membership) = consolidate_entries(entries, embeddings, &established).unwrap();
+        assert_eq!(groups[0].intent_id, "int1:persistedcluster");
+        assert!(
+            membership
+                .values()
+                .all(|group| group == "int1:persistedcluster")
+        );
+    }
+
+    #[test]
+    fn overlay_dedup_semantic_negation_veto_beats_embedding_similarity() {
+        let fixture = semantic_fixture();
+        let (entries, embeddings) = semantic_case(&fixture, "negation_veto_supersede");
+        let similarity = intent_candidate_similarity(&embeddings[0], &embeddings[1]);
+        assert!(
+            similarity >= SEMANTIC_INTENT_CANDIDATE_THRESHOLD,
+            "counterexample must be an embedding candidate, got {similarity}"
+        );
+        assert!(negation_veto(&entries[0].thesis, &entries[1].thesis));
+        let (groups, _) = consolidate_entries(entries, embeddings, &BTreeMap::new()).unwrap();
+        assert_eq!(groups.len(), 2, "vetoed candidate was falsely merged");
+    }
+
+    #[test]
+    fn overlay_supersede_is_evidence_backed_and_current_sorts_first_per_target() {
+        let fixture = semantic_fixture();
+        let (entries, embeddings) = semantic_case(&fixture, "negation_veto_supersede");
+        let old_hash = entries[0].content_hash.clone();
+        let (groups, _) = consolidate_entries(entries, embeddings, &BTreeMap::new()).unwrap();
+        let current = groups
+            .iter()
+            .find(|entry| entry.status == "current")
+            .unwrap();
+        let superseded = groups
+            .iter()
+            .find(|entry| entry.status == "superseded")
+            .unwrap();
+        assert_eq!(
+            groups[0].status, "current",
+            "current must sort first in target group"
+        );
+        assert!(current.valid_from > superseded.valid_from);
+        assert_eq!(
+            superseded.valid_to.as_deref(),
+            Some(current.valid_from.as_str())
+        );
+        let forward = superseded
+            .relations
+            .iter()
+            .find(|relation| relation.kind == "superseded_by")
+            .expect("older decision needs superseded_by");
+        assert_eq!(forward.intent_id, current.intent_id);
+        assert!(forward.evidence_ref.starts_with("ev1:"));
+        assert!(forward.confidence >= SEMANTIC_INTENT_CANDIDATE_THRESHOLD as f64);
+        assert_eq!(forward.observed_at, current.valid_from);
+        assert!(current.relations.iter().any(|relation| {
+            relation.kind == "supersedes" && relation.intent_id == superseded.intent_id
+        }));
+        assert_ne!(
+            superseded.content_hash, old_hash,
+            "supersede must revise content hash"
+        );
+    }
+
     #[test]
     fn thesis_filter_drops_dispatch_boilerplate_and_caps_output() {
         assert!(distill_thesis("TASK: VIBECRAFTED_REPORT_PATH=/tmp/x").is_none());
@@ -981,6 +1741,7 @@ mod tests {
         fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
         let intent = IndexedIntent {
             intent_id: "int1:0123456789abcdef".to_owned(),
+            group_intent_id: String::new(),
             evidence_event_id: "ev1:codex:session-0001:000001:text:0123456789abcdef".to_owned(),
             claim_key: "claim2:test".to_owned(),
             session_id: "session-0001".to_owned(),
@@ -988,12 +1749,16 @@ mod tests {
             thesis: "main.rs remains the executable boundary".to_owned(),
             valid_from: "2026-07-12T12:00:00Z".to_owned(),
             authority: "operator_confirmed".to_owned(),
+            embedding: vec![1.0, 0.0],
         };
         let index = SideIndex {
             schema: OVERLAY_INDEX_SCHEMA.to_owned(),
             repo_id: "Loctree/example".to_owned(),
             store_revision: format!("sr1:{}", "a".repeat(64)),
+            embedding_model: "test".to_owned(),
             entries: vec![intent],
+            groups: Vec::new(),
+            unresolved_attributions: Vec::new(),
         };
         let catalog = AnchorCatalog {
             repo_id: "Loctree/example".to_owned(),
@@ -1008,7 +1773,7 @@ mod tests {
                 signature_hash: None,
             }],
         };
-        let (entries, unresolved) = resolve_entries(&index, &catalog, &root);
+        let (entries, unresolved) = resolve_entries(&index.entries, &catalog, &root);
         assert!(entries.is_empty());
         assert_eq!(unresolved.len(), 1);
         assert_eq!(unresolved[0].confidence, 0.72);
@@ -1025,10 +1790,13 @@ mod tests {
             anchors: Vec::new(),
         };
         let store = format!("sr1:{}", "b".repeat(64));
-        let revision = overlay_revision(&catalog, &store);
-        let changed = overlay_revision_with_attribution(&catalog, &store, "resolver.v2");
+        let model = "cloud:test-model";
+        let revision = overlay_revision(&catalog, &store, model);
+        let changed = overlay_revision_with_attribution(&catalog, &store, "resolver.v2", model);
+        let semantic_changed = overlay_revision(&catalog, &store, "cloud:next-model");
         assert!(revision.starts_with("ov1:"));
         assert_ne!(revision, changed);
+        assert_ne!(revision, semantic_changed);
         assert_eq!(store, format!("sr1:{}", "b".repeat(64)));
     }
 
@@ -1101,7 +1869,13 @@ mod tests {
         };
         let (first, first_stats) = build_overlay(&options).unwrap();
         assert_eq!(first_stats.raw_session_files_opened, 0);
-        assert_eq!(first.entries.len(), golden.pairs.len());
+        let expected_groups = golden
+            .pairs
+            .iter()
+            .map(|pair| (&pair.path, &pair.thesis_marker))
+            .collect::<BTreeSet<_>>()
+            .len();
+        assert_eq!(first.entries.len(), expected_groups);
         assert!(first.entries.iter().all(|entry| {
             entry
                 .refs

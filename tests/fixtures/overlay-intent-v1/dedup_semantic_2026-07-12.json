@@ -1,0 +1,43 @@
+{
+  "schema": "aicx.overlay.semantic-fixture.v1",
+  "source": "Frozen from the 2026-07-12 loctree-suite pathology bucket described in substrate-makieta A1-01/A1-02; no live-store dependency.",
+  "cases": [
+    {
+      "name": "three_session_paraphrases",
+      "claims": [
+        {"intent_id":"int1:branch0000000001","session":"may-a","thesis":"Cache ownership is scoped per branch in src/cache.rs","decided_at":"2026-05-01T08:00:00Z","evidence":"ev1:codex:may-a:000001:text:0000000000000001","target":{"kind":"path","path":"src/cache.rs","language":"rs"},"embedding":[1.0,0.0,0.0,0.0]},
+        {"intent_id":"int1:branch0000000002","session":"may-b","thesis":"Each git branch keeps an independent cache in src/cache.rs","decided_at":"2026-05-02T08:00:00Z","evidence":"ev1:claude:may-b:000002:text:0000000000000002","target":{"kind":"path","path":"src/cache.rs","language":"rs"},"embedding":[0.99,0.01,0.0,0.0]},
+        {"intent_id":"int1:branch0000000003","session":"may-c","thesis":"The cache namespace follows the active branch in src/cache.rs","decided_at":"2026-05-03T08:00:00Z","evidence":"ev1:junie:may-c:step:s3:text:0000000000000003","target":{"kind":"path","path":"src/cache.rs","language":"rs"},"embedding":[0.98,0.02,0.0,0.0]}
+      ]
+    },
+    {
+      "name": "live_decision_why_swap",
+      "claims": [
+        {"intent_id":"int1:swap000000000001","session":"live-decision","thesis":"DECISION: the intent overlay rides forced loct context in docs/contracts/overlay.json","decided_at":"2026-07-12T18:20:00Z","evidence":"ev1:claude:live-decision:000042:text:0000000000000042","target":{"kind":"path","path":"docs/contracts/overlay.json","language":"json"},"embedding":[0.0,1.0,0.0,0.0]},
+        {"intent_id":"int1:swap000000000002","session":"live-why","thesis":"WHY: intent is base cognition, therefore docs/contracts/overlay.json belongs in forced context","decided_at":"2026-07-12T18:21:00Z","evidence":"ev1:codex:live-why:000043:text:0000000000000043","target":{"kind":"path","path":"docs/contracts/overlay.json","language":"json"},"embedding":[0.0,0.99,0.01,0.0]}
+      ]
+    },
+    {
+      "name": "live_intent_15x",
+      "claims": [
+        {"intent_id":"int1:rant000000000001","session":"live-rant-a","thesis":"INTENT: operator quote (15x) says the overlay is forced context in docs/contracts/overlay.json","decided_at":"2026-07-12T18:22:00Z","evidence":"ev1:claude:live-rant-a:000044:text:0000000000000044","target":{"kind":"path","path":"docs/contracts/overlay.json","language":"json"},"embedding":[0.0,0.0,1.0,0.0]},
+        {"intent_id":"int1:rant000000000002","session":"live-rant-b","thesis":"INTENT: repeated (15x) operator demand keeps docs/contracts/overlay.json in base cognition","decided_at":"2026-07-12T18:23:00Z","evidence":"ev1:codex:live-rant-b:000045:text:0000000000000045","target":{"kind":"path","path":"docs/contracts/overlay.json","language":"json"},"embedding":[0.0,0.01,0.99,0.0]},
+        {"intent_id":"int1:rant000000000003","session":"live-rant-c","thesis":"INTENT: docs/contracts/overlay.json must ride the mandatory read, repeated (15x)","decided_at":"2026-07-12T18:24:00Z","evidence":"ev1:junie:live-rant-c:step:s4:text:0000000000000046","target":{"kind":"path","path":"docs/contracts/overlay.json","language":"json"},"embedding":[0.0,0.02,0.98,0.0]}
+      ]
+    },
+    {
+      "name": "negation_veto_supersede",
+      "claims": [
+        {"intent_id":"int1:cache000000000001","session":"may-cache","thesis":"cache per branch in src/cache.rs","decided_at":"2026-05-10T10:00:00Z","evidence":"ev1:claude:may-cache:000010:text:0000000000000010","target":{"kind":"path","path":"src/cache.rs","language":"rs"},"embedding":[0.70,0.70,0.0,0.0]},
+        {"intent_id":"int1:cache000000000002","session":"july-cache","thesis":"cache per branch WYŁĄCZONY in src/cache.rs","decided_at":"2026-07-10T10:00:00Z","evidence":"ev1:codex:july-cache:000020:text:0000000000000020","target":{"kind":"path","path":"src/cache.rs","language":"rs"},"embedding":[0.71,0.69,0.0,0.0]}
+      ]
+    },
+    {
+      "name": "same_semantics_different_typed_targets",
+      "claims": [
+        {"intent_id":"int1:target0000000001","session":"target-a","thesis":"Cache ownership follows the branch","decided_at":"2026-06-01T10:00:00Z","evidence":"ev1:codex:target-a:000001:text:0000000000000031","target":{"kind":"path","path":"src/cache.rs","language":"rs"},"embedding":[0.2,0.2,0.2,0.2]},
+        {"intent_id":"int1:target0000000002","session":"target-b","thesis":"Cache ownership follows the branch","decided_at":"2026-06-02T10:00:00Z","evidence":"ev1:codex:target-b:000002:text:0000000000000032","target":{"kind":"symbol","path":"src/cache.rs","language":"rs","qualified_symbol":"Cache::open"},"embedding":[0.2,0.2,0.2,0.2]}
+      ]
+    }
+  ]
+}
