@@ -94,6 +94,8 @@ fn run_aicx(home: &Path, args: &[&str]) -> Output {
     Command::new(ensure_aicx_binary_exists())
         .args(args)
         .env("HOME", home)
+        // Windows resolves the home dir from USERPROFILE, not HOME (dirs::home_dir).
+        .env("USERPROFILE", home)
         // Drop any operator-pinned AICX_HOME so the spawned binary
         // resolves under the test's temp HOME — see frame_kind_contract.rs
         // for the full reasoning.
@@ -125,13 +127,13 @@ fn context_pack_ingest_retains_immutable_pack_and_live_reads_skip_examples() {
 
     write_file(
         &pack.join("raw").join("ctx-example.md"),
-        "[project: VetCoders/aicx | agent: loct-context-pack | date: 2026-05-08]\n\n[signals]\nDecision:\n- [decision] Frozen prism example must not become live truth\n[/signals]\n",
+        "[project: Vetcoders/aicx | agent: loct-context-pack | date: 2026-05-08]\n\n[signals]\nDecision:\n- [decision] Frozen prism example must not become live truth\n[/signals]\n",
     );
     write_file(
         &pack.join("sidecars").join("ctx-example.json"),
         &json!({
             "id": "ctx-example",
-            "project": "VetCoders/aicx",
+            "project": "Vetcoders/aicx",
             "agent": "loct-context-pack",
             "date": "2026-05-08",
             "session_id": "batch-alpha",

@@ -1,6 +1,6 @@
 //! Shared canonical types used by the intent engine.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -14,6 +14,8 @@ pub use crate::timeline::{FrameKind, Kind, RepoIdentity, SemanticSegment, Source
 #[serde(rename_all = "lowercase")]
 pub enum EntryType {
     Intent,
+    Task,
+    Commitment,
     Why,
     Argue,
     Decision,
@@ -28,6 +30,8 @@ impl EntryType {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Intent => "intent",
+            Self::Task => "task",
+            Self::Commitment => "commitment",
             Self::Why => "why",
             Self::Argue => "argue",
             Self::Decision => "decision",
@@ -42,6 +46,8 @@ impl EntryType {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "intent" => Some(Self::Intent),
+            "task" | "todo" => Some(Self::Task),
+            "commitment" | "promise" => Some(Self::Commitment),
             "why" => Some(Self::Why),
             "argue" | "argument" | "debate" => Some(Self::Argue),
             "decision" => Some(Self::Decision),
@@ -116,6 +122,7 @@ impl Eq for Link {}
 pub struct IntentEntry {
     pub id: String,
     pub entry_type: EntryType,
+    #[serde(rename = "status", alias = "state")]
     pub state: EntryState,
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -124,6 +131,8 @@ pub struct IntentEntry {
     pub evidence: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<Link>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
     pub confidence: f32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,

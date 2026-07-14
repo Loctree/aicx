@@ -21,6 +21,7 @@ impl IntentsScreen {
             project: project_filter.clone(),
             hours,
             strict: false,
+            min_confidence: None,
             kind_filter: None,
             frame_kind: None,
         };
@@ -61,17 +62,7 @@ impl IntentsScreen {
     }
 
     pub fn move_selection(&mut self, delta: isize) {
-        if self.visible.is_empty() {
-            return;
-        }
-        if delta < 0 {
-            self.selected = self.selected.saturating_sub(delta.unsigned_abs());
-        } else {
-            self.selected = self
-                .selected
-                .saturating_add(delta as usize)
-                .min(self.visible.len() - 1);
-        }
+        self.selected = super::move_index(self.selected, self.visible.len(), delta);
     }
 
     pub fn apply_query(&mut self, query: String) {
@@ -98,11 +89,17 @@ impl IntentsScreen {
         self.visible
             .get(self.selected)
             .map(|record| {
+                let voice_marker = if record.source.as_deref() == Some("voice_transcript") {
+                    " [voice]"
+                } else {
+                    ""
+                };
                 format!(
-                    "{} | {} | {}\n{}\n\nsource: {}",
+                    "{} | {} | {}{}\n{}\n\nsource: {}",
                     record.date,
                     record.agent,
                     record.kind.heading(),
+                    voice_marker,
                     record.summary,
                     record.source_chunk
                 )
@@ -113,7 +110,7 @@ impl IntentsScreen {
     pub fn cycle_project_filter(&mut self) {
         self.project = match self.project.as_deref() {
             None => Some("aicx".to_string()),
-            Some("aicx") => Some("memex".to_string()),
+            Some("aicx") => Some("rust-memex".to_string()),
             Some(_) => None,
         };
         *self = Self::load(self.project.clone(), self.hours, self.agent.clone());

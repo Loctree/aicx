@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # pipeline-init.sh — Initialize ERi pipeline directory structure
 # Usage: bash pipeline-init.sh <slug> [root-dir]
-# Created by M&K (c)2026 VetCoders
+# Created by vetcoders (c)2026
 
 set -euo pipefail
 

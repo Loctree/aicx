@@ -1,10 +1,14 @@
+// App-only integration surface: compiled to an empty target under the slim
+// `loctree-consumer` profile (`--no-default-features`).
+#![cfg(feature = "app")]
+
 //! Integration tests for shared HTTP Bearer auth on the dashboard `/api/*` surface
 //! and on MCP HTTP transport. Both servers share `aicx::auth::require_auth_layer`,
 //! so these tests exercise the same contract: identical-shape 401 on missing or
 //! invalid token, pass-through on a matching constant-time compare, and
 //! refusal-to-bind for non-loopback hosts without a token.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use aicx::auth::{self, AuthConfig, AuthSource};
 use axum::{

@@ -48,7 +48,7 @@ follow-up implementation pass:
 - `src/api.rs:352` - semantic index row count uses `BufReader::lines()`.
 - `src/output.rs:501` - `find_last_sync_timestamp` scans markdown lines.
 - `src/main.rs:2718` - Codex session metadata scan uses `BufReader::lines()`.
-- `src/sources.rs:4613` - CodeScribe custom lexicon JSONL uses
+- `src/sources.rs:4613` - Codescribe custom lexicon JSONL uses
   `BufReader::lines()`.
 - `src/vector_index.rs:1018` / `src/vector_index.rs:1021` - tmp index header
   uses `read_line`.
@@ -160,27 +160,46 @@ Keep new work out of this PR unless it closes an existing merge blocker.
 Current live evidence:
 
 - Loctree prism pass: score 11/15, band `9..12`, payload
-  `/Users/maciejgad/.vibecrafted/artifacts/Loctree/aicx/2026_0524/polarize/polr-222423-57363/prism.json`.
+  `/Users/user/.vibecrafted/artifacts/Loctree/aicx/2026_0524/polarize/polr-222423-57363/prism.json`.
 - GitHub PR #5 is open, non-draft, mergeable, with green remote checks.
 - Local `cargo test --lib dashboard::tests::test_inline_markdown -- --test-threads=1`
   is green after `2030d3f` switched the Node harness to
   `globalThis.AicxMarkdown`.
-- Local full `make test` is still red: isolated
-  `vector_index::iter3_tests::query_index_recovery_hint_uses_full_rescan_not_fresh`
-  fails because the recovery message does not contain `--full-rescan`, and
-  full parallel execution also exposed a flaky dashboard-server log-capture
-  assertion that passes in isolation.
-- `docs/BUGFIXES.md` already records M-13 as deferred; keep that truth unless a
-  dedicated CSP nonce/header implementation lands in a separate scoped cut.
+- Local full `make test` is GREEN on a clean run (verified 2026-05-28 pass-6,
+  exit 0, 0 failed across all binaries). The recovery-hint SC-01 blocker is
+  fully closed: `vector_index::iter3_tests::query_index_recovery_hint_uses_full_rescan_not_fresh`
+  passes (the recovery hint at `vector_index.rs:1688` now carries the canonical
+  `aicx index --full-rescan --project <name>`). The dashboard-server
+  log-capture flake of
+  `dashboard_server::tests::regenerate_logs_detailed_reason_without_leaking_403_body`
+  is now fully fixed (`675dc68`): the per-module thread-local `with_default`
+  capture helpers were replaced by one shared `test_support::capture_logs`
+  backed by a single process-global subscriber (max level TRACE, so no callsite
+  is ever cached as disabled) routing to a thread-local buffer. 0 flakes in 15
+  full `make test` runs (prior rate ~1/3–1/10).
+- M-13 (CSP nonce/header) remains deferred; keep that truth unless a
+  dedicated implementation lands in a separate scoped cut.
 
 Split / block list before merge:
 
-- Fix the vector-index recovery-hint regression so the canonical operator
-  recovery path is `aicx index --full-rescan --project <name>`.
-- Stabilize or quarantine the dashboard-server log-capture assertion under full
-  parallel `make test`.
+- [done @abeb7ba] vector-index recovery-hint regression fixed — canonical
+  operator recovery path is `aicx index --full-rescan --project <name>`.
+- [done @675dc68] dashboard-server log-capture flake fixed at the root: shared
+  `test_support::capture_logs` over a reloadable process-global subscriber
+  (the thread-local `with_default` helpers + `623c65a` mutex are gone). 0
+  flakes in 15 full `make test` runs.
 - Keep H-2 Layer 1 store/index reconciliation operator-side until a separate
-  PR owns it.
+  PR owns it. Sharp caveat: `aicx store --full-rescan` is additive-only — it
+  backfills `missing` index tuples but does NOT prune `orphaned` ones (the
+  store update path is `.entry().or_default()`). Doctor's "reconcile" wording
+  over-promises orphan pruning; a true orphan-prune/reconcile pass is a
+  separate future cut.
 - Keep broader extractor/UI diagnostic read-cap work in a separate follow-up.
+  The general read sites are already capped (central `read_to_string_validated`
+  8 MiB cap + `read_line_capped` + the semantic NDJSON cap wired across
+  `vector_index.rs`, `api.rs`, `search_engine.rs`, `adapter_brute_force.rs`).
+  The only remaining uncapped reads are two trusted child-subprocess pipes in
+  `src/wizard/screens/store.rs:131` (stderr) and `:140` (stdout), which read
+  our own `aicx store` child — low-risk, deferred.
 - Do not add new release-channel, installer, CSP nonce, or heartbeat work to
   PR #5 unless the operator explicitly reopens the scope.

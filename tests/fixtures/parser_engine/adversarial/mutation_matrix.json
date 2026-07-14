@@ -1,0 +1,18 @@
+{
+  "schema": "aicx.parser_adversarial_matrix.v1",
+  "agents": ["codex", "claude", "gemini", "grok", "junie"],
+  "mutations": [
+    "baseline",
+    "truncated_tail",
+    "unknown_event",
+    "opaque_payload",
+    "oversized_unit"
+  ],
+  "invariants": [
+    "closed_coverage",
+    "deterministic_canonical_bytes",
+    "selected_source_byte_bound",
+    "no_secret_projection",
+    "append_stable_mutation_scoped_evidence_ids"
+  ]
+}

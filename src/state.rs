@@ -3,7 +3,7 @@
 //! Tracks processing watermarks, content hashes for deduplication,
 //! and run history. Persists to `~/.aicx/state.json`.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -145,7 +145,7 @@ pub struct RunRecord {
     pub timestamp: DateTime<Utc>,
     /// Number of new entries added during this run.
     pub entries_added: usize,
-    /// Sources processed (e.g., "claude:CodeScribe", "codex:global").
+    /// Sources processed (e.g., "claude:Codescribe", "codex:global").
     pub sources: Vec<String>,
 }
 
@@ -784,16 +784,16 @@ mod tests {
         let t2 = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
         let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 8, 0, 0).unwrap();
 
-        state.update_watermark("claude:CodeScribe", t1);
-        assert_eq!(state.get_watermark("claude:CodeScribe"), Some(t1));
+        state.update_watermark("claude:Codescribe", t1);
+        assert_eq!(state.get_watermark("claude:Codescribe"), Some(t1));
 
         // Newer timestamp updates
-        state.update_watermark("claude:CodeScribe", t2);
-        assert_eq!(state.get_watermark("claude:CodeScribe"), Some(t2));
+        state.update_watermark("claude:Codescribe", t2);
+        assert_eq!(state.get_watermark("claude:Codescribe"), Some(t2));
 
         // Older timestamp does NOT update
-        state.update_watermark("claude:CodeScribe", t0);
-        assert_eq!(state.get_watermark("claude:CodeScribe"), Some(t2));
+        state.update_watermark("claude:Codescribe", t0);
+        assert_eq!(state.get_watermark("claude:Codescribe"), Some(t2));
     }
 
     #[test]
@@ -1138,7 +1138,7 @@ mod tests {
             Utc::now().timestamp_nanos_opt().unwrap()
         ));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("VetCoders").join("Vista")).unwrap();
+        std::fs::create_dir_all(root.join("Vetcoders").join("Vista")).unwrap();
         std::fs::create_dir_all(root.join("vetcoders").join("vista")).unwrap();
 
         let plan = migration::generate_case_bucket_merge_script(&root).unwrap();
@@ -1146,8 +1146,8 @@ mod tests {
         assert_eq!(plan.merges.len(), 2);
         assert!(plan.script.contains("Review before running"));
         assert!(plan.script.contains("vetcoders"));
-        assert!(plan.script.contains("VetCoders"));
-        assert!(root.join("VetCoders").join("Vista").exists());
+        assert!(plan.script.contains("Vetcoders"));
+        assert!(root.join("Vetcoders").join("Vista").exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1155,7 +1155,7 @@ mod tests {
     // Replaces the legacy `test_state_path_is_under_store` which asserted
     // `path.contains(".aicx")` — a literal-pattern relic from before
     // `$AICX_HOME` override existed. Under any pinned `AICX_HOME` (e.g.
-    // the operator's `AICX_HOME=/Users/silver/aicx`) that asserted
+    // the operator's `AICX_HOME=/Users/user/aicx`) that asserted
     // false-positive failed silently as a "baseline failure". Pass-4
     // op-agent + operator agreed to refuse that anti-pattern: the
     // contract is "state path lives under base dir, named state.json"

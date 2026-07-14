@@ -1,0 +1,4 @@
+{"type":"user","content":[{"type":"text","text":"ok"}]}
+not valid json here
+{"type":"assistant","content":""}
+{"type":"unknown_shape","foo":"bar"}

@@ -4,7 +4,7 @@
 //! given HF repository in a list of cache directories. The runtime copy also
 //! supports operator overrides via `AICX_EMBEDDER_PATH`.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use std::env;
 use std::fs;
@@ -40,7 +40,7 @@ fn cache_bases() -> Vec<PathBuf> {
     if let Ok(path) = env::var("HF_HOME") {
         out.push(PathBuf::from(path).join("hub"));
     }
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::os_user_home() {
         out.push(home.join(".cache").join("huggingface").join("hub"));
     }
     if let Ok(aicx_home) = crate::store::resolve_aicx_home() {

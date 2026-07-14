@@ -46,7 +46,7 @@ fn parses_artifact_frontmatter_and_status() {
 #[test]
 fn build_reports_explorer_merges_markdown_and_meta_and_keeps_meta_only_runs() {
     let root = tmp_dir("merge-meta");
-    let repo_root = root.join("VetCoders").join("ai-contexters");
+    let repo_root = root.join("Vetcoders").join("ai-contexters");
     let report_path = repo_root
         .join("2026_0412")
         .join("reports")
@@ -88,15 +88,22 @@ fn build_reports_explorer_merges_markdown_and_meta_and_keeps_meta_only_runs() {
   "agent": "codex",
   "run_id": "marb-131611-001",
   "prompt_id": "marbles-ancestor_L1_20260411",
-  "transcript": "__TRANSCRIPT__"
+  "transcript": __TRANSCRIPT__
 }"#
-        .replace("__TRANSCRIPT__", &transcript.display().to_string()),
+        .replace(
+            "__TRANSCRIPT__",
+            // serde_json quotes + escapes the path so a Windows path with
+            // backslashes (`C:\…`) stays valid JSON; on Unix the value is
+            // byte-identical to the previous raw embedding.
+            &serde_json::to_string(&transcript.display().to_string())
+                .expect("encode transcript path as JSON"),
+        ),
     );
     write_file(&transcript, "[13:16:11] assistant: booting artifact scan\n");
 
     let config = ReportsExtractorConfig {
         artifacts_root: root.clone(),
-        org: "VetCoders".to_string(),
+        org: "Vetcoders".to_string(),
         repo: "ai-contexters".to_string(),
         date_from: Some(NaiveDate::from_ymd_opt(2026, 4, 11).expect("date")),
         date_to: Some(NaiveDate::from_ymd_opt(2026, 4, 12).expect("date")),
@@ -144,7 +151,7 @@ fn build_reports_explorer_merges_markdown_and_meta_and_keeps_meta_only_runs() {
 #[test]
 fn build_reports_explorer_does_not_read_transcripts_outside_repo_root() {
     let root = tmp_dir("outside-transcript");
-    let repo_root = root.join("VetCoders").join("ai-contexters");
+    let repo_root = root.join("Vetcoders").join("ai-contexters");
     let meta_path = repo_root
         .join("2026_0411")
         .join("reports")
@@ -159,14 +166,19 @@ fn build_reports_explorer_does_not_read_transcripts_outside_repo_root() {
   "agent": "codex",
   "run_id": "marb-outside-transcript",
   "prompt_id": "outside-transcript",
-  "transcript": "__TRANSCRIPT__"
+  "transcript": __TRANSCRIPT__
 }"#
-        .replace("__TRANSCRIPT__", &outside.display().to_string()),
+        .replace(
+            "__TRANSCRIPT__",
+            // serde_json quotes + escapes so a Windows path stays valid JSON.
+            &serde_json::to_string(&outside.display().to_string())
+                .expect("encode transcript path as JSON"),
+        ),
     );
 
     let config = ReportsExtractorConfig {
         artifacts_root: root.clone(),
-        org: "VetCoders".to_string(),
+        org: "Vetcoders".to_string(),
         repo: "ai-contexters".to_string(),
         date_from: None,
         date_to: None,
@@ -196,12 +208,37 @@ fn infers_day_root_workflow_from_prompt_ids_and_file_stems() {
         Some("report-artifacts-dashboard")
     );
     assert_eq!(
+        prompt_workflow_slug(Some(
+            "20260612_0810_improve-aicx-installer-output-ux_20260612"
+        ))
+        .as_deref(),
+        Some("improve-aicx-installer-output-ux")
+    );
+    assert_eq!(
+        prompt_workflow_slug(Some(
+            "20260612_0810_perform-the-vc-justdo-skill-on-this-repository_20260612"
+        )),
+        None
+    );
+    assert_eq!(
         stem_workflow_slug(Path::new(
             "/tmp/20260412_2031_report-artifacts-dashboard_codex.md"
         ))
         .as_deref(),
         Some("report-artifacts-dashboard")
     );
+    for path in [
+        "/tmp/20260612_075248_just-075248-9497_improve-aicx-installer-output-ux_codex.md",
+        "/tmp/20260612_075248_just-075248-9497_improve-aicx-installer-output-ux_codex.meta.json",
+        "/tmp/20260612_075248_just-075248-9497_improve-aicx-installer-output-ux_codex.transcript.log",
+        "/tmp/20260612_075248_just-075248-9497_improve-aicx-installer-output-ux_codex_launch.sh",
+    ] {
+        assert_eq!(
+            stem_workflow_slug(Path::new(path)).as_deref(),
+            Some("improve-aicx-installer-output-ux"),
+            "{path}"
+        );
+    }
     assert_eq!(
         title_workflow_slug("Examination: report artifacts dashboard").as_deref(),
         Some("examination-report-artifacts-dashboard")

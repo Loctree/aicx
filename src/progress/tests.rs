@@ -59,11 +59,14 @@ fn phase_finish_err_yields_failure_record_with_hint() {
     let reporter = Arc::new(TestReporter::default());
     let phase = Phase::start(reporter, "bm25_sync", Some(10));
     phase.tick(3);
-    let record = phase.finish_err("disk full", Some("aicx doctor --fix"));
+    let record = phase.finish_err("disk full", Some("aicx doctor --rebuild-steer-index"));
 
     assert_eq!(record.phase, "bm25_sync");
     assert_eq!(record.error, "disk full");
-    assert_eq!(record.recovery_hint.as_deref(), Some("aicx doctor --fix"));
+    assert_eq!(
+        record.recovery_hint.as_deref(),
+        Some("aicx doctor --rebuild-steer-index")
+    );
 }
 
 #[test]
@@ -74,7 +77,7 @@ fn failure_log_is_thread_safe_and_collects_records() {
         phase: "steer_sync",
         elapsed_ms: 12,
         error: "boom".into(),
-        recovery_hint: Some("aicx doctor --fix".into()),
+        recovery_hint: Some("aicx doctor --rebuild-steer-index".into()),
     });
     let snap = log.snapshot();
     assert!(!log.is_empty());
@@ -84,8 +87,14 @@ fn failure_log_is_thread_safe_and_collects_records() {
 
 #[test]
 fn recovery_hint_for_known_phases() {
-    assert_eq!(recovery_hint_for("steer_sync"), Some("aicx doctor --fix"));
-    assert_eq!(recovery_hint_for("bm25_sync"), Some("aicx doctor --fix"));
+    assert_eq!(
+        recovery_hint_for("steer_sync"),
+        Some("aicx doctor --rebuild-steer-index")
+    );
+    assert_eq!(
+        recovery_hint_for("bm25_sync"),
+        Some("aicx doctor --rebuild-steer-index")
+    );
     assert_eq!(
         recovery_hint_for("extract"),
         Some("aicx store --full-rescan")
@@ -118,9 +127,8 @@ fn phase_label_and_detail_cover_pre_write_phases() {
 // NOTE: Heartbeat behavior tests (periodic ticks + floor pinning) live in
 // `tests/store_progress_markers.rs`. Keeping them out of the lib test
 // binary avoids widening parallel-test scheduling windows around the
-// pre-existing shared `diagnostics::STATE` race exercised by
-// `sources::tests::test_extract_codex_file_mixed_*` and
-// `diagnostics::tests::*`. The integration binary runs in a separate
+// pre-existing shared `diagnostics::STATE` race exercised by extraction
+// tests and `diagnostics::tests::*`. The integration binary runs in a separate
 // process with its own global state.
 #[test]
 fn heartbeat_stop_joins_thread_without_panic() {
@@ -144,7 +152,7 @@ fn render_failure_tail_returns_true_when_failures_present() {
         phase: "steer_sync",
         elapsed_ms: 250,
         error: "Lance index corrupted".into(),
-        recovery_hint: Some("aicx doctor --fix".into()),
+        recovery_hint: Some("aicx doctor --rebuild-steer-index".into()),
     });
     assert!(render_failure_tail(&log));
 }

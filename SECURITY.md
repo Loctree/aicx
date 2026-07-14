@@ -8,8 +8,8 @@ If you discover a security vulnerability in aicx, please report it responsibly.
 
 ### How to Report
 
-- Use [GitHub Security Advisories](https://github.com/VetCoders/ai-contexters/security/advisories/new) to submit a private report.
-- Alternatively, contact us directly at **void@div0.space**.
+- Use [GitHub Security Advisories](https://github.com/vetcoders/ai-contexters/security/advisories/new) to submit a private report.
+- Alternatively, contact us directly at **hello@vetcoders.io**.
 
 ### What to Include
 
@@ -41,6 +41,35 @@ DACL.
 On Windows, pass a token explicitly with `--auth-token <token>` or use
 `AICX_HTTP_AUTH_TOKEN` so no token file is created.
 
+## Dashboard HTTP Defense Model
+
+The dashboard HTTP surface is defended by a deliberate, layered model. This
+is a conscious design decision, not an accidental omission.
+
+- **Primary defense — auth token.** Every dashboard route is gated by a
+  256-bit CSPRNG auth token, compared in constant time. The token is never
+  logged and never echoed into UI/HTML or error bodies; failures return a
+  uniform `401` with no oracle.
+- **Primary defense — explicit non-loopback policy.** The server refuses to
+  bind to a non-loopback address unless the operator has explicitly opted in
+  to a non-local CORS policy *and* enforced auth is active. Loopback-only is
+  the default.
+- **Defense-in-depth — CSRF/Origin checks.** The older CSRF gate is retained
+  as defense-in-depth (Origin/header validation on mutating routes), but it is
+  no longer the primary model. Because the dashboard uses no cookie/session
+  ambient credential, classic CSRF is structurally absent regardless.
+
+### Accepted risks (operator sign-off)
+
+- **Auth token in process argv.** When the dashboard is started via the
+  background-spawn path, `--auth-token` is passed as a child-process argument,
+  so it is visible to other local users via `ps` / `/proc/<pid>/cmdline`. On a
+  single-operator host this is accepted; on shared hosts prefer
+  `AICX_HTTP_AUTH_TOKEN`.
+- **Rate limiting is peer-IP, not proxy-aware.** The `/api/*` rate limiter
+  buckets by peer IP. Behind a reverse proxy (nginx/Caddy) all clients share
+  one bucket per proxy IP; proxy-aware limiting is a tracked follow-up.
+
 ---
 
-Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders

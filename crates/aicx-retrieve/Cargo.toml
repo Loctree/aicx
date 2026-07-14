@@ -1,11 +1,11 @@
 [package]
 name = "aicx-retrieve"
-version = "0.2.0"
+version = "0.11.0"
 edition = "2024"
 rust-version = "1.91.1"
 license = "BUSL-1.1"
 description = "Retrieval trait surface, Tantivy adapter, and manifest contract for aicx hybrid indexes."
-authors = ["Maciej Gad <void@div0.space>", "Monika Szymanska <hello@vetcoders.io>"]
+authors = ["Vetcoders <hello@vetcoders.io>"]
 repository = "https://github.com/Loctree/aicx"
 homepage = "https://github.com/Loctree/aicx"
 documentation = "https://docs.rs/aicx-retrieve"
@@ -15,7 +15,7 @@ categories = ["text-processing", "development-tools"]
 
 [dependencies]
 anyhow = "1.0"
-aicx-parser = { path = "../aicx-parser" }
+aicx-parser = { path = "../aicx-parser", version = "0.11.0" }
 blake3 = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"

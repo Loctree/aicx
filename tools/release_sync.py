@@ -205,6 +205,44 @@ def transform_cargo_toml(text: str, version: str) -> str:
     )
 
 
+# Internal workspace crates version-track the main aicx crate (policy since
+# 0.9.2: the whole workspace is published to crates.io together so aicx is
+# consumable as a library). Both the per-crate `version =` and every
+# `aicx-* = { ... version = "..." ... }` dependency requirement must follow
+# the root version, or `cargo publish` resolves against stale crates.io
+# versions and `--locked` verification fails.
+INTERNAL_DEP_RE = re.compile(
+    r'^(aicx-[a-z0-9-]+\s*=\s*\{[^}]*?version\s*=\s*")[^"]*(")',
+    re.MULTILINE,
+)
+
+
+def workspace_crate_manifests() -> list[pathlib.Path]:
+    crates_root = ROOT / "crates"
+    if not crates_root.is_dir():
+        return []
+    return sorted(
+        manifest
+        for crate_dir in crates_root.iterdir()
+        if (manifest := crate_dir / "Cargo.toml").is_file()
+    )
+
+
+def transform_internal_dep_versions(text: str, version: str) -> str:
+    return INTERNAL_DEP_RE.sub(lambda m: f"{m.group(1)}{version}{m.group(2)}", text)
+
+
+def transform_workspace_crate_manifest(text: str, version: str) -> str:
+    bumped = replace_once(
+        text,
+        r'^version = "[^"]*"',
+        f'version = "{version}"',
+        flags=re.MULTILINE,
+        label="workspace crate package version",
+    )
+    return transform_internal_dep_versions(bumped, version)
+
+
 def npm_manifest_paths() -> list[pathlib.Path]:
     root = ROOT / "distribution" / "npm"
     manifests: list[pathlib.Path] = []
@@ -242,11 +280,22 @@ def sync_versions(version: str, *, write: bool) -> list[str]:
     changed: list[str] = []
 
     cargo_original = CARGO_TOML.read_text(encoding="utf-8")
-    cargo_updated = transform_cargo_toml(cargo_original, version)
+    cargo_updated = transform_internal_dep_versions(
+        transform_cargo_toml(cargo_original, version), version
+    )
     if cargo_original != cargo_updated:
         changed.append(root_relative(CARGO_TOML))
         if write:
             CARGO_TOML.write_text(cargo_updated, encoding="utf-8")
+
+    for crate_manifest in workspace_crate_manifests():
+        original = crate_manifest.read_text(encoding="utf-8")
+        updated = transform_workspace_crate_manifest(original, version)
+        if original == updated:
+            continue
+        changed.append(root_relative(crate_manifest))
+        if write:
+            crate_manifest.write_text(updated, encoding="utf-8")
 
     for manifest_path in npm_manifest_paths():
         original = manifest_path.read_text(encoding="utf-8")

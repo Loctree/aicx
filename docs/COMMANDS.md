@@ -94,16 +94,16 @@ Examples:
 
 ```bash
 # Last 24h, store-first chunks, keep stdout quiet
-aicx claude -p CodeScribe -H 24
+aicx claude -p Codescribe -H 24
 
 # Print chunk paths explicitly
-aicx claude -p CodeScribe -H 24 --emit paths
+aicx claude -p Codescribe -H 24 --emit paths
 
 # Also write a local JSON report
-aicx claude -p CodeScribe -H 24 -o ./reports -f json
+aicx claude -p Codescribe -H 24 -o ./reports -f json
 
 # Automation-friendly JSON payload on stdout
-aicx claude -p CodeScribe -H 24 --emit json | jq .
+aicx claude -p Codescribe -H 24 --emit json | jq .
 ```
 
 `--emit json` payload shape (stable fields):
@@ -111,12 +111,12 @@ aicx claude -p CodeScribe -H 24 --emit json | jq .
 ```json
 {
   "generated_at": "2026-02-08T03:12:34Z",
-  "project_filter": "CodeScribe",
-  "requested_source_filters": ["CodeScribe"],
-  "resolved_repositories": ["VetCoders/CodeScribe"],
+  "project_filter": "Codescribe",
+  "requested_source_filters": ["Codescribe"],
+  "resolved_repositories": ["Vetcoders/Codescribe"],
   "includes_non_repository_contexts": false,
   "resolved_store_buckets": {
-    "VetCoders/CodeScribe": { "claude": 123 }
+    "Vetcoders/Codescribe": { "claude": 123 }
   },
   "hours_back": 24,
   "total_entries": 123,
@@ -139,7 +139,7 @@ Same as `claude`, including `--emit <paths|json|none>` with default `none`, and 
 Example:
 
 ```bash
-aicx codex -p CodeScribe -H 48 --loctree --emit json | jq .
+aicx codex -p Codescribe -H 48 --loctree --emit json | jq .
 ```
 
 ## `aicx all`
@@ -171,28 +171,39 @@ aicx all -H 48 --user-only
 
 ## `aicx extract`
 
-Extract a single session file and write to a specific output path.
+Extract a single session for one agent — by session id or by direct file.
 
-Bypasses the canonical store — useful for one-off inspection or piping.
+Bypasses the canonical store — useful for one-off inspection or piping. The
+agent is a required subcommand; the pre-C7 `--agent`/`--format` flag grammar is
+rejected with a structured migration hint.
 
 ```bash
-aicx extract --format <claude|codex|gemini|gemini-antigravity> --output <FILE> <INPUT>
+aicx extract <codex|claude|gemini|grok|junie> --session <id> [--conversation] [-o FILE]
+aicx extract <codex|claude|gemini|grok|junie> --file <path> --conversation -o <path>
 ```
 
 Options:
-- `--format <FORMAT>` input format / agent
-- `--no-redact-secrets` disable secret redaction for this one-off extract
-- `gemini` reads classic Gemini CLI JSON sessions from `~/.gemini/tmp/.../session-*.json`
-- `gemini-antigravity` resolves either `conversations/<uuid>.pb` or `brain/<uuid>/`, prefers readable conversation artifacts inside `brain/<uuid>/`, and explicitly falls back to `.system_generated/steps/*/output.txt` when no chat-grade artifact is readable
-- `-o, --output <OUTPUT>` output file path
+- `--session <ID>` resolve through the session catalog first (bounded identity
+  headers, zero body reads), then parse exactly the one resolved source.
+  Accepts the full id, a logical alias, a UUID suffix (≥8 chars), or a unique
+  prefix; ambiguous references fail with the sorted candidate list.
+- `--file <PATH>` direct source handle from this path only — no catalog scan,
+  no global AICX state. Requires `-o`. A Gemini Antigravity `brain/<uuid>/`
+  directory is accepted here as a direct input.
+- `-o, --output <OUTPUT>` output file path. Session mode defaults to
+  `~/.aicx/extracts/<agent>/<session_id>[_conversation][_user].md` — the four
+  mode combinations never collide on disk.
+- `--conversation` denoised user/assistant transcript only
 - `--user-only` exclude assistant + reasoning messages
+- `--no-redact-secrets` disable secret redaction for this one-off extract
 - `--max-message-chars <N>` truncate huge messages in markdown (`0` = no truncation)
 
 Example:
 
 ```bash
-aicx extract --format claude /path/to/session.jsonl -o /tmp/report.md
-aicx extract --format gemini-antigravity ~/.gemini/antigravity/conversations/<uuid>.pb -o /tmp/report.md
+aicx extract codex --session 019d780f-6763-7d40-a7f8-ab0c2313c576 --conversation
+aicx extract codex --file ~/.codex/sessions/2026/04/10/rollout-<...>.jsonl --conversation -o /tmp/recall.md
+aicx extract claude --file /path/to/session.jsonl -o /tmp/report.md
 ```
 
 ## `aicx store`
@@ -225,7 +236,7 @@ Notes:
 Example:
 
 ```bash
-aicx store -p CodeScribe --agent claude -H 720 --emit paths
+aicx store -p Codescribe --agent claude -H 720 --emit paths
 ```
 
 ## `aicx corpus`
@@ -234,14 +245,26 @@ Audit and deterministically repair derived markdown corpora. Raw JSONL and log
 files remain provenance; this surface is for cleaned-but-faithful markdown that
 feeds retrieval.
 
+`validate-cards` is the card-contract gate: it validates card schema v1/v2
+sidecars, headers, full-file hashes, and md↔sidecar signal parity (see
+[`CARD_CONTRACT.md`](./CARD_CONTRACT.md)). Writer-born v2 cards stay strict.
+Migration-stamped v2 cards (`migrated_from_schema`) downgrade legacy-impossible
+gaps to explicit warnings: `migrated_missing_source` and
+`migrated_signals_unbackfilled`.
+
 ```bash
 aicx corpus audit [OPTIONS]
 aicx corpus repair [OPTIONS]
+aicx corpus validate-cards [ROOT] [--strict] [--json]
 ```
 
 Options:
 - `--root <DIR>...` corpus roots to scan (default: `$HOME/.aicx`, `$HOME/.ai-contexters`, optional `$HOME/.xcia`)
 - `--emit <text|json>` output format
+- `ROOT` store subtree or markdown card to validate with `validate-cards` (defaults to the corpus roots used by audit)
+- `--strict` make `validate-cards` exit non-zero when hard validation errors are present; migrated warning classes do not fail the gate
+- `--json` emit the `validate-cards` report as compact JSON
+- `-v, --verbose` echo per-file extractor warnings to stderr (default aggregates a per-extractor summary; structured detail always lands in `~/.aicx/state/diagnostics-<run-id>.log`)
 - `--dry-run` preview repair candidates without modifying markdown (repair default unless `--apply` is passed)
 - `--apply` rewrite derived markdown deterministically
 - `--backup` write backups before applying repairs
@@ -251,6 +274,8 @@ Examples:
 
 ```bash
 aicx corpus audit --root "$HOME/.aicx" --emit json
+aicx corpus validate-cards "$HOME/.aicx/store/Loctree/aicx" --json
+aicx corpus validate-cards "$HOME/.aicx/store/Loctree/aicx" --strict
 aicx corpus repair --root "$HOME/.aicx/store/Loctree/aicx/2026_0502" --dry-run --manifest /tmp/aicx-repair-preview.json
 aicx corpus repair --root "$HOME/.aicx/store/Loctree/aicx/2026_0502" --apply --backup
 ```
@@ -260,10 +285,10 @@ aicx corpus repair --root "$HOME/.aicx/store/Loctree/aicx/2026_0502" --apply --b
 Semantic search across the canonical corpus.
 
 Search uses the materialized semantic index by default. When the embedder or
-index is unavailable, it fails fast with `kind`, `reason`, and
-`recommendation`; it does not silently pretend fuzzy results are semantic
-oracle truth. Use `--no-semantic` only when you intentionally want the explicit
-filesystem-fuzzy escape hatch.
+index is unavailable, it automatically falls back to filesystem-fuzzy and
+surfaces the typed semantic failure as `semantic_fallback` in JSON or as a
+stderr note in text mode. Use `--no-semantic` only when you intentionally want
+to skip the semantic attempt.
 
 ```bash
 aicx search [OPTIONS] <QUERY>
@@ -274,9 +299,9 @@ Options:
 - `-p, --project <PROJECT>...` repo or store-bucket filter(s); omit to search all projects
 - `-H, --hours <HOURS>` lookback window (`0` = all time)
 - `-d, --date <DATE>` filter by date (single day, range, or open-ended)
-- `-l, --limit <N>` max results (default: `10`)
-- `-s, --score <SCORE>` minimum quality threshold (`0..=100`)
-- `--no-semantic` run explicit filesystem-fuzzy search instead of semantic search
+- `--limit <N>` max results (default: `10`)
+- `--score <SCORE>` minimum quality threshold (`0..=100`)
+- `--no-semantic` skip semantic search and run filesystem-fuzzy directly
 - `-j, --json` emit compact JSON instead of plain text
 
 Examples:
@@ -316,8 +341,8 @@ Examples:
 
 ```bash
 aicx refs -H 24 --emit paths
-aicx read /Users/polyversai/.aicx/store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md
-aicx read store/VetCoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md --max-chars 4000 --json
+aicx read /Users/user/.aicx/store/Vetcoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md
+aicx read store/Vetcoders/aicx/2026_0502/reports/codex/2026_0502_codex_sess_001.md --max-chars 4000 --json
 ```
 
 ## `aicx steer`
@@ -332,11 +357,11 @@ aicx steer [OPTIONS]
 Options:
 - `--run-id <RUN_ID>` filter by run_id (exact match)
 - `--prompt-id <PROMPT_ID>` filter by prompt_id (exact match)
-- `-a, --agent <AGENT>` filter by agent: claude, codex, gemini
+- `--agent <AGENT>` filter by agent: claude, codex, gemini, junie, codescribe
 - `-k, --kind <KIND>` filter by kind: conversations, plans, reports, other
 - `-p, --project <PROJECT>...` repo or store-bucket filter(s); omit to search all projects
 - `-d, --date <DATE>` filter by date: single day, range, or open-ended
-- `-l, --limit <N>` max results (default: `20`)
+- `--limit <N>` max results (default: `10`)
 - `-j, --json` emit JSON with `oracle_status`
 
 Examples:
@@ -368,14 +393,28 @@ Options:
 - `--legacy-root <DIR>` override legacy input store root (default: `~/.ai-contexters`)
 - `--store-root <DIR>` override AICX store root (default: `~/.aicx`)
 - `--no-intent-schema` skip the post-migration intent schema scan on the canonical store
+- `--cards-v2 [<ROOT>]` upgrade store cards v1 -> v2 in place (sidecar schema/honesty fields, `migrated_from_schema: 1`, refreshed full-file `content_sha256`, bracket header -> YAML frontmatter; body bytes never change). Optional `ROOT` overrides the walked directory (default: canonical store dir). Dry-run by default
+- `--apply` write the cards-v2 migration (without it, `--cards-v2` is a dry run)
+- `-v, --verbose` echo per-file extractor warnings to stderr (default aggregates a per-extractor summary)
 
-Example:
+Known limitation: `--cards-v2` with a non-default `ROOT` is currently blocked
+by a pre-existing sanitize read-allowlist bug ("Cannot read from path outside
+allowed directories"); it works against the default `~/.aicx` store. See
+"Open / not landed" in [`CARD_CONTRACT.md`](./CARD_CONTRACT.md).
+
+Examples:
 
 ```bash
 aicx migrate --dry-run
 
 # Full legacy -> canonical migration plus intent-schema pass from home directory
 aicx migrate
+
+# Preview the card v1 -> v2 upgrade on the canonical store (dry-run default)
+aicx migrate --cards-v2
+
+# Write the card upgrade (body bytes invariant, full-file hash refreshed, idempotent)
+aicx migrate --cards-v2 --apply
 ```
 
 ## `aicx migrate-intent-schema`
@@ -468,7 +507,7 @@ Options:
 Example:
 
 ```bash
-aicx refs -H 72 -p CodeScribe
+aicx refs -H 72 -p Codescribe
 ```
 
 ## `aicx rank`
@@ -493,6 +532,7 @@ aicx intents [OPTIONS]
 Options:
 - `-p, --project <PROJECT>...` repo or store-bucket filter(s); omit to scan all projects
 - `-H, --hours <HOURS>` lookback window (default: `720`)
+- `--limit <N>` max results (default: unlimited, so a full roadmap is never silently clipped; an explicit `--limit 10` means 10)
 - `--emit <markdown|json>` output format (default: `markdown`; `json` includes `oracle_status`)
 - `--strict` only show high-confidence intents
 - `--kind <decision|intent|outcome|task>` filter by kind
@@ -500,8 +540,108 @@ Options:
 Example:
 
 ```bash
-aicx intents -p CodeScribe loctree-suite --strict --kind decision
+aicx intents -p Codescribe loctree-suite --strict --kind decision
 ```
+
+## Truth-pipeline lanes (sessions / claims / results / clarify)
+
+`aicx` separates five epistemic lanes so agent self-report can never become
+truth by repetition:
+
+1. **Intents belong to humans** — `aicx intents` (user-only frames by default).
+2. **Claims belong to agents** — `aicx claims extract`; always `unverified` at birth.
+3. **Results belong to evidence** — `aicx results collect`; no evidence, no result.
+4. **Fractures are promise-vs-runtime gaps** — surfaced by `aicx clarify`.
+5. **Clarify belongs to unresolved human decisions** — at most 5 A/B/C questions.
+
+Every machine-readable lane export is wrapped in the `aicx.lanes.v1` envelope:
+`schema_version`, absolute `generated_at` (RFC3339, full date+year),
+`source_time_coverage`, `source_files`, `extraction_mode`, `role_filter`,
+`timezone_assumptions`, and `warnings` (non-empty whenever any timestamp is
+partial or inferred — partial time is never silently presented as full).
+
+Privacy note: lane exports embed raw text fragments of agent messages — each
+`claim_text` is the leading line of the source message verbatim. Paths under
+the user's home directory in artifact-evidence excerpts are redacted to `~`.
+
+## `aicx sessions`
+
+Discover and list agent sessions on disk (claude + codex + gemini + junie),
+newest first, with absolute RFC3339 timestamps.
+
+```bash
+aicx sessions list [--cwd] [--agent <claude|codex|gemini|junie>] [--since YYYY-MM-DD]
+                   [--all] [--limit <N>] [--format table|json]
+aicx sessions current [--json]
+aicx sessions show <session_id> [--format markdown|json]   # alias: aicx session show
+aicx sessions report <session_id> [--agent <a>] [--hours <H>] [--repo <path>]
+                     [--max <N>] [--format markdown|json]
+```
+
+- `current` prints the current agent session id for commit trailers and handoffs.
+  It prefers runtime env such as `CODEX_THREAD_ID`, then falls back to the newest
+  recent session associated with the current cwd.
+- `--cwd` infers the repo from the current directory and lists only its sessions.
+- `--agent` accepts exactly `claude`, `codex`, `gemini`, or `junie`; anything
+  else is a CLI error, never a silently empty list.
+- Table output is the operator copy/paste surface: full `SESSION`, canonical
+  repo `PROJECT`, compact source `PATH`, minute-precision `UPDATED (TZ)`,
+  combined `MSGS`/user count, and source-path `USR` derived from
+  `/Users/<user>/...`.
+- Sessions without a parseable timestamp are still listed — the table shows
+  them with an explicit `(no timestamp)` marker (and they survive the
+  `--since` window) instead of being silently dated out.
+
+`aicx sessions report` is the unified per-session truth surface: all five
+lanes in one rendering — classified human-intent lines (Lane 1, strict user
+allowlist), agent claims with their evidence-folded verification statuses
+(Lanes 2-3), contract fractures (Lane 4), and at most 5 clarify decision
+questions (Lane 5) — plus an explicit "fake-complete candidates" list
+(contradicted or high-risk-unverified claims). JSON output wraps the payload
+in the `aicx.lanes.v1` envelope with `role_filter: all` (the report reads both
+user and agent rows; the claim-only lanes stay `agent_only`).
+
+## `aicx claims`
+
+Lane 2: extract agent claims (audit targets, never truth) from one session.
+
+```bash
+aicx claims extract --session <id-or-prefix> [--agent <a>] [--hours <H>] [--format json|summary]
+```
+
+Every claim carries the absolute source-message timestamp, a
+`timestamp_partial` marker, an `extracted_at` stamp, and is born
+`unverified`. Applause verdicts (`ready_to_push` / `shippable` /
+`no_blockers`) are flagged `high_risk_unverified_claim`.
+
+## `aicx results`
+
+Lane 3: collect repo evidence for a session's claims and fold it into
+verification statuses. Read-only — nothing is executed.
+
+```bash
+aicx results collect --session <id-or-prefix> [--agent <a>] [--hours <H>]
+                     [--repo <path>] [--format json|summary]
+```
+
+For every checkable file path a claim names, artifact existence yields a
+`pass` result and absence a `fail`; `verify_claims` then promotes/demotes:
+pass → `verified`, fail → `contradicted`, mixed → `partial`, no evidence →
+stays `unverified` (never promoted).
+
+## `aicx clarify`
+
+Lane 5: turn verified gaps into at most 5 A/B/C **decision** questions —
+never fact questions the system can answer itself.
+
+```bash
+aicx clarify --session <id-or-prefix> [--agent <a>] [--hours <H>] [--repo <path>]
+             [--max <1-5>] [--format markdown|json]
+```
+
+Questions come from contract fractures (Lane 4): contradicted claims and
+unbacked applause verdicts, severest first, each with a default
+recommendation and the cost of not deciding.
 
 ## `aicx dashboard`
 
@@ -547,7 +687,7 @@ aicx reports [OPTIONS]
 
 Options:
 - `--artifacts-root <DIR>` override the Vibecrafted artifact root (default: `~/.vibecrafted/artifacts`)
-- `--org <ORG>` artifact organization bucket (default: `VetCoders`)
+- `--org <ORG>` artifact organization bucket (default: `Vetcoders`)
 - `--repo <REPO>` repo bucket (defaults to current directory name)
 - `--workflow <FILTER>` case-insensitive filter across workflow label, skill code, run/prompt IDs, lane, and title
 - `--date-from <YYYY-MM-DD|YYYY_MMDD>` inclusive start date
@@ -598,7 +738,10 @@ aicx state --info
 Run `aicx` as an MCP server (stdio or streamable HTTP transport).
 
 Exposes search, read, steer, intents, and rank tools over MCP for agent retrieval.
-`aicx_search` is semantic and fails fast when the index is not ready.
+`aicx_search` is semantic-first and uses the same filtered retrieval primitive
+as CLI `aicx search`. When the semantic index or embedder is not ready it
+returns filesystem-fuzzy results with an explicit `semantic_fallback` payload;
+pass `strict_semantic = true` to get fail-fast semantic errors.
 `aicx_steer`, `aicx_intents`, and `aicx_rank` query the canonical corpus on disk
 and return grounded source paths or chunk references.
 `aicx_read` pulls the actual chunk content by path, file name, or compact
@@ -610,13 +753,65 @@ aicx serve [OPTIONS]
 
 Options:
 - `--transport <stdio|http>` transport (default: `stdio`; legacy alias `sse` is still accepted)
+- `--host <HOST>` streamable HTTP bind host (default: `127.0.0.1`)
 - `--port <PORT>` streamable HTTP port (default: `8044`)
+- `--allowed-host <HOST>` allowed inbound HTTP `Host` header for streamable HTTP clients; repeat for remote hostnames/IPs
+- `--allow-any-host` disable HTTP `Host` validation; only use on trusted networks
+- `--auth-token <TOKEN>` explicit Bearer token for HTTP transport
+- `--require-auth <true|false>` require Bearer auth on HTTP transport (default: `true`)
+- `--no-require-auth` disable Bearer auth; accepted only for loopback binds
 
 Example:
 
 ```bash
 aicx serve --transport http --port 8044
+aicx serve --transport http --host 0.0.0.0 --allowed-host mcp.example.internal --port 8044
+aicx-mcp --transport http --host 127.0.0.1 --port 8044
 ```
+
+Remote or tailnet example:
+
+```bash
+aicx serve --transport http \
+  --host 0.0.0.0 \
+  --port 8044 \
+  --auth-token "$AICX_MCP_TOKEN"
+```
+
+Security contract:
+
+- Loopback (`127.0.0.1`) may use `--no-require-auth` for local operator flows.
+- Non-loopback binds (`0.0.0.0`, Tailscale IPs, LAN IPs) refuse to start when
+  auth is disabled. Use `--auth-token` or `AICX_HTTP_AUTH_TOKEN`.
+- `/health` is public liveness. `/mcp` is Bearer-auth gated when auth is enabled.
+
+macOS first-run note:
+
+On macOS, the Application Firewall can show a modal prompt such as
+`Do you want the application "aicx-mcp" to accept incoming network connections?`
+for a newly built or newly installed binary. Until the operator clicks
+**Allow** on the host running the server, non-loopback requests can appear as
+TCP connects followed by HTTP timeouts. This is a host-level permission prompt,
+not an MCP routing, auth, index, or ranking failure. If non-loopback HTTP hangs
+with `CLOSE_WAIT` and no request reaches the server logs, verify the host's
+Firewall settings before changing AICX code.
+
+For remote agent adoption and a repeatable Silver -> Sztudio smoke, see
+`docs/MCP_AGENT_ADOPTION.md`.
+
+### HTTP auth token resolution
+
+The HTTP transport resolves a single Bearer token from one canonical cascade
+(first match wins):
+
+1. `--auth-token <TOKEN>` (explicit CLI override)
+2. `AICX_HTTP_AUTH_TOKEN` environment variable
+3. `<AICX_HOME>/auth-token` file — honors `$AICX_HOME`; defaults to `~/.aicx/auth-token`
+4. otherwise a token is generated and persisted to that file (mode `0600` on Unix)
+
+`--no-require-auth` skips the cascade entirely and serves without auth (local
+debugging only). Run `aicx doctor` to see which source is active — it reports
+the token *source*, never the token value.
 
 ## `aicx init` (Retired)
 

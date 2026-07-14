@@ -8,7 +8,7 @@ set -euo pipefail
 #   bash install.sh --skip-install  # MCP config only
 # Run from a local checkout, or pass --release to install from GitHub Releases.
 #
-# Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+# Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 SOURCE_PATH="${BASH_SOURCE[0]:-$0}"
 if [ -n "$SOURCE_PATH" ] && [ -e "$SOURCE_PATH" ]; then
@@ -30,6 +30,9 @@ AICX_GIT_URL="${AICX_GIT_URL:-https://github.com/Loctree/aicx}"
 AICX_BIN_DIR="${AICX_BIN_DIR:-$HOME/.local/bin}"
 AICX_RELEASE_REPO="${AICX_RELEASE_REPO:-Loctree/aicx}"
 AICX_RELEASE_TAG="${AICX_RELEASE_TAG:-latest}"
+AICX_CONFIG_PATH="${AICX_CONFIG_PATH:-$HOME/.aicx/config.toml}"
+AICX_HOME_PICKER="${AICX_HOME_PICKER:-auto}"
+AICX_STORAGE_HOME="${AICX_STORAGE_HOME:-}"
 AICX_EMBEDDER_PICKER="${AICX_EMBEDDER_PICKER:-auto}"
 AICX_EMBEDDER_PROFILE="${AICX_EMBEDDER_PROFILE:-}"
 AICX_EMBEDDER_FILENAME="${AICX_EMBEDDER_FILENAME:-${AICX_EMBEDDER_FILE:-}}"
@@ -37,6 +40,7 @@ AICX_EMBEDDER_CONFIG_PATH="${AICX_EMBEDDER_CONFIG_PATH:-$HOME/.aicx/embedder.tom
 AICX_INSTALL_FORCE="${AICX_INSTALL_FORCE:-0}"
 AICX_INSTALL_DRY_RUN="${AICX_INSTALL_DRY_RUN:-0}"
 AICX_CARGO_BIN_DIR="${AICX_CARGO_BIN_DIR:-${CARGO_INSTALL_ROOT:+$CARGO_INSTALL_ROOT/bin}}"
+AICX_EMBEDDER_SETUP_DETAIL="No local embedder profile was configured in this run."
 if [ -z "$AICX_CARGO_BIN_DIR" ]; then
   AICX_CARGO_BIN_DIR="$HOME/.cargo/bin"
 fi
@@ -53,6 +57,9 @@ for arg in "$@"; do
     --verify-path-only) VERIFY_PATH_ONLY=1 ;;
     --release) AICX_INSTALL_MODE="release" ;;
     --release-tag=*) AICX_RELEASE_TAG="${arg#*=}" ;;
+    --pick-home) AICX_HOME_PICKER="1" ;;
+    --no-home-prompt) AICX_HOME_PICKER="0" ;;
+    --aicx-home=*) AICX_STORAGE_HOME="${arg#*=}" ;;
     --pick-embedder) AICX_EMBEDDER_PICKER="1" ;;
     --no-embedder-prompt) AICX_EMBEDDER_PICKER="0" ;;
     --embedder-profile=*) AICX_EMBEDDER_PROFILE="${arg#*=}" ;;
@@ -88,7 +95,13 @@ for arg in "$@"; do
       echo "  --pick-embedder                    # interactive config for ~/.aicx/embedder.toml"
       echo "  --embedder-profile=base|dev|premium"
       echo "  --no-embedder-prompt               # suppress interactive picker"
-      echo "  note: this writes AICX local embedder preferences; Roost/rust-memex remains the heavy retrieval plane"
+      echo "  note: writes only AICX local embedder preferences"
+      echo ""
+      echo "AICX storage root picker:"
+      echo "  --pick-home                        # ask where AICX_HOME should live"
+      echo "  --aicx-home=/absolute/path         # persist [storage].home in ~/.aicx/config.toml"
+      echo "  --no-home-prompt                   # suppress interactive AICX_HOME picker"
+      echo "  default: ~/.aicx                   # semantic index remains ~/.aicx/indexed/"
       exit 0
       ;;
   esac
@@ -186,6 +199,102 @@ embedder_file_for_profile() {
     premium) echo "F2LLM-v2-1.7B.Q6_K.gguf" ;;
     *) return 1 ;;
   esac
+}
+
+write_storage_home_config() {
+  local configured_home="$1"
+  local config_path="$AICX_CONFIG_PATH"
+
+  mkdir -p "$(dirname "$config_path")"
+  AICX_CONFIG_PATH_FOR_WRITE="$config_path" \
+  AICX_STORAGE_HOME_FOR_WRITE="$configured_home" \
+  python3 - <<'PY'
+from pathlib import Path
+import json
+import os
+import re
+
+config_path = Path(os.environ["AICX_CONFIG_PATH_FOR_WRITE"]).expanduser()
+storage_home = os.environ["AICX_STORAGE_HOME_FOR_WRITE"].strip()
+expanded = Path(storage_home).expanduser()
+if not storage_home:
+    raise SystemExit("empty AICX storage home")
+if any(ord(ch) < 32 for ch in storage_home):
+    raise SystemExit("invalid AICX home: control characters are not allowed")
+if ".." in expanded.parts:
+    raise SystemExit(
+        "invalid AICX home: parent-directory traversal (`..`) is not allowed"
+    )
+if not (storage_home == "~" or storage_home.startswith("~/") or expanded.is_absolute()):
+    raise SystemExit(
+        f"invalid AICX home {storage_home!r}: use an absolute path or ~/..."
+    )
+
+home_line = f"home = {json.dumps(storage_home)}"
+lines = config_path.read_text(encoding="utf-8").splitlines() if config_path.exists() else []
+out = []
+in_storage = False
+storage_seen = False
+home_written = False
+
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith("[") and stripped.endswith("]") and not stripped.startswith("[["):
+        if in_storage and not home_written:
+            out.append(home_line)
+            home_written = True
+        in_storage = stripped == "[storage]"
+        storage_seen = storage_seen or in_storage
+        out.append(line)
+        continue
+
+    if in_storage and re.match(r"^\s*home\s*=", line):
+        if not home_written:
+            out.append(home_line)
+            home_written = True
+        continue
+
+    out.append(line)
+
+if in_storage and not home_written:
+    out.append(home_line)
+elif not storage_seen:
+    if out and out[-1].strip():
+        out.append("")
+    out.append("[storage]")
+    out.append(home_line)
+
+config_path.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+print(config_path)
+PY
+}
+
+maybe_configure_aicx_home() {
+  local picker selected_home config_written default_home
+  picker=$(normalise_bool "$AICX_HOME_PICKER")
+  default_home="$HOME/.aicx"
+  selected_home="${AICX_STORAGE_HOME:-}"
+
+  if [ -z "$selected_home" ] && { [ "$picker" = "1" ] || { [ "$picker" = "auto" ] && [ -t 0 ] && [ -t 1 ] && [ -z "${CI:-}" ]; }; }; then
+    echo ""
+    echo "AICX storage root setup"
+    echo "  Default root: $default_home"
+    echo "  Semantic index path: <AICX_HOME>/indexed/_all/embeddings.ndjson"
+    echo "  Press Enter for the default, or enter an absolute path / ~/... for a persistent custom root."
+    printf "AICX_HOME [%s]: " "$default_home"
+    read -r selected_home || true
+    selected_home="${selected_home:-}"
+  fi
+
+  if [ -z "$selected_home" ]; then
+    echo "  AICX_HOME default kept: $default_home"
+    return 0
+  fi
+
+  config_written=$(write_storage_home_config "$selected_home")
+  echo "  config: $config_written"
+  echo "  storage root: $selected_home"
+  echo "  semantic index path: $selected_home/indexed/_all/embeddings.ndjson"
 }
 
 write_embedder_config() {
@@ -289,12 +398,14 @@ maybe_configure_native_embedder() {
   if [ -n "${AICX_EMBEDDER_PATH:-}" ]; then
     config_written=$(write_embedder_config "" "" "" "$AICX_EMBEDDER_PATH")
     echo "  native embedder path pinned in $config_written"
+    AICX_EMBEDDER_SETUP_DETAIL="Saved explicit local embedder path in $config_written."
     return 0
   fi
 
   if [ -n "$selected_repo" ]; then
     config_written=$(write_embedder_config "" "$selected_repo" "$selected_filename" "")
     echo "  native embedder repo pinned in $config_written"
+    AICX_EMBEDDER_SETUP_DETAIL="Saved local embedder repo preference in $config_written."
     maybe_prime_embedder_cache "$selected_repo" "$selected_filename"
     return 0
   fi
@@ -303,6 +414,7 @@ maybe_configure_native_embedder() {
     case "$explicit_profile" in
       none|off|skip)
         echo "  native embedder picker: skipped by explicit profile"
+        AICX_EMBEDDER_SETUP_DETAIL="You skipped native embedder setup."
         return 0
         ;;
       base|dev|premium)
@@ -316,19 +428,33 @@ maybe_configure_native_embedder() {
   elif [ "$picker" = "1" ] || { [ "$picker" = "auto" ] && [ -t 0 ] && [ -t 1 ] && [ -z "${CI:-}" ]; }; then
     echo ""
     echo "Native embedder setup"
-    echo "  This does not bloat the installed bundle."
-    echo "  It writes ~/.aicx/embedder.toml and can prime exactly one GGUF file in the HF cache."
-    echo "  This is AICX's first-choice local embedding path; Roost/rust-memex remains the heavy retrieval plane."
+    echo "  This optional step writes $AICX_EMBEDDER_CONFIG_PATH."
+    echo "  Model download is explicit and opt-in."
     echo ""
-    echo "  1) skip"
-    echo "  2) base    - F2LLM 0.6B Q4_K_M GGUF (~397 MB, portable default)"
-    echo "  3) dev     - F2LLM 1.7B Q4_K_M GGUF (~1.1 GB, workstation tier)"
-    echo "  4) premium - F2LLM 1.7B Q6_K GGUF (~1.4 GB, stronger local tier)"
-    printf "Choose native embedder profile [1-4]: "
+    echo "  1) Skip"
+    echo "     Do not configure local embeddings now."
+    echo ""
+    echo "  2) Base"
+    echo "     F2LLM 0.6B Q4_K_M GGUF"
+    echo "     Approx. 397 MB"
+    echo "     Recommended default."
+    echo ""
+    echo "  3) Dev"
+    echo "     F2LLM 1.7B Q4_K_M GGUF"
+    echo "     Approx. 1.1 GB"
+    echo "     Better quality, requires more resources."
+    echo ""
+    echo "  4) Premium"
+    echo "     F2LLM 1.7B Q6_K GGUF"
+    echo "     Approx. 1.4 GB"
+    echo "     Highest local quality, largest download."
+    echo ""
+    printf "Select profile [1-4]: "
     read -r reply || true
     case "${reply:-1}" in
       1|"")
         echo "  native embedder picker: skipped"
+        AICX_EMBEDDER_SETUP_DETAIL="You skipped native embedder setup."
         return 0
         ;;
       2) selected_profile="base" ;;
@@ -336,6 +462,7 @@ maybe_configure_native_embedder() {
       4) selected_profile="premium" ;;
       *)
         echo "  native embedder picker: invalid choice, skipping"
+        AICX_EMBEDDER_SETUP_DETAIL="No local embedder profile was configured; invalid picker choice was ignored."
         return 0
         ;;
     esac
@@ -347,6 +474,7 @@ maybe_configure_native_embedder() {
   selected_filename=$(embedder_file_for_profile "$selected_profile")
   config_written=$(write_embedder_config "$selected_profile" "$selected_repo" "$selected_filename" "")
   echo "  native embedder preference saved to $config_written"
+  AICX_EMBEDDER_SETUP_DETAIL="Saved the '$selected_profile' local embedder profile in $config_written."
   maybe_prime_embedder_cache "$selected_repo" "$selected_filename"
 }
 
@@ -475,18 +603,19 @@ target_install_version() {
   esac
 }
 
-scan_aicx_shadows() {
-  local target_path="$1"
+scan_binary_shadows() {
+  local binary_name="$1"
+  local target_path="$2"
   local shadow_paths count path version resolved
 
-  echo "Scanning current aicx installation surface..."
-  shadow_paths=$(which -a aicx 2>/dev/null | sort -u || true)
+  echo "Scanning current $binary_name installation surface..."
+  shadow_paths=$(which -a "$binary_name" 2>/dev/null | sort -u || true)
   if [ -z "$shadow_paths" ]; then
-    echo "  no existing aicx on PATH"
+    echo "  no existing $binary_name on PATH"
     return 0
   fi
 
-  echo "Found existing aicx installations:"
+  echo "Found existing $binary_name installations:"
   count=0
   while IFS= read -r path; do
     [ -n "$path" ] || continue
@@ -495,10 +624,10 @@ scan_aicx_shadows() {
     echo "  $path -> $version"
   done <<< "$shadow_paths"
 
-  resolved=$(command -v aicx 2>/dev/null || true)
+  resolved=$(command -v "$binary_name" 2>/dev/null || true)
   if [ "$count" -gt 1 ] || { [ -n "$resolved" ] && ! same_path "$resolved" "$target_path"; }; then
     echo ""
-    echo "WARNING: Multiple or shadowing aicx binaries detected."
+    echo "WARNING: Multiple or shadowing $binary_name binaries detected."
     echo "  target install path: $target_path"
     if [ -n "$resolved" ]; then
       echo "  PATH currently resolves to: $resolved"
@@ -522,6 +651,14 @@ scan_aicx_shadows() {
   fi
 }
 
+scan_aicx_shadows() {
+  local target_aicx="$1"
+  local target_mcp="$2"
+
+  scan_binary_shadows "aicx" "$target_aicx"
+  scan_binary_shadows "aicx-mcp" "$target_mcp"
+}
+
 cleanup_shadow_pair() {
   local dir="$1"
   local target_dir="$2"
@@ -543,7 +680,11 @@ cleanup_shadow_pair() {
   fi
 
   if semver_le "$candidate_version" "$target_version"; then
-    echo "  removing shadow aicx $candidate_version from $dir (target $target_version)"
+    if [ "$AICX_INSTALL_DRY_RUN" = "1" ]; then
+      echo "  would remove shadow aicx $candidate_version from $dir (target $target_version)"
+    else
+      echo "  removing shadow aicx $candidate_version from $dir (target $target_version)"
+    fi
     cleanup_old_binaries "$dir/aicx"
     cleanup_old_binaries "$dir/aicx-mcp"
   else
@@ -566,6 +707,7 @@ cleanup_shadow_aicx_binaries() {
 
 verify_install_path_resolution() {
   local installed_path="$1"
+  local binary_name="${2:-aicx}"
   local installed_version path_resolved path_resolved_version
 
   if ! [ -x "$installed_path" ]; then
@@ -573,17 +715,17 @@ verify_install_path_resolution() {
   fi
 
   installed_version=$("$installed_path" --version 2>/dev/null || echo "unknown")
-  path_resolved=$(command -v aicx 2>/dev/null || true)
+  path_resolved=$(command -v "$binary_name" 2>/dev/null || true)
   if [ -z "$path_resolved" ]; then
     echo ""
     echo "=========================================="
-    echo "WARNING: installed aicx is not on PATH"
+    echo "WARNING: installed $binary_name is not on PATH"
     echo "  Installed to: $installed_path -> $installed_version"
-    echo "  Add $(dirname "$installed_path") to PATH before running aicx."
+    echo "  Add $(dirname "$installed_path") to PATH before running $binary_name."
     echo "=========================================="
     return 0
   fi
-  path_resolved_version=$(aicx --version 2>/dev/null || echo "unknown")
+  path_resolved_version=$("$binary_name" --version 2>/dev/null || echo "unknown")
   if [ -n "$path_resolved" ] && { ! same_path "$path_resolved" "$installed_path" || [ "$installed_version" != "$path_resolved_version" ]; }; then
     echo ""
     echo "=========================================="
@@ -591,14 +733,14 @@ verify_install_path_resolution() {
     echo "  Installed to: $installed_path -> $installed_version"
     echo "  PATH resolves to: $path_resolved -> $path_resolved_version"
     echo ""
-    echo "Other aicx binaries in PATH:"
-    which -a aicx 2>/dev/null | sort -u | while IFS= read -r path; do
+    echo "Other $binary_name binaries in PATH:"
+    which -a "$binary_name" 2>/dev/null | sort -u | while IFS= read -r path; do
       if [ -n "$path" ] && ! same_path "$path" "$installed_path"; then
         echo "  $path"
       fi
     done
     echo ""
-    echo "To fix: ensure $(dirname "$installed_path") is before other aicx locations in your PATH,"
+    echo "To fix: ensure $(dirname "$installed_path") is before other $binary_name locations in your PATH,"
     echo "or remove the older binary shown above."
     echo "=========================================="
   fi
@@ -698,7 +840,7 @@ download_release_bundle() {
   release_tag=$(resolve_release_tag)
   target=$(detect_release_target)
   case "$target" in
-    *apple-darwin|*windows-gnu) archive_ext="zip" ;;
+    *apple-darwin|*windows*) archive_ext="zip" ;;
     *) archive_ext="tar.gz" ;;
   esac
   bundle_name="aicx-${release_tag}-${target}-slim"
@@ -709,7 +851,13 @@ download_release_bundle() {
   checksum_path="$tmp_dir/${archive_name}.sha256"
 
   cleanup_release_tmp() {
-    rm -rf "$tmp_dir"
+    # The EXIT trap runs at global scope after the function stack is unwound
+    # (e.g. when `set -e` aborts on the delegated installer failing), so the
+    # `local tmp_dir` is no longer in scope. Guard against nounset and skip the
+    # removal when it is empty/unset.
+    if [ -n "${tmp_dir:-}" ]; then
+      rm -rf "$tmp_dir"
+    fi
   }
   trap cleanup_release_tmp EXIT
 
@@ -747,8 +895,19 @@ archive_path = Path(os.environ["ARCHIVE_PATH"])
 dest_dir = Path(os.environ["DEST_DIR"])
 
 if archive_path.name.endswith(".zip"):
+    # zipfile.extractall does NOT restore POSIX modes from external_attr, so the
+    # bundled `aicx`/`aicx-mcp`/`install.sh` would land as 0644 and the delegated
+    # bundled installer would reject them (no executable bit). Extract per entry
+    # and restore the mode from the high 16 bits of external_attr. Skip macOS
+    # AppleDouble (`._*`) sidecar entries produced by the system zip tool.
     with zipfile.ZipFile(archive_path) as archive:
-        archive.extractall(dest_dir)
+        for info in archive.infolist():
+            if os.path.basename(info.filename).startswith("._"):
+                continue
+            extracted = archive.extract(info, dest_dir)
+            mode = info.external_attr >> 16
+            if mode:
+                os.chmod(extracted, mode)
 elif archive_path.name.endswith(".tar.gz"):
     with tarfile.open(archive_path, "r:gz") as archive:
         archive.extractall(dest_dir)
@@ -766,6 +925,11 @@ PY
   AICX_BIN_DIR="$AICX_BIN_DIR" \
   AICX_INSTALL_FORCE="$AICX_INSTALL_FORCE" \
   AICX_INSTALL_DRY_RUN="$AICX_INSTALL_DRY_RUN" \
+  AICX_CONFIG_PATH="$AICX_CONFIG_PATH" \
+  AICX_HOME_PICKER="$AICX_HOME_PICKER" \
+  AICX_STORAGE_HOME="$AICX_STORAGE_HOME" \
+  AICX_EMBEDDER_PICKER="$AICX_EMBEDDER_PICKER" \
+  AICX_EMBEDDER_PROFILE="$AICX_EMBEDDER_PROFILE" \
   bash "$bundle_dir/install.sh"
   exit 0
 }
@@ -794,13 +958,15 @@ resolve_install_mode() {
 INSTALL_MODE=$(resolve_install_mode)
 INSTALL_TARGET_BIN_DIR=$(install_target_bin_dir "$INSTALL_MODE")
 INSTALL_TARGET_AICX="$INSTALL_TARGET_BIN_DIR/aicx"
+INSTALL_TARGET_AICX_MCP="$INSTALL_TARGET_BIN_DIR/aicx-mcp"
 INSTALL_TARGET_VERSION=$(target_install_version "$INSTALL_MODE")
 if [ "$VERIFY_PATH_ONLY" -eq 1 ]; then
-  verify_install_path_resolution "$INSTALL_TARGET_AICX"
+  verify_install_path_resolution "$INSTALL_TARGET_AICX" "aicx"
+  verify_install_path_resolution "$INSTALL_TARGET_AICX_MCP" "aicx-mcp"
   exit 0
 fi
 if [ "$SKIP_INSTALL" -eq 0 ]; then
-  scan_aicx_shadows "$INSTALL_TARGET_AICX"
+  scan_aicx_shadows "$INSTALL_TARGET_AICX" "$INSTALL_TARGET_AICX_MCP"
   cleanup_shadow_aicx_binaries "$INSTALL_TARGET_BIN_DIR" "$INSTALL_TARGET_VERSION"
 fi
 if [ "$SHADOW_CHECK_ONLY" -eq 1 ]; then
@@ -865,7 +1031,8 @@ else
 fi
 
 if [ "$SKIP_INSTALL" -eq 0 ]; then
-  verify_install_path_resolution "$INSTALL_TARGET_AICX"
+  verify_install_path_resolution "$INSTALL_TARGET_AICX" "aicx"
+  verify_install_path_resolution "$INSTALL_TARGET_AICX_MCP" "aicx-mcp"
 fi
 
 # --- Step 2: Verify ---
@@ -898,8 +1065,9 @@ else
   echo "  Warning: aicx-mcp not found. MCP config will be skipped."
 fi
 
-# --- Step 3: Configure MCP ---
-echo "[3/4] Configuring MCP servers..."
+# --- Step 3: Configure storage + MCP ---
+echo "[3/4] Configuring storage + MCP servers..."
+maybe_configure_aicx_home
 
 configure_mcp() {
   local tool_name="$1"
@@ -977,41 +1145,51 @@ maybe_configure_native_embedder
 echo ""
 
 # --- Done ---
-echo "=== Setup complete ==="
+echo "=== AICX setup complete ==="
 echo ""
-if path_has_dir "$AICX_BIN_DIR"; then
-  echo "Install path:"
-  echo "  $AICX_BIN_DIR is already on PATH"
-else
-  echo "PATH note:"
-  echo "  Add $AICX_BIN_DIR to PATH so new shells pick up the bundled install first."
-  echo "  Example: export PATH=\"$AICX_BIN_DIR:\$PATH\""
-  echo ""
-fi
-if [ -d "$HOME/.ai-contexters" ]; then
-  echo "Legacy store detected at ~/.ai-contexters/"
-  echo "Run 'aicx migrate' to move your history to the new canonical ~/.aicx/ store."
-  echo ""
-fi
 echo "Installed:"
-echo "  aicx      — CLI for extraction, search, steer, dashboard"
-echo "  aicx-mcp  — MCP server (4 tools: search, read, rank, steer)"
+echo "  aicx      - command-line tool for indexing and searching agent history"
+echo "  aicx-mcp  - MCP server for Claude Code, Codex and Gemini"
 echo ""
-echo "MCP tools available in Claude Code / Codex / Gemini:"
-echo "  aicx_search  — fuzzy search across session history"
-echo "  aicx_read    — read one canonical chunk by path or ref"
-echo "  aicx_rank    — quality-score stored chunks"
-echo "  aicx_steer   — retrieve chunks by run/prompt/project/agent/date metadata"
+echo "Install path:"
+echo "  $INSTALL_TARGET_BIN_DIR"
+if path_has_dir "$INSTALL_TARGET_BIN_DIR"; then
+  echo "  This path is already available in PATH."
+else
+  echo "  Add this path to PATH so new shells pick up the bundled install first."
+  echo "  Example: export PATH=\"$INSTALL_TARGET_BIN_DIR:\$PATH\""
+fi
+echo ""
+if [ -d "$HOME/.ai-contexters" ]; then
+  echo "Legacy store:"
+  echo "  Found ~/.ai-contexters/"
+  echo "  Run 'aicx migrate' to move your history to the canonical ~/.aicx/ store."
+  echo ""
+fi
+echo "MCP tools:"
+echo "  aicx_search  - search session history"
+echo "  aicx_read    - read a stored chunk"
+echo "  aicx_rank    - score stored chunks"
+echo "  aicx_steer   - search by project, agent, date or run metadata"
 echo ""
 echo "Quick start:"
-echo "  aicx all -H 24                     # rescan last 24h from all agents"
-echo "  aicx search 'query terms'          # fuzzy search across session history"
-echo "  aicx refs -H 24                    # compact summary of recent files"
-echo "  aicx steer --project aicx          # metadata-aware retrieval"
+echo "  aicx all -H 24"
+echo "      Index the last 24 hours from supported agents."
 echo ""
-echo "Native local embeddings:"
-echo "  bash install.sh --pick-embedder    # choose and optionally hydrate one GGUF model"
-echo "  config: ~/.aicx/embedder.toml      # backend/profile/repo/filename/path"
+echo "  aicx search \"query terms\""
+echo "      Search indexed session history."
 echo ""
-echo "Heavy retrieval:"
-echo "  Use Roost/rust-memex for the advanced operator retrieval plane; AICX stays the portable corpus + local embedding foundation."
+echo "  aicx refs -H 24"
+echo "      Show compact references from the last 24 hours."
+echo ""
+echo "  aicx steer --project aicx"
+echo "      Search using project metadata."
+echo ""
+echo "Local embeddings:"
+echo "  $AICX_EMBEDDER_SETUP_DETAIL"
+echo ""
+echo "  To configure or change local embeddings later, run:"
+echo "    bash install.sh --pick-embedder"
+echo ""
+echo "  Config file:"
+echo "    $AICX_EMBEDDER_CONFIG_PATH"

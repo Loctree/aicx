@@ -11,10 +11,11 @@ ifeq (,$(shell command -v cargo 2>/dev/null))
   endif
 endif
 
-.PHONY: all build build-native release-binaries install install-bin install-config install-cargo git-hooks
-.PHONY: precheck precheck-native test test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
+.PHONY: all build build-native completions release-binaries install install-bin install-config install-cargo git-hooks
+.PHONY: precheck precheck-native loctree-consumer-check test test-native check fmt fmt-check clippy clippy-native semgrep ci clean help manifest-check
 .PHONY: embeddings-check embeddings-test embeddings-clippy embeddings-hydrate embeddings-info
 .PHONY: version version-show version-check version-bump version-patch bump-patch changelog-close release-notes release-plan release-prepare release-check release-tag release-push package-check release-bundle release-bundle-only-binaries test-e2e
+.PHONY: publish-crates publish-crates-dry
 
 all: build
 
@@ -45,6 +46,13 @@ build:
 
 build-native:
 	cargo build --locked --release --features native-embedder --bin aicx --bin aicx-mcp
+
+completions:
+	@mkdir -p completions
+	cargo run --locked --bin aicx -- completions bash > completions/aicx.bash
+	cargo run --locked --bin aicx -- completions zsh > completions/_aicx
+	cargo run --locked --bin aicx -- completions fish > completions/aicx.fish
+	python3 tools/canonicalize_completions.py
 
 release-binaries:
 	@if [ -z "$(STAGING_DIR)" ]; then \
@@ -115,10 +123,20 @@ precheck-native:
 	cargo check --locked -p aicx-embeddings --features gguf
 	cargo check --locked -p aicx --features native-embedder --all-targets
 
+loctree-consumer-check:
+	cargo check --locked -p aicx --no-default-features --features loctree-consumer
+	cargo test --locked -p aicx --lib --no-default-features --features loctree-consumer slim_profile_exposes_read_core_contract
+	@hits=$$(cargo tree --locked --no-default-features --features loctree-consumer -p aicx | grep -ciE 'lancedb|llama' || true); \
+	if [ "$$hits" != "0" ]; then \
+		echo "loctree-consumer pulled forbidden lancedb/llama dependencies ($$hits hits)" >&2; \
+		exit 1; \
+	fi
+
 manifest-check:
 	@$(PYTHON) -c 'import sys, re; text = open("Cargo.toml", "r").read(); bad = [m.group(1) for m in re.finditer(r"^([\w-]+)\s*=.*path\s*=", text, re.MULTILINE) if m.group(1) not in ("rmcp-memex", "aicx-embeddings", "aicx-retrieve", "aicx-parser", "aicx-monitor", "aicx-progress-contracts", "path")]; sys.exit("Manifest policy check failed:\n  - Unexpected local path dependency: " + ", ".join(bad)) if bad else print("Manifest policy: ok (approved local product deps only)")'
 
 test:
+	@$(MAKE) loctree-consumer-check
 	cargo test --locked -p aicx --all-targets
 	cargo test --locked -p aicx-embeddings
 
@@ -145,31 +163,28 @@ test-retrieval-eval-rebaseline:
 
 check:
 	@echo "=== AICX Quality Gate ==="
-	@echo "[1/10] Checking manifest portability..."
+	@echo "[1/11] Checking manifest portability..."
 	@$(MAKE) manifest-check
-	@echo "[2/10] Checking formatting..."
+	@echo "[2/11] Checking formatting..."
 	@cargo fmt --all --check || (echo "Run 'make fmt' to fix formatting." && exit 1)
-	@echo "[3/10] Running default cargo check..."
+	@echo "[3/11] Running default cargo check..."
 	@$(MAKE) precheck
-	@echo "[4/10] Running native GGUF cargo check..."
+	@echo "[4/11] Running loctree consumer profile check..."
+	@$(MAKE) loctree-consumer-check
+	@echo "[5/11] Running native GGUF cargo check..."
 	@$(MAKE) precheck-native
-	@echo "[5/10] Running default clippy..."
+	@echo "[6/11] Running default clippy..."
 	@$(MAKE) clippy
-	@echo "[6/10] Running native GGUF clippy..."
+	@echo "[7/11] Running native GGUF clippy..."
 	@$(MAKE) clippy-native
-	@echo "[7/10] Running default tests..."
+	@echo "[8/11] Running default tests..."
 	@$(MAKE) test
-	@echo "[8/10] Running native GGUF tests..."
+	@echo "[9/11] Running native GGUF tests..."
 	@$(MAKE) test-native
-	@echo "[9/10] Building slim release binaries..."
+	@echo "[10/11] Building slim release binaries..."
 	@cargo build --locked --release --bin aicx --bin aicx-mcp
-	@echo "[10/10] Running Semgrep (if available)..."
-	@if command -v semgrep >/dev/null 2>&1 || command -v pipx >/dev/null 2>&1; then \
-		SEMGREP=$$(command -v semgrep || echo "pipx run semgrep"); \
-		$$SEMGREP --config auto --error --quiet . --exclude target; \
-	else \
-		echo "[!] Semgrep not available, skipping (install: pipx install semgrep)"; \
-	fi
+	@echo "[11/11] Running Semgrep (required)..."
+	@$(MAKE) semgrep
 	@echo "=== All checks passed ==="
 
 fmt:
@@ -219,12 +234,11 @@ embeddings-clippy:
 	cargo clippy --locked -p aicx-embeddings --features gguf -- -D warnings
 
 semgrep:
-	@if command -v semgrep >/dev/null 2>&1 || command -v pipx >/dev/null 2>&1; then \
-		SEMGREP=$$(command -v semgrep || echo "pipx run semgrep"); \
-		$$SEMGREP --config auto --error --quiet . --exclude target; \
-	else \
-		echo "[!] Semgrep not available, skipping (install: pipx install semgrep)"; \
-	fi
+	@if command -v semgrep >/dev/null 2>&1; then SEMGREP="semgrep"; \
+	elif command -v uvx >/dev/null 2>&1; then SEMGREP="uvx semgrep"; \
+	elif command -v pipx >/dev/null 2>&1; then SEMGREP="pipx run semgrep"; \
+	else echo "[x] Semgrep is REQUIRED — no runner found. Install semgrep, or use 'uvx semgrep' / 'pipx run semgrep'." >&2; exit 1; fi; \
+	$$SEMGREP --config auto --error --quiet . --exclude target
 
 ci: check
 	@echo "CI-equivalent local checks passed."
@@ -249,10 +263,10 @@ version-bump:
 ifeq ($(origin VERSION),command line)
 	@$(PYTHON) tools/release_sync.py bump "$(VERSION)"
 	@echo ""
-	@echo "Versioned release surfaces synced from Cargo.toml into docs + distribution/npm."
+	@echo "Versioned release surfaces synced from Cargo.toml into workspace crates + docs + distribution/npm."
 	@echo "Cargo.lock is intentionally not touched by version-bump."
-	@echo "To sync the lockfile for this package only (no network):"
-	@echo "  cargo update --package $(PACKAGE_NAME) --offline"
+	@echo "To sync the lockfile for all workspace packages (no network):"
+	@echo "  cargo update --workspace --offline"
 	@echo "Or rely on 'make release-prepare' to sync it for you."
 else
 	@echo "VERSION is required. Usage: make version-bump VERSION={patch|minor|major|x.y.z}" >&2 && exit 1
@@ -300,7 +314,7 @@ release-prepare:
 ifeq ($(origin VERSION),command line)
 	@$(MAKE) version-bump VERSION=$(VERSION)
 	@$(MAKE) changelog-close CHANGELOG_GENERATE=1
-	@cargo update --package $(PACKAGE_NAME) --offline
+	@cargo update --workspace --offline
 	@$(MAKE) version-check
 	@$(PYTHON) tools/release_sync.py notes --output dist/release-notes.md
 	@$(MAKE) precheck
@@ -344,9 +358,27 @@ release-push:
 	git push origin "$(TAG)"
 
 package-check:
-	@echo "crates.io packaging is intentionally disabled for aicx."
-	@echo "Use GitHub Release archives + npm platform packages instead."
-	@echo "Run: make release-check"
+	@echo "crates.io is NOT the user-facing release path — that is GitHub Releases."
+	@echo "User binaries: GitHub Release archives + npm + Homebrew tap."
+	@echo "Publishing aicx to crates.io as a LIBRARY (e.g. for Loctree to depend on): make publish-crates"
+
+# --- crates.io publish (SOURCE registry — library consumption, NOT the real release) ---
+# The REAL, user-facing publish is GitHub Releases (signed prebuilt binaries):
+#   make release-tag && make release-push   (or `gh release create`).
+# This target exists so aicx is consumable as a LIBRARY crate (Loctree depends on it)
+# and `cargo install aicx` works from source. crates.io is PERMANENT (yank, never delete).
+# Order is topological: leaves first, then aicx-retrieve (needs aicx-parser), then aicx.
+CRATE_LEAVES := aicx-parser aicx-embeddings aicx-monitor aicx-progress-contracts
+CRATE_PUBLISH_ORDER := aicx-parser aicx-embeddings aicx-monitor aicx-progress-contracts aicx-retrieve aicx
+
+publish-crates-dry:
+	@echo "crates.io DRY-RUN (no upload). SOURCE registry — NOT the real release (= GitHub Releases)."
+	@for c in $(CRATE_LEAVES); do echo "==> dry-run $$c"; cargo publish --dry-run -p $$c --locked --allow-dirty || exit $$?; done
+	@echo "OK: leaves dry-run clean. aicx-retrieve + aicx verify only AFTER their deps are live on crates.io."
+
+publish-crates:
+	@echo "crates.io publish (SOURCE registry, PERMANENT). The user-facing release is GitHub Releases — see 'make release-push'."
+	@for c in $(CRATE_PUBLISH_ORDER); do echo "==> publish $$c"; cargo publish -p $$c --locked || exit $$?; done
 
 release-bundle:
 	@KEYS="$(KEYS)" \
@@ -374,51 +406,57 @@ release-bundle-only-binaries:
 clean:
 	cargo clean
 
+# Help colors
+HELP_C_CYAN   := \033[36m
+HELP_C_GREEN  := \033[32m
+HELP_C_YELLOW := \033[33m
+HELP_C_RESET  := \033[0m
+
 help:
-	@echo "AICX Build System"
-	@echo ""
-	@echo "Core Commands:"
-	@echo "  make build           - Build release binaries (aicx + aicx-mcp)"
-	@echo "  make build-native    - Build release binaries with native GGUF embedder support"
-	@echo "  make install         - Install binaries + configure local MCP clients via install.sh"
-	@echo "  make install-bin     - Install only aicx + aicx-mcp from the current checkout"
-	@echo "  make install-config  - Configure local MCP clients without reinstalling binaries"
-	@echo "  make install-cargo   - Explain why crates.io install is not the active path"
-	@echo "  make git-hooks       - Install repo-local pre-commit + pre-push hooks"
-	@echo "  make precheck        - Quick default cargo check"
-	@echo "  make precheck-native - Quick native GGUF cargo check"
-	@echo "  make manifest-check  - Fail if Cargo.toml uses local path dependencies"
-	@echo "  make check           - Full local gate (fmt, check, clippy, test, build, semgrep)"
-	@echo "  make test            - Run all tests"
-	@echo "  make test-native     - Run native GGUF embedder tests"
-	@echo "  make fmt             - Format all Rust code"
-	@echo "  make clean           - Clean build artifacts"
-	@echo ""
-	@echo "Native Embeddings:"
-	@echo "  make embeddings-info EMBEDDER_PROFILE=base|dev|premium     - Show GGUF profile details"
-	@echo "  make embeddings-hydrate EMBEDDER_PROFILE=base|dev|premium  - Download selected GGUF into HF cache"
-	@echo "  make embeddings-check                                      - Check aicx-embeddings with GGUF backend"
-	@echo "  make embeddings-test                                       - Test aicx-embeddings with GGUF backend"
-	@echo "  make embeddings-clippy                                     - Clippy aicx-embeddings with GGUF backend"
-	@echo ""
-	@echo "Release / Version:"
-	@echo "  make version               - Alias for version-show"
-	@echo "  make version-show          - Show package version and tag state"
-	@echo "  make version-check         - Validate synced release surfaces (Cargo/docs/npm/changelog basics)"
-	@echo "  make version-bump VERSION=X - Bump version and sync docs/npm surfaces. X={patch|minor|major|x.y.z}"
-	@echo "  make version-patch         - Alias for version-bump VERSION=patch"
-	@echo "  make bump-patch            - Alias for version-bump VERSION=patch"
-	@echo "  make changelog-close       - Close CHANGELOG '## [Unreleased]' to current version + date"
-	@echo "  make release-notes         - Print release notes body derived from CHANGELOG current version section"
-	@echo "  make release-plan          - Print the full post-merge release flow"
-	@echo "  make release-prepare VERSION=X - version-bump + changelog-close + notes preview + precheck. X={patch|minor|major|x.y.z}"
-	@echo "  make release-check         - Strict release readiness gate"
-	@echo "  make release-tag           - Create annotated tag from Cargo.toml version"
-	@echo "  make release-push          - Push the current release tag to origin"
-	@echo "  make package-check         - Explain binary-release packaging track"
-	@echo "  make release-bundle        - Local macOS bundle + codesign + notarize using KEYS/NOTARY_PROFILE (NATIVE=1 for GGUF backend)"
-	@echo ""
-	@echo "Quick start:"
-	@echo "  make install         - Contributor/local operator setup"
-	@echo "  make check           - Full local verification"
-	@echo "  make release-plan    - Review release flow before tagging"
+	@printf '\n$(HELP_C_CYAN)%s$(HELP_C_RESET)\n' 'AICX Build System'
+	@printf '\n'
+	@printf '  $(HELP_C_YELLOW)%s$(HELP_C_RESET)\n' 'CORE COMMANDS'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'build' '- Build release binaries (aicx + aicx-mcp)'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'build-native' '- Build release binaries with native GGUF embedder support'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install' '- Install binaries + configure local MCP clients via install.sh'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-bin' '- Install only aicx + aicx-mcp from the current checkout'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-config' '- Configure local MCP clients without reinstalling binaries'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-cargo' '- Explain why crates.io install is not the active path'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'git-hooks' '- Install repo-local pre-commit + pre-push hooks'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'precheck' '- Quick default cargo check'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'precheck-native' 'Quick native GGUF cargo check'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'manifest-check' '- Fail if Cargo.toml uses local path dependencies'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'check' '- Full local gate (fmt, check, clippy, test, build, semgrep)'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test' '- Run all tests'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test-native' '- Run native GGUF embedder tests'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'fmt' '- Format all Rust code'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'clean' '- Clean build artifacts'
+	@printf '\n'
+	@printf '  $(HELP_C_YELLOW)%s$(HELP_C_RESET)\n' 'NATIVE EMBEDDINGS'
+	@printf '%s\n' '  make embeddings-info EMBEDDER_PROFILE=base|dev|premium     - Show GGUF profile details'
+	@printf '%s\n' '  make embeddings-hydrate EMBEDDER_PROFILE=base|dev|premium  - Download selected GGUF into HF cache'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'embeddings-check' '- Check aicx-embeddings with GGUF backend'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'embeddings-test' '- Test aicx-embeddings with GGUF backend'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'embeddings-clippy' '- Clippy aicx-embeddings with GGUF backend'
+	@printf '\n'
+	@printf '  $(HELP_C_YELLOW)%s$(HELP_C_RESET)\n' 'RELEASE / VERSION'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'version' '- Alias for version-show'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'version-show' '- Show package version and tag state'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'version-check' '- Validate synced release surfaces (Cargo/docs/npm/changelog basics)'
+	@printf '%s\n' '  make version-bump VERSION=X - Bump version and sync docs/npm surfaces. X={patch|minor|major|x.y.z}'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'version-patch' '- Alias for version-bump VERSION=patch'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'bump-patch' '- Alias for version-bump VERSION=patch'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'changelog-close' "- Close CHANGELOG '## [Unreleased]' to current version + date"
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'release-notes' '- Print release notes body derived from CHANGELOG current version section'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'release-plan' '- Print the full post-merge release flow'
+	@printf '%s\n' '  make release-prepare VERSION=X - version-bump + changelog-close + notes preview + precheck. X={patch|minor|major|x.y.z}'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'release-check' '- Strict release readiness gate'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'release-tag' '- Create annotated tag from Cargo.toml version'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'release-push' '- Push the current release tag to origin'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'package-check' '- Explain binary-release packaging track'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'release-bundle' '- Local macOS bundle + codesign + notarize using KEYS/NOTARY_PROFILE (NATIVE=1 for GGUF backend)'
+	@printf '\n'
+	@printf '  $(HELP_C_YELLOW)%s$(HELP_C_RESET)\n' 'QUICK START'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install' '- Contributor/local operator setup'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'check' '- Full local verification'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'release-plan' '- Review release flow before tagging'

@@ -6,14 +6,14 @@
 //!
 //! Two production backends compile in by default:
 //! - **Cloud** (`cloud-embedder` feature) — HTTP POST against an
-//!   OpenAI-compatible `/v1/embeddings`. Recommended VetCoders production
+//!   OpenAI-compatible `/v1/embeddings`. Recommended Vetcoders production
 //!   default: zero-install, config-driven URL/model/api_key_env.
 //! - **Native GGUF** (`native-embedder` feature) — local llama.cpp
 //!   inference over an F2LLM/GGUF model resolved from `AICX_EMBEDDER_PATH`
 //!   or the local HuggingFace cache. Release bundles stay slim and do not
 //!   silently carry model payloads.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 #![cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
 

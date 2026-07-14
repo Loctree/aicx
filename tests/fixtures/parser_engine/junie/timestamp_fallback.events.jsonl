@@ -1,0 +1,2 @@
+{"kind":"UserPromptEvent","requestId":"prompt-260408-214823-br8l","prompt":"Timestamp comes from request id."}
+{"kind":"AgentTextBlockUpdatedEvent","stepId":"step-1","text":"Stable fallback."}

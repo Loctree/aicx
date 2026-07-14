@@ -21,9 +21,9 @@
 //! query patterns; the public API ([`query_index`]) stays the same so the
 //! storage swap is transparent to callers.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
-use std::io::{self, BufRead, Read};
+use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -150,6 +150,160 @@ pub struct IndexStats {
     /// Checkpoint path used for resume, when a full build continued from
     /// an existing temporary index instead of truncating it.
     pub resume_tmp_path: Option<PathBuf>,
+}
+
+/// Report for deriving one project-scoped semantic bucket from the
+/// cross-project `_all` bucket without re-embedding.
+#[derive(Debug, Clone, Serialize)]
+pub struct DerivedProjectIndexStats {
+    pub project: String,
+    pub source_index_path: PathBuf,
+    pub index_path: PathBuf,
+    pub entries_written: usize,
+    pub elapsed_ms: u128,
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+struct DerivedProjectIndexWriter {
+    project: String,
+    source_index_path: PathBuf,
+    index_path: PathBuf,
+    tmp_path: PathBuf,
+    final_tmp_path: PathBuf,
+    writer: std::io::BufWriter<std::fs::File>,
+    source_header: IndexHeader,
+    entries_written: usize,
+    started: Instant,
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+impl DerivedProjectIndexWriter {
+    fn create(
+        project: &str,
+        source_index_path: &Path,
+        source_header: &IndexHeader,
+    ) -> Result<Self> {
+        use std::fs;
+        use std::io::Write;
+
+        let index_path = index_path(Some(project))?;
+        if source_index_path == index_path {
+            anyhow::bail!(
+                "source and target index paths are identical: {}",
+                index_path.display()
+            );
+        }
+        let Some(parent) = index_path.parent() else {
+            anyhow::bail!("index path has no parent: {}", index_path.display());
+        };
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create derived project index dir: {}", parent.display()))?;
+
+        let tmp_path = index_path.with_extension("ndjson.tmp");
+        let final_tmp_path = index_path.with_extension("ndjson.commit.tmp");
+        let _ = fs::remove_file(&tmp_path);
+        let _ = fs::remove_file(&final_tmp_path);
+
+        let tmp = crate::sanitize::create_file_validated(&tmp_path)
+            .with_context(|| format!("create derived project tmp index: {}", tmp_path.display()))?;
+        let mut writer = std::io::BufWriter::new(tmp);
+        writeln!(
+            writer,
+            "{}",
+            serde_json::to_string(&IndexHeader {
+                schema_version: source_header.schema_version.clone(),
+                model_id: source_header.model_id.clone(),
+                model_profile: source_header.model_profile.clone(),
+                dimension: source_header.dimension,
+                generated_at: chrono::Utc::now().to_rfc3339(),
+                entry_count: 0,
+            })?
+        )
+        .with_context(|| format!("write placeholder derived header: {}", tmp_path.display()))?;
+
+        Ok(Self {
+            project: project.to_string(),
+            source_index_path: source_index_path.to_path_buf(),
+            index_path,
+            tmp_path,
+            final_tmp_path,
+            writer,
+            source_header: source_header.clone(),
+            entries_written: 0,
+            started: Instant::now(),
+        })
+    }
+
+    fn write_row(&mut self, line: &str) -> Result<()> {
+        use std::io::Write;
+
+        writeln!(self.writer, "{line}")
+            .with_context(|| format!("write derived project row: {}", self.tmp_path.display()))?;
+        self.entries_written += 1;
+        Ok(())
+    }
+
+    fn cleanup_tmp(&self) {
+        let _ = std::fs::remove_file(&self.tmp_path);
+        let _ = std::fs::remove_file(&self.final_tmp_path);
+    }
+
+    fn finalize(self) -> Result<DerivedProjectIndexStats> {
+        use std::fs;
+        use std::io::Write;
+
+        let Self {
+            project,
+            source_index_path,
+            index_path,
+            tmp_path,
+            final_tmp_path,
+            mut writer,
+            source_header,
+            entries_written,
+            started,
+        } = self;
+
+        writer
+            .flush()
+            .with_context(|| format!("flush derived project tmp index: {}", tmp_path.display()))?;
+        drop(writer);
+
+        if entries_written == 0 {
+            let _ = fs::remove_file(&tmp_path);
+            anyhow::bail!(
+                "no entries for project `{project}` found in {}",
+                source_index_path.display()
+            );
+        }
+
+        let truthful_header = IndexHeader {
+            schema_version: source_header.schema_version,
+            model_id: source_header.model_id,
+            model_profile: source_header.model_profile,
+            dimension: source_header.dimension,
+            generated_at: chrono::Utc::now().to_rfc3339(),
+            entry_count: entries_written,
+        };
+        rewrite_index_with_truthful_header(&tmp_path, &final_tmp_path, &truthful_header)
+            .with_context(|| format!("rewrite derived project header: {}", tmp_path.display()))?;
+        let _ = fs::remove_file(&tmp_path);
+        fs::rename(&final_tmp_path, &index_path).with_context(|| {
+            format!(
+                "commit derived project index: {} -> {}",
+                final_tmp_path.display(),
+                index_path.display()
+            )
+        })?;
+
+        Ok(DerivedProjectIndexStats {
+            project,
+            source_index_path,
+            index_path,
+            entries_written,
+            elapsed_ms: started.elapsed().as_millis(),
+        })
+    }
 }
 
 /// One row of the persistent NDJSON-backed index.
@@ -407,10 +561,9 @@ pub fn hybrid_dense_path(project: Option<&str>) -> Result<PathBuf> {
 pub fn observed_source_hash_for_index_path(path: &Path) -> Result<String> {
     let mut file = crate::sanitize::open_file_validated(path)
         .with_context(|| format!("open {}", path.display()))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .with_context(|| format!("read {}", path.display()))?;
-    Ok(format!("{:x}", Sha256::digest(&bytes)))
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).with_context(|| format!("read {}", path.display()))?;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -746,6 +899,7 @@ pub fn write_index_with_options(
     let mut skipped = 0usize;
     let mut failed = 0usize;
     let tick_interval = Duration::from_secs(1);
+    let mut hybrid_delta_chunks = Vec::new();
 
     for (item_index, stored) in files.iter().take(cap).enumerate() {
         let entry_id = chunk_id_from_path(&stored.path);
@@ -817,6 +971,27 @@ pub fn write_index_with_options(
             cwd: chunk_cwd(&stored.path),
             embedding,
         };
+        if incremental_baseline.is_some() {
+            let metadata = serde_json::json!({
+                "source_path": stored.path.to_string_lossy(),
+                "project": stored.project,
+                "agent": stored.agent,
+                "date": stored.date_iso,
+                "kind": stored.kind.dir_name(),
+                "session_id": stored.session_id,
+                "frame_kind": chunk_frame_kind(&stored.path),
+                "cwd": chunk_cwd(&stored.path),
+            });
+            hybrid_delta_chunks.push(aicx_retrieve::DenseChunkRef {
+                chunk: aicx_retrieve::ChunkRef {
+                    id: entry_id.clone(),
+                    source_path: stored.path.to_string_lossy().to_string(),
+                    text: content,
+                    metadata,
+                },
+                embedding: entry.embedding.clone(),
+            });
+        }
         writeln!(writer, "{}", serde_json::to_string(&entry)?)?;
         stats.embeddings_computed += 1;
         indexed += 1;
@@ -991,7 +1166,64 @@ pub fn write_index_with_options(
         }
     }
 
-    if let Err(err) = materialize_hybrid_index(&target_path, project, &info) {
+    // Bug A1: `materialize_hybrid_index` does a full, destructive tantivy
+    // rebuild on every call. Skip it when this incremental run added nothing
+    // and the committed manifest still matches the embedder — keeps the
+    // last-good hybrid index queryable and avoids the 98%-CPU / 12-min
+    // rebuild pathology. A dimension/model migration flips the manifest match
+    // to false and rebuilds regardless.
+    let manifest_matches_pre_commit_source =
+        incremental_baseline.as_ref().is_some_and(|baseline| {
+            hybrid_manifest_matches_committed_source(
+                project,
+                baseline.source_chunk_count,
+                &baseline.source_hash_blake3,
+            )
+        });
+    let hybrid_mode = decide_hybrid_materialization(
+        incremental_baseline.is_some(),
+        indexed,
+        failed,
+        hybrid_manifest_matches_embedder(project, &info),
+        manifest_matches_pre_commit_source,
+        has_existing_hybrid_artifacts(project),
+    );
+    let hybrid_result = match hybrid_mode {
+        HybridMaterializationMode::Skip => {
+            eprintln!(
+                "[aicx][phase=index event=hybrid_skip reason=no_op_incremental_manifest_match indexed=0 failed=0]"
+            );
+            Ok(None)
+        }
+        HybridMaterializationMode::IncrementalInsert => {
+            let committed_source_hash = observed_source_hash_for_index_path(&target_path)?;
+            match incremental_materialize_hybrid(
+                project,
+                &info,
+                &hybrid_delta_chunks,
+                total_indexed,
+                &committed_source_hash,
+            ) {
+                Ok(manifest) => {
+                    eprintln!(
+                        "[aicx][phase=index event=hybrid_incremental indexed={indexed} failed={failed} dense_count={}]",
+                        manifest.dense_count
+                    );
+                    Ok(Some(manifest))
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[aicx][phase=index event=hybrid_incremental_fallback reason=incremental_failed error={err:#}]"
+                    );
+                    materialize_hybrid_index(&target_path, project, &info).map(Some)
+                }
+            }
+        }
+        HybridMaterializationMode::FullRebuild => {
+            materialize_hybrid_index(&target_path, project, &info).map(Some)
+        }
+    };
+    if let Err(err) = hybrid_result {
         on_event(&IndexEvent::RunFailed {
             error: format!("{err:#}"),
             processed_before_failure: processed,
@@ -1041,10 +1273,25 @@ fn materialize_hybrid_index(
     let source_hash = observed_source_hash_for_index_path(index_path)?;
     let mut lexical_chunks = Vec::with_capacity(entries.len());
     let mut dense_chunks = Vec::with_capacity(entries.len());
+    let mut skipped_missing_source_count = 0usize;
+    let mut skipped_missing_source_examples: Vec<PathBuf> = Vec::new();
 
     for entry in entries {
-        let text = crate::sanitize::read_to_string_validated(&entry.path)
-            .with_context(|| format!("read chunk for hybrid index: {}", entry.path.display()))?;
+        let text = match crate::sanitize::read_to_string_validated(&entry.path) {
+            Ok(text) => text,
+            Err(_err) if !entry.path.exists() => {
+                skipped_missing_source_count += 1;
+                if skipped_missing_source_examples.len() < 5 {
+                    skipped_missing_source_examples.push(entry.path.clone());
+                }
+                continue;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("read chunk for hybrid index: {}", entry.path.display())
+                });
+            }
+        };
         let metadata = index_entry_metadata_json(&entry);
         let chunk = ChunkRef {
             id: entry.id.clone(),
@@ -1057,6 +1304,23 @@ fn materialize_hybrid_index(
             chunk,
             embedding: entry.embedding,
         });
+    }
+    if skipped_missing_source_count > 0 {
+        let examples = skipped_missing_source_examples
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        eprintln!(
+            "[aicx][phase=index event=hybrid_skip_missing_sources skipped={} examples={}]",
+            skipped_missing_source_count, examples
+        );
+    }
+    if dense_chunks.is_empty() && skipped_missing_source_count > 0 {
+        anyhow::bail!(
+            "hybrid build has no live source chunks after skipping {} stale semantic row(s)",
+            skipped_missing_source_count
+        );
     }
 
     let lexical = Box::new(TantivyAdapter::new(manifest_dir.clone())?);
@@ -1073,6 +1337,377 @@ fn materialize_hybrid_index(
     dense_persist.persist_ndjson(&hybrid_dense_path(project)?)?;
 
     Ok(manifest)
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn incremental_materialize_hybrid(
+    project: Option<&str>,
+    info: &crate::embedder::EmbeddingModelInfo,
+    delta_chunks: &[aicx_retrieve::DenseChunkRef],
+    source_chunk_count: usize,
+    source_hash: &str,
+) -> Result<aicx_retrieve::Manifest> {
+    use aicx_retrieve::{
+        DenseIndex, Distance, FusionStrategy, LexicalIndex, Manifest, ReciprocalRankFusion,
+        TantivyAdapter, validate_live_bindings_for_refresh,
+    };
+
+    if delta_chunks.is_empty() {
+        anyhow::bail!("incremental hybrid materialize requires at least one delta chunk");
+    }
+
+    let manifest_dir = hybrid_index_dir(project)?;
+    let manifest_path = hybrid_manifest_path(project)?;
+    let dense_path = hybrid_dense_path(project)?;
+    let manifest = Manifest::read_from_path(&manifest_path)?;
+    let mut lexical = TantivyAdapter::new(manifest_dir)?;
+    let mut dense = aicx_retrieve::load_from_ndjson(&dense_path, info.dimension, Distance::Cosine)?;
+    let fusion = ReciprocalRankFusion::default();
+    let fingerprint = hybrid_embedder_fingerprint(info);
+
+    validate_live_bindings_for_refresh(&manifest, &lexical, &dense, &fusion, &fingerprint)
+        .map_err(|err| anyhow::anyhow!("incremental hybrid validate existing artifacts: {err}"))?;
+
+    let build_started_at = Manifest::now_utc();
+    for delta in delta_chunks {
+        lexical.insert(&delta.chunk)?;
+        dense.insert(delta)?;
+    }
+    dense.persist_ndjson(&dense_path)?;
+    let build_completed_at = Manifest::now_utc();
+    let refreshed = Manifest {
+        schema_version: manifest.schema_version,
+        generation_id: Manifest::fresh_generation_id(),
+        source_chunk_count,
+        source_hash_blake3: aicx_retrieve::source_hash_blake3(source_hash),
+        embedder_model: fingerprint.model,
+        embedder_url_hash: fingerprint.url_hash,
+        embedder_dim: fingerprint.dim,
+        embedder_distance: fingerprint.distance,
+        dense_count: dense.count(),
+        dense_kind: dense.kind().to_string(),
+        lexical_commit_id: lexical.commit_id().0.clone(),
+        lexical_doc_count: lexical.doc_count(),
+        build_started_at,
+        build_completed_at,
+        build_wall_seconds: build_completed_at
+            .signed_duration_since(build_started_at)
+            .num_seconds()
+            .max(0) as u64,
+        fusion_algorithm: fusion.name().to_string(),
+        fusion_k: aicx_retrieve::RRF_K_DEFAULT,
+    };
+    refreshed.write_to_path(&manifest_path)?;
+    Ok(refreshed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HybridMaterializationMode {
+    Skip,
+    IncrementalInsert,
+    FullRebuild,
+}
+
+pub(crate) fn decide_hybrid_materialization(
+    is_incremental: bool,
+    indexed: usize,
+    failed: usize,
+    manifest_matches_embedder: bool,
+    manifest_matches_committed_source: bool,
+    has_existing_hybrid: bool,
+) -> HybridMaterializationMode {
+    let hybrid_is_current =
+        manifest_matches_embedder && manifest_matches_committed_source && has_existing_hybrid;
+    if is_incremental && indexed == 0 && failed == 0 && hybrid_is_current {
+        HybridMaterializationMode::Skip
+    } else if is_incremental && indexed > 0 && failed == 0 && hybrid_is_current {
+        HybridMaterializationMode::IncrementalInsert
+    } else {
+        HybridMaterializationMode::FullRebuild
+    }
+}
+
+/// Pure decision: should `materialize_hybrid_index` be SKIPPED on this run?
+///
+/// Bug A1: `materialize_hybrid_index` triggers a full tantivy lexical rebuild
+/// (`remove_dir_all` + reindex of every doc) and is otherwise called
+/// unconditionally after each dense commit — so a no-op incremental run
+/// (zero new chunks) needlessly burns CPU and tears down the last-good
+/// lexical index. Skip it when nothing changed.
+///
+/// Skip ONLY when ALL hold:
+/// - `is_incremental` — not a `--full-rescan` (which must always rebuild),
+/// - `indexed == 0` — no new/changed rows materialized,
+/// - `failed == 0` — no embed failures to reconcile,
+/// - `manifest_matches_embedder` — the committed hybrid manifest still matches
+///   the current embedder. A dimension/model change (operator's F2LLM 2048 ->
+///   qwen3 4096 migration) flips this to false and FORCES a rebuild even on a
+///   no-op incremental, so search never keeps serving a stale-model hybrid.
+/// - `manifest_matches_committed_source` — the existing hybrid still points at
+///   the same committed semantic corpus the incremental delta is based on.
+/// - `has_existing_hybrid` — manifest + persisted dense + Tantivy lexical
+///   artifacts exist.
+#[allow(dead_code)]
+pub(crate) fn should_skip_hybrid_rebuild(
+    is_incremental: bool,
+    indexed: usize,
+    failed: usize,
+    manifest_matches_embedder: bool,
+    manifest_matches_committed_source: bool,
+    has_existing_hybrid: bool,
+) -> bool {
+    decide_hybrid_materialization(
+        is_incremental,
+        indexed,
+        failed,
+        manifest_matches_embedder,
+        manifest_matches_committed_source,
+        has_existing_hybrid,
+    ) == HybridMaterializationMode::Skip
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn has_existing_hybrid_artifacts(project: Option<&str>) -> bool {
+    let Ok(manifest_path) = hybrid_manifest_path(project) else {
+        return false;
+    };
+    let Ok(dense_path) = hybrid_dense_path(project) else {
+        return false;
+    };
+    let Ok(hybrid_dir) = hybrid_index_dir(project) else {
+        return false;
+    };
+    let lexical_meta = hybrid_dir
+        .join(aicx_retrieve::TANTIVY_INDEX_DIR)
+        .join("meta.json");
+    manifest_path.exists() && dense_path.exists() && lexical_meta.exists()
+}
+
+/// Does the committed hybrid manifest still match the CURRENT embedder?
+///
+/// Reads the on-disk manifest and compares its recorded dimension + model id
+/// against the live embedder. A missing/unreadable manifest, or a
+/// dimension/model change (F2LLM 2048 -> qwen3 4096 migration), returns
+/// `false` — which forces [`should_skip_hybrid_rebuild`] to rebuild rather
+/// than skip, so search never serves a stale-model hybrid.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn hybrid_manifest_matches_embedder(
+    project: Option<&str>,
+    info: &crate::embedder::EmbeddingModelInfo,
+) -> bool {
+    let Ok(manifest_path) = hybrid_manifest_path(project) else {
+        return false;
+    };
+    if !manifest_path.exists() {
+        return false;
+    }
+    match aicx_retrieve::Manifest::read_from_path(&manifest_path) {
+        Ok(manifest) => {
+            manifest.embedder_dim == info.dimension && manifest.embedder_model == info.model_id
+        }
+        Err(_) => false,
+    }
+}
+
+/// Rebuild the hybrid lexical + dense + manifest artifacts from the EXISTING
+/// committed semantic index, WITHOUT re-embedding (the `aicx repair` recovery
+/// path). The committed index already holds every chunk's embedding, so
+/// `materialize_hybrid_index` reconstructs the full retrieval surface from it
+/// — turning an unqueryable build (dense present, hybrid missing/stale) into a
+/// queryable one in seconds instead of a multi-hour re-embed.
+///
+/// The embedder is loaded only for its model/dimension fingerprint (recorded
+/// in the manifest and checked against the committed index); it never
+/// re-embeds chunk content.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub fn repair_hybrid_from_committed(project: Option<&str>) -> Result<aicx_retrieve::Manifest> {
+    let index_path = index_path(project)?;
+    if !index_path.exists() {
+        anyhow::bail!(
+            "no committed semantic index at {} — run `aicx index` first (repair only rebuilds \
+             hybrid artifacts from existing embeddings; it does not embed)",
+            index_path.display()
+        );
+    }
+    let engine = crate::embedder::EmbeddingEngine::new().context(
+        "repair needs the embedder for the model/dimension fingerprint (it does NOT re-embed chunks)",
+    )?;
+    let info = engine.info().clone();
+    materialize_hybrid_index(&index_path, project, &info)
+}
+
+/// Build-disabled stub for binaries compiled without any embedder feature.
+#[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+pub fn repair_hybrid_from_committed(_project: Option<&str>) -> Result<aicx_retrieve::Manifest> {
+    anyhow::bail!(
+        "repair requires an embedder feature — rebuild with `--features native-embedder` or `--features cloud-embedder`"
+    )
+}
+
+/// Materialize `indexed/<project>/embeddings.ndjson` from the existing
+/// cross-project `_all` semantic index without invoking the embedder.
+///
+/// The `_all` index already stores full [`IndexEntry`] rows including each
+/// vector. For project-scoped fast paths we can stream-filter those rows into
+/// a project bucket, rewrite the header with the truthful row count, and then
+/// let [`repair_hybrid_from_committed`] build lexical+dense hybrid artifacts
+/// from that committed project index. This is a repair/derivation path, not a
+/// semantic refresh: any chunks missing from `_all` are necessarily missing
+/// from the derived bucket too.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub fn derive_project_index_from_all(project: &str) -> Result<DerivedProjectIndexStats> {
+    if project.trim().is_empty() {
+        anyhow::bail!("project is required; refusing to derive the cross-project _all bucket");
+    }
+    let mut stats = derive_project_indexes_from_all(&[project.to_string()])?;
+    stats
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("no derived report for project `{project}`"))
+}
+
+/// Materialize project-scoped semantic buckets from the existing `_all`
+/// semantic index in one streaming pass.
+///
+/// `projects` is a set of canonical `<owner>/<repo>` slugs. When empty, every
+/// project present in `_all` is materialized. This is the public-repo contract
+/// repair path for `aicx index`: a user who builds the global semantic index
+/// must also get project-scoped `aicx search -p ...` without learning about
+/// storage buckets or running one manual derive per project.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub fn derive_project_indexes_from_all(
+    projects: &[String],
+) -> Result<Vec<DerivedProjectIndexStats>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io::BufReader;
+
+    let source_index_path = index_path(None)?;
+    if !source_index_path.exists() {
+        anyhow::bail!(
+            "no cross-project semantic index at {} — build `_all` first with `aicx index`",
+            source_index_path.display()
+        );
+    }
+
+    let _lock = crate::locks::acquire_exclusive(crate::locks::lance_lock_path()?)?;
+    let source = crate::sanitize::open_file_validated(&source_index_path)
+        .with_context(|| format!("open _all semantic index: {}", source_index_path.display()))?;
+    let mut reader = BufReader::new(source);
+    let header_line = read_index_line_capped(
+        &mut reader,
+        &source_index_path,
+        1,
+        "cross-project semantic header",
+    )
+    .with_context(|| format!("read _all header: {}", source_index_path.display()))?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "empty cross-project semantic index: {}",
+            source_index_path.display()
+        )
+    })?;
+    let source_header = serde_json::from_str::<IndexHeader>(&header_line)
+        .with_context(|| format!("parse _all header: {}", source_index_path.display()))?;
+
+    let requested: BTreeSet<String> = projects
+        .iter()
+        .map(|project| project.trim())
+        .filter(|project| !project.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    let derive_all_projects = requested.is_empty();
+    let mut writers: BTreeMap<String, DerivedProjectIndexWriter> = BTreeMap::new();
+
+    for (idx, line) in
+        capped_index_lines(reader, &source_index_path, 2, "cross-project semantic data").enumerate()
+    {
+        let line = line.with_context(|| {
+            format!(
+                "read _all semantic index line {}: {}",
+                idx + 2,
+                source_index_path.display()
+            )
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let project = extract_project_from_index_line(&line).with_context(|| {
+            format!(
+                "read project field from _all semantic index line {}: {}",
+                idx + 2,
+                source_index_path.display()
+            )
+        })?;
+        let Some(project) = project else {
+            anyhow::bail!(
+                "missing project field in _all semantic index line {}: {}",
+                idx + 2,
+                source_index_path.display()
+            );
+        };
+        if !derive_all_projects && !requested.contains(&project) {
+            continue;
+        }
+        if !writers.contains_key(&project) {
+            let writer =
+                DerivedProjectIndexWriter::create(&project, &source_index_path, &source_header)
+                    .with_context(|| {
+                        format!("create derived project writer for `{project}` from `_all`")
+                    })?;
+            writers.insert(project.clone(), writer);
+        }
+        writers
+            .get_mut(&project)
+            .expect("writer inserted for project")
+            .write_row(&line)?;
+    }
+
+    if !derive_all_projects {
+        let found: BTreeSet<String> = writers.keys().cloned().collect();
+        let missing: Vec<String> = requested.difference(&found).cloned().collect();
+        if !missing.is_empty() {
+            for writer in writers.values() {
+                writer.cleanup_tmp();
+            }
+            anyhow::bail!(
+                "no entries for project(s) {} found in {}",
+                missing.join(", "),
+                source_index_path.display()
+            );
+        }
+    }
+
+    writers
+        .into_values()
+        .map(DerivedProjectIndexWriter::finalize)
+        .collect()
+}
+
+#[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+pub fn derive_project_index_from_all(_project: &str) -> Result<DerivedProjectIndexStats> {
+    anyhow::bail!(
+        "derive requires an embedder feature — rebuild with `--features native-embedder` or `--features cloud-embedder`"
+    )
+}
+
+#[cfg(not(any(feature = "native-embedder", feature = "cloud-embedder")))]
+pub fn derive_project_indexes_from_all(
+    _projects: &[String],
+) -> Result<Vec<DerivedProjectIndexStats>> {
+    anyhow::bail!(
+        "derive requires an embedder feature — rebuild with `--features native-embedder` or `--features cloud-embedder`"
+    )
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn extract_project_from_index_line(line: &str) -> Result<Option<String>> {
+    let Some(offset) = line.find("\"project\":") else {
+        return Ok(None);
+    };
+    let tail = &line[offset + "\"project\":".len()..];
+    let mut deserializer = serde_json::Deserializer::from_str(tail);
+    String::deserialize(&mut deserializer)
+        .map(Some)
+        .context("parse compact project string")
 }
 
 /// Rewrite the placeholder header in `tmp_path` with the truthful one and
@@ -1118,7 +1753,15 @@ fn rewrite_index_with_truthful_header(
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn read_committed_index_entries(path: &Path) -> Result<(IndexHeader, Vec<IndexEntry>)> {
+pub(crate) fn read_committed_index_entries(path: &Path) -> Result<(IndexHeader, Vec<IndexEntry>)> {
+    read_committed_index_entries_matching_project(path, None)
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+pub(crate) fn read_committed_index_entries_matching_project(
+    path: &Path,
+    project_filter: Option<&str>,
+) -> Result<(IndexHeader, Vec<IndexEntry>)> {
     use std::io::BufReader;
 
     let file = crate::sanitize::open_file_validated(path)
@@ -1130,10 +1773,25 @@ fn read_committed_index_entries(path: &Path) -> Result<(IndexHeader, Vec<IndexEn
     let header = serde_json::from_str::<IndexHeader>(&header_line)
         .with_context(|| format!("parse header in {}", path.display()))?;
     let mut entries = Vec::new();
+    let project_needle = project_filter
+        .map(|project| {
+            serde_json::to_string(project).map(|project_json| format!("\"project\":{project_json}"))
+        })
+        .transpose()?;
     for (idx, line) in capped_index_lines(reader, path, 2, "committed semantic data").enumerate() {
         let line = line.with_context(|| format!("read line {} in {}", idx + 2, path.display()))?;
         if line.trim().is_empty() {
             continue;
+        }
+        if let Some(needle) = project_needle.as_deref() {
+            // The persistent IndexEntry JSON is compact and includes a
+            // top-level `"project":"owner/repo"` field. For `_all` fallback
+            // queries this cheap textual guard avoids deserializing large
+            // 4096-float embeddings from unrelated projects before the dense
+            // leg can apply its exact FilterSet.
+            if !line.contains(needle) {
+                continue;
+            }
         }
         let entry = serde_json::from_str::<IndexEntry>(&line)
             .with_context(|| format!("parse line {} in {}", idx + 2, path.display()))?;
@@ -1143,7 +1801,7 @@ fn read_committed_index_entries(path: &Path) -> Result<(IndexHeader, Vec<IndexEn
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn index_entry_metadata_json(entry: &IndexEntry) -> serde_json::Value {
+pub(crate) fn index_entry_metadata_json(entry: &IndexEntry) -> serde_json::Value {
     serde_json::json!({
         "source_path": entry.path.to_string_lossy(),
         "project": entry.project,
@@ -1310,6 +1968,8 @@ pub(crate) struct IncrementalBaseline {
     #[allow(dead_code)] // validated at parse time; kept for diagnostics & future reconcile mode
     pub(crate) cutoff: std::time::SystemTime,
     pub(crate) embedded_ids: std::collections::HashSet<String>,
+    pub(crate) source_chunk_count: usize,
+    pub(crate) source_hash_blake3: String,
 }
 
 /// Read the committed index at `path`, validate that its header matches
@@ -1415,10 +2075,38 @@ fn load_incremental_baseline(
         return Ok(None);
     }
 
+    let source_hash = observed_source_hash_for_index_path(path)
+        .with_context(|| format!("hash committed incremental index: {}", path.display()))?;
+
     Ok(Some(IncrementalBaseline {
         cutoff: cutoff_st,
         embedded_ids,
+        source_chunk_count: data_rows,
+        source_hash_blake3: aicx_retrieve::source_hash_blake3(&source_hash),
     }))
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn hybrid_manifest_matches_committed_source(
+    project: Option<&str>,
+    source_chunk_count: usize,
+    source_hash_blake3: &str,
+) -> bool {
+    let Ok(path) = hybrid_manifest_path(project) else {
+        return false;
+    };
+    let Ok(manifest) = aicx_retrieve::Manifest::read_from_path(&path) else {
+        return false;
+    };
+    let lexical_schema_prefix = format!("{}:", aicx_retrieve::TANTIVY_SCHEMA_VERSION);
+    if !manifest
+        .lexical_commit_id
+        .starts_with(&lexical_schema_prefix)
+    {
+        return false;
+    }
+    manifest.source_chunk_count == source_chunk_count
+        && manifest.source_hash_blake3 == source_hash_blake3
 }
 
 /// Return the subset of `files` that need to be embedded under the
@@ -1829,674 +2517,7 @@ pub fn query_index(
 }
 
 #[cfg(test)]
-mod iter3_tests {
-    use super::*;
-    use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    #[test]
-    fn cosine_orthogonal_vectors_are_zero() {
-        let a = [1.0f32, 0.0, 0.0];
-        let b = [0.0f32, 1.0, 0.0];
-        assert!((cosine_similarity(&a, &b)).abs() < 1e-6);
-    }
-
-    #[test]
-    fn cosine_identical_vectors_are_one() {
-        let a = [0.5f32, 0.3, 0.8];
-        let b = [0.5f32, 0.3, 0.8];
-        let s = cosine_similarity(&a, &b);
-        assert!((s - 1.0).abs() < 1e-6, "expected ~1.0, got {}", s);
-    }
-
-    #[test]
-    fn cosine_zero_vector_is_safely_zero() {
-        let a = [0.0f32, 0.0, 0.0];
-        let b = [1.0f32, 2.0, 3.0];
-        assert_eq!(cosine_similarity(&a, &b), 0.0);
-    }
-
-    #[test]
-    fn cosine_dimension_mismatch_returns_zero() {
-        let a = [1.0f32, 2.0];
-        let b = [1.0f32, 2.0, 3.0];
-        assert_eq!(cosine_similarity(&a, &b), 0.0);
-    }
-
-    #[test]
-    fn chunk_id_strips_md_extension() {
-        let path = Path::new("/tmp/store/foo/bar/baz_001.md");
-        assert_eq!(chunk_id_from_path(path), "baz_001");
-    }
-
-    #[test]
-    fn index_path_collapses_slashes_to_underscores() {
-        let dir = tempdir_for_test();
-        let path = index_path_for(&dir, Some("vetcoders/aicx"));
-        let path_str = path.to_string_lossy();
-        assert!(
-            path_str.contains("vetcoders_aicx"),
-            "expected slash collapsed to underscore in {path_str}"
-        );
-        assert!(
-            path_str.ends_with("embeddings.ndjson"),
-            "expected NDJSON filename in {path_str}"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-    #[test]
-    fn partition_incremental_files_keeps_only_unembedded_and_fresh() {
-        // G-3 partition logic on a synthetic corpus. The committed
-        // baseline knows about ids `a` and `b`; chunk `c` is brand new.
-        // `a` is older than cutoff AND committed -> skip; `b` is newer
-        // than cutoff but already committed -> skip (crash-recovery
-        // guard); `c` is the only survivor (new id wins regardless of
-        // mtime, plus its mtime is fresh here anyway).
-        use std::collections::HashSet;
-
-        let dir = tempdir_for_test();
-        let cutoff_dt = chrono::DateTime::parse_from_rfc3339("2026-05-15T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-
-        let chunks = [
-            ("a", "2026-05-14T00:00:00Z"), // older than cutoff
-            ("b", "2026-05-16T00:00:00Z"), // newer than cutoff
-            ("c", "2026-05-16T00:00:00Z"), // newer than cutoff
-        ];
-        let mut files: Vec<crate::store::StoredContextFile> = Vec::new();
-        for (id, mtime_rfc) in chunks {
-            let path = dir.join(format!("{id}.md"));
-            std::fs::write(&path, format!("# chunk {id}")).unwrap();
-            let ts: std::time::SystemTime = chrono::DateTime::parse_from_rfc3339(mtime_rfc)
-                .unwrap()
-                .with_timezone(&chrono::Utc)
-                .into();
-            filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(ts)).unwrap();
-            files.push(crate::store::StoredContextFile {
-                path,
-                project: "test".into(),
-                repo: None,
-                date_compact: "20260516".into(),
-                date_iso: "2026-05-16".into(),
-                kind: crate::timeline::Kind::Other,
-                agent: "claude".into(),
-                session_id: id.into(),
-                chunk: 0,
-            });
-        }
-
-        let mut embedded_ids = HashSet::new();
-        embedded_ids.insert("a".to_string());
-        embedded_ids.insert("b".to_string());
-        let baseline = IncrementalBaseline {
-            cutoff: cutoff_dt.into(),
-            embedded_ids,
-        };
-
-        let to_embed = partition_incremental_files(&files, &baseline);
-        let ids: Vec<String> = to_embed
-            .iter()
-            .map(|stored| chunk_id_from_path(&stored.path))
-            .collect();
-        assert_eq!(ids, vec!["c".to_string()]);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-    #[test]
-    fn partition_incremental_files_reembeds_missing_id_with_old_mtime() {
-        // Regression for PR #6 follow-up: a chunk restored from backup /
-        // rsync / quarantine restore may have an mtime OLDER than the
-        // committed `header.generated_at`, but if its id is not in the
-        // committed body the incremental walk MUST still pick it up.
-        // Otherwise Layer 2 semantic search silently drifts incomplete
-        // and operators are forced into `--full-rescan` to recover.
-        use std::collections::HashSet;
-
-        let dir = tempdir_for_test();
-        let cutoff_dt = chrono::DateTime::parse_from_rfc3339("2026-05-15T12:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-
-        // Chunk `restored` has an old mtime (way before the cutoff) and
-        // no entry in the committed embedded_ids set — exactly the
-        // backup-restore shape we want to cover.
-        let restored_path = dir.join("restored.md");
-        std::fs::write(&restored_path, "# restored chunk").unwrap();
-        let old_ts: std::time::SystemTime =
-            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc)
-                .into();
-        filetime::set_file_mtime(&restored_path, filetime::FileTime::from_system_time(old_ts))
-            .unwrap();
-
-        let files = vec![crate::store::StoredContextFile {
-            path: restored_path,
-            project: "test".into(),
-            repo: None,
-            date_compact: "20260101".into(),
-            date_iso: "2026-01-01".into(),
-            kind: crate::timeline::Kind::Other,
-            agent: "claude".into(),
-            session_id: "restored".into(),
-            chunk: 0,
-        }];
-
-        // Committed baseline mentions other ids, never `restored`.
-        let mut embedded_ids = HashSet::new();
-        embedded_ids.insert("a".to_string());
-        embedded_ids.insert("b".to_string());
-        let baseline = IncrementalBaseline {
-            cutoff: cutoff_dt.into(),
-            embedded_ids,
-        };
-
-        let to_embed = partition_incremental_files(&files, &baseline);
-        let ids: Vec<String> = to_embed
-            .iter()
-            .map(|stored| chunk_id_from_path(&stored.path))
-            .collect();
-        assert_eq!(
-            ids,
-            vec!["restored".to_string()],
-            "missing-id chunk with old mtime must be re-embedded"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-    #[test]
-    fn copy_committed_body_into_streams_data_rows_only() {
-        // G-3 incremental seed: existing committed index has 5 data rows
-        // plus a header. The seed helper must write exactly those 5 rows
-        // into the tmp writer (header dropped because the caller writes a
-        // fresh placeholder of its own).
-        let dir = tempdir_for_test();
-        let target = dir.join("embeddings.ndjson");
-        let tmp = dir.join("embeddings.ndjson.tmp");
-
-        let header = IndexHeader {
-            schema_version: "v0-test".into(),
-            model_id: "test-model".into(),
-            model_profile: "base".into(),
-            dimension: 4,
-            generated_at: "2026-05-15T12:00:00Z".into(),
-            entry_count: 5,
-        };
-        let mut body = serde_json::to_string(&header).unwrap();
-        body.push('\n');
-        for i in 0..5 {
-            body.push_str(&format!(
-                r#"{{"id":"row-{i}","embedding":[0.1,0.2,0.3,0.4]}}"#
-            ));
-            body.push('\n');
-        }
-        std::fs::write(&target, &body).unwrap();
-
-        {
-            let mut writer = std::io::BufWriter::new(std::fs::File::create(&tmp).unwrap());
-            use std::io::Write;
-            // Caller writes its own placeholder first.
-            writeln!(writer, "{{\"placeholder\":true}}").unwrap();
-            let rows = copy_committed_body_into(&mut writer, &target).unwrap();
-            assert_eq!(rows, 5, "seed must surface row count for D-2 math");
-        }
-
-        let content = std::fs::read_to_string(&tmp).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 6, "placeholder header + 5 data rows");
-        assert_eq!(lines[0], "{\"placeholder\":true}");
-        for (i, expected_id) in (0..5).map(|i| format!("row-{i}")).enumerate() {
-            assert!(
-                lines[i + 1].contains(&expected_id),
-                "row {} preserved verbatim",
-                i
-            );
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-    #[test]
-    fn incremental_round_trip_appends_only_new_rows() {
-        // End-to-end shape: first committed index has 3 rows. Operator
-        // adds 5 more chunks. Incremental walk + seed + rewrite produces
-        // a final file with exactly 8 rows and a truthful entry_count.
-        let dir = tempdir_for_test();
-        let target = dir.join("embeddings.ndjson");
-        let tmp = dir.join("embeddings.ndjson.tmp");
-        let commit_tmp = dir.join("embeddings.ndjson.commit-tmp");
-
-        // 1. Seed the canonical committed file with 3 rows.
-        let old_header = IndexHeader {
-            schema_version: INDEX_SCHEMA_VERSION.into(),
-            model_id: "test-model".into(),
-            model_profile: "base".into(),
-            dimension: 4,
-            generated_at: "2026-05-15T12:00:00Z".into(),
-            entry_count: 3,
-        };
-        let mut body = serde_json::to_string(&old_header).unwrap();
-        body.push('\n');
-        for i in 0..3 {
-            body.push_str(&format!(
-                r#"{{"id":"old-{i}","project":"test","agent":"claude","date":"20260515","path":"/tmp/old-{i}.md","kind":"other","session_id":"old-{i}","frame_kind":null,"cwd":null,"embedding":[0.1,0.2,0.3,0.4]}}"#
-            ));
-            body.push('\n');
-        }
-        std::fs::write(&target, &body).unwrap();
-
-        // 2. Simulate incremental write: tmp = placeholder + copy of old
-        //    body + 5 brand-new rows. Mirrors the production sequencing
-        //    inside `write_index_with_options` without invoking the
-        //    embedder (the unit-of-work the test is asserting is the
-        //    file-level math, not the embed step itself).
-        {
-            let mut writer = std::io::BufWriter::new(std::fs::File::create(&tmp).unwrap());
-            use std::io::Write;
-            let placeholder = IndexHeader {
-                entry_count: 0,
-                generated_at: "2026-05-16T12:00:00Z".into(),
-                ..old_header.clone()
-            };
-            writeln!(writer, "{}", serde_json::to_string(&placeholder).unwrap()).unwrap();
-            copy_committed_body_into(&mut writer, &target).unwrap();
-            for i in 0..5 {
-                writeln!(
-                    writer,
-                    r#"{{"id":"new-{i}","project":"test","agent":"claude","date":"20260516","path":"/tmp/new-{i}.md","kind":"other","session_id":"new-{i}","frame_kind":null,"cwd":null,"embedding":[0.5,0.6,0.7,0.8]}}"#
-                )
-                .unwrap();
-            }
-        }
-
-        // 3. Truthful header rewrite (D-2 contract) + atomic rename
-        //    onto the canonical target.
-        let truthful = IndexHeader {
-            entry_count: 8,
-            generated_at: "2026-05-16T12:00:00Z".into(),
-            ..old_header
-        };
-        rewrite_index_with_truthful_header(&tmp, &commit_tmp, &truthful).unwrap();
-        let _ = std::fs::remove_file(&tmp);
-        std::fs::rename(&commit_tmp, &target).unwrap();
-
-        // 4. Assertions: header.entry_count == 8, body has 3 old + 5 new
-        //    rows, no full re-embed of the originals.
-        let final_content = std::fs::read_to_string(&target).unwrap();
-        let lines: Vec<&str> = final_content.lines().collect();
-        assert_eq!(lines.len(), 9, "header + 3 old + 5 new = 9 lines");
-        let final_header: IndexHeader = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(
-            final_header.entry_count, 8,
-            "D-2 entry_count truthful after incremental append"
-        );
-        let old_count = (1..=3).filter(|i| lines[*i].contains("old-")).count();
-        let new_count = (4..=8).filter(|i| lines[*i].contains("new-")).count();
-        assert_eq!(old_count, 3, "3 original rows preserved verbatim");
-        assert_eq!(new_count, 5, "exactly 5 new rows appended");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-    #[test]
-    fn rewrite_index_with_truthful_header_replaces_placeholder_and_preserves_entries() {
-        // D-2: rewrite swap-and-rename helper produces a file whose first
-        // line carries the truthful entry_count and whose data lines are
-        // byte-for-byte identical to the placeholder tmp.
-        let dir = tempdir_for_test();
-        let tmp_path = dir.join("test.ndjson.tmp");
-        let final_tmp = dir.join("test.ndjson.commit-tmp");
-
-        let placeholder = IndexHeader {
-            schema_version: "v0-test".to_string(),
-            model_id: "test-model".to_string(),
-            model_profile: "base".to_string(),
-            dimension: 4,
-            generated_at: "2026-01-01T00:00:00Z".to_string(),
-            entry_count: 0,
-        };
-        let entries = [
-            r#"{"id":"a","embedding":[0.1,0.2,0.3,0.4]}"#,
-            r#"{"id":"b","embedding":[0.5,0.6,0.7,0.8]}"#,
-            r#"{"id":"c","embedding":[0.9,1.0,1.1,1.2]}"#,
-        ];
-        let mut tmp_bytes = serde_json::to_string(&placeholder).unwrap();
-        tmp_bytes.push('\n');
-        for entry in &entries {
-            tmp_bytes.push_str(entry);
-            tmp_bytes.push('\n');
-        }
-        std::fs::write(&tmp_path, &tmp_bytes).unwrap();
-
-        let truthful = IndexHeader {
-            entry_count: entries.len(),
-            ..placeholder.clone()
-        };
-        rewrite_index_with_truthful_header(&tmp_path, &final_tmp, &truthful)
-            .expect("rewrite must succeed");
-
-        let lines: Vec<String> = std::fs::read_to_string(&final_tmp)
-            .unwrap()
-            .lines()
-            .map(String::from)
-            .collect();
-        let header: IndexHeader = serde_json::from_str(&lines[0]).expect("header parses");
-        assert_eq!(
-            header.entry_count,
-            entries.len(),
-            "rewritten header must carry truthful entry_count"
-        );
-        assert_eq!(&lines[1..], entries);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn index_path_uses_all_bucket_for_no_project_filter() {
-        let dir = tempdir_for_test();
-        let path = index_path_for(&dir, None);
-        assert!(
-            path.to_string_lossy().contains("_all"),
-            "expected _all bucket in {}",
-            path.display()
-        );
-        assert_eq!(path, dir.join("indexed").join("_all").join(INDEX_FILE_NAME));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    fn tempdir_for_test() -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        let n = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        p.push(format!(
-            "aicx-vector-index-test-{}-{}-{n}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        p
-    }
-
-    /// Build a synthetic NDJSON data-line for an `IndexEntry`. Mirrors the
-    /// real `write_index` row shape without going through filesystem.
-    fn make_entry_line(id: &str, embedding: Vec<f32>) -> String {
-        let entry = IndexEntry {
-            id: id.to_string(),
-            project: "test".to_string(),
-            agent: "claude".to_string(),
-            date: "20260515".to_string(),
-            path: std::path::PathBuf::from(format!("/tmp/aicx-test/{id}.md")),
-            kind: "session".to_string(),
-            session_id: id.to_string(),
-            frame_kind: None,
-            cwd: None,
-            embedding,
-        };
-        serde_json::to_string(&entry).expect("serialize synthetic entry")
-    }
-
-    fn ok_lines(
-        lines: impl IntoIterator<Item = String>,
-    ) -> impl Iterator<Item = std::io::Result<String>> {
-        lines.into_iter().map(Ok::<_, std::io::Error>)
-    }
-
-    #[test]
-    fn capped_index_lines_error_on_oversized_and_advance_to_next_line() {
-        let next = make_entry_line("after-oversized", vec![1.0]);
-        let mut input = "x".repeat(crate::sanitize::MAX_VALIDATED_BYTES + 1);
-        input.push('\n');
-        input.push_str(&next);
-        input.push('\n');
-
-        let reader = std::io::BufReader::new(std::io::Cursor::new(input.into_bytes()));
-        let mut lines = capped_index_lines(
-            reader,
-            Path::new("/tmp/aicx-vector-index-oversized.ndjson"),
-            2,
-            "test index data",
-        );
-        let err = lines
-            .next()
-            .expect("first oversized line is observed")
-            .unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("exceeds"));
-        let second = lines
-            .next()
-            .expect("reader advances to following line")
-            .expect("second line is valid");
-        assert_eq!(second, next);
-    }
-
-    #[test]
-    fn scan_index_entries_no_corrupt_returns_all_hits() {
-        let q = vec![1.0f32, 0.0, 0.0];
-        let lines = vec![
-            make_entry_line("a", vec![1.0, 0.0, 0.0]),
-            make_entry_line("b", vec![0.0, 1.0, 0.0]),
-            make_entry_line("c", vec![0.5, 0.5, 0.0]),
-        ];
-        let scan = scan_index_entries(ok_lines(lines), &q, None, None).expect("scan");
-        assert_eq!(scan.total_data_lines, 3);
-        assert_eq!(scan.corrupt_count, 0);
-        assert_eq!(scan.hits.len(), 3);
-    }
-
-    #[test]
-    fn scan_index_entries_counts_corrupt_lines_below_threshold() {
-        // 1 corrupt out of 10 = 10% — above the 5% threshold ratio, but
-        // policy lives in `query_index`. The helper itself only reports.
-        let q = vec![1.0f32, 0.0];
-        let mut lines: Vec<String> = (0..9)
-            .map(|i| make_entry_line(&format!("ok-{i}"), vec![1.0, 0.0]))
-            .collect();
-        lines.push("{not valid json".to_string());
-
-        let scan = scan_index_entries(ok_lines(lines), &q, None, None).expect("scan");
-        assert_eq!(scan.total_data_lines, 10);
-        assert_eq!(scan.corrupt_count, 1);
-        assert_eq!(scan.hits.len(), 9, "valid entries still parsed and scored");
-    }
-
-    fn make_hit(id: &str, score: f32) -> QueryHit {
-        QueryHit {
-            id: id.to_string(),
-            project: "test".to_string(),
-            agent: "claude".to_string(),
-            date: "20260524".to_string(),
-            path: std::path::PathBuf::from(format!("/tmp/aicx-test/{id}.md")),
-            kind: "session".to_string(),
-            session_id: id.to_string(),
-            frame_kind: None,
-            cwd: None,
-            score,
-        }
-    }
-
-    #[test]
-    fn finalize_query_hits_truncates_to_requested_limit() {
-        // Bug #32 regression. The legacy `query_index` accepted a `limit`
-        // arg but did not honor it — the parameter was prefixed `_limit`
-        // and the post-scan tail returned every hit. This locks the
-        // contract that the returned vec has `len() <= limit`.
-        let hits: Vec<QueryHit> = (0..50)
-            .map(|i| make_hit(&format!("h-{i}"), (50 - i) as f32 / 50.0))
-            .collect();
-        let out = finalize_query_hits(hits, 10);
-        assert_eq!(out.len(), 10, "limit honored: returns exactly 10 hits");
-        // Top score is the highest (1.0); confirm score-desc sort holds
-        // after truncate so the kept 10 are the BEST 10, not a random
-        // slice.
-        assert!(
-            out.windows(2).all(|w| w[0].score >= w[1].score),
-            "hits remain sorted score-desc after truncate"
-        );
-        assert_eq!(out[0].id, "h-0", "highest-scoring hit retained at head");
-    }
-
-    #[test]
-    fn finalize_query_hits_returns_full_pool_when_limit_exceeds_pool() {
-        // Pool shorter than limit ⇒ return everything (no padding, no
-        // panic). Documents the "fewer if pool exhausted" half of the
-        // bug #32 contract.
-        let hits: Vec<QueryHit> = (0..3)
-            .map(|i| make_hit(&format!("h-{i}"), i as f32 / 3.0))
-            .collect();
-        let out = finalize_query_hits(hits, 100);
-        assert_eq!(out.len(), 3);
-    }
-
-    #[test]
-    fn finalize_query_hits_zero_limit_returns_empty() {
-        // `limit == 0` is a legal request for "no hits, just confirm the
-        // scan ran". The legacy code ignored `_limit` entirely; the fix
-        // honors it strictly, including the degenerate case.
-        let hits: Vec<QueryHit> = (0..5)
-            .map(|i| make_hit(&format!("h-{i}"), i as f32))
-            .collect();
-        let out = finalize_query_hits(hits, 0);
-        assert!(out.is_empty(), "limit=0 returns empty vec");
-    }
-
-    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-    #[test]
-    fn query_index_recovery_hint_uses_full_rescan_not_fresh() {
-        // Bug #33 regression. Keep the fixture on-disk and exercise the same
-        // scan + integrity path that produces the operator-facing recovery
-        // hint, but avoid the shared global lance lock. The full query helper
-        // acquires `~/.aicx/locks/lance.lock`, which can legitimately block
-        // behind concurrent index tests on macOS and mask the recovery hint
-        // assertion with an unrelated timeout.
-        let root = tempdir_for_test();
-        let path = index_path_for(&root, Some("recovery-hint"));
-        std::fs::create_dir_all(path.parent().expect("index parent")).unwrap();
-
-        let header = IndexHeader {
-            schema_version: INDEX_SCHEMA_VERSION.to_string(),
-            model_id: "test-model".to_string(),
-            model_profile: "base".to_string(),
-            dimension: 2,
-            generated_at: "2026-05-24T18:13:11Z".to_string(),
-            entry_count: 20,
-        };
-        let mut body = serde_json::to_string(&header).expect("serialize header");
-        body.push('\n');
-        for i in 0..18 {
-            body.push_str(&make_entry_line(&format!("ok-{i}"), vec![1.0, 0.0]));
-            body.push('\n');
-        }
-        body.push_str("{not valid json\n");
-        body.push_str("{still not valid json\n");
-        std::fs::write(&path, body).expect("write corrupt fixture index");
-
-        let file = crate::sanitize::open_file_validated(&path).expect("open fixture index");
-        let mut reader = std::io::BufReader::new(file);
-        let header_line = read_index_line_capped(&mut reader, &path, 1, "query index header")
-            .expect("read header")
-            .expect("fixture header");
-        let header: IndexHeader = serde_json::from_str(&header_line).expect("parse header");
-        assert_eq!(
-            header.dimension, 2,
-            "fixture header should match query embedding"
-        );
-
-        let scan = scan_index_entries(
-            capped_index_lines(reader, &path, 2, "query index data"),
-            &[1.0, 0.0],
-            None,
-            None,
-        )
-        .expect("scan corrupt fixture");
-        let err =
-            enforce_index_integrity(&path, &scan).expect_err("corrupt fixture should fail-fast");
-        let message = format!("{err:#}");
-        assert!(
-            message.contains("--full-rescan"),
-            "query_index recovery hint must reference the canonical rescan flag"
-        );
-        let stale_flag = format!("--{}", "fresh");
-        assert!(
-            !message.contains(&stale_flag),
-            "stale rescan flag hint must not appear in the recovery message"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn scan_index_entries_empty_lines_are_skipped_not_counted() {
-        let q = vec![1.0f32, 0.0];
-        let lines = vec![
-            make_entry_line("a", vec![1.0, 0.0]),
-            "".to_string(),
-            make_entry_line("b", vec![0.0, 1.0]),
-        ];
-        let scan = scan_index_entries(ok_lines(lines), &q, None, None).expect("scan");
-        assert_eq!(scan.total_data_lines, 2, "empty line does not count");
-        assert_eq!(scan.corrupt_count, 0);
-        assert_eq!(scan.hits.len(), 2);
-    }
-
-    #[test]
-    fn scan_index_entries_majority_corrupt_still_returns_ok_caller_enforces_policy() {
-        // 6 corrupt out of 10 = 60%. The helper does NOT fail-fast — that
-        // is `query_index`'s job. Helper only surfaces the count so the
-        // caller can apply `CORRUPT_RATE_FAIL_FAST` policy with `path`
-        // context for the operator-facing error message.
-        let q = vec![1.0f32, 0.0];
-        let mut lines: Vec<String> = (0..4)
-            .map(|i| make_entry_line(&format!("ok-{i}"), vec![1.0, 0.0]))
-            .collect();
-        for _ in 0..6 {
-            lines.push("{garbage".to_string());
-        }
-        let scan = scan_index_entries(ok_lines(lines), &q, None, None).expect("scan");
-        assert_eq!(scan.total_data_lines, 10);
-        assert_eq!(scan.corrupt_count, 6);
-        assert_eq!(scan.hits.len(), 4);
-
-        let rate = scan.corrupt_count as f64 / scan.total_data_lines as f64;
-        assert!(
-            scan.total_data_lines >= CORRUPT_MIN_SAMPLE.saturating_sub(11)
-                && rate > CORRUPT_RATE_FAIL_FAST,
-            "rate {} should exceed threshold {}",
-            rate,
-            CORRUPT_RATE_FAIL_FAST
-        );
-    }
-
-    #[test]
-    fn scan_index_entries_kind_filter_excludes_non_matching() {
-        let q = vec![1.0f32];
-        let lines = vec![
-            make_entry_line("keep-1", vec![1.0]),
-            make_entry_line("keep-2", vec![1.0]),
-        ];
-        // make_entry_line defaults `kind = "session"`. Asking for "report"
-        // should drop everything.
-        let scan =
-            scan_index_entries(ok_lines(lines.clone()), &q, Some("report"), None).expect("scan");
-        assert_eq!(scan.total_data_lines, 2);
-        assert_eq!(scan.corrupt_count, 0);
-        assert_eq!(scan.hits.len(), 0);
-
-        let scan2 = scan_index_entries(ok_lines(lines), &q, Some("session"), None).expect("scan");
-        assert_eq!(scan2.hits.len(), 2);
-    }
-}
+mod iter3_tests;
 
 /// Cosine similarity between two equal-length vectors. Returns `0.0`
 /// when either vector is the zero vector (avoids NaN).
@@ -2597,140 +2618,4 @@ pub fn render_stats_json(stats: &IndexStats) -> Result<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn full_index_eta_zero_when_no_embeddings() {
-        let stats = IndexStats {
-            chunks_total: 1000,
-            chunks_sampled: 10,
-            embeddings_computed: 0,
-            embed_errors: 10,
-            dimension: None,
-            model_id: None,
-            model_profile: None,
-            fallback_reason: Some("test".into()),
-            elapsed_ms: 100,
-            dry_run: true,
-            index_path: None,
-            resumed_embeddings: 0,
-            resume_tmp_path: None,
-        };
-        assert!(stats.full_index_eta_secs().is_none());
-    }
-
-    #[test]
-    fn full_index_eta_scales_linearly() {
-        let stats = IndexStats {
-            chunks_total: 10_000,
-            chunks_sampled: 10,
-            embeddings_computed: 10,
-            embed_errors: 0,
-            dimension: Some(1024),
-            model_id: Some("F2LLM-v2-0.6B.Q4_K_M.gguf".into()),
-            model_profile: Some("base".into()),
-            fallback_reason: None,
-            // 10 embeds in 1000 ms ⇒ 100 ms per embed.
-            elapsed_ms: 1000,
-            dry_run: true,
-            index_path: None,
-            resumed_embeddings: 0,
-            resume_tmp_path: None,
-        };
-        // 10000 * 100 ms = 1_000_000 ms = 1000 s.
-        assert_eq!(stats.full_index_eta_secs(), Some(1000));
-    }
-
-    #[test]
-    fn render_stats_text_includes_fallback_reason_when_set() {
-        let stats = IndexStats {
-            chunks_total: 0,
-            chunks_sampled: 0,
-            embeddings_computed: 0,
-            embed_errors: 0,
-            dimension: None,
-            model_id: None,
-            model_profile: None,
-            fallback_reason: Some("native-embedder feature not compiled in".into()),
-            elapsed_ms: 5,
-            dry_run: true,
-            index_path: None,
-            resumed_embeddings: 0,
-            resume_tmp_path: None,
-        };
-        let text = render_stats_text(&stats);
-        assert!(text.contains("fallback_reason:"));
-        assert!(text.contains("native-embedder feature not compiled in"));
-        assert!(text.contains("dry-run only"));
-    }
-
-    #[test]
-    fn render_stats_text_includes_eta_when_available() {
-        let stats = IndexStats {
-            chunks_total: 5_000,
-            chunks_sampled: 50,
-            embeddings_computed: 50,
-            embed_errors: 0,
-            dimension: Some(1024),
-            model_id: Some("F2LLM-v2-0.6B.Q4_K_M.gguf".into()),
-            model_profile: Some("base".into()),
-            fallback_reason: None,
-            elapsed_ms: 5_000,
-            dry_run: true,
-            index_path: None,
-            resumed_embeddings: 0,
-            resume_tmp_path: None,
-        };
-        let text = render_stats_text(&stats);
-        assert!(text.contains("full_index_eta_secs:"));
-        assert!(text.contains("dimension:"));
-        assert!(text.contains("F2LLM-v2-0.6B.Q4_K_M.gguf"));
-    }
-
-    #[test]
-    fn render_stats_json_round_trips() {
-        let stats = IndexStats {
-            chunks_total: 42,
-            chunks_sampled: 8,
-            embeddings_computed: 8,
-            embed_errors: 0,
-            dimension: Some(1024),
-            model_id: Some("model-x".into()),
-            model_profile: Some("base".into()),
-            fallback_reason: None,
-            elapsed_ms: 800,
-            dry_run: true,
-            index_path: None,
-            resumed_embeddings: 0,
-            resume_tmp_path: None,
-        };
-        let json = render_stats_json(&stats).expect("serialize");
-        assert!(json.contains("\"chunks_total\":42"));
-        assert!(json.contains("\"dry_run\":true"));
-        assert!(json.contains("\"model_id\":\"model-x\""));
-    }
-
-    #[test]
-    fn take_prefix_bytes_short_input_unchanged() {
-        let s = "hello";
-        assert_eq!(take_prefix_bytes(s, 10), "hello");
-    }
-
-    #[test]
-    fn take_prefix_bytes_caps_at_codepoint_boundary() {
-        // "ą" is 2 bytes in UTF-8. Cap at 1 byte must not split it.
-        let s = "ąść";
-        let out = take_prefix_bytes(s, 1);
-        assert_eq!(out, "");
-    }
-
-    #[test]
-    fn take_prefix_bytes_preserves_codepoints_under_cap() {
-        let s = "ąść";
-        // Bytes: ą=0xC4 0x85 (2), ś=0xC5 0x9B (2), ć=0xC4 0x87 (2). 6 total.
-        let out = take_prefix_bytes(s, 4);
-        // Cap of 4 must include exactly two codepoints (ą + ś).
-        assert_eq!(out, "ąś");
-    }
-}
+mod tests;

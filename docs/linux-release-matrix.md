@@ -76,4 +76,4 @@ error occurred in cc-rs: failed to find tool "aarch64-linux-musl-gcc": No such f
 - **Local Dev Environments**: Developing against `sqlite-vec` for musl from macOS without a fully functional `cross` + docker toolchain is currently blocked by missing C cross-compilers.
 
 ---
-*Vibecrafted. with AI Agents by VetCoders (c)2024-2026 LibraxisAI*
+*Vibecrafted. with AI Agents by Vetcoders (c)2024-2026 LibraxisAI*

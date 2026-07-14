@@ -1,0 +1,10 @@
+{"kind":"CurrentDirectoryChangedEvent","currentDirectory":"/work/aicx","branch":"fix/aicx-daily-usefulness","requestId":"anchor-260408-214715-a1"}
+{"kind":"SystemMessageEvent","message":"You are Junie."}
+{"kind":"UserPromptEvent","requestId":"prompt-260408-214823-br8l","prompt":"Implement deterministic adapter.","model":"unknown-junie-model"}
+{"kind":"UserPromptEvent","requestId":"meta-260408-214824-m1","prompt":"Prefer explicit evidence.","isMetaPrompt":true}
+{"kind":"AgentReasoningBlockUpdatedEvent","stepId":"step-1","text":"Need map first."}
+{"kind":"AgentTextBlockUpdatedEvent","stepId":"step-1","text":"Implemented Junie adapter."}
+{"kind":"AgentToolCallBlockUpdatedEvent","stepId":"step-1","toolName":"open","toolCallId":"tool-1","arguments":"{\"path\":\"Cargo.toml\"}"}
+{"kind":"AgentToolCallOutputBlockUpdatedEvent","stepId":"step-1","toolName":"open","toolCallId":"tool-1","output":"ok"}
+{"kind":"AgentStateChangedEvent","state":"idle"}
+{"kind":"SurpriseJunieEvent","payload":{"shape":"unmodeled but visible"}}

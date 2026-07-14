@@ -18,7 +18,7 @@ const WRAPPER = {
 };
 // assetTriple reflects the cleaned name produced by release_bundle.sh
 // (`-unknown-` stripped from linux). archiveExt: macOS+Windows ship .zip
-// (Apple notarized .zip for darwin, plain .zip for windows-gnu); Linux .tar.gz.
+// (Apple notarized .zip for darwin, plain .zip for windows); Linux .tar.gz.
 const PLATFORMS = [
   {
     key: "darwin-arm64",
@@ -40,7 +40,7 @@ const PLATFORMS = [
   {
     key: "win32-x64-gnu",
     packageName: "@loctree/aicx-win32-x64-gnu",
-    assetTriple: "x86_64-pc-windows-gnu",
+    assetTriple: "x86_64-pc-windows-msvc",
     archiveExt: "zip",
     os: "win32",
     cpu: "x64",

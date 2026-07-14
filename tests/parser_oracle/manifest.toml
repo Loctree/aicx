@@ -1,0 +1,71 @@
+schema_version = 1
+normative_matrix = "tests/parser_oracle/normative_fields.toml"
+contract = "docs/PARSER_NORMATIVE_CONTRACT.md"
+donor_repo = "/Volumes/LibraxisShare/vc-workspace/vetcoders/transcript-builder"
+
+[[case]]
+id = "codex_minimal"
+agent = "codex"
+fixture = "tests/fixtures/parser_engine/codex/minimal.jsonl"
+expected = "tests/fixtures/parser_engine/codex/expected.json"
+oracle_kind = "transcript_builder"
+oracle_command = "/Volumes/LibraxisShare/vc-workspace/vetcoders/transcript-builder/transcript-builder build-session-record tests/fixtures/parser_engine/codex/minimal.jsonl --out-dir {oracle_out} --agent codex --l1-only"
+exact_fields = ["agent", "session_id", "visible_turns", "coverage", "status", "usage"]
+
+[[case.heuristic_assertions]]
+path = "heuristic.intent_summary"
+op = "contains_any"
+values = ["oracle", "harness"]
+
+[[case]]
+id = "grok_minimal"
+agent = "grok"
+fixture = "tests/fixtures/parser_engine/grok/session"
+expected = "tests/fixtures/parser_engine/grok/expected.json"
+oracle_kind = "transcript_builder"
+oracle_command = "/Volumes/LibraxisShare/vc-workspace/vetcoders/transcript-builder/transcript-builder build-session-record tests/fixtures/parser_engine/grok/session --out-dir {oracle_out} --agent grok --l1-only"
+exact_fields = ["agent", "session_id", "visible_turns", "coverage", "status", "usage"]
+
+[[case.heuristic_assertions]]
+path = "heuristic.intent_summary"
+op = "nonempty"
+
+[[case]]
+id = "claude_minimal"
+agent = "claude"
+fixture = "tests/fixtures/parser_engine/claude/minimal.jsonl"
+expected = "tests/fixtures/parser_engine/claude/expected.json"
+oracle_kind = "transcript_builder"
+oracle_command = "/Volumes/LibraxisShare/vc-workspace/vetcoders/transcript-builder/transcript-builder build-session-record tests/fixtures/parser_engine/claude/minimal.jsonl --out-dir {oracle_out} --agent claude --l1-only"
+exact_fields = ["agent", "session_id", "visible_turns", "coverage", "status", "usage"]
+
+[[case.heuristic_assertions]]
+path = "heuristic.intent_summary"
+op = "contains_any"
+values = ["oracle", "contract"]
+
+[[case]]
+id = "gemini_minimal"
+agent = "gemini"
+fixture = "tests/fixtures/parser_engine/gemini/minimal.json"
+expected = "tests/fixtures/parser_engine/gemini/expected.json"
+oracle_kind = "transcript_builder"
+oracle_command = "/Volumes/LibraxisShare/vc-workspace/vetcoders/transcript-builder/transcript-builder build-session-record tests/fixtures/parser_engine/gemini/minimal.json --out-dir {oracle_out} --agent gemini --l1-only"
+exact_fields = ["agent", "session_id", "visible_turns", "coverage", "status", "usage"]
+
+[[case.heuristic_assertions]]
+path = "heuristic.intent_summary"
+op = "nonempty"
+
+[[case]]
+id = "junie_minimal"
+agent = "junie"
+fixture = "tests/fixtures/parser_engine/junie/session-20260713/events.jsonl"
+expected = "tests/fixtures/parser_engine/junie/expected.json"
+oracle_kind = "rust_golden"
+exact_fields = ["agent", "session_id", "visible_turns", "coverage", "status", "usage"]
+
+[[case.heuristic_assertions]]
+path = "heuristic.intent_summary"
+op = "contains_any"
+values = ["oracle", "junie"]

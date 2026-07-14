@@ -19,7 +19,7 @@
 //! operator running this test sees the same diagnostic + recommendation
 //! as a real user would.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 #![cfg(feature = "e2e-aicx")]
 

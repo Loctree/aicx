@@ -1,3 +1,7 @@
+// App-only integration surface: compiled to an empty target under the slim
+// `loctree-consumer` profile (`--no-default-features`).
+#![cfg(feature = "app")]
+
 //! Integration coverage for the structured `[aicx][phase=...]` markers
 //! emitted by `aicx::progress` when the pipeline is asked to behave
 //! non-interactively. The chunk + steer + bm25 surface is the contract
@@ -5,7 +9,7 @@
 //! without spinning the full `aicx store` pipeline (which would touch
 //! `~/.aicx/store/` and is excluded from this pass).
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2024-2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2024-2026 Vetcoders
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -265,9 +269,11 @@ fn heartbeat_with_backoff_emits_fewer_ticks_than_constant_interval() {
     // On a 20-minute segment phase, a constant 2s heartbeat emits ~600
     // ticks — that floods the structured log. Backoff doubles the
     // interval each tick (capped at `max`) so a long phase converges
-    // to one tick per `max`. This test runs for ~1.2s with initial=50ms
-    // max=400ms: a constant 50ms heartbeat would fire ~24 times; the
-    // backoff schedule (50, 100, 200, 400, 400, 400) fires ~5-6 times.
+    // to one tick per `max`. Heartbeat intervals are intentionally
+    // clamped to >=250ms, so this test uses the real lower bound:
+    // over ~1.2s, a constant 250ms heartbeat would fire ~4 times, while
+    // the backoff schedule (250, 400, 400) lands around 2-3 ticks on
+    // normal runners.
     let reporter = Arc::new(CapturingReporter::default());
     let phase = Phase::start(reporter.clone(), "segment", None);
     let hb = Heartbeat::spawn_with_backoff(
@@ -281,8 +287,8 @@ fn heartbeat_with_backoff_emits_fewer_ticks_than_constant_interval() {
 
     let ticks = reporter.tick_count("segment");
     assert!(
-        (3..=12).contains(&ticks),
-        "expected backoff to land in [3, 12] ticks over 1.2s with initial=50ms max=400ms, got {ticks}"
+        (2..=5).contains(&ticks),
+        "expected backoff to land in [2, 5] ticks over 1.2s with clamped initial=250ms max=400ms, got {ticks}"
     );
 }
 
@@ -341,7 +347,10 @@ fn failed_phase_records_recovery_hint_and_gates_lance_tail_rendering() {
         recovery_hint_for("steer_sync"),
     );
     assert_eq!(record.phase, "steer_sync");
-    assert_eq!(record.recovery_hint.as_deref(), Some("aicx doctor --fix"));
+    assert_eq!(
+        record.recovery_hint.as_deref(),
+        Some("aicx doctor --rebuild-steer-index")
+    );
     log.record(record);
 
     let records = log.snapshot();

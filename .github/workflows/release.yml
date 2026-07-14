@@ -28,13 +28,13 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
           path: aicx
 
       - name: Checkout rust-memex sibling
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: Loctree/rust-memex
           ref: ${{ env.RUST_MEMEX_REF }}
@@ -87,7 +87,7 @@ jobs:
           RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
         run: git rev-parse --verify "refs/tags/${RELEASE_TAG}" >/dev/null
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
 
@@ -123,7 +123,7 @@ jobs:
           python -m pip install --upgrade pip semgrep
           semgrep --config auto --error --quiet
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
         with:
           components: clippy, rustfmt
 
@@ -176,15 +176,15 @@ jobs:
             target: aarch64-apple-darwin
           - runner_name: windows-pc
             runner: '["self-hosted", "windows-pc"]'
-            target: x86_64-pc-windows-gnu
+            target: x86_64-pc-windows-msvc
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           path: aicx
 
       - name: Checkout rust-memex sibling
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: Loctree/rust-memex
           ref: ${{ env.RUST_MEMEX_REF }}
@@ -192,6 +192,12 @@ jobs:
 
       - name: Install protoc
         # Manual install — see ci.yml for rationale (arduino/setup-protoc#108).
+        # Skipped on windows-pc: the slim Windows bundle builds default
+        # features only (no `lance`), so rust-memex/grpc — the sole protoc
+        # consumer — is never compiled. Running it on Windows previously hit
+        # the `else` branch and exited 1, blocking the Windows leg before the
+        # build even started.
+        if: matrix.runner_name != 'windows-pc'
         shell: bash
         run: |
           if command -v protoc >/dev/null 2>&1; then
@@ -209,7 +215,7 @@ jobs:
           fi
           protoc --version
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
         with:
           targets: ${{ matrix.target }}
 
@@ -225,7 +231,7 @@ jobs:
           PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
           LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}
         run: |
-          # KEYS dir + .notary.env live on the dragon runner under $HOME/.keys.
+          # KEYS dir + .notary.env live on the signing runner under $HOME/.keys.
           KEYS="$HOME/.keys" ./tools/release_bundle.sh
 
       - name: Build binaries-only release (ops-linux, GPG-detached)
@@ -245,20 +251,32 @@ jobs:
 
       - name: Build binaries-only release (windows-pc, GPG-detached .zip)
         if: matrix.runner_name == 'windows-pc'
+        # Plain `shell: bash`. The runner host PATH puts Git for Windows
+        # (`C:\Program Files\Git\bin`) ahead of System32, so `bash` resolves to
+        # Git Bash, not the WSL stub. A custom absolute-path `shell:` with `{0}`
+        # made the runner throw "Second path fragment must not be a drive or UNC
+        # name" before the script ran; `shell: bash` avoids that path-combine.
         shell: bash
-        working-directory: aicx
         env:
           TARGET: ${{ matrix.target }}
           DIST_DIR: ${{ github.workspace }}/aicx/dist
           AICX_RELEASE_BUNDLE_ONLY_BINARIES: "1"
           AICX_BUNDLE_FLAVOR: slim
+          # Windows release runners have no LLVM, so drop the default
+          # `native-embedder` feature (it pulls llama-cpp-sys -> bindgen ->
+          # libclang). The slim Windows binary keeps the cloud embedder; in-process
+          # GGUF stays a Unix/native-runner capability.
+          NO_DEFAULT_FEATURES: "1"
+          FEATURES: app,cloud-embedder
           AICX_CLEAN_AFTER_BUILD: "0"
           PACKAGE_NAME: ${{ env.PACKAGE_NAME }}
           LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}
-          # Strawberry Perl ships mingw-w64 gcc — required for windows-gnu target.
-          # Add it to PATH so cargo's linker finds it.
-          PATH: "C:\\Strawberry\\c\\bin;C:\\Program Files (x86)\\GnuPG\\bin;C:\\Program Files\\Git\\usr\\bin;${{ env.PATH }}"
         run: |
+          cd "$GITHUB_WORKSPACE/aicx"
+          # Prepend GnuPG to PATH without clobbering the runner's real PATH.
+          # (Strawberry Perl /c/Strawberry/c/bin was only needed for the old
+          # MinGW/gnu target; the runner now builds the native msvc target.)
+          export PATH="/c/Program Files (x86)/GnuPG/bin:$PATH"
           ./tools/release_bundle.sh
 
       - name: Build .deb (linux only)
@@ -270,7 +288,12 @@ jobs:
           DIST_DIR: ${{ github.workspace }}/aicx/dist
           LOCTREE_GPG_KEY_ID: ${{ vars.LOCTREE_GPG_KEY_ID }}
         run: |
-          cargo install --quiet cargo-deb --locked || cargo install --quiet cargo-deb
+          # Idempotent: a previous successful run leaves cargo-deb installed on
+          # this self-hosted runner, and `cargo install` errors with "binary
+          # already exists". Only install when it is missing.
+          command -v cargo-deb >/dev/null 2>&1 \
+            || cargo install --quiet cargo-deb --locked \
+            || cargo install --quiet cargo-deb
           cargo deb --target "${TARGET}" --no-build --output "${DIST_DIR}/"
           PASSPHRASE_FILE="${HOME}/.keys/.gpg.passphrase"
           if [[ -z "${LOCTREE_GPG_KEY_ID}" ]]; then
@@ -293,7 +316,7 @@ jobs:
               "${deb}"
           done
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-${{ matrix.target }}
           # Selective: archives + checksums + sigs + debs only — exclude bundle
@@ -314,6 +337,7 @@ jobs:
 
       - name: Clean local build artifacts
         if: always()
+        shell: bash
         working-directory: aicx
         run: |
           cargo clean --target "${{ matrix.target }}" || true
@@ -325,17 +349,17 @@ jobs:
     runs-on: [self-hosted, ops-linux]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
           pattern: release-*
           merge-multiple: true
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
 

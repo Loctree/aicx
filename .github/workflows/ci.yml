@@ -24,27 +24,26 @@ jobs:
             runner: '["self-hosted", "ops-linux"]'
           - name: macos-self-hosted
             runner: '["self-hosted", "dragon-macos"]'
+          - name: windows-latest
+            runner: '"windows-latest"'
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           path: aicx
 
       - name: Checkout rust-memex sibling
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: Loctree/rust-memex
           ref: ${{ env.RUST_MEMEX_REF }}
           path: rust-memex
 
       - name: Install protoc
-        # Manual install instead of arduino/setup-protoc@v3 — that action
-        # GitHub-API-fetches release metadata even for pinned versions,
-        # which times out intermittently on the macos-self-hosted runner
-        # (arduino/setup-protoc#108; observed 2026-05-24 PR #9 macOS:
-        # 34s "unable to get latest version" hang after 2+ successful
-        # runs). brew/apt provide protoc v23+, prost-build / tonic-build
-        # compatible.
+        # Skipped on Windows: the slim Windows bundle builds default features
+        # only (no `lance`), so rust-memex/grpc — the sole protoc consumer —
+        # is never compiled.
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           if command -v protoc >/dev/null 2>&1; then
@@ -62,12 +61,12 @@ jobs:
           fi
           protoc --version
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         if: runner.os == 'Linux'
         with:
           python-version: '3.x'
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07
         with:
           components: clippy, rustfmt
 
@@ -81,6 +80,22 @@ jobs:
       - name: cargo check
         working-directory: aicx
         run: cargo check --locked
+
+      # Mirrors `make loctree-consumer-check` (raw cargo so windows-latest
+      # does not depend on GNU make): the slim library profile consumed by
+      # Loctree must build, pass its contract test, and stay free of
+      # lancedb/llama dependencies.
+      - name: loctree-consumer-check
+        working-directory: aicx
+        shell: bash
+        run: |
+          cargo check --locked -p aicx --no-default-features --features loctree-consumer
+          cargo test --locked -p aicx --lib --no-default-features --features loctree-consumer slim_profile_exposes_read_core_contract
+          hits=$(cargo tree --locked --no-default-features --features loctree-consumer -p aicx | grep -ciE 'lancedb|llama' || true)
+          if [ "$hits" != "0" ]; then
+            echo "loctree-consumer pulled forbidden lancedb/llama dependencies ($hits hits)" >&2
+            exit 1
+          fi
 
       - name: cargo clippy default
         working-directory: aicx
@@ -96,7 +111,7 @@ jobs:
         working-directory: aicx
         # Keep serialized until remaining AICX_HOME-mutating tests share one
         # root-crate lock or move to explicit-home helpers (Wave F).
-        run: cargo test --locked --all-targets -- --test-threads=2
+        run: cargo test --locked --all-targets --no-fail-fast -- --test-threads=2
 
       - name: cargo test native GGUF
         working-directory: aicx

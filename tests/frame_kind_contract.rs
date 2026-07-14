@@ -1,453 +1,209 @@
-use chrono::{SecondsFormat, Utc};
-use serde_json::{Value, json};
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+// App-only integration surface: compiled to an empty target under the slim
+// `loctree-consumer` profile (`--no-default-features`).
+#![cfg(feature = "app")]
 
-fn unique_test_dir(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "aicx-frame-kind-{name}-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time before unix epoch")
-            .as_nanos()
-    ))
-}
+//! Frozen projection contract between the typed parser model and the stable
+//! `FrameKind` retrieval vocabulary (C7 model-backed output layer).
+//!
+//! Conversation/report rendering and the store pipeline consume these
+//! mappings; changing any string or arm here is a breaking contract change
+//! and must be classified through the C0A normative matrix first.
 
-fn write_file(path: &Path, content: &str) {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).expect("create parent directories");
-    }
-    fs::write(path, content).expect("write file");
-}
+use aicx::output::{
+    conversation_messages_from_model, frame_kind_for_turn, role_str_for_turn,
+    timeline_entries_from_model,
+};
+use aicx::parser::engine::{
+    BoundaryFlags, CoverageReport, Known, ParseStatus, Provenance, Segment, SessionModel, Turn,
+    TurnKind, TurnRange, TurnRole, VisibleCompleteness,
+};
+use aicx::timeline::FrameKind;
 
-fn write_codex_session(path: &Path, cwd: &Path) {
-    let now = Utc::now();
-    let lines = [
-        json!({
-            "timestamp": (now - chrono::Duration::seconds(4)).to_rfc3339_opts(SecondsFormat::Secs, true),
-            "type": "session_meta",
-            "payload": {
-                "id": "frame-kind-contract",
-                "cwd": cwd.display().to_string(),
-            }
-        })
-        .to_string(),
-        json!({
-            "timestamp": (now - chrono::Duration::seconds(4)).to_rfc3339_opts(SecondsFormat::Secs, true),
-            "type": "turn_context",
-            "payload": {
-                "cwd": cwd.display().to_string(),
-            }
-        })
-        .to_string(),
-        json!({
-            "timestamp": (now - chrono::Duration::seconds(3)).to_rfc3339_opts(SecondsFormat::Secs, true),
-            "type": "event_msg",
-            "payload": {
-                "type": "user_message",
-                "message": "User asks for frame separation",
-            }
-        })
-        .to_string(),
-        json!({
-            "timestamp": (now - chrono::Duration::seconds(2)).to_rfc3339_opts(SecondsFormat::Secs, true),
-            "type": "event_msg",
-            "payload": {
-                "type": "agent_message",
-                "message": "Visible assistant reply",
-            }
-        })
-        .to_string(),
-        json!({
-            "timestamp": (now - chrono::Duration::seconds(1)).to_rfc3339_opts(SecondsFormat::Secs, true),
-            "type": "event_msg",
-            "payload": {
-                "type": "thinking_delta",
-                "text": "Hidden chain of thought",
-            }
-        })
-        .to_string(),
-        json!({
-            "timestamp": now.to_rfc3339_opts(SecondsFormat::Secs, true),
-            "type": "event_msg",
-            "payload": {
-                "type": "tool_call",
-                "message": "searchDocs({\"query\":\"frame_kind\"})",
-            }
-        })
-        .to_string(),
+#[test]
+fn frame_kind_strings_are_frozen() {
+    let expected = [
+        (FrameKind::UserMsg, "user_msg"),
+        (FrameKind::AgentReply, "agent_reply"),
+        (FrameKind::InternalThought, "internal_thought"),
+        (FrameKind::ToolCall, "tool_call"),
+        (FrameKind::SystemNote, "system_note"),
     ];
-
-    write_file(path, &lines.join("\n"));
-}
-
-fn write_claude_session_with_empty_signature(path: &Path, cwd: &Path) {
-    let now = Utc::now();
-    let lines = [
-        json!({
-            "type": "user",
-            "message": {
-                "role": "user",
-                "content": "Please answer visibly",
-            },
-            "timestamp": (now - chrono::Duration::seconds(2)).to_rfc3339_opts(SecondsFormat::Secs, true),
-            "sessionId": "claude-signature-contract",
-            "gitBranch": "main",
-            "cwd": cwd.display().to_string(),
-        })
-        .to_string(),
-        json!({
-            "type": "assistant",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "thinking",
-                        "thinking": "",
-                        "signature": "abc123",
-                    },
-                    {
-                        "type": "text",
-                        "text": "Visible Claude answer",
-                    }
-                ],
-            },
-            "timestamp": (now - chrono::Duration::seconds(1)).to_rfc3339_opts(SecondsFormat::Secs, true),
-            "sessionId": "claude-signature-contract",
-            "gitBranch": "main",
-            "cwd": cwd.display().to_string(),
-        })
-        .to_string(),
-    ];
-
-    write_file(path, &lines.join("\n"));
-}
-
-fn current_profile_dir() -> PathBuf {
-    let test_exe = std::env::current_exe().expect("resolve current test executable");
-    test_exe
-        .parent()
-        .and_then(Path::parent)
-        .expect("resolve cargo profile dir")
-        .to_path_buf()
-}
-
-fn fallback_aicx_path() -> PathBuf {
-    let mut path = current_profile_dir().join("aicx");
-    if cfg!(windows) {
-        path.set_extension("exe");
+    for (kind, rendered) in expected {
+        assert_eq!(kind.as_str(), rendered);
+        assert_eq!(
+            FrameKind::parse(rendered),
+            Some(kind),
+            "frame kind string `{rendered}` must round-trip"
+        );
     }
-    path
-}
-
-fn ensure_aicx_binary_exists() -> PathBuf {
-    static BIN_PATH: OnceLock<PathBuf> = OnceLock::new();
-
-    BIN_PATH
-        .get_or_init(|| {
-            if let Some(env_path) = std::env::var_os("CARGO_BIN_EXE_aicx").map(PathBuf::from)
-                && env_path.is_file()
-            {
-                return env_path;
-            }
-
-            let env_path = PathBuf::from(env!("CARGO_BIN_EXE_aicx"));
-            if env_path.is_file() {
-                return env_path;
-            }
-
-            let fallback = fallback_aicx_path();
-            if fallback.is_file() {
-                return fallback;
-            }
-
-            let cargo = std::env::var_os("CARGO")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("cargo"));
-            let output = Command::new(&cargo)
-                .args(["build", "--locked", "--bin", "aicx"])
-                .current_dir(env!("CARGO_MANIFEST_DIR"))
-                .output()
-                .expect("build fallback aicx binary");
-
-            assert!(
-                output.status.success(),
-                "fallback cargo build --bin aicx failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(
-                fallback.is_file(),
-                "fallback cargo build succeeded but binary missing at {}",
-                fallback.display()
-            );
-
-            fallback
-        })
-        .clone()
-}
-
-fn run_aicx(home: &Path, args: &[&str]) -> Output {
-    fs::create_dir_all(home).expect("create temp HOME");
-    Command::new(ensure_aicx_binary_exists())
-        .args(args)
-        .env("HOME", home)
-        .env("AICX_ALLOW_TMP", "1")
-        // Drop any operator-pinned AICX_HOME so the spawned binary
-        // resolves under the test's temp HOME, not the operator's
-        // canonical install. Without this, an operator running
-        // `cargo test` with `AICX_HOME` exported sees the binary
-        // write into the pinned dir while sanitize's allowlist
-        // (rooted at the test's HOME) refuses to read it back.
-        .env_remove("AICX_HOME")
-        .output()
-        .expect("run aicx")
-}
-
-fn assert_success(output: &Output) {
-    assert!(
-        output.status.success(),
-        "command failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn parse_stdout_json(output: &Output) -> Value {
-    assert_success(output);
-    serde_json::from_slice(&output.stdout).expect("parse stdout json")
-}
-
-fn json_paths(value: &Value, key: &str) -> Vec<PathBuf> {
-    value[key]
-        .as_array()
-        .expect("json array")
-        .iter()
-        .map(|path| {
-            PathBuf::from(
-                path.as_str()
-                    .expect("string path in json payload")
-                    .to_string(),
-            )
-        })
-        .collect()
 }
 
 #[test]
-fn codex_store_round_trips_frame_kind_filters() {
-    let root = unique_test_dir("round-trip");
-    let home = root.join("home");
-    let repo_root = home.join("hosted").join("VetCoders").join("ai-contexters");
-    let history_path = home.join(".codex").join("history.jsonl");
-    let session_path = home
-        .join(".codex")
-        .join("sessions")
-        .join("2026")
-        .join("04")
-        .join("14")
-        .join("rollout-frame-kind.jsonl");
-
-    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
-    write_file(&history_path, "");
-    write_codex_session(&session_path, &repo_root);
-
-    let store_output = run_aicx(&home, &["codex", "-H", "24", "--emit", "json"]);
-    let payload = parse_stdout_json(&store_output);
-    let store_paths = json_paths(&payload, "store_paths");
-    assert_eq!(store_paths.len(), 4);
-
-    let mut paths_by_frame = BTreeMap::new();
-    for path in &store_paths {
-        let sidecar: Value = serde_json::from_slice(
-            &fs::read(path.with_extension("meta.json")).expect("read sidecar"),
-        )
-        .expect("parse sidecar json");
-        let frame_kind = sidecar["frame_kind"]
-            .as_str()
-            .expect("frame kind in sidecar")
-            .to_string();
-        paths_by_frame.insert(frame_kind, path.clone());
+fn turn_kind_to_frame_kind_mapping_is_frozen() {
+    let expected = [
+        (TurnKind::UserMsg, FrameKind::UserMsg),
+        (TurnKind::AgentReply, FrameKind::AgentReply),
+        (TurnKind::InternalThought, FrameKind::InternalThought),
+        (TurnKind::ToolCall, FrameKind::ToolCall),
+        (TurnKind::ToolResult, FrameKind::ToolCall),
+        (TurnKind::SystemNote, FrameKind::SystemNote),
+    ];
+    for (turn_kind, frame_kind) in expected {
+        assert_eq!(
+            frame_kind_for_turn(turn_kind),
+            frame_kind,
+            "TurnKind::{turn_kind:?} projection drifted"
+        );
     }
+}
 
-    assert_eq!(
-        paths_by_frame.keys().cloned().collect::<Vec<_>>(),
-        vec![
-            "agent_reply".to_string(),
-            "internal_thought".to_string(),
-            "tool_call".to_string(),
-            "user_msg".to_string(),
-        ]
-    );
+#[test]
+fn turn_role_strings_are_frozen() {
+    assert_eq!(role_str_for_turn(TurnRole::User), "user");
+    assert_eq!(role_str_for_turn(TurnRole::Assistant), "assistant");
+    assert_eq!(role_str_for_turn(TurnRole::System), "system");
+    assert_eq!(role_str_for_turn(TurnRole::Tool), "tool");
+}
 
-    // `aicx search` is semantic-only since v0.7. In this hermetic test env
-    // there's no hydrated embedder or built index, so the CLI must fail
-    // fast with a typed error payload (exit code 2) rather than silently
-    // returning empty results. End-to-end frame_kind round-trip with a
-    // real index lives in `tests/e2e_pipeline.rs` (feature-gated against
-    // the operator's canonical ~/.aicx config).
-    let search_output = run_aicx(
-        &home,
-        &[
-            "search",
-            "Hidden chain of thought",
-            "--frame-kind",
-            "internal_thought",
-            "--json",
-            "-p",
-            "ai-contexters",
-        ],
+fn synthetic_model() -> SessionModel {
+    let provenance = Provenance {
+        agent: aicx::parser::engine::AgentKind::Codex,
+        model: Known::unknown(),
+        cli_version: Known::unknown(),
+        cwd: Known::value("/work/space/aicx".to_owned()),
+        branch: Known::value("fix/aicx-daily-usefulness".to_owned()),
+        started_at: Known::value("2026-07-13T04:00:00Z".to_owned()),
+        ended_at: Known::unknown(),
+        original_source_hash: "a".repeat(64),
+        original_source_bytes: 512,
+    };
+    let coverage = CoverageReport::with_raw_line_count(
+        0,
+        0,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        ParseStatus {
+            visible_completeness: VisibleCompleteness::CompleteVisible,
+            boundary_flags: BoundaryFlags::default(),
+            malformed_tail_present: false,
+            visible_event_lost: false,
+        },
     );
-    assert_eq!(
-        search_output.status.code(),
-        Some(2),
-        "semantic-only search must fail fast with exit 2 when preconditions are missing\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&search_output.stdout),
-        String::from_utf8_lossy(&search_output.stderr)
-    );
-    let search_payload: Value =
-        serde_json::from_slice(&search_output.stdout).expect("fail-fast emits JSON payload");
-    assert_eq!(search_payload["ok"].as_bool(), Some(false));
-    assert_eq!(
-        search_payload["error"].as_str(),
-        Some("semantic_search_unavailable")
-    );
-    let kind = search_payload["kind"]
-        .as_str()
-        .expect("fail-fast payload carries kind label");
-    assert!(
-        matches!(
-            kind,
-            "embedder_feature_missing" | "embedder_unavailable" | "index_not_built" | "empty_index"
+    let mut model = SessionModel::new("019f0000-1111-7111-8111-000000000001", provenance, coverage);
+    model.segments.push(Segment {
+        segment_id: 1,
+        cwd: Known::value("/work/space/aicx".to_owned()),
+        branch: Known::value("fix/aicx-daily-usefulness".to_owned()),
+        started_at: Known::value("2026-07-13T04:00:00Z".to_owned()),
+        ended_at: Known::unknown(),
+        turn_range: TurnRange { start: 0, end: 3 },
+    });
+    let turn = |idx: u64, role: TurnRole, kind: TurnKind, text: &str, ts: Known<String>| Turn {
+        turn_idx: idx,
+        role,
+        timestamp: ts,
+        kind,
+        text: text.to_owned(),
+        text_hash: "b".repeat(64),
+        text_chars: text.chars().count() as u64,
+        tool_name: Known::unknown(),
+        segment_id: 1,
+        raw_unit_refs: Vec::new(),
+    };
+    model.turns = vec![
+        turn(
+            0,
+            TurnRole::User,
+            TurnKind::UserMsg,
+            "please fix the parser",
+            Known::value("2026-07-13T04:00:01Z".to_owned()),
         ),
-        "unexpected fail-fast kind: {kind}"
-    );
-    assert!(
-        !search_payload["reason"]
-            .as_str()
-            .unwrap_or_default()
-            .is_empty(),
-        "fail-fast reason must not be empty"
-    );
-    assert!(
-        !search_payload["recommendation"]
-            .as_str()
-            .unwrap_or_default()
-            .is_empty(),
-        "fail-fast recommendation must not be empty"
-    );
-
-    #[cfg(feature = "lance")]
-    {
-        let steer_output = run_aicx(
-            &home,
-            &["steer", "-p", "ai-contexters", "--frame-kind", "user_msg"],
-        );
-        assert_success(&steer_output);
-        let steer_stdout = String::from_utf8_lossy(&steer_output.stdout);
-
-        let expected_user_file = paths_by_frame["user_msg"]
-            .file_name()
-            .expect("user chunk filename")
-            .to_string_lossy()
-            .into_owned();
-        assert!(steer_stdout.contains(&expected_user_file));
-        for unexpected in ["agent_reply", "internal_thought", "tool_call"] {
-            let unexpected_path = paths_by_frame[unexpected]
-                .file_name()
-                .expect("unexpected chunk filename")
-                .to_string_lossy()
-                .into_owned();
-            assert!(
-                !steer_stdout.contains(&unexpected_path),
-                "steer output leaked {unexpected} path: {steer_stdout}"
-            );
-        }
-    }
-
-    #[cfg(not(feature = "lance"))]
-    {
-        let steer_output = run_aicx(
-            &home,
-            &["steer", "-p", "ai-contexters", "--frame-kind", "user_msg"],
-        );
-        assert!(
-            !steer_output.status.success(),
-            "steer should fail when lance is disabled"
-        );
-        let steer_stderr = String::from_utf8_lossy(&steer_output.stderr);
-        assert!(steer_stderr.contains("not enabled in this aicx build"));
-    }
-
-    let _ = fs::remove_dir_all(&root);
+        turn(
+            1,
+            TurnRole::Assistant,
+            TurnKind::InternalThought,
+            "thinking about the shape",
+            Known::value("2026-07-13T04:00:02Z".to_owned()),
+        ),
+        turn(
+            2,
+            TurnRole::Assistant,
+            TurnKind::ToolCall,
+            "cargo test",
+            Known::value("2026-07-13T04:00:03Z".to_owned()),
+        ),
+        // Unknown per-turn timestamp: must fall back to session provenance
+        // start, flagged via timestamp_source — never a fabricated time.
+        turn(
+            3,
+            TurnRole::Assistant,
+            TurnKind::AgentReply,
+            "done, gates green",
+            Known::unknown(),
+        ),
+    ];
+    model
 }
 
 #[test]
-fn claude_store_does_not_emit_empty_thinking_signature() {
-    let root = unique_test_dir("claude-signature-store");
-    let home = root.join("home");
-    let repo_root = home.join("hosted").join("VetCoders").join("aicx");
-    let session_path = home
-        .join(".claude")
-        .join("projects")
-        .join("-Users-test-hosted-VetCoders-aicx")
-        .join("claude-signature-contract.jsonl");
+fn timeline_projection_is_pure_and_complete() {
+    let model = synthetic_model();
+    let entries = timeline_entries_from_model(&model);
 
-    fs::create_dir_all(repo_root.join(".git")).expect("create repo root");
-    write_claude_session_with_empty_signature(&session_path, &repo_root);
-
-    let store_output = run_aicx(
-        &home,
-        &["store", "--agent", "claude", "-H", "24", "--emit", "json"],
-    );
-    let payload = parse_stdout_json(&store_output);
-    let store_paths = json_paths(&payload, "store_paths");
-    assert_eq!(store_paths.len(), 2);
-
-    let mut saw_agent_reply = false;
-    for path in &store_paths {
-        let chunk = fs::read_to_string(path).expect("read stored chunk");
-        assert!(!chunk.contains("signature"));
-        assert!(!chunk.contains("abc123"));
-        assert!(!chunk.contains(r#""type":"thinking""#));
-
-        let sidecar: Value = serde_json::from_slice(
-            &fs::read(path.with_extension("meta.json")).expect("read sidecar"),
-        )
-        .expect("parse sidecar");
-        if sidecar["frame_kind"].as_str() == Some("agent_reply") {
-            saw_agent_reply = true;
-            assert!(chunk.contains("Visible Claude answer"));
-        }
+    assert_eq!(entries.len(), model.turns.len(), "projection drops no turn");
+    for entry in &entries {
+        assert_eq!(entry.agent, "codex");
+        assert_eq!(entry.session_id, model.session_id);
+        assert!(
+            entry.source_path.is_none(),
+            "typed model is path-free; projections must not invent paths"
+        );
+        assert_eq!(
+            entry.source_sha256.as_deref(),
+            Some(model.provenance.original_source_hash.as_str())
+        );
     }
-    assert!(saw_agent_reply, "expected an agent_reply chunk");
-
-    let input_arg = session_path.display().to_string();
-    let conversation_path = root.join("conversation.md");
-    let output_arg = conversation_path.display().to_string();
-    let conversation_output = run_aicx(
-        &home,
-        &[
-            "extract",
-            "--format",
-            "claude",
-            &input_arg,
-            "-o",
-            &output_arg,
-            "--conversation",
-        ],
+    assert_eq!(entries[0].frame_kind, Some(FrameKind::UserMsg));
+    assert_eq!(entries[1].frame_kind, Some(FrameKind::InternalThought));
+    assert_eq!(entries[2].frame_kind, Some(FrameKind::ToolCall));
+    assert_eq!(entries[3].frame_kind, Some(FrameKind::AgentReply));
+    assert_eq!(
+        entries[3].timestamp_source.as_deref(),
+        Some("session_provenance"),
+        "unknown turn timestamp falls back to session start, explicitly flagged"
     );
-    assert_success(&conversation_output);
-    let conversation = fs::read_to_string(conversation_path).expect("read conversation markdown");
-    assert!(conversation.contains("Visible Claude answer"));
-    assert!(!conversation.contains(r#""signature""#));
-    assert!(!conversation.contains("abc123"));
+    assert_eq!(
+        entries[3].timestamp.to_rfc3339(),
+        "2026-07-13T04:00:00+00:00"
+    );
 
-    let _ = fs::remove_dir_all(&root);
+    // Determinism: the projection is a pure function of the model.
+    let first = serde_json::to_string(&entries).expect("serialize projection");
+    let second =
+        serde_json::to_string(&timeline_entries_from_model(&model)).expect("serialize again");
+    assert_eq!(first, second, "projection must be deterministic");
+}
+
+#[test]
+fn conversation_projection_keeps_only_user_and_agent_frames() {
+    let model = synthetic_model();
+    let messages = conversation_messages_from_model(&model, None);
+
+    assert_eq!(
+        messages.len(),
+        2,
+        "reasoning and tool frames must not enter the conversation projection"
+    );
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[0].message, "please fix the parser");
+    assert_eq!(messages[1].role, "assistant");
+    assert_eq!(messages[1].message, "done, gates green");
+    assert_eq!(
+        messages[0].repo_project, "aicx",
+        "repo identity derives from the model's segment cwd"
+    );
+
+    let overridden = conversation_messages_from_model(&model, Some("vetcoders"));
+    assert!(overridden.iter().all(|m| m.repo_project == "vetcoders"));
 }

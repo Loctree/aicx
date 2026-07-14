@@ -1,25 +1,26 @@
-//! Semantic-only search dispatch with fail-fast diagnostics.
+//! Semantic search dispatch with typed diagnostics.
 //!
-//! `aicx search` is **semantic-by-contract** since v0.7: a query is encoded
+//! The library primitive is **semantic-by-contract**: a query is encoded
 //! through the in-process embedder ([`crate::embedder`], which re-exports
 //! the local [`aicx_embeddings`] crate's GGUF + cloud HTTP stack) and
 //! matched against a materialized vector index of the canonical store.
 //!
-//! There is no silent fuzzy fallback. When a precondition is missing
+//! The primitive never pretends fuzzy results are semantic. When a precondition is missing
 //! (embedder unhydrated, index not built, empty/low-signal corpus,
 //! dimension mismatch between query and index), [`try_semantic_search`]
 //! returns a typed [`SemanticError`] with a human-readable `reason` AND
-//! an actionable `recommendation`. The caller renders the error and
-//! exits non-zero so operators see exactly what to do, instead of
-//! receiving "0 results" without a story.
+//! an actionable `recommendation`. The CLI may then explicitly degrade to
+//! filesystem-fuzzy while surfacing the semantic failure in its rendered output.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde::Serialize;
 
 use crate::rank::FuzzyResult;
+use crate::sanitize::normalize_query;
 use crate::timeline::FrameKind;
 
 /// Successful semantic search outcome with rendering-ready data.
@@ -44,6 +45,11 @@ pub struct SemanticSearchOutcome {
 
 /// Result of a semantic search call.
 pub type SemanticOutcome = SemanticSearchOutcome;
+
+const BACKEND_HYBRID_RRF: &str = "hybrid_rrf";
+const BACKEND_HYBRID_RRF_GLOBAL_SCOPED: &str = "hybrid_rrf_global_scoped";
+const BACKEND_SEMANTIC_DENSE_ONLY: &str = "semantic_dense_only";
+const BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED: &str = "semantic_dense_only_global_scoped";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HybridRetrievalStatus {
@@ -266,6 +272,11 @@ pub fn try_semantic_search(
         let mut scanned = 0usize;
         let mut model_id = None;
         let mut hybrid_statuses = Vec::new();
+        // Track whether any scope fell back to dense-only, so the merged
+        // outcome reports the degraded backend instead of silently claiming
+        // hybrid — the degraded status must reach the CLI/MCP boundary.
+        let mut any_dense_only = false;
+        let mut any_global_project_scope = false;
         for scope in scopes {
             let mut outcome = try_semantic_search_native(
                 query,
@@ -274,6 +285,15 @@ pub fn try_semantic_search(
                 frame_kind_filter,
                 kind_filter,
             )?;
+            if outcome
+                .backend_label
+                .starts_with(BACKEND_SEMANTIC_DENSE_ONLY)
+            {
+                any_dense_only = true;
+            }
+            if outcome.backend_label.ends_with("_global_scoped") {
+                any_global_project_scope = true;
+            }
             scanned += outcome.scanned;
             model_id.get_or_insert(outcome.model_id.clone());
             if let Some(status) = outcome.retrieval_status.clone() {
@@ -286,11 +306,110 @@ pub fn try_semantic_search(
         Ok(SemanticOutcome {
             results: merged_results,
             scanned,
-            backend_label: "hybrid_rrf",
+            backend_label: if any_dense_only && any_global_project_scope {
+                BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
+            } else if any_dense_only {
+                BACKEND_SEMANTIC_DENSE_ONLY
+            } else if any_global_project_scope {
+                BACKEND_HYBRID_RRF_GLOBAL_SCOPED
+            } else {
+                BACKEND_HYBRID_RRF
+            },
             model_id: model_id.unwrap_or_else(|| "unknown".to_string()),
             retrieval_status: merge_hybrid_statuses(&hybrid_statuses),
         })
     }
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[derive(Debug)]
+struct SemanticBucketScope<'a> {
+    index_project: Option<&'a str>,
+    retrieval_project_filter: Option<&'a str>,
+    index_path: std::path::PathBuf,
+    used_global_project_scope: bool,
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+#[derive(Clone, Copy)]
+struct SemanticRetrievalFilters<'a> {
+    kind: Option<&'a str>,
+    frame_kind: Option<FrameKind>,
+    project: Option<&'a str>,
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn index_not_built_error(path: std::path::PathBuf, project_filter: Option<&str>) -> SemanticError {
+    let recommendation = match project_filter {
+        Some(p) => format!(
+            "run `aicx index` to build the global index used by `search -p {p}`; \
+             optionally run `aicx index --project {p}` to materialize a local project cache"
+        ),
+        None => {
+            "run `aicx index` (one-off; subsequent runs query the index in-process)".to_string()
+        }
+    };
+    let legacy_hint = legacy_index_hint(project_filter, &path)
+        .map(|hint| format!(" {hint}"))
+        .unwrap_or_default();
+    SemanticError::IndexNotBuilt {
+        path: path.clone(),
+        reason: format!(
+            "vector index not yet materialized at {}{}",
+            path.display(),
+            legacy_hint
+        ),
+        recommendation,
+    }
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn legacy_index_hint(project_filter: Option<&str>, canonical_path: &Path) -> Option<String> {
+    let legacy_path = crate::os_user_home()?
+        .join("index")
+        .join(crate::vector_index::index_bucket_name(project_filter))
+        .join("embeddings.ndjson");
+    if legacy_path.exists() && legacy_path != canonical_path {
+        Some(format!(
+            "Found legacy index at {}; current AICX uses {}.",
+            legacy_path.display(),
+            canonical_path.display()
+        ))
+    } else {
+        None
+    }
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn select_semantic_bucket_scope<'a>(
+    project_filter: Option<&'a str>,
+    project_index_path: std::path::PathBuf,
+    all_index_path: std::path::PathBuf,
+) -> std::result::Result<SemanticBucketScope<'a>, SemanticError> {
+    if project_index_path.exists() {
+        return Ok(SemanticBucketScope {
+            index_project: project_filter,
+            // Keep project pushdown even inside a project-specific bucket as
+            // a defensive guard against stale or mixed-project artifacts.
+            retrieval_project_filter: project_filter,
+            index_path: project_index_path,
+            used_global_project_scope: false,
+        });
+    }
+
+    if let Some(project) = project_filter {
+        if all_index_path.exists() {
+            return Ok(SemanticBucketScope {
+                index_project: None,
+                retrieval_project_filter: Some(project),
+                index_path: all_index_path,
+                used_global_project_scope: true,
+            });
+        }
+        return Err(index_not_built_error(project_index_path, project_filter));
+    }
+
+    Err(index_not_built_error(project_index_path, project_filter))
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -301,7 +420,50 @@ fn try_semantic_search_native(
     frame_kind_filter: Option<FrameKind>,
     kind_filter: Option<&str>,
 ) -> std::result::Result<SemanticOutcome, SemanticError> {
-    // Probe the embedder first.
+    // Resolve + verify the committed index FIRST, BEFORE paying the
+    // (potentially heavy) embedder bootstrap. On a host with no local index
+    // (e.g. a read mirror, which serves semantic from a remote mesh host and
+    // keeps `indexed/` empty by design) this makes `aicx search` / the MCP
+    // `aicx_search` fail-fast with `IndexNotBuilt` WITHOUT loading the
+    // embedder — so a client retrying a deterministically-missing index does
+    // not pay a model/config bootstrap (the most expensive step) on every
+    // call. Functionally identical to checking after; the order is what saves
+    // the CPU.
+    let project_index_path = crate::vector_index::index_path(project_filter).map_err(|err| {
+        SemanticError::IndexNotBuilt {
+            path: std::path::PathBuf::new(),
+            reason: format!("could not resolve index path: {err}"),
+            recommendation: "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index`"
+                .to_string(),
+        }
+    })?;
+    let all_index_path = if project_filter.is_some() {
+        crate::vector_index::index_path(None).map_err(|err| SemanticError::IndexNotBuilt {
+            path: std::path::PathBuf::new(),
+            reason: format!("could not resolve _all index path: {err}"),
+            recommendation: "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index`"
+                .to_string(),
+        })?
+    } else {
+        project_index_path.clone()
+    };
+    let scope = select_semantic_bucket_scope(project_filter, project_index_path, all_index_path)?;
+    let path = scope.index_path.clone();
+
+    // Touch the file once to surface IO errors early with a readable
+    // recommendation.
+    if let Err(err) = std::fs::metadata(&path) {
+        return Err(SemanticError::IndexCorrupt {
+            path: path.clone(),
+            reason: format!("cannot stat index file: {err}"),
+            recommendation: format!(
+                "delete and rebuild: `rm -f {} && aicx index`",
+                path.display()
+            ),
+        });
+    }
+
+    // Index exists — NOW probe the embedder (the expensive bootstrap step).
     let mut engine = match crate::embedder::EmbeddingEngine::new() {
         Ok(engine) => engine,
         Err(err) => {
@@ -328,42 +490,6 @@ fn try_semantic_search_native(
 
     let info = engine.info().clone();
     let embedder_dim = info.dimension;
-
-    let path = crate::vector_index::index_path(project_filter).map_err(|err| {
-        SemanticError::IndexNotBuilt {
-            path: std::path::PathBuf::new(),
-            reason: format!("could not resolve index path: {err}"),
-            recommendation: "ensure $AICX_HOME (or $HOME) is writable, then run `aicx index`"
-                .to_string(),
-        }
-    })?;
-
-    if !path.exists() {
-        let cmd = match project_filter {
-            Some(p) => format!("aicx index --project {p}"),
-            None => "aicx index".to_string(),
-        };
-        return Err(SemanticError::IndexNotBuilt {
-            path: path.clone(),
-            reason: format!("vector index not yet materialized at {}", path.display()),
-            recommendation: format!(
-                "run `{cmd}` (one-off; subsequent runs query the index in-process)"
-            ),
-        });
-    }
-
-    // Touch the file once to surface IO errors early with a readable
-    // recommendation.
-    if let Err(err) = std::fs::metadata(&path) {
-        return Err(SemanticError::IndexCorrupt {
-            path: path.clone(),
-            reason: format!("cannot stat index file: {err}"),
-            recommendation: format!(
-                "delete and rebuild: `rm -f {} && aicx index`",
-                path.display()
-            ),
-        });
-    }
 
     // Read header line first so we can detect dimension mismatch BEFORE
     // touching any vectors.
@@ -429,7 +555,7 @@ fn try_semantic_search_native(
     }
 
     let manifest_path =
-        crate::vector_index::hybrid_manifest_path(project_filter).map_err(|err| {
+        crate::vector_index::hybrid_manifest_path(scope.index_project).map_err(|err| {
             SemanticError::IndexCorrupt {
                 path: path.clone(),
                 reason: format!("could not resolve hybrid manifest path: {err}"),
@@ -437,23 +563,8 @@ fn try_semantic_search_native(
                     .to_string(),
             }
         })?;
-    if !manifest_path.exists() {
-        let cmd = match project_filter {
-            Some(p) => format!("aicx index --project {p}"),
-            None => "aicx index".to_string(),
-        };
-        return Err(SemanticError::RetrievalManifestMissing {
-            path: manifest_path.clone(),
-            reason: format!(
-                "hybrid retrieval manifest is missing at {}",
-                manifest_path.display()
-            ),
-            recommendation: format!(
-                "run `{cmd}` with the current binary so lexical+dense hybrid artifacts are committed"
-            ),
-        });
-    }
-
+    // Embed the query once — both the hybrid path and the dense-only
+    // fallback need the query vector.
     let query_embedding = match engine.embed(query) {
         Ok(embedding) => embedding,
         Err(err) => {
@@ -467,9 +578,53 @@ fn try_semantic_search_native(
         }
     };
 
-    let hybrid = load_hybrid_index(project_filter, &path, &info, &manifest_path)?;
+    let retrieval_filters = SemanticRetrievalFilters {
+        kind: kind_filter,
+        frame_kind: frame_kind_filter,
+        project: scope.retrieval_project_filter,
+    };
+
+    // Patch 3 / Bug B+: the hybrid (tantivy lexical + dense fusion) stack can
+    // be unavailable for manifest-side reasons — never committed
+    // (`RetrievalManifestMissing`) or mid-rebuild / mismatched
+    // (`RetrievalManifestStale`; e.g. `TantivyAdapter::build` wipes its dir
+    // before committing). The dense embeddings in the committed index stay a
+    // valid semantic artifact throughout, so degrade to dense-only ranking
+    // instead of hard-failing the whole query. Lexical is part of the
+    // ranking, not a precondition for semantic search.
+    let hybrid = if manifest_path.exists() {
+        match load_hybrid_index(scope.index_project, &path, &info, &manifest_path) {
+            Ok(hybrid) => hybrid,
+            Err(SemanticError::RetrievalManifestMissing { .. })
+            | Err(SemanticError::RetrievalManifestStale { .. }) => {
+                return query_dense_only_from_primary(
+                    &path,
+                    &query_embedding,
+                    embedder_dim,
+                    limit,
+                    retrieval_filters,
+                    &info.model_id,
+                    scope.used_global_project_scope,
+                );
+            }
+            Err(other) => return Err(other),
+        }
+    } else {
+        // Manifest was never committed — serve dense-only directly from the
+        // primary committed index (already validated above: exists, correct
+        // dimension, non-empty).
+        return query_dense_only_from_primary(
+            &path,
+            &query_embedding,
+            embedder_dim,
+            limit,
+            retrieval_filters,
+            &info.model_id,
+            scope.used_global_project_scope,
+        );
+    };
     let manifest = hybrid.manifest().cloned();
-    let filters = hybrid_filters(kind_filter, frame_kind_filter);
+    let filters = hybrid_filters(retrieval_filters);
     let hits = match hybrid.query_hybrid(aicx_retrieve::HybridQueryInput {
         query_text: query,
         query_embedding: &query_embedding,
@@ -510,6 +665,12 @@ fn try_semantic_search_native(
             let path = hit_path(&h);
             let score_pct = hybrid_score_pct(h.score);
             let matched_lines = semantic_preview_lines(&path);
+            let label_backend = if scope.used_global_project_scope {
+                BACKEND_HYBRID_RRF_GLOBAL_SCOPED
+            } else {
+                BACKEND_HYBRID_RRF
+            };
+            let label = format!("{label_backend}:{}", h.chunk_id);
             FuzzyResult {
                 file: path.to_string_lossy().to_string(),
                 path: path.to_string_lossy().to_string(),
@@ -520,7 +681,7 @@ fn try_semantic_search_native(
                 date: hit_metadata_string(&h, "date"),
                 timestamp: None,
                 score: score_pct,
-                label: format!("hybrid_rrf:{}", h.chunk_id),
+                label,
                 density: h.score,
                 matched_lines,
                 session_id: hit_metadata_optional_string(&h, "session_id"),
@@ -532,7 +693,11 @@ fn try_semantic_search_native(
     Ok(SemanticOutcome {
         results,
         scanned,
-        backend_label: "hybrid_rrf",
+        backend_label: if scope.used_global_project_scope {
+            BACKEND_HYBRID_RRF_GLOBAL_SCOPED
+        } else {
+            BACKEND_HYBRID_RRF
+        },
         model_id: info.model_id,
         retrieval_status,
     })
@@ -618,25 +783,191 @@ fn load_hybrid_index(
     })
 }
 
+/// Dense-only semantic fallback that reads the PRIMARY committed index
+/// (`index_path` = `vector_index::index_path`, i.e. `indexed/<bucket>/embeddings.ndjson`)
+/// directly, bypassing the hybrid manifest + tantivy lexical layer entirely.
+///
+/// Engaged when the hybrid stack is unavailable for any manifest-side reason
+/// (`RetrievalManifestMissing` / `RetrievalManifestStale`) — e.g. the lexical
+/// index is mid-rebuild (`TantivyAdapter::build` wipes its dir) or the manifest
+/// was never committed. The dense embeddings in the committed index remain a
+/// valid semantic artifact throughout, so we degrade to dense-only cosine
+/// ranking instead of hard-failing the whole query.
+///
+/// This is NOT the doctrinal "silent fuzzy fallback" (see module docs): it is
+/// explicit semantic search over real embeddings, surfaced via
+/// `backend_label = "semantic_dense_only"`. Hard-fail only when there is no
+/// valid dense artifact to serve.
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
-fn hybrid_filters(
-    kind_filter: Option<&str>,
-    frame_kind_filter: Option<FrameKind>,
-) -> aicx_retrieve::FilterSet {
-    let mut filters = aicx_retrieve::FilterSet::default();
-    if let Some(kind) = kind_filter {
-        filters.values.insert(
+fn query_dense_only_from_primary(
+    index_path: &std::path::Path,
+    query_embedding: &[f32],
+    dim: usize,
+    limit: usize,
+    filters: SemanticRetrievalFilters<'_>,
+    model_id: &str,
+    used_global_project_scope: bool,
+) -> std::result::Result<SemanticOutcome, SemanticError> {
+    use aicx_retrieve::{BruteForceAdapter, ChunkRef, DenseChunkRef, DenseIndex, Distance};
+
+    let (header, entries) = crate::vector_index::read_committed_index_entries_matching_project(
+        index_path,
+        filters.project,
+    )
+    .map_err(|err| SemanticError::IndexCorrupt {
+        path: index_path.to_path_buf(),
+        reason: format!("dense-only fallback could not read committed index: {err:#}"),
+        recommendation: format!(
+            "delete and rebuild: `rm -f {} && aicx index`",
+            index_path.display()
+        ),
+    })?;
+
+    // Defensive dimension guard: a committed index built with a different
+    // embedder (operator's F2LLM 2048 -> qwen3 4096 migration) must NOT be
+    // scored against the current query vector. Surface DimensionMismatch
+    // rather than ranking meaningless cross-model cosine.
+    if header.dimension != dim {
+        return Err(SemanticError::DimensionMismatch {
+            path: index_path.to_path_buf(),
+            index_dim: header.dimension,
+            embedder_dim: dim,
+            reason: format!(
+                "dense-only fallback: committed index dimension={} (model {}), current embedder dimension={}",
+                header.dimension, header.model_id, dim
+            ),
+            recommendation: format!(
+                "rebuild with the current embedder: `rm -f {} && aicx index`",
+                index_path.display()
+            ),
+        });
+    }
+
+    if entries.is_empty() {
+        return Err(SemanticError::EmptyIndex {
+            path: index_path.to_path_buf(),
+            reason: format!(
+                "dense-only fallback: committed index at {} contains 0 entries",
+                index_path.display()
+            ),
+            recommendation: "run `aicx extract --all` to populate the corpus, then `aicx index`"
+                .to_string(),
+        });
+    }
+
+    let scanned = entries.len();
+    let dense_chunks: Vec<DenseChunkRef> = entries
+        .into_iter()
+        .map(|entry| {
+            let metadata = crate::vector_index::index_entry_metadata_json(&entry);
+            DenseChunkRef {
+                chunk: ChunkRef {
+                    id: entry.id,
+                    source_path: entry.path.to_string_lossy().to_string(),
+                    // Dense ranking scores embeddings, not text — keep the
+                    // body out of memory (227k chunks otherwise).
+                    text: String::new(),
+                    metadata,
+                },
+                embedding: entry.embedding,
+            }
+        })
+        .collect();
+
+    let mut dense = BruteForceAdapter::new(dim).with_distance(Distance::Cosine);
+    DenseIndex::build(&mut dense, &dense_chunks).map_err(|err| SemanticError::IndexCorrupt {
+        path: index_path.to_path_buf(),
+        reason: format!("dense-only fallback could not build in-memory dense index: {err:#}"),
+        recommendation: format!(
+            "delete and rebuild: `rm -f {} && aicx index`",
+            index_path.display()
+        ),
+    })?;
+
+    let filter_set = hybrid_filters(filters);
+    let hits = DenseIndex::query(&dense, query_embedding, limit, &filter_set).map_err(|err| {
+        SemanticError::IndexCorrupt {
+            path: index_path.to_path_buf(),
+            reason: format!("dense-only fallback query failed: {err:#}"),
+            recommendation: "retry; if it persists rebuild with `aicx index`".to_string(),
+        }
+    })?;
+
+    let results: Vec<FuzzyResult> = hits
+        .into_iter()
+        .map(|h| {
+            let path = hit_path(&h);
+            let score_pct = dense_score_pct(h.score);
+            let matched_lines = semantic_preview_lines(&path);
+            let label = if used_global_project_scope {
+                format!("dense_only_global_scoped:{}", h.chunk_id)
+            } else {
+                format!("dense_only:{}", h.chunk_id)
+            };
+            FuzzyResult {
+                file: path.to_string_lossy().to_string(),
+                path: path.to_string_lossy().to_string(),
+                project: hit_metadata_string(&h, "project"),
+                kind: hit_metadata_string(&h, "kind"),
+                frame_kind: hit_metadata_optional_string(&h, "frame_kind"),
+                agent: hit_metadata_string(&h, "agent"),
+                date: hit_metadata_string(&h, "date"),
+                timestamp: None,
+                score: score_pct,
+                label,
+                density: h.score,
+                matched_lines,
+                session_id: hit_metadata_optional_string(&h, "session_id"),
+                cwd: hit_metadata_optional_string(&h, "cwd"),
+            }
+        })
+        .collect();
+
+    Ok(SemanticOutcome {
+        results,
+        scanned,
+        backend_label: if used_global_project_scope {
+            BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
+        } else {
+            BACKEND_SEMANTIC_DENSE_ONLY
+        },
+        model_id: model_id.to_string(),
+        retrieval_status: None,
+    })
+}
+
+/// Map a brute-force Cosine **similarity** (`[-1.0, 1.0]`, higher = closer)
+/// to a `[0, 100]` percentage. Distinct from [`hybrid_score_pct`], which
+/// scales an RRF-fused score — the dense-only leg is not RRF-fused, so it
+/// must not borrow that scaling.
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn dense_score_pct(cosine_similarity: f32) -> u8 {
+    let clamped = cosine_similarity.clamp(-1.0, 1.0);
+    (((clamped + 1.0) * 0.5 * 100.0).round() as i32).clamp(0, 100) as u8
+}
+
+#[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+fn hybrid_filters(filters: SemanticRetrievalFilters<'_>) -> aicx_retrieve::FilterSet {
+    let mut set = aicx_retrieve::FilterSet::default();
+    if let Some(project) = filters.project {
+        set.values.insert(
+            "project".to_string(),
+            serde_json::Value::String(project.to_string()),
+        );
+    }
+    if let Some(kind) = filters.kind {
+        set.values.insert(
             "kind".to_string(),
             serde_json::Value::String(kind.to_string()),
         );
     }
-    if let Some(frame_kind) = frame_kind_filter {
-        filters.values.insert(
+    if let Some(frame_kind) = filters.frame_kind {
+        set.values.insert(
             "frame_kind".to_string(),
             serde_json::Value::String(frame_kind.as_str().to_string()),
         );
     }
-    filters
+    set
 }
 
 #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
@@ -743,11 +1074,11 @@ fn semantic_preview_lines(path: &std::path::Path) -> Vec<String> {
     let Ok(content) = crate::sanitize::read_to_string_validated(path) else {
         return Vec::new();
     };
-    content
+    crate::card_header::card_body(&content)
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .filter(|line| !line.starts_with("[project:"))
+        .filter(|line| !crate::card_header::is_bracket_header_line(line))
         .filter(|line| *line != "[signals]" && *line != "[/signals]")
         .filter(|line| !line.starts_with("id: "))
         .take(MAX_LINES)
@@ -847,6 +1178,24 @@ pub const FILTER_EXAMINED_CAP_RATIO: usize = 10;
 /// still have enough material for filter pushdown to be meaningful.
 pub const FILTER_EXAMINED_CAP_MIN: usize = 50;
 
+fn default_search_quality_active(frame_kind_filter: Option<FrameKind>) -> bool {
+    frame_kind_filter.is_none()
+}
+
+fn semantic_fetch_limit(
+    user_limit: usize,
+    frame_kind_filter: Option<FrameKind>,
+    post_filters: &SemanticSearchFilters,
+) -> usize {
+    if post_filters.is_active() || default_search_quality_active(frame_kind_filter) {
+        user_limit
+            .saturating_mul(FILTER_EXAMINED_CAP_RATIO)
+            .max(FILTER_EXAMINED_CAP_MIN)
+    } else {
+        user_limit.max(1)
+    }
+}
+
 /// Filter-aware semantic retrieval. Wraps [`try_semantic_search`] with a
 /// bounded examined-pool fetch + canonical post-filter application so
 /// CLI (`aicx search`) and MCP (`aicx_search`) share one truth for the
@@ -867,13 +1216,7 @@ pub fn try_semantic_search_filtered(
     kind_filter: Option<&str>,
     post_filters: &SemanticSearchFilters,
 ) -> std::result::Result<FilteredSemanticOutcome, SemanticError> {
-    let fetch_limit = if post_filters.is_active() {
-        user_limit
-            .saturating_mul(FILTER_EXAMINED_CAP_RATIO)
-            .max(FILTER_EXAMINED_CAP_MIN)
-    } else {
-        user_limit.max(1)
-    };
+    let fetch_limit = semantic_fetch_limit(user_limit, frame_kind_filter, post_filters);
 
     let outcome = try_semantic_search(
         store_root,
@@ -893,10 +1236,11 @@ pub fn try_semantic_search_filtered(
     } = outcome;
 
     let examined = results.len();
-    let filtered = apply_semantic_post_filters(results, post_filters);
+    let quality_filtered = apply_default_semantic_quality(results, query, frame_kind_filter);
+    let filtered = apply_semantic_post_filters(quality_filtered, post_filters);
     let matched = filtered.len();
     let diagnostic = partial_pushdown_diagnostic(
-        post_filters.is_active(),
+        post_filters.is_active() || default_search_quality_active(frame_kind_filter),
         examined,
         matched,
         user_limit,
@@ -913,6 +1257,289 @@ pub fn try_semantic_search_filtered(
         },
         diagnostic,
     })
+}
+
+fn apply_default_semantic_quality(
+    mut results: Vec<FuzzyResult>,
+    query: &str,
+    frame_kind_filter: Option<FrameKind>,
+) -> Vec<FuzzyResult> {
+    if frame_kind_filter.is_none() {
+        results.retain(default_visible_frame);
+    }
+
+    for result in &mut results {
+        result.score = semantic_quality_score(query, result);
+    }
+    results.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.date.cmp(&a.date)));
+    dedupe_semantic_results(results)
+}
+
+fn default_visible_frame(result: &FuzzyResult) -> bool {
+    match result.frame_kind.as_deref().and_then(FrameKind::parse) {
+        Some(FrameKind::UserMsg | FrameKind::AgentReply) | None => true,
+        Some(FrameKind::InternalThought | FrameKind::ToolCall | FrameKind::SystemNote) => false,
+    }
+}
+
+fn semantic_quality_score(query: &str, result: &FuzzyResult) -> u8 {
+    let mut score = result.score as i16;
+    score += match result.frame_kind.as_deref().and_then(FrameKind::parse) {
+        Some(FrameKind::UserMsg) => 6,
+        Some(FrameKind::AgentReply) => 5,
+        None => 1,
+        Some(FrameKind::InternalThought | FrameKind::ToolCall | FrameKind::SystemNote) => -20,
+    };
+
+    let normalized_query = normalize_query(query);
+    let query_terms: Vec<&str> = normalized_query
+        .split_whitespace()
+        .filter(|term| term.len() >= 3)
+        .collect();
+    let haystack = semantic_result_haystack(result);
+    let anchors = query_anchors(&normalized_query);
+    if !normalized_query.is_empty() && haystack.contains(&normalized_query) {
+        score += 12;
+    }
+    score += anchor_quality_delta(&anchors, &haystack);
+    score += informative_agent_reply_delta(result, &anchors, &haystack);
+    if !query_terms.is_empty() {
+        let matched_terms = query_terms
+            .iter()
+            .filter(|term| haystack.contains(**term))
+            .count();
+        score += (matched_terms.saturating_mul(3).min(12)) as i16;
+        if matched_terms == 0 {
+            score -= 15;
+        }
+    }
+    if low_signal_semantic_result(result) {
+        score -= 8;
+    }
+
+    score.clamp(0, 100) as u8
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueryAnchor {
+    token: String,
+    parts: Vec<String>,
+    strong: bool,
+}
+
+fn query_anchors(normalized_query: &str) -> Vec<QueryAnchor> {
+    let mut seen = HashSet::new();
+    let mut anchors = Vec::new();
+
+    for raw_token in normalized_query.split_whitespace() {
+        let token = raw_token
+            .trim_matches(|ch: char| !is_anchor_char(ch))
+            .to_string();
+        if token.len() < 3 || !seen.insert(token.clone()) {
+            continue;
+        }
+
+        let parts = split_anchor_parts(&token);
+        let has_separator = token.chars().any(is_anchor_separator);
+        let has_digit = token.chars().any(|ch| ch.is_ascii_digit());
+        let strong = token.len() >= 5 && ((has_separator && parts.len() >= 2) || has_digit);
+
+        anchors.push(QueryAnchor {
+            token,
+            parts,
+            strong,
+        });
+    }
+
+    anchors
+}
+
+fn is_anchor_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/' | ':' | '.')
+}
+
+fn is_anchor_separator(ch: char) -> bool {
+    matches!(ch, '-' | '_' | '/' | ':' | '.')
+}
+
+fn split_anchor_parts(token: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    token
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| part.len() >= 3)
+        .filter_map(|part| {
+            let part = part.to_string();
+            seen.insert(part.clone()).then_some(part)
+        })
+        .collect()
+}
+
+fn anchor_quality_delta(anchors: &[QueryAnchor], haystack: &str) -> i16 {
+    let strong_anchors: Vec<&QueryAnchor> = anchors.iter().filter(|anchor| anchor.strong).collect();
+    if strong_anchors.is_empty() {
+        return 0;
+    }
+
+    let mut exact_matches = 0usize;
+    let mut full_part_matches = 0usize;
+    let mut matched_parts = HashSet::new();
+
+    for anchor in strong_anchors {
+        if haystack.contains(&anchor.token) {
+            exact_matches += 1;
+        }
+
+        let matched_count = anchor
+            .parts
+            .iter()
+            .filter(|part| {
+                let matched = haystack.contains(part.as_str());
+                if matched {
+                    matched_parts.insert((*part).clone());
+                }
+                matched
+            })
+            .count();
+
+        if anchor.parts.len() >= 2 && matched_count == anchor.parts.len() {
+            full_part_matches += 1;
+        }
+    }
+
+    let mut delta = 0i16;
+    delta += (exact_matches.saturating_mul(28).min(56)) as i16;
+    delta += (full_part_matches.saturating_mul(18).min(36)) as i16;
+    delta += (matched_parts.len().saturating_mul(4).min(16)) as i16;
+
+    if exact_matches == 0 && full_part_matches == 0 {
+        if matched_parts.is_empty() {
+            delta -= 30;
+        } else {
+            delta -= 8;
+        }
+    }
+
+    delta
+}
+
+fn informative_agent_reply_delta(
+    result: &FuzzyResult,
+    anchors: &[QueryAnchor],
+    haystack: &str,
+) -> i16 {
+    if result.frame_kind.as_deref().and_then(FrameKind::parse) != Some(FrameKind::AgentReply) {
+        return 0;
+    }
+    if !has_strong_anchor_evidence(anchors, haystack) {
+        return 0;
+    }
+
+    let text = normalize_query(&result.matched_lines.join(" "));
+    let word_count = text
+        .split_whitespace()
+        .filter(|word| word.chars().filter(|ch| ch.is_ascii_alphabetic()).count() >= 3)
+        .count();
+    if word_count < 10 {
+        return 0;
+    }
+
+    let answer_markers = [
+        "to jest to",
+        "chodzi o",
+        "dlatego",
+        "poniewaz",
+        "przyczyna",
+        "diagnoza",
+        "wniosek",
+        "incydent",
+        "root cause",
+        "because",
+        "reason",
+        "summary",
+        "diagnosis",
+        "conclusion",
+    ];
+    if answer_markers.iter().any(|marker| text.contains(marker)) {
+        22
+    } else if word_count >= 22 {
+        8
+    } else {
+        0
+    }
+}
+
+fn has_strong_anchor_evidence(anchors: &[QueryAnchor], haystack: &str) -> bool {
+    anchors.iter().any(|anchor| {
+        anchor.strong
+            && (haystack.contains(&anchor.token)
+                || (anchor.parts.len() >= 2
+                    && anchor
+                        .parts
+                        .iter()
+                        .all(|part| haystack.contains(part.as_str()))))
+    })
+}
+
+fn semantic_result_haystack(result: &FuzzyResult) -> String {
+    normalize_query(&format!(
+        "{} {} {} {} {} {} {}",
+        result.project,
+        result.kind,
+        result.frame_kind.as_deref().unwrap_or_default(),
+        result.agent,
+        result.date,
+        result.path,
+        result.matched_lines.join(" ")
+    ))
+}
+
+fn low_signal_semantic_result(result: &FuzzyResult) -> bool {
+    let joined = result.matched_lines.join(" ");
+    let normalized = normalize_query(&joined);
+    if normalized.trim().is_empty() {
+        return true;
+    }
+    let noisy_needles = [
+        "last_token_usage",
+        "input_tokens",
+        "reasoning_output_tokens",
+        "model_context_window",
+        "toolu_",
+        "web_search",
+        "open_page",
+        "no matching deferred tools found",
+    ];
+    if noisy_needles
+        .iter()
+        .any(|needle| normalized.contains(needle))
+    {
+        return true;
+    }
+    let content_chars = normalized
+        .chars()
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .count();
+    content_chars < 8
+}
+
+fn dedupe_semantic_results(results: Vec<FuzzyResult>) -> Vec<FuzzyResult> {
+    let mut seen_snippets = HashSet::new();
+    let mut deduped = Vec::with_capacity(results.len());
+    for result in results {
+        let snippet_key = normalize_query(&result.matched_lines.join("\n"));
+        if snippet_key.len() >= 24
+            && !seen_snippets.insert(format!(
+                "{}|{}|{}",
+                result.project,
+                result.frame_kind.as_deref().unwrap_or("-"),
+                snippet_key
+            ))
+        {
+            continue;
+        }
+        deduped.push(result);
+    }
+    deduped
 }
 
 /// Pure helper for the post-fetch filter pass. Kept `pub(crate)` so unit
@@ -993,32 +1620,367 @@ pub fn render_semantic_status_line(
             )
         })
         .unwrap_or_default();
+    // The dense-only degraded path (Bug B+) must not masquerade as a healthy
+    // hybrid query: tell the operator the lexical fusion leg is unavailable
+    // and that this is a fallback, not the full stack.
+    let dense_only = backend_label.starts_with(BACKEND_SEMANTIC_DENSE_ONLY);
+    let all_bucket_fallback = backend_label.ends_with("_all_fallback");
+    let global_project_scope = backend_label.ends_with("_global_scoped");
+    let (prefix, index_label, fallback_label, scope_label) = if dense_only && all_bucket_fallback {
+        (
+            "[degraded] ",
+            "dense_only",
+            "hybrid_unavailable,all_bucket",
+            "",
+        )
+    } else if dense_only && global_project_scope {
+        (
+            "[degraded] ",
+            "dense_only",
+            "hybrid_unavailable",
+            " scope=global_project_filter",
+        )
+    } else if dense_only {
+        ("[degraded] ", "dense_only", "hybrid_unavailable", "")
+    } else if all_bucket_fallback {
+        ("", "hybrid", "all_bucket", "")
+    } else if global_project_scope {
+        ("", "hybrid", "none", " scope=global_project_filter")
+    } else {
+        ("", "hybrid", "none", "")
+    };
     format!(
-        "{} result(s) from {} candidate chunks. oracle_status: backend={} index=hybrid fallback=none model={} loctree_scope_safe=true{}",
-        result_count, scanned, backend_label, model_id, manifest
+        "{}{} result(s) from {} candidate chunks. oracle_status: backend={} index={} fallback={} model={} loctree_scope_safe=true{}{}",
+        prefix,
+        result_count,
+        scanned,
+        backend_label,
+        index_label,
+        fallback_label,
+        model_id,
+        scope_label,
+        manifest
     )
+}
+
+/// Bounded fetch limit for fuzzy retrieval. When post-filters are active we
+/// over-fetch up to `FILTER_EXAMINED_CAP_RATIO`× the requested limit (floored
+/// at `FILTER_EXAMINED_CAP_MIN`) so inside-window matches that sit below the
+/// raw top-N still surface instead of being lost to a silent-empty result.
+pub fn fuzzy_fetch_limit(user_limit: usize, filters_active: bool) -> usize {
+    if filters_active {
+        user_limit
+            .saturating_mul(FILTER_EXAMINED_CAP_RATIO)
+            .max(FILTER_EXAMINED_CAP_MIN)
+    } else {
+        user_limit
+    }
+}
+
+/// Apply the shared score/agent/date/hours post-filters to a fuzzy result set
+/// in place. Date bounds win over the `--hours` cutoff to match legacy
+/// precedence.
+fn apply_fuzzy_post_filters(
+    results: &mut Vec<crate::rank::FuzzyResult>,
+    post_filters: &SemanticSearchFilters,
+) {
+    if let Some(min_score) = post_filters.score_min {
+        results.retain(|r| r.score >= min_score);
+    }
+    if let Some(ref agent_filter) = post_filters.agent {
+        results.retain(|r| r.agent == *agent_filter);
+    }
+    if post_filters.date_lo.is_some() || post_filters.date_hi.is_some() {
+        let lo = post_filters.date_lo.as_deref();
+        let hi = post_filters.date_hi.as_deref();
+        results.retain(|r| {
+            lo.is_none_or(|lo| r.date.as_str() >= lo) && hi.is_none_or(|hi| r.date.as_str() <= hi)
+        });
+    } else if let Some(ref cutoff) = post_filters.hours_cutoff {
+        let cutoff = cutoff.as_str();
+        results.retain(|r| r.date.as_str() >= cutoff);
+    }
+}
+
+/// Shared fuzzy retrieval + post-filter primitive. Both the CLI `aicx search`
+/// fallback and the MCP `aicx_search` fallback route through this so the two
+/// surfaces cannot drift in *what* they retrieve and filter. Fetches a bounded
+/// pool then applies the post-filters; ordering/truncation is the caller's job
+/// via [`finalize_fuzzy_results`].
+pub fn fuzzy_search_with_post_filters(
+    store_root: &Path,
+    query: &str,
+    limit: usize,
+    project_scopes: &[Option<&str>],
+    frame_kind: Option<FrameKind>,
+    post_filters: &SemanticSearchFilters,
+) -> anyhow::Result<(Vec<crate::rank::FuzzyResult>, usize)> {
+    let fetch_limit = fuzzy_fetch_limit(limit, post_filters.is_active());
+    let (mut results, scanned) = crate::rank::fuzzy_search_store(
+        store_root,
+        query,
+        fetch_limit,
+        project_scopes,
+        frame_kind,
+    )?;
+    apply_fuzzy_post_filters(&mut results, post_filters);
+    Ok((results, scanned))
+}
+
+/// Shared "finalize" step for fuzzy/semantic result sets: optional kind retain,
+/// then sort, then truncate to `limit`. Both CLI and MCP search call this so
+/// ordering and limit semantics stay byte-identical across surfaces. `sort`
+/// accepts `"newest"` / `"oldest"` / `"score"`. `None` falls back to descending
+/// score; any unknown token falls back to `"newest"` (timestamp/date
+/// descending), matching the unit test below.
+pub fn finalize_fuzzy_results(
+    mut results: Vec<crate::rank::FuzzyResult>,
+    kind_filter: Option<&str>,
+    sort: Option<&str>,
+    limit: usize,
+) -> Vec<crate::rank::FuzzyResult> {
+    if let Some(kind_filter) = kind_filter {
+        results.retain(|r| r.kind == kind_filter);
+    }
+    match sort {
+        Some(sort_order) => results.sort_by(|a, b| {
+            let t_a = a.timestamp.as_deref().unwrap_or(a.date.as_str());
+            let t_b = b.timestamp.as_deref().unwrap_or(b.date.as_str());
+            match sort_order {
+                "newest" => t_b.cmp(t_a),
+                "oldest" => t_a.cmp(t_b),
+                "score" => b.score.cmp(&a.score).then(t_b.cmp(t_a)),
+                _ => t_b.cmp(t_a),
+            }
+        }),
+        None => results.sort_by_key(|b| std::cmp::Reverse(b.score)),
+    }
+    results.into_iter().take(limit).collect()
+}
+
+/// Append an `index_snapshot` honesty hint to a rendered hybrid search payload.
+///
+/// Hybrid results reflect the committed index *manifest* (a snapshot of the
+/// corpus at index-build time), not a live freshness check — that check scans
+/// canonical chunks and is intentionally kept off the search hot path. Without
+/// this hint a `hybrid_rrf` result reads as "fully fresh"; the hint keeps the
+/// surface honest by pointing callers at `aicx index status` to confirm there
+/// are no pending (un-embedded) chunks. Shared by CLI and MCP so both surfaces
+/// emit the identical honesty signal.
+pub fn inject_index_snapshot_hint(rendered: &str, source_chunks: usize) -> anyhow::Result<String> {
+    let mut value: serde_json::Value = serde_json::from_str(rendered).map_err(|e| {
+        anyhow::anyhow!("parse rendered search payload for index_snapshot hint: {e}")
+    })?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "index_snapshot".to_string(),
+            serde_json::json!({
+                "source_chunks": source_chunks,
+                "freshness_verified": false,
+                "note": "results reflect the committed index snapshot; run `aicx index status` to confirm there are no pending (un-embedded) chunks",
+            }),
+        );
+    }
+    serde_json::to_string(&value)
+        .map_err(|e| anyhow::anyhow!("serialize search payload with index_snapshot hint: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::ffi::OsString;
+
+    fn fuzzy(score: u8, kind: &str, date: &str, ts: Option<&str>) -> crate::rank::FuzzyResult {
+        crate::rank::FuzzyResult {
+            file: "f".to_string(),
+            path: "p".to_string(),
+            project: "proj".to_string(),
+            kind: kind.to_string(),
+            frame_kind: None,
+            agent: "claude".to_string(),
+            date: date.to_string(),
+            timestamp: ts.map(|s| s.to_string()),
+            score,
+            label: "l".to_string(),
+            density: 0.0,
+            matched_lines: Vec::new(),
+            session_id: None,
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn fuzzy_fetch_limit_over_fetches_only_when_filters_active() {
+        // Inactive filters: fetch exactly the requested limit.
+        assert_eq!(fuzzy_fetch_limit(5, false), 5);
+        // Active filters: over-fetch CAP_RATIO× the limit, floored at CAP_MIN.
+        assert_eq!(
+            fuzzy_fetch_limit(20, true),
+            20 * FILTER_EXAMINED_CAP_RATIO // 200, above the floor
+        );
+        assert_eq!(fuzzy_fetch_limit(1, true), FILTER_EXAMINED_CAP_MIN);
+    }
+
+    #[test]
+    fn finalize_fuzzy_results_defaults_to_descending_score() {
+        let input = vec![
+            fuzzy(10, "decision", "2026-01-01", None),
+            fuzzy(50, "decision", "2026-01-01", None),
+            fuzzy(30, "decision", "2026-01-01", None),
+        ];
+        let out = finalize_fuzzy_results(input, None, None, 10);
+        assert_eq!(
+            out.iter().map(|r| r.score).collect::<Vec<_>>(),
+            vec![50, 30, 10]
+        );
+    }
+
+    #[test]
+    fn finalize_fuzzy_results_honors_newest_and_oldest() {
+        let input = vec![
+            fuzzy(10, "decision", "2026-01-01", Some("2026-01-01T00:00:00Z")),
+            fuzzy(10, "decision", "2026-01-03", Some("2026-01-03T00:00:00Z")),
+            fuzzy(10, "decision", "2026-01-02", Some("2026-01-02T00:00:00Z")),
+        ];
+        let newest = finalize_fuzzy_results(input.clone(), None, Some("newest"), 10);
+        assert_eq!(
+            newest.iter().map(|r| r.date.clone()).collect::<Vec<_>>(),
+            vec!["2026-01-03", "2026-01-02", "2026-01-01"]
+        );
+        let oldest = finalize_fuzzy_results(input, None, Some("oldest"), 10);
+        assert_eq!(
+            oldest.iter().map(|r| r.date.clone()).collect::<Vec<_>>(),
+            vec!["2026-01-01", "2026-01-02", "2026-01-03"]
+        );
+    }
+
+    #[test]
+    fn finalize_fuzzy_results_retains_kind_then_truncates() {
+        let input = vec![
+            fuzzy(90, "decision", "2026-01-01", None),
+            fuzzy(80, "task", "2026-01-01", None),
+            fuzzy(70, "decision", "2026-01-01", None),
+            fuzzy(60, "decision", "2026-01-01", None),
+        ];
+        let out = finalize_fuzzy_results(input, Some("decision"), None, 2);
+        assert_eq!(out.len(), 2, "kind retain then truncate to limit");
+        assert!(out.iter().all(|r| r.kind == "decision"));
+        assert_eq!(
+            out.iter().map(|r| r.score).collect::<Vec<_>>(),
+            vec![90, 70]
+        );
+    }
+
+    #[test]
+    fn finalize_fuzzy_results_unknown_sort_token_falls_back_to_newest() {
+        // The shared primitive treats any unknown sort token as "newest" so a
+        // caller passing an out-of-contract string degrades gracefully instead
+        // of panicking or diverging from the MCP surface.
+        let input = vec![
+            fuzzy(10, "decision", "2026-01-01", Some("2026-01-01T00:00:00Z")),
+            fuzzy(10, "decision", "2026-01-02", Some("2026-01-02T00:00:00Z")),
+        ];
+        let out = finalize_fuzzy_results(input, None, Some("nonsense"), 10);
+        assert_eq!(
+            out.iter().map(|r| r.date.clone()).collect::<Vec<_>>(),
+            vec!["2026-01-02", "2026-01-01"]
+        );
+    }
+
+    #[test]
+    fn inject_index_snapshot_hint_marks_freshness_unverified() {
+        let payload = inject_index_snapshot_hint(
+            r#"{"oracle_status":{"backend":"hybrid_rrf"},"results":2,"items":[]}"#,
+            11906,
+        )
+        .expect("index_snapshot hint should inject");
+        let json: serde_json::Value =
+            serde_json::from_str(&payload).expect("payload stays valid JSON");
+        assert_eq!(json["results"], 2);
+        assert_eq!(json["index_snapshot"]["source_chunks"], 11906);
+        assert_eq!(json["index_snapshot"]["freshness_verified"], false);
+        assert!(
+            json["index_snapshot"]["note"]
+                .as_str()
+                .unwrap()
+                .contains("aicx index status")
+        );
+    }
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static SEARCH_TEST_AICX_HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct SearchTestAicxHomeGuard {
+        previous: Option<OsString>,
+        dir: PathBuf,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for SearchTestAicxHomeGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(previous) => {
+                    // SAFETY: tests that mutate AICX_HOME are serialized by
+                    // SEARCH_TEST_AICX_HOME_LOCK for the guard lifetime.
+                    unsafe { std::env::set_var("AICX_HOME", previous) };
+                }
+                None => {
+                    // SAFETY: tests that mutate AICX_HOME are serialized by
+                    // SEARCH_TEST_AICX_HOME_LOCK for the guard lifetime.
+                    unsafe { std::env::remove_var("AICX_HOME") };
+                }
+            }
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn set_search_test_aicx_home(label: &str) -> SearchTestAicxHomeGuard {
+        let guard = SEARCH_TEST_AICX_HOME_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("search AICX_HOME test lock");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "aicx-search-engine-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create isolated search AICX_HOME");
+        let previous = std::env::var_os("AICX_HOME");
+        // SAFETY: guarded by SEARCH_TEST_AICX_HOME_LOCK for the full
+        // lifetime of the returned guard.
+        unsafe { std::env::set_var("AICX_HOME", &dir) };
+        SearchTestAicxHomeGuard {
+            previous,
+            dir,
+            _guard: guard,
+        }
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    fn test_semantic_filters<'a>(project: Option<&'a str>) -> SemanticRetrievalFilters<'a> {
+        SemanticRetrievalFilters {
+            kind: None,
+            frame_kind: None,
+            project,
+        }
+    }
 
     #[test]
     fn fail_fast_carries_actionable_recommendation() {
+        let home = set_search_test_aicx_home("fail-fast");
         // In any test environment we either lack the feature flag, lack a
         // hydrated embedder, or lack a built index. The function must
         // never panic, and the typed error must carry both a non-empty
         // `reason` AND a non-empty `recommendation` so the operator
         // knows what to do next.
-        let result = try_semantic_search(
-            Path::new("/tmp/aicx-search-engine-test"),
-            "any query",
-            10,
-            &[None],
-            None,
-            None,
-        );
+        let result = try_semantic_search(&home.dir, "any query", 10, &[None], None, None);
 
         match result {
             Err(err) => {
@@ -1077,23 +2039,713 @@ mod tests {
         assert!(line.contains("loctree_scope_safe=true"));
     }
 
+    /// Patch 3 / Bug B+ observability: the dense-only degraded path must NOT
+    /// render as a healthy hybrid query. It must say so out loud (operator
+    /// sees the quality drop), not silently claim `index=hybrid fallback=none`.
+    #[test]
+    fn semantic_status_line_flags_dense_only_as_degraded() {
+        let line = render_semantic_status_line(
+            "semantic_dense_only",
+            "qwen3-embedding-8b",
+            5,
+            227_290,
+            None,
+        );
+        assert!(line.contains("backend=semantic_dense_only"));
+        assert!(
+            !line.contains("index=hybrid"),
+            "dense-only must not claim index=hybrid: {line}"
+        );
+        assert!(
+            !line.contains("fallback=none"),
+            "dense-only is a fallback; must not claim fallback=none: {line}"
+        );
+        assert!(
+            line.contains("degraded") && line.contains("fallback=hybrid_unavailable"),
+            "dense-only must surface degraded status explicitly: {line}"
+        );
+    }
+
+    #[test]
+    fn semantic_status_line_marks_hybrid_global_project_scope() {
+        let line = render_semantic_status_line(
+            BACKEND_HYBRID_RRF_GLOBAL_SCOPED,
+            "qwen3-embedding:8b",
+            10,
+            259_007,
+            None,
+        );
+
+        assert!(line.contains("backend=hybrid_rrf_global_scoped"));
+        assert!(line.contains("index=hybrid"));
+        assert!(line.contains("fallback=none"));
+        assert!(line.contains("scope=global_project_filter"));
+        assert!(
+            !line.contains("degraded"),
+            "global-scoped hybrid search should not claim degraded dense-only: {line}"
+        );
+    }
+
+    /// F1 regression: project-scoped semantic search may run on a host where
+    /// only the cross-project `_all` bucket is materialized. In that case `_all`
+    /// is the canonical global index, and the requested project stays a strict
+    /// retrieval filter.
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn project_bucket_missing_uses_global_index_with_project_filter() {
+        let dir =
+            std::env::temp_dir().join(format!("aicx-semantic-global-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let project_index_path = dir.join("vetcoders_vista").join("embeddings.ndjson");
+        let all_index_path = dir.join("_all").join("embeddings.ndjson");
+        std::fs::create_dir_all(all_index_path.parent().unwrap()).expect("create all bucket");
+        std::fs::write(&all_index_path, "{}\n").expect("touch all index");
+
+        let scope = select_semantic_bucket_scope(
+            Some("vetcoders/vista"),
+            project_index_path.clone(),
+            all_index_path.clone(),
+        )
+        .expect("missing project bucket should use existing _all bucket");
+
+        assert_eq!(scope.index_path, all_index_path);
+        assert_eq!(scope.index_project, None);
+        assert_eq!(scope.retrieval_project_filter, Some("vetcoders/vista"));
+        assert!(
+            scope.used_global_project_scope,
+            "scope should explicitly mark the global project filter path"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F1 regression: when dense-only fallback queries the global `_all` index,
+    /// project filtering must happen inside retrieval before top-N selection. A
+    /// very close hit from another project must not crowd out the requested
+    /// project.
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn dense_only_global_index_project_filter_is_strict_before_limit() {
+        use crate::vector_index::{IndexEntry, IndexHeader};
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!(
+            "aicx-dense-only-project-filter-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let vista_chunk = dir.join("vista.md");
+        let other_chunk = dir.join("other.md");
+        std::fs::write(&vista_chunk, "vista transcription duplication note").expect("write vista");
+        std::fs::write(&other_chunk, "other project with near identical embedding")
+            .expect("write other");
+
+        let header = IndexHeader {
+            schema_version: "1".to_string(),
+            model_id: "test-model".to_string(),
+            model_profile: "test".to_string(),
+            dimension: 3,
+            generated_at: "2026-06-03T00:00:00Z".to_string(),
+            entry_count: 2,
+        };
+        let mk_entry =
+            |id: &str, project: &str, path: &std::path::Path, emb: Vec<f32>| IndexEntry {
+                id: id.to_string(),
+                project: project.to_string(),
+                agent: "claude".to_string(),
+                date: "20260603".to_string(),
+                path: path.to_path_buf(),
+                kind: "conversations".to_string(),
+                session_id: format!("sess-{id}"),
+                frame_kind: Some("agent_reply".to_string()),
+                cwd: None,
+                embedding: emb,
+            };
+        let other = mk_entry(
+            "other-hit",
+            "vetcoders/other",
+            &other_chunk,
+            vec![1.0, 0.0, 0.0],
+        );
+        let other_bad_dim = mk_entry(
+            "other-bad-dim",
+            "vetcoders/other",
+            &other_chunk,
+            vec![1.0, 0.0],
+        );
+        let vista = mk_entry(
+            "vista-hit",
+            "vetcoders/vista",
+            &vista_chunk,
+            vec![0.8, 0.2, 0.0],
+        );
+        let index_path = dir.join("embeddings.ndjson");
+        {
+            let mut f = std::fs::File::create(&index_path).expect("create index");
+            writeln!(f, "{}", serde_json::to_string(&header).unwrap()).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&other).unwrap()).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&other_bad_dim).unwrap()).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&vista).unwrap()).unwrap();
+        }
+
+        let query = vec![1.0_f32, 0.0, 0.0];
+        let outcome = query_dense_only_from_primary(
+            &index_path,
+            &query,
+            3,
+            1,
+            test_semantic_filters(Some("vetcoders/vista")),
+            "test-model",
+            false,
+        )
+        .expect("dense-only global query should retain requested project hits");
+
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].project, "vetcoders/vista");
+        assert!(
+            outcome.results[0].label.contains("vista-hit"),
+            "expected requested project hit, got {}",
+            outcome.results[0].label
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Patch 3 / Bug B+: when the hybrid stack is unavailable, semantic
+    /// search must degrade to dense-only ranking over the PRIMARY committed
+    /// index instead of hard-failing. This proves the dense leg reads the
+    /// committed `embeddings.ndjson` directly, ranks by cosine, labels itself
+    /// `semantic_dense_only`, and surfaces the closest embedding first.
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn dense_only_from_primary_ranks_by_cosine_without_hybrid() {
+        use crate::vector_index::{IndexEntry, IndexHeader};
+        use std::io::Write;
+
+        let dir =
+            std::env::temp_dir().join(format!("aicx-dense-only-ranks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let chunk_a = dir.join("a.md");
+        let chunk_b = dir.join("b.md");
+        std::fs::write(&chunk_a, "alpha chunk body about the noise filter").expect("write a");
+        std::fs::write(&chunk_b, "beta chunk body about something unrelated").expect("write b");
+
+        let header = IndexHeader {
+            schema_version: "1".to_string(),
+            model_id: "test-model".to_string(),
+            model_profile: "test".to_string(),
+            dimension: 3,
+            generated_at: "2026-06-01T00:00:00Z".to_string(),
+            entry_count: 2,
+        };
+        let mk_entry = |id: &str, path: &std::path::Path, emb: Vec<f32>| IndexEntry {
+            id: id.to_string(),
+            project: "test/repo".to_string(),
+            agent: "claude".to_string(),
+            date: "20260601".to_string(),
+            path: path.to_path_buf(),
+            kind: "conversations".to_string(),
+            session_id: format!("sess-{id}"),
+            frame_kind: Some("agent_reply".to_string()),
+            cwd: None,
+            embedding: emb,
+        };
+        let entry_a = mk_entry("chunk-a", &chunk_a, vec![1.0, 0.0, 0.0]);
+        let entry_b = mk_entry("chunk-b", &chunk_b, vec![0.0, 1.0, 0.0]);
+
+        let index_path = dir.join("embeddings.ndjson");
+        {
+            let mut f = std::fs::File::create(&index_path).expect("create index");
+            writeln!(f, "{}", serde_json::to_string(&header).unwrap()).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&entry_a).unwrap()).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&entry_b).unwrap()).unwrap();
+        }
+
+        // Query closest to entry_a's [1, 0, 0].
+        let query = vec![0.9_f32, 0.1, 0.0];
+        let outcome = query_dense_only_from_primary(
+            &index_path,
+            &query,
+            3,
+            10,
+            test_semantic_filters(None),
+            "test-model",
+            false,
+        )
+        .expect("dense-only query should succeed on a valid primary index");
+
+        assert_eq!(
+            outcome.backend_label, "semantic_dense_only",
+            "dense-only path must label itself explicitly, not as hybrid"
+        );
+        assert!(
+            !outcome.results.is_empty(),
+            "a valid dense index must yield at least one hit"
+        );
+        assert!(
+            outcome.results[0].label.contains("chunk-a"),
+            "closest embedding (chunk-a) must rank first, got label: {}",
+            outcome.results[0].label
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn dense_only_global_scope_labels_backend_explicitly() {
+        use crate::vector_index::{IndexEntry, IndexHeader};
+        use std::io::Write;
+
+        let dir =
+            std::env::temp_dir().join(format!("aicx-dense-only-all-label-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let chunk_path = dir.join("vista.md");
+        std::fs::write(&chunk_path, "vista fallback chunk").expect("write chunk");
+        let index_path = dir.join("embeddings.ndjson");
+
+        let header = IndexHeader {
+            schema_version: "1".to_string(),
+            model_id: "test-model".to_string(),
+            model_profile: "test".to_string(),
+            dimension: 3,
+            generated_at: "2026-06-04T00:00:00Z".to_string(),
+            entry_count: 1,
+        };
+        let entry = IndexEntry {
+            id: "vista-hit".to_string(),
+            project: "vetcoders/vista".to_string(),
+            agent: "claude".to_string(),
+            date: "20260604".to_string(),
+            path: chunk_path,
+            kind: "conversations".to_string(),
+            session_id: "sess-vista-hit".to_string(),
+            frame_kind: Some("agent_reply".to_string()),
+            cwd: None,
+            embedding: vec![1.0, 0.0, 0.0],
+        };
+
+        {
+            let mut f = std::fs::File::create(&index_path).expect("create index");
+            writeln!(f, "{}", serde_json::to_string(&header).unwrap()).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
+        }
+
+        let outcome = query_dense_only_from_primary(
+            &index_path,
+            &[1.0, 0.0, 0.0],
+            3,
+            10,
+            test_semantic_filters(Some("vetcoders/vista")),
+            "test-model",
+            true,
+        )
+        .expect("dense-only global scoped query should succeed");
+
+        assert_eq!(
+            outcome.backend_label,
+            BACKEND_SEMANTIC_DENSE_ONLY_GLOBAL_SCOPED
+        );
+        assert!(
+            outcome.results[0]
+                .label
+                .starts_with("dense_only_global_scoped:"),
+            "global-scoped hit label should be explicit, got {}",
+            outcome.results[0].label
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Migration safety (operator's F2LLM 2048 -> qwen3 4096 case): a committed
+    /// index built at a different dimension must be REJECTED, never scored —
+    /// cross-model cosine is meaningless. The dense-only leg must surface
+    /// DimensionMismatch, not silently rank garbage.
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn dense_only_rejects_dimension_mismatch_instead_of_ranking_garbage() {
+        use crate::vector_index::{IndexEntry, IndexHeader};
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!(
+            "aicx-dense-only-dimmismatch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let chunk = dir.join("c.md");
+        std::fs::write(&chunk, "body").expect("write");
+
+        // Committed index was built at dimension 2 (older model)...
+        let header = IndexHeader {
+            schema_version: "1".to_string(),
+            model_id: "old-2d-model".to_string(),
+            model_profile: "test".to_string(),
+            dimension: 2,
+            generated_at: "2026-06-01T00:00:00Z".to_string(),
+            entry_count: 1,
+        };
+        let entry = IndexEntry {
+            id: "c".to_string(),
+            project: "test/repo".to_string(),
+            agent: "claude".to_string(),
+            date: "20260601".to_string(),
+            path: chunk.clone(),
+            kind: "conversations".to_string(),
+            session_id: "s".to_string(),
+            frame_kind: None,
+            cwd: None,
+            embedding: vec![1.0, 0.0],
+        };
+        let index_path = dir.join("embeddings.ndjson");
+        {
+            let mut f = std::fs::File::create(&index_path).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&header).unwrap()).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
+        }
+
+        // ...but the current embedder is dimension 3.
+        let query = vec![1.0_f32, 0.0, 0.0];
+        let err = query_dense_only_from_primary(
+            &index_path,
+            &query,
+            3,
+            10,
+            test_semantic_filters(None),
+            "qwen3-3d",
+            false,
+        )
+        .expect_err("dimension mismatch must error, not rank cross-model garbage");
+        assert_eq!(
+            err.kind(),
+            "dimension_mismatch",
+            "expected dimension_mismatch, got kind={} reason={}",
+            err.kind(),
+            err.reason()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A committed index with a header but zero data rows must surface
+    /// EmptyIndex (actionable), never panic or return an empty-but-Ok outcome.
+    #[cfg(any(feature = "native-embedder", feature = "cloud-embedder"))]
+    #[test]
+    fn dense_only_empty_index_is_typed_error_not_panic() {
+        use crate::vector_index::IndexHeader;
+        use std::io::Write;
+
+        let dir =
+            std::env::temp_dir().join(format!("aicx-dense-only-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let header = IndexHeader {
+            schema_version: "1".to_string(),
+            model_id: "m".to_string(),
+            model_profile: "test".to_string(),
+            dimension: 3,
+            generated_at: "2026-06-01T00:00:00Z".to_string(),
+            entry_count: 0,
+        };
+        let index_path = dir.join("embeddings.ndjson");
+        {
+            let mut f = std::fs::File::create(&index_path).unwrap();
+            writeln!(f, "{}", serde_json::to_string(&header).unwrap()).unwrap();
+        }
+
+        let query = vec![1.0_f32, 0.0, 0.0];
+        let err = query_dense_only_from_primary(
+            &index_path,
+            &query,
+            3,
+            10,
+            test_semantic_filters(None),
+            "m",
+            false,
+        )
+        .expect_err("empty committed index must error");
+        assert_eq!(err.kind(), "empty_index");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn fake_hit(rank: usize, date: &str, agent: &str, score: u8) -> FuzzyResult {
+        fake_hit_with_frame(rank, date, agent, score, None, vec![format!("rank {rank}")])
+    }
+
+    fn fake_hit_with_frame(
+        rank: usize,
+        date: &str,
+        agent: &str,
+        score: u8,
+        frame_kind: Option<&str>,
+        matched_lines: Vec<String>,
+    ) -> FuzzyResult {
         FuzzyResult {
             file: format!("rank-{rank}.md"),
             path: format!("rank-{rank}.md"),
             project: "test/repo".to_string(),
             kind: "conversations".to_string(),
-            frame_kind: None,
+            frame_kind: frame_kind.map(ToString::to_string),
             agent: agent.to_string(),
             date: date.to_string(),
             timestamp: None,
             score,
             label: format!("test:{rank}"),
             density: 0.5,
-            matched_lines: Vec::new(),
+            matched_lines,
             session_id: None,
             cwd: None,
         }
+    }
+
+    #[test]
+    fn default_semantic_quality_drops_machine_frames_and_recovers_human_hits() {
+        let pool = vec![
+            fake_hit_with_frame(
+                0,
+                "2026-06-01",
+                "codex",
+                99,
+                Some("tool_call"),
+                vec!["[12:00:00] tool: id: toolu_01abc".to_string()],
+            ),
+            fake_hit_with_frame(
+                1,
+                "2026-06-01",
+                "codex",
+                98,
+                Some("system_note"),
+                vec![r#"[12:00:01] system: {"last_token_usage":{"input_tokens":123}}"#.to_string()],
+            ),
+            fake_hit_with_frame(
+                2,
+                "2026-06-01",
+                "claude",
+                82,
+                Some("user_msg"),
+                vec!["[21:47:27] user: dorobmy shot features (1, 2, 3 powyzej)".to_string()],
+            ),
+            fake_hit_with_frame(
+                3,
+                "2026-06-01",
+                "claude",
+                81,
+                Some("agent_reply"),
+                vec!["[21:48:10] assistant: shot features implementation plan".to_string()],
+            ),
+        ];
+
+        let filtered = apply_default_semantic_quality(pool, "shot features", None);
+        let frames: Vec<Option<&str>> = filtered
+            .iter()
+            .map(|result| result.frame_kind.as_deref())
+            .collect();
+
+        assert_eq!(
+            frames,
+            vec![Some("user_msg"), Some("agent_reply")],
+            "default operator search should hide machine frames from top results"
+        );
+        assert!(
+            filtered[0].score > 82,
+            "literal human match should get a quality boost, got {}",
+            filtered[0].score
+        );
+    }
+
+    #[test]
+    fn default_semantic_quality_prioritizes_hyphenated_anchor_overlap() {
+        let pool = vec![
+            fake_hit_with_frame(
+                0,
+                "2026-06-01",
+                "codex",
+                93,
+                Some("agent_reply"),
+                vec![
+                    "[10:00:00] assistant: zrobmy tak, przeklikam appke i zobaczymy co sie wysypie"
+                        .to_string(),
+                ],
+            ),
+            fake_hit_with_frame(
+                1,
+                "2026-06-01",
+                "claude",
+                68,
+                Some("agent_reply"),
+                vec![
+                    "[10:01:00] assistant: To jest to - vista leak + devista; leak-vista-info poszlo do public repo"
+                        .to_string(),
+                ],
+            ),
+        ];
+
+        let filtered =
+            apply_default_semantic_quality(pool, "vista-leak o co w tym chodziolo?", None);
+
+        assert_eq!(
+            filtered[0].label, "test:1",
+            "hyphenated query anchors should beat higher dense-score vibe matches"
+        );
+        assert!(
+            filtered[0].score > filtered[1].score,
+            "anchor-bearing hit should outrank no-anchor hit: {filtered:?}"
+        );
+    }
+
+    #[test]
+    fn default_semantic_quality_prioritizes_underscore_anchor_overlap() {
+        let pool = vec![
+            fake_hit_with_frame(
+                0,
+                "2026-06-01",
+                "codex",
+                91,
+                Some("agent_reply"),
+                vec!["[10:00:00] assistant: auth flow and trusted device notes".to_string()],
+            ),
+            fake_hit_with_frame(
+                1,
+                "2026-06-01",
+                "claude",
+                64,
+                Some("agent_reply"),
+                vec![
+                    "[10:01:00] assistant: deep-link includes completion_token and portal completion endpoint"
+                        .to_string(),
+                ],
+            ),
+        ];
+
+        let filtered = apply_default_semantic_quality(pool, "completion_token auth leak", None);
+
+        assert_eq!(
+            filtered[0].label, "test:1",
+            "underscore/code-ish anchors should carry lexical evidence weight"
+        );
+    }
+
+    #[test]
+    fn default_semantic_quality_prioritizes_digit_code_anchor_overlap() {
+        let pool = vec![
+            fake_hit_with_frame(
+                0,
+                "2026-06-01",
+                "codex",
+                88,
+                Some("agent_reply"),
+                vec![
+                    "[10:00:00] assistant: Silver and Sztudio connection is now stable".to_string(),
+                ],
+            ),
+            fake_hit_with_frame(
+                1,
+                "2026-06-01",
+                "claude",
+                57,
+                Some("agent_reply"),
+                vec![
+                    "[10:01:00] assistant: Sztudio uses qwen3 embedding model for semantic index"
+                        .to_string(),
+                ],
+            ),
+        ];
+
+        let filtered = apply_default_semantic_quality(pool, "qwen3-embedding sztudio silver", None);
+
+        assert_eq!(
+            filtered[0].label, "test:1",
+            "digit/code anchors should prevent generic host mentions from winning"
+        );
+    }
+
+    #[test]
+    fn default_semantic_quality_prefers_answer_like_agent_reply_over_anchor_echo() {
+        let pool = vec![
+            fake_hit_with_frame(
+                0,
+                "2026-06-01",
+                "codex",
+                76,
+                Some("user_msg"),
+                vec![
+                    "[10:00:00] user: spoko, ostatnio w podobny sposob poszlo duzo leak-vista-info"
+                        .to_string(),
+                ],
+            ),
+            fake_hit_with_frame(
+                1,
+                "2026-06-01",
+                "claude",
+                60,
+                Some("agent_reply"),
+                vec![
+                    "[10:01:00] assistant: To jest to - vista leak plus devista; leak-vista-info poszlo do public repo i trzeba zamknac incydent"
+                        .to_string(),
+                ],
+            ),
+        ];
+
+        let filtered =
+            apply_default_semantic_quality(pool, "vista-leak o co w tym chodzilo?", None);
+
+        assert_eq!(
+            filtered[0].label, "test:1",
+            "answer-like agent replies with the same anchor evidence should beat short anchor echoes"
+        );
+    }
+
+    #[test]
+    fn explicit_frame_kind_keeps_requested_machine_frame() {
+        let pool = vec![
+            fake_hit_with_frame(
+                0,
+                "2026-06-01",
+                "codex",
+                92,
+                Some("tool_call"),
+                vec!["[12:00:00] tool: rg frame_kind".to_string()],
+            ),
+            fake_hit_with_frame(
+                1,
+                "2026-06-01",
+                "codex",
+                80,
+                Some("user_msg"),
+                vec!["[12:00:03] user: frame kind please".to_string()],
+            ),
+        ];
+
+        let filtered =
+            apply_default_semantic_quality(pool, "frame_kind", Some(FrameKind::ToolCall));
+
+        assert!(
+            filtered
+                .iter()
+                .any(|result| result.frame_kind.as_deref() == Some("tool_call")),
+            "explicit frame-kind search must still allow tool_call results"
+        );
+    }
+
+    #[test]
+    fn default_semantic_quality_expands_examined_pool_without_user_filters() {
+        let filters = SemanticSearchFilters::default();
+
+        assert_eq!(
+            semantic_fetch_limit(10, None, &filters),
+            10 * FILTER_EXAMINED_CAP_RATIO,
+            "default human-facing quality gate needs a wider pool than the displayed limit"
+        );
+        assert_eq!(
+            semantic_fetch_limit(10, Some(FrameKind::ToolCall), &filters),
+            10,
+            "explicit frame-kind queries should not pay the default quality-pool expansion"
+        );
     }
 
     /// Bug #31 regression: top-N raw semantic hits sit outside the

@@ -25,14 +25,22 @@ REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 
 # Pick the newest Python ≥ 3.11 available. tomllib is stdlib only from 3.11,
 # and bash scripts don't inherit .zshrc PATH ordering, so we detect explicitly
-# instead of trusting `python3`. Caller can override with PYTHON=...
-PYTHON="${PYTHON:-$(command -v python3.14 2>/dev/null \
-  || command -v python3.13 2>/dev/null \
-  || command -v python3.12 2>/dev/null \
-  || command -v python3.11 2>/dev/null \
-  || command -v python3 2>/dev/null)}"
-if [[ -z "$PYTHON" ]]; then
-  echo "Error: no Python interpreter found (need 3.11+ for stdlib tomllib)." >&2
+# instead of trusting `python3`. Candidates that resolve but can't import
+# tomllib are skipped, not fatal — on Windows `python3` is the WindowsApps
+# Store stub while the real interpreter is plain `python`. Caller can
+# override with PYTHON=...
+if [[ -z "${PYTHON:-}" ]]; then
+  for _py_candidate in python3.14 python3.13 python3.12 python3.11 python3 python; do
+    _py_path="$(command -v "$_py_candidate" 2>/dev/null)" || continue
+    if "$_py_path" -c 'import tomllib' >/dev/null 2>&1; then
+      PYTHON="$_py_path"
+      break
+    fi
+  done
+  unset _py_candidate _py_path
+fi
+if [[ -z "${PYTHON:-}" ]]; then
+  echo "Error: no Python 3.11+ with stdlib tomllib found (set PYTHON=... to override)." >&2
   exit 1
 fi
 if ! "$PYTHON" -c 'import tomllib' >/dev/null 2>&1; then
@@ -47,6 +55,14 @@ PACKAGE_NAME="${PACKAGE_NAME:-}"
 CLEAN_AFTER_BUILD="${AICX_CLEAN_AFTER_BUILD:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 FEATURES_VALUE="${FEATURES:-${AICX_CARGO_FEATURES:-}}"
+# Opt out of default features (e.g. drop `native-embedder` -> no llama-cpp-sys ->
+# no libclang requirement). Windows release runners have no LLVM, so the Windows
+# leg builds slim (`NO_DEFAULT_FEATURES=1 FEATURES=app,cloud-embedder`).
+NODEFAULT_VALUE="${NO_DEFAULT_FEATURES:-${AICX_CARGO_NO_DEFAULT:-}}"
+NODEFAULT_FLAG=""
+if [[ "$NODEFAULT_VALUE" == "1" ]]; then
+  NODEFAULT_FLAG="--no-default-features"
+fi
 NATIVE_VALUE="${NATIVE:-0}"
 
 usage() {
@@ -193,6 +209,21 @@ PY
 
 cleanup() {
   local status=$?
+  # Restore the operator's original default keychain before tearing the
+  # temporary one down (see the default-keychain switch in the signing path).
+  if [[ -n "${ORIGINAL_DEFAULT_KEYCHAIN:-}" ]]; then
+    security default-keychain -s "${ORIGINAL_DEFAULT_KEYCHAIN}" >/dev/null 2>&1 || true
+  fi
+  # Restore the user search list to its pre-run state FIRST, unconditionally.
+  # This drops the temp entry whether or not the keychain file still exists —
+  # `delete-keychain` below only removes the entry when the file is present, so
+  # a killed run or wiped DIST_DIR would otherwise leave a dangling reference
+  # that breaks every later `security unlock-keychain` and pops "Keychain Not
+  # Found" on the next signing op.
+  if [[ -n "${ORIGINAL_KEYCHAIN_LIST:-}" ]]; then
+    # shellcheck disable=SC2086  # intentional word-split over the keychain path list
+    security list-keychains -d user -s ${ORIGINAL_KEYCHAIN_LIST} >/dev/null 2>&1 || true
+  fi
   if [[ -n "${TEMP_KEYCHAIN_PATH:-}" && -f "${TEMP_KEYCHAIN_PATH}" ]]; then
     security delete-keychain "${TEMP_KEYCHAIN_PATH}" >/dev/null 2>&1 || true
   fi
@@ -205,14 +236,24 @@ fi
 
 require_cmd cargo
 
-require_cmd shasum
+# Portable SHA-256: macOS/Linux ship perl `shasum`, Git Bash on Windows only
+# ships coreutils `sha256sum`. Both emit the same "HASH  filename" format.
+if command -v shasum >/dev/null 2>&1; then
+  sha256_file() { shasum -a 256 "$1"; }
+elif command -v sha256sum >/dev/null 2>&1; then
+  sha256_file() { sha256sum "$1"; }
+else
+  echo "Error: missing required command: shasum or sha256sum" >&2
+  exit 1
+fi
 
 if [[ "${AICX_RELEASE_BUNDLE_ONLY_BINARIES:-0}" == "1" ]]; then
   echo "=== AICX GPG-signed bundle (binaries-only, no Apple codesign) ==="
   TARGET="${TARGET:-$(host_target)}"
-  case "$TARGET" in
-    *windows*) echo "Error: release-bundle-only-binaries does not support Windows targets yet: $TARGET" >&2; exit 1 ;;
-  esac
+  # Windows targets ARE supported on this path: the staging/zip/sign logic
+  # below branches on `*windows*` (.exe suffix, portable zip, no install.sh).
+  # The earlier blanket `exit 1` guard was a stale leftover from before that
+  # branching landed and is intentionally gone.
 
   VERSION="$(toml_value package.version)"
   if [[ -z "$PACKAGE_NAME" ]]; then
@@ -282,7 +323,7 @@ EOF
     fi
     echo "  2. compose $BUNDLE_DIR layout (bin + LICENSE + README + install.sh + docs)"
     echo "  3. tar -czf $ARCHIVE_PATH"
-    echo "  4. shasum -a 256 -> $CHECKSUM_PATH"
+    echo "  4. sha256 checksum -> $CHECKSUM_PATH"
     exit 0
   fi
 
@@ -291,10 +332,10 @@ EOF
     cd "$REPO_ROOT"
     if [[ -n "$FEATURES_VALUE" ]]; then
       # shellcheck disable=SC2086
-      $BUILD_CMD --locked --release --target "$TARGET" --features "$FEATURES_VALUE" --bin aicx --bin aicx-mcp
+      $BUILD_CMD --locked --release --target "$TARGET" $NODEFAULT_FLAG --features "$FEATURES_VALUE" --bin aicx --bin aicx-mcp
     else
       # shellcheck disable=SC2086
-      $BUILD_CMD --locked --release --target "$TARGET" --bin aicx --bin aicx-mcp
+      $BUILD_CMD --locked --release --target "$TARGET" $NODEFAULT_FLAG --bin aicx --bin aicx-mcp
     fi
   )
 
@@ -333,7 +374,7 @@ with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED) as zf:
   else
     (cd "$DIST_DIR" && tar -czf "$ARCHIVE_PATH" "$BUNDLE_BASENAME")
   fi
-  (cd "$DIST_DIR" && shasum -a 256 "$(basename "$ARCHIVE_PATH")") > "$CHECKSUM_PATH"
+  (cd "$DIST_DIR" && sha256_file "$(basename "$ARCHIVE_PATH")") > "$CHECKSUM_PATH"
 
   # Bundle staging directory only matters for inspection; remove it so it
   # never reaches `gh release upload` (which fails on directories).
@@ -521,9 +562,9 @@ echo "[1/6] Building release binaries..."
 (
   cd "$REPO_ROOT"
   if [[ -n "$FEATURES_VALUE" ]]; then
-    cargo build --locked --release --target "$TARGET" --features "$FEATURES_VALUE" --bin aicx --bin aicx-mcp
+    cargo build --locked --release --target "$TARGET" $NODEFAULT_FLAG --features "$FEATURES_VALUE" --bin aicx --bin aicx-mcp
   else
-    cargo build --locked --release --target "$TARGET" --bin aicx --bin aicx-mcp
+    cargo build --locked --release --target "$TARGET" $NODEFAULT_FLAG --bin aicx --bin aicx-mcp
   fi
 )
 
@@ -543,11 +584,34 @@ echo "[2/6] Preparing temporary signing keychain..."
 TEMP_KEYCHAIN_PATH="$DIST_DIR/${BUNDLE_BASENAME}.keychain-db"
 TEMP_KEYCHAIN_PASSWORD="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 EXISTING_KEYCHAINS="$(security list-keychains -d user | tr -d '"' | tr '\n' ' ')"
+# Snapshot the pre-modification search list so cleanup can restore it verbatim.
+# `delete-keychain` only drops the temp entry while the keychain FILE exists; a
+# killed run or a wiped DIST_DIR leaves the file gone but the entry behind as a
+# dangling reference, which is what surfaces later as a "Keychain Not Found"
+# dialog and breaks `security unlock-keychain` for every subsequent session.
+ORIGINAL_KEYCHAIN_LIST="$EXISTING_KEYCHAINS"
 
 security create-keychain -p "$TEMP_KEYCHAIN_PASSWORD" "$TEMP_KEYCHAIN_PATH"
 security set-keychain-settings -lut 21600 "$TEMP_KEYCHAIN_PATH"
 security unlock-keychain -p "$TEMP_KEYCHAIN_PASSWORD" "$TEMP_KEYCHAIN_PATH"
 security list-keychains -d user -s "$TEMP_KEYCHAIN_PATH" $EXISTING_KEYCHAINS >/dev/null
+# Make the temp keychain the default. Under a launchd runner session
+# (`SessionCreate=true`), codesign resolves a signing identity BY NAME from
+# the default keychain only — the search-list set above is not consulted, so
+# without this codesign reports "no identity found" even though the import
+# succeeded. `cleanup` restores the original default on exit.
+# A non-interactive runner session may have no default keychain at all
+# (`SecKeychainCopyDomainDefault user: A default keychain could not be found`),
+# which would abort under `set -e`. Tolerate the empty case; cleanup only
+# restores when a previous default actually existed.
+ORIGINAL_DEFAULT_KEYCHAIN="$(security default-keychain -d user 2>/dev/null | tr -d ' "' || true)"
+security default-keychain -d user -s "$TEMP_KEYCHAIN_PATH"
+# Also set the COMMON (dynamic/session) default — not just the `-d user` domain.
+# Under a headless LaunchDaemon runner session codesign resolves the signing
+# identity from the session default, which the user-domain set above does not
+# populate: that is why a clean import (verified: 1 valid identity) still failed
+# `[3/6]` with "no identity found" on the release runner. No-op interactively.
+security default-keychain -s "$TEMP_KEYCHAIN_PATH" 2>/dev/null || true
 security import "$CERT_P12" \
   -k "$TEMP_KEYCHAIN_PATH" \
   -P "$CERT_PASSWORD" \
@@ -558,6 +622,33 @@ security set-key-partition-list \
   -s \
   -k "$TEMP_KEYCHAIN_PASSWORD" \
   "$TEMP_KEYCHAIN_PATH" >/dev/null
+
+# Preflight: prove the imported identity is actually resolvable for codesigning
+# in THIS session BEFORE the signing loop. The create/import/partition-list dance
+# above succeeds even in a session with no keychain services (a runner spawned
+# from a system LaunchDaemon, over ssh, or by a detached non-Aqua supervisor),
+# but codesign then fails at [3/6] with "no identity found" — after the entire
+# build, often behind a SecurityAgent GUI dialog. Fail fast here with the remedy.
+SESSION_MANAGER="$(launchctl managername 2>/dev/null || echo '<unknown>')"
+if ! security find-identity -v -p codesigning "$TEMP_KEYCHAIN_PATH" 2>/dev/null \
+    | grep -qF -- "$SIGNING_IDENTITY"; then
+  {
+    echo "Error: signing identity '$SIGNING_IDENTITY' imported into the temp"
+    echo "       keychain but NOT resolvable for codesigning in this session"
+    echo "       (launchctl managername: $SESSION_MANAGER — must be: Aqua)."
+    echo ""
+    echo "codesign resolves a keychain identity only inside the logged-in user's"
+    echo "Aqua GUI session. Run the dragon-macos runner as a per-user LaunchAgent"
+    echo "bootstrapped into gui/\$(id -u) WHILE LOGGED IN — never from a system"
+    echo "LaunchDaemon or a detached non-Aqua supervisor."
+    echo "See docs/RELEASES.md -> 'macOS Signing Runner Session Requirement'."
+    echo ""
+    echo "find-identity in this session:"
+    security find-identity -v -p codesigning 2>&1 | sed 's/^/  /'
+  } >&2
+  exit 1
+fi
+echo "[2b/6] Signing identity resolvable in session ($SESSION_MANAGER)."
 
 echo "[3/6] Signing release binaries..."
 for binary in "$BUNDLE_DIR/aicx" "$BUNDLE_DIR/aicx-mcp"; do
@@ -574,7 +665,7 @@ done
 echo "[4/6] Packaging notarization archive..."
 rm -f "$ARCHIVE_PATH" "$CHECKSUM_PATH" "$NOTARY_LOG_PATH" "${ARCHIVE_PATH}.asc"
 ditto -c -k --keepParent "$BUNDLE_DIR" "$ARCHIVE_PATH"
-shasum -a 256 "$ARCHIVE_PATH" > "$CHECKSUM_PATH"
+sha256_file "$ARCHIVE_PATH" > "$CHECKSUM_PATH"
 
 # GPG detached signature is mandatory — Loctree releases never ship unsigned.
 if [[ -z "${LOCTREE_GPG_KEY_ID:-}" ]]; then

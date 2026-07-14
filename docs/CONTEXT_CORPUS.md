@@ -6,7 +6,7 @@ The **Context Corpus** is `aicx`'s immutable retention path for `loct-context-pa
 
 ## Why a separate corpus
 
-The canonical store at `~/.aicx/store/` is **operator session truth**: extracted from raw agent logs, deduplicated by content, indexed by `steer_db` for steering metadata retrieval, and consumed by `aicx intents` for the 9-type intent classifier.
+The canonical store at `~/.aicx/store/` is **operator session truth**: extracted from raw agent logs, deduplicated by content, indexed by `steer_db` for steering metadata retrieval, and consumed by `aicx intents` for the 11-type intent classifier.
 
 `loct-context-pack` artifacts are different in kind:
 
@@ -85,7 +85,7 @@ Two consumers of the canonical store apply the corpus filter:
 
 ### `aicx intents`
 
-The intent classifier and session post-processor walk the canonical store under `~/.aicx/store/` only — the corpus root is not on the scan list. Even if a corpus chunk somehow lands inside the canonical hierarchy (e.g. via a manual `cp`), `is_context_corpus_sidecar()` flags it on read and the classifier skips it. Result: the 9-type taxonomy (Intent / Why / Argue / Decision / Assumption / Outcome / Result / Question / Insight) is learned strictly from operator session truth, never from example evidence.
+The intent classifier and session post-processor walk the canonical store under `~/.aicx/store/` only — the corpus root is not on the scan list. Even if a corpus chunk somehow lands inside the canonical hierarchy (e.g. via a manual `cp`), `is_context_corpus_sidecar()` flags it on read and the classifier skips it. Result: the 11-type taxonomy (Intent / Task / Commitment / Why / Argue / Decision / Assumption / Outcome / Result / Question / Insight) is learned strictly from operator session truth, never from example evidence.
 
 ### Semantic index (`aicx_search`, `aicx_rank`, dashboard `/api/search/semantic`)
 

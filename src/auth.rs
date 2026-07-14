@@ -1,10 +1,11 @@
 //! Shared HTTP Bearer-token auth for MCP HTTP transport and dashboard server.
 //!
-//! Single token loaded from CLI override, `AICX_HTTP_AUTH_TOKEN`, `~/.aicx/auth-token`,
+//! Single token loaded from CLI override, `AICX_HTTP_AUTH_TOKEN`,
+//! `<AICX_HOME>/auth-token` (honors `$AICX_HOME`; defaults to `~/.aicx`),
 //! or generated and persisted on Unix (mode 0600). Compared in constant time.
 //! Mismatch and missing produce the same 401 body to defeat oracle probing.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use anyhow::{Context, Result, anyhow};
 use axum::{
@@ -82,6 +83,60 @@ fn default_token_path() -> Result<PathBuf> {
     Ok(crate::store::resolve_aicx_home()?.join("auth-token"))
 }
 
+/// Where the HTTP auth token resolves from, as a non-mutating probe.
+///
+/// Distinct from [`AuthSource`] (which is produced by [`load_auth_config`] and
+/// may *generate* a token as a side effect). This probe never reads the token
+/// value, never generates, and never writes — it only reports the source so
+/// `aicx doctor` can show operators where the token comes from without
+/// triggering token creation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenSourceProbe {
+    /// `AICX_HTTP_AUTH_TOKEN` is set and non-empty.
+    Env,
+    /// A persisted token file exists at this path.
+    File(PathBuf),
+    /// No token present yet; one would be generated at this path on first
+    /// authenticated HTTP serve.
+    WouldGenerate(PathBuf),
+    /// The token path could not be resolved (no home directory).
+    Unresolved,
+}
+
+impl TokenSourceProbe {
+    /// Operator-facing label. Never includes the token value.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Env => "env (AICX_HTTP_AUTH_TOKEN)".to_string(),
+            Self::File(path) => format!("file: {}", path.display()),
+            Self::WouldGenerate(path) => {
+                format!(
+                    "none yet — would generate at {} on first HTTP serve",
+                    path.display()
+                )
+            }
+            Self::Unresolved => "unresolved (no home directory)".to_string(),
+        }
+    }
+}
+
+/// Non-mutating probe of the active HTTP auth-token source. Mirrors the
+/// resolution order of [`load_auth_config`] (env → file → would-generate) but
+/// performs no reads of the token value, no generation, and no writes.
+pub fn probe_token_source() -> TokenSourceProbe {
+    if std::env::var("AICX_HTTP_AUTH_TOKEN")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return TokenSourceProbe::Env;
+    }
+    match default_token_path() {
+        Ok(path) if path.exists() => TokenSourceProbe::File(path),
+        Ok(path) => TokenSourceProbe::WouldGenerate(path),
+        Err(_) => TokenSourceProbe::Unresolved,
+    }
+}
+
 /// Load auth configuration from (in order): CLI override, env, file, or generate.
 ///
 /// `require_auth = false` skips all of the above and returns [`AuthConfig::disabled`].
@@ -113,7 +168,7 @@ pub fn load_auth_config(cli_token: Option<&str>, require_auth: bool) -> Result<A
 
     let path = default_token_path()?;
     if path.exists() {
-        let content = std::fs::read_to_string(&path)
+        let content = crate::sanitize::read_to_string_validated(&path)
             .with_context(|| format!("Read auth token file {}", path.display()))?;
         let token = content.trim().to_string();
         if !token.is_empty() {
@@ -144,6 +199,7 @@ pub fn load_auth_config(cli_token: Option<&str>, require_auth: bool) -> Result<A
 /// happy-path create, recovering from a startup race against another
 /// process, and atomically replacing a truncated / empty existing file.
 #[derive(Debug)]
+#[cfg_attr(not(unix), allow(dead_code))]
 enum TokenPersistOutcome {
     /// We won the create race and wrote our token to disk.
     Created,
@@ -173,14 +229,52 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn persist_token_file(path: &PathBuf, token: &str) -> Result<TokenPersistOutcome> {
+fn persist_token_file(path: &Path, token: &str) -> Result<TokenPersistOutcome> {
     #[cfg(windows)]
     {
-        let _ = token;
-        return Err(anyhow!(
-            "Refusing to persist aicx auth token file {} on Windows because this build does not configure restricted file ACLs. Run aicx auth on Linux/macOS, or pass --auth-token <token> explicitly so the token file is never written.",
-            path.display()
-        ));
+        use std::io::{ErrorKind, Write};
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Create token directory {}", parent.display()))?;
+        }
+
+        // FULL PORT: the token file is born with a protected owner-only DACL
+        // (the Windows analogue of Unix mode 0600) instead of refusing to
+        // persist. See `windows_acl::create_new_restricted`.
+        match windows_acl::create_new_restricted(path) {
+            Ok(mut file) => {
+                file.write_all(format!("{}\n", token).as_bytes())
+                    .with_context(|| format!("Write token file {}", path.display()))?;
+                file.flush()
+                    .with_context(|| format!("Flush token file {}", path.display()))?;
+                Ok(TokenPersistOutcome::Created)
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                // Same two-case recovery as the Unix path: a startup race that
+                // lost create_new, or an empty/whitespace file we must replace.
+                let existing =
+                    crate::sanitize::read_to_string_validated(path).with_context(|| {
+                        format!(
+                            "Re-read existing token file after AlreadyExists: {}",
+                            path.display()
+                        )
+                    })?;
+                let trimmed = existing.trim();
+                if !trimmed.is_empty() {
+                    return Ok(TokenPersistOutcome::AdoptedExisting(trimmed.to_string()));
+                }
+                atomic_replace_token_file(path, token)
+                    .with_context(|| format!("Replace empty token file {}", path.display()))?;
+                Ok(TokenPersistOutcome::Overwrote)
+            }
+            Err(err) => Err(err).with_context(|| {
+                format!(
+                    "Create token file {} atomically with restricted owner-only ACL",
+                    path.display()
+                )
+            }),
+        }
     }
 
     #[cfg(unix)]
@@ -215,12 +309,13 @@ fn persist_token_file(path: &PathBuf, token: &str) -> Result<TokenPersistOutcome
                 //      load_auth_config fell through to generate+persist.
                 // Reading the file once tells us which case we're in and
                 // lets us avoid aborting the entire auth init on either.
-                let existing = std::fs::read_to_string(path).with_context(|| {
-                    format!(
-                        "Re-read existing token file after AlreadyExists: {}",
-                        path.display()
-                    )
-                })?;
+                let existing =
+                    crate::sanitize::read_to_string_validated(path).with_context(|| {
+                        format!(
+                            "Re-read existing token file after AlreadyExists: {}",
+                            path.display()
+                        )
+                    })?;
                 let trimmed = existing.trim();
                 if !trimmed.is_empty() {
                     return Ok(TokenPersistOutcome::AdoptedExisting(trimmed.to_string()));
@@ -306,6 +401,227 @@ fn atomic_replace_token_file(path: &Path, token: &str) -> Result<()> {
         let _ = std::fs::remove_file(&tmp_path);
     }
     res
+}
+
+/// Windows analogue of the Unix atomic replace: write a sibling tempfile with
+/// the same protected owner-only DACL, then replace the destination via
+/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` (std `rename` refuses an existing
+/// target on Windows). A crash mid-write leaves only the tempfile behind, which
+/// the error path cleans up — the destination is never truncated.
+#[cfg(windows)]
+fn atomic_replace_token_file(path: &Path, token: &str) -> Result<()> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Token file path has no parent: {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("Token file path has no filename: {}", path.display()))?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let mut rand = [0u8; 8];
+    getrandom::fill(&mut rand)
+        .map_err(|err| anyhow!("Generate random tmp suffix for token replace: {err}"))?;
+    let tmp_path = parent.join(format!(
+        ".{}.tmp.{}.{}.{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        nanos,
+        hex_encode(&rand),
+    ));
+
+    let res = (|| -> Result<()> {
+        let mut file = windows_acl::create_new_restricted(&tmp_path)
+            .with_context(|| format!("Create tmp token file {}", tmp_path.display()))?;
+        file.write_all(format!("{}\n", token).as_bytes())
+            .with_context(|| format!("Write tmp token file {}", tmp_path.display()))?;
+        file.flush()
+            .with_context(|| format!("Flush tmp token file {}", tmp_path.display()))?;
+        // Drop the handle so the replace is unambiguous.
+        drop(file);
+        windows_acl::replace_existing(&tmp_path, path).with_context(|| {
+            format!(
+                "Rename tmp token file {} -> {}",
+                tmp_path.display(),
+                path.display()
+            )
+        })
+    })();
+
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    res
+}
+
+/// Windows-only FFI for creating a token file with a protected owner-only DACL
+/// (the analogue of Unix mode 0600) and for replace-existing renames.
+///
+/// The SDDL string requests a *protected* DACL (`P` — parent-directory ACEs are
+/// not inherited) granting Full Access to the object OWNER (the user that
+/// creates the file, i.e. our own process) and to LocalSystem (`SY`), and to
+/// nobody else. Everyone / Authenticated Users receive no access, matching the
+/// 0600 intent. The descriptor is applied atomically at creation via
+/// `CreateFileW`'s `SECURITY_ATTRIBUTES`, so the file is never briefly
+/// world-readable.
+///
+/// NOTE: ACL *enforcement* cannot be verified on a non-Windows host; the
+/// windows-latest CI job exercises the create path, and the restriction itself
+/// is auditable with `icacls <token-file>` on a Windows box.
+#[cfg(windows)]
+mod windows_acl {
+    use std::ffi::c_void;
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use std::path::Path;
+
+    const TOKEN_SDDL: &str = "D:P(A;;FA;;;OW)(A;;FA;;;SY)";
+
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const CREATE_NEW: u32 = 1;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const SDDL_REVISION_1: u32 = 1;
+    const ERROR_FILE_EXISTS: i32 = 80;
+    const ERROR_ALREADY_EXISTS: i32 = 183;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    /// Mirror of Win32 `SECURITY_ATTRIBUTES`.
+    #[repr(C)]
+    struct SecurityAttributes {
+        n_length: u32,
+        lp_security_descriptor: *mut c_void,
+        b_inherit_handle: i32,
+    }
+
+    unsafe extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            string_security_descriptor: *const u16,
+            string_sd_revision: u32,
+            security_descriptor: *mut *mut c_void,
+            security_descriptor_size: *mut u32,
+        ) -> i32;
+
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            lp_security_attributes: *mut SecurityAttributes,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            h_template_file: *mut c_void,
+        ) -> *mut c_void;
+
+        fn MoveFileExW(
+            lp_existing_file_name: *const u16,
+            lp_new_file_name: *const u16,
+            dw_flags: u32,
+        ) -> i32;
+
+        fn LocalFree(h_mem: *mut c_void) -> *mut c_void;
+    }
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    /// Create `path` with `CREATE_NEW` and a protected owner-only DACL applied
+    /// atomically at creation, returning an owned [`File`]. Mirrors the Unix
+    /// `create_new(true).mode(0o600)` open: a pre-existing target yields
+    /// [`io::ErrorKind::AlreadyExists`] so callers share the recovery path.
+    pub fn create_new_restricted(path: &Path) -> io::Result<File> {
+        let sddl: Vec<u16> = TOKEN_SDDL
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut psd: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `sddl` is a NUL-terminated UTF-16 string; `psd` receives a
+        // LocalAlloc'd self-relative security descriptor freed via LocalFree.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut psd,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut sa = SecurityAttributes {
+            n_length: std::mem::size_of::<SecurityAttributes>() as u32,
+            lp_security_descriptor: psd,
+            b_inherit_handle: 0,
+        };
+        let wpath = wide(path);
+        // SAFETY: `wpath` is NUL-terminated; `sa` is valid for the call and
+        // references the descriptor built above.
+        let handle = unsafe {
+            CreateFileW(
+                wpath.as_ptr(),
+                GENERIC_WRITE,
+                0, // no sharing while the token is being written
+                &mut sa,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        // Capture the error BEFORE LocalFree, which may reset the thread's
+        // last-error value on success.
+        let create_err = (handle as isize == INVALID_HANDLE_VALUE).then(io::Error::last_os_error);
+        // SAFETY: `psd` was allocated by ConvertStringSecurityDescriptor...
+        unsafe { LocalFree(psd) };
+
+        match create_err {
+            None => {
+                // SAFETY: a valid, exclusively-owned handle from CreateFileW;
+                // ownership transfers into the File.
+                Ok(unsafe { File::from_raw_handle(handle as _) })
+            }
+            Some(err) => {
+                // CREATE_NEW reports a pre-existing target as ERROR_FILE_EXISTS;
+                // normalise to AlreadyExists for the shared recovery branch.
+                if matches!(
+                    err.raw_os_error(),
+                    Some(ERROR_FILE_EXISTS) | Some(ERROR_ALREADY_EXISTS)
+                ) {
+                    Err(io::Error::from(io::ErrorKind::AlreadyExists))
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    /// Replace `dst` with `src` atomically (overwriting an existing `dst`).
+    pub fn replace_existing(src: &Path, dst: &Path) -> io::Result<()> {
+        let wsrc = wide(src);
+        let wdst = wide(dst);
+        // SAFETY: both paths are NUL-terminated UTF-16 strings valid for the call.
+        let ok = unsafe {
+            MoveFileExW(
+                wsrc.as_ptr(),
+                wdst.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Hand-rolled constant-time byte slice comparison. Returns true iff the inputs
@@ -435,6 +751,31 @@ mod tests {
     // Serialise env-var manipulation to avoid cross-test interference.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn token_source_probe_describe_never_leaks_value() {
+        assert_eq!(
+            TokenSourceProbe::Env.describe(),
+            "env (AICX_HTTP_AUTH_TOKEN)"
+        );
+        let file = TokenSourceProbe::File(std::path::PathBuf::from("/x/auth-token"));
+        assert!(file.describe().starts_with("file:"));
+        assert!(file.describe().contains("/x/auth-token"));
+        let would = TokenSourceProbe::WouldGenerate(std::path::PathBuf::from("/x/auth-token"));
+        assert!(would.describe().contains("would generate"));
+    }
+
+    #[test]
+    fn probe_token_source_detects_env_without_generating() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        // Safety: env access is serialised by ENV_MUTEX for the test's duration.
+        unsafe {
+            std::env::set_var("AICX_HTTP_AUTH_TOKEN", "probe-test-token");
+        }
+        assert_eq!(probe_token_source(), TokenSourceProbe::Env);
+        clear_env();
+    }
+
     fn clear_env() {
         // Safety: the mutex guards concurrent access to process env across tests.
         unsafe {
@@ -468,7 +809,7 @@ mod tests {
             "warning must reference peer-IP / proxy contract: {msg}"
         );
 
-        let tailscale = std::net::IpAddr::from([100u8, 75, 30, 90]);
+        let tailscale = std::net::IpAddr::from([100u8, 64, 0, 1]);
         assert!(super::proxy_rate_limit_warning(tailscale).is_some());
     }
 

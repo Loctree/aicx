@@ -6,7 +6,7 @@
 ## Product Truth
 
 AICX now treats the native embedder as its first-choice local embedding path,
-not as a fallback behind memex.
+not as a fallback behind rust-memex.
 
 The split is:
 
@@ -15,8 +15,8 @@ The split is:
 - **Roost/rust-memex** owns the advanced retrieval/operator plane: heavier
   provider routing, richer indexing, and premium retrieval workflows.
 
-This removes the old schizophrenia where AICX pretended to be memex while also
-depending on memex internals for the same job.
+This removes the old schizophrenia where AICX pretended to be rust-memex while also
+depending on rust-memex internals for the same job.
 
 ## Library Boundary
 
@@ -48,7 +48,7 @@ Why GGUF:
 - quantized model files are dramatically smaller than fp16 safetensors
 - one model file is easier to hydrate, verify, and cache
 - llama.cpp already exposes pooled embeddings for BERT/F2LLM-style GGUF models
-- CodeScribe's Candle path is a good architectural precedent, but it was built
+- Codescribe's Candle path is a good architectural precedent, but it was built
   for MiniLM/BERT safetensors, not for the F2LLM quant line
 
 Runtime details:
@@ -130,9 +130,38 @@ Resolution order:
 1. `AICX_EMBEDDER_PATH`
 2. `AICX_EMBEDDER_REPO` + `AICX_EMBEDDER_FILENAME`
 3. `AICX_EMBEDDER_CONFIG`
-4. `~/.aicx/embedder.toml`
-5. `~/.aicx/config.toml`
-6. profile defaults
+4. `$AICX_HOME/config.toml` or `[storage].home`/`config.toml`
+5. `$AICX_HOME/embedder.toml` or `[storage].home`/`embedder.toml`
+6. bootstrap `~/.aicx/config.toml`
+7. bootstrap `~/.aicx/embedder.toml`
+8. profile defaults
+
+Persistent AICX root relocation:
+
+```toml
+[storage]
+# `AICX_HOME` env still wins for one-shot commands.
+# Use an absolute path or ~/...
+home = "~/aicx"
+```
+
+When `AICX_HOME` is unset, AICX reads bootstrap `~/.aicx/config.toml` first
+only to discover `[storage].home`. The runtime root then becomes
+`$home/store`, `$home/indexed`, `$home/state`, and `$home/embeddings`.
+This avoids typing `AICX_HOME=...` for every command while keeping env as the
+explicit override.
+
+Installer UX:
+
+```bash
+bash install.sh --pick-home
+# or non-interactive:
+bash install.sh --aicx-home="$HOME/.aicx"
+```
+
+The default root remains `~/.aicx`, so the default semantic index remains
+`~/.aicx/indexed/_all/embeddings.ndjson`. Picking a custom AICX home moves the
+same layout under that root: `<AICX_HOME>/indexed/_all/embeddings.ndjson`.
 
 Useful env vars:
 
@@ -204,6 +233,6 @@ in the local cache, so the command is safe on clean CI runners.
 
 ## Credits
 
-CodeScribe proved the in-process local model shape is comfortable in Rust.
+Codescribe proved the in-process local model shape is comfortable in Rust.
 AICX keeps that architectural lesson but switches the production model format
 to GGUF because quantized F2LLM is the sharper distribution path here.

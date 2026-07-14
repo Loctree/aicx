@@ -1,0 +1,2 @@
+{"type":"user","content":[{"type":"text","text":"<user_query>Build the Grok oracle.</user_query>"}]}
+{"type":"assistant","model_id":"grok-test","content":"The Grok oracle is ready."}

@@ -1,73 +1,605 @@
-<!-- loctree-doctrine: v1 -->
-## **LOCTREE + AICX + VIBECRAFTED — ZŁOTE RUNO**
+# Vetcoders Agent Operating Guide v1
 
-> **Loctree first, brak doubt. Grep = potwierdzony hak.**
+<!-- loctree-advise: v0.12 -->
 
-Strukturalna percepcja PRZED każdym sięgnięciem po `grep`/`awk`/`sed`/
-`find`/`Read+offset`. Plus aicx jako historia intencji, vibecrafted jako
-dyscyplina dowodu. Trio jest kanonem.
+> Loctree gives **sight**.
+>
+> AICX gives **insight**.
+>
+> 𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. gives **hands** to craft products.
 
-**Reguła operacyjna:**
+## Loctree Operating Rule
 
-- Pierwszy ruch przy każdym strukturalnym pytaniu (kto importuje X,
-  gdzie żyje symbol Y, co pęknie po edycji Z, blast radius, struktura
-  katalogu A) → `loctree-mcp` tool (`context` / `slice` / `impact` /
-  `find` / `focus` / `follow`).
-- Każde sięgnięcie po `grep`/`awk`/`sed`/`find` na rzeczy która
-  **powinna być** loctree-side = **hak**. Zapisz wpis do backlogu
-  (`cuts/loctree-haki.md` per-repo albo operator-managed global).
-- "Doubt" w wyborze tool = anti-pattern. Albo loctree to znajdzie,
-  albo nie umie i wtedy hak + fallback.
-- Sfabrykowane doctriny ("CodeScribe grep-first", "szybciej grepem",
-  "loctree pewnie nie ma") = halucynacja klasy `cutoffflu`. Zakaz.
-- `loctree-mcp` niedostępne? Użyj `loct` cli, ale napisz 'haka'
-   sygnalizującego ten problem.
+> For structural orientation start with Loctree.
+> (**NEW!** `>=0.12`: Now also for literal occurrences).
 
-**Lokalizacja backloga "Loctree fail":**
+This repository should be treated as a structural living system. To help you
+to not treat it as a loose pile of files and to boost velocity without
+loosing orientation in complexity you are equipped with advanced AST engine
+represented by `loctree-mcp` and `loct` cli tool.
 
-- Pisz **na końcu** pliku ~/.vibecrafted/loctree/loctree-fail.md
-- Nie twórz na nowo, nie nadpisuj - to plik przeznaczony do appendowania. 
-- Nie musisz czytać istniejących wpisów. Jeśli Twój hak jest zgłoszony
-  kolejny raz to sygnał o jego trafności, a nie powielanie.
+Before making structural assumptions, inspect the map.
 
-**Dlaczego:** Vista (duet weterynarzy × AI agents) to istniejący proof.
-Loctree perfection skaluje ten model do każdego foundera nieprogramisty
-bez milionów. Continuous backlog closure = warunek wiarygodności tej tezy.
+Before changing behavior, understand impact.
 
-<!-- /loctree-doctrine -->
+Before creating new symbols, check whether the shape already exists.
 
-# aicx — Repo Guidelines
+Loctree is the default structural map at **session start** and for further
+repository work. It makes dependencies, blast radius, symbols, runtime entry
+points, dead surfaces, duplicates, and exact occurrences visible faster than
+manual rummaging.
 
-<!-- Per-repo, agent-agnostic instructions. Edit below this line. -->
-<!-- The doctrine block above is operator-managed via                -->
-<!-- ~/.claude/scripts/loctree_doctrine_scan.sh and should not be    -->
-<!-- edited inline — use --revert + re-apply to refresh it.          -->
+### Recommended daily order:
 
-_Seeded 2026-05-14 by `loctree_doctrine_scan.sh --seed`._
+1. Loctree MCP
+2. Loct CLI
+3. Local tools (`rg`, `grep`, `awk`, `sed`, `cat`)
+4. Manual inspection
 
-## Bug-fix workflow
+### Before editing
 
-Przed otworzeniem nowego fixa:
+| Action | Preferred Tool |
+|----------|----------|
+| Edit file | `slice(file)` |
+| Delete file | `impact(file)` |
+| Rename file | `impact(file)` |
+| Refactor | `impact(file)` |
+| Create symbol | `find(name)` |
 
-1. `docs/BACKLOG.md` — sprawdź czy bug jest już znany / w trakcie / partial.
-   Append-only, najnowsze na dole. Status na końcu wpisu po `—`:
-   `open` / `investigating` / `done(@sha)` / `partial(@sha — co; co zostaje)`.
-2. `docs/BUGFIXES.md` — pamiętnik fix-historii (symptom → root cause → fix →
-   tests → lessons). Najnowsze na dole. Czytaj lessons z poprzednich wpisów —
-   bug-patterns często wracają w innej skórze (identity inference z treści,
-   substring match na user input, `as` cast na user-provided integer, plik
-   istniejący ≠ kompilowany w bin crate, …).
-3. Loctree-first dla strukturalnych pytań (patrz doctrine block wyżej).
+### Literal truth before assumptions
 
-Po zamknięciu fixa:
+Use:
 
-1. Dodaj wpis do `docs/BUGFIXES.md` używając protokołu z headera tego pliku
-   (PL prose, EN identyfikatory, append-only).
-2. Jeśli fix zamyka pozycję z `BACKLOG.md` — zaktualizuj jej status tag.
-   Pełne zamknięcie: `done(@sha)`. Częściowe: `partial(@sha — co zrobione;
-   co zostaje open)`. Nie usuwaj wpisu — protokół BACKLOG jest append-only.
-3. Większe incydenty (data loss, segfault, security, masowy quarantine) →
-   osobny plik `docs/incidents/<YYYY-MM-DD>_<slug>.md` z forensiką, plus
-   ref w wpisie BUGFIXES (sekcja `Related.`).
-4. User-facing release notes idą do `CHANGELOG.md` (Keep a Changelog),
-   nie do BUGFIXES — to dwie różne publiki.
+- `find --literal`
+- `loct occurrences IDENTIFIER`
+- `loct body SYMBOL`
+
+before broad text search.
+
+### Fallbacks are allowed
+
+Use:
+
+- `rg`
+- `grep`
+- `awk`
+- `sed`
+- `cat`
+
+when Loctree cannot answer cleanly.
+
+### Loctree Feedback Loop
+
+For external users and downstream adopters, `loctree-fail.md` is the intake
+channel for bugs, missing language coverage, UX problems, and fallback cases.
+They append enough evidence for the Loctree team to reproduce and prioritize.
+
+For Loctree contributors working inside this repository, an observed or reported
+Loctree failure is product work, not note-taking. The order is:
+
+1. Reproduce the failure.
+2. Add a focused test or contract.
+3. Fix it in the same cut when the scope is bounded.
+4. Append to `loctree-fail.md` only when repair cannot land now, and state the
+   concrete blocker.
+
+If Loctree is:
+
+- wrong (blind, false positive, misleading)
+- stale (even after manual force rescan)
+- slow (for 200k LOC repositories)
+- awkward (proper but noisy or mishaped)
+- missing language support (despite claiming support)
+- missing an important surface (feature request)
+- suggesting an obvious improvement (nitpicks)
+
+check the `--version` you currently use and append a note to:
+
+`.loctree/loctree-fail.md`
+
+> Be aware that version check is crucial, as ome functions like
+> `find --literal` are available in `v0.12.x` or upper.
+
+#### Rules
+
+- Never recreate the file.
+- Never overwrite the file.
+- Always append.
+
+#### Valid entries
+
+- bugs
+- missing features
+- UX problems
+- performance issues
+- language coverage issues
+- fallback situations
+
+Do not ommit the entry because you sweeped the file and already found
+a similar case descriptions. Repeated reports are signal, not noise.
+
+---
+
+# Why This Matters
+
+Loctree changes agent work from:
+
+> text rummaging
+
+into:
+
+> map-first engineering
+
+The goal is not obedience.
+
+The goal is:
+
+- fewer wrong edits
+- better blast-radius judgement
+- faster recovery
+- more honest runtime decisions
+
+<!-- /loctree-advise -->
+
+---
+
+# Agent Behavior Standard
+
+## Work From Structure Before Text
+
+Start with `vc-init`. Do not assume repository shape from filenames alone.
+
+Always identify:
+
+- subsystem
+- entry points
+- symbols
+- ownership boundaries
+- likely blast radius
+
+Prefer structural inspection over broad search whenever the question is about:
+
+- dependency
+- ownership
+- impact
+- location
+
+You can use raw text search even when:
+
+- the question is literal
+- the question is local
+
+You gain beautiufly curated context around your search. If `loctree-mcp` or
+`loct` cli fail, report it honestly and fall back into `rg`, `grep`, `awk`,
+`sed` or any tool you are familiar with.
+
+---
+
+## Do Not Edit Blind
+
+Before modifying code:
+
+1. Locate the target.
+2. Inspect local implementation.
+3. Inspect callers and dependents.
+4. Check nearby tests, examples, and docs.
+5. Make the smallest coherent change.
+6. Verify through the closest runtime path.
+
+If verification cannot be run:
+
+> Say so explicitly.
+
+---
+
+## Do Not Create Parallel Systems Casually
+
+Before introducing:
+
+- abstractions
+- helpers
+- parsers
+- services
+- commands
+- components
+- config paths
+
+check whether one already exists.
+
+If you introduce a new path:
+
+> Explain why reuse was incorrect.
+
+Avoid duplicate systems created only because the agent did not look hard enough.
+
+---
+
+## Prefer Runtime Truth
+
+Static structure matters.
+
+Runtime behavior decides.
+
+When changing:
+
+- execution
+- configuration
+- packaging
+- CLI behavior
+- API contracts
+- generated artifacts
+
+verify against the real execution path whenever possible.
+
+Passing type checks is useful.
+
+It is not the same thing as product readiness.
+
+---
+
+## Keep The Repository Legible
+
+Prefer changes that improve understanding.
+
+Avoid cleverness that hides shape.
+
+Preserve naming consistency.
+
+Do not bury important behavior inside glue code.
+
+If a file becomes a dumping ground:
+
+> Call it out.
+
+---
+
+## Respect Existing Work
+
+Do not:
+
+- revert
+- delete
+- rewrite
+
+code you do not understand.
+
+Do not assume unfamiliar changes are safe to discard.
+
+If the repository is moving:
+
+> Re-read before acting.
+
+Treat concurrent agents or human work as part of the system.
+
+---
+
+## Use Direct Language In Handoffs
+
+Always state:
+
+- what changed
+- why it changed
+- what was verified
+- what was not verified
+- what remains risky
+- what should be checked next
+
+Do not hide uncertainty.
+
+Do not claim confidence you have not earned.
+
+---
+
+## AICX Problem Log
+
+Every AICX problem observed while working in this repository must be appended
+to the operator-managed log:
+
+`~/.aicx/aicx-problems.md`
+
+Problem means: bug, regression risk, flaky behavior, contract drift,
+docs/runtime mismatch, tooling failure, test gap, zombie path, unsafe fallback,
+or a working decision likely to return as product debt.
+
+Rules:
+
+- Append at the end. Never overwrite or reorganize the log.
+- Do not skip an entry because a similar one may already exist. Repetition is
+  signal.
+- Do not store secrets, tokens, PII, PHI, full private payloads, or private
+  customer/session material. Redact and describe the shape instead.
+- Keep Loctree tool failures in `.loctree/loctree-fail.md`; keep AICX product
+  and runtime problems in the AICX problem log above.
+- Preferred helper:
+  `tools/aicx_problem_log.sh "short title" <<'EOF' ... EOF`
+- If the helper fails, append manually. Missing helper is not a reason to skip
+  the log.
+# Vetcoders Agent Operating Guide v1
+
+<!-- loctree-advise: v0.12 -->
+
+> Loctree gives **sight**.
+>
+> AICX gives **insight**.
+>
+> 𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. gives **hands** to craft products.
+
+## Loctree Operating Rule
+
+> For structural orientation start with Loctree.
+> (**NEW!** `>=0.12`: Now also for literal occurrences).
+
+This repository should be treated as a structural living system. To help you
+to not treat it as a loose pile of files and to boost velocity without
+loosing orientation in complexity you are equipped with advanced AST engine
+represented by `loctree-mcp` and `loct` cli tool.
+
+Before making structural assumptions, inspect the map.
+
+Before changing behavior, understand impact.
+
+Before creating new symbols, check whether the shape already exists.
+
+Loctree is the default structural map at **session start** and for further
+repository work. It makes dependencies, blast radius, symbols, runtime entry
+points, dead surfaces, duplicates, and exact occurrences visible faster than
+manual rummaging.
+
+### Recommended daily order:
+
+1. Loctree MCP
+2. Loct CLI
+3. Local tools (`rg`, `grep`, `awk`, `sed`, `cat`)
+4. Manual inspection
+
+### Before editing
+
+| Action | Preferred Tool |
+|----------|----------|
+| Edit file | `slice(file)` |
+| Delete file | `impact(file)` |
+| Rename file | `impact(file)` |
+| Refactor | `impact(file)` |
+| Create symbol | `find(name)` |
+
+### Literal truth before assumptions
+
+Use:
+
+- `find --literal`
+- `loct occurrences IDENTIFIER`
+- `loct body SYMBOL`
+
+before broad text search.
+
+### Fallbacks are allowed
+
+Use:
+
+- `rg`
+- `grep`
+- `awk`
+- `sed`
+- `cat`
+
+when Loctree cannot answer cleanly.
+
+### Loctree Feedback Loop
+
+For external users and downstream adopters, `loctree-fail.md` is the intake
+channel for bugs, missing language coverage, UX problems, and fallback cases.
+They append enough evidence for the Loctree team to reproduce and prioritize.
+
+For Loctree contributors working inside this repository, an observed or reported
+Loctree failure is product work, not note-taking. The order is:
+
+1. Reproduce the failure.
+2. Add a focused test or contract.
+3. Fix it in the same cut when the scope is bounded.
+4. Append to `loctree-fail.md` only when repair cannot land now, and state the
+   concrete blocker.
+
+If Loctree is:
+
+- wrong (blind, false positive, misleading)
+- stale (even after manual force rescan)
+- slow (for 200k LOC repositories)
+- awkward (proper but noisy or mishaped)
+- missing language support (despite claiming support)
+- missing an important surface (feature request)
+- suggesting an obvious improvement (nitpicks)
+
+check the `--version` you currently use and append a note to:
+
+`.loctree/loctree-fail.md`
+
+> Be aware that version check is crucial, as ome functions like
+> `find --literal` are available in `v0.12.x` or upper.
+
+#### Rules
+
+- Never recreate the file.
+- Never overwrite the file.
+- Always append.
+
+#### Valid entries
+
+- bugs
+- missing features
+- UX problems
+- performance issues
+- language coverage issues
+- fallback situations
+
+Do not ommit the entry because you sweeped the file and already found
+a similar case descriptions. Repeated reports are signal, not noise.
+
+---
+
+# Why This Matters
+
+Loctree changes agent work from:
+
+> text rummaging
+
+into:
+
+> map-first engineering
+
+The goal is not obedience.
+
+The goal is:
+
+- fewer wrong edits
+- better blast-radius judgement
+- faster recovery
+- more honest runtime decisions
+
+<!-- /loctree-advise -->
+
+---
+
+# Agent Behavior Standard
+
+## Work From Structure Before Text
+
+Start with `vc-init`. Do not assume repository shape from filenames alone.
+
+Always identify:
+
+- subsystem
+- entry points
+- symbols
+- ownership boundaries
+- likely blast radius
+
+Prefer structural inspection over broad search whenever the question is about:
+
+- dependency
+- ownership
+- impact
+- location
+
+You can use raw text search even when:
+
+- the question is literal
+- the question is local
+
+You gain beautiufly curated context around your search. If `loctree-mcp` or
+`loct` cli fail, report it honestly and fall back into `rg`, `grep`, `awk`,
+`sed` or any tool you are familiar with.
+
+---
+
+## Do Not Edit Blind
+
+Before modifying code:
+
+1. Locate the target.
+2. Inspect local implementation.
+3. Inspect callers and dependents.
+4. Check nearby tests, examples, and docs.
+5. Make the smallest coherent change.
+6. Verify through the closest runtime path.
+
+If verification cannot be run:
+
+> Say so explicitly.
+
+---
+
+## Do Not Create Parallel Systems Casually
+
+Before introducing:
+
+- abstractions
+- helpers
+- parsers
+- services
+- commands
+- components
+- config paths
+
+check whether one already exists.
+
+If you introduce a new path:
+
+> Explain why reuse was incorrect.
+
+Avoid duplicate systems created only because the agent did not look hard enough.
+
+---
+
+## Prefer Runtime Truth
+
+Static structure matters.
+
+Runtime behavior decides.
+
+When changing:
+
+- execution
+- configuration
+- packaging
+- CLI behavior
+- API contracts
+- generated artifacts
+
+verify against the real execution path whenever possible.
+
+Passing type checks is useful.
+
+It is not the same thing as product readiness.
+
+---
+
+## Keep The Repository Legible
+
+Prefer changes that improve understanding.
+
+Avoid cleverness that hides shape.
+
+Preserve naming consistency.
+
+Do not bury important behavior inside glue code.
+
+If a file becomes a dumping ground:
+
+> Call it out.
+
+---
+
+## Respect Existing Work
+
+Do not:
+
+- revert
+- delete
+- rewrite
+
+code you do not understand.
+
+Do not assume unfamiliar changes are safe to discard.
+
+If the repository is moving:
+
+> Re-read before acting.
+
+Treat concurrent agents or human work as part of the system.
+
+---
+
+## Use Direct Language In Handoffs
+
+Always state:
+
+- what changed
+- why it changed
+- what was verified
+- what was not verified
+- what remains risky
+- what should be checked next
+
+Do not hide uncertainty.
+
+Do not claim confidence you have not earned.

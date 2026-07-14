@@ -32,7 +32,7 @@ pub enum Confirmation {
 impl Confirmation {
     pub fn command(&self) -> &'static str {
         match self {
-            Self::DoctorFix => "aicx doctor --fix",
+            Self::DoctorFix => "aicx doctor --rebuild-steer-index",
             Self::DoctorFixBuckets => "aicx doctor --fix-buckets",
         }
     }

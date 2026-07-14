@@ -93,6 +93,8 @@ fn run_aicx(home: &Path, args: &[&str]) -> Output {
     Command::new(ensure_aicx_binary_exists())
         .args(args)
         .env("HOME", home)
+        // Windows resolves the home dir from USERPROFILE, not HOME (dirs::home_dir).
+        .env("USERPROFILE", home)
         .env("AICX_ALLOW_TMP", "1")
         // Drop any operator-pinned AICX_HOME so the spawned binary
         // resolves under the test's temp HOME — see frame_kind_contract.rs
@@ -117,7 +119,7 @@ fn reports_builds_html_and_default_bundle_from_vibecrafted_artifacts() {
     let root = unique_test_dir("reports-extractor");
     let home = root.join("home");
     let artifacts_root = root.join("artifacts");
-    let repo_root = artifacts_root.join("VetCoders").join("ai-contexters");
+    let repo_root = artifacts_root.join("Vetcoders").join("ai-contexters");
     let html_output = root.join("out").join("report-explorer.html");
     let bundle_output = root.join("out").join("report-explorer.bundle.json");
 
@@ -179,7 +181,7 @@ fn reports_builds_html_and_default_bundle_from_vibecrafted_artifacts() {
             "--artifacts-root",
             &artifacts_root.display().to_string(),
             "--org",
-            "VetCoders",
+            "Vetcoders",
             "--repo",
             "ai-contexters",
             "--date-from",
@@ -257,7 +259,7 @@ fn reports_escapes_xss_payloads_in_embedded_json_and_html() {
     let root = unique_test_dir("reports-xss");
     let home = root.join("home");
     let artifacts_root = root.join("artifacts");
-    let repo_root = artifacts_root.join("VetCoders").join("aicx");
+    let repo_root = artifacts_root.join("Vetcoders").join("aicx");
     let html_output = root.join("out").join("xss.html");
 
     write_xss_fixture(&repo_root);
@@ -269,7 +271,7 @@ fn reports_escapes_xss_payloads_in_embedded_json_and_html() {
             "--artifacts-root",
             &artifacts_root.display().to_string(),
             "--org",
-            "VetCoders",
+            "Vetcoders",
             "--repo",
             "aicx",
             "--date-from",
@@ -337,7 +339,7 @@ fn reports_refuses_overwrite_without_force_and_succeeds_with_force() {
     let root = unique_test_dir("reports-force");
     let home = root.join("home");
     let artifacts_root = root.join("artifacts");
-    let repo_root = artifacts_root.join("VetCoders").join("aicx");
+    let repo_root = artifacts_root.join("Vetcoders").join("aicx");
     let html_output = root.join("out").join("force.html");
     let bundle_output = root.join("out").join("force.bundle.json");
 
@@ -357,7 +359,7 @@ fn reports_refuses_overwrite_without_force_and_succeeds_with_force() {
             "--artifacts-root",
             &artifacts_root.display().to_string(),
             "--org",
-            "VetCoders",
+            "Vetcoders",
             "--repo",
             "aicx",
             "--date-from",
@@ -384,7 +386,7 @@ fn reports_refuses_overwrite_without_force_and_succeeds_with_force() {
             "--artifacts-root",
             &artifacts_root.display().to_string(),
             "--org",
-            "VetCoders",
+            "Vetcoders",
             "--repo",
             "aicx",
             "--date-from",
@@ -415,7 +417,7 @@ fn reports_refuses_overwrite_without_force_and_succeeds_with_force() {
             "--artifacts-root",
             &artifacts_root.display().to_string(),
             "--org",
-            "VetCoders",
+            "Vetcoders",
             "--repo",
             "aicx",
             "--date-from",
@@ -442,7 +444,7 @@ fn reports_composite_record_key_distinguishes_artifacts_with_same_run_id() {
     let root = unique_test_dir("reports-composite-key");
     let home = root.join("home");
     let artifacts_root = root.join("artifacts");
-    let repo_root = artifacts_root.join("VetCoders").join("aicx");
+    let repo_root = artifacts_root.join("Vetcoders").join("aicx");
     let html_output = root.join("out").join("composite.html");
     let bundle_output = root.join("out").join("composite.bundle.json");
 
@@ -472,7 +474,7 @@ fn reports_composite_record_key_distinguishes_artifacts_with_same_run_id() {
             "--artifacts-root",
             &artifacts_root.display().to_string(),
             "--org",
-            "VetCoders",
+            "Vetcoders",
             "--repo",
             "aicx",
             "--date-from",
@@ -513,7 +515,7 @@ fn reports_deterministic_flag_derives_generated_at_from_record_timestamps() {
     let root = unique_test_dir("reports-deterministic");
     let home = root.join("home");
     let artifacts_root = root.join("artifacts");
-    let repo_root = artifacts_root.join("VetCoders").join("aicx");
+    let repo_root = artifacts_root.join("Vetcoders").join("aicx");
     let html_output_a = root.join("out").join("det-a.html");
     let bundle_output_a = root.join("out").join("det-a.bundle.json");
     let html_output_b = root.join("out").join("det-b.html");
@@ -547,7 +549,7 @@ fn reports_deterministic_flag_derives_generated_at_from_record_timestamps() {
             "--artifacts-root".to_string(),
             artifacts_root.display().to_string(),
             "--org".to_string(),
-            "VetCoders".to_string(),
+            "Vetcoders".to_string(),
             "--repo".to_string(),
             "aicx".to_string(),
             "--date-from".to_string(),

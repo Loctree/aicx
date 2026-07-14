@@ -1,0 +1,841 @@
+# Donor field ownership matrix — session_record.v1 (schema 1.2.0) → AICX classes.
+# Machine truth for docs/PARSER_NORMATIVE_CONTRACT.md §1.
+# Classes: normative | heuristic_projection | diagnostic | out_of_scope.
+# kernel_fingerprint = true is legal ONLY for class = "normative" (checker-enforced).
+# Owners: "C1 kernel" (SessionModel), "C6 store", "C7 projections", "A1 overlay",
+#         "diagnostics" (coverage/warning surface), "donor-only" (not adopted).
+
+schema = "aicx.parser.normative_fields.v1"
+donor_schema = "session_record.v1"
+donor_schema_version = "1.2.0"
+
+# ---------------------------------------------------------------- top level
+
+[[field]]
+path = "schema"
+class = "out_of_scope"
+owner = "donor-only"
+kernel_fingerprint = false
+reason = "Donor discriminator literal; AICX model versioning is owned by C1, not copied from the donor."
+
+[[field]]
+path = "schema_version"
+class = "out_of_scope"
+owner = "donor-only"
+kernel_fingerprint = false
+reason = "Donor semver; AICX kernel versions its own canonical model."
+
+[[field]]
+path = "map_id"
+class = "out_of_scope"
+owner = "donor-only"
+kernel_fingerprint = false
+reason = "Donor output-directory layout identity; AICX identity is evidence_event_id + store ids, never a derived directory slug."
+
+[[field]]
+path = "session_id"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Direct source identity (Codex session_meta.id / Claude sessionId / Gemini session_id or filename / Grok summary.info.id / Junie directory id); participates in evidence_event_id."
+
+[[field]]
+path = "generated_at"
+class = "diagnostic"
+owner = "diagnostics"
+kernel_fingerprint = false
+reason = "Wall-clock creation stamp of the record artifact; wall clock is banned from the canonical fingerprint."
+
+[[field]]
+path = "generator.name"
+class = "diagnostic"
+owner = "diagnostics"
+kernel_fingerprint = false
+reason = "Producer provenance; determinism is keyed BY adapter version, the version string is not model content."
+
+[[field]]
+path = "generator.version"
+class = "diagnostic"
+owner = "diagnostics"
+kernel_fingerprint = false
+reason = "Producer provenance; same as generator.name."
+
+[[field]]
+path = "generator.adapter"
+class = "diagnostic"
+owner = "diagnostics"
+kernel_fingerprint = false
+reason = "Adapter selector provenance; AICX AgentKind is normative separately via provenance.agent."
+
+# ---------------------------------------------------------------- provenance
+
+[[field]]
+path = "provenance.agent"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Adapter constant, source truth; participates in evidence_event_id."
+
+[[field]]
+path = "provenance.model"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Direct source field (session_meta.model / first-turn model); unknown stays unknown."
+
+[[field]]
+path = "provenance.cli_version"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Direct source field when present; nullable truth."
+
+[[field]]
+path = "provenance.cwd"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Direct source field (turn_context.cwd / Gemini path-inferred is adapter-declared); session-start cwd is raw truth."
+
+[[field]]
+path = "provenance.branch"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Direct source field (gitBranch / turn_context.branch); NO git subprocess fallback — determinism rule."
+
+[[field]]
+path = "provenance.started_at"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "First source timestamp; raw truth."
+
+[[field]]
+path = "provenance.ended_at"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Last source timestamp; null = open-ended is truth, not a default."
+
+[[field]]
+path = "provenance.duration_seconds"
+class = "out_of_scope"
+owner = "donor-only"
+kernel_fingerprint = false
+reason = "Donor-deprecated alias of duration_span_seconds; aliases are not transplanted."
+
+[[field]]
+path = "provenance.duration_span_seconds"
+class = "diagnostic"
+owner = "diagnostics"
+kernel_fingerprint = false
+reason = "Derived arithmetic (ended_at - started_at); recomputable, not source truth, never fingerprinted."
+
+[[field]]
+path = "provenance.active_duration_seconds"
+class = "heuristic_projection"
+owner = "C7 projections"
+kernel_fingerprint = false
+reason = "Gap-cap policy metric (parameterized by a 600s cap); policy output, not parser truth."
+
+[[field]]
+path = "provenance.duration_gap_cap_seconds"
+class = "heuristic_projection"
+owner = "C7 projections"
+kernel_fingerprint = false
+reason = "Policy parameter of active_duration_seconds."
+
+[[field]]
+path = "provenance.original_jsonl_path"
+class = "diagnostic"
+owner = "diagnostics"
+kernel_fingerprint = false
+reason = "Forensic pointer to L0; absolute path — banned from fingerprint and from any event identity."
+
+[[field]]
+path = "provenance.original_jsonl_hash"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Source content hash (sha256 of bytes); normative provenance — but NEVER the sole event identity (evidence rule §5.2)."
+
+[[field]]
+path = "provenance.original_jsonl_bytes"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Source size truth."
+
+[[field]]
+path = "provenance.bundle_relative_path"
+class = "out_of_scope"
+owner = "donor-only"
+kernel_fingerprint = false
+reason = "Donor export-bundle reservation, always null in v1."
+
+# ---------------------------------------------------------------- intent (heuristic layer)
+
+[[field]]
+path = "intent.summary"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Title/summary heuristic; intent extraction is A1 territory, never kernel truth."
+
+[[field]]
+path = "intent.body"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Regex mission-slice of the dispatched prompt; deterministic but semantic policy, not parser truth."
+
+[[field]]
+path = "intent.body_source"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Provenance of the heuristic slice."
+
+[[field]]
+path = "intent.body_chars"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Derived from the heuristic slice."
+
+[[field]]
+path = "intent.acceptance_criteria_raw"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Regex section slice; intent layer input."
+
+[[field]]
+path = "intent.out_of_scope_raw"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Regex section slice; intent layer input."
+
+# ---------------------------------------------------------------- dispatched_via (heuristic layer)
+
+[[field]]
+path = "dispatched_via.skill_name"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Signal-detection product; kernel keeps raw skill/dispatch markers, classification of 'dispatched workflow' is a projection."
+
+[[field]]
+path = "dispatched_via.skill_source_path"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Derived from the detected marker."
+
+[[field]]
+path = "dispatched_via.dispatch_hash"
+class = "out_of_scope"
+owner = "donor-only"
+kernel_fingerprint = false
+reason = "Reserved-null in donor v1."
+
+[[field]]
+path = "dispatched_via.dispatch_signals_detected"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Closed-enum pattern scoring over prompt text; projection input, not raw truth."
+
+[[field]]
+path = "dispatched_via.dispatch_prompt_turn_idx"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Derived from signal detection."
+
+[[field]]
+path = "dispatched_via.is_dispatched_workflow"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Threshold rule (≥2 signals AND ≥1000 chars); policy, not truth."
+
+# ---------------------------------------------------------------- segments (structural core)
+
+[[field]]
+path = "segments[].segment_id"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Deterministic ordinal of the cwd-change split; segment split ONLY on cwd change is a frozen rule."
+
+[[field]]
+path = "segments[].source_project"
+class = "heuristic_projection"
+owner = "C6 store"
+kernel_fingerprint = false
+reason = "Slug policy over cwd; store/bucket naming with canonical case-normalization is a projection concern."
+
+[[field]]
+path = "segments[].topic_project_candidate"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Hardcoded regex pattern detection; observability only, never structural."
+
+[[field]]
+path = "segments[].project_mismatch"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Derived from topic_project_candidate."
+
+[[field]]
+path = "segments[].cwd"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Raw per-segment cwd truth."
+
+[[field]]
+path = "segments[].branch"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Raw per-segment branch truth from source fields."
+
+[[field]]
+path = "segments[].started_at"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Raw segment boundary timestamp."
+
+[[field]]
+path = "segments[].ended_at"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Raw segment boundary timestamp."
+
+[[field]]
+path = "segments[].turn_range"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Gap-free turn coverage per segment is a validator invariant."
+
+[[field]]
+path = "segments[].sub_intent"
+class = "out_of_scope"
+owner = "donor-only"
+kernel_fingerprint = false
+reason = "Reserved-null extension point in donor v1."
+
+# ---------------------------------------------------------------- decision_candidates (heuristic layer)
+
+[[field]]
+path = "segments[].decision_candidates[].turn_idx"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Candidate enumeration policy (every assistant text turn); A1 clusters intents, kernel keeps typed turns only."
+
+[[field]]
+path = "segments[].decision_candidates[].timestamp"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Belongs to the candidate projection."
+
+[[field]]
+path = "segments[].decision_candidates[].text_excerpt"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "200-char slice policy."
+
+[[field]]
+path = "segments[].decision_candidates[].kind"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Candidate classification."
+
+[[field]]
+path = "segments[].decision_candidates[].confidence"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Confidence ladder is enrichment vocabulary."
+
+# ---------------------------------------------------------------- footprint (projection over typed tool events)
+
+[[field]]
+path = "segments[].footprint.tool_call_counts"
+class = "heuristic_projection"
+owner = "C6 store"
+kernel_fingerprint = false
+reason = "Kernel truth is the typed ToolEvent stream; aggregated counts are a projection."
+
+[[field]]
+path = "segments[].footprint.files_referenced"
+class = "heuristic_projection"
+owner = "C6 store"
+kernel_fingerprint = false
+reason = "Mixes structured tool args (deterministic) with command path-token parsing (heuristic); projection over ToolEvents."
+
+[[field]]
+path = "segments[].footprint.files_referenced_count"
+class = "heuristic_projection"
+owner = "C6 store"
+kernel_fingerprint = false
+reason = "Derived count."
+
+[[field]]
+path = "segments[].footprint.files_modified"
+class = "heuristic_projection"
+owner = "C6 store"
+kernel_fingerprint = false
+reason = "Write/edit-arg subset policy; projection over ToolEvents."
+
+[[field]]
+path = "segments[].footprint.files_modified_count"
+class = "heuristic_projection"
+owner = "C6 store"
+kernel_fingerprint = false
+reason = "Derived count."
+
+[[field]]
+path = "segments[].footprint.files_touched"
+class = "out_of_scope"
+owner = "donor-only"
+kernel_fingerprint = false
+reason = "Donor-deprecated alias of files_referenced."
+
+[[field]]
+path = "segments[].footprint.files_touched_count"
+class = "out_of_scope"
+owner = "donor-only"
+kernel_fingerprint = false
+reason = "Donor-deprecated alias."
+
+[[field]]
+path = "segments[].footprint.commands_executed"
+class = "heuristic_projection"
+owner = "C6 store"
+kernel_fingerprint = false
+reason = "Aggregation policy over shell ToolEvents."
+
+[[field]]
+path = "segments[].footprint.git_diff_stat"
+class = "heuristic_projection"
+owner = "C6 store"
+kernel_fingerprint = false
+reason = "Opportunistic extraction from tool output text."
+
+# ---------------------------------------------------------------- outcome (heuristic layer)
+
+[[field]]
+path = "segments[].outcome.verdict"
+class = "out_of_scope"
+owner = "donor-only"
+kernel_fingerprint = false
+reason = "Donor-deprecated alias of agent_outcome."
+
+[[field]]
+path = "segments[].outcome.agent_outcome"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Regex/tail-excerpt outcome guess with explicit heuristic confidence; enrichment territory."
+
+[[field]]
+path = "segments[].outcome.tb_verification_state"
+class = "out_of_scope"
+owner = "donor-only"
+kernel_fingerprint = false
+reason = "Donor TB verification axis; AICX is not TB."
+
+[[field]]
+path = "segments[].outcome.deliverables"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Bullet-filter heuristic over the last assistant message."
+
+[[field]]
+path = "segments[].outcome.gates"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Gate command/result pattern classification; kernel keeps raw gate commands + correlated results as typed events, classification is projection."
+
+[[field]]
+path = "segments[].outcome.last_assistant_excerpts"
+class = "heuristic_projection"
+owner = "C7 projections"
+kernel_fingerprint = false
+reason = "Tail-slice presentation policy."
+
+[[field]]
+path = "segments[].outcome.verdict_confidence"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Confidence ladder vocabulary of the heuristic layer."
+
+# ---------------------------------------------------------------- boundary (session-time observability)
+
+[[field]]
+path = "segments[].boundary[].kind"
+class = "diagnostic"
+owner = "diagnostics"
+kernel_fingerprint = false
+reason = "Session-time observability entries; the normative axis is carried by C0A boundary flags (opaque_reasoning_present / unsupported_visible_event) in the status contract, kind=encrypted_payload maps onto opaque_reasoning_present."
+
+[[field]]
+path = "segments[].boundary[].count"
+class = "diagnostic"
+owner = "diagnostics"
+kernel_fingerprint = false
+reason = "Observability counter."
+
+[[field]]
+path = "segments[].boundary[].first_turn_index"
+class = "diagnostic"
+owner = "diagnostics"
+kernel_fingerprint = false
+reason = "Observability locator."
+
+[[field]]
+path = "segments[].boundary[].note"
+class = "diagnostic"
+owner = "diagnostics"
+kernel_fingerprint = false
+reason = "Free-text observability."
+
+[[field]]
+path = "segments[].boundary[].recovered_via"
+class = "diagnostic"
+owner = "diagnostics"
+kernel_fingerprint = false
+reason = "Forensic recovery hint (may contain a path — banned from fingerprint)."
+
+# ---------------------------------------------------------------- skill_invocations (deterministic markers)
+
+[[field]]
+path = "skill_invocations[].turn_idx"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Deterministic marker location; SessionModel carries skill/dispatch markers."
+
+[[field]]
+path = "skill_invocations[].skill_name"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Deterministic regex + path-validation detection (ported concept from aicx skill_collapse)."
+
+[[field]]
+path = "skill_invocations[].skill_source_path"
+class = "diagnostic"
+owner = "diagnostics"
+kernel_fingerprint = false
+reason = "Recovery pointer; may be absolute — banned from fingerprint."
+
+[[field]]
+path = "skill_invocations[].payload_hash"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Content hash of the dropped payload; deterministic truth."
+
+[[field]]
+path = "skill_invocations[].payload_bytes"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Size truth of the dropped payload."
+
+[[field]]
+path = "skill_invocations[].first_invoked_at"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Source timestamp of the marker turn."
+
+[[field]]
+path = "skill_invocations[].detection_marker"
+class = "diagnostic"
+owner = "diagnostics"
+kernel_fingerprint = false
+reason = "Debug echo of the matched marker line."
+
+# ---------------------------------------------------------------- parser_coverage (accounting core)
+
+[[field]]
+path = "parser_coverage.raw_line_count"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Accounting invariant input: consumed + skipped == raw units."
+
+[[field]]
+path = "parser_coverage.consumed_count"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Accounting invariant."
+
+[[field]]
+path = "parser_coverage.skipped_count"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Accounting invariant."
+
+[[field]]
+path = "parser_coverage.unreadable_count"
+class = "diagnostic"
+owner = "diagnostics"
+kernel_fingerprint = false
+reason = "Derived subset (source-limit vs adapter-gap split); recomputable from skipped reasons."
+
+[[field]]
+path = "parser_coverage.unsupported_count"
+class = "diagnostic"
+owner = "diagnostics"
+kernel_fingerprint = false
+reason = "Derived subset; recomputable from skipped reasons."
+
+[[field]]
+path = "parser_coverage.consumed_ranges"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Lossless compact encoding of the consumed set; invariant input."
+
+[[field]]
+path = "parser_coverage.consumed_by_kind"
+class = "diagnostic"
+owner = "diagnostics"
+kernel_fingerprint = false
+reason = "Informational breakdown, explicitly NOT an invariant input in the donor."
+
+[[field]]
+path = "parser_coverage.skipped_lines[].line_no"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Typed skip record location; invariant input."
+
+[[field]]
+path = "parser_coverage.skipped_lines[].reason"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Closed-enum skip reason; unknown shapes are data, not silence."
+
+[[field]]
+path = "parser_coverage.skipped_lines[].detail"
+class = "diagnostic"
+owner = "diagnostics"
+kernel_fingerprint = false
+reason = "Free-text sample detail (bounded)."
+
+[[field]]
+path = "parser_coverage.skipped_lines[].bytes"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Byte accounting of the skipped unit."
+
+[[field]]
+path = "parser_coverage.parse_status"
+class = "normative"
+owner = "C1 kernel (status contract)"
+kernel_fingerprint = true
+reason = "Superseded shape: donor enum is replaced by C0A visible completeness (complete_visible|partial_visible|fatal) + orthogonal boundary flags; the mapped status is normative, the donor enum is not re-emitted."
+
+[[field]]
+path = "parser_coverage.warnings[].kind"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Typed warning records are part of parser truth (stable warnings rule)."
+
+[[field]]
+path = "parser_coverage.warnings[].count"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Typed warning accounting."
+
+[[field]]
+path = "parser_coverage.warnings[].first_line_no"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Warning locator."
+
+[[field]]
+path = "parser_coverage.warnings[].samples"
+class = "diagnostic"
+owner = "diagnostics"
+kernel_fingerprint = false
+reason = "Bounded free-text samples; strict caps, never fingerprinted."
+
+# ---------------------------------------------------------------- chat / turns
+
+[[field]]
+path = "chat.preserved"
+class = "out_of_scope"
+owner = "donor-only"
+kernel_fingerprint = false
+reason = "Donor L1 preview policy switch; AICX SessionModel keeps full content until projection."
+
+[[field]]
+path = "chat.preservation_policy"
+class = "out_of_scope"
+owner = "donor-only"
+kernel_fingerprint = false
+reason = "Donor 2000-char preview cap policy; not adopted — projections own their own truncation."
+
+[[field]]
+path = "chat.turn_count"
+class = "diagnostic"
+owner = "diagnostics"
+kernel_fingerprint = false
+reason = "Derived count."
+
+[[field]]
+path = "chat.turns[].turn_idx"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "0-based turn ordinal; ordering truth."
+
+[[field]]
+path = "chat.turns[].role"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Visible conversation role truth."
+
+[[field]]
+path = "chat.turns[].timestamp"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Source timestamp truth (null when the agent does not log per-turn)."
+
+[[field]]
+path = "chat.turns[].kind"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Frame classification; AICX maps onto its FrameKind vocabulary (user_msg/agent_reply/internal_thought/tool_call/system_note) — mapping frozen by C1."
+
+[[field]]
+path = "chat.turns[].text_preview"
+class = "out_of_scope"
+owner = "donor-only"
+kernel_fingerprint = false
+reason = "Donor preview cap; AICX kernel keeps full turn content, projections truncate per their own policy."
+
+[[field]]
+path = "chat.turns[].text_hash"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Full-content hash; integrity + dedup truth."
+
+[[field]]
+path = "chat.turns[].text_chars"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Full-content size truth."
+
+[[field]]
+path = "chat.turns[].tool_name"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Typed tool identity on tool turns; correlation ids are kernel truth."
+
+[[field]]
+path = "chat.turns[].tool_input_summary"
+class = "heuristic_projection"
+owner = "C7 projections"
+kernel_fingerprint = false
+reason = "Summarization policy; kernel keeps typed args on ToolEvent."
+
+[[field]]
+path = "chat.turns[].tool_output_summary"
+class = "heuristic_projection"
+owner = "C7 projections"
+kernel_fingerprint = false
+reason = "Summarization policy."
+
+[[field]]
+path = "chat.turns[].segment_id"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Deterministic turn→segment binding."
+
+[[field]]
+path = "chat.turns[].dispatch_signals_detected"
+class = "heuristic_projection"
+owner = "A1 overlay"
+kernel_fingerprint = false
+reason = "Per-turn signal scoring; projection input."
+
+[[field]]
+path = "chat.turns[].raw_line_nos"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Turn→raw-unit linkage; the substrate of evidence_event_id references."
+
+# ---------------------------------------------------------------- AICX normative extensions (not donor fields)
+
+[[aicx_field]]
+path = "usage_events[]"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Donor does not model usage telemetry; typed UsageEvent (provider/model, token components, reported cost+currency, timestamp/span, snapshot|delta|cumulative semantics) is an AICX normative extension. Unknown stays unknown, never zero."
+
+[[aicx_field]]
+path = "evidence_event_id"
+class = "normative"
+owner = "C1 kernel"
+kernel_fingerprint = true
+reason = "Stable source-event identity, derivation v1 (contract §5): agent + session_id + locator + content hash; append/relocation-stable, no absolute path, never the whole-file hash alone."
+
+[[aicx_field]]
+path = "visible_completeness"
+class = "normative"
+owner = "C1 kernel (status contract)"
+kernel_fingerprint = true
+reason = "C0A status contract axis 1: complete_visible | partial_visible | fatal."
+
+[[aicx_field]]
+path = "boundary_flags.opaque_reasoning_present"
+class = "normative"
+owner = "C1 kernel (status contract)"
+kernel_fingerprint = true
+reason = "C0A status contract axis 2; alone never degrades visible completeness."
+
+[[aicx_field]]
+path = "boundary_flags.unsupported_visible_event"
+class = "normative"
+owner = "C1 kernel (status contract)"
+kernel_fingerprint = true
+reason = "C0A status contract axis 2; preservation is not loss, requires a warning record."

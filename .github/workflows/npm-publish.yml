@@ -19,7 +19,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       release_tag: ${{ steps.meta.outputs.release_tag }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Validate requested version
         id: meta
@@ -63,18 +63,18 @@ jobs:
           base_url="https://github.com/Loctree/aicx/releases/download/${RELEASE_TAG}"
           # Signed-only release surface. macOS ships .zip (notarized via ditto);
           # Linux ships .tar.gz (GPG-detached); Windows ships .zip (GPG-detached
-          # MinGW-w64 build). All three carry GPG .asc sidecars.
+          # MSVC build). All three carry GPG .asc sidecars.
           assets=(
             "aicx-v${{ steps.meta.outputs.version }}-aarch64-apple-darwin-slim.zip"
             "aicx-v${{ steps.meta.outputs.version }}-x86_64-linux-gnu-slim.tar.gz"
-            "aicx-v${{ steps.meta.outputs.version }}-x86_64-pc-windows-gnu-slim.zip"
+            "aicx-v${{ steps.meta.outputs.version }}-x86_64-pc-windows-msvc-slim.zip"
           )
           for asset in "${assets[@]}"; do
             curl -fsLI "${base_url}/${asset}" >/dev/null
             curl -fsLI "${base_url}/${asset}.sha256" >/dev/null
           done
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
 
@@ -95,9 +95,9 @@ jobs:
           - linux-x64-gnu
           - win32-x64-gnu
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           registry-url: "https://registry.npmjs.org"
@@ -116,9 +116,9 @@ jobs:
     needs: [verify, publish-platform-packages]
     runs-on: [self-hosted, ops-linux]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           registry-url: "https://registry.npmjs.org"

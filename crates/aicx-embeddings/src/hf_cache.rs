@@ -152,24 +152,13 @@ fn cache_bases() -> Vec<PathBuf> {
     if let Some(home) = dirs::home_dir() {
         out.push(home.join(".cache").join("huggingface").join("hub"));
     }
-    if let Some(aicx_home) = resolve_aicx_home() {
+    if let Some(aicx_home) = crate::config::aicx_home_root() {
         out.push(aicx_home.join("embeddings"));
         out.push(aicx_home.join("embeddings").join("hub"));
     }
     out.sort();
     out.dedup();
     out
-}
-
-/// Local mirror of `aicx::store::resolve_aicx_home`. Returns the resolved
-/// AICX home: `$AICX_HOME` when set + non-empty, otherwise `~/.aicx`.
-/// Duplicated because `aicx-embeddings` is a leaf crate (the main
-/// `aicx` crate depends on it, not the other way around).
-fn resolve_aicx_home() -> Option<PathBuf> {
-    match env::var_os("AICX_HOME") {
-        Some(value) if !value.is_empty() => Some(PathBuf::from(value)),
-        _ => dirs::home_dir().map(|home| home.join(".aicx")),
-    }
 }
 
 fn find_snapshot_in_base(base: &Path, repo: &str, filename: &str) -> Result<PathBuf, HfCacheMiss> {
@@ -266,17 +255,21 @@ fn validate_cache_file(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
     fn tempdir() -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "aicx-hf-cache-test-{}-{}",
+            "aicx-hf-cache-test-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&p).unwrap();
         p

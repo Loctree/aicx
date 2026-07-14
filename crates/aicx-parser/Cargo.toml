@@ -1,11 +1,11 @@
 [package]
 name = "aicx-parser"
-version = "0.8.0"
+version = "0.11.0"
 edition = "2024"
 rust-version = "1.91.1"
 license = "BUSL-1.1"
 description = "Transcript parser, chunker, and slicer for AI session transcripts (Claude, Codex, Gemini, Junie). Companion crate of aicx."
-authors = ["Maciej Gad <void@div0.space>", "Monika Szymanska <hello@vetcoders.io>"]
+authors = ["Vetcoders <hello@vetcoders.io>"]
 repository = "https://github.com/Loctree/aicx"
 homepage = "https://github.com/Loctree/aicx"
 documentation = "https://docs.rs/aicx-parser"
@@ -19,9 +19,11 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 siphasher = "1.0"
 regex = "1"
 schemars = { version = "1.2.1", optional = true }
+toml = "0.8"
 unicode-normalization = "0.1"
 
 [features]

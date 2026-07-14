@@ -1,10 +1,14 @@
+// App-only integration surface: compiled to an empty target under the slim
+// `loctree-consumer` profile (`--no-default-features`).
+#![cfg(feature = "app")]
+
 //! Regression tests for Wave B-1 (bugs #27, #28, #30):
 //!
 //! - #27: dashboard per-event project filter is strict (no substring leak).
 //! - #28: covered inline in `src/dashboard_server.rs` because the rollup is
 //!   crate-private; this file asserts the public dashboard filter surface
 //!   behaves strictly.
-//! - #30: the memex CLI fork (`run_memex_cli` / `run_memex_cross_search`)
+//! - #30: the rust-memex CLI fork (`run_memex_cli` / `run_memex_cross_search`)
 //!   is gone from `src/dashboard_server.rs`; assert by greppable absence
 //!   so the dead surface cannot creep back into the dashboard process.
 
@@ -49,7 +53,7 @@ fn project_filter_does_not_match_substring_leak() {
 
 #[test]
 fn dashboard_server_source_has_no_memex_cli_fork() {
-    // Bug #30: the dashboard process no longer shells out to a memex
+    // Bug #30: the dashboard process no longer shells out to a rust-memex
     // sub-process. `run_memex_cli` and `run_memex_cross_search` are
     // removed; this test guards the absence at the source level so a
     // future refactor can't silently re-introduce the fork.
@@ -69,7 +73,7 @@ fn dashboard_server_source_has_no_memex_cli_fork() {
     ] {
         assert!(
             !source.contains(needle),
-            "memex CLI fork resurfaced in src/dashboard_server.rs: matched {needle:?}"
+            "rust-memex CLI fork resurfaced in src/dashboard_server.rs: matched {needle:?}"
         );
     }
 }

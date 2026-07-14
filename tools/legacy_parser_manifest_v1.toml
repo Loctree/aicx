@@ -1,0 +1,75 @@
+schema_version = 1
+baseline_commit = "b1f2712cfc72f47293edad646547690552372aa4"
+scan_roots = ["src", "crates/aicx-parser/src"]
+
+deleted_symbols = [
+  "CodexEntry",
+  "CodexSessionEvent",
+  "parse_codex_session_events_with_diagnostics",
+  "parse_grok_chat_history",
+  "ClaudeRawEntry",
+  "extract_claude_classified_blocks",
+  "parse_claude_jsonl",
+  "GeminiSession",
+  "extract_gemini_classified_blocks",
+  "parse_gemini_session_content",
+  "BlockProjection",
+  "project_junie_block",
+  "detect_junie_interesting_kind",
+]
+
+forbidden_fallbacks = [
+  "parse(all sessions) + scan(all sessions) + filter(one)",
+  "if ev.event_type != \"event_msg\"",
+  "legacy session parser compatibility fallback",
+]
+
+[[deleted_path]]
+path = "src/sources/providers/claude.rs"
+removed_by = "b1f2712"
+
+[[deleted_path]]
+path = "src/sources/providers/codex.rs"
+removed_by = "b1f2712"
+
+[[deleted_path]]
+path = "src/sources/providers/gemini.rs"
+removed_by = "b1f2712"
+
+[[deleted_path]]
+path = "src/sources/providers/junie.rs"
+removed_by = "b1f2712"
+
+[[deleted_path]]
+path = "src/sources/shared/diagnostics.rs"
+removed_by = "b1f2712"
+
+[[deleted_path]]
+path = "src/sources/shared/json.rs"
+removed_by = "b1f2712"
+
+[[deleted_path]]
+path = "src/sources/shared/timeline.rs"
+removed_by = "b1f2712"
+
+[[deleted_path]]
+path = "src/sources/tests.rs"
+removed_by = "b1f2712"
+
+[[deleted_path]]
+path = "tests/content_sanitization_e2e.rs"
+removed_by = "b1f2712"
+
+[[deleted_path]]
+path = "tests/diagnostics_summary.rs"
+removed_by = "b1f2712"
+
+# NOTE(C7): `tests/frame_kind_contract.rs` was deleted by b1f2712 with the
+# legacy engine and is deliberately REINSTATED by the C7 CLI cutover as a new
+# model-projection contract test (TurnKind -> FrameKind over SessionModel).
+# It shares only the filename with the deleted legacy test, so it is no
+# longer listed under [[deleted_path]].
+
+[[deleted_path]]
+path = "tests/legacy_codex_format_test.rs"
+removed_by = "b1f2712"

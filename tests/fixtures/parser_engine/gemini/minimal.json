@@ -1,0 +1,1 @@
+{"sessionId":"33333333-3333-4333-8333-333333333333","startTime":"2026-07-13T00:00:00Z","lastUpdated":"2026-07-13T00:00:01Z","messages":[{"id":"u1","timestamp":"2026-07-13T00:00:00Z","type":"user","content":"Build the Gemini oracle."},{"id":"a1","timestamp":"2026-07-13T00:00:01Z","type":"gemini","content":"The Gemini oracle is ready.","model":"gemini-test"}]}

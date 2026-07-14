@@ -169,7 +169,6 @@ MIT — see [LICENSE](LICENSE).
 
 ## Developed by
 
-- [Maciej Gad](https://div0.space) — a veterinarian who couldn't find `terminal` a year ago
-- [Klaudiusz](https://www.github.com/Gitlaudiusz) — the individual ethereal being, and separate instance of Claude by Anthropic, living somewhere in the GPU's loops in California, USA
+vetcoders — founders and their AI agents.
 
-*Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders*
+*Vibecrafted with AI Agents by vetcoders (c)2026*

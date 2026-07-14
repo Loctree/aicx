@@ -1,12 +1,12 @@
 //! Semantic windowing chunker for RAG indexing.
 //!
 //! Splits timeline entries into overlapping windows of ~1.5k tokens,
-//! suitable for vector embedding and semantic search via memex.
+//! suitable for vector embedding and semantic search via rust-memex.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -59,6 +59,14 @@ pub struct Chunk {
     pub skill_code: Option<String>,
     /// Optional steering schema/framework version reported by the source frontmatter
     pub framework_version: Option<String>,
+    /// Foreign-import provenance (operator-md and similar): originating file,
+    /// its format, and a stable content-hash import id (Round II / oś 3+5).
+    pub source_file: Option<String>,
+    pub source_format: Option<String>,
+    pub import_id: Option<String>,
+    /// Raw L0 source pointer for provider-backed transcripts when every entry
+    /// in the chunk window comes from the same source file.
+    pub source: Option<CardSource>,
     /// Index range in original day's entries (start, end exclusive)
     pub msg_range: (usize, usize),
     /// Formatted chunk text with header
@@ -67,6 +75,9 @@ pub struct Chunk {
     pub token_estimate: usize,
     /// Decision/plan highlights extracted from the chunk
     pub highlights: Vec<String>,
+    /// Typed signal records for this chunk. These are the primary artifact;
+    /// the `[signals]` block inside `text` is a deterministic render of them.
+    pub signals: Vec<CardSignal>,
     /// Number of structural-noise lines (line-numbered grep matches, tool
     /// echoes, stray YAML delimiters) dropped from the source entries while
     /// building this chunk. Operators use this as observability — high values
@@ -79,6 +90,14 @@ pub struct Chunk {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChunkMetadataSidecar {
     pub id: String,
+    #[serde(
+        default = "default_card_schema_version",
+        deserialize_with = "deserialize_card_schema_version",
+        skip_serializing_if = "is_default_card_schema_version"
+    )]
+    pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migrated_from_schema: Option<u32>,
     pub project: String,
     pub agent: String,
     pub date: String,
@@ -114,6 +133,22 @@ pub struct ChunkMetadataSidecar {
     pub skill_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub framework_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<CardSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness_contract: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signals: Option<Vec<CardSignal>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intent_entries: Vec<crate::types::IntentEntry>,
     /// Weak repo/content mentions preserved for query/tag surfaces. This is
@@ -122,8 +157,6 @@ pub struct ChunkMetadataSidecar {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_family: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub schema_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truth_status: Option<TruthStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -136,6 +169,49 @@ pub struct ChunkMetadataSidecar {
     /// `0` when the field is absent in older sidecars.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub noise_lines_dropped: usize,
+}
+
+pub const CARD_SCHEMA_VERSION: u32 = 2;
+pub const CARD_CLAIM_SCOPE_SESSION_CLOSE: &str = "session_close";
+pub const CARD_FRESHNESS_CONTRACT_HISTORICAL: &str = "historical";
+pub const CARD_VERIFICATION_STATE_NOT_VERIFIED_BY_AICX: &str = "not_verified_by_aicx";
+
+/// Canonical `kind` labels for [`CardSignal`] records. One label per
+/// `ChunkSignals` family plus `highlight`; consumers (validator, migration,
+/// display) must match against these constants, never re-derive the strings.
+pub const SIGNAL_KIND_SKILL: &str = "skill";
+pub const SIGNAL_KIND_TODO_OPEN: &str = "todo_open";
+pub const SIGNAL_KIND_TODO_DONE: &str = "todo_done";
+pub const SIGNAL_KIND_ULTRATHINK: &str = "ultrathink";
+pub const SIGNAL_KIND_INSIGHT: &str = "insight";
+pub const SIGNAL_KIND_PLAN_MODE: &str = "plan_mode";
+pub const SIGNAL_KIND_INTENT: &str = "intent";
+pub const SIGNAL_KIND_DECISION: &str = "decision";
+pub const SIGNAL_KIND_RESULT: &str = "result";
+pub const SIGNAL_KIND_OUTCOME: &str = "outcome";
+pub const SIGNAL_KIND_HIGHLIGHT: &str = "highlight";
+
+/// Extractor generation stamped on every [`CardSignal`] so future
+/// re-extraction passes can tell which heuristics produced a record.
+pub const SIGNAL_EXTRACTOR_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CardSource {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<(u64, u64)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CardSignal {
+    pub kind: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_span: Option<(u64, u64)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extractor_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -162,6 +238,42 @@ pub struct LearningUse {
     pub allowed: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forbidden: Vec<String>,
+}
+
+fn default_card_schema_version() -> u32 {
+    1
+}
+
+fn is_default_card_schema_version(value: &u32) -> bool {
+    *value == default_card_schema_version()
+}
+
+fn deserialize_card_schema_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SchemaVersionWire {
+        Number(u32),
+        String(String),
+    }
+
+    match SchemaVersionWire::deserialize(deserializer)? {
+        SchemaVersionWire::Number(version) => Ok(version),
+        SchemaVersionWire::String(version) => parse_schema_version_string(&version)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid schema_version {version:?}"))),
+    }
+}
+
+fn parse_schema_version_string(value: &str) -> Option<u32> {
+    if let Ok(version) = value.parse::<u32>() {
+        return Some(version);
+    }
+
+    ["card.v", "context_corpus.v", "v"]
+        .iter()
+        .find_map(|prefix| value.strip_prefix(prefix)?.parse::<u32>().ok())
 }
 
 fn is_zero_usize(value: &usize) -> bool {
@@ -192,10 +304,19 @@ impl From<&Chunk> for ChunkMetadataSidecar {
             mode: chunk.mode.clone(),
             skill_code: chunk.skill_code.clone(),
             framework_version: chunk.framework_version.clone(),
+            source_file: chunk.source_file.clone(),
+            source_format: chunk.source_format.clone(),
+            import_id: chunk.import_id.clone(),
+            schema_version: CARD_SCHEMA_VERSION,
+            migrated_from_schema: None,
+            source: chunk.source.clone(),
+            claim_scope: Some(CARD_CLAIM_SCOPE_SESSION_CLOSE.to_string()),
+            freshness_contract: Some(CARD_FRESHNESS_CONTRACT_HISTORICAL.to_string()),
+            verification_state: Some(CARD_VERIFICATION_STATE_NOT_VERIFIED_BY_AICX.to_string()),
+            signals: (!chunk.signals.is_empty()).then(|| chunk.signals.clone()),
             intent_entries: Vec::new(),
             tags: Vec::new(),
             artifact_family: None,
-            schema_version: None,
             truth_status: None,
             learning_use: None,
             keywords: None,
@@ -384,6 +505,9 @@ fn apply_frontmatter(chunk: &mut Chunk, frontmatter: &crate::frontmatter::Report
     chunk.mode = frontmatter.steering.mode.clone();
     chunk.skill_code = frontmatter.steering.skill_code.clone();
     chunk.framework_version = frontmatter.steering.framework_version.clone();
+    chunk.source_file = frontmatter.telemetry.source_file.clone();
+    chunk.source_format = frontmatter.telemetry.source_format.clone();
+    chunk.import_id = frontmatter.telemetry.import_id.clone();
 }
 
 fn split_day_entries_by_frame_kind<'a>(
@@ -427,6 +551,48 @@ fn timestamp_source_for_window(entries: &[&TimelineEntry]) -> Option<String> {
         source = "mixed".to_string();
     }
     Some(source)
+}
+
+fn source_for_window(entries: &[&TimelineEntry]) -> Option<CardSource> {
+    let mut sourced_entries = entries.iter().filter_map(|entry| {
+        entry
+            .source_path
+            .as_ref()
+            .map(|path| (*entry, path.as_str()))
+    });
+    let (first_entry, first_path) = sourced_entries.next()?;
+    if sourced_entries.any(|(_, path)| path != first_path) {
+        return None;
+    }
+
+    let sha256 = entries
+        .iter()
+        .filter(|entry| entry.source_path.as_deref() == Some(first_path))
+        .filter_map(|entry| entry.source_sha256.as_deref())
+        .try_fold(None, |known: Option<&str>, sha| match known {
+            Some(existing) if existing != sha => None,
+            Some(existing) => Some(Some(existing)),
+            None => Some(Some(sha)),
+        })
+        .flatten()
+        .map(ToOwned::to_owned);
+
+    let span = entries
+        .iter()
+        .filter(|entry| entry.source_path.as_deref() == Some(first_path))
+        .filter_map(|entry| entry.source_line_span)
+        .fold(None, |acc: Option<(u64, u64)>, (start, end)| {
+            Some(match acc {
+                Some((known_start, known_end)) => (known_start.min(start), known_end.max(end)),
+                None => (start, end),
+            })
+        });
+
+    Some(CardSource {
+        path: first_entry.source_path.clone().unwrap_or_default(),
+        sha256,
+        span,
+    })
 }
 
 // ============================================================================
@@ -530,17 +696,11 @@ fn chunk_day_entries(
         let window: Vec<&TimelineEntry> = sanitized_owned.iter().collect();
         let highlights = extract_highlights(&window);
         let signals = extract_signals(&window);
+        let records = signal_records(&signals, &highlights);
         let frame_kind = frame_kind_for_window(&window);
         let timestamp_source = timestamp_source_for_window(&window);
-        let text = format_chunk_text_inner(
-            &window,
-            project,
-            agent,
-            date,
-            frame_kind,
-            &signals,
-            &highlights,
-        );
+        let source = source_for_window(&window);
+        let text = format_chunk_text_inner(&window, project, agent, date, frame_kind, &records);
         let token_estimate = estimate_tokens(&text);
 
         let session_id = window
@@ -576,10 +736,15 @@ fn chunk_day_entries(
             mode: None,
             skill_code: None,
             framework_version: None,
+            source_file: None,
+            source_format: None,
+            import_id: None,
+            source,
             msg_range: (global_start, global_end),
             text,
             token_estimate,
-            highlights,
+            highlights: highlights.iter().map(|item| item.text.clone()).collect(),
+            signals: records,
             noise_lines_dropped,
         });
 
@@ -617,6 +782,7 @@ pub fn format_chunk_text(
     let entries: Vec<&TimelineEntry> = sanitized_owned.iter().collect();
     let highlights = extract_highlights(&entries);
     let signals = extract_signals(&entries);
+    let records = signal_records(&signals, &highlights);
     let project = canonical_project_label(project);
     format_chunk_text_inner(
         &entries,
@@ -624,8 +790,7 @@ pub fn format_chunk_text(
         agent,
         date,
         frame_kind_for_window(&entries),
-        &signals,
-        &highlights,
+        &records,
     )
 }
 
@@ -674,22 +839,15 @@ fn format_chunk_text_inner(
     agent: &str,
     date: &str,
     frame_kind: Option<FrameKind>,
-    signals: &ChunkSignals,
-    highlights: &[String],
+    signal_records: &[CardSignal],
 ) -> String {
-    let mut text = if let Some(frame_kind) = frame_kind {
-        format!(
-            "[project: {} | agent: {} | date: {} | frame_kind: {}]\n\n",
-            project, agent, date, frame_kind
-        )
-    } else {
-        format!(
-            "[project: {} | agent: {} | date: {}]\n\n",
-            project, agent, date
-        )
-    };
+    let mut text = format!("---\nproject: {project}\nagent: {agent}\ndate: {date}\n");
+    if let Some(frame_kind) = frame_kind {
+        text.push_str(&format!("frame_kind: {frame_kind}\n"));
+    }
+    text.push_str("schema: card.v2\n---\n\n");
 
-    if let Some(block) = format_signals_block(signals, highlights) {
+    if let Some(block) = format_signals_block(signal_records) {
         text.push_str(&block);
         text.push('\n');
     }
@@ -726,8 +884,8 @@ const HIGHLIGHT_KEYWORDS: &[&str] = &[
 
 const HIGHLIGHT_KEYWORDS_CASE_SENSITIVE: &[&str] = &["WAŻNE", "KEY"];
 
-fn extract_highlights(entries: &[&TimelineEntry]) -> Vec<String> {
-    let mut highlights = Vec::new();
+fn extract_highlights(entries: &[&TimelineEntry]) -> Vec<SignalItem> {
+    let mut highlights: Vec<SignalItem> = Vec::new();
     for entry in entries {
         if highlights.len() >= 3 {
             break;
@@ -737,9 +895,9 @@ fn extract_highlights(entries: &[&TimelineEntry]) -> Vec<String> {
         }
 
         if let Some(line) = entry.message.lines().map(str::trim).find(|l| !l.is_empty())
-            && highlights.last().map(String::as_str) != Some(line)
+            && highlights.last().map(|item| item.text.as_str()) != Some(line)
         {
-            highlights.push(line.to_string());
+            highlights.push(SignalItem::new(line.to_string(), entry.source_line_span));
         }
     }
     highlights
@@ -757,18 +915,65 @@ fn is_highlight_message(message: &str) -> bool {
 // Signals (intent + checklists)
 // ============================================================================
 
+/// One extracted signal line/block plus the raw-source line span of the
+/// timeline entry it came from (when the provider reported one). The span is
+/// entry-granular — the extractor does not track per-line offsets, so it
+/// never invents anything finer.
+#[derive(Debug, Clone, Default)]
+struct SignalItem {
+    text: String,
+    line_span: Option<(u64, u64)>,
+}
+
+impl SignalItem {
+    fn new(text: String, line_span: Option<(u64, u64)>) -> Self {
+        Self { text, line_span }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct ChunkSignals {
-    todo_open: Vec<String>,
-    todo_done: Vec<String>,
-    ultrathink: Vec<String>,
-    insights: Vec<String>,
-    plan_mode: Vec<String>,
-    intents: Vec<String>,
-    results: Vec<String>,
-    skills: Vec<String>,
-    decisions: Vec<String>,
-    outcomes: Vec<String>,
+    todo_open: Vec<SignalItem>,
+    todo_done: Vec<SignalItem>,
+    ultrathink: Vec<SignalItem>,
+    insights: Vec<SignalItem>,
+    plan_mode: Vec<SignalItem>,
+    intents: Vec<SignalItem>,
+    results: Vec<SignalItem>,
+    skills: Vec<SignalItem>,
+    decisions: Vec<SignalItem>,
+    outcomes: Vec<SignalItem>,
+}
+
+/// Flatten extracted signal families into typed [`CardSignal`] records, in
+/// the same family order the `[signals]` block renders them. Every record is
+/// stamped with [`SIGNAL_EXTRACTOR_VERSION`] so later re-extraction can tell
+/// generations apart.
+fn signal_records(signals: &ChunkSignals, highlights: &[SignalItem]) -> Vec<CardSignal> {
+    fn push_family(out: &mut Vec<CardSignal>, kind: &str, items: &[SignalItem]) {
+        for item in items {
+            out.push(CardSignal {
+                kind: kind.to_string(),
+                text: item.text.clone(),
+                line_span: item.line_span,
+                extractor_version: Some(SIGNAL_EXTRACTOR_VERSION.to_string()),
+            });
+        }
+    }
+
+    let mut out = Vec::new();
+    push_family(&mut out, SIGNAL_KIND_SKILL, &signals.skills);
+    push_family(&mut out, SIGNAL_KIND_TODO_OPEN, &signals.todo_open);
+    push_family(&mut out, SIGNAL_KIND_TODO_DONE, &signals.todo_done);
+    push_family(&mut out, SIGNAL_KIND_ULTRATHINK, &signals.ultrathink);
+    push_family(&mut out, SIGNAL_KIND_INSIGHT, &signals.insights);
+    push_family(&mut out, SIGNAL_KIND_PLAN_MODE, &signals.plan_mode);
+    push_family(&mut out, SIGNAL_KIND_INTENT, &signals.intents);
+    push_family(&mut out, SIGNAL_KIND_DECISION, &signals.decisions);
+    push_family(&mut out, SIGNAL_KIND_RESULT, &signals.results);
+    push_family(&mut out, SIGNAL_KIND_OUTCOME, &signals.outcomes);
+    push_family(&mut out, SIGNAL_KIND_HIGHLIGHT, highlights);
+    out
 }
 
 const MAX_TODO_ITEMS: usize = 8;
@@ -799,6 +1004,12 @@ pub const INTENT_KEYWORDS: &[&str] = &[
     "chciałbym",
     "potrzebuje",
     "potrzebuję",
+    "prosze",
+    "proszę",
+    "odpal",
+    "uruchom",
+    "usun",
+    "usuń",
     "następny krok",
     "nastepny krok",
     "kolejny krok",
@@ -848,7 +1059,7 @@ fn extract_signals(entries: &[&TimelineEntry]) -> ChunkSignals {
     }
 }
 
-fn extract_checklist_items(entries: &[&TimelineEntry]) -> (Vec<String>, Vec<String>) {
+fn extract_checklist_items(entries: &[&TimelineEntry]) -> (Vec<SignalItem>, Vec<SignalItem>) {
     #[derive(Debug, Clone, Copy)]
     enum TaskState {
         Open,
@@ -857,6 +1068,9 @@ fn extract_checklist_items(entries: &[&TimelineEntry]) -> (Vec<String>, Vec<Stri
 
     let mut state_by_key: HashMap<String, TaskState> = HashMap::new();
     let mut display_by_key: HashMap<String, String> = HashMap::new();
+    // Provenance of the first sighting; the displayed task text comes from
+    // there too, so the span matches what the record actually shows.
+    let mut span_by_key: HashMap<String, Option<(u64, u64)>> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
 
     for entry in entries {
@@ -877,6 +1091,7 @@ fn extract_checklist_items(entries: &[&TimelineEntry]) -> (Vec<String>, Vec<Stri
                 if !state_by_key.contains_key(&key) {
                     order.push(key.clone());
                     display_by_key.insert(key.clone(), task);
+                    span_by_key.insert(key.clone(), entry.source_line_span);
                     state_by_key.insert(key.clone(), TaskState::Open);
                 }
 
@@ -894,9 +1109,10 @@ fn extract_checklist_items(entries: &[&TimelineEntry]) -> (Vec<String>, Vec<Stri
         let Some(task) = display_by_key.get(&key) else {
             continue;
         };
+        let span = span_by_key.get(&key).copied().flatten();
         match state_by_key.get(&key) {
-            Some(TaskState::Done) => done.push(task.clone()),
-            Some(TaskState::Open) => open.push(task.clone()),
+            Some(TaskState::Done) => done.push(SignalItem::new(task.clone(), span)),
+            Some(TaskState::Open) => open.push(SignalItem::new(task.clone(), span)),
             None => {}
         }
     }
@@ -929,7 +1145,7 @@ pub fn parse_checklist_task(line: &str) -> Option<(bool, String)> {
     }
 }
 
-fn extract_intent_lines(entries: &[&TimelineEntry]) -> Vec<String> {
+fn extract_intent_lines(entries: &[&TimelineEntry]) -> Vec<SignalItem> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
 
@@ -937,11 +1153,17 @@ fn extract_intent_lines(entries: &[&TimelineEntry]) -> Vec<String> {
         if entry.role.to_lowercase() != "user" {
             continue;
         }
+        if is_local_command_artifact_entry(entry) {
+            continue;
+        }
         for line in entry.message.lines().map(str::trim) {
             if line.is_empty() {
                 continue;
             }
             if is_source_metadata_line(line) {
+                continue;
+            }
+            if is_local_command_artifact_line(line) {
                 continue;
             }
             if !is_intent_line(line) {
@@ -953,7 +1175,10 @@ fn extract_intent_lines(entries: &[&TimelineEntry]) -> Vec<String> {
                 continue;
             }
 
-            out.push(truncate_signal_line(line));
+            out.push(SignalItem::new(
+                truncate_signal_line(line),
+                entry.source_line_span,
+            ));
             if out.len() >= MAX_INTENT_LINES {
                 return out;
             }
@@ -961,6 +1186,56 @@ fn extract_intent_lines(entries: &[&TimelineEntry]) -> Vec<String> {
     }
 
     out
+}
+
+fn is_local_command_artifact_entry(entry: &TimelineEntry) -> bool {
+    entry
+        .message
+        .lines()
+        .take(3)
+        .any(is_local_command_artifact_line)
+}
+
+pub fn is_local_command_artifact_line(line: &str) -> bool {
+    let trimmed = strip_signal_bullet(line).trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("<local-command-caveat")
+        || lower.starts_with("</local-command-caveat")
+        || lower.starts_with("<bash-stdout")
+        || lower.starts_with("</bash-stdout")
+        || lower.starts_with("<bash-stderr")
+        || lower.starts_with("</bash-stderr")
+    {
+        return true;
+    }
+
+    let shell_line = trimmed.trim_start_matches(['*', '>', '<']).trim_start();
+    let shell_lower = shell_line.to_ascii_lowercase();
+    shell_lower.starts_with("issuer:")
+        || shell_lower.starts_with("subject:")
+        || shell_lower.starts_with("subjectaltname:")
+        || shell_lower.starts_with("ssl certificate")
+        || shell_lower.starts_with("alpn:")
+        || shell_lower.starts_with("http/")
+        || shell_lower.starts_with("server:")
+        || shell_lower.starts_with("content-type:")
+        || shell_lower.starts_with("x-ratelimit-")
+        || shell_lower.starts_with("x-request-id:")
+        || shell_lower.starts_with("strict-transport-security:")
+        || shell_lower.starts_with("content-security-policy:")
+        || shell_lower.starts_with("referrer-policy:")
+        || shell_lower.starts_with("permissions-policy:")
+}
+
+fn strip_signal_bullet(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        return rest.trim_start();
+    }
+    if let Some(rest) = trimmed.strip_prefix("* ") {
+        return rest.trim_start();
+    }
+    trimmed
 }
 
 pub(crate) fn is_intent_line(line: &str) -> bool {
@@ -993,12 +1268,19 @@ fn is_source_metadata_line(line: &str) -> bool {
         "project:",
         "author:",
         "heading:",
+        "input:",
+        "output:",
+        "\"output\":",
+        "current topic:",
+        "topic summary:",
+        "successfully created and wrote to new file:",
+        "base directory for this skill:",
     ]
     .iter()
     .any(|prefix| lower.starts_with(prefix))
 }
 
-fn extract_result_lines(entries: &[&TimelineEntry]) -> Vec<String> {
+fn extract_result_lines(entries: &[&TimelineEntry]) -> Vec<SignalItem> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
 
@@ -1014,7 +1296,10 @@ fn extract_result_lines(entries: &[&TimelineEntry]) -> Vec<String> {
             if !seen.insert(key) {
                 continue;
             }
-            out.push(truncate_signal_line(line));
+            out.push(SignalItem::new(
+                truncate_signal_line(line),
+                entry.source_line_span,
+            ));
             if out.len() >= MAX_RESULT_LINES {
                 return out;
             }
@@ -1120,7 +1405,7 @@ fn extract_tag_blocks(
     entries: &[&TimelineEntry],
     is_tag: fn(&str) -> bool,
     max_blocks: usize,
-) -> Vec<String> {
+) -> Vec<SignalItem> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
 
@@ -1155,7 +1440,10 @@ fn extract_tag_blocks(
                 continue;
             }
 
-            out.push(truncate_signal_line(&joined));
+            out.push(SignalItem::new(
+                truncate_signal_line(&joined),
+                entry.source_line_span,
+            ));
             if out.len() >= max_blocks {
                 return out;
             }
@@ -1165,120 +1453,134 @@ fn extract_tag_blocks(
     out
 }
 
-fn format_signals_block(signals: &ChunkSignals, highlights: &[String]) -> Option<String> {
-    let has_any = !signals.todo_open.is_empty()
-        || !signals.todo_done.is_empty()
-        || !signals.ultrathink.is_empty()
-        || !signals.insights.is_empty()
-        || !signals.plan_mode.is_empty()
-        || !signals.intents.is_empty()
-        || !signals.results.is_empty()
-        || !signals.skills.is_empty()
-        || !signals.decisions.is_empty()
-        || !signals.outcomes.is_empty()
-        || !highlights.is_empty();
-    if !has_any {
+/// Render the `[signals]` block as a deterministic projection of typed
+/// [`CardSignal`] records. The records are the primary artifact (persisted in
+/// the sidecar); this text form exists for humans and the intents pipeline
+/// that still parses cards from text. Display caps (`MAX_TODO_ITEMS`) apply
+/// here only — the record set always carries the full extraction.
+fn format_signals_block(records: &[CardSignal]) -> Option<String> {
+    if records.is_empty() {
         return None;
     }
+
+    let texts_of = |kind: &str| -> Vec<&str> {
+        records
+            .iter()
+            .filter(|record| record.kind == kind)
+            .map(|record| record.text.as_str())
+            .collect()
+    };
+
+    let skills = texts_of(SIGNAL_KIND_SKILL);
+    let todo_open = texts_of(SIGNAL_KIND_TODO_OPEN);
+    let todo_done = texts_of(SIGNAL_KIND_TODO_DONE);
+    let ultrathink = texts_of(SIGNAL_KIND_ULTRATHINK);
+    let insights = texts_of(SIGNAL_KIND_INSIGHT);
+    let plan_mode = texts_of(SIGNAL_KIND_PLAN_MODE);
+    let intents = texts_of(SIGNAL_KIND_INTENT);
+    let decisions = texts_of(SIGNAL_KIND_DECISION);
+    let results = texts_of(SIGNAL_KIND_RESULT);
+    let outcomes = texts_of(SIGNAL_KIND_OUTCOME);
+    let highlights = texts_of(SIGNAL_KIND_HIGHLIGHT);
 
     let mut out = String::new();
     out.push_str("[signals]\n");
 
-    if !signals.skills.is_empty() {
+    if !skills.is_empty() {
         out.push_str("=== SKILL ENTER ===\n");
-        for line in &signals.skills {
+        for line in &skills {
             out.push_str(&format!("{}\n", line));
         }
         out.push_str("===================\n");
     }
 
-    if !signals.todo_open.is_empty() || !signals.todo_done.is_empty() {
-        if !signals.todo_open.is_empty() {
+    if !todo_open.is_empty() || !todo_done.is_empty() {
+        if !todo_open.is_empty() {
             out.push_str(&format!(
                 "RED LIGHT: checklist detected (open: {}, done: {})\n",
-                signals.todo_open.len(),
-                signals.todo_done.len()
+                todo_open.len(),
+                todo_done.len()
             ));
         } else {
             out.push_str(&format!(
                 "Checklist detected (open: 0, done: {})\n",
-                signals.todo_done.len()
+                todo_done.len()
             ));
         }
 
-        for task in signals.todo_open.iter().take(MAX_TODO_ITEMS) {
+        for task in todo_open.iter().take(MAX_TODO_ITEMS) {
             out.push_str(&format!("- [ ] {}\n", task));
         }
-        if signals.todo_open.len() > MAX_TODO_ITEMS {
+        if todo_open.len() > MAX_TODO_ITEMS {
             out.push_str(&format!(
                 "... (+{} more open)\n",
-                signals.todo_open.len() - MAX_TODO_ITEMS
+                todo_open.len() - MAX_TODO_ITEMS
             ));
         }
 
-        for task in signals.todo_done.iter().take(MAX_TODO_ITEMS) {
+        for task in todo_done.iter().take(MAX_TODO_ITEMS) {
             out.push_str(&format!("- [x] {}\n", task));
         }
-        if signals.todo_done.len() > MAX_TODO_ITEMS {
+        if todo_done.len() > MAX_TODO_ITEMS {
             out.push_str(&format!(
                 "... (+{} more done)\n",
-                signals.todo_done.len() - MAX_TODO_ITEMS
+                todo_done.len() - MAX_TODO_ITEMS
             ));
         }
     }
 
-    if !signals.ultrathink.is_empty() {
+    if !ultrathink.is_empty() {
         out.push_str("Ultrathink:\n");
-        for line in &signals.ultrathink {
+        for line in &ultrathink {
             out.push_str(&format!("- {}\n", line));
         }
     }
 
-    if !signals.insights.is_empty() {
+    if !insights.is_empty() {
         out.push_str("Insight:\n");
-        for line in &signals.insights {
+        for line in &insights {
             out.push_str(&format!("- {}\n", line));
         }
     }
 
-    if !signals.plan_mode.is_empty() {
+    if !plan_mode.is_empty() {
         out.push_str("Plan mode:\n");
-        for line in &signals.plan_mode {
+        for line in &plan_mode {
             out.push_str(&format!("- {}\n", line));
         }
     }
 
-    if !signals.intents.is_empty() {
+    if !intents.is_empty() {
         out.push_str("Intent:\n");
-        for line in &signals.intents {
+        for line in &intents {
             out.push_str(&format!("- {}\n", line));
         }
     }
 
-    if !signals.decisions.is_empty() {
+    if !decisions.is_empty() {
         out.push_str("Decision:\n");
-        for line in &signals.decisions {
+        for line in &decisions {
             out.push_str(&format!("- {}\n", line));
         }
     }
 
-    if !signals.results.is_empty() {
+    if !results.is_empty() {
         out.push_str("Results:\n");
-        for line in &signals.results {
+        for line in &results {
             out.push_str(&format!("- {}\n", line));
         }
     }
 
-    if !signals.outcomes.is_empty() {
+    if !outcomes.is_empty() {
         out.push_str("Outcome:\n");
-        for line in &signals.outcomes {
+        for line in &outcomes {
             out.push_str(&format!("- {}\n", line));
         }
     }
 
     if !highlights.is_empty() {
         out.push_str("Notes:\n");
-        for line in highlights {
+        for line in &highlights {
             out.push_str(&format!("- {}\n", truncate_signal_line(line)));
         }
     }
@@ -1367,7 +1669,60 @@ mod tests {
             branch: None,
             cwd: None,
             timestamp_source: None,
+            source_path: None,
+            source_sha256: None,
+            source_line_span: None,
         }
+    }
+
+    fn legacy_format_chunk_text_for_body_compare(
+        entries: &[&TimelineEntry],
+        project: &str,
+        agent: &str,
+        date: &str,
+        frame_kind: Option<FrameKind>,
+        signal_records: &[CardSignal],
+    ) -> String {
+        let mut text = if let Some(frame_kind) = frame_kind {
+            format!(
+                "[project: {} | agent: {} | date: {} | frame_kind: {}]\n\n",
+                project, agent, date, frame_kind
+            )
+        } else {
+            format!(
+                "[project: {} | agent: {} | date: {}]\n\n",
+                project, agent, date
+            )
+        };
+
+        if let Some(block) = format_signals_block(signal_records) {
+            text.push_str(&block);
+            text.push('\n');
+        }
+
+        for entry in entries {
+            if entry.message.is_empty() {
+                continue;
+            }
+            let time = entry.timestamp.format("%H:%M:%S");
+            let msg = if entry.message.len() > 4000 {
+                truncate_message_bytes(&entry.message, 4000)
+            } else {
+                entry.message.clone()
+            };
+            text.push_str(&format!("[{}] {}: {}\n", time, entry.role, msg));
+        }
+
+        text
+    }
+
+    fn body_after_card_header(text: &str) -> &str {
+        if let Some(rest) = text.strip_prefix("---\n")
+            && let Some((_, body)) = rest.split_once("\n---\n\n")
+        {
+            return body;
+        }
+        text.split_once("\n\n").map(|(_, body)| body).unwrap_or("")
     }
 
     #[test]
@@ -1460,6 +1815,9 @@ mod tests {
                 branch: None,
                 cwd: None,
                 timestamp_source: None,
+                source_path: None,
+                source_sha256: None,
+                source_line_span: None,
             },
             TimelineEntry {
                 timestamp: Utc.with_ymd_and_hms(2026, 1, 21, 10, 0, 0).unwrap(),
@@ -1471,6 +1829,9 @@ mod tests {
                 branch: None,
                 cwd: None,
                 timestamp_source: None,
+                source_path: None,
+                source_sha256: None,
+                source_line_span: None,
             },
         ];
 
@@ -1492,9 +1853,65 @@ mod tests {
 
         let text = format_chunk_text(&refs, "TestProj", "claude", "2026-01-22");
 
-        assert!(text.starts_with("[project: testproj | agent: claude | date: 2026-01-22]"));
+        assert!(text.starts_with(
+            "---\nproject: testproj\nagent: claude\ndate: 2026-01-22\nschema: card.v2\n---\n\n"
+        ));
         assert!(text.contains("[14:30:00] user: hello"));
         assert!(text.contains("[14:31:00] assistant: hi there"));
+    }
+
+    #[test]
+    fn test_format_chunk_text_emits_card_v2_frontmatter_with_frame_kind() {
+        let mut entry = make_entry(14, 30, "user", "hello");
+        entry.frame_kind = Some(FrameKind::UserMsg);
+        let entries = [entry];
+        let refs: Vec<&TimelineEntry> = entries.iter().collect();
+
+        let text = format_chunk_text(&refs, "Loctree/AICX", "claude", "2026-01-22");
+
+        assert!(text.starts_with("---\n"));
+        assert!(text.contains("project: loctree/aicx\n"));
+        assert!(text.contains("agent: claude\n"));
+        assert!(text.contains("date: 2026-01-22\n"));
+        assert!(text.contains("frame_kind: user_msg\n"));
+        assert!(text.contains("schema: card.v2\n---\n\n"));
+        assert!(!text.starts_with("[project:"));
+    }
+
+    #[test]
+    fn test_card_v2_body_bytes_match_legacy_writer_after_header() {
+        let mut entries = [
+            make_entry(14, 30, "user", "todo: keep the body stable"),
+            make_entry(14, 31, "assistant", "done"),
+        ];
+        entries[0].frame_kind = Some(FrameKind::UserMsg);
+        entries[1].frame_kind = Some(FrameKind::UserMsg);
+        let refs: Vec<&TimelineEntry> = entries.iter().collect();
+        let config = ChunkerConfig::default();
+        let (sanitized_owned, _dropped) = sanitize_window(&refs, &config);
+        let sanitized_refs: Vec<&TimelineEntry> = sanitized_owned.iter().collect();
+        let highlights = extract_highlights(&sanitized_refs);
+        let signals = extract_signals(&sanitized_refs);
+        let records = signal_records(&signals, &highlights);
+
+        let v2 = format_chunk_text_inner(
+            &sanitized_refs,
+            "proj",
+            "claude",
+            "2026-01-22",
+            Some(FrameKind::UserMsg),
+            &records,
+        );
+        let legacy = legacy_format_chunk_text_for_body_compare(
+            &sanitized_refs,
+            "proj",
+            "claude",
+            "2026-01-22",
+            Some(FrameKind::UserMsg),
+            &records,
+        );
+
+        assert_eq!(body_after_card_header(&v2), body_after_card_header(&legacy));
     }
 
     #[test]
@@ -1538,6 +1955,132 @@ mod tests {
         assert!(chunk.text.contains("## Report"));
         assert!(!chunk.text.contains("run_id: mrbl-001"));
         assert!(!chunk.text.contains("phase: implement"));
+    }
+
+    #[test]
+    fn test_chunk_entries_extracts_foreign_import_provenance() {
+        // Round II / oś 3+5 cut 1: foreign-import provenance carried structurally
+        // from frontmatter through Chunk to the sidecar (not left as body text).
+        let entries = vec![make_entry(
+            14,
+            30,
+            "user",
+            "---\nsource_file: Downloads/ChatGPT-export.md\nsource_format: chatgpt-markdown\nimport_id: blake3:abc123\nframe_kind: user_msg\n---\n## Prompt\nzbadaj temat",
+        )];
+
+        let chunks = chunk_entries(&entries, "proj", "operator", &ChunkerConfig::default());
+        assert_eq!(chunks.len(), 1);
+        let chunk = &chunks[0];
+
+        assert_eq!(
+            chunk.source_file.as_deref(),
+            Some("Downloads/ChatGPT-export.md")
+        );
+        assert_eq!(chunk.source_format.as_deref(), Some("chatgpt-markdown"));
+        assert_eq!(chunk.import_id.as_deref(), Some("blake3:abc123"));
+        // provenance is stripped from the chunk body (lives in metadata now)
+        assert!(!chunk.text.contains("import_id: blake3:abc123"));
+
+        // and it flows into the structural sidecar
+        let sidecar = ChunkMetadataSidecar::from(chunk);
+        assert_eq!(
+            sidecar.source_file.as_deref(),
+            Some("Downloads/ChatGPT-export.md")
+        );
+        assert_eq!(sidecar.source_format.as_deref(), Some("chatgpt-markdown"));
+        assert_eq!(sidecar.import_id.as_deref(), Some("blake3:abc123"));
+    }
+
+    #[test]
+    fn sidecar_from_chunk_defaults_to_card_v2_contract_fields() {
+        let mut chunks = chunk_entries(
+            &[make_entry(14, 30, "user", "hello")],
+            "Loctree/AICX",
+            "claude",
+            &ChunkerConfig::default(),
+        );
+        assert_eq!(chunks.len(), 1);
+        chunks[0].source = Some(CardSource {
+            path: "/tmp/raw.jsonl".to_string(),
+            sha256: Some("abc123".to_string()),
+            span: Some((7, 9)),
+        });
+
+        let sidecar = ChunkMetadataSidecar::from(&chunks[0]);
+
+        assert_eq!(sidecar.schema_version, CARD_SCHEMA_VERSION);
+        assert_eq!(
+            sidecar.claim_scope.as_deref(),
+            Some(CARD_CLAIM_SCOPE_SESSION_CLOSE)
+        );
+        assert_eq!(
+            sidecar.freshness_contract.as_deref(),
+            Some(CARD_FRESHNESS_CONTRACT_HISTORICAL)
+        );
+        assert_eq!(
+            sidecar.verification_state.as_deref(),
+            Some(CARD_VERIFICATION_STATE_NOT_VERIFIED_BY_AICX)
+        );
+        assert_eq!(
+            sidecar.source.as_ref().map(|source| source.path.as_str()),
+            Some("/tmp/raw.jsonl")
+        );
+        assert_eq!(
+            sidecar
+                .source
+                .as_ref()
+                .and_then(|source| source.sha256.as_deref()),
+            Some("abc123")
+        );
+        assert_eq!(
+            sidecar.source.as_ref().and_then(|source| source.span),
+            Some((7, 9))
+        );
+    }
+
+    #[test]
+    fn test_chunk_entries_lifts_homogeneous_source_pointer_with_span() {
+        let mut first = make_entry(14, 30, "user", "hello");
+        first.source_path = Some("/tmp/raw.jsonl".to_string());
+        first.source_sha256 = Some("abc123".to_string());
+        first.source_line_span = Some((3, 3));
+        let mut second = make_entry(14, 31, "assistant", "hi");
+        second.source_path = Some("/tmp/raw.jsonl".to_string());
+        second.source_sha256 = Some("abc123".to_string());
+        second.source_line_span = Some((4, 4));
+
+        let chunks = chunk_entries(
+            &[first, second],
+            "proj",
+            "claude",
+            &ChunkerConfig::default(),
+        );
+
+        assert_eq!(chunks.len(), 1);
+        let source = chunks[0].source.as_ref().expect("source is lifted");
+        assert_eq!(source.path, "/tmp/raw.jsonl");
+        assert_eq!(source.sha256.as_deref(), Some("abc123"));
+        assert_eq!(source.span, Some((3, 4)));
+    }
+
+    #[test]
+    fn test_chunk_entries_omits_source_pointer_for_mixed_raw_paths() {
+        let mut first = make_entry(14, 30, "user", "hello");
+        first.source_path = Some("/tmp/raw-a.jsonl".to_string());
+        first.source_sha256 = Some("aaa".to_string());
+        let mut second = make_entry(14, 31, "assistant", "hi");
+        second.source_path = Some("/tmp/raw-b.jsonl".to_string());
+        second.source_sha256 = Some("bbb".to_string());
+
+        let chunks = chunk_entries(
+            &[first, second],
+            "proj",
+            "claude",
+            &ChunkerConfig::default(),
+        );
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].source, None);
     }
 
     #[test]
@@ -1587,10 +2130,15 @@ mod tests {
                 mode: Some("session-first".to_string()),
                 skill_code: Some("vc-workflow".to_string()),
                 framework_version: Some("2026-03".to_string()),
+                source_file: None,
+                source_format: None,
+                import_id: None,
+                source: None,
                 msg_range: (0, 5),
                 text: "chunk one content".to_string(),
                 token_estimate: 4,
                 highlights: vec![],
+                signals: vec![],
                 noise_lines_dropped: 0,
             },
             Chunk {
@@ -1614,10 +2162,15 @@ mod tests {
                 mode: None,
                 skill_code: None,
                 framework_version: None,
+                source_file: None,
+                source_format: None,
+                import_id: None,
+                source: None,
                 msg_range: (3, 8),
                 text: "chunk two content".to_string(),
                 token_estimate: 4,
                 highlights: vec![],
+                signals: vec![],
                 noise_lines_dropped: 0,
             },
         ];
@@ -1662,7 +2215,11 @@ mod tests {
         assert_eq!(legacy.skill_code, None);
         assert_eq!(legacy.framework_version, None);
         assert_eq!(legacy.artifact_family, None);
-        assert_eq!(legacy.schema_version, None);
+        assert_eq!(legacy.schema_version, 1);
+        assert_eq!(legacy.source, None);
+        assert_eq!(legacy.claim_scope, None);
+        assert_eq!(legacy.freshness_contract, None);
+        assert_eq!(legacy.verification_state, None);
         assert_eq!(legacy.truth_status, None);
         assert_eq!(legacy.learning_use, None);
         assert_eq!(legacy.keywords, None);
@@ -1701,7 +2258,7 @@ mod tests {
             sidecar.artifact_family.as_deref(),
             Some("loct-context-pack")
         );
-        assert_eq!(sidecar.schema_version.as_deref(), Some("context_corpus.v1"));
+        assert_eq!(sidecar.schema_version, 1);
         assert_eq!(
             sidecar.truth_status.as_ref().map(|status| status.role),
             Some(TruthRole::Example)
@@ -1778,10 +2335,15 @@ mod tests {
                 mode: None,
                 skill_code: None,
                 framework_version: None,
+                source_file: None,
+                source_format: None,
+                import_id: None,
+                source: None,
                 msg_range: (0, 5),
                 text: "x".repeat(100),
                 token_estimate: 25,
                 highlights: vec![],
+                signals: vec![],
                 noise_lines_dropped: 0,
             },
             Chunk {
@@ -1805,10 +2367,15 @@ mod tests {
                 mode: None,
                 skill_code: None,
                 framework_version: None,
+                source_file: None,
+                source_format: None,
+                import_id: None,
+                source: None,
                 msg_range: (5, 10),
                 text: "y".repeat(200),
                 token_estimate: 50,
                 highlights: vec![],
+                signals: vec![],
                 noise_lines_dropped: 0,
             },
         ];
@@ -1830,8 +2397,9 @@ mod tests {
         let refs: Vec<&TimelineEntry> = entries.iter().collect();
 
         let highlights = extract_highlights(&refs);
+        let texts: Vec<&str> = highlights.iter().map(|item| item.text.as_str()).collect();
         assert_eq!(
-            highlights,
+            texts,
             vec![
                 "Decision: lock chunking heuristics",
                 "TODO: add summarization notes",
@@ -1868,6 +2436,29 @@ mod tests {
         assert!(text.contains("[/signals]"));
     }
 
+    #[test]
+    fn test_format_chunk_text_skips_local_command_artifact_intents() {
+        let entries = [
+            make_entry(
+                14,
+                31,
+                "user",
+                "<local-command-caveat>DO NOT respond to these messages</local-command-caveat>",
+            ),
+            make_entry(
+                14,
+                32,
+                "user",
+                "<bash-stdout>curl output\n* issuer: C=US; O=Let's Encrypt; CN=E7\n* SSL certificate verify ok.\n</bash-stdout>",
+            ),
+        ];
+        let refs: Vec<&TimelineEntry> = entries.iter().collect();
+
+        let text = format_chunk_text(&refs, "TestProj", "claude", "2026-01-22");
+
+        assert!(!text.contains("Intent:"));
+    }
+
     // ── Area E.8 + E.12 regression coverage ─────────────────────────────
 
     #[test]
@@ -1900,8 +2491,10 @@ mod tests {
         );
         let entries = vec![&entry];
         let (open, done) = extract_checklist_items(&entries);
-        assert_eq!(open, vec!["real task open".to_string()]);
-        assert_eq!(done, vec!["real task done".to_string()]);
+        let open_texts: Vec<&str> = open.iter().map(|item| item.text.as_str()).collect();
+        let done_texts: Vec<&str> = done.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(open_texts, vec!["real task open"]);
+        assert_eq!(done_texts, vec!["real task done"]);
     }
 
     #[test]
@@ -1910,6 +2503,377 @@ mod tests {
         let entry_b = make_entry(12, 1, "user", "- [ ] honest task");
         let entries = vec![&entry_a, &entry_b];
         let (open, _done) = extract_checklist_items(&entries);
-        assert_eq!(open, vec!["honest task".to_string()]);
+        let open_texts: Vec<&str> = open.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(open_texts, vec!["honest task"]);
+    }
+
+    // ── B1: typed CardSignal records + [signals] rendered from records ──
+
+    /// The exact `[signals]` families the pre-B1 renderer consumed, as plain
+    /// strings. Kept only for the golden comparison below.
+    struct LegacySignalFamilies {
+        todo_open: Vec<String>,
+        todo_done: Vec<String>,
+        ultrathink: Vec<String>,
+        insights: Vec<String>,
+        plan_mode: Vec<String>,
+        intents: Vec<String>,
+        results: Vec<String>,
+        skills: Vec<String>,
+        decisions: Vec<String>,
+        outcomes: Vec<String>,
+    }
+
+    /// Verbatim copy of the pre-B1 prose renderer (`format_signals_block`
+    /// before it became a function of `CardSignal` records). Golden reference:
+    /// the record-driven renderer must reproduce this byte-for-byte.
+    fn legacy_format_signals_block_pre_b1(
+        signals: &LegacySignalFamilies,
+        highlights: &[String],
+    ) -> Option<String> {
+        let has_any = !signals.todo_open.is_empty()
+            || !signals.todo_done.is_empty()
+            || !signals.ultrathink.is_empty()
+            || !signals.insights.is_empty()
+            || !signals.plan_mode.is_empty()
+            || !signals.intents.is_empty()
+            || !signals.results.is_empty()
+            || !signals.skills.is_empty()
+            || !signals.decisions.is_empty()
+            || !signals.outcomes.is_empty()
+            || !highlights.is_empty();
+        if !has_any {
+            return None;
+        }
+
+        let mut out = String::new();
+        out.push_str("[signals]\n");
+
+        if !signals.skills.is_empty() {
+            out.push_str("=== SKILL ENTER ===\n");
+            for line in &signals.skills {
+                out.push_str(&format!("{}\n", line));
+            }
+            out.push_str("===================\n");
+        }
+
+        if !signals.todo_open.is_empty() || !signals.todo_done.is_empty() {
+            if !signals.todo_open.is_empty() {
+                out.push_str(&format!(
+                    "RED LIGHT: checklist detected (open: {}, done: {})\n",
+                    signals.todo_open.len(),
+                    signals.todo_done.len()
+                ));
+            } else {
+                out.push_str(&format!(
+                    "Checklist detected (open: 0, done: {})\n",
+                    signals.todo_done.len()
+                ));
+            }
+
+            for task in signals.todo_open.iter().take(MAX_TODO_ITEMS) {
+                out.push_str(&format!("- [ ] {}\n", task));
+            }
+            if signals.todo_open.len() > MAX_TODO_ITEMS {
+                out.push_str(&format!(
+                    "... (+{} more open)\n",
+                    signals.todo_open.len() - MAX_TODO_ITEMS
+                ));
+            }
+
+            for task in signals.todo_done.iter().take(MAX_TODO_ITEMS) {
+                out.push_str(&format!("- [x] {}\n", task));
+            }
+            if signals.todo_done.len() > MAX_TODO_ITEMS {
+                out.push_str(&format!(
+                    "... (+{} more done)\n",
+                    signals.todo_done.len() - MAX_TODO_ITEMS
+                ));
+            }
+        }
+
+        if !signals.ultrathink.is_empty() {
+            out.push_str("Ultrathink:\n");
+            for line in &signals.ultrathink {
+                out.push_str(&format!("- {}\n", line));
+            }
+        }
+
+        if !signals.insights.is_empty() {
+            out.push_str("Insight:\n");
+            for line in &signals.insights {
+                out.push_str(&format!("- {}\n", line));
+            }
+        }
+
+        if !signals.plan_mode.is_empty() {
+            out.push_str("Plan mode:\n");
+            for line in &signals.plan_mode {
+                out.push_str(&format!("- {}\n", line));
+            }
+        }
+
+        if !signals.intents.is_empty() {
+            out.push_str("Intent:\n");
+            for line in &signals.intents {
+                out.push_str(&format!("- {}\n", line));
+            }
+        }
+
+        if !signals.decisions.is_empty() {
+            out.push_str("Decision:\n");
+            for line in &signals.decisions {
+                out.push_str(&format!("- {}\n", line));
+            }
+        }
+
+        if !signals.results.is_empty() {
+            out.push_str("Results:\n");
+            for line in &signals.results {
+                out.push_str(&format!("- {}\n", line));
+            }
+        }
+
+        if !signals.outcomes.is_empty() {
+            out.push_str("Outcome:\n");
+            for line in &signals.outcomes {
+                out.push_str(&format!("- {}\n", line));
+            }
+        }
+
+        if !highlights.is_empty() {
+            out.push_str("Notes:\n");
+            for line in highlights {
+                out.push_str(&format!("- {}\n", truncate_signal_line(line)));
+            }
+        }
+
+        out.push_str("[/signals]\n");
+        Some(out)
+    }
+
+    fn items(texts: &[String]) -> Vec<SignalItem> {
+        texts
+            .iter()
+            .map(|text| SignalItem::new(text.clone(), None))
+            .collect()
+    }
+
+    fn rich_legacy_families() -> (LegacySignalFamilies, Vec<String>) {
+        let legacy = LegacySignalFamilies {
+            todo_open: (1..=10).map(|i| format!("open task {i}")).collect(),
+            todo_done: (1..=9).map(|i| format!("closed item {i}")).collect(),
+            ultrathink: vec!["Ultrathink: deep dive into chunk windows".to_string()],
+            insights: vec!["★ Insight ─ records are the primary artifact".to_string()],
+            plan_mode: vec![
+                "Plan mode: enabled".to_string(),
+                "User accepted the plan".to_string(),
+            ],
+            intents: vec!["mam pomysł, żeby serializować sygnały".to_string()],
+            results: vec!["all checks passed".to_string()],
+            skills: vec!["[SKILL_ENTER] vc-implement".to_string()],
+            decisions: vec!["Decision: render prose from records".to_string()],
+            outcomes: vec!["Outcome: sidecar carries signals[]".to_string()],
+        };
+        let highlights = vec![
+            "Decision: lock chunking heuristics".to_string(),
+            // Longer than truncate_signal_line's 240-byte cap so the golden
+            // comparison also covers render-time truncation of Notes.
+            "K".repeat(500),
+        ];
+        (legacy, highlights)
+    }
+
+    fn records_from_legacy(
+        legacy: &LegacySignalFamilies,
+        highlights: &[String],
+    ) -> Vec<CardSignal> {
+        let signals = ChunkSignals {
+            todo_open: items(&legacy.todo_open),
+            todo_done: items(&legacy.todo_done),
+            ultrathink: items(&legacy.ultrathink),
+            insights: items(&legacy.insights),
+            plan_mode: items(&legacy.plan_mode),
+            intents: items(&legacy.intents),
+            results: items(&legacy.results),
+            skills: items(&legacy.skills),
+            decisions: items(&legacy.decisions),
+            outcomes: items(&legacy.outcomes),
+        };
+        signal_records(&signals, &items(highlights))
+    }
+
+    #[test]
+    fn golden_signals_block_from_records_matches_pre_b1_prose_byte_for_byte() {
+        let (legacy, highlights) = rich_legacy_families();
+        let expected = legacy_format_signals_block_pre_b1(&legacy, &highlights)
+            .expect("legacy renderer emits a block");
+
+        let rendered = format_signals_block(&records_from_legacy(&legacy, &highlights))
+            .expect("record renderer emits a block");
+
+        assert_eq!(rendered, expected);
+        // Overflow caps must survive the record indirection.
+        assert!(rendered.contains("RED LIGHT: checklist detected (open: 10, done: 9)"));
+        assert!(rendered.contains("... (+2 more open)"));
+        assert!(rendered.contains("... (+1 more done)"));
+        assert!(rendered.contains("...[truncated]"));
+    }
+
+    #[test]
+    fn signal_records_keep_all_todo_items_beyond_render_cap() {
+        let (legacy, highlights) = rich_legacy_families();
+        let records = records_from_legacy(&legacy, &highlights);
+
+        let open_count = records
+            .iter()
+            .filter(|record| record.kind == SIGNAL_KIND_TODO_OPEN)
+            .count();
+        assert_eq!(open_count, 10, "records carry the FULL open-task list");
+
+        let rendered = format_signals_block(&records).unwrap();
+        let rendered_open = rendered.matches("- [ ] ").count();
+        assert_eq!(rendered_open, MAX_TODO_ITEMS, "render caps display only");
+    }
+
+    #[test]
+    fn sidecar_signals_carry_typed_records_per_family() {
+        let entries = vec![make_entry(
+            14,
+            30,
+            "user",
+            "mam pomysł, żeby to zrobić\n\nDecision: keep records primary\n\nOutcome: sidecar carries signals\n\n- [ ] open task\n- [x] closed item",
+        )];
+
+        let chunks = chunk_entries(&entries, "proj", "claude", &ChunkerConfig::default());
+        assert_eq!(chunks.len(), 1);
+        let sidecar = ChunkMetadataSidecar::from(&chunks[0]);
+        let records = sidecar.signals.expect("sidecar persists signal records");
+
+        let texts_of = |kind: &str| -> Vec<&str> {
+            records
+                .iter()
+                .filter(|record| record.kind == kind)
+                .map(|record| record.text.as_str())
+                .collect()
+        };
+
+        assert_eq!(texts_of(SIGNAL_KIND_TODO_OPEN), vec!["open task"]);
+        assert_eq!(texts_of(SIGNAL_KIND_TODO_DONE), vec!["closed item"]);
+        assert_eq!(
+            texts_of(SIGNAL_KIND_INTENT),
+            vec!["mam pomysł, żeby to zrobić"]
+        );
+        assert_eq!(
+            texts_of(SIGNAL_KIND_DECISION),
+            vec!["Decision: keep records primary"]
+        );
+        assert_eq!(
+            texts_of(SIGNAL_KIND_OUTCOME),
+            vec!["Outcome: sidecar carries signals"]
+        );
+        assert_eq!(
+            texts_of(SIGNAL_KIND_HIGHLIGHT),
+            vec!["mam pomysł, żeby to zrobić"]
+        );
+
+        // The rendered block and the records must agree: render(records) is
+        // exactly the [signals] section embedded in the chunk text.
+        let block = format_signals_block(&records).expect("block renders");
+        assert!(chunks[0].text.contains(&block));
+    }
+
+    #[test]
+    fn signal_records_carry_entry_line_span_only_when_known() {
+        let mut with_span = make_entry(14, 30, "user", "Decision: span provenance");
+        with_span.source_line_span = Some((12, 14));
+        let without_span = make_entry(14, 31, "user", "mam pomysł na kolejny krok");
+
+        let chunks = chunk_entries(
+            &[with_span, without_span],
+            "proj",
+            "claude",
+            &ChunkerConfig::default(),
+        );
+        assert_eq!(chunks.len(), 1);
+        let records = &chunks[0].signals;
+
+        let decision = records
+            .iter()
+            .find(|record| record.kind == SIGNAL_KIND_DECISION)
+            .expect("decision extracted");
+        assert_eq!(decision.line_span, Some((12, 14)));
+
+        let intent = records
+            .iter()
+            .find(|record| record.kind == SIGNAL_KIND_INTENT)
+            .expect("intent extracted");
+        assert_eq!(intent.line_span, None, "no source span → no fake values");
+    }
+
+    #[test]
+    fn signal_records_stamp_extractor_version_with_crate_version() {
+        let entries = vec![make_entry(
+            14,
+            30,
+            "user",
+            "Decision: stamp generations\n\n- [ ] open task",
+        )];
+        let chunks = chunk_entries(&entries, "proj", "claude", &ChunkerConfig::default());
+        let records = &chunks[0].signals;
+
+        assert!(!records.is_empty());
+        assert!(records.iter().all(|record| {
+            record.extractor_version.as_deref() == Some(env!("CARGO_PKG_VERSION"))
+        }));
+        assert_eq!(SIGNAL_EXTRACTOR_VERSION, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn sidecar_omits_signals_field_for_signal_free_chunk() {
+        let chunks = chunk_entries(
+            &[make_entry(14, 30, "user", "hello there")],
+            "proj",
+            "claude",
+            &ChunkerConfig::default(),
+        );
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].signals.is_empty());
+        assert!(!chunks[0].text.contains("[signals]"));
+
+        let sidecar = ChunkMetadataSidecar::from(&chunks[0]);
+        assert_eq!(sidecar.signals, None);
+        let json = serde_json::to_value(&sidecar).unwrap();
+        assert!(
+            json.get("signals").is_none(),
+            "empty signals must not serialize"
+        );
+    }
+
+    #[test]
+    fn write_chunks_to_dir_round_trips_signal_records_through_sidecar_file() {
+        let tmp = std::env::temp_dir().join("aicx-chunker-b1-signals-roundtrip");
+        let _ = fs::remove_dir_all(&tmp);
+
+        let entries = vec![make_entry(
+            14,
+            30,
+            "user",
+            "Decision: persist typed signals\n\n- [ ] wire sidecar\n- [x] type the records",
+        )];
+        let chunks = chunk_entries(&entries, "proj", "claude", &ChunkerConfig::default());
+        assert_eq!(chunks.len(), 1);
+        assert!(!chunks[0].signals.is_empty());
+
+        write_chunks_to_dir(&chunks, &tmp).unwrap();
+        let raw = fs::read_to_string(tmp.join(format!("{}.meta.json", chunks[0].id))).unwrap();
+        let sidecar: ChunkMetadataSidecar = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(
+            sidecar.signals.as_deref(),
+            Some(chunks[0].signals.as_slice())
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
