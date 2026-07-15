@@ -1466,10 +1466,13 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::store::write_canonical_projection_at;
+    #[cfg(unix)]
     use aicx_parser::engine::{
         AgentKind, BoundaryFlags, ParseStatus, TurnKind, VisibleCompleteness,
     };
+    #[cfg(unix)]
     use aicx_parser::projections::{
         CANONICAL_CARD_SCHEMA, CanonicalProjection, ProjectAttribution, ProjectBucket,
         TimelineFrame,
