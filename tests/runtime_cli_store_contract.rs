@@ -1380,6 +1380,59 @@ fn session_batch_quarantines_bad_claude_source_and_holds_watermark() {
 }
 
 #[test]
+fn session_batch_drops_duplicate_physical_source_and_counts_it() {
+    let root = unique_test_dir("claude-batch-duplicate-source");
+    let home = root.join("home");
+    let sessions = home.join(".claude").join("projects").join("project");
+    let fresh = sessions.join("33333333-3333-4333-8333-333333333333.jsonl");
+    let stale = sessions.join("44444444-4444-4444-8444-444444444444.jsonl");
+    // Same logical session discovered through two physical paths (e.g. a live
+    // rollout plus an archived copy). Different bodies on purpose: without the
+    // per-batch guard BOTH would project and the manifest would carry two card
+    // sets for one session (the pre-fix run died on `duplicate canonical card
+    // id` for identical copies and silently doubled for diverged ones).
+    write_claude_session_fixture(&fresh, Some("twin-session"), "fresh prompt");
+    write_claude_session_fixture(&stale, Some("twin-session"), "stale prompt");
+    filetime::set_file_mtime(
+        &stale,
+        filetime::FileTime::from_system_time(
+            SystemTime::now() - std::time::Duration::from_secs(3600),
+        ),
+    )
+    .expect("age the stale duplicate");
+
+    let output = run_aicx(&home, &["claude", "-H", "24", "--emit", "json"]);
+    assert_success(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("session ingest summary: ingested=1 skipped=0 duplicate_sources=1"),
+        "duplicate physical source must be dropped and counted, not skipped\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Watermark held"),
+        "a dropped duplicate must not hold the watermark\nstderr:\n{stderr}"
+    );
+
+    let projection_dir = home
+        .join(".aicx")
+        .join("store")
+        .join("canonical-projection-v1");
+    let manifest: Value = serde_json::from_str(
+        &fs::read_to_string(projection_dir.join("manifest.json"))
+            .expect("canonical projection manifest"),
+    )
+    .expect("valid canonical projection manifest");
+    let card_ids = manifest["card_ids"].as_array().expect("manifest card ids");
+    assert_eq!(
+        card_ids.len(),
+        1,
+        "exactly one card set may project for one logical session"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn session_batch_returns_exit_three_when_every_session_is_quarantined() {
     let root = unique_test_dir("claude-batch-all-skipped");
     let home = root.join("home");
