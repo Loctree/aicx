@@ -6391,13 +6391,24 @@ fn emit_session_batch_summary(agent: &str, batch: &sources::SessionExtractionBat
         eprintln!("    recover: {}", skip.recover);
     }
     if batch.selected_sessions > 0 || !batch.skipped.is_empty() || batch.filtered_out_sessions > 0 {
-        eprintln!(
-            "  [{}] session ingest summary: ingested={} skipped={} filtered_out={}",
-            agent,
-            batch.ingested_sessions,
-            batch.skipped.len(),
-            batch.filtered_out_sessions
-        );
+        if batch.duplicate_sources > 0 {
+            eprintln!(
+                "  [{}] session ingest summary: ingested={} skipped={} filtered_out={} duplicate_sources={}",
+                agent,
+                batch.ingested_sessions,
+                batch.skipped.len(),
+                batch.filtered_out_sessions,
+                batch.duplicate_sources
+            );
+        } else {
+            eprintln!(
+                "  [{}] session ingest summary: ingested={} skipped={} filtered_out={}",
+                agent,
+                batch.ingested_sessions,
+                batch.skipped.len(),
+                batch.filtered_out_sessions
+            );
+        }
     }
 }
 

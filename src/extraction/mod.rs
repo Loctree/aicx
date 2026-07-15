@@ -68,6 +68,10 @@ pub struct SessionExtractionBatch {
     /// outside `selected_sessions`/`skipped`: an all-filtered batch is an
     /// empty result, not an all-skipped failure.
     pub filtered_out_sessions: usize,
+    /// Extra physical sources whose logical session was already ingested in
+    /// this batch (e.g. an archived copy of the same rollout file). Dropped,
+    /// not skipped: they must not hold the watermark or trigger retries.
+    pub duplicate_sources: usize,
     pub skipped: Vec<SessionSkip>,
 }
 
@@ -81,9 +85,25 @@ impl SessionExtractionBatch {
             ingested_session_ids: BTreeSet::new(),
             selected_sessions: 0,
             filtered_out_sessions: 0,
+            duplicate_sources: 0,
             skipped: Vec::new(),
         }
     }
+}
+
+/// Freshest copy first: one logical session can be discoverable through more
+/// than one physical path (e.g. a live rollout file plus an archived copy).
+/// Parsing the most recently modified source first lets the per-batch
+/// session-id guard drop the older duplicates, so the canonical projection
+/// never sees two card sets for one session (`duplicate canonical card id`).
+#[cfg(feature = "app")]
+fn order_sources_freshest_first(sources: &mut [crate::session_catalog::CatalogSource]) {
+    sources.sort_by(|left, right| {
+        right
+            .fingerprint
+            .modified_unix_nanos
+            .cmp(&left.fingerprint.modified_unix_nanos)
+    });
 }
 
 /// Discover identities with the catalog and parse every selected session once.
@@ -110,11 +130,13 @@ pub fn extract_agent_sessions(
     let scan = crate::session_catalog::SessionCatalog::new(agent, &root)?.scan_with_stats();
     let parser_agent = parser_agent(agent);
     let mut batch = SessionExtractionBatch::default();
-    for source in scan
+    let mut sources: Vec<_> = scan
         .result?
         .into_iter()
         .filter(|source| source_is_selected(source.fingerprint.modified_unix_nanos, config))
-    {
+        .collect();
+    order_sources_freshest_first(&mut sources);
+    for source in sources {
         let parsed = crate::parser_dispatch::parse_file(
             parser_agent,
             &source.source_id,
@@ -134,6 +156,13 @@ pub fn extract_agent_sessions(
                     continue;
                 }
                 batch.selected_sessions += 1;
+                if batch
+                    .ingested_session_ids
+                    .contains(&session.model().session_id)
+                {
+                    batch.duplicate_sources += 1;
+                    continue;
+                }
                 let projection = match aicx_parser::projections::project_validated_session(
                     &session,
                     &canonical_projection_config(),
