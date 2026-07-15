@@ -98,6 +98,10 @@ impl SessionExtractionBatch {
 /// never sees two card sets for one session (`duplicate canonical card id`).
 #[cfg(feature = "app")]
 fn order_sources_freshest_first(sources: &mut [crate::session_catalog::CatalogSource]) {
+    // STABLE sort on purpose (NOT sort_unstable_by): archived copies made with
+    // `cp -p` carry an identical mtime, and on a tie the catalog scan order
+    // must decide the duplicate winner deterministically. An unstable sort
+    // would make "which copy wins" run-to-run random for equal timestamps.
     sources.sort_by(|left, right| {
         right
             .fingerprint
