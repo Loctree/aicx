@@ -1478,6 +1478,7 @@ mod tests {
 
     static TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
+    #[cfg(unix)]
     #[derive(Debug, Deserialize)]
     struct GoldenSet {
         repo_id: String,
@@ -1487,6 +1488,7 @@ mod tests {
         pairs: Vec<GoldenPair>,
     }
 
+    #[cfg(unix)]
     #[derive(Debug, Deserialize)]
     struct GoldenPair {
         anchor_id: String,
@@ -1496,6 +1498,7 @@ mod tests {
         evidence: GoldenEvidence,
     }
 
+    #[cfg(unix)]
     #[derive(Debug, Deserialize)]
     struct GoldenEvidence {
         path: String,
@@ -1982,6 +1985,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn canonical_card(index: usize, pair: &GoldenPair) -> CanonicalCard {
         let evidence = format!("ev1:codex:session-{index:04}:{index:06}:text:{index:016x}");
         CanonicalCard {
@@ -2023,6 +2027,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn write_projection(root: &Path, cards: &[CanonicalCard], revision_byte: char) {
         write_canonical_projection_at(
             root,
