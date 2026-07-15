@@ -1320,7 +1320,15 @@ fn session_batch_quarantines_bad_claude_source_and_holds_watermark() {
     assert_success(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("session ingest summary: ingested=1 skipped=1"));
-    assert!(stderr.contains(&invalid.display().to_string()));
+    let invalid_name = invalid
+        .file_name()
+        .expect("invalid fixture file name")
+        .to_string_lossy()
+        .into_owned();
+    // Path rendering differs per platform (Windows may canonicalize with a
+    // verbatim \\?\ prefix); the unique fixture file name proves the skip
+    // points at the offending source without asserting the exact rendering.
+    assert!(stderr.contains(&invalid_name));
     assert!(stderr.contains("session_id=22222222-2222-4222-8222-222222222222"));
     assert!(stderr.contains("recover: aicx extract claude --file"));
     assert!(stderr.contains("Watermark held: 1 skipped session(s)"));
@@ -1366,7 +1374,7 @@ fn session_batch_quarantines_bad_claude_source_and_holds_watermark() {
         .expect("diagnostics log");
     let log = fs::read_to_string(diagnostic.path()).expect("read diagnostics log");
     assert!(log.contains("session_skip agent=claude"));
-    assert!(log.contains(&invalid.display().to_string()));
+    assert!(log.contains(&invalid_name));
 
     let _ = fs::remove_dir_all(&root);
 }
