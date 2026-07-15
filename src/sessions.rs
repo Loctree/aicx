@@ -1332,7 +1332,7 @@ mod tests {
         // The project dir encodes cwd with '/'->'-'; a real hyphen (vc-workspace)
         // must NOT be mis-pruned by a lossy decode when matching --cwd.
         let root = temp_root("cwdprune");
-        let proj = root.join("-Users-me-vc-workspace-aicx");
+        let proj = root.join("-Users-tester-vc-workspace-aicx");
         fs::create_dir_all(&proj).unwrap();
         write_session(
             &proj,
@@ -1539,7 +1539,7 @@ mod tests {
         // A dir whose encoded name merely shares a string prefix with the
         // encoded --cwd must be pruned: `repo` is not `repository`.
         let root = temp_root("cwdprune_boundary");
-        let sibling = root.join("-Users-me-repository");
+        let sibling = root.join("-Users-tester-repository");
         fs::create_dir_all(&sibling).unwrap();
         write_session(
             &sibling,
@@ -1548,7 +1548,7 @@ mod tests {
                 r#"{"type":"user","cwd":"/Users/tester/repository","message":{"role":"user","content":"x"},"timestamp":"2026-06-08T10:00:00.000Z"}"#,
             ],
         );
-        let nested = root.join("-Users-me-repo-sub");
+        let nested = root.join("-Users-tester-repo-sub");
         fs::create_dir_all(&nested).unwrap();
         write_session(
             &nested,
