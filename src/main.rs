@@ -6353,12 +6353,22 @@ fn emit_session_batch_summary(agent: &str, batch: &sources::SessionExtractionBat
         eprintln!("    recover: {}", skip.recover);
     }
     if batch.selected_sessions > 0 || !batch.skipped.is_empty() {
-        eprintln!(
-            "  [{}] session ingest summary: ingested={} skipped={}",
-            agent,
-            batch.ingested_sessions,
-            batch.skipped.len()
-        );
+        if batch.duplicate_sources > 0 {
+            eprintln!(
+                "  [{}] session ingest summary: ingested={} skipped={} duplicate_sources={}",
+                agent,
+                batch.ingested_sessions,
+                batch.skipped.len(),
+                batch.duplicate_sources
+            );
+        } else {
+            eprintln!(
+                "  [{}] session ingest summary: ingested={} skipped={}",
+                agent,
+                batch.ingested_sessions,
+                batch.skipped.len()
+            );
+        }
     }
 }
 
