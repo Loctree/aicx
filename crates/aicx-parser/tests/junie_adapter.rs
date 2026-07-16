@@ -193,6 +193,47 @@ fn junie_native_matrix_models_core_shapes_and_coverage() {
 }
 
 #[test]
+fn junie_a2ux_live_envelope_maps_roles_and_latest_snapshots() {
+    let source = fixture_source_with_session(
+        "a2ux-live",
+        include_str!("../../../tests/fixtures/parser_engine/junie/session-a2ux-live/events.jsonl"),
+        "session-260713-155923-jemh",
+    );
+    let read = RawUnitReader::new(ReaderPolicy::default())
+        .read(&source)
+        .unwrap();
+    let adapter = JunieAdapter;
+    let model = adapter
+        .assemble(&source, &read, adapter.classify(&source, &read).unwrap())
+        .expect("assemble live Junie A2ux fixture")
+        .into_model();
+
+    assert_eq!(model.coverage.raw_line_count, 5);
+
+    let turns = model
+        .turns
+        .iter()
+        .map(|turn| (turn.role, turn.kind, turn.text.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(turns.len(), 3);
+    assert!(turns.contains(&(
+        TurnRole::Assistant,
+        TurnKind::InternalThought,
+        "Inspect the Junie parser and its normative contract."
+    )));
+    assert!(turns.contains(&(
+        TurnRole::Tool,
+        TurnKind::ToolCall,
+        "cargo test -p aicx-parser junie"
+    )));
+    assert!(turns.contains(&(
+        TurnRole::Assistant,
+        TurnKind::AgentReply,
+        "Implemented the Junie A2ux parser."
+    )));
+}
+
+#[test]
 fn junie_native_golden_matches_reviewed_fixture() {
     let source = fixture_source_with_session(
         "20260713",
