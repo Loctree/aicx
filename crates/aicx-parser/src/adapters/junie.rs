@@ -69,10 +69,9 @@ impl AgentAdapter for JunieAdapter {
         {
             let logical_kind = block.logical_kind();
             let locator = format!(
-                "{}_{}-{}",
-                ordinal_locator(block.parent.physical_ordinal),
-                logical_kind,
-                sanitize_locator(&block.key.step_id)
+                "step:{}:{}",
+                sanitize_locator(&block.key.step_id),
+                sanitize_locator(&block.key.event_kind)
             );
             let evidence_event_id = evidence_event_id_from_hash(
                 source.agent(),
@@ -140,6 +139,7 @@ fn classify_raw(
         );
     };
 
+    let value = agent_event_payload(value);
     let event_kind = event_kind(value);
     match event_kind.as_deref() {
         Some("UserPromptEvent") => {
@@ -189,7 +189,16 @@ fn classify_raw(
             },
             logical_block(value, kind),
         ),
-        Some("AgentStateChangedEvent" | "ProgressStartedEvent" | "ProgressFinishedEvent") => (
+        Some(
+            "AgentStateChangedEvent"
+            | "AgentStateUpdatedEvent"
+            | "AgentCurrentStatusUpdatedEvent"
+            | "AgentContextUpdatedEvent"
+            | "AgentModeUpdatedEvent"
+            | "AgentModelUpdatedEvent"
+            | "ProgressStartedEvent"
+            | "ProgressFinishedEvent",
+        ) => (
             "agent_event:state".to_owned(),
             ClassifiedDisposition::Skipped {
                 reason: SkippedReason::Unsupported,
@@ -306,6 +315,7 @@ impl<'a> Assembly<'a> {
 
     fn consume_physical(&mut self, kind: &str, value: &Value, evidence: RawUnitRef) {
         let timestamp = timestamp_for(value, &self.started_at);
+        let value = agent_event_payload(value);
         if matches!(self.started_at, Known::Unknown(_)) {
             self.started_at = timestamp.clone();
             self.segment_started_at = timestamp.clone();
@@ -640,7 +650,7 @@ impl<'a> Assembly<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct BlockKey {
     step_id: String,
-    flavor: BlockFlavor,
+    event_kind: String,
 }
 
 #[derive(Debug, Clone)]
@@ -701,6 +711,8 @@ fn logical_block(value: &Value, event_kind: &str) -> Option<LogicalBlock> {
         BlockFlavor::ToolCall => first_text(
             value,
             &[
+                &["command"],
+                &["text"],
                 &["arguments"],
                 &["input"],
                 &["content"],
@@ -724,6 +736,7 @@ fn logical_block(value: &Value, event_kind: &str) -> Option<LogicalBlock> {
             value,
             &[
                 &["text"],
+                &["result"],
                 &["content"],
                 &["markdown"],
                 &["data", "text"],
@@ -738,26 +751,51 @@ fn logical_block(value: &Value, event_kind: &str) -> Option<LogicalBlock> {
             ],
         ),
     };
+    let text = if text.is_empty() {
+        match event_kind {
+            "ViewFilesBlockUpdatedEvent" => {
+                value.get("files").map(Value::to_string).unwrap_or_default()
+            }
+            "FileChangesBlockUpdatedEvent" => value
+                .get("changes")
+                .map(Value::to_string)
+                .unwrap_or_default(),
+            _ => text,
+        }
+    } else {
+        text
+    };
+    let tool_name = first_present(
+        value,
+        &[
+            &["toolName"],
+            &["tool"],
+            &["name"],
+            &["data", "toolName"],
+            &["data", "tool"],
+            &["data", "name"],
+            &["event", "agentEvent", "toolName"],
+            &["event", "agentEvent", "tool"],
+            &["event", "agentEvent", "name"],
+        ],
+    )
+    .unwrap_or(match event_kind {
+        "TerminalBlockUpdatedEvent" => "terminal",
+        "McpBlockUpdatedEvent" => "mcp",
+        "ToolBlockUpdatedEvent" => "junie_tool",
+        "ViewFilesBlockUpdatedEvent" => "view_files",
+        "FileChangesBlockUpdatedEvent" => "file_changes",
+        _ => "",
+    })
+    .to_owned();
     Some(LogicalBlock {
-        key: BlockKey { step_id, flavor },
+        key: BlockKey {
+            step_id,
+            event_kind: event_kind.to_owned(),
+        },
         flavor,
         text,
-        tool_name: first_present(
-            value,
-            &[
-                &["toolName"],
-                &["tool"],
-                &["name"],
-                &["data", "toolName"],
-                &["data", "tool"],
-                &["data", "name"],
-                &["event", "agentEvent", "toolName"],
-                &["event", "agentEvent", "tool"],
-                &["event", "agentEvent", "name"],
-            ],
-        )
-        .unwrap_or("")
-        .to_owned(),
+        tool_name,
         correlation_id: first_present(
             value,
             &[
@@ -802,8 +840,15 @@ fn block_flavor(kind: &str) -> Option<BlockFlavor> {
         "AgentTextBlockUpdatedEvent"
         | "AgentResultBlockUpdatedEvent"
         | "ResultBlockUpdatedEvent" => Some(BlockFlavor::Text),
-        "AgentReasoningBlockUpdatedEvent" => Some(BlockFlavor::Reasoning),
-        "AgentToolCallBlockUpdatedEvent" => Some(BlockFlavor::ToolCall),
+        "AgentReasoningBlockUpdatedEvent" | "AgentThoughtBlockUpdatedEvent" => {
+            Some(BlockFlavor::Reasoning)
+        }
+        "AgentToolCallBlockUpdatedEvent"
+        | "TerminalBlockUpdatedEvent"
+        | "McpBlockUpdatedEvent"
+        | "ToolBlockUpdatedEvent"
+        | "FileChangesBlockUpdatedEvent"
+        | "ViewFilesBlockUpdatedEvent" => Some(BlockFlavor::ToolCall),
         "AgentToolCallOutputBlockUpdatedEvent" | "AgentToolResultBlockUpdatedEvent" => {
             Some(BlockFlavor::ToolResult)
         }
@@ -846,6 +891,14 @@ fn event_kind(value: &Value) -> Option<String> {
         ],
     )
     .map(str::to_owned)
+}
+
+fn agent_event_payload(value: &Value) -> &Value {
+    if string_at(value, &["kind"]) == Some("SessionA2uxEvent") {
+        value.pointer("/event/agentEvent").unwrap_or(value)
+    } else {
+        value
+    }
 }
 
 fn timestamp_for(value: &Value, fallback: &Known<String>) -> Known<String> {
