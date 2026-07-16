@@ -12,8 +12,110 @@ use axum::{
     routing::get,
 };
 use http_body_util::BodyExt;
-use std::net::SocketAddr;
+use std::{
+    io::{Read as _, Write as _},
+    net::SocketAddr,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 use tower::ServiceExt;
+
+#[test]
+fn stdio_server_exits_cleanly_within_five_seconds_after_stdin_eof() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_aicx-mcp"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn aicx-mcp stdio server");
+
+    drop(child.stdin.take());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll aicx-mcp exit") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill hung aicx-mcp after EOF timeout");
+            let _ = child.wait();
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            panic!("aicx-mcp did not exit within 5s after stdin EOF; stderr: {stderr}");
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr)
+            .expect("read aicx-mcp stderr");
+    }
+    assert!(
+        status.success(),
+        "stdin EOF must be a clean lifecycle exit; status={status}, stderr={stderr}"
+    );
+}
+
+#[test]
+fn initialized_stdio_server_exits_within_five_seconds_after_stdin_eof() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_aicx-mcp"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn initialized aicx-mcp stdio server");
+
+    let mut stdin = child.stdin.take().expect("take aicx-mcp stdin");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-03-26","capabilities":{{}},"clientInfo":{{"name":"mcp-slim","version":"1"}}}}}}"#
+    )
+    .expect("send MCP initialize request");
+    stdin.flush().expect("flush MCP initialize request");
+    drop(stdin);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll initialized aicx-mcp exit") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child
+                .kill()
+                .expect("kill initialized aicx-mcp after EOF timeout");
+            let _ = child.wait();
+            panic!("initialized aicx-mcp did not exit within 5s after stdin EOF");
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .expect("take initialized aicx-mcp stdout")
+        .read_to_string(&mut stdout)
+        .expect("read initialized aicx-mcp stdout");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("take initialized aicx-mcp stderr")
+        .read_to_string(&mut stderr)
+        .expect("read initialized aicx-mcp stderr");
+
+    assert!(
+        status.success(),
+        "initialized stdin EOF must be a clean lifecycle exit; status={status}, stderr={stderr}"
+    );
+    assert!(
+        stdout.contains(r#""id":1"#),
+        "server should answer initialize before the clean EOF exit; stdout={stdout}, stderr={stderr}"
+    );
+}
 
 #[test]
 fn test_mcp_slim_defaults() {

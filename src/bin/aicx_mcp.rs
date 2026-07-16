@@ -12,7 +12,7 @@
 //! Vibecrafted with AI Agents by Vetcoders (c)2026 Vetcoders
 
 use aicx::auth;
-use aicx::mcp::{self, McpHttpConfig, McpTransport};
+use aicx::mcp::{self, McpHttpConfig, McpLifecycleConfig, McpTransport};
 use std::io::Write as _;
 use std::net::IpAddr;
 use std::panic;
@@ -62,6 +62,10 @@ struct Args {
     /// Disable Bearer auth on HTTP transport. Only allowed on loopback binds.
     #[arg(long = "no-require-auth", action = clap::ArgAction::SetTrue)]
     no_require_auth: bool,
+
+    /// Drop idle request memory after this many minutes (stdio and HTTP).
+    #[arg(long, default_value_t = 15, value_parser = clap::value_parser!(u64).range(1..))]
+    idle_drop_minutes: u64,
 }
 
 // Safe stderr logging — never panics, even if stderr is closed.
@@ -142,8 +146,14 @@ fn main() -> ExitCode {
         allowed_hosts: args.allowed_hosts,
         allow_any_host: args.allow_any_host,
     };
-    match rt.block_on(async { mcp::run_transport(args.transport, http_config, auth_config).await })
-    {
+    let lifecycle = McpLifecycleConfig {
+        idle_memory_drop_after: std::time::Duration::from_secs(
+            args.idle_drop_minutes.saturating_mul(60),
+        ),
+    };
+    match rt.block_on(async {
+        mcp::run_transport_with_lifecycle(args.transport, http_config, auth_config, lifecycle).await
+    }) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let err_str = format!("{e:?}");
@@ -171,6 +181,7 @@ mod tests {
 
         assert_eq!(args.host, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(args.port, 8044);
+        assert_eq!(args.idle_drop_minutes, 15);
     }
 
     #[test]
@@ -226,5 +237,15 @@ mod tests {
         assert!(rendered.contains("--host"));
         assert!(rendered.contains("Bind address for streamable HTTP transport"));
         assert!(rendered.contains("--no-require-auth"));
+        assert!(rendered.contains("--idle-drop-minutes"));
+    }
+
+    #[test]
+    fn idle_drop_minutes_accepts_positive_override_and_rejects_zero() {
+        let args = Args::try_parse_from(["aicx-mcp", "--idle-drop-minutes", "3"])
+            .expect("positive idle drop override should parse");
+        assert_eq!(args.idle_drop_minutes, 3);
+
+        assert!(Args::try_parse_from(["aicx-mcp", "--idle-drop-minutes", "0"]).is_err());
     }
 }
