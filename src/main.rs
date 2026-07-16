@@ -2277,8 +2277,42 @@ fn run_command(command: Option<Commands>) -> Result<()> {
         }) => {
             let json = aicx::cli::failure::want_json_envelope(false);
 
-            // Removed flag grammar: reject with a structured migration hint,
-            // never silently alias to the subcommand form.
+            // `--agent <a>` is a DEPRECATED ALIAS for the agent subcommand
+            // (restored 2026-07-16: hard removal broke fleet-wide silent
+            // consumers — hooks with `|| true` never read the migration hint).
+            // `--format` stays removed; `hours`/`include_assistant` have no
+            // new-grammar equivalent, so they still route to the hard error.
+            let alias_eligible = agent.is_some()
+                && target.is_none()
+                && format.is_none()
+                && hours.is_none()
+                && !include_assistant;
+            if alias_eligible {
+                let agent_name = agent.as_deref().unwrap_or_default();
+                if let Some(extract_agent) = ExtractAgent::from_str(agent_name) {
+                    let label = extract_agent.label();
+                    eprintln!(
+                        "note: `--agent {label}` is a deprecated alias; canonical form: `aicx extract {label} ...`"
+                    );
+                    let args = ExtractAgentArgs {
+                        redaction: RedactionArgs {
+                            redact_secrets: true,
+                        },
+                        session,
+                        file: input,
+                        output,
+                        project,
+                        user_only,
+                        max_message_chars: max_message_chars.unwrap_or(0),
+                        conversation,
+                    };
+                    run_extract_target(extract_agent, args)?;
+                    return Ok(());
+                }
+            }
+
+            // Removed flag grammar (--format, or legacy flags without a
+            // resolvable --agent): reject with a structured migration hint.
             let legacy_flags_used = agent.is_some()
                 || format.is_some()
                 || session.is_some()
@@ -2306,7 +2340,7 @@ fn run_command(command: Option<Commands>) -> Result<()> {
                     json,
                     aicx::cli::failure::StructuredFailure::new(
                         "legacy_flag_grammar",
-                        "legacy --agent/--format flag grammar was removed; the agent is a required subcommand",
+                        "legacy --format flag grammar was removed; the agent is a required subcommand (`--agent <a>` is accepted as a deprecated alias)",
                         format!("rerun as `{migration}`"),
                     )
                     .with_fallback(migration),
