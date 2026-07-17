@@ -27,13 +27,14 @@
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aicx::api::Aicx;
 use aicx::dashboard::project_matches_filter;
 use aicx::intents::{IntentExtraction, IntentsConfig};
-use aicx::store::project_filter_matches;
+use aicx::store::{ProjectMatchMode, project_filter_matches, require_project_resolution};
 
 const LEAKY_FILTER: &str = "vista";
 const LEAKY_CANDIDATE_ORG: &str = "vetcoders";
@@ -124,6 +125,15 @@ fn payload_projects(payload: &Value) -> Vec<&str> {
         .expect("intents envelope items")
         .iter()
         .map(|item| item["project"].as_str().expect("intent project"))
+        .collect()
+}
+
+fn payload_session_ids(payload: &Value) -> Vec<&str> {
+    payload["items"]
+        .as_array()
+        .expect("intents envelope items")
+        .iter()
+        .map(|item| item["session_id"].as_str().expect("intent session_id"))
         .collect()
 }
 
@@ -246,74 +256,105 @@ fn rank_path_rejects_substring_leak() {
 }
 
 #[test]
-fn intents_collector_is_strict_and_preserves_explicit_wildcards() {
+fn resolver_world_model_is_exact_fail_closed_and_explicitly_fuzzy() {
     let root = strict_filter_corpus();
+    let corpus = aicx::store::project_identities_in_store_at(&root).expect("discover corpus");
 
-    let exact = extract_via_api(&root, "LibraxisAI/vista");
+    let ambiguous =
+        require_project_resolution(&["vista".to_string()], &corpus, ProjectMatchMode::Exact)
+            .expect_err("two exact bare identities must fail closed");
     assert_eq!(
-        exact
-            .records
-            .iter()
-            .map(|record| record.project.as_str())
-            .collect::<Vec<_>>(),
-        ["LibraxisAI/vista"],
-        "exact slug must exclude VistaScribe-dev and vista-portal"
+        ambiguous.candidates(),
+        ["Another/vista", "LibraxisAI/vista"]
     );
 
-    let bare = extract_via_api(&root, "vista");
-    let bare_projects = bare
-        .records
-        .iter()
-        .map(|record| record.project.as_str())
-        .collect::<Vec<_>>();
-    assert!(bare_projects.contains(&"LibraxisAI/vista"));
-    assert!(bare_projects.contains(&"Another/vista"));
-    assert!(!bare_projects.contains(&"VetCoders/vista-portal"));
+    let exact = require_project_resolution(
+        &["LibraxisAI/vista".to_string()],
+        &corpus,
+        ProjectMatchMode::Exact,
+    )
+    .expect("owner/repo exact");
+    assert_eq!(exact.selected, ["LibraxisAI/vista"]);
 
-    let owner = extract_via_api(&root, "LibraxisAI/");
-    let owner_projects = owner
-        .records
-        .iter()
-        .map(|record| record.project.as_str())
-        .collect::<Vec<_>>();
-    assert!(owner_projects.contains(&"LibraxisAI/vista"));
-    assert!(owner_projects.contains(&"LibraxisAI/VistaScribe-dev"));
-    assert!(!owner_projects.contains(&"VetCoders/vista-portal"));
+    let unique = require_project_resolution(
+        &["vista-portal".to_string()],
+        &corpus,
+        ProjectMatchMode::Exact,
+    )
+    .expect("unique bare repo");
+    assert_eq!(unique.selected, ["VetCoders/vista-portal"]);
 
-    let repo = extract_via_api(&root, "/vista");
-    let repo_projects = repo
-        .records
-        .iter()
-        .map(|record| record.project.as_str())
-        .collect::<Vec<_>>();
-    assert!(repo_projects.contains(&"LibraxisAI/vista"));
-    assert!(repo_projects.contains(&"Another/vista"));
-    assert!(!repo_projects.contains(&"VetCoders/vista-portal"));
+    let fuzzy =
+        require_project_resolution(&["vista".to_string()], &corpus, ProjectMatchMode::Fuzzy)
+            .expect("explicit fuzzy family search");
+    assert_eq!(
+        fuzzy.selected,
+        [
+            "Another/vista",
+            "LibraxisAI/VistaScribe-dev",
+            "LibraxisAI/vista",
+            "VetCoders/vista-portal",
+        ]
+    );
 
     fs::remove_dir_all(root).expect("remove strict-filter corpus");
 }
 
 #[test]
-fn intents_cli_and_mcp_api_path_share_strict_collector_semantics() {
+fn intents_cli_and_mcp_resolution_path_share_selected_session_set() {
     let root = strict_filter_corpus();
+    let corpus = aicx::store::project_identities_in_store_at(&root).expect("discover corpus");
+    let selected = require_project_resolution(
+        &["LibraxisAI/vista".to_string()],
+        &corpus,
+        ProjectMatchMode::Exact,
+    )
+    .expect("shared exact resolution");
 
-    // The CLI calls the same collector + envelope formatter in `run_intents`.
-    // Exercise those production functions directly here; the delivery smoke
-    // launches the real binary against the same three-bucket corpus.
-    let cli = render_mcp_api_payload(&root, "LibraxisAI/vista");
-    assert_eq!(payload_projects(&cli), ["LibraxisAI/vista"]);
+    let mcp = render_mcp_api_payload(&root, &selected.selected[0]);
+    assert_eq!(payload_projects(&mcp), ["LibraxisAI/vista"]);
 
-    let mcp = render_mcp_api_payload(&root, "vista");
-    let mcp_projects = payload_projects(&mcp);
-    assert!(mcp_projects.contains(&"LibraxisAI/vista"));
-    assert!(mcp_projects.contains(&"Another/vista"));
-    assert!(!mcp_projects.contains(&"LibraxisAI/VistaScribe-dev"));
-    assert!(!mcp_projects.contains(&"VetCoders/vista-portal"));
+    let cli = Command::new(env!("CARGO_BIN_EXE_aicx"))
+        .env("AICX_HOME", &root)
+        .env("AICX_ALLOW_TMP", "1")
+        .args([
+            "intents",
+            "-p",
+            "LibraxisAI/vista",
+            "--emit",
+            "json",
+            "-H",
+            "0",
+        ])
+        .output()
+        .expect("run CLI intents");
+    assert!(
+        cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_payload: Value = serde_json::from_slice(&cli.stdout).expect("parse CLI envelope");
+    assert_eq!(payload_projects(&cli_payload), payload_projects(&mcp));
+    assert_eq!(payload_session_ids(&cli_payload), payload_session_ids(&mcp));
+
+    let ambiguous_cli = Command::new(env!("CARGO_BIN_EXE_aicx"))
+        .env("AICX_HOME", &root)
+        .env("AICX_ALLOW_TMP", "1")
+        .args(["intents", "-p", "vista", "--emit", "json", "-H", "0"])
+        .output()
+        .expect("run ambiguous CLI intents");
+    assert!(!ambiguous_cli.status.success());
+    let stderr = String::from_utf8_lossy(&ambiguous_cli.stderr);
+    assert!(stderr.contains("Another/vista"), "{stderr}");
+    assert!(stderr.contains("LibraxisAI/vista"), "{stderr}");
+    assert!(!stderr.contains("vista-portal"), "{stderr}");
 
     let intents_source = read_source("src/intents.rs");
     assert!(intents_source.contains("store::project_filter_matches"));
     assert!(!intents_source.contains(".contains(&project.to_ascii_lowercase())"));
     let mcp_source = read_source("src/mcp.rs");
+    assert!(mcp_source.contains("resolve_mcp_projects"));
+    assert!(mcp_source.contains("project_resolution_mcp_error"));
     assert!(mcp_source.contains("extract_intents_with_stats_for_projects"));
     assert!(mcp_source.contains("format_intents_oracle_json"));
     let cli_source = read_source("src/main.rs");

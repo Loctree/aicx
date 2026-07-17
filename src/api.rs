@@ -124,7 +124,8 @@ impl Aicx {
         } else {
             opts.projects
         };
-        let project_scopes_owned = search_project_scopes(&self.config.store_root, &owned_projects)?;
+        let project_scopes_owned =
+            search_project_scopes(&self.config.store_root, &owned_projects, opts.project_match)?;
         let project_scopes: Vec<Option<&str>> = project_scopes_owned
             .iter()
             .map(|scope| scope.as_deref())
@@ -197,6 +198,7 @@ pub struct SearchOptions {
     pub limit: usize,
     pub projects: Vec<String>,
     pub project: Option<String>,
+    pub project_match: crate::store::ProjectMatchMode,
     pub frame_kind: Option<FrameKind>,
     pub kind: Option<String>,
 }
@@ -208,6 +210,7 @@ impl Default for SearchOptions {
             limit: 10,
             projects: Vec::new(),
             project: None,
+            project_match: crate::store::ProjectMatchMode::Exact,
             frame_kind: None,
             kind: None,
         }
@@ -215,13 +218,17 @@ impl Default for SearchOptions {
 }
 
 #[cfg(feature = "app")]
-fn search_project_scopes(store_root: &Path, projects: &[String]) -> Result<Vec<Option<String>>> {
+fn search_project_scopes(
+    store_root: &Path,
+    projects: &[String],
+    match_mode: crate::store::ProjectMatchMode,
+) -> Result<Vec<Option<String>>> {
     if projects.is_empty() {
         return Ok(vec![None]);
     }
-    let resolved =
-        crate::store::resolve_filters_to_store_or_index_slugs_at_or_error(store_root, projects)?;
-    Ok(resolved.into_iter().map(Some).collect())
+    let corpus = crate::store::project_identities_in_store_or_index_at(store_root)?;
+    let resolution = crate::store::require_project_resolution(projects, &corpus, match_mode)?;
+    Ok(resolution.selected.into_iter().map(Some).collect())
 }
 
 #[derive(Debug, Clone, Serialize)]

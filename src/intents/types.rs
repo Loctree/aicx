@@ -99,6 +99,13 @@ pub struct IntentExtractionStats {
 /// JSON consumers (including MCP) must be able to distinguish a complete
 /// result from a cap-truncated, identity-narrowed, or limit-saturated view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProjectResolutionScope {
+    pub match_mode: String,
+    pub selected: Vec<String>,
+    pub candidates: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IntentsCompleteness {
     pub complete: bool,
     pub candidate_cap: usize,
@@ -111,6 +118,24 @@ pub struct IntentsCompleteness {
     pub requested_limit: Option<usize>,
     pub available_before_limit: usize,
     pub limit_saturated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ProjectResolutionScope>,
+}
+
+impl IntentsCompleteness {
+    pub fn with_project_scope(
+        mut self,
+        match_mode: impl Into<String>,
+        selected: Vec<String>,
+        candidates: Vec<String>,
+    ) -> Self {
+        self.scope = Some(ProjectResolutionScope {
+            match_mode: match_mode.into(),
+            selected,
+            candidates,
+        });
+        self
+    }
 }
 
 impl IntentExtractionStats {
@@ -137,6 +162,7 @@ impl IntentExtractionStats {
             requested_limit,
             available_before_limit,
             limit_saturated,
+            scope: None,
         }
     }
 }
