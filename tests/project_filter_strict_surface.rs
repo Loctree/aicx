@@ -343,7 +343,14 @@ fn mcp_intents_response_with_arguments(root: &std::path::Path, arguments: Value)
 }
 
 fn mcp_intents_payload(root: &std::path::Path, project: &str) -> Value {
-    let response = mcp_intents_response(root, project);
+    mcp_intents_payload_with_arguments(
+        root,
+        serde_json::json!({"project": project, "hours": 0, "emit": "json", "limit": 100}),
+    )
+}
+
+fn mcp_intents_payload_with_arguments(root: &std::path::Path, arguments: Value) -> Value {
+    let response = mcp_intents_response_with_arguments(root, arguments);
     let text = response["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or_else(|| panic!("MCP intents result missing text: {response}"));
@@ -612,6 +619,48 @@ fn resolver_world_model_is_exact_fail_closed_and_explicitly_fuzzy() {
         ]
     );
 
+    let cli = Command::new(env!("CARGO_BIN_EXE_aicx"))
+        .env("AICX_HOME", &root)
+        .env("AICX_ALLOW_TMP", "1")
+        .args([
+            "--project-fuzzy",
+            "intents",
+            "-p",
+            "vista",
+            "--emit",
+            "json",
+            "-H",
+            "0",
+        ])
+        .output()
+        .expect("run fuzzy CLI intents");
+    assert!(
+        cli.status.success(),
+        "fuzzy CLI intents failed: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_payload: Value = serde_json::from_slice(&cli.stdout).expect("parse fuzzy CLI envelope");
+    let mcp_payload = mcp_intents_payload_with_arguments(
+        &root,
+        serde_json::json!({
+            "project": "vista",
+            "project_match": "fuzzy",
+            "hours": 0,
+            "emit": "json",
+            "limit": 100
+        }),
+    );
+    for payload in [&cli_payload, &mcp_payload] {
+        assert_eq!(
+            payload["completeness"]["warnings"],
+            serde_json::json!(["fuzzy project matching active"])
+        );
+        assert_eq!(
+            payload["completeness"]["scope"]["selected"],
+            serde_json::json!(fuzzy.selected)
+        );
+    }
+
     fs::remove_dir_all(root).expect("remove strict-filter corpus");
 }
 
@@ -878,6 +927,13 @@ fn legacy_record_falls_back_to_path_heuristic_with_cli_mcp_parity() {
     assert_eq!(
         mcp_payload["completeness"]["identity_source"],
         "path-heuristic"
+    );
+    let expected_warning = serde_json::json!(["1 record(s) resolved by path heuristic"]);
+    assert_eq!(cli_payload["completeness"]["warnings"], expected_warning);
+    assert_eq!(mcp_payload["completeness"]["warnings"], expected_warning);
+    println!(
+        "legacy-cli-envelope={}",
+        serde_json::to_string(&cli_payload).expect("serialize legacy CLI envelope evidence")
     );
 
     fs::remove_dir_all(root).expect("remove legacy fallback corpus");

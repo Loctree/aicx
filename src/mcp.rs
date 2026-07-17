@@ -1720,11 +1720,7 @@ impl AicxMcpServer {
                 );
                 let completeness = extraction
                     .stats
-                    .completeness(
-                        Vec::new(),
-                        display.requested_limit,
-                        display.available_before_limit,
-                    )
+                    .completeness(display.requested_limit, display.available_before_limit)
                     .with_project_scope(
                         project_resolution.match_mode.as_str(),
                         project_resolution.selected.clone(),
@@ -2545,14 +2541,13 @@ mod tests {
                 "three/aicx".to_string(),
             ],
             identity_source: crate::intents::PERSISTED_IDENTITY_SOURCE.to_string(),
+            path_heuristic_records: 0,
         };
-        let completeness = stats
-            .completeness(Vec::new(), Some(1), 3)
-            .with_project_scope(
-                "exact",
-                vec!["two/aicx".to_string()],
-                vec!["two/aicx".to_string()],
-            );
+        let completeness = stats.completeness(Some(1), 3).with_project_scope(
+            "exact",
+            vec!["two/aicx".to_string()],
+            vec!["two/aicx".to_string()],
+        );
         let body = crate::intents::format_intents_oracle_json_with_completeness(
             &records,
             oracle_status,
@@ -2582,9 +2577,16 @@ mod tests {
             payload["completeness"]["matched_project_buckets"],
             serde_json::json!(["one/aicx", "two/aicx", "three/aicx"])
         );
+        assert!(
+            payload["completeness"]
+                .as_object()
+                .is_some_and(|value| !value.contains_key("skipped_project_buckets"))
+        );
         assert_eq!(
-            payload["completeness"]["skipped_project_buckets"],
-            serde_json::json!([])
+            payload["completeness"]["warnings"],
+            serde_json::json!([
+                "candidate cap of 5000 reached; 2 candidate(s) and 0 task event(s) dropped"
+            ])
         );
         assert_eq!(payload["completeness"]["limit_saturated"], true);
         assert_eq!(
