@@ -856,9 +856,23 @@ fn format_chunk_text_inner(
     // that have already been routed through `sanitize_window`, so message
     // bodies here are noise-free. Skip empty messages so windows that reduced
     // to pure scaffolding don't emit empty role lines.
+    //
+    // Turn lines carry only `[HH:MM:SS]`, so a window crossing midnight
+    // would read as time running backwards. Anchor every day change with a
+    // standalone `— YYYY-MM-DD —` line (O5). The separator deliberately does
+    // not start with `[`, so `rank.rs::is_conversation_line` and the hook
+    // regexes over turn lines never match it; day-partitioned windows (the
+    // `chunk_entries` norm) never change dates mid-window and stay
+    // byte-for-byte identical.
+    let mut current_date = date.to_owned();
     for entry in entries {
         if entry.message.is_empty() {
             continue;
+        }
+        let entry_date = entry.timestamp.format("%Y-%m-%d").to_string();
+        if entry_date != current_date {
+            text.push_str(&format!("— {entry_date} —\n"));
+            current_date = entry_date;
         }
         let time = entry.timestamp.format("%H:%M:%S");
         // Truncate very long messages to avoid monster chunks (UTF-8 safe).
@@ -1723,6 +1737,85 @@ mod tests {
             return body;
         }
         text.split_once("\n\n").map(|(_, body)| body).unwrap_or("")
+    }
+
+    // SYNTHETIC midnight-crossing session (mission O5, operator backlog
+    // 2026-07-16 ~03:10): entries carry only `[HH:MM:SS]`, so a session
+    // crossing midnight reads as time running backwards without a date
+    // anchor between entries.
+    fn make_entry_on(
+        year: i32,
+        month: u32,
+        day: u32,
+        hour: u32,
+        min: u32,
+        role: &str,
+        msg: &str,
+    ) -> TimelineEntry {
+        let mut entry = make_entry(hour, min, role, msg);
+        entry.timestamp = Utc
+            .with_ymd_and_hms(year, month, day, hour, min, 0)
+            .unwrap();
+        entry
+    }
+
+    #[test]
+    fn test_chunk_text_midnight_window_emits_date_separator() {
+        let before = make_entry_on(2026, 7, 15, 23, 58, "user", "still on day one");
+        let after = make_entry_on(2026, 7, 16, 0, 3, "assistant", "now past midnight");
+        let window = [&before, &after];
+        let text = format_chunk_text_inner(&window, "proj", "claude", "2026-07-15", None, &[]);
+
+        // (b) header carries the full window-start date.
+        assert!(text.contains("date: 2026-07-15\n"), "text:\n{text}");
+        // (a) day change between entries is anchored by a separator line.
+        assert!(
+            text.contains("\n— 2026-07-16 —\n"),
+            "midnight crossing must emit a date separator line\ntext:\n{text}"
+        );
+        let separator_idx = text.find("— 2026-07-16 —").unwrap();
+        assert!(
+            separator_idx < text.find("[00:03:00] assistant:").unwrap(),
+            "separator must precede the first entry of the new day"
+        );
+        assert!(
+            separator_idx > text.find("[23:58:00] user:").unwrap(),
+            "separator must follow the last entry of the previous day"
+        );
+
+        // (c) turn lines stay byte-identical to the frozen consumer contract
+        // (`rank.rs::is_conversation_line`): exactly the same `[HH:MM:SS]`
+        // lines, unchanged, and the separator itself never matches.
+        let is_turn_line = |line: &str| {
+            let trimmed = line.trim();
+            trimmed.starts_with('[')
+                && trimmed.len() > 12
+                && trimmed.as_bytes().get(3) == Some(&b':')
+                && trimmed.as_bytes().get(6) == Some(&b':')
+                && trimmed.as_bytes().get(9) == Some(&b']')
+        };
+        let turn_lines: Vec<&str> = text.lines().filter(|line| is_turn_line(line)).collect();
+        assert_eq!(
+            turn_lines,
+            vec![
+                "[23:58:00] user: still on day one",
+                "[00:03:00] assistant: now past midnight",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_chunk_text_same_day_window_has_no_date_separator() {
+        // Day-partitioned windows (the `chunk_entries` norm) must stay
+        // byte-for-byte unchanged: no separator on a same-day window.
+        let first = make_entry_on(2026, 7, 15, 10, 0, "user", "same day question");
+        let second = make_entry_on(2026, 7, 15, 10, 5, "assistant", "same day answer");
+        let window = [&first, &second];
+        let text = format_chunk_text_inner(&window, "proj", "claude", "2026-07-15", None, &[]);
+        assert!(
+            !text.contains("— 2026-07-15 —"),
+            "same-day window must not emit a date separator\ntext:\n{text}"
+        );
     }
 
     #[test]
