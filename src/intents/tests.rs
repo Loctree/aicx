@@ -316,8 +316,8 @@ Intent:
 }
 
 #[test]
-fn collapse_session_merges_exact_daily_duplicates_across_session_forks() {
-    let make_record = |session_id: &str, source_chunk: &str| IntentRecord {
+fn collapse_session_merges_exact_daily_duplicates_within_session() {
+    let make_record = |source_chunk: &str| IntentRecord {
         kind: IntentKind::Intent,
         summary: "przerobimy Screenscribe na portal".to_string(),
         context: None,
@@ -326,7 +326,7 @@ fn collapse_session_merges_exact_daily_duplicates_across_session_forks() {
         agent: "codex".to_string(),
         date: "2026-05-31".to_string(),
         timestamp: None,
-        session_id: session_id.to_string(),
+        session_id: "same-session".to_string(),
         count: None,
         first_chunk: None,
         last_chunk: None,
@@ -336,9 +336,9 @@ fn collapse_session_merges_exact_daily_duplicates_across_session_forks() {
     };
 
     let records = vec![
-        make_record("fork-a", "a.md"),
-        make_record("fork-b", "b.md"),
-        make_record("fork-c", "c.md"),
+        make_record("a.md"),
+        make_record("b.md"),
+        make_record("c.md"),
     ];
     let collapsed = apply_display_filters(
         records,
@@ -353,6 +353,188 @@ fn collapse_session_merges_exact_daily_duplicates_across_session_forks() {
     assert!(collapsed[0].source_chunk.contains("a.md"));
     assert!(collapsed[0].source_chunk.contains("b.md"));
     assert!(collapsed[0].source_chunk.contains("c.md"));
+}
+
+#[test]
+fn collapse_session_keeps_same_session_id_in_distinct_projects() {
+    let make_record = |project: &str, source_chunk: &str| IntentRecord {
+        kind: IntentKind::Intent,
+        summary: "preserve project-scoped session identity".to_string(),
+        context: None,
+        evidence: vec![],
+        project: project.to_string(),
+        agent: "codex".to_string(),
+        date: "2026-07-17".to_string(),
+        timestamp: Some("2026-07-17T12:00:00Z".to_string()),
+        session_id: "shared-session".to_string(),
+        count: None,
+        first_chunk: None,
+        last_chunk: None,
+        source_chunk: source_chunk.to_string(),
+        source: None,
+        honesty: Default::default(),
+    };
+
+    let collapsed = apply_display_filters(
+        vec![
+            make_record("alpha/product", "alpha.md"),
+            make_record("beta/product", "beta.md"),
+        ],
+        &IntentDisplayFilters {
+            collapse_session: true,
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(collapsed.len(), 2);
+    assert_eq!(
+        collapsed
+            .iter()
+            .map(|record| (record.project.as_str(), record.session_id.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("alpha/product", "shared-session"),
+            ("beta/product", "shared-session"),
+        ]
+    );
+}
+
+#[test]
+fn collapse_session_prefers_substantive_intent_over_newer_task_noise() {
+    let make_record =
+        |kind: IntentKind, summary: &str, timestamp: &str, source: &str| IntentRecord {
+            kind,
+            summary: summary.to_string(),
+            context: None,
+            evidence: vec![],
+            project: "Loctree/aicx".to_string(),
+            agent: "codex".to_string(),
+            date: timestamp[..10].to_string(),
+            timestamp: Some(timestamp.to_string()),
+            session_id: "quality-session".to_string(),
+            count: None,
+            first_chunk: None,
+            last_chunk: None,
+            source_chunk: source.to_string(),
+            source: None,
+            honesty: Default::default(),
+        };
+    let records = vec![
+        make_record(
+            IntentKind::Task,
+            "Set model to Opus 4.8",
+            "2026-07-17T12:00:00Z",
+            "task-newest.md",
+        ),
+        make_record(
+            IntentKind::Intent,
+            "Make newest-N deterministic across the shared CLI and MCP collector",
+            "2026-07-16T12:00:00Z",
+            "intent.md",
+        ),
+        make_record(
+            IntentKind::Task,
+            "Set model to Sonnet",
+            "2026-07-15T12:00:00Z",
+            "task-oldest.md",
+        ),
+    ];
+
+    let forward = apply_display_filters(
+        records.clone(),
+        &IntentDisplayFilters {
+            collapse_session: true,
+            ..Default::default()
+        },
+    );
+    let reverse = apply_display_filters(
+        records.into_iter().rev().collect(),
+        &IntentDisplayFilters {
+            collapse_session: true,
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(
+        forward, reverse,
+        "representative must not depend on input order"
+    );
+    assert_eq!(forward.len(), 1);
+    assert_eq!(forward[0].kind, IntentKind::Intent);
+    assert_eq!(
+        forward[0].summary,
+        "Make newest-N deterministic across the shared CLI and MCP collector"
+    );
+    assert!(!forward[0].summary.contains("Set model"));
+    assert_eq!(forward[0].count, Some(3));
+}
+
+#[test]
+fn newest_limit_uses_total_identity_order_for_timestamp_ties() {
+    let make_record = |project: &str, session_id: &str, source_chunk: &str| IntentRecord {
+        kind: IntentKind::Intent,
+        summary: format!("intent {project} {session_id} {source_chunk}"),
+        context: None,
+        evidence: vec![],
+        project: project.to_string(),
+        agent: "codex".to_string(),
+        date: "2026-07-17".to_string(),
+        timestamp: Some("2026-07-17T12:00:00Z".to_string()),
+        session_id: session_id.to_string(),
+        count: None,
+        first_chunk: None,
+        last_chunk: None,
+        source_chunk: source_chunk.to_string(),
+        source: None,
+        honesty: Default::default(),
+    };
+    let records = vec![
+        make_record("beta/repo", "session-b", "chunk-2"),
+        make_record("alpha/repo", "session-b", "chunk-2"),
+        make_record("alpha/repo", "session-a", "chunk-2"),
+        make_record("alpha/repo", "session-a", "chunk-1"),
+    ];
+    let filters = IntentDisplayFilters {
+        limit: Some(3),
+        ..Default::default()
+    };
+
+    let forward = apply_display_filters(records.clone(), &filters);
+    let reverse = apply_display_filters(records.into_iter().rev().collect(), &filters);
+    let ids = |items: &[IntentRecord]| {
+        items
+            .iter()
+            .map(|record| {
+                (
+                    record.project.clone(),
+                    record.session_id.clone(),
+                    record.source_chunk.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(ids(&forward), ids(&reverse));
+    assert_eq!(
+        ids(&forward),
+        [
+            (
+                "alpha/repo".to_string(),
+                "session-a".to_string(),
+                "chunk-1".to_string(),
+            ),
+            (
+                "alpha/repo".to_string(),
+                "session-a".to_string(),
+                "chunk-2".to_string(),
+            ),
+            (
+                "alpha/repo".to_string(),
+                "session-b".to_string(),
+                "chunk-2".to_string(),
+            ),
+        ]
+    );
 }
 
 #[test]
